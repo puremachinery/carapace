@@ -133,7 +133,6 @@ impl PluginManifest {
 }
 
 /// Loaded plugin information
-#[derive(Debug)]
 pub struct LoadedPlugin {
     /// Plugin manifest
     pub manifest: PluginManifest,
@@ -141,6 +140,18 @@ pub struct LoadedPlugin {
     pub wasm_path: PathBuf,
     /// Compiled WASM module (can be instantiated multiple times)
     pub module: Module,
+    /// Raw WASM bytes (for component instantiation)
+    pub wasm_bytes: Vec<u8>,
+}
+
+impl std::fmt::Debug for LoadedPlugin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoadedPlugin")
+            .field("manifest", &self.manifest)
+            .field("wasm_path", &self.wasm_path)
+            .field("wasm_bytes_len", &self.wasm_bytes.len())
+            .finish()
+    }
 }
 
 /// Plugin loader that manages discovery and loading of WASM plugins
@@ -274,6 +285,7 @@ impl PluginLoader {
             manifest,
             wasm_path: wasm_path.to_path_buf(),
             module,
+            wasm_bytes,
         };
 
         // Store the plugin
@@ -316,6 +328,7 @@ impl PluginLoader {
             manifest,
             wasm_path: PathBuf::new(), // No file path for byte-loaded plugins
             module,
+            wasm_bytes: wasm_bytes.to_vec(),
         };
 
         // Store the plugin

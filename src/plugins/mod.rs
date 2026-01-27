@@ -36,10 +36,16 @@
 
 pub mod bindings;
 pub mod capabilities;
+pub mod dispatch;
 pub mod host;
 pub mod loader;
+pub mod runtime;
+pub mod tools;
 
 pub mod caps;
+
+#[cfg(test)]
+mod tests;
 
 // Re-export commonly used types
 pub use bindings::{
@@ -52,8 +58,20 @@ pub use capabilities::{
     CapabilityError, ConfigEnforcer, CredentialEnforcer, RateLimiterRegistry, SsrfProtection,
     HTTP_RATE_LIMIT_PER_MINUTE, LOG_RATE_LIMIT_PER_MINUTE,
 };
+pub use dispatch::{
+    is_modifiable_hook, DispatchError, HookDispatchResult, HookDispatcher, ToolDispatcher,
+    WebhookDispatcher, MODIFIABLE_HOOKS,
+};
 pub use host::{
     HostError, HttpRequest, HttpResponse, MediaFetchResult, PluginHostContext,
     PluginHostContextBuilder, MAX_HTTP_BODY_SIZE, MAX_LOG_MESSAGE_SIZE, MAX_URL_LENGTH,
 };
 pub use loader::{LoadedPlugin, LoaderError, PluginKind, PluginLoader, PluginManifest};
+pub use runtime::{
+    HostState, PluginInstanceHandle, PluginRuntime, RuntimeError, DEFAULT_EXECUTION_TIMEOUT,
+    MAX_PLUGIN_MEMORY_BYTES,
+};
+pub use tools::{
+    create_registry as create_tools_registry, BuiltinTool, ToolInvokeContext, ToolInvokeError,
+    ToolInvokeResult, ToolsRegistry,
+};
