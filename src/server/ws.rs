@@ -228,6 +228,7 @@ pub struct WsServerState {
     device_registry: Arc<devices::DevicePairingRegistry>,
     node_registry: Mutex<NodeRegistry>,
     node_pairing: Arc<nodes::NodePairingRegistry>,
+    connections: Mutex<HashMap<String, ConnectionHandle>>,
     channel_registry: Arc<channels::ChannelRegistry>,
     message_pipeline: Arc<messages::outbound::MessagePipeline>,
     session_store: Arc<sessions::SessionStore>,
@@ -242,6 +243,7 @@ impl WsServerState {
             device_registry: Arc::new(devices::DevicePairingRegistry::in_memory()),
             node_registry: Mutex::new(NodeRegistry::default()),
             node_pairing: Arc::new(nodes::NodePairingRegistry::in_memory()),
+            connections: Mutex::new(HashMap::new()),
             channel_registry: channels::create_registry(),
             message_pipeline: messages::outbound::create_pipeline(),
             session_store: Arc::new(sessions::SessionStore::with_base_path(
@@ -263,6 +265,7 @@ impl WsServerState {
             device_registry,
             node_registry: Mutex::new(NodeRegistry::default()),
             node_pairing,
+            connections: Mutex::new(HashMap::new()),
             channel_registry: channels::create_registry(),
             message_pipeline: messages::outbound::create_pipeline(),
             session_store: Arc::new(sessions::SessionStore::with_base_path(
@@ -286,6 +289,22 @@ impl WsServerState {
         let mut guard = self.event_seq.lock();
         *guard += 1;
         *guard
+    }
+
+    fn register_connection(&self, conn: &ConnectionContext, tx: mpsc::UnboundedSender<Message>) {
+        let mut conns = self.connections.lock();
+        conns.insert(
+            conn.conn_id.clone(),
+            ConnectionHandle {
+                role: conn.role.clone(),
+                tx,
+            },
+        );
+    }
+
+    fn unregister_connection(&self, conn_id: &str) {
+        let mut conns = self.connections.lock();
+        conns.remove(conn_id);
     }
 }
 
@@ -658,6 +677,12 @@ struct ConnectionContext {
     device_id: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+struct ConnectionHandle {
+    role: String,
+    tx: mpsc::UnboundedSender<Message>,
+}
+
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<WsServerState>>,
@@ -884,7 +909,15 @@ async fn handle_socket(
     }
 
     if let Some(device) = device_opt {
-        if let Err(err) = ensure_paired(&state, device, &connect_params, &role, &scopes, is_local) {
+        if let Err(err) = ensure_paired(
+            &state,
+            device,
+            &connect_params,
+            &role,
+            &scopes,
+            is_local,
+            remote_addr,
+        ) {
             let _ = send_response(&tx, &req_id, false, None, Some(err.clone()));
             let _ = send_close(&tx, 1008, err.message.as_str());
             return;
@@ -976,6 +1009,8 @@ async fn handle_socket(
         client: connect_params.client.clone(),
         device_id,
     };
+
+    state.register_connection(&conn, tx.clone());
 
     let tick_tx = tx.clone();
     let tick_state = state.clone();
@@ -1071,6 +1106,7 @@ async fn handle_socket(
     drop(tx);
     let _ = send_task.await;
 
+    state.unregister_connection(&conn.conn_id);
     state.node_registry.lock().unregister(&conn.conn_id);
 }
 
@@ -3988,8 +4024,13 @@ fn handle_device_pair_list(state: &WsServerState) -> Result<Value, ErrorShape> {
                 "displayName": req.display_name,
                 "platform": req.platform,
                 "clientId": req.client_id,
+                "clientMode": req.client_mode,
+                "role": req.role,
                 "roles": req.requested_roles,
                 "scopes": req.requested_scopes,
+                "remoteIp": req.remote_ip,
+                "silent": req.silent,
+                "isRepair": req.is_repair,
                 "ts": req.created_at_ms
             })
         })
@@ -4050,6 +4091,17 @@ fn handle_device_pair_approve(
             _ => error_shape(ERROR_UNAVAILABLE, &e.to_string(), None),
         })?;
 
+    broadcast_event(
+        state,
+        "device.pair.resolved",
+        json!({
+            "requestId": request_id,
+            "deviceId": device.device_id,
+            "decision": "approved",
+            "ts": now_ms()
+        }),
+    );
+
     Ok(json!({
         "requestId": request_id,
         "device": {
@@ -4069,13 +4121,13 @@ fn handle_device_pair_approve(
 
 fn handle_device_pair_reject(
     params: Option<&Value>,
-    _state: &WsServerState,
+    state: &WsServerState,
 ) -> Result<Value, ErrorShape> {
     let request_id = params
         .and_then(|v| v.get("requestId"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "requestId is required", None))?;
-    let request = _state
+    let request = state
         .device_registry
         .reject_request(request_id, None)
         .map_err(|e| match e {
@@ -4087,6 +4139,18 @@ fn handle_device_pair_reject(
             }
             _ => error_shape(ERROR_UNAVAILABLE, &e.to_string(), None),
         })?;
+
+    broadcast_event(
+        state,
+        "device.pair.resolved",
+        json!({
+            "requestId": request_id,
+            "deviceId": request.device_id,
+            "decision": "rejected",
+            "ts": now_ms()
+        }),
+    );
+
     Ok(json!({
         "requestId": request_id,
         "deviceId": request.device_id
@@ -4535,6 +4599,7 @@ fn ensure_paired(
     role: &str,
     scopes: &[String],
     is_local: bool,
+    remote_addr: SocketAddr,
 ) -> Result<(), ErrorShape> {
     if let Some(paired) = state.device_registry.get_paired_device(&device.id) {
         if paired.public_key != device.public_key {
@@ -4551,20 +4616,28 @@ fn ensure_paired(
             paired.roles.iter().any(|r| r == role)
         };
         if !role_allowed {
-            return require_pairing(state, device, connect, role, scopes, is_local);
+            return require_pairing(state, device, connect, role, scopes, is_local, remote_addr);
         }
 
         if !scopes.is_empty() {
             if paired.scopes.is_empty() || !scopes.iter().all(|scope| paired.scopes.contains(scope))
             {
-                return require_pairing(state, device, connect, role, scopes, is_local);
+                return require_pairing(
+                    state,
+                    device,
+                    connect,
+                    role,
+                    scopes,
+                    is_local,
+                    remote_addr,
+                );
             }
         }
 
         return Ok(());
     }
 
-    require_pairing(state, device, connect, role, scopes, is_local)
+    require_pairing(state, device, connect, role, scopes, is_local, remote_addr)
 }
 
 fn require_pairing(
@@ -4574,10 +4647,16 @@ fn require_pairing(
     role: &str,
     scopes: &[String],
     is_local: bool,
+    remote_addr: SocketAddr,
 ) -> Result<(), ErrorShape> {
-    let request = state
+    let remote_ip = if is_local {
+        None
+    } else {
+        Some(remote_addr.ip().to_string())
+    };
+    let outcome = state
         .device_registry
-        .request_pairing(
+        .request_pairing_with_status(
             device.id.clone(),
             device.public_key.clone(),
             vec![role.to_string()],
@@ -4585,6 +4664,9 @@ fn require_pairing(
             connect.client.display_name.clone(),
             Some(connect.client.platform.clone()),
             Some(connect.client.id.clone()),
+            Some(connect.client.mode.clone()),
+            remote_ip,
+            Some(is_local),
         )
         .map_err(|e| match e {
             devices::DevicePairingError::PublicKeyMismatch => {
@@ -4596,6 +4678,31 @@ fn require_pairing(
             _ => error_shape(ERROR_UNAVAILABLE, &e.to_string(), None),
         })?;
 
+    let request = outcome.request;
+    let silent = request.silent.unwrap_or(false);
+    if outcome.created && !silent {
+        broadcast_event(
+            state,
+            "device.pair.requested",
+            json!({
+                "requestId": request.request_id,
+                "deviceId": request.device_id,
+                "publicKey": request.public_key,
+                "displayName": request.display_name,
+                "platform": request.platform,
+                "clientId": request.client_id,
+                "clientMode": request.client_mode,
+                "role": request.role,
+                "roles": request.requested_roles,
+                "scopes": request.requested_scopes,
+                "remoteIp": request.remote_ip,
+                "silent": request.silent,
+                "isRepair": request.is_repair,
+                "ts": request.created_at_ms
+            }),
+        );
+    }
+
     if is_local {
         let _ = state
             .device_registry
@@ -4605,6 +4712,17 @@ fn require_pairing(
                 request.requested_scopes,
             )
             .map_err(|e| error_shape(ERROR_UNAVAILABLE, &e.to_string(), None))?;
+
+        broadcast_event(
+            state,
+            "device.pair.resolved",
+            json!({
+                "requestId": request.request_id,
+                "deviceId": request.device_id,
+                "decision": "approved",
+                "ts": now_ms()
+            }),
+        );
         return Ok(());
     }
 
@@ -4763,6 +4881,29 @@ fn error_shape(code: &'static str, message: &str, details: Option<Value>) -> Err
 fn send_json<T: Serialize>(tx: &mpsc::UnboundedSender<Message>, payload: &T) -> Result<(), ()> {
     let text = serde_json::to_string(payload).map_err(|_| ())?;
     tx.send(Message::Text(text)).map_err(|_| ())
+}
+
+fn broadcast_event(state: &WsServerState, event: &str, payload: Value) {
+    let frame = EventFrame {
+        frame_type: "event",
+        event,
+        payload,
+        seq: Some(state.next_event_seq()),
+        state_version: None,
+    };
+    let mut conns = state.connections.lock();
+    let mut dead = Vec::new();
+    for (conn_id, conn) in conns.iter() {
+        if conn.role == "node" {
+            continue;
+        }
+        if send_json(&conn.tx, &frame).is_err() {
+            dead.push(conn_id.clone());
+        }
+    }
+    for conn_id in dead {
+        conns.remove(&conn_id);
+    }
 }
 
 fn send_response(

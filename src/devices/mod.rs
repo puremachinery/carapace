@@ -52,6 +52,9 @@ pub struct DevicePairingRequest {
     pub public_key: String,
     /// Current state of the request
     pub state: PairingState,
+    /// Requested role (primary)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
     /// Requested roles
     #[serde(default)]
     pub requested_roles: Vec<String>,
@@ -67,6 +70,18 @@ pub struct DevicePairingRequest {
     /// Client ID
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
+    /// Client mode
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_mode: Option<String>,
+    /// Remote IP address
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_ip: Option<String>,
+    /// Whether this request should be silent (auto-approve)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub silent: Option<bool>,
+    /// Whether this is a repair request for an existing device
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_repair: Option<bool>,
     /// Timestamp when request was created (Unix ms)
     pub created_at_ms: u64,
     /// Timestamp when request was resolved (Unix ms)
@@ -75,6 +90,11 @@ pub struct DevicePairingRequest {
     /// Reason for rejection (if rejected)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rejection_reason: Option<String>,
+}
+
+pub struct PairingRequestOutcome {
+    pub request: DevicePairingRequest,
+    pub created: bool,
 }
 
 impl DevicePairingRequest {
@@ -87,17 +107,26 @@ impl DevicePairingRequest {
         display_name: Option<String>,
         platform: Option<String>,
         client_id: Option<String>,
+        client_mode: Option<String>,
+        remote_ip: Option<String>,
+        silent: Option<bool>,
+        is_repair: Option<bool>,
     ) -> Self {
         Self {
             request_id: Uuid::new_v4().to_string(),
             device_id,
             public_key,
             state: PairingState::Pending,
+            role: requested_roles.first().cloned(),
             requested_roles,
             requested_scopes,
             display_name,
             platform,
             client_id,
+            client_mode,
+            remote_ip,
+            silent,
+            is_repair,
             created_at_ms: now_ms(),
             resolved_at_ms: None,
             rejection_reason: None,
@@ -195,6 +224,9 @@ impl PairedDevice {
 pub struct DeviceToken {
     /// Token hash for secure storage
     pub token_hash: String,
+    /// Plaintext token (stored for reuse)
+    #[serde(default)]
+    pub token: String,
     /// Device ID this token belongs to
     pub device_id: String,
     /// Role this token is valid for
@@ -218,6 +250,7 @@ impl DeviceToken {
         let now = now_ms();
         (
             Self {
+                token: token.clone(),
                 token_hash,
                 device_id,
                 role,
@@ -396,6 +429,18 @@ impl DevicePairingRegistry {
         })
     }
 
+    pub fn with_auto_save(
+        storage_path: PathBuf,
+        auto_save: bool,
+    ) -> Result<Self, DevicePairingError> {
+        let store = Self::load_or_create(&storage_path)?;
+        Ok(Self {
+            store: RwLock::new(store),
+            storage_path,
+            auto_save,
+        })
+    }
+
     /// Create an in-memory only registry (for testing)
     pub fn in_memory() -> Self {
         Self {
@@ -509,18 +554,41 @@ impl DevicePairingRegistry {
         display_name: Option<String>,
         platform: Option<String>,
         client_id: Option<String>,
+        client_mode: Option<String>,
+        remote_ip: Option<String>,
+        silent: Option<bool>,
     ) -> Result<DevicePairingRequest, DevicePairingError> {
+        let outcome = self.request_pairing_with_status(
+            device_id,
+            public_key,
+            requested_roles,
+            requested_scopes,
+            display_name,
+            platform,
+            client_id,
+            client_mode,
+            remote_ip,
+            silent,
+        )?;
+        Ok(outcome.request)
+    }
+
+    pub fn request_pairing_with_status(
+        &self,
+        device_id: String,
+        public_key: String,
+        requested_roles: Vec<String>,
+        requested_scopes: Vec<String>,
+        display_name: Option<String>,
+        platform: Option<String>,
+        client_id: Option<String>,
+        client_mode: Option<String>,
+        remote_ip: Option<String>,
+        silent: Option<bool>,
+    ) -> Result<PairingRequestOutcome, DevicePairingError> {
         self.cleanup_expired();
 
         let mut store = self.store.write();
-
-        // Check if device is already paired (allow repair/upgrade requests)
-        if let Some(existing) = store.paired_devices.get(&device_id) {
-            // Verify public key matches
-            if existing.public_key != public_key {
-                return Err(DevicePairingError::PublicKeyMismatch);
-            }
-        }
 
         // Check for existing pending request for this device
         if let Some(existing) = store
@@ -532,8 +600,10 @@ impl DevicePairingRegistry {
             if existing.public_key != public_key {
                 return Err(DevicePairingError::PublicKeyMismatch);
             }
-            // Return existing request
-            return Ok(existing.clone());
+            return Ok(PairingRequestOutcome {
+                request: existing.clone(),
+                created: false,
+            });
         }
 
         // Check pending request limit
@@ -546,6 +616,7 @@ impl DevicePairingRegistry {
             return Err(DevicePairingError::TooManyPendingRequests);
         }
 
+        let is_repair = store.paired_devices.contains_key(&device_id);
         let request = DevicePairingRequest::new(
             device_id,
             public_key,
@@ -554,6 +625,10 @@ impl DevicePairingRegistry {
             display_name,
             platform,
             client_id,
+            client_mode,
+            remote_ip,
+            silent,
+            Some(is_repair),
         );
         store
             .pending_requests
@@ -561,7 +636,10 @@ impl DevicePairingRegistry {
         drop(store);
 
         let _ = self.save();
-        Ok(request)
+        Ok(PairingRequestOutcome {
+            request,
+            created: true,
+        })
     }
 
     /// List all pairing requests (pending and recent resolved)
@@ -886,6 +964,42 @@ impl DevicePairingRegistry {
         role: String,
         scopes: Vec<String>,
     ) -> Result<IssuedDeviceToken, DevicePairingError> {
+        let store = self.store.read();
+
+        let device = store
+            .paired_devices
+            .get(device_id)
+            .ok_or(DevicePairingError::DeviceNotPaired)?;
+
+        // Validate role is allowed
+        if !device.roles.contains(&role) && !device.roles.is_empty() {
+            return Err(DevicePairingError::RoleNotAllowed);
+        }
+
+        // Validate scopes are allowed
+        if !scopes_allow(&scopes, &device.scopes) && !device.scopes.is_empty() {
+            return Err(DevicePairingError::ScopeNotAllowed);
+        }
+
+        // Reuse existing token if valid and scopes match
+        if let Some(existing) = store.tokens.values().find(|token| {
+            token.device_id == device_id
+                && token.role == role
+                && !token.revoked
+                && now_ms() < token.expires_at_ms
+                && scopes_allow(&scopes, &token.scopes)
+        }) {
+            if !existing.token.is_empty() {
+                return Ok(IssuedDeviceToken {
+                    token: existing.token.clone(),
+                    role: existing.role.clone(),
+                    scopes: existing.scopes.clone(),
+                    issued_at_ms: existing.issued_at_ms,
+                });
+            }
+        }
+
+        drop(store);
         self.rotate_token(device_id, role, scopes)
     }
 
@@ -1044,6 +1158,9 @@ mod tests {
             Some("Test Device".to_string()),
             Some("darwin".to_string()),
             Some("cli".to_string()),
+            None,
+            None,
+            None,
         );
 
         assert!(result.is_ok());
@@ -1066,6 +1183,9 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
+                None,
             )
             .unwrap();
         let req2 = registry
@@ -1074,6 +1194,9 @@ mod tests {
                 "pubkey-1".to_string(),
                 vec![],
                 vec![],
+                None,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -1096,6 +1219,9 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
+                None,
             )
             .unwrap();
 
@@ -1104,6 +1230,9 @@ mod tests {
             "pubkey-2".to_string(), // Different key
             vec![],
             vec![],
+            None,
+            None,
+            None,
             None,
             None,
             None,
@@ -1122,6 +1251,9 @@ mod tests {
                 vec!["operator".to_string()],
                 vec![],
                 Some("Test Device".to_string()),
+                None,
+                None,
+                None,
                 None,
                 None,
             )
@@ -1159,6 +1291,9 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
+                None,
             )
             .unwrap();
 
@@ -1187,6 +1322,9 @@ mod tests {
                 "pubkey-1".to_string(),
                 vec![],
                 vec![],
+                None,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -1224,6 +1362,9 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
+                None,
             )
             .unwrap();
         let (_device, token) = registry
@@ -1253,6 +1394,9 @@ mod tests {
                 "pubkey-1".to_string(),
                 vec![],
                 vec![],
+                None,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -1291,6 +1435,9 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
+                    None,
+                    None,
                 )
                 .unwrap();
         }
@@ -1301,6 +1448,9 @@ mod tests {
             "pubkey-overflow".to_string(),
             vec![],
             vec![],
+            None,
+            None,
+            None,
             None,
             None,
             None,
@@ -1326,6 +1476,9 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
+                    None,
+                    None,
                 )
                 .unwrap();
             registry
@@ -1342,6 +1495,9 @@ mod tests {
                 "pubkey-new".to_string(),
                 vec![],
                 vec![],
+                None,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -1368,6 +1524,10 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
+            None,
+            None,
         );
 
         assert_eq!(request.state, PairingState::Pending);
@@ -1383,6 +1543,10 @@ mod tests {
             "pubkey-2".to_string(),
             vec![],
             vec![],
+            None,
+            None,
+            None,
+            None,
             None,
             None,
             None,
