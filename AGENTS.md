@@ -2,7 +2,7 @@
 
 ## Project Context
 
-This is a Rust rewrite of the moltbot gateway. Reference implementation: `/Users/zera/build/moltbot`
+carapace is a secure, stable Rust alternative to moltbot - for when your molt needs a hard shell.
 
 ## Code Review Cadence
 
@@ -22,7 +22,7 @@ These require immediate review before integration. Flag completion to the operat
 
 - `src/auth/` - all authentication code
 - `src/credentials/` - OS keychain integration
-- `src/sidecar/` - plugin capability boundary
+- `src/plugins/` - plugin capability boundary
 - `src/server/ratelimit.rs` - rate limiting
 - `src/server/csrf.rs` - CSRF protection
 - `src/hooks/auth.rs` - hook token handling
@@ -36,7 +36,7 @@ When completing a security-critical module:
 
 These can proceed without blocking:
 - Directory scaffolding
-- Type definitions (`types.rs`, `types.ts`)
+- Type definitions (`types.rs`)
 - Documentation (`.md` files)
 - Test fixtures (`tests/golden/`)
 - CI/CD configuration
@@ -103,12 +103,9 @@ Flag these to the operator immediately:
 
 ## Reference Files
 
-- Implementation plan: `docs/refactor/implementation-plan.md`
-- Migration plan: `docs/refactor/rust-migration.md`
-- Compatibility checklist: `docs/refactor/compatibility-checklist.md`
 - Protocol specs: `docs/protocol/*.md`
 - Golden traces: `tests/golden/`
-- Original implementation: `/Users/zera/build/moltbot/src/`
+- Architecture: `docs/architecture.md`
 
 ## Response Style
 

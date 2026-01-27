@@ -157,7 +157,7 @@ sequenceDiagram
 
 | Component | Path | Description |
 |-----------|------|-------------|
-| WS Server | `src/server/ws.rs` | WebSocket JSON-RPC, method dispatch |
+| WS Server | `src/server/ws/` | WebSocket JSON-RPC, method dispatch |
 | HTTP Gateway | `src/server/http.rs` | HTTP endpoints, static files |
 | OpenAI Compat | `src/server/openai.rs` | /v1/chat/completions, /v1/responses |
 | Control API | `src/server/control.rs` | /control/status, /control/channels |
