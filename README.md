@@ -1,6 +1,6 @@
 # carapace
 
-Rust implementation of the Moltbot gateway.
+A secure, stable Rust alternative to moltbot - for when your molt needs a hard shell.
 
 ## Status
 
