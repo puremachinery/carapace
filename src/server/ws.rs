@@ -13,7 +13,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -23,7 +23,7 @@ use tokio::sync::mpsc;
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::{config, credentials};
+use crate::{auth, config, credentials};
 
 const PROTOCOL_VERSION: u32 = 3;
 const MAX_PAYLOAD_BYTES: usize = 512 * 1024;
@@ -159,39 +159,14 @@ const GATEWAY_EVENTS: [&str; 18] = [
 ];
 
 #[derive(Clone, Debug)]
-pub enum AuthMode {
-    Token,
-    Password,
-}
-
-#[derive(Clone, Debug)]
-pub struct ResolvedGatewayAuth {
-    pub mode: AuthMode,
-    pub token: Option<String>,
-    pub password: Option<String>,
-    pub allow_tailscale: bool,
-}
-
-impl Default for ResolvedGatewayAuth {
-    fn default() -> Self {
-        Self {
-            mode: AuthMode::Token,
-            token: None,
-            password: None,
-            allow_tailscale: false,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
 pub struct WsAuthConfig {
-    pub resolved: ResolvedGatewayAuth,
+    pub resolved: auth::ResolvedGatewayAuth,
 }
 
 impl Default for WsAuthConfig {
     fn default() -> Self {
         Self {
-            resolved: ResolvedGatewayAuth::default(),
+            resolved: auth::ResolvedGatewayAuth::default(),
         }
     }
 }
@@ -203,6 +178,8 @@ pub struct WsServerConfig {
     pub trusted_proxies: Vec<String>,
     pub control_ui_allow_insecure_auth: bool,
     pub control_ui_disable_device_auth: bool,
+    pub node_allow_commands: Vec<String>,
+    pub node_deny_commands: Vec<String>,
 }
 
 impl Default for WsServerConfig {
@@ -213,6 +190,8 @@ impl Default for WsServerConfig {
             trusted_proxies: Vec::new(),
             control_ui_allow_insecure_auth: false,
             control_ui_disable_device_auth: false,
+            node_allow_commands: Vec::new(),
+            node_deny_commands: Vec::new(),
         }
     }
 }
@@ -239,6 +218,7 @@ pub struct WsServerState {
     config: WsServerConfig,
     start_time: Instant,
     device_store: Mutex<DeviceStore>,
+    node_registry: Mutex<NodeRegistry>,
     event_seq: Mutex<u64>,
 }
 
@@ -248,6 +228,7 @@ impl WsServerState {
             config,
             start_time: Instant::now(),
             device_store: Mutex::new(DeviceStore::default()),
+            node_registry: Mutex::new(NodeRegistry::default()),
             event_seq: Mutex::new(0),
         }
     }
@@ -283,6 +264,9 @@ pub async fn build_ws_config_from_files() -> Result<WsServerConfig, WsConfigErro
         .and_then(|v| v.as_object());
     let control_ui_obj = gateway
         .and_then(|g| g.get("controlUi"))
+        .and_then(|v| v.as_object());
+    let nodes_obj = gateway
+        .and_then(|g| g.get("nodes"))
         .and_then(|v| v.as_object());
 
     let mode = auth_obj
@@ -322,19 +306,19 @@ pub async fn build_ws_config_from_files() -> Result<WsServerConfig, WsConfigErro
     let password = env_password.or(password_cfg).or(creds.password);
 
     let resolved_mode = match mode {
-        "password" => AuthMode::Password,
-        "token" => AuthMode::Token,
+        "password" => auth::AuthMode::Password,
+        "token" => auth::AuthMode::Token,
         _ => {
             if password.is_some() {
-                AuthMode::Password
+                auth::AuthMode::Password
             } else {
-                AuthMode::Token
+                auth::AuthMode::Token
             }
         }
     };
 
     let allow_tailscale = allow_tailscale_cfg.unwrap_or_else(|| {
-        tailscale_mode == "serve" && !matches!(resolved_mode, AuthMode::Password)
+        tailscale_mode == "serve" && !matches!(resolved_mode, auth::AuthMode::Password)
     });
 
     let trusted_proxies = gateway
@@ -355,10 +339,30 @@ pub async fn build_ws_config_from_files() -> Result<WsServerConfig, WsConfigErro
         .and_then(|o| o.get("dangerouslyDisableDeviceAuth"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let node_allow_commands = nodes_obj
+        .and_then(|o| o.get("allowCommands"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let node_deny_commands = nodes_obj
+        .and_then(|o| o.get("denyCommands"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
 
     Ok(WsServerConfig {
         auth: WsAuthConfig {
-            resolved: ResolvedGatewayAuth {
+            resolved: auth::ResolvedGatewayAuth {
                 mode: resolved_mode,
                 token,
                 password,
@@ -369,6 +373,8 @@ pub async fn build_ws_config_from_files() -> Result<WsServerConfig, WsConfigErro
         trusted_proxies,
         control_ui_allow_insecure_auth,
         control_ui_disable_device_auth,
+        node_allow_commands,
+        node_deny_commands,
     })
 }
 
@@ -443,6 +449,53 @@ impl DeviceStore {
     #[allow(dead_code)]
     fn stats(&self) -> (usize, usize) {
         (self.paired.len(), self.tokens.len())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct NodeSession {
+    node_id: String,
+    commands: HashSet<String>,
+}
+
+#[derive(Debug, Default)]
+struct NodeRegistry {
+    nodes_by_id: HashMap<String, NodeSession>,
+    nodes_by_conn: HashMap<String, String>,
+}
+
+impl NodeRegistry {
+    fn register(&mut self, conn_id: &str, node_id: String, commands: HashSet<String>) {
+        if let Some(existing) = self.nodes_by_conn.remove(conn_id) {
+            self.nodes_by_id.remove(&existing);
+        }
+        if let Some(existing_conn) = self.nodes_by_conn.iter().find_map(|(conn, id)| {
+            if id == &node_id {
+                Some(conn.clone())
+            } else {
+                None
+            }
+        }) {
+            self.nodes_by_conn.remove(&existing_conn);
+        }
+        self.nodes_by_id.insert(
+            node_id.clone(),
+            NodeSession {
+                node_id: node_id.clone(),
+                commands,
+            },
+        );
+        self.nodes_by_conn.insert(conn_id.to_string(), node_id);
+    }
+
+    fn unregister(&mut self, conn_id: &str) -> Option<String> {
+        let node_id = self.nodes_by_conn.remove(conn_id)?;
+        self.nodes_by_id.remove(&node_id);
+        Some(node_id)
+    }
+
+    fn get(&self, node_id: &str) -> Option<&NodeSession> {
+        self.nodes_by_id.get(node_id)
     }
 }
 
@@ -785,7 +838,8 @@ async fn handle_socket(
         return;
     }
 
-    let is_local = is_local_direct_request(remote_addr, &headers, &state.config.trusted_proxies);
+    let is_local =
+        auth::is_local_direct_request(remote_addr, &headers, &state.config.trusted_proxies);
     let role = connect_params
         .role
         .clone()
@@ -858,7 +912,6 @@ async fn handle_socket(
         &connect_params,
         &headers,
         remote_addr,
-        is_local,
         device_id.as_deref(),
         &role,
         &scopes,
@@ -880,6 +933,38 @@ async fn handle_socket(
     let issued_token = device_id
         .as_ref()
         .map(|id| ensure_device_token(&state, id, &role, &scopes));
+
+    if role == "node" {
+        let allowlist = resolve_node_command_allowlist(
+            &state.config.node_allow_commands,
+            &state.config.node_deny_commands,
+            Some(connect_params.client.platform.as_str()),
+            connect_params.client.device_family.as_deref(),
+        );
+        let declared = connect_params.commands.clone().unwrap_or_default();
+        let filtered = declared
+            .into_iter()
+            .map(|cmd| cmd.trim().to_string())
+            .filter(|cmd| !cmd.is_empty() && allowlist.contains(cmd))
+            .collect::<Vec<_>>();
+        connect_params.commands = Some(filtered);
+    }
+
+    if role == "node" {
+        let node_id = device_id
+            .clone()
+            .unwrap_or_else(|| connect_params.client.id.clone());
+        let commands = connect_params
+            .commands
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<HashSet<String>>();
+        state
+            .node_registry
+            .lock()
+            .register(&conn_id, node_id, commands);
+    }
 
     let hello = HelloOkPayload {
         payload_type: "hello-ok",
@@ -1023,6 +1108,8 @@ async fn handle_socket(
     tick_task.abort();
     drop(tx);
     let _ = send_task.await;
+
+    state.node_registry.lock().unregister(&conn.conn_id);
 }
 
 struct ParsedRequest {
@@ -1553,7 +1640,7 @@ fn dispatch_method(
         "node.rename" => handle_node_rename(params),
         "node.list" => handle_node_list(),
         "node.describe" => handle_node_describe(params),
-        "node.invoke" => handle_node_invoke(params),
+        "node.invoke" => handle_node_invoke(params, state),
         "node.invoke.result" => handle_node_invoke_result(params),
         "node.event" => handle_node_event(params),
 
@@ -2169,20 +2256,40 @@ fn handle_node_describe(params: Option<&Value>) -> Result<Value, ErrorShape> {
     }))
 }
 
-fn handle_node_invoke(params: Option<&Value>) -> Result<Value, ErrorShape> {
+fn handle_node_invoke(params: Option<&Value>, state: &WsServerState) -> Result<Value, ErrorShape> {
     let node_id = params
         .and_then(|v| v.get("nodeId"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "nodeId is required", None))?;
-    let method = params
-        .and_then(|v| v.get("method"))
+    let command = params
+        .and_then(|v| v.get("command").or_else(|| v.get("method")))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "method is required", None))?;
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "command is required", None))?;
+    let registry = state.node_registry.lock();
+    let node = registry
+        .get(node_id)
+        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "unknown nodeId", None))?;
+    if node.commands.is_empty() {
+        return Err(error_shape(
+            ERROR_FORBIDDEN,
+            "node did not declare commands",
+            Some(json!({ "nodeId": node_id })),
+        ));
+    }
+    if !node.commands.contains(command) {
+        return Err(error_shape(
+            ERROR_FORBIDDEN,
+            "command not allowlisted",
+            Some(json!({ "nodeId": node_id, "command": command })),
+        ));
+    }
     Ok(json!({
         "ok": true,
         "invokeId": Uuid::new_v4().to_string(),
         "nodeId": node_id,
-        "method": method
+        "command": command
     }))
 }
 
@@ -2588,7 +2695,6 @@ fn authorize_connection(
     connect: &ConnectParams,
     headers: &HeaderMap,
     remote_addr: SocketAddr,
-    is_local: bool,
     device_id: Option<&str>,
     role: &str,
     scopes: &[String],
@@ -2596,57 +2702,24 @@ fn authorize_connection(
     let auth = &state.config.auth.resolved;
     let connect_auth = connect.auth.as_ref();
 
-    // Tailscale auth: verify both headers AND that connection is from Tailscale
-    if auth.allow_tailscale && !is_local {
-        if let Some(ts_auth) = verify_tailscale_auth(headers, remote_addr) {
+    let auth_result = auth::authorize_gateway_connect(
+        auth,
+        connect_auth.and_then(|a| a.token.as_deref()),
+        connect_auth.and_then(|a| a.password.as_deref()),
+        headers,
+        remote_addr,
+        &state.config.trusted_proxies,
+    );
+
+    if auth_result.ok {
+        if matches!(auth_result.method, Some(auth::GatewayAuthMethod::Tailscale)) {
             tracing::debug!(
-                user = %ts_auth.user_login,
+                user = %auth_result.user.as_deref().unwrap_or("unknown"),
                 ip = %remote_addr.ip(),
                 "tailscale auth accepted"
             );
-            return Ok(());
         }
-    }
-
-    match auth.mode {
-        AuthMode::Token => {
-            let Some(token) = auth.token.as_ref() else {
-                return Err(error_shape(
-                    ERROR_INVALID_REQUEST,
-                    "unauthorized: gateway token not configured on gateway (set gateway.auth.token)",
-                    None,
-                ));
-            };
-            let Some(provided) = connect_auth.and_then(|a| a.token.as_ref()) else {
-                return Err(error_shape(
-                    ERROR_INVALID_REQUEST,
-                    "unauthorized: token missing",
-                    None,
-                ));
-            };
-            if timing_safe_eq(token, provided) {
-                return Ok(());
-            }
-        }
-        AuthMode::Password => {
-            let Some(password) = auth.password.as_ref() else {
-                return Err(error_shape(
-                    ERROR_INVALID_REQUEST,
-                    "unauthorized: gateway password not configured on gateway (set gateway.auth.password)",
-                    None,
-                ));
-            };
-            let Some(provided) = connect_auth.and_then(|a| a.password.as_ref()) else {
-                return Err(error_shape(
-                    ERROR_INVALID_REQUEST,
-                    "unauthorized: password missing",
-                    None,
-                ));
-            };
-            if timing_safe_eq(password, provided) {
-                return Ok(());
-            }
-        }
+        return Ok(());
     }
 
     if let Some(device_id) = device_id {
@@ -2657,7 +2730,12 @@ fn authorize_connection(
         }
     }
 
-    Err(error_shape(ERROR_INVALID_REQUEST, "unauthorized", None))
+    let reason = auth_result
+        .reason
+        .unwrap_or(auth::GatewayAuthFailure::Unauthorized)
+        .message();
+
+    Err(error_shape(ERROR_INVALID_REQUEST, reason, None))
 }
 
 fn ensure_paired(
@@ -2818,64 +2896,6 @@ fn base64url_decode(input: &str) -> Result<Vec<u8>, ()> {
         .map_err(|_| ())
 }
 
-/// Tailscale auth info extracted from headers
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-struct TailscaleAuth {
-    user_login: String,
-    user_name: Option<String>,
-}
-
-/// Verify Tailscale authentication.
-///
-/// Tailscale Serve adds trusted headers when proxying requests. We verify:
-/// 1. Required headers are present (tailscale-user-login or x-tailscale-user)
-/// 2. The connection is from a Tailscale IP (100.64.0.0/10 CGNAT range or localhost for serve)
-fn verify_tailscale_auth(headers: &HeaderMap, remote_addr: SocketAddr) -> Option<TailscaleAuth> {
-    let ip = remote_addr.ip();
-
-    // Verify connection is from Tailscale or localhost (Tailscale Serve runs locally)
-    let is_tailscale_ip = match ip {
-        std::net::IpAddr::V4(v4) => {
-            let octets = v4.octets();
-            // Tailscale CGNAT: 100.64.0.0/10 (100.64.x.x - 100.127.x.x)
-            // Also allow localhost for local Tailscale Serve
-            (octets[0] == 100 && (octets[1] & 0xC0) == 64) || v4.is_loopback()
-        }
-        std::net::IpAddr::V6(v6) => v6.is_loopback(),
-    };
-
-    if !is_tailscale_ip {
-        tracing::debug!(
-            ip = %ip,
-            "tailscale auth rejected: not from tailscale IP"
-        );
-        return None;
-    }
-
-    // Extract user info from headers
-    let user_login = header_value(headers, "tailscale-user-login")
-        .or_else(|| header_value(headers, "x-tailscale-user"))?;
-
-    let user_name = header_value(headers, "tailscale-user-name");
-
-    Some(TailscaleAuth {
-        user_login,
-        user_name,
-    })
-}
-
-fn timing_safe_eq(a: &str, b: &str) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut out = 0u8;
-    for (x, y) in a.bytes().zip(b.bytes()) {
-        out |= x ^ y;
-    }
-    out == 0
-}
-
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2977,6 +2997,129 @@ async fn recv_text_with_timeout(
     }
 }
 
+const CANVAS_COMMANDS: [&str; 8] = [
+    "canvas.present",
+    "canvas.hide",
+    "canvas.navigate",
+    "canvas.eval",
+    "canvas.snapshot",
+    "canvas.a2ui.push",
+    "canvas.a2ui.pushJSONL",
+    "canvas.a2ui.reset",
+];
+const CAMERA_COMMANDS: [&str; 3] = ["camera.list", "camera.snap", "camera.clip"];
+const SCREEN_COMMANDS: [&str; 1] = ["screen.record"];
+const LOCATION_COMMANDS: [&str; 1] = ["location.get"];
+const SMS_COMMANDS: [&str; 1] = ["sms.send"];
+const SYSTEM_COMMANDS: [&str; 6] = [
+    "system.run",
+    "system.which",
+    "system.notify",
+    "system.execApprovals.get",
+    "system.execApprovals.set",
+    "browser.proxy",
+];
+
+fn normalize_platform_id(platform: Option<&str>, device_family: Option<&str>) -> &'static str {
+    let raw = platform.unwrap_or_default().trim().to_lowercase();
+    if raw.starts_with("ios") {
+        return "ios";
+    }
+    if raw.starts_with("android") {
+        return "android";
+    }
+    if raw.starts_with("mac") || raw.starts_with("darwin") {
+        return "macos";
+    }
+    if raw.starts_with("win") {
+        return "windows";
+    }
+    if raw.starts_with("linux") {
+        return "linux";
+    }
+    let family = device_family.unwrap_or_default().trim().to_lowercase();
+    if family.contains("iphone") || family.contains("ipad") || family.contains("ios") {
+        return "ios";
+    }
+    if family.contains("android") {
+        return "android";
+    }
+    if family.contains("mac") {
+        return "macos";
+    }
+    if family.contains("windows") {
+        return "windows";
+    }
+    if family.contains("linux") {
+        return "linux";
+    }
+    "unknown"
+}
+
+fn default_node_commands(platform_id: &str) -> Vec<&'static str> {
+    let mut commands = Vec::new();
+    match platform_id {
+        "ios" => {
+            commands.extend_from_slice(&CANVAS_COMMANDS);
+            commands.extend_from_slice(&CAMERA_COMMANDS);
+            commands.extend_from_slice(&SCREEN_COMMANDS);
+            commands.extend_from_slice(&LOCATION_COMMANDS);
+        }
+        "android" => {
+            commands.extend_from_slice(&CANVAS_COMMANDS);
+            commands.extend_from_slice(&CAMERA_COMMANDS);
+            commands.extend_from_slice(&SCREEN_COMMANDS);
+            commands.extend_from_slice(&LOCATION_COMMANDS);
+            commands.extend_from_slice(&SMS_COMMANDS);
+        }
+        "macos" => {
+            commands.extend_from_slice(&CANVAS_COMMANDS);
+            commands.extend_from_slice(&CAMERA_COMMANDS);
+            commands.extend_from_slice(&SCREEN_COMMANDS);
+            commands.extend_from_slice(&LOCATION_COMMANDS);
+            commands.extend_from_slice(&SYSTEM_COMMANDS);
+        }
+        "linux" | "windows" => {
+            commands.extend_from_slice(&SYSTEM_COMMANDS);
+        }
+        _ => {
+            commands.extend_from_slice(&CANVAS_COMMANDS);
+            commands.extend_from_slice(&CAMERA_COMMANDS);
+            commands.extend_from_slice(&SCREEN_COMMANDS);
+            commands.extend_from_slice(&LOCATION_COMMANDS);
+            commands.extend_from_slice(&SMS_COMMANDS);
+            commands.extend_from_slice(&SYSTEM_COMMANDS);
+        }
+    }
+    commands
+}
+
+fn resolve_node_command_allowlist(
+    allow: &[String],
+    deny: &[String],
+    platform: Option<&str>,
+    device_family: Option<&str>,
+) -> HashSet<String> {
+    let platform_id = normalize_platform_id(platform, device_family);
+    let mut allowlist: HashSet<String> = default_node_commands(platform_id)
+        .into_iter()
+        .map(|cmd| cmd.to_string())
+        .collect();
+    for cmd in allow {
+        let trimmed = cmd.trim();
+        if !trimmed.is_empty() {
+            allowlist.insert(trimmed.to_string());
+        }
+    }
+    for cmd in deny {
+        let trimmed = cmd.trim();
+        if !trimmed.is_empty() {
+            allowlist.remove(trimmed);
+        }
+    }
+    allowlist
+}
+
 fn resolve_state_dir() -> PathBuf {
     if let Ok(dir) = env::var("CLAWDBOT_STATE_DIR") {
         return PathBuf::from(dir);
@@ -2986,246 +3129,9 @@ fn resolve_state_dir() -> PathBuf {
         .join(".clawdbot")
 }
 
-fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
-    headers
-        .get(name)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
-fn get_host_name(host_header: Option<String>) -> String {
-    let host = host_header.unwrap_or_default();
-    let trimmed = host.trim();
-    if trimmed.starts_with('[') {
-        if let Some(end) = trimmed.find(']') {
-            return trimmed[1..end].to_string();
-        }
-    }
-    trimmed.split(':').next().unwrap_or_default().to_string()
-}
-
-fn normalize_ip(raw: &str) -> Option<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if let Some(stripped) = trimmed.strip_prefix("::ffff:") {
-        return Some(stripped.to_string());
-    }
-    Some(trimmed.to_string())
-}
-
-fn parse_forwarded_for(value: Option<String>) -> Option<String> {
-    let raw = value?;
-    let first = raw.split(',').next()?.trim();
-    normalize_ip(first)
-}
-
-fn is_loopback_address(ip: &str) -> bool {
-    ip == "127.0.0.1" || ip.starts_with("127.") || ip == "::1" || ip.starts_with("::ffff:127.")
-}
-
-fn is_trusted_proxy(remote: Option<&str>, trusted: &[String]) -> bool {
-    let remote = remote.and_then(normalize_ip);
-    if remote.is_none() || trusted.is_empty() {
-        return false;
-    }
-    let remote = remote.unwrap();
-    trusted
-        .iter()
-        .filter_map(|p| normalize_ip(p))
-        .any(|p| p == remote)
-}
-
-fn resolve_client_ip(
-    remote: &str,
-    forwarded_for: Option<String>,
-    real_ip: Option<String>,
-    trusted: &[String],
-) -> Option<String> {
-    if !is_trusted_proxy(Some(remote), trusted) {
-        return normalize_ip(remote);
-    }
-    parse_forwarded_for(forwarded_for).or_else(|| normalize_ip(&real_ip.unwrap_or_default()))
-}
-
-fn is_local_direct_request(
-    remote_addr: SocketAddr,
-    headers: &HeaderMap,
-    trusted: &[String],
-) -> bool {
-    let remote_ip = remote_addr.ip().to_string();
-    let forwarded_for = header_value(headers, "x-forwarded-for");
-    let real_ip = header_value(headers, "x-real-ip");
-    let has_forwarded = forwarded_for.is_some() || real_ip.is_some();
-    let host = get_host_name(header_value(headers, "host"));
-    let host_is_local = host == "localhost" || host == "127.0.0.1" || host == "::1";
-    let host_is_tailscale = host.ends_with(".ts.net");
-    let client_ip = resolve_client_ip(&remote_ip, forwarded_for, real_ip, trusted);
-    if !client_ip
-        .as_ref()
-        .map(|ip| is_loopback_address(ip))
-        .unwrap_or(false)
-    {
-        return false;
-    }
-    (host_is_local || host_is_tailscale)
-        && (!has_forwarded || is_trusted_proxy(Some(&remote_ip), trusted))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn make_headers(pairs: &[(&str, &str)]) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        for (name, value) in pairs {
-            headers.insert(
-                axum::http::header::HeaderName::try_from(*name).unwrap(),
-                axum::http::header::HeaderValue::from_str(value).unwrap(),
-            );
-        }
-        headers
-    }
-
-    #[test]
-    fn test_tailscale_auth_accepts_localhost_with_headers() {
-        let headers = make_headers(&[("tailscale-user-login", "user@example.com")]);
-        let addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
-        let auth = verify_tailscale_auth(&headers, addr);
-        assert!(auth.is_some());
-        assert_eq!(auth.unwrap().user_login, "user@example.com");
-    }
-
-    #[test]
-    fn test_tailscale_auth_accepts_cgnat_ip_with_headers() {
-        let headers = make_headers(&[("tailscale-user-login", "user@tailnet.ts.net")]);
-        // 100.64.x.x is in the Tailscale CGNAT range
-        let addr: SocketAddr = "100.64.1.1:12345".parse().unwrap();
-        let auth = verify_tailscale_auth(&headers, addr);
-        assert!(auth.is_some());
-        assert_eq!(auth.unwrap().user_login, "user@tailnet.ts.net");
-    }
-
-    #[test]
-    fn test_tailscale_auth_accepts_x_tailscale_user_header() {
-        let headers = make_headers(&[("x-tailscale-user", "altuser@example.com")]);
-        let addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
-        let auth = verify_tailscale_auth(&headers, addr);
-        assert!(auth.is_some());
-        assert_eq!(auth.unwrap().user_login, "altuser@example.com");
-    }
-
-    #[test]
-    fn test_tailscale_auth_rejects_external_ip() {
-        let headers = make_headers(&[("tailscale-user-login", "user@example.com")]);
-        // External IP - not Tailscale
-        let addr: SocketAddr = "8.8.8.8:12345".parse().unwrap();
-        let auth = verify_tailscale_auth(&headers, addr);
-        assert!(auth.is_none());
-    }
-
-    #[test]
-    fn test_tailscale_auth_rejects_private_ip_outside_cgnat() {
-        let headers = make_headers(&[("tailscale-user-login", "user@example.com")]);
-        // 192.168.x.x is private but not Tailscale
-        let addr: SocketAddr = "192.168.1.1:12345".parse().unwrap();
-        let auth = verify_tailscale_auth(&headers, addr);
-        assert!(auth.is_none());
-    }
-
-    #[test]
-    fn test_tailscale_auth_rejects_missing_headers() {
-        let headers = HeaderMap::new();
-        let addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
-        let auth = verify_tailscale_auth(&headers, addr);
-        assert!(auth.is_none());
-    }
-
-    #[test]
-    fn test_tailscale_cgnat_range() {
-        // Valid Tailscale CGNAT: 100.64.0.0 - 100.127.255.255
-        let headers = make_headers(&[("tailscale-user-login", "user@example.com")]);
-
-        // Should accept: 100.64.x.x through 100.127.x.x
-        let addr1: SocketAddr = "100.64.0.1:12345".parse().unwrap();
-        assert!(verify_tailscale_auth(&headers, addr1).is_some());
-
-        let addr2: SocketAddr = "100.100.50.25:12345".parse().unwrap();
-        assert!(verify_tailscale_auth(&headers, addr2).is_some());
-
-        let addr3: SocketAddr = "100.127.255.254:12345".parse().unwrap();
-        assert!(verify_tailscale_auth(&headers, addr3).is_some());
-
-        // Should reject: 100.128.x.x (outside CGNAT)
-        let addr4: SocketAddr = "100.128.0.1:12345".parse().unwrap();
-        assert!(verify_tailscale_auth(&headers, addr4).is_none());
-
-        // Should reject: 100.0.x.x (outside CGNAT)
-        let addr5: SocketAddr = "100.0.0.1:12345".parse().unwrap();
-        assert!(verify_tailscale_auth(&headers, addr5).is_none());
-    }
-
-    #[test]
-    fn test_loopback_address() {
-        assert!(is_loopback_address("127.0.0.1"));
-        assert!(is_loopback_address("127.0.0.2"));
-        assert!(is_loopback_address("127.255.255.255"));
-        assert!(is_loopback_address("::1"));
-        assert!(is_loopback_address("::ffff:127.0.0.1"));
-        assert!(!is_loopback_address("192.168.1.1"));
-        assert!(!is_loopback_address("10.0.0.1"));
-    }
-
-    #[test]
-    fn test_normalize_ip() {
-        assert_eq!(normalize_ip("192.168.1.1"), Some("192.168.1.1".to_string()));
-        assert_eq!(
-            normalize_ip("::ffff:192.168.1.1"),
-            Some("192.168.1.1".to_string())
-        );
-        assert_eq!(normalize_ip("  10.0.0.1  "), Some("10.0.0.1".to_string()));
-        assert_eq!(normalize_ip(""), None);
-        assert_eq!(normalize_ip("   "), None);
-    }
-
-    #[test]
-    fn test_get_host_name() {
-        assert_eq!(
-            get_host_name(Some("localhost:8080".to_string())),
-            "localhost"
-        );
-        assert_eq!(get_host_name(Some("localhost".to_string())), "localhost");
-        assert_eq!(get_host_name(Some("[::1]:8080".to_string())), "::1");
-        assert_eq!(get_host_name(None), "");
-    }
-
-    #[test]
-    fn test_parse_forwarded_for() {
-        assert_eq!(
-            parse_forwarded_for(Some("192.168.1.1".to_string())),
-            Some("192.168.1.1".to_string())
-        );
-        assert_eq!(
-            parse_forwarded_for(Some("192.168.1.1, 10.0.0.1".to_string())),
-            Some("192.168.1.1".to_string())
-        );
-        assert_eq!(
-            parse_forwarded_for(Some("::ffff:192.168.1.1".to_string())),
-            Some("192.168.1.1".to_string())
-        );
-        assert_eq!(parse_forwarded_for(None), None);
-    }
-
-    #[test]
-    fn test_timing_safe_eq() {
-        assert!(timing_safe_eq("abc", "abc"));
-        assert!(!timing_safe_eq("abc", "abd"));
-        assert!(!timing_safe_eq("abc", "ab"));
-        assert!(!timing_safe_eq("ab", "abc"));
-        assert!(timing_safe_eq("", ""));
-    }
 
     #[test]
     fn test_error_shape() {
@@ -3258,6 +3164,44 @@ mod tests {
         );
         assert_eq!(get_value_at_path(&root, "gateway.missing"), None);
         assert_eq!(get_value_at_path(&root, "unknown"), None);
+    }
+
+    #[test]
+    fn test_handle_node_invoke_enforces_allowlist() {
+        let state = WsServerState::new(WsServerConfig::default());
+        let mut registry = state.node_registry.lock();
+        registry.register(
+            "conn-1",
+            "node-1".to_string(),
+            HashSet::from(["system.run".to_string()]),
+        );
+        drop(registry);
+
+        let ok_params = json!({ "nodeId": "node-1", "command": "system.run" });
+        assert!(handle_node_invoke(Some(&ok_params), &state).is_ok());
+
+        let bad_params = json!({ "nodeId": "node-1", "command": "sms.send" });
+        let err = handle_node_invoke(Some(&bad_params), &state).unwrap_err();
+        assert_eq!(err.code, ERROR_FORBIDDEN);
+    }
+
+    #[test]
+    fn test_normalize_platform_id() {
+        assert_eq!(normalize_platform_id(Some("Darwin"), None), "macos");
+        assert_eq!(normalize_platform_id(None, Some("iPhone13,3")), "ios");
+        assert_eq!(normalize_platform_id(Some("android"), None), "android");
+        assert_eq!(normalize_platform_id(None, None), "unknown");
+    }
+
+    #[test]
+    fn test_resolve_node_command_allowlist() {
+        let allow = vec!["custom.command".to_string()];
+        let deny = vec!["canvas.present".to_string()];
+        let allowlist = resolve_node_command_allowlist(&allow, &deny, Some("darwin"), None);
+        assert!(allowlist.contains("system.run"));
+        assert!(!allowlist.contains("sms.send"));
+        assert!(allowlist.contains("custom.command"));
+        assert!(!allowlist.contains("canvas.present"));
     }
 
     // ============== Method Authorization Tests ==============
