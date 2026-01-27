@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -455,13 +455,36 @@ pub async fn build_ws_config_from_files() -> Result<WsServerConfig, WsConfigErro
 #[derive(Debug, Clone)]
 struct NodeSession {
     node_id: String,
+    conn_id: String,
     commands: HashSet<String>,
+}
+
+#[derive(Debug)]
+struct PendingInvoke {
+    node_id: String,
+    command: String,
+    responder: oneshot::Sender<NodeInvokeResult>,
+}
+
+#[derive(Debug, Clone)]
+struct NodeInvokeError {
+    code: Option<String>,
+    message: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct NodeInvokeResult {
+    ok: bool,
+    payload: Option<Value>,
+    payload_json: Option<String>,
+    error: Option<NodeInvokeError>,
 }
 
 #[derive(Debug, Default)]
 struct NodeRegistry {
     nodes_by_id: HashMap<String, NodeSession>,
     nodes_by_conn: HashMap<String, String>,
+    pending_invokes: HashMap<String, PendingInvoke>,
 }
 
 impl NodeRegistry {
@@ -482,6 +505,7 @@ impl NodeRegistry {
             node_id.clone(),
             NodeSession {
                 node_id: node_id.clone(),
+                conn_id: conn_id.to_string(),
                 commands,
             },
         );
@@ -491,11 +515,60 @@ impl NodeRegistry {
     fn unregister(&mut self, conn_id: &str) -> Option<String> {
         let node_id = self.nodes_by_conn.remove(conn_id)?;
         self.nodes_by_id.remove(&node_id);
+        let pending: Vec<String> = self
+            .pending_invokes
+            .iter()
+            .filter_map(|(invoke_id, pending)| {
+                if pending.node_id == node_id {
+                    Some(invoke_id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for invoke_id in pending {
+            if let Some(pending) = self.pending_invokes.remove(&invoke_id) {
+                let _ = pending.responder.send(NodeInvokeResult {
+                    ok: false,
+                    payload: None,
+                    payload_json: None,
+                    error: Some(NodeInvokeError {
+                        code: Some("NOT_CONNECTED".to_string()),
+                        message: Some("node disconnected".to_string()),
+                    }),
+                });
+            }
+        }
         Some(node_id)
     }
 
     fn get(&self, node_id: &str) -> Option<&NodeSession> {
         self.nodes_by_id.get(node_id)
+    }
+
+    fn conn_id_for_node(&self, node_id: &str) -> Option<String> {
+        self.nodes_by_id
+            .get(node_id)
+            .map(|session| session.conn_id.clone())
+    }
+
+    fn insert_pending_invoke(&mut self, invoke_id: String, pending: PendingInvoke) {
+        self.pending_invokes.insert(invoke_id, pending);
+    }
+
+    fn remove_pending_invoke(&mut self, invoke_id: &str) -> Option<PendingInvoke> {
+        self.pending_invokes.remove(invoke_id)
+    }
+
+    fn resolve_invoke(&mut self, invoke_id: &str, node_id: &str, result: NodeInvokeResult) -> bool {
+        let Some(pending) = self.pending_invokes.remove(invoke_id) else {
+            return false;
+        };
+        if pending.node_id != node_id {
+            return false;
+        }
+        let _ = pending.responder.send(result);
+        true
     }
 }
 
@@ -1079,7 +1152,7 @@ async fn handle_socket(
             continue;
         }
         let method_known = GATEWAY_METHODS.contains(&method.as_str());
-        let result = dispatch_method(&method, params.as_ref(), &state, &conn);
+        let result = dispatch_method(&method, params.as_ref(), &state, &conn).await;
         match result {
             Ok(payload) => {
                 let _ = send_response(&tx, &req_id, true, Some(payload), None);
@@ -1791,7 +1864,7 @@ fn check_operator_authorization(
     Ok(())
 }
 
-fn dispatch_method(
+async fn dispatch_method(
     method: &str,
     params: Option<&Value>,
     state: &WsServerState,
@@ -1882,7 +1955,7 @@ fn dispatch_method(
         "node.rename" => handle_node_rename(params, state),
         "node.list" => handle_node_list(state),
         "node.describe" => handle_node_describe(params, state),
-        "node.invoke" => handle_node_invoke(params, state),
+        "node.invoke" => handle_node_invoke(params, state).await,
         "node.invoke.result" => handle_node_invoke_result(params, state, conn),
         "node.event" => handle_node_event(params, state, conn),
 
@@ -3921,40 +3994,163 @@ fn handle_node_describe(
     }))
 }
 
-fn handle_node_invoke(params: Option<&Value>, state: &WsServerState) -> Result<Value, ErrorShape> {
+async fn handle_node_invoke(
+    params: Option<&Value>,
+    state: &WsServerState,
+) -> Result<Value, ErrorShape> {
+    let params =
+        params.ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "params required", None))?;
     let node_id = params
-        .and_then(|v| v.get("nodeId"))
+        .get("nodeId")
         .and_then(|v| v.as_str())
         .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "nodeId is required", None))?;
     let command = params
-        .and_then(|v| v.get("command").or_else(|| v.get("method")))
+        .get("command")
+        .or_else(|| params.get("method"))
         .and_then(|v| v.as_str())
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "command is required", None))?;
-    let registry = state.node_registry.lock();
-    let node = registry
-        .get(node_id)
-        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "unknown nodeId", None))?;
-    if node.commands.is_empty() {
+    let idempotency_key = params
+        .get("idempotencyKey")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "idempotencyKey is required", None))?;
+    let timeout_ms = params
+        .get("timeoutMs")
+        .and_then(|v| v.as_i64())
+        .filter(|v| *v >= 0)
+        .map(|v| v as u64);
+    let params_value = params.get("params").cloned();
+    let params_json = match params_value {
+        Some(value) => Some(
+            serde_json::to_string(&value)
+                .map_err(|_| error_shape(ERROR_INVALID_REQUEST, "params not serializable", None))?,
+        ),
+        None => None,
+    };
+
+    let (conn_id, commands) = {
+        let registry = state.node_registry.lock();
+        let node = registry
+            .get(node_id)
+            .ok_or_else(|| error_shape(ERROR_UNAVAILABLE, "node not connected", None))?;
+        (node.conn_id.clone(), node.commands.clone())
+    };
+
+    if commands.is_empty() {
         return Err(error_shape(
             ERROR_FORBIDDEN,
             "node did not declare commands",
             Some(json!({ "nodeId": node_id })),
         ));
     }
-    if !node.commands.contains(command) {
+    if !commands.contains(command) {
         return Err(error_shape(
             ERROR_FORBIDDEN,
             "command not allowlisted",
             Some(json!({ "nodeId": node_id, "command": command })),
         ));
     }
+
+    let invoke_id = Uuid::new_v4().to_string();
+    let (responder, receiver) = oneshot::channel();
+    {
+        let mut registry = state.node_registry.lock();
+        registry.insert_pending_invoke(
+            invoke_id.clone(),
+            PendingInvoke {
+                node_id: node_id.to_string(),
+                command: command.to_string(),
+                responder,
+            },
+        );
+    }
+
+    let mut payload = serde_json::Map::new();
+    payload.insert("id".to_string(), json!(invoke_id));
+    payload.insert("nodeId".to_string(), json!(node_id));
+    payload.insert("command".to_string(), json!(command));
+    payload.insert("idempotencyKey".to_string(), json!(idempotency_key));
+    if let Some(params_json) = params_json {
+        payload.insert("paramsJSON".to_string(), json!(params_json));
+    }
+    if let Some(timeout_ms) = timeout_ms {
+        payload.insert("timeoutMs".to_string(), json!(timeout_ms));
+    }
+
+    if !send_event_to_connection(
+        state,
+        &conn_id,
+        "node.invoke.request",
+        Value::Object(payload),
+    ) {
+        state.node_registry.lock().remove_pending_invoke(&invoke_id);
+        return Err(error_shape(
+            ERROR_UNAVAILABLE,
+            "failed to send invoke to node",
+            Some(json!({ "nodeId": node_id, "command": command })),
+        ));
+    }
+
+    let timeout_ms = timeout_ms.unwrap_or(30_000);
+    let result = match tokio::time::timeout(Duration::from_millis(timeout_ms), receiver).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => NodeInvokeResult {
+            ok: false,
+            payload: None,
+            payload_json: None,
+            error: Some(NodeInvokeError {
+                code: Some("UNAVAILABLE".to_string()),
+                message: Some("node invoke failed".to_string()),
+            }),
+        },
+        Err(_) => {
+            state.node_registry.lock().remove_pending_invoke(&invoke_id);
+            return Err(error_shape(
+                ERROR_UNAVAILABLE,
+                "node invoke timed out",
+                Some(json!({
+                    "details": { "code": "TIMEOUT", "nodeId": node_id, "command": command }
+                })),
+            ));
+        }
+    };
+
+    if !result.ok {
+        let error = result.error.unwrap_or(NodeInvokeError {
+            code: None,
+            message: None,
+        });
+        return Err(error_shape(
+            ERROR_UNAVAILABLE,
+            error.message.as_deref().unwrap_or("node invoke failed"),
+            Some(json!({
+                "details": {
+                    "nodeId": node_id,
+                    "command": command,
+                    "nodeError": {
+                        "code": error.code,
+                        "message": error.message
+                    }
+                }
+            })),
+        ));
+    }
+
+    let payload = if let Some(payload_json) = result.payload_json.clone() {
+        serde_json::from_str(&payload_json).unwrap_or(Value::Null)
+    } else {
+        result.payload.unwrap_or(Value::Null)
+    };
+
     Ok(json!({
         "ok": true,
-        "invokeId": Uuid::new_v4().to_string(),
         "nodeId": node_id,
-        "command": command
+        "command": command,
+        "payload": payload,
+        "payloadJSON": result.payload_json
     }))
 }
 
@@ -3974,22 +4170,34 @@ fn handle_node_invoke_result(
     }
 
     let invoke_id = params
-        .and_then(|v| v.get("invokeId"))
+        .and_then(|v| v.get("id").or_else(|| v.get("invokeId")))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "invokeId is required", None))?;
-    let result = params.and_then(|v| v.get("result")).cloned();
-    let error = params.and_then(|v| v.get("error")).cloned();
-    let complete = params
-        .and_then(|v| v.get("complete"))
+        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "id is required", None))?;
+    let node_id = params
+        .and_then(|v| v.get("nodeId"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "nodeId is required", None))?;
+    let ok = params
+        .and_then(|v| v.get("ok"))
         .and_then(|v| v.as_bool())
-        .unwrap_or(true);
+        .unwrap_or(false);
+    let payload = params.and_then(|v| v.get("payload")).cloned();
+    let payload_json = params
+        .and_then(|v| v.get("payloadJSON"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let error = params
+        .and_then(|v| v.get("error"))
+        .and_then(|v| v.as_object());
 
-    // Get node ID from connection or device_id
-    let node_id = conn
+    let caller_node_id = conn
         .device_id
         .as_ref()
         .or_else(|| Some(&conn.client.id))
         .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "node identity required", None))?;
+    if caller_node_id != node_id {
+        return Err(error_shape(ERROR_INVALID_REQUEST, "nodeId mismatch", None));
+    }
 
     // Verify the node is paired
     if !state.node_pairing.is_paired(node_id) {
@@ -3999,16 +4207,31 @@ fn handle_node_invoke_result(
     // Update last seen time
     state.node_pairing.touch_node(node_id);
 
-    // In a full implementation, this would route the result back to the
-    // connection that initiated the invoke. For now, we acknowledge receipt.
-    Ok(json!({
-        "ok": true,
-        "invokeId": invoke_id,
-        "nodeId": node_id,
-        "complete": complete,
-        "hasResult": result.is_some(),
-        "hasError": error.is_some()
-    }))
+    let result = NodeInvokeResult {
+        ok,
+        payload,
+        payload_json,
+        error: error.map(|err| NodeInvokeError {
+            code: err
+                .get("code")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            message: err
+                .get("message")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+        }),
+    };
+
+    let resolved = state
+        .node_registry
+        .lock()
+        .resolve_invoke(invoke_id, node_id, result);
+    if !resolved {
+        return Ok(json!({ "ok": true, "ignored": true }));
+    }
+
+    Ok(json!({ "ok": true }))
 }
 
 fn handle_node_event(
@@ -4025,15 +4248,27 @@ fn handle_node_event(
         ));
     }
 
+    let caller_node_id = conn
+        .device_id
+        .as_ref()
+        .or_else(|| Some(&conn.client.id))
+        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "node identity required", None))?;
     let node_id = params
         .and_then(|v| v.get("nodeId"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "nodeId is required", None))?;
+        .unwrap_or(caller_node_id);
+    if node_id != caller_node_id {
+        return Err(error_shape(ERROR_INVALID_REQUEST, "nodeId mismatch", None));
+    }
     let event = params
         .and_then(|v| v.get("event"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "event is required", None))?;
     let payload = params.and_then(|v| v.get("payload")).cloned();
+    let payload_json = params
+        .and_then(|v| v.get("payloadJSON"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
     // Verify the node is paired
     if !state.node_pairing.is_paired(node_id) {
@@ -4049,7 +4284,7 @@ fn handle_node_event(
         "ok": true,
         "nodeId": node_id,
         "event": event,
-        "hasPayload": payload.is_some()
+        "hasPayload": payload.is_some() || payload_json.is_some()
     }))
 }
 
@@ -4960,6 +5195,30 @@ fn send_json<T: Serialize>(tx: &mpsc::UnboundedSender<Message>, payload: &T) -> 
     tx.send(Message::Text(text)).map_err(|_| ())
 }
 
+fn send_event_to_connection(
+    state: &WsServerState,
+    conn_id: &str,
+    event: &str,
+    payload: Value,
+) -> bool {
+    let frame = EventFrame {
+        frame_type: "event",
+        event,
+        payload,
+        seq: Some(state.next_event_seq()),
+        state_version: None,
+    };
+    let mut conns = state.connections.lock();
+    let Some(conn) = conns.get(conn_id) else {
+        return false;
+    };
+    if send_json(&conn.tx, &frame).is_err() {
+        conns.remove(conn_id);
+        return false;
+    }
+    true
+}
+
 fn event_required_scope(event: &str) -> Option<&'static str> {
     match event {
         "device.pair.requested"
@@ -5220,9 +5479,27 @@ mod tests {
         assert_eq!(get_value_at_path(&root, "unknown"), None);
     }
 
-    #[test]
-    fn test_handle_node_invoke_enforces_allowlist() {
-        let state = WsServerState::new(WsServerConfig::default());
+    #[tokio::test]
+    async fn test_handle_node_invoke_enforces_allowlist() {
+        let state = Arc::new(WsServerState::new(WsServerConfig::default()));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let node_conn = ConnectionContext {
+            conn_id: "conn-1".to_string(),
+            role: "node".to_string(),
+            scopes: vec![],
+            client: ClientInfo {
+                id: "node-1".to_string(),
+                version: "1.0".to_string(),
+                platform: "test".to_string(),
+                mode: "test".to_string(),
+                display_name: None,
+                device_family: None,
+                model_identifier: None,
+                instance_id: None,
+            },
+            device_id: Some("node-1".to_string()),
+        };
+        state.register_connection(&node_conn, tx);
         let mut registry = state.node_registry.lock();
         registry.register(
             "conn-1",
@@ -5231,11 +5508,60 @@ mod tests {
         );
         drop(registry);
 
-        let ok_params = json!({ "nodeId": "node-1", "command": "system.run" });
-        assert!(handle_node_invoke(Some(&ok_params), &state).is_ok());
+        let outcome = state
+            .node_pairing
+            .request_pairing_with_status(
+                "node-1".to_string(),
+                None,
+                vec!["system.run".to_string()],
+                None,
+                None,
+            )
+            .unwrap();
+        let _ = state
+            .node_pairing
+            .approve_request(&outcome.request.request_id)
+            .unwrap();
 
-        let bad_params = json!({ "nodeId": "node-1", "command": "sms.send" });
-        let err = handle_node_invoke(Some(&bad_params), &state).unwrap_err();
+        let node_state = Arc::clone(&state);
+        let node_conn = node_conn.clone();
+        let responder = tokio::spawn(async move {
+            if let Some(Message::Text(text)) = rx.recv().await {
+                let value: Value = serde_json::from_str(&text).unwrap();
+                let invoke_id = value
+                    .get("payload")
+                    .and_then(|v| v.get("id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap()
+                    .to_string();
+                let params = json!({
+                    "id": invoke_id,
+                    "nodeId": "node-1",
+                    "ok": true,
+                    "payload": { "ok": true }
+                });
+                let _ = handle_node_invoke_result(Some(&params), node_state.as_ref(), &node_conn);
+            }
+        });
+
+        let ok_params = json!({
+            "nodeId": "node-1",
+            "command": "system.run",
+            "idempotencyKey": "req-1"
+        });
+        assert!(handle_node_invoke(Some(&ok_params), state.as_ref())
+            .await
+            .is_ok());
+        let _ = responder.await;
+
+        let bad_params = json!({
+            "nodeId": "node-1",
+            "command": "sms.send",
+            "idempotencyKey": "req-2"
+        });
+        let err = handle_node_invoke(Some(&bad_params), state.as_ref())
+            .await
+            .unwrap_err();
         assert_eq!(err.code, ERROR_FORBIDDEN);
     }
 

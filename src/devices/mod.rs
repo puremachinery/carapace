@@ -110,6 +110,7 @@ pub struct DeviceMetadataPatch {
 
 impl DevicePairingRequest {
     /// Create a new pending pairing request
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device_id: String,
         public_key: String,
@@ -564,6 +565,7 @@ impl DevicePairingRegistry {
     // === Pairing Request Methods ===
 
     /// Create a new pairing request
+    #[allow(clippy::too_many_arguments)]
     pub fn request_pairing(
         &self,
         device_id: String,
@@ -592,6 +594,7 @@ impl DevicePairingRegistry {
         Ok(outcome.request)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn request_pairing_with_status(
         &self,
         device_id: String,

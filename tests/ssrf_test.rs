@@ -186,7 +186,8 @@ fn test_ssrf_aws_metadata_paths() {
 
 #[test]
 fn test_ssrf_gcp_metadata() {
-    let result = SsrfProtection::validate_url("http://metadata.google.internal/computeMetadata/v1/");
+    let result =
+        SsrfProtection::validate_url("http://metadata.google.internal/computeMetadata/v1/");
     assert!(matches!(result, Err(CapabilityError::SsrfBlocked(_))));
 
     let result = SsrfProtection::validate_url("http://metadata/computeMetadata/v1/");

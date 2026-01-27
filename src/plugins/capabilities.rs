@@ -189,16 +189,12 @@ impl CredentialEnforcer {
 
     /// Sanitize plugin ID to prevent path traversal
     fn sanitize_plugin_id(plugin_id: &str) -> String {
-        plugin_id
-            .replace("..", "_")
-            .replace('/', "_")
-            .replace('\\', "_")
-            .replace(':', "_")
+        plugin_id.replace("..", "_").replace(['/', '\\', ':'], "_")
     }
 
     /// Sanitize key to prevent injection attacks
     fn sanitize_key(key: &str) -> String {
-        key.replace("..", "_").replace('/', "_").replace('\\', "_")
+        key.replace("..", "_").replace(['/', '\\'], "_")
     }
 
     /// Check if a key is valid (not too long, no invalid characters)

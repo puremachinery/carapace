@@ -191,7 +191,7 @@ impl OpenAiError {
 }
 
 /// State for OpenAI endpoints
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct OpenAiState {
     /// Whether chat completions endpoint is enabled
     pub chat_completions_enabled: bool,
@@ -201,17 +201,6 @@ pub struct OpenAiState {
     pub gateway_token: Option<String>,
     /// Gateway auth password
     pub gateway_password: Option<String>,
-}
-
-impl Default for OpenAiState {
-    fn default() -> Self {
-        OpenAiState {
-            chat_completions_enabled: false,
-            responses_enabled: false,
-            gateway_token: None,
-            gateway_password: None,
-        }
-    }
 }
 
 /// Parse agent ID from model string

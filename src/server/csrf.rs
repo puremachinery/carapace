@@ -320,7 +320,7 @@ fn extract_session_id(headers: &HeaderMap) -> Option<String> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() / 600)
         .unwrap_or(0);
-    hasher.update(&window.to_le_bytes());
+    hasher.update(window.to_le_bytes());
 
     let hash = hasher.finalize();
     Some(URL_SAFE_NO_PAD.encode(&hash[..16]))
@@ -368,10 +368,10 @@ fn check_origin(
     match origin {
         Some(origin) => {
             // Check against allowed origins
-            if !config.allowed_origins.is_empty() {
-                if config.allowed_origins.iter().any(|o| origin.starts_with(o)) {
-                    return Ok(());
-                }
+            if !config.allowed_origins.is_empty()
+                && config.allowed_origins.iter().any(|o| origin.starts_with(o))
+            {
+                return Ok(());
             }
 
             // Check same-origin

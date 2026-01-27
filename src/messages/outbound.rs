@@ -201,6 +201,7 @@ impl OutboundMessage {
     }
 
     /// Set chat ID on the message
+    #[allow(clippy::wrong_self_convention)] // Builder pattern - takes ownership intentionally
     pub fn to_chat(mut self, chat_id: impl Into<String>) -> Self {
         self.metadata.chat_id = Some(chat_id.into());
         self
@@ -446,7 +447,7 @@ impl MessagePipeline {
         // Add to queues
         let queue_position = {
             let mut queues = self.queues.write();
-            let queue = queues.entry(channel_id).or_insert_with(VecDeque::new);
+            let queue = queues.entry(channel_id).or_default();
             queue.push_back(queued.clone());
             queue.len()
         };

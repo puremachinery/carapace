@@ -91,29 +91,31 @@ impl SecurityHeadersConfig {
 
     /// Create a configuration suitable for the Control UI
     pub fn for_control_ui() -> Self {
-        let mut config = Self::default();
         // Control UI may need to connect to WebSocket on different ports
-        config.csp = concat!(
-            "default-src 'self'; ",
-            "script-src 'self' 'unsafe-eval'; ", // Some bundlers need eval
-            "style-src 'self' 'unsafe-inline'; ",
-            "img-src 'self' data: blob: https:; ",
-            "connect-src 'self' wss: ws: http: https:; ",
-            "frame-ancestors 'none'; ",
-            "base-uri 'self'; ",
-            "form-action 'self'"
-        )
-        .to_string();
-        config
+        Self {
+            csp: concat!(
+                "default-src 'self'; ",
+                "script-src 'self' 'unsafe-eval'; ", // Some bundlers need eval
+                "style-src 'self' 'unsafe-inline'; ",
+                "img-src 'self' data: blob: https:; ",
+                "connect-src 'self' wss: ws: http: https:; ",
+                "frame-ancestors 'none'; ",
+                "base-uri 'self'; ",
+                "form-action 'self'"
+            )
+            .to_string(),
+            ..Self::default()
+        }
     }
 
     /// Create a configuration for API-only endpoints
     pub fn for_api() -> Self {
-        let mut config = Self::default();
         // API endpoints don't serve HTML, so CSP can be more restrictive
-        config.csp = "default-src 'none'; frame-ancestors 'none'".to_string();
-        config.frame_options = "DENY".to_string();
-        config
+        Self {
+            csp: "default-src 'none'; frame-ancestors 'none'".to_string(),
+            frame_options: "DENY".to_string(),
+            ..Self::default()
+        }
     }
 }
 
