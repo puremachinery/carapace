@@ -5,10 +5,12 @@
 //! - Tools API (POST /tools/invoke)
 //! - Control UI (static files + SPA fallback + avatar endpoint)
 //! - Auth middleware (hooks token, gateway auth, loopback bypass)
+//! - Security middleware (headers, CSRF, rate limiting)
 
 use axum::{
     extract::{ConnectInfo, Path, Query, State},
     http::{header, HeaderMap, StatusCode, Uri},
+    middleware,
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -23,7 +25,12 @@ use tokio::fs;
 use tracing::debug;
 use uuid::Uuid;
 
-use crate::hooks::auth::{extract_hooks_token, timing_safe_equal, validate_hooks_token};
+use crate::server::csrf::{csrf_middleware, CsrfConfig, CsrfTokenStore};
+use crate::server::headers::{security_headers_middleware, SecurityHeadersConfig};
+use crate::server::ratelimit::{rate_limit_middleware, RateLimitConfig, RateLimiter};
+
+use crate::auth;
+use crate::hooks::auth::{extract_hooks_token, validate_hooks_token};
 use crate::hooks::handler::{
     validate_agent_request, validate_wake_request, AgentRequest, AgentResponse, HooksErrorResponse,
     WakeRequest, WakeResponse,
@@ -88,13 +95,77 @@ pub struct AppState {
     pub config: Arc<HttpConfig>,
 }
 
-/// Create the HTTP router with all endpoints
+/// Middleware configuration for the HTTP server
+#[derive(Debug, Clone)]
+pub struct MiddlewareConfig {
+    /// Security headers configuration
+    pub security_headers: SecurityHeadersConfig,
+    /// CSRF protection configuration
+    pub csrf: CsrfConfig,
+    /// Rate limiting configuration
+    pub rate_limit: RateLimitConfig,
+    /// Whether to enable security headers middleware
+    pub enable_security_headers: bool,
+    /// Whether to enable CSRF middleware
+    pub enable_csrf: bool,
+    /// Whether to enable rate limiting middleware
+    pub enable_rate_limit: bool,
+}
+
+impl Default for MiddlewareConfig {
+    fn default() -> Self {
+        MiddlewareConfig {
+            security_headers: SecurityHeadersConfig::default(),
+            csrf: CsrfConfig::default(),
+            rate_limit: RateLimitConfig::default(),
+            enable_security_headers: true,
+            enable_csrf: false, // Disabled by default for API compatibility
+            enable_rate_limit: true,
+        }
+    }
+}
+
+impl MiddlewareConfig {
+    /// Create a configuration with all middleware disabled (for testing)
+    pub fn none() -> Self {
+        MiddlewareConfig {
+            security_headers: SecurityHeadersConfig::default(),
+            csrf: CsrfConfig::default(),
+            rate_limit: RateLimitConfig::default(),
+            enable_security_headers: false,
+            enable_csrf: false,
+            enable_rate_limit: false,
+        }
+    }
+
+    /// Create a configuration with all security middleware enabled
+    pub fn full() -> Self {
+        MiddlewareConfig {
+            security_headers: SecurityHeadersConfig::default(),
+            csrf: CsrfConfig::default(),
+            rate_limit: RateLimitConfig::default(),
+            enable_security_headers: true,
+            enable_csrf: true,
+            enable_rate_limit: true,
+        }
+    }
+}
+
+/// Create the HTTP router with all endpoints (without middleware)
 pub fn create_router(config: HttpConfig) -> Router {
+    create_router_with_middleware(config, MiddlewareConfig::none())
+}
+
+/// Create the HTTP router with all endpoints and middleware
+pub fn create_router_with_middleware(
+    config: HttpConfig,
+    middleware_config: MiddlewareConfig,
+) -> Router {
     let state = AppState {
         config: Arc::new(config.clone()),
     };
 
-    let mut router = Router::new();
+    let mut router: Router<AppState> = Router::new();
 
     // Hooks routes (when enabled)
     if config.hooks_enabled {
@@ -129,7 +200,37 @@ pub fn create_router(config: HttpConfig) -> Router {
             .route(&format!("{}/*path", base), get(control_ui_static));
     }
 
-    router.with_state(state)
+    // Convert to stateless Router and apply middleware layers
+    // Order matters: last added = first executed
+    // The order here is: rate_limit -> csrf -> security_headers -> handler
+    let mut stateless_router: Router = router.with_state(state);
+
+    // Rate limiting middleware (applied first to reject overloaded requests early)
+    if middleware_config.enable_rate_limit {
+        let limiter = RateLimiter::new(middleware_config.rate_limit);
+        stateless_router = stateless_router.layer(middleware::from_fn_with_state(
+            limiter,
+            rate_limit_middleware,
+        ));
+    }
+
+    // CSRF protection middleware
+    if middleware_config.enable_csrf {
+        let csrf_store = CsrfTokenStore::new(middleware_config.csrf);
+        stateless_router =
+            stateless_router.layer(middleware::from_fn_with_state(csrf_store, csrf_middleware));
+    }
+
+    // Security headers middleware (applied last, runs after handler)
+    if middleware_config.enable_security_headers {
+        let headers_config = Arc::new(middleware_config.security_headers);
+        stateless_router = stateless_router.layer(middleware::from_fn_with_state(
+            headers_config,
+            security_headers_middleware,
+        ));
+    }
+
+    stateless_router
 }
 
 /// Normalize hooks path (ensure leading slash, no trailing slash)
@@ -463,7 +564,7 @@ fn check_gateway_auth(
     if let Some(token) = &config.gateway_token {
         if !token.is_empty() {
             if let Some(provided) = provided {
-                if timing_safe_equal(provided, token) {
+                if auth::timing_safe_eq(provided, token) {
                     return None;
                 }
             }
@@ -475,7 +576,7 @@ fn check_gateway_auth(
     if let Some(password) = &config.gateway_password {
         if !password.is_empty() {
             if let Some(provided) = provided {
-                if timing_safe_equal(provided, password) {
+                if auth::timing_safe_eq(provided, password) {
                     return None;
                 }
             }
@@ -485,7 +586,7 @@ fn check_gateway_auth(
 
     // No auth configured - only allow loopback requests
     // This prevents accidental exposure when binding to 0.0.0.0
-    if is_loopback_request(remote_addr, headers) {
+    if auth::is_loopback_request(remote_addr, headers) {
         return None;
     }
 
@@ -737,45 +838,6 @@ async fn serve_avatar_metadata(state: &AppState, agent_id: &str) -> Response {
 // Loopback Detection
 // ============================================================================
 
-/// Check if the request is from loopback
-pub fn is_loopback_request(remote_addr: Option<IpAddr>, headers: &HeaderMap) -> bool {
-    // Check remote address
-    if let Some(addr) = remote_addr {
-        if is_loopback_addr(addr) {
-            // Also check that no proxy headers are present
-            if !has_proxy_headers(headers) {
-                return true;
-            }
-        }
-    }
-
-    false
-}
-
-/// Check if an IP address is loopback
-fn is_loopback_addr(addr: IpAddr) -> bool {
-    match addr {
-        IpAddr::V4(v4) => v4.is_loopback() || v4.octets()[0] == 127,
-        IpAddr::V6(v6) => {
-            v6.is_loopback() || {
-                // Check for ::ffff:127.x.x.x (IPv4-mapped IPv6)
-                let octets = v6.octets();
-                octets[0..10] == [0; 10]
-                    && octets[10] == 0xff
-                    && octets[11] == 0xff
-                    && octets[12] == 127
-            }
-        }
-    }
-}
-
-/// Check if request has proxy headers
-fn has_proxy_headers(headers: &HeaderMap) -> bool {
-    headers.contains_key("x-forwarded-for")
-        || headers.contains_key("x-forwarded-proto")
-        || headers.contains_key("x-forwarded-host")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -793,9 +855,14 @@ mod tests {
         }
     }
 
+    /// Create a test router that can be used with oneshot()
+    fn test_router(config: HttpConfig) -> Router {
+        create_router(config)
+    }
+
     #[tokio::test]
     async fn test_hooks_wake_success() {
-        let router = create_router(test_config());
+        let router = test_router(test_config());
 
         let req = Request::builder()
             .method("POST")
@@ -818,7 +885,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_hooks_wake_missing_text() {
-        let router = create_router(test_config());
+        let router = test_router(test_config());
 
         let req = Request::builder()
             .method("POST")
@@ -841,7 +908,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_hooks_wake_unauthorized() {
-        let router = create_router(test_config());
+        let router = test_router(test_config());
 
         let req = Request::builder()
             .method("POST")
@@ -856,7 +923,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_hooks_wake_wrong_token() {
-        let router = create_router(test_config());
+        let router = test_router(test_config());
 
         let req = Request::builder()
             .method("POST")
@@ -872,7 +939,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_hooks_agent_success() {
-        let router = create_router(test_config());
+        let router = test_router(test_config());
 
         let req = Request::builder()
             .method("POST")
@@ -895,7 +962,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_hooks_agent_missing_message() {
-        let router = create_router(test_config());
+        let router = test_router(test_config());
 
         let req = Request::builder()
             .method("POST")
@@ -918,7 +985,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_tools_invoke_success() {
-        let router = create_router(test_config());
+        let router = test_router(test_config());
 
         let req = Request::builder()
             .method("POST")
@@ -941,7 +1008,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_tools_invoke_not_found() {
-        let router = create_router(test_config());
+        let router = test_router(test_config());
 
         let req = Request::builder()
             .method("POST")
@@ -964,7 +1031,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_tools_invoke_missing_tool() {
-        let router = create_router(test_config());
+        let router = test_router(test_config());
 
         let req = Request::builder()
             .method("POST")
@@ -980,7 +1047,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_tools_invoke_unauthorized() {
-        let router = create_router(test_config());
+        let router = test_router(test_config());
 
         let req = Request::builder()
             .method("POST")
@@ -1022,10 +1089,16 @@ mod tests {
     fn test_is_loopback_addr() {
         use std::net::{Ipv4Addr, Ipv6Addr};
 
-        assert!(is_loopback_addr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));
-        assert!(is_loopback_addr(IpAddr::V4(Ipv4Addr::new(127, 1, 2, 3))));
-        assert!(!is_loopback_addr(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));
-        assert!(is_loopback_addr(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        assert!(auth::is_loopback_addr(IpAddr::V4(Ipv4Addr::new(
+            127, 0, 0, 1
+        ))));
+        assert!(auth::is_loopback_addr(IpAddr::V4(Ipv4Addr::new(
+            127, 1, 2, 3
+        ))));
+        assert!(!auth::is_loopback_addr(IpAddr::V4(Ipv4Addr::new(
+            192, 168, 1, 1
+        ))));
+        assert!(auth::is_loopback_addr(IpAddr::V6(Ipv6Addr::LOCALHOST)));
     }
 
     #[test]
