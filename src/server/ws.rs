@@ -297,6 +297,7 @@ impl WsServerState {
             conn.conn_id.clone(),
             ConnectionHandle {
                 role: conn.role.clone(),
+                scopes: conn.scopes.clone(),
                 tx,
             },
         );
@@ -680,6 +681,7 @@ struct ConnectionContext {
 #[derive(Clone, Debug)]
 struct ConnectionHandle {
     role: String,
+    scopes: Vec<String>,
     tx: mpsc::UnboundedSender<Message>,
 }
 
@@ -4219,8 +4221,20 @@ fn handle_device_token_rotate(
             arr.iter()
                 .filter_map(|v| v.as_str().map(|s| s.to_string()))
                 .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+        });
+    let scopes = match scopes {
+        Some(scopes) => scopes,
+        None => state
+            .device_registry
+            .latest_token_scopes(device_id, role)
+            .or_else(|| {
+                state
+                    .device_registry
+                    .get_paired_device(device_id)
+                    .map(|device| device.scopes)
+            })
+            .unwrap_or_default(),
+    };
 
     let meta = state
         .device_registry
@@ -4946,6 +4960,17 @@ fn send_json<T: Serialize>(tx: &mpsc::UnboundedSender<Message>, payload: &T) -> 
     tx.send(Message::Text(text)).map_err(|_| ())
 }
 
+fn event_required_scope(event: &str) -> Option<&'static str> {
+    match event {
+        "device.pair.requested"
+        | "device.pair.resolved"
+        | "node.pair.requested"
+        | "node.pair.resolved" => Some("operator.pairing"),
+        "exec.approval.requested" | "exec.approval.resolved" => Some("operator.approvals"),
+        _ => None,
+    }
+}
+
 fn broadcast_event(state: &WsServerState, event: &str, payload: Value) {
     let frame = EventFrame {
         frame_type: "event",
@@ -4954,11 +4979,17 @@ fn broadcast_event(state: &WsServerState, event: &str, payload: Value) {
         seq: Some(state.next_event_seq()),
         state_version: None,
     };
+    let required_scope = event_required_scope(event);
     let mut conns = state.connections.lock();
     let mut dead = Vec::new();
     for (conn_id, conn) in conns.iter() {
         if conn.role == "node" {
             continue;
+        }
+        if let Some(required_scope) = required_scope {
+            if conn.role != "admin" && !scope_satisfies(&conn.scopes, required_scope) {
+                continue;
+            }
         }
         if send_json(&conn.tx, &frame).is_err() {
             dead.push(conn_id.clone());
@@ -5250,6 +5281,50 @@ mod tests {
             },
             device_id: None,
         }
+    }
+
+    fn make_conn_with_id(role: &str, scopes: Vec<String>, conn_id: &str) -> ConnectionContext {
+        ConnectionContext {
+            conn_id: conn_id.to_string(),
+            role: role.to_string(),
+            scopes,
+            client: ClientInfo {
+                id: "test-client".to_string(),
+                version: "1.0".to_string(),
+                platform: "test".to_string(),
+                mode: "test".to_string(),
+                display_name: None,
+                device_family: None,
+                model_identifier: None,
+                instance_id: None,
+            },
+            device_id: None,
+        }
+    }
+
+    #[test]
+    fn test_broadcast_event_scope_guard() {
+        let state = WsServerState::new(WsServerConfig::default());
+        let (tx_denied, mut rx_denied) = mpsc::unbounded_channel();
+        let (tx_allowed, mut rx_allowed) = mpsc::unbounded_channel();
+        let denied = make_conn_with_id("operator", vec![], "conn-denied");
+        let allowed = make_conn_with_id(
+            "operator",
+            vec!["operator.pairing".to_string()],
+            "conn-allowed",
+        );
+
+        state.register_connection(&denied, tx_denied);
+        state.register_connection(&allowed, tx_allowed);
+
+        broadcast_event(
+            &state,
+            "device.pair.requested",
+            json!({ "requestId": "req-1" }),
+        );
+
+        assert!(rx_allowed.try_recv().is_ok());
+        assert!(rx_denied.try_recv().is_err());
     }
 
     #[test]

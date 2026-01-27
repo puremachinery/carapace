@@ -818,6 +818,20 @@ impl DevicePairingRegistry {
         store.paired_devices.get(device_id).cloned()
     }
 
+    /// Get the most recent token scopes for a device role
+    pub fn latest_token_scopes(&self, device_id: &str, role: &str) -> Option<Vec<String>> {
+        let store = self.store.read();
+        if !store.paired_devices.contains_key(device_id) {
+            return None;
+        }
+        store
+            .tokens
+            .values()
+            .filter(|token| token.device_id == device_id && token.role == role)
+            .max_by_key(|token| token.issued_at_ms)
+            .map(|token| token.scopes.clone())
+    }
+
     /// Check if a device is paired
     pub fn is_paired(&self, device_id: &str) -> bool {
         let store = self.store.read();
