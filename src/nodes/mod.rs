@@ -62,6 +62,36 @@ pub struct NodePairingRequest {
     /// Platform identifier
     #[serde(skip_serializing_if = "Option::is_none")]
     pub platform: Option<String>,
+    /// Node version
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Core version (for split-version nodes)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub core_version: Option<String>,
+    /// UI version (for split-version nodes)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ui_version: Option<String>,
+    /// Device family (e.g., "iPhone", "iPad", "Mac")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_family: Option<String>,
+    /// Model identifier (e.g., "iPhone13,3")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_identifier: Option<String>,
+    /// Node capabilities
+    #[serde(default)]
+    pub caps: Vec<String>,
+    /// Node permissions
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<HashMap<String, bool>>,
+    /// Remote IP address
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_ip: Option<String>,
+    /// Whether the request was made silently (for auto-approval flows)
+    #[serde(default)]
+    pub silent: bool,
+    /// Whether this is a repair request (node was previously paired)
+    #[serde(default)]
+    pub is_repair: bool,
     /// Timestamp when request was created (Unix ms)
     pub created_at_ms: u64,
     /// Timestamp when request was resolved (Unix ms)
@@ -77,8 +107,36 @@ pub struct NodePairingOutcome {
     pub created: bool,
 }
 
+/// Builder for NodePairingRequest
+#[derive(Debug, Clone, Default)]
+pub struct NodePairingRequestBuilder {
+    pub node_id: String,
+    pub public_key: Option<String>,
+    pub commands: Vec<String>,
+    pub display_name: Option<String>,
+    pub platform: Option<String>,
+    pub version: Option<String>,
+    pub core_version: Option<String>,
+    pub ui_version: Option<String>,
+    pub device_family: Option<String>,
+    pub model_identifier: Option<String>,
+    pub caps: Vec<String>,
+    pub permissions: Option<HashMap<String, bool>>,
+    pub remote_ip: Option<String>,
+    pub silent: bool,
+}
+
+impl NodePairingRequestBuilder {
+    pub fn new(node_id: String) -> Self {
+        Self {
+            node_id,
+            ..Default::default()
+        }
+    }
+}
+
 impl NodePairingRequest {
-    /// Create a new pending pairing request
+    /// Create a new pending pairing request (legacy API for backward compatibility)
     pub fn new(
         node_id: String,
         public_key: Option<String>,
@@ -86,14 +144,39 @@ impl NodePairingRequest {
         display_name: Option<String>,
         platform: Option<String>,
     ) -> Self {
+        Self::from_builder(
+            NodePairingRequestBuilder {
+                node_id,
+                public_key,
+                commands,
+                display_name,
+                platform,
+                ..Default::default()
+            },
+            false,
+        )
+    }
+
+    /// Create a new pending pairing request from builder
+    pub fn from_builder(builder: NodePairingRequestBuilder, is_repair: bool) -> Self {
         Self {
             request_id: Uuid::new_v4().to_string(),
-            node_id,
-            public_key,
+            node_id: builder.node_id,
+            public_key: builder.public_key,
             state: PairingState::Pending,
-            commands,
-            display_name,
-            platform,
+            commands: builder.commands,
+            display_name: builder.display_name,
+            platform: builder.platform,
+            version: builder.version,
+            core_version: builder.core_version,
+            ui_version: builder.ui_version,
+            device_family: builder.device_family,
+            model_identifier: builder.model_identifier,
+            caps: builder.caps,
+            permissions: builder.permissions,
+            remote_ip: builder.remote_ip,
+            silent: builder.silent,
+            is_repair,
             created_at_ms: now_ms(),
             resolved_at_ms: None,
             rejection_reason: None,
@@ -147,7 +230,33 @@ pub struct PairedNode {
     /// Platform identifier
     #[serde(skip_serializing_if = "Option::is_none")]
     pub platform: Option<String>,
-    /// Timestamp when paired (Unix ms)
+    /// Node version
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Core version (for split-version nodes)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub core_version: Option<String>,
+    /// UI version (for split-version nodes)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ui_version: Option<String>,
+    /// Device family (e.g., "iPhone", "iPad", "Mac")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_family: Option<String>,
+    /// Model identifier (e.g., "iPhone13,3")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_identifier: Option<String>,
+    /// Node capabilities
+    #[serde(default)]
+    pub caps: Vec<String>,
+    /// Node permissions
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<HashMap<String, bool>>,
+    /// Remote IP address
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_ip: Option<String>,
+    /// Timestamp when originally created (Unix ms)
+    pub created_at_ms: u64,
+    /// Timestamp when approved/paired (Unix ms)
     pub paired_at_ms: u64,
     /// Last seen timestamp (Unix ms)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -156,14 +265,24 @@ pub struct PairedNode {
 
 impl PairedNode {
     /// Create from an approved pairing request
-    pub fn from_request(request: &NodePairingRequest) -> Self {
+    pub fn from_request(request: &NodePairingRequest, existing_created_at: Option<u64>) -> Self {
+        let now = now_ms();
         Self {
             node_id: request.node_id.clone(),
             public_key: request.public_key.clone(),
             commands: request.commands.clone(),
             display_name: request.display_name.clone(),
             platform: request.platform.clone(),
-            paired_at_ms: now_ms(),
+            version: request.version.clone(),
+            core_version: request.core_version.clone(),
+            ui_version: request.ui_version.clone(),
+            device_family: request.device_family.clone(),
+            model_identifier: request.model_identifier.clone(),
+            caps: request.caps.clone(),
+            permissions: request.permissions.clone(),
+            remote_ip: request.remote_ip.clone(),
+            created_at_ms: existing_created_at.unwrap_or(now),
+            paired_at_ms: now,
             last_seen_ms: None,
         }
     }
@@ -462,7 +581,7 @@ impl NodePairingRegistry {
 
     // === Pairing Request Methods ===
 
-    /// Create a new pairing request
+    /// Create a new pairing request (legacy API for backward compatibility)
     pub fn request_pairing(
         &self,
         node_id: String,
@@ -471,16 +590,19 @@ impl NodePairingRegistry {
         display_name: Option<String>,
         platform: Option<String>,
     ) -> Result<NodePairingRequest, NodePairingError> {
-        let outcome = self.request_pairing_with_status(
+        let builder = NodePairingRequestBuilder {
             node_id,
             public_key,
             commands,
             display_name,
             platform,
-        )?;
+            ..Default::default()
+        };
+        let outcome = self.request_pairing_with_builder(builder)?;
         Ok(outcome.request)
     }
 
+    /// Create a new pairing request (legacy API for backward compatibility)
     pub fn request_pairing_with_status(
         &self,
         node_id: String,
@@ -489,26 +611,42 @@ impl NodePairingRegistry {
         display_name: Option<String>,
         platform: Option<String>,
     ) -> Result<NodePairingOutcome, NodePairingError> {
+        let builder = NodePairingRequestBuilder {
+            node_id,
+            public_key,
+            commands,
+            display_name,
+            platform,
+            ..Default::default()
+        };
+        self.request_pairing_with_builder(builder)
+    }
+
+    /// Create a new pairing request with full options
+    pub fn request_pairing_with_builder(
+        &self,
+        builder: NodePairingRequestBuilder,
+    ) -> Result<NodePairingOutcome, NodePairingError> {
         self.cleanup_expired();
 
         let mut store = self.store.write();
 
-        // Check if node is already paired
-        if store.paired_nodes.contains_key(&node_id) {
-            return Err(NodePairingError::NodeAlreadyPaired);
-        }
+        let node_id = &builder.node_id;
 
         // Check for existing pending request for this node
         if let Some(existing) = store
             .pending_requests
             .values()
-            .find(|r| r.node_id == node_id && r.state == PairingState::Pending)
+            .find(|r| &r.node_id == node_id && r.state == PairingState::Pending)
         {
             return Ok(NodePairingOutcome {
                 request: existing.clone(),
                 created: false,
             });
         }
+
+        // Check if node is already paired (this is a repair request)
+        let is_repair = store.paired_nodes.contains_key(node_id);
 
         // Check pending request limit
         let pending_count = store
@@ -520,8 +658,7 @@ impl NodePairingRegistry {
             return Err(NodePairingError::TooManyPendingRequests);
         }
 
-        let request =
-            NodePairingRequest::new(node_id, public_key, commands, display_name, platform);
+        let request = NodePairingRequest::from_builder(builder, is_repair);
         store
             .pending_requests
             .insert(request.request_id.clone(), request.clone());
@@ -584,12 +721,9 @@ impl NodePairingRegistry {
             return Err(NodePairingError::RequestExpired);
         }
 
-        // Clone the data we need before modifying anything
+        // Clone the full request to use for creating the paired node
+        let request_clone = request.clone();
         let node_id = request.node_id.clone();
-        let public_key = request.public_key.clone();
-        let commands = request.commands.clone();
-        let display_name = request.display_name.clone();
-        let platform = request.platform.clone();
 
         // Check paired node limit and evict if needed
         if store.paired_nodes.len() >= MAX_PAIRED_NODES {
@@ -608,21 +742,16 @@ impl NodePairingRegistry {
             }
         }
 
+        // Get existing created_at if this is a re-pair (repair) situation
+        let existing_created_at = store.paired_nodes.get(&node_id).map(|n| n.created_at_ms);
+
         // Now approve the request
         if let Some(req) = store.pending_requests.get_mut(request_id) {
             req.approve();
         }
 
-        // Create the paired node
-        let paired_node = PairedNode {
-            node_id: node_id.clone(),
-            public_key,
-            commands,
-            display_name,
-            platform,
-            paired_at_ms: now_ms(),
-            last_seen_ms: None,
-        };
+        // Create the paired node from the full request
+        let paired_node = PairedNode::from_request(&request_clone, existing_created_at);
         store
             .paired_nodes
             .insert(node_id.clone(), paired_node.clone());
@@ -881,18 +1010,31 @@ mod tests {
     }
 
     #[test]
-    fn test_already_paired_node_cannot_request() {
+    fn test_already_paired_node_can_request_repair() {
         let registry = test_registry();
 
         // Create and approve a request
         let req = registry
             .request_pairing("node-1".to_string(), None, vec![], None, None)
             .unwrap();
+        assert!(!req.is_repair, "first request should not be a repair");
         registry.approve_request(&req.request_id).unwrap();
 
-        // Try to request again
-        let result = registry.request_pairing("node-1".to_string(), None, vec![], None, None);
-        assert!(matches!(result, Err(NodePairingError::NodeAlreadyPaired)));
+        // Try to request again - should succeed as a repair request
+        let result = registry.request_pairing_with_builder(NodePairingRequestBuilder {
+            node_id: "node-1".to_string(),
+            ..Default::default()
+        });
+        assert!(result.is_ok(), "repair request should succeed");
+        let outcome = result.unwrap();
+        assert!(
+            outcome.request.is_repair,
+            "second request should be a repair"
+        );
+        assert!(
+            outcome.created,
+            "repair request should create a new pending request"
+        );
     }
 
     #[test]
@@ -1174,5 +1316,136 @@ mod tests {
         assert!(!constant_time_eq("abc", "ab"));
         assert!(!constant_time_eq("ab", "abc"));
         assert!(constant_time_eq("", ""));
+    }
+
+    #[test]
+    fn test_extended_fields_in_pairing_request() {
+        let mut permissions = HashMap::new();
+        permissions.insert("camera".to_string(), true);
+        permissions.insert("location".to_string(), false);
+
+        let builder = NodePairingRequestBuilder {
+            node_id: "node-extended".to_string(),
+            public_key: Some("pubkey".to_string()),
+            commands: vec!["cmd1".to_string(), "cmd2".to_string()],
+            display_name: Some("Extended Node".to_string()),
+            platform: Some("ios".to_string()),
+            version: Some("2.0.0".to_string()),
+            core_version: Some("1.5.0".to_string()),
+            ui_version: Some("2.0.0-beta".to_string()),
+            device_family: Some("iPhone".to_string()),
+            model_identifier: Some("iPhone14,2".to_string()),
+            caps: vec!["audio".to_string(), "camera".to_string()],
+            permissions: Some(permissions.clone()),
+            remote_ip: Some("192.168.1.100".to_string()),
+            silent: true,
+        };
+
+        let request = NodePairingRequest::from_builder(builder, false);
+
+        assert_eq!(request.node_id, "node-extended");
+        assert_eq!(request.version, Some("2.0.0".to_string()));
+        assert_eq!(request.core_version, Some("1.5.0".to_string()));
+        assert_eq!(request.ui_version, Some("2.0.0-beta".to_string()));
+        assert_eq!(request.device_family, Some("iPhone".to_string()));
+        assert_eq!(request.model_identifier, Some("iPhone14,2".to_string()));
+        assert_eq!(
+            request.caps,
+            vec!["audio".to_string(), "camera".to_string()]
+        );
+        assert_eq!(request.permissions, Some(permissions));
+        assert_eq!(request.remote_ip, Some("192.168.1.100".to_string()));
+        assert!(request.silent);
+        assert!(!request.is_repair);
+    }
+
+    #[test]
+    fn test_extended_fields_carried_to_paired_node() {
+        let registry = test_registry();
+
+        let mut permissions = HashMap::new();
+        permissions.insert("filesystem".to_string(), true);
+
+        let builder = NodePairingRequestBuilder {
+            node_id: "node-carry-fields".to_string(),
+            public_key: None,
+            commands: vec!["system.run".to_string()],
+            display_name: Some("Carry Fields Node".to_string()),
+            platform: Some("darwin".to_string()),
+            version: Some("3.0.0".to_string()),
+            core_version: Some("2.5.0".to_string()),
+            ui_version: Some("3.0.0".to_string()),
+            device_family: Some("Mac".to_string()),
+            model_identifier: Some("MacBookPro18,3".to_string()),
+            caps: vec!["exec".to_string()],
+            permissions: Some(permissions.clone()),
+            remote_ip: Some("10.0.0.50".to_string()),
+            silent: false,
+        };
+
+        let outcome = registry.request_pairing_with_builder(builder).unwrap();
+        let (paired_node, _token) = registry
+            .approve_request(&outcome.request.request_id)
+            .unwrap();
+
+        assert_eq!(paired_node.node_id, "node-carry-fields");
+        assert_eq!(paired_node.version, Some("3.0.0".to_string()));
+        assert_eq!(paired_node.core_version, Some("2.5.0".to_string()));
+        assert_eq!(paired_node.ui_version, Some("3.0.0".to_string()));
+        assert_eq!(paired_node.device_family, Some("Mac".to_string()));
+        assert_eq!(
+            paired_node.model_identifier,
+            Some("MacBookPro18,3".to_string())
+        );
+        assert_eq!(paired_node.caps, vec!["exec".to_string()]);
+        assert_eq!(paired_node.permissions, Some(permissions));
+        assert_eq!(paired_node.remote_ip, Some("10.0.0.50".to_string()));
+        assert!(paired_node.created_at_ms > 0);
+        assert!(paired_node.paired_at_ms > 0);
+    }
+
+    #[test]
+    fn test_repair_preserves_created_at_ms() {
+        let registry = test_registry();
+
+        // First pairing
+        let builder1 = NodePairingRequestBuilder {
+            node_id: "node-repair-test".to_string(),
+            display_name: Some("Repair Test Node".to_string()),
+            ..Default::default()
+        };
+        let outcome1 = registry.request_pairing_with_builder(builder1).unwrap();
+        let (first_node, _) = registry
+            .approve_request(&outcome1.request.request_id)
+            .unwrap();
+        let original_created_at = first_node.created_at_ms;
+
+        // Wait a tiny bit to ensure timestamps are different
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // Re-pair (repair)
+        let builder2 = NodePairingRequestBuilder {
+            node_id: "node-repair-test".to_string(),
+            display_name: Some("Repair Test Node Updated".to_string()),
+            version: Some("2.0.0".to_string()),
+            ..Default::default()
+        };
+        let outcome2 = registry.request_pairing_with_builder(builder2).unwrap();
+        assert!(outcome2.request.is_repair);
+
+        let (repaired_node, _) = registry
+            .approve_request(&outcome2.request.request_id)
+            .unwrap();
+
+        // created_at_ms should be preserved from the original pairing
+        assert_eq!(repaired_node.created_at_ms, original_created_at);
+        // paired_at_ms should be updated
+        assert!(repaired_node.paired_at_ms > original_created_at);
+        // New fields should be updated
+        assert_eq!(
+            repaired_node.display_name,
+            Some("Repair Test Node Updated".to_string())
+        );
+        assert_eq!(repaired_node.version, Some("2.0.0".to_string()));
     }
 }

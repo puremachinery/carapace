@@ -166,9 +166,9 @@ Error:
 
 ## Methods
 
-Base methods (84+) plus channel plugin methods. Channel plugins may add additional methods.
+Base methods (108+) plus channel plugin methods. Channel plugins may add additional methods.
 
-Note: Method dispatch is implemented in `src/server/ws.rs`.
+Note: Method dispatch is implemented in `src/server/ws/handlers/mod.rs`.
 
 ### Health & Status
 - `health` - Get gateway health status
@@ -209,14 +209,23 @@ Note: Method dispatch is implemented in `src/server/ws.rs`.
 ### TTS (Text-to-Speech)
 - `tts.status` - Get TTS status
 - `tts.providers` - List TTS providers
+- `tts.voices` - List voices for current provider
 - `tts.enable` - Enable TTS
 - `tts.disable` - Disable TTS
 - `tts.convert` - Convert text to speech
+- `tts.speak` - Speak text immediately
+- `tts.stop` - Stop TTS playback
 - `tts.setProvider` - Set TTS provider
+- `tts.setVoice` - Set TTS voice
+- `tts.configure` - Configure TTS settings (rate, pitch, volume)
 
 ### Voice Wake
-- `voicewake.get` - Get voice wake config
-- `voicewake.set` - Set voice wake config
+- `voicewake.get` - Get voice wake triggers
+- `voicewake.set` - Set voice wake triggers (broadcasts `voicewake.changed`)
+- `voicewake.enable` - Enable voice wake
+- `voicewake.disable` - Disable voice wake
+- `voicewake.keywords` - List available wake keywords
+- `voicewake.test` - Test voice wake detection
 
 ### Wizard
 - `wizard.start` - Start onboarding wizard
@@ -225,7 +234,12 @@ Note: Method dispatch is implemented in `src/server/ws.rs`.
 - `wizard.status` - Get wizard status
 
 ### Talk Mode
-- `talk.mode` - Set talk mode (voice interaction)
+- `talk.mode` - Set talk mode (off, push-to-talk, voice-activated, continuous)
+- `talk.status` - Get talk mode status
+- `talk.start` - Start talk (begin listening)
+- `talk.stop` - Stop talk (stop listening)
+- `talk.configure` - Configure talk settings (VAD threshold, silence timeout)
+- `talk.devices` - List available audio devices
 
 ### Models & Skills
 - `models.list` - List available models
@@ -293,7 +307,7 @@ Note: Method dispatch is implemented in `src/server/ws.rs`.
 
 ## Events
 
-Events are broadcast to connected clients. See `src/server/ws.rs` for implementation.
+Events are broadcast to connected clients. See `src/server/ws/mod.rs` for implementation.
 
 | Event | Description |
 |-------|-------------|

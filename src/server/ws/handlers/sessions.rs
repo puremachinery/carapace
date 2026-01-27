@@ -1,8 +1,420 @@
 //! Session, agent, and chat handlers.
+//!
+//! This module implements the agent and chat methods for the WebSocket server:
+//! - `agent`: Send a message to the agent and start a streaming response
+//! - `agent.wait`: Wait for an agent run to complete
+//! - `chat.send`: Send a chat message and queue an agent response
+//! - `chat.abort`: Cancel an in-progress agent run
+//!
+//! ## Streaming Events
+//!
+//! During agent execution, the following events are emitted:
+//! - `agent.started`: Agent run has started
+//! - `agent.delta`: Partial response content (streaming)
+//! - `agent.tool.start`: Tool execution started
+//! - `agent.tool.end`: Tool execution completed
+//! - `agent.completed`: Agent run completed successfully
+//! - `agent.error`: Agent run failed
+//!
+//! ## Cancellation
+//!
+//! Agent runs can be cancelled via `chat.abort`. The cancellation is coordinated
+//! through a per-session cancellation token that is checked periodically during
+//! execution.
 
 use serde_json::{json, Value};
+use std::collections::HashMap;
+use tokio::sync::oneshot;
 
 use super::super::*;
+
+/// Status of an agent run
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentRunStatus {
+    /// Run is queued but not yet started
+    Queued,
+    /// Run is currently executing
+    Running,
+    /// Run completed successfully
+    Completed,
+    /// Run failed with an error
+    Failed,
+    /// Run was cancelled
+    Cancelled,
+}
+
+impl std::fmt::Display for AgentRunStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Queued => write!(f, "queued"),
+            Self::Running => write!(f, "running"),
+            Self::Completed => write!(f, "completed"),
+            Self::Failed => write!(f, "failed"),
+            Self::Cancelled => write!(f, "cancelled"),
+        }
+    }
+}
+
+/// Represents an active agent run
+#[derive(Debug)]
+pub struct AgentRun {
+    /// Unique run identifier
+    pub run_id: String,
+    /// Session key this run belongs to
+    pub session_key: String,
+    /// Current status
+    pub status: AgentRunStatus,
+    /// Original message that started this run
+    pub message: String,
+    /// Accumulated response content
+    pub response: String,
+    /// Error message if failed
+    pub error: Option<String>,
+    /// When the run was created (Unix ms)
+    pub created_at: u64,
+    /// When the run started executing (Unix ms)
+    pub started_at: Option<u64>,
+    /// When the run completed (Unix ms)
+    pub completed_at: Option<u64>,
+    /// Cancellation signal sender
+    cancel_tx: Option<oneshot::Sender<()>>,
+    /// Waiters for this run to complete
+    waiters: Vec<oneshot::Sender<AgentRunResult>>,
+}
+
+/// Result of an agent run for waiters
+#[derive(Debug, Clone)]
+pub struct AgentRunResult {
+    pub run_id: String,
+    pub status: AgentRunStatus,
+    pub response: Option<String>,
+    pub error: Option<String>,
+    pub started_at: Option<u64>,
+    pub completed_at: Option<u64>,
+}
+
+/// Registry for tracking active agent runs
+#[derive(Debug, Default)]
+pub struct AgentRunRegistry {
+    /// Active runs by run_id
+    runs: HashMap<String, AgentRun>,
+    /// Run IDs by session key (for looking up runs by session)
+    runs_by_session: HashMap<String, Vec<String>>,
+}
+
+impl AgentRunRegistry {
+    /// Create a new empty registry
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a new agent run
+    pub fn register(&mut self, run: AgentRun) {
+        let run_id = run.run_id.clone();
+        let session_key = run.session_key.clone();
+        self.runs.insert(run_id.clone(), run);
+        self.runs_by_session
+            .entry(session_key)
+            .or_default()
+            .push(run_id);
+    }
+
+    /// Get a run by ID
+    pub fn get(&self, run_id: &str) -> Option<&AgentRun> {
+        self.runs.get(run_id)
+    }
+
+    /// Get a mutable run by ID
+    pub fn get_mut(&mut self, run_id: &str) -> Option<&mut AgentRun> {
+        self.runs.get_mut(run_id)
+    }
+
+    /// Get all run IDs for a session
+    pub fn get_runs_for_session(&self, session_key: &str) -> Vec<String> {
+        self.runs_by_session
+            .get(session_key)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Remove a completed run
+    pub fn remove(&mut self, run_id: &str) -> Option<AgentRun> {
+        if let Some(run) = self.runs.remove(run_id) {
+            if let Some(runs) = self.runs_by_session.get_mut(&run.session_key) {
+                runs.retain(|id| id != run_id);
+            }
+            Some(run)
+        } else {
+            None
+        }
+    }
+
+    /// Mark a run as started
+    pub fn mark_started(&mut self, run_id: &str) -> bool {
+        if let Some(run) = self.runs.get_mut(run_id) {
+            run.status = AgentRunStatus::Running;
+            run.started_at = Some(now_ms());
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Mark a run as completed with a response
+    pub fn mark_completed(&mut self, run_id: &str, response: String) -> bool {
+        if let Some(run) = self.runs.get_mut(run_id) {
+            run.status = AgentRunStatus::Completed;
+            run.response = response.clone();
+            run.completed_at = Some(now_ms());
+
+            // Notify all waiters
+            let result = AgentRunResult {
+                run_id: run.run_id.clone(),
+                status: AgentRunStatus::Completed,
+                response: Some(response),
+                error: None,
+                started_at: run.started_at,
+                completed_at: run.completed_at,
+            };
+            for waiter in run.waiters.drain(..) {
+                let _ = waiter.send(result.clone());
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Mark a run as failed with an error
+    pub fn mark_failed(&mut self, run_id: &str, error: String) -> bool {
+        if let Some(run) = self.runs.get_mut(run_id) {
+            run.status = AgentRunStatus::Failed;
+            run.error = Some(error.clone());
+            run.completed_at = Some(now_ms());
+
+            // Notify all waiters
+            let result = AgentRunResult {
+                run_id: run.run_id.clone(),
+                status: AgentRunStatus::Failed,
+                response: None,
+                error: Some(error),
+                started_at: run.started_at,
+                completed_at: run.completed_at,
+            };
+            for waiter in run.waiters.drain(..) {
+                let _ = waiter.send(result.clone());
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Mark a run as cancelled
+    pub fn mark_cancelled(&mut self, run_id: &str) -> bool {
+        if let Some(run) = self.runs.get_mut(run_id) {
+            // Send cancellation signal
+            if let Some(cancel_tx) = run.cancel_tx.take() {
+                let _ = cancel_tx.send(());
+            }
+
+            run.status = AgentRunStatus::Cancelled;
+            run.completed_at = Some(now_ms());
+
+            // Notify all waiters
+            let result = AgentRunResult {
+                run_id: run.run_id.clone(),
+                status: AgentRunStatus::Cancelled,
+                response: None,
+                error: Some("cancelled".to_string()),
+                started_at: run.started_at,
+                completed_at: run.completed_at,
+            };
+            for waiter in run.waiters.drain(..) {
+                let _ = waiter.send(result.clone());
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Append delta content to a running run
+    pub fn append_delta(&mut self, run_id: &str, delta: &str) -> bool {
+        if let Some(run) = self.runs.get_mut(run_id) {
+            if run.status == AgentRunStatus::Running {
+                run.response.push_str(delta);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Add a waiter for a run
+    pub fn add_waiter(&mut self, run_id: &str) -> Option<oneshot::Receiver<AgentRunResult>> {
+        if let Some(run) = self.runs.get_mut(run_id) {
+            // If already completed, return the result immediately
+            if matches!(
+                run.status,
+                AgentRunStatus::Completed | AgentRunStatus::Failed | AgentRunStatus::Cancelled
+            ) {
+                let (tx, rx) = oneshot::channel();
+                let result = AgentRunResult {
+                    run_id: run.run_id.clone(),
+                    status: run.status,
+                    response: if run.status == AgentRunStatus::Completed {
+                        Some(run.response.clone())
+                    } else {
+                        None
+                    },
+                    error: run.error.clone(),
+                    started_at: run.started_at,
+                    completed_at: run.completed_at,
+                };
+                let _ = tx.send(result);
+                return Some(rx);
+            }
+
+            // Otherwise add to waiters
+            let (tx, rx) = oneshot::channel();
+            run.waiters.push(tx);
+            Some(rx)
+        } else {
+            None
+        }
+    }
+
+    /// Get active (non-completed) runs for a session
+    pub fn get_active_runs_for_session(&self, session_key: &str) -> Vec<String> {
+        self.runs_by_session
+            .get(session_key)
+            .map(|runs| {
+                runs.iter()
+                    .filter(|run_id| {
+                        self.runs.get(*run_id).is_some_and(|r| {
+                            matches!(r.status, AgentRunStatus::Queued | AgentRunStatus::Running)
+                        })
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Clean up old completed runs (older than 1 hour)
+    pub fn cleanup_old_runs(&mut self) {
+        let cutoff = now_ms().saturating_sub(3600 * 1000);
+        let to_remove: Vec<String> = self
+            .runs
+            .iter()
+            .filter(|(_, run)| {
+                matches!(
+                    run.status,
+                    AgentRunStatus::Completed | AgentRunStatus::Failed | AgentRunStatus::Cancelled
+                ) && run.completed_at.unwrap_or(0) < cutoff
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        for run_id in to_remove {
+            self.remove(&run_id);
+        }
+    }
+}
+
+/// Streaming event types for agent execution
+#[derive(Debug, Clone)]
+pub enum AgentStreamEvent {
+    /// Agent run has started
+    Started { run_id: String, session_key: String },
+    /// Partial response content
+    Delta { run_id: String, delta: String },
+    /// Tool execution started
+    ToolStart {
+        run_id: String,
+        tool_name: String,
+        tool_call_id: String,
+    },
+    /// Tool execution completed
+    ToolEnd {
+        run_id: String,
+        tool_call_id: String,
+        result: String,
+    },
+    /// Agent run completed successfully
+    Completed { run_id: String, response: String },
+    /// Agent run failed
+    Error { run_id: String, error: String },
+}
+
+impl AgentStreamEvent {
+    /// Convert to a JSON event payload
+    pub fn to_event_payload(&self) -> (String, Value) {
+        match self {
+            Self::Started {
+                run_id,
+                session_key,
+            } => (
+                "agent.started".to_string(),
+                json!({
+                    "runId": run_id,
+                    "sessionKey": session_key,
+                    "ts": now_ms()
+                }),
+            ),
+            Self::Delta { run_id, delta } => (
+                "agent.delta".to_string(),
+                json!({
+                    "runId": run_id,
+                    "delta": delta,
+                    "ts": now_ms()
+                }),
+            ),
+            Self::ToolStart {
+                run_id,
+                tool_name,
+                tool_call_id,
+            } => (
+                "agent.tool.start".to_string(),
+                json!({
+                    "runId": run_id,
+                    "toolName": tool_name,
+                    "toolCallId": tool_call_id,
+                    "ts": now_ms()
+                }),
+            ),
+            Self::ToolEnd {
+                run_id,
+                tool_call_id,
+                result,
+            } => (
+                "agent.tool.end".to_string(),
+                json!({
+                    "runId": run_id,
+                    "toolCallId": tool_call_id,
+                    "result": result,
+                    "ts": now_ms()
+                }),
+            ),
+            Self::Completed { run_id, response } => (
+                "agent.completed".to_string(),
+                json!({
+                    "runId": run_id,
+                    "response": response,
+                    "ts": now_ms()
+                }),
+            ),
+            Self::Error { run_id, error } => (
+                "agent.error".to_string(),
+                json!({
+                    "runId": run_id,
+                    "error": error,
+                    "ts": now_ms()
+                }),
+            ),
+        }
+    }
+}
 
 pub(super) fn handle_sessions_list(
     state: &WsServerState,
@@ -612,6 +1024,9 @@ pub(super) fn handle_sessions_compact(
             )
         })?;
 
+    // Node returns archived as a path (string) to the archived transcript file
+    // Rust implementation doesn't archive to file yet, so omit the field
+    // TODO: Add archived field when file archiving is implemented
     Ok(json!({
         "ok": true,
         "key": session.session_key,
@@ -620,6 +1035,34 @@ pub(super) fn handle_sessions_compact(
     }))
 }
 
+/// Handle the `agent` method - start an agent run with streaming support
+///
+/// This method:
+/// 1. Creates or retrieves the session
+/// 2. Appends the user message to session history
+/// 3. Registers a new agent run in the registry
+/// 4. Returns immediately with the run ID
+///
+/// The actual agent execution happens asynchronously, and streaming events
+/// are emitted via the WebSocket connection.
+///
+/// ## Parameters
+/// - `message` (required): The user message to send to the agent
+/// - `idempotencyKey` (required): Unique key for this request (becomes run ID)
+/// - `sessionKey` (optional): Session key (defaults to "default")
+/// - `stream` (optional): Whether to stream responses (defaults to true)
+/// - Additional session metadata fields (label, model, thinkingLevel, etc.)
+///
+/// ## Response
+/// ```json
+/// {
+///   "runId": "...",
+///   "status": "started",
+///   "message": "...",
+///   "sessionKey": "...",
+///   "streaming": true
+/// }
+/// ```
 pub(super) fn handle_agent(
     params: Option<&Value>,
     state: &WsServerState,
@@ -646,6 +1089,10 @@ pub(super) fn handle_agent(
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .unwrap_or("default");
+    let stream = params
+        .and_then(|v| v.get("stream"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
 
     let metadata = build_session_metadata(params);
     let session = state
@@ -669,12 +1116,50 @@ pub(super) fn handle_agent(
             )
         })?;
 
-    // In full implementation, this would queue an agent run
+    // Create cancellation channel for this run
+    let (cancel_tx, _cancel_rx) = oneshot::channel::<()>();
+
+    // Create the agent run
+    let run = AgentRun {
+        run_id: idempotency_key.to_string(),
+        session_key: session.session_key.clone(),
+        status: AgentRunStatus::Queued,
+        message: message.to_string(),
+        response: String::new(),
+        error: None,
+        created_at: now_ms(),
+        started_at: None,
+        completed_at: None,
+        cancel_tx: Some(cancel_tx),
+        waiters: Vec::new(),
+    };
+
+    let run_id = run.run_id.clone();
+    let session_key_out = run.session_key.clone();
+
+    // Register the run in the agent_run_registry
+    {
+        let mut registry = state.agent_run_registry.lock();
+        registry.register(run);
+    }
+
+    // Note: In a full implementation, the agent executor would:
+    // 1. Mark run as Running via registry.mark_started()
+    // 2. Call the LLM with streaming
+    // 3. Emit delta events for each chunk
+    // 4. Emit tool events as needed
+    // 5. Append assistant message to history
+    // 6. Mark run as Completed/Failed via registry.mark_completed()/mark_failed()
+    //
+    // For now, the run stays in Queued status until an external executor processes it.
+
+    // Node returns "accepted" status (not "started")
     Ok(json!({
-        "runId": idempotency_key,
-        "status": "started",
+        "runId": run_id,
+        "status": "accepted",
         "message": message,
-        "sessionKey": session.session_key
+        "sessionKey": session_key_out,
+        "streaming": stream
     }))
 }
 
@@ -686,17 +1171,109 @@ pub(super) fn handle_agent_identity_get(_state: &WsServerState) -> Result<Value,
     }))
 }
 
-pub(super) fn handle_agent_wait(params: Option<&Value>) -> Result<Value, ErrorShape> {
+/// Handle the `agent.wait` method - wait for an agent run to complete
+///
+/// Blocks until the run completes or times out, per Node semantics.
+///
+/// ## Parameters
+/// - `runId` (required): The run ID to wait for
+/// - `timeoutMs` (optional): Maximum time to wait in milliseconds (default: 120000 = 2 min)
+///
+/// ## Response (Node-compatible)
+/// ```json
+/// {
+///   "runId": "...",
+///   "status": "ok" | "error" | "timeout",
+///   "startedAt": 1234567890 | null,
+///   "endedAt": 1234567890 | null
+/// }
+/// ```
+pub(super) async fn handle_agent_wait(
+    params: Option<&Value>,
+    state: &WsServerState,
+) -> Result<Value, ErrorShape> {
     let run_id = params
         .and_then(|v| v.get("runId"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "runId is required", None))?;
-    // In full implementation, this would wait for an agent run to complete
-    Ok(json!({
-        "runId": run_id,
-        "status": "completed",
-        "result": null
-    }))
+    // Node uses timeoutMs (not timeout)
+    let timeout_ms = params
+        .and_then(|v| v.get("timeoutMs"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(120_000)
+        .min(600_000); // Max 10 minutes
+
+    // Helper to convert internal status to Node status
+    fn to_node_status(status: AgentRunStatus) -> &'static str {
+        match status {
+            AgentRunStatus::Completed => "ok",
+            AgentRunStatus::Failed | AgentRunStatus::Cancelled => "error",
+            AgentRunStatus::Queued | AgentRunStatus::Running => "timeout",
+        }
+    }
+
+    // Try to add a waiter for this run
+    let waiter = {
+        let mut registry = state.agent_run_registry.lock();
+        registry.add_waiter(run_id)
+    };
+
+    if let Some(rx) = waiter {
+        // Wait for completion or timeout
+        match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), rx).await {
+            Ok(Ok(result)) => {
+                // Run completed (or was already completed)
+                Ok(json!({
+                    "runId": result.run_id,
+                    "status": to_node_status(result.status),
+                    "startedAt": result.started_at,
+                    "endedAt": result.completed_at
+                }))
+            }
+            Ok(Err(_)) => {
+                // Channel closed unexpectedly - check registry for final state
+                let registry = state.agent_run_registry.lock();
+                if let Some(run) = registry.get(run_id) {
+                    Ok(json!({
+                        "runId": run.run_id,
+                        "status": to_node_status(run.status),
+                        "startedAt": run.started_at,
+                        "endedAt": run.completed_at
+                    }))
+                } else {
+                    Ok(json!({
+                        "runId": run_id,
+                        "status": "timeout",
+                        "startedAt": null,
+                        "endedAt": null
+                    }))
+                }
+            }
+            Err(_) => {
+                // Timeout - return timeout status
+                let registry = state.agent_run_registry.lock();
+                let (started_at, ended_at) = if let Some(run) = registry.get(run_id) {
+                    (run.started_at, run.completed_at)
+                } else {
+                    (None, None)
+                };
+                Ok(json!({
+                    "runId": run_id,
+                    "status": "timeout",
+                    "startedAt": started_at,
+                    "endedAt": ended_at
+                }))
+            }
+        }
+    } else {
+        // Run not found - return timeout status per Node semantics
+        Ok(json!({
+            "runId": run_id,
+            "status": "timeout",
+            "startedAt": null,
+            "endedAt": null
+        }))
+    }
 }
 
 pub(super) fn handle_chat_history(
@@ -757,6 +1334,30 @@ pub(super) fn handle_chat_history(
     }))
 }
 
+/// Handle the `chat.send` method - send a chat message and queue an agent response
+///
+/// This is similar to `agent` but designed for chat UI flows where:
+/// - The message is always appended to history
+/// - A response is queued (but may not stream)
+/// - The caller typically polls for completion or uses WebSocket events
+///
+/// ## Parameters
+/// - `message` (required): The user message to send
+/// - `idempotencyKey` (required): Unique key for this request (becomes run ID)
+/// - `sessionId` or `sessionKey` (one required): Identifies the session
+/// - `stream` (optional): Whether to stream responses (defaults to true)
+/// - `triggerAgent` (optional): Whether to trigger an agent run (defaults to true)
+///
+/// ## Response
+/// ```json
+/// {
+///   "runId": "..." | null,
+///   "messageId": "...",
+///   "status": "queued" | "sent",
+///   "sessionKey": "...",
+///   "agentTriggered": true | false
+/// }
+/// ```
 pub(super) fn handle_chat_send(
     state: &WsServerState,
     params: Option<&Value>,
@@ -783,6 +1384,14 @@ pub(super) fn handle_chat_send(
         .and_then(|v| v.get("idempotencyKey"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "idempotencyKey is required", None))?;
+    let stream = params
+        .and_then(|v| v.get("stream"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let trigger_agent = params
+        .and_then(|v| v.get("triggerAgent"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
 
     let session = if let Some(session_id) = session_id {
         state
@@ -804,9 +1413,12 @@ pub(super) fn handle_chat_send(
             })?
     };
 
+    // Create and append the user message
+    let chat_message = sessions::ChatMessage::user(session.id.clone(), message);
+    let message_id = chat_message.id.clone();
     state
         .session_store
-        .append_message(sessions::ChatMessage::user(session.id.clone(), message))
+        .append_message(chat_message)
         .map_err(|err| {
             error_shape(
                 ERROR_UNAVAILABLE,
@@ -815,13 +1427,89 @@ pub(super) fn handle_chat_send(
             )
         })?;
 
+    // Emit chat event for the user message
+    // TODO: When ws/mod.rs exposes broadcast_event, emit chat event here
+    // broadcast_event(state, "chat", json!({
+    //     "sessionKey": session.session_key,
+    //     "messageId": message_id,
+    //     "role": "user",
+    //     "content": message,
+    //     "ts": now_ms()
+    // }));
+
+    // If agent triggering is enabled, queue the agent run
+    let (run_id, status) = if trigger_agent {
+        // Create cancellation channel
+        let (cancel_tx, _cancel_rx) = oneshot::channel::<()>();
+
+        // Create the agent run
+        let run = AgentRun {
+            run_id: idempotency_key.to_string(),
+            session_key: session.session_key.clone(),
+            status: AgentRunStatus::Queued,
+            message: message.to_string(),
+            response: String::new(),
+            error: None,
+            created_at: now_ms(),
+            started_at: None,
+            completed_at: None,
+            cancel_tx: Some(cancel_tx),
+            waiters: Vec::new(),
+        };
+
+        let run_id = run.run_id.clone();
+
+        // Register the run in the agent_run_registry
+        {
+            let mut registry = state.agent_run_registry.lock();
+            registry.register(run);
+        }
+
+        // Note: The agent executor would:
+        // 1. Emit agent.started event
+        // 2. Call LLM with history
+        // 3. Emit agent.delta events for streaming
+        // 4. Emit agent.tool.* events for tools
+        // 5. Append assistant message to history
+        // 6. Emit agent.completed or agent.error event
+
+        (Some(run_id), "queued")
+    } else {
+        (None, "sent")
+    };
+
     Ok(json!({
-        "runId": idempotency_key,
-        "status": "queued",
-        "sessionKey": session.session_key
+        "runId": run_id,
+        "messageId": message_id,
+        "status": status,
+        "sessionKey": session.session_key,
+        "agentTriggered": trigger_agent,
+        "streaming": stream
     }))
 }
 
+/// Handle the `chat.abort` method - cancel in-progress agent runs
+///
+/// This method cancels one or more agent runs. It can cancel:
+/// - A specific run by `runId`
+/// - All active runs for a session by `sessionId` or `sessionKey`
+/// - All active runs if neither is specified (not recommended)
+///
+/// ## Parameters
+/// - `runId` (optional): Specific run ID to cancel
+/// - `sessionId` or `sessionKey` (optional): Cancel all runs for this session
+/// - `reason` (optional): Cancellation reason for logging
+///
+/// ## Response
+/// ```json
+/// {
+///   "ok": true,
+///   "aborted": true | false,
+///   "sessionKey": "..." | null,
+///   "runIds": ["..."],
+///   "reason": "..." | null
+/// }
+/// ```
 pub(super) fn handle_chat_abort(
     state: &WsServerState,
     params: Option<&Value>,
@@ -838,6 +1526,14 @@ pub(super) fn handle_chat_abort(
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
+    let reason = params
+        .and_then(|v| v.get("reason"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    // Resolve the session (if provided)
     let session = if let Some(session_id) = session_id {
         state.session_store.get_session(session_id).ok()
     } else if let Some(key) = session_key.as_deref() {
@@ -845,13 +1541,340 @@ pub(super) fn handle_chat_abort(
     } else {
         None
     };
+    let resolved_session_key = session
+        .as_ref()
+        .map(|s| s.session_key.clone())
+        .or(session_key);
+
+    // Collect run IDs to cancel
+    let runs_to_cancel: Vec<String> = if let Some(run_id) = run_id.clone() {
+        // Cancel specific run
+        vec![run_id]
+    } else if let Some(ref session_key) = resolved_session_key {
+        // Cancel all active runs for the session
+        let registry = state.agent_run_registry.lock();
+        registry.get_active_runs_for_session(session_key)
+    } else {
+        // No specific target - return empty list
+        Vec::new()
+    };
+
+    // Cancel each run and track which were actually cancelled
+    let mut cancelled_runs: Vec<String> = Vec::new();
+    {
+        let mut registry = state.agent_run_registry.lock();
+        for run_id in &runs_to_cancel {
+            if registry.mark_cancelled(run_id) {
+                cancelled_runs.push(run_id.clone());
+            }
+        }
+    }
+
+    let aborted = !cancelled_runs.is_empty();
+
     Ok(json!({
         "ok": true,
-        "aborted": false,
-        "sessionKey": session
-            .as_ref()
-            .map(|s| s.session_key.clone())
-            .or(session_key),
-        "runIds": run_id.map(|id| vec![id]).unwrap_or_default()
+        "aborted": aborted,
+        "sessionKey": resolved_session_key,
+        "runIds": if run_id.is_some() { runs_to_cancel } else { cancelled_runs },
+        "reason": reason
     }))
+}
+
+// ============== Tests ==============
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ============== AgentRunStatus Tests ==============
+
+    #[test]
+    fn test_agent_run_status_display() {
+        assert_eq!(AgentRunStatus::Queued.to_string(), "queued");
+        assert_eq!(AgentRunStatus::Running.to_string(), "running");
+        assert_eq!(AgentRunStatus::Completed.to_string(), "completed");
+        assert_eq!(AgentRunStatus::Failed.to_string(), "failed");
+        assert_eq!(AgentRunStatus::Cancelled.to_string(), "cancelled");
+    }
+
+    // ============== AgentRunRegistry Tests ==============
+
+    fn create_test_run(run_id: &str, session_key: &str) -> AgentRun {
+        let (cancel_tx, _cancel_rx) = oneshot::channel::<()>();
+        AgentRun {
+            run_id: run_id.to_string(),
+            session_key: session_key.to_string(),
+            status: AgentRunStatus::Queued,
+            message: "test message".to_string(),
+            response: String::new(),
+            error: None,
+            created_at: now_ms(),
+            started_at: None,
+            completed_at: None,
+            cancel_tx: Some(cancel_tx),
+            waiters: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_agent_run_registry_register_and_get() {
+        let mut registry = AgentRunRegistry::new();
+        let run = create_test_run("run-1", "session-1");
+
+        registry.register(run);
+
+        let retrieved = registry.get("run-1");
+        assert!(retrieved.is_some());
+        assert_eq!(retrieved.unwrap().run_id, "run-1");
+        assert_eq!(retrieved.unwrap().session_key, "session-1");
+    }
+
+    #[test]
+    fn test_agent_run_registry_get_runs_for_session() {
+        let mut registry = AgentRunRegistry::new();
+        registry.register(create_test_run("run-1", "session-1"));
+        registry.register(create_test_run("run-2", "session-1"));
+        registry.register(create_test_run("run-3", "session-2"));
+
+        let session1_runs = registry.get_runs_for_session("session-1");
+        assert_eq!(session1_runs.len(), 2);
+        assert!(session1_runs.contains(&"run-1".to_string()));
+        assert!(session1_runs.contains(&"run-2".to_string()));
+
+        let session2_runs = registry.get_runs_for_session("session-2");
+        assert_eq!(session2_runs.len(), 1);
+        assert!(session2_runs.contains(&"run-3".to_string()));
+    }
+
+    #[test]
+    fn test_agent_run_registry_mark_started() {
+        let mut registry = AgentRunRegistry::new();
+        registry.register(create_test_run("run-1", "session-1"));
+
+        assert!(registry.mark_started("run-1"));
+
+        let run = registry.get("run-1").unwrap();
+        assert_eq!(run.status, AgentRunStatus::Running);
+        assert!(run.started_at.is_some());
+    }
+
+    #[test]
+    fn test_agent_run_registry_mark_completed() {
+        let mut registry = AgentRunRegistry::new();
+        registry.register(create_test_run("run-1", "session-1"));
+        registry.mark_started("run-1");
+
+        assert!(registry.mark_completed("run-1", "test response".to_string()));
+
+        let run = registry.get("run-1").unwrap();
+        assert_eq!(run.status, AgentRunStatus::Completed);
+        assert_eq!(run.response, "test response");
+        assert!(run.completed_at.is_some());
+    }
+
+    #[test]
+    fn test_agent_run_registry_mark_failed() {
+        let mut registry = AgentRunRegistry::new();
+        registry.register(create_test_run("run-1", "session-1"));
+        registry.mark_started("run-1");
+
+        assert!(registry.mark_failed("run-1", "test error".to_string()));
+
+        let run = registry.get("run-1").unwrap();
+        assert_eq!(run.status, AgentRunStatus::Failed);
+        assert_eq!(run.error, Some("test error".to_string()));
+        assert!(run.completed_at.is_some());
+    }
+
+    #[test]
+    fn test_agent_run_registry_mark_cancelled() {
+        let mut registry = AgentRunRegistry::new();
+        registry.register(create_test_run("run-1", "session-1"));
+        registry.mark_started("run-1");
+
+        assert!(registry.mark_cancelled("run-1"));
+
+        let run = registry.get("run-1").unwrap();
+        assert_eq!(run.status, AgentRunStatus::Cancelled);
+        assert!(run.completed_at.is_some());
+    }
+
+    #[test]
+    fn test_agent_run_registry_append_delta() {
+        let mut registry = AgentRunRegistry::new();
+        registry.register(create_test_run("run-1", "session-1"));
+        registry.mark_started("run-1");
+
+        assert!(registry.append_delta("run-1", "Hello"));
+        assert!(registry.append_delta("run-1", " World"));
+
+        let run = registry.get("run-1").unwrap();
+        assert_eq!(run.response, "Hello World");
+    }
+
+    #[test]
+    fn test_agent_run_registry_append_delta_only_when_running() {
+        let mut registry = AgentRunRegistry::new();
+        registry.register(create_test_run("run-1", "session-1"));
+
+        // Should not append when queued
+        assert!(!registry.append_delta("run-1", "test"));
+
+        registry.mark_started("run-1");
+        assert!(registry.append_delta("run-1", "test"));
+
+        registry.mark_completed("run-1", "done".to_string());
+        // Should not append when completed
+        assert!(!registry.append_delta("run-1", "more"));
+    }
+
+    #[test]
+    fn test_agent_run_registry_remove() {
+        let mut registry = AgentRunRegistry::new();
+        registry.register(create_test_run("run-1", "session-1"));
+
+        let removed = registry.remove("run-1");
+        assert!(removed.is_some());
+        assert_eq!(removed.unwrap().run_id, "run-1");
+
+        assert!(registry.get("run-1").is_none());
+        assert!(registry.get_runs_for_session("session-1").is_empty());
+    }
+
+    #[test]
+    fn test_agent_run_registry_get_active_runs() {
+        let mut registry = AgentRunRegistry::new();
+        registry.register(create_test_run("run-1", "session-1"));
+        registry.register(create_test_run("run-2", "session-1"));
+        registry.register(create_test_run("run-3", "session-1"));
+
+        registry.mark_started("run-1");
+        registry.mark_completed("run-2", "done".to_string());
+        // run-3 stays queued
+
+        let active = registry.get_active_runs_for_session("session-1");
+        assert_eq!(active.len(), 2);
+        assert!(active.contains(&"run-1".to_string()));
+        assert!(active.contains(&"run-3".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_agent_run_registry_add_waiter_immediate_completion() {
+        let mut registry = AgentRunRegistry::new();
+        registry.register(create_test_run("run-1", "session-1"));
+        registry.mark_started("run-1");
+        registry.mark_completed("run-1", "final response".to_string());
+
+        // Adding a waiter to a completed run should return immediately
+        let rx = registry.add_waiter("run-1").unwrap();
+        let result = rx.await.unwrap();
+
+        assert_eq!(result.run_id, "run-1");
+        assert_eq!(result.status, AgentRunStatus::Completed);
+        assert_eq!(result.response, Some("final response".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_agent_run_registry_waiter_notified_on_completion() {
+        let mut registry = AgentRunRegistry::new();
+        registry.register(create_test_run("run-1", "session-1"));
+        registry.mark_started("run-1");
+
+        // Add waiter before completion
+        let rx = registry.add_waiter("run-1").unwrap();
+
+        // Complete the run
+        registry.mark_completed("run-1", "final response".to_string());
+
+        // Waiter should receive the result
+        let result = rx.await.unwrap();
+        assert_eq!(result.status, AgentRunStatus::Completed);
+        assert_eq!(result.response, Some("final response".to_string()));
+    }
+
+    // ============== AgentStreamEvent Tests ==============
+
+    #[test]
+    fn test_agent_stream_event_started() {
+        let event = AgentStreamEvent::Started {
+            run_id: "run-1".to_string(),
+            session_key: "session-1".to_string(),
+        };
+        let (event_name, payload) = event.to_event_payload();
+
+        assert_eq!(event_name, "agent.started");
+        assert_eq!(payload["runId"], "run-1");
+        assert_eq!(payload["sessionKey"], "session-1");
+        assert!(payload["ts"].as_u64().is_some());
+    }
+
+    #[test]
+    fn test_agent_stream_event_delta() {
+        let event = AgentStreamEvent::Delta {
+            run_id: "run-1".to_string(),
+            delta: "Hello".to_string(),
+        };
+        let (event_name, payload) = event.to_event_payload();
+
+        assert_eq!(event_name, "agent.delta");
+        assert_eq!(payload["runId"], "run-1");
+        assert_eq!(payload["delta"], "Hello");
+    }
+
+    #[test]
+    fn test_agent_stream_event_tool_start() {
+        let event = AgentStreamEvent::ToolStart {
+            run_id: "run-1".to_string(),
+            tool_name: "calculator".to_string(),
+            tool_call_id: "call-1".to_string(),
+        };
+        let (event_name, payload) = event.to_event_payload();
+
+        assert_eq!(event_name, "agent.tool.start");
+        assert_eq!(payload["runId"], "run-1");
+        assert_eq!(payload["toolName"], "calculator");
+        assert_eq!(payload["toolCallId"], "call-1");
+    }
+
+    #[test]
+    fn test_agent_stream_event_tool_end() {
+        let event = AgentStreamEvent::ToolEnd {
+            run_id: "run-1".to_string(),
+            tool_call_id: "call-1".to_string(),
+            result: "42".to_string(),
+        };
+        let (event_name, payload) = event.to_event_payload();
+
+        assert_eq!(event_name, "agent.tool.end");
+        assert_eq!(payload["runId"], "run-1");
+        assert_eq!(payload["toolCallId"], "call-1");
+        assert_eq!(payload["result"], "42");
+    }
+
+    #[test]
+    fn test_agent_stream_event_completed() {
+        let event = AgentStreamEvent::Completed {
+            run_id: "run-1".to_string(),
+            response: "Full response".to_string(),
+        };
+        let (event_name, payload) = event.to_event_payload();
+
+        assert_eq!(event_name, "agent.completed");
+        assert_eq!(payload["runId"], "run-1");
+        assert_eq!(payload["response"], "Full response");
+    }
+
+    #[test]
+    fn test_agent_stream_event_error() {
+        let event = AgentStreamEvent::Error {
+            run_id: "run-1".to_string(),
+            error: "Something went wrong".to_string(),
+        };
+        let (event_name, payload) = event.to_event_payload();
+
+        assert_eq!(event_name, "agent.error");
+        assert_eq!(payload["runId"], "run-1");
+        assert_eq!(payload["error"], "Something went wrong");
+    }
 }

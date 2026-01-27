@@ -53,3 +53,4 @@ path = "src/lib.rs"
 [[bin]]
 name = "rusty-clawd"
 path = "src/main.rs"
+test = false

@@ -10,19 +10,19 @@ use std::path::PathBuf;
 use super::super::*;
 
 #[derive(Debug, Serialize)]
-struct ConfigIssue {
+pub(super) struct ConfigIssue {
     path: String,
     message: String,
 }
 
 #[derive(Debug)]
-struct ConfigSnapshot {
+pub(super) struct ConfigSnapshot {
     path: String,
     exists: bool,
     raw: Option<String>,
     parsed: Value,
     valid: bool,
-    config: Value,
+    pub(super) config: Value,
     hash: Option<String>,
     issues: Vec<ConfigIssue>,
 }

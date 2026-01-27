@@ -27,12 +27,12 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::{auth, channels, config, credentials, devices, messages, nodes, sessions};
+use crate::{auth, channels, config, credentials, cron, devices, exec, messages, nodes, sessions};
 
 mod handlers;
 mod tests;
 
-use handlers::*;
+pub(super) use handlers::*;
 
 const PROTOCOL_VERSION: u32 = 3;
 const MAX_PAYLOAD_BYTES: usize = 512 * 1024;
@@ -48,7 +48,7 @@ const LOGS_MAX_BYTES: usize = 1_000_000;
 const ERROR_INVALID_REQUEST: &str = "INVALID_REQUEST";
 const ERROR_NOT_PAIRED: &str = "NOT_PAIRED";
 const ERROR_UNAVAILABLE: &str = "UNAVAILABLE";
-const ERROR_FORBIDDEN: &str = "FORBIDDEN";
+// Note: Node doesn't use ERROR_FORBIDDEN - use ERROR_INVALID_REQUEST for auth errors
 
 const ALLOWED_CLIENT_IDS: [&str; 12] = [
     "webchat-ui",
@@ -68,49 +68,85 @@ const ALLOWED_CLIENT_IDS: [&str; 12] = [
 const ALLOWED_CLIENT_MODES: [&str; 7] =
     ["webchat", "cli", "ui", "backend", "node", "probe", "test"];
 
-const GATEWAY_METHODS: [&str; 79] = [
+const GATEWAY_METHODS: [&str; 108] = [
+    // Health/status
     "health",
     "status",
     "logs.tail",
+    // Channels
     "channels.status",
     "channels.logout",
+    // Config
     "config.get",
     "config.set",
     "config.apply",
     "config.patch",
     "config.schema",
+    // Agent
     "agent",
     "agent.identity.get",
     "agent.wait",
+    // Chat
     "chat.send",
     "chat.history",
     "chat.abort",
+    // Sessions
     "sessions.list",
     "sessions.preview",
     "sessions.patch",
     "sessions.reset",
     "sessions.delete",
     "sessions.compact",
+    // TTS
     "tts.status",
     "tts.providers",
+    "tts.voices",
     "tts.enable",
     "tts.disable",
     "tts.convert",
     "tts.setProvider",
+    "tts.setVoice",
+    "tts.configure",
+    "tts.speak",
+    "tts.stop",
+    // Voice wake
     "voicewake.get",
     "voicewake.set",
+    "voicewake.enable",
+    "voicewake.disable",
+    "voicewake.keywords",
+    "voicewake.test",
+    // Wizard
     "wizard.start",
     "wizard.next",
+    "wizard.back",
     "wizard.cancel",
     "wizard.status",
+    "wizard.list",
+    // Talk mode
     "talk.mode",
+    "talk.status",
+    "talk.start",
+    "talk.stop",
+    "talk.configure",
+    "talk.devices",
+    // Models/agents/skills
     "models.list",
     "agents.list",
     "skills.status",
     "skills.bins",
     "skills.install",
     "skills.update",
+    // Update
     "update.run",
+    "update.status",
+    "update.check",
+    "update.setChannel",
+    "update.configure",
+    "update.install",
+    "update.dismiss",
+    "update.releaseNotes",
+    // Cron
     "cron.status",
     "cron.list",
     "cron.add",
@@ -118,6 +154,7 @@ const GATEWAY_METHODS: [&str; 79] = [
     "cron.remove",
     "cron.run",
     "cron.runs",
+    // Node pairing
     "node.pair.request",
     "node.pair.list",
     "node.pair.approve",
@@ -129,19 +166,29 @@ const GATEWAY_METHODS: [&str; 79] = [
     "node.invoke",
     "node.invoke.result",
     "node.event",
+    // Device pairing
     "device.pair.list",
     "device.pair.approve",
     "device.pair.reject",
     "device.token.rotate",
     "device.token.revoke",
+    // Exec approvals
     "exec.approvals.get",
     "exec.approvals.set",
     "exec.approvals.node.get",
     "exec.approvals.node.set",
     "exec.approval.request",
     "exec.approval.resolve",
+    // Usage
     "usage.status",
+    "usage.enable",
+    "usage.disable",
     "usage.cost",
+    "usage.session",
+    "usage.providers",
+    "usage.daily",
+    "usage.reset",
+    // Misc
     "last-heartbeat",
     "set-heartbeats",
     "wake",
@@ -226,6 +273,124 @@ impl Default for WsPolicy {
     }
 }
 
+/// Presence entry for a connected client.
+/// Matches the Node.js PresenceEntrySchema in src/gateway/protocol/schema/snapshot.ts
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PresenceEntry {
+    /// Client hostname or display name
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// Client IP address (remote only)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ip: Option<String>,
+    /// Client version
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Client platform (darwin, linux, win32)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+    /// Device family (MacBookPro, iPhone, etc)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_family: Option<String>,
+    /// Device model identifier
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_identifier: Option<String>,
+    /// Client mode (ui, cli, webchat, etc)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// Connection reason (connect or disconnect)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Tags
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<String>>,
+    /// Last update timestamp
+    pub ts: u64,
+    /// Device identity ID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    /// Roles
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub roles: Option<Vec<String>>,
+    /// Scopes
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<Vec<String>>,
+    /// Instance ID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
+    /// Event text (from system-event)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// Seconds since last input (idle time)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_input_seconds: Option<u64>,
+    /// Connection ID (internal, not serialized to match Node schema)
+    #[serde(skip)]
+    pub conn_id: String,
+    /// Client ID (internal, not serialized to match Node schema)
+    #[serde(skip)]
+    pub client_id: Option<String>,
+}
+
+/// Cached health snapshot
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct HealthSnapshot {
+    pub ts: u64,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channels: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<Value>,
+}
+
+/// System event entry for history
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemEvent {
+    pub ts: u64,
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Maximum number of system events to keep in history
+const SYSTEM_EVENT_HISTORY_MAX: usize = 1000;
+
+/// Tracks presence and health version numbers for stateVersion in events
+#[derive(Debug, Default)]
+struct StateVersionTracker {
+    presence: u64,
+    health: u64,
+}
+
+impl StateVersionTracker {
+    fn increment_presence(&mut self) -> u64 {
+        self.presence += 1;
+        self.presence
+    }
+
+    fn increment_health(&mut self) -> u64 {
+        self.health += 1;
+        self.health
+    }
+
+    fn current(&self) -> StateVersion {
+        StateVersion {
+            presence: self.presence,
+            health: self.health,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct WsServerState {
     config: WsServerConfig,
@@ -238,6 +403,20 @@ pub struct WsServerState {
     message_pipeline: Arc<messages::outbound::MessagePipeline>,
     session_store: Arc<sessions::SessionStore>,
     event_seq: Mutex<u64>,
+    /// Tracks connected client presence
+    presence: Mutex<HashMap<String, PresenceEntry>>,
+    /// Cached health snapshot
+    health_cache: Mutex<HealthSnapshot>,
+    /// Tracks state versions for presence and health
+    state_versions: Mutex<StateVersionTracker>,
+    /// Exec approval manager
+    exec_manager: exec::ExecApprovalManager,
+    /// Cron job scheduler
+    cron_scheduler: cron::CronScheduler,
+    /// Agent run registry for tracking active/completed agent invocations
+    pub agent_run_registry: Mutex<handlers::AgentRunRegistry>,
+    /// System event history (enqueued via system-event method)
+    system_event_history: Mutex<Vec<SystemEvent>>,
 }
 
 impl WsServerState {
@@ -255,6 +434,18 @@ impl WsServerState {
                 resolve_state_dir().join("sessions"),
             )),
             event_seq: Mutex::new(0),
+            presence: Mutex::new(HashMap::new()),
+            health_cache: Mutex::new(HealthSnapshot {
+                ts: now_ms(),
+                status: "healthy".to_string(),
+                channels: None,
+                agent: None,
+            }),
+            state_versions: Mutex::new(StateVersionTracker::default()),
+            exec_manager: exec::ExecApprovalManager::new(),
+            cron_scheduler: cron::CronScheduler::in_memory(),
+            agent_run_registry: Mutex::new(handlers::AgentRunRegistry::new()),
+            system_event_history: Mutex::new(Vec::new()),
         }
     }
 
@@ -277,6 +468,18 @@ impl WsServerState {
                 state_dir.join("sessions"),
             )),
             event_seq: Mutex::new(0),
+            presence: Mutex::new(HashMap::new()),
+            health_cache: Mutex::new(HealthSnapshot {
+                ts: now_ms(),
+                status: "healthy".to_string(),
+                channels: None,
+                agent: None,
+            }),
+            state_versions: Mutex::new(StateVersionTracker::default()),
+            exec_manager: exec::ExecApprovalManager::new(),
+            cron_scheduler: cron::CronScheduler::new(state_dir.join("cron"), true),
+            agent_run_registry: Mutex::new(handlers::AgentRunRegistry::new()),
+            system_event_history: Mutex::new(Vec::new()),
         })
     }
 
@@ -296,21 +499,226 @@ impl WsServerState {
         *guard
     }
 
-    fn register_connection(&self, conn: &ConnectionContext, tx: mpsc::UnboundedSender<Message>) {
-        let mut conns = self.connections.lock();
-        conns.insert(
-            conn.conn_id.clone(),
-            ConnectionHandle {
-                role: conn.role.clone(),
-                scopes: conn.scopes.clone(),
-                tx,
-            },
-        );
+    /// Get the current state version (presence + health)
+    fn current_state_version(&self) -> StateVersion {
+        self.state_versions.lock().current()
     }
 
+    /// Register a connection and update presence tracking.
+    /// Broadcasts a presence event to all operators.
+    fn register_connection(
+        &self,
+        conn: &ConnectionContext,
+        tx: mpsc::UnboundedSender<Message>,
+        remote_ip: Option<String>,
+    ) {
+        // Add to connections map
+        {
+            let mut conns = self.connections.lock();
+            conns.insert(
+                conn.conn_id.clone(),
+                ConnectionHandle {
+                    role: conn.role.clone(),
+                    scopes: conn.scopes.clone(),
+                    tx,
+                },
+            );
+        }
+
+        // Add to presence tracking
+        let entry = PresenceEntry {
+            host: conn.client.display_name.clone(),
+            ip: remote_ip,
+            version: Some(conn.client.version.clone()),
+            platform: Some(conn.client.platform.clone()),
+            device_family: conn.client.device_family.clone(),
+            model_identifier: conn.client.model_identifier.clone(),
+            mode: Some(conn.client.mode.clone()),
+            reason: Some("connect".to_string()),
+            tags: None,
+            ts: now_ms(),
+            device_id: conn.device_id.clone(),
+            conn_id: conn.conn_id.clone(),
+            client_id: Some(conn.client.id.clone()),
+            roles: Some(vec![conn.role.clone()]),
+            scopes: Some(conn.scopes.clone()),
+            instance_id: conn.client.instance_id.clone(),
+            text: None,
+            last_input_seconds: None,
+        };
+
+        {
+            let mut presence = self.presence.lock();
+            presence.insert(conn.conn_id.clone(), entry);
+        }
+
+        // Increment presence version and broadcast
+        let state_version = {
+            let mut versions = self.state_versions.lock();
+            versions.increment_presence();
+            versions.current()
+        };
+
+        self.broadcast_presence_event(state_version);
+    }
+
+    /// Unregister a connection and update presence tracking.
+    /// Broadcasts a presence event to remaining operators.
     fn unregister_connection(&self, conn_id: &str) {
+        // Remove from connections
+        {
+            let mut conns = self.connections.lock();
+            conns.remove(conn_id);
+        }
+
+        // Update presence tracking (mark as disconnect, then remove)
+        {
+            let mut presence = self.presence.lock();
+            if let Some(entry) = presence.get_mut(conn_id) {
+                entry.reason = Some("disconnect".to_string());
+                entry.ts = now_ms();
+            }
+            presence.remove(conn_id);
+        }
+
+        // Increment presence version and broadcast
+        let state_version = {
+            let mut versions = self.state_versions.lock();
+            versions.increment_presence();
+            versions.current()
+        };
+
+        self.broadcast_presence_event(state_version);
+    }
+
+    /// Get current presence list as JSON values with TTL pruning and ts-desc ordering.
+    /// Prunes expired entries (older than 5 minutes) to match Node's listSystemPresence.
+    fn get_presence_list(&self) -> Vec<Value> {
+        const PRESENCE_TTL_MS: u64 = 5 * 60 * 1000; // 5 minutes
+        const MAX_PRESENCE_ENTRIES: usize = 200; // Node uses 200
+        let now = now_ms();
+        let cutoff = now.saturating_sub(PRESENCE_TTL_MS);
+
+        let mut presence = self.presence.lock();
+
+        // Prune expired entries
+        presence.retain(|_, entry| entry.ts >= cutoff);
+
+        // Collect, filter disconnects, and sort by ts descending
+        let mut entries: Vec<_> = presence
+            .values()
+            .filter(|e| e.reason.as_deref() != Some("disconnect"))
+            .map(|e| (e.ts, serde_json::to_value(e).unwrap_or(json!({}))))
+            .collect();
+
+        // Sort by ts descending (newest first)
+        entries.sort_by(|a, b| b.0.cmp(&a.0));
+
+        // Limit to MAX_PRESENCE_ENTRIES (Node parity)
+        entries
+            .into_iter()
+            .take(MAX_PRESENCE_ENTRIES)
+            .map(|(_, v)| v)
+            .collect()
+    }
+
+    /// Enqueue a system event to history (per Node's enqueueSystemEvent)
+    pub fn enqueue_system_event(&self, event: SystemEvent) {
+        let mut history = self.system_event_history.lock();
+        history.push(event);
+        // Trim to max size, keeping newest
+        if history.len() > SYSTEM_EVENT_HISTORY_MAX {
+            let excess = history.len() - SYSTEM_EVENT_HISTORY_MAX;
+            history.drain(0..excess);
+        }
+    }
+
+    /// Get system event history
+    pub fn get_system_event_history(&self) -> Vec<SystemEvent> {
+        self.system_event_history.lock().clone()
+    }
+
+    /// Get cached health snapshot
+    fn get_health_snapshot(&self) -> HealthSnapshot {
+        self.health_cache.lock().clone()
+    }
+
+    /// Update health snapshot and broadcast if changed
+    pub fn update_health(&self, status: &str, channels: Option<Value>, agent: Option<Value>) {
+        let new_snapshot = HealthSnapshot {
+            ts: now_ms(),
+            status: status.to_string(),
+            channels,
+            agent,
+        };
+
+        let should_broadcast = {
+            let mut cache = self.health_cache.lock();
+            let changed = cache.status != new_snapshot.status;
+            *cache = new_snapshot.clone();
+            changed
+        };
+
+        if should_broadcast {
+            let state_version = {
+                let mut versions = self.state_versions.lock();
+                versions.increment_health();
+                versions.current()
+            };
+            self.broadcast_health_event(new_snapshot, state_version);
+        }
+    }
+
+    /// Broadcast presence event to all operator connections
+    pub fn broadcast_presence_event(&self, state_version: StateVersion) {
+        let presence_list = self.get_presence_list();
+        let frame = EventFrame {
+            frame_type: "event",
+            event: "presence",
+            payload: json!({ "presence": presence_list }),
+            seq: Some(self.next_event_seq()),
+            state_version: Some(state_version),
+        };
+
         let mut conns = self.connections.lock();
-        conns.remove(conn_id);
+        let mut dead = Vec::new();
+        for (conn_id, conn) in conns.iter() {
+            // Only send to operators, not nodes
+            if conn.role == "node" {
+                continue;
+            }
+            if send_json(&conn.tx, &frame).is_err() {
+                dead.push(conn_id.clone());
+            }
+        }
+        for conn_id in dead {
+            conns.remove(&conn_id);
+        }
+    }
+
+    /// Broadcast health event to all operator connections
+    fn broadcast_health_event(&self, snapshot: HealthSnapshot, state_version: StateVersion) {
+        let frame = EventFrame {
+            frame_type: "event",
+            event: "health",
+            payload: serde_json::to_value(&snapshot).unwrap_or(json!({})),
+            seq: Some(self.next_event_seq()),
+            state_version: Some(state_version),
+        };
+
+        let mut conns = self.connections.lock();
+        let mut dead = Vec::new();
+        for (conn_id, conn) in conns.iter() {
+            if conn.role == "node" {
+                continue;
+            }
+            if send_json(&conn.tx, &frame).is_err() {
+                dead.push(conn_id.clone());
+            }
+        }
+        for conn_id in dead {
+            conns.remove(&conn_id);
+        }
     }
 }
 
@@ -1069,6 +1477,18 @@ async fn handle_socket(
         });
     }
 
+    // Compute remote IP for presence tracking
+    let remote_ip_for_presence = if is_local {
+        None
+    } else {
+        Some(remote_addr.ip().to_string())
+    };
+
+    // Get current state version and snapshots for hello response
+    let current_state_version = state.current_state_version();
+    let presence_list = state.get_presence_list();
+    let health_snapshot = state.get_health_snapshot();
+
     let hello = HelloOkPayload {
         payload_type: "hello-ok",
         protocol: PROTOCOL_VERSION,
@@ -1083,12 +1503,9 @@ async fn handle_socket(
             events: GATEWAY_EVENTS.iter().map(|s| s.to_string()).collect(),
         },
         snapshot: Snapshot {
-            presence: Vec::new(),
-            health: json!({}),
-            state_version: StateVersion {
-                presence: 0,
-                health: 0,
-            },
+            presence: presence_list,
+            health: serde_json::to_value(&health_snapshot).unwrap_or(json!({})),
+            state_version: current_state_version,
             uptime_ms: state.start_time.elapsed().as_millis() as u64,
             config_path: None,
             state_dir: None,
@@ -1118,7 +1535,7 @@ async fn handle_socket(
         device_id,
     };
 
-    state.register_connection(&conn, tx.clone());
+    state.register_connection(&conn, tx.clone(), remote_ip_for_presence);
 
     let tick_tx = tx.clone();
     let tick_state = state.clone();
@@ -1780,6 +2197,300 @@ fn broadcast_event(state: &WsServerState, event: &str, payload: Value) {
     for conn_id in dead {
         conns.remove(&conn_id);
     }
+}
+
+// ============================================================================
+// Operator Broadcast Helpers
+// ============================================================================
+// These functions provide typed broadcast helpers for specific event types,
+// matching the Node.js gateway's broadcast patterns in src/gateway/server-broadcast.ts
+
+/// Broadcast an agent event to all operator connections.
+/// Agent events include: start, delta, tool_use, tool_result, final, error, thinking
+///
+/// # Arguments
+/// * `state` - Server state
+/// * `run_id` - Agent run identifier (from idempotencyKey)
+/// * `seq` - Event sequence within this run
+/// * `stream` - Stream type (text, tool_use, tool_result, final, error, thinking)
+/// * `data` - Stream-specific data
+pub fn broadcast_agent_event(
+    state: &WsServerState,
+    run_id: &str,
+    seq: u64,
+    stream: &str,
+    data: Value,
+) {
+    let payload = json!({
+        "runId": run_id,
+        "seq": seq,
+        "stream": stream,
+        "ts": now_ms(),
+        "data": data
+    });
+    broadcast_event(state, "agent", payload);
+}
+
+/// Broadcast a chat event to all operator connections.
+/// Chat events are used by webchat-ui clients.
+///
+/// # Arguments
+/// * `state` - Server state
+/// * `run_id` - Chat run identifier (from idempotencyKey)
+/// * `session_key` - Session key
+/// * `seq` - Event sequence within this run
+/// * `chat_state` - Event state: "delta", "final", "aborted", "error"
+/// * `message` - Optional message content
+/// * `error_message` - Optional error description (for error state)
+/// * `usage` - Optional token usage (for final state)
+/// * `stop_reason` - Optional stop reason
+pub fn broadcast_chat_event(
+    state: &WsServerState,
+    run_id: &str,
+    session_key: &str,
+    seq: u64,
+    chat_state: &str,
+    message: Option<Value>,
+    error_message: Option<&str>,
+    usage: Option<Value>,
+    stop_reason: Option<&str>,
+) {
+    let mut payload = json!({
+        "runId": run_id,
+        "sessionKey": session_key,
+        "seq": seq,
+        "state": chat_state
+    });
+    if let Some(msg) = message {
+        payload["message"] = msg;
+    }
+    if let Some(err) = error_message {
+        payload["errorMessage"] = json!(err);
+    }
+    if let Some(u) = usage {
+        payload["usage"] = u;
+    }
+    if let Some(sr) = stop_reason {
+        payload["stopReason"] = json!(sr);
+    }
+    broadcast_event(state, "chat", payload);
+}
+
+/// Broadcast a cron job event to all operator connections.
+///
+/// # Arguments
+/// * `state` - Server state
+/// * `job_id` - Cron job identifier
+/// * `status` - Job status (e.g., "started", "completed", "failed")
+/// * `run_id` - Optional run identifier
+/// * `result` - Optional result data
+pub fn broadcast_cron_event(
+    state: &WsServerState,
+    job_id: &str,
+    status: &str,
+    run_id: Option<&str>,
+    result: Option<Value>,
+) {
+    let mut payload = json!({
+        "jobId": job_id,
+        "status": status,
+        "ts": now_ms()
+    });
+    if let Some(rid) = run_id {
+        payload["runId"] = json!(rid);
+    }
+    if let Some(r) = result {
+        payload["result"] = r;
+    }
+    broadcast_event(state, "cron", payload);
+}
+
+/// Broadcast a voicewake configuration change event.
+/// This is sent to node clients when voice wake triggers are updated.
+///
+/// # Arguments
+/// * `state` - Server state
+/// * `triggers` - Updated voice wake triggers
+pub fn broadcast_voicewake_changed(state: &WsServerState, triggers: Vec<String>) {
+    let payload = json!({
+        "triggers": triggers,
+        "ts": now_ms()
+    });
+    // voicewake.changed goes to all connections including nodes
+    let frame = EventFrame {
+        frame_type: "event",
+        event: "voicewake.changed",
+        payload,
+        seq: Some(state.next_event_seq()),
+        state_version: None,
+    };
+    let mut conns = state.connections.lock();
+    let mut dead = Vec::new();
+    for (conn_id, conn) in conns.iter() {
+        if send_json(&conn.tx, &frame).is_err() {
+            dead.push(conn_id.clone());
+        }
+    }
+    for conn_id in dead {
+        conns.remove(&conn_id);
+    }
+}
+
+/// Broadcast an exec approval requested event.
+/// This is sent to operators with the approvals scope.
+///
+/// # Arguments
+/// * `state` - Server state
+/// * `request_id` - Approval request identifier
+/// * `command` - Command requesting approval
+/// * `args` - Command arguments
+/// * `cwd` - Optional working directory
+/// * `agent_id` - Optional agent identifier
+/// * `session_key` - Optional session key
+pub fn broadcast_exec_approval_requested(
+    state: &WsServerState,
+    request_id: &str,
+    command: &str,
+    args: Vec<String>,
+    cwd: Option<&str>,
+    agent_id: Option<&str>,
+    session_key: Option<&str>,
+) {
+    let mut payload = json!({
+        "requestId": request_id,
+        "command": command,
+        "args": args,
+        "ts": now_ms()
+    });
+    if let Some(c) = cwd {
+        payload["cwd"] = json!(c);
+    }
+    if let Some(aid) = agent_id {
+        payload["agentId"] = json!(aid);
+    }
+    if let Some(sk) = session_key {
+        payload["sessionKey"] = json!(sk);
+    }
+    broadcast_event(state, "exec.approval.requested", payload);
+}
+
+/// Broadcast an exec approval resolved event.
+/// This is sent to operators with the approvals scope.
+///
+/// # Arguments
+/// * `state` - Server state
+/// * `request_id` - Approval request identifier
+/// * `decision` - Decision: "approved" or "denied"
+pub fn broadcast_exec_approval_resolved(state: &WsServerState, request_id: &str, decision: &str) {
+    let payload = json!({
+        "requestId": request_id,
+        "decision": decision,
+        "ts": now_ms()
+    });
+    broadcast_event(state, "exec.approval.resolved", payload);
+}
+
+/// Broadcast a shutdown event to all connections.
+/// This notifies clients that the server is shutting down.
+///
+/// # Arguments
+/// * `state` - Server state
+/// * `reason` - Shutdown reason
+/// * `restart_expected_ms` - Optional expected restart time in milliseconds
+pub fn broadcast_shutdown(state: &WsServerState, reason: &str, restart_expected_ms: Option<u64>) {
+    let mut payload = json!({
+        "reason": reason
+    });
+    if let Some(ms) = restart_expected_ms {
+        payload["restartExpectedMs"] = json!(ms);
+    }
+    let frame = EventFrame {
+        frame_type: "event",
+        event: "shutdown",
+        payload,
+        seq: Some(state.next_event_seq()),
+        state_version: None,
+    };
+    // Shutdown goes to all connections
+    let conns = state.connections.lock();
+    for conn in conns.values() {
+        let _ = send_json(&conn.tx, &frame);
+    }
+}
+
+/// Broadcast a heartbeat event to all operator connections.
+///
+/// # Arguments
+/// * `state` - Server state
+pub fn broadcast_heartbeat(state: &WsServerState) {
+    let payload = json!({
+        "ts": now_ms()
+    });
+    broadcast_event(state, "heartbeat", payload);
+}
+
+/// Broadcast a talk mode change event to all operator connections.
+///
+/// # Arguments
+/// * `state` - Server state
+/// * `enabled` - Whether talk mode is enabled
+/// * `channel` - Optional channel identifier
+pub fn broadcast_talk_mode(state: &WsServerState, enabled: bool, channel: Option<&str>) {
+    let mut payload = json!({
+        "enabled": enabled
+    });
+    if let Some(ch) = channel {
+        payload["channel"] = json!(ch);
+    }
+    broadcast_event(state, "talk.mode", payload);
+}
+
+/// Send an event to a specific node connection (for node.invoke.request).
+/// This is used to request a node to invoke a command.
+///
+/// # Arguments
+/// * `state` - Server state
+/// * `node_id` - Target node identifier
+/// * `invoke_id` - Invocation identifier
+/// * `command` - Command to invoke
+/// * `args` - Command arguments
+/// * `cwd` - Optional working directory
+/// * `env` - Optional environment variables
+/// * `timeout_ms` - Optional timeout in milliseconds
+///
+/// Returns true if the event was sent successfully
+pub fn send_node_invoke_request(
+    state: &WsServerState,
+    node_id: &str,
+    invoke_id: &str,
+    command: &str,
+    args: Vec<String>,
+    cwd: Option<&str>,
+    env: Option<HashMap<String, String>>,
+    timeout_ms: Option<u64>,
+) -> bool {
+    let node_registry = state.node_registry.lock();
+    let Some(conn_id) = node_registry.conn_id_for_node(node_id) else {
+        return false;
+    };
+    drop(node_registry);
+
+    let mut payload = json!({
+        "id": invoke_id,
+        "command": command,
+        "args": args
+    });
+    if let Some(c) = cwd {
+        payload["cwd"] = json!(c);
+    }
+    if let Some(e) = env {
+        payload["env"] = serde_json::to_value(e).unwrap_or(json!({}));
+    }
+    if let Some(t) = timeout_ms {
+        payload["timeoutMs"] = json!(t);
+    }
+
+    send_event_to_connection(state, &conn_id, "node.invoke.request", payload)
 }
 
 fn send_response(

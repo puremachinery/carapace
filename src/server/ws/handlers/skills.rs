@@ -3,8 +3,8 @@
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
-use super::config::{map_validation_issues, read_config_snapshot, write_config_file};
 use super::super::*;
+use super::config::{map_validation_issues, read_config_snapshot, write_config_file};
 
 fn ensure_object(value: &mut Value) -> &mut serde_json::Map<String, Value> {
     if !value.is_object() {
