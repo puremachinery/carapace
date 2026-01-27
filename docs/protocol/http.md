@@ -239,9 +239,9 @@ Errors:
 No dedicated HTTP health endpoint is wired in the gateway HTTP server.
 Health is exposed over the WebSocket protocol (`health` method) and via WS events.
 
-## Other HTTP Handlers (Phase 2)
+## Additional HTTP Handlers
 
-The following handlers are wired in the Node gateway but deferred to Phase 2 documentation:
+The following handlers are available but require additional documentation:
 
 ### Slack HTTP Handlers
 - OAuth callback endpoints for Slack integration
@@ -275,4 +275,4 @@ These endpoints require additional documentation of:
 - Request/response schemas
 - Error handling behavior
 
-See `src/gateway/server-http.ts` lines 241-273 for the complete handler wiring.
+See `src/server/http.rs` for the Rust implementation of HTTP handlers.

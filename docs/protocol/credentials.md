@@ -1,5 +1,7 @@
 # Credential Storage
 
+> **Note**: This doc defines the target design for credential storage and migration. Update to reflect actual implementation once the credential subsystem is complete.
+
 This document defines how the Rust gateway should store secrets and how to migrate
 legacy plaintext credentials from the Node gateway.
 

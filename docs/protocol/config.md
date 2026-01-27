@@ -1,5 +1,7 @@
 # Config File Format
 
+> **Note**: This doc describes the Node gateway config format as the compatibility target. Update to reflect Rust implementation differences once config loading is complete.
+
 This document describes the Clawdbot config file format as implemented by the current Node gateway.
 It is the compatibility target for the Rust rewrite.
 

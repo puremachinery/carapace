@@ -166,9 +166,9 @@ Error:
 
 ## Methods
 
-Source: `src/gateway/server-methods-list.ts`
+Base methods (84+) plus channel plugin methods. Channel plugins may add additional methods.
 
-Base methods (84) plus channel plugin methods. Channel plugins may add additional methods.
+Note: Method dispatch is implemented in `src/server/ws.rs`.
 
 ### Health & Status
 - `health` - Get gateway health status
@@ -293,7 +293,7 @@ Base methods (84) plus channel plugin methods. Channel plugins may add additiona
 
 ## Events
 
-Source: `src/gateway/server-methods-list.ts` GATEWAY_EVENTS
+Events are broadcast to connected clients. See `src/server/ws.rs` for implementation.
 
 | Event | Description |
 |-------|-------------|
