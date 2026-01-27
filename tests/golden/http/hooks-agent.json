@@ -11,7 +11,7 @@
     "required": true,
     "methods": [
       "Authorization: Bearer <token>",
-      "X-Clawdbot-Token: <token>",
+      "X-Moltbot-Token: <token>",
       "?token=<token> (deprecated)"
     ]
   },

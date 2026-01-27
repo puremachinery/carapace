@@ -1,4 +1,4 @@
-# rusty-clawd Architecture
+# carapace Architecture
 
 High-level overview of the Rust gateway components and their relationships.
 
@@ -56,7 +56,7 @@ graph TB
     end
 
     subgraph "Storage"
-        FS[(File System<br/>~/.clawdbot/)]
+        FS[(File System<br/>~/.moltbot/)]
     end
 
     %% Client connections

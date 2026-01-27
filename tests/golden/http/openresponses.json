@@ -20,7 +20,7 @@
     "properties": {
       "model": {
         "type": "string",
-        "description": "Model identifier. Can include agent ID as 'clawdbot:<agentId>' or 'agent:<agentId>'"
+        "description": "Model identifier. Can include agent ID as 'moltbot:<agentId>' or 'agent:<agentId>'"
       },
       "input": {
         "oneOf": [
@@ -237,7 +237,7 @@
         "path": "/v1/responses",
         "headers": { "Authorization": "Bearer {{gateway_token}}" },
         "body": {
-          "model": "clawdbot",
+          "model": "moltbot",
           "input": "Hello, how are you?"
         }
       },
@@ -259,7 +259,7 @@
         "path": "/v1/responses",
         "headers": { "Authorization": "Bearer {{gateway_token}}" },
         "body": {
-          "model": "clawdbot",
+          "model": "moltbot",
           "input": [
             { "type": "message", "role": "user", "content": "What is 2+2?" }
           ]
@@ -275,7 +275,7 @@
         "path": "/v1/responses",
         "headers": { "Authorization": "Bearer {{gateway_token}}" },
         "body": {
-          "model": "clawdbot",
+          "model": "moltbot",
           "input": "Hello",
           "instructions": "Always respond in French"
         }
@@ -290,7 +290,7 @@
         "path": "/v1/responses",
         "headers": { "Authorization": "Bearer {{gateway_token}}" },
         "body": {
-          "model": "clawdbot",
+          "model": "moltbot",
           "input": "Tell me a story",
           "stream": true
         }
@@ -308,7 +308,7 @@
         "path": "/v1/responses",
         "headers": { "Authorization": "Bearer {{gateway_token}}" },
         "body": {
-          "model": "clawdbot",
+          "model": "moltbot",
           "input": "What's the weather in Tokyo?",
           "tools": [
             {
@@ -341,7 +341,7 @@
         "path": "/v1/responses",
         "headers": { "Authorization": "Bearer {{gateway_token}}" },
         "body": {
-          "model": "clawdbot",
+          "model": "moltbot",
           "input": "Do something",
           "tools": [{ "type": "function", "function": { "name": "my_tool", "description": "A tool" } }],
           "tool_choice": "required"
@@ -358,7 +358,7 @@
         "path": "/v1/responses",
         "headers": { "Authorization": "Bearer {{gateway_token}}" },
         "body": {
-          "model": "clawdbot",
+          "model": "moltbot",
           "input": "Do something",
           "tools": [
             { "type": "function", "function": { "name": "tool_a" } },
@@ -378,7 +378,7 @@
         "path": "/v1/responses",
         "headers": { "Authorization": "Bearer {{gateway_token}}" },
         "body": {
-          "model": "clawdbot",
+          "model": "moltbot",
           "input": [
             { "type": "message", "role": "user", "content": "What's the weather?" },
             { "type": "function_call_output", "call_id": "call_123", "output": "Sunny, 72F" }
@@ -395,7 +395,7 @@
         "path": "/v1/responses",
         "headers": { "Authorization": "Bearer {{gateway_token}}" },
         "body": {
-          "model": "clawdbot",
+          "model": "moltbot",
           "input": [
             {
               "type": "message",
@@ -418,7 +418,7 @@
         "path": "/v1/responses",
         "headers": { "Authorization": "Bearer {{gateway_token}}" },
         "body": {
-          "model": "clawdbot",
+          "model": "moltbot",
           "input": [
             {
               "type": "message",
@@ -441,7 +441,7 @@
         "path": "/v1/responses",
         "headers": { "Authorization": "Bearer {{gateway_token}}" },
         "body": {
-          "model": "clawdbot",
+          "model": "moltbot",
           "input": [
             {
               "type": "message",
@@ -464,7 +464,7 @@
         "path": "/v1/responses",
         "headers": { "Authorization": "Bearer {{gateway_token}}" },
         "body": {
-          "model": "clawdbot",
+          "model": "moltbot",
           "input": [
             { "type": "message", "role": "system", "content": "You are helpful" }
           ]
@@ -517,7 +517,7 @@
         "path": "/v1/responses",
         "headers": { "Authorization": "Bearer {{gateway_token}}" },
         "body": {
-          "model": "clawdbot",
+          "model": "moltbot",
           "input": "test",
           "tool_choice": "required"
         }
@@ -543,7 +543,7 @@
         "path": "/v1/responses",
         "headers": { "Authorization": "Bearer {{gateway_token}}" },
         "body": {
-          "model": "clawdbot",
+          "model": "moltbot",
           "input": "test",
           "tools": [{ "type": "function", "function": { "name": "tool_a" } }],
           "tool_choice": { "type": "function", "function": { "name": "unknown_tool" } }

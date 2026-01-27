@@ -1,6 +1,6 @@
 {
   "$schema": "golden-trace-v1",
-  "description": "WebSocket event types and payloads - based on clawdbot gateway source code",
+  "description": "WebSocket event types and payloads - based on moltbot gateway source code",
   "source_files": [
     "src/gateway/server-methods-list.ts",
     "src/gateway/server-broadcast.ts",
@@ -295,7 +295,7 @@
           "publicKey": "base64url-encoded-public-key",
           "displayName": "iPhone 15",
           "platform": "ios",
-          "clientId": "clawdbot-ios",
+          "clientId": "moltbot-ios",
           "clientMode": "ui",
           "role": "operator",
           "scopes": ["operator.admin"],

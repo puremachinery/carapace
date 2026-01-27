@@ -1,8 +1,8 @@
-# rusty-clawd Agent Guidelines
+# carapace Agent Guidelines
 
 ## Project Context
 
-This is a Rust rewrite of the clawdbot gateway. Reference implementation: `/Users/zera/build/clawdbot`
+This is a Rust rewrite of the moltbot gateway. Reference implementation: `/Users/zera/build/moltbot`
 
 ## Code Review Cadence
 
@@ -57,9 +57,11 @@ Before starting a new phase:
 - Security-critical code includes comments explaining the security property
 - Keep files under ~500 lines; split when beneficial
 
-### TypeScript Code (sidecar-host)
-- Run formatter before committing
-- Strict TypeScript, no `any`
+### Testing
+- Use `just test` or `cargo nextest run` (NOT `cargo test`)
+- nextest has better parallelism and output
+- `just test-one NAME` for specific tests
+- `just test-verbose` for full output
 
 ### Documentation
 - Use code blocks for examples
@@ -106,7 +108,7 @@ Flag these to the operator immediately:
 - Compatibility checklist: `docs/refactor/compatibility-checklist.md`
 - Protocol specs: `docs/protocol/*.md`
 - Golden traces: `tests/golden/`
-- Original implementation: `/Users/zera/build/clawdbot/src/`
+- Original implementation: `/Users/zera/build/moltbot/src/`
 
 ## Response Style
 

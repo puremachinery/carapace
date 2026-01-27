@@ -1,4 +1,4 @@
-# Clawdbot Gateway WebSocket Protocol
+# Moltbot Gateway WebSocket Protocol
 
 Protocol Version: 3
 

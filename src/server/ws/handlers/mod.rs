@@ -72,7 +72,7 @@ pub(super) fn handle_status(state: &WsServerState) -> Value {
         "uptimeMs": state.start_time.elapsed().as_millis() as u64,
         "version": env!("CARGO_PKG_VERSION"),
         "runtime": {
-            "name": "rusty-clawd",
+            "name": "carapace",
             "platform": std::env::consts::OS,
             "arch": std::env::consts::ARCH
         },

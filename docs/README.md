@@ -1,6 +1,6 @@
-# rusty-clawd Documentation
+# carapace Documentation
 
-Rust implementation of the Clawdbot gateway.
+Rust implementation of the Moltbot gateway.
 
 ## Overview
 

@@ -1,7 +1,7 @@
 //! Windows Credential Manager storage
 //!
 //! Uses the `keyring` crate to interface with Windows Credential Manager.
-//! Target name format: `clawdbot:<kind>:<agentId>:<id>`
+//! Target name format: `moltbot:<kind>:<agentId>:<id>`
 
 use super::{CredentialBackend, CredentialError, CredentialKey, SERVICE_NAME};
 use keyring::Entry;
@@ -24,7 +24,7 @@ impl WindowsCredentialBackend {
     }
 
     /// Get or create a keyring entry for the given key
-    /// On Windows, the target name will be: `clawdbot:<kind>:<agentId>:<id>`
+    /// On Windows, the target name will be: `moltbot:<kind>:<agentId>:<id>`
     fn get_entry(&self, key: &CredentialKey) -> Result<Entry, CredentialError> {
         // Windows Credential Manager uses target name as the unique identifier
         // We use service:account format which keyring translates to target name

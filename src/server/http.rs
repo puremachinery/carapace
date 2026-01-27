@@ -98,7 +98,7 @@ impl Default for HttpConfig {
             valid_channels: Vec::new(),
             agents_dir: dirs::home_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
-                .join(".clawdbot/agents"),
+                .join(".moltbot/agents"),
             openai_chat_completions_enabled: false,
             openai_responses_enabled: false,
             control_endpoints_enabled: false,
@@ -320,7 +320,7 @@ pub fn create_router_with_state(
             .route(&base, get(control_ui_redirect))
             .route(&format!("{}/", base), get(control_ui_index))
             .route(
-                &format!("{}/__clawdbot_avatar__/:agent_id", base),
+                &format!("{}/__moltbot_avatar__/:agent_id", base),
                 get(avatar_handler),
             )
             .route(&format!("{}/*path", base), get(control_ui_static));
@@ -715,11 +715,11 @@ async fn tools_invoke_handler(
 
     // Extract context from headers
     let message_channel = headers
-        .get("x-clawdbot-message-channel")
+        .get("x-moltbot-message-channel")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
     let account_id = headers
-        .get("x-clawdbot-account-id")
+        .get("x-moltbot-account-id")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
@@ -874,8 +874,8 @@ async fn control_ui_static(State(state): State<AppState>, Path(path): Path<Strin
     let file_path = dist_path.join(safe_path);
 
     // Check if it's the avatar endpoint
-    if safe_path.starts_with("__clawdbot_avatar__/") {
-        let agent_id = safe_path.trim_start_matches("__clawdbot_avatar__/");
+    if safe_path.starts_with("__moltbot_avatar__/") {
+        let agent_id = safe_path.trim_start_matches("__moltbot_avatar__/");
         return serve_avatar(&state, agent_id).await;
     }
 
@@ -911,9 +911,9 @@ async fn serve_index_html(state: &AppState) -> Response {
             };
 
             let injected = content
-                .replace("__CLAWDBOT_CONTROL_UI_BASE_PATH__", &base_path)
-                .replace("__CLAWDBOT_ASSISTANT_NAME__", "Clawdbot")
-                .replace("__CLAWDBOT_ASSISTANT_AVATAR__", "");
+                .replace("__MOLTBOT_CONTROL_UI_BASE_PATH__", &base_path)
+                .replace("__MOLTBOT_ASSISTANT_NAME__", "Moltbot")
+                .replace("__MOLTBOT_ASSISTANT_AVATAR__", "");
 
             (
                 StatusCode::OK,
@@ -976,7 +976,7 @@ pub struct AvatarQuery {
     pub meta: Option<String>,
 }
 
-/// GET /__clawdbot_avatar__/:agent_id - Serve agent avatar
+/// GET /__moltbot_avatar__/:agent_id - Serve agent avatar
 async fn avatar_handler(
     State(state): State<AppState>,
     Path(agent_id): Path<String>,
@@ -1039,7 +1039,7 @@ async fn serve_avatar_metadata(state: &AppState, agent_id: &str) -> Response {
             } else {
                 state.config.control_ui_base_path.clone()
             };
-            let url = format!("{}/__clawdbot_avatar__/{}", base, agent_id);
+            let url = format!("{}/__moltbot_avatar__/{}", base, agent_id);
             return (
                 StatusCode::OK,
                 [

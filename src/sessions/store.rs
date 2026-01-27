@@ -446,11 +446,11 @@ impl Default for SessionStore {
 }
 
 impl SessionStore {
-    /// Create a new session store with default path (~/.clawdbot/sessions/)
+    /// Create a new session store with default path (~/.moltbot/sessions/)
     pub fn new() -> Self {
         let base_path = dirs::home_dir()
-            .map(|p| p.join(".clawdbot").join("sessions"))
-            .unwrap_or_else(|| PathBuf::from(".clawdbot/sessions"));
+            .map(|p| p.join(".moltbot").join("sessions"))
+            .unwrap_or_else(|| PathBuf::from(".moltbot/sessions"));
         Self::with_base_path(base_path)
     }
 

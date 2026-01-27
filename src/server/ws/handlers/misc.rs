@@ -179,10 +179,10 @@ pub(super) fn handle_agents_list() -> Result<Value, ErrorShape> {
     if agents.is_empty() {
         agents.push(json!({
             "id": "default",
-            "name": "Clawdbot",
+            "name": "Moltbot",
             "description": "Default assistant",
             "identity": {
-                "name": "Clawdbot"
+                "name": "Moltbot"
             },
             "enabled": true,
             "default": true

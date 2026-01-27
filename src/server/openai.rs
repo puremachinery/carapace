@@ -24,7 +24,7 @@ use uuid::Uuid;
 /// OpenAI chat completions request
 #[derive(Debug, Deserialize)]
 pub struct ChatCompletionsRequest {
-    /// Model identifier (e.g., "clawdbot", "clawdbot:agent-id")
+    /// Model identifier (e.g., "moltbot", "moltbot:agent-id")
     #[serde(default = "default_model")]
     pub model: String,
     /// Array of conversation messages
@@ -37,7 +37,7 @@ pub struct ChatCompletionsRequest {
 }
 
 fn default_model() -> String {
-    "clawdbot".to_string()
+    "moltbot".to_string()
 }
 
 /// Chat message in OpenAI format
@@ -204,10 +204,10 @@ pub struct OpenAiState {
 }
 
 /// Parse agent ID from model string
-/// Supports: "clawdbot", "clawdbot:agent-id", "agent:agent-id"
+/// Supports: "moltbot", "moltbot:agent-id", "agent:agent-id"
 pub fn parse_agent_id(model: &str) -> Option<String> {
-    if model.starts_with("clawdbot:") {
-        Some(model.strip_prefix("clawdbot:").unwrap().to_string())
+    if model.starts_with("moltbot:") {
+        Some(model.strip_prefix("moltbot:").unwrap().to_string())
     } else if model.starts_with("agent:") {
         Some(model.strip_prefix("agent:").unwrap().to_string())
     } else {
@@ -274,8 +274,8 @@ pub async fn chat_completions_handler(
 
     // Parse agent ID from model or headers
     let _agent_id = headers
-        .get("x-clawdbot-agent-id")
-        .or_else(|| headers.get("x-clawdbot-agent"))
+        .get("x-moltbot-agent-id")
+        .or_else(|| headers.get("x-moltbot-agent"))
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
         .or_else(|| parse_agent_id(&req.model));
@@ -291,7 +291,7 @@ pub async fn chat_completions_handler(
 
     // Non-streaming response
     // In a real implementation, this would call the agent and get a real response
-    let mock_response = "I'm Clawdbot, your AI assistant. How can I help you today?";
+    let mock_response = "I'm Moltbot, your AI assistant. How can I help you today?";
 
     let response = ChatCompletionResponse {
         id: response_id,
@@ -319,7 +319,7 @@ pub async fn chat_completions_handler(
 
 /// Generate streaming chat response
 async fn streaming_chat_response(response_id: String, created: i64, model: String) -> Response {
-    let mock_response = "I'm Clawdbot, your AI assistant. How can I help you today?";
+    let mock_response = "I'm Moltbot, your AI assistant. How can I help you today?";
     let words: Vec<&str> = mock_response.split(' ').collect();
 
     let stream = async_stream::stream! {
@@ -666,7 +666,7 @@ pub async fn responses_handler(
     let created_at = chrono::Utc::now().timestamp();
 
     // Mock response
-    let mock_response = "I'm Clawdbot, your AI assistant.";
+    let mock_response = "I'm Moltbot, your AI assistant.";
 
     if req.stream {
         // Streaming would be implemented here
@@ -705,9 +705,9 @@ mod tests {
 
     #[test]
     fn test_parse_agent_id() {
-        assert_eq!(parse_agent_id("clawdbot"), None);
+        assert_eq!(parse_agent_id("moltbot"), None);
         assert_eq!(
-            parse_agent_id("clawdbot:email-agent"),
+            parse_agent_id("moltbot:email-agent"),
             Some("email-agent".to_string())
         );
         assert_eq!(parse_agent_id("agent:main"), Some("main".to_string()));
@@ -770,7 +770,7 @@ mod tests {
             id: "chatcmpl_test".to_string(),
             object: "chat.completion".to_string(),
             created: 1700000000,
-            model: "clawdbot".to_string(),
+            model: "moltbot".to_string(),
             choices: vec![ChatChoice {
                 index: 0,
                 message: ChatMessage {

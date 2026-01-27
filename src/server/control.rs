@@ -180,7 +180,7 @@ pub async fn status_handler(State(state): State<ControlState>, headers: HeaderMa
         connected_channels: connected_count,
         total_channels: total_count,
         runtime: RuntimeInfo {
-            name: "rusty-clawd".to_string(),
+            name: "carapace".to_string(),
             version: state.version.clone(),
             platform: std::env::consts::OS.to_string(),
             arch: std::env::consts::ARCH.to_string(),
@@ -345,7 +345,7 @@ mod tests {
             connected_channels: 2,
             total_channels: 3,
             runtime: RuntimeInfo {
-                name: "rusty-clawd".to_string(),
+                name: "carapace".to_string(),
                 version: "0.1.0".to_string(),
                 platform: "linux".to_string(),
                 arch: "x86_64".to_string(),

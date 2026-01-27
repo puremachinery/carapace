@@ -52,17 +52,17 @@ const ERROR_UNAVAILABLE: &str = "UNAVAILABLE";
 
 const ALLOWED_CLIENT_IDS: [&str; 12] = [
     "webchat-ui",
-    "clawdbot-control-ui",
+    "moltbot-control-ui",
     "webchat",
     "cli",
     "gateway-client",
-    "clawdbot-macos",
-    "clawdbot-ios",
-    "clawdbot-android",
+    "moltbot-macos",
+    "moltbot-ios",
+    "moltbot-android",
     "node-host",
     "test",
     "fingerprint",
-    "clawdbot-probe",
+    "moltbot-probe",
 ];
 
 const ALLOWED_CLIENT_MODES: [&str; 7] =
@@ -778,8 +778,8 @@ pub async fn build_ws_config_from_files() -> Result<WsServerConfig, WsConfigErro
         .and_then(|v| v.as_str())
         .unwrap_or("off");
 
-    let env_token = env::var("CLAWDBOT_GATEWAY_TOKEN").ok();
-    let env_password = env::var("CLAWDBOT_GATEWAY_PASSWORD").ok();
+    let env_token = env::var("MOLTBOT_GATEWAY_TOKEN").ok();
+    let env_password = env::var("MOLTBOT_GATEWAY_PASSWORD").ok();
 
     let state_dir = resolve_state_dir();
     let creds = match credentials::read_gateway_auth(state_dir).await {
@@ -1356,7 +1356,7 @@ async fn handle_socket(
         .as_ref()
         .and_then(|a| a.password.as_ref())
         .is_some();
-    let is_control_ui = connect_params.client.id == "clawdbot-control-ui";
+    let is_control_ui = connect_params.client.id == "moltbot-control-ui";
     let allow_control_ui_bypass = is_control_ui
         && (state.config.control_ui_allow_insecure_auth
             || state.config.control_ui_disable_device_auth);
@@ -2093,7 +2093,7 @@ fn now_ms() -> u64 {
 }
 
 fn server_version() -> String {
-    std::env::var("CLAWDBOT_VERSION")
+    std::env::var("MOLTBOT_VERSION")
         .or_else(|_| std::env::var("npm_package_version"))
         .unwrap_or_else(|_| "dev".to_string())
 }
@@ -2668,10 +2668,10 @@ fn resolve_node_command_allowlist(
 }
 
 fn resolve_state_dir() -> PathBuf {
-    if let Ok(dir) = env::var("CLAWDBOT_STATE_DIR") {
+    if let Ok(dir) = env::var("MOLTBOT_STATE_DIR") {
         return PathBuf::from(dir);
     }
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".clawdbot")
+        .join(".moltbot")
 }

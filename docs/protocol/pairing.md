@@ -132,7 +132,7 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 Pairing state is stored under the Gateway state directory:
 
 ```
-~/.clawdbot/
+~/.moltbot/
 ├── nodes/
 │   ├── paired.json      # Paired nodes with hashed tokens
 │   └── pending.json     # Pending requests (auto-expire)

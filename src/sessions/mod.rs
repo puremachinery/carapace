@@ -1,7 +1,7 @@
 //! Session and storage layer
 //!
 //! Provides persistence for sessions and chat history with compaction support.
-//! Sessions are stored in `~/.clawdbot/sessions/` using JSONL format for
+//! Sessions are stored in `~/.moltbot/sessions/` using JSONL format for
 //! append-friendly history operations.
 
 mod store;

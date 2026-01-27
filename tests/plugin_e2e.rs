@@ -19,7 +19,7 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use rusty_clawd::plugins::{
+use carapace::plugins::{
     is_modifiable_hook, BindingError, ChannelCapabilities, ChannelInfo, ChannelPluginInstance,
     ChatType, DeliveryResult, HookDispatcher, HookEvent, HookPluginInstance, HookResult,
     OutboundContext, PluginKind, PluginManifest, PluginRegistry, ServicePluginInstance,

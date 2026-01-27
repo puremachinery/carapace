@@ -1,6 +1,6 @@
 {
   "$schema": "golden-trace-v1",
-  "description": "WebSocket error codes and close codes - based on clawdbot gateway source code",
+  "description": "WebSocket error codes and close codes - based on moltbot gateway source code",
   "source_files": [
     "src/gateway/protocol/schema/error-codes.ts",
     "src/gateway/server/ws-connection/message-handler.ts",
@@ -229,7 +229,7 @@
           "params": {
             "minProtocol": 3,
             "maxProtocol": 3,
-            "client": { "id": "clawdbot-macos", "version": "1.0.0", "platform": "darwin", "mode": "ui" }
+            "client": { "id": "moltbot-macos", "version": "1.0.0", "platform": "darwin", "mode": "ui" }
           }
         },
         "response": {

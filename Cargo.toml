@@ -1,8 +1,8 @@
 [package]
-name = "rusty-clawd"
+name = "carapace"
 version = "0.1.0"
 edition = "2021"
-description = "Rust rewrite of clawdbot gateway"
+description = "A secure, stable Rust alternative to moltbot"
 license = "MIT"
 
 [dependencies]
@@ -47,10 +47,10 @@ tempfile = "3"
 keychain-tests = []
 
 [lib]
-name = "rusty_clawd"
+name = "carapace"
 path = "src/lib.rs"
 
 [[bin]]
-name = "rusty-clawd"
+name = "carapace"
 path = "src/main.rs"
 test = false

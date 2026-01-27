@@ -181,7 +181,7 @@ These are improvements over the Node gateway, not compatibility requirements.
 ## Directory Structure
 
 ```
-rusty-clawd/
+carapace/
 ├── Cargo.toml
 ├── src/
 │   ├── main.rs

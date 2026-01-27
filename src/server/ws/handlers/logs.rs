@@ -24,12 +24,12 @@ struct LogSlice {
 }
 
 fn resolve_log_file_path() -> PathBuf {
-    if let Ok(path) = env::var("CLAWDBOT_LOG_FILE") {
+    if let Ok(path) = env::var("MOLTBOT_LOG_FILE") {
         if !path.trim().is_empty() {
             return PathBuf::from(path);
         }
     }
-    resolve_state_dir().join("logs").join("clawdbot.log")
+    resolve_state_dir().join("logs").join("moltbot.log")
 }
 
 fn resolve_log_file(path: &PathBuf) -> PathBuf {
@@ -37,7 +37,7 @@ fn resolve_log_file(path: &PathBuf) -> PathBuf {
         return path.clone();
     }
     static ROLLING_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"^clawdbot-\d{4}-\d{2}-\d{2}\.log$").unwrap());
+        LazyLock::new(|| Regex::new(r"^moltbot-\d{4}-\d{2}-\d{2}\.log$").unwrap());
     let file_name = path.file_name().and_then(|v| v.to_str()).unwrap_or("");
     if !ROLLING_RE.is_match(file_name) {
         return path.clone();

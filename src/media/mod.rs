@@ -17,7 +17,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use rusty_clawd::media::{MediaFetcher, MediaStore, FetchConfig, StoreConfig};
+//! use carapace::media::{MediaFetcher, MediaStore, FetchConfig, StoreConfig};
 //!
 //! // Fetch media with SSRF protection
 //! let fetcher = MediaFetcher::new();

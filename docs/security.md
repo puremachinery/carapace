@@ -1,6 +1,6 @@
 # Security
 
-Security considerations for the rusty-clawd gateway implementation.
+Security considerations for the carapace gateway implementation.
 
 ## Threat Model
 
@@ -97,8 +97,8 @@ let sanitized = plugin_id
 ## Sensitive Data Locations
 
 ```
-~/.clawdbot/
-├── clawdbot.json           # Config (may contain tokens)
+~/.moltbot/
+├── moltbot.json           # Config (may contain tokens)
 ├── credentials/            # Channel credentials, allowlists
 │   ├── whatsapp/          # WhatsApp session data
 │   └── *-allowFrom.json   # Pairing allowlists

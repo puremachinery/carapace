@@ -6,11 +6,11 @@
 //! - OpenAI compatibility endpoints
 //! - Control endpoints
 
-use rusty_clawd::channels::{ChannelInfo, ChannelRegistry, ChannelStatus};
-use rusty_clawd::hooks::{
+use carapace::channels::{ChannelInfo, ChannelRegistry, ChannelStatus};
+use carapace::hooks::{
     HookAction, HookMapping, HookMappingContext, HookMappingResult, HookRegistry,
 };
-use rusty_clawd::plugins::{ToolInvokeContext, ToolInvokeResult, ToolsRegistry};
+use carapace::plugins::{ToolInvokeContext, ToolInvokeResult, ToolsRegistry};
 use serde_json::json;
 use std::collections::HashMap;
 

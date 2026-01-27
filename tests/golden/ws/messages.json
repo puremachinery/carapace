@@ -1,6 +1,6 @@
 {
   "$schema": "golden-trace-v1",
-  "description": "WebSocket message frame formats and RPC methods - based on clawdbot gateway source code",
+  "description": "WebSocket message frame formats and RPC methods - based on moltbot gateway source code",
   "source_files": [
     "src/gateway/protocol/schema/frames.ts",
     "src/gateway/server-methods-list.ts",

@@ -6,7 +6,7 @@
     "src/gateway/hooks.ts"
   ],
   "notes": [
-    "Token extraction priority: Authorization Bearer > X-Clawdbot-Token header > ?token query param",
+    "Token extraction priority: Authorization Bearer > X-Moltbot-Token header > ?token query param",
     "Query param token triggers deprecation warning in server logs",
     "Hooks must be enabled via config: hooks.enabled=true, hooks.token required",
     "Default base path is /hooks, configurable via hooks.path",
@@ -72,13 +72,13 @@
     },
     {
       "name": "authorized_header_token",
-      "description": "X-Clawdbot-Token header (alternative to Bearer)",
+      "description": "X-Moltbot-Token header (alternative to Bearer)",
       "request": {
         "method": "POST",
         "path": "/hooks/wake",
         "headers": {
           "Content-Type": "application/json",
-          "X-Clawdbot-Token": "{{hooks_token}}"
+          "X-Moltbot-Token": "{{hooks_token}}"
         },
         "body": { "text": "test message" }
       },

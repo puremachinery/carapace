@@ -6,43 +6,43 @@
   ],
   "endpoints": {
     "a2ui": {
-      "path": "/__clawdbot__/a2ui/*",
+      "path": "/__moltbot__/a2ui/*",
       "description": "A2UI static assets and HTML serving",
       "methods": ["GET", "HEAD"]
     },
     "canvas_host": {
-      "path": "/__clawdbot__/canvas/*",
+      "path": "/__moltbot__/canvas/*",
       "description": "Canvas host endpoints (handled by canvasHost)",
       "reference": "src/canvas-host/server.ts"
     },
     "canvas_ws": {
-      "path": "/__clawdbot/ws",
+      "path": "/__moltbot/ws",
       "description": "WebSocket endpoint for canvas live reload",
       "protocol": "WebSocket"
     }
   },
   "constants": {
-    "A2UI_PATH": "/__clawdbot__/a2ui",
-    "CANVAS_HOST_PATH": "/__clawdbot__/canvas",
-    "CANVAS_WS_PATH": "/__clawdbot/ws"
+    "A2UI_PATH": "/__moltbot__/a2ui",
+    "CANVAS_HOST_PATH": "/__moltbot__/canvas",
+    "CANVAS_WS_PATH": "/__moltbot/ws"
   },
   "notes": [
     "A2UI assets located in src/canvas-host/a2ui/ or dist/canvas-host/a2ui/",
     "index.html has live reload script injected automatically",
     "WebSocket broadcasts 'reload' message for hot reload during development",
-    "Mobile app bridge: Clawdbot.postMessage() and Clawdbot.sendUserAction()"
+    "Mobile app bridge: Moltbot.postMessage() and Moltbot.sendUserAction()"
   ],
   "live_reload_injection": {
     "description": "Script injected before </body> in HTML responses",
     "provides": [
-      "globalThis.Clawdbot.postMessage(payload) - Post message to native app",
-      "globalThis.Clawdbot.sendUserAction(action) - Send user action with auto-generated ID",
-      "globalThis.clawdbotPostMessage - Alias",
-      "globalThis.clawdbotSendUserAction - Alias"
+      "globalThis.Moltbot.postMessage(payload) - Post message to native app",
+      "globalThis.Moltbot.sendUserAction(action) - Send user action with auto-generated ID",
+      "globalThis.moltbotPostMessage - Alias",
+      "globalThis.moltbotSendUserAction - Alias"
     ],
     "platform_handlers": {
-      "ios": "window.webkit.messageHandlers.clawdbotCanvasA2UIAction.postMessage()",
-      "android": "window.clawdbotCanvasA2UIAction.postMessage()"
+      "ios": "window.webkit.messageHandlers.moltbotCanvasA2UIAction.postMessage()",
+      "android": "window.moltbotCanvasA2UIAction.postMessage()"
     }
   },
   "scenarios": [
@@ -51,7 +51,7 @@
       "description": "Serve A2UI index.html with live reload",
       "request": {
         "method": "GET",
-        "path": "/__clawdbot__/a2ui/"
+        "path": "/__moltbot__/a2ui/"
       },
       "response": {
         "status": 200,
@@ -60,9 +60,9 @@
           "Cache-Control": "no-store"
         },
         "body_contains": [
-          "clawdbotCanvasA2UIAction",
-          "Clawdbot.postMessage",
-          "Clawdbot.sendUserAction"
+          "moltbotCanvasA2UIAction",
+          "Moltbot.postMessage",
+          "Moltbot.sendUserAction"
         ]
       }
     },
@@ -71,7 +71,7 @@
       "description": "Serve index.html for path without trailing slash",
       "request": {
         "method": "GET",
-        "path": "/__clawdbot__/a2ui"
+        "path": "/__moltbot__/a2ui"
       },
       "response": {
         "status": 200,
@@ -83,7 +83,7 @@
       "description": "Serve A2UI JavaScript bundle",
       "request": {
         "method": "GET",
-        "path": "/__clawdbot__/a2ui/a2ui.bundle.js"
+        "path": "/__moltbot__/a2ui/a2ui.bundle.js"
       },
       "response": {
         "status": 200,
@@ -98,7 +98,7 @@
       "description": "Serve static assets (images, CSS, etc.)",
       "request": {
         "method": "GET",
-        "path": "/__clawdbot__/a2ui/styles.css"
+        "path": "/__moltbot__/a2ui/styles.css"
       },
       "response": {
         "status": 200,
@@ -110,7 +110,7 @@
       "description": "HEAD request for existence check",
       "request": {
         "method": "HEAD",
-        "path": "/__clawdbot__/a2ui/index.html"
+        "path": "/__moltbot__/a2ui/index.html"
       },
       "response": {
         "status": 200
@@ -121,7 +121,7 @@
       "description": "Non-existent file returns 404",
       "request": {
         "method": "GET",
-        "path": "/__clawdbot__/a2ui/nonexistent.js"
+        "path": "/__moltbot__/a2ui/nonexistent.js"
       },
       "response": {
         "status": 404,
@@ -133,7 +133,7 @@
       "description": "Only GET/HEAD methods allowed",
       "request": {
         "method": "POST",
-        "path": "/__clawdbot__/a2ui/"
+        "path": "/__moltbot__/a2ui/"
       },
       "response": {
         "status": 405,
@@ -146,7 +146,7 @@
       "config_note": "When a2ui directory cannot be located",
       "request": {
         "method": "GET",
-        "path": "/__clawdbot__/a2ui/"
+        "path": "/__moltbot__/a2ui/"
       },
       "response": {
         "status": 503,
@@ -158,7 +158,7 @@
       "description": "Path traversal attempts blocked",
       "request": {
         "method": "GET",
-        "path": "/__clawdbot__/a2ui/../../../etc/passwd"
+        "path": "/__moltbot__/a2ui/../../../etc/passwd"
       },
       "response": {
         "status": 404,
@@ -170,7 +170,7 @@
       "description": "Symlinks outside root are not followed",
       "request": {
         "method": "GET",
-        "path": "/__clawdbot__/a2ui/evil-symlink"
+        "path": "/__moltbot__/a2ui/evil-symlink"
       },
       "response": {
         "status": 404
@@ -182,7 +182,7 @@
       "description": "Directory paths serve index.html",
       "request": {
         "method": "GET",
-        "path": "/__clawdbot__/a2ui/subdir/"
+        "path": "/__moltbot__/a2ui/subdir/"
       },
       "response": {
         "status": 200
@@ -194,7 +194,7 @@
       "description": "Non-HTML files served without script injection",
       "request": {
         "method": "GET",
-        "path": "/__clawdbot__/a2ui/data.json"
+        "path": "/__moltbot__/a2ui/data.json"
       },
       "response": {
         "status": 200

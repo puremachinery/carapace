@@ -18,5 +18,5 @@ mod server;
 mod sessions;
 
 fn main() {
-    println!("rusty-clawd gateway");
+    println!("carapace gateway");
 }

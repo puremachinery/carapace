@@ -87,7 +87,7 @@ pub struct StoreConfig {
 impl Default for StoreConfig {
     fn default() -> Self {
         Self {
-            base_dir: std::env::temp_dir().join("rusty-clawd-media"),
+            base_dir: std::env::temp_dir().join("carapace-media"),
             max_file_size: DEFAULT_MAX_FILE_SIZE,
             ttl: Duration::from_secs(DEFAULT_TTL_SECS),
             cleanup_interval: Duration::from_secs(DEFAULT_CLEANUP_INTERVAL_SECS),

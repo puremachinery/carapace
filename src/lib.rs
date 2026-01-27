@@ -1,6 +1,6 @@
-//! rusty-clawd gateway library
+//! carapace gateway library
 //!
-//! This library provides the core functionality for the rusty-clawd gateway,
+//! This library provides the core functionality for the carapace gateway,
 //! including HTTP/WebSocket servers, plugin system, and channel management.
 
 #![allow(dead_code)]

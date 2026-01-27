@@ -11,7 +11,7 @@
 //! - Additional protocol schemes
 //! - Edge cases in hostname validation
 
-use rusty_clawd::plugins::capabilities::{CapabilityError, SsrfConfig, SsrfProtection};
+use carapace::plugins::capabilities::{CapabilityError, SsrfConfig, SsrfProtection};
 
 // ============== URL Encoding Bypass Attempts ==============
 

@@ -2,16 +2,16 @@
 
 > **Note**: This doc describes the Node gateway config format as the compatibility target. Update to reflect Rust implementation differences once config loading is complete.
 
-This document describes the Clawdbot config file format as implemented by the current Node gateway.
+This document describes the Moltbot config file format as implemented by the current Node gateway.
 It is the compatibility target for the Rust rewrite.
 
 ## File Location
 
 Default config path:
 
-- `~/.clawdbot/clawdbot.json`
-- If `CLAWDBOT_STATE_DIR` is set, defaults to `${CLAWDBOT_STATE_DIR}/clawdbot.json`
-- Override with `CLAWDBOT_CONFIG_PATH`
+- `~/.moltbot/moltbot.json`
+- If `MOLTBOT_STATE_DIR` is set, defaults to `${MOLTBOT_STATE_DIR}/moltbot.json`
+- Override with `MOLTBOT_CONFIG_PATH`
 
 The file is parsed as **JSON5** (comments, trailing commas allowed).
 

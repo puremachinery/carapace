@@ -1,7 +1,7 @@
 //! Configuration parsing module
 //!
 //! Handles JSON5 configuration with includes, environment variable substitution,
-//! and caching. Matches clawdbot's format for drop-in compatibility.
+//! and caching. Matches moltbot's format for drop-in compatibility.
 
 use parking_lot::RwLock;
 use regex::Regex;
@@ -61,30 +61,30 @@ struct CachedConfig {
 static CONFIG_CACHE: LazyLock<RwLock<Option<CachedConfig>>> = LazyLock::new(|| RwLock::new(None));
 
 /// Get the config file path.
-/// Priority: CLAWDBOT_CONFIG_PATH > CLAWDBOT_STATE_DIR/clawdbot.json > ~/.clawdbot/clawdbot.json
+/// Priority: MOLTBOT_CONFIG_PATH > MOLTBOT_STATE_DIR/moltbot.json > ~/.moltbot/moltbot.json
 pub fn get_config_path() -> PathBuf {
-    if let Ok(path) = env::var("CLAWDBOT_CONFIG_PATH") {
+    if let Ok(path) = env::var("MOLTBOT_CONFIG_PATH") {
         return PathBuf::from(path);
     }
 
-    if let Ok(state_dir) = env::var("CLAWDBOT_STATE_DIR") {
-        return PathBuf::from(state_dir).join("clawdbot.json");
+    if let Ok(state_dir) = env::var("MOLTBOT_STATE_DIR") {
+        return PathBuf::from(state_dir).join("moltbot.json");
     }
 
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".clawdbot")
-        .join("clawdbot.json")
+        .join(".moltbot")
+        .join("moltbot.json")
 }
 
 /// Get the cache TTL duration
 fn get_cache_ttl() -> Option<Duration> {
     // Check if caching is disabled
-    if env::var("CLAWDBOT_DISABLE_CONFIG_CACHE").is_ok() {
+    if env::var("MOLTBOT_DISABLE_CONFIG_CACHE").is_ok() {
         return None;
     }
 
-    let ms = env::var("CLAWDBOT_CONFIG_CACHE_MS")
+    let ms = env::var("MOLTBOT_CONFIG_CACHE_MS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(DEFAULT_CACHE_TTL_MS);
@@ -740,8 +740,8 @@ mod tests {
     #[test]
     fn test_config_cache_ttl_default() {
         let _lock = ENV_LOCK.lock().unwrap();
-        env::remove_var("CLAWDBOT_CONFIG_CACHE_MS");
-        env::remove_var("CLAWDBOT_DISABLE_CONFIG_CACHE");
+        env::remove_var("MOLTBOT_CONFIG_CACHE_MS");
+        env::remove_var("MOLTBOT_DISABLE_CONFIG_CACHE");
 
         let ttl = get_cache_ttl();
         assert_eq!(ttl, Some(Duration::from_millis(200)));
@@ -751,58 +751,58 @@ mod tests {
     fn test_config_cache_ttl_custom() {
         let _lock = ENV_LOCK.lock().unwrap();
         // Ensure disabled cache env var is not set
-        env::remove_var("CLAWDBOT_DISABLE_CONFIG_CACHE");
-        env::set_var("CLAWDBOT_CONFIG_CACHE_MS", "500");
+        env::remove_var("MOLTBOT_DISABLE_CONFIG_CACHE");
+        env::set_var("MOLTBOT_CONFIG_CACHE_MS", "500");
 
         let ttl = get_cache_ttl();
         assert_eq!(ttl, Some(Duration::from_millis(500)));
 
-        env::remove_var("CLAWDBOT_CONFIG_CACHE_MS");
+        env::remove_var("MOLTBOT_CONFIG_CACHE_MS");
     }
 
     #[test]
     fn test_config_cache_disabled() {
         let _lock = ENV_LOCK.lock().unwrap();
-        env::set_var("CLAWDBOT_DISABLE_CONFIG_CACHE", "1");
+        env::set_var("MOLTBOT_DISABLE_CONFIG_CACHE", "1");
 
         let ttl = get_cache_ttl();
         assert!(ttl.is_none());
 
-        env::remove_var("CLAWDBOT_DISABLE_CONFIG_CACHE");
+        env::remove_var("MOLTBOT_DISABLE_CONFIG_CACHE");
     }
 
     #[test]
     fn test_get_config_path_default() {
         let _lock = ENV_LOCK.lock().unwrap();
-        env::remove_var("CLAWDBOT_CONFIG_PATH");
-        env::remove_var("CLAWDBOT_STATE_DIR");
+        env::remove_var("MOLTBOT_CONFIG_PATH");
+        env::remove_var("MOLTBOT_STATE_DIR");
 
         let path = get_config_path();
-        assert!(path.ends_with(".clawdbot/clawdbot.json"));
+        assert!(path.ends_with(".moltbot/moltbot.json"));
     }
 
     #[test]
     fn test_get_config_path_override() {
         let _lock = ENV_LOCK.lock().unwrap();
-        env::remove_var("CLAWDBOT_STATE_DIR");
-        env::set_var("CLAWDBOT_CONFIG_PATH", "/custom/path/config.json");
+        env::remove_var("MOLTBOT_STATE_DIR");
+        env::set_var("MOLTBOT_CONFIG_PATH", "/custom/path/config.json");
 
         let path = get_config_path();
         assert_eq!(path, PathBuf::from("/custom/path/config.json"));
 
-        env::remove_var("CLAWDBOT_CONFIG_PATH");
+        env::remove_var("MOLTBOT_CONFIG_PATH");
     }
 
     #[test]
     fn test_get_config_path_state_dir() {
         let _lock = ENV_LOCK.lock().unwrap();
-        env::remove_var("CLAWDBOT_CONFIG_PATH");
-        env::set_var("CLAWDBOT_STATE_DIR", "/custom/state");
+        env::remove_var("MOLTBOT_CONFIG_PATH");
+        env::set_var("MOLTBOT_STATE_DIR", "/custom/state");
 
         let path = get_config_path();
-        assert_eq!(path, PathBuf::from("/custom/state/clawdbot.json"));
+        assert_eq!(path, PathBuf::from("/custom/state/moltbot.json"));
 
-        env::remove_var("CLAWDBOT_STATE_DIR");
+        env::remove_var("MOLTBOT_STATE_DIR");
     }
 
     #[test]

@@ -1,4 +1,4 @@
-# Justfile for rusty-clawd
+# Justfile for carapace
 # Install just: cargo install just
 # Run: just <recipe>
 

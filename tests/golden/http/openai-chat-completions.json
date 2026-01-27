@@ -18,9 +18,9 @@
     "properties": {
       "model": {
         "type": "string",
-        "default": "clawdbot",
-        "description": "Model identifier. Can include agent ID as 'clawdbot:<agentId>' or 'agent:<agentId>'",
-        "examples": ["clawdbot", "clawdbot:email-agent", "agent:main"]
+        "default": "moltbot",
+        "description": "Model identifier. Can include agent ID as 'moltbot:<agentId>' or 'agent:<agentId>'",
+        "examples": ["moltbot", "moltbot:email-agent", "agent:main"]
       },
       "messages": {
         "type": "array",
@@ -160,17 +160,17 @@
     }
   },
   "headers": {
-    "X-Clawdbot-Agent-Id": {
+    "X-Moltbot-Agent-Id": {
       "description": "Override agent ID (alternative to model field)",
-      "aliases": ["X-Clawdbot-Agent"]
+      "aliases": ["X-Moltbot-Agent"]
     },
-    "X-Clawdbot-Session-Key": {
+    "X-Moltbot-Session-Key": {
       "description": "Explicit session key for conversation context"
     }
   },
   "session_key_resolution": {
     "priority": [
-      "X-Clawdbot-Session-Key header if present",
+      "X-Moltbot-Session-Key header if present",
       "Auto-generated: openai-user:<user> if user field provided",
       "Auto-generated: openai:<uuid> otherwise"
     ],
@@ -185,7 +185,7 @@
         "path": "/v1/chat/completions",
         "headers": { "Authorization": "Bearer {{gateway_token}}" },
         "body": {
-          "model": "clawdbot",
+          "model": "moltbot",
           "messages": [
             { "role": "user", "content": "Hello" }
           ]
@@ -220,7 +220,7 @@
         "path": "/v1/chat/completions",
         "headers": { "Authorization": "Bearer {{gateway_token}}" },
         "body": {
-          "model": "clawdbot",
+          "model": "moltbot",
           "messages": [{ "role": "user", "content": "Hello" }],
           "stream": true
         }
@@ -241,7 +241,7 @@
         "path": "/v1/chat/completions",
         "headers": { "Authorization": "Bearer {{gateway_token}}" },
         "body": {
-          "model": "clawdbot",
+          "model": "moltbot",
           "messages": [
             { "role": "system", "content": "You are a helpful assistant." },
             { "role": "user", "content": "Hi" }
@@ -258,7 +258,7 @@
         "path": "/v1/chat/completions",
         "headers": { "Authorization": "Bearer {{gateway_token}}" },
         "body": {
-          "model": "clawdbot:email-agent",
+          "model": "moltbot:email-agent",
           "messages": [{ "role": "user", "content": "Send summary" }]
         }
       },
@@ -273,10 +273,10 @@
         "path": "/v1/chat/completions",
         "headers": {
           "Authorization": "Bearer {{gateway_token}}",
-          "X-Clawdbot-Agent-Id": "special-agent"
+          "X-Moltbot-Agent-Id": "special-agent"
         },
         "body": {
-          "model": "clawdbot:email-agent",
+          "model": "moltbot:email-agent",
           "messages": [{ "role": "user", "content": "test" }]
         }
       },
@@ -291,7 +291,7 @@
         "path": "/v1/chat/completions",
         "headers": { "Authorization": "Bearer {{gateway_token}}" },
         "body": {
-          "model": "clawdbot",
+          "model": "moltbot",
           "messages": [
             { "role": "system", "content": "You are helpful" }
           ]
@@ -329,7 +329,7 @@
       "request": {
         "method": "POST",
         "path": "/v1/chat/completions",
-        "body": { "model": "clawdbot", "messages": [] }
+        "body": { "model": "moltbot", "messages": [] }
       },
       "response": {
         "status": 401,
@@ -353,7 +353,7 @@
         "path": "/v1/chat/completions",
         "headers": { "Authorization": "Bearer {{gateway_token}}" },
         "body": {
-          "model": "clawdbot",
+          "model": "moltbot",
           "messages": [
             {
               "role": "user",

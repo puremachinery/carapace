@@ -1167,7 +1167,7 @@ pub(super) fn handle_agent_identity_get(_state: &WsServerState) -> Result<Value,
     // Return agent identity (would read from config)
     Ok(json!({
         "agentId": "default",
-        "name": "Clawdbot"
+        "name": "Moltbot"
     }))
 }
 

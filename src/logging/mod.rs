@@ -15,13 +15,13 @@
 //!
 //! # Environment Variables
 //!
-//! - `CLAWDBOT_LOG` - Primary log level/filter (takes precedence)
+//! - `MOLTBOT_LOG` - Primary log level/filter (takes precedence)
 //! - `RUST_LOG` - Fallback log level/filter
 //!
 //! # Examples
 //!
 //! ```no_run
-//! use rusty_clawd::logging::{init_logging, LogConfig, LogFormat, LogOutput};
+//! use carapace::logging::{init_logging, LogConfig, LogFormat, LogOutput};
 //!
 //! // Development setup (plaintext to stdout)
 //! init_logging(LogConfig::development()).unwrap();
@@ -32,7 +32,7 @@
 //! // Custom setup with file output
 //! init_logging(LogConfig {
 //!     format: LogFormat::Json,
-//!     output: LogOutput::File("/var/log/rusty-clawd.log".into()),
+//!     output: LogOutput::File("/var/log/carapace.log".into()),
 //!     default_level: tracing::Level::INFO,
 //! }).unwrap();
 //! ```
@@ -131,10 +131,10 @@ pub enum LoggingError {
 
 /// Build an EnvFilter from environment variables or default level.
 ///
-/// Checks CLAWDBOT_LOG first, then RUST_LOG, falling back to the default level.
+/// Checks MOLTBOT_LOG first, then RUST_LOG, falling back to the default level.
 fn build_env_filter(default_level: Level) -> Result<EnvFilter, LoggingError> {
-    // Check CLAWDBOT_LOG first, then RUST_LOG
-    if let Ok(filter) = std::env::var("CLAWDBOT_LOG") {
+    // Check MOLTBOT_LOG first, then RUST_LOG
+    if let Ok(filter) = std::env::var("MOLTBOT_LOG") {
         return Ok(EnvFilter::try_new(filter)?);
     }
     if let Ok(filter) = std::env::var("RUST_LOG") {
@@ -359,7 +359,7 @@ mod tests {
     #[test]
     fn test_env_filter_default() {
         // Clear env vars for this test
-        std::env::remove_var("CLAWDBOT_LOG");
+        std::env::remove_var("MOLTBOT_LOG");
         std::env::remove_var("RUST_LOG");
 
         // Filter should be created successfully with default level
@@ -371,16 +371,16 @@ mod tests {
     }
 
     #[test]
-    fn test_env_filter_clawdbot_log() {
-        std::env::set_var("CLAWDBOT_LOG", "debug");
+    fn test_env_filter_moltbot_log() {
+        std::env::set_var("MOLTBOT_LOG", "debug");
         let filter = build_env_filter(Level::INFO);
-        assert!(filter.is_ok(), "Should create filter from CLAWDBOT_LOG");
-        std::env::remove_var("CLAWDBOT_LOG");
+        assert!(filter.is_ok(), "Should create filter from MOLTBOT_LOG");
+        std::env::remove_var("MOLTBOT_LOG");
     }
 
     #[test]
     fn test_env_filter_rust_log_fallback() {
-        std::env::remove_var("CLAWDBOT_LOG");
+        std::env::remove_var("MOLTBOT_LOG");
         std::env::set_var("RUST_LOG", "warn");
         let filter = build_env_filter(Level::INFO);
         assert!(
@@ -391,28 +391,28 @@ mod tests {
     }
 
     #[test]
-    fn test_env_filter_clawdbot_takes_precedence() {
-        std::env::set_var("CLAWDBOT_LOG", "error");
+    fn test_env_filter_moltbot_takes_precedence() {
+        std::env::set_var("MOLTBOT_LOG", "error");
         std::env::set_var("RUST_LOG", "debug");
-        // CLAWDBOT_LOG should take precedence (both are valid, so just verify creation)
+        // MOLTBOT_LOG should take precedence (both are valid, so just verify creation)
         let filter = build_env_filter(Level::INFO);
         assert!(
             filter.is_ok(),
-            "Should create filter with CLAWDBOT_LOG taking precedence"
+            "Should create filter with MOLTBOT_LOG taking precedence"
         );
-        std::env::remove_var("CLAWDBOT_LOG");
+        std::env::remove_var("MOLTBOT_LOG");
         std::env::remove_var("RUST_LOG");
     }
 
     #[test]
     fn test_env_filter_complex_directive() {
-        std::env::set_var("CLAWDBOT_LOG", "gateway=debug,ws=info,http=warn");
+        std::env::set_var("MOLTBOT_LOG", "gateway=debug,ws=info,http=warn");
         let filter = build_env_filter(Level::INFO);
         assert!(
             filter.is_ok(),
-            "Should parse complex directive from CLAWDBOT_LOG"
+            "Should parse complex directive from MOLTBOT_LOG"
         );
-        std::env::remove_var("CLAWDBOT_LOG");
+        std::env::remove_var("MOLTBOT_LOG");
     }
 
     #[test]

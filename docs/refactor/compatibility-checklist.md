@@ -1,31 +1,31 @@
 # Rust Gateway Compatibility Checklist
 
-This checklist defines parity requirements for the Rust gateway migration. Each item must be verified to ensure drop-in compatibility with existing Clawdbot clients.
+This checklist defines parity requirements for the Rust gateway migration. Each item must be verified to ensure drop-in compatibility with existing Moltbot clients.
 
 ## 1. Config Compatibility
 
 ### JSON Config File Format
 
 - [ ] Support JSON5 parsing (comments, trailing commas, unquoted keys)
-- [ ] Config file location: `~/.clawdbot/clawdbot.json` (or `CLAWDBOT_CONFIG_PATH` override)
+- [ ] Config file location: `~/.moltbot/moltbot.json` (or `MOLTBOT_CONFIG_PATH` override)
 - [ ] Support `$include` directive for config file composition
   - [ ] Relative path resolution from parent config
   - [ ] Circular include detection and error
 - [ ] Support `${VAR}` environment variable substitution in config values
 - [ ] Config validation with schema (report path + message for each issue)
 - [ ] Return empty config `{}` when file does not exist
-- [ ] Config caching with 200ms TTL (configurable via `CLAWDBOT_CONFIG_CACHE_MS`)
+- [ ] Config caching with 200ms TTL (configurable via `MOLTBOT_CONFIG_CACHE_MS`)
 
 ### Environment Variable Overrides
 
 | Variable | Purpose |
 |----------|---------|
-| `CLAWDBOT_CONFIG_PATH` | Override config file location |
-| `CLAWDBOT_GATEWAY_PORT` | Override default port (18789) |
-| `CLAWDBOT_GATEWAY_TOKEN` | Gateway auth token |
-| `CLAWDBOT_GATEWAY_PASSWORD` | Gateway auth password |
-| `CLAWDBOT_CONFIG_CACHE_MS` | Config cache TTL |
-| `CLAWDBOT_DISABLE_CONFIG_CACHE` | Disable config caching |
+| `MOLTBOT_CONFIG_PATH` | Override config file location |
+| `MOLTBOT_GATEWAY_PORT` | Override default port (18789) |
+| `MOLTBOT_GATEWAY_TOKEN` | Gateway auth token |
+| `MOLTBOT_GATEWAY_PASSWORD` | Gateway auth password |
+| `MOLTBOT_CONFIG_CACHE_MS` | Config cache TTL |
+| `MOLTBOT_DISABLE_CONFIG_CACHE` | Disable config caching |
 
 - [ ] All environment variables take precedence over config file values
 - [ ] Support `config.env` section to set environment variables from config
@@ -53,7 +53,7 @@ This checklist defines parity requirements for the Rust gateway migration. Each 
 ### Token Auth
 
 - [ ] Timing-safe comparison using constant-time equality (`timingSafeEqual`)
-- [ ] Token from `gateway.auth.token` config or `CLAWDBOT_GATEWAY_TOKEN` env var
+- [ ] Token from `gateway.auth.token` config or `MOLTBOT_GATEWAY_TOKEN` env var
 - [ ] Token provided in connect params: `{ auth: { token: "..." } }`
 - [ ] Return `token_missing` when client provides no token
 - [ ] Return `token_mismatch` when token does not match
@@ -62,7 +62,7 @@ This checklist defines parity requirements for the Rust gateway migration. Each 
 ### Password Auth
 
 - [ ] Timing-safe comparison using constant-time equality
-- [ ] Password from `gateway.auth.password` config or `CLAWDBOT_GATEWAY_PASSWORD` env var
+- [ ] Password from `gateway.auth.password` config or `MOLTBOT_GATEWAY_PASSWORD` env var
 - [ ] Password provided in connect params: `{ auth: { password: "..." } }`
 - [ ] Return `password_missing` when client provides no password
 - [ ] Return `password_mismatch` when password does not match
@@ -301,7 +301,7 @@ This checklist defines parity requirements for the Rust gateway migration. Each 
 
 **Token Auth:**
 - Header: `Authorization: Bearer <token>` (preferred)
-- Header: `X-Clawdbot-Token: <token>` (alternative)
+- Header: `X-Moltbot-Token: <token>` (alternative)
 - Query: `?token=<token>` (deprecated, logs warning)
 
 **POST /hooks/wake**
@@ -414,7 +414,7 @@ Response (400):
 ### Token Auth
 
 - [ ] Check `Authorization: Bearer <token>` header first
-- [ ] Check `X-Clawdbot-Token: <token>` header second
+- [ ] Check `X-Moltbot-Token: <token>` header second
 - [ ] Check `?token=<token>` query param last (log deprecation warning)
 - [ ] Return 401 "Unauthorized" for invalid/missing token
 - [ ] Timing-safe token comparison
@@ -544,7 +544,7 @@ Response (400):
 
 ### mDNS/Bonjour
 
-- [ ] Broadcast `_clawdbot._tcp` service
+- [ ] Broadcast `_moltbot._tcp` service
 - [ ] Include TXT records: machine name, port, TLS fingerprint
 - [ ] Support modes: off, minimal (no cli/ssh), full
 - [ ] Clean shutdown: unregister service
@@ -617,7 +617,7 @@ flows (prompts, configPatch, profiles).
 **Rust behavior:** WASM provider plugins handle inference only. Auth/registration is
 configured via host config or CLI, with credentials stored in the host credential store.
 
-**Migration:** Configure provider credentials via `clawdbot config set` or environment
+**Migration:** Configure provider credentials via `moltbot config set` or environment
 variables. Provider plugins read credentials via `credential-get()`.
 
 **Rationale:** WASM sandbox cannot access terminal/UI for interactive prompts, and
