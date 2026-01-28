@@ -395,8 +395,18 @@ impl CronScheduler {
         result
     }
 
+    /// Maximum number of cron jobs allowed.
+    const MAX_JOBS: usize = 500;
+
     /// Add a new job.
-    pub fn add(&self, input: CronJobCreate) -> CronJob {
+    pub fn add(&self, input: CronJobCreate) -> Result<CronJob, CronError> {
+        {
+            let jobs = self.jobs.read();
+            if jobs.len() >= Self::MAX_JOBS {
+                return Err(CronError::LimitExceeded(Self::MAX_JOBS));
+            }
+        }
+
         let now = now_ms();
         let job_id = Uuid::new_v4().to_string();
 
@@ -442,7 +452,7 @@ impl CronScheduler {
             details: None,
         });
 
-        job
+        Ok(job)
     }
 
     /// Update an existing job.
@@ -723,6 +733,8 @@ pub enum CronError {
     JobNotFound(String),
     #[error("store error: {0}")]
     StoreError(String),
+    #[error("job limit exceeded (max {0})")]
+    LimitExceeded(usize),
 }
 
 /// Create a shared cron scheduler.
@@ -814,7 +826,7 @@ mod tests {
             isolation: None,
         };
 
-        let job = scheduler.add(input);
+        let job = scheduler.add(input).unwrap();
         assert!(!job.id.is_empty());
         assert_eq!(job.name, "Test Job");
         assert!(job.enabled);
@@ -829,42 +841,46 @@ mod tests {
         let scheduler = CronScheduler::in_memory();
 
         // Add enabled job
-        scheduler.add(CronJobCreate {
-            name: "Enabled Job".to_string(),
-            agent_id: None,
-            description: None,
-            enabled: true,
-            delete_after_run: None,
-            schedule: CronSchedule::Every {
-                every_ms: 60_000,
-                anchor_ms: None,
-            },
-            session_target: CronSessionTarget::Main,
-            wake_mode: CronWakeMode::Now,
-            payload: CronPayload::SystemEvent {
-                text: "test".to_string(),
-            },
-            isolation: None,
-        });
+        scheduler
+            .add(CronJobCreate {
+                name: "Enabled Job".to_string(),
+                agent_id: None,
+                description: None,
+                enabled: true,
+                delete_after_run: None,
+                schedule: CronSchedule::Every {
+                    every_ms: 60_000,
+                    anchor_ms: None,
+                },
+                session_target: CronSessionTarget::Main,
+                wake_mode: CronWakeMode::Now,
+                payload: CronPayload::SystemEvent {
+                    text: "test".to_string(),
+                },
+                isolation: None,
+            })
+            .unwrap();
 
         // Add disabled job
-        scheduler.add(CronJobCreate {
-            name: "Disabled Job".to_string(),
-            agent_id: None,
-            description: None,
-            enabled: false,
-            delete_after_run: None,
-            schedule: CronSchedule::Every {
-                every_ms: 60_000,
-                anchor_ms: None,
-            },
-            session_target: CronSessionTarget::Main,
-            wake_mode: CronWakeMode::Now,
-            payload: CronPayload::SystemEvent {
-                text: "test".to_string(),
-            },
-            isolation: None,
-        });
+        scheduler
+            .add(CronJobCreate {
+                name: "Disabled Job".to_string(),
+                agent_id: None,
+                description: None,
+                enabled: false,
+                delete_after_run: None,
+                schedule: CronSchedule::Every {
+                    every_ms: 60_000,
+                    anchor_ms: None,
+                },
+                session_target: CronSessionTarget::Main,
+                wake_mode: CronWakeMode::Now,
+                payload: CronPayload::SystemEvent {
+                    text: "test".to_string(),
+                },
+                isolation: None,
+            })
+            .unwrap();
 
         // List only enabled
         let enabled_jobs = scheduler.list(false);
@@ -880,23 +896,25 @@ mod tests {
     fn test_cron_scheduler_update_job() {
         let scheduler = CronScheduler::in_memory();
 
-        let job = scheduler.add(CronJobCreate {
-            name: "Original Name".to_string(),
-            agent_id: None,
-            description: None,
-            enabled: true,
-            delete_after_run: None,
-            schedule: CronSchedule::Every {
-                every_ms: 60_000,
-                anchor_ms: None,
-            },
-            session_target: CronSessionTarget::Main,
-            wake_mode: CronWakeMode::Now,
-            payload: CronPayload::SystemEvent {
-                text: "test".to_string(),
-            },
-            isolation: None,
-        });
+        let job = scheduler
+            .add(CronJobCreate {
+                name: "Original Name".to_string(),
+                agent_id: None,
+                description: None,
+                enabled: true,
+                delete_after_run: None,
+                schedule: CronSchedule::Every {
+                    every_ms: 60_000,
+                    anchor_ms: None,
+                },
+                session_target: CronSessionTarget::Main,
+                wake_mode: CronWakeMode::Now,
+                payload: CronPayload::SystemEvent {
+                    text: "test".to_string(),
+                },
+                isolation: None,
+            })
+            .unwrap();
 
         let updated = scheduler
             .update(
@@ -918,23 +936,25 @@ mod tests {
     fn test_cron_scheduler_remove_job() {
         let scheduler = CronScheduler::in_memory();
 
-        let job = scheduler.add(CronJobCreate {
-            name: "To Remove".to_string(),
-            agent_id: None,
-            description: None,
-            enabled: true,
-            delete_after_run: None,
-            schedule: CronSchedule::Every {
-                every_ms: 60_000,
-                anchor_ms: None,
-            },
-            session_target: CronSessionTarget::Main,
-            wake_mode: CronWakeMode::Now,
-            payload: CronPayload::SystemEvent {
-                text: "test".to_string(),
-            },
-            isolation: None,
-        });
+        let job = scheduler
+            .add(CronJobCreate {
+                name: "To Remove".to_string(),
+                agent_id: None,
+                description: None,
+                enabled: true,
+                delete_after_run: None,
+                schedule: CronSchedule::Every {
+                    every_ms: 60_000,
+                    anchor_ms: None,
+                },
+                session_target: CronSessionTarget::Main,
+                wake_mode: CronWakeMode::Now,
+                payload: CronPayload::SystemEvent {
+                    text: "test".to_string(),
+                },
+                isolation: None,
+            })
+            .unwrap();
 
         assert_eq!(scheduler.list(true).len(), 1);
 
@@ -954,20 +974,22 @@ mod tests {
     fn test_cron_scheduler_run_job() {
         let scheduler = CronScheduler::in_memory();
 
-        let job = scheduler.add(CronJobCreate {
-            name: "Runnable Job".to_string(),
-            agent_id: None,
-            description: None,
-            enabled: true,
-            delete_after_run: None,
-            schedule: CronSchedule::At { at_ms: 0 }, // Already due
-            session_target: CronSessionTarget::Main,
-            wake_mode: CronWakeMode::Now,
-            payload: CronPayload::SystemEvent {
-                text: "test".to_string(),
-            },
-            isolation: None,
-        });
+        let job = scheduler
+            .add(CronJobCreate {
+                name: "Runnable Job".to_string(),
+                agent_id: None,
+                description: None,
+                enabled: true,
+                delete_after_run: None,
+                schedule: CronSchedule::At { at_ms: 0 }, // Already due
+                session_target: CronSessionTarget::Main,
+                wake_mode: CronWakeMode::Now,
+                payload: CronPayload::SystemEvent {
+                    text: "test".to_string(),
+                },
+                isolation: None,
+            })
+            .unwrap();
 
         // Force run
         let result = scheduler.run(&job.id, Some(CronRunMode::Force)).unwrap();
@@ -984,22 +1006,24 @@ mod tests {
     fn test_cron_scheduler_run_not_due() {
         let scheduler = CronScheduler::in_memory();
 
-        let job = scheduler.add(CronJobCreate {
-            name: "Future Job".to_string(),
-            agent_id: None,
-            description: None,
-            enabled: true,
-            delete_after_run: None,
-            schedule: CronSchedule::At {
-                at_ms: now_ms() + 1_000_000,
-            },
-            session_target: CronSessionTarget::Main,
-            wake_mode: CronWakeMode::Now,
-            payload: CronPayload::SystemEvent {
-                text: "test".to_string(),
-            },
-            isolation: None,
-        });
+        let job = scheduler
+            .add(CronJobCreate {
+                name: "Future Job".to_string(),
+                agent_id: None,
+                description: None,
+                enabled: true,
+                delete_after_run: None,
+                schedule: CronSchedule::At {
+                    at_ms: now_ms() + 1_000_000,
+                },
+                session_target: CronSessionTarget::Main,
+                wake_mode: CronWakeMode::Now,
+                payload: CronPayload::SystemEvent {
+                    text: "test".to_string(),
+                },
+                isolation: None,
+            })
+            .unwrap();
 
         // Due mode should not run
         let result = scheduler.run(&job.id, Some(CronRunMode::Due)).unwrap();
@@ -1012,23 +1036,25 @@ mod tests {
     fn test_cron_scheduler_get_job() {
         let scheduler = CronScheduler::in_memory();
 
-        let job = scheduler.add(CronJobCreate {
-            name: "Get Test".to_string(),
-            agent_id: None,
-            description: None,
-            enabled: true,
-            delete_after_run: None,
-            schedule: CronSchedule::Every {
-                every_ms: 60_000,
-                anchor_ms: None,
-            },
-            session_target: CronSessionTarget::Main,
-            wake_mode: CronWakeMode::Now,
-            payload: CronPayload::SystemEvent {
-                text: "test".to_string(),
-            },
-            isolation: None,
-        });
+        let job = scheduler
+            .add(CronJobCreate {
+                name: "Get Test".to_string(),
+                agent_id: None,
+                description: None,
+                enabled: true,
+                delete_after_run: None,
+                schedule: CronSchedule::Every {
+                    every_ms: 60_000,
+                    anchor_ms: None,
+                },
+                session_target: CronSessionTarget::Main,
+                wake_mode: CronWakeMode::Now,
+                payload: CronPayload::SystemEvent {
+                    text: "test".to_string(),
+                },
+                isolation: None,
+            })
+            .unwrap();
 
         let fetched = scheduler.get(&job.id);
         assert!(fetched.is_some());
@@ -1036,6 +1062,68 @@ mod tests {
 
         let not_found = scheduler.get("non-existent");
         assert!(not_found.is_none());
+    }
+
+    #[test]
+    fn test_cron_scheduler_job_limit() {
+        let scheduler = CronScheduler::in_memory();
+
+        // Fill to the limit
+        for i in 0..CronScheduler::MAX_JOBS {
+            scheduler
+                .add(CronJobCreate {
+                    name: format!("Job {}", i),
+                    agent_id: None,
+                    description: None,
+                    enabled: false,
+                    delete_after_run: None,
+                    schedule: CronSchedule::At { at_ms: 0 },
+                    session_target: CronSessionTarget::Main,
+                    wake_mode: CronWakeMode::Now,
+                    payload: CronPayload::SystemEvent {
+                        text: "t".to_string(),
+                    },
+                    isolation: None,
+                })
+                .unwrap();
+        }
+
+        // One more should fail
+        let result = scheduler.add(CronJobCreate {
+            name: "Over Limit".to_string(),
+            agent_id: None,
+            description: None,
+            enabled: false,
+            delete_after_run: None,
+            schedule: CronSchedule::At { at_ms: 0 },
+            session_target: CronSessionTarget::Main,
+            wake_mode: CronWakeMode::Now,
+            payload: CronPayload::SystemEvent {
+                text: "t".to_string(),
+            },
+            isolation: None,
+        });
+        assert!(matches!(result, Err(CronError::LimitExceeded(500))));
+
+        // Removing one and adding should succeed
+        let jobs = scheduler.list(true);
+        scheduler.remove(&jobs[0].id);
+        assert!(scheduler
+            .add(CronJobCreate {
+                name: "After Remove".to_string(),
+                agent_id: None,
+                description: None,
+                enabled: false,
+                delete_after_run: None,
+                schedule: CronSchedule::At { at_ms: 0 },
+                session_target: CronSessionTarget::Main,
+                wake_mode: CronWakeMode::Now,
+                payload: CronPayload::SystemEvent {
+                    text: "t".to_string(),
+                },
+                isolation: None,
+            })
+            .is_ok());
     }
 
     #[test]

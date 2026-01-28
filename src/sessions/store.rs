@@ -11,6 +11,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
+use tracing::warn;
 use uuid::Uuid;
 
 /// Default message count threshold for auto-compaction
@@ -34,6 +35,12 @@ pub enum SessionStoreError {
     InvalidSessionKey(String),
     #[error("Compaction in progress for session: {0}")]
     CompactionInProgress(String),
+    #[error("Session is already archived: {0}")]
+    AlreadyArchived(String),
+    #[error("Session is not archived: {0}")]
+    NotArchived(String),
+    #[error("Archive not found: {0}")]
+    ArchiveNotFound(String),
 }
 
 impl From<std::io::Error> for SessionStoreError {
@@ -116,6 +123,47 @@ pub struct CompactionMetadata {
     /// Original message count before compactions
     #[serde(default)]
     pub original_message_count: usize,
+}
+
+/// Result of an archive operation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchiveResult {
+    /// Session ID that was archived
+    pub session_id: String,
+    /// Path to the archive file
+    pub archive_path: String,
+    /// Number of messages archived
+    pub message_count: usize,
+    /// Size of the archive file in bytes
+    pub archive_size: u64,
+    /// Timestamp when the archive was created (Unix ms)
+    pub archived_at: i64,
+    /// Whether history was deleted after archiving
+    pub history_deleted: bool,
+}
+
+/// Result of a restore operation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RestoreResult {
+    /// Session ID that was restored
+    pub session_id: String,
+    /// Number of messages restored
+    pub message_count: usize,
+    /// Timestamp when the restore happened (Unix ms)
+    pub restored_at: i64,
+}
+
+/// Archived session metadata stored in archive file
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchivedSession {
+    /// Original session data
+    pub session: Session,
+    /// All messages at time of archiving
+    pub messages: Vec<ChatMessage>,
+    /// When the archive was created (Unix ms)
+    pub archived_at: i64,
+    /// Archive format version
+    pub version: u32,
 }
 
 /// Metadata associated with a session
@@ -478,14 +526,49 @@ impl SessionStore {
         Ok(())
     }
 
-    /// Get the metadata file path for a session
-    fn session_meta_path(&self, session_id: &str) -> PathBuf {
-        self.base_path.join(format!("{}.json", session_id))
+    /// Validate session_id to prevent path traversal attacks.
+    /// Session IDs must be valid UUIDs or alphanumeric slugs (letters, numbers, hyphens, underscores).
+    fn validate_session_id(session_id: &str) -> Result<(), SessionStoreError> {
+        // Reject empty IDs
+        if session_id.is_empty() {
+            return Err(SessionStoreError::InvalidSessionKey(
+                "session_id cannot be empty".to_string(),
+            ));
+        }
+
+        // Reject path traversal attempts
+        if session_id.contains("..") || session_id.contains('/') || session_id.contains('\\') {
+            return Err(SessionStoreError::InvalidSessionKey(format!(
+                "invalid session_id (path traversal detected): {}",
+                session_id
+            )));
+        }
+
+        // Allow only safe characters: alphanumeric, hyphens, underscores
+        // This covers UUIDs (with hyphens) and typical slug formats
+        if !session_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(SessionStoreError::InvalidSessionKey(format!(
+                "invalid session_id (must be alphanumeric with hyphens/underscores): {}",
+                session_id
+            )));
+        }
+
+        Ok(())
     }
 
-    /// Get the history file path for a session
-    fn session_history_path(&self, session_id: &str) -> PathBuf {
-        self.base_path.join(format!("{}.jsonl", session_id))
+    /// Get the metadata file path for a session (validates session_id)
+    fn session_meta_path(&self, session_id: &str) -> Result<PathBuf, SessionStoreError> {
+        Self::validate_session_id(session_id)?;
+        Ok(self.base_path.join(format!("{}.json", session_id)))
+    }
+
+    /// Get the history file path for a session (validates session_id)
+    fn session_history_path(&self, session_id: &str) -> Result<PathBuf, SessionStoreError> {
+        Self::validate_session_id(session_id)?;
+        Ok(self.base_path.join(format!("{}.jsonl", session_id)))
     }
 
     /// Create a new session
@@ -528,6 +611,9 @@ impl SessionStore {
 
     /// Get a session by ID
     pub fn get_session(&self, session_id: &str) -> Result<Session, SessionStoreError> {
+        // Validate session_id upfront for defense in depth
+        Self::validate_session_id(session_id)?;
+
         // Check cache first
         {
             let sessions = self.sessions.read();
@@ -666,7 +752,7 @@ impl SessionStore {
         let mut session = self.get_session(session_id)?;
 
         // Delete history file
-        let history_path = self.session_history_path(session_id);
+        let history_path = self.session_history_path(session_id)?;
         if history_path.exists() {
             fs::remove_file(&history_path)?;
         }
@@ -697,8 +783,8 @@ impl SessionStore {
         let session = self.get_session(session_id)?;
 
         // Delete files
-        let meta_path = self.session_meta_path(session_id);
-        let history_path = self.session_history_path(session_id);
+        let meta_path = self.session_meta_path(session_id)?;
+        let history_path = self.session_history_path(session_id)?;
 
         if meta_path.exists() {
             fs::remove_file(&meta_path)?;
@@ -719,13 +805,24 @@ impl SessionStore {
     }
 
     /// Append a message to session history
+    ///
+    /// Returns an error if the session is archived (read-only).
     pub fn append_message(&self, message: ChatMessage) -> Result<(), SessionStoreError> {
         self.ensure_base_dir()?;
 
         let session_id = message.session_id.clone();
 
+        // Check session status - archived sessions are read-only.
+        // Use get_session to check both cache and disk, ensuring the guard
+        // works even if the session hasn't been loaded into memory yet.
+        if let Ok(session) = self.get_session(&session_id) {
+            if session.status == SessionStatus::Archived {
+                return Err(SessionStoreError::AlreadyArchived(session_id));
+            }
+        }
+
         // Append to history file (JSONL format)
-        let history_path = self.session_history_path(&session_id);
+        let history_path = self.session_history_path(&session_id)?;
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -748,7 +845,7 @@ impl SessionStore {
         limit: Option<usize>,
         before_id: Option<&str>,
     ) -> Result<Vec<ChatMessage>, SessionStoreError> {
-        let history_path = self.session_history_path(session_id);
+        let history_path = self.session_history_path(session_id)?;
 
         if !history_path.exists() {
             return Ok(Vec::new());
@@ -790,7 +887,7 @@ impl SessionStore {
 
     /// Clear all history for a session
     pub fn clear_history(&self, session_id: &str) -> Result<(), SessionStoreError> {
-        let history_path = self.session_history_path(session_id);
+        let history_path = self.session_history_path(session_id)?;
 
         if history_path.exists() {
             fs::remove_file(&history_path)?;
@@ -827,6 +924,10 @@ impl SessionStore {
     {
         let mut session = self.get_session(session_id)?;
 
+        if session.status == SessionStatus::Archived {
+            return Err(SessionStoreError::AlreadyArchived(session_id.to_string()));
+        }
+
         if session.status == SessionStatus::Compacting {
             return Err(SessionStoreError::CompactionInProgress(
                 session_id.to_string(),
@@ -856,7 +957,7 @@ impl SessionStore {
         let summary = summary_fn(&to_compact);
 
         // Write new history file atomically
-        let history_path = self.session_history_path(session_id);
+        let history_path = self.session_history_path(session_id)?;
         let temp_path = history_path.with_extension("jsonl.tmp");
 
         {
@@ -927,9 +1028,292 @@ impl SessionStore {
         }
     }
 
+    // ========================================================================
+    // Archive Operations
+    // ========================================================================
+
+    /// Get the archive directory path
+    fn archive_dir(&self) -> PathBuf {
+        self.base_path.join("archives")
+    }
+
+    /// Get the archive file path for a session
+    fn archive_path(&self, session_id: &str) -> Result<PathBuf, SessionStoreError> {
+        Self::validate_session_id(session_id)?;
+        Ok(self
+            .archive_dir()
+            .join(format!("{}.archive.json", session_id)))
+    }
+
+    /// Ensure the archive directory exists
+    fn ensure_archive_dir(&self) -> Result<(), SessionStoreError> {
+        let archive_dir = self.archive_dir();
+        if !archive_dir.exists() {
+            fs::create_dir_all(&archive_dir)?;
+        }
+        Ok(())
+    }
+
+    /// Archive a session to a compressed file
+    ///
+    /// This creates an archive file containing all session metadata and messages.
+    /// The session status is set to Archived, making it read-only.
+    ///
+    /// # Arguments
+    /// * `session_id` - The session to archive
+    /// * `delete_history` - If true, delete the history file after archiving (keeps metadata)
+    ///
+    /// # Returns
+    /// Archive result with path and stats
+    pub fn archive_session(
+        &self,
+        session_id: &str,
+        delete_history: bool,
+    ) -> Result<ArchiveResult, SessionStoreError> {
+        let mut session = self.get_session(session_id)?;
+
+        // Don't archive if already archived
+        if session.status == SessionStatus::Archived {
+            return Err(SessionStoreError::AlreadyArchived(session_id.to_string()));
+        }
+
+        self.ensure_archive_dir()?;
+
+        // Get all messages
+        let messages = self.get_history(session_id, None, None)?;
+        let message_count = messages.len();
+
+        // Create archive structure
+        let archived = ArchivedSession {
+            session: session.clone(),
+            messages,
+            archived_at: now_millis(),
+            version: 1,
+        };
+
+        // Write archive file
+        let archive_path = self.archive_path(session_id)?;
+        let temp_path = archive_path.with_extension("tmp");
+
+        {
+            let file = File::create(&temp_path)?;
+            let writer = BufWriter::new(file);
+            serde_json::to_writer_pretty(writer, &archived)?;
+        }
+
+        // Atomic rename
+        fs::rename(&temp_path, &archive_path)?;
+
+        // Get archive size
+        let archive_size = fs::metadata(&archive_path).map(|m| m.len()).unwrap_or(0);
+
+        // Update session status to archived
+        session.status = SessionStatus::Archived;
+        session.updated_at = now_millis();
+        self.write_session_meta(&session)?;
+
+        // Optionally delete history file to save space
+        if delete_history {
+            let history_path = self.session_history_path(session_id)?;
+            if history_path.exists() {
+                fs::remove_file(&history_path)?;
+            }
+        }
+
+        // Update cache
+        {
+            let mut sessions = self.sessions.write();
+            if let Some(cached) = sessions.get_mut(session_id) {
+                cached.session = session;
+                cached.dirty = false;
+            }
+        }
+
+        Ok(ArchiveResult {
+            session_id: session_id.to_string(),
+            archive_path: archive_path.display().to_string(),
+            message_count,
+            archive_size,
+            archived_at: archived.archived_at,
+            history_deleted: delete_history,
+        })
+    }
+
+    /// Restore a session from archive
+    ///
+    /// This reads the archive file and restores the session history.
+    /// The session status is set back to Active.
+    ///
+    /// # Arguments
+    /// * `session_id` - The session to restore
+    ///
+    /// # Returns
+    /// Restore result with stats
+    pub fn restore_session(&self, session_id: &str) -> Result<RestoreResult, SessionStoreError> {
+        let mut session = self.get_session(session_id)?;
+
+        // Only restore archived sessions
+        if session.status != SessionStatus::Archived {
+            return Err(SessionStoreError::NotArchived(session_id.to_string()));
+        }
+
+        // Read archive file
+        let archive_path = self.archive_path(session_id)?;
+        if !archive_path.exists() {
+            return Err(SessionStoreError::ArchiveNotFound(session_id.to_string()));
+        }
+
+        let archive_content = fs::read_to_string(&archive_path)?;
+        let archived: ArchivedSession = serde_json::from_str(&archive_content)?;
+
+        // Restore messages to history file
+        let history_path = self.session_history_path(session_id)?;
+        {
+            let file = File::create(&history_path)?;
+            let mut writer = BufWriter::new(file);
+            for msg in &archived.messages {
+                serde_json::to_writer(&mut writer, msg)?;
+                writeln!(writer)?;
+            }
+            writer.flush()?;
+        }
+
+        let message_count = archived.messages.len();
+
+        // Update session status to active
+        session.status = SessionStatus::Active;
+        session.message_count = message_count;
+        session.updated_at = now_millis();
+        session.last_activity_at = Some(now_millis());
+        self.write_session_meta(&session)?;
+
+        // Update cache
+        {
+            let mut sessions = self.sessions.write();
+            if let Some(cached) = sessions.get_mut(session_id) {
+                cached.session = session;
+                cached.dirty = false;
+            }
+        }
+
+        Ok(RestoreResult {
+            session_id: session_id.to_string(),
+            message_count,
+            restored_at: now_millis(),
+        })
+    }
+
+    /// List all archived sessions
+    ///
+    /// Returns sessions with Archived status along with archive file info
+    pub fn list_archived_sessions(&self) -> Result<Vec<(Session, Option<u64>)>, SessionStoreError> {
+        self.load_sessions_from_disk()?;
+
+        let sessions = self.sessions.read();
+        let mut result = Vec::new();
+
+        for cached in sessions.values() {
+            if cached.session.status == SessionStatus::Archived {
+                // Skip sessions with invalid IDs (shouldn't happen, but defensive)
+                let archive_path = match self.archive_path(&cached.session.id) {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+                let archive_size = if archive_path.exists() {
+                    fs::metadata(&archive_path).ok().map(|m| m.len())
+                } else {
+                    None
+                };
+                result.push((cached.session.clone(), archive_size));
+            }
+        }
+
+        // Sort by updated_at descending
+        result.sort_by(|a, b| b.0.updated_at.cmp(&a.0.updated_at));
+
+        Ok(result)
+    }
+
+    /// Delete an archive file without restoring
+    ///
+    /// This removes the archive file but keeps the session metadata.
+    /// Use this to clean up archives that are no longer needed.
+    pub fn delete_archive(&self, session_id: &str) -> Result<bool, SessionStoreError> {
+        let archive_path = self.archive_path(session_id)?;
+        if archive_path.exists() {
+            fs::remove_file(&archive_path)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Get archive info for a session
+    pub fn get_archive_info(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<(PathBuf, u64, i64)>, SessionStoreError> {
+        let archive_path = self.archive_path(session_id)?;
+        if !archive_path.exists() {
+            return Ok(None);
+        }
+
+        let metadata = fs::metadata(&archive_path)?;
+        let size = metadata.len();
+
+        // Read archived_at from the file
+        let content = fs::read_to_string(&archive_path)?;
+        let archived: ArchivedSession = serde_json::from_str(&content)?;
+
+        Ok(Some((archive_path, size, archived.archived_at)))
+    }
+
+    /// Archive old inactive sessions automatically
+    ///
+    /// Archives sessions that haven't been updated within the given threshold.
+    ///
+    /// # Arguments
+    /// * `inactive_days` - Archive sessions not updated in this many days
+    /// * `delete_history` - Whether to delete history after archiving
+    ///
+    /// # Returns
+    /// Number of sessions archived
+    pub fn archive_inactive_sessions(
+        &self,
+        inactive_days: u32,
+        delete_history: bool,
+    ) -> Result<Vec<ArchiveResult>, SessionStoreError> {
+        self.load_sessions_from_disk()?;
+
+        let cutoff = now_millis() - (inactive_days as i64 * 24 * 60 * 60 * 1000);
+        let to_archive: Vec<String> = {
+            let sessions = self.sessions.read();
+            sessions
+                .values()
+                .filter(|c| {
+                    c.session.status == SessionStatus::Active && c.session.updated_at < cutoff
+                })
+                .map(|c| c.session.id.clone())
+                .collect()
+        };
+
+        let mut results = Vec::new();
+        for session_id in to_archive {
+            match self.archive_session(&session_id, delete_history) {
+                Ok(result) => results.push(result),
+                Err(e) => {
+                    // Log but continue with other sessions
+                    warn!("Failed to archive session {}: {}", session_id, e);
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
     /// Load a session from disk
     fn load_session(&self, session_id: &str) -> Result<Session, SessionStoreError> {
-        let meta_path = self.session_meta_path(session_id);
+        let meta_path = self.session_meta_path(session_id)?;
 
         if !meta_path.exists() {
             return Err(SessionStoreError::NotFound(session_id.to_string()));
@@ -1001,7 +1385,7 @@ impl SessionStore {
     fn write_session_meta(&self, session: &Session) -> Result<(), SessionStoreError> {
         self.ensure_base_dir()?;
 
-        let meta_path = self.session_meta_path(&session.id);
+        let meta_path = self.session_meta_path(&session.id)?;
         let temp_path = meta_path.with_extension("json.tmp");
 
         // Write to temp file first
@@ -1830,5 +2214,430 @@ mod tests {
         f.created_before = Some(now_millis() + 1000);
         let result = store.list_sessions(f).unwrap();
         assert_eq!(result.len(), 1);
+    }
+
+    // ============== Archive Tests ==============
+
+    #[test]
+    fn test_archive_session() {
+        let (store, _temp) = create_test_store();
+
+        let session = store
+            .create_session(
+                "agent-1",
+                SessionMetadata {
+                    name: Some("Archive Test".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        // Add some messages
+        for i in 0..5 {
+            store
+                .append_message(ChatMessage::user(&session.id, format!("Message {}", i)))
+                .unwrap();
+        }
+
+        // Archive the session
+        let result = store.archive_session(&session.id, false).unwrap();
+
+        assert_eq!(result.session_id, session.id);
+        assert_eq!(result.message_count, 5);
+        assert!(result.archive_size > 0);
+        assert!(!result.history_deleted);
+
+        // Verify session status changed
+        let archived = store.get_session(&session.id).unwrap();
+        assert_eq!(archived.status, SessionStatus::Archived);
+
+        // Verify archive file exists
+        let archive_path = store.archive_path(&session.id).unwrap();
+        assert!(archive_path.exists());
+    }
+
+    #[test]
+    fn test_archive_session_with_history_deletion() {
+        let (store, _temp) = create_test_store();
+
+        let session = store
+            .create_session("agent-1", SessionMetadata::default())
+            .unwrap();
+
+        store
+            .append_message(ChatMessage::user(&session.id, "Hello"))
+            .unwrap();
+
+        // Archive with history deletion
+        let result = store.archive_session(&session.id, true).unwrap();
+        assert!(result.history_deleted);
+
+        // Verify history file is deleted
+        let history_path = store.session_history_path(&session.id).unwrap();
+        assert!(!history_path.exists());
+    }
+
+    #[test]
+    fn test_archive_already_archived() {
+        let (store, _temp) = create_test_store();
+
+        let session = store
+            .create_session("agent-1", SessionMetadata::default())
+            .unwrap();
+
+        store
+            .append_message(ChatMessage::user(&session.id, "Hello"))
+            .unwrap();
+
+        // Archive first time
+        store.archive_session(&session.id, false).unwrap();
+
+        // Try to archive again
+        let result = store.archive_session(&session.id, false);
+        assert!(matches!(result, Err(SessionStoreError::AlreadyArchived(_))));
+    }
+
+    #[test]
+    fn test_append_message_rejected_for_archived_session() {
+        let (store, _temp) = create_test_store();
+
+        let session = store
+            .create_session("agent-1", SessionMetadata::default())
+            .unwrap();
+
+        store
+            .append_message(ChatMessage::user(&session.id, "Before archive"))
+            .unwrap();
+
+        // Archive the session
+        store.archive_session(&session.id, false).unwrap();
+
+        // Attempting to append to an archived session must fail
+        let result = store.append_message(ChatMessage::user(&session.id, "After archive"));
+        assert!(
+            matches!(result, Err(SessionStoreError::AlreadyArchived(_))),
+            "append_message should reject writes to archived sessions"
+        );
+
+        // Verify history was not modified (still just the one pre-archive message)
+        let history = store.get_history(&session.id, None, None).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].content, "Before archive");
+    }
+
+    #[test]
+    fn test_restore_session() {
+        let (store, _temp) = create_test_store();
+
+        let session = store
+            .create_session("agent-1", SessionMetadata::default())
+            .unwrap();
+
+        // Add messages
+        store
+            .append_message(ChatMessage::user(&session.id, "Hello"))
+            .unwrap();
+        store
+            .append_message(ChatMessage::assistant(&session.id, "Hi there!"))
+            .unwrap();
+
+        // Archive with history deletion
+        store.archive_session(&session.id, true).unwrap();
+
+        // Verify history is gone
+        let history_before = store.get_history(&session.id, None, None).unwrap();
+        assert!(history_before.is_empty());
+
+        // Restore
+        let result = store.restore_session(&session.id).unwrap();
+        assert_eq!(result.session_id, session.id);
+        assert_eq!(result.message_count, 2);
+
+        // Verify session status is active again
+        let restored = store.get_session(&session.id).unwrap();
+        assert_eq!(restored.status, SessionStatus::Active);
+
+        // Verify history is restored
+        let history_after = store.get_history(&session.id, None, None).unwrap();
+        assert_eq!(history_after.len(), 2);
+        assert_eq!(history_after[0].content, "Hello");
+        assert_eq!(history_after[1].content, "Hi there!");
+    }
+
+    #[test]
+    fn test_restore_not_archived() {
+        let (store, _temp) = create_test_store();
+
+        let session = store
+            .create_session("agent-1", SessionMetadata::default())
+            .unwrap();
+
+        // Try to restore non-archived session
+        let result = store.restore_session(&session.id);
+        assert!(matches!(result, Err(SessionStoreError::NotArchived(_))));
+    }
+
+    #[test]
+    fn test_list_archived_sessions() {
+        let (store, _temp) = create_test_store();
+
+        // Create and archive some sessions
+        let session1 = store
+            .create_session("agent-1", SessionMetadata::default())
+            .unwrap();
+        let session2 = store
+            .create_session(
+                "agent-1",
+                SessionMetadata {
+                    channel: Some("discord".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let _session3 = store
+            .create_session(
+                "agent-1",
+                SessionMetadata {
+                    channel: Some("telegram".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        store.archive_session(&session1.id, false).unwrap();
+        store.archive_session(&session2.id, false).unwrap();
+        // session3 not archived
+
+        let archived = store.list_archived_sessions().unwrap();
+        assert_eq!(archived.len(), 2);
+    }
+
+    #[test]
+    fn test_delete_archive() {
+        let (store, _temp) = create_test_store();
+
+        let session = store
+            .create_session("agent-1", SessionMetadata::default())
+            .unwrap();
+
+        store
+            .append_message(ChatMessage::user(&session.id, "Hello"))
+            .unwrap();
+
+        store.archive_session(&session.id, false).unwrap();
+
+        // Verify archive exists
+        let archive_path = store.archive_path(&session.id).unwrap();
+        assert!(archive_path.exists());
+
+        // Delete archive
+        let deleted = store.delete_archive(&session.id).unwrap();
+        assert!(deleted);
+
+        // Verify archive is gone
+        assert!(!archive_path.exists());
+
+        // Delete again returns false
+        let deleted_again = store.delete_archive(&session.id).unwrap();
+        assert!(!deleted_again);
+    }
+
+    #[test]
+    fn test_get_archive_info() {
+        let (store, _temp) = create_test_store();
+
+        let session = store
+            .create_session("agent-1", SessionMetadata::default())
+            .unwrap();
+
+        store
+            .append_message(ChatMessage::user(&session.id, "Hello"))
+            .unwrap();
+
+        // No archive yet
+        let info = store.get_archive_info(&session.id).unwrap();
+        assert!(info.is_none());
+
+        // Archive
+        store.archive_session(&session.id, false).unwrap();
+
+        // Get archive info
+        let info = store.get_archive_info(&session.id).unwrap();
+        assert!(info.is_some());
+        let (path, size, archived_at) = info.unwrap();
+        assert!(path.exists());
+        assert!(size > 0);
+        assert!(archived_at > 0);
+    }
+
+    #[test]
+    fn test_archive_result_serialization() {
+        let result = ArchiveResult {
+            session_id: "session-1".to_string(),
+            archive_path: "/path/to/archive.json".to_string(),
+            message_count: 42,
+            archive_size: 12345,
+            archived_at: 1234567890,
+            history_deleted: false,
+        };
+
+        let json = serde_json::to_string(&result).unwrap();
+        let parsed: ArchiveResult = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.session_id, "session-1");
+        assert_eq!(parsed.message_count, 42);
+        assert_eq!(parsed.archive_size, 12345);
+    }
+
+    #[test]
+    fn test_archived_session_serialization() {
+        let session = Session::new("agent-1", SessionMetadata::default());
+        let messages = vec![
+            ChatMessage::user(&session.id, "Hello"),
+            ChatMessage::assistant(&session.id, "Hi!"),
+        ];
+
+        let archived = ArchivedSession {
+            session: session.clone(),
+            messages,
+            archived_at: 1234567890,
+            version: 1,
+        };
+
+        let json = serde_json::to_string(&archived).unwrap();
+        let parsed: ArchivedSession = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.session.id, session.id);
+        assert_eq!(parsed.messages.len(), 2);
+        assert_eq!(parsed.archived_at, 1234567890);
+        assert_eq!(parsed.version, 1);
+    }
+
+    #[test]
+    fn test_archive_empty_session() {
+        let (store, _temp) = create_test_store();
+
+        let session = store
+            .create_session("agent-1", SessionMetadata::default())
+            .unwrap();
+
+        // Archive with no messages
+        let result = store.archive_session(&session.id, false).unwrap();
+        assert_eq!(result.message_count, 0);
+
+        // Restore should work
+        let restored = store.restore_session(&session.id).unwrap();
+        assert_eq!(restored.message_count, 0);
+    }
+
+    #[test]
+    fn test_archive_inactive_sessions() {
+        let (store, _temp) = create_test_store();
+
+        // Create sessions (all will be "recent" since created now)
+        let _s1 = store
+            .create_session("agent-1", SessionMetadata::default())
+            .unwrap();
+        let _s2 = store
+            .create_session(
+                "agent-1",
+                SessionMetadata {
+                    channel: Some("ch2".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        // Try to archive sessions older than 30 days (none should match)
+        let results = store.archive_inactive_sessions(30, false).unwrap();
+        assert!(results.is_empty());
+    }
+
+    // ==================== Path Traversal Security Tests ====================
+
+    #[test]
+    fn test_validate_session_id_rejects_path_traversal() {
+        // Path traversal with ..
+        assert!(SessionStore::validate_session_id("../etc/passwd").is_err());
+        assert!(SessionStore::validate_session_id("foo/../bar").is_err());
+        assert!(SessionStore::validate_session_id("..").is_err());
+
+        // Path traversal with slashes
+        assert!(SessionStore::validate_session_id("/etc/passwd").is_err());
+        assert!(SessionStore::validate_session_id("foo/bar").is_err());
+        assert!(SessionStore::validate_session_id("foo\\bar").is_err());
+
+        // Empty ID
+        assert!(SessionStore::validate_session_id("").is_err());
+
+        // Invalid characters
+        assert!(SessionStore::validate_session_id("foo bar").is_err());
+        assert!(SessionStore::validate_session_id("foo@bar").is_err());
+        assert!(SessionStore::validate_session_id("foo:bar").is_err());
+    }
+
+    #[test]
+    fn test_validate_session_id_accepts_valid_ids() {
+        // UUIDs
+        assert!(SessionStore::validate_session_id("550e8400-e29b-41d4-a716-446655440000").is_ok());
+
+        // Alphanumeric slugs
+        assert!(SessionStore::validate_session_id("my-session-123").is_ok());
+        assert!(SessionStore::validate_session_id("session_with_underscores").is_ok());
+        assert!(SessionStore::validate_session_id("ABC123").is_ok());
+    }
+
+    #[test]
+    fn test_get_session_rejects_path_traversal() {
+        let (store, _temp) = create_test_store();
+
+        // Create a valid session first
+        let session = store
+            .create_session("agent-1", SessionMetadata::default())
+            .unwrap();
+        assert!(store.get_session(&session.id).is_ok());
+
+        // Path traversal attempts should fail with InvalidSessionKey error
+        let result = store.get_session("../malicious");
+        assert!(matches!(
+            result,
+            Err(SessionStoreError::InvalidSessionKey(_))
+        ));
+
+        let result = store.get_session("foo/../bar");
+        assert!(matches!(
+            result,
+            Err(SessionStoreError::InvalidSessionKey(_))
+        ));
+
+        let result = store.get_session("/etc/passwd");
+        assert!(matches!(
+            result,
+            Err(SessionStoreError::InvalidSessionKey(_))
+        ));
+    }
+
+    #[test]
+    fn test_delete_session_rejects_path_traversal() {
+        let (store, _temp) = create_test_store();
+
+        // Path traversal attempts should fail
+        let result = store.delete_session("../malicious");
+        assert!(matches!(
+            result,
+            Err(SessionStoreError::InvalidSessionKey(_))
+        ));
+    }
+
+    #[test]
+    fn test_get_history_rejects_path_traversal() {
+        let (store, _temp) = create_test_store();
+
+        // Path traversal attempts should fail
+        let result = store.get_history("../malicious", None, None);
+        assert!(matches!(
+            result,
+            Err(SessionStoreError::InvalidSessionKey(_))
+        ));
     }
 }

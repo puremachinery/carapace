@@ -7,8 +7,8 @@
 mod store;
 
 pub use store::{
-    ChatMessage, CompactionMetadata, MessageRole, Session, SessionFilter, SessionMetadata,
-    SessionStatus, SessionStore, SessionStoreError,
+    ArchiveResult, ArchivedSession, ChatMessage, CompactionMetadata, MessageRole, RestoreResult,
+    Session, SessionFilter, SessionMetadata, SessionStatus, SessionStore, SessionStoreError,
 };
 
 /// Create a new session store with default settings
