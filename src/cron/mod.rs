@@ -8,6 +8,9 @@
 //! Jobs can execute either in the main session or in isolated sessions,
 //! and can deliver messages to various channels.
 
+pub mod executor;
+pub mod tick;
+
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -319,7 +322,7 @@ impl Default for CronStoreFile {
 pub struct CronScheduler {
     enabled: bool,
     store_path: PathBuf,
-    jobs: RwLock<Vec<CronJob>>,
+    pub(crate) jobs: RwLock<Vec<CronJob>>,
     run_log: RwLock<Vec<CronRunLogEntry>>,
     event_tx: Option<mpsc::UnboundedSender<CronEvent>>,
 }
@@ -570,73 +573,38 @@ impl CronScheduler {
                 ok: true,
                 ran: false,
                 reason: Some(CronRunReason::NotDue),
+                payload: None,
+                job_id: id.to_string(),
             });
         }
 
         // Mark as running
         job.state.running_at_ms = Some(now);
 
+        // Compute next run time so scheduler won't re-fire
+        job.state.next_run_at_ms = compute_next_run(&job.schedule, now);
+
+        // Clone payload before dropping the lock
+        let payload = job.payload.clone();
+        let job_id = id.to_string();
+
         self.emit_event(CronEvent {
-            job_id: id.to_string(),
+            job_id: job_id.clone(),
             action: CronEventAction::Started,
             next_run_at_ms: job.state.next_run_at_ms,
             details: None,
         });
 
-        // Simulate job execution (actual execution would be async)
-        let run_at_ms = now;
-        let duration_ms = 0; // Would be actual duration in real implementation
-
-        // Update job state after run
-        job.state.last_run_at_ms = Some(run_at_ms);
-        job.state.last_duration_ms = Some(duration_ms);
-        job.state.last_status = Some(CronJobStatus::Ok);
-        job.state.running_at_ms = None;
-
-        // Compute next run time
-        job.state.next_run_at_ms = compute_next_run(&job.schedule, now);
-
-        // Record run log
-        let log_entry = CronRunLogEntry {
-            ts: now,
-            job_id: id.to_string(),
-            action: "finished".to_string(),
-            status: Some(CronJobStatus::Ok),
-            error: None,
-            summary: None,
-            run_at_ms: Some(run_at_ms),
-            duration_ms: Some(duration_ms),
-            next_run_at_ms: job.state.next_run_at_ms,
-        };
-
-        let job_id = id.to_string();
-        let next_run = job.state.next_run_at_ms;
         drop(jobs);
 
-        {
-            let mut run_log = self.run_log.write();
-            run_log.push(log_entry);
-            // Keep only last 1000 entries
-            if run_log.len() > 1000 {
-                let drain_count = run_log.len() - 1000;
-                run_log.drain(0..drain_count);
-            }
-        }
-
-        self.emit_event(CronEvent {
-            job_id,
-            action: CronEventAction::Finished,
-            next_run_at_ms: next_run,
-            details: Some(serde_json::json!({
-                "status": "ok",
-                "durationMs": duration_ms
-            })),
-        });
-
+        // Actual execution is handled by the caller (cron executor / tick loop).
+        // This method returns the payload for async execution.
         Ok(CronRunResult {
             ok: true,
             ran: true,
             reason: None,
+            payload: Some(payload),
+            job_id,
         })
     }
 
@@ -663,6 +631,89 @@ impl CronScheduler {
     pub fn get(&self, id: &str) -> Option<CronJob> {
         let jobs = self.jobs.read();
         jobs.iter().find(|j| j.id == id).cloned()
+    }
+
+    /// Get IDs of jobs that are due to run now.
+    ///
+    /// Returns job IDs that are enabled, not currently running, and past their next_run_at_ms.
+    pub fn get_due_job_ids(&self) -> Vec<String> {
+        let now = now_ms();
+        let jobs = self.jobs.read();
+        jobs.iter()
+            .filter(|j| {
+                j.enabled
+                    && j.state.running_at_ms.is_none()
+                    && j.state.next_run_at_ms.is_some_and(|next| now >= next)
+            })
+            .map(|j| j.id.clone())
+            .collect()
+    }
+
+    /// Mark a job run as finished, updating state and recording a log entry.
+    ///
+    /// Called by the cron executor after payload execution completes.
+    pub fn mark_run_finished(
+        &self,
+        job_id: &str,
+        status: CronJobStatus,
+        duration_ms: u64,
+        error: Option<String>,
+    ) -> Result<(), CronError> {
+        let now = now_ms();
+        let mut jobs = self.jobs.write();
+        let job = jobs
+            .iter_mut()
+            .find(|j| j.id == job_id)
+            .ok_or_else(|| CronError::JobNotFound(job_id.to_string()))?;
+
+        job.state.running_at_ms = None;
+        job.state.last_run_at_ms = Some(now);
+        job.state.last_duration_ms = Some(duration_ms);
+        job.state.last_status = Some(status);
+        job.state.last_error = error.clone();
+
+        let should_delete = job.delete_after_run == Some(true);
+        let next_run = job.state.next_run_at_ms;
+        let job_id_owned = job_id.to_string();
+        drop(jobs);
+
+        // Record run log
+        let log_entry = CronRunLogEntry {
+            ts: now,
+            job_id: job_id_owned.clone(),
+            action: "finished".to_string(),
+            status: Some(status),
+            error,
+            summary: None,
+            run_at_ms: Some(now),
+            duration_ms: Some(duration_ms),
+            next_run_at_ms: next_run,
+        };
+
+        {
+            let mut run_log = self.run_log.write();
+            run_log.push(log_entry);
+            if run_log.len() > 1000 {
+                let drain_count = run_log.len() - 1000;
+                run_log.drain(0..drain_count);
+            }
+        }
+
+        self.emit_event(CronEvent {
+            job_id: job_id_owned.clone(),
+            action: CronEventAction::Finished,
+            next_run_at_ms: next_run,
+            details: Some(serde_json::json!({
+                "status": format!("{:?}", status),
+                "durationMs": duration_ms
+            })),
+        });
+
+        if should_delete {
+            self.remove(&job_id_owned);
+        }
+
+        Ok(())
     }
 
     fn emit_event(&self, event: CronEvent) {
@@ -724,6 +775,12 @@ pub struct CronRunResult {
     pub ran: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<CronRunReason>,
+    /// The job payload (present when the job ran)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload: Option<CronPayload>,
+    /// The job ID
+    #[serde(rename = "jobId")]
+    pub job_id: String,
 }
 
 /// Errors that can occur in the cron scheduler.
@@ -778,7 +835,7 @@ fn compute_next_run(schedule: &CronSchedule, now: u64) -> Option<u64> {
     }
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_else(|_| Duration::from_secs(0))
@@ -995,8 +1052,16 @@ mod tests {
         let result = scheduler.run(&job.id, Some(CronRunMode::Force)).unwrap();
         assert!(result.ok);
         assert!(result.ran);
+        assert!(result.payload.is_some());
+        assert_eq!(result.job_id, job.id);
 
-        // Check run was logged
+        // Run no longer records log entry — that's done by mark_run_finished.
+        // Simulate the executor finishing:
+        scheduler
+            .mark_run_finished(&job.id, CronJobStatus::Ok, 0, None)
+            .unwrap();
+
+        // Check run was logged by mark_run_finished
         let runs = scheduler.runs(Some(&job.id), None);
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].job_id, job.id);
@@ -1176,5 +1241,194 @@ mod tests {
             anchor_ms: None,
         };
         assert_eq!(compute_next_run(&schedule, 1000), None);
+    }
+
+    #[test]
+    fn test_get_due_job_ids_filters_correctly() {
+        let scheduler = CronScheduler::in_memory();
+
+        // Enabled, due, not running → should be included
+        // Use Every schedule with anchor in the past so next_run_at_ms is in the past
+        let due_job = scheduler
+            .add(CronJobCreate {
+                name: "Due Job".to_string(),
+                agent_id: None,
+                description: None,
+                enabled: true,
+                delete_after_run: None,
+                schedule: CronSchedule::Every {
+                    every_ms: 1_000_000_000, // large interval
+                    anchor_ms: Some(1),      // anchor far in past → next_run = anchor + k*every
+                },
+                session_target: CronSessionTarget::Main,
+                wake_mode: CronWakeMode::Now,
+                payload: CronPayload::SystemEvent {
+                    text: "due".to_string(),
+                },
+                isolation: None,
+            })
+            .unwrap();
+
+        // Manually set next_run_at_ms to a past time so it's due
+        {
+            let mut jobs = scheduler.jobs.write();
+            let job = jobs.iter_mut().find(|j| j.id == due_job.id).unwrap();
+            job.state.next_run_at_ms = Some(1); // epoch + 1ms, definitely past
+        }
+
+        // Disabled → should be excluded
+        let _disabled_job = scheduler
+            .add(CronJobCreate {
+                name: "Disabled Job".to_string(),
+                agent_id: None,
+                description: None,
+                enabled: false,
+                delete_after_run: None,
+                schedule: CronSchedule::Every {
+                    every_ms: 60000,
+                    anchor_ms: None,
+                },
+                session_target: CronSessionTarget::Main,
+                wake_mode: CronWakeMode::Now,
+                payload: CronPayload::SystemEvent {
+                    text: "disabled".to_string(),
+                },
+                isolation: None,
+            })
+            .unwrap();
+
+        // Not due (future) → should be excluded
+        let _future_job = scheduler
+            .add(CronJobCreate {
+                name: "Future Job".to_string(),
+                agent_id: None,
+                description: None,
+                enabled: true,
+                delete_after_run: None,
+                schedule: CronSchedule::At {
+                    at_ms: now_ms() + 1_000_000,
+                },
+                session_target: CronSessionTarget::Main,
+                wake_mode: CronWakeMode::Now,
+                payload: CronPayload::SystemEvent {
+                    text: "future".to_string(),
+                },
+                isolation: None,
+            })
+            .unwrap();
+
+        let due_ids = scheduler.get_due_job_ids();
+        assert_eq!(due_ids.len(), 1);
+        assert_eq!(due_ids[0], due_job.id);
+    }
+
+    #[test]
+    fn test_run_returns_payload() {
+        let scheduler = CronScheduler::in_memory();
+
+        let job = scheduler
+            .add(CronJobCreate {
+                name: "Payload Job".to_string(),
+                agent_id: None,
+                description: None,
+                enabled: true,
+                delete_after_run: None,
+                schedule: CronSchedule::At { at_ms: 0 },
+                session_target: CronSessionTarget::Main,
+                wake_mode: CronWakeMode::Now,
+                payload: CronPayload::SystemEvent {
+                    text: "payload test".to_string(),
+                },
+                isolation: None,
+            })
+            .unwrap();
+
+        let result = scheduler.run(&job.id, Some(CronRunMode::Force)).unwrap();
+        assert!(result.ok);
+        assert!(result.ran);
+        assert!(result.payload.is_some());
+
+        match result.payload.unwrap() {
+            CronPayload::SystemEvent { text } => assert_eq!(text, "payload test"),
+            _ => panic!("expected SystemEvent payload"),
+        }
+    }
+
+    #[test]
+    fn test_mark_run_finished_updates_state() {
+        let scheduler = CronScheduler::in_memory();
+
+        let job = scheduler
+            .add(CronJobCreate {
+                name: "Finish Test".to_string(),
+                agent_id: None,
+                description: None,
+                enabled: true,
+                delete_after_run: None,
+                schedule: CronSchedule::At { at_ms: 0 },
+                session_target: CronSessionTarget::Main,
+                wake_mode: CronWakeMode::Now,
+                payload: CronPayload::SystemEvent {
+                    text: "test".to_string(),
+                },
+                isolation: None,
+            })
+            .unwrap();
+
+        // Start the run
+        let result = scheduler.run(&job.id, Some(CronRunMode::Force)).unwrap();
+        assert!(result.ran);
+
+        // Mark as finished
+        scheduler
+            .mark_run_finished(&job.id, CronJobStatus::Ok, 42, None)
+            .unwrap();
+
+        // Verify state was updated
+        let updated = scheduler.get(&job.id).unwrap();
+        assert!(updated.state.running_at_ms.is_none());
+        assert!(updated.state.last_run_at_ms.is_some());
+        assert_eq!(updated.state.last_duration_ms, Some(42));
+        assert_eq!(updated.state.last_status, Some(CronJobStatus::Ok));
+        assert!(updated.state.last_error.is_none());
+
+        // Verify log entry was recorded
+        let runs = scheduler.runs(Some(&job.id), None);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].action, "finished");
+        assert_eq!(runs[0].duration_ms, Some(42));
+    }
+
+    #[test]
+    fn test_mark_run_finished_deletes_oneshot() {
+        let scheduler = CronScheduler::in_memory();
+
+        let job = scheduler
+            .add(CronJobCreate {
+                name: "Oneshot Job".to_string(),
+                agent_id: None,
+                description: None,
+                enabled: true,
+                delete_after_run: Some(true),
+                schedule: CronSchedule::At { at_ms: 0 },
+                session_target: CronSessionTarget::Main,
+                wake_mode: CronWakeMode::Now,
+                payload: CronPayload::SystemEvent {
+                    text: "oneshot".to_string(),
+                },
+                isolation: None,
+            })
+            .unwrap();
+
+        // Start and finish the run
+        let result = scheduler.run(&job.id, Some(CronRunMode::Force)).unwrap();
+        assert!(result.ran);
+
+        scheduler
+            .mark_run_finished(&job.id, CronJobStatus::Ok, 10, None)
+            .unwrap();
+
+        // Job should have been removed
+        assert!(scheduler.get(&job.id).is_none());
     }
 }

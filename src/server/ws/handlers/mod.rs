@@ -596,7 +596,7 @@ pub(super) async fn dispatch_method(
         "cron.add" => handle_cron_add(state, params),
         "cron.update" => handle_cron_update(state, params),
         "cron.remove" => handle_cron_remove(state, params),
-        "cron.run" => handle_cron_run(state, params),
+        "cron.run" => handle_cron_run(state.clone(), params),
         "cron.runs" => handle_cron_runs(state, params),
 
         // Node pairing

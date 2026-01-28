@@ -273,7 +273,7 @@ pub(super) fn handle_cron_remove(
 
 /// Manually run a cron job.
 pub(super) fn handle_cron_run(
-    state: &WsServerState,
+    state: Arc<WsServerState>,
     params: Option<&Value>,
 ) -> Result<Value, ErrorShape> {
     let job_id = params
@@ -326,7 +326,7 @@ pub(super) fn handle_cron_run(
     if result.ran {
         // Broadcast cron.started event
         broadcast_cron_event(
-            state,
+            &state,
             job_id,
             "started",
             None,
@@ -337,18 +337,51 @@ pub(super) fn handle_cron_run(
             })),
         );
 
-        // Broadcast cron.completed event
-        broadcast_cron_event(
-            state,
-            job_id,
-            "completed",
-            None,
-            Some(json!({
-                "jobId": job_id,
-                "name": job.as_ref().map(|j| j.name.as_str()),
-                "status": "ok"
-            })),
-        );
+        // Spawn async payload execution if there's a payload
+        if let Some(payload) = result.payload.clone() {
+            let state_clone = state.clone();
+            let job_id_owned = job_id.to_string();
+            let job_name = job.as_ref().map(|j| j.name.clone());
+            tokio::spawn(async move {
+                let start = std::time::Instant::now();
+                let outcome =
+                    crate::cron::executor::execute_payload(&job_id_owned, &payload, &state_clone)
+                        .await;
+                let duration_ms = start.elapsed().as_millis() as u64;
+
+                let (status, error) = match outcome {
+                    Ok(_) => (CronJobStatus::Ok, None),
+                    Err(e) => (CronJobStatus::Error, Some(e)),
+                };
+
+                if let Err(e) = state_clone.cron_scheduler.mark_run_finished(
+                    &job_id_owned,
+                    status,
+                    duration_ms,
+                    error,
+                ) {
+                    tracing::warn!(
+                        job_id = %job_id_owned,
+                        error = %e,
+                        "failed to mark cron run finished"
+                    );
+                }
+
+                // Broadcast cron.completed event
+                broadcast_cron_event(
+                    &state_clone,
+                    &job_id_owned,
+                    "completed",
+                    None,
+                    Some(json!({
+                        "jobId": &job_id_owned,
+                        "name": job_name,
+                        "status": format!("{:?}", status),
+                        "durationMs": duration_ms
+                    })),
+                );
+            });
+        }
     }
 
     Ok(json!({

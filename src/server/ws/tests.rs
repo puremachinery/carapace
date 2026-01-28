@@ -1663,6 +1663,13 @@ fn test_cron_scheduler_integration() {
         .unwrap();
     assert!(result.ok);
     assert!(result.ran);
+    assert!(result.payload.is_some());
+
+    // Run no longer records log entry — mark_run_finished does.
+    state
+        .cron_scheduler
+        .mark_run_finished(&job.id, crate::cron::CronJobStatus::Ok, 0, None)
+        .unwrap();
 
     // Check runs
     let runs = state.cron_scheduler.runs(Some(&job.id), None);
