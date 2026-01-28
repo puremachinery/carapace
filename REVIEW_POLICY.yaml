@@ -1,0 +1,345 @@
+# REVIEW_POLICY.yaml
+# Drop this file in your repo root to guide AI agents on targeted code reviews.
+# Instead of "review this", agents should perform each enabled review type separately.
+
+version: "1.0"
+
+# Global defaults (can be overridden per review type)
+defaults:
+  enabled: true
+  frequency: "every_pr"  # every_pr | daily | weekly | monthly | quarterly | manual
+  severity: "medium"     # low | medium | high | critical
+
+review_types:
+
+  # ============================================================================
+  # CORRECTNESS / LOGIC
+  # ============================================================================
+  correctness:
+    logic:
+      description: "Does the code do what it claims? Are algorithms implemented correctly?"
+      enabled: true
+      frequency: "every_pr"
+      severity: "critical"
+
+    edge_cases:
+      description: "Boundary conditions, empty/null inputs, overflow, off-by-one errors"
+      enabled: true
+      frequency: "every_pr"
+      severity: "high"
+
+    error_handling:
+      description: "Failure modes, exception paths, error propagation, recovery logic"
+      enabled: true
+      frequency: "every_pr"
+      severity: "high"
+
+    concurrency:
+      description: "Race conditions, deadlocks, atomicity, thread safety"
+      enabled: true
+      frequency: "every_pr"
+      severity: "critical"
+      # Skip if project is single-threaded/synchronous
+      skip_if:
+        - "no_concurrency"
+        - "single_threaded"
+
+  # ============================================================================
+  # SECURITY
+  # ============================================================================
+  security:
+    input_validation:
+      description: "Injection attacks, sanitization, encoding, untrusted input handling"
+      enabled: true
+      frequency: "every_pr"
+      severity: "critical"
+
+    authn_authz:
+      description: "Authentication, authorization, access control, privilege escalation"
+      enabled: true
+      frequency: "every_pr"
+      severity: "critical"
+      skip_if:
+        - "no_auth"
+        - "internal_tool"
+
+    secrets:
+      description: "Hardcoded credentials, API keys, key management, .env handling"
+      enabled: true
+      frequency: "every_pr"
+      severity: "critical"
+
+    dependencies:
+      description: "CVEs in dependencies, supply chain risks, outdated packages"
+      enabled: true
+      frequency: "weekly"
+      severity: "high"
+
+  # ============================================================================
+  # ARCHITECTURE / DESIGN
+  # ============================================================================
+  architecture:
+    api_design:
+      description: "API contracts, versioning, backwards compatibility, REST/GraphQL conventions"
+      enabled: true
+      frequency: "every_pr"
+      severity: "medium"
+      only_if:
+        - "has_api"
+        - "api_changes"
+
+    abstractions:
+      description: "Coupling, cohesion, separation of concerns, DRY violations, layering"
+      enabled: true
+      frequency: "every_pr"
+      severity: "medium"
+
+    scalability:
+      description: "Bottlenecks, resource growth patterns, horizontal vs vertical scaling"
+      enabled: true
+      frequency: "monthly"
+      severity: "medium"
+      skip_if:
+        - "prototype"
+        - "small_scale"
+
+    data_model:
+      description: "Schema design, migrations, consistency, normalization, indexing"
+      enabled: true
+      frequency: "every_pr"
+      severity: "high"
+      only_if:
+        - "schema_changes"
+        - "has_database"
+
+  # ============================================================================
+  # QUALITY / MAINTAINABILITY
+  # ============================================================================
+  quality:
+    readability:
+      description: "Naming, comments, complexity (cyclomatic, cognitive), code organization"
+      enabled: true
+      frequency: "every_pr"
+      severity: "medium"
+
+    test_coverage:
+      description: "Unit tests, integration tests, property-based tests, test quality"
+      enabled: true
+      frequency: "every_pr"
+      severity: "high"
+
+    documentation:
+      description: "README, docstrings, inline comments, ADRs, API docs"
+      enabled: true
+      frequency: "weekly"
+      severity: "low"
+
+    style:
+      description: "Formatting, linting, language conventions, consistency"
+      enabled: false  # Usually handled by automated tooling
+      frequency: "every_pr"
+      severity: "low"
+      note: "Prefer automated linters (prettier, scalafmt, black, etc.)"
+
+  # ============================================================================
+  # PERFORMANCE
+  # ============================================================================
+  performance:
+    algorithmic:
+      description: "Big-O complexity, hot paths, unnecessary computation"
+      enabled: true
+      frequency: "every_pr"
+      severity: "medium"
+
+    memory:
+      description: "Allocations, leaks, GC pressure, large object handling"
+      enabled: true
+      frequency: "every_pr"
+      severity: "medium"
+
+    io:
+      description: "N+1 queries, batching, caching, connection pooling, network calls"
+      enabled: true
+      frequency: "every_pr"
+      severity: "high"
+
+  # ============================================================================
+  # OPERATIONAL
+  # ============================================================================
+  operational:
+    observability:
+      description: "Logging quality, metrics, tracing, alerting hooks"
+      enabled: true
+      frequency: "weekly"
+      severity: "medium"
+      skip_if:
+        - "prototype"
+        - "local_only"
+
+    configuration:
+      description: "Env vars, feature flags, defaults, config validation"
+      enabled: true
+      frequency: "every_pr"
+      severity: "medium"
+
+    deployment:
+      description: "Rollback safety, migration ordering, blue-green compatibility"
+      enabled: true
+      frequency: "every_pr"
+      severity: "high"
+      skip_if:
+        - "library"
+        - "no_deploy"
+
+    failure_modes:
+      description: "Graceful degradation, circuit breakers, retry logic, timeouts"
+      enabled: true
+      frequency: "monthly"
+      severity: "high"
+
+  # ============================================================================
+  # COMPLIANCE / PROCESS
+  # ============================================================================
+  compliance:
+    licenses:
+      description: "Dependency licenses, compatibility, attribution requirements"
+      enabled: true
+      frequency: "quarterly"
+      severity: "medium"
+      skip_if:
+        - "internal_only"
+        - "prototype"
+
+    regulatory:
+      description: "GDPR, PCI, SOC2, HIPAA implications"
+      enabled: true  # Enabled: handles_pii flag is set
+      frequency: "quarterly"
+      severity: "critical"
+      only_if:
+        - "handles_pii"
+        - "handles_payments"
+        - "healthcare"
+
+    breaking_changes:
+      description: "Semver compliance, deprecation policy, changelog updates"
+      enabled: true
+      frequency: "every_pr"
+      severity: "medium"
+      only_if:
+        - "library"
+        - "public_api"
+
+# ============================================================================
+# PROJECT FLAGS
+# Set these to control which reviews are skipped via skip_if / only_if
+# ============================================================================
+project_flags:
+  - "has_api"
+  - "has_database"
+  - "public_api"
+  - "handles_pii"
+  # Uncomment flags that apply to this project:
+  # - "prototype"
+  # - "small_scale"
+  # - "internal_only"
+  # - "no_auth"
+  # - "no_concurrency"
+  # - "single_threaded"
+  # - "library"
+  # - "handles_payments"
+  # - "healthcare"
+  # - "local_only"
+  # - "no_deploy"
+
+# ============================================================================
+# POSTPONEMENTS
+# Temporarily skip specific reviews until a date
+# ============================================================================
+postponements:
+  # Example:
+  # - review: "operational.observability"
+  #   until: "2025-03-01"
+  #   reason: "Deferring until post-MVP launch"
+  []
+
+# ============================================================================
+# STATE TRACKING & HISTORY
+# ============================================================================
+state_file: ".review_state.yaml"      # Gitignored, tracks last run per review type
+history_dir: ".review_history/"       # Gitignored, stores full review outputs
+
+history_retention:
+  max_per_type: 5                     # Keep N most recent reviews per type
+  max_age_days: 90                    # Delete reviews older than N days
+  # Both conditions are checked; file deleted if EITHER is exceeded
+
+# ============================================================================
+# AGENT INSTRUCTIONS
+# ============================================================================
+agent_instructions: |
+  When asked to "review" this codebase or a PR:
+
+  1. Parse this REVIEW_POLICY.yaml file first
+  2. Load .review_state.yaml to check last run times and current git ref
+  3. Check project_flags to determine which skip_if/only_if conditions apply
+  4. Check postponements for temporarily disabled reviews
+  5. Determine which reviews are due:
+     - Compare last_run + frequency against current time
+     - Compare last_ref against current HEAD (code changed = re-review)
+     - "every_pr" reviews always run on PR/diff reviews
+  6. For each due review type:
+     - Perform that review as a SEPARATE pass
+     - Report findings grouped by review type
+     - Include severity in findings
+  7. Do NOT combine all reviews into one generic pass
+  8. Prioritize by severity: critical > high > medium > low
+  9. After completing reviews:
+     a. UPDATE .review_state.yaml with:
+        - last_run: current ISO timestamp
+        - last_ref: current git HEAD short SHA
+        - status: pass | warn | fail | skipped
+        - findings_count: number of issues found
+        - critical_count: number of critical/blocking issues
+        - notes: brief summary if useful
+     b. WRITE full output to .review_history/{review_type}/{timestamp}_{short_sha}.md
+     c. PRUNE old history files per history_retention settings
+
+  History file format (.review_history/{category}.{subcategory}/{timestamp}_{sha}.md):
+    ```
+    # {category}.{subcategory} Review
+
+    **Date:** {ISO timestamp}
+    **Git Ref:** {full sha}
+    **Status:** PASS | WARN | FAIL
+    **Findings:** {count} ({critical_count} critical)
+
+    ## Summary
+    {brief summary}
+
+    ## Findings
+    - `file:line` - description
+    - `file:line` - description
+
+    ## Files Reviewed
+    - path/to/file.ext
+    ```
+
+  History pruning (run after each review):
+    1. List files in .review_history/{review_type}/
+    2. Delete files where:
+       - File count > max_per_type (keep newest N)
+       - OR file age > max_age_days
+    3. Sort by timestamp in filename to determine age/order
+
+  Frequency interpretation:
+  - every_pr: Run on any PR review or when code changed since last_ref
+  - daily: Run if last_run > 24 hours ago
+  - weekly: Run if last_run > 7 days ago
+  - monthly: Run if last_run > 30 days ago
+  - quarterly: Run if last_run > 90 days ago
+  - manual: Only run when explicitly requested
+
+  Consulting history:
+  - When reviewing, you may read recent history files to see patterns
+  - Recurring issues across multiple reviews may warrant higher severity
+  - Resolved issues from prior reviews can be noted as fixed

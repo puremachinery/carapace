@@ -3,3 +3,7 @@
 *.swo
 .DS_Store
 TODO.md
+
+# AI Review System
+.review_state.yaml
+.review_history/
