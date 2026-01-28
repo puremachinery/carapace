@@ -9,7 +9,7 @@ license = "MIT"
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.7", features = ["ws"] }
 chrono = { version = "0.4", features = ["serde"] }
-reqwest = { version = "0.11", features = ["rustls-tls", "stream"], default-features = false }
+reqwest = { version = "0.11", features = ["rustls-tls", "stream", "json"], default-features = false }
 hickory-resolver = "0.24"
 url = "2"
 tokio-tungstenite = "0.21"
@@ -34,6 +34,8 @@ base64 = "0.22"
 ed25519-dalek = { version = "2", features = ["std"] }
 futures-util = "0.3"
 async-stream = "0.3"
+async-trait = "0.1"
+bytes = "1"
 getrandom = "0.2"
 hex = "0.4"
 sha2 = "0.10"

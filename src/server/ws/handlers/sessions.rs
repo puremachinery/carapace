@@ -76,8 +76,6 @@ pub struct AgentRun {
     pub started_at: Option<u64>,
     /// When the run completed (Unix ms)
     pub completed_at: Option<u64>,
-    /// Cancellation signal sender
-    cancel_tx: Option<oneshot::Sender<()>>,
     /// Waiters for this run to complete
     waiters: Vec<oneshot::Sender<AgentRunResult>>,
 }
@@ -211,13 +209,9 @@ impl AgentRunRegistry {
     }
 
     /// Mark a run as cancelled
+    // TODO: wire cancellation token into executor
     pub fn mark_cancelled(&mut self, run_id: &str) -> bool {
         if let Some(run) = self.runs.get_mut(run_id) {
-            // Send cancellation signal
-            if let Some(cancel_tx) = run.cancel_tx.take() {
-                let _ = cancel_tx.send(());
-            }
-
             run.status = AgentRunStatus::Cancelled;
             run.completed_at = Some(now_ms());
 
@@ -1366,7 +1360,7 @@ pub(super) fn handle_sessions_archive_delete(
 /// ```
 pub(super) fn handle_agent(
     params: Option<&Value>,
-    state: &WsServerState,
+    state: Arc<WsServerState>,
     _conn: &ConnectionContext,
 ) -> Result<Value, ErrorShape> {
     let message = params
@@ -1417,9 +1411,6 @@ pub(super) fn handle_agent(
             )
         })?;
 
-    // Create cancellation channel for this run
-    let (cancel_tx, _cancel_rx) = oneshot::channel::<()>();
-
     // Create the agent run
     let run = AgentRun {
         run_id: idempotency_key.to_string(),
@@ -1431,7 +1422,6 @@ pub(super) fn handle_agent(
         created_at: now_ms(),
         started_at: None,
         completed_at: None,
-        cancel_tx: Some(cancel_tx),
         waiters: Vec::new(),
     };
 
@@ -1444,20 +1434,40 @@ pub(super) fn handle_agent(
         registry.register(run);
     }
 
-    // Note: In a full implementation, the agent executor would:
-    // 1. Mark run as Running via registry.mark_started()
-    // 2. Call the LLM with streaming
-    // 3. Emit delta events for each chunk
-    // 4. Emit tool events as needed
-    // 5. Append assistant message to history
-    // 6. Mark run as Completed/Failed via registry.mark_completed()/mark_failed()
-    //
-    // For now, the run stays in Queued status until an external executor processes it.
+    // Spawn the agent executor if an LLM provider is configured
+    let status = if let Some(provider) = state.llm_provider().cloned() {
+        let model = params
+            .and_then(|v| v.get("model"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(crate::agent::DEFAULT_MODEL);
+        let config = crate::agent::AgentConfig {
+            model: model.to_string(),
+            system: params
+                .and_then(|v| v.get("system"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            deliver: params
+                .and_then(|v| v.get("deliver"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            ..Default::default()
+        };
+        crate::agent::spawn_run(
+            run_id.clone(),
+            session_key_out.clone(),
+            config,
+            state.clone(),
+            provider,
+        );
+        "accepted"
+    } else {
+        // No provider configured — run stays queued
+        "queued"
+    };
 
-    // Node returns "accepted" status (not "started")
     Ok(json!({
         "runId": run_id,
-        "status": "accepted",
+        "status": status,
         "message": message,
         "sessionKey": session_key_out,
         "streaming": stream
@@ -1660,7 +1670,7 @@ pub(super) fn handle_chat_history(
 /// }
 /// ```
 pub(super) fn handle_chat_send(
-    state: &WsServerState,
+    state: Arc<WsServerState>,
     params: Option<&Value>,
     _conn: &ConnectionContext,
 ) -> Result<Value, ErrorShape> {
@@ -1730,7 +1740,7 @@ pub(super) fn handle_chat_send(
 
     // Emit chat event for the user message
     broadcast_chat_event(
-        state,
+        &state,
         &idempotency_key,
         &session.session_key,
         0, // First event in this run
@@ -1746,9 +1756,6 @@ pub(super) fn handle_chat_send(
 
     // If agent triggering is enabled, queue the agent run
     let (run_id, status) = if trigger_agent {
-        // Create cancellation channel
-        let (cancel_tx, _cancel_rx) = oneshot::channel::<()>();
-
         // Create the agent run
         let run = AgentRun {
             run_id: idempotency_key.to_string(),
@@ -1760,7 +1767,6 @@ pub(super) fn handle_chat_send(
             created_at: now_ms(),
             started_at: None,
             completed_at: None,
-            cancel_tx: Some(cancel_tx),
             waiters: Vec::new(),
         };
 
@@ -1772,15 +1778,27 @@ pub(super) fn handle_chat_send(
             registry.register(run);
         }
 
-        // Note: The agent executor would:
-        // 1. Emit agent.started event
-        // 2. Call LLM with history
-        // 3. Emit agent.delta events for streaming
-        // 4. Emit agent.tool.* events for tools
-        // 5. Append assistant message to history
-        // 6. Emit agent.completed or agent.error event
+        // Spawn the agent executor if an LLM provider is configured
+        let status = if let Some(provider) = state.llm_provider().cloned() {
+            let config = crate::agent::AgentConfig {
+                model: crate::agent::DEFAULT_MODEL.to_string(),
+                deliver: true,
+                ..Default::default()
+            };
+            crate::agent::spawn_run(
+                run_id.clone(),
+                session.session_key.clone(),
+                config,
+                state.clone(),
+                provider,
+            );
+            "accepted"
+        } else {
+            // No provider configured — run stays queued
+            "queued"
+        };
 
-        (Some(run_id), "queued")
+        (Some(run_id), status)
     } else {
         (None, "sent")
     };
@@ -1908,7 +1926,6 @@ mod tests {
     // ============== AgentRunRegistry Tests ==============
 
     fn create_test_run(run_id: &str, session_key: &str) -> AgentRun {
-        let (cancel_tx, _cancel_rx) = oneshot::channel::<()>();
         AgentRun {
             run_id: run_id.to_string(),
             session_key: session_key.to_string(),
@@ -1919,7 +1936,6 @@ mod tests {
             created_at: now_ms(),
             started_at: None,
             completed_at: None,
-            cancel_tx: Some(cancel_tx),
             waiters: Vec::new(),
         }
     }

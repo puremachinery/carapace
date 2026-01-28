@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 #![allow(unused_imports)]
 
+mod agent;
 mod auth;
 mod channels;
 mod config;

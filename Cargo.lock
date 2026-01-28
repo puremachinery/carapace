@@ -510,8 +510,10 @@ name = "carapace"
 version = "0.1.0"
 dependencies = [
  "async-stream",
+ "async-trait",
  "axum",
  "base64 0.22.1",
+ "bytes",
  "chrono",
  "dirs 5.0.1",
  "ed25519-dalek",

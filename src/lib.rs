@@ -6,6 +6,7 @@
 #![allow(dead_code)]
 #![allow(unused_imports)]
 
+pub mod agent;
 pub mod auth;
 pub mod channels;
 pub mod config;

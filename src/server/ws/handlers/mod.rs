@@ -39,8 +39,10 @@ pub(super) use update::*;
 pub(super) use usage::*;
 pub(super) use voicewake::*;
 
-// Re-export AgentRunRegistry for use in WsServerState
+// Re-export types needed outside the handlers module
 pub use sessions::AgentRunRegistry;
+pub use sessions::AgentRunStatus;
+pub use usage::record_usage;
 pub(super) use wizard::*;
 
 pub(super) fn handle_health() -> Value {
@@ -489,7 +491,7 @@ fn check_operator_authorization(
 pub(super) async fn dispatch_method(
     method: &str,
     params: Option<&Value>,
-    state: &WsServerState,
+    state: &Arc<WsServerState>,
     conn: &ConnectionContext,
 ) -> Result<Value, ErrorShape> {
     // Check authorization before dispatching
@@ -524,13 +526,13 @@ pub(super) async fn dispatch_method(
         "channels.logout" => handle_channels_logout(params, state),
 
         // Agent
-        "agent" => handle_agent(params, state, conn),
+        "agent" => handle_agent(params, state.clone(), conn),
         "agent.identity.get" => handle_agent_identity_get(state),
         "agent.wait" => handle_agent_wait(params, state).await,
 
         // Chat
         "chat.history" => handle_chat_history(state, params),
-        "chat.send" => handle_chat_send(state, params, conn),
+        "chat.send" => handle_chat_send(state.clone(), params, conn),
         "chat.abort" => handle_chat_abort(state, params),
 
         // TTS

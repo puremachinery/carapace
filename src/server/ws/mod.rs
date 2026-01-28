@@ -27,13 +27,21 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::{auth, channels, config, credentials, cron, devices, exec, messages, nodes, sessions};
+use crate::{
+    agent, auth, channels, config, credentials, cron, devices, exec, messages, nodes, plugins,
+    sessions,
+};
 
 mod handlers;
 #[cfg(test)]
 mod tests;
 
 pub(super) use handlers::*;
+
+// Re-export types used by the agent module
+pub use handlers::record_usage;
+pub use handlers::AgentRunRegistry;
+pub use handlers::AgentRunStatus;
 
 const PROTOCOL_VERSION: u32 = 3;
 const MAX_PAYLOAD_BYTES: usize = 512 * 1024;
@@ -392,7 +400,6 @@ impl StateVersionTracker {
     }
 }
 
-#[derive(Debug)]
 pub struct WsServerState {
     config: WsServerConfig,
     start_time: Instant,
@@ -418,6 +425,24 @@ pub struct WsServerState {
     pub agent_run_registry: Mutex<handlers::AgentRunRegistry>,
     /// System event history (enqueued via system-event method)
     system_event_history: Mutex<Vec<SystemEvent>>,
+    /// LLM provider for agent execution
+    llm_provider: Option<Arc<dyn agent::LlmProvider>>,
+    /// Tools registry for agent tool dispatch
+    tools_registry: Option<Arc<plugins::ToolsRegistry>>,
+}
+
+impl std::fmt::Debug for WsServerState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WsServerState")
+            .field("config", &self.config)
+            .field("start_time", &self.start_time)
+            .field("llm_provider", &self.llm_provider.as_ref().map(|_| ".."))
+            .field(
+                "tools_registry",
+                &self.tools_registry.as_ref().map(|_| ".."),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl WsServerState {
@@ -447,6 +472,8 @@ impl WsServerState {
             cron_scheduler: cron::CronScheduler::in_memory(),
             agent_run_registry: Mutex::new(handlers::AgentRunRegistry::new()),
             system_event_history: Mutex::new(Vec::new()),
+            llm_provider: None,
+            tools_registry: None,
         }
     }
 
@@ -481,6 +508,8 @@ impl WsServerState {
             cron_scheduler: cron::CronScheduler::new(state_dir.join("cron"), true),
             agent_run_registry: Mutex::new(handlers::AgentRunRegistry::new()),
             system_event_history: Mutex::new(Vec::new()),
+            llm_provider: None,
+            tools_registry: None,
         })
     }
 
@@ -498,6 +527,31 @@ impl WsServerState {
     pub(crate) fn with_session_store(mut self, store: Arc<sessions::SessionStore>) -> Self {
         self.session_store = store;
         self
+    }
+
+    pub fn with_llm_provider(mut self, provider: Arc<dyn agent::LlmProvider>) -> Self {
+        self.llm_provider = Some(provider);
+        self
+    }
+
+    pub fn with_tools_registry(mut self, registry: Arc<plugins::ToolsRegistry>) -> Self {
+        self.tools_registry = Some(registry);
+        self
+    }
+
+    /// Get the session store.
+    pub fn session_store(&self) -> &Arc<sessions::SessionStore> {
+        &self.session_store
+    }
+
+    /// Get the tools registry, if configured.
+    pub fn tools_registry(&self) -> Option<&plugins::ToolsRegistry> {
+        self.tools_registry.as_deref()
+    }
+
+    /// Get the LLM provider, if configured.
+    pub fn llm_provider(&self) -> Option<&Arc<dyn agent::LlmProvider>> {
+        self.llm_provider.as_ref()
     }
 
     fn next_event_seq(&self) -> u64 {
