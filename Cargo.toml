@@ -9,7 +9,7 @@ license = "MIT"
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.7", features = ["ws"] }
 chrono = { version = "0.4", features = ["serde"] }
-reqwest = { version = "0.11", features = ["rustls-tls", "stream", "json"], default-features = false }
+reqwest = { version = "0.11", features = ["rustls-tls", "stream", "json", "blocking"], default-features = false }
 hickory-resolver = "0.24"
 url = "2"
 tokio-tungstenite = "0.21"

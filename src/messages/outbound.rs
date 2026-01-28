@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use tokio::sync::Notify;
 use uuid::Uuid;
 
 /// Maximum number of completed messages to retain for status lookup
@@ -383,7 +384,6 @@ pub struct ChannelStats {
 ///
 /// This is a skeleton implementation - actual delivery logic
 /// will be added when channel implementations are ready.
-#[derive(Debug)]
 pub struct MessagePipeline {
     /// Queued messages by channel
     queues: RwLock<HashMap<String, VecDeque<QueuedMessage>>>,
@@ -395,6 +395,19 @@ pub struct MessagePipeline {
     stats_queued: AtomicU64,
     stats_sent: AtomicU64,
     stats_failed: AtomicU64,
+    /// Notify delivery workers when messages are queued
+    notify: Arc<Notify>,
+}
+
+impl std::fmt::Debug for MessagePipeline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MessagePipeline")
+            .field("queues", &self.queues)
+            .field("messages", &self.messages)
+            .field("max_queue_size", &self.max_queue_size)
+            .field("notify", &"Notify")
+            .finish()
+    }
 }
 
 impl Default for MessagePipeline {
@@ -418,7 +431,13 @@ impl MessagePipeline {
             stats_queued: AtomicU64::new(0),
             stats_sent: AtomicU64::new(0),
             stats_failed: AtomicU64::new(0),
+            notify: Arc::new(Notify::new()),
         }
+    }
+
+    /// Get the notifier for delivery workers to await on
+    pub fn notifier(&self) -> &Arc<Notify> {
+        &self.notify
     }
 
     /// Queue a message for delivery
@@ -459,6 +478,9 @@ impl MessagePipeline {
         }
 
         self.stats_queued.fetch_add(1, Ordering::Relaxed);
+
+        // Wake delivery worker
+        self.notify.notify_one();
 
         Ok(QueueResult {
             message_id,

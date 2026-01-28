@@ -3,6 +3,8 @@
 //! Provides channel registry for tracking active messaging channels
 //! and their connection states.
 
+pub mod webhook;
+
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

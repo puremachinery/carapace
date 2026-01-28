@@ -43,8 +43,7 @@ pub use handlers::record_usage;
 pub use handlers::AgentRunRegistry;
 pub use handlers::AgentRunStatus;
 
-// Re-export AgentRun for test construction
-#[cfg(test)]
+// Re-export AgentRun for use by cron executor and tests
 pub use handlers::sessions::AgentRun;
 
 const PROTOCOL_VERSION: u32 = 3;
@@ -424,7 +423,7 @@ pub struct WsServerState {
     /// Exec approval manager
     exec_manager: exec::ExecApprovalManager,
     /// Cron job scheduler
-    cron_scheduler: cron::CronScheduler,
+    pub cron_scheduler: cron::CronScheduler,
     /// Agent run registry for tracking active/completed agent invocations
     pub agent_run_registry: Mutex<handlers::AgentRunRegistry>,
     /// System event history (enqueued via system-event method)
@@ -433,6 +432,8 @@ pub struct WsServerState {
     llm_provider: Option<Arc<dyn agent::LlmProvider>>,
     /// Tools registry for agent tool dispatch
     tools_registry: Option<Arc<plugins::ToolsRegistry>>,
+    /// Plugin registry for channel/tool/webhook plugins
+    plugin_registry: Option<Arc<plugins::PluginRegistry>>,
 }
 
 impl std::fmt::Debug for WsServerState {
@@ -444,6 +445,10 @@ impl std::fmt::Debug for WsServerState {
             .field(
                 "tools_registry",
                 &self.tools_registry.as_ref().map(|_| ".."),
+            )
+            .field(
+                "plugin_registry",
+                &self.plugin_registry.as_ref().map(|_| ".."),
             )
             .finish_non_exhaustive()
     }
@@ -478,6 +483,7 @@ impl WsServerState {
             system_event_history: Mutex::new(Vec::new()),
             llm_provider: None,
             tools_registry: None,
+            plugin_registry: None,
         }
     }
 
@@ -514,6 +520,7 @@ impl WsServerState {
             system_event_history: Mutex::new(Vec::new()),
             llm_provider: None,
             tools_registry: None,
+            plugin_registry: None,
         })
     }
 
@@ -543,6 +550,11 @@ impl WsServerState {
         self
     }
 
+    pub fn with_plugin_registry(mut self, registry: Arc<plugins::PluginRegistry>) -> Self {
+        self.plugin_registry = Some(registry);
+        self
+    }
+
     /// Get the session store.
     pub fn session_store(&self) -> &Arc<sessions::SessionStore> {
         &self.session_store
@@ -556,6 +568,11 @@ impl WsServerState {
     /// Get the LLM provider, if configured.
     pub fn llm_provider(&self) -> Option<&Arc<dyn agent::LlmProvider>> {
         self.llm_provider.as_ref()
+    }
+
+    /// Get the plugin registry, if configured.
+    pub fn plugin_registry(&self) -> Option<&Arc<plugins::PluginRegistry>> {
+        self.plugin_registry.as_ref()
     }
 
     fn next_event_seq(&self) -> u64 {
