@@ -10,10 +10,10 @@
 
 | Category | Completion | Notes |
 |----------|-----------|-------|
-| Infrastructure (WS, HTTP, config, logging) | ~99% | Production-quality, TLS, mDNS, config reload, CLI |
+| Infrastructure (WS, HTTP, config, logging) | ~99% | Production-quality, TLS, mDNS, config reload, CLI, Tailscale |
 | Security (auth, credentials, rate limiting) | ~97% | Real, reviewed, tool allowlists |
 | Data storage (sessions, cron, usage, nodes, devices) | ~99% | Real, tested, file-backed, retention cleanup |
-| Core functionality (agent/LLM, channel delivery, cron execution) | ~98% | Multi-provider (Anthropic/OpenAI/Ollama), built-in tools, media analysis, link understanding |
+| Core functionality (agent/LLM, channel delivery, cron execution) | ~99% | Multi-provider (Anthropic/OpenAI/Ollama/Gemini/Bedrock), built-in tools, channel tools, media analysis, link understanding |
 
 ## Infrastructure (Complete)
 
@@ -36,14 +36,16 @@
 - [x] mDNS discovery — `_moltbot._tcp.local.` Bonjour broadcast, off/minimal/full modes, graceful shutdown
 - [x] Config defaults — 7-section defaults pipeline, deep-merge with user-wins semantics, partial config support
 - [x] Config hot reload — file watcher (notify), SIGHUP handler, `config.reload` WS method, debounce, validation
-- [x] CLI — `start`, `config`, `status`, `logs`, `version`, `backup`, `restore`, `reset` subcommands via clap
+- [x] CLI — `start`, `config`, `status`, `logs`, `version`, `backup`, `restore`, `reset`, `setup`, `pair`, `update` subcommands via clap
 - [x] Network binding modes — loopback/lan/auto/tailnet/custom with interface detection
 - [x] Link understanding — URL extraction, SSRF-safe fetching, HTML-to-text, LRU cache
+- [x] Tailscale serve/funnel — auto-configure Tailscale serve (LAN proxy) or funnel (public internet), lifecycle management, teardown on shutdown
 
 ## Core Functionality
 
-- [x] Agent/LLM execution engine — `src/agent/` with Anthropic + OpenAI + Ollama streaming, MultiProvider dispatch, tool dispatch, context building, cancellation token, per-chunk stream timeout
+- [x] Agent/LLM execution engine — `src/agent/` with Anthropic + OpenAI + Ollama + Gemini + Bedrock streaming, MultiProvider dispatch, tool dispatch, context building, cancellation token, per-chunk stream timeout
 - [x] Built-in agent tools — 10 tools: current_time, web_fetch, memory_read/write/list, message_send, session_list/read, config_read, math_eval
+- [x] Channel-specific agent tools — 15 tools gated by channel: Telegram (edit, delete, pin, reply_markup, send_photo), Discord (reaction, embed, thread, edit, delete), Slack (blocks, ephemeral, reaction, update, delete)
 - [x] Agent tool allowlists — AllowAll/AllowList/DenyList policy with enforcement at definition filtering and dispatch gating
 - [x] Media understanding — Anthropic + OpenAI image analysis, OpenAI Whisper audio transcription, result caching
 - [x] Channel message delivery — `src/messages/delivery.rs` delivery loop spawned at startup, drains queue, invokes channel plugins
@@ -113,7 +115,7 @@ Priority order reflects what blocks real-world usage soonest.
 
 ### P1 — Required for real agent usage
 
-- [~] **Multiple LLM providers** — Anthropic, OpenAI, and Ollama implemented with `MultiProvider` dispatch. Still needed: Google Gemini, AWS Bedrock.
+- [x] **Multiple LLM providers** — Anthropic, OpenAI, Ollama, Google Gemini, and AWS Bedrock implemented with `MultiProvider` dispatch
 - [x] **Built-in agent tools** — 10 core tools in `src/agent/builtin_tools.rs`, wired into `ToolsRegistry`
 - [x] **Media understanding pipeline** — `src/media/analysis.rs` with Anthropic + OpenAI image analysis, Whisper transcription, caching
 
@@ -121,19 +123,19 @@ Priority order reflects what blocks real-world usage soonest.
 
 - [x] **Session scoping and reset rules** — `src/sessions/scoping.rs` with per-sender/global/per-channel-peer, daily/idle/manual reset
 - [x] **Config reload modes** — `src/config/watcher.rs` with hot/hybrid/off, file watcher, SIGHUP, WS method
-- [ ] **Channel-specific agent tools** — Telegram (edit_message, delete_message, pin, reply_markup), Discord (reactions, embeds, threads), Slack (blocks, modals, ephemeral). These are built-in tools gated by which channel the conversation originated from.
+- [x] **Channel-specific agent tools** — `src/agent/channel_tools.rs` with 15 tools: Telegram (edit, delete, pin, reply_markup, send_photo), Discord (reaction, embed, thread, edit, delete), Slack (blocks, ephemeral, reaction, update, delete), gated by `message_channel`
 
 ### P3 — Needed for production operations
 
 - [ ] **Remote gateway support** — SSH tunnel transport for NAT traversal, direct WebSocket with fingerprint-based trust-on-first-use verification. Enables nodes to connect to gateways they can't reach directly.
-- [~] **CLI subcommands** — `start`, `config`, `status`, `logs`, `version`, `backup`, `restore`, `reset` implemented. Still needed: `setup` (interactive first-run), `pair` (node pairing), `update`.
+- [x] **CLI subcommands** — `start`, `config`, `status`, `logs`, `version`, `backup`, `restore`, `reset`, `setup`, `pair`, `update` implemented via clap
 - [ ] **Auth profiles** — OAuth flow for multi-provider auth (Google, GitHub, Discord), profile storage, token refresh. Currently only supports static token/password auth.
 - [x] **Network binding modes** — loopback/lan/auto/tailnet/custom in `src/server/bind.rs`
 
 ### P4 — Nice to have
 
 - [x] **Link understanding pipeline** — `src/links/mod.rs` with URL extraction, SSRF-safe fetching, HTML-to-text, LRU cache
-- [ ] **Tailscale serve/funnel modes** — auto-configure Tailscale serve (LAN proxy) or funnel (public internet) for zero-config HTTPS exposure. Requires Tailscale CLI integration.
+- [x] **Tailscale serve/funnel modes** — `src/tailscale/mod.rs` with serve/funnel/off modes, CLI wrapper, lifecycle management, teardown on shutdown
 - [x] **Agent tool allowlists** — `src/agent/tool_policy.rs` with AllowAll/AllowList/DenyList, enforcement at definition filtering and dispatch
 - [x] **Automatic session retention cleanup** — `src/sessions/retention.rs` with background timer, configurable interval/retention days
 
@@ -147,7 +149,7 @@ Priority order reflects what blocks real-world usage soonest.
 
 ## Tests
 
-- [x] 1,497 tests passing (`cargo nextest run`)
+- [x] 1,669 tests passing (`cargo nextest run`)
 - [x] Pre-commit hooks: `cargo fmt --check` + `cargo clippy -- -D warnings`
 - [x] Pre-push hooks: full test suite via `cargo nextest run`
 - [x] CI: fmt, clippy -D warnings, build, test, cross-platform build matrix (macOS, Windows, Linux)
