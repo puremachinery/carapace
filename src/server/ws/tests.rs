@@ -1799,3 +1799,420 @@ fn test_cron_scheduler_event_integration() {
     let event: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(event["payload"]["status"], "completed");
 }
+
+// ============== Node Event Routing Tests ==============
+
+fn make_node_conn(node_id: &str, conn_id: &str) -> ConnectionContext {
+    ConnectionContext {
+        conn_id: conn_id.to_string(),
+        role: "node".to_string(),
+        scopes: vec![],
+        client: ClientInfo {
+            id: node_id.to_string(),
+            version: "1.0".to_string(),
+            platform: "test".to_string(),
+            mode: "node".to_string(),
+            display_name: None,
+            device_family: None,
+            model_identifier: None,
+            instance_id: None,
+        },
+        device_id: Some(node_id.to_string()),
+    }
+}
+
+fn pair_node(state: &WsServerState, node_id: &str) {
+    let params = json!({ "nodeId": node_id, "displayName": node_id });
+    let result = handle_node_pair_request(Some(&params), state).unwrap();
+    let request_id = result["request"]["requestId"].as_str().unwrap();
+    handle_node_pair_approve(Some(&json!({ "requestId": request_id })), state).unwrap();
+}
+
+#[test]
+fn test_handle_node_event_requires_node_role() {
+    let state = WsServerState::new(WsServerConfig::default());
+    let conn = make_conn("admin");
+
+    let params = json!({
+        "nodeId": "node-1",
+        "event": "some.event",
+        "payload": { "key": "value" }
+    });
+    let result = handle_node_event(Some(&params), &state, &conn);
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err().code, ERROR_INVALID_REQUEST);
+}
+
+#[test]
+fn test_handle_node_event_requires_pairing() {
+    let state = WsServerState::new(WsServerConfig::default());
+    let conn = make_node_conn("unpaired-node", "conn-node");
+
+    let params = json!({
+        "nodeId": "unpaired-node",
+        "event": "some.event"
+    });
+    let result = handle_node_event(Some(&params), &state, &conn);
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err().code, ERROR_NOT_PAIRED);
+}
+
+#[test]
+fn test_handle_node_event_requires_event_field() {
+    let state = WsServerState::new(WsServerConfig::default());
+    pair_node(&state, "node-1");
+    let conn = make_node_conn("node-1", "conn-node-1");
+
+    let params = json!({
+        "nodeId": "node-1",
+        "payload": { "key": "value" }
+    });
+    let result = handle_node_event(Some(&params), &state, &conn);
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err().code, ERROR_INVALID_REQUEST);
+}
+
+#[test]
+fn test_handle_node_event_prevents_node_id_mismatch() {
+    let state = WsServerState::new(WsServerConfig::default());
+    pair_node(&state, "node-1");
+    let conn = make_node_conn("node-1", "conn-node-1");
+
+    let params = json!({
+        "nodeId": "node-other",
+        "event": "some.event"
+    });
+    let result = handle_node_event(Some(&params), &state, &conn);
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err().code, ERROR_INVALID_REQUEST);
+}
+
+#[test]
+fn test_handle_node_event_broadcasts_to_operators() {
+    let state = WsServerState::new(WsServerConfig::default());
+    pair_node(&state, "node-1");
+
+    // Register an operator connection to receive broadcasts
+    let (tx_op, mut rx_op) = mpsc::unbounded_channel();
+    let op_conn = make_conn_with_id("operator", vec![], "op-conn");
+    state.register_connection(&op_conn, tx_op, None);
+
+    // Clear the presence broadcast
+    let _ = rx_op.try_recv();
+
+    // Send a node event
+    let node_conn = make_node_conn("node-1", "conn-node-1");
+    let params = json!({
+        "nodeId": "node-1",
+        "event": "status.changed",
+        "payload": { "status": "idle", "battery": 85 }
+    });
+    let result = handle_node_event(Some(&params), &state, &node_conn);
+    assert!(result.is_ok());
+
+    let response = result.unwrap();
+    assert_eq!(response["ok"], true);
+    assert_eq!(response["nodeId"], "node-1");
+    assert_eq!(response["event"], "status.changed");
+    assert_eq!(response["hasPayload"], true);
+
+    // Operator should receive the broadcast
+    let msg = rx_op.try_recv();
+    assert!(msg.is_ok(), "Operator should receive node.event broadcast");
+    let Message::Text(text) = msg.unwrap() else {
+        panic!("expected text message");
+    };
+    let event: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(event["type"], "event");
+    assert_eq!(event["event"], "node.event");
+    assert_eq!(event["payload"]["nodeId"], "node-1");
+    assert_eq!(event["payload"]["event"], "status.changed");
+    assert_eq!(event["payload"]["payload"]["status"], "idle");
+    assert_eq!(event["payload"]["payload"]["battery"], 85);
+    assert!(event["payload"]["ts"].as_u64().is_some());
+}
+
+#[test]
+fn test_handle_node_event_does_not_broadcast_to_nodes() {
+    let state = WsServerState::new(WsServerConfig::default());
+    pair_node(&state, "node-1");
+    pair_node(&state, "node-2");
+
+    // Register a node connection (should NOT receive broadcasts)
+    let (tx_node2, mut rx_node2) = mpsc::unbounded_channel();
+    let node2_conn = make_node_conn("node-2", "conn-node-2");
+    state.register_connection(&node2_conn, tx_node2, None);
+
+    // Register an operator connection (should receive broadcasts)
+    let (tx_op, mut rx_op) = mpsc::unbounded_channel();
+    let op_conn = make_conn_with_id("operator", vec![], "op-conn");
+    state.register_connection(&op_conn, tx_op, None);
+
+    // Clear presence broadcasts
+    let _ = rx_op.try_recv();
+    let _ = rx_op.try_recv();
+
+    // Send a node event from node-1
+    let node1_conn = make_node_conn("node-1", "conn-node-1");
+    let params = json!({
+        "nodeId": "node-1",
+        "event": "heartbeat",
+        "payload": { "uptime": 12345 }
+    });
+    let result = handle_node_event(Some(&params), &state, &node1_conn);
+    assert!(result.is_ok());
+
+    // Operator should receive it
+    assert!(rx_op.try_recv().is_ok(), "Operator should receive event");
+
+    // Node-2 should NOT receive it
+    assert!(
+        rx_node2.try_recv().is_err(),
+        "Other nodes should not receive node.event broadcasts"
+    );
+}
+
+#[test]
+fn test_handle_node_event_with_payload_json() {
+    let state = WsServerState::new(WsServerConfig::default());
+    pair_node(&state, "node-1");
+
+    // Register an operator connection
+    let (tx_op, mut rx_op) = mpsc::unbounded_channel();
+    let op_conn = make_conn_with_id("operator", vec![], "op-conn");
+    state.register_connection(&op_conn, tx_op, None);
+
+    // Clear the presence broadcast
+    let _ = rx_op.try_recv();
+
+    // Send a node event with payloadJSON (string-encoded JSON)
+    let node_conn = make_node_conn("node-1", "conn-node-1");
+    let params = json!({
+        "nodeId": "node-1",
+        "event": "data.update",
+        "payloadJSON": r#"{"temperature":22.5,"humidity":60}"#
+    });
+    let result = handle_node_event(Some(&params), &state, &node_conn);
+    assert!(result.is_ok());
+    assert_eq!(result.unwrap()["hasPayload"], true);
+
+    // Operator should receive the broadcast with parsed payloadJSON
+    let msg = rx_op.try_recv();
+    assert!(msg.is_ok());
+    let Message::Text(text) = msg.unwrap() else {
+        panic!("expected text message");
+    };
+    let event: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(event["payload"]["event"], "data.update");
+    assert_eq!(event["payload"]["payload"]["temperature"], 22.5);
+    assert_eq!(event["payload"]["payload"]["humidity"], 60);
+}
+
+#[test]
+fn test_handle_node_event_without_payload() {
+    let state = WsServerState::new(WsServerConfig::default());
+    pair_node(&state, "node-1");
+
+    // Register an operator connection
+    let (tx_op, mut rx_op) = mpsc::unbounded_channel();
+    let op_conn = make_conn_with_id("operator", vec![], "op-conn");
+    state.register_connection(&op_conn, tx_op, None);
+
+    // Clear the presence broadcast
+    let _ = rx_op.try_recv();
+
+    // Send a node event without any payload
+    let node_conn = make_node_conn("node-1", "conn-node-1");
+    let params = json!({
+        "nodeId": "node-1",
+        "event": "ready"
+    });
+    let result = handle_node_event(Some(&params), &state, &node_conn);
+    assert!(result.is_ok());
+    assert_eq!(result.unwrap()["hasPayload"], false);
+
+    // Operator should receive the broadcast with null payload
+    let msg = rx_op.try_recv();
+    assert!(msg.is_ok());
+    let Message::Text(text) = msg.unwrap() else {
+        panic!("expected text message");
+    };
+    let event: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(event["payload"]["event"], "ready");
+    assert_eq!(event["payload"]["payload"], Value::Null);
+}
+
+#[test]
+fn test_handle_node_event_defaults_node_id_from_connection() {
+    let state = WsServerState::new(WsServerConfig::default());
+    pair_node(&state, "node-1");
+
+    let node_conn = make_node_conn("node-1", "conn-node-1");
+
+    // Send without explicit nodeId -- should default to connection's node id
+    let params = json!({
+        "event": "ping"
+    });
+    let result = handle_node_event(Some(&params), &state, &node_conn);
+    assert!(result.is_ok());
+    assert_eq!(result.unwrap()["nodeId"], "node-1");
+}
+
+#[test]
+fn test_node_event_in_gateway_events() {
+    // Verify that node.event is registered as a known gateway event
+    assert!(
+        GATEWAY_EVENTS.contains(&"node.event"),
+        "node.event should be in GATEWAY_EVENTS"
+    );
+}
+
+#[test]
+fn test_node_list_merges_paired_metadata_with_live_data() {
+    let state = WsServerState::new(WsServerConfig::default());
+
+    // Pair a node with extended fields
+    let params = json!({
+        "nodeId": "node-merge",
+        "displayName": "Merge Node",
+        "platform": "darwin",
+        "version": "1.0.0",
+        "coreVersion": "0.9.0",
+        "uiVersion": "1.0.0",
+        "deviceFamily": "Mac",
+        "modelIdentifier": "MacBookPro18,3",
+        "caps": ["exec", "audio"],
+        "commands": ["system.run"],
+        "permissions": { "filesystem": true },
+        "remoteIp": "192.168.1.10"
+    });
+    let result = handle_node_pair_request(Some(&params), &state).unwrap();
+    let request_id = result["request"]["requestId"].as_str().unwrap();
+    handle_node_pair_approve(Some(&json!({ "requestId": request_id })), &state).unwrap();
+
+    // Register a live session with updated version
+    {
+        let mut registry = state.node_registry.lock();
+        registry.register(NodeSession {
+            node_id: "node-merge".to_string(),
+            conn_id: "conn-merge".to_string(),
+            display_name: Some("Merge Node Live".to_string()),
+            platform: Some("darwin".to_string()),
+            version: Some("2.0.0".to_string()),
+            device_family: Some("Mac".to_string()),
+            model_identifier: Some("MacBookPro18,3".to_string()),
+            remote_ip: Some("10.0.0.5".to_string()),
+            caps: vec!["exec".to_string(), "video".to_string()],
+            commands: HashSet::from(["system.run".to_string(), "screen.capture".to_string()]),
+            permissions: Some({
+                let mut m = HashMap::new();
+                m.insert("filesystem".to_string(), true);
+                m.insert("screen".to_string(), true);
+                m
+            }),
+            path_env: Some("/usr/local/bin".to_string()),
+            connected_at_ms: now_ms(),
+        });
+    }
+
+    // node.list should merge paired + live data
+    let result = handle_node_list(&state).unwrap();
+    let nodes = result["nodes"].as_array().unwrap();
+    assert_eq!(nodes.len(), 1);
+
+    let node = &nodes[0];
+    // Live data should take precedence for version and display name
+    assert_eq!(node["version"], "2.0.0");
+    assert_eq!(node["displayName"], "Merge Node Live");
+    assert_eq!(node["remoteIp"], "10.0.0.5");
+    // Paired-only fields should still be present
+    assert_eq!(node["coreVersion"], "0.9.0");
+    assert_eq!(node["uiVersion"], "1.0.0");
+    // Caps should be merged (union of both)
+    let caps = node["caps"].as_array().unwrap();
+    let cap_strs: Vec<&str> = caps.iter().map(|v| v.as_str().unwrap()).collect();
+    assert!(cap_strs.contains(&"exec"));
+    assert!(cap_strs.contains(&"audio"));
+    assert!(cap_strs.contains(&"video"));
+    // Commands should be merged
+    let commands = node["commands"].as_array().unwrap();
+    let cmd_strs: Vec<&str> = commands.iter().map(|v| v.as_str().unwrap()).collect();
+    assert!(cmd_strs.contains(&"system.run"));
+    assert!(cmd_strs.contains(&"screen.capture"));
+    // Should be connected and paired
+    assert_eq!(node["connected"], true);
+    assert_eq!(node["paired"], true);
+    // pathEnv from live data
+    assert_eq!(node["pathEnv"], "/usr/local/bin");
+}
+
+#[test]
+fn test_node_describe_merges_paired_metadata_with_live_data() {
+    let state = WsServerState::new(WsServerConfig::default());
+
+    // Pair a node with extended fields
+    let params = json!({
+        "nodeId": "node-describe-merge",
+        "displayName": "Describe Merge",
+        "platform": "ios",
+        "version": "1.0.0",
+        "coreVersion": "0.8.0",
+        "uiVersion": "1.0.0",
+        "deviceFamily": "iPhone",
+        "modelIdentifier": "iPhone14,2",
+        "caps": ["camera"],
+        "commands": ["camera.snap"],
+        "permissions": { "camera": true },
+        "remoteIp": "172.16.0.1"
+    });
+    let result = handle_node_pair_request(Some(&params), &state).unwrap();
+    let request_id = result["request"]["requestId"].as_str().unwrap();
+    handle_node_pair_approve(Some(&json!({ "requestId": request_id })), &state).unwrap();
+
+    // Register a live session with additional caps
+    {
+        let mut registry = state.node_registry.lock();
+        registry.register(NodeSession {
+            node_id: "node-describe-merge".to_string(),
+            conn_id: "conn-describe-merge".to_string(),
+            display_name: Some("Describe Merge Live".to_string()),
+            platform: Some("ios".to_string()),
+            version: Some("2.0.0".to_string()),
+            device_family: Some("iPhone".to_string()),
+            model_identifier: Some("iPhone14,2".to_string()),
+            remote_ip: Some("172.16.0.2".to_string()),
+            caps: vec!["camera".to_string(), "location".to_string()],
+            commands: HashSet::from(["camera.snap".to_string(), "location.get".to_string()]),
+            permissions: None,
+            path_env: None,
+            connected_at_ms: now_ms(),
+        });
+    }
+
+    // node.describe should merge paired + live data
+    let describe_params = json!({ "nodeId": "node-describe-merge" });
+    let result = handle_node_describe(Some(&describe_params), &state).unwrap();
+
+    // Live data should take precedence
+    assert_eq!(result["version"], "2.0.0");
+    assert_eq!(result["displayName"], "Describe Merge Live");
+    assert_eq!(result["remoteIp"], "172.16.0.2");
+    // Paired-only fields should still be present
+    assert_eq!(result["coreVersion"], "0.8.0");
+    assert_eq!(result["uiVersion"], "1.0.0");
+    // Caps merged
+    let caps = result["caps"].as_array().unwrap();
+    let cap_strs: Vec<&str> = caps.iter().map(|v| v.as_str().unwrap()).collect();
+    assert!(cap_strs.contains(&"camera"));
+    assert!(cap_strs.contains(&"location"));
+    // Commands merged
+    let commands = result["commands"].as_array().unwrap();
+    let cmd_strs: Vec<&str> = commands.iter().map(|v| v.as_str().unwrap()).collect();
+    assert!(cmd_strs.contains(&"camera.snap"));
+    assert!(cmd_strs.contains(&"location.get"));
+    // Permissions from paired data should be used since live has None
+    assert_eq!(result["permissions"], json!({ "camera": true }));
+    // Connected and paired
+    assert_eq!(result["connected"], true);
+    assert_eq!(result["paired"], true);
+}

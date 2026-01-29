@@ -596,7 +596,7 @@ pub(super) async fn dispatch_method(
         "update.check" => handle_update_check().await,
         "update.setChannel" => handle_update_set_channel(params),
         "update.configure" => handle_update_configure(params),
-        "update.install" => handle_update_install(),
+        "update.install" => handle_update_install().await,
         "update.dismiss" => handle_update_dismiss(),
         "update.releaseNotes" => handle_update_release_notes(),
 

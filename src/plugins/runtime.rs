@@ -689,6 +689,9 @@ impl<B: CredentialBackend + Send + Sync + 'static> ChannelPluginInstance for Cha
             message_id: Some(uuid::Uuid::new_v4().to_string()),
             error: None,
             retryable: false,
+            conversation_id: None,
+            to_jid: None,
+            poll_id: None,
         })
     }
 
@@ -698,6 +701,9 @@ impl<B: CredentialBackend + Send + Sync + 'static> ChannelPluginInstance for Cha
             message_id: Some(uuid::Uuid::new_v4().to_string()),
             error: None,
             retryable: false,
+            conversation_id: None,
+            to_jid: None,
+            poll_id: None,
         })
     }
 }

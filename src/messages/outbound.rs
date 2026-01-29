@@ -327,6 +327,20 @@ impl QueuedMessage {
     }
 }
 
+/// Delivery result fields returned from channel plugins (re-exported for convenience)
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DeliveryResultFields {
+    /// Channel-specific conversation identifier
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<String>,
+    /// Recipient JID (Jabber ID) for XMPP-based channels
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_jid: Option<String>,
+    /// Poll identifier when the message is a poll
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub poll_id: Option<String>,
+}
+
 /// Result of queueing a message
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueueResult {
@@ -337,6 +351,9 @@ pub struct QueueResult {
     /// Position in queue (if queued)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub queue_position: Option<usize>,
+    /// Optional delivery result fields populated after delivery
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery_result: Option<DeliveryResultFields>,
 }
 
 /// Error types for pipeline operations
@@ -486,6 +503,7 @@ impl MessagePipeline {
             message_id,
             status: DeliveryStatus::Queued,
             queue_position: Some(queue_position),
+            delivery_result: None,
         })
     }
 
@@ -1027,6 +1045,7 @@ mod tests {
             message_id: MessageId::from_string("test-123"),
             status: DeliveryStatus::Queued,
             queue_position: Some(1),
+            delivery_result: None,
         };
 
         let json = serde_json::to_string(&result).unwrap();
@@ -1034,6 +1053,36 @@ mod tests {
 
         assert_eq!(parsed.message_id.0, "test-123");
         assert_eq!(parsed.status, DeliveryStatus::Queued);
+    }
+
+    #[test]
+    fn test_queue_result_with_delivery_fields() {
+        let result = QueueResult {
+            message_id: MessageId::from_string("test-456"),
+            status: DeliveryStatus::Sent,
+            queue_position: None,
+            delivery_result: Some(DeliveryResultFields {
+                conversation_id: Some("conv-123".to_string()),
+                to_jid: Some("user@chat.example.com".to_string()),
+                poll_id: None,
+            }),
+        };
+
+        let json = serde_json::to_string(&result).unwrap();
+        let parsed: QueueResult = serde_json::from_str(&json).unwrap();
+
+        let delivery = parsed.delivery_result.unwrap();
+        assert_eq!(delivery.conversation_id, Some("conv-123".to_string()));
+        assert_eq!(delivery.to_jid, Some("user@chat.example.com".to_string()));
+        assert_eq!(delivery.poll_id, None);
+    }
+
+    #[test]
+    fn test_delivery_result_fields_default() {
+        let fields = DeliveryResultFields::default();
+        assert_eq!(fields.conversation_id, None);
+        assert_eq!(fields.to_jid, None);
+        assert_eq!(fields.poll_id, None);
     }
 
     #[test]

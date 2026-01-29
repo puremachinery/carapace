@@ -91,6 +91,9 @@ impl WebhookChannel {
                         message_id: None,
                         error: None,
                         retryable: false,
+                        conversation_id: None,
+                        to_jid: None,
+                        poll_id: None,
                     })
                 } else {
                     let retryable = status.is_server_error();
@@ -99,6 +102,9 @@ impl WebhookChannel {
                         message_id: None,
                         error: Some(format!("HTTP {}", status)),
                         retryable,
+                        conversation_id: None,
+                        to_jid: None,
+                        poll_id: None,
                     })
                 }
             }
@@ -107,6 +113,9 @@ impl WebhookChannel {
                 message_id: None,
                 error: Some(e.to_string()),
                 retryable: true,
+                conversation_id: None,
+                to_jid: None,
+                poll_id: None,
             }),
         }
     }

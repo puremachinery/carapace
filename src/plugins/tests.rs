@@ -68,6 +68,9 @@ mod integration_tests {
                 message_id: Some(format!("msg-{}-{}", self.id, ctx.to)),
                 error: None,
                 retryable: false,
+                conversation_id: None,
+                to_jid: None,
+                poll_id: None,
             })
         }
 
@@ -77,6 +80,9 @@ mod integration_tests {
                 message_id: Some(format!("media-{}-{}", self.id, ctx.to)),
                 error: None,
                 retryable: false,
+                conversation_id: None,
+                to_jid: None,
+                poll_id: None,
             })
         }
     }

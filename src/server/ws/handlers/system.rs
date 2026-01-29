@@ -248,20 +248,35 @@ pub(super) fn handle_send(
     .with_metadata(metadata);
     let ctx = messages::outbound::OutboundContext::new().with_trace_id(idempotency_key);
 
-    let _queued = state
+    let queued = state
         .message_pipeline
         .queue(outbound.clone(), ctx)
         .map_err(|e| error_shape(ERROR_UNAVAILABLE, &format!("queue failed: {}", e), None))?;
 
-    // Node returns {runId, messageId, channel} plus optional fields from delivery result
-    // (channelId, conversationId, toJid, pollId). We only include fields we actually have
-    // from the delivery pipeline - don't echo back request params.
-    // TODO: Add optional fields when delivery pipeline provides them
-    Ok(json!({
+    // Node returns {runId, messageId, channel} plus optional delivery result fields
+    // (conversationId, toJid, pollId). Delivery happens asynchronously so we
+    // populate these from the queued result metadata when available.
+    let delivery_result = queued.delivery_result.as_ref();
+
+    let mut response = json!({
         "runId": idempotency_key,
         "messageId": outbound.id.0,
         "channel": outbound.channel_id
-    }))
+    });
+
+    if let Some(result) = delivery_result {
+        if let Some(ref conversation_id) = result.conversation_id {
+            response["conversationId"] = json!(conversation_id);
+        }
+        if let Some(ref to_jid) = result.to_jid {
+            response["toJid"] = json!(to_jid);
+        }
+        if let Some(ref poll_id) = result.poll_id {
+            response["pollId"] = json!(poll_id);
+        }
+    }
+
+    Ok(response)
 }
 
 /// Handle system-presence - returns list of connected clients (read-only, no params)
@@ -791,5 +806,115 @@ mod tests {
         };
         let key2 = derive_presence_key(&None, &None, &parsed_upper, "fallback");
         assert_eq!(key2, "myhost.local");
+    }
+
+    fn make_test_conn() -> ConnectionContext {
+        ConnectionContext {
+            conn_id: "test-conn".to_string(),
+            role: "admin".to_string(),
+            scopes: vec![],
+            client: ClientInfo {
+                id: "test-client".to_string(),
+                version: "1.0".to_string(),
+                platform: "test".to_string(),
+                mode: "test".to_string(),
+                display_name: None,
+                device_family: None,
+                model_identifier: None,
+                instance_id: None,
+            },
+            device_id: None,
+        }
+    }
+
+    #[test]
+    fn test_handle_send_returns_base_fields() {
+        let state = WsServerState::new(WsServerConfig::default());
+        let conn = make_test_conn();
+        let params = json!({
+            "to": "user123",
+            "message": "hello",
+            "idempotencyKey": "key-001",
+            "channel": "default"
+        });
+
+        let result = handle_send(&state, Some(&params), &conn).unwrap();
+
+        assert_eq!(result["runId"], "key-001");
+        assert!(result["messageId"].is_string());
+        assert_eq!(result["channel"], "default");
+    }
+
+    #[test]
+    fn test_handle_send_omits_delivery_fields_when_none() {
+        let state = WsServerState::new(WsServerConfig::default());
+        let conn = make_test_conn();
+        let params = json!({
+            "to": "user456",
+            "message": "test message",
+            "idempotencyKey": "key-002"
+        });
+
+        let result = handle_send(&state, Some(&params), &conn).unwrap();
+
+        // When delivery hasn't happened, these fields should not be present
+        assert!(result.get("conversationId").is_none());
+        assert!(result.get("toJid").is_none());
+        assert!(result.get("pollId").is_none());
+    }
+
+    #[test]
+    fn test_handle_send_requires_to() {
+        let state = WsServerState::new(WsServerConfig::default());
+        let conn = make_test_conn();
+        let params = json!({
+            "message": "hello",
+            "idempotencyKey": "key-003"
+        });
+
+        let result = handle_send(&state, Some(&params), &conn);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_handle_send_requires_message() {
+        let state = WsServerState::new(WsServerConfig::default());
+        let conn = make_test_conn();
+        let params = json!({
+            "to": "user123",
+            "idempotencyKey": "key-004"
+        });
+
+        let result = handle_send(&state, Some(&params), &conn);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_handle_send_requires_idempotency_key() {
+        let state = WsServerState::new(WsServerConfig::default());
+        let conn = make_test_conn();
+        let params = json!({
+            "to": "user123",
+            "message": "hello"
+        });
+
+        let result = handle_send(&state, Some(&params), &conn);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_handle_send_defaults_to_default_channel() {
+        let state = WsServerState::new(WsServerConfig::default());
+        let conn = make_test_conn();
+        let params = json!({
+            "to": "user123",
+            "message": "hello",
+            "idempotencyKey": "key-005"
+        });
+
+        let result = handle_send(&state, Some(&params), &conn).unwrap();
+
+        // When no channel is specified, defaults to "default"
+        assert_eq!(result["channel"], "default");
     }
 }

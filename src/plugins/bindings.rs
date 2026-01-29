@@ -57,6 +57,12 @@ pub struct DeliveryResult {
     pub message_id: Option<String>,
     pub error: Option<String>,
     pub retryable: bool,
+    /// Channel-specific conversation identifier (e.g., WhatsApp conversation ID)
+    pub conversation_id: Option<String>,
+    /// Recipient JID (Jabber ID) for XMPP-based channels
+    pub to_jid: Option<String>,
+    /// Poll identifier when the message is a poll
+    pub poll_id: Option<String>,
 }
 
 /// Chat type supported by channels
@@ -509,9 +515,29 @@ mod tests {
             message_id: Some("msg-123".to_string()),
             error: None,
             retryable: false,
+            conversation_id: None,
+            to_jid: None,
+            poll_id: None,
         };
         assert!(result.ok);
         assert_eq!(result.message_id, Some("msg-123".to_string()));
+    }
+
+    #[test]
+    fn test_delivery_result_with_optional_fields() {
+        let result = DeliveryResult {
+            ok: true,
+            message_id: Some("msg-456".to_string()),
+            error: None,
+            retryable: false,
+            conversation_id: Some("conv-789".to_string()),
+            to_jid: Some("user@example.com".to_string()),
+            poll_id: Some("poll-001".to_string()),
+        };
+        assert!(result.ok);
+        assert_eq!(result.conversation_id, Some("conv-789".to_string()));
+        assert_eq!(result.to_jid, Some("user@example.com".to_string()));
+        assert_eq!(result.poll_id, Some("poll-001".to_string()));
     }
 
     #[test]

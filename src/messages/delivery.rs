@@ -160,6 +160,9 @@ async fn deliver_message(
                 message_id: None,
                 error: None,
                 retryable: false,
+                conversation_id: None,
+                to_jid: None,
+                poll_id: None,
             };
             for part in parts {
                 last_result =
@@ -236,6 +239,9 @@ mod tests {
                     message_id: None,
                     error: Some("mock failure".to_string()),
                     retryable: self.retryable,
+                    conversation_id: None,
+                    to_jid: None,
+                    poll_id: None,
                 })
             } else {
                 Ok(DeliveryResult {
@@ -243,6 +249,9 @@ mod tests {
                     message_id: Some("sent-1".to_string()),
                     error: None,
                     retryable: false,
+                    conversation_id: None,
+                    to_jid: None,
+                    poll_id: None,
                 })
             }
         }
@@ -254,6 +263,9 @@ mod tests {
                 message_id: Some("sent-media-1".to_string()),
                 error: None,
                 retryable: false,
+                conversation_id: None,
+                to_jid: None,
+                poll_id: None,
             })
         }
     }

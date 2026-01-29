@@ -893,8 +893,25 @@ pub(crate) fn handle_node_event(
     // Update last seen time
     state.node_pairing.touch_node(node_id);
 
-    // In a full implementation, this would broadcast the event to subscribed
-    // operator connections. For now, we acknowledge receipt.
+    // Resolve the effective payload: prefer parsed payload, fall back to payloadJSON
+    let effective_payload = if let Some(pj) = &payload_json {
+        serde_json::from_str(pj).unwrap_or(Value::Null)
+    } else {
+        payload.clone().unwrap_or(Value::Null)
+    };
+
+    // Broadcast the node event to all operator connections
+    broadcast_event(
+        state,
+        "node.event",
+        json!({
+            "nodeId": node_id,
+            "event": event,
+            "payload": effective_payload,
+            "ts": now_ms()
+        }),
+    );
+
     Ok(json!({
         "ok": true,
         "nodeId": node_id,

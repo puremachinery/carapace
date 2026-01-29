@@ -8,9 +8,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::io::AsyncWriteExt;
 use tracing::warn;
 
 use super::super::*;
+
+/// GitHub API response for a release asset
+#[derive(Debug, Deserialize)]
+struct GitHubAsset {
+    name: String,
+    browser_download_url: String,
+    size: u64,
+}
 
 /// GitHub API response for the latest release
 #[derive(Debug, Deserialize)]
@@ -18,6 +27,8 @@ struct GitHubRelease {
     tag_name: String,
     html_url: String,
     body: Option<String>,
+    #[serde(default)]
+    assets: Vec<GitHubAsset>,
 }
 
 /// Available update channels
@@ -302,40 +313,195 @@ pub(super) fn handle_update_configure(params: Option<&Value>) -> Result<Value, E
     }))
 }
 
+/// Build the expected release asset name for the current platform.
+///
+/// GitHub release assets follow the pattern `carapace-{os}-{arch}` (with `.exe`
+/// on Windows). We map Rust's `std::env::consts` values to the names used in
+/// the release workflow.
+fn expected_asset_name() -> String {
+    let os = match std::env::consts::OS {
+        "macos" => "darwin",
+        other => other,
+    };
+    let arch = std::env::consts::ARCH;
+    let ext = if std::env::consts::OS == "windows" {
+        ".exe"
+    } else {
+        ""
+    };
+    format!("carapace-{os}-{arch}{ext}")
+}
+
+/// Download the release binary from GitHub and stage it in the state directory.
+///
+/// The function:
+/// 1. Re-fetches the latest release to obtain the asset list.
+/// 2. Locates the asset matching the current platform.
+/// 3. Streams the binary to `{state_dir}/updates/carapace-{version}`.
+/// 4. Verifies the download size is non-zero.
+///
+/// On success the staging path is returned. On failure, `last_error` is set and
+/// the `installing` flag is cleared.
+async fn download_and_stage(version: &str) -> Result<String, String> {
+    let current_version = {
+        let state = UPDATE_STATE.read();
+        state.current_version.clone()
+    };
+    let user_agent = format!("carapace/{}", current_version);
+
+    // Fetch release metadata (with asset list) ----------------------------
+    let client = reqwest::Client::new();
+    let release: GitHubRelease = client
+        .get("https://api.github.com/repos/puremachinery/carapace/releases/latest")
+        .header("User-Agent", &user_agent)
+        .header("Accept", "application/vnd.github+json")
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|e| format!("failed to fetch release metadata: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("failed to parse release metadata: {e}"))?;
+
+    // Find the matching asset for this platform ---------------------------
+    let wanted = expected_asset_name();
+    let asset = release
+        .assets
+        .iter()
+        .find(|a| a.name == wanted)
+        .ok_or_else(|| {
+            format!(
+                "no matching asset '{}' in release {} (available: {})",
+                wanted,
+                release.tag_name,
+                release
+                    .assets
+                    .iter()
+                    .map(|a| a.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?;
+
+    // Prepare staging directory -------------------------------------------
+    let updates_dir = resolve_state_dir().join("updates");
+    tokio::fs::create_dir_all(&updates_dir)
+        .await
+        .map_err(|e| format!("failed to create updates directory: {e}"))?;
+
+    let staged_name = format!("carapace-{version}");
+    let staged_path = updates_dir.join(&staged_name);
+
+    // Download the binary -------------------------------------------------
+    let resp = client
+        .get(&asset.browser_download_url)
+        .header("User-Agent", &user_agent)
+        .timeout(Duration::from_secs(300))
+        .send()
+        .await
+        .map_err(|e| format!("failed to download asset: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("asset download returned status {}", resp.status()));
+    }
+
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("failed to read asset bytes: {e}"))?;
+
+    // Verify download integrity (minimum: non-empty) ----------------------
+    if bytes.is_empty() {
+        return Err("downloaded asset is empty".to_string());
+    }
+
+    // Write to staging path -----------------------------------------------
+    let mut file = tokio::fs::File::create(&staged_path)
+        .await
+        .map_err(|e| format!("failed to create staged file: {e}"))?;
+
+    file.write_all(&bytes)
+        .await
+        .map_err(|e| format!("failed to write staged file: {e}"))?;
+
+    file.flush()
+        .await
+        .map_err(|e| format!("failed to flush staged file: {e}"))?;
+
+    // On Unix, make the staged binary executable --------------------------
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o755);
+        std::fs::set_permissions(&staged_path, perms)
+            .map_err(|e| format!("failed to set executable permissions: {e}"))?;
+    }
+
+    Ok(staged_path.to_string_lossy().into_owned())
+}
+
 /// Install an available update
-pub(super) fn handle_update_install() -> Result<Value, ErrorShape> {
+pub(super) async fn handle_update_install() -> Result<Value, ErrorShape> {
+    // Validate and set the installing flag --------------------------------
+    let version = {
+        let mut state = UPDATE_STATE.write();
+
+        if !state.update_available {
+            return Err(error_shape(
+                ERROR_INVALID_REQUEST,
+                "no update available",
+                None,
+            ));
+        }
+
+        if state.installing {
+            return Err(error_shape(
+                ERROR_UNAVAILABLE,
+                "update installation already in progress",
+                None,
+            ));
+        }
+
+        let version = match &state.latest_version {
+            Some(v) => v.clone(),
+            None => {
+                return Err(error_shape(
+                    ERROR_INVALID_REQUEST,
+                    "latest version not known; run update.check first",
+                    None,
+                ));
+            }
+        };
+
+        state.installing = true;
+        state.last_error = None;
+        version
+    };
+
+    // Perform the download (lock is NOT held during the await) ------------
+    let result = download_and_stage(&version).await;
+
+    // Update state based on outcome ---------------------------------------
     let mut state = UPDATE_STATE.write();
+    state.installing = false;
 
-    if !state.update_available {
-        return Err(error_shape(
-            ERROR_INVALID_REQUEST,
-            "no update available",
-            None,
-        ));
+    match result {
+        Ok(staged_path) => Ok(json!({
+            "ok": true,
+            "version": version,
+            "stagedPath": staged_path,
+            "message": "Update staged successfully. Restart to apply."
+        })),
+        Err(err) => {
+            warn!("update install failed: {err}");
+            state.last_error = Some(err.clone());
+            Err(error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("update install failed: {err}"),
+                Some(json!({ "version": version })),
+            ))
+        }
     }
-
-    if state.installing {
-        return Err(error_shape(
-            ERROR_UNAVAILABLE,
-            "update installation already in progress",
-            None,
-        ));
-    }
-
-    state.installing = true;
-
-    // In a real implementation, this would:
-    // 1. Download the update if not already cached
-    // 2. Verify the download integrity
-    // 3. Install the update
-    // 4. Restart the application
-
-    Ok(json!({
-        "ok": true,
-        "installing": true,
-        "version": state.latest_version,
-        "message": "Update will be installed on restart"
-    }))
 }
 
 /// Dismiss an available update notification
@@ -454,13 +620,90 @@ mod tests {
         assert_eq!(result["channel"], "beta");
     }
 
-    #[test]
-    fn test_update_install_no_update() {
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_update_install_no_update() {
         let _lock = TEST_LOCK.lock().unwrap();
         reset_state();
-        let result = handle_update_install();
+        let result = handle_update_install().await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code, ERROR_INVALID_REQUEST);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_update_install_already_installing() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        reset_state();
+        {
+            let mut state = UPDATE_STATE.write();
+            state.update_available = true;
+            state.latest_version = Some("99.0.0".to_string());
+            state.installing = true;
+        }
+        let result = handle_update_install().await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, ERROR_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_update_install_no_version() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        reset_state();
+        {
+            let mut state = UPDATE_STATE.write();
+            state.update_available = true;
+            // latest_version left as None
+        }
+        let result = handle_update_install().await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, ERROR_INVALID_REQUEST);
+        // installing flag must be cleared even on validation failure path
+        let state = UPDATE_STATE.read();
+        assert!(!state.installing);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_update_install_download_failure_clears_flag() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        reset_state();
+        {
+            let mut state = UPDATE_STATE.write();
+            state.update_available = true;
+            state.latest_version = Some("99.0.0".to_string());
+            state.download_url =
+                Some("https://github.com/puremachinery/carapace/releases/tag/v99.0.0".to_string());
+        }
+        // The download will fail in test environments (no such release).
+        let result = handle_update_install().await;
+        assert!(result.is_err());
+        // Verify installing flag is cleared after failure
+        let state = UPDATE_STATE.read();
+        assert!(!state.installing);
+        // last_error should be populated
+        assert!(state.last_error.is_some());
+    }
+
+    #[test]
+    fn test_expected_asset_name() {
+        let name = expected_asset_name();
+        // Must start with "carapace-"
+        assert!(
+            name.starts_with("carapace-"),
+            "unexpected asset name: {name}"
+        );
+        // Must contain a platform identifier
+        let os = std::env::consts::OS;
+        let expected_os = match os {
+            "macos" => "darwin",
+            other => other,
+        };
+        assert!(
+            name.contains(expected_os),
+            "asset name '{name}' does not contain expected OS '{expected_os}'"
+        );
     }
 
     #[test]

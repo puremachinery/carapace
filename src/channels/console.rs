@@ -59,6 +59,9 @@ impl ChannelPluginInstance for ConsoleChannel {
             message_id: Some(Uuid::new_v4().to_string()),
             error: None,
             retryable: false,
+            conversation_id: None,
+            to_jid: None,
+            poll_id: None,
         })
     }
 
@@ -85,6 +88,9 @@ impl ChannelPluginInstance for ConsoleChannel {
             message_id: Some(Uuid::new_v4().to_string()),
             error: None,
             retryable: false,
+            conversation_id: None,
+            to_jid: None,
+            poll_id: None,
         })
     }
 }

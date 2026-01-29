@@ -92,6 +92,9 @@ impl ChannelPluginInstance for MockChannel {
                 message_id: None,
                 error: Some("Simulated failure".to_string()),
                 retryable: true,
+                conversation_id: None,
+                to_jid: None,
+                poll_id: None,
             })
         } else {
             Ok(DeliveryResult {
@@ -99,6 +102,9 @@ impl ChannelPluginInstance for MockChannel {
                 message_id: Some(format!("msg-{}-{}", self.id, ctx.to)),
                 error: None,
                 retryable: false,
+                conversation_id: None,
+                to_jid: None,
+                poll_id: None,
             })
         }
     }
@@ -110,6 +116,9 @@ impl ChannelPluginInstance for MockChannel {
             message_id: Some(format!("media-{}-{}", self.id, ctx.to)),
             error: None,
             retryable: false,
+            conversation_id: None,
+            to_jid: None,
+            poll_id: None,
         })
     }
 }

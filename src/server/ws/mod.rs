@@ -215,7 +215,7 @@ const GATEWAY_METHODS: [&str; 114] = [
     "system-event",
 ];
 
-const GATEWAY_EVENTS: [&str; 18] = [
+const GATEWAY_EVENTS: [&str; 19] = [
     "connect.challenge",
     "agent",
     "chat",
@@ -229,6 +229,7 @@ const GATEWAY_EVENTS: [&str; 18] = [
     "node.pair.requested",
     "node.pair.resolved",
     "node.invoke.request",
+    "node.event",
     "device.pair.requested",
     "device.pair.resolved",
     "voicewake.changed",
