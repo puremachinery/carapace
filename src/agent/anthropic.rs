@@ -170,6 +170,10 @@ impl LlmProvider for AnthropicProvider {
     }
 }
 
+/// Maximum SSE line buffer size (1 MB). If a single SSE line exceeds this,
+/// the stream is treated as corrupted to prevent unbounded memory growth.
+const MAX_SSE_BUFFER_BYTES: usize = 1_048_576;
+
 /// Process an SSE byte stream into StreamEvents.
 async fn process_sse_stream<S>(mut stream: S, tx: &mpsc::Sender<StreamEvent>) -> Result<(), String>
 where
@@ -185,6 +189,13 @@ where
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| format!("stream read error: {e}"))?;
         buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+        if buffer.len() > MAX_SSE_BUFFER_BYTES {
+            return Err(format!(
+                "SSE buffer exceeded {} bytes, aborting stream",
+                MAX_SSE_BUFFER_BYTES
+            ));
+        }
 
         // Process complete lines
         while let Some(newline_pos) = buffer.find('\n') {

@@ -425,6 +425,7 @@ pub fn validate_config(config: &Value) -> Vec<ValidationIssue> {
             "skills",
             "plugins",
             "anthropic",
+            "sessions",
         ];
 
         for key in obj.keys() {

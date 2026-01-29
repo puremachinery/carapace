@@ -71,13 +71,28 @@ pub fn get_model_pricing(model: &str) -> Option<ModelPricing> {
             output_cost_per_mtok: 15.0,
         });
     }
-    if model_lower.contains("claude-3-haiku") || model_lower.contains("claude-3.0-haiku") {
+    if model_lower.contains("claude-3-haiku")
+        || model_lower.contains("claude-3.0-haiku")
+        || model_lower.contains("claude-haiku-3")
+    {
         return Some(ModelPricing {
             input_cost_per_mtok: 0.25,
             output_cost_per_mtok: 1.25,
         });
     }
-    // Claude 4 models (hypothetical future pricing based on patterns)
+    // Claude 4 / claude-sonnet-4 / claude-haiku-4 models
+    if model_lower.contains("claude-sonnet-4") {
+        return Some(ModelPricing {
+            input_cost_per_mtok: 3.0,
+            output_cost_per_mtok: 15.0,
+        });
+    }
+    if model_lower.contains("claude-haiku-4") {
+        return Some(ModelPricing {
+            input_cost_per_mtok: 0.25,
+            output_cost_per_mtok: 1.25,
+        });
+    }
     if model_lower.contains("claude-opus-4")
         || model_lower.contains("claude-4-opus")
         || model_lower.contains("claude-4.0-opus")
@@ -168,7 +183,7 @@ fn current_month() -> String {
 }
 
 fn is_leap_year(year: u64) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+    (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
 }
 
 fn days_in_month(year: u64, month: u64) -> u64 {

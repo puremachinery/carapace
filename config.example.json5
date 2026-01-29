@@ -55,6 +55,7 @@
   // --- LLM provider -----------------------------------------------------
   anthropic: {
     apiKey: "${ANTHROPIC_API_KEY}",   // export ANTHROPIC_API_KEY="sk-ant-..."
+    // baseUrl: "https://api.anthropic.com",  // override with ANTHROPIC_BASE_URL env var
   },
 
   // --- Agents -----------------------------------------------------------
@@ -69,6 +70,11 @@
   //       },
   //     },
   //   ],
+  // },
+
+  // --- Sessions ---------------------------------------------------------
+  // sessions: {
+  //   retentionDays: 90,       // auto-delete sessions older than N days (default: unlimited)
   // },
 
   // --- Logging ----------------------------------------------------------

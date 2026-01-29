@@ -321,6 +321,9 @@ pub fn create_router_with_state(
             );
     }
 
+    // Health check (unauthenticated, always enabled)
+    router = router.route("/health", get(health_handler));
+
     // Tools API
     router = router.route("/tools/invoke", post(tools_invoke_handler));
 
@@ -467,6 +470,24 @@ fn normalize_hooks_path(path: &str) -> String {
         result.pop();
     }
     result
+}
+
+// ============================================================================
+// Health Check
+// ============================================================================
+
+/// GET /health - Lightweight liveness probe for container orchestrators.
+async fn health_handler(State(state): State<AppState>) -> Response {
+    let uptime = chrono::Utc::now().timestamp() - state.start_time;
+    (
+        StatusCode::OK,
+        Json(json!({
+            "status": "ok",
+            "version": env!("CARGO_PKG_VERSION"),
+            "uptime_seconds": uptime,
+        })),
+    )
+        .into_response()
 }
 
 // ============================================================================
@@ -1655,5 +1676,27 @@ mod tests {
             result.is_some(),
             "Loopback with proxy headers should be rejected"
         );
+    }
+
+    #[tokio::test]
+    async fn test_health_endpoint() {
+        let router = test_router(test_config());
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "ok");
+        assert!(json["version"].as_str().is_some());
+        assert!(json["uptime_seconds"].as_i64().is_some());
     }
 }

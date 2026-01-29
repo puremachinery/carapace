@@ -297,7 +297,7 @@ pub struct ChatMessage {
     pub tool_name: Option<String>,
     /// Token count for this message
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tokens: Option<u32>,
+    pub tokens: Option<u64>,
     /// Timestamp when message was created (Unix ms)
     pub created_at: i64,
     /// Additional metadata
@@ -355,7 +355,7 @@ impl ChatMessage {
     }
 
     /// Set token count
-    pub fn with_tokens(mut self, tokens: u32) -> Self {
+    pub fn with_tokens(mut self, tokens: u64) -> Self {
         self.tokens = Some(tokens);
         self
     }
@@ -384,6 +384,8 @@ pub struct SessionFilter {
     pub created_before: Option<i64>,
     /// Filter sessions updated after this timestamp (Unix ms)
     pub updated_after: Option<i64>,
+    /// Filter sessions updated before this timestamp (Unix ms)
+    pub updated_before: Option<i64>,
     /// Maximum number of sessions to return
     pub limit: Option<usize>,
     /// Number of sessions to skip
@@ -466,6 +468,11 @@ impl SessionFilter {
         }
         if let Some(updated_after) = self.updated_after {
             if session.updated_at < updated_after {
+                return false;
+            }
+        }
+        if let Some(updated_before) = self.updated_before {
+            if session.updated_at > updated_before {
                 return false;
             }
         }
@@ -848,6 +855,39 @@ impl SessionStore {
 
         for session in &sessions {
             self.delete_session(&session.id)?;
+        }
+
+        Ok(count)
+    }
+
+    /// Delete sessions that have not been updated within the given retention period.
+    ///
+    /// Returns the number of sessions deleted.
+    pub fn cleanup_expired(&self, retention_days: u32) -> Result<usize, SessionStoreError> {
+        let cutoff_ms = now_millis() - (retention_days as i64) * 24 * 60 * 60 * 1000;
+        let filter = SessionFilter {
+            updated_before: Some(cutoff_ms),
+            ..SessionFilter::default()
+        };
+        let expired = self.list_sessions(filter)?;
+        let count = expired.len();
+
+        for session in &expired {
+            if let Err(e) = self.delete_session(&session.id) {
+                warn!(
+                    session_id = %session.id,
+                    error = %e,
+                    "failed to delete expired session"
+                );
+            }
+        }
+
+        if count > 0 {
+            tracing::info!(
+                deleted = count,
+                retention_days,
+                "cleaned up expired sessions"
+            );
         }
 
         Ok(count)

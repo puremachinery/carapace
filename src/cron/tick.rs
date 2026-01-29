@@ -5,9 +5,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::cron::executor::execute_payload;
+use crate::cron::executor::{execute_payload, CronRunOutcome};
 use crate::cron::{CronJobStatus, CronRunMode};
-use crate::server::ws::WsServerState;
+use crate::server::ws::{AgentRunStatus, WsServerState};
 
 /// Run the cron tick loop.
 ///
@@ -19,6 +19,9 @@ pub async fn cron_tick_loop(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut ticker = tokio::time::interval(interval);
+    // Run session cleanup once per hour (count ticks)
+    let cleanup_every = std::cmp::max(1, 3600 / interval.as_secs().max(1));
+    let mut tick_count: u64 = 0;
 
     loop {
         tokio::select! {
@@ -28,6 +31,17 @@ pub async fn cron_tick_loop(
 
         if *shutdown.borrow() {
             break;
+        }
+
+        tick_count += 1;
+
+        // Periodic session cleanup
+        if tick_count.is_multiple_of(cleanup_every) {
+            if let Some(days) = state.session_retention_days() {
+                if let Err(e) = state.session_store().cleanup_expired(days) {
+                    tracing::warn!(error = %e, "session cleanup failed");
+                }
+            }
         }
 
         let due_ids = state.cron_scheduler.get_due_job_ids();
@@ -51,12 +65,46 @@ pub async fn cron_tick_loop(
                 tokio::spawn(async move {
                     let start = std::time::Instant::now();
                     let outcome = execute_payload(&job_id, &payload, &state).await;
-                    let duration_ms = start.elapsed().as_millis() as u64;
 
+                    // For AgentTurn payloads, wait for the agent run to actually complete
+                    // before reporting the cron job status.
                     let (status, error) = match outcome {
-                        Ok(_) => (CronJobStatus::Ok, None),
+                        Ok(CronRunOutcome::Spawned { run_id }) => {
+                            let waiter = {
+                                let mut registry = state.agent_run_registry.lock();
+                                registry.add_waiter(&run_id)
+                            };
+                            if let Some(rx) = waiter {
+                                match rx.await {
+                                    Ok(result) => match result.status {
+                                        AgentRunStatus::Completed => (CronJobStatus::Ok, None),
+                                        AgentRunStatus::Failed => {
+                                            (CronJobStatus::Error, result.error)
+                                        }
+                                        AgentRunStatus::Cancelled => (
+                                            CronJobStatus::Error,
+                                            Some("agent run cancelled".to_string()),
+                                        ),
+                                        _ => (CronJobStatus::Ok, None),
+                                    },
+                                    Err(_) => (
+                                        CronJobStatus::Error,
+                                        Some("agent run waiter dropped".to_string()),
+                                    ),
+                                }
+                            } else {
+                                // Run not found in registry (shouldn't happen)
+                                (
+                                    CronJobStatus::Error,
+                                    Some("agent run not found".to_string()),
+                                )
+                            }
+                        }
+                        Ok(CronRunOutcome::Broadcast) => (CronJobStatus::Ok, None),
                         Err(e) => (CronJobStatus::Error, Some(e)),
                     };
+
+                    let duration_ms = start.elapsed().as_millis() as u64;
 
                     if let Err(e) =
                         state

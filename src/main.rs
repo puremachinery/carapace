@@ -17,6 +17,7 @@ mod nodes;
 mod plugins;
 mod server;
 mod sessions;
+mod usage;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -74,9 +75,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map(|s| s.to_string())
     });
 
+    let base_url = std::env::var("ANTHROPIC_BASE_URL").ok().or_else(|| {
+        cfg.get("anthropic")
+            .and_then(|v| v.get("baseUrl"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    });
+
     let ws_state = if let Some(key) = api_key {
         match agent::anthropic::AnthropicProvider::new(key) {
-            Ok(provider) => {
+            Ok(mut provider) => {
+                if let Some(url) = base_url {
+                    provider = provider.with_base_url(url);
+                }
                 info!("LLM provider configured (Anthropic)");
                 let inner = Arc::try_unwrap(ws_state)
                     .expect("WsServerState Arc should have single owner at startup");

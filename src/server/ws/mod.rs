@@ -246,6 +246,9 @@ pub struct WsServerConfig {
     pub control_ui_disable_device_auth: bool,
     pub node_allow_commands: Vec<String>,
     pub node_deny_commands: Vec<String>,
+    /// Optional session retention in days. Sessions not updated within this
+    /// period are automatically deleted. `None` means unlimited retention.
+    pub session_retention_days: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -538,6 +541,11 @@ impl WsServerState {
     /// Get the session store.
     pub fn session_store(&self) -> &Arc<sessions::SessionStore> {
         &self.session_store
+    }
+
+    /// Get the configured session retention period in days, if any.
+    pub fn session_retention_days(&self) -> Option<u32> {
+        self.config.session_retention_days
     }
 
     /// Get the tools registry, if configured.
@@ -924,6 +932,12 @@ pub async fn build_ws_config_from_files() -> Result<WsServerConfig, WsConfigErro
         })
         .unwrap_or_default();
 
+    let sessions_obj = cfg.get("sessions").and_then(|v| v.as_object());
+    let session_retention_days = sessions_obj
+        .and_then(|s| s.get("retentionDays"))
+        .and_then(|v| v.as_u64())
+        .map(|d| d as u32);
+
     Ok(WsServerConfig {
         auth: WsAuthConfig {
             resolved: auth::ResolvedGatewayAuth {
@@ -939,6 +953,7 @@ pub async fn build_ws_config_from_files() -> Result<WsServerConfig, WsConfigErro
         control_ui_disable_device_auth,
         node_allow_commands,
         node_deny_commands,
+        session_retention_days,
     })
 }
 

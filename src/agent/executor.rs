@@ -105,6 +105,7 @@ pub async fn execute_run(
         let mut pending_tool_calls: Vec<(String, String, Value)> = Vec::new(); // (id, name, input)
         let mut stop_reason = StopReason::EndTurn;
         let mut turn_usage = TokenUsage::default();
+        let mut got_stop = false;
 
         loop {
             let event = tokio::select! {
@@ -166,6 +167,7 @@ pub async fn execute_run(
                 StreamEvent::Stop { reason, usage } => {
                     stop_reason = reason;
                     turn_usage = usage;
+                    got_stop = true;
                     break;
                 }
 
@@ -192,6 +194,13 @@ pub async fn execute_run(
                     return Err(AgentError::Provider(message));
                 }
             }
+        }
+
+        // Detect premature stream end (network interruption, upstream error)
+        if !got_stop {
+            return Err(AgentError::Stream(
+                "stream ended without stop event".to_string(),
+            ));
         }
 
         // Track usage
@@ -232,8 +241,8 @@ pub async fn execute_run(
                 serde_json::to_string(&blocks).unwrap_or_else(|_| turn_text.clone())
             };
 
-            let msg = ChatMessage::assistant(&session.id, &content)
-                .with_tokens(turn_usage.output_tokens as u32);
+            let msg =
+                ChatMessage::assistant(&session.id, &content).with_tokens(turn_usage.output_tokens);
             state
                 .session_store()
                 .append_message(msg.clone())
@@ -351,19 +360,16 @@ pub async fn execute_run(
     Ok(())
 }
 
-/// Rough cost estimate per model. Returns USD.
+/// Cost estimate per model using the shared pricing table. Returns USD.
 fn estimate_cost(model: &str, input_tokens: u64, output_tokens: u64) -> f64 {
-    let (input_rate, output_rate) = if model.contains("opus") {
-        (15.0 / 1_000_000.0, 75.0 / 1_000_000.0)
-    } else if model.contains("sonnet") {
-        (3.0 / 1_000_000.0, 15.0 / 1_000_000.0)
-    } else if model.contains("haiku") {
-        (0.25 / 1_000_000.0, 1.25 / 1_000_000.0)
-    } else {
-        // Default to sonnet pricing
-        (3.0 / 1_000_000.0, 15.0 / 1_000_000.0)
-    };
-    input_tokens as f64 * input_rate + output_tokens as f64 * output_rate
+    use crate::usage::{get_model_pricing, ModelPricing};
+
+    let pricing = get_model_pricing(model).unwrap_or(ModelPricing {
+        // Default to sonnet pricing for unknown models
+        input_cost_per_mtok: 3.0,
+        output_cost_per_mtok: 15.0,
+    });
+    pricing.calculate_cost(input_tokens, output_tokens)
 }
 
 #[cfg(test)]
