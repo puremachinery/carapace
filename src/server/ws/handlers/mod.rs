@@ -551,7 +551,7 @@ pub(super) async fn dispatch_method(
         "tts.voices" => handle_tts_voices(),
         "tts.enable" => handle_tts_enable(),
         "tts.disable" => handle_tts_disable(),
-        "tts.convert" => handle_tts_convert(params),
+        "tts.convert" => handle_tts_convert(params).await,
         "tts.setProvider" => handle_tts_set_provider(params),
         "tts.setVoice" => handle_tts_set_voice(params),
         "tts.configure" => handle_tts_configure(params),
@@ -591,9 +591,9 @@ pub(super) async fn dispatch_method(
         "skills.update" => handle_skills_update(params),
 
         // Update
-        "update.run" => handle_update_run(params),
+        "update.run" => handle_update_run(params).await,
         "update.status" => handle_update_status(),
-        "update.check" => handle_update_check(),
+        "update.check" => handle_update_check().await,
         "update.setChannel" => handle_update_set_channel(params),
         "update.configure" => handle_update_configure(params),
         "update.install" => handle_update_install(),

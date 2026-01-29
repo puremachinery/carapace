@@ -62,15 +62,75 @@ pub(super) fn handle_skills_status() -> Result<Value, ErrorShape> {
     let cfg = config::load_config().unwrap_or(Value::Object(serde_json::Map::new()));
     let workspace_dir = resolve_workspace_dir(&cfg);
     let managed_skills_dir = workspace_dir.join("skills");
+
+    let skills_arr = build_skills_array(&cfg);
+
     Ok(json!({
         "workspaceDir": workspace_dir.to_string_lossy(),
         "managedSkillsDir": managed_skills_dir.to_string_lossy(),
-        "skills": []
+        "skills": skills_arr
     }))
 }
 
+/// Build a JSON array of skill entries from the config's `skills.entries` map.
+fn build_skills_array(cfg: &Value) -> Vec<Value> {
+    let entries = match cfg
+        .get("skills")
+        .and_then(|s| s.get("entries"))
+        .and_then(|e| e.as_object())
+    {
+        Some(map) => map,
+        None => return Vec::new(),
+    };
+
+    entries
+        .iter()
+        .map(|(key, entry)| {
+            json!({
+                "name": key,
+                "enabled": entry.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true),
+                "installId": entry.get("installId").cloned().unwrap_or(Value::Null),
+                "requestedAt": entry.get("requestedAt").cloned().unwrap_or(Value::Null),
+            })
+        })
+        .collect()
+}
+
 pub(super) fn handle_skills_bins() -> Result<Value, ErrorShape> {
-    Ok(json!({ "bins": [] }))
+    let cfg = config::load_config().unwrap_or(Value::Object(serde_json::Map::new()));
+    let workspace_dir = resolve_workspace_dir(&cfg);
+    let managed_skills_dir = workspace_dir.join("skills");
+
+    let bins = scan_skills_bins(&managed_skills_dir);
+
+    Ok(json!({ "bins": bins }))
+}
+
+/// Scan the managed skills directory for binary files.
+/// Returns an empty vec if the directory does not exist or cannot be read.
+fn scan_skills_bins(dir: &std::path::Path) -> Vec<Value> {
+    let read_dir = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut bins = Vec::new();
+    for entry in read_dir {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        // Only include files (skip subdirectories)
+        if path.is_file() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            bins.push(json!({
+                "name": name,
+                "path": path.to_string_lossy(),
+            }));
+        }
+    }
+    bins
 }
 
 pub(super) fn handle_skills_install(params: Option<&Value>) -> Result<Value, ErrorShape> {
@@ -204,4 +264,131 @@ pub(super) fn handle_skills_update(params: Option<&Value>) -> Result<Value, Erro
         "skillKey": skill_key,
         "updated": true
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_build_skills_array_empty_config() {
+        let cfg = json!({});
+        let result = build_skills_array(&cfg);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_build_skills_array_no_entries() {
+        let cfg = json!({ "skills": {} });
+        let result = build_skills_array(&cfg);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_build_skills_array_empty_entries() {
+        let cfg = json!({ "skills": { "entries": {} } });
+        let result = build_skills_array(&cfg);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_build_skills_array_with_entries() {
+        let cfg = json!({
+            "skills": {
+                "entries": {
+                    "weather": {
+                        "enabled": true,
+                        "installId": "abc-123",
+                        "requestedAt": 1700000000000u64
+                    },
+                    "calendar": {
+                        "enabled": false,
+                        "installId": "def-456",
+                        "requestedAt": 1700000001000u64
+                    }
+                }
+            }
+        });
+        let result = build_skills_array(&cfg);
+        assert_eq!(result.len(), 2);
+
+        // Find weather and calendar entries (order is not guaranteed in JSON objects)
+        let weather = result.iter().find(|v| v["name"] == "weather").unwrap();
+        assert_eq!(weather["enabled"], true);
+        assert_eq!(weather["installId"], "abc-123");
+        assert_eq!(weather["requestedAt"], 1700000000000u64);
+
+        let calendar = result.iter().find(|v| v["name"] == "calendar").unwrap();
+        assert_eq!(calendar["enabled"], false);
+        assert_eq!(calendar["installId"], "def-456");
+        assert_eq!(calendar["requestedAt"], 1700000001000u64);
+    }
+
+    #[test]
+    fn test_build_skills_array_enabled_defaults_true() {
+        let cfg = json!({
+            "skills": {
+                "entries": {
+                    "minimal": {}
+                }
+            }
+        });
+        let result = build_skills_array(&cfg);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["name"], "minimal");
+        assert_eq!(result[0]["enabled"], true);
+        assert!(result[0]["installId"].is_null());
+        assert!(result[0]["requestedAt"].is_null());
+    }
+
+    #[test]
+    fn test_build_skills_array_entries_not_object() {
+        // If entries is not an object (e.g. an array), return empty
+        let cfg = json!({ "skills": { "entries": [1, 2, 3] } });
+        let result = build_skills_array(&cfg);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_scan_skills_bins_nonexistent_dir() {
+        let result = scan_skills_bins(std::path::Path::new(
+            "/nonexistent/path/that/does/not/exist/skills",
+        ));
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_scan_skills_bins_empty_dir() {
+        let dir = TempDir::new().unwrap();
+        let result = scan_skills_bins(dir.path());
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_scan_skills_bins_with_files() {
+        let dir = TempDir::new().unwrap();
+        // Create some files
+        std::fs::write(dir.path().join("skill-a"), b"#!/bin/sh\n").unwrap();
+        std::fs::write(dir.path().join("skill-b"), b"#!/bin/sh\n").unwrap();
+        // Create a subdirectory (should be skipped)
+        std::fs::create_dir(dir.path().join("subdir")).unwrap();
+
+        let result = scan_skills_bins(dir.path());
+        assert_eq!(result.len(), 2);
+
+        let names: Vec<&str> = result.iter().map(|v| v["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"skill-a"));
+        assert!(names.contains(&"skill-b"));
+
+        // Verify paths are absolute
+        for bin in &result {
+            let path = bin["path"].as_str().unwrap();
+            assert!(
+                std::path::Path::new(path).is_absolute(),
+                "path should be absolute: {}",
+                path
+            );
+        }
+    }
 }

@@ -8,8 +8,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tracing::warn;
 
 use super::super::*;
+
+/// GitHub API response for the latest release
+#[derive(Debug, Deserialize)]
+struct GitHubRelease {
+    tag_name: String,
+    html_url: String,
+    body: Option<String>,
+}
 
 /// Available update channels
 pub const UPDATE_CHANNELS: [&str; 3] = ["stable", "beta", "dev"];
@@ -70,8 +79,67 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// Fetch the latest release from GitHub and update global state.
+///
+/// On success, populates `latest_version`, `update_available`, `download_url`,
+/// and `release_notes`. On failure, sets `last_error` and leaves
+/// `update_available` as `false`. Always clears the `checking` flag before
+/// returning.
+async fn fetch_latest_release() {
+    let current_version = {
+        let state = UPDATE_STATE.read();
+        state.current_version.clone()
+    };
+
+    let user_agent = format!("carapace/{}", current_version);
+
+    let result: Result<GitHubRelease, String> = async {
+        let client = reqwest::Client::new();
+        let resp = client
+            .get("https://api.github.com/repos/puremachinery/carapace/releases/latest")
+            .header("User-Agent", &user_agent)
+            .header("Accept", "application/vnd.github+json")
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await
+            .map_err(|e| format!("HTTP request failed: {e}"))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("GitHub API returned status {}", resp.status()));
+        }
+
+        resp.json::<GitHubRelease>()
+            .await
+            .map_err(|e| format!("failed to parse release JSON: {e}"))
+    }
+    .await;
+
+    let mut state = UPDATE_STATE.write();
+    match result {
+        Ok(release) => {
+            let latest = release
+                .tag_name
+                .strip_prefix('v')
+                .unwrap_or(&release.tag_name)
+                .to_string();
+
+            state.update_available = latest != current_version;
+            state.latest_version = Some(latest);
+            state.download_url = Some(release.html_url);
+            state.release_notes = release.body;
+            state.last_error = None;
+        }
+        Err(err) => {
+            warn!("update check failed: {err}");
+            state.last_error = Some(err);
+            state.update_available = false;
+        }
+    }
+    state.checking = false;
+}
+
 /// Trigger an update check and optionally install
-pub(super) fn handle_update_run(params: Option<&Value>) -> Result<Value, ErrorShape> {
+pub(super) async fn handle_update_run(params: Option<&Value>) -> Result<Value, ErrorShape> {
     let check_only = params
         .and_then(|v| v.get("checkOnly"))
         .and_then(|v| v.as_bool())
@@ -82,31 +150,34 @@ pub(super) fn handle_update_run(params: Option<&Value>) -> Result<Value, ErrorSh
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let mut state = UPDATE_STATE.write();
+    // Acquire lock briefly to validate and set flags
+    {
+        let mut state = UPDATE_STATE.write();
 
-    // Prevent concurrent update operations
-    if state.checking || state.installing {
-        return Err(error_shape(
-            ERROR_UNAVAILABLE,
-            "update operation already in progress",
-            Some(json!({
-                "checking": state.checking,
-                "installing": state.installing
-            })),
-        ));
+        // Prevent concurrent update operations
+        if state.checking || state.installing {
+            return Err(error_shape(
+                ERROR_UNAVAILABLE,
+                "update operation already in progress",
+                Some(json!({
+                    "checking": state.checking,
+                    "installing": state.installing
+                })),
+            ));
+        }
+
+        state.checking = true;
+        state.last_check_at = Some(now_ms());
+        state.last_error = None;
     }
 
-    state.last_check_at = Some(now_ms());
-    state.last_error = None;
+    // Perform the real HTTP check (lock is not held during the await)
+    fetch_latest_release().await;
 
-    // In a real implementation, this would:
-    // 1. Check for updates from the update server
-    // 2. Download and install if available and not check_only
-    // For now, simulate no update available
+    // When check_only is false and an update is available, the state is
+    // already populated. Actual download/install is a future task.
 
-    state.checking = false;
-    state.update_available = false;
-
+    let state = UPDATE_STATE.read();
     Ok(json!({
         "ok": true,
         "currentVersion": state.current_version,
@@ -138,27 +209,29 @@ pub(super) fn handle_update_status() -> Result<Value, ErrorShape> {
 }
 
 /// Check for updates without installing
-pub(super) fn handle_update_check() -> Result<Value, ErrorShape> {
-    let mut state = UPDATE_STATE.write();
+pub(super) async fn handle_update_check() -> Result<Value, ErrorShape> {
+    // Acquire lock briefly to validate and set checking flag
+    {
+        let mut state = UPDATE_STATE.write();
 
-    if state.checking {
-        return Err(error_shape(
-            ERROR_UNAVAILABLE,
-            "update check already in progress",
-            None,
-        ));
+        if state.checking {
+            return Err(error_shape(
+                ERROR_UNAVAILABLE,
+                "update check already in progress",
+                None,
+            ));
+        }
+
+        state.checking = true;
+        state.last_check_at = Some(now_ms());
+        state.last_error = None;
     }
 
-    state.checking = true;
-    state.last_check_at = Some(now_ms());
-    state.last_error = None;
+    // Perform the actual HTTP check (lock is not held during the await)
+    fetch_latest_release().await;
 
-    // Simulate update check
-    // In production, this would make an HTTP request to the update server
-    state.checking = false;
-    state.update_available = false;
-    state.latest_version = Some(state.current_version.clone());
-
+    // Read final state and build response
+    let state = UPDATE_STATE.read();
     Ok(json!({
         "ok": true,
         "currentVersion": state.current_version,
@@ -314,29 +387,35 @@ mod tests {
         assert_eq!(result["autoUpdate"], true);
     }
 
-    #[test]
-    fn test_update_run() {
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_update_run() {
         let _lock = TEST_LOCK.lock().unwrap();
         reset_state();
-        let result = handle_update_run(None).unwrap();
+        // In test environments the HTTP request will fail, but the handler
+        // must still succeed (returning updateAvailable: false with a last_error).
+        let result = handle_update_run(None).await.unwrap();
         assert_eq!(result["ok"], true);
         assert_eq!(result["updateAvailable"], false);
     }
 
-    #[test]
-    fn test_update_run_check_only() {
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_update_run_check_only() {
         let _lock = TEST_LOCK.lock().unwrap();
         reset_state();
         let params = json!({ "checkOnly": true });
-        let result = handle_update_run(Some(&params)).unwrap();
+        let result = handle_update_run(Some(&params)).await.unwrap();
         assert_eq!(result["checkOnly"], true);
     }
 
-    #[test]
-    fn test_update_check() {
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_update_check() {
         let _lock = TEST_LOCK.lock().unwrap();
         reset_state();
-        let result = handle_update_check().unwrap();
+        // HTTP will fail in tests, but handler returns Ok with an error recorded in state
+        let result = handle_update_check().await.unwrap();
         assert_eq!(result["ok"], true);
     }
 
@@ -390,5 +469,21 @@ mod tests {
         reset_state();
         let result = handle_update_dismiss().unwrap();
         assert_eq!(result["ok"], true);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_update_check_records_error_on_http_failure() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        reset_state();
+        // This will attempt to reach GitHub and fail in test environments
+        let result = handle_update_check().await.unwrap();
+        assert_eq!(result["ok"], true);
+        // After a failed HTTP call, checking flag must be cleared
+        let state = UPDATE_STATE.read();
+        assert!(!state.checking);
+        // last_error should be populated since HTTP failed
+        assert!(state.last_error.is_some());
+        assert!(!state.update_available);
     }
 }

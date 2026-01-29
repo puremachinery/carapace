@@ -103,6 +103,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ws_state
     };
 
+    // 6b. Register built-in console channel (for testing/demo)
+    let ws_state = {
+        let plugin_reg = Arc::new(plugins::PluginRegistry::new());
+        plugin_reg.register_channel(
+            "console".to_string(),
+            Arc::new(channels::console::ConsoleChannel::new()),
+        );
+        ws_state.channel_registry().register(
+            channels::ChannelInfo::new("console", "Console")
+                .with_status(channels::ChannelStatus::Connected),
+        );
+        let inner = Arc::try_unwrap(ws_state)
+            .expect("WsServerState Arc should have single owner at startup");
+        Arc::new(inner.with_plugin_registry(plugin_reg))
+    };
+    info!("Console channel registered");
+
     // 7. Build HTTP config and router
     let http_config = server::http::build_http_config(&cfg);
     let http_router = server::http::create_router_with_state(

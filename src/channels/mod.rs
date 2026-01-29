@@ -3,6 +3,7 @@
 //! Provides channel registry for tracking active messaging channels
 //! and their connection states.
 
+pub mod console;
 pub mod webhook;
 
 use parking_lot::RwLock;

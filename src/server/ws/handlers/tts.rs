@@ -144,8 +144,29 @@ pub(super) fn handle_tts_disable() -> Result<Value, ErrorShape> {
     }))
 }
 
+/// Resolve the OpenAI API key from config or environment.
+fn resolve_openai_api_key() -> Option<String> {
+    // Try config first: models.providers.openai.apiKey
+    if let Ok(cfg) = config::load_config() {
+        if let Some(key) = cfg
+            .get("models")
+            .and_then(|v| v.get("providers"))
+            .and_then(|v| v.get("openai"))
+            .and_then(|v| v.get("apiKey"))
+            .and_then(|v| v.as_str())
+        {
+            if !key.is_empty() {
+                return Some(key.to_string());
+            }
+        }
+    }
+
+    // Fall back to environment variable
+    env::var("OPENAI_API_KEY").ok().filter(|k| !k.is_empty())
+}
+
 /// Convert text to speech
-pub(super) fn handle_tts_convert(params: Option<&Value>) -> Result<Value, ErrorShape> {
+pub(super) async fn handle_tts_convert(params: Option<&Value>) -> Result<Value, ErrorShape> {
     let text = params
         .and_then(|v| v.get("text"))
         .and_then(|v| v.as_str())
@@ -159,24 +180,89 @@ pub(super) fn handle_tts_convert(params: Option<&Value>) -> Result<Value, ErrorS
         ));
     }
 
-    let state = TTS_STATE.read();
+    // Read state in a block so the parking_lot guard (which is !Send) is
+    // dropped before any await point.
+    let (provider, voice, rate, pitch) = {
+        let state = TTS_STATE.read();
 
-    if !state.enabled {
-        return Err(error_shape(ERROR_UNAVAILABLE, "TTS is not enabled", None));
+        if !state.enabled {
+            return Err(error_shape(ERROR_UNAVAILABLE, "TTS is not enabled", None));
+        }
+
+        let provider = state.provider.as_deref().unwrap_or("system").to_string();
+        let voice = state.voice.clone().unwrap_or_else(|| "alloy".to_string());
+        let rate = state.rate;
+        let pitch = state.pitch;
+        (provider, voice, rate, pitch)
+    };
+
+    if provider == "openai" {
+        if let Some(api_key) = resolve_openai_api_key() {
+            let client = reqwest::Client::new();
+            let body = json!({
+                "model": "tts-1",
+                "input": text,
+                "voice": voice,
+                "response_format": "mp3"
+            });
+
+            let response = client
+                .post("https://api.openai.com/v1/audio/speech")
+                .header("Authorization", format!("Bearer {}", api_key))
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| {
+                    error_shape(
+                        ERROR_UNAVAILABLE,
+                        &format!("OpenAI TTS request failed: {}", e),
+                        None,
+                    )
+                })?;
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let err_body = response.text().await.unwrap_or_default();
+                return Err(error_shape(
+                    ERROR_UNAVAILABLE,
+                    &format!("OpenAI TTS API error ({}): {}", status, err_body),
+                    None,
+                ));
+            }
+
+            let audio_bytes = response.bytes().await.map_err(|e| {
+                error_shape(
+                    ERROR_UNAVAILABLE,
+                    &format!("failed to read OpenAI TTS response: {}", e),
+                    None,
+                )
+            })?;
+
+            let audio_b64 = base64::engine::general_purpose::STANDARD.encode(&audio_bytes);
+
+            return Ok(json!({
+                "ok": true,
+                "text": text,
+                "provider": provider,
+                "voice": voice,
+                "rate": rate,
+                "pitch": pitch,
+                "audio": audio_b64,
+                "audioFormat": "mp3",
+                "duration": null
+            }));
+        }
+        // No API key available – fall through to null-audio response
     }
 
-    let provider = state.provider.as_deref().unwrap_or("system");
-
-    // In a real implementation, this would call the TTS provider
-    // and return the audio data (base64 encoded or as a URL)
+    // Non-OpenAI provider or no API key: return null audio
     Ok(json!({
         "ok": true,
         "text": text,
         "provider": provider,
-        "voice": state.voice,
-        "rate": state.rate,
-        "pitch": state.pitch,
-        // Audio would be base64 encoded PCM/MP3 data
+        "voice": voice,
+        "rate": rate,
+        "pitch": pitch,
         "audio": null,
         "audioFormat": "mp3",
         "duration": null
@@ -396,28 +482,53 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_tts_convert_requires_enabled() {
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_tts_convert_requires_enabled() {
         let _lock = TEST_LOCK.lock().unwrap();
         reset_state();
 
         let params = json!({ "text": "Hello world" });
-        let result = handle_tts_convert(Some(&params));
+        let result = handle_tts_convert(Some(&params)).await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code, ERROR_UNAVAILABLE);
     }
 
-    #[test]
-    fn test_tts_convert_when_enabled() {
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_tts_convert_when_enabled() {
         let _lock = TEST_LOCK.lock().unwrap();
         reset_state();
         handle_tts_enable().unwrap();
 
         let params = json!({ "text": "Hello world" });
-        let result = handle_tts_convert(Some(&params)).unwrap();
+        let result = handle_tts_convert(Some(&params)).await.unwrap();
         assert_eq!(result["ok"], true);
         assert_eq!(result["text"], "Hello world");
         assert_eq!(result["provider"], "system");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_tts_convert_openai_no_api_key_returns_null_audio() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        reset_state();
+
+        // Enable TTS and set provider to openai
+        handle_tts_enable().unwrap();
+        let params = json!({ "provider": "openai" });
+        handle_tts_set_provider(Some(&params)).unwrap();
+
+        // Ensure no OPENAI_API_KEY is set for this test
+        env::remove_var("OPENAI_API_KEY");
+
+        let params = json!({ "text": "Hello from OpenAI" });
+        let result = handle_tts_convert(Some(&params)).await.unwrap();
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["text"], "Hello from OpenAI");
+        assert_eq!(result["provider"], "openai");
+        assert!(result["audio"].is_null());
+        assert_eq!(result["audioFormat"], "mp3");
     }
 
     #[test]

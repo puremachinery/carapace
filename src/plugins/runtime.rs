@@ -25,8 +25,8 @@ use std::time::Duration;
 
 use parking_lot::RwLock;
 use thiserror::Error;
-use wasmtime::component::{Component, Linker};
-use wasmtime::{Config, Engine, Store};
+use wasmtime::component::{Component, ComponentType, Lift, Linker, Lower};
+use wasmtime::{Config, Engine, Store, StoreContextMut};
 
 use crate::credentials::{CredentialBackend, CredentialStore};
 
@@ -34,7 +34,7 @@ use super::bindings::{
     BindingError, ChannelCapabilities, ChannelInfo, ChannelPluginInstance, ChatType,
     DeliveryResult, HookEvent, HookPluginInstance, HookResult, OutboundContext, PluginError,
     PluginRegistry, ServicePluginInstance, ToolContext, ToolDefinition, ToolPluginInstance,
-    ToolResult, WebhookPluginInstance, WebhookRequest, WebhookResponse,
+    ToolResult, WebhookPluginInstance, WebhookRequest, WebhookResponse, WitHost,
 };
 use super::capabilities::{RateLimiterRegistry, SsrfConfig};
 use super::host::{HostError, HttpRequest, HttpResponse, MediaFetchResult, PluginHostContext};
@@ -45,6 +45,81 @@ pub const MAX_PLUGIN_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Default execution timeout per function call (30s)
 pub const DEFAULT_EXECUTION_TIMEOUT: Duration = Duration::from_secs(30);
+
+// ============== WIT Component Model Types ==============
+//
+// These types mirror the WIT record definitions in wit/plugin.wit and are used
+// by the component model linker to marshal data between host and guest.
+
+/// Assert that a future is Send.
+///
+/// # Safety
+///
+/// The caller must guarantee that the future is actually Send-safe.
+/// This is needed because `CredentialBackend` uses `async fn` in trait
+/// which doesn't imply `Send` at the trait level, even though all concrete
+/// implementations are Send (the backend type `B` is bound as `Send + Sync`).
+unsafe fn assert_send<T>(
+    fut: impl std::future::Future<Output = T>,
+) -> impl std::future::Future<Output = T> + Send {
+    /// Wrapper that unsafely implements Send for a future.
+    struct AssertSend<F>(F);
+    // SAFETY: Caller guarantees the inner future is Send-safe.
+    unsafe impl<F> Send for AssertSend<F> {}
+    impl<F: std::future::Future> std::future::Future for AssertSend<F> {
+        type Output = F::Output;
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            // SAFETY: We are not moving the inner future, just projecting through the wrapper.
+            unsafe { self.map_unchecked_mut(|s| &mut s.0).poll(cx) }
+        }
+    }
+    AssertSend(fut)
+}
+
+/// WIT `http-request` record for the component model linker.
+#[derive(Clone, Debug, ComponentType, Lift, Lower)]
+#[component(record)]
+struct WitHttpRequest {
+    #[component(name = "method")]
+    method: String,
+    #[component(name = "url")]
+    url: String,
+    #[component(name = "headers")]
+    headers: Vec<(String, String)>,
+    #[component(name = "body")]
+    body: Option<Vec<u8>>,
+}
+
+/// WIT `http-response` record for the component model linker.
+#[derive(Clone, Debug, ComponentType, Lift, Lower)]
+#[component(record)]
+struct WitHttpResponse {
+    #[component(name = "status")]
+    status: u16,
+    #[component(name = "headers")]
+    headers: Vec<(String, String)>,
+    #[component(name = "body")]
+    body: Option<Vec<u8>>,
+}
+
+/// WIT `media-fetch-result` record for the component model linker.
+#[derive(Clone, Debug, ComponentType, Lift, Lower)]
+#[component(record)]
+struct WitMediaFetchResult {
+    #[component(name = "ok")]
+    ok: bool,
+    #[component(name = "local-path")]
+    local_path: Option<String>,
+    #[component(name = "mime-type")]
+    mime_type: Option<String>,
+    #[component(name = "size")]
+    size: Option<u64>,
+    #[component(name = "error")]
+    error: Option<String>,
+}
 
 /// Plugin runtime errors
 #[derive(Error, Debug)]
@@ -258,27 +333,199 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
         Ok(())
     }
 
-    /// Add host functions to the linker
+    /// Add host functions to the linker.
     ///
-    /// Note: In a full implementation, this would use wit-bindgen generated bindings
-    /// to provide host functions. The component model linker uses a different API
-    /// than the core module linker. For production use, we would:
+    /// Registers all host interface functions defined in `wit/plugin.wit` with the
+    /// wasmtime component model linker. Each function is bound under the `"host"`
+    /// instance namespace and delegates to [`WitHost`] which wraps
+    /// [`PluginHostContext`] for the actual implementation.
     ///
-    /// 1. Run `wit-bindgen` to generate Rust types from wit/plugin.wit
-    /// 2. Implement the generated host traits
-    /// 3. Use the generated `add_to_linker` function
-    ///
-    /// For now, we leave the linker empty and rely on the adapters providing
-    /// mock implementations of plugin functionality.
-    fn add_host_functions(&self, _linker: &mut Linker<HostState<B>>) -> Result<(), RuntimeError> {
-        // TODO: Add host function bindings via wit-bindgen generated code
-        // The host interface is defined in wit/plugin.wit
-        //
-        // Host functions to implement:
-        // - log-debug, log-info, log-warn, log-error (logging)
-        // - config-get (scoped config access)
-        // - credential-get, credential-set (isolated credential access)
-        // - http-fetch, media-fetch (SSRF-protected HTTP)
+    /// Sync functions (logging, config) use `func_wrap`.
+    /// Async functions (credentials, HTTP, media) use `func_wrap_async`.
+    fn add_host_functions(&self, linker: &mut Linker<HostState<B>>) -> Result<(), RuntimeError> {
+        let mut host_instance = linker.instance("host").map_err(|e| {
+            RuntimeError::WasmtimeError(format!("Failed to create host instance in linker: {}", e))
+        })?;
+
+        // ---- Logging (sync) ----
+
+        host_instance
+            .func_wrap(
+                "log-debug",
+                |ctx: StoreContextMut<'_, HostState<B>>, (message,): (String,)| {
+                    let wit = WitHost::new(ctx.data().host_ctx.clone());
+                    wit.log_debug(&message);
+                    Ok(())
+                },
+            )
+            .map_err(|e| RuntimeError::WasmtimeError(format!("Failed to bind log-debug: {}", e)))?;
+
+        host_instance
+            .func_wrap(
+                "log-info",
+                |ctx: StoreContextMut<'_, HostState<B>>, (message,): (String,)| {
+                    let wit = WitHost::new(ctx.data().host_ctx.clone());
+                    wit.log_info(&message);
+                    Ok(())
+                },
+            )
+            .map_err(|e| RuntimeError::WasmtimeError(format!("Failed to bind log-info: {}", e)))?;
+
+        host_instance
+            .func_wrap(
+                "log-warn",
+                |ctx: StoreContextMut<'_, HostState<B>>, (message,): (String,)| {
+                    let wit = WitHost::new(ctx.data().host_ctx.clone());
+                    wit.log_warn(&message);
+                    Ok(())
+                },
+            )
+            .map_err(|e| RuntimeError::WasmtimeError(format!("Failed to bind log-warn: {}", e)))?;
+
+        host_instance
+            .func_wrap(
+                "log-error",
+                |ctx: StoreContextMut<'_, HostState<B>>, (message,): (String,)| {
+                    let wit = WitHost::new(ctx.data().host_ctx.clone());
+                    wit.log_error(&message);
+                    Ok(())
+                },
+            )
+            .map_err(|e| RuntimeError::WasmtimeError(format!("Failed to bind log-error: {}", e)))?;
+
+        // ---- Config (sync) ----
+
+        host_instance
+            .func_wrap(
+                "config-get",
+                |ctx: StoreContextMut<'_, HostState<B>>,
+                 (key,): (String,)|
+                 -> wasmtime::Result<(Option<String>,)> {
+                    let wit = WitHost::new(ctx.data().host_ctx.clone());
+                    Ok((wit.config_get(&key),))
+                },
+            )
+            .map_err(|e| {
+                RuntimeError::WasmtimeError(format!("Failed to bind config-get: {}", e))
+            })?;
+
+        // ---- Credentials (async) ----
+
+        host_instance
+            .func_wrap_async(
+                "credential-get",
+                |ctx: StoreContextMut<'_, HostState<B>>,
+                 (key,): (String,)|
+                 -> Box<
+                    dyn std::future::Future<Output = wasmtime::Result<(Option<String>,)>>
+                        + Send
+                        + '_,
+                > {
+                    let host_ctx = ctx.data().host_ctx.clone();
+                    // SAFETY: PluginHostContext<B> is Send+Sync (B: Send+Sync),
+                    // and all concrete CredentialBackend impls produce Send futures.
+                    Box::new(unsafe {
+                        assert_send(async move {
+                            let wit = WitHost::new(host_ctx);
+                            Ok((wit.credential_get(&key).await,))
+                        })
+                    })
+                },
+            )
+            .map_err(|e| {
+                RuntimeError::WasmtimeError(format!("Failed to bind credential-get: {}", e))
+            })?;
+
+        host_instance
+            .func_wrap_async(
+                "credential-set",
+                |ctx: StoreContextMut<'_, HostState<B>>,
+                 (key, value): (String, String)|
+                 -> Box<
+                    dyn std::future::Future<Output = wasmtime::Result<(bool,)>> + Send + '_,
+                > {
+                    let host_ctx = ctx.data().host_ctx.clone();
+                    // SAFETY: Same reasoning as credential-get above.
+                    Box::new(unsafe {
+                        assert_send(async move {
+                            let wit = WitHost::new(host_ctx);
+                            Ok((wit.credential_set(&key, &value).await,))
+                        })
+                    })
+                },
+            )
+            .map_err(|e| {
+                RuntimeError::WasmtimeError(format!("Failed to bind credential-set: {}", e))
+            })?;
+
+        // ---- HTTP (async) ----
+
+        host_instance
+            .func_wrap_async(
+                "http-fetch",
+                |ctx: StoreContextMut<'_, HostState<B>>,
+                 (req,): (WitHttpRequest,)|
+                 -> Box<
+                    dyn std::future::Future<
+                            Output = wasmtime::Result<(Result<WitHttpResponse, String>,)>,
+                        > + Send
+                        + '_,
+                > {
+                    let host_ctx = ctx.data().host_ctx.clone();
+                    Box::new(async move {
+                        let wit = WitHost::new(host_ctx);
+                        let host_req = HttpRequest {
+                            method: req.method,
+                            url: req.url,
+                            headers: req.headers,
+                            body: req.body,
+                        };
+                        let result = match wit.http_fetch(host_req).await {
+                            Ok(resp) => Ok(WitHttpResponse {
+                                status: resp.status,
+                                headers: resp.headers,
+                                body: resp.body,
+                            }),
+                            Err(e) => Err(e),
+                        };
+                        Ok((result,))
+                    })
+                },
+            )
+            .map_err(|e| {
+                RuntimeError::WasmtimeError(format!("Failed to bind http-fetch: {}", e))
+            })?;
+
+        // ---- Media (async) ----
+
+        host_instance
+            .func_wrap_async(
+                "media-fetch",
+                |ctx: StoreContextMut<'_, HostState<B>>,
+                 (url, max_bytes, timeout_ms): (String, Option<u64>, Option<u32>)|
+                 -> Box<
+                    dyn std::future::Future<Output = wasmtime::Result<(WitMediaFetchResult,)>>
+                        + Send
+                        + '_,
+                > {
+                    let host_ctx = ctx.data().host_ctx.clone();
+                    Box::new(async move {
+                        let wit = WitHost::new(host_ctx);
+                        let result = wit.media_fetch(&url, max_bytes, timeout_ms).await;
+                        Ok((WitMediaFetchResult {
+                            ok: result.ok,
+                            local_path: result.local_path,
+                            mime_type: result.mime_type,
+                            size: result.size,
+                            error: result.error,
+                        },))
+                    })
+                },
+            )
+            .map_err(|e| {
+                RuntimeError::WasmtimeError(format!("Failed to bind media-fetch: {}", e))
+            })?;
+
         Ok(())
     }
 
