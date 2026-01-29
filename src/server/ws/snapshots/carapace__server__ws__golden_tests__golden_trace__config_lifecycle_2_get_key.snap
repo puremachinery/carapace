@@ -7,6 +7,6 @@ expression: normalized
   "ok": true,
   "result": {
     "key": "gateway.port",
-    "value": 18789
+    "value": "<CONFIG_VALUE>"
   }
 }

@@ -166,6 +166,14 @@ mod golden_trace {
                     }
                 }
 
+                // Normalize config key lookup responses (config.get with a key param).
+                // The value depends on config file content on disk.
+                if map.contains_key("key") && map.contains_key("value") {
+                    if let Some(Value::String(_)) = map.get("key") {
+                        map.insert("value".to_string(), json!("<CONFIG_VALUE>"));
+                    }
+                }
+
                 // Normalize the "count" field for sessions when it depends on disk.
                 if map.contains_key("count") && map.contains_key("defaults") {
                     // This is a sessions.list response.
