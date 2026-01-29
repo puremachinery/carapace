@@ -827,9 +827,7 @@ impl SessionStore {
 
         let mut exported = Vec::new();
         for session in &sessions {
-            let history = self
-                .get_history(&session.id, None, None)
-                .unwrap_or_default();
+            let history = self.get_history(&session.id, None, None)?;
             exported.push(serde_json::json!({
                 "session": session,
                 "messages": history,
@@ -847,17 +845,27 @@ impl SessionStore {
     /// Delete all data for a user (GDPR Art. 17 — right to erasure).
     ///
     /// Deletes all sessions and their histories for the given user_id.
-    /// Returns the number of sessions deleted.
+    /// Uses best-effort: logs individual failures and continues.
+    /// Returns the number of sessions successfully deleted.
     pub fn purge_user_data(&self, user_id: &str) -> Result<usize, SessionStoreError> {
         let filter = SessionFilter::new().with_user_id(user_id);
         let sessions = self.list_sessions(filter)?;
-        let count = sessions.len();
+        let mut deleted = 0;
 
         for session in &sessions {
-            self.delete_session(&session.id)?;
+            if let Err(e) = self.delete_session(&session.id) {
+                warn!(
+                    session_id = %session.id,
+                    user_id = %user_id,
+                    error = %e,
+                    "failed to delete session during user purge"
+                );
+            } else {
+                deleted += 1;
+            }
         }
 
-        Ok(count)
+        Ok(deleted)
     }
 
     /// Delete sessions that have not been updated within the given retention period.

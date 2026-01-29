@@ -209,6 +209,8 @@ Note: Method dispatch is implemented in `src/server/ws/handlers/mod.rs`.
 - `sessions.restore` - Restore an archived session (sets status back to Active)
 - `sessions.archives` - List all archived sessions with metadata and archive size
 - `sessions.archive.delete` - Delete an archive file without affecting session metadata
+- `sessions.export_user` - Export all sessions and histories for a user (GDPR data portability)
+- `sessions.purge_user` - Delete all sessions and histories for a user (GDPR right to erasure)
 
 ### TTS (Text-to-Speech)
 - `tts.status` - Get TTS status

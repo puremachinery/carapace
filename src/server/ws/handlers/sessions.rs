@@ -1007,6 +1007,7 @@ pub(super) fn handle_sessions_export_user(
     let user_id = params
         .and_then(|p| p.get("userId"))
         .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
         .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "userId is required", None))?;
 
     let data = state
@@ -1031,6 +1032,7 @@ pub(super) fn handle_sessions_purge_user(
     let user_id = params
         .and_then(|p| p.get("userId"))
         .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
         .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "userId is required", None))?;
 
     let count = state
@@ -2492,5 +2494,123 @@ mod tests {
         let result = handle_sessions_archive_delete(&state, Some(&params)).unwrap();
         assert_eq!(result["ok"], true);
         assert_eq!(result["deleted"], true);
+    }
+
+    // ============== Export/Purge User Tests ==============
+
+    #[test]
+    fn test_handle_sessions_export_user_requires_user_id() {
+        let (state, _tmp) = make_state_with_temp_sessions();
+        let result = handle_sessions_export_user(&state, None);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, "INVALID_REQUEST");
+    }
+
+    #[test]
+    fn test_handle_sessions_export_user_rejects_empty_user_id() {
+        let (state, _tmp) = make_state_with_temp_sessions();
+        let params = json!({ "userId": "" });
+        let result = handle_sessions_export_user(&state, Some(&params));
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, "INVALID_REQUEST");
+    }
+
+    #[test]
+    fn test_handle_sessions_export_user_empty() {
+        let (state, _tmp) = make_state_with_temp_sessions();
+        let params = json!({ "userId": "user-999" });
+        let result = handle_sessions_export_user(&state, Some(&params)).unwrap();
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["data"]["user_id"], "user-999");
+        assert_eq!(result["data"]["session_count"], 0);
+        assert_eq!(result["data"]["sessions"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_handle_sessions_export_user_with_data() {
+        let (state, _tmp) = make_state_with_temp_sessions();
+
+        let meta = sessions::SessionMetadata {
+            user_id: Some("user-42".to_string()),
+            ..Default::default()
+        };
+        let session = state.session_store.create_session("agent-1", meta).unwrap();
+        state
+            .session_store
+            .append_message(sessions::ChatMessage::user(&session.id, "Hello"))
+            .unwrap();
+
+        let params = json!({ "userId": "user-42" });
+        let result = handle_sessions_export_user(&state, Some(&params)).unwrap();
+        assert_eq!(result["ok"], true);
+        let data = &result["data"];
+        assert_eq!(data["user_id"], "user-42");
+        assert_eq!(data["session_count"], 1);
+        let exported_sessions = data["sessions"].as_array().unwrap();
+        assert_eq!(exported_sessions.len(), 1);
+        let messages = exported_sessions[0]["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+    }
+
+    #[test]
+    fn test_handle_sessions_purge_user_requires_user_id() {
+        let (state, _tmp) = make_state_with_temp_sessions();
+        let result = handle_sessions_purge_user(&state, None);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, "INVALID_REQUEST");
+    }
+
+    #[test]
+    fn test_handle_sessions_purge_user_rejects_empty_user_id() {
+        let (state, _tmp) = make_state_with_temp_sessions();
+        let params = json!({ "userId": "" });
+        let result = handle_sessions_purge_user(&state, Some(&params));
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, "INVALID_REQUEST");
+    }
+
+    #[test]
+    fn test_handle_sessions_purge_user_empty() {
+        let (state, _tmp) = make_state_with_temp_sessions();
+        let params = json!({ "userId": "user-999" });
+        let result = handle_sessions_purge_user(&state, Some(&params)).unwrap();
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["sessionsDeleted"], 0);
+    }
+
+    #[test]
+    fn test_handle_sessions_purge_user_deletes_sessions() {
+        let (state, _tmp) = make_state_with_temp_sessions();
+
+        for i in 0..3 {
+            let meta = sessions::SessionMetadata {
+                user_id: Some("user-42".to_string()),
+                chat_id: Some(format!("chat-{}", i)),
+                ..Default::default()
+            };
+            state.session_store.create_session("agent-1", meta).unwrap();
+        }
+        // Create a session for a different user that should NOT be deleted
+        let other_meta = sessions::SessionMetadata {
+            user_id: Some("user-99".to_string()),
+            chat_id: Some("other-chat".to_string()),
+            ..Default::default()
+        };
+        state
+            .session_store
+            .create_session("agent-1", other_meta)
+            .unwrap();
+
+        let params = json!({ "userId": "user-42" });
+        let result = handle_sessions_purge_user(&state, Some(&params)).unwrap();
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["sessionsDeleted"], 3);
+
+        // Verify the other user's session is still there
+        let remaining = state
+            .session_store
+            .list_sessions(sessions::SessionFilter::new().with_user_id("user-99"))
+            .unwrap();
+        assert_eq!(remaining.len(), 1);
     }
 }

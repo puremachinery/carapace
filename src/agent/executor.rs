@@ -379,19 +379,31 @@ pub async fn execute_run(
 /// Strips potential secrets (API keys, internal URLs with auth) from error
 /// messages while preserving the error type and human-readable portion.
 fn sanitize_provider_error(message: &str) -> String {
+    use std::sync::LazyLock;
+
+    static API_KEY_RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"(sk-ant-|sk-|key-)[A-Za-z0-9_-]{10,}").unwrap());
+    static AUTH_HEADER_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"(?i)(authorization|x-api-key):\s*(bearer\s+)?\S+").unwrap()
+    });
+
     // Strip anything that looks like an API key (sk-ant-..., sk-..., key-...)
-    let sanitized = regex::Regex::new(r"(sk-ant-|sk-|key-)[A-Za-z0-9_-]{10,}")
-        .map(|re| re.replace_all(message, "[REDACTED]").to_string())
-        .unwrap_or_else(|_| message.to_string());
+    let sanitized = API_KEY_RE.replace_all(message, "[REDACTED]");
 
-    // Strip Authorization header values
-    let sanitized = regex::Regex::new(r"(?i)(authorization:\s*)(bearer\s+)?\S+")
-        .map(|re| re.replace_all(&sanitized, "$1[REDACTED]").to_string())
-        .unwrap_or(sanitized);
+    // Strip Authorization and x-api-key header values
+    let sanitized = AUTH_HEADER_RE
+        .replace_all(&sanitized, "$1: [REDACTED]")
+        .into_owned();
 
-    // Cap length to prevent huge error payloads
+    // Cap length to prevent huge error payloads (char-boundary safe)
     if sanitized.len() > 500 {
-        format!("{}... (truncated)", &sanitized[..500])
+        let boundary = sanitized
+            .char_indices()
+            .map(|(i, _)| i)
+            .take_while(|&i| i <= 500)
+            .last()
+            .unwrap_or(0);
+        format!("{}... (truncated)", &sanitized[..boundary])
     } else {
         sanitized
     }
@@ -965,6 +977,80 @@ mod tests {
             result
         );
     }
+
+    // ============== sanitize_provider_error Tests ==============
+
+    #[test]
+    fn test_sanitize_short_ascii() {
+        let result = sanitize_provider_error("connection refused");
+        assert_eq!(result, "connection refused");
+    }
+
+    #[test]
+    fn test_sanitize_strips_api_key() {
+        let msg = "auth error with key sk-ant-api03-abcdefghij1234567890";
+        let result = sanitize_provider_error(msg);
+        assert!(result.contains("[REDACTED]"));
+        assert!(!result.contains("abcdefghij"));
+    }
+
+    #[test]
+    fn test_sanitize_strips_authorization_header() {
+        let msg = "proxy error: Authorization: Bearer sk-ant-secret1234567890";
+        let result = sanitize_provider_error(msg);
+        assert!(!result.contains("secret1234567890"));
+    }
+
+    #[test]
+    fn test_sanitize_strips_x_api_key_header() {
+        let msg = "gateway echo: x-api-key: sk-ant-api03-abcdefghij1234567890";
+        let result = sanitize_provider_error(msg);
+        assert!(!result.contains("abcdefghij"));
+        assert!(result.contains("x-api-key: [REDACTED]"));
+    }
+
+    #[test]
+    fn test_sanitize_truncates_long_ascii() {
+        let msg = "x".repeat(600);
+        let result = sanitize_provider_error(&msg);
+        assert!(result.ends_with("... (truncated)"));
+        // Should be 500 x's + "... (truncated)"
+        assert_eq!(&result[..500], "x".repeat(500));
+    }
+
+    #[test]
+    fn test_sanitize_no_truncation_at_exactly_500() {
+        let msg = "y".repeat(500);
+        let result = sanitize_provider_error(&msg);
+        assert_eq!(result, msg);
+    }
+
+    #[test]
+    fn test_sanitize_truncation_at_501() {
+        let msg = "z".repeat(501);
+        let result = sanitize_provider_error(&msg);
+        assert!(result.ends_with("... (truncated)"));
+    }
+
+    #[test]
+    fn test_sanitize_multibyte_truncation() {
+        // Each '€' is 3 bytes. 167 * 3 = 501 bytes > 500 threshold.
+        let msg = "€".repeat(167);
+        let result = sanitize_provider_error(&msg);
+        assert!(result.ends_with("... (truncated)"));
+        // Must not panic — the old code would panic slicing mid-codepoint.
+        // Boundary should be at 166 * 3 = 498 bytes (last char boundary <= 500).
+        let prefix = &result[..result.len() - "... (truncated)".len()];
+        assert_eq!(prefix, "€".repeat(166));
+    }
+
+    #[test]
+    fn test_sanitize_empty_string() {
+        let result = sanitize_provider_error("");
+        assert_eq!(result, "");
+    }
+
+    // ============== estimate_cost Tests ==============
 
     #[test]
     fn test_estimate_cost_sonnet() {
