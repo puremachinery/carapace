@@ -414,6 +414,12 @@ impl SessionFilter {
         self
     }
 
+    /// Filter by user ID
+    pub fn with_user_id(mut self, user_id: impl Into<String>) -> Self {
+        self.user_id = Some(user_id.into());
+        self
+    }
+
     /// Set result limit
     pub fn with_limit(mut self, limit: usize) -> Self {
         self.limit = Some(limit);
@@ -804,6 +810,49 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Export all data for a user (GDPR Art. 20 — data portability).
+    ///
+    /// Returns all sessions and their chat histories for the given user_id
+    /// as a portable JSON value.
+    pub fn export_user_data(&self, user_id: &str) -> Result<serde_json::Value, SessionStoreError> {
+        let filter = SessionFilter::new().with_user_id(user_id);
+        let sessions = self.list_sessions(filter)?;
+
+        let mut exported = Vec::new();
+        for session in &sessions {
+            let history = self
+                .get_history(&session.id, None, None)
+                .unwrap_or_default();
+            exported.push(serde_json::json!({
+                "session": session,
+                "messages": history,
+            }));
+        }
+
+        Ok(serde_json::json!({
+            "user_id": user_id,
+            "exported_at": chrono::Utc::now().to_rfc3339(),
+            "session_count": exported.len(),
+            "sessions": exported,
+        }))
+    }
+
+    /// Delete all data for a user (GDPR Art. 17 — right to erasure).
+    ///
+    /// Deletes all sessions and their histories for the given user_id.
+    /// Returns the number of sessions deleted.
+    pub fn purge_user_data(&self, user_id: &str) -> Result<usize, SessionStoreError> {
+        let filter = SessionFilter::new().with_user_id(user_id);
+        let sessions = self.list_sessions(filter)?;
+        let count = sessions.len();
+
+        for session in &sessions {
+            self.delete_session(&session.id)?;
+        }
+
+        Ok(count)
+    }
+
     /// Append a message to session history
     ///
     /// Returns an error if the session is archived (read-only).
@@ -838,6 +887,45 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Append multiple messages in a single file open/write/close cycle.
+    /// More efficient than calling `append_message` repeatedly for batch writes
+    /// (e.g., assistant message + tool results in the executor).
+    pub fn append_messages(&self, messages: &[ChatMessage]) -> Result<(), SessionStoreError> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        self.ensure_base_dir()?;
+
+        let session_id = &messages[0].session_id;
+
+        // Check session status
+        if let Ok(session) = self.get_session(session_id) {
+            if session.status == SessionStatus::Archived {
+                return Err(SessionStoreError::AlreadyArchived(session_id.to_string()));
+            }
+        }
+
+        let history_path = self.session_history_path(session_id)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&history_path)?;
+        let mut writer = BufWriter::new(file);
+
+        for msg in messages {
+            serde_json::to_writer(&mut writer, msg)?;
+            writeln!(writer)?;
+        }
+        writer.flush()?;
+
+        // Update message count
+        for _ in messages {
+            self.increment_message_count(session_id)?;
+        }
+
+        Ok(())
+    }
+
     /// Get chat history for a session
     pub fn get_history(
         &self,
@@ -863,7 +951,17 @@ impl SessionStore {
                 continue;
             }
 
-            let msg: ChatMessage = serde_json::from_str(&line)?;
+            let msg: ChatMessage = match serde_json::from_str(&line) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        error = %e,
+                        "skipping corrupt JSONL line in session history"
+                    );
+                    continue;
+                }
+            };
 
             if !found_before {
                 if Some(msg.id.as_str()) == before_id {

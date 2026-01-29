@@ -26,8 +26,13 @@ impl AnthropicProvider {
                 "API key must not be empty".to_string(),
             ));
         }
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(300))
+            .build()
+            .map_err(|e| AgentError::Provider(format!("failed to build HTTP client: {e}")))?;
         Ok(Self {
-            client: reqwest::Client::new(),
+            client,
             api_key,
             base_url: "https://api.anthropic.com".to_string(),
         })

@@ -102,7 +102,7 @@ pub(super) const NODE_ONLY_METHODS: [&str; 3] = ["node.invoke.result", "node.eve
 ///
 /// Per Node.js gateway: config.*, wizard.*, update.*, skills.install/update,
 /// channels.logout, sessions.*, and cron.* require operator.admin for operators.
-const OPERATOR_ADMIN_REQUIRED_METHODS: [&str; 31] = [
+const OPERATOR_ADMIN_REQUIRED_METHODS: [&str; 33] = [
     "config.get",
     "config.set",
     "config.apply",
@@ -112,6 +112,8 @@ const OPERATOR_ADMIN_REQUIRED_METHODS: [&str; 31] = [
     "sessions.reset",
     "sessions.delete",
     "sessions.compact",
+    "sessions.export_user",
+    "sessions.purge_user",
     // All wizard.* methods
     "wizard.start",
     "wizard.next",
@@ -225,7 +227,9 @@ fn get_method_required_role(method: &str) -> &'static str {
         | "exec.approvals.set"
         | "exec.approvals.node.set"
         | "exec.approval.request"
-        | "exec.approval.resolve" => "admin",
+        | "exec.approval.resolve"
+        | "sessions.export_user"
+        | "sessions.purge_user" => "admin",
 
         // Unknown methods default to admin (fail secure)
         _ => "admin",
@@ -520,6 +524,8 @@ pub(super) async fn dispatch_method(
         "sessions.restore" => handle_sessions_restore(state, params),
         "sessions.archives" => handle_sessions_archives(state, params),
         "sessions.archive.delete" => handle_sessions_archive_delete(state, params),
+        "sessions.export_user" => handle_sessions_export_user(state, params),
+        "sessions.purge_user" => handle_sessions_purge_user(state, params),
 
         // Channels
         "channels.status" => handle_channels_status(state),

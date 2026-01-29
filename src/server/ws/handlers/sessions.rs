@@ -150,9 +150,13 @@ impl AgentRunRegistry {
         }
     }
 
-    /// Mark a run as started
+    /// Mark a run as started.
+    /// Returns false if the run was already cancelled (avoids TOCTOU race).
     pub fn mark_started(&mut self, run_id: &str) -> bool {
         if let Some(run) = self.runs.get_mut(run_id) {
+            if run.status == AgentRunStatus::Cancelled || run.cancel_token.is_cancelled() {
+                return false;
+            }
             run.status = AgentRunStatus::Running;
             run.started_at = Some(now_ms());
             true
@@ -636,10 +640,7 @@ pub(super) fn handle_sessions_preview(
                         let items = messages
                             .into_iter()
                             .map(|msg| {
-                                let mut text = msg.content;
-                                if text.len() > max_chars {
-                                    text.truncate(max_chars);
-                                }
+                                let text = truncate_preview(&msg.content, max_chars);
                                 json!({
                                     "role": role_to_string(msg.role),
                                     "text": text
@@ -770,7 +771,14 @@ fn truncate_preview(text: &str, max_len: usize) -> String {
     if text.len() <= max_len {
         return text.to_string();
     }
-    let mut out = text[..max_len].to_string();
+    // Find the last char boundary at or before max_len to avoid
+    // panicking on multi-byte UTF-8 characters.
+    let boundary = text[..=max_len.min(text.len() - 1)]
+        .char_indices()
+        .map(|(i, _)| i)
+        .next_back()
+        .unwrap_or(0);
+    let mut out = text[..boundary].to_string();
     out.push('…');
     out
 }
@@ -952,6 +960,54 @@ pub(super) fn handle_sessions_delete(
     };
 
     Ok(json!({ "ok": true, "key": key, "deleted": deleted }))
+}
+
+/// Handle sessions.export_user — GDPR data portability (Art. 20)
+pub(super) fn handle_sessions_export_user(
+    state: &WsServerState,
+    params: Option<&Value>,
+) -> Result<Value, ErrorShape> {
+    let user_id = params
+        .and_then(|p| p.get("userId"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "userId is required", None))?;
+
+    let data = state
+        .session_store
+        .export_user_data(user_id)
+        .map_err(|err| {
+            error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("user data export failed: {}", err),
+                None,
+            )
+        })?;
+
+    Ok(json!({ "ok": true, "data": data }))
+}
+
+/// Handle sessions.purge_user — GDPR right to erasure (Art. 17)
+pub(super) fn handle_sessions_purge_user(
+    state: &WsServerState,
+    params: Option<&Value>,
+) -> Result<Value, ErrorShape> {
+    let user_id = params
+        .and_then(|p| p.get("userId"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "userId is required", None))?;
+
+    let count = state
+        .session_store
+        .purge_user_data(user_id)
+        .map_err(|err| {
+            error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("user data purge failed: {}", err),
+                None,
+            )
+        })?;
+
+    Ok(json!({ "ok": true, "userId": user_id, "sessionsDeleted": count }))
 }
 
 pub(super) fn handle_sessions_compact(

@@ -37,6 +37,8 @@
 //! }).unwrap();
 //! ```
 
+pub mod buffer;
+
 use std::fs::File;
 use std::io;
 use std::path::PathBuf;
@@ -171,6 +173,9 @@ pub fn init_logging(config: LogConfig) -> Result<(), LoggingError> {
     // RFC 3339 timestamp format
     let timer = UtcTime::rfc_3339();
 
+    // Buffer layer captures logs for the logs.tail WebSocket endpoint
+    let buffer_layer = buffer::LogBufferLayer::new();
+
     match (&config.format, &config.output) {
         (LogFormat::Json, LogOutput::Stdout) => {
             let layer = tracing_subscriber::fmt::layer()
@@ -182,7 +187,10 @@ pub fn init_logging(config: LogConfig) -> Result<(), LoggingError> {
                 .with_writer(io::stdout)
                 .with_filter(filter);
 
-            tracing_subscriber::registry().with(layer).init();
+            tracing_subscriber::registry()
+                .with(layer)
+                .with(buffer_layer)
+                .init();
         }
         (LogFormat::Json, LogOutput::Stderr) => {
             let layer = tracing_subscriber::fmt::layer()
@@ -194,7 +202,10 @@ pub fn init_logging(config: LogConfig) -> Result<(), LoggingError> {
                 .with_writer(io::stderr)
                 .with_filter(filter);
 
-            tracing_subscriber::registry().with(layer).init();
+            tracing_subscriber::registry()
+                .with(layer)
+                .with(buffer_layer)
+                .init();
         }
         (LogFormat::Json, LogOutput::File(path)) => {
             let file = File::create(path)?;
@@ -207,7 +218,10 @@ pub fn init_logging(config: LogConfig) -> Result<(), LoggingError> {
                 .with_writer(file)
                 .with_filter(filter);
 
-            tracing_subscriber::registry().with(layer).init();
+            tracing_subscriber::registry()
+                .with(layer)
+                .with(buffer_layer)
+                .init();
         }
         (LogFormat::Plaintext, LogOutput::Stdout) => {
             let layer = tracing_subscriber::fmt::layer()
@@ -220,7 +234,10 @@ pub fn init_logging(config: LogConfig) -> Result<(), LoggingError> {
                 .with_writer(io::stdout)
                 .with_filter(filter);
 
-            tracing_subscriber::registry().with(layer).init();
+            tracing_subscriber::registry()
+                .with(layer)
+                .with(buffer_layer)
+                .init();
         }
         (LogFormat::Plaintext, LogOutput::Stderr) => {
             let layer = tracing_subscriber::fmt::layer()
@@ -233,7 +250,10 @@ pub fn init_logging(config: LogConfig) -> Result<(), LoggingError> {
                 .with_writer(io::stderr)
                 .with_filter(filter);
 
-            tracing_subscriber::registry().with(layer).init();
+            tracing_subscriber::registry()
+                .with(layer)
+                .with(buffer_layer)
+                .init();
         }
         (LogFormat::Plaintext, LogOutput::File(path)) => {
             let file = File::create(path)?;
@@ -247,7 +267,10 @@ pub fn init_logging(config: LogConfig) -> Result<(), LoggingError> {
                 .with_writer(file)
                 .with_filter(filter);
 
-            tracing_subscriber::registry().with(layer).init();
+            tracing_subscriber::registry()
+                .with(layer)
+                .with(buffer_layer)
+                .init();
         }
     }
 

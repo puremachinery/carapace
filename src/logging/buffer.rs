@@ -36,19 +36,22 @@ pub enum LogLevel {
     Error = 4,
 }
 
-impl LogLevel {
-    /// Parse a log level from a string
-    pub fn from_str(s: &str) -> Option<Self> {
+impl std::str::FromStr for LogLevel {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "trace" => Some(LogLevel::Trace),
-            "debug" => Some(LogLevel::Debug),
-            "info" => Some(LogLevel::Info),
-            "warn" | "warning" => Some(LogLevel::Warn),
-            "error" => Some(LogLevel::Error),
-            _ => None,
+            "trace" => Ok(LogLevel::Trace),
+            "debug" => Ok(LogLevel::Debug),
+            "info" => Ok(LogLevel::Info),
+            "warn" | "warning" => Ok(LogLevel::Warn),
+            "error" => Ok(LogLevel::Error),
+            _ => Err(format!("unknown log level: {s}")),
         }
     }
+}
 
+impl LogLevel {
     /// Convert tracing Level to LogLevel
     pub fn from_tracing(level: &Level) -> Self {
         match *level {
@@ -470,13 +473,13 @@ mod tests {
 
     #[test]
     fn test_log_level_from_str() {
-        assert_eq!(LogLevel::from_str("trace"), Some(LogLevel::Trace));
-        assert_eq!(LogLevel::from_str("DEBUG"), Some(LogLevel::Debug));
-        assert_eq!(LogLevel::from_str("Info"), Some(LogLevel::Info));
-        assert_eq!(LogLevel::from_str("warn"), Some(LogLevel::Warn));
-        assert_eq!(LogLevel::from_str("warning"), Some(LogLevel::Warn));
-        assert_eq!(LogLevel::from_str("error"), Some(LogLevel::Error));
-        assert_eq!(LogLevel::from_str("invalid"), None);
+        assert_eq!("trace".parse::<LogLevel>(), Ok(LogLevel::Trace));
+        assert_eq!("DEBUG".parse::<LogLevel>(), Ok(LogLevel::Debug));
+        assert_eq!("Info".parse::<LogLevel>(), Ok(LogLevel::Info));
+        assert_eq!("warn".parse::<LogLevel>(), Ok(LogLevel::Warn));
+        assert_eq!("warning".parse::<LogLevel>(), Ok(LogLevel::Warn));
+        assert_eq!("error".parse::<LogLevel>(), Ok(LogLevel::Error));
+        assert!("invalid".parse::<LogLevel>().is_err());
     }
 
     #[test]

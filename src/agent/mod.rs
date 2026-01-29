@@ -11,7 +11,9 @@ pub mod tools;
 
 use std::sync::Arc;
 
-use crate::server::ws::WsServerState;
+use futures_util::FutureExt;
+
+use crate::server::ws::{AgentRunStatus, WsServerState};
 pub use executor::execute_run;
 pub use provider::{LlmProvider, StreamEvent};
 use tokio_util::sync::CancellationToken;
@@ -90,21 +92,46 @@ pub fn spawn_run(
     cancel_token: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let result = execute_run(
+        let result: Result<Result<(), AgentError>, _> = std::panic::AssertUnwindSafe(execute_run(
             run_id.clone(),
             session_key,
             config,
             state.clone(),
             provider,
             cancel_token,
-        )
+        ))
+        .catch_unwind()
         .await;
 
-        if let Err(e) = result {
-            tracing::error!(run_id = %run_id, error = %e, "agent run failed");
-            // Mark the run as failed in the registry
-            let mut registry = state.agent_run_registry.lock();
-            registry.mark_failed(&run_id, e.to_string());
+        match result {
+            Ok(Ok(())) => { /* marked completed inside execute_run */ }
+            Ok(Err(AgentError::Cancelled)) => {
+                // Ensure marked as cancelled (may already be set by chat.abort)
+                let mut registry = state.agent_run_registry.lock();
+                if !registry
+                    .get(&run_id)
+                    .is_some_and(|r| r.status == AgentRunStatus::Cancelled)
+                {
+                    registry.mark_cancelled(&run_id);
+                }
+            }
+            Ok(Err(e)) => {
+                tracing::error!(run_id = %run_id, error = %e, "agent run failed");
+                let mut registry = state.agent_run_registry.lock();
+                registry.mark_failed(&run_id, e.to_string());
+            }
+            Err(panic_payload) => {
+                let msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                    (*s).to_string()
+                } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "unknown panic".to_string()
+                };
+                tracing::error!(run_id = %run_id, panic = %msg, "agent run panicked");
+                let mut registry = state.agent_run_registry.lock();
+                registry.mark_failed(&run_id, format!("panic: {msg}"));
+            }
         }
     })
 }

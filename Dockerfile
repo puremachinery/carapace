@@ -1,0 +1,28 @@
+# ---- Build stage ----
+FROM rust:1.84-slim AS builder
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY src/ src/
+COPY tests/ tests/
+COPY wit/ wit/
+
+RUN cargo build --release --locked \
+        --config 'profile.release.strip=true'
+
+# ---- Runtime stage ----
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/target/release/carapace /usr/local/bin/carapace
+
+# State directory for sessions, cron, config
+ENV MOLTBOT_STATE_DIR=/data
+RUN mkdir -p /data
+
+EXPOSE 18789
+
+ENTRYPOINT ["carapace"]

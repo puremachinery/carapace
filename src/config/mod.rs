@@ -61,20 +61,30 @@ struct CachedConfig {
 static CONFIG_CACHE: LazyLock<RwLock<Option<CachedConfig>>> = LazyLock::new(|| RwLock::new(None));
 
 /// Get the config file path.
-/// Priority: MOLTBOT_CONFIG_PATH > MOLTBOT_STATE_DIR/moltbot.json > ~/.moltbot/moltbot.json
+/// Priority: MOLTBOT_CONFIG_PATH > MOLTBOT_STATE_DIR/moltbot.json5 > ~/.moltbot/moltbot.json5
+/// Falls back to .json extension if the .json5 file doesn't exist.
 pub fn get_config_path() -> PathBuf {
     if let Ok(path) = env::var("MOLTBOT_CONFIG_PATH") {
         return PathBuf::from(path);
     }
 
     if let Ok(state_dir) = env::var("MOLTBOT_STATE_DIR") {
-        return PathBuf::from(state_dir).join("moltbot.json");
+        let dir = PathBuf::from(state_dir);
+        let json5 = dir.join("moltbot.json5");
+        if json5.exists() {
+            return json5;
+        }
+        return dir.join("moltbot.json");
     }
 
-    dirs::home_dir()
+    let base = dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".moltbot")
-        .join("moltbot.json")
+        .join(".moltbot");
+    let json5 = base.join("moltbot.json5");
+    if json5.exists() {
+        return json5;
+    }
+    base.join("moltbot.json")
 }
 
 /// Get the cache TTL duration
@@ -414,6 +424,7 @@ pub fn validate_config(config: &Value) -> Vec<ValidationIssue> {
             "gateway",
             "skills",
             "plugins",
+            "anthropic",
         ];
 
         for key in obj.keys() {
@@ -778,6 +789,7 @@ mod tests {
         env::remove_var("MOLTBOT_STATE_DIR");
 
         let path = get_config_path();
+        // Falls back to .json when .json5 doesn't exist on disk
         assert!(path.ends_with(".moltbot/moltbot.json"));
     }
 
@@ -800,6 +812,7 @@ mod tests {
         env::set_var("MOLTBOT_STATE_DIR", "/custom/state");
 
         let path = get_config_path();
+        // Falls back to .json when .json5 doesn't exist on disk
         assert_eq!(path, PathBuf::from("/custom/state/moltbot.json"));
 
         env::remove_var("MOLTBOT_STATE_DIR");

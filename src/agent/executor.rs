@@ -32,10 +32,12 @@ pub async fn execute_run(
     let seq = AtomicU64::new(0);
     let next_seq = || seq.fetch_add(1, Ordering::Relaxed);
 
-    // 1. Mark run as Running
+    // 1. Mark run as Running (returns false if already cancelled)
     {
         let mut registry = state.agent_run_registry.lock();
-        registry.mark_started(&run_id);
+        if !registry.mark_started(&run_id) {
+            return Err(AgentError::Cancelled);
+        }
     }
 
     // Broadcast started event
@@ -57,6 +59,7 @@ pub async fn execute_run(
     let mut accumulated_text = String::new();
     let mut total_input_tokens: u64 = 0;
     let mut total_output_tokens: u64 = 0;
+    let mut final_stop_reason = StopReason::EndTurn;
 
     // Load history once before the loop to avoid O(turns × history_size) disk I/O
     let mut history = state
@@ -239,9 +242,12 @@ pub async fn execute_run(
         }
 
         accumulated_text.push_str(&turn_text);
+        final_stop_reason = stop_reason;
 
         // If there are tool calls, execute them and continue the loop
         if !pending_tool_calls.is_empty() && stop_reason == StopReason::ToolUse {
+            let mut tool_msgs = Vec::with_capacity(pending_tool_calls.len());
+
             for (tool_id, tool_name, tool_input) in &pending_tool_calls {
                 // Execute the tool
                 let tool_result = if let Some(tools_registry) = state.tools_registry() {
@@ -277,18 +283,20 @@ pub async fn execute_run(
                     }),
                 );
 
-                // Append tool result to session history
                 let mut tool_msg =
                     ChatMessage::tool(&session.id, tool_name, tool_id, &result_content);
                 if is_error {
                     tool_msg.metadata = Some(json!({"is_error": true}));
                 }
-                state
-                    .session_store()
-                    .append_message(tool_msg.clone())
-                    .map_err(|e| AgentError::SessionStore(e.to_string()))?;
-                history.push(tool_msg);
+                tool_msgs.push(tool_msg);
             }
+
+            // Batch-append all tool results in a single file write
+            state
+                .session_store()
+                .append_messages(&tool_msgs)
+                .map_err(|e| AgentError::SessionStore(e.to_string()))?;
+            history.extend(tool_msgs);
 
             // Continue loop — tool results will be sent back to LLM on next turn
             continue;
@@ -299,10 +307,10 @@ pub async fn execute_run(
     }
 
     // 6. Broadcast completion
-    let stop_reason_str = if accumulated_text.is_empty() {
-        "max_tokens"
-    } else {
-        "end_turn"
+    let stop_reason_str = match final_stop_reason {
+        StopReason::EndTurn => "end_turn",
+        StopReason::MaxTokens => "max_tokens",
+        StopReason::ToolUse => "tool_use",
     };
 
     broadcast_agent_event(
@@ -662,6 +670,257 @@ mod tests {
         let run = registry.get(run_id).unwrap();
         assert_eq!(run.status, crate::server::ws::AgentRunStatus::Completed);
         assert!(run.response.is_empty(), "response should be empty");
+    }
+
+    /// Helper: register a run with a specific cancel token so tests can control it.
+    fn setup_session_and_run_with_token(
+        state: &WsServerState,
+        session_key: &str,
+        run_id: &str,
+        cancel_token: CancellationToken,
+    ) -> sessions::Session {
+        let session = state
+            .session_store()
+            .get_or_create_session(session_key, sessions::SessionMetadata::default())
+            .unwrap();
+        state
+            .session_store()
+            .append_message(sessions::ChatMessage::user(&session.id, "Hello"))
+            .unwrap();
+        {
+            use crate::server::ws::{AgentRun, AgentRunStatus};
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            let mut registry = state.agent_run_registry.lock();
+            registry.register(AgentRun {
+                run_id: run_id.to_string(),
+                session_key: session_key.to_string(),
+                status: AgentRunStatus::Queued,
+                message: "Hello".to_string(),
+                response: String::new(),
+                error: None,
+                created_at: now,
+                started_at: None,
+                completed_at: None,
+                cancel_token,
+                waiters: Vec::new(),
+            });
+        }
+        session
+    }
+
+    /// Mock provider that pauses before sending events, giving time to cancel.
+    struct SlowMockProvider {
+        delay_ms: u64,
+        events: parking_lot::Mutex<Vec<Vec<StreamEvent>>>,
+    }
+
+    impl SlowMockProvider {
+        fn new(delay_ms: u64, events: Vec<Vec<StreamEvent>>) -> Self {
+            let mut reversed = events;
+            reversed.reverse();
+            Self {
+                delay_ms,
+                events: parking_lot::Mutex::new(reversed),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for SlowMockProvider {
+        async fn complete(
+            &self,
+            _request: crate::agent::provider::CompletionRequest,
+        ) -> Result<mpsc::Receiver<StreamEvent>, crate::agent::AgentError> {
+            let events = {
+                let mut responses = self.events.lock();
+                responses.pop().unwrap_or_default()
+            };
+            let delay = self.delay_ms;
+            let (tx, rx) = mpsc::channel(64);
+            tokio::spawn(async move {
+                for event in events {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    let _ = tx.send(event).await;
+                }
+            });
+            Ok(rx)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cancellation_before_start() {
+        // Cancel the token before execute_run is called — mark_started should
+        // return false, and execute_run should return Cancelled immediately.
+        let (state, _tmp) = make_test_state();
+        let run_id = "run-cancel-before";
+        let session_key = "test-cancel-before";
+        let token = CancellationToken::new();
+        setup_session_and_run_with_token(&state, session_key, run_id, token.clone());
+
+        // Cancel before running
+        token.cancel();
+
+        let provider = Arc::new(MockProvider::text("should not appear"));
+        let config = AgentConfig {
+            max_turns: 5,
+            ..Default::default()
+        };
+
+        let result = execute_run(
+            run_id.to_string(),
+            session_key.to_string(),
+            config,
+            state.clone(),
+            provider,
+            token,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(crate::agent::AgentError::Cancelled)),
+            "expected Cancelled, got: {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cancellation_mid_stream() {
+        // Cancel the token while the stream is being consumed — the select!
+        // branch should fire and return Cancelled.
+        let (state, _tmp) = make_test_state();
+        let run_id = "run-cancel-stream";
+        let session_key = "test-cancel-stream";
+        let token = CancellationToken::new();
+        setup_session_and_run_with_token(&state, session_key, run_id, token.clone());
+
+        // Slow provider: sends events with 200ms delay each
+        let provider = Arc::new(SlowMockProvider::new(
+            200,
+            vec![vec![
+                StreamEvent::TextDelta {
+                    text: "chunk1".to_string(),
+                },
+                StreamEvent::TextDelta {
+                    text: "chunk2".to_string(),
+                },
+                StreamEvent::TextDelta {
+                    text: "chunk3".to_string(),
+                },
+                StreamEvent::Stop {
+                    reason: StopReason::EndTurn,
+                    usage: TokenUsage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                    },
+                },
+            ]],
+        ));
+
+        let cancel_token = token.clone();
+        // Cancel after 300ms — should interrupt mid-stream
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            cancel_token.cancel();
+        });
+
+        let config = AgentConfig {
+            max_turns: 5,
+            ..Default::default()
+        };
+
+        let result = execute_run(
+            run_id.to_string(),
+            session_key.to_string(),
+            config,
+            state.clone(),
+            provider,
+            token,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(crate::agent::AgentError::Cancelled)),
+            "expected Cancelled, got: {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cancellation_during_second_turn_stream() {
+        // Cancel the token during the second turn's streaming.
+        // Turn 1 completes fast (tool use), turn 2 streams slowly so the cancel fires mid-stream.
+        let (state, _tmp) = make_test_state_with_tools();
+        let run_id = "run-cancel-turn2";
+        let session_key = "test-cancel-turn2";
+        let token = CancellationToken::new();
+        setup_session_and_run_with_token(&state, session_key, run_id, token.clone());
+
+        // Turn 1 is fast (tool use), turn 2 is slow (300ms per event).
+        // We cancel at 100ms into turn 2, which should catch it in the select! branch.
+        let provider = Arc::new(SlowMockProvider::new(
+            300,
+            vec![
+                // Turn 1
+                vec![
+                    StreamEvent::ToolUse {
+                        id: "tool_1".to_string(),
+                        name: "time".to_string(),
+                        input: serde_json::json!({}),
+                    },
+                    StreamEvent::Stop {
+                        reason: StopReason::ToolUse,
+                        usage: TokenUsage {
+                            input_tokens: 10,
+                            output_tokens: 5,
+                        },
+                    },
+                ],
+                // Turn 2 (slow — events arrive at 300ms intervals)
+                vec![
+                    StreamEvent::TextDelta {
+                        text: "unreachable".to_string(),
+                    },
+                    StreamEvent::Stop {
+                        reason: StopReason::EndTurn,
+                        usage: TokenUsage {
+                            input_tokens: 10,
+                            output_tokens: 5,
+                        },
+                    },
+                ],
+            ],
+        ));
+
+        let cancel_token = token.clone();
+        // Cancel at 800ms — after turn 1 completes (~600ms) but before turn 2 finishes (~1200ms)
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+            cancel_token.cancel();
+        });
+
+        let config = AgentConfig {
+            max_turns: 5,
+            ..Default::default()
+        };
+
+        let result = execute_run(
+            run_id.to_string(),
+            session_key.to_string(),
+            config,
+            state.clone(),
+            provider,
+            token,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(crate::agent::AgentError::Cancelled)),
+            "expected Cancelled, got: {:?}",
+            result
+        );
     }
 
     #[test]

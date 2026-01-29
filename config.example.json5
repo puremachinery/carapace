@@ -1,0 +1,87 @@
+// Carapace gateway configuration
+//
+// Copy this file to ~/.moltbot/moltbot.json5 and edit to taste.
+// Override the path with MOLTBOT_CONFIG_PATH or MOLTBOT_STATE_DIR env vars.
+//
+// Format: JSON5 (comments, trailing commas, unquoted keys are all valid)
+// Docs:   docs/protocol/config.md
+
+{
+  // --- Gateway server ---------------------------------------------------
+  gateway: {
+    bind: "loopback",       // "loopback" | "lan" | "tailnet" | "all" | custom IP
+    port: 18789,
+
+    auth: {
+      // Uncomment one:
+      // mode: "token",
+      // token: "${MOLTBOT_GATEWAY_TOKEN}",
+
+      // mode: "password",
+      // password: "${MOLTBOT_GATEWAY_PASSWORD}",
+
+      // Allow Tailscale-authenticated connections (requires tailscale.mode = "serve")
+      // allowTailscale: true,
+    },
+
+    // tailscale: {
+    //   mode: "serve",      // "off" | "serve"
+    // },
+
+    // Webhook / hooks API
+    hooks: {
+      enabled: false,
+      // token: "${HOOKS_TOKEN}",
+      // path: "/hooks",
+      // maxBodyBytes: 262144,   // 256 KB
+    },
+
+    // OpenAI-compatible API endpoints
+    // openai: {
+    //   chatCompletions: true,  // POST /v1/chat/completions
+    //   responses: true,        // POST /v1/responses
+    // },
+
+    // Control UI (web dashboard)
+    // controlUi: {
+    //   enabled: true,
+    //   path: "dist/control-ui",
+    // },
+
+    // Trusted reverse proxy IPs (for X-Forwarded-For)
+    // trustedProxies: ["127.0.0.1", "::1"],
+  },
+
+  // --- LLM provider -----------------------------------------------------
+  anthropic: {
+    apiKey: "${ANTHROPIC_API_KEY}",   // export ANTHROPIC_API_KEY="sk-ant-..."
+  },
+
+  // --- Agents -----------------------------------------------------------
+  // agents: {
+  //   list: [
+  //     {
+  //       id: "default",
+  //       default: true,
+  //       identity: {
+  //         name: "Carapace",
+  //         description: "A helpful assistant",
+  //       },
+  //     },
+  //   ],
+  // },
+
+  // --- Logging ----------------------------------------------------------
+  // logging: {
+  //   level: "info",          // "trace" | "debug" | "info" | "warn" | "error"
+  //   format: "pretty",       // "pretty" | "json"
+  // },
+
+  // --- Plugins (WASM) ---------------------------------------------------
+  // plugins: {
+  //   enabled: true,
+  //   load: {
+  //     paths: ["/path/to/plugins"],
+  //   },
+  // },
+}

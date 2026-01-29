@@ -1,0 +1,13 @@
+.git
+.github
+.githooks
+.gitignore
+.claude
+.review_history
+target
+docs
+AGENTS.md
+REVIEW_POLICY.yaml
+TODO.md
+*.md
+!README.md
