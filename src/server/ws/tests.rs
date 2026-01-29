@@ -2415,3 +2415,49 @@ fn test_broadcast_sends_identical_bytes_to_all_connections() {
         "voicewake broadcast bytes must be identical for operator and node"
     );
 }
+
+#[test]
+fn test_every_gateway_method_has_explicit_role_assignment() {
+    // Methods that are explicitly assigned "admin" in get_method_required_role.
+    // If a method returns "admin" but is NOT in this list, it means the method
+    // is falling through to the default `_ => "admin"` arm, which is a bug —
+    // it should be explicitly listed.
+    let explicit_admin_methods: std::collections::HashSet<&str> = [
+        "device.pair.approve",
+        "device.pair.reject",
+        "device.token.rotate",
+        "device.token.revoke",
+        "node.pair.request",
+        "node.pair.approve",
+        "node.pair.reject",
+        "node.pair.verify",
+        "node.rename",
+        "exec.approvals.set",
+        "exec.approvals.node.set",
+        "exec.approval.request",
+        "exec.approval.resolve",
+        "sessions.export_user",
+        "sessions.purge_user",
+        "system-event",
+    ]
+    .into_iter()
+    .collect();
+
+    // Node-only methods are dispatched before role checks, so they
+    // legitimately have no explicit role assignment.
+    let node_only: std::collections::HashSet<&str> = NODE_ONLY_METHODS.iter().copied().collect();
+
+    for method in &GATEWAY_METHODS {
+        if node_only.contains(method) {
+            continue;
+        }
+        let role = get_method_required_role(method);
+        assert!(
+            role == "read" || role == "write" || explicit_admin_methods.contains(method),
+            "GATEWAY_METHODS entry '{}' returns role '{}' via default fallthrough — \
+             add it to an explicit arm in get_method_required_role()",
+            method,
+            role,
+        );
+    }
+}

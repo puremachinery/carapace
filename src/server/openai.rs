@@ -116,9 +116,9 @@ pub struct ChatChoice {
 /// Token usage statistics
 #[derive(Debug, Serialize)]
 pub struct ChatUsage {
-    pub prompt_tokens: i32,
-    pub completion_tokens: i32,
-    pub total_tokens: i32,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
 }
 
 /// Chat completion chunk for streaming
@@ -594,9 +594,9 @@ pub async fn chat_completions_handler(
                     finish_reason: "stop".to_string(),
                 }],
                 usage: ChatUsage {
-                    prompt_tokens: usage.input_tokens as i32,
-                    completion_tokens: usage.output_tokens as i32,
-                    total_tokens: (usage.input_tokens + usage.output_tokens) as i32,
+                    prompt_tokens: usage.input_tokens,
+                    completion_tokens: usage.output_tokens,
+                    total_tokens: usage.input_tokens + usage.output_tokens,
                 },
             };
             (StatusCode::OK, Json(response)).into_response()
@@ -766,9 +766,9 @@ pub struct OutputContent {
 /// Usage for OpenResponses
 #[derive(Debug, Serialize)]
 pub struct ResponsesUsage {
-    pub input_tokens: i32,
-    pub output_tokens: i32,
-    pub total_tokens: i32,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
 }
 
 /// Error in OpenResponses
@@ -981,9 +981,9 @@ pub async fn responses_handler(
                     status: "completed".to_string(),
                 }],
                 usage: ResponsesUsage {
-                    input_tokens: usage.input_tokens as i32,
-                    output_tokens: usage.output_tokens as i32,
-                    total_tokens: (usage.input_tokens + usage.output_tokens) as i32,
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                    total_tokens: usage.input_tokens + usage.output_tokens,
                 },
                 error: None,
             };
@@ -1088,6 +1088,37 @@ mod tests {
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("chat.completion"));
         assert!(json.contains("chatcmpl_test"));
+    }
+
+    #[test]
+    fn test_chat_usage_large_token_values_not_truncated() {
+        // Values above i32::MAX (2^31 - 1 = 2_147_483_647) must not be truncated
+        let large: u64 = 5_000_000_000;
+        let usage = ChatUsage {
+            prompt_tokens: large,
+            completion_tokens: large,
+            total_tokens: large * 2,
+        };
+        let json = serde_json::to_string(&usage).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["prompt_tokens"].as_u64().unwrap(), large);
+        assert_eq!(parsed["completion_tokens"].as_u64().unwrap(), large);
+        assert_eq!(parsed["total_tokens"].as_u64().unwrap(), large * 2);
+    }
+
+    #[test]
+    fn test_responses_usage_large_token_values_not_truncated() {
+        let large: u64 = 5_000_000_000;
+        let usage = ResponsesUsage {
+            input_tokens: large,
+            output_tokens: large,
+            total_tokens: large * 2,
+        };
+        let json = serde_json::to_string(&usage).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["input_tokens"].as_u64().unwrap(), large);
+        assert_eq!(parsed["output_tokens"].as_u64().unwrap(), large);
+        assert_eq!(parsed["total_tokens"].as_u64().unwrap(), large * 2);
     }
 
     #[test]

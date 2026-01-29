@@ -84,10 +84,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ws_state = if let Some(key) = api_key {
         match agent::anthropic::AnthropicProvider::new(key) {
-            Ok(mut provider) => {
-                if let Some(url) = base_url {
-                    provider = provider.with_base_url(url);
-                }
+            Ok(provider) => {
+                let provider = if let Some(url) = base_url {
+                    match provider.with_base_url(url) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            warn!("Invalid ANTHROPIC_BASE_URL: {}", e);
+                            return Err(e.into());
+                        }
+                    }
+                } else {
+                    provider
+                };
                 info!("LLM provider configured (Anthropic)");
                 let inner = Arc::try_unwrap(ws_state)
                     .expect("WsServerState Arc should have single owner at startup");

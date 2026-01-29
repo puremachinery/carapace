@@ -38,9 +38,18 @@ impl AnthropicProvider {
         })
     }
 
-    pub fn with_base_url(mut self, url: String) -> Self {
-        self.base_url = url;
-        self
+    pub fn with_base_url(mut self, url: String) -> Result<Self, AgentError> {
+        let parsed = url::Url::parse(&url)
+            .map_err(|e| AgentError::InvalidBaseUrl(format!("invalid URL \"{url}\": {e}")))?;
+        if parsed.scheme() != "https" {
+            return Err(AgentError::InvalidBaseUrl(format!(
+                "base URL must use https scheme, got \"{}\"",
+                parsed.scheme()
+            )));
+        }
+        // Strip trailing slash for consistent path joining
+        self.base_url = url.trim_end_matches('/').to_string();
+        Ok(self)
     }
 
     /// Build the JSON body for the Anthropic Messages API.
@@ -186,6 +195,8 @@ where
         std::collections::HashMap::new();
     let mut accumulated_usage = TokenUsage::default();
 
+    let mut got_message_stop = false;
+
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| format!("stream read error: {e}"))?;
         buffer.push_str(&String::from_utf8_lossy(&chunk));
@@ -210,6 +221,9 @@ where
             if let Some(evt) = line.strip_prefix("event: ") {
                 event_type = evt.to_string();
             } else if let Some(data) = line.strip_prefix("data: ") {
+                if event_type == "message_stop" {
+                    got_message_stop = true;
+                }
                 if let Some(event) =
                     parse_sse_event(&event_type, data, &mut tool_calls, &mut accumulated_usage)
                 {
@@ -231,7 +245,11 @@ where
         }
     }
 
-    Ok(())
+    if got_message_stop {
+        Ok(())
+    } else {
+        Err("stream ended without message_stop event (premature termination)".to_string())
+    }
 }
 
 /// Parse a single SSE event into a StreamEvent.
@@ -526,5 +544,149 @@ mod tests {
             &mut usage,
         );
         assert_eq!(usage.input_tokens, 250);
+    }
+
+    #[test]
+    fn test_default_base_url() {
+        let provider = AnthropicProvider::new("test-key".to_string()).unwrap();
+        assert_eq!(provider.base_url, "https://api.anthropic.com");
+    }
+
+    #[test]
+    fn test_custom_base_url_accepted() {
+        let provider = AnthropicProvider::new("test-key".to_string())
+            .unwrap()
+            .with_base_url("https://proxy.example.com".to_string())
+            .unwrap();
+        assert_eq!(provider.base_url, "https://proxy.example.com");
+    }
+
+    #[test]
+    fn test_custom_base_url_trailing_slash_stripped() {
+        let provider = AnthropicProvider::new("test-key".to_string())
+            .unwrap()
+            .with_base_url("https://proxy.example.com/".to_string())
+            .unwrap();
+        assert_eq!(provider.base_url, "https://proxy.example.com");
+    }
+
+    #[test]
+    fn test_base_url_rejects_http() {
+        let result = AnthropicProvider::new("test-key".to_string())
+            .unwrap()
+            .with_base_url("http://insecure.example.com".to_string());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("https"), "error should mention https: {err}");
+    }
+
+    #[test]
+    fn test_base_url_rejects_invalid_url() {
+        let result = AnthropicProvider::new("test-key".to_string())
+            .unwrap()
+            .with_base_url("not-a-url".to_string());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("invalid URL"),
+            "error should mention invalid URL: {err}"
+        );
+    }
+
+    #[test]
+    fn test_base_url_with_path() {
+        let provider = AnthropicProvider::new("test-key".to_string())
+            .unwrap()
+            .with_base_url("https://proxy.example.com/v1/anthropic".to_string())
+            .unwrap();
+        assert_eq!(provider.base_url, "https://proxy.example.com/v1/anthropic");
+    }
+
+    /// Helper: build a mock byte stream from raw SSE text chunks.
+    fn mock_sse_stream(
+        chunks: Vec<&str>,
+    ) -> futures_util::stream::Iter<std::vec::IntoIter<Result<bytes::Bytes, reqwest::Error>>> {
+        let items: Vec<Result<bytes::Bytes, reqwest::Error>> = chunks
+            .into_iter()
+            .map(|s| Ok(bytes::Bytes::from(s.to_owned())))
+            .collect();
+        futures_util::stream::iter(items)
+    }
+
+    #[tokio::test]
+    async fn test_complete_stream_with_message_stop_returns_ok() {
+        // A complete Anthropic SSE stream: message_start, content deltas,
+        // message_delta (with stop), and message_stop.
+        let sse_data = concat!(
+            "event: message_start\n",
+            "data: {\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-20250514\",\"usage\":{\"input_tokens\":10}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\n",
+            "data: {\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n",
+            "event: message_stop\n",
+            "data: {}\n\n",
+        );
+
+        let stream = mock_sse_stream(vec![sse_data]);
+        let (tx, mut rx) = mpsc::channel(64);
+
+        let result = process_sse_stream(stream, &tx).await;
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result);
+
+        // Verify we received the expected events
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        // Should have TextDelta and Stop
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::TextDelta { text } if text == "Hello")),
+            "expected TextDelta with 'Hello', got: {:?}",
+            events,
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                StreamEvent::Stop {
+                    reason: StopReason::EndTurn,
+                    ..
+                }
+            )),
+            "expected Stop with EndTurn, got: {:?}",
+            events,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_truncated_stream_without_message_stop_returns_error() {
+        // A truncated stream: message_start and a text delta, but no
+        // message_delta or message_stop (simulating network interruption).
+        let sse_data = concat!(
+            "event: message_start\n",
+            "data: {\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-20250514\",\"usage\":{\"input_tokens\":10}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n",
+            // Stream ends abruptly here — no message_delta, no message_stop
+        );
+
+        let stream = mock_sse_stream(vec![sse_data]);
+        let (tx, _rx) = mpsc::channel(64);
+
+        let result = process_sse_stream(stream, &tx).await;
+        assert!(result.is_err(), "expected Err for truncated stream, got Ok");
+        let err_msg = result.unwrap_err();
+        assert!(
+            err_msg.contains("message_stop"),
+            "error should mention message_stop: {err_msg}",
+        );
     }
 }

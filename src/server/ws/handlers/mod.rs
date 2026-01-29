@@ -159,7 +159,7 @@ const OPERATOR_ADMIN_REQUIRED_METHODS: [&str; 37] = [
 /// - admin: device pairing, exec approvals, sensitive operations
 ///
 /// Note: For operators, additional scope checks are applied separately.
-fn get_method_required_role(method: &str) -> &'static str {
+pub(super) fn get_method_required_role(method: &str) -> &'static str {
     match method {
         // Read-only operations (any authenticated role)
         "health"
@@ -169,6 +169,7 @@ fn get_method_required_role(method: &str) -> &'static str {
         | "config.schema"
         | "sessions.list"
         | "sessions.preview"
+        | "sessions.archives"
         | "channels.status"
         | "agent.identity.get"
         | "chat.history"
@@ -203,17 +204,60 @@ fn get_method_required_role(method: &str) -> &'static str {
         | "logs.tail" => "read",
 
         // Write operations (requires write or admin role)
-        "config.set" | "config.apply" | "config.patch" | "sessions.patch" | "sessions.reset"
-        | "sessions.delete" | "sessions.compact" | "channels.logout" | "agent" | "agent.wait"
-        | "chat.send" | "chat.abort" | "tts.enable" | "tts.disable" | "tts.convert"
-        | "tts.setProvider" | "tts.setVoice" | "tts.configure" | "tts.speak" | "tts.stop"
-        | "voicewake.set" | "voicewake.enable" | "voicewake.disable" | "voicewake.test"
-        | "wizard.start" | "wizard.next" | "wizard.back" | "wizard.cancel" | "talk.mode"
-        | "talk.start" | "talk.stop" | "talk.configure" | "skills.install" | "skills.update"
-        | "update.run" | "update.check" | "update.setChannel" | "update.configure"
-        | "update.install" | "update.dismiss" | "usage.enable" | "usage.disable"
-        | "usage.reset" | "cron.add" | "cron.update" | "cron.remove" | "cron.run"
-        | "node.invoke" | "set-heartbeats" | "wake" | "send" => "write",
+        "config.set"
+        | "config.apply"
+        | "config.patch"
+        | "sessions.patch"
+        | "sessions.reset"
+        | "sessions.delete"
+        | "sessions.compact"
+        | "sessions.archive"
+        | "sessions.restore"
+        | "sessions.archive.delete"
+        | "channels.logout"
+        | "agent"
+        | "agent.wait"
+        | "chat.send"
+        | "chat.abort"
+        | "tts.enable"
+        | "tts.disable"
+        | "tts.convert"
+        | "tts.setProvider"
+        | "tts.setVoice"
+        | "tts.configure"
+        | "tts.speak"
+        | "tts.stop"
+        | "voicewake.set"
+        | "voicewake.enable"
+        | "voicewake.disable"
+        | "voicewake.test"
+        | "wizard.start"
+        | "wizard.next"
+        | "wizard.back"
+        | "wizard.cancel"
+        | "talk.mode"
+        | "talk.start"
+        | "talk.stop"
+        | "talk.configure"
+        | "skills.install"
+        | "skills.update"
+        | "update.run"
+        | "update.check"
+        | "update.setChannel"
+        | "update.configure"
+        | "update.install"
+        | "update.dismiss"
+        | "usage.enable"
+        | "usage.disable"
+        | "usage.reset"
+        | "cron.add"
+        | "cron.update"
+        | "cron.remove"
+        | "cron.run"
+        | "node.invoke"
+        | "set-heartbeats"
+        | "wake"
+        | "send" => "write",
 
         // system-presence is read-only (lists system presence)
         "system-presence" => "read",

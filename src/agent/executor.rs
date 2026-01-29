@@ -1072,4 +1072,42 @@ mod tests {
         // 1000 * 0.25/1M + 500 * 1.25/1M = 0.00025 + 0.000625 = 0.000875
         assert!((cost - 0.000875).abs() < 0.00001);
     }
+
+    #[tokio::test]
+    async fn test_premature_stream_end_returns_stream_error() {
+        // Mock provider that sends a TextDelta but never sends Stop —
+        // simulates a premature stream termination (network drop).
+        let (state, _tmp) = make_test_state();
+        let run_id = "run-premature-end";
+        let session_key = "test-premature-end";
+        setup_session_and_run(&state, session_key, run_id);
+
+        let provider = Arc::new(MockProvider::new(vec![vec![
+            // TextDelta but no Stop event — channel will close
+            StreamEvent::TextDelta {
+                text: "partial output".to_string(),
+            },
+        ]]));
+
+        let config = AgentConfig {
+            max_turns: 5,
+            ..Default::default()
+        };
+
+        let result = execute_run(
+            run_id.to_string(),
+            session_key.to_string(),
+            config,
+            state.clone(),
+            provider,
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert!(
+            matches!(&result, Err(AgentError::Stream(msg)) if msg.contains("stop")),
+            "expected Stream error about missing stop event, got: {:?}",
+            result,
+        );
+    }
 }

@@ -1007,7 +1007,7 @@ pub(super) fn handle_sessions_export_user(
     let user_id = params
         .and_then(|p| p.get("userId"))
         .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.trim().is_empty())
         .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "userId is required", None))?;
 
     let data = state
@@ -1033,7 +1033,7 @@ pub(super) fn handle_sessions_purge_user(
     let user_id = params
         .and_then(|p| p.get("userId"))
         .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.trim().is_empty())
         .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "userId is required", None))?;
 
     let (deleted, total) = state
@@ -2599,6 +2599,15 @@ mod tests {
     }
 
     #[test]
+    fn test_handle_sessions_export_user_rejects_whitespace_user_id() {
+        let (state, _tmp) = make_state_with_temp_sessions();
+        let params = json!({ "userId": "   " });
+        let result = handle_sessions_export_user(&state, Some(&params));
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, "INVALID_REQUEST");
+    }
+
+    #[test]
     fn test_handle_sessions_export_user_empty() {
         let (state, _tmp) = make_state_with_temp_sessions();
         let params = json!({ "userId": "user-999" });
@@ -2649,6 +2658,15 @@ mod tests {
     fn test_handle_sessions_purge_user_rejects_empty_user_id() {
         let (state, _tmp) = make_state_with_temp_sessions();
         let params = json!({ "userId": "" });
+        let result = handle_sessions_purge_user(&state, Some(&params));
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, "INVALID_REQUEST");
+    }
+
+    #[test]
+    fn test_handle_sessions_purge_user_rejects_whitespace_user_id() {
+        let (state, _tmp) = make_state_with_temp_sessions();
+        let params = json!({ "userId": "  \t  " });
         let result = handle_sessions_purge_user(&state, Some(&params));
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code, "INVALID_REQUEST");

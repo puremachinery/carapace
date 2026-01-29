@@ -404,13 +404,6 @@ impl CronScheduler {
 
     /// Add a new job.
     pub fn add(&self, input: CronJobCreate) -> Result<CronJob, CronError> {
-        {
-            let jobs = self.jobs.read();
-            if jobs.len() >= Self::MAX_JOBS {
-                return Err(CronError::LimitExceeded(Self::MAX_JOBS));
-            }
-        }
-
         let now = now_ms();
         let job_id = Uuid::new_v4().to_string();
 
@@ -446,6 +439,9 @@ impl CronScheduler {
 
         {
             let mut jobs = self.jobs.write();
+            if jobs.len() >= Self::MAX_JOBS {
+                return Err(CronError::LimitExceeded(Self::MAX_JOBS));
+            }
             jobs.push(job.clone());
         }
 
@@ -1979,5 +1975,75 @@ mod tests {
         assert_eq!(expr.days_of_month.len(), 31); // 1-31
         assert_eq!(expr.months.len(), 12); // 1-12
         assert_eq!(expr.days_of_week.len(), 7); // 0-6
+    }
+
+    #[test]
+    fn test_cron_job_limit_enforced_under_concurrent_access() {
+        use std::sync::Arc;
+
+        let scheduler = Arc::new(CronScheduler::in_memory());
+
+        // Pre-fill to MAX_JOBS - 1 so there is exactly one slot remaining
+        for i in 0..(CronScheduler::MAX_JOBS - 1) {
+            scheduler
+                .add(CronJobCreate {
+                    name: format!("Prefill {i}"),
+                    agent_id: None,
+                    description: None,
+                    enabled: false,
+                    delete_after_run: None,
+                    schedule: CronSchedule::At { at_ms: 0 },
+                    session_target: CronSessionTarget::Main,
+                    wake_mode: CronWakeMode::Now,
+                    payload: CronPayload::SystemEvent {
+                        text: "t".to_string(),
+                    },
+                    isolation: None,
+                })
+                .unwrap();
+        }
+
+        // Spawn multiple threads that all try to grab the last slot
+        let num_threads = 10;
+        let barrier = Arc::new(std::sync::Barrier::new(num_threads));
+        let handles: Vec<_> = (0..num_threads)
+            .map(|i| {
+                let sched = Arc::clone(&scheduler);
+                let bar = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    bar.wait(); // synchronize start
+                    sched.add(CronJobCreate {
+                        name: format!("Concurrent {i}"),
+                        agent_id: None,
+                        description: None,
+                        enabled: false,
+                        delete_after_run: None,
+                        schedule: CronSchedule::At { at_ms: 0 },
+                        session_target: CronSessionTarget::Main,
+                        wake_mode: CronWakeMode::Now,
+                        payload: CronPayload::SystemEvent {
+                            text: "t".to_string(),
+                        },
+                        isolation: None,
+                    })
+                })
+            })
+            .collect();
+
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let successes = results.iter().filter(|r| r.is_ok()).count();
+        let failures = results.iter().filter(|r| r.is_err()).count();
+
+        // Exactly one thread should succeed; the rest must be rejected
+        assert_eq!(successes, 1, "exactly one concurrent add should succeed");
+        assert_eq!(
+            failures,
+            num_threads - 1,
+            "all other concurrent adds should be rejected"
+        );
+
+        // Total jobs must never exceed MAX_JOBS
+        let total = scheduler.jobs.read().len();
+        assert_eq!(total, CronScheduler::MAX_JOBS);
     }
 }
