@@ -14,7 +14,7 @@ RUN cargo build --release --locked \
 FROM debian:bookworm-slim
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/carapace /usr/local/bin/carapace
@@ -24,5 +24,8 @@ ENV MOLTBOT_STATE_DIR=/data
 RUN mkdir -p /data
 
 EXPOSE 18789
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:18789/health || exit 1
 
 ENTRYPOINT ["carapace"]

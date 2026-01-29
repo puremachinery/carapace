@@ -102,7 +102,7 @@ pub(super) const NODE_ONLY_METHODS: [&str; 3] = ["node.invoke.result", "node.eve
 ///
 /// Per Node.js gateway: config.*, wizard.*, update.*, skills.install/update,
 /// channels.logout, sessions.*, and cron.* require operator.admin for operators.
-const OPERATOR_ADMIN_REQUIRED_METHODS: [&str; 33] = [
+const OPERATOR_ADMIN_REQUIRED_METHODS: [&str; 37] = [
     "config.get",
     "config.set",
     "config.apply",
@@ -112,6 +112,10 @@ const OPERATOR_ADMIN_REQUIRED_METHODS: [&str; 33] = [
     "sessions.reset",
     "sessions.delete",
     "sessions.compact",
+    "sessions.archive",
+    "sessions.restore",
+    "sessions.archives",
+    "sessions.archive.delete",
     "sessions.export_user",
     "sessions.purge_user",
     // All wizard.* methods

@@ -197,10 +197,15 @@ where
             ));
         }
 
-        // Process complete lines
-        while let Some(newline_pos) = buffer.find('\n') {
-            let line = buffer[..newline_pos].trim_end_matches('\r').to_string();
-            buffer = buffer[newline_pos + 1..].to_string();
+        // Process complete lines.
+        // We track how far we've consumed to avoid O(n²) re-copying.
+        let mut consumed = 0;
+        while let Some(rel_pos) = buffer[consumed..].find('\n') {
+            let newline_pos = consumed + rel_pos;
+            let line = buffer[consumed..newline_pos]
+                .trim_end_matches('\r')
+                .to_string();
+            consumed = newline_pos + 1;
 
             if let Some(evt) = line.strip_prefix("event: ") {
                 event_type = evt.to_string();
@@ -219,6 +224,10 @@ where
                 }
             }
             // Ignore empty lines and comments
+        }
+        // Remove consumed bytes in one operation
+        if consumed > 0 {
+            buffer.drain(..consumed);
         }
     }
 
@@ -247,7 +256,13 @@ fn parse_sse_event(
         }
 
         "content_block_delta" => {
-            let index = parsed["index"].as_u64().unwrap_or(0);
+            let index = match parsed["index"].as_u64() {
+                Some(i) => i,
+                None => {
+                    tracing::warn!("content_block_delta missing index field, defaulting to 0");
+                    0
+                }
+            };
             let delta = &parsed["delta"];
 
             match delta["type"].as_str() {
@@ -273,7 +288,13 @@ fn parse_sse_event(
         }
 
         "content_block_stop" => {
-            let index = parsed["index"].as_u64().unwrap_or(0);
+            let index = match parsed["index"].as_u64() {
+                Some(i) => i,
+                None => {
+                    tracing::warn!("content_block_stop missing index field, defaulting to 0");
+                    0
+                }
+            };
             if let Some((id, name, input_json)) = tool_calls.remove(&index) {
                 let input: Value = serde_json::from_str(&input_json).unwrap_or(json!({}));
                 Some(StreamEvent::ToolUse { id, name, input })

@@ -80,7 +80,7 @@ const ALLOWED_CLIENT_IDS: [&str; 12] = [
 const ALLOWED_CLIENT_MODES: [&str; 7] =
     ["webchat", "cli", "ui", "backend", "node", "probe", "test"];
 
-const GATEWAY_METHODS: [&str; 110] = [
+const GATEWAY_METHODS: [&str; 114] = [
     // Health/status
     "health",
     "status",
@@ -109,6 +109,10 @@ const GATEWAY_METHODS: [&str; 110] = [
     "sessions.reset",
     "sessions.delete",
     "sessions.compact",
+    "sessions.archive",
+    "sessions.restore",
+    "sessions.archives",
+    "sessions.archive.delete",
     "sessions.export_user",
     "sessions.purge_user",
     // TTS

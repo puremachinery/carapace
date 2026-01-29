@@ -5,6 +5,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
@@ -13,6 +14,11 @@ use crate::agent::provider::*;
 use crate::agent::tools::{self, ToolCallResult};
 use crate::agent::{AgentConfig, AgentError};
 use crate::server::ws::{broadcast_agent_event, broadcast_chat_event, WsServerState};
+
+/// Maximum wall-clock time for a single LLM turn (call + stream processing).
+/// This is a safety net above the reqwest-level timeout (300s) to catch hangs
+/// in stream processing or channel backpressure.
+const TURN_TIMEOUT: Duration = Duration::from_secs(600);
 use crate::sessions::{ChatMessage, MessageRole};
 use tokio_util::sync::CancellationToken;
 
@@ -94,11 +100,16 @@ pub async fn execute_run(
             temperature: config.temperature,
         };
 
-        // Call LLM
-        let mut rx = provider
-            .complete(request)
-            .await
-            .map_err(|e| AgentError::Provider(e.to_string()))?;
+        // Call LLM (with per-turn timeout)
+        let mut rx = match tokio::time::timeout(TURN_TIMEOUT, provider.complete(request)).await {
+            Ok(result) => result.map_err(|e| AgentError::Provider(e.to_string()))?,
+            Err(_) => {
+                return Err(AgentError::Provider(format!(
+                    "LLM turn timed out after {}s",
+                    TURN_TIMEOUT.as_secs()
+                )));
+            }
+        };
 
         // Process the stream
         let mut turn_text = String::new();
@@ -172,13 +183,14 @@ pub async fn execute_run(
                 }
 
                 StreamEvent::Error { message } => {
-                    // Broadcast error
+                    // Sanitize error before broadcasting — strip potential secrets
+                    let safe_message = sanitize_provider_error(&message);
                     broadcast_agent_event(
                         &state,
                         &run_id,
                         next_seq(),
                         "error",
-                        json!({ "message": &message }),
+                        json!({ "message": &safe_message }),
                     );
                     broadcast_chat_event(
                         &state,
@@ -187,11 +199,13 @@ pub async fn execute_run(
                         next_seq(),
                         "error",
                         None,
-                        Some(&message),
+                        Some(&safe_message),
                         None,
                         None,
                     );
-                    return Err(AgentError::Provider(message));
+                    // Log the full unsanitized error server-side
+                    tracing::error!(run_id = %run_id, error = %message, "LLM provider error");
+                    return Err(AgentError::Provider(safe_message));
                 }
             }
         }
@@ -358,6 +372,29 @@ pub async fn execute_run(
     }
 
     Ok(())
+}
+
+/// Sanitize a provider error message before sending to clients.
+///
+/// Strips potential secrets (API keys, internal URLs with auth) from error
+/// messages while preserving the error type and human-readable portion.
+fn sanitize_provider_error(message: &str) -> String {
+    // Strip anything that looks like an API key (sk-ant-..., sk-..., key-...)
+    let sanitized = regex::Regex::new(r"(sk-ant-|sk-|key-)[A-Za-z0-9_-]{10,}")
+        .map(|re| re.replace_all(message, "[REDACTED]").to_string())
+        .unwrap_or_else(|_| message.to_string());
+
+    // Strip Authorization header values
+    let sanitized = regex::Regex::new(r"(?i)(authorization:\s*)(bearer\s+)?\S+")
+        .map(|re| re.replace_all(&sanitized, "$1[REDACTED]").to_string())
+        .unwrap_or(sanitized);
+
+    // Cap length to prevent huge error payloads
+    if sanitized.len() > 500 {
+        format!("{}... (truncated)", &sanitized[..500])
+    } else {
+        sanitized
+    }
 }
 
 /// Cost estimate per model using the shared pricing table. Returns USD.

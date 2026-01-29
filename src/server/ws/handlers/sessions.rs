@@ -109,7 +109,13 @@ impl AgentRunRegistry {
         Self::default()
     }
 
-    /// Register a new agent run
+    /// Maximum number of runs to keep in the registry before pruning.
+    const MAX_RUNS: usize = 1000;
+
+    /// Register a new agent run.
+    ///
+    /// Automatically prunes old completed runs when the registry exceeds
+    /// [`MAX_RUNS`] to prevent unbounded memory growth.
     pub fn register(&mut self, run: AgentRun) {
         let run_id = run.run_id.clone();
         let session_key = run.session_key.clone();
@@ -118,6 +124,37 @@ impl AgentRunRegistry {
             .entry(session_key)
             .or_default()
             .push(run_id);
+
+        if self.runs.len() > Self::MAX_RUNS {
+            self.prune_completed();
+        }
+    }
+
+    /// Remove the oldest completed/failed/cancelled runs to stay under the cap.
+    fn prune_completed(&mut self) {
+        let target = Self::MAX_RUNS / 2;
+        if self.runs.len() <= target {
+            return;
+        }
+
+        // Collect terminal run IDs sorted by completed_at (oldest first)
+        let mut terminal: Vec<(String, u64)> = self
+            .runs
+            .iter()
+            .filter(|(_, r)| {
+                matches!(
+                    r.status,
+                    AgentRunStatus::Completed | AgentRunStatus::Failed | AgentRunStatus::Cancelled
+                )
+            })
+            .map(|(id, r)| (id.clone(), r.completed_at.unwrap_or(0)))
+            .collect();
+        terminal.sort_by_key(|(_, ts)| *ts);
+
+        let to_remove = self.runs.len().saturating_sub(target);
+        for (run_id, _) in terminal.into_iter().take(to_remove) {
+            self.remove(&run_id);
+        }
     }
 
     /// Get a run by ID
