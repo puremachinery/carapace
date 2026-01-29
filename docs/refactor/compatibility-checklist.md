@@ -6,15 +6,15 @@ This checklist defines parity requirements for the Rust gateway migration. Each 
 
 ### JSON Config File Format
 
-- [ ] Support JSON5 parsing (comments, trailing commas, unquoted keys)
-- [ ] Config file location: `~/.moltbot/moltbot.json` (or `MOLTBOT_CONFIG_PATH` override)
-- [ ] Support `$include` directive for config file composition
-  - [ ] Relative path resolution from parent config
-  - [ ] Circular include detection and error
-- [ ] Support `${VAR}` environment variable substitution in config values
-- [ ] Config validation with schema (report path + message for each issue)
-- [ ] Return empty config `{}` when file does not exist
-- [ ] Config caching with 200ms TTL (configurable via `MOLTBOT_CONFIG_CACHE_MS`)
+- [x] Support JSON5 parsing (comments, trailing commas, unquoted keys)
+- [x] Config file location: `~/.moltbot/moltbot.json` (or `MOLTBOT_CONFIG_PATH` override)
+- [x] Support `$include` directive for config file composition
+  - [x] Relative path resolution from parent config
+  - [x] Circular include detection and error
+- [x] Support `${VAR}` environment variable substitution in config values
+- [x] Config validation with schema (report path + message for each issue)
+- [x] Return empty config `{}` when file does not exist
+- [x] Config caching with 200ms TTL (configurable via `MOLTBOT_CONFIG_CACHE_MS`)
 
 ### Environment Variable Overrides
 
@@ -27,7 +27,7 @@ This checklist defines parity requirements for the Rust gateway migration. Each 
 | `MOLTBOT_CONFIG_CACHE_MS` | Config cache TTL |
 | `MOLTBOT_DISABLE_CONFIG_CACHE` | Disable config caching |
 
-- [ ] All environment variables take precedence over config file values
+- [x] All environment variables take precedence over config file values
 - [ ] Support `config.env` section to set environment variables from config
 
 ### Default Values
@@ -52,51 +52,51 @@ This checklist defines parity requirements for the Rust gateway migration. Each 
 
 ### Token Auth
 
-- [ ] Timing-safe comparison using constant-time equality (`timingSafeEqual`)
-- [ ] Token from `gateway.auth.token` config or `MOLTBOT_GATEWAY_TOKEN` env var
-- [ ] Token provided in connect params: `{ auth: { token: "..." } }`
-- [ ] Return `token_missing` when client provides no token
-- [ ] Return `token_mismatch` when token does not match
-- [ ] Return `token_missing_config` when gateway has no token configured
+- [x] Timing-safe comparison using constant-time equality (`timingSafeEqual`)
+- [x] Token from `gateway.auth.token` config or `MOLTBOT_GATEWAY_TOKEN` env var
+- [x] Token provided in connect params: `{ auth: { token: "..." } }`
+- [x] Return `token_missing` when client provides no token
+- [x] Return `token_mismatch` when token does not match
+- [x] Return `token_missing_config` when gateway has no token configured
 
 ### Password Auth
 
-- [ ] Timing-safe comparison using constant-time equality
-- [ ] Password from `gateway.auth.password` config or `MOLTBOT_GATEWAY_PASSWORD` env var
-- [ ] Password provided in connect params: `{ auth: { password: "..." } }`
-- [ ] Return `password_missing` when client provides no password
-- [ ] Return `password_mismatch` when password does not match
-- [ ] Return `password_missing_config` when gateway has no password configured
+- [x] Timing-safe comparison using constant-time equality
+- [x] Password from `gateway.auth.password` config or `MOLTBOT_GATEWAY_PASSWORD` env var
+- [x] Password provided in connect params: `{ auth: { password: "..." } }`
+- [x] Return `password_missing` when client provides no password
+- [x] Return `password_mismatch` when password does not match
+- [x] Return `password_missing_config` when gateway has no password configured
 
 ### Tailscale Auth (whois verification)
 
-- [ ] Check `allowTailscale` setting (default: true when `tailscale.mode=serve` and not password mode)
-- [ ] Verify Tailscale proxy headers: `x-forwarded-for`, `x-forwarded-proto`, `x-forwarded-host`
-- [ ] Extract client IP from `x-forwarded-for` header
-- [ ] Call `tailscale whois` to verify identity
-- [ ] Compare whois login with `tailscale-user-login` header (case-insensitive)
-- [ ] Return `tailscale_user_missing` when header absent
-- [ ] Return `tailscale_proxy_missing` when proxy headers absent
-- [ ] Return `tailscale_whois_failed` when whois lookup fails
-- [ ] Return `tailscale_user_mismatch` when login does not match
+- [x] Check `allowTailscale` setting (default: true when `tailscale.mode=serve` and not password mode)
+- [x] Verify Tailscale proxy headers: `x-forwarded-for`, `x-forwarded-proto`, `x-forwarded-host`
+- [x] Extract client IP from `x-forwarded-for` header
+- [x] Call `tailscale whois` to verify identity
+- [x] Compare whois login with `tailscale-user-login` header (case-insensitive)
+- [x] Return `tailscale_user_missing` when header absent
+- [x] Return `tailscale_proxy_missing` when proxy headers absent
+- [x] Return `tailscale_whois_failed` when whois lookup fails
+- [x] Return `tailscale_user_mismatch` when login does not match
 
 ### Local Loopback Bypass
 
-- [ ] Detect loopback addresses: `127.0.0.1`, `127.x.x.x`, `::1`, `::ffff:127.x.x.x`
-- [ ] Check Host header: `localhost`, `127.0.0.1`, `::1`, or `*.ts.net`
-- [ ] Verify no proxy headers present (unless from trusted proxy)
-- [ ] Support `gateway.trustedProxies` config for reverse proxy setups
+- [x] Detect loopback addresses: `127.0.0.1`, `127.x.x.x`, `::1`, `::ffff:127.x.x.x`
+- [x] Check Host header: `localhost`, `127.0.0.1`, `::1`, or `*.ts.net`
+- [x] Verify no proxy headers present (unless from trusted proxy)
+- [x] Support `gateway.trustedProxies` config for reverse proxy setups
 - [ ] Log warning when proxy headers detected from untrusted address
 
 ### Device Identity Auth
 
-- [ ] Derive device ID from public key (base64url-encoded SHA-256)
-- [ ] Verify device signature against auth payload
-- [ ] Signature payload version v1 (legacy) and v2 (with nonce)
-- [ ] Signature skew window: 10 minutes (`DEVICE_SIGNATURE_SKEW_MS`)
-- [ ] Require nonce for non-loopback connections
-- [ ] Support device token verification for paired devices
-- [ ] Device pairing flow: request -> approve/reject -> store
+- [x] Derive device ID from public key (base64url-encoded SHA-256)
+- [x] Verify device signature against auth payload
+- [x] Signature payload version v1 (legacy) and v2 (with nonce)
+- [x] Signature skew window: 10 minutes (`DEVICE_SIGNATURE_SKEW_MS`)
+- [x] Require nonce for non-loopback connections
+- [x] Support device token verification for paired devices
+- [x] Device pairing flow: request -> approve/reject -> store
 
 ---
 
@@ -104,29 +104,29 @@ This checklist defines parity requirements for the Rust gateway migration. Each 
 
 ### Protocol Version
 
-- [ ] Current protocol version: Check `PROTOCOL_VERSION` constant
-- [ ] Protocol negotiation via `minProtocol`/`maxProtocol` in connect params
-- [ ] Reject connections when `maxProtocol < PROTOCOL_VERSION` or `minProtocol > PROTOCOL_VERSION`
-- [ ] Return error code `1002` (protocol error) for version mismatch
+- [x] Current protocol version: Check `PROTOCOL_VERSION` constant
+- [x] Protocol negotiation via `minProtocol`/`maxProtocol` in connect params
+- [x] Reject connections when `maxProtocol < PROTOCOL_VERSION` or `minProtocol > PROTOCOL_VERSION`
+- [x] Return error code `1002` (protocol error) for version mismatch
 
 ### Connection Handshake
 
-1. [ ] Server sends `connect.challenge` event on connection open:
+1. [x] Server sends `connect.challenge` event on connection open:
    ```json
    { "type": "event", "event": "connect.challenge", "payload": { "nonce": "<uuid>", "ts": <timestamp> } }
    ```
 
-2. [ ] Client sends `connect` request:
+2. [x] Client sends `connect` request:
    ```json
    { "type": "req", "id": "<uuid>", "method": "connect", "params": <ConnectParams> }
    ```
 
-3. [ ] Server validates auth and responds with `hello-ok`:
+3. [x] Server validates auth and responds with `hello-ok`:
    ```json
    { "type": "res", "id": "<uuid>", "ok": true, "payload": <HelloOk> }
    ```
 
-4. [ ] Handshake timeout: configurable (default in `getHandshakeTimeoutMs()`)
+4. [x] Handshake timeout: configurable (default in `getHandshakeTimeoutMs()`)
 
 ### ConnectParams Schema
 
@@ -237,8 +237,8 @@ This checklist defines parity requirements for the Rust gateway migration. Each 
 | `INVALID_REQUEST` | Invalid request format or params |
 | `UNAVAILABLE` | Service unavailable |
 
-- [ ] Implement all error codes
-- [ ] Include error shape in response when `ok: false`
+- [x] Implement all error codes
+- [x] Include error shape in response when `ok: false`
 
 ### Event Types
 
@@ -263,7 +263,7 @@ This checklist defines parity requirements for the Rust gateway migration. Each 
 | `exec.approval.requested` | Exec approval requested |
 | `exec.approval.resolved` | Exec approval resolved |
 
-- [ ] Implement all event types
+- [x] Implement all event types
 - [ ] Include `stateVersion` in presence/health events
 - [ ] Support `dropIfSlow` broadcast option
 
@@ -275,7 +275,7 @@ This checklist defines parity requirements for the Rust gateway migration. Each 
 | `1002` | Protocol error (version mismatch) |
 | `1008` | Policy violation (auth failure, handshake error) |
 
-- [ ] Truncate close reason to fit WebSocket limit (123 bytes)
+- [x] Truncate close reason to fit WebSocket limit (123 bytes)
 
 ---
 
@@ -381,14 +381,14 @@ Response (400):
 | 413 | Payload too large |
 | 500 | Internal server error |
 
-- [ ] Implement all status codes
-- [ ] Set `Content-Type: application/json; charset=utf-8` for JSON responses
-- [ ] Set `Content-Type: text/plain; charset=utf-8` for error messages
-- [ ] Set `Allow: POST` header for 405 responses
+- [x] Implement all status codes
+- [x] Set `Content-Type: application/json; charset=utf-8` for JSON responses
+- [x] Set `Content-Type: text/plain; charset=utf-8` for error messages
+- [x] Set `Allow: POST` header for 405 responses
 
 ### HTTP/WebSocket Upgrade
 
-- [ ] Handle WebSocket upgrade requests (do not interfere with ws library)
+- [x] Handle WebSocket upgrade requests (do not interfere with ws library)
 - [ ] Support canvas host upgrade for live-reload
 
 ---
@@ -397,33 +397,33 @@ Response (400):
 
 ### /hooks/wake
 
-- [ ] Validate `text` field is non-empty string
-- [ ] Validate `mode` is "now" or "next-heartbeat" (default: "now")
-- [ ] Return 400 with `{ ok: false, error: "text required" }` when missing
+- [x] Validate `text` field is non-empty string
+- [x] Validate `mode` is "now" or "next-heartbeat" (default: "now")
+- [x] Return 400 with `{ ok: false, error: "text required" }` when missing
 
 ### /hooks/agent
 
-- [ ] Validate `message` field is non-empty string
-- [ ] Default `name` to "Hook" when absent
-- [ ] Default `wakeMode` to "now"
-- [ ] Generate `sessionKey` as `hook:<uuid>` when absent
-- [ ] Validate `channel` is valid channel ID or "last"
-- [ ] Default `deliver` to true unless explicitly false
-- [ ] Return 202 with `runId` (async dispatch)
+- [x] Validate `message` field is non-empty string
+- [x] Default `name` to "Hook" when absent
+- [x] Default `wakeMode` to "now"
+- [x] Generate `sessionKey` as `hook:<uuid>` when absent
+- [x] Validate `channel` is valid channel ID or "last"
+- [x] Default `deliver` to true unless explicitly false
+- [x] Return 202 with `runId` (async dispatch)
 
 ### Token Auth
 
-- [ ] Check `Authorization: Bearer <token>` header first
-- [ ] Check `X-Moltbot-Token: <token>` header second
-- [ ] Check `?token=<token>` query param last (log deprecation warning)
-- [ ] Return 401 "Unauthorized" for invalid/missing token
-- [ ] Timing-safe token comparison
+- [x] Check `Authorization: Bearer <token>` header first
+- [x] Check `X-Moltbot-Token: <token>` header second
+- [x] Check `?token=<token>` query param last (log deprecation warning)
+- [x] Return 401 "Unauthorized" for invalid/missing token
+- [x] Timing-safe token comparison
 
 ### Hook Mappings
 
-- [ ] Support custom hook mappings from config `hooks.mappings`
-- [ ] Apply mapping transformations (path match, payload extraction)
-- [ ] Return 204 No Content for mappings with null action
+- [x] Support custom hook mappings from config `hooks.mappings`
+- [x] Apply mapping transformations (path match, payload extraction)
+- [x] Return 204 No Content for mappings with null action
 
 ---
 
@@ -436,8 +436,8 @@ Response (400):
 | 0 | Success |
 | 1 | General error (invalid args, runtime error) |
 
-- [ ] Exit 0 on successful completion
-- [ ] Exit 1 on error with message to stderr
+- [x] Exit 0 on successful completion
+- [x] Exit 1 on error with message to stderr
 
 ### Gateway Command Flags
 
@@ -450,7 +450,7 @@ Response (400):
 
 - [ ] Support all existing flag names
 - [ ] Maintain flag short aliases where they exist
-- [ ] Print startup message with bound address and port
+- [x] Print startup message with bound address and port
 
 ### Config Command Flags
 
@@ -507,10 +507,10 @@ Response (400):
 | `agent.wait` | Wait for agent |
 | `chat.*` | WebChat methods |
 
-- [ ] Implement all base methods
+- [x] Implement all base methods
 - [ ] Support channel-specific gateway methods from plugins
 - [ ] Validate params with AJV schemas
-- [ ] Return proper error shapes for validation failures
+- [x] Return proper error shapes for validation failures
 
 ---
 
@@ -574,16 +574,16 @@ Response (400):
 ## Verification Checklist
 
 ### Unit Tests
-- [ ] Config parsing (JSON5, includes, env substitution)
-- [ ] Auth logic (token, password, Tailscale, loopback)
+- [x] Config parsing (JSON5, includes, env substitution)
+- [x] Auth logic (token, password, Tailscale, loopback)
 - [ ] Protocol validation (AJV schemas)
-- [ ] HTTP endpoint handlers
+- [x] HTTP endpoint handlers
 
 ### Integration Tests
-- [ ] WebSocket handshake flow
-- [ ] Full auth scenarios
-- [ ] Hooks API end-to-end
-- [ ] Gateway method round-trips
+- [x] WebSocket handshake flow
+- [x] Full auth scenarios
+- [x] Hooks API end-to-end
+- [x] Gateway method round-trips
 
 ### Compatibility Tests
 - [ ] Connect with existing Node.js CLI

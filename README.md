@@ -90,23 +90,29 @@ just fmt-check
 
 ```
 src/
-├── auth/           # Authentication (tokens, passwords, loopback)
+├── agent/          # LLM execution engine (Anthropic streaming, tool dispatch, context)
+├── auth/           # Authentication (tokens, passwords, Tailscale whois, loopback)
 ├── channels/       # Channel registry
-├── credentials/    # Credential storage
-├── devices/        # Device pairing
+├── config/         # JSON5 config parsing, $include, env substitution
+├── credentials/    # Credential storage (macOS Keychain, Linux Secret Service, Windows)
+├── cron/           # Cron scheduler, background tick loop, payload execution
+├── devices/        # Device pairing state machine
+├── exec/           # Exec approval workflow (request, wait, resolve)
 ├── hooks/          # Webhook mappings
-├── logging/        # Structured logging
-├── media/          # Media fetch/store
-├── messages/       # Outbound messages
-├── nodes/          # Node pairing
-├── plugins/        # WASM plugin runtime
-├── server/         # HTTP + WebSocket server
-└── sessions/       # Session storage
+├── logging/        # Structured logging (ring buffer, JSON/plaintext)
+├── media/          # SSRF-protected media fetch/store
+├── messages/       # Outbound message pipeline and delivery loop
+├── nodes/          # Node pairing state machine
+├── plugins/        # WASM plugin runtime (wasmtime, capability enforcement)
+├── server/         # HTTP + WebSocket server, handlers, rate limiting
+├── sessions/       # Session storage (JSONL history, compaction, archiving)
+└── usage/          # Token counting, cost calculation, model pricing
 
 docs/
 ├── architecture.md # Component diagrams
 ├── security.md     # Threat model
-└── protocol/       # Protocol specifications
+├── protocol/       # Protocol specifications
+└── refactor/       # Migration planning (historical)
 
 tests/
 ├── golden/         # Golden test traces

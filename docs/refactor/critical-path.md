@@ -1,12 +1,14 @@
 # Critical Path: Agent, Channels, Cron
 
-Three subsystems must be implemented to make carapace a functional gateway. This document contains the architecture, interface designs, and implementation steps for each.
+> **Status: ALL THREE SUBSYSTEMS IMPLEMENTED.** This document is retained as architectural reference. See the implementation status tables at the bottom for completion details.
+
+Three subsystems were required to make carapace a functional gateway. This document contains the architecture, interface designs, and implementation history for each.
 
 ## Dependency Graph
 
 ```
                     ┌──────────────────────┐
-                    │  1. Agent Executor    │
+                    │  1. Agent Executor    │  ✓ DONE
                     │  (LLM + streaming +   │
                     │   tool orchestration) │
                     └──────┬───────┬───────┘
@@ -14,44 +16,36 @@ Three subsystems must be implemented to make carapace a functional gateway. This
               ┌────────────┘       └────────────┐
               ▼                                  ▼
 ┌─────────────────────────┐        ┌─────────────────────────┐
-│  2. Channel Delivery    │        │  3. Cron Execution      │
-│  (outbound pipeline +   │        │  (background tick +     │
+│  2. Channel Delivery    │  ✓     │  3. Cron Execution      │  ✓
+│  (outbound pipeline +   │  DONE  │  (background tick +     │  DONE
 │   plugin invocation)    │        │   payload dispatch)     │
 └─────────────────────────┘        └─────────────────────────┘
 ```
-
-**Order**: Agent executor first. Channel delivery and cron execution can proceed in parallel after, since both depend on the agent executor but not on each other.
 
 ---
 
 ## 1. Agent/LLM Execution Engine
 
-### What Exists
+### Implementation Summary
 
-The scaffolding is already in place:
+All components are implemented and wired together:
 
 | Component | Location | Status |
 |-----------|----------|--------|
-| `handle_agent` | `src/server/ws/handlers/sessions.rs:1333` | Accepts message, creates `AgentRun`, registers in `agent_run_registry` — but does not execute |
-| `handle_agent_wait` | `src/server/ws/handlers/sessions.rs:1486` | Blocks on oneshot channel waiting for run completion — functional |
-| `handle_chat_send` | `src/server/ws/handlers/sessions.rs:1632` | Queues user message, creates `AgentRun` if `triggerAgent=true` — does not execute |
-| `handle_chat_abort` | `src/server/ws/handlers/sessions.rs:1814` | Cancels runs via `mark_cancelled()` — functional |
+| `handle_agent` | `src/server/ws/handlers/sessions.rs` | Creates `AgentRun`, spawns `agent::spawn_run()` |
+| `handle_agent_wait` | `src/server/ws/handlers/sessions.rs` | Blocks on oneshot channel waiting for run completion |
+| `handle_chat_send` | `src/server/ws/handlers/sessions.rs` | Queues user message, spawns agent run if `triggerAgent=true` |
+| `handle_chat_abort` | `src/server/ws/handlers/sessions.rs` | Cancels runs via `mark_cancelled()` → `CancellationToken` |
 | `AgentRunRegistry` | `src/server/ws/handlers/sessions.rs` | Tracks run lifecycle with `Queued`, `Running`, `Completed`, `Failed`, `Cancelled` states |
 | `SessionStore` | `src/sessions/store.rs` | Full history management (JSONL append, get_history, compaction) |
 | `ExecApprovalManager` | `src/exec/mod.rs` | Approval workflow with oneshot wait/resolve channels |
 | Usage tracking | `src/usage/mod.rs` | Model pricing, token counting, cost calculation |
-| Broadcast infrastructure | `src/server/ws/mod.rs` | `broadcast_event`, `broadcast_chat_event` for streaming to WS clients |
-
-The comment at `sessions.rs:1441-1449` documents the intended execution flow:
-```rust
-// Note: In a full implementation, the agent executor would:
-// 1. Mark run as Running via registry.mark_started()
-// 2. Call the LLM with streaming
-// 3. Emit delta events for each chunk
-// 4. Emit tool events as needed
-// 5. Append assistant message to history
-// 6. Mark run as Completed/Failed via registry
-```
+| Broadcast infrastructure | `src/server/ws/mod.rs` | `broadcast_agent_event`, `broadcast_chat_event` for streaming to WS clients |
+| Agent executor | `src/agent/executor.rs` | Core run loop: history → LLM → stream → tools → history → complete |
+| Anthropic provider | `src/agent/anthropic.rs` | SSE streaming client for Anthropic Messages API |
+| Context builder | `src/agent/context.rs` | Converts `ChatMessage` history to `LlmMessage` format |
+| Tool dispatch | `src/agent/tools.rs` | Plugin tool invocation via `ToolsRegistry` |
+| Cancellation | `src/server/ws/handlers/sessions.rs` | `CancellationToken` in `AgentRun`, `tokio::select!` in stream loop |
 
 ### Module Structure
 
@@ -297,17 +291,16 @@ This is the glue that connects existing handlers to the new executor. `handle_ag
 
 ## 2. Channel Message Delivery
 
-### What Exists
+### Implementation Summary
 
 | Component | Location | Status |
 |-----------|----------|--------|
-| `ChannelRegistry` | `src/channels/mod.rs` | Status tracker only — `register`, `update_status`, `is_connected` |
-| `MessagePipeline` | `src/messages/outbound.rs` | In-memory queue with `queue()`, `next_for_channel()`, `mark_sent/failed()` |
-| `ChannelPluginInstance` trait | `src/plugins/bindings.rs:170` | Defines `send_text()`, `send_media()` — never invoked |
-| Plugin registry | `src/plugins/bindings.rs:344` | `register_channel()`, `get_channel()` — wired but unused |
-| `handle_send` | `src/server/ws/handlers/system.rs:214` | Calls `message_pipeline.queue()` and returns immediately |
-
-Comment at `outbound.rs:382`: "This is a skeleton implementation — actual delivery logic will be added when channel implementations are ready."
+| `ChannelRegistry` | `src/channels/mod.rs` | Status tracker — `register`, `update_status`, `is_connected` |
+| `MessagePipeline` | `src/messages/outbound.rs` | In-memory queue with `queue()`, `next_for_channel()`, `mark_sent/failed()`, `Notify` for wake |
+| `delivery_loop` | `src/messages/delivery.rs` | Background task draining queue, invoking channel plugins, handling retries |
+| Plugin registry | `src/plugins/bindings.rs` | `register_channel()`, `get_channel()` |
+| `handle_send` | `src/server/ws/handlers/system.rs` | Calls `message_pipeline.queue()`, returns `runId`/`messageId`/`channel` |
+| Startup wiring | `src/main.rs` | Spawns `delivery_loop` as background tokio task |
 
 ### Architecture
 
@@ -480,17 +473,16 @@ The hooks HTTP handler already exists (`src/hooks/handler.rs`). It needs to call
 
 ## 3. Cron Background Execution
 
-### What Exists
+### Implementation Summary
 
 | Component | Location | Status |
 |-----------|----------|--------|
 | `CronScheduler` | `src/cron/mod.rs` | Full CRUD, schedule parsing, state tracking, 500-job limit |
-| `CronPayload` | `src/cron/mod.rs:74` | `SystemEvent { text }` and `AgentTurn { message, model, channel, deliver }` — defined but ignored |
-| `run()` | `src/cron/mod.rs:543` | Checks due/force, marks running, **simulates execution (line 586)**, marks complete |
-| `CronEvent` emission | `src/cron/mod.rs:668` | Sends events to `mpsc::UnboundedSender<CronEvent>` — wired to WS broadcast |
-| `handle_cron_run` | `src/server/ws/handlers/cron.rs:274` | Calls `scheduler.run()`, broadcasts started/completed events |
-
-No `tokio::spawn` for periodic cron checks exists anywhere in the codebase. The only way to run a cron job is manual `cron.run` WS method call.
+| `CronPayload` | `src/cron/mod.rs` | `SystemEvent { text }` and `AgentTurn { message, model, ... }` |
+| `execute_payload` | `src/cron/executor.rs` | Dispatches `SystemEvent` (broadcast) and `AgentTurn` (spawn agent run) |
+| `cron_tick_loop` | `src/cron/tick.rs` | Background task (10s interval) scanning for due jobs and spawning execution |
+| `handle_cron_run` | `src/server/ws/handlers/cron.rs` | Manual trigger via WS method call |
+| Startup wiring | `src/main.rs` | Spawns `cron_tick_loop` as background tokio task |
 
 ### Architecture
 
@@ -671,7 +663,7 @@ impl CronScheduler {
 
 ---
 
-## Implementation Order
+## Implementation Order (All Complete)
 
 ### Phase A: Agent Executor (Blocker 1) — COMPLETE
 
