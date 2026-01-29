@@ -17,6 +17,8 @@ use std::sync::Arc;
 
 use crate::auth;
 use crate::channels::{ChannelInfo, ChannelRegistry, ChannelStatus};
+use crate::config;
+use crate::server::ws::{map_validation_issues, persist_config_file, read_config_snapshot};
 
 /// Control endpoint state
 #[derive(Clone)]
@@ -117,6 +119,9 @@ pub struct ConfigUpdateRequest {
     pub path: String,
     /// New value
     pub value: Value,
+    /// SHA256 hash of current config for optimistic concurrency
+    #[serde(default)]
+    pub base_hash: Option<String>,
 }
 
 /// Config update response
@@ -131,6 +136,9 @@ pub struct ConfigUpdateResponse {
     /// Applied configuration
     #[serde(skip_serializing_if = "Option::is_none")]
     pub applied: Option<Value>,
+    /// SHA256 hash of the persisted config (for subsequent optimistic concurrency)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
 }
 
 /// Control API error
@@ -274,19 +282,108 @@ pub async fn config_handler(
         }
     }
 
-    // In a real implementation, this would update the configuration
-    // For now, return success with a note that it's not persisted
+    // Read current config snapshot (with hash for optimistic concurrency)
+    let snapshot = read_config_snapshot();
+
+    // Check optimistic concurrency if the config file exists
+    if snapshot.exists {
+        match (&req.base_hash, &snapshot.hash) {
+            (Some(provided), Some(expected)) => {
+                let provided = provided.trim();
+                if !provided.is_empty() && provided != expected {
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(ControlError::new(
+                            "Config changed since last load; re-read config and retry",
+                        )),
+                    )
+                        .into_response();
+                }
+            }
+            (None, Some(_)) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ControlError::new(
+                        "baseHash is required when config file exists; read config first to obtain the hash",
+                    )),
+                )
+                    .into_response();
+            }
+            _ => {} // No hash available or file doesn't exist - allow
+        }
+    }
+
+    // Apply the path-based update to the current config
+    let mut updated_config = snapshot.config.clone();
+    set_value_at_path(&mut updated_config, &req.path, req.value.clone());
+
+    // Validate the updated config
+    let issues = map_validation_issues(config::validate_config(&updated_config));
+    if !issues.is_empty() {
+        let issue_details: Vec<Value> = issues
+            .iter()
+            .map(|i| json!({ "path": i.path, "message": i.message }))
+            .collect();
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "ok": false,
+                "error": "Invalid configuration",
+                "issues": issue_details,
+            })),
+        )
+            .into_response();
+    }
+
+    // Persist the updated config atomically
+    let config_path = config::get_config_path();
+    if let Err(msg) = persist_config_file(&config_path, &updated_config) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ControlError::new(msg)),
+        )
+            .into_response();
+    }
+
+    // Re-read to get the new hash
+    let new_snapshot = read_config_snapshot();
+
     let response = ConfigUpdateResponse {
         ok: true,
         error: None,
         applied: Some(json!({
             "path": req.path,
             "value": req.value,
-            "note": "Configuration update acknowledged (not persisted in this implementation)"
+            "config": new_snapshot.config,
         })),
+        hash: new_snapshot.hash,
     };
 
     (StatusCode::OK, Json(response)).into_response()
+}
+
+/// Set a value at a dot-notation path in a JSON object.
+/// Creates intermediate objects as needed.
+fn set_value_at_path(root: &mut Value, path: &str, value: Value) {
+    let parts: Vec<&str> = path.split('.').collect();
+    let mut current = root;
+
+    for (i, part) in parts.iter().enumerate() {
+        if i == parts.len() - 1 {
+            // Last segment: set the value
+            if let Value::Object(map) = current {
+                map.insert(part.to_string(), value);
+            }
+            return;
+        }
+        // Intermediate segment: ensure it's an object
+        if !current.get(*part).is_some_and(|v| v.is_object()) {
+            if let Value::Object(map) = current {
+                map.insert(part.to_string(), Value::Object(serde_json::Map::new()));
+            }
+        }
+        current = current.get_mut(*part).expect("just inserted");
+    }
 }
 
 /// Check control endpoint authentication
@@ -391,6 +488,44 @@ mod tests {
         let req: ConfigUpdateRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.path, "agent.model");
         assert_eq!(req.value, "claude-3");
+        assert!(req.base_hash.is_none());
+    }
+
+    #[test]
+    fn test_config_update_request_with_base_hash() {
+        let json = r#"{"path": "agent.model", "value": "claude-3", "baseHash": "abc123"}"#;
+        let req: ConfigUpdateRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.path, "agent.model");
+        assert_eq!(req.value, "claude-3");
+        assert_eq!(req.base_hash.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn test_config_update_response_serialization() {
+        let response = ConfigUpdateResponse {
+            ok: true,
+            error: None,
+            applied: Some(json!({"path": "gateway.port", "value": 9000})),
+            hash: Some("deadbeef".to_string()),
+        };
+        let json_str = serde_json::to_string(&response).unwrap();
+        assert!(json_str.contains("\"ok\":true"));
+        assert!(json_str.contains("\"hash\":\"deadbeef\""));
+        assert!(!json_str.contains("\"error\""));
+    }
+
+    #[test]
+    fn test_config_update_response_without_hash() {
+        let response = ConfigUpdateResponse {
+            ok: true,
+            error: None,
+            applied: None,
+            hash: None,
+        };
+        let json_str = serde_json::to_string(&response).unwrap();
+        assert!(json_str.contains("\"ok\":true"));
+        assert!(!json_str.contains("\"hash\""));
+        assert!(!json_str.contains("\"applied\""));
     }
 
     #[test]
@@ -399,5 +534,47 @@ mod tests {
         let json = serde_json::to_string(&error).unwrap();
         assert!(json.contains("\"ok\":false"));
         assert!(json.contains("Unauthorized"));
+    }
+
+    #[test]
+    fn test_set_value_at_path_simple() {
+        let mut root = json!({"gateway": {"port": 8080}});
+        set_value_at_path(&mut root, "gateway.port", json!(9000));
+        assert_eq!(root["gateway"]["port"], 9000);
+    }
+
+    #[test]
+    fn test_set_value_at_path_creates_intermediates() {
+        let mut root = json!({});
+        set_value_at_path(&mut root, "gateway.auth.mode", json!("token"));
+        assert_eq!(root["gateway"]["auth"]["mode"], "token");
+    }
+
+    #[test]
+    fn test_set_value_at_path_top_level() {
+        let mut root = json!({"existing": true});
+        set_value_at_path(&mut root, "newKey", json!("newValue"));
+        assert_eq!(root["newKey"], "newValue");
+        assert_eq!(root["existing"], true);
+    }
+
+    #[test]
+    fn test_set_value_at_path_overwrites_non_object() {
+        let mut root = json!({"gateway": "string_value"});
+        set_value_at_path(&mut root, "gateway.port", json!(9000));
+        // The string value is replaced with an object containing port
+        assert_eq!(root["gateway"]["port"], 9000);
+    }
+
+    #[test]
+    fn test_set_value_at_path_complex_value() {
+        let mut root = json!({"channels": {}});
+        set_value_at_path(
+            &mut root,
+            "channels.telegram",
+            json!({"enabled": true, "token": "abc"}),
+        );
+        assert_eq!(root["channels"]["telegram"]["enabled"], true);
+        assert_eq!(root["channels"]["telegram"]["token"], "abc");
     }
 }

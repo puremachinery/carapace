@@ -298,6 +298,9 @@ pub fn create_router_with_state(
 ) -> Router {
     let start_time = chrono::Utc::now().timestamp();
 
+    // Extract LLM provider before moving ws_state into AppState
+    let llm_provider = ws_state.as_ref().and_then(|ws| ws.llm_provider().cloned());
+
     let state = AppState {
         config: Arc::new(config.clone()),
         hook_registry,
@@ -334,6 +337,7 @@ pub fn create_router_with_state(
             responses_enabled: config.openai_responses_enabled,
             gateway_token: config.gateway_token.clone(),
             gateway_password: config.gateway_password.clone(),
+            llm_provider: llm_provider.clone(),
         };
 
         if config.openai_chat_completions_enabled {
@@ -354,6 +358,7 @@ pub fn create_router_with_state(
             responses_enabled: config.openai_responses_enabled,
             gateway_token: config.gateway_token.clone(),
             gateway_password: config.gateway_password.clone(),
+            llm_provider,
         };
 
         if config.openai_responses_enabled {

@@ -40,6 +40,9 @@ pub(super) use usage::*;
 pub(super) use voicewake::*;
 
 // Re-export types needed outside the handlers module
+pub(crate) use config::{
+    map_validation_issues, persist_config_file, read_config_snapshot, ConfigIssue, ConfigSnapshot,
+};
 pub use sessions::AgentRunRegistry;
 pub use sessions::AgentRunStatus;
 pub use usage::record_usage;

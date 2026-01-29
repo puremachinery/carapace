@@ -46,6 +46,11 @@ pub use handlers::AgentRunStatus;
 // Re-export AgentRun for use by cron executor and tests
 pub use handlers::sessions::AgentRun;
 
+// Re-export config persistence types for use by control endpoint
+pub(crate) use handlers::{
+    map_validation_issues, persist_config_file, read_config_snapshot, ConfigIssue, ConfigSnapshot,
+};
+
 const PROTOCOL_VERSION: u32 = 3;
 const MAX_PAYLOAD_BYTES: usize = 512 * 1024;
 const MAX_BUFFERED_BYTES: usize = (1024 * 1024 * 3) / 2;

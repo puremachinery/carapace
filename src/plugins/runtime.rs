@@ -26,7 +26,7 @@ use std::time::Duration;
 use parking_lot::RwLock;
 use thiserror::Error;
 use wasmtime::component::{Component, ComponentType, Lift, Linker, Lower};
-use wasmtime::{Config, Engine, Store, StoreContextMut};
+use wasmtime::{AsContextMut, Config, Engine, Store, StoreContextMut};
 
 use crate::credentials::{CredentialBackend, CredentialStore};
 
@@ -121,6 +121,355 @@ struct WitMediaFetchResult {
     error: Option<String>,
 }
 
+// ============== WIT Export Types (Guest -> Host) ==============
+//
+// These types represent the return values from WASM component exports.
+// They implement `Lift` to be deserialized from WASM memory.
+
+/// WIT `channel-info` record returned by `channel-meta.get-info` export.
+#[derive(Clone, Debug, ComponentType, Lift, Lower)]
+#[component(record)]
+struct WitChannelInfo {
+    #[component(name = "id")]
+    id: String,
+    #[component(name = "label")]
+    label: String,
+    #[component(name = "selection-label")]
+    selection_label: String,
+    #[component(name = "docs-path")]
+    docs_path: String,
+    #[component(name = "blurb")]
+    blurb: String,
+    #[component(name = "order")]
+    order: u32,
+}
+
+/// WIT `chat-type` enum used in channel capabilities.
+#[derive(Clone, Debug, ComponentType, Lift, Lower)]
+#[component(enum)]
+#[allow(dead_code)]
+enum WitChatType {
+    #[component(name = "dm")]
+    Dm,
+    #[component(name = "group")]
+    Group,
+    #[component(name = "channel")]
+    Channel,
+    #[component(name = "thread")]
+    Thread,
+}
+
+/// WIT `channel-capabilities` record returned by `channel-meta.get-capabilities` export.
+#[derive(Clone, Debug, ComponentType, Lift, Lower)]
+#[component(record)]
+struct WitChannelCapabilities {
+    #[component(name = "chat-types")]
+    chat_types: Vec<WitChatType>,
+    #[component(name = "polls")]
+    polls: bool,
+    #[component(name = "reactions")]
+    reactions: bool,
+    #[component(name = "edit")]
+    edit: bool,
+    #[component(name = "unsend")]
+    unsend: bool,
+    #[component(name = "reply")]
+    reply: bool,
+    #[component(name = "effects")]
+    effects: bool,
+    #[component(name = "group-management")]
+    group_management: bool,
+    #[component(name = "threads")]
+    threads: bool,
+    #[component(name = "media")]
+    media: bool,
+    #[component(name = "native-commands")]
+    native_commands: bool,
+    #[component(name = "block-streaming")]
+    block_streaming: bool,
+}
+
+/// WIT `outbound-context` record passed to channel send functions.
+#[derive(Clone, Debug, ComponentType, Lift, Lower)]
+#[component(record)]
+struct WitOutboundContext {
+    #[component(name = "to")]
+    to: String,
+    #[component(name = "text")]
+    text: String,
+    #[component(name = "media-url")]
+    media_url: Option<String>,
+    #[component(name = "gif-playback")]
+    gif_playback: bool,
+    #[component(name = "reply-to-id")]
+    reply_to_id: Option<String>,
+    #[component(name = "thread-id")]
+    thread_id: Option<String>,
+    #[component(name = "account-id")]
+    account_id: Option<String>,
+}
+
+/// WIT `plugin-error` record returned in `result<T, plugin-error>` exports.
+#[derive(Clone, Debug, ComponentType, Lift, Lower)]
+#[component(record)]
+struct WitPluginError {
+    #[component(name = "code")]
+    code: String,
+    #[component(name = "message")]
+    message: String,
+    #[component(name = "retryable")]
+    retryable: bool,
+}
+
+/// WIT `delivery-result` record returned by send functions.
+#[derive(Clone, Debug, ComponentType, Lift, Lower)]
+#[component(record)]
+struct WitDeliveryResult {
+    #[component(name = "ok")]
+    ok: bool,
+    #[component(name = "message-id")]
+    message_id: Option<String>,
+    #[component(name = "error")]
+    error: Option<String>,
+    #[component(name = "retryable")]
+    retryable: bool,
+}
+
+/// WIT `tool-definition` record returned by `tool.get-definitions` export.
+#[derive(Clone, Debug, ComponentType, Lift, Lower)]
+#[component(record)]
+struct WitToolDefinition {
+    #[component(name = "name")]
+    name: String,
+    #[component(name = "description")]
+    description: String,
+    #[component(name = "input-schema")]
+    input_schema: String,
+}
+
+/// WIT `tool-context` record passed to `tool.invoke` export.
+#[derive(Clone, Debug, ComponentType, Lift, Lower)]
+#[component(record)]
+struct WitToolContext {
+    #[component(name = "agent-id")]
+    agent_id: Option<String>,
+    #[component(name = "session-key")]
+    session_key: Option<String>,
+    #[component(name = "message-channel")]
+    message_channel: Option<String>,
+    #[component(name = "sandboxed")]
+    sandboxed: bool,
+}
+
+/// WIT `tool-result` record returned by `tool.invoke` export.
+#[derive(Clone, Debug, ComponentType, Lift, Lower)]
+#[component(record)]
+struct WitToolResult {
+    #[component(name = "success")]
+    success: bool,
+    #[component(name = "result")]
+    result: Option<String>,
+    #[component(name = "error")]
+    error: Option<String>,
+}
+
+/// WIT `webhook-request` record passed to `webhook.handle` export.
+#[derive(Clone, Debug, ComponentType, Lift, Lower)]
+#[component(record)]
+struct WitWebhookRequest {
+    #[component(name = "method")]
+    method: String,
+    #[component(name = "path")]
+    path: String,
+    #[component(name = "headers")]
+    headers: Vec<(String, String)>,
+    #[component(name = "body")]
+    body: Option<Vec<u8>>,
+    #[component(name = "query")]
+    query: Option<String>,
+}
+
+/// WIT `webhook-response` record returned by `webhook.handle` export.
+#[derive(Clone, Debug, ComponentType, Lift, Lower)]
+#[component(record)]
+struct WitWebhookResponse {
+    #[component(name = "status")]
+    status: u16,
+    #[component(name = "headers")]
+    headers: Vec<(String, String)>,
+    #[component(name = "body")]
+    body: Option<Vec<u8>>,
+}
+
+/// WIT `hook-event` record passed to `hooks.handle` export.
+#[derive(Clone, Debug, ComponentType, Lift, Lower)]
+#[component(record)]
+struct WitHookEvent {
+    #[component(name = "hook-name")]
+    hook_name: String,
+    #[component(name = "payload")]
+    payload: String,
+}
+
+/// WIT `hook-result` record returned by `hooks.handle` export.
+#[derive(Clone, Debug, ComponentType, Lift, Lower)]
+#[component(record)]
+struct WitHookResult {
+    #[component(name = "handled")]
+    handled: bool,
+    #[component(name = "cancel")]
+    cancel: bool,
+    #[component(name = "modified-payload")]
+    modified_payload: Option<String>,
+}
+
+// ============== Type Conversions ==============
+
+impl From<WitChannelInfo> for ChannelInfo {
+    fn from(wit: WitChannelInfo) -> Self {
+        Self {
+            id: wit.id,
+            label: wit.label,
+            selection_label: wit.selection_label,
+            docs_path: wit.docs_path,
+            blurb: wit.blurb,
+            order: wit.order,
+        }
+    }
+}
+
+impl From<WitChatType> for ChatType {
+    fn from(wit: WitChatType) -> Self {
+        match wit {
+            WitChatType::Dm => ChatType::Dm,
+            WitChatType::Group => ChatType::Group,
+            WitChatType::Channel => ChatType::Channel,
+            WitChatType::Thread => ChatType::Thread,
+        }
+    }
+}
+
+impl From<WitChannelCapabilities> for ChannelCapabilities {
+    fn from(wit: WitChannelCapabilities) -> Self {
+        Self {
+            chat_types: wit.chat_types.into_iter().map(ChatType::from).collect(),
+            polls: wit.polls,
+            reactions: wit.reactions,
+            edit: wit.edit,
+            unsend: wit.unsend,
+            reply: wit.reply,
+            effects: wit.effects,
+            group_management: wit.group_management,
+            threads: wit.threads,
+            media: wit.media,
+            native_commands: wit.native_commands,
+            block_streaming: wit.block_streaming,
+        }
+    }
+}
+
+impl From<&OutboundContext> for WitOutboundContext {
+    fn from(ctx: &OutboundContext) -> Self {
+        Self {
+            to: ctx.to.clone(),
+            text: ctx.text.clone(),
+            media_url: ctx.media_url.clone(),
+            gif_playback: ctx.gif_playback,
+            reply_to_id: ctx.reply_to_id.clone(),
+            thread_id: ctx.thread_id.clone(),
+            account_id: ctx.account_id.clone(),
+        }
+    }
+}
+
+impl From<WitDeliveryResult> for DeliveryResult {
+    fn from(wit: WitDeliveryResult) -> Self {
+        Self {
+            ok: wit.ok,
+            message_id: wit.message_id,
+            error: wit.error,
+            retryable: wit.retryable,
+            // These fields are not in the WIT delivery-result type;
+            // they are host-side extensions. Default to None.
+            conversation_id: None,
+            to_jid: None,
+            poll_id: None,
+        }
+    }
+}
+
+impl From<WitToolDefinition> for ToolDefinition {
+    fn from(wit: WitToolDefinition) -> Self {
+        Self {
+            name: wit.name,
+            description: wit.description,
+            input_schema: wit.input_schema,
+        }
+    }
+}
+
+impl From<&ToolContext> for WitToolContext {
+    fn from(ctx: &ToolContext) -> Self {
+        Self {
+            agent_id: ctx.agent_id.clone(),
+            session_key: ctx.session_key.clone(),
+            message_channel: ctx.message_channel.clone(),
+            sandboxed: ctx.sandboxed,
+        }
+    }
+}
+
+impl From<WitToolResult> for ToolResult {
+    fn from(wit: WitToolResult) -> Self {
+        Self {
+            success: wit.success,
+            result: wit.result,
+            error: wit.error,
+        }
+    }
+}
+
+impl From<&WebhookRequest> for WitWebhookRequest {
+    fn from(req: &WebhookRequest) -> Self {
+        Self {
+            method: req.method.clone(),
+            path: req.path.clone(),
+            headers: req.headers.clone(),
+            body: req.body.clone(),
+            query: req.query.clone(),
+        }
+    }
+}
+
+impl From<WitWebhookResponse> for WebhookResponse {
+    fn from(wit: WitWebhookResponse) -> Self {
+        Self {
+            status: wit.status,
+            headers: wit.headers,
+            body: wit.body,
+        }
+    }
+}
+
+impl From<&HookEvent> for WitHookEvent {
+    fn from(event: &HookEvent) -> Self {
+        Self {
+            hook_name: event.hook_name.clone(),
+            payload: event.payload.clone(),
+        }
+    }
+}
+
+impl From<WitHookResult> for HookResult {
+    fn from(wit: WitHookResult) -> Self {
+        Self {
+            handled: wit.handled,
+            cancel: wit.cancel,
+            modified_payload: wit.modified_payload,
+        }
+    }
+}
+
 /// Plugin runtime errors
 #[derive(Error, Debug)]
 pub enum RuntimeError {
@@ -195,12 +544,120 @@ pub struct PluginInstanceHandle<B: CredentialBackend + Send + Sync + 'static> {
     pub manifest: PluginManifest,
 
     /// The wasmtime store with plugin state
-    #[allow(dead_code)]
     store: RwLock<Store<HostState<B>>>,
 
     /// Component instance (for calling exports)
-    #[allow(dead_code)]
     instance: wasmtime::component::Instance,
+}
+
+impl<B: CredentialBackend + Send + Sync + 'static> PluginInstanceHandle<B> {
+    /// Call an exported function from a named interface with no parameters.
+    ///
+    /// Looks up the function `func_name` within the exported interface `iface_name`,
+    /// calls it asynchronously (required by the async-enabled engine), and returns
+    /// the result. Handles the `post_return_async` cleanup automatically.
+    fn call_export_no_args<R>(&self, iface_name: &str, func_name: &str) -> Result<R, BindingError>
+    where
+        R: wasmtime::component::ComponentNamedList + Lift + Send + Sync + 'static,
+    {
+        let mut store = self.store.write();
+        let instance = self.instance;
+
+        // Get the exported interface, then get the typed function
+        let func = {
+            let mut exports = instance.exports(&mut *store);
+            let mut iface = exports.instance(iface_name).ok_or_else(|| {
+                BindingError::CallError(format!("exported interface '{}' not found", iface_name))
+            })?;
+            iface.typed_func::<(), R>(func_name).map_err(|e| {
+                BindingError::CallError(format!(
+                    "failed to get typed func '{}.{}': {}",
+                    iface_name, func_name, e
+                ))
+            })?
+        };
+
+        // Call the function asynchronously (required by async-enabled engine)
+        // We bridge sync -> async using tokio's block_in_place + block_on
+        let result = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(async { func.call_async(&mut *store, ()).await })
+        })
+        .map_err(|e| {
+            BindingError::CallError(format!(
+                "call to '{}.{}' failed: {}",
+                iface_name, func_name, e
+            ))
+        })?;
+
+        // Post-return cleanup
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(async { func.post_return_async(&mut *store).await })
+        })
+        .map_err(|e| {
+            BindingError::CallError(format!(
+                "post_return for '{}.{}' failed: {}",
+                iface_name, func_name, e
+            ))
+        })?;
+
+        Ok(result)
+    }
+
+    /// Call an exported function from a named interface with one parameter.
+    ///
+    /// Same as [`call_export_no_args`] but accepts a single typed parameter.
+    fn call_export_one_arg<P, R>(
+        &self,
+        iface_name: &str,
+        func_name: &str,
+        param: P,
+    ) -> Result<R, BindingError>
+    where
+        P: wasmtime::component::ComponentNamedList + Lower + Send + Sync + 'static,
+        R: wasmtime::component::ComponentNamedList + Lift + Send + Sync + 'static,
+    {
+        let mut store = self.store.write();
+        let instance = self.instance;
+
+        let func = {
+            let mut exports = instance.exports(&mut *store);
+            let mut iface = exports.instance(iface_name).ok_or_else(|| {
+                BindingError::CallError(format!("exported interface '{}' not found", iface_name))
+            })?;
+            iface.typed_func::<P, R>(func_name).map_err(|e| {
+                BindingError::CallError(format!(
+                    "failed to get typed func '{}.{}': {}",
+                    iface_name, func_name, e
+                ))
+            })?
+        };
+
+        let result = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(async { func.call_async(&mut *store, param).await })
+        })
+        .map_err(|e| {
+            BindingError::CallError(format!(
+                "call to '{}.{}' failed: {}",
+                iface_name, func_name, e
+            ))
+        })?;
+
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(async { func.post_return_async(&mut *store).await })
+        })
+        .map_err(|e| {
+            BindingError::CallError(format!(
+                "post_return for '{}.{}' failed: {}",
+                iface_name, func_name, e
+            ))
+        })?;
+
+        Ok(result)
+    }
 }
 
 impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
@@ -635,7 +1092,6 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
 /// Adapter that implements ChannelPluginInstance for WASM plugins
 struct ChannelAdapter<B: CredentialBackend + Send + Sync + 'static> {
     plugin_id: String,
-    #[allow(dead_code)]
     handle: Arc<PluginInstanceHandle<B>>,
 }
 
@@ -647,71 +1103,62 @@ impl<B: CredentialBackend + Send + Sync + 'static> ChannelAdapter<B> {
 
 // Manual Send/Sync implementations for adapters
 // These are safe because we only hold Arc<PluginInstanceHandle> which protects concurrent access
+// via interior RwLock on the store.
 unsafe impl<B: CredentialBackend + Send + Sync + 'static> Send for ChannelAdapter<B> {}
 unsafe impl<B: CredentialBackend + Send + Sync + 'static> Sync for ChannelAdapter<B> {}
 
 impl<B: CredentialBackend + Send + Sync + 'static> ChannelPluginInstance for ChannelAdapter<B> {
     fn get_info(&self) -> Result<ChannelInfo, BindingError> {
-        // In a full implementation, this would call the WASM export
-        // For now, return placeholder based on plugin ID
-        Ok(ChannelInfo {
-            id: self.plugin_id.clone(),
-            label: self.plugin_id.clone(),
-            selection_label: self.plugin_id.clone(),
-            docs_path: format!("/channels/{}", self.plugin_id),
-            blurb: format!("{} channel plugin", self.plugin_id),
-            order: 100,
-        })
+        tracing::debug!(plugin_id = %self.plugin_id, "Calling WASM export channel-meta.get-info");
+        let (wit_info,): (WitChannelInfo,) = self
+            .handle
+            .call_export_no_args("channel-meta", "get-info")?;
+        Ok(ChannelInfo::from(wit_info))
     }
 
     fn get_capabilities(&self) -> Result<ChannelCapabilities, BindingError> {
-        // In a full implementation, this would call the WASM export
-        Ok(ChannelCapabilities {
-            chat_types: vec![ChatType::Dm, ChatType::Group],
-            polls: false,
-            reactions: false,
-            edit: false,
-            unsend: false,
-            reply: true,
-            effects: false,
-            group_management: false,
-            threads: false,
-            media: true,
-            native_commands: false,
-            block_streaming: false,
-        })
+        tracing::debug!(plugin_id = %self.plugin_id, "Calling WASM export channel-meta.get-capabilities");
+        let (wit_caps,): (WitChannelCapabilities,) = self
+            .handle
+            .call_export_no_args("channel-meta", "get-capabilities")?;
+        Ok(ChannelCapabilities::from(wit_caps))
     }
 
-    fn send_text(&self, _ctx: OutboundContext) -> Result<DeliveryResult, BindingError> {
-        // In a full implementation, this would call the WASM export
-        Ok(DeliveryResult {
-            ok: true,
-            message_id: Some(uuid::Uuid::new_v4().to_string()),
-            error: None,
-            retryable: false,
-            conversation_id: None,
-            to_jid: None,
-            poll_id: None,
-        })
+    fn send_text(&self, ctx: OutboundContext) -> Result<DeliveryResult, BindingError> {
+        tracing::debug!(plugin_id = %self.plugin_id, to = %ctx.to, "Calling WASM export channel-adapter.send-text");
+        let wit_ctx = WitOutboundContext::from(&ctx);
+        // The WIT export returns `result<delivery-result, plugin-error>`
+        let (result,): (Result<WitDeliveryResult, WitPluginError>,) = self
+            .handle
+            .call_export_one_arg("channel-adapter", "send-text", (wit_ctx,))?;
+        match result {
+            Ok(dr) => Ok(DeliveryResult::from(dr)),
+            Err(pe) => Err(BindingError::CallError(format!(
+                "plugin error [{}]: {}",
+                pe.code, pe.message
+            ))),
+        }
     }
 
-    fn send_media(&self, _ctx: OutboundContext) -> Result<DeliveryResult, BindingError> {
-        Ok(DeliveryResult {
-            ok: true,
-            message_id: Some(uuid::Uuid::new_v4().to_string()),
-            error: None,
-            retryable: false,
-            conversation_id: None,
-            to_jid: None,
-            poll_id: None,
-        })
+    fn send_media(&self, ctx: OutboundContext) -> Result<DeliveryResult, BindingError> {
+        tracing::debug!(plugin_id = %self.plugin_id, to = %ctx.to, "Calling WASM export channel-adapter.send-media");
+        let wit_ctx = WitOutboundContext::from(&ctx);
+        let (result,): (Result<WitDeliveryResult, WitPluginError>,) = self
+            .handle
+            .call_export_one_arg("channel-adapter", "send-media", (wit_ctx,))?;
+        match result {
+            Ok(dr) => Ok(DeliveryResult::from(dr)),
+            Err(pe) => Err(BindingError::CallError(format!(
+                "plugin error [{}]: {}",
+                pe.code, pe.message
+            ))),
+        }
     }
 }
 
 /// Adapter that implements ToolPluginInstance for WASM plugins
 struct ToolAdapter<B: CredentialBackend + Send + Sync + 'static> {
     plugin_id: String,
-    #[allow(dead_code)]
     handle: Arc<PluginInstanceHandle<B>>,
 }
 
@@ -726,33 +1173,39 @@ unsafe impl<B: CredentialBackend + Send + Sync + 'static> Sync for ToolAdapter<B
 
 impl<B: CredentialBackend + Send + Sync + 'static> ToolPluginInstance for ToolAdapter<B> {
     fn get_definitions(&self) -> Result<Vec<ToolDefinition>, BindingError> {
-        // In a full implementation, this would call the WASM export
-        Ok(vec![ToolDefinition {
-            name: format!("{}_tool", self.plugin_id),
-            description: format!("Tool provided by {} plugin", self.plugin_id),
-            input_schema: r#"{"type": "object", "properties": {}}"#.to_string(),
-        }])
+        tracing::debug!(plugin_id = %self.plugin_id, "Calling WASM export tool.get-definitions");
+        let (wit_defs,): (Vec<WitToolDefinition>,) =
+            self.handle.call_export_no_args("tool", "get-definitions")?;
+        Ok(wit_defs.into_iter().map(ToolDefinition::from).collect())
     }
 
     fn invoke(
         &self,
-        _name: &str,
-        _params: &str,
-        _ctx: ToolContext,
+        name: &str,
+        params: &str,
+        ctx: ToolContext,
     ) -> Result<ToolResult, BindingError> {
-        // In a full implementation, this would call the WASM export
-        Ok(ToolResult {
-            success: true,
-            result: Some("Tool invoked successfully".to_string()),
-            error: None,
-        })
+        tracing::debug!(plugin_id = %self.plugin_id, tool = %name, "Calling WASM export tool.invoke");
+        let wit_ctx = WitToolContext::from(&ctx);
+        // The WIT export signature: invoke(name: string, params: string, ctx: tool-context) -> result<tool-result, plugin-error>
+        let (result,): (Result<WitToolResult, WitPluginError>,) = self.handle.call_export_one_arg(
+            "tool",
+            "invoke",
+            (name.to_string(), params.to_string(), wit_ctx),
+        )?;
+        match result {
+            Ok(tr) => Ok(ToolResult::from(tr)),
+            Err(pe) => Err(BindingError::CallError(format!(
+                "plugin error [{}]: {}",
+                pe.code, pe.message
+            ))),
+        }
     }
 }
 
 /// Adapter that implements WebhookPluginInstance for WASM plugins
 struct WebhookAdapter<B: CredentialBackend + Send + Sync + 'static> {
     plugin_id: String,
-    #[allow(dead_code)]
     handle: Arc<PluginInstanceHandle<B>>,
 }
 
@@ -767,25 +1220,36 @@ unsafe impl<B: CredentialBackend + Send + Sync + 'static> Sync for WebhookAdapte
 
 impl<B: CredentialBackend + Send + Sync + 'static> WebhookPluginInstance for WebhookAdapter<B> {
     fn get_paths(&self) -> Result<Vec<String>, BindingError> {
-        // In a full implementation, this would call the WASM export
-        // Note: Paths are prefixed with /plugins/<plugin-id>/ by the host
-        Ok(vec!["/webhook".to_string(), "/callback".to_string()])
+        tracing::debug!(plugin_id = %self.plugin_id, "Calling WASM export webhook.get-paths");
+        let (paths,): (Vec<String>,) = self.handle.call_export_no_args("webhook", "get-paths")?;
+        Ok(paths)
     }
 
-    fn handle(&self, _req: WebhookRequest) -> Result<WebhookResponse, BindingError> {
-        // In a full implementation, this would call the WASM export
-        Ok(WebhookResponse {
-            status: 200,
-            headers: vec![("Content-Type".to_string(), "application/json".to_string())],
-            body: Some(br#"{"status": "ok"}"#.to_vec()),
-        })
+    fn handle(&self, req: WebhookRequest) -> Result<WebhookResponse, BindingError> {
+        tracing::debug!(
+            plugin_id = %self.plugin_id,
+            method = %req.method,
+            path = %req.path,
+            "Calling WASM export webhook.handle"
+        );
+        let wit_req = WitWebhookRequest::from(&req);
+        // The WIT export returns `result<webhook-response, plugin-error>`
+        let (result,): (Result<WitWebhookResponse, WitPluginError>,) = self
+            .handle
+            .call_export_one_arg("webhook", "handle", (wit_req,))?;
+        match result {
+            Ok(wr) => Ok(WebhookResponse::from(wr)),
+            Err(pe) => Err(BindingError::CallError(format!(
+                "plugin error [{}]: {}",
+                pe.code, pe.message
+            ))),
+        }
     }
 }
 
 /// Adapter that implements ServicePluginInstance for WASM plugins
 struct ServiceAdapter<B: CredentialBackend + Send + Sync + 'static> {
     plugin_id: String,
-    #[allow(dead_code)]
     handle: Arc<PluginInstanceHandle<B>>,
 }
 
@@ -800,27 +1264,34 @@ unsafe impl<B: CredentialBackend + Send + Sync + 'static> Sync for ServiceAdapte
 
 impl<B: CredentialBackend + Send + Sync + 'static> ServicePluginInstance for ServiceAdapter<B> {
     fn start(&self) -> Result<(), BindingError> {
-        // In a full implementation, this would call the WASM export
-        tracing::debug!(plugin_id = %self.plugin_id, "Service start called");
-        Ok(())
+        tracing::debug!(plugin_id = %self.plugin_id, "Calling WASM export service.start");
+        // The WIT export returns `result<_, plugin-error>`
+        let (result,): (Result<(), WitPluginError>,) =
+            self.handle.call_export_no_args("service", "start")?;
+        result.map_err(|pe| {
+            BindingError::CallError(format!("plugin error [{}]: {}", pe.code, pe.message))
+        })
     }
 
     fn stop(&self) -> Result<(), BindingError> {
-        // In a full implementation, this would call the WASM export
-        tracing::debug!(plugin_id = %self.plugin_id, "Service stop called");
-        Ok(())
+        tracing::debug!(plugin_id = %self.plugin_id, "Calling WASM export service.stop");
+        let (result,): (Result<(), WitPluginError>,) =
+            self.handle.call_export_no_args("service", "stop")?;
+        result.map_err(|pe| {
+            BindingError::CallError(format!("plugin error [{}]: {}", pe.code, pe.message))
+        })
     }
 
     fn health(&self) -> Result<bool, BindingError> {
-        // In a full implementation, this would call the WASM export
-        Ok(true)
+        tracing::debug!(plugin_id = %self.plugin_id, "Calling WASM export service.health");
+        let (healthy,): (bool,) = self.handle.call_export_no_args("service", "health")?;
+        Ok(healthy)
     }
 }
 
 /// Adapter that implements HookPluginInstance for WASM plugins
 struct HookAdapter<B: CredentialBackend + Send + Sync + 'static> {
     plugin_id: String,
-    #[allow(dead_code)]
     handle: Arc<PluginInstanceHandle<B>>,
 }
 
@@ -835,38 +1306,29 @@ unsafe impl<B: CredentialBackend + Send + Sync + 'static> Sync for HookAdapter<B
 
 impl<B: CredentialBackend + Send + Sync + 'static> HookPluginInstance for HookAdapter<B> {
     fn get_hooks(&self) -> Result<Vec<String>, BindingError> {
-        // In a full implementation, this would call the WASM export
-        // Return the 14 hook types per protocol
-        Ok(vec![
-            "before_agent_start".to_string(),
-            "agent_end".to_string(),
-            "session_start".to_string(),
-            "session_end".to_string(),
-            "before_compaction".to_string(),
-            "after_compaction".to_string(),
-            "message_received".to_string(),
-            "message_sending".to_string(),
-            "message_sent".to_string(),
-            "before_tool_call".to_string(),
-            "after_tool_call".to_string(),
-            "tool_result_persist".to_string(),
-            "gateway_start".to_string(),
-            "gateway_stop".to_string(),
-        ])
+        tracing::debug!(plugin_id = %self.plugin_id, "Calling WASM export hooks.get-hooks");
+        let (hooks,): (Vec<String>,) = self.handle.call_export_no_args("hooks", "get-hooks")?;
+        Ok(hooks)
     }
 
     fn handle(&self, event: HookEvent) -> Result<HookResult, BindingError> {
-        // In a full implementation, this would call the WASM export
         tracing::debug!(
             plugin_id = %self.plugin_id,
             hook = %event.hook_name,
-            "Hook event handled"
+            "Calling WASM export hooks.handle"
         );
-        Ok(HookResult {
-            handled: true,
-            cancel: false,
-            modified_payload: None,
-        })
+        let wit_event = WitHookEvent::from(&event);
+        // The WIT export returns `result<hook-result, plugin-error>`
+        let (result,): (Result<WitHookResult, WitPluginError>,) =
+            self.handle
+                .call_export_one_arg("hooks", "handle", (wit_event,))?;
+        match result {
+            Ok(hr) => Ok(HookResult::from(hr)),
+            Err(pe) => Err(BindingError::CallError(format!(
+                "plugin error [{}]: {}",
+                pe.code, pe.message
+            ))),
+        }
     }
 }
 
@@ -954,5 +1416,258 @@ mod tests {
         };
         assert!(result.handled);
         assert!(result.modified_payload.is_some());
+    }
+
+    // ============== WIT Type Conversion Tests ==============
+
+    #[test]
+    fn test_wit_channel_info_conversion() {
+        let wit = WitChannelInfo {
+            id: "msteams".to_string(),
+            label: "Microsoft Teams".to_string(),
+            selection_label: "Teams".to_string(),
+            docs_path: "/channels/msteams".to_string(),
+            blurb: "Microsoft Teams channel".to_string(),
+            order: 10,
+        };
+        let info = ChannelInfo::from(wit);
+        assert_eq!(info.id, "msteams");
+        assert_eq!(info.label, "Microsoft Teams");
+        assert_eq!(info.selection_label, "Teams");
+        assert_eq!(info.docs_path, "/channels/msteams");
+        assert_eq!(info.blurb, "Microsoft Teams channel");
+        assert_eq!(info.order, 10);
+    }
+
+    #[test]
+    fn test_wit_chat_type_conversion() {
+        assert!(matches!(ChatType::from(WitChatType::Dm), ChatType::Dm));
+        assert!(matches!(
+            ChatType::from(WitChatType::Group),
+            ChatType::Group
+        ));
+        assert!(matches!(
+            ChatType::from(WitChatType::Channel),
+            ChatType::Channel
+        ));
+        assert!(matches!(
+            ChatType::from(WitChatType::Thread),
+            ChatType::Thread
+        ));
+    }
+
+    #[test]
+    fn test_wit_channel_capabilities_conversion() {
+        let wit = WitChannelCapabilities {
+            chat_types: vec![WitChatType::Dm, WitChatType::Group],
+            polls: true,
+            reactions: true,
+            edit: false,
+            unsend: false,
+            reply: true,
+            effects: false,
+            group_management: true,
+            threads: true,
+            media: true,
+            native_commands: false,
+            block_streaming: true,
+        };
+        let caps = ChannelCapabilities::from(wit);
+        assert_eq!(caps.chat_types.len(), 2);
+        assert_eq!(caps.chat_types[0], ChatType::Dm);
+        assert_eq!(caps.chat_types[1], ChatType::Group);
+        assert!(caps.polls);
+        assert!(caps.reactions);
+        assert!(!caps.edit);
+        assert!(!caps.unsend);
+        assert!(caps.reply);
+        assert!(!caps.effects);
+        assert!(caps.group_management);
+        assert!(caps.threads);
+        assert!(caps.media);
+        assert!(!caps.native_commands);
+        assert!(caps.block_streaming);
+    }
+
+    #[test]
+    fn test_wit_outbound_context_conversion() {
+        let ctx = OutboundContext {
+            to: "user@example.com".to_string(),
+            text: "Hello, world!".to_string(),
+            media_url: Some("https://example.com/image.png".to_string()),
+            gif_playback: true,
+            reply_to_id: Some("msg-123".to_string()),
+            thread_id: None,
+            account_id: Some("acc-456".to_string()),
+        };
+        let wit = WitOutboundContext::from(&ctx);
+        assert_eq!(wit.to, "user@example.com");
+        assert_eq!(wit.text, "Hello, world!");
+        assert_eq!(
+            wit.media_url,
+            Some("https://example.com/image.png".to_string())
+        );
+        assert!(wit.gif_playback);
+        assert_eq!(wit.reply_to_id, Some("msg-123".to_string()));
+        assert!(wit.thread_id.is_none());
+        assert_eq!(wit.account_id, Some("acc-456".to_string()));
+    }
+
+    #[test]
+    fn test_wit_delivery_result_conversion() {
+        let wit = WitDeliveryResult {
+            ok: true,
+            message_id: Some("msg-789".to_string()),
+            error: None,
+            retryable: false,
+        };
+        let result = DeliveryResult::from(wit);
+        assert!(result.ok);
+        assert_eq!(result.message_id, Some("msg-789".to_string()));
+        assert!(result.error.is_none());
+        assert!(!result.retryable);
+        // Host-side extensions default to None
+        assert!(result.conversation_id.is_none());
+        assert!(result.to_jid.is_none());
+        assert!(result.poll_id.is_none());
+    }
+
+    #[test]
+    fn test_wit_delivery_result_conversion_error() {
+        let wit = WitDeliveryResult {
+            ok: false,
+            message_id: None,
+            error: Some("Rate limited".to_string()),
+            retryable: true,
+        };
+        let result = DeliveryResult::from(wit);
+        assert!(!result.ok);
+        assert!(result.message_id.is_none());
+        assert_eq!(result.error, Some("Rate limited".to_string()));
+        assert!(result.retryable);
+    }
+
+    #[test]
+    fn test_wit_tool_definition_conversion() {
+        let wit = WitToolDefinition {
+            name: "web_search".to_string(),
+            description: "Search the web".to_string(),
+            input_schema: r#"{"type": "object", "properties": {"query": {"type": "string"}}}"#
+                .to_string(),
+        };
+        let def = ToolDefinition::from(wit);
+        assert_eq!(def.name, "web_search");
+        assert_eq!(def.description, "Search the web");
+        assert!(def.input_schema.contains("query"));
+    }
+
+    #[test]
+    fn test_wit_tool_context_conversion() {
+        let ctx = ToolContext {
+            agent_id: Some("agent-1".to_string()),
+            session_key: Some("session-abc".to_string()),
+            message_channel: Some("slack".to_string()),
+            sandboxed: true,
+        };
+        let wit = WitToolContext::from(&ctx);
+        assert_eq!(wit.agent_id, Some("agent-1".to_string()));
+        assert_eq!(wit.session_key, Some("session-abc".to_string()));
+        assert_eq!(wit.message_channel, Some("slack".to_string()));
+        assert!(wit.sandboxed);
+    }
+
+    #[test]
+    fn test_wit_tool_result_conversion() {
+        let wit = WitToolResult {
+            success: true,
+            result: Some("42".to_string()),
+            error: None,
+        };
+        let result = ToolResult::from(wit);
+        assert!(result.success);
+        assert_eq!(result.result, Some("42".to_string()));
+        assert!(result.error.is_none());
+    }
+
+    #[test]
+    fn test_wit_webhook_request_conversion() {
+        let req = WebhookRequest {
+            method: "POST".to_string(),
+            path: "/webhook/events".to_string(),
+            headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+            body: Some(br#"{"event": "test"}"#.to_vec()),
+            query: Some("token=abc".to_string()),
+        };
+        let wit = WitWebhookRequest::from(&req);
+        assert_eq!(wit.method, "POST");
+        assert_eq!(wit.path, "/webhook/events");
+        assert_eq!(wit.headers.len(), 1);
+        assert!(wit.body.is_some());
+        assert_eq!(wit.query, Some("token=abc".to_string()));
+    }
+
+    #[test]
+    fn test_wit_webhook_response_conversion() {
+        let wit = WitWebhookResponse {
+            status: 200,
+            headers: vec![("Content-Type".to_string(), "text/plain".to_string())],
+            body: Some(b"OK".to_vec()),
+        };
+        let resp = WebhookResponse::from(wit);
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.headers.len(), 1);
+        assert_eq!(resp.body, Some(b"OK".to_vec()));
+    }
+
+    #[test]
+    fn test_wit_hook_event_conversion() {
+        let event = HookEvent {
+            hook_name: "message_sending".to_string(),
+            payload: r#"{"to": "user", "content": "hi"}"#.to_string(),
+        };
+        let wit = WitHookEvent::from(&event);
+        assert_eq!(wit.hook_name, "message_sending");
+        assert!(wit.payload.contains("content"));
+    }
+
+    #[test]
+    fn test_wit_hook_result_conversion() {
+        let wit = WitHookResult {
+            handled: true,
+            cancel: false,
+            modified_payload: Some(r#"{"content": "modified"}"#.to_string()),
+        };
+        let result = HookResult::from(wit);
+        assert!(result.handled);
+        assert!(!result.cancel);
+        assert_eq!(
+            result.modified_payload,
+            Some(r#"{"content": "modified"}"#.to_string())
+        );
+    }
+
+    #[test]
+    fn test_wit_hook_result_conversion_cancel() {
+        let wit = WitHookResult {
+            handled: true,
+            cancel: true,
+            modified_payload: None,
+        };
+        let result = HookResult::from(wit);
+        assert!(result.handled);
+        assert!(result.cancel);
+        assert!(result.modified_payload.is_none());
+    }
+
+    #[test]
+    fn test_wit_plugin_error_fields() {
+        let pe = WitPluginError {
+            code: "RATE_LIMITED".to_string(),
+            message: "Too many requests".to_string(),
+            retryable: true,
+        };
+        assert_eq!(pe.code, "RATE_LIMITED");
+        assert_eq!(pe.message, "Too many requests");
+        assert!(pe.retryable);
     }
 }

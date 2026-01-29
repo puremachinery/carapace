@@ -10,24 +10,24 @@ use std::path::PathBuf;
 use super::super::*;
 
 #[derive(Debug, Serialize)]
-pub(super) struct ConfigIssue {
-    path: String,
-    message: String,
+pub(crate) struct ConfigIssue {
+    pub(crate) path: String,
+    pub(crate) message: String,
 }
 
 #[derive(Debug)]
-pub(super) struct ConfigSnapshot {
-    path: String,
-    exists: bool,
-    raw: Option<String>,
-    parsed: Value,
-    valid: bool,
-    pub(super) config: Value,
-    hash: Option<String>,
-    issues: Vec<ConfigIssue>,
+pub(crate) struct ConfigSnapshot {
+    pub(crate) path: String,
+    pub(crate) exists: bool,
+    pub(crate) raw: Option<String>,
+    pub(crate) parsed: Value,
+    pub(crate) valid: bool,
+    pub(crate) config: Value,
+    pub(crate) hash: Option<String>,
+    pub(crate) issues: Vec<ConfigIssue>,
 }
 
-pub(super) fn map_validation_issues(issues: Vec<config::ValidationIssue>) -> Vec<ConfigIssue> {
+pub(crate) fn map_validation_issues(issues: Vec<config::ValidationIssue>) -> Vec<ConfigIssue> {
     issues
         .into_iter()
         .map(|issue| ConfigIssue {
@@ -37,12 +37,12 @@ pub(super) fn map_validation_issues(issues: Vec<config::ValidationIssue>) -> Vec
         .collect()
 }
 
-fn sha256_hex(value: &str) -> String {
+pub(crate) fn sha256_hex(value: &str) -> String {
     let digest = Sha256::digest(value.as_bytes());
     format!("{:x}", digest)
 }
 
-pub(super) fn read_config_snapshot() -> ConfigSnapshot {
+pub(crate) fn read_config_snapshot() -> ConfigSnapshot {
     let path = config::get_config_path();
     let path_str = path.display().to_string();
     if !path.exists() {
@@ -151,53 +151,35 @@ fn require_config_base_hash(
     Ok(())
 }
 
-pub(super) fn write_config_file(path: &PathBuf, config_value: &Value) -> Result<(), ErrorShape> {
+/// Write a config value to disk atomically. Returns `Err(message)` on failure.
+/// This is the `pub(crate)` helper so non-WS code (e.g. the control HTTP
+/// endpoint) can persist config without depending on `ErrorShape`.
+pub(crate) fn persist_config_file(path: &PathBuf, config_value: &Value) -> Result<(), String> {
     if let Some(parent) = path.parent() {
-        if let Err(err) = fs::create_dir_all(parent) {
-            return Err(error_shape(
-                ERROR_UNAVAILABLE,
-                &format!("failed to create config dir: {}", err),
-                None,
-            ));
-        }
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create config dir: {}", err))?;
     }
 
     let content = serde_json::to_string_pretty(config_value)
-        .map_err(|err| error_shape(ERROR_UNAVAILABLE, &err.to_string(), None))?;
+        .map_err(|err| format!("failed to serialize config: {}", err))?;
     let tmp_path = path.with_extension("json.tmp");
     {
-        let mut file = fs::File::create(&tmp_path).map_err(|err| {
-            error_shape(
-                ERROR_UNAVAILABLE,
-                &format!("failed to write config: {}", err),
-                None,
-            )
-        })?;
-        file.write_all(content.as_bytes()).map_err(|err| {
-            error_shape(
-                ERROR_UNAVAILABLE,
-                &format!("failed to write config: {}", err),
-                None,
-            )
-        })?;
-        file.write_all(b"\n").map_err(|err| {
-            error_shape(
-                ERROR_UNAVAILABLE,
-                &format!("failed to write config: {}", err),
-                None,
-            )
-        })?;
+        let mut file = fs::File::create(&tmp_path)
+            .map_err(|err| format!("failed to write config: {}", err))?;
+        file.write_all(content.as_bytes())
+            .map_err(|err| format!("failed to write config: {}", err))?;
+        file.write_all(b"\n")
+            .map_err(|err| format!("failed to write config: {}", err))?;
     }
-    if let Err(err) = fs::rename(&tmp_path, path) {
-        return Err(error_shape(
-            ERROR_UNAVAILABLE,
-            &format!("failed to replace config: {}", err),
-            None,
-        ));
-    }
+    fs::rename(&tmp_path, path).map_err(|err| format!("failed to replace config: {}", err))?;
 
     config::clear_cache();
     Ok(())
+}
+
+pub(super) fn write_config_file(path: &PathBuf, config_value: &Value) -> Result<(), ErrorShape> {
+    persist_config_file(path, config_value)
+        .map_err(|msg| error_shape(ERROR_UNAVAILABLE, &msg, None))
 }
 
 fn merge_patch(base: Value, patch: Value) -> Value {

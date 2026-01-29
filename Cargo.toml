@@ -48,6 +48,7 @@ tempfile = "3"
 
 [features]
 keychain-tests = []
+secret-service-tests = []
 
 [lib]
 name = "carapace"

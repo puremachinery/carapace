@@ -618,9 +618,14 @@ pub(super) fn handle_exec_approval_resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Mutex to serialize tests that modify global state (env vars).
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_handle_exec_approvals_get() {
+        let _lock = TEST_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("MOLTBOT_STATE_DIR", tmp.path());
         let result = handle_exec_approvals_get();
@@ -646,6 +651,7 @@ mod tests {
 
     #[test]
     fn test_handle_exec_approvals_set_validates_file() {
+        let _lock = TEST_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("MOLTBOT_STATE_DIR", tmp.path());
 
@@ -666,6 +672,7 @@ mod tests {
 
     #[test]
     fn test_exec_approvals_roundtrip() {
+        let _lock = TEST_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("MOLTBOT_STATE_DIR", tmp.path());
 
@@ -689,6 +696,7 @@ mod tests {
 
     #[test]
     fn test_exec_approvals_base_hash_concurrency() {
+        let _lock = TEST_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("MOLTBOT_STATE_DIR", tmp.path());
 
