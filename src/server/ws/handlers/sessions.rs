@@ -1575,12 +1575,89 @@ pub(super) fn handle_agent(
     }))
 }
 
-pub(super) fn handle_agent_identity_get(_state: &WsServerState) -> Result<Value, ErrorShape> {
-    // Return agent identity (would read from config)
-    Ok(json!({
-        "agentId": "default",
-        "name": "Moltbot"
-    }))
+pub(super) fn handle_agent_identity_get(params: Option<&Value>) -> Result<Value, ErrorShape> {
+    let cfg = config::load_config().unwrap_or(Value::Object(serde_json::Map::new()));
+    let agent_id = params
+        .and_then(|v| v.get("agentId"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
+
+    let agents_list = cfg
+        .get("agents")
+        .and_then(|v| v.get("list"))
+        .and_then(|v| v.as_array());
+
+    // If an explicit agentId was requested, it must be found or we error
+    if let Some(requested_id) = agent_id {
+        let found = agents_list.and_then(|list| {
+            list.iter()
+                .find(|entry| entry.get("id").and_then(|v| v.as_str()) == Some(requested_id))
+        });
+        return match found {
+            Some(entry) => {
+                let identity = entry.get("identity");
+                let name = identity
+                    .and_then(|v| v.get("name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Moltbot");
+                let description = identity
+                    .and_then(|v| v.get("description"))
+                    .and_then(|v| v.as_str());
+                Ok(json!({
+                    "agentId": requested_id,
+                    "name": name,
+                    "description": description,
+                }))
+            }
+            None => Err(error_shape(
+                ERROR_INVALID_REQUEST,
+                &format!("agent not found: {}", requested_id),
+                Some(json!({ "agentId": requested_id })),
+            )),
+        };
+    }
+
+    // No agentId: find default agent, fall back to first
+    let agent = agents_list.and_then(|list| {
+        let default = list.iter().find(|entry| {
+            entry
+                .get("default")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+        });
+        default.or_else(|| list.first())
+    });
+
+    match agent {
+        Some(entry) => {
+            let id = entry
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("default");
+            let identity = entry.get("identity");
+            let name = identity
+                .and_then(|v| v.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("Moltbot");
+            let description = identity
+                .and_then(|v| v.get("description"))
+                .and_then(|v| v.as_str());
+            Ok(json!({
+                "agentId": id,
+                "name": name,
+                "description": description,
+            }))
+        }
+        None => {
+            // No agents configured — return hardcoded default
+            Ok(json!({
+                "agentId": "default",
+                "name": "Moltbot",
+                "description": null,
+            }))
+        }
+    }
 }
 
 /// Handle the `agent.wait` method - wait for an agent run to complete
@@ -2612,5 +2689,33 @@ mod tests {
             .list_sessions(sessions::SessionFilter::new().with_user_id("user-99"))
             .unwrap();
         assert_eq!(remaining.len(), 1);
+    }
+
+    // ============== Agent Identity Tests ==============
+
+    #[test]
+    fn test_agent_identity_get_no_params_no_config() {
+        // With no config, should return hardcoded default
+        let result = handle_agent_identity_get(None).unwrap();
+        assert_eq!(result["agentId"], "default");
+        assert_eq!(result["name"], "Moltbot");
+    }
+
+    #[test]
+    fn test_agent_identity_get_unknown_agent_id_errors() {
+        let params = json!({ "agentId": "nonexistent-agent" });
+        let result = handle_agent_identity_get(Some(&params));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, ERROR_INVALID_REQUEST);
+    }
+
+    #[test]
+    fn test_agent_identity_get_response_shape() {
+        let result = handle_agent_identity_get(None).unwrap();
+        assert!(result.get("agentId").is_some());
+        assert!(result.get("name").is_some());
+        // description should be present (even if null)
+        assert!(result.get("description").is_some());
     }
 }

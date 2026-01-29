@@ -537,7 +537,7 @@ pub(super) async fn dispatch_method(
 
         // Agent
         "agent" => handle_agent(params, state.clone(), conn),
-        "agent.identity.get" => handle_agent_identity_get(state),
+        "agent.identity.get" => handle_agent_identity_get(params),
         "agent.wait" => handle_agent_wait(params, state).await,
 
         // Chat

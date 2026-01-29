@@ -9,6 +9,10 @@
 //! - exec.approval.resolve: Resolve a pending approval request
 
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::fs;
+use std::io::Write;
+use std::path::PathBuf;
 use uuid::Uuid;
 
 use super::super::*;
@@ -21,27 +25,130 @@ pub use crate::exec::{
 /// Default timeout for approval requests (2 minutes).
 const DEFAULT_APPROVAL_TIMEOUT_MS: u64 = 120_000;
 
+/// Return the path to the exec-approvals.json file within the state directory.
+fn exec_approvals_path() -> PathBuf {
+    resolve_state_dir().join("exec-approvals.json")
+}
+
+/// Compute SHA256 hex digest of a string.
+fn sha256_hex(value: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    format!("{:x}", digest)
+}
+
+/// Snapshot of the exec-approvals file on disk.
+struct ExecApprovalsSnapshot {
+    path: String,
+    exists: bool,
+    hash: Option<String>,
+    file: Value,
+}
+
+/// Read the exec-approvals file and return a snapshot.
+fn read_exec_approvals_snapshot() -> ExecApprovalsSnapshot {
+    let path = exec_approvals_path();
+    let path_str = path.display().to_string();
+
+    if !path.exists() {
+        return ExecApprovalsSnapshot {
+            path: path_str,
+            exists: false,
+            hash: None,
+            file: json!({ "mode": "ask", "rules": [] }),
+        };
+    }
+
+    match fs::read_to_string(&path) {
+        Ok(raw) => {
+            let hash = Some(sha256_hex(&raw));
+            let file = serde_json::from_str::<Value>(&raw)
+                .unwrap_or(json!({ "mode": "ask", "rules": [] }));
+            ExecApprovalsSnapshot {
+                path: path_str,
+                exists: true,
+                hash,
+                file,
+            }
+        }
+        Err(_) => ExecApprovalsSnapshot {
+            path: path_str,
+            exists: false,
+            hash: None,
+            file: json!({ "mode": "ask", "rules": [] }),
+        },
+    }
+}
+
+/// Atomically write the exec-approvals file (tmp + rename). Returns the new hash.
+fn write_exec_approvals_file(path: &PathBuf, file_value: &Value) -> Result<String, ErrorShape> {
+    if let Some(parent) = path.parent() {
+        if let Err(err) = fs::create_dir_all(parent) {
+            return Err(error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("failed to create state dir: {}", err),
+                None,
+            ));
+        }
+    }
+
+    let content = serde_json::to_string_pretty(file_value)
+        .map_err(|err| error_shape(ERROR_UNAVAILABLE, &err.to_string(), None))?;
+    let tmp_path = path.with_extension("json.tmp");
+    {
+        let mut file = fs::File::create(&tmp_path).map_err(|err| {
+            error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("failed to write exec approvals: {}", err),
+                None,
+            )
+        })?;
+        file.write_all(content.as_bytes()).map_err(|err| {
+            error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("failed to write exec approvals: {}", err),
+                None,
+            )
+        })?;
+        file.write_all(b"\n").map_err(|err| {
+            error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("failed to write exec approvals: {}", err),
+                None,
+            )
+        })?;
+    }
+    if let Err(err) = fs::rename(&tmp_path, path) {
+        return Err(error_shape(
+            ERROR_UNAVAILABLE,
+            &format!("failed to replace exec approvals: {}", err),
+            None,
+        ));
+    }
+
+    // Hash the content that was actually written (with trailing newline)
+    let mut written = content;
+    written.push('\n');
+    Ok(sha256_hex(&written))
+}
+
 /// Get global exec approvals configuration.
 ///
-/// This returns the exec approvals settings stored on the gateway.
-/// In a full implementation, this would read from disk.
+/// Reads the exec-approvals.json file from the state directory.
+/// Returns `{ path, exists, hash, file }`.
 pub(super) fn handle_exec_approvals_get() -> Result<Value, ErrorShape> {
-    // TODO: Implement reading from disk when exec approvals store is implemented
+    let snapshot = read_exec_approvals_snapshot();
     Ok(json!({
-        "path": null,
-        "exists": false,
-        "hash": null,
-        "file": {
-            "mode": "ask",
-            "rules": []
-        }
+        "path": if snapshot.exists { json!(snapshot.path) } else { Value::Null },
+        "exists": snapshot.exists,
+        "hash": snapshot.hash,
+        "file": snapshot.file
     }))
 }
 
 /// Set global exec approvals configuration.
 ///
-/// This updates the exec approvals settings on the gateway.
-/// Requires a baseHash parameter for optimistic concurrency control.
+/// Writes the exec-approvals.json file atomically.
+/// Requires a `baseHash` parameter for optimistic concurrency when the file already exists.
 pub(super) fn handle_exec_approvals_set(params: Option<&Value>) -> Result<Value, ErrorShape> {
     let file = params
         .and_then(|v| v.get("file"))
@@ -56,13 +163,47 @@ pub(super) fn handle_exec_approvals_set(params: Option<&Value>) -> Result<Value,
         ));
     }
 
-    // TODO: Implement writing to disk when exec approvals store is implemented
-    // For now, return the file as confirmation
+    let snapshot = read_exec_approvals_snapshot();
+
+    // Optimistic concurrency: if file exists, baseHash must match
+    if snapshot.exists {
+        let base_hash = params
+            .and_then(|v| v.get("baseHash"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty());
+
+        let expected = snapshot.hash.as_deref();
+        if expected.is_none() {
+            return Err(error_shape(
+                ERROR_INVALID_REQUEST,
+                "exec approvals hash unavailable; re-run exec.approvals.get and retry",
+                None,
+            ));
+        }
+        let Some(base_hash) = base_hash else {
+            return Err(error_shape(
+                ERROR_INVALID_REQUEST,
+                "baseHash required; re-run exec.approvals.get and retry",
+                None,
+            ));
+        };
+        if Some(base_hash) != expected {
+            return Err(error_shape(
+                ERROR_INVALID_REQUEST,
+                "exec approvals changed since last load; re-run exec.approvals.get and retry",
+                None,
+            ));
+        }
+    }
+
+    let path = exec_approvals_path();
+    let new_hash = write_exec_approvals_file(&path, file)?;
 
     Ok(json!({
-        "path": null,
+        "path": path.display().to_string(),
         "exists": true,
-        "hash": Uuid::new_v4().to_string(),
+        "hash": new_hash,
         "file": file.clone()
     }))
 }
@@ -480,10 +621,16 @@ mod tests {
 
     #[test]
     fn test_handle_exec_approvals_get() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("MOLTBOT_STATE_DIR", tmp.path());
         let result = handle_exec_approvals_get();
         assert!(result.is_ok());
         let value = result.unwrap();
         assert_eq!(value["exists"], false);
+        assert_eq!(value["path"], Value::Null);
+        assert_eq!(value["hash"], Value::Null);
+        assert!(value["file"].is_object());
+        std::env::remove_var("MOLTBOT_STATE_DIR");
     }
 
     #[test]
@@ -499,6 +646,9 @@ mod tests {
 
     #[test]
     fn test_handle_exec_approvals_set_validates_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("MOLTBOT_STATE_DIR", tmp.path());
+
         let params = json!({ "file": "not an object" });
         let result = handle_exec_approvals_set(Some(&params));
         assert!(result.is_err());
@@ -506,6 +656,69 @@ mod tests {
         let params = json!({ "file": { "mode": "ask", "rules": [] } });
         let result = handle_exec_approvals_set(Some(&params));
         assert!(result.is_ok());
+        let value = result.unwrap();
+        assert_eq!(value["exists"], true);
+        assert!(value["hash"].is_string());
+        assert!(value["path"].is_string());
+
+        std::env::remove_var("MOLTBOT_STATE_DIR");
+    }
+
+    #[test]
+    fn test_exec_approvals_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("MOLTBOT_STATE_DIR", tmp.path());
+
+        // Set approvals
+        let file_data = json!({ "mode": "allow", "rules": [{"pattern": "ls"}] });
+        let params = json!({ "file": file_data });
+        let set_result = handle_exec_approvals_set(Some(&params)).unwrap();
+        assert_eq!(set_result["exists"], true);
+        let hash = set_result["hash"].as_str().unwrap().to_string();
+
+        // Get approvals — should match what was set
+        let get_result = handle_exec_approvals_get().unwrap();
+        assert_eq!(get_result["exists"], true);
+        assert_eq!(get_result["hash"], hash);
+        assert_eq!(get_result["file"]["mode"], "allow");
+        assert_eq!(get_result["file"]["rules"][0]["pattern"], "ls");
+        assert!(get_result["path"].is_string());
+
+        std::env::remove_var("MOLTBOT_STATE_DIR");
+    }
+
+    #[test]
+    fn test_exec_approvals_base_hash_concurrency() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("MOLTBOT_STATE_DIR", tmp.path());
+
+        // Initial write (no file exists yet, no baseHash required)
+        let params = json!({ "file": { "mode": "ask", "rules": [] } });
+        let first = handle_exec_approvals_set(Some(&params)).unwrap();
+        let correct_hash = first["hash"].as_str().unwrap().to_string();
+
+        // Attempt without baseHash — should fail (file exists now)
+        let params = json!({ "file": { "mode": "deny", "rules": [] } });
+        let result = handle_exec_approvals_set(Some(&params));
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, ERROR_INVALID_REQUEST);
+
+        // Attempt with wrong baseHash — should fail
+        let params = json!({ "file": { "mode": "deny", "rules": [] }, "baseHash": "wrong" });
+        let result = handle_exec_approvals_set(Some(&params));
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, ERROR_INVALID_REQUEST);
+
+        // Attempt with correct baseHash — should succeed
+        let params = json!({ "file": { "mode": "deny", "rules": [] }, "baseHash": correct_hash });
+        let result = handle_exec_approvals_set(Some(&params));
+        assert!(result.is_ok());
+        let value = result.unwrap();
+        assert_eq!(value["file"]["mode"], "deny");
+        // Hash should have changed
+        assert_ne!(value["hash"].as_str().unwrap(), correct_hash);
+
+        std::env::remove_var("MOLTBOT_STATE_DIR");
     }
 
     #[tokio::test]
