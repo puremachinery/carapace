@@ -10,10 +10,10 @@
 
 | Category | Completion | Notes |
 |----------|-----------|-------|
-| Infrastructure (WS, HTTP, config, logging) | ~98% | Production-quality, config control persists |
-| Security (auth, credentials, rate limiting) | ~95% | Real, reviewed |
-| Data storage (sessions, cron, usage, nodes, devices) | ~98% | Real, tested, file-backed |
-| Core functionality (agent/LLM, channel delivery, cron execution) | ~96% | Agent executor, delivery loop, cron tick, WASM runtime, OpenAI compat, plugin loader all functional |
+| Infrastructure (WS, HTTP, config, logging) | ~99% | Production-quality, TLS, mDNS, config reload, CLI |
+| Security (auth, credentials, rate limiting) | ~97% | Real, reviewed, tool allowlists |
+| Data storage (sessions, cron, usage, nodes, devices) | ~99% | Real, tested, file-backed, retention cleanup |
+| Core functionality (agent/LLM, channel delivery, cron execution) | ~98% | Multi-provider (Anthropic/OpenAI/Ollama), built-in tools, media analysis, link understanding |
 
 ## Infrastructure (Complete)
 
@@ -27,7 +27,7 @@
 - [x] HTTP server — static files, routing, health check, hooks, OpenAI-compatible chat endpoint (wired to LLM provider)
 - [x] Config control HTTP endpoint — PATCH config with validation, optimistic concurrency, persistence
 - [x] WebSocket server — JSON-RPC dispatch, auth, handshake, broadcast
-- [x] Media pipeline — SSRF-protected fetch, temp storage, cleanup
+- [x] Media pipeline — SSRF-protected fetch, temp storage, cleanup, image/audio analysis
 - [x] Plugin runtime — wasmtime, capability enforcement, sandbox, real WASM export calls
 - [x] Plugin loader — WASM metadata extraction, manifest derivation, kind detection from exports
 - [x] Hooks — webhook handler, token auth, mappings
@@ -35,16 +35,23 @@
 - [x] TLS — self-signed cert auto-generation, configurable cert/key paths, SHA-256 fingerprint, `axum-server` rustls binding
 - [x] mDNS discovery — `_moltbot._tcp.local.` Bonjour broadcast, off/minimal/full modes, graceful shutdown
 - [x] Config defaults — 7-section defaults pipeline, deep-merge with user-wins semantics, partial config support
-- [x] CLI — `start`, `config` (show/get/set/path), `status`, `logs`, `version` subcommands via clap
+- [x] Config hot reload — file watcher (notify), SIGHUP handler, `config.reload` WS method, debounce, validation
+- [x] CLI — `start`, `config`, `status`, `logs`, `version`, `backup`, `restore`, `reset` subcommands via clap
+- [x] Network binding modes — loopback/lan/auto/tailnet/custom with interface detection
+- [x] Link understanding — URL extraction, SSRF-safe fetching, HTML-to-text, LRU cache
 
 ## Core Functionality
 
-- [x] Agent/LLM execution engine — `src/agent/` with Anthropic + OpenAI streaming, MultiProvider dispatch, tool dispatch, context building, cancellation token, per-chunk stream timeout
+- [x] Agent/LLM execution engine — `src/agent/` with Anthropic + OpenAI + Ollama streaming, MultiProvider dispatch, tool dispatch, context building, cancellation token, per-chunk stream timeout
+- [x] Built-in agent tools — 10 tools: current_time, web_fetch, memory_read/write/list, message_send, session_list/read, config_read, math_eval
+- [x] Agent tool allowlists — AllowAll/AllowList/DenyList policy with enforcement at definition filtering and dispatch gating
+- [x] Media understanding — Anthropic + OpenAI image analysis, OpenAI Whisper audio transcription, result caching
 - [x] Channel message delivery — `src/messages/delivery.rs` delivery loop spawned at startup, drains queue, invokes channel plugins
 - [x] Cron background execution — `src/cron/tick.rs` tick loop (10s interval) spawned at startup, payload execution via `src/cron/executor.rs`
 - [x] GDPR data portability — `sessions.export_user` exports all user sessions/histories, resilient to per-session failures with warnings
 - [x] GDPR right to erasure — `sessions.purge_user` deletes all user data (best-effort), reports deleted/total counts
-- [x] Session retention — automatic cleanup of expired sessions via configurable TTL
+- [x] Session retention — automatic cleanup via background timer with configurable interval and retention days
+- [x] Session scoping — per-sender/global/per-channel-peer session isolation with daily/idle/manual reset policies
 - [x] Exec approvals persistence — `exec.approvals.get/set` with atomic file I/O and SHA256 optimistic concurrency
 
 ## WS Method Handlers
@@ -66,6 +73,7 @@
 - [x] `node.*` / `device.*` — pairing state machines, token management
 - [x] `config.get` — config reading
 - [x] `config.set` / `config.apply` / `config.patch` — config writing with validation, optimistic concurrency, JSON merge-patch
+- [x] `config.reload` — hot/hybrid reload with validation, broadcasts `config.changed` event
 - [x] `agent` / `agent.wait` — LLM execution with streaming, tool orchestration, cancellation via `CancellationToken`
 - [x] `agent.identity.get` — reads from config `agents.list`, supports explicit `agentId` lookup
 - [x] `chat.send` / `chat.abort` — queues messages, spawns agent run, cancellation
@@ -99,35 +107,35 @@ Priority order reflects what blocks real-world usage soonest.
 
 ### P0 — Required for LAN deployment
 
-- [x] **TLS termination** — self-signed cert auto-generation via `rcgen`, configurable cert/key paths, SHA-256 fingerprint at startup, `axum-server` TLS binding. `src/tls/mod.rs`.
-- [x] **mDNS service discovery** — Bonjour broadcast of `_moltbot._tcp.local.`, off/minimal/full modes, graceful shutdown. `src/discovery/mod.rs`.
-- [x] **Config defaults application** — 7-section defaults pipeline mirroring clawdbot's `apply*` functions, deep-merge with user-wins semantics. `src/config/defaults.rs`.
+- [x] **TLS termination** — `src/tls/mod.rs`
+- [x] **mDNS service discovery** — `src/discovery/mod.rs`
+- [x] **Config defaults application** — `src/config/defaults.rs`
 
 ### P1 — Required for real agent usage
 
-- [~] **Multiple LLM providers** — Anthropic and OpenAI implemented with `MultiProvider` dispatch by model prefix. `src/agent/openai.rs`. Still needed: Google Gemini, AWS Bedrock, Ollama (local).
-- [ ] **Built-in agent tools** — clawdbot ships ~60 tools the agent can invoke (web_fetch, web_search, browser, image_generate, image_edit, memory_read, memory_write, message_send, session_read, channel_list, plus channel-specific actions). Carapace dispatches to WASM plugin tools but has no built-in tool set.
-- [ ] **Media understanding pipeline** — multi-provider image/audio/video analysis with scope gating (per-channel, per-agent). Includes transcription, image description, video keyframe extraction. Currently the media pipeline fetches and stores files but doesn't analyze content.
+- [~] **Multiple LLM providers** — Anthropic, OpenAI, and Ollama implemented with `MultiProvider` dispatch. Still needed: Google Gemini, AWS Bedrock.
+- [x] **Built-in agent tools** — 10 core tools in `src/agent/builtin_tools.rs`, wired into `ToolsRegistry`
+- [x] **Media understanding pipeline** — `src/media/analysis.rs` with Anthropic + OpenAI image analysis, Whisper transcription, caching
 
 ### P2 — Required for multi-user / multi-channel deployments
 
-- [ ] **Session scoping and reset rules** — per-sender vs global vs per-channel-peer session isolation, daily/idle/manual reset policies, configurable per channel. Carapace has session CRUD but no automatic scoping or scheduled resets.
-- [ ] **Config reload modes** — hot (no restart), hybrid (partial restart), full restart with debounce. Currently config changes require a full process restart.
+- [x] **Session scoping and reset rules** — `src/sessions/scoping.rs` with per-sender/global/per-channel-peer, daily/idle/manual reset
+- [x] **Config reload modes** — `src/config/watcher.rs` with hot/hybrid/off, file watcher, SIGHUP, WS method
 - [ ] **Channel-specific agent tools** — Telegram (edit_message, delete_message, pin, reply_markup), Discord (reactions, embeds, threads), Slack (blocks, modals, ephemeral). These are built-in tools gated by which channel the conversation originated from.
 
 ### P3 — Needed for production operations
 
 - [ ] **Remote gateway support** — SSH tunnel transport for NAT traversal, direct WebSocket with fingerprint-based trust-on-first-use verification. Enables nodes to connect to gateways they can't reach directly.
-- [~] **CLI subcommands** — `start`, `config` (show/get/set/path), `status`, `logs`, `version` implemented. `src/cli/mod.rs`. Still needed: `setup` (interactive first-run), `pair` (node pairing), `update`, `reset`, `backup`, `restore`.
+- [~] **CLI subcommands** — `start`, `config`, `status`, `logs`, `version`, `backup`, `restore`, `reset` implemented. Still needed: `setup` (interactive first-run), `pair` (node pairing), `update`.
 - [ ] **Auth profiles** — OAuth flow for multi-provider auth (Google, GitHub, Discord), profile storage, token refresh. Currently only supports static token/password auth.
-- [ ] **Network binding modes** — `auto` (all interfaces), `lan` (non-loopback), `loopback` (127.0.0.1 only), `tailnet` (Tailscale interface only). Currently binds to the configured address without mode-based logic.
+- [x] **Network binding modes** — loopback/lan/auto/tailnet/custom in `src/server/bind.rs`
 
 ### P4 — Nice to have
 
-- [ ] **Link understanding pipeline** — URL extraction from messages, fetch + summarize linked content, cache results. Feeds into agent context so it can reference linked articles/docs.
+- [x] **Link understanding pipeline** — `src/links/mod.rs` with URL extraction, SSRF-safe fetching, HTML-to-text, LRU cache
 - [ ] **Tailscale serve/funnel modes** — auto-configure Tailscale serve (LAN proxy) or funnel (public internet) for zero-config HTTPS exposure. Requires Tailscale CLI integration.
-- [ ] **Agent tool allowlists** — per-agent tool policy (allow/deny lists) so untrusted model output can only invoke approved tools. Currently `sandboxed: false` on all tool invocations.
-- [ ] **Automatic session retention cleanup** — `cleanup_expired()` exists but has no caller. Wire into cron tick or a dedicated background timer to auto-purge sessions past their TTL.
+- [x] **Agent tool allowlists** — `src/agent/tool_policy.rs` with AllowAll/AllowList/DenyList, enforcement at definition filtering and dispatch
+- [x] **Automatic session retention cleanup** — `src/sessions/retention.rs` with background timer, configurable interval/retention days
 
 ## Missing Non-Code Artifacts
 
@@ -139,7 +147,7 @@ Priority order reflects what blocks real-world usage soonest.
 
 ## Tests
 
-- [x] 1,232 tests passing (`cargo nextest run`)
+- [x] 1,497 tests passing (`cargo nextest run`)
 - [x] Pre-commit hooks: `cargo fmt --check` + `cargo clippy -- -D warnings`
 - [x] Pre-push hooks: full test suite via `cargo nextest run`
 - [x] CI: fmt, clippy -D warnings, build, test, cross-platform build matrix (macOS, Windows, Linux)
