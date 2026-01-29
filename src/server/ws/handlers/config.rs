@@ -347,3 +347,60 @@ pub(super) fn handle_config_schema() -> Result<Value, ErrorShape> {
         }
     }))
 }
+
+/// Handle the `config.reload` WS method (admin-only).
+///
+/// Triggers a manual config reload, re-reading the config file from disk,
+/// validating it, and updating the config cache. The reload mode used is
+/// read from the current config's `gateway.reload.mode` (defaulting to "hot"
+/// for manual reloads).
+pub(super) fn handle_config_reload(state: &WsServerState) -> Result<Value, ErrorShape> {
+    use crate::config::watcher::{perform_reload, ReloadMode};
+
+    // Determine reload mode from current config
+    let current_config =
+        config::load_config().unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
+    let mode_str = current_config
+        .get("gateway")
+        .and_then(|g| g.get("reload"))
+        .and_then(|r| r.get("mode"))
+        .and_then(|m| m.as_str())
+        .unwrap_or("hot");
+
+    // For manual reload, use the configured mode (or "hot" if "off")
+    let mode = match ReloadMode::parse_mode(mode_str) {
+        ReloadMode::Off => ReloadMode::Hot, // Manual reload always does at least hot
+        other => other,
+    };
+
+    let result = perform_reload(&mode);
+
+    if result.success {
+        // Broadcast config.changed event to all WS clients
+        broadcast_config_changed(state, &result.mode);
+
+        Ok(json!({
+            "ok": true,
+            "mode": result.mode,
+            "warnings": result.warnings
+        }))
+    } else {
+        Err(error_shape(
+            ERROR_UNAVAILABLE,
+            &result.error.unwrap_or_else(|| "reload failed".to_string()),
+            None,
+        ))
+    }
+}
+
+/// Broadcast a `config.changed` event to all connected WS clients.
+///
+/// This is called after a successful config reload (from file watcher, SIGHUP,
+/// or the `config.reload` WS method).
+pub fn broadcast_config_changed(state: &WsServerState, mode: &str) {
+    let payload = json!({
+        "mode": mode,
+        "ts": now_ms()
+    });
+    broadcast_event(state, "config.changed", payload);
+}

@@ -1,11 +1,11 @@
 //! Bind mode resolution (loopback, tailscale, etc.)
 //!
 //! Parses `gateway.bind` config values and resolves to socket addresses:
-//! - `loopback` -> 127.0.0.1
-//! - `lan` -> detect LAN interface IP
-//! - `tailnet` -> Tailscale IP (100.x.x.x range)
-//! - `auto` -> try tailnet, fall back to lan
-//! - Custom IP/hostname
+//! - `loopback` -> 127.0.0.1 (default, safest — local access only)
+//! - `lan` -> detect first non-loopback IPv4 address (LAN-accessible)
+//! - `auto` -> 0.0.0.0 (all interfaces)
+//! - `tailnet` -> Tailscale IP (100.x.x.x CGNAT range)
+//! - Any explicit IP address or `host:port` -> use as-is
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::process::Command;
@@ -25,9 +25,9 @@ pub enum BindMode {
     Lan,
     /// Bind to Tailscale IP (100.x.x.x range)
     Tailnet,
-    /// Try tailnet first, fall back to lan
-    Auto,
     /// Bind to all interfaces (0.0.0.0)
+    Auto,
+    /// Bind to all interfaces (0.0.0.0) — alias for Auto
     All,
     /// Custom IP address or hostname
     Custom(String),
@@ -67,33 +67,20 @@ pub fn parse_bind_mode(value: &str) -> BindMode {
     }
 }
 
-/// Resolve a bind mode to a socket address
+/// Resolve a bind mode to a socket address.
+///
+/// For most modes, the `port` parameter is used directly. For `Custom` mode
+/// with a `host:port` string, the embedded port overrides the `port` parameter.
 pub fn resolve_bind_address(mode: &BindMode, port: u16) -> Result<SocketAddr, BindError> {
-    let ip = match mode {
-        BindMode::Loopback => IpAddr::V4(Ipv4Addr::LOCALHOST),
-        BindMode::Lan => detect_lan_ip()?,
-        BindMode::Tailnet => detect_tailscale_ip()?,
-        BindMode::Auto => {
-            // Try tailnet first, fall back to lan
-            match detect_tailscale_ip() {
-                Ok(ip) => {
-                    debug!("Auto bind: using Tailscale IP {}", ip);
-                    ip
-                }
-                Err(e) => {
-                    debug!(
-                        "Auto bind: Tailscale not available ({}), falling back to LAN",
-                        e
-                    );
-                    detect_lan_ip()?
-                }
-            }
+    match mode {
+        BindMode::Loopback => Ok(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)),
+        BindMode::Lan => Ok(SocketAddr::new(detect_lan_ip()?, port)),
+        BindMode::Tailnet => Ok(SocketAddr::new(detect_tailscale_ip()?, port)),
+        BindMode::Auto | BindMode::All => {
+            Ok(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port))
         }
-        BindMode::All => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-        BindMode::Custom(addr) => resolve_custom_address(addr)?,
-    };
-
-    Ok(SocketAddr::new(ip, port))
+        BindMode::Custom(addr) => resolve_custom_address(addr, port),
+    }
 }
 
 /// Detect the primary LAN interface IP address
@@ -256,20 +243,74 @@ fn detect_tailscale_ip() -> Result<IpAddr, BindError> {
     }
 }
 
-/// Resolve a custom IP address or hostname
-fn resolve_custom_address(addr: &str) -> Result<IpAddr, BindError> {
-    // Try parsing as IP address first
-    if let Ok(ip) = addr.parse::<IpAddr>() {
-        return Ok(ip);
+/// Resolve a custom IP address, hostname, or `host:port` string.
+///
+/// If the string contains a colon-separated port (e.g. `"192.168.1.5:9000"`
+/// or `"myhost:9000"`), the embedded port is used instead of `default_port`.
+/// A bare IP or hostname uses `default_port`.
+fn resolve_custom_address(addr: &str, default_port: u16) -> Result<SocketAddr, BindError> {
+    // Try parsing as a full socket address (e.g. "192.168.1.5:9000")
+    if let Ok(sock) = addr.parse::<SocketAddr>() {
+        return Ok(sock);
     }
 
-    // Try resolving as hostname
-    let socket_addr = format!("{}:0", addr);
+    // Try parsing as a bare IP address (no port)
+    if let Ok(ip) = addr.parse::<IpAddr>() {
+        return Ok(SocketAddr::new(ip, default_port));
+    }
+
+    // Check for host:port format (split on last colon to handle IPv6 correctly)
+    if let Some((host, port_str)) = split_host_port(addr) {
+        if let Ok(port) = port_str.parse::<u16>() {
+            let ip = resolve_hostname(host)?;
+            return Ok(SocketAddr::new(ip, port));
+        }
+    }
+
+    // Treat the whole string as a hostname
+    let ip = resolve_hostname(addr)?;
+    Ok(SocketAddr::new(ip, default_port))
+}
+
+/// Split a `host:port` string. Returns `None` if there is no port component.
+/// For IPv6 addresses in brackets (e.g. `[::1]:8080`), handles the bracket syntax.
+fn split_host_port(addr: &str) -> Option<(&str, &str)> {
+    // Handle bracketed IPv6: [::1]:port
+    if addr.starts_with('[') {
+        if let Some(bracket_end) = addr.find(']') {
+            if addr.as_bytes().get(bracket_end + 1) == Some(&b':') {
+                let host = &addr[1..bracket_end];
+                let port = &addr[bracket_end + 2..];
+                if !port.is_empty() {
+                    return Some((host, port));
+                }
+            }
+        }
+        return None;
+    }
+
+    // For non-bracketed strings, only split if there's exactly one colon
+    // (multiple colons would indicate an IPv6 address without brackets)
+    let colon_count = addr.chars().filter(|&c| c == ':').count();
+    if colon_count == 1 {
+        let idx = addr.rfind(':')?;
+        let host = &addr[..idx];
+        let port = &addr[idx + 1..];
+        if !host.is_empty() && !port.is_empty() {
+            return Some((host, port));
+        }
+    }
+
+    None
+}
+
+/// Resolve a hostname to an IP address, preferring IPv4.
+fn resolve_hostname(host: &str) -> Result<IpAddr, BindError> {
+    let socket_addr = format!("{}:0", host);
     match socket_addr.to_socket_addrs() {
-        Ok(mut addrs) => {
-            // Prefer IPv4 addresses
+        Ok(addrs) => {
             let mut ipv6 = None;
-            for addr in addrs.by_ref() {
+            for addr in addrs {
                 match addr.ip() {
                     IpAddr::V4(_) => return Ok(addr.ip()),
                     IpAddr::V6(_) => {
@@ -281,12 +322,12 @@ fn resolve_custom_address(addr: &str) -> Result<IpAddr, BindError> {
             }
 
             ipv6.ok_or_else(|| BindError::ResolutionFailed {
-                host: addr.to_string(),
+                host: host.to_string(),
                 message: "No addresses found".to_string(),
             })
         }
         Err(e) => Err(BindError::ResolutionFailed {
-            host: addr.to_string(),
+            host: host.to_string(),
             message: e.to_string(),
         }),
     }
@@ -343,14 +384,7 @@ pub fn resolve_bind_with_metadata(mode: &BindMode, port: u16) -> Result<Resolved
         BindMode::Loopback => (format!("localhost only ({})", address), false),
         BindMode::Lan => (format!("local network ({})", address), true),
         BindMode::Tailnet => (format!("Tailscale network ({})", address), true),
-        BindMode::Auto => {
-            let is_tailscale = matches!(address.ip(), IpAddr::V4(ip) if is_tailscale_ip(ip));
-            if is_tailscale {
-                (format!("Tailscale (auto-detected) ({})", address), true)
-            } else {
-                (format!("local network (auto-detected) ({})", address), true)
-            }
-        }
+        BindMode::Auto => (format!("all interfaces ({})", address), true),
         BindMode::All => (format!("all interfaces ({})", address), true),
         BindMode::Custom(addr) => (
             format!("custom ({} -> {})", addr, address),
@@ -499,6 +533,74 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_auto_binds_all_interfaces() {
+        let addr = resolve_bind_address(&BindMode::Auto, 8080).unwrap();
+        assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        assert_eq!(addr.port(), 8080);
+    }
+
+    #[test]
+    fn test_resolve_auto_same_as_all() {
+        let auto_addr = resolve_bind_address(&BindMode::Auto, 5000).unwrap();
+        let all_addr = resolve_bind_address(&BindMode::All, 5000).unwrap();
+        assert_eq!(auto_addr, all_addr);
+    }
+
+    #[test]
+    fn test_resolve_custom_host_port() {
+        // An explicit host:port should use the embedded port, not the default
+        let addr =
+            resolve_bind_address(&BindMode::Custom("127.0.0.1:9000".to_string()), 3000).unwrap();
+        assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+        assert_eq!(addr.port(), 9000);
+    }
+
+    #[test]
+    fn test_resolve_custom_bare_ip_uses_default_port() {
+        let addr = resolve_bind_address(&BindMode::Custom("10.0.0.5".to_string()), 4000).unwrap();
+        assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)));
+        assert_eq!(addr.port(), 4000);
+    }
+
+    #[test]
+    fn test_split_host_port_basic() {
+        assert_eq!(split_host_port("host:1234"), Some(("host", "1234")));
+        assert_eq!(
+            split_host_port("192.168.1.1:8080"),
+            Some(("192.168.1.1", "8080"))
+        );
+    }
+
+    #[test]
+    fn test_split_host_port_no_port() {
+        assert_eq!(split_host_port("192.168.1.1"), None);
+        assert_eq!(split_host_port("hostname"), None);
+    }
+
+    #[test]
+    fn test_split_host_port_ipv6_no_brackets() {
+        // Multiple colons without brackets -> treated as IPv6, no split
+        assert_eq!(split_host_port("::1"), None);
+        assert_eq!(split_host_port("fe80::1"), None);
+    }
+
+    #[test]
+    fn test_split_host_port_ipv6_bracketed() {
+        assert_eq!(split_host_port("[::1]:8080"), Some(("::1", "8080")));
+        assert_eq!(split_host_port("[fe80::1]:443"), Some(("fe80::1", "443")));
+    }
+
+    #[test]
+    fn test_split_host_port_edge_cases() {
+        // Empty port
+        assert_eq!(split_host_port("host:"), None);
+        // Empty host
+        assert_eq!(split_host_port(":1234"), None);
+        // Bracket without port
+        assert_eq!(split_host_port("[::1]"), None);
+    }
+
+    #[test]
     fn test_resolve_with_metadata_loopback() {
         let result = resolve_bind_with_metadata(&BindMode::Loopback, DEFAULT_PORT).unwrap();
         assert_eq!(result.address.port(), DEFAULT_PORT);
@@ -511,6 +613,14 @@ mod tests {
         let result = resolve_bind_with_metadata(&BindMode::All, 8080).unwrap();
         assert!(result.externally_accessible);
         assert!(result.description.contains("all interfaces"));
+    }
+
+    #[test]
+    fn test_resolve_with_metadata_auto() {
+        let result = resolve_bind_with_metadata(&BindMode::Auto, 8080).unwrap();
+        assert!(result.externally_accessible);
+        assert!(result.description.contains("all interfaces"));
+        assert_eq!(result.address.ip(), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
     }
 
     #[test]

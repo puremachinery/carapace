@@ -256,6 +256,115 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         shutdown_rx.clone(),
     ));
 
+    // Config file watcher (hot/hybrid reload)
+    let config_watcher = config::watcher::ConfigWatcher::from_config(&cfg);
+    {
+        let config_path = config::get_config_path();
+        info!("Config reload mode: {:?}", config_watcher.mode());
+        config_watcher.start(config_path, shutdown_rx.clone());
+    }
+
+    // Bridge config watcher events to WS broadcasts
+    {
+        let mut config_rx = config_watcher.subscribe();
+        let ws_state_for_config = ws_state.clone();
+        let mut config_shutdown_rx = shutdown_rx.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    event = config_rx.recv() => {
+                        match event {
+                            Ok(config::watcher::ConfigEvent::Reloaded(result)) => {
+                                server::ws::broadcast_config_changed(
+                                    &ws_state_for_config,
+                                    &result.mode,
+                                );
+                            }
+                            Ok(config::watcher::ConfigEvent::ReloadFailed(_)) => {
+                                // Failed reloads are already logged by the watcher;
+                                // no broadcast needed (previous config stays active).
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                warn!("Config event receiver lagged by {} events", n);
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                break;
+                            }
+                        }
+                    }
+                    _ = config_shutdown_rx.changed() => {
+                        if *config_shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // SIGHUP handler for manual config reload (Unix only)
+    #[cfg(unix)]
+    {
+        let ws_state_for_sighup = ws_state.clone();
+        let config_event_tx = config_watcher.event_sender();
+        let mut sighup_shutdown_rx = shutdown_rx.clone();
+        tokio::spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sighup =
+                signal(SignalKind::hangup()).expect("failed to install SIGHUP handler");
+            loop {
+                tokio::select! {
+                    _ = sighup.recv() => {
+                        info!("SIGHUP received, triggering config reload");
+                        // Determine reload mode from current config
+                        let current_cfg = config::load_config()
+                            .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
+                        let mode_str = current_cfg
+                            .get("gateway")
+                            .and_then(|g| g.get("reload"))
+                            .and_then(|r| r.get("mode"))
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("hot");
+                        let mode = match config::watcher::ReloadMode::parse_mode(mode_str) {
+                            config::watcher::ReloadMode::Off => config::watcher::ReloadMode::Hot,
+                            other => other,
+                        };
+                        let result = config::watcher::perform_reload(&mode);
+                        if result.success {
+                            server::ws::broadcast_config_changed(
+                                &ws_state_for_sighup,
+                                &result.mode,
+                            );
+                            // Also notify any config event subscribers
+                            let _ = config_event_tx.send(
+                                config::watcher::ConfigEvent::Reloaded(result),
+                            );
+                        } else {
+                            let _ = config_event_tx.send(
+                                config::watcher::ConfigEvent::ReloadFailed(result),
+                            );
+                        }
+                    }
+                    _ = sighup_shutdown_rx.changed() => {
+                        if *sighup_shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // Session retention cleanup loop
+    let retention_config = sessions::retention::build_retention_config(&cfg);
+    if retention_config.enabled {
+        tokio::spawn(sessions::retention::retention_cleanup_loop(
+            ws_state.session_store().clone(),
+            retention_config,
+            shutdown_rx.clone(),
+        ));
+    }
+
     // 11. Parse TLS configuration
     let tls_config = tls::parse_tls_config(&cfg);
     let tls_setup = if tls_config.enabled {
@@ -297,9 +406,11 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     info!("Carapace gateway v{}", env!("CARGO_PKG_VERSION"));
     let protocol = if tls_setup.is_some() { "https" } else { "http" };
     info!(
-        "Listening on {} ({protocol}://{})",
-        resolved.description, resolved.address
+        "Bind mode: {} -> {protocol}://{}",
+        server::bind::bind_mode_display_name(&resolved.mode),
+        resolved.address
     );
+    info!("Listening on {}", resolved.description);
     info!("State directory: {}", state_dir.display());
     if ws_state.llm_provider().is_some() {
         info!("LLM: enabled");

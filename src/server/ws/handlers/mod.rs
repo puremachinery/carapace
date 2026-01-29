@@ -41,7 +41,8 @@ pub(super) use voicewake::*;
 
 // Re-export types needed outside the handlers module
 pub(crate) use config::{
-    map_validation_issues, persist_config_file, read_config_snapshot, ConfigIssue, ConfigSnapshot,
+    broadcast_config_changed, map_validation_issues, persist_config_file, read_config_snapshot,
+    ConfigIssue, ConfigSnapshot,
 };
 pub use sessions::AgentRunRegistry;
 pub use sessions::AgentRunStatus;
@@ -105,12 +106,13 @@ pub(super) const NODE_ONLY_METHODS: [&str; 3] = ["node.invoke.result", "node.eve
 ///
 /// Per Node.js gateway: config.*, wizard.*, update.*, skills.install/update,
 /// channels.logout, sessions.*, and cron.* require operator.admin for operators.
-const OPERATOR_ADMIN_REQUIRED_METHODS: [&str; 37] = [
+const OPERATOR_ADMIN_REQUIRED_METHODS: [&str; 38] = [
     "config.get",
     "config.set",
     "config.apply",
     "config.patch",
     "config.schema",
+    "config.reload",
     "sessions.patch",
     "sessions.reset",
     "sessions.delete",
@@ -264,6 +266,9 @@ pub(super) fn get_method_required_role(method: &str) -> &'static str {
 
         // system-event is admin-only (can trigger system events)
         "system-event" => "admin",
+
+        // Config reload (admin-only, triggers config re-read and cache update)
+        "config.reload" => "admin",
 
         // Admin operations (requires admin role, or operator with specific scopes)
         "device.pair.approve"
@@ -563,6 +568,7 @@ pub(super) async fn dispatch_method(
         "config.apply" => handle_config_apply(params),
         "config.patch" => handle_config_patch(params),
         "config.schema" => handle_config_schema(),
+        "config.reload" => handle_config_reload(state),
 
         // Sessions
         "sessions.list" => handle_sessions_list(state, params),

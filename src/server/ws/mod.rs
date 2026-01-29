@@ -48,7 +48,8 @@ pub use handlers::sessions::AgentRun;
 
 // Re-export config persistence types for use by control endpoint
 pub(crate) use handlers::{
-    map_validation_issues, persist_config_file, read_config_snapshot, ConfigIssue, ConfigSnapshot,
+    broadcast_config_changed, map_validation_issues, persist_config_file, read_config_snapshot,
+    ConfigIssue, ConfigSnapshot,
 };
 
 const PROTOCOL_VERSION: u32 = 3;
@@ -85,7 +86,7 @@ const ALLOWED_CLIENT_IDS: [&str; 12] = [
 const ALLOWED_CLIENT_MODES: [&str; 7] =
     ["webchat", "cli", "ui", "backend", "node", "probe", "test"];
 
-const GATEWAY_METHODS: [&str; 114] = [
+const GATEWAY_METHODS: [&str; 115] = [
     // Health/status
     "health",
     "status",
@@ -99,6 +100,7 @@ const GATEWAY_METHODS: [&str; 114] = [
     "config.apply",
     "config.patch",
     "config.schema",
+    "config.reload",
     // Agent
     "agent",
     "agent.identity.get",
@@ -220,7 +222,7 @@ const GATEWAY_METHODS: [&str; 114] = [
     "system-event",
 ];
 
-const GATEWAY_EVENTS: [&str; 19] = [
+const GATEWAY_EVENTS: [&str; 20] = [
     "connect.challenge",
     "agent",
     "chat",
@@ -231,6 +233,7 @@ const GATEWAY_EVENTS: [&str; 19] = [
     "health",
     "heartbeat",
     "cron",
+    "config.changed",
     "node.pair.requested",
     "node.pair.resolved",
     "node.invoke.request",

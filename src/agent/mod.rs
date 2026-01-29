@@ -4,6 +4,7 @@
 //! and the core agent run loop that ties everything together.
 
 pub mod anthropic;
+pub mod builtin_tools;
 pub mod context;
 pub mod executor;
 pub mod openai;

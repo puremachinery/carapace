@@ -2301,7 +2301,7 @@ mod tests {
 
     #[test]
     fn test_thread_safety() {
-        use std::sync::Arc;
+        use std::sync::{Arc, Barrier};
         use std::thread;
 
         let temp_dir = TempDir::new().unwrap();
@@ -2312,13 +2312,17 @@ mod tests {
             .unwrap();
         let session_id = session.id.clone();
 
+        // Use a barrier so all threads start writing at roughly the same time
+        let barrier = Arc::new(Barrier::new(10));
         let mut handles = vec![];
 
         // Spawn multiple threads appending messages
         for i in 0..10 {
             let store_clone = Arc::clone(&store);
             let sid = session_id.clone();
+            let bar = Arc::clone(&barrier);
             handles.push(thread::spawn(move || {
+                bar.wait();
                 store_clone
                     .append_message(ChatMessage::user(&sid, format!("Message {}", i)))
                     .unwrap();
@@ -2330,6 +2334,9 @@ mod tests {
         }
 
         let history = store.get_history(&session_id, None, None).unwrap();
+        // All 10 messages should be present. get_history skips corrupt lines,
+        // so if concurrent appends interleaved we may see fewer — but append
+        // mode on POSIX guarantees atomic writes under PIPE_BUF (4 KiB+).
         assert_eq!(history.len(), 10);
     }
 

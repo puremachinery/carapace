@@ -19,9 +19,6 @@ pub async fn cron_tick_loop(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut ticker = tokio::time::interval(interval);
-    // Run session cleanup once per hour (count ticks)
-    let cleanup_every = std::cmp::max(1, 3600 / interval.as_secs().max(1));
-    let mut tick_count: u64 = 0;
 
     loop {
         tokio::select! {
@@ -31,17 +28,6 @@ pub async fn cron_tick_loop(
 
         if *shutdown.borrow() {
             break;
-        }
-
-        tick_count += 1;
-
-        // Periodic session cleanup
-        if tick_count.is_multiple_of(cleanup_every) {
-            if let Some(days) = state.session_retention_days() {
-                if let Err(e) = state.session_store().cleanup_expired(days) {
-                    tracing::warn!(error = %e, "session cleanup failed");
-                }
-            }
         }
 
         let due_ids = state.cron_scheduler.get_due_job_ids();

@@ -2439,6 +2439,7 @@ fn test_every_gateway_method_has_explicit_role_assignment() {
         "sessions.export_user",
         "sessions.purge_user",
         "system-event",
+        "config.reload",
     ]
     .into_iter()
     .collect();

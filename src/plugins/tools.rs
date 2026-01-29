@@ -138,6 +138,11 @@ impl ToolsRegistry {
             }),
         });
 
+        // Register core built-in agent tools
+        for tool in crate::agent::builtin_tools::builtin_tools() {
+            registry.register_builtin_tool(tool);
+        }
+
         registry
     }
 

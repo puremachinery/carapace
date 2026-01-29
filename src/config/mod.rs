@@ -4,6 +4,7 @@
 //! and caching. Matches moltbot's format for drop-in compatibility.
 
 pub mod defaults;
+pub mod watcher;
 
 use parking_lot::RwLock;
 use regex::Regex;
@@ -390,6 +391,33 @@ fn substitute_env_in_string(s: &str) -> Result<String, ConfigError> {
 pub fn clear_cache() {
     let mut cache = CONFIG_CACHE.write();
     *cache = None;
+}
+
+/// Atomically update the config cache with a pre-validated config value.
+///
+/// This is used by the config watcher and reload mechanism to install a new
+/// config without going through file I/O again (the caller has already parsed
+/// and validated the new config).
+pub fn update_cache(value: Value) {
+    let mut cache = CONFIG_CACHE.write();
+    *cache = Some(CachedConfig {
+        value,
+        loaded_at: Instant::now(),
+    });
+}
+
+/// Reload the config from disk, validate it, and update the cache atomically.
+///
+/// Returns the new config on success or a `ConfigError` if the file cannot be
+/// read or parsed. Validation warnings are returned alongside the config; only
+/// hard parse/read errors cause an `Err`.
+pub fn reload_config() -> Result<(Value, Vec<ValidationIssue>), ConfigError> {
+    let path = get_config_path();
+    let new_config = load_config_uncached(&path)?;
+    let issues = validate_config(&new_config);
+    // Update the cache with the freshly loaded config
+    update_cache(new_config.clone());
+    Ok((new_config, issues))
 }
 
 /// Validation error with path context
