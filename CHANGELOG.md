@@ -73,6 +73,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Health endpoints:** `/health/live`, `/health/ready`.
 - **Prometheus metrics endpoint:** `/metrics`.
 - **Resource monitoring:** disk, memory, file descriptor threshold warnings.
+- **Encrypted config secrets:** AES-256-GCM at-rest encryption with PBKDF2 key
+  derivation for sensitive configuration values.
+- **Structured audit logging:** append-only JSONL audit trail with 17 event types
+  and file rotation at 50 MB.
+- **Secret masking in logs:** regex-based redaction of API keys, bearer tokens,
+  passwords, and query parameters in log output.
+- **Backup encryption:** AES-256-GCM archive encryption with PBKDF2-HMAC-SHA256
+  (600K iterations).
+- **Config schema validation:** typed startup-time validation with fail-fast on
+  errors and warnings for unknown keys.
+- **WebSocket hardening:** per-connection token-bucket rate limiting, global and
+  per-IP connection caps, JSON depth/size limits.
+- **WASM fuel limits:** deterministic CPU budget per plugin call via wasmtime fuel
+  metering.
+- **Provider hot-swap:** automatic LLM provider rebuild on API key rotation
+  without restart.
 
 ### Security
 
@@ -87,6 +103,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Session file tamper detection via HMAC-SHA256 sidecars.
 - Prompt injection detection in system prompts.
 - Output PII and credential redaction.
+- AES-256-GCM encrypted config secrets at rest.
+- Backup archive encryption (PBKDF2, 600K iterations).
+- Secret redaction in structured log output.
+- WebSocket connection and message rate limits.
+- JSON depth and payload size limits.
+- WASM fuel-based CPU limits per plugin call.
+- File locking and atomic writes with fsync for session storage.
+- Auth profile token encryption at rest via platform keychain.
+- cargo-deny, gitleaks, trivy, hadolint, and cargo-geiger in CI.
 
 [Unreleased]: https://github.com/your-org/carapace/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/your-org/carapace/releases/tag/v0.1.0
