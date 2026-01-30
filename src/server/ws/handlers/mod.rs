@@ -615,7 +615,6 @@ fn dispatch_tts_voice(
         "tts.setProvider" => Some(handle_tts_set_provider(params)),
         "tts.setVoice" => Some(handle_tts_set_voice(params)),
         "tts.configure" => Some(handle_tts_configure(params)),
-        "tts.speak" => Some(handle_tts_speak(params)),
         "tts.stop" => Some(handle_tts_stop()),
         "voicewake.get" => Some(handle_voicewake_get()),
         "voicewake.set" => Some(handle_voicewake_set(params, Some(state))),
@@ -736,6 +735,7 @@ pub(super) async fn dispatch_method(
 
         // TTS async
         "tts.convert" => handle_tts_convert(params).await,
+        "tts.speak" => handle_tts_speak(params).await,
 
         // Wizard
         "wizard.start" => handle_wizard_start(params),

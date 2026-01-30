@@ -277,7 +277,17 @@ async fn fetch_latest_release() {
 
             state.update_available = latest != current_version;
             state.latest_version = Some(latest);
-            state.download_url = Some(release.html_url);
+
+            // Prefer the platform-specific asset download URL; fall back to
+            // the release page URL so the user can still reach the release.
+            let wanted = expected_asset_name();
+            let asset_url = release
+                .assets
+                .iter()
+                .find(|a| a.name == wanted)
+                .map(|a| a.browser_download_url.clone());
+            state.download_url = Some(asset_url.unwrap_or(release.html_url));
+
             state.release_notes = release.body;
             state.last_error = None;
         }
@@ -290,7 +300,12 @@ async fn fetch_latest_release() {
     state.checking = false;
 }
 
-/// Trigger an update check and optionally install
+/// Trigger an update check and optionally install.
+///
+/// When `checkOnly` is false (the default) and an update is available, the
+/// handler proceeds to download and install the update, returning the same
+/// response shape as `update.install`.  When `checkOnly` is true the handler
+/// only performs the version check.
 pub(super) async fn handle_update_run(params: Option<&Value>) -> Result<Value, ErrorShape> {
     let check_only = params
         .and_then(|v| v.get("checkOnly"))
@@ -326,8 +341,17 @@ pub(super) async fn handle_update_run(params: Option<&Value>) -> Result<Value, E
     // Perform the real HTTP check (lock is not held during the await)
     fetch_latest_release().await;
 
-    // When check_only is false and an update is available, the state is
-    // already populated. Actual download/install is a future task.
+    // Determine whether we should install
+    let should_install = {
+        let state = UPDATE_STATE.read();
+        !check_only && (state.update_available || force)
+    };
+
+    if should_install {
+        // Delegate to the install handler which handles download, staging,
+        // and atomic replacement.
+        return handle_update_install().await;
+    }
 
     let state = UPDATE_STATE.read();
     Ok(json!({
@@ -473,13 +497,56 @@ fn expected_asset_name() -> String {
     format!("carapace-{os}-{arch}{ext}")
 }
 
+/// Compute the SHA-256 hex digest of an in-memory byte buffer.
+fn sha256_bytes(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    format!("{:x}", hasher.finalize())
+}
+
+/// Verify the downloaded binary against a SHA-256 checksum file.
+///
+/// The `checksum_text` is expected to be in the GNU coreutils format:
+///   `<hex_hash>  <filename>` (or just a bare hex hash).
+///
+/// Returns `Ok(())` when the hashes match, or an `Err` describing the
+/// mismatch.
+fn verify_checksum(actual_hash: &str, checksum_text: &str) -> Result<(), String> {
+    // The checksum file may contain: "<hash>  <filename>\n" or just "<hash>\n".
+    let expected = checksum_text
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_lowercase();
+
+    if expected.is_empty() {
+        return Err("checksum file is empty or malformed".to_string());
+    }
+
+    if expected.len() != 64 || !expected.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!(
+            "checksum file does not contain a valid SHA-256 hash: '{expected}'"
+        ));
+    }
+
+    if actual_hash != expected {
+        return Err(format!(
+            "SHA-256 mismatch: expected {expected}, got {actual_hash}"
+        ));
+    }
+
+    Ok(())
+}
+
 /// Download the release binary from GitHub and stage it in the state directory.
 ///
 /// The function:
 /// 1. Re-fetches the latest release to obtain the asset list.
 /// 2. Locates the asset matching the current platform.
-/// 3. Streams the binary to `{state_dir}/updates/carapace-{version}`.
-/// 4. Verifies the download size is non-zero.
+/// 3. Downloads the binary to `{state_dir}/updates/carapace-{version}`.
+/// 4. If a `.sha256` checksum asset exists, downloads it and verifies integrity.
+/// 5. On Unix, sets executable permissions.
 ///
 /// On success the staging path is returned. On failure, `last_error` is set and
 /// the `installing` flag is cleared.
@@ -524,6 +591,10 @@ async fn download_and_stage(version: &str) -> Result<String, String> {
             )
         })?;
 
+    // Check for a companion checksum asset (e.g. carapace-darwin-aarch64.sha256)
+    let checksum_name = format!("{wanted}.sha256");
+    let checksum_asset = release.assets.iter().find(|a| a.name == checksum_name);
+
     // Prepare staging directory -------------------------------------------
     let updates_dir = resolve_state_dir().join("updates");
     tokio::fs::create_dir_all(&updates_dir)
@@ -551,9 +622,35 @@ async fn download_and_stage(version: &str) -> Result<String, String> {
         .await
         .map_err(|e| format!("failed to read asset bytes: {e}"))?;
 
-    // Verify download integrity (minimum: non-empty) ----------------------
+    // Verify download integrity -------------------------------------------
     if bytes.is_empty() {
         return Err("downloaded asset is empty".to_string());
+    }
+
+    // If a checksum asset is available, download and verify
+    if let Some(cksum) = checksum_asset {
+        let cksum_resp = client
+            .get(&cksum.browser_download_url)
+            .header("User-Agent", &user_agent)
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await
+            .map_err(|e| format!("failed to download checksum file: {e}"))?;
+
+        if cksum_resp.status().is_success() {
+            let cksum_text = cksum_resp
+                .text()
+                .await
+                .map_err(|e| format!("failed to read checksum file: {e}"))?;
+
+            let actual_hash = sha256_bytes(&bytes);
+            verify_checksum(&actual_hash, &cksum_text)?;
+        } else {
+            warn!(
+                "checksum asset download returned status {}; skipping verification",
+                cksum_resp.status()
+            );
+        }
     }
 
     // Write to staging path -----------------------------------------------
@@ -631,15 +728,20 @@ pub(super) async fn handle_update_install() -> Result<Value, ErrorShape> {
             // Apply the staged binary atomically
             match apply_staged_update(&staged_path) {
                 Ok(apply_result) => {
+                    // Mark update as consumed so callers don't re-install.
+                    state.update_available = false;
+
                     // Clean up old binaries in the background
                     cleanup_old_binaries();
                     Ok(json!({
                         "ok": true,
+                        "status": "success",
                         "version": version,
                         "stagedPath": staged_path,
                         "applied": apply_result.applied,
                         "sha256": apply_result.sha256,
                         "binaryPath": apply_result.binary_path,
+                        "restartRequired": true,
                         "message": "Update applied successfully. Restart to use new version."
                     }))
                 }
@@ -1124,5 +1226,143 @@ mod tests {
         assert!(!result.applied);
         assert_eq!(result.sha256, "abc");
         assert_eq!(result.binary_path, "/bin/ttt");
+    }
+
+    // -----------------------------------------------------------------------
+    // sha256_bytes tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sha256_bytes_known_value() {
+        let hash = sha256_bytes(b"hello world\n");
+        assert_eq!(
+            hash, "a948904f2f0f479b8f8197694b30184b0d2ed1c1cd2a1ec0fb85d299a192a447",
+            "SHA-256 of 'hello world\\n' mismatch"
+        );
+    }
+
+    #[test]
+    fn test_sha256_bytes_empty() {
+        let hash = sha256_bytes(b"");
+        assert_eq!(
+            hash,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn test_sha256_bytes_deterministic() {
+        let h1 = sha256_bytes(b"test data");
+        let h2 = sha256_bytes(b"test data");
+        assert_eq!(h1, h2);
+    }
+
+    // -----------------------------------------------------------------------
+    // verify_checksum tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_verify_checksum_match_bare_hash() {
+        let data = b"hello";
+        let hash = sha256_bytes(data);
+        // checksum file contains just the hash
+        let result = verify_checksum(&hash, &hash);
+        assert!(result.is_ok(), "bare hash should match: {:?}", result);
+    }
+
+    #[test]
+    fn test_verify_checksum_match_gnu_format() {
+        let data = b"hello";
+        let hash = sha256_bytes(data);
+        // GNU coreutils format: "<hash>  <filename>"
+        let checksum_text = format!("{}  carapace-darwin-aarch64", hash);
+        let result = verify_checksum(&hash, &checksum_text);
+        assert!(result.is_ok(), "GNU format should match: {:?}", result);
+    }
+
+    #[test]
+    fn test_verify_checksum_mismatch() {
+        let result = verify_checksum(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  file.bin",
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("mismatch"),
+            "error should mention mismatch: {err}"
+        );
+    }
+
+    #[test]
+    fn test_verify_checksum_empty_file() {
+        let result = verify_checksum(
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "",
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("empty"), "error should mention empty: {err}");
+    }
+
+    #[test]
+    fn test_verify_checksum_malformed() {
+        let result = verify_checksum(
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "not-a-valid-sha256",
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_verify_checksum_with_trailing_whitespace() {
+        let hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let checksum_text = format!("{}  empty.bin\n", hash);
+        let result = verify_checksum(hash, &checksum_text);
+        assert!(
+            result.is_ok(),
+            "trailing whitespace should not cause failure: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_verify_checksum_case_insensitive() {
+        let hash_lower = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let hash_upper = "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855";
+        let result = verify_checksum(hash_lower, hash_upper);
+        assert!(
+            result.is_ok(),
+            "checksum verification should be case-insensitive: {:?}",
+            result
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Platform detection tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_expected_asset_name_contains_arch() {
+        let name = expected_asset_name();
+        let arch = std::env::consts::ARCH;
+        assert!(
+            name.contains(arch),
+            "asset name '{name}' does not contain arch '{arch}'"
+        );
+    }
+
+    #[test]
+    fn test_expected_asset_name_checksum_companion() {
+        let name = expected_asset_name();
+        let checksum_name = format!("{name}.sha256");
+        assert!(
+            checksum_name.ends_with(".sha256"),
+            "checksum name should end with .sha256: {checksum_name}"
+        );
+        assert!(
+            checksum_name.starts_with("carapace-"),
+            "checksum name should start with carapace-: {checksum_name}"
+        );
     }
 }

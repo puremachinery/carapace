@@ -1,7 +1,7 @@
 //! Text-to-speech handlers.
 //!
 //! Manages TTS settings including provider selection, voice configuration,
-//! and text-to-speech conversion.
+//! and text-to-speech conversion via the OpenAI TTS API.
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -12,6 +12,9 @@ use super::super::*;
 
 /// Available TTS providers
 pub const TTS_PROVIDERS: [&str; 4] = ["system", "elevenlabs", "openai", "google"];
+
+/// Audio formats supported by the OpenAI TTS API.
+pub const OPENAI_AUDIO_FORMATS: [&str; 4] = ["mp3", "opus", "aac", "flac"];
 
 /// Available system voices (platform-dependent)
 pub const SYSTEM_VOICES: [&str; 6] = ["samantha", "alex", "victoria", "karen", "daniel", "moira"];
@@ -165,7 +168,94 @@ fn resolve_openai_api_key() -> Option<String> {
     env::var("OPENAI_API_KEY").ok().filter(|k| !k.is_empty())
 }
 
-/// Convert text to speech
+/// Validate and normalise the requested audio format.
+///
+/// Returns the format string to use with the OpenAI API. If `raw` is `None`
+/// the default format `"mp3"` is returned.
+fn validate_audio_format(raw: Option<&str>) -> Result<&'static str, ErrorShape> {
+    match raw {
+        None => Ok("mp3"),
+        Some(f) => {
+            let lower = f.trim();
+            OPENAI_AUDIO_FORMATS
+                .iter()
+                .find(|&&fmt| fmt.eq_ignore_ascii_case(lower))
+                .copied()
+                .ok_or_else(|| {
+                    error_shape(
+                        ERROR_INVALID_REQUEST,
+                        &format!(
+                            "unsupported audio format '{}'; supported: mp3, opus, aac, flac",
+                            f
+                        ),
+                        Some(json!({ "supportedFormats": OPENAI_AUDIO_FORMATS })),
+                    )
+                })
+        }
+    }
+}
+
+/// Call the OpenAI TTS API and return raw audio bytes.
+async fn openai_tts_request(
+    api_key: &str,
+    text: &str,
+    voice: &str,
+    format: &str,
+    speed: f64,
+) -> Result<bytes::Bytes, ErrorShape> {
+    let client = reqwest::Client::new();
+    let body = json!({
+        "model": "tts-1",
+        "input": text,
+        "voice": voice,
+        "response_format": format,
+        "speed": speed.clamp(0.25, 4.0)
+    });
+
+    let response = client
+        .post("https://api.openai.com/v1/audio/speech")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| {
+            error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("OpenAI TTS request failed: {}", e),
+                None,
+            )
+        })?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let err_body = response.text().await.unwrap_or_default();
+        return Err(error_shape(
+            ERROR_UNAVAILABLE,
+            &format!("OpenAI TTS API error ({}): {}", status, err_body),
+            None,
+        ));
+    }
+
+    response.bytes().await.map_err(|e| {
+        error_shape(
+            ERROR_UNAVAILABLE,
+            &format!("failed to read OpenAI TTS response: {}", e),
+            None,
+        )
+    })
+}
+
+/// Convert text to speech.
+///
+/// Params:
+///   - `text` (required): the text to convert.
+///   - `format` (optional): audio format — `mp3` (default), `opus`, `aac`, or `flac`.
+///
+/// When the provider is `openai` and an API key is available the handler
+/// calls the OpenAI TTS API and returns base64-encoded audio.  If no key is
+/// configured for the `openai` provider the handler returns a clear error.
+/// For other providers (e.g. `system`) the handler returns `audio: null`
+/// since those providers do not have a server-side synthesis path.
 pub(super) async fn handle_tts_convert(params: Option<&Value>) -> Result<Value, ErrorShape> {
     let text = params
         .and_then(|v| v.get("text"))
@@ -179,6 +269,11 @@ pub(super) async fn handle_tts_convert(params: Option<&Value>) -> Result<Value, 
             None,
         ));
     }
+
+    let requested_format = params
+        .and_then(|v| v.get("format"))
+        .and_then(|v| v.as_str());
+    let audio_format = validate_audio_format(requested_format)?;
 
     // Read state in a block so the parking_lot guard (which is !Send) is
     // dropped before any await point.
@@ -197,65 +292,33 @@ pub(super) async fn handle_tts_convert(params: Option<&Value>) -> Result<Value, 
     };
 
     if provider == "openai" {
-        if let Some(api_key) = resolve_openai_api_key() {
-            let client = reqwest::Client::new();
-            let body = json!({
-                "model": "tts-1",
-                "input": text,
-                "voice": voice,
-                "response_format": "mp3"
-            });
+        let api_key = resolve_openai_api_key().ok_or_else(|| {
+            error_shape(
+                ERROR_UNAVAILABLE,
+                "OpenAI API key not configured; set models.providers.openai.apiKey in config or OPENAI_API_KEY env var",
+                None,
+            )
+        })?;
 
-            let response = client
-                .post("https://api.openai.com/v1/audio/speech")
-                .header("Authorization", format!("Bearer {}", api_key))
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| {
-                    error_shape(
-                        ERROR_UNAVAILABLE,
-                        &format!("OpenAI TTS request failed: {}", e),
-                        None,
-                    )
-                })?;
+        let audio_bytes = openai_tts_request(&api_key, text, &voice, audio_format, rate).await?;
 
-            if !response.status().is_success() {
-                let status = response.status();
-                let err_body = response.text().await.unwrap_or_default();
-                return Err(error_shape(
-                    ERROR_UNAVAILABLE,
-                    &format!("OpenAI TTS API error ({}): {}", status, err_body),
-                    None,
-                ));
-            }
+        let audio_b64 = base64::engine::general_purpose::STANDARD.encode(&audio_bytes);
 
-            let audio_bytes = response.bytes().await.map_err(|e| {
-                error_shape(
-                    ERROR_UNAVAILABLE,
-                    &format!("failed to read OpenAI TTS response: {}", e),
-                    None,
-                )
-            })?;
-
-            let audio_b64 = base64::engine::general_purpose::STANDARD.encode(&audio_bytes);
-
-            return Ok(json!({
-                "ok": true,
-                "text": text,
-                "provider": provider,
-                "voice": voice,
-                "rate": rate,
-                "pitch": pitch,
-                "audio": audio_b64,
-                "audioFormat": "mp3",
-                "duration": null
-            }));
-        }
-        // No API key available – fall through to null-audio response
+        return Ok(json!({
+            "ok": true,
+            "text": text,
+            "provider": provider,
+            "voice": voice,
+            "rate": rate,
+            "pitch": pitch,
+            "audio": audio_b64,
+            "audioFormat": audio_format,
+            "audioSize": audio_bytes.len(),
+            "duration": null
+        }));
     }
 
-    // Non-OpenAI provider or no API key: return null audio
+    // Non-OpenAI provider: no server-side synthesis available.
     Ok(json!({
         "ok": true,
         "text": text,
@@ -264,7 +327,7 @@ pub(super) async fn handle_tts_convert(params: Option<&Value>) -> Result<Value, 
         "rate": rate,
         "pitch": pitch,
         "audio": null,
-        "audioFormat": "mp3",
+        "audioFormat": audio_format,
         "duration": null
     }))
 }
@@ -389,8 +452,11 @@ pub(super) fn handle_tts_stop() -> Result<Value, ErrorShape> {
     }))
 }
 
-/// Speak text immediately (shorthand for convert + play)
-pub(super) fn handle_tts_speak(params: Option<&Value>) -> Result<Value, ErrorShape> {
+/// Speak text immediately (shorthand for convert + play).
+///
+/// Delegates to the conversion pipeline and wraps the result with a unique
+/// speech ID so callers can track playback.
+pub(super) async fn handle_tts_speak(params: Option<&Value>) -> Result<Value, ErrorShape> {
     let text = params
         .and_then(|v| v.get("text"))
         .and_then(|v| v.as_str())
@@ -404,23 +470,19 @@ pub(super) fn handle_tts_speak(params: Option<&Value>) -> Result<Value, ErrorSha
         ));
     }
 
-    let state = TTS_STATE.read();
-
-    if !state.enabled {
-        return Err(error_shape(ERROR_UNAVAILABLE, "TTS is not enabled", None));
-    }
-
     // Generate a unique ID for this speech request
     let speech_id = uuid::Uuid::new_v4().to_string();
 
-    Ok(json!({
-        "ok": true,
-        "speechId": speech_id,
-        "text": text,
-        "provider": state.provider,
-        "voice": state.voice,
-        "status": "queued"
-    }))
+    // Delegate to the convert pipeline for the actual audio synthesis.
+    let mut converted = handle_tts_convert(params).await?;
+
+    // Attach the speech ID and mark as playing.
+    if let Some(obj) = converted.as_object_mut() {
+        obj.insert("speechId".to_string(), json!(speech_id));
+        obj.insert("status".to_string(), json!("playing"));
+    }
+
+    Ok(converted)
 }
 
 #[cfg(test)]
@@ -510,7 +572,7 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn test_tts_convert_openai_no_api_key_returns_null_audio() {
+    async fn test_tts_convert_openai_no_api_key_returns_error() {
         let _lock = TEST_LOCK.lock().unwrap();
         reset_state();
 
@@ -523,12 +585,18 @@ mod tests {
         env::remove_var("OPENAI_API_KEY");
 
         let params = json!({ "text": "Hello from OpenAI" });
-        let result = handle_tts_convert(Some(&params)).await.unwrap();
-        assert_eq!(result["ok"], true);
-        assert_eq!(result["text"], "Hello from OpenAI");
-        assert_eq!(result["provider"], "openai");
-        assert!(result["audio"].is_null());
-        assert_eq!(result["audioFormat"], "mp3");
+        let result = handle_tts_convert(Some(&params)).await;
+        assert!(
+            result.is_err(),
+            "should error when no API key is configured"
+        );
+        let err = result.unwrap_err();
+        assert_eq!(err.code, ERROR_UNAVAILABLE);
+        assert!(
+            err.message.contains("API key"),
+            "error message should mention API key: {}",
+            err.message
+        );
     }
 
     #[test]
@@ -578,5 +646,203 @@ mod tests {
         assert_eq!(result["provider"], "system");
         let voices = result["voices"].as_array().unwrap();
         assert!(!voices.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Audio format validation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_audio_format_default() {
+        let result = validate_audio_format(None).unwrap();
+        assert_eq!(result, "mp3");
+    }
+
+    #[test]
+    fn test_validate_audio_format_all_supported() {
+        for fmt in &OPENAI_AUDIO_FORMATS {
+            let result = validate_audio_format(Some(fmt)).unwrap();
+            assert_eq!(result, *fmt);
+        }
+    }
+
+    #[test]
+    fn test_validate_audio_format_case_insensitive() {
+        assert_eq!(validate_audio_format(Some("MP3")).unwrap(), "mp3");
+        assert_eq!(validate_audio_format(Some("Opus")).unwrap(), "opus");
+        assert_eq!(validate_audio_format(Some("AAC")).unwrap(), "aac");
+        assert_eq!(validate_audio_format(Some("FLAC")).unwrap(), "flac");
+    }
+
+    #[test]
+    fn test_validate_audio_format_invalid() {
+        let result = validate_audio_format(Some("wav"));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, ERROR_INVALID_REQUEST);
+        assert!(err.message.contains("wav"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Convert with format parameter tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_tts_convert_invalid_format() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        reset_state();
+        handle_tts_enable().unwrap();
+
+        let params = json!({ "text": "Hello", "format": "wav" });
+        let result = handle_tts_convert(Some(&params)).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, ERROR_INVALID_REQUEST);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_tts_convert_system_returns_null_audio() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        reset_state();
+        handle_tts_enable().unwrap();
+
+        let params = json!({ "text": "Hello", "format": "opus" });
+        let result = handle_tts_convert(Some(&params)).await.unwrap();
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["provider"], "system");
+        assert!(result["audio"].is_null());
+        assert_eq!(result["audioFormat"], "opus");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_tts_convert_empty_text() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        reset_state();
+        handle_tts_enable().unwrap();
+
+        let params = json!({ "text": "   " });
+        let result = handle_tts_convert(Some(&params)).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, ERROR_INVALID_REQUEST);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_tts_convert_missing_text() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        reset_state();
+        handle_tts_enable().unwrap();
+
+        let params = json!({});
+        let result = handle_tts_convert(Some(&params)).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, ERROR_INVALID_REQUEST);
+    }
+
+    // -----------------------------------------------------------------------
+    // Speak handler tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_tts_speak_requires_enabled() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        reset_state();
+
+        let params = json!({ "text": "Hello" });
+        let result = handle_tts_speak(Some(&params)).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, ERROR_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_tts_speak_returns_speech_id() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        reset_state();
+        handle_tts_enable().unwrap();
+
+        let params = json!({ "text": "Hello" });
+        let result = handle_tts_speak(Some(&params)).await.unwrap();
+        assert_eq!(result["ok"], true);
+        assert!(result["speechId"].is_string(), "should have speechId");
+        assert_eq!(result["status"], "playing");
+        assert_eq!(result["text"], "Hello");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_tts_speak_empty_text() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        reset_state();
+        handle_tts_enable().unwrap();
+
+        let params = json!({ "text": "" });
+        let result = handle_tts_speak(Some(&params)).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, ERROR_INVALID_REQUEST);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_tts_speak_openai_no_key_returns_error() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        reset_state();
+        handle_tts_enable().unwrap();
+        let p = json!({ "provider": "openai" });
+        handle_tts_set_provider(Some(&p)).unwrap();
+        env::remove_var("OPENAI_API_KEY");
+
+        let params = json!({ "text": "Test speech" });
+        let result = handle_tts_speak(Some(&params)).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, ERROR_UNAVAILABLE);
+    }
+
+    // -----------------------------------------------------------------------
+    // Set voice tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_tts_set_voice() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        reset_state();
+
+        let params = json!({ "voice": "echo" });
+        let result = handle_tts_set_voice(Some(&params)).unwrap();
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["voice"], "echo");
+    }
+
+    #[test]
+    fn test_tts_set_voice_empty_rejected() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        reset_state();
+
+        let params = json!({ "voice": "  " });
+        let result = handle_tts_set_voice(Some(&params));
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // OpenAI voices listing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_tts_voices_openai() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        reset_state();
+        let p = json!({ "provider": "openai" });
+        handle_tts_set_provider(Some(&p)).unwrap();
+
+        let result = handle_tts_voices().unwrap();
+        assert_eq!(result["provider"], "openai");
+        let voices = result["voices"].as_array().unwrap();
+        assert_eq!(voices.len(), 6);
+        let ids: Vec<&str> = voices.iter().map(|v| v["id"].as_str().unwrap()).collect();
+        assert!(ids.contains(&"alloy"));
+        assert!(ids.contains(&"shimmer"));
     }
 }
