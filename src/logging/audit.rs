@@ -256,7 +256,10 @@ async fn writer_task(mut rx: mpsc::Receiver<AuditEntry>, log_path: PathBuf, rota
             .create(true)
             .append(true)
             .open(&log_path)
-            .and_then(|mut f| writeln!(f, "{line}"));
+            .and_then(|mut f| {
+                writeln!(f, "{line}")?;
+                f.sync_all()
+            });
 
         if let Err(e) = result {
             tracing::error!("audit: failed to write entry: {e}");

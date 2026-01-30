@@ -340,6 +340,9 @@ pub fn create_router_with_state(
         .route("/health/live", get(health_handler))
         .route("/health/ready", get(health_ready_handler));
 
+    // Metrics (Prometheus scrape endpoint, unauthenticated)
+    router = router.route("/metrics", get(crate::server::metrics::metrics_handler));
+
     // Tools API
     router = router.route("/tools/invoke", post(tools_invoke_handler));
 

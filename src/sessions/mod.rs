@@ -4,6 +4,7 @@
 //! Sessions are stored in `~/.moltbot/sessions/` using JSONL format for
 //! append-friendly history operations.
 
+pub mod file_lock;
 pub mod retention;
 pub mod scoping;
 mod store;

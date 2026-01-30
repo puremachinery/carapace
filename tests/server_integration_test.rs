@@ -210,3 +210,36 @@ async fn test_health_ready_endpoint_responds() {
 
     handle.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------
+// 10. Metrics endpoint returns 200 with Prometheus format
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_metrics_endpoint_responds() {
+    let handle = start_test_server().await;
+    let url = format!("{}/metrics", handle.base_url());
+
+    let resp = reqwest::get(&url).await.expect("GET /metrics failed");
+    assert_eq!(resp.status(), 200);
+
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .expect("missing content-type")
+        .to_str()
+        .unwrap();
+    assert!(
+        content_type.starts_with("text/plain"),
+        "expected text/plain content-type, got: {}",
+        content_type
+    );
+
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("carapace_"),
+        "metrics body should contain carapace_ prefix lines"
+    );
+
+    handle.shutdown().await;
+}

@@ -49,6 +49,7 @@ tar = "0.4"
 aes-gcm = "0.10"
 zeroize = "1"
 libc = "0.2"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 
 [dev-dependencies]
 insta = { version = "1", features = ["json"] }

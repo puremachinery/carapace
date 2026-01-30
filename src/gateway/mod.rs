@@ -9,6 +9,8 @@
 //!
 //! Configuration lives under `gateway.remote` in the JSON5 config file.
 
+use futures_util::stream::{SplitSink, SplitStream};
+use futures_util::{SinkExt, StreamExt};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -18,8 +20,13 @@ use std::io::Write as IoWrite;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::net::TcpStream;
+use tokio::sync::Mutex;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tracing::{error, info, warn};
 use uuid::Uuid;
+
+type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 // ============================================================================
 // Constants
@@ -177,9 +184,8 @@ pub enum GatewayConnectionState {
 
 /// Handle representing an active connection to a remote gateway.
 ///
-/// The actual WebSocket transport is not yet wired; this struct tracks the
-/// connection metadata and will be extended when a WS client crate is added.
-#[derive(Debug)]
+/// Holds the WebSocket stream halves behind async mutexes so that reads
+/// and writes can proceed independently.
 pub struct GatewayConnection {
     /// ID of the gateway this connection belongs to.
     pub gateway_id: String,
@@ -187,15 +193,46 @@ pub struct GatewayConnection {
     pub state: GatewayConnectionState,
     /// Protocol version negotiated with the remote side.
     pub protocol_version: u32,
+    /// WebSocket write half (`None` if stub / disconnected).
+    ws_writer: Option<Mutex<SplitSink<WsStream, tokio_tungstenite::tungstenite::Message>>>,
+    /// WebSocket read half (`None` if stub / disconnected).
+    ws_reader: Option<Mutex<SplitStream<WsStream>>>,
+}
+
+impl std::fmt::Debug for GatewayConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GatewayConnection")
+            .field("gateway_id", &self.gateway_id)
+            .field("state", &self.state)
+            .field("protocol_version", &self.protocol_version)
+            .field("has_ws_writer", &self.ws_writer.is_some())
+            .field("has_ws_reader", &self.ws_reader.is_some())
+            .finish()
+    }
 }
 
 impl GatewayConnection {
-    /// Create a new connection handle in the `Connected` state.
+    /// Create a new connection handle in the `Connected` state (without
+    /// a real WebSocket stream — for testing / stub use).
     pub fn new_connected(gateway_id: String) -> Self {
         Self {
             gateway_id,
             state: GatewayConnectionState::Connected { since_ms: now_ms() },
             protocol_version: PROTOCOL_VERSION,
+            ws_writer: None,
+            ws_reader: None,
+        }
+    }
+
+    /// Create a connection handle backed by a real WebSocket stream.
+    fn new_with_stream(gateway_id: String, stream: WsStream) -> Self {
+        let (writer, reader) = stream.split();
+        Self {
+            gateway_id,
+            state: GatewayConnectionState::Connected { since_ms: now_ms() },
+            protocol_version: PROTOCOL_VERSION,
+            ws_writer: Some(Mutex::new(writer)),
+            ws_reader: Some(Mutex::new(reader)),
         }
     }
 
@@ -204,12 +241,44 @@ impl GatewayConnection {
         matches!(self.state, GatewayConnectionState::Connected { .. })
     }
 
-    /// Send a JSON-RPC message (sync convenience method).
-    pub fn send_message(&self, _method: &str, _params: &Value) -> Result<(), GatewayError> {
-        if !self.is_connected() {
-            return Err(GatewayError::ConnectionFailed("not connected".to_string()));
-        }
-        Ok(())
+    /// Whether this connection has a real WebSocket stream attached.
+    pub fn has_stream(&self) -> bool {
+        self.ws_writer.is_some()
+    }
+
+    /// Send a JSON-RPC message over the WebSocket.
+    pub async fn send_message(&self, method: &str, params: &Value) -> Result<(), GatewayError> {
+        let writer = self
+            .ws_writer
+            .as_ref()
+            .ok_or_else(|| GatewayError::ConnectionFailed("no WebSocket stream".into()))?;
+
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": Uuid::new_v4().to_string(),
+            "method": method,
+            "params": params,
+        });
+        let text = serde_json::to_string(&msg)
+            .map_err(|e| GatewayError::ConnectionFailed(e.to_string()))?;
+
+        writer
+            .lock()
+            .await
+            .send(tokio_tungstenite::tungstenite::Message::Text(text))
+            .await
+            .map_err(|e| GatewayError::ConnectionFailed(e.to_string()))
+    }
+
+    /// Receive the next message from the WebSocket.
+    ///
+    /// Returns `None` when the stream is closed or no reader is available.
+    pub async fn recv_message(
+        &self,
+    ) -> Option<Result<tokio_tungstenite::tungstenite::Message, GatewayError>> {
+        let reader = self.ws_reader.as_ref()?;
+        let result = reader.lock().await.next().await?;
+        Some(result.map_err(|e| GatewayError::ConnectionFailed(e.to_string())))
     }
 }
 
@@ -433,16 +502,12 @@ pub fn verify_fingerprint(expected: Option<&str>, actual: &str) -> Result<String
 
 /// Connect to a remote gateway via direct WebSocket.
 ///
-/// This performs the following steps:
-/// 1. Establish a TCP + TLS connection to `entry.url`.
-/// 2. Verify the TLS certificate fingerprint via TOFU.
-/// 3. Upgrade to WebSocket and send a protocol v3 handshake.
-/// 4. Return a `GatewayConnection` handle.
-///
-/// # Note
-/// The actual WebSocket transport is not yet wired. This function creates the
-/// connection handle and validates parameters; the real network I/O will be
-/// added when a WS client transport is integrated.
+/// 1. Validate parameters.
+/// 2. Establish a TLS + WebSocket connection to `entry.url` via
+///    `tokio-tungstenite`.
+/// 3. Extract the TLS certificate fingerprint and verify it via TOFU.
+/// 4. Send a JSON-RPC `gateway.connect` handshake.
+/// 5. Return a [`GatewayConnection`] with live read/write stream halves.
 pub async fn connect_to_gateway(
     entry: &GatewayEntry,
     auth_token: &str,
@@ -462,6 +527,19 @@ pub async fn connect_to_gateway(
         return Err(GatewayError::AuthFailed("client ID is empty".to_string()));
     }
 
+    // Validate URL scheme
+    let url = url::Url::parse(&entry.url)
+        .map_err(|e| GatewayError::ConnectionFailed(format!("invalid URL: {}", e)))?;
+    match url.scheme() {
+        "ws" | "wss" => {}
+        other => {
+            return Err(GatewayError::ConnectionFailed(format!(
+                "unsupported URL scheme: {}",
+                other
+            )));
+        }
+    }
+
     info!(
         gateway_id = %entry.id,
         gateway_name = %entry.name,
@@ -469,21 +547,115 @@ pub async fn connect_to_gateway(
         "connecting to remote gateway"
     );
 
-    // TODO: wire actual WS client transport
-    //
-    // The implementation would:
-    // 1. Resolve the URL and open a TLS TCP stream via tokio::net::TcpStream
-    //    + tokio_rustls::TlsConnector.
-    // 2. Extract the server certificate and call verify_fingerprint() against
-    //    entry.fingerprint.
-    // 3. Perform the HTTP/1.1 upgrade to WebSocket.
-    // 4. Send the JSON-RPC handshake:
-    //    { "id": "<uuid>", "method": "gateway.connect",
-    //      "params": { "clientId": "<client_id>", "token": "<auth_token>",
-    //                  "protocolVersion": 3 } }
-    // 5. Wait for the response and verify `ok: true`.
+    // Establish the WebSocket connection (TLS handled by tokio-tungstenite
+    // when the URL scheme is wss://).
+    let (ws_stream, _response) = tokio_tungstenite::connect_async(&entry.url)
+        .await
+        .map_err(|e| GatewayError::ConnectionFailed(format!("WebSocket connect failed: {}", e)))?;
 
-    Ok(GatewayConnection::new_connected(entry.id.clone()))
+    // Extract TLS fingerprint if the stream is TLS-wrapped
+    let actual_fp = extract_tls_fingerprint(&ws_stream);
+    if let Some(ref fp) = actual_fp {
+        let verified = verify_fingerprint(entry.fingerprint.as_deref(), fp)?;
+        info!(fingerprint = %verified, "TLS fingerprint verified");
+    } else if entry.fingerprint.is_some() {
+        // Expected a fingerprint but got a non-TLS connection
+        return Err(GatewayError::ConnectionFailed(
+            "expected TLS connection for fingerprint verification but got plaintext".into(),
+        ));
+    }
+
+    // Build the connection handle (splits the stream)
+    let conn = GatewayConnection::new_with_stream(entry.id.clone(), ws_stream);
+
+    // Send JSON-RPC handshake
+    let handshake_id = Uuid::new_v4().to_string();
+    let handshake = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": handshake_id,
+        "method": "gateway.connect",
+        "params": {
+            "clientId": client_id,
+            "token": auth_token,
+            "protocolVersion": PROTOCOL_VERSION,
+        }
+    });
+    let handshake_text = serde_json::to_string(&handshake)
+        .map_err(|e| GatewayError::ConnectionFailed(e.to_string()))?;
+
+    {
+        let writer = conn.ws_writer.as_ref().unwrap();
+        writer
+            .lock()
+            .await
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                handshake_text,
+            ))
+            .await
+            .map_err(|e| GatewayError::ConnectionFailed(format!("handshake send failed: {}", e)))?;
+    }
+
+    // Wait for handshake response
+    match conn.recv_message().await {
+        Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
+            let resp: Value = serde_json::from_str(&text).map_err(|e| {
+                GatewayError::ConnectionFailed(format!("handshake response parse failed: {}", e))
+            })?;
+            let ok = resp
+                .get("result")
+                .and_then(|r| r.get("ok"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if !ok {
+                let err_msg = resp
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("handshake rejected");
+                return Err(GatewayError::AuthFailed(err_msg.to_string()));
+            }
+        }
+        Some(Ok(_)) => {
+            return Err(GatewayError::ConnectionFailed(
+                "unexpected non-text handshake response".into(),
+            ));
+        }
+        Some(Err(e)) => {
+            return Err(GatewayError::ConnectionFailed(format!(
+                "handshake receive failed: {}",
+                e
+            )));
+        }
+        None => {
+            return Err(GatewayError::ConnectionFailed(
+                "connection closed during handshake".into(),
+            ));
+        }
+    }
+
+    info!(
+        gateway_id = %entry.id,
+        "gateway WebSocket connected and handshake completed"
+    );
+
+    Ok(conn)
+}
+
+/// Extract the SHA-256 fingerprint from a TLS-wrapped WebSocket stream.
+///
+/// Returns `None` for plaintext (non-TLS) streams or if certificate
+/// extraction is not supported by the TLS backend.
+fn extract_tls_fingerprint(stream: &WsStream) -> Option<String> {
+    let tls_stream = match stream.get_ref() {
+        MaybeTlsStream::Rustls(s) => s,
+        _ => return None,
+    };
+    let (_, conn) = tls_stream.get_ref();
+    let certs = conn.peer_certificates()?;
+    let cert_der = certs.first()?;
+    let digest = <sha2::Sha256 as sha2::Digest>::digest(cert_der.as_ref());
+    let hex: Vec<String> = digest.iter().map(|b| format!("{:02X}", b)).collect();
+    Some(hex.join(":"))
 }
 
 // ============================================================================
@@ -630,6 +802,8 @@ pub struct GatewayConfig {
     pub reconnect_interval_ms: u64,
     /// Maximum number of consecutive reconnect attempts before giving up.
     pub max_reconnect_attempts: u32,
+    /// Auth token passed in the `gateway.connect` handshake.
+    pub auth_token: String,
 }
 
 impl Default for GatewayConfig {
@@ -640,6 +814,7 @@ impl Default for GatewayConfig {
             auto_reconnect: true,
             reconnect_interval_ms: DEFAULT_RECONNECT_INTERVAL_MS,
             max_reconnect_attempts: DEFAULT_MAX_RECONNECT_ATTEMPTS,
+            auth_token: String::new(),
         }
     }
 }
@@ -694,6 +869,12 @@ pub fn build_gateway_config(cfg: &Value) -> GatewayConfig {
         .and_then(|v| v.as_u64())
         .map(|v| v as u32)
         .unwrap_or(DEFAULT_MAX_RECONNECT_ATTEMPTS);
+
+    let auth_token = remote
+        .get("authToken")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
 
     let gateways = remote
         .get("gateways")
@@ -756,6 +937,7 @@ pub fn build_gateway_config(cfg: &Value) -> GatewayConfig {
         auto_reconnect,
         reconnect_interval_ms,
         max_reconnect_attempts,
+        auth_token,
     }
 }
 
@@ -829,17 +1011,47 @@ pub async fn run_gateway_lifecycle(
 
                 reg.update_connection_state(&gateway_id, GatewayConnectionState::Connecting);
 
-                // For now, the connect_to_gateway stub immediately returns Connected.
-                match connect_to_gateway(&entry, "", &gateway_id).await {
-                    Ok(_conn) => {
+                match connect_to_gateway(&entry, &cfg.auth_token, &gateway_id).await {
+                    Ok(conn) => {
                         reg.update_connection_state(
                             &gateway_id,
                             GatewayConnectionState::Connected { since_ms: now_ms() },
                         );
                         attempts = 0;
 
-                        // Wait for shutdown while "connected"
-                        let _ = rx.changed().await;
+                        // Read loop: process incoming messages until
+                        // disconnection or shutdown.
+                        loop {
+                            tokio::select! {
+                                msg = conn.recv_message() => {
+                                    match msg {
+                                        Some(Ok(_)) => {
+                                            // Message received — could dispatch here
+                                        }
+                                        Some(Err(e)) => {
+                                            warn!(
+                                                gateway_id = %gateway_id,
+                                                error = %e,
+                                                "gateway read error, will reconnect"
+                                            );
+                                            break;
+                                        }
+                                        None => {
+                                            info!(
+                                                gateway_id = %gateway_id,
+                                                "gateway connection closed by remote"
+                                            );
+                                            break;
+                                        }
+                                    }
+                                }
+                                _ = rx.changed() => {
+                                    if *rx.borrow() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
                         if *rx.borrow() {
                             break;
                         }
@@ -1586,16 +1798,28 @@ mod tests {
         assert_eq!(conn.protocol_version, PROTOCOL_VERSION);
     }
 
+    #[tokio::test]
+    async fn test_gateway_connection_send_without_stream() {
+        // A stub connection (no WS stream) should return an error
+        let conn = GatewayConnection::new_connected("gw-2".to_string());
+        let result = conn.send_message("test.method", &json!({})).await;
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            GatewayError::ConnectionFailed(_)
+        ));
+    }
+
     #[test]
-    fn test_gateway_connection_send_when_disconnected() {
+    fn test_gateway_connection_disconnected_not_connected() {
         let conn = GatewayConnection {
-            gateway_id: "gw-2".to_string(),
+            gateway_id: "gw-3".to_string(),
             state: GatewayConnectionState::Disconnected,
             protocol_version: PROTOCOL_VERSION,
+            ws_writer: None,
+            ws_reader: None,
         };
         assert!(!conn.is_connected());
-        let result = conn.send_message("test.method", &json!({}));
-        assert!(result.is_err());
     }
 
     // ====================================================================

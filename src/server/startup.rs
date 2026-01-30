@@ -265,6 +265,22 @@ pub fn spawn_background_tasks(
         });
     }
 
+    // Resource monitor (60s sampling interval)
+    {
+        let state_dir = crate::server::ws::resolve_state_dir();
+        let health_checker = Arc::new(crate::server::health::HealthChecker::new(state_dir));
+        let monitor = Arc::new(crate::server::resource_monitor::ResourceMonitor::new(
+            health_checker,
+        ));
+        let monitor_rx = shutdown_rx.clone();
+        tokio::spawn(crate::server::resource_monitor::run_resource_monitor(
+            monitor,
+            Duration::from_secs(60),
+            crate::server::resource_monitor::ResourceThresholds::default(),
+            monitor_rx,
+        ));
+    }
+
     // Session retention cleanup loop
     let retention_config = sessions::retention::build_retention_config(raw_config);
     if retention_config.enabled {

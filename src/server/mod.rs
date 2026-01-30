@@ -11,6 +11,7 @@ pub mod http;
 pub mod metrics;
 pub mod openai;
 pub mod ratelimit;
+pub mod resource_monitor;
 pub mod startup;
 pub mod ws;
 

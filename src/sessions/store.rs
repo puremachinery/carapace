@@ -14,6 +14,8 @@ use std::sync::Arc;
 use tracing::warn;
 use uuid::Uuid;
 
+use super::file_lock::FileLock;
+
 /// Default message count threshold for auto-compaction
 const DEFAULT_COMPACT_THRESHOLD: usize = 100;
 
@@ -947,6 +949,8 @@ impl SessionStore {
 
         // Append to history file (JSONL format)
         let history_path = self.session_history_path(&session_id)?;
+        let _lock =
+            FileLock::acquire(&history_path).map_err(|e| SessionStoreError::Io(e.to_string()))?;
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -955,6 +959,10 @@ impl SessionStore {
         serde_json::to_writer(&mut writer, &message)?;
         writeln!(writer)?;
         writer.flush()?;
+        writer
+            .into_inner()
+            .map_err(|e| std::io::Error::other(e.to_string()))?
+            .sync_all()?;
 
         // Update session message count
         self.increment_message_count(&session_id)?;
@@ -981,6 +989,8 @@ impl SessionStore {
         }
 
         let history_path = self.session_history_path(session_id)?;
+        let _lock =
+            FileLock::acquire(&history_path).map_err(|e| SessionStoreError::Io(e.to_string()))?;
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -992,6 +1002,10 @@ impl SessionStore {
             writeln!(writer)?;
         }
         writer.flush()?;
+        writer
+            .into_inner()
+            .map_err(|e| std::io::Error::other(e.to_string()))?
+            .sync_all()?;
 
         // Update message count
         for _ in messages {
@@ -1107,6 +1121,11 @@ impl SessionStore {
             ));
         }
 
+        // Acquire lock on the history file for the duration of compaction
+        let history_path = self.session_history_path(session_id)?;
+        let _lock =
+            FileLock::acquire(&history_path).map_err(|e| SessionStoreError::Io(e.to_string()))?;
+
         // Mark as compacting
         session.status = SessionStatus::Compacting;
         self.write_session_meta(&session)?;
@@ -1130,7 +1149,6 @@ impl SessionStore {
         let summary = summary_fn(&to_compact);
 
         // Write new history file atomically
-        let history_path = self.session_history_path(session_id)?;
         let temp_path = history_path.with_extension("jsonl.tmp");
 
         {
@@ -1250,6 +1268,11 @@ impl SessionStore {
         if session.status == SessionStatus::Archived {
             return Err(SessionStoreError::AlreadyArchived(session_id.to_string()));
         }
+
+        // Acquire lock on the history file for the duration of archiving
+        let history_path = self.session_history_path(session_id)?;
+        let _lock =
+            FileLock::acquire(&history_path).map_err(|e| SessionStoreError::Io(e.to_string()))?;
 
         self.ensure_archive_dir()?;
 
@@ -1565,6 +1588,9 @@ impl SessionStore {
         self.ensure_base_dir()?;
 
         let meta_path = self.session_meta_path(&session.id)?;
+        let _lock =
+            FileLock::acquire(&meta_path).map_err(|e| SessionStoreError::Io(e.to_string()))?;
+
         let temp_path = meta_path.with_extension("json.tmp");
 
         // Write to temp file first, then sync
