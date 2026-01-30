@@ -6,6 +6,7 @@ pub mod bind;
 pub mod control;
 pub mod csrf;
 pub mod headers;
+pub mod health;
 pub mod http;
 pub mod metrics;
 pub mod openai;

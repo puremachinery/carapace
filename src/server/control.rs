@@ -65,6 +65,9 @@ pub struct GatewayStatusResponse {
     pub total_channels: usize,
     /// Runtime information
     pub runtime: RuntimeInfo,
+    /// System diagnostics (disk, memory, fds, LLM reachability)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<crate::server::health::SystemDiagnostics>,
 }
 
 /// Runtime information
@@ -180,6 +183,13 @@ pub async fn status_handler(State(state): State<ControlState>, headers: HeaderMa
         .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
         .unwrap_or_default();
 
+    // Gather system diagnostics
+    let diagnostics = {
+        let state_dir = crate::server::ws::resolve_state_dir();
+        let checker = crate::server::health::HealthChecker::new(state_dir);
+        Some(checker.gather_diagnostics(false))
+    };
+
     let response = GatewayStatusResponse {
         ok: true,
         version: state.version.clone(),
@@ -193,6 +203,7 @@ pub async fn status_handler(State(state): State<ControlState>, headers: HeaderMa
             platform: std::env::consts::OS.to_string(),
             arch: std::env::consts::ARCH.to_string(),
         },
+        diagnostics,
     };
 
     (StatusCode::OK, Json(response)).into_response()
@@ -447,6 +458,7 @@ mod tests {
                 platform: "linux".to_string(),
                 arch: "x86_64".to_string(),
             },
+            diagnostics: None,
         };
 
         let json = serde_json::to_string(&response).unwrap();
