@@ -3,6 +3,7 @@
 use serde_json::Value;
 
 use crate::agent::provider::ToolDefinition;
+use crate::agent::sandbox::ProcessSandboxConfig;
 use crate::plugins::tools::{ToolInvokeContext, ToolInvokeResult, ToolsRegistry};
 
 /// Result of a tool execution.
@@ -15,6 +16,10 @@ pub enum ToolCallResult {
 }
 
 /// Execute a tool call via the tools registry.
+///
+/// When `sandbox_config` is provided and enabled, the `sandboxed` flag is set
+/// on the `ToolInvokeContext` so that tool handlers can apply OS-level
+/// sandboxing to spawned subprocesses.
 pub fn execute_tool_call(
     tool_name: &str,
     tool_input: Value,
@@ -22,12 +27,47 @@ pub fn execute_tool_call(
     session_key: &str,
     agent_id: Option<&str>,
 ) -> ToolCallResult {
+    execute_tool_call_with_sandbox(
+        tool_name,
+        tool_input,
+        tools_registry,
+        session_key,
+        agent_id,
+        None,
+    )
+}
+
+/// Execute a tool call with optional sandbox configuration.
+///
+/// This is the full-featured entry point that accepts an optional
+/// `ProcessSandboxConfig`. The `sandboxed` flag on the invoke context
+/// reflects whether sandboxing is active.
+pub fn execute_tool_call_with_sandbox(
+    tool_name: &str,
+    tool_input: Value,
+    tools_registry: &ToolsRegistry,
+    session_key: &str,
+    agent_id: Option<&str>,
+    sandbox_config: Option<&ProcessSandboxConfig>,
+) -> ToolCallResult {
+    let sandboxed = sandbox_config.is_some_and(|c| c.enabled);
+
+    if sandboxed {
+        tracing::debug!(
+            tool = %tool_name,
+            max_cpu = sandbox_config.unwrap().max_cpu_seconds,
+            max_mem_mb = sandbox_config.unwrap().max_memory_mb,
+            max_fds = sandbox_config.unwrap().max_fds,
+            "executing tool with process sandbox enabled"
+        );
+    }
+
     let ctx = ToolInvokeContext {
         agent_id: agent_id.map(|s| s.to_string()),
         session_key: session_key.to_string(),
         message_channel: None,
         account_id: None,
-        sandboxed: false,
+        sandboxed,
         dry_run: false,
     };
 

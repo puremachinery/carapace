@@ -14,8 +14,10 @@ pub mod factory;
 pub mod gemini;
 pub mod ollama;
 pub mod openai;
+pub mod output_sanitizer;
 pub mod prompt_guard;
 pub mod provider;
+pub mod sandbox;
 pub mod tool_policy;
 pub mod tools;
 
@@ -87,6 +89,11 @@ pub struct AgentConfig {
     pub exfiltration_guard: bool,
     /// Prompt guard configuration for defense-in-depth filtering.
     pub prompt_guard: prompt_guard::PromptGuardConfig,
+    /// OS-level sandbox configuration for tool subprocess execution.
+    pub process_sandbox: sandbox::ProcessSandboxConfig,
+    /// Output sanitizer configuration for safe web rendering (CSP, HTML/Markdown
+    /// sanitization).
+    pub output_sanitizer: output_sanitizer::OutputSanitizerConfig,
 }
 
 impl Default for AgentConfig {
@@ -101,6 +108,8 @@ impl Default for AgentConfig {
             tool_policy: ToolPolicy::default(),
             exfiltration_guard: false,
             prompt_guard: prompt_guard::PromptGuardConfig::default(),
+            process_sandbox: sandbox::ProcessSandboxConfig::default(),
+            output_sanitizer: output_sanitizer::OutputSanitizerConfig::default(),
         }
     }
 }

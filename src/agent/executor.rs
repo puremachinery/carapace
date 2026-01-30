@@ -252,12 +252,18 @@ fn execute_tools_with_guards(
                 message: format!("Tool \"{}\" is not available for this agent", tool_name),
             }
         } else if let Some(tools_registry) = state.tools_registry() {
-            tools::execute_tool_call(
+            let sandbox = if config.process_sandbox.enabled {
+                Some(&config.process_sandbox)
+            } else {
+                None
+            };
+            tools::execute_tool_call_with_sandbox(
                 tool_name,
                 tool_input.clone(),
                 tools_registry,
                 session_key,
                 None,
+                sandbox,
             )
         } else {
             ToolCallResult::Error {
@@ -356,6 +362,7 @@ fn finalize_run(
     total_input_tokens: u64,
     total_output_tokens: u64,
     accumulated_text: String,
+    csp_policy: &str,
 ) {
     let stop_reason_str = match final_stop_reason {
         StopReason::EndTurn => "end_turn",
@@ -373,6 +380,9 @@ fn finalize_run(
             "usage": {
                 "inputTokens": total_input_tokens,
                 "outputTokens": total_output_tokens,
+            },
+            "contentPolicy": {
+                "csp": csp_policy,
             }
         }),
     );
@@ -383,7 +393,12 @@ fn finalize_run(
         session_key,
         seq.fetch_add(1, Ordering::Relaxed),
         "final",
-        Some(json!({ "content": &accumulated_text })),
+        Some(json!({
+            "content": &accumulated_text,
+            "contentPolicy": {
+                "csp": csp_policy,
+            }
+        })),
         None,
         Some(json!({
             "inputTokens": total_input_tokens,
@@ -478,6 +493,23 @@ async fn execute_single_turn(
             }
         }
         postflight_result.sanitized
+    } else {
+        turn_text
+    };
+
+    // Output sanitization — strip dangerous HTML/Markdown constructs so that
+    // agent output is safe for web UI rendering.  Runs after post-flight (PII
+    // redaction) and before persistence.
+    let turn_text = if config.output_sanitizer.sanitize_html {
+        let sanitized =
+            crate::agent::output_sanitizer::sanitize_output(&turn_text, &config.output_sanitizer);
+        if sanitized.was_modified {
+            tracing::info!(
+                run_id = %run_id,
+                "output sanitizer modified agent response for safe rendering"
+            );
+        }
+        sanitized.content
     } else {
         turn_text
     };
@@ -632,6 +664,7 @@ pub async fn execute_run(
         total_input_tokens,
         total_output_tokens,
         accumulated_text,
+        &config.output_sanitizer.csp_policy,
     );
 
     Ok(())

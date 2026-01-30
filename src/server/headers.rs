@@ -117,6 +117,21 @@ impl SecurityHeadersConfig {
             ..Self::default()
         }
     }
+
+    /// Create a configuration for rendering agent-generated content.
+    ///
+    /// Uses the restrictive CSP from `output_sanitizer::default_csp_policy()`:
+    /// - `default-src 'none'` — block everything by default
+    /// - `img-src https: data:` — allow HTTPS images and data-URI images
+    /// - `style-src 'unsafe-inline'` — allow inline styles for Markdown rendering
+    /// - No `script-src`, `frame-src`, or `object-src`
+    pub fn for_agent_content() -> Self {
+        Self {
+            csp: crate::agent::output_sanitizer::default_csp_policy(),
+            frame_options: "DENY".to_string(),
+            ..Self::default()
+        }
+    }
 }
 
 /// Builder for SecurityHeadersConfig
