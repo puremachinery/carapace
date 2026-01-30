@@ -23,7 +23,7 @@ uuid = { version = "1", features = ["v4"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter", "time"] }
 keyring = "2"
-wasmtime = { version = "18", features = ["component-model"] }
+wasmtime = { version = "29", features = ["component-model"] }
 thiserror = "1"
 parking_lot = "0.12"
 base64 = "0.22"

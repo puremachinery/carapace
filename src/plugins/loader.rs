@@ -105,6 +105,10 @@ pub struct PluginManifest {
     pub version: String,
     /// Plugin kind
     pub kind: PluginKind,
+    /// Fine-grained permissions declared by the plugin.
+    /// When present, these are validated at load time and enforced at runtime.
+    #[serde(default)]
+    pub permissions: super::permissions::DeclaredPermissions,
 }
 
 impl PluginManifest {
@@ -519,6 +523,7 @@ fn derive_manifest(
         description,
         version,
         kind,
+        permissions: super::permissions::DeclaredPermissions::default(),
     }
 }
 
@@ -900,6 +905,7 @@ mod tests {
             description: "A test plugin".to_string(),
             version: "1.0.0".to_string(),
             kind: PluginKind::Tool,
+            permissions: Default::default(),
         };
         assert!(manifest.validate().is_ok());
 
@@ -910,6 +916,7 @@ mod tests {
             description: "Test".to_string(),
             version: "1.0.0".to_string(),
             kind: PluginKind::Tool,
+            permissions: Default::default(),
         };
         assert!(manifest.validate().is_err());
 
@@ -920,6 +927,7 @@ mod tests {
             description: "Test".to_string(),
             version: "1.0.0".to_string(),
             kind: PluginKind::Tool,
+            permissions: Default::default(),
         };
         assert!(manifest.validate().is_err());
 
@@ -930,6 +938,7 @@ mod tests {
             description: "Test".to_string(),
             version: "1".to_string(),
             kind: PluginKind::Tool,
+            permissions: Default::default(),
         };
         assert!(manifest.validate().is_err());
     }

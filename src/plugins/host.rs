@@ -22,6 +22,7 @@ use super::capabilities::{
     CapabilityError, ConfigEnforcer, CredentialEnforcer, RateLimiterRegistry, SsrfConfig,
     SsrfProtection,
 };
+use super::permissions::PermissionEnforcer;
 
 /// Maximum message size for logging (4KB)
 pub const MAX_LOG_MESSAGE_SIZE: usize = 4 * 1024;
@@ -82,6 +83,9 @@ pub const MAX_HTTP_TIMEOUT_MS: u32 = 60_000;
 pub enum HostError {
     #[error("Capability error: {0}")]
     Capability(#[from] CapabilityError),
+
+    #[error("Permission denied: {0}")]
+    PermissionDenied(String),
 
     #[error("Credential error: {0}")]
     Credential(String),
@@ -151,6 +155,9 @@ pub struct PluginHostContext<B: CredentialBackend + 'static> {
 
     /// SSRF configuration (whether to allow Tailscale IPs, etc.)
     ssrf_config: SsrfConfig,
+
+    /// Fine-grained permission enforcer for this plugin.
+    permission_enforcer: PermissionEnforcer,
 }
 
 impl<B: CredentialBackend + 'static> PluginHostContext<B> {
@@ -175,12 +182,32 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
         rate_limiters: Arc<RateLimiterRegistry>,
         ssrf_config: SsrfConfig,
     ) -> Self {
+        let permission_enforcer = PermissionEnforcer::permissive(&plugin_id);
         Self {
             plugin_id,
             credential_store,
             rate_limiters,
             config_cache: RwLock::new(None),
             ssrf_config,
+            permission_enforcer,
+        }
+    }
+
+    /// Create a new plugin host context with custom SSRF config and permission enforcer
+    pub fn with_permissions(
+        plugin_id: String,
+        credential_store: Arc<CredentialStore<B>>,
+        rate_limiters: Arc<RateLimiterRegistry>,
+        ssrf_config: SsrfConfig,
+        permission_enforcer: PermissionEnforcer,
+    ) -> Self {
+        Self {
+            plugin_id,
+            credential_store,
+            rate_limiters,
+            config_cache: RwLock::new(None),
+            ssrf_config,
+            permission_enforcer,
         }
     }
 
@@ -301,6 +328,11 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
         // Validate key
         CredentialEnforcer::validate_key(key)?;
 
+        // Fine-grained permission check: verify the key is in the plugin's allowed scope
+        self.permission_enforcer
+            .check_credential_key(key)
+            .map_err(|e| HostError::PermissionDenied(e.to_string()))?;
+
         // Build the prefixed key
         let prefixed = CredentialEnforcer::prefix_key(&self.plugin_id, key);
 
@@ -315,6 +347,11 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
     pub async fn credential_set(&self, key: &str, value: &str) -> Result<bool, HostError> {
         // Validate key
         CredentialEnforcer::validate_key(key)?;
+
+        // Fine-grained permission check: verify the key is in the plugin's allowed scope
+        self.permission_enforcer
+            .check_credential_key(key)
+            .map_err(|e| HostError::PermissionDenied(e.to_string()))?;
 
         // Build the prefixed key
         let prefixed = CredentialEnforcer::prefix_key(&self.plugin_id, key);
@@ -394,7 +431,7 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
         })
     }
 
-    /// Validate an HTTP request's URL, method, body size, and rate limit.
+    /// Validate an HTTP request's URL, method, body size, rate limit, and permissions.
     /// Returns the validated uppercase method string.
     fn validate_http_request(&self, req: &HttpRequest) -> Result<String, HostError> {
         if req.url.len() > MAX_URL_LENGTH {
@@ -405,6 +442,12 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
         }
 
         SsrfProtection::validate_url_with_config(&req.url, &self.ssrf_config)?;
+
+        // Fine-grained permission check: verify the URL is in the plugin's allowed patterns
+        self.permission_enforcer
+            .check_http_url(&req.url)
+            .map_err(|e| HostError::PermissionDenied(e.to_string()))?;
+
         self.rate_limiters.check_http_request(&self.plugin_id)?;
 
         if let Some(ref body) = req.body {
@@ -530,6 +573,11 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
 
         // Validate URL for SSRF
         SsrfProtection::validate_url_with_config(url, &self.ssrf_config)?;
+
+        // Fine-grained permission check: verify the media URL is in the plugin's allowed patterns
+        self.permission_enforcer
+            .check_media_url(url)
+            .map_err(|e| HostError::PermissionDenied(e.to_string()))?;
 
         // Check rate limit (media fetch counts as HTTP request)
         self.rate_limiters.check_http_request(&self.plugin_id)?;
@@ -664,6 +712,7 @@ pub struct PluginHostContextBuilder<B: CredentialBackend + 'static> {
     credential_store: Option<Arc<CredentialStore<B>>>,
     rate_limiters: Option<Arc<RateLimiterRegistry>>,
     ssrf_config: SsrfConfig,
+    permission_enforcer: Option<PermissionEnforcer>,
 }
 
 impl<B: CredentialBackend + 'static> Default for PluginHostContextBuilder<B> {
@@ -678,6 +727,7 @@ impl<B: CredentialBackend + 'static> PluginHostContextBuilder<B> {
             credential_store: None,
             rate_limiters: None,
             ssrf_config: SsrfConfig::default(),
+            permission_enforcer: None,
         }
     }
 
@@ -703,6 +753,12 @@ impl<B: CredentialBackend + 'static> PluginHostContextBuilder<B> {
         self
     }
 
+    /// Set the fine-grained permission enforcer
+    pub fn permission_enforcer(mut self, enforcer: PermissionEnforcer) -> Self {
+        self.permission_enforcer = Some(enforcer);
+        self
+    }
+
     pub fn build(self, plugin_id: String) -> Result<PluginHostContext<B>, HostError> {
         let credential_store = self
             .credential_store
@@ -712,11 +768,16 @@ impl<B: CredentialBackend + 'static> PluginHostContextBuilder<B> {
             .rate_limiters
             .unwrap_or_else(|| Arc::new(RateLimiterRegistry::new()));
 
-        Ok(PluginHostContext::with_ssrf_config(
+        let permission_enforcer = self
+            .permission_enforcer
+            .unwrap_or_else(|| PermissionEnforcer::permissive(&plugin_id));
+
+        Ok(PluginHostContext::with_permissions(
             plugin_id,
             credential_store,
             rate_limiters,
             self.ssrf_config,
+            permission_enforcer,
         ))
     }
 }

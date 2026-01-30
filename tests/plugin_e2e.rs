@@ -803,6 +803,7 @@ fn test_manifest_validation_valid() {
         description: "A test plugin".to_string(),
         version: "1.0.0".to_string(),
         kind: PluginKind::Tool,
+        permissions: Default::default(),
     };
     assert!(manifest.validate().is_ok());
 }
@@ -816,6 +817,7 @@ fn test_manifest_validation_id_format() {
         description: "Test".to_string(),
         version: "1.0.0".to_string(),
         kind: PluginKind::Tool,
+        permissions: Default::default(),
     };
     assert!(manifest.validate().is_err());
 
@@ -826,6 +828,7 @@ fn test_manifest_validation_id_format() {
         description: "Test".to_string(),
         version: "1.0.0".to_string(),
         kind: PluginKind::Tool,
+        permissions: Default::default(),
     };
     assert!(manifest.validate().is_err());
 
@@ -836,6 +839,7 @@ fn test_manifest_validation_id_format() {
         description: "Test".to_string(),
         version: "1.0.0".to_string(),
         kind: PluginKind::Tool,
+        permissions: Default::default(),
     };
     assert!(manifest.validate().is_err());
 
@@ -846,6 +850,7 @@ fn test_manifest_validation_id_format() {
         description: "Test".to_string(),
         version: "1.0.0".to_string(),
         kind: PluginKind::Tool,
+        permissions: Default::default(),
     };
     assert!(manifest.validate().is_err());
 
@@ -856,6 +861,7 @@ fn test_manifest_validation_id_format() {
         description: "Test".to_string(),
         version: "1.0.0".to_string(),
         kind: PluginKind::Tool,
+        permissions: Default::default(),
     };
     assert!(manifest.validate().is_ok());
 }
@@ -869,6 +875,7 @@ fn test_manifest_validation_version() {
         description: "Test".to_string(),
         version: "1".to_string(),
         kind: PluginKind::Tool,
+        permissions: Default::default(),
     };
     assert!(manifest.validate().is_err());
 
@@ -880,6 +887,7 @@ fn test_manifest_validation_version() {
             description: "Test".to_string(),
             version: version.to_string(),
             kind: PluginKind::Tool,
+            permissions: Default::default(),
         };
         assert!(
             manifest.validate().is_ok(),

@@ -560,6 +560,7 @@ mod integration_tests {
             description: "A test plugin".to_string(),
             version: "1.0.0".to_string(),
             kind: PluginKind::Tool,
+            permissions: Default::default(),
         };
         assert!(manifest.validate().is_ok());
 
@@ -570,6 +571,7 @@ mod integration_tests {
             description: "Test".to_string(),
             version: "1.0.0".to_string(),
             kind: PluginKind::Tool,
+            permissions: Default::default(),
         };
         assert!(manifest.validate().is_err());
 
@@ -580,6 +582,7 @@ mod integration_tests {
             description: "Test".to_string(),
             version: "1.0.0".to_string(),
             kind: PluginKind::Tool,
+            permissions: Default::default(),
         };
         assert!(manifest.validate().is_err());
     }

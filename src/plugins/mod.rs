@@ -39,6 +39,7 @@ pub mod capabilities;
 pub mod dispatch;
 pub mod host;
 pub mod loader;
+pub mod permissions;
 pub mod runtime;
 pub mod sandbox;
 pub mod signature;
@@ -69,6 +70,11 @@ pub use host::{
     PluginHostContextBuilder, MAX_HTTP_BODY_SIZE, MAX_LOG_MESSAGE_SIZE, MAX_URL_LENGTH,
 };
 pub use loader::{LoadedPlugin, LoaderError, PluginKind, PluginLoader, PluginManifest};
+pub use permissions::{
+    compute_effective_permissions, validate_declared_permissions, DeclaredPermissions,
+    EffectivePermissions, PermissionConfig, PermissionEnforcer, PermissionError,
+    PermissionOverride,
+};
 pub use runtime::{
     HostState, PluginInstanceHandle, PluginRuntime, RuntimeError, DEFAULT_EXECUTION_TIMEOUT,
     DEFAULT_FUEL_BUDGET, MAX_PLUGIN_MEMORY_BYTES,

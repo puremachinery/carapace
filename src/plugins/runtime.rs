@@ -39,6 +39,10 @@ use super::bindings::{
 use super::capabilities::{RateLimiterRegistry, SsrfConfig};
 use super::host::{HostError, HttpRequest, HttpResponse, MediaFetchResult, PluginHostContext};
 use super::loader::{LoadedPlugin, PluginKind, PluginLoader, PluginManifest};
+use super::permissions::{
+    compute_effective_permissions, validate_declared_permissions, PermissionConfig,
+    PermissionEnforcer,
+};
 
 /// Maximum memory per plugin instance (64MB)
 pub const MAX_PLUGIN_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
@@ -152,8 +156,9 @@ struct WitChannelInfo {
 }
 
 /// WIT `chat-type` enum used in channel capabilities.
-#[derive(Clone, Debug, ComponentType, Lift, Lower)]
+#[derive(Clone, Copy, Debug, ComponentType, Lift, Lower)]
 #[component(enum)]
+#[repr(u8)]
 #[allow(dead_code)]
 enum WitChatType {
     #[component(name = "dm")]
@@ -550,6 +555,9 @@ pub struct PluginRuntime<B: CredentialBackend + 'static> {
     /// Sandbox configuration for capability enforcement
     sandbox_config: super::sandbox::SandboxConfig,
 
+    /// Fine-grained permission configuration
+    permission_config: PermissionConfig,
+
     /// Loaded plugin instances by ID
     instances: RwLock<HashMap<String, Arc<PluginInstanceHandle<B>>>>,
 
@@ -567,9 +575,59 @@ pub struct PluginInstanceHandle<B: CredentialBackend + Send + Sync + 'static> {
 
     /// Component instance (for calling exports)
     instance: wasmtime::component::Instance,
+
+    /// Component (needed for export index lookups in wasmtime 29+)
+    component: Component,
 }
 
 impl<B: CredentialBackend + Send + Sync + 'static> PluginInstanceHandle<B> {
+    /// Look up a typed function from a named exported interface.
+    ///
+    /// Uses `Component::get_export_index` to navigate the interface hierarchy
+    /// (wasmtime 24+ removed `Instance::exports()` in favour of index-based lookups).
+    fn get_iface_typed_func<P, R>(
+        &self,
+        store: &mut Store<HostState<B>>,
+        iface_name: &str,
+        func_name: &str,
+    ) -> Result<wasmtime::component::TypedFunc<P, R>, BindingError>
+    where
+        P: wasmtime::component::ComponentNamedList + Lower + Send + Sync + 'static,
+        R: wasmtime::component::ComponentNamedList + Lift + Send + Sync + 'static,
+    {
+        // Step 1: look up the exported interface index
+        let (_item, iface_idx) =
+            self.component
+                .export_index(None, iface_name)
+                .ok_or_else(|| {
+                    BindingError::CallError(format!(
+                        "exported interface '{}' not found",
+                        iface_name
+                    ))
+                })?;
+
+        // Step 2: look up the function within that interface
+        let (_item, func_idx) = self
+            .component
+            .export_index(Some(&iface_idx), func_name)
+            .ok_or_else(|| {
+                BindingError::CallError(format!(
+                    "function '{}' not found in interface '{}'",
+                    func_name, iface_name
+                ))
+            })?;
+
+        // Step 3: get the typed func from the instance using the index
+        self.instance
+            .get_typed_func::<P, R>(&mut *store, &func_idx)
+            .map_err(|e| {
+                BindingError::CallError(format!(
+                    "failed to get typed func '{}.{}': {}",
+                    iface_name, func_name, e
+                ))
+            })
+    }
+
     /// Call an exported function from a named interface with no parameters.
     ///
     /// Looks up the function `func_name` within the exported interface `iface_name`,
@@ -580,7 +638,6 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginInstanceHandle<B> {
         R: wasmtime::component::ComponentNamedList + Lift + Send + Sync + 'static,
     {
         let mut store = self.store.write();
-        let instance = self.instance;
 
         // Set fuel budget for this call
         if let Err(e) = store.set_fuel(DEFAULT_FUEL_BUDGET) {
@@ -591,18 +648,7 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginInstanceHandle<B> {
         }
 
         // Get the exported interface, then get the typed function
-        let func = {
-            let mut exports = instance.exports(&mut *store);
-            let mut iface = exports.instance(iface_name).ok_or_else(|| {
-                BindingError::CallError(format!("exported interface '{}' not found", iface_name))
-            })?;
-            iface.typed_func::<(), R>(func_name).map_err(|e| {
-                BindingError::CallError(format!(
-                    "failed to get typed func '{}.{}': {}",
-                    iface_name, func_name, e
-                ))
-            })?
-        };
+        let func = self.get_iface_typed_func::<(), R>(&mut store, iface_name, func_name)?;
 
         // Call the function asynchronously (required by async-enabled engine)
         // We bridge sync -> async using tokio's block_in_place + block_on
@@ -610,7 +656,7 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginInstanceHandle<B> {
             tokio::runtime::Handle::current()
                 .block_on(async { func.call_async(&mut *store, ()).await })
         })
-        .map_err(|e| {
+        .map_err(|e: wasmtime::Error| {
             let msg = e.to_string();
             if msg.contains("fuel") {
                 BindingError::CallError(format!(
@@ -654,7 +700,6 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginInstanceHandle<B> {
         R: wasmtime::component::ComponentNamedList + Lift + Send + Sync + 'static,
     {
         let mut store = self.store.write();
-        let instance = self.instance;
 
         // Set fuel budget for this call
         if let Err(e) = store.set_fuel(DEFAULT_FUEL_BUDGET) {
@@ -664,24 +709,13 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginInstanceHandle<B> {
             )));
         }
 
-        let func = {
-            let mut exports = instance.exports(&mut *store);
-            let mut iface = exports.instance(iface_name).ok_or_else(|| {
-                BindingError::CallError(format!("exported interface '{}' not found", iface_name))
-            })?;
-            iface.typed_func::<P, R>(func_name).map_err(|e| {
-                BindingError::CallError(format!(
-                    "failed to get typed func '{}.{}': {}",
-                    iface_name, func_name, e
-                ))
-            })?
-        };
+        let func = self.get_iface_typed_func::<P, R>(&mut store, iface_name, func_name)?;
 
         let result = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
                 .block_on(async { func.call_async(&mut *store, param).await })
         })
-        .map_err(|e| {
+        .map_err(|e: wasmtime::Error| {
             let msg = e.to_string();
             if msg.contains("fuel") {
                 BindingError::CallError(format!(
@@ -749,6 +783,25 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
         ssrf_config: SsrfConfig,
         sandbox_config: super::sandbox::SandboxConfig,
     ) -> Result<Self, RuntimeError> {
+        Self::with_permissions_config(
+            loader,
+            credential_store,
+            rate_limiters,
+            ssrf_config,
+            sandbox_config,
+            PermissionConfig::default(),
+        )
+    }
+
+    /// Create a new plugin runtime with all configuration including fine-grained permissions
+    pub fn with_permissions_config(
+        loader: Arc<PluginLoader>,
+        credential_store: Arc<CredentialStore<B>>,
+        rate_limiters: Arc<RateLimiterRegistry>,
+        ssrf_config: SsrfConfig,
+        sandbox_config: super::sandbox::SandboxConfig,
+        permission_config: PermissionConfig,
+    ) -> Result<Self, RuntimeError> {
         // Configure wasmtime engine
         let mut config = Config::new();
         config.wasm_component_model(true);
@@ -766,6 +819,7 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
             rate_limiters,
             ssrf_config,
             sandbox_config,
+            permission_config,
             instances: RwLock::new(HashMap::new()),
             registry: Arc::new(PluginRegistry::new()),
         })
@@ -828,12 +882,41 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
             }
         }
 
-        // Create host context for this plugin
-        let host_ctx = Arc::new(PluginHostContext::with_ssrf_config(
+        // Validate fine-grained permissions at load time
+        let permission_errors = validate_declared_permissions(
+            plugin_id,
+            &loaded.manifest.permissions,
+            &self.permission_config,
+        );
+        if !permission_errors.is_empty() {
+            let error_msgs: Vec<String> = permission_errors.iter().map(|e| e.to_string()).collect();
+            tracing::warn!(
+                plugin_id = %plugin_id,
+                errors = ?error_msgs,
+                "plugin declared permissions failed validation"
+            );
+            return Err(RuntimeError::CapabilityDenied {
+                plugin_id: plugin_id.to_string(),
+                capabilities: error_msgs,
+            });
+        }
+
+        // Compute effective permissions for this plugin
+        let effective_permissions = compute_effective_permissions(
+            plugin_id,
+            &loaded.manifest.permissions,
+            &self.permission_config,
+        );
+        let permission_enforcer =
+            PermissionEnforcer::new(effective_permissions, self.permission_config.enabled);
+
+        // Create host context for this plugin with permission enforcement
+        let host_ctx = Arc::new(PluginHostContext::with_permissions(
             plugin_id.to_string(),
             self.credential_store.clone(),
             self.rate_limiters.clone(),
             self.ssrf_config.clone(),
+            permission_enforcer,
         ));
 
         // Create the host state
@@ -878,6 +961,7 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
             manifest: loaded.manifest.clone(),
             store: RwLock::new(store),
             instance,
+            component,
         });
 
         // Store the instance
