@@ -174,3 +174,39 @@ async fn test_multiple_servers_parallel() {
     handle_a.shutdown().await;
     handle_b.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------
+// 8. Health liveness probe returns 200
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_health_live_endpoint_responds() {
+    let handle = start_test_server().await;
+    let url = format!("{}/health/live", handle.base_url());
+
+    let resp = reqwest::get(&url).await.expect("GET /health/live failed");
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "ok");
+
+    handle.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// 9. Health readiness probe returns 200 (no LLM configured = still ready)
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_health_ready_endpoint_responds() {
+    let handle = start_test_server().await;
+    let url = format!("{}/health/ready", handle.base_url());
+
+    let resp = reqwest::get(&url).await.expect("GET /health/ready failed");
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "ready");
+
+    handle.shutdown().await;
+}
