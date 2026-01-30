@@ -89,6 +89,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   metering.
 - **Provider hot-swap:** automatic LLM provider rebuild on API key rotation
   without restart.
+- **wasmtime 29:** upgraded from 18, resolving 3 RustSec advisories. Fuel
+  metering, component model export index API.
+- **Fine-grained plugin permissions:** URL pattern matching, credential key
+  scopes, per-plugin overrides with load-time validation and runtime enforcement.
+- **mTLS gateway clustering:** cluster CA generation (rcgen), node certificate
+  issuance/revocation, rustls mutual TLS for gateway-to-gateway connections.
+- **TLS CLI:** `tls init-ca`, `tls issue-cert`, `tls revoke-cert`, `tls show-ca`
+  subcommands.
+- **Agent execution sandboxing:** macOS Seatbelt (sandbox-exec SBPL profiles),
+  Linux Landlock (raw syscalls), resource limits (CPU, memory, file descriptors)
+  per tool subprocess.
+- **Output content security:** HTML/Markdown sanitizer stripping XSS vectors,
+  dangerous tags, and non-image data URIs from agent output.
+- **TTS audio pipeline:** OpenAI TTS API with format selection (mp3, opus, aac,
+  flac) and base64 encoding.
+- **Self-update installer:** platform-specific binary download with SHA-256
+  checksum verification and atomic replacement.
 
 ### Security
 
@@ -112,6 +129,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - File locking and atomic writes with fsync for session storage.
 - Auth profile token encryption at rest via platform keychain.
 - cargo-deny, gitleaks, trivy, hadolint, and cargo-geiger in CI.
+- OS-level sandboxing for agent tool subprocesses (Seatbelt, Landlock, rlimits).
+- Output HTML/Markdown sanitization (XSS, dangerous tags, data URI filtering).
+- mTLS with cluster CA for gateway-to-gateway authentication.
+- Fine-grained WASM plugin permission enforcement (URL, credential, media scopes).
+- wasmtime 29 (resolves RUSTSEC-2024-0006, -0007, -0384).
 
 [Unreleased]: https://github.com/your-org/carapace/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/your-org/carapace/releases/tag/v0.1.0

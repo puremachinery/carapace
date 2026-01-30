@@ -1,6 +1,10 @@
-# Rust Gateway Compatibility Checklist
+# Compatibility Checklist (Historical)
 
-This checklist defines parity requirements for the Rust gateway migration. Each item must be verified to ensure drop-in compatibility with existing Moltbot clients.
+> **Status: Migration complete.** Parity has been achieved. Unchecked items
+> below represent intentional divergences or features deferred by design, not
+> missing work. This document is retained as reference.
+
+This checklist defined parity requirements for the Rust gateway migration.
 
 ## 1. Config Compatibility
 

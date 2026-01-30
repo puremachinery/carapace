@@ -1,52 +1,48 @@
 # carapace
 
-> **This project is under active development and is not yet production-ready.**
-> Core functionality works and 1,900+ tests pass, but hardening work remains
-> before this should be used outside of development/testing.
+A security-focused, open-source personal AI assistant. Runs on your machine. Works through Telegram, Discord, Slack, and webhooks. Supports Anthropic, OpenAI, Ollama, Gemini, and Bedrock. Extensible via WASM plugins. Written in Rust.
 
-A secure, stable Rust alternative to moltbot - for when your molt needs a hard shell.
+A hardened alternative to openclaw / moltbot / clawdbot — for when your molt needs a hard shell.
 
-## What Works Today
+## Features
 
 - **Multi-provider LLM engine** — Anthropic, OpenAI, Ollama, Google Gemini, AWS Bedrock with streaming, tool dispatch, and cancellation
-- **25 agent tools** — 10 built-in (web fetch, memory, sessions, math, etc.) + 15 channel-specific (Telegram, Discord, Slack)
-- **WASM plugin runtime** — wasmtime-based with capability enforcement and sandboxing
-- **Security hardening** — encrypted config secrets, SSRF protection with DNS rebinding defense, exfiltration-sensitive tool policy, audit logging, secret masking, backup encryption
-- **Infrastructure** — TLS, mDNS discovery, config hot-reload, Tailscale integration, Prometheus metrics
-- **Full CI pipeline** — clippy, fmt, nextest (cross-platform), cargo-deny, gitleaks, trivy, hadolint, cargo-geiger
+- **Multi-channel messaging** — Telegram, Discord, Slack with platform-specific tools (25 total: 10 built-in + 15 channel-specific)
+- **WASM plugin runtime** — wasmtime 29 with Ed25519 signature verification, capability sandboxing, and fuel-based CPU limits
+- **Security by default** — fail-closed auth, localhost-only binding, encrypted secrets (AES-256-GCM), SSRF/DNS-rebinding defense, prompt guard, OS-level sandboxing (Seatbelt/Landlock), output content security
+- **Infrastructure** — TLS, mTLS for gateway clustering, mDNS discovery, config hot-reload, Tailscale integration, Prometheus metrics, structured audit logging
 
-## What's Still Needed for Production
+## Security
 
-- **Resource safety** — Connection limits, WASM CPU budgets, JSON depth limits (in progress)
-- **Operational tooling** — Deep health checks, config schema validation, per-user rate limiting
-- **Data integrity** — File locking for concurrent access, atomic writes audit
-- **Gateway transport** — Real WebSocket client for remote gateway connections (currently stubbed)
-- **Prompt injection defense** — Multi-layer prompt guard system
+Carapace is hardened against every major vulnerability class reported in the [January 2026 moltbot security disclosures](https://www.theregister.com/2026/01/27/clawdbot_moltbot_security_concerns/):
+
+| Threat | Carapace defense |
+|---|---|
+| Unauthenticated access | Denied by default (fail-closed) |
+| Exposed network ports | Localhost-only binding (127.0.0.1) |
+| Plaintext secret storage | AES-256-GCM at rest, zeroized in memory |
+| Skills supply chain | Ed25519 signatures + WASM capability sandbox |
+| Prompt injection | Prompt guard + exec approval flow + tool policies |
+| No process sandboxing | Seatbelt (macOS) / Landlock (Linux) + rlimits |
+| SSRF / DNS rebinding | Private IP blocking + post-resolution validation |
+
+See [CHANGELOG.md](CHANGELOG.md) for the full security feature list.
 
 ## Requirements
 
-- Rust 1.87+ (2021 edition, MSRV enforced in CI)
-- For WASM plugins: wasmtime 18+
+- Rust 1.93+ (MSRV enforced in CI)
+- wasmtime 29 (included as dependency)
 
 ### Recommended Tools
 
 ```bash
-# Task runner (like make, but better)
-cargo install just
-
-# Faster test runner with better output
-cargo install cargo-nextest
-
-# File watcher for development (optional)
-cargo install cargo-watch
-
-# Code coverage (optional)
-cargo install cargo-tarpaulin
+cargo install just            # Task runner
+cargo install cargo-nextest   # Faster test runner
+cargo install cargo-watch     # File watcher (optional)
+cargo install cargo-tarpaulin # Coverage (optional)
 ```
 
-## Development
-
-This project uses [just](https://github.com/casey/just) as a task runner. Run `just` to see available commands:
+## Quick Start
 
 ```bash
 just          # Show all available recipes
@@ -57,79 +53,45 @@ just check    # Run lint + fmt-check + test
 just watch    # Watch for changes and run tests
 ```
 
-## Building
-
-```bash
-cargo build
-# or
-just build
-```
-
 ## Testing
 
-Using [cargo-nextest](https://nexte.st/) (recommended - faster, better output):
-```bash
-cargo nextest run
-# or
-just test
-```
-
-Using standard cargo test:
-```bash
-cargo test
-# or
-just test-cargo
-```
-
-Run specific tests:
-```bash
-just test-one test_name
-```
-
-With coverage:
-```bash
-just test-coverage
-# or
-cargo tarpaulin --out Html
-```
-
-## Linting
+2,436 lib tests + 10 integration tests. Zero Clippy warnings. Cross-platform CI (Linux, macOS, Windows).
 
 ```bash
-cargo clippy
-cargo fmt --check
-# or
-just lint
-just fmt-check
+cargo nextest run       # or: just test
+cargo test              # or: just test-cargo
+just test-one test_name # Run specific test
+just test-coverage      # With coverage
 ```
+
+## CI Pipeline
+
+Format, Clippy, nextest (cross-platform), MSRV 1.93, cargo-audit, cargo-deny, gitleaks, trivy, hadolint, cargo-geiger.
 
 ## Project Structure
 
 ```
 src/
-├── agent/          # LLM execution engine (Anthropic streaming, tool dispatch, context)
-├── auth/           # Authentication (tokens, passwords, Tailscale whois, loopback)
-├── channels/       # Channel registry
-├── config/         # JSON5 config parsing, $include, env substitution
-├── credentials/    # Credential storage (macOS Keychain, Linux Secret Service, Windows)
-├── cron/           # Cron scheduler, background tick loop, payload execution
+├── agent/          # LLM execution engine, prompt guard, sandbox, output sanitizer
+├── auth/           # Token, password, and Tailscale authentication
+├── channels/       # Channel registry (Telegram, Discord, Slack)
+├── cli/            # CLI subcommands (start, config, backup, tls, etc.)
+├── config/         # JSON5 config with $include, env substitution, hot reload
+├── credentials/    # Platform-native credential storage (Keychain, Secret Service, Windows)
+├── cron/           # Cron scheduler, background tick loop
 ├── devices/        # Device pairing state machine
 ├── exec/           # Exec approval workflow (request, wait, resolve)
+├── gateway/        # Gateway connections with mTLS support
 ├── hooks/          # Webhook mappings
-├── logging/        # Structured logging (ring buffer, JSON/plaintext)
+├── logging/        # Structured logging, ring buffer, secret masking
 ├── media/          # SSRF-protected media fetch/store
 ├── messages/       # Outbound message pipeline and delivery loop
 ├── nodes/          # Node pairing state machine
-├── plugins/        # WASM plugin runtime (wasmtime, capability enforcement)
-├── server/         # HTTP + WebSocket server, handlers, rate limiting
-├── sessions/       # Session storage (JSONL history, compaction, archiving)
+├── plugins/        # WASM plugin runtime, permissions, signature verification
+├── server/         # HTTP + WebSocket server, handlers, rate limiting, CSP
+├── sessions/       # Session storage (JSONL, compaction, HMAC integrity)
+├── tls/            # TLS, mTLS, cluster CA management
 └── usage/          # Token counting, cost calculation, model pricing
-
-docs/
-├── architecture.md # Component diagrams
-├── security.md     # Threat model
-├── protocol/       # Protocol specifications
-└── refactor/       # Migration planning (historical)
 
 tests/
 ├── golden/         # Golden test traces
@@ -138,8 +100,10 @@ tests/
 
 ## Documentation
 
-See [docs/README.md](docs/README.md) for full documentation index.
+- [Architecture](docs/architecture.md) — component diagrams, request flows, agent execution pipeline
+- [Security](docs/security.md) — threat model, trust boundaries, implementation checklist
+- [Full documentation index](docs/README.md)
 
 ## License
 
-MIT - see [LICENSE](LICENSE)
+MIT — see [LICENSE](LICENSE).

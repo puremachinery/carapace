@@ -1,4 +1,8 @@
-# Rust Migration Plan
+# Rust Migration Plan (Historical)
+
+> **Status: Complete.** The migration from Node.js to Rust is finished. This
+> document is retained as historical reference. For current architecture, see
+> [architecture.md](../architecture.md).
 
 ## Goals
 - Eliminate npm supply chain exposure entirely.

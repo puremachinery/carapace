@@ -1,9 +1,7 @@
 # Config File Format
 
-> **Note**: This doc describes the Node gateway config format as the compatibility target. Update to reflect Rust implementation differences once config loading is complete.
-
-This document describes the Moltbot config file format as implemented by the current Node gateway.
-It is the compatibility target for the Rust rewrite.
+This document describes the config file format as implemented by the carapace
+gateway. The format is compatible with the original Node.js moltbot gateway.
 
 ## File Location
 

@@ -1,6 +1,6 @@
 # carapace Architecture
 
-High-level overview of the Rust gateway components and their relationships.
+High-level overview of carapace components and their relationships.
 
 ## Component Diagram
 
@@ -164,6 +164,47 @@ sequenceDiagram
     Note over N: Node stores token for future auth
 ```
 
+## Agent Execution Pipeline
+
+```mermaid
+sequenceDiagram
+    participant In as Inbound Message
+    participant PG as Prompt Guard
+    participant Ctx as Context Builder
+    participant LLM as LLM Provider
+    participant TD as Tool Dispatch
+    participant EA as Exec Approval
+    participant SB as OS Sandbox
+    participant OC as Output Sanitizer
+    participant PII as PII Filter
+    participant Out as Outbound
+
+    In->>PG: Raw message
+    PG->>PG: Pre-flight injection scan
+    PG->>PG: Tag untrusted content
+    PG->>Ctx: Guarded message
+
+    Ctx->>LLM: Session history + system prompt + tools
+
+    loop Tool use loop (max N turns)
+        LLM-->>TD: tool_use request
+        TD->>TD: Check allowlist / deny-list
+        TD->>EA: Requires approval?
+        EA-->>TD: allow-once / allow-always / deny
+        TD->>SB: Execute in sandbox
+        SB->>SB: Seatbelt (macOS) / Landlock (Linux)
+        SB->>SB: rlimits (CPU, memory, fds)
+        SB-->>TD: Tool result
+        TD-->>LLM: Tool result
+    end
+
+    LLM-->>OC: Final response
+    OC->>OC: Strip XSS, dangerous tags, data URIs
+    OC->>PII: Sanitized output
+    PII->>PII: Redact API keys, tokens, PII
+    PII->>Out: Safe output → channel delivery
+```
+
 ## Key Files
 
 | Component | Path | Description |
@@ -190,16 +231,6 @@ sequenceDiagram
 | Media | `src/media/` | Media fetch, store, pipeline |
 | Credentials | `src/credentials/mod.rs` | Encrypted credential storage |
 | Logging | `src/logging/mod.rs` | tracing setup, ring buffer, log tail streaming |
-
-## Not Yet Implemented
-
-These modules are designed but not yet built. See [Critical Path](refactor/critical-path.md) for full designs.
-
-| Component | Planned Path | Description |
-|-----------|-------------|-------------|
-| Agent Executor | `src/agent/` | LLM provider abstraction, streaming, tool orchestration |
-| Message Delivery | `src/messages/delivery.rs` | Background worker that delivers queued messages via channel plugins |
-| Cron Execution | `src/cron/tick.rs`, `src/cron/executor.rs` | Background tick loop, payload dispatch (SystemEvent, AgentTurn) |
 
 ## Design Decisions
 

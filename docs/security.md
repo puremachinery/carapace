@@ -1,6 +1,6 @@
 # Security
 
-Security considerations for the carapace gateway implementation.
+Security architecture and threat model for carapace.
 
 ## Threat Model
 
@@ -33,6 +33,67 @@ Attackers can:
 │                 Execution Layer                  │
 │     Sandboxing, tool policies, elevated mode    │
 └─────────────────────────────────────────────────┘
+```
+
+## Trust Boundary Diagram
+
+```mermaid
+graph TB
+    subgraph "External (Untrusted)"
+        User[User Messages]
+        ExtAPI[External APIs]
+        Skills[WASM Skills]
+    end
+
+    subgraph "Network Boundary"
+        Bind["Bind Mode<br/>(localhost default)"]
+        TLS["TLS / mTLS"]
+        RateLimit["Rate Limiting<br/>(per-IP, per-endpoint)"]
+    end
+
+    subgraph "Authentication Boundary"
+        Auth["Token / Password / Tailscale<br/>(timing-safe, fail-closed)"]
+        DeviceAuth["Device Identity<br/>(Ed25519 + pairing)"]
+    end
+
+    subgraph "Agent Pipeline"
+        PromptGuard["Prompt Guard<br/>(pre-flight injection scan,<br/>untrusted content tagging)"]
+        LLM["LLM Provider<br/>(Anthropic, OpenAI, Ollama,<br/>Gemini, Bedrock)"]
+        ToolDispatch["Tool Dispatch<br/>(allowlist + deny-list policy)"]
+        ExecApproval["Exec Approval<br/>(user consent gate)"]
+        Sandbox["OS Sandbox<br/>(Seatbelt / Landlock / rlimits)"]
+        OutputCSP["Output Sanitizer<br/>(XSS, data URI, tag stripping)"]
+        PIIFilter["PII / Credential Filter<br/>(post-flight redaction)"]
+    end
+
+    subgraph "Data at Rest"
+        Secrets["AES-256-GCM Encrypted Secrets<br/>(PBKDF2, 600K iterations)"]
+        Sessions["HMAC-SHA256 Session Integrity"]
+        Audit["Append-Only Audit Log<br/>(JSONL, 17 event types)"]
+        Keychain["Platform Keychain<br/>(macOS / Linux / Windows)"]
+    end
+
+    subgraph "Plugin Boundary"
+        PluginSig["Ed25519 Signature Verification"]
+        PluginCaps["Capability Sandbox<br/>(deny-by-default: HTTP, creds, media)"]
+        PluginFuel["WASM Fuel Limits<br/>(CPU budget per call)"]
+        PluginPerms["Fine-Grained Permissions<br/>(URL patterns, credential scopes)"]
+    end
+
+    User --> Bind --> TLS --> RateLimit --> Auth
+    Auth --> PromptGuard --> LLM
+    LLM --> ToolDispatch --> ExecApproval --> Sandbox
+    Sandbox --> OutputCSP --> PIIFilter
+    PIIFilter --> User
+
+    LLM --> ExtAPI
+    ToolDispatch --> Audit
+
+    Skills --> PluginSig --> PluginCaps --> PluginFuel
+    PluginCaps --> PluginPerms
+
+    Secrets --> Keychain
+    Sessions --> Audit
 ```
 
 ## Implementation Checklist

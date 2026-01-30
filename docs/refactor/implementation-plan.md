@@ -1,4 +1,8 @@
-# Implementation Plan
+# Implementation Plan (Historical)
+
+> **Status: Complete.** All six phases are finished. This document is retained
+> as historical reference for how the migration was planned and executed. For
+> current architecture, see [architecture.md](../architecture.md).
 
 ## Agent Allocation
 - **Agents 1-6**: Parallel workers, assigned dynamically

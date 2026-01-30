@@ -60,7 +60,7 @@ hooks run the full test suite via `cargo nextest run`.
 
 ## Testing
 
-Carapace has 1,669+ tests. We use several testing strategies:
+Carapace has 2,436+ tests. We use several testing strategies:
 
 - **Unit tests:** Inline `#[cfg(test)]` modules alongside implementation code.
 - **Integration tests:** Module-specific `tests.rs` files within the `src/`

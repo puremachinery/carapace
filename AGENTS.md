@@ -2,7 +2,7 @@
 
 ## Project Context
 
-carapace is a secure, stable Rust alternative to moltbot - for when your molt needs a hard shell.
+carapace is a security-focused, open-source personal AI assistant — a hardened alternative to openclaw / moltbot / clawdbot.
 
 ## Code Review Cadence
 
