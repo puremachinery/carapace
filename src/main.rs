@@ -90,7 +90,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Run the gateway server (the original `main` logic).
 async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Initialize logging
-    let log_config = if std::env::var("MOLTBOT_DEV").is_ok() {
+    let log_config = if std::env::var("MOLTBOT_DEV")
+        .map(|v| !v.is_empty() && v != "0" && v.to_lowercase() != "false")
+        .unwrap_or(false)
+    {
         logging::LogConfig::development()
     } else {
         logging::LogConfig::production()

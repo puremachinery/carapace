@@ -124,17 +124,17 @@ impl SecretStore {
 }
 
 /// Parsed components of an encrypted value.
-pub struct EncryptedParts {
+pub(crate) struct EncryptedParts {
     /// The AES-GCM nonce (96-bit)
-    pub nonce: [u8; NONCE_LEN],
+    pub(crate) nonce: [u8; NONCE_LEN],
     /// The encrypted ciphertext bytes
-    pub ciphertext: Vec<u8>,
+    pub(crate) ciphertext: Vec<u8>,
     /// The PBKDF2 salt
-    pub salt: [u8; SALT_LEN],
+    pub(crate) salt: [u8; SALT_LEN],
 }
 
 /// Parse an `enc:v1:NONCE:CIPHERTEXT:SALT` string into its components.
-pub fn parse_encrypted(encrypted: &str) -> Result<EncryptedParts, SecretError> {
+pub(crate) fn parse_encrypted(encrypted: &str) -> Result<EncryptedParts, SecretError> {
     let rest = encrypted.strip_prefix(ENC_PREFIX).ok_or_else(|| {
         let preview: String = encrypted.chars().take(10).collect();
         SecretError::BadFormat(format!("expected prefix, got '{}'", preview))

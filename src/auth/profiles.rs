@@ -14,13 +14,21 @@ use std::fmt;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
-use uuid::Uuid;
 
 use crate::config::secrets::{is_encrypted, SecretStore};
 
 /// Maximum number of auth profiles that can be stored.
 const MAX_PROFILES: usize = 20;
+
+/// Shared HTTP client for all OAuth2 requests, with a 30-second timeout.
+static OAUTH_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+});
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -39,6 +47,7 @@ pub enum AuthProfileError {
     SerializationError(String),
     InvalidState,
     PkceError(String),
+    DuplicateProfileId(String),
 }
 
 impl fmt::Display for AuthProfileError {
@@ -56,6 +65,7 @@ impl fmt::Display for AuthProfileError {
             Self::SerializationError(msg) => write!(f, "Serialization error: {}", msg),
             Self::InvalidState => write!(f, "Invalid state parameter"),
             Self::PkceError(msg) => write!(f, "PKCE error: {}", msg),
+            Self::DuplicateProfileId(id) => write!(f, "Duplicate profile ID: {}", id),
         }
     }
 }
@@ -298,8 +308,6 @@ pub async fn exchange_code(
     code: &str,
     code_verifier: &str,
 ) -> Result<OAuthTokens, AuthProfileError> {
-    let client = reqwest::Client::new();
-
     let params = [
         ("grant_type", "authorization_code"),
         ("code", code),
@@ -309,7 +317,7 @@ pub async fn exchange_code(
         ("code_verifier", code_verifier),
     ];
 
-    let resp = client
+    let resp = OAUTH_CLIENT
         .post(&provider_config.token_url)
         .header("Accept", "application/json")
         .form(&params)
@@ -342,8 +350,6 @@ pub async fn refresh_token(
     provider_config: &OAuthProviderConfig,
     refresh_tok: &str,
 ) -> Result<OAuthTokens, AuthProfileError> {
-    let client = reqwest::Client::new();
-
     let params = [
         ("grant_type", "refresh_token"),
         ("refresh_token", refresh_tok),
@@ -351,7 +357,7 @@ pub async fn refresh_token(
         ("client_secret", &provider_config.client_secret),
     ];
 
-    let resp = client
+    let resp = OAUTH_CLIENT
         .post(&provider_config.token_url)
         .header("Accept", "application/json")
         .form(&params)
@@ -446,9 +452,7 @@ pub async fn fetch_user_info(
     provider_config: &OAuthProviderConfig,
     access_token: &str,
 ) -> Result<UserInfo, AuthProfileError> {
-    let client = reqwest::Client::new();
-
-    let mut req = client
+    let mut req = OAUTH_CLIENT
         .get(&provider_config.userinfo_url)
         .bearer_auth(access_token);
 
@@ -565,7 +569,7 @@ pub struct ProfileStore {
     secret_store: Option<SecretStore>,
     /// Password bytes kept for `decrypt_rekey` (values on disk may have been
     /// encrypted with a different salt than the current `SecretStore`).
-    encryption_password: Option<Vec<u8>>,
+    encryption_password: Option<zeroize::Zeroizing<Vec<u8>>>,
 }
 
 impl ProfileStore {
@@ -601,7 +605,7 @@ impl ProfileStore {
             profiles: RwLock::new(Vec::new()),
             state_path,
             secret_store: Some(secret_store),
-            encryption_password: Some(password.to_vec()),
+            encryption_password: Some(zeroize::Zeroizing::new(password.to_vec())),
         })
     }
 
@@ -623,7 +627,11 @@ impl ProfileStore {
 
         // Decrypt token fields if we have a SecretStore
         if let Some(ref store) = self.secret_store {
-            let password = self.encryption_password.as_deref().unwrap_or(&[]);
+            let password: &[u8] = self
+                .encryption_password
+                .as_deref()
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
             for profile in profiles.iter_mut() {
                 Self::decrypt_tokens(&mut profile.tokens, store, password);
             }
@@ -745,6 +753,9 @@ impl ProfileStore {
         let mut guard = self.profiles.write();
         if guard.len() >= MAX_PROFILES {
             return Err(AuthProfileError::MaxProfilesExceeded);
+        }
+        if guard.iter().any(|p| p.id == profile.id) {
+            return Err(AuthProfileError::DuplicateProfileId(profile.id));
         }
         guard.push(profile);
         self.save_profiles(&guard)
@@ -1212,12 +1223,15 @@ mod tests {
         let store = ProfileStore::new(dir.path().to_path_buf());
 
         store.add(sample_profile("dup")).unwrap();
-        // Adding another profile with the same ID is allowed (store doesn't enforce unique IDs
-        // at the add level - caller is responsible for generating unique UUIDs).
-        store.add(sample_profile("dup")).unwrap();
+        // Adding another profile with the same ID should be rejected.
+        let result = store.add(sample_profile("dup"));
+        assert!(
+            matches!(result, Err(AuthProfileError::DuplicateProfileId(ref id)) if id == "dup"),
+            "Expected DuplicateProfileId error"
+        );
 
-        // Both exist; list shows two entries
-        assert_eq!(store.list().len(), 2);
+        // Only the first profile exists
+        assert_eq!(store.list().len(), 1);
     }
 
     #[test]

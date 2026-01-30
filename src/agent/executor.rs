@@ -1641,4 +1641,69 @@ mod tests {
             tool_msg.content
         );
     }
+
+    // ============== sanitize_provider_error Additional Coverage ==============
+
+    #[test]
+    fn test_sanitize_provider_error_strips_api_key() {
+        let msg = "Error: invalid key sk-ant-api03-abcdefghij1234567890";
+        let result = sanitize_provider_error(msg);
+        assert!(!result.contains("sk-ant-api03"));
+        assert!(result.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn test_sanitize_provider_error_strips_x_api_key_header() {
+        let msg = "Request failed: x-api-key: sk-ant-abcdefghij1234567890";
+        let result = sanitize_provider_error(msg);
+        assert!(!result.contains("sk-ant-"));
+        assert!(result.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn test_sanitize_provider_error_strips_authorization_header() {
+        let msg = "HTTP error: Authorization: Bearer tok_abcdefghij1234567890";
+        let result = sanitize_provider_error(msg);
+        assert!(!result.contains("tok_abcdefghij"));
+        assert!(result.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn test_sanitize_provider_error_truncates_long_messages() {
+        let long_msg = "x".repeat(1000);
+        let result = sanitize_provider_error(&long_msg);
+        assert!(result.len() < 600); // 500 + "... (truncated)"
+        assert!(result.ends_with("... (truncated)"));
+    }
+
+    #[test]
+    fn test_sanitize_provider_error_utf8_boundary() {
+        // Each emoji is 4 bytes. 126 emojis = 504 bytes > 500
+        let msg = "\u{1f525}".repeat(126);
+        let result = sanitize_provider_error(&msg);
+        // Should not panic and should truncate safely
+        assert!(result.ends_with("... (truncated)"));
+        // Verify no partial UTF-8
+        assert!(result.is_char_boundary(result.len() - "... (truncated)".len()));
+    }
+
+    #[test]
+    fn test_sanitize_provider_error_short_message_unchanged() {
+        let msg = "Connection refused";
+        let result = sanitize_provider_error(msg);
+        assert_eq!(result, "Connection refused");
+    }
+
+    #[test]
+    fn test_sanitize_provider_error_empty_string() {
+        let result = sanitize_provider_error("");
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_sanitize_provider_error_exactly_500_bytes() {
+        let msg = "a".repeat(500);
+        let result = sanitize_provider_error(&msg);
+        assert_eq!(result, msg); // Should NOT be truncated at exactly 500
+    }
 }

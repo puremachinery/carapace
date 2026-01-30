@@ -269,6 +269,15 @@ pub struct WsServerConfig {
     /// Optional session retention in days. Sessions not updated within this
     /// period are automatically deleted. `None` means unlimited retention.
     pub session_retention_days: Option<u32>,
+    /// Maximum total concurrent WebSocket connections.
+    /// `None` means use the default (1024).
+    pub max_ws_connections: Option<usize>,
+    /// Maximum concurrent WebSocket connections from a single IP.
+    /// `None` means use the default (32).
+    pub max_ws_per_ip: Option<usize>,
+    /// Maximum JSON nesting depth for incoming WS messages.
+    /// `None` means use the default (32).
+    pub max_json_depth: Option<usize>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -462,6 +471,12 @@ impl std::fmt::Debug for WsServerState {
 
 impl WsServerState {
     pub fn new(config: WsServerConfig) -> Self {
+        let connection_tracker = limits::ConnectionTracker::with_limits(
+            config
+                .max_ws_connections
+                .unwrap_or(limits::DEFAULT_MAX_CONNECTIONS),
+            config.max_ws_per_ip.unwrap_or(limits::DEFAULT_MAX_PER_IP),
+        );
         Self {
             config,
             start_time: Instant::now(),
@@ -490,7 +505,7 @@ impl WsServerState {
             llm_provider: None,
             tools_registry: None,
             plugin_registry: None,
-            connection_tracker: limits::ConnectionTracker::new(),
+            connection_tracker,
         }
     }
 
@@ -500,6 +515,12 @@ impl WsServerState {
     ) -> Result<Self, WsConfigError> {
         let node_pairing = nodes::create_registry(state_dir.clone())?;
         let device_registry = devices::create_registry(state_dir.clone())?;
+        let connection_tracker = limits::ConnectionTracker::with_limits(
+            config
+                .max_ws_connections
+                .unwrap_or(limits::DEFAULT_MAX_CONNECTIONS),
+            config.max_ws_per_ip.unwrap_or(limits::DEFAULT_MAX_PER_IP),
+        );
         Ok(Self {
             config,
             start_time: Instant::now(),
@@ -528,7 +549,7 @@ impl WsServerState {
             llm_provider: None,
             tools_registry: None,
             plugin_registry: None,
-            connection_tracker: limits::ConnectionTracker::new(),
+            connection_tracker,
         })
     }
 
@@ -973,6 +994,22 @@ pub async fn build_ws_config_from_files() -> Result<WsServerConfig, WsConfigErro
         .and_then(|v| v.as_u64())
         .map(|d| d as u32);
 
+    let ws_obj = gateway
+        .and_then(|g| g.get("ws"))
+        .and_then(|v| v.as_object());
+    let max_ws_connections = ws_obj
+        .and_then(|w| w.get("maxConnections"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
+    let max_ws_per_ip = ws_obj
+        .and_then(|w| w.get("maxPerIp"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
+    let max_json_depth = ws_obj
+        .and_then(|w| w.get("maxJsonDepth"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
+
     Ok(WsServerConfig {
         auth: WsAuthConfig {
             resolved: auth::ResolvedGatewayAuth {
@@ -989,6 +1026,9 @@ pub async fn build_ws_config_from_files() -> Result<WsServerConfig, WsConfigErro
         node_allow_commands,
         node_deny_commands,
         session_retention_days,
+        max_ws_connections,
+        max_ws_per_ip,
+        max_json_depth,
     })
 }
 
@@ -1399,7 +1439,8 @@ async fn handle_socket(
         }
     };
 
-    if let Err(depth_err) = validate_json_depth(&parsed, MAX_JSON_DEPTH) {
+    let json_depth_limit = state.config.max_json_depth.unwrap_or(MAX_JSON_DEPTH);
+    if let Err(depth_err) = validate_json_depth(&parsed, json_depth_limit) {
         let _ = send_close(&tx, 1008, &depth_err);
         return;
     }
@@ -1740,7 +1781,7 @@ async fn handle_socket(
                 break;
             }
         };
-        if let Err(depth_err) = validate_json_depth(&parsed, MAX_JSON_DEPTH) {
+        if let Err(depth_err) = validate_json_depth(&parsed, json_depth_limit) {
             let _ = send_close(&tx, 1008, &depth_err);
             break;
         }
@@ -1760,7 +1801,7 @@ async fn handle_socket(
             }
         };
         if let Some(ref p) = params {
-            if let Err(depth_err) = validate_json_depth(p, MAX_JSON_DEPTH) {
+            if let Err(depth_err) = validate_json_depth(p, json_depth_limit) {
                 let err = error_shape(ERROR_INVALID_REQUEST, &depth_err, None);
                 let _ = send_response(&tx, &req_id, false, None, Some(err));
                 continue;

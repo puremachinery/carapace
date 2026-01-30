@@ -3033,4 +3033,142 @@ mod tests {
         assert!(result.is_err());
         assert!(matches!(result, Err(SessionStoreError::InvalidUserId(_))));
     }
+
+    #[test]
+    fn test_export_user_data_returns_sessions() {
+        let (store, _temp) = create_test_store();
+
+        // Create sessions for the user
+        let _s1 = store
+            .create_session(
+                "agent-1",
+                SessionMetadata {
+                    user_id: Some("user123".into()),
+                    channel: Some("channel1".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let _s2 = store
+            .create_session(
+                "agent-1",
+                SessionMetadata {
+                    user_id: Some("user123".into()),
+                    channel: Some("channel2".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        // Create session for different user
+        let _s3 = store
+            .create_session(
+                "agent-1",
+                SessionMetadata {
+                    user_id: Some("other_user".into()),
+                    channel: Some("channel1".into()),
+                    chat_id: Some("other".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let export = store.export_user_data("user123").unwrap();
+        assert_eq!(export["session_count"], 2);
+        assert_eq!(export["user_id"], "user123");
+        assert!(export["exported_at"].is_string());
+        assert!(export["warnings"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_export_user_data_empty_user() {
+        let (store, _temp) = create_test_store();
+
+        let result = store.export_user_data("");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_export_user_data_whitespace_user() {
+        let (store, _temp) = create_test_store();
+
+        let result = store.export_user_data("   ");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_export_user_data_no_sessions() {
+        let (store, _temp) = create_test_store();
+
+        let export = store.export_user_data("nonexistent").unwrap();
+        assert_eq!(export["session_count"], 0);
+        assert!(export["sessions"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_purge_user_data_deletes_sessions() {
+        let (store, _temp) = create_test_store();
+
+        let _s1 = store
+            .create_session(
+                "agent-1",
+                SessionMetadata {
+                    user_id: Some("user123".into()),
+                    channel: Some("channel1".into()),
+                    chat_id: Some("purge-c1".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let _s2 = store
+            .create_session(
+                "agent-1",
+                SessionMetadata {
+                    user_id: Some("user123".into()),
+                    channel: Some("channel2".into()),
+                    chat_id: Some("purge-c2".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let _s3 = store
+            .create_session(
+                "agent-1",
+                SessionMetadata {
+                    user_id: Some("other_user".into()),
+                    channel: Some("channel1".into()),
+                    chat_id: Some("purge-other".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let (deleted, total) = store.purge_user_data("user123").unwrap();
+        assert_eq!(deleted, 2);
+        assert_eq!(total, 2);
+
+        // Verify user123's sessions are gone
+        let export = store.export_user_data("user123").unwrap();
+        assert_eq!(export["session_count"], 0);
+
+        // Verify other_user's sessions remain
+        let export = store.export_user_data("other_user").unwrap();
+        assert_eq!(export["session_count"], 1);
+    }
+
+    #[test]
+    fn test_purge_user_data_empty_user() {
+        let (store, _temp) = create_test_store();
+
+        let result = store.purge_user_data("");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_purge_user_data_no_sessions() {
+        let (store, _temp) = create_test_store();
+
+        let (deleted, total) = store.purge_user_data("nonexistent").unwrap();
+        assert_eq!(deleted, 0);
+        assert_eq!(total, 0);
+    }
 }

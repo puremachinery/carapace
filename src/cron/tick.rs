@@ -30,6 +30,9 @@ pub async fn cron_tick_loop(
             break;
         }
 
+        // Prune expired exec-approval requests each tick to avoid unbounded memory growth.
+        state.exec_manager().cleanup_expired();
+
         let due_ids = state.cron_scheduler.get_due_job_ids();
 
         for job_id in due_ids {

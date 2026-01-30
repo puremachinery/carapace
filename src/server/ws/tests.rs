@@ -2568,3 +2568,36 @@ fn test_empty_value_passes() {
     assert!(validate_json_depth(&json!(3.15), MAX_JSON_DEPTH).is_ok());
     assert!(validate_json_depth(&json!(""), MAX_JSON_DEPTH).is_ok());
 }
+
+#[test]
+fn test_validate_json_depth_at_small_limit() {
+    // Test with a smaller limit.
+    // Depth model: root value starts at depth 1.
+    // {"a": {"b": 1}} has leaf at depth 3, so it needs max_depth >= 3.
+    assert!(validate_json_depth(&json!({"a": {"b": 1}}), 3).is_ok());
+    // {"a": {"b": {"c": 1}}} has leaf at depth 4, so max_depth 3 rejects it.
+    assert!(validate_json_depth(&json!({"a": {"b": {"c": 1}}}), 3).is_err());
+}
+
+#[test]
+fn test_validate_json_depth_zero_rejects_nested() {
+    // Depth 0 rejects everything because even a scalar starts at depth 1.
+    assert!(validate_json_depth(&json!("hello"), 0).is_err());
+    assert!(validate_json_depth(&json!(42), 0).is_err());
+    // Nested structures are also rejected.
+    assert!(validate_json_depth(&json!({"a": 1}), 0).is_err());
+    assert!(validate_json_depth(&json!([1]), 0).is_err());
+}
+
+#[test]
+fn test_validate_json_depth_limit_1() {
+    // Depth 1 allows only scalar values (root at depth 1, no children).
+    assert!(validate_json_depth(&json!("hello"), 1).is_ok());
+    assert!(validate_json_depth(&json!(42), 1).is_ok());
+    // Objects and arrays have children at depth 2, which exceeds limit 1.
+    assert!(validate_json_depth(&json!({"a": 1}), 1).is_err());
+    assert!(validate_json_depth(&json!([1, 2, 3]), 1).is_err());
+    // Nested structures are also rejected.
+    assert!(validate_json_depth(&json!({"a": {"b": 1}}), 1).is_err());
+    assert!(validate_json_depth(&json!([[1]]), 1).is_err());
+}
