@@ -10,6 +10,7 @@ pub mod http;
 pub mod metrics;
 pub mod openai;
 pub mod ratelimit;
+pub mod startup;
 pub mod ws;
 
 // Re-export key types

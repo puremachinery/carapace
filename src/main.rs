@@ -351,162 +351,10 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     };
     info!("Console channel registered");
 
-    // 7. Build HTTP config and router
+    // 7. Build HTTP config
     let http_config = server::http::build_http_config(&cfg);
-    let http_router = server::http::create_router_with_state(
-        http_config,
-        server::http::MiddlewareConfig::default(),
-        Arc::new(hooks::registry::HookRegistry::new()),
-        Arc::new(plugins::tools::ToolsRegistry::new()),
-        ws_state.channel_registry().clone(),
-        Some(ws_state.clone()),
-    );
 
-    // 8. Merge HTTP + WS into a single router
-    let ws_router = Router::new()
-        .route("/ws", get(server::ws::ws_handler))
-        .with_state(ws_state.clone());
-
-    let app = http_router.merge(ws_router);
-
-    // 9. Create shutdown channel
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-
-    // 10. Spawn background tasks
-
-    // Delivery loop (if plugin registry is available)
-    if let Some(plugin_reg) = ws_state.plugin_registry().cloned() {
-        let pipeline = ws_state.message_pipeline().clone();
-        let channels = ws_state.channel_registry().clone();
-        let state = ws_state.clone();
-        let rx = shutdown_rx.clone();
-        tokio::spawn(messages::delivery::delivery_loop(
-            pipeline, plugin_reg, channels, state, rx,
-        ));
-    }
-
-    // Cron tick loop
-    tokio::spawn(cron::tick::cron_tick_loop(
-        ws_state.clone(),
-        Duration::from_secs(10),
-        shutdown_rx.clone(),
-    ));
-
-    // Config file watcher (hot/hybrid reload)
-    let config_watcher = config::watcher::ConfigWatcher::from_config(&cfg);
-    {
-        let config_path = config::get_config_path();
-        info!("Config reload mode: {:?}", config_watcher.mode());
-        config_watcher.start(config_path, shutdown_rx.clone());
-    }
-
-    // Bridge config watcher events to WS broadcasts
-    {
-        let mut config_rx = config_watcher.subscribe();
-        let ws_state_for_config = ws_state.clone();
-        let mut config_shutdown_rx = shutdown_rx.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    event = config_rx.recv() => {
-                        match event {
-                            Ok(config::watcher::ConfigEvent::Reloaded(result)) => {
-                                server::ws::broadcast_config_changed(
-                                    &ws_state_for_config,
-                                    &result.mode,
-                                );
-                            }
-                            Ok(config::watcher::ConfigEvent::ReloadFailed(_)) => {
-                                // Failed reloads are already logged by the watcher;
-                                // no broadcast needed (previous config stays active).
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                warn!("Config event receiver lagged by {} events", n);
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                                break;
-                            }
-                        }
-                    }
-                    _ = config_shutdown_rx.changed() => {
-                        if *config_shutdown_rx.borrow() {
-                            break;
-                        }
-                    }
-                }
-            }
-        });
-    }
-
-    // SIGHUP handler for manual config reload (Unix only)
-    #[cfg(unix)]
-    {
-        let ws_state_for_sighup = ws_state.clone();
-        let config_event_tx = config_watcher.event_sender();
-        let mut sighup_shutdown_rx = shutdown_rx.clone();
-        tokio::spawn(async move {
-            use tokio::signal::unix::{signal, SignalKind};
-            let mut sighup = match signal(SignalKind::hangup()) {
-                Ok(s) => s,
-                Err(e) => {
-                    error!("Failed to install SIGHUP handler: {}", e);
-                    return;
-                }
-            };
-            loop {
-                tokio::select! {
-                    _ = sighup.recv() => {
-                        info!("SIGHUP received, triggering config reload");
-                        // Determine reload mode from current config
-                        let current_cfg = config::load_config()
-                            .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
-                        let mode_str = current_cfg
-                            .get("gateway")
-                            .and_then(|g| g.get("reload"))
-                            .and_then(|r| r.get("mode"))
-                            .and_then(|m| m.as_str())
-                            .unwrap_or("hot");
-                        let mode = match config::watcher::ReloadMode::parse_mode(mode_str) {
-                            config::watcher::ReloadMode::Off => config::watcher::ReloadMode::Hot,
-                            other => other,
-                        };
-                        let result = config::watcher::perform_reload(&mode);
-                        if result.success {
-                            server::ws::broadcast_config_changed(
-                                &ws_state_for_sighup,
-                                &result.mode,
-                            );
-                            // Also notify any config event subscribers
-                            let _ = config_event_tx.send(
-                                config::watcher::ConfigEvent::Reloaded(result),
-                            );
-                        } else {
-                            let _ = config_event_tx.send(
-                                config::watcher::ConfigEvent::ReloadFailed(result),
-                            );
-                        }
-                    }
-                    _ = sighup_shutdown_rx.changed() => {
-                        if *sighup_shutdown_rx.borrow() {
-                            break;
-                        }
-                    }
-                }
-            }
-        });
-    }
-
-    // Session retention cleanup loop
-    let retention_config = sessions::retention::build_retention_config(&cfg);
-    if retention_config.enabled {
-        tokio::spawn(sessions::retention::retention_cleanup_loop(
-            ws_state.session_store().clone(),
-            retention_config,
-            shutdown_rx.clone(),
-        ));
-    }
-
-    // 11. Parse TLS configuration
+    // 8. Parse TLS configuration
     let tls_config = tls::parse_tls_config(&cfg);
     let tls_setup = if tls_config.enabled {
         match tls::setup_tls(&tls_config) {
@@ -525,37 +373,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // 12. Start mDNS discovery (after we know the port and TLS state)
-    let discovery_config = discovery::build_discovery_config(&cfg);
-    if discovery_config.mode.is_enabled() {
-        let tls_fingerprint = tls_setup.as_ref().map(|t| t.fingerprint.clone());
-        let device_name = discovery::resolve_service_name(&discovery_config);
-        let discovery_props = discovery::ServiceProperties {
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            fingerprint: tls_fingerprint,
-            device_name,
-        };
-        tokio::spawn(discovery::run_mdns_lifecycle(
-            discovery_config.clone(),
-            port,
-            discovery_props,
-            shutdown_rx.clone(),
-        ));
-    }
-
-    // 12b. Start Tailscale serve/funnel (if configured)
-    let tailscale_config = tailscale::build_tailscale_config(&cfg, port);
-    if tailscale_config.mode != tailscale::TailscaleMode::Off {
-        let ts_shutdown_rx = shutdown_rx.clone();
-        tokio::spawn(async move {
-            match tailscale::run_tailscale_lifecycle(tailscale_config, ts_shutdown_rx).await {
-                Ok(()) => info!("Tailscale lifecycle completed"),
-                Err(e) => warn!("Tailscale lifecycle error: {}", e),
-            }
-        });
-    }
-
-    // 13. Startup banner
+    // 9. Startup banner (printed before server starts listening)
     info!("Carapace gateway v{}", env!("CARGO_PKG_VERSION"));
     let protocol = if tls_setup.is_some() { "https" } else { "http" };
     info!(
@@ -574,13 +392,63 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     if cron_count > 0 {
         info!("Cron jobs loaded: {}", cron_count);
     }
+
+    // 10. Start mDNS discovery (need a shutdown_rx for all paths)
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    let discovery_config = discovery::build_discovery_config(&cfg);
     if discovery_config.mode.is_enabled() {
+        let tls_fingerprint = tls_setup.as_ref().map(|t| t.fingerprint.clone());
+        let device_name = discovery::resolve_service_name(&discovery_config);
+        let discovery_props = discovery::ServiceProperties {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            fingerprint: tls_fingerprint,
+            device_name,
+        };
         info!("mDNS discovery: {:?}", discovery_config.mode);
+        tokio::spawn(discovery::run_mdns_lifecycle(
+            discovery_config,
+            port,
+            discovery_props,
+            shutdown_rx.clone(),
+        ));
     }
 
-    // 14. Start server with graceful shutdown
+    // 10b. Start Tailscale serve/funnel (if configured)
+    let tailscale_config = tailscale::build_tailscale_config(&cfg, port);
+    if tailscale_config.mode != tailscale::TailscaleMode::Off {
+        let ts_shutdown_rx = shutdown_rx.clone();
+        tokio::spawn(async move {
+            match tailscale::run_tailscale_lifecycle(tailscale_config, ts_shutdown_rx).await {
+                Ok(()) => info!("Tailscale lifecycle completed"),
+                Err(e) => warn!("Tailscale lifecycle error: {}", e),
+            }
+        });
+    }
+
+    // 11. Start server (TLS vs non-TLS)
     if let Some(tls_result) = tls_setup {
-        // TLS-enabled server using axum-server with rustls
+        // TLS-enabled server using axum-server with rustls.
+        // This path stays inline because axum_server doesn't expose
+        // local_addr before serving, so it can't return a ServerHandle.
+        let http_router = server::http::create_router_with_state(
+            http_config,
+            server::http::MiddlewareConfig::default(),
+            Arc::new(hooks::registry::HookRegistry::new()),
+            Arc::new(plugins::tools::ToolsRegistry::new()),
+            ws_state.channel_registry().clone(),
+            Some(ws_state.clone()),
+        );
+
+        let ws_router = Router::new()
+            .route("/ws", get(server::ws::ws_handler))
+            .with_state(ws_state.clone());
+
+        let app = http_router.merge(ws_router);
+
+        // Spawn background tasks
+        server::startup::spawn_background_tasks(&ws_state, &cfg, &shutdown_rx);
+
         let rustls_config =
             axum_server::tls_rustls::RustlsConfig::from_config(tls_result.server_config);
         let addr = resolved.address;
@@ -588,8 +456,6 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         let handle = axum_server::Handle::new();
         let shutdown_handle = handle.clone();
 
-        // Spawn a task that awaits the shutdown signal, performs cleanup,
-        // then tells axum_server to gracefully shut down via its Handle API.
         tokio::spawn(async move {
             shutdown_signal(shutdown_tx, ws_state.clone()).await;
             shutdown_handle.graceful_shutdown(Some(Duration::from_secs(30)));
@@ -600,15 +466,27 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await?;
     } else {
-        // Plain TCP server (no TLS)
-        let listener = tokio::net::TcpListener::bind(resolved.address).await?;
+        // Non-TLS path: delegate to run_server_with_config for testability.
+        let server_config = server::startup::ServerConfig {
+            ws_state: ws_state.clone(),
+            http_config,
+            middleware_config: server::http::MiddlewareConfig::default(),
+            hook_registry: Arc::new(hooks::registry::HookRegistry::new()),
+            tools_registry: Arc::new(plugins::tools::ToolsRegistry::new()),
+            bind_address: resolved.address,
+            raw_config: cfg,
+            spawn_background_tasks: true,
+        };
 
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(shutdown_signal(shutdown_tx, ws_state.clone()))
-        .await?;
+        let handle = server::startup::run_server_with_config(server_config).await?;
+
+        // Wait for OS shutdown signal, then trigger graceful shutdown
+        let reason = await_shutdown_trigger().await;
+        info!("Shutdown signal received ({})", reason);
+
+        // Notify background tasks via the handle's internal channel
+        // (the handle's shutdown method sends the watch signal)
+        handle.shutdown().await;
     }
 
     info!("Gateway shut down");

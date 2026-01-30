@@ -610,12 +610,12 @@ impl WsServerState {
     }
 
     /// Get the outbound message pipeline.
-    pub(crate) fn message_pipeline(&self) -> &Arc<messages::outbound::MessagePipeline> {
+    pub fn message_pipeline(&self) -> &Arc<messages::outbound::MessagePipeline> {
         &self.message_pipeline
     }
 
     /// Get the channel registry.
-    pub(crate) fn channel_registry(&self) -> &Arc<channels::ChannelRegistry> {
+    pub fn channel_registry(&self) -> &Arc<channels::ChannelRegistry> {
         &self.channel_registry
     }
 
