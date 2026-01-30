@@ -64,6 +64,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   concurrency control.
 - **CI/CD:** Format, lint, build, and test pipelines (cross-platform) with
   security audit and release workflow.
+- **Prompt guard:** pre-flight system prompt analysis, untrusted content tagging,
+  post-flight PII/credential filtering, config lint.
+- **Skill signatures:** Ed25519 verification with trusted publisher lists.
+- **Capability sandbox:** WASM import-based capability enumeration and policy
+  enforcement.
+- **Session integrity:** HMAC-SHA256 sidecar verification with auto-migration.
+- **Health endpoints:** `/health/live`, `/health/ready`.
+- **Prometheus metrics endpoint:** `/metrics`.
+- **Resource monitoring:** disk, memory, file descriptor threshold warnings.
 
 ### Security
 
@@ -72,6 +81,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - PKCE for all OAuth2 flows.
 - Platform-native credential storage.
 - Input sanitization and validation throughout.
+- Ed25519 skill signature verification.
+- WASM capability sandbox enforcement (deny-by-default for HTTP, credentials,
+  media).
+- Session file tamper detection via HMAC-SHA256 sidecars.
+- Prompt injection detection in system prompts.
+- Output PII and credential redaction.
 
 [Unreleased]: https://github.com/your-org/carapace/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/your-org/carapace/releases/tag/v0.1.0
