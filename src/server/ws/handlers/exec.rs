@@ -150,7 +150,7 @@ fn write_exec_approvals_file(path: &PathBuf, file_value: &Value) -> Result<Strin
 pub(super) fn handle_exec_approvals_get() -> Result<Value, ErrorShape> {
     let snapshot = read_exec_approvals_snapshot();
     Ok(json!({
-        "path": if snapshot.exists { json!(snapshot.path) } else { Value::Null },
+        "path": snapshot.path,
         "exists": snapshot.exists,
         "hash": snapshot.hash,
         "file": snapshot.file

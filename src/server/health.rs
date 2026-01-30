@@ -127,6 +127,7 @@ pub fn disk_free_bytes(path: &Path) -> Option<u64> {
     unsafe {
         let mut stat: libc::statvfs = std::mem::zeroed();
         if libc::statvfs(c_path.as_ptr(), &mut stat) == 0 {
+            #[allow(clippy::unnecessary_cast)]
             Some(stat.f_bavail as u64 * stat.f_frsize as u64)
         } else {
             None

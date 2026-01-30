@@ -2,7 +2,7 @@
 name = "carapace"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.87"
+rust-version = "1.93"
 description = "A secure, stable Rust alternative to moltbot"
 license = "MIT"
 
