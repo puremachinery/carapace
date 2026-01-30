@@ -25,6 +25,7 @@ use thiserror::Error;
 use wasmtime::{Config, Engine, Module};
 
 /// Plugin loading errors
+#[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum LoaderError {
     #[error("Failed to read plugins directory: {0}")]
@@ -533,20 +534,15 @@ fn compute_sha256_hex(data: &[u8]) -> String {
 }
 
 /// Verify that a skill's WASM bytes match the expected SHA-256 hash stored in the
-/// skills manifest in the given directory.
+/// skills manifest.
 ///
 /// If no manifest entry or no `sha256` field exists for the skill (legacy entry),
 /// verification is skipped with a warning log and `Ok(())` is returned.
 pub fn verify_skill_hash_on_load(
     skill_name: &str,
     wasm_bytes: &[u8],
-    skills_dir: &Path,
+    manifest: &serde_json::Value,
 ) -> Result<(), LoaderError> {
-    let manifest = match load_skills_manifest(skill_name, skills_dir) {
-        Some(m) => m,
-        None => return Ok(()),
-    };
-
     let expected_hash = manifest
         .get(skill_name)
         .and_then(|entry| entry.get("sha256"))
@@ -586,18 +582,12 @@ pub fn verify_skill_hash_on_load(
 }
 
 /// Load the skills manifest from the given directory.
-/// Returns `None` if the manifest file does not exist (with a warning log).
-fn load_skills_manifest(skill_name: &str, skills_dir: &Path) -> Option<serde_json::Value> {
+/// Returns `None` if the manifest file does not exist.
+pub fn load_skills_manifest(skills_dir: &Path) -> Option<serde_json::Value> {
     let manifest_path = skills_dir.join(SKILLS_MANIFEST_FILE);
     match fs::read_to_string(&manifest_path) {
         Ok(contents) => Some(serde_json::from_str(&contents).unwrap_or_default()),
-        Err(_) => {
-            tracing::warn!(
-                skill = %skill_name,
-                "no skills manifest found, skipping hash verification"
-            );
-            None
-        }
+        Err(_) => None,
     }
 }
 
@@ -693,28 +683,35 @@ impl PluginLoader {
         Ok(loaded_ids)
     }
 
-    /// Load a single plugin from a WASM file
-    pub fn load_plugin(&self, wasm_path: &Path) -> Result<String, LoaderError> {
+    /// Core loading logic: reads, verifies, and compiles a WASM plugin
+    /// without inserting it into the plugin map.
+    fn load_plugin_inner(
+        &self,
+        wasm_path: &Path,
+    ) -> Result<(String, Arc<LoadedPlugin>), LoaderError> {
         // Read the WASM file
         let wasm_bytes = fs::read(wasm_path).map_err(|e| LoaderError::WasmReadError {
             path: wasm_path.display().to_string(),
             message: e.to_string(),
         })?;
 
+        // Read manifest once
+        let manifest_json = wasm_path.parent().and_then(load_skills_manifest);
+
         // Verify SHA-256 hash against the skills manifest (if present)
-        if let Some(parent_dir) = wasm_path.parent() {
+        if let Some(ref manifest) = manifest_json {
             if let Some(stem) = wasm_path.file_stem().and_then(|s| s.to_str()) {
-                verify_skill_hash_on_load(stem, &wasm_bytes, parent_dir)?;
+                verify_skill_hash_on_load(stem, &wasm_bytes, manifest)?;
             }
         }
 
         // Verify Ed25519 signature against the skills manifest (if present)
-        if let Some(parent_dir) = wasm_path.parent() {
+        if let Some(ref manifest) = manifest_json {
             if let Some(stem) = wasm_path.file_stem().and_then(|s| s.to_str()) {
                 super::signature::verify_skill_signature(
                     stem,
                     &wasm_bytes,
-                    parent_dir,
+                    manifest,
                     &self.signature_config,
                 )?;
             }
@@ -727,21 +724,34 @@ impl PluginLoader {
                 message: e.to_string(),
             })?;
 
-        // Enumerate WASM capabilities for sandbox checking
         let discovered_capabilities = Some(super::sandbox::enumerate_capabilities(&module));
 
-        // For now, we extract the plugin ID from the filename
-        // In a full implementation, we would instantiate the module and call get_manifest()
         let plugin_id = wasm_path
             .file_stem()
             .and_then(|s| s.to_str())
             .ok_or_else(|| LoaderError::InvalidPluginId(wasm_path.display().to_string()))?
             .to_string();
 
-        // Validate plugin ID format
         if !Self::is_valid_plugin_id(&plugin_id) {
             return Err(LoaderError::InvalidPluginId(plugin_id));
         }
+
+        let plugin_manifest = derive_manifest(&plugin_id, wasm_path, &wasm_bytes, &module);
+
+        let loaded = Arc::new(LoadedPlugin {
+            manifest: plugin_manifest,
+            wasm_path: wasm_path.to_path_buf(),
+            module,
+            wasm_bytes,
+            discovered_capabilities,
+        });
+
+        Ok((plugin_id, loaded))
+    }
+
+    /// Load a single plugin from a WASM file
+    pub fn load_plugin(&self, wasm_path: &Path) -> Result<String, LoaderError> {
+        let (plugin_id, loaded) = self.load_plugin_inner(wasm_path)?;
 
         // Check for duplicates
         {
@@ -751,22 +761,10 @@ impl PluginLoader {
             }
         }
 
-        // Derive manifest metadata from the WASM module
-        let manifest = derive_manifest(&plugin_id, wasm_path, &wasm_bytes, &module);
-
-        // Create loaded plugin
-        let loaded = LoadedPlugin {
-            manifest,
-            wasm_path: wasm_path.to_path_buf(),
-            module,
-            wasm_bytes,
-            discovered_capabilities,
-        };
-
         // Store the plugin
         {
             let mut plugins = self.plugins.write();
-            plugins.insert(plugin_id.clone(), Arc::new(loaded));
+            plugins.insert(plugin_id.clone(), loaded);
         }
 
         Ok(plugin_id)
@@ -850,7 +848,10 @@ impl PluginLoader {
         Ok(())
     }
 
-    /// Reload a plugin from its WASM file
+    /// Reload a plugin from its WASM file.
+    ///
+    /// The new module is compiled and verified *before* replacing the old one,
+    /// so the plugin stays available if the reload fails.
     pub fn reload_plugin(&self, plugin_id: &str) -> Result<(), LoaderError> {
         let wasm_path = {
             let plugins = self.plugins.read();
@@ -867,9 +868,10 @@ impl PluginLoader {
             )));
         }
 
-        // Unload and reload
-        self.unload_plugin(plugin_id)?;
-        self.load_plugin(&wasm_path)?;
+        // Load new plugin first, then swap atomically
+        let (_, new_plugin) = self.load_plugin_inner(&wasm_path)?;
+        let mut plugins = self.plugins.write();
+        plugins.insert(plugin_id.to_string(), new_plugin);
 
         Ok(())
     }

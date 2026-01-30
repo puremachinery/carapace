@@ -1547,7 +1547,12 @@ impl SessionStore {
                 enabled: true,
                 action: self.integrity_action,
             };
-            match super::integrity::verify_hmac_file(key, &meta_path, &integrity_config) {
+            match super::integrity::verify_hmac_file(
+                key,
+                content.as_bytes(),
+                &meta_path,
+                &integrity_config,
+            ) {
                 Ok(()) => {}
                 Err(super::integrity::IntegrityError::Rejected { file }) => {
                     return Err(SessionStoreError::Io(format!(
@@ -1636,11 +1641,14 @@ impl SessionStore {
 
         let temp_path = meta_path.with_extension("json.tmp");
 
+        // Serialize to bytes so we can reuse for HMAC
+        let serialized = serde_json::to_vec_pretty(session)?;
+
         // Write to temp file first, then sync
         {
             let file = File::create(&temp_path)?;
             let mut writer = BufWriter::new(file);
-            serde_json::to_writer_pretty(&mut writer, session)?;
+            writer.write_all(&serialized)?;
             writer.flush()?;
             writer
                 .into_inner()
@@ -1653,7 +1661,7 @@ impl SessionStore {
 
         // Write HMAC sidecar if integrity is enabled
         if let Some(ref key) = self.hmac_key {
-            if let Err(e) = super::integrity::write_hmac_file(key, &meta_path) {
+            if let Err(e) = super::integrity::write_hmac_file(key, &serialized, &meta_path) {
                 tracing::warn!(
                     session_id = %session.id,
                     error = %e,

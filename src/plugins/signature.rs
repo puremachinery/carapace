@@ -7,7 +7,6 @@
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 
 use super::loader::LoaderError;
 
@@ -97,30 +96,12 @@ fn parse_signature(hex_sig: &str) -> Result<Signature, LoaderError> {
 pub fn verify_skill_signature(
     skill_name: &str,
     wasm_bytes: &[u8],
-    skills_dir: &Path,
+    manifest: &serde_json::Value,
     config: &SignatureConfig,
 ) -> Result<(), LoaderError> {
     if !config.enabled {
         return Ok(());
     }
-
-    let manifest_path = skills_dir.join("skills-manifest.json");
-    let manifest: serde_json::Value = match std::fs::read_to_string(&manifest_path) {
-        Ok(contents) => serde_json::from_str(&contents).unwrap_or_default(),
-        Err(_) => {
-            if config.require_signature {
-                return Err(LoaderError::SignatureVerificationFailed {
-                    skill_name: skill_name.to_string(),
-                    reason: "no skills manifest found and signatures are required".to_string(),
-                });
-            }
-            tracing::warn!(
-                skill = %skill_name,
-                "no skills manifest found, skipping signature verification"
-            );
-            return Ok(());
-        }
-    };
 
     let entry = match manifest.get(skill_name) {
         Some(e) => e,
@@ -187,11 +168,13 @@ pub fn verify_skill_signature(
             reason: format!("signature parse error: {e}"),
         })?;
 
-    // Check trusted publishers
+    // Check trusted publishers (case-insensitive hex comparison)
+    let publisher_lower = publisher_key_hex.to_ascii_lowercase();
     if !config.trusted_publishers.is_empty()
         && !config
             .trusted_publishers
-            .contains(&publisher_key_hex.to_string())
+            .iter()
+            .any(|tp| tp.to_ascii_lowercase() == publisher_lower)
     {
         return Err(LoaderError::SignatureVerificationFailed {
             skill_name: skill_name.to_string(),
@@ -224,6 +207,7 @@ mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use std::fs;
+    use std::path::Path;
     use tempfile::TempDir;
 
     fn generate_keypair() -> (SigningKey, VerifyingKey) {
@@ -315,6 +299,8 @@ mod tests {
         let sig_hex = hex::encode(signature.to_bytes());
 
         write_manifest(dir.path(), "test-skill", &pub_hex, &sig_hex);
+        let manifest_content = fs::read_to_string(dir.path().join("skills-manifest.json")).unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(&manifest_content).unwrap();
 
         let config = SignatureConfig {
             enabled: true,
@@ -322,7 +308,7 @@ mod tests {
             trusted_publishers: Vec::new(),
         };
 
-        let result = verify_skill_signature("test-skill", wasm_bytes, dir.path(), &config);
+        let result = verify_skill_signature("test-skill", wasm_bytes, &manifest, &config);
         assert!(
             result.is_ok(),
             "signature verification failed: {:?}",
@@ -342,6 +328,8 @@ mod tests {
         let sig_hex = hex::encode(signature.to_bytes());
 
         write_manifest(dir.path(), "test-skill", &pub_hex, &sig_hex);
+        let manifest_content = fs::read_to_string(dir.path().join("skills-manifest.json")).unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(&manifest_content).unwrap();
 
         let config = SignatureConfig {
             enabled: true,
@@ -349,7 +337,7 @@ mod tests {
             trusted_publishers: Vec::new(),
         };
 
-        let result = verify_skill_signature("test-skill", tampered, dir.path(), &config);
+        let result = verify_skill_signature("test-skill", tampered, &manifest, &config);
         assert!(result.is_err());
     }
 
@@ -366,6 +354,8 @@ mod tests {
         let sig_hex = hex::encode(signature.to_bytes());
 
         write_manifest(dir.path(), "my-skill", &pub_hex, &sig_hex);
+        let manifest_content = fs::read_to_string(dir.path().join("skills-manifest.json")).unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(&manifest_content).unwrap();
 
         let config = SignatureConfig {
             enabled: true,
@@ -373,7 +363,7 @@ mod tests {
             trusted_publishers: vec![pub_hex.clone()],
         };
 
-        let result = verify_skill_signature("my-skill", wasm_bytes, dir.path(), &config);
+        let result = verify_skill_signature("my-skill", wasm_bytes, &manifest, &config);
         assert!(result.is_ok());
     }
 
@@ -390,6 +380,8 @@ mod tests {
         let other_hex = hex::encode(other_key.as_bytes());
 
         write_manifest(dir.path(), "my-skill", &pub_hex, &sig_hex);
+        let manifest_content = fs::read_to_string(dir.path().join("skills-manifest.json")).unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(&manifest_content).unwrap();
 
         let config = SignatureConfig {
             enabled: true,
@@ -397,48 +389,72 @@ mod tests {
             trusted_publishers: vec![other_hex],
         };
 
-        let result = verify_skill_signature("my-skill", wasm_bytes, dir.path(), &config);
+        let result = verify_skill_signature("my-skill", wasm_bytes, &manifest, &config);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_trusted_publisher_case_insensitive() {
+        let dir = TempDir::new().unwrap();
+        let (signing_key, verifying_key) = generate_keypair();
+        let wasm_bytes = b"wasm bytes for case test";
+
+        let signature = sign_wasm_bytes(wasm_bytes, &signing_key);
+        let pub_hex = hex::encode(verifying_key.as_bytes());
+        let sig_hex = hex::encode(signature.to_bytes());
+
+        write_manifest(dir.path(), "my-skill", &pub_hex, &sig_hex);
+        let manifest_content = fs::read_to_string(dir.path().join("skills-manifest.json")).unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(&manifest_content).unwrap();
+
+        // Use UPPERCASE in trusted_publishers, lowercase in manifest
+        let config = SignatureConfig {
+            enabled: true,
+            require_signature: true,
+            trusted_publishers: vec![pub_hex.to_ascii_uppercase()],
+        };
+
+        let result = verify_skill_signature("my-skill", wasm_bytes, &manifest, &config);
+        assert!(
+            result.is_ok(),
+            "case-insensitive comparison should pass: {:?}",
+            result
+        );
     }
 
     // ==================== Missing Signature Handling ====================
 
     #[test]
     fn test_missing_signature_require_false_ok() {
-        let dir = TempDir::new().unwrap();
-        // No manifest at all
+        // No manifest at all (Null value)
         let config = SignatureConfig {
             enabled: true,
             require_signature: false,
             trusted_publishers: Vec::new(),
         };
 
-        let result = verify_skill_signature("some-skill", b"wasm", dir.path(), &config);
+        let result =
+            verify_skill_signature("some-skill", b"wasm", &serde_json::Value::Null, &config);
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_missing_signature_require_true_fails() {
-        let dir = TempDir::new().unwrap();
-        // No manifest at all
+        // No manifest at all (Null value)
         let config = SignatureConfig {
             enabled: true,
             require_signature: true,
             trusted_publishers: Vec::new(),
         };
 
-        let result = verify_skill_signature("some-skill", b"wasm", dir.path(), &config);
+        let result =
+            verify_skill_signature("some-skill", b"wasm", &serde_json::Value::Null, &config);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_missing_entry_require_false_ok() {
-        let dir = TempDir::new().unwrap();
-        fs::write(
-            dir.path().join("skills-manifest.json"),
-            r#"{"other-skill": {}}"#,
-        )
-        .unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(r#"{"other-skill": {}}"#).unwrap();
 
         let config = SignatureConfig {
             enabled: true,
@@ -446,21 +462,15 @@ mod tests {
             trusted_publishers: Vec::new(),
         };
 
-        let result = verify_skill_signature("missing-skill", b"wasm", dir.path(), &config);
+        let result = verify_skill_signature("missing-skill", b"wasm", &manifest, &config);
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_missing_publisher_key_require_true_fails() {
-        let dir = TempDir::new().unwrap();
         let manifest = serde_json::json!({
             "my-skill": { "sha256": "dummy" }
         });
-        fs::write(
-            dir.path().join("skills-manifest.json"),
-            serde_json::to_string(&manifest).unwrap(),
-        )
-        .unwrap();
 
         let config = SignatureConfig {
             enabled: true,
@@ -468,7 +478,7 @@ mod tests {
             trusted_publishers: Vec::new(),
         };
 
-        let result = verify_skill_signature("my-skill", b"wasm", dir.path(), &config);
+        let result = verify_skill_signature("my-skill", b"wasm", &manifest, &config);
         assert!(result.is_err());
     }
 
@@ -484,7 +494,7 @@ mod tests {
 
         // No manifest, but disabled — should pass
         let result =
-            verify_skill_signature("any-skill", b"wasm", Path::new("/nonexistent"), &config);
+            verify_skill_signature("any-skill", b"wasm", &serde_json::Value::Null, &config);
         assert!(result.is_ok());
     }
 

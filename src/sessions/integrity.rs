@@ -7,6 +7,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -61,25 +62,22 @@ pub enum IntegrityError {
     Rejected { file: String },
 }
 
-/// Derive an HMAC key from a server secret using SHA-256.
+/// Derive an HMAC key from a server secret using HKDF-SHA256.
 ///
-/// Uses domain separation: `SHA-256(server_secret || "session-integrity-hmac-v1")`
+/// Uses `KEY_DERIVATION_TAG` as the salt and `b"hmac-key"` as the info parameter.
 pub fn derive_hmac_key(server_secret: &[u8]) -> [u8; 32] {
-    use sha2::Digest;
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(server_secret);
-    hasher.update(KEY_DERIVATION_TAG);
-    let result = hasher.finalize();
+    let hk = Hkdf::<Sha256>::new(Some(KEY_DERIVATION_TAG), server_secret);
     let mut key = [0u8; 32];
-    key.copy_from_slice(&result);
+    hk.expand(b"hmac-key", &mut key)
+        .expect("32-byte output is valid for HKDF-SHA256");
     key
 }
 
 /// Compute HMAC-SHA256 over the given data.
-pub fn compute_hmac(key: &[u8; 32], data: &[u8]) -> Vec<u8> {
+pub fn compute_hmac(key: &[u8; 32], data: &[u8]) -> [u8; 32] {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC-SHA256 accepts any key length");
     mac.update(data);
-    mac.finalize().into_bytes().to_vec()
+    mac.finalize().into_bytes().into()
 }
 
 /// Verify HMAC-SHA256 over the given data.
@@ -97,18 +95,22 @@ fn hmac_path(file_path: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
-/// Write an HMAC sidecar file for the given data file.
+/// Write an HMAC sidecar file for the given data.
 ///
-/// Reads the file contents, computes the HMAC, and writes it to `{file_path}.hmac`.
-pub fn write_hmac_file(key: &[u8; 32], file_path: &Path) -> Result<(), io::Error> {
-    let data = fs::read(file_path)?;
-    let hmac = compute_hmac(key, &data);
+/// The caller provides the data bytes directly (e.g., the serialized content
+/// that was just written to `file_path`). The function computes the HMAC and
+/// writes it to `{file_path}.hmac`.
+pub fn write_hmac_file(key: &[u8; 32], data: &[u8], file_path: &Path) -> Result<(), io::Error> {
+    let hmac = compute_hmac(key, data);
     let sidecar = hmac_path(file_path);
     fs::write(&sidecar, hex::encode(hmac))?;
     Ok(())
 }
 
-/// Verify the HMAC sidecar file for the given data file.
+/// Verify the HMAC sidecar file for the given data.
+///
+/// The caller provides the data bytes directly (e.g., the file content that
+/// was just read from `file_path`).
 ///
 /// # Behavior
 ///
@@ -118,15 +120,13 @@ pub fn write_hmac_file(key: &[u8; 32], file_path: &Path) -> Result<(), io::Error
 /// - HMAC mismatch with `action: Reject` → returns error.
 pub fn verify_hmac_file(
     key: &[u8; 32],
+    data: &[u8],
     file_path: &Path,
     config: &IntegrityConfig,
 ) -> Result<(), IntegrityError> {
     if !config.enabled {
         return Ok(());
     }
-
-    // Read the data file
-    let data = fs::read(file_path)?;
 
     let sidecar = hmac_path(file_path);
     let file_name = file_path
@@ -142,7 +142,7 @@ pub fn verify_hmac_file(
                     reason: format!("invalid hex in HMAC sidecar: {e}"),
                 })?;
 
-            if !verify_hmac(key, &data, &stored_hmac) {
+            if !verify_hmac(key, data, &stored_hmac) {
                 let msg = format!("HMAC verification failed for {file_name} — possible tampering");
 
                 match config.action {
@@ -167,8 +167,14 @@ pub fn verify_hmac_file(
                         "no HMAC sidecar found — auto-migrating (writing HMAC)"
                     );
                     // Auto-migrate: write the HMAC sidecar
-                    let hmac = compute_hmac(key, &data);
-                    let _ = fs::write(&sidecar, hex::encode(hmac));
+                    let hmac = compute_hmac(key, data);
+                    if let Err(e) = fs::write(&sidecar, hex::encode(hmac)) {
+                        tracing::warn!(
+                            file = %file_name,
+                            error = %e,
+                            "failed to write HMAC sidecar during auto-migration"
+                        );
+                    }
                     Ok(())
                 }
                 IntegrityAction::Reject => Err(IntegrityError::Rejected {
@@ -183,7 +189,6 @@ pub fn verify_hmac_file(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
     use tempfile::TempDir;
 
     // ==================== Key Derivation ====================
@@ -208,6 +213,19 @@ mod tests {
         assert_eq!(key.len(), 32);
     }
 
+    #[test]
+    fn test_derive_hmac_key_uses_hkdf() {
+        // Verify the HKDF derivation produces a proper key (not all zeros, not the input)
+        let key = derive_hmac_key(b"my-secret");
+        assert_ne!(key, [0u8; 32]);
+        // Key should differ from a simple SHA-256 hash of the secret
+        use sha2::Digest;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(b"my-secret");
+        let simple_hash: [u8; 32] = hasher.finalize().into();
+        assert_ne!(key, simple_hash);
+    }
+
     // ==================== HMAC Roundtrip ====================
 
     #[test]
@@ -216,6 +234,13 @@ mod tests {
         let data = b"session data here";
         let hmac = compute_hmac(&key, data);
         assert!(verify_hmac(&key, data, &hmac));
+    }
+
+    #[test]
+    fn test_compute_hmac_returns_fixed_size() {
+        let key = derive_hmac_key(b"test-secret");
+        let hmac: [u8; 32] = compute_hmac(&key, b"data");
+        assert_eq!(hmac.len(), 32);
     }
 
     #[test]
@@ -249,10 +274,11 @@ mod tests {
     fn test_write_hmac_file() {
         let dir = TempDir::new().unwrap();
         let file_path = dir.path().join("meta.json");
-        fs::write(&file_path, r#"{"id":"test"}"#).unwrap();
+        let data = r#"{"id":"test"}"#;
+        fs::write(&file_path, data).unwrap();
 
         let key = derive_hmac_key(b"server-secret");
-        write_hmac_file(&key, &file_path).unwrap();
+        write_hmac_file(&key, data.as_bytes(), &file_path).unwrap();
 
         let sidecar = dir.path().join("meta.json.hmac");
         assert!(sidecar.exists(), "HMAC sidecar should exist");
@@ -265,17 +291,18 @@ mod tests {
     fn test_verify_hmac_file_success() {
         let dir = TempDir::new().unwrap();
         let file_path = dir.path().join("history.jsonl");
-        fs::write(&file_path, "line1\nline2\n").unwrap();
+        let data = "line1\nline2\n";
+        fs::write(&file_path, data).unwrap();
 
         let key = derive_hmac_key(b"test-secret");
-        write_hmac_file(&key, &file_path).unwrap();
+        write_hmac_file(&key, data.as_bytes(), &file_path).unwrap();
 
         let config = IntegrityConfig {
             enabled: true,
             action: IntegrityAction::Reject,
         };
 
-        let result = verify_hmac_file(&key, &file_path, &config);
+        let result = verify_hmac_file(&key, data.as_bytes(), &file_path, &config);
         assert!(result.is_ok());
     }
 
@@ -283,20 +310,22 @@ mod tests {
     fn test_verify_hmac_file_tampered() {
         let dir = TempDir::new().unwrap();
         let file_path = dir.path().join("meta.json");
-        fs::write(&file_path, r#"{"id":"original"}"#).unwrap();
+        let original = r#"{"id":"original"}"#;
+        fs::write(&file_path, original).unwrap();
 
         let key = derive_hmac_key(b"test-secret");
-        write_hmac_file(&key, &file_path).unwrap();
+        write_hmac_file(&key, original.as_bytes(), &file_path).unwrap();
 
         // Tamper with the file
-        fs::write(&file_path, r#"{"id":"tampered"}"#).unwrap();
+        let tampered = r#"{"id":"tampered"}"#;
+        fs::write(&file_path, tampered).unwrap();
 
         let config = IntegrityConfig {
             enabled: true,
             action: IntegrityAction::Reject,
         };
 
-        let result = verify_hmac_file(&key, &file_path, &config);
+        let result = verify_hmac_file(&key, tampered.as_bytes(), &file_path, &config);
         assert!(result.is_err());
     }
 
@@ -304,13 +333,15 @@ mod tests {
     fn test_verify_hmac_file_tampered_warn_mode() {
         let dir = TempDir::new().unwrap();
         let file_path = dir.path().join("meta.json");
-        fs::write(&file_path, r#"{"id":"original"}"#).unwrap();
+        let original = r#"{"id":"original"}"#;
+        fs::write(&file_path, original).unwrap();
 
         let key = derive_hmac_key(b"test-secret");
-        write_hmac_file(&key, &file_path).unwrap();
+        write_hmac_file(&key, original.as_bytes(), &file_path).unwrap();
 
         // Tamper
-        fs::write(&file_path, r#"{"id":"tampered"}"#).unwrap();
+        let tampered = r#"{"id":"tampered"}"#;
+        fs::write(&file_path, tampered).unwrap();
 
         let config = IntegrityConfig {
             enabled: true,
@@ -318,7 +349,7 @@ mod tests {
         };
 
         // Warn mode should still return Ok
-        let result = verify_hmac_file(&key, &file_path, &config);
+        let result = verify_hmac_file(&key, tampered.as_bytes(), &file_path, &config);
         assert!(result.is_ok());
     }
 
@@ -328,7 +359,8 @@ mod tests {
     fn test_missing_hmac_warn_auto_migrates() {
         let dir = TempDir::new().unwrap();
         let file_path = dir.path().join("meta.json");
-        fs::write(&file_path, r#"{"id":"test"}"#).unwrap();
+        let data = r#"{"id":"test"}"#;
+        fs::write(&file_path, data).unwrap();
 
         let key = derive_hmac_key(b"test-secret");
 
@@ -338,7 +370,7 @@ mod tests {
         };
 
         // No HMAC file exists yet
-        let result = verify_hmac_file(&key, &file_path, &config);
+        let result = verify_hmac_file(&key, data.as_bytes(), &file_path, &config);
         assert!(result.is_ok());
 
         // Auto-migration should have created the HMAC file
@@ -349,7 +381,7 @@ mod tests {
         );
 
         // Now verification should pass
-        let result = verify_hmac_file(&key, &file_path, &config);
+        let result = verify_hmac_file(&key, data.as_bytes(), &file_path, &config);
         assert!(result.is_ok());
     }
 
@@ -357,7 +389,8 @@ mod tests {
     fn test_missing_hmac_reject_fails() {
         let dir = TempDir::new().unwrap();
         let file_path = dir.path().join("meta.json");
-        fs::write(&file_path, r#"{"id":"test"}"#).unwrap();
+        let data = r#"{"id":"test"}"#;
+        fs::write(&file_path, data).unwrap();
 
         let key = derive_hmac_key(b"test-secret");
 
@@ -366,7 +399,7 @@ mod tests {
             action: IntegrityAction::Reject,
         };
 
-        let result = verify_hmac_file(&key, &file_path, &config);
+        let result = verify_hmac_file(&key, data.as_bytes(), &file_path, &config);
         assert!(result.is_err());
     }
 
@@ -377,7 +410,8 @@ mod tests {
         let key = derive_hmac_key(b"secret");
         let dir = TempDir::new().unwrap();
         let file_path = dir.path().join("meta.json");
-        fs::write(&file_path, "data").unwrap();
+        let data = "data";
+        fs::write(&file_path, data).unwrap();
 
         let config = IntegrityConfig {
             enabled: false,
@@ -385,7 +419,7 @@ mod tests {
         };
 
         // No HMAC sidecar, but disabled — should pass
-        let result = verify_hmac_file(&key, &file_path, &config);
+        let result = verify_hmac_file(&key, data.as_bytes(), &file_path, &config);
         assert!(result.is_ok());
     }
 
@@ -455,23 +489,36 @@ mod tests {
 
         let file1 = dir.path().join("meta.json");
         let file2 = dir.path().join("history.jsonl");
-        fs::write(&file1, "meta content").unwrap();
-        fs::write(&file2, "history content").unwrap();
+        let data1 = "meta content";
+        let data2 = "history content";
+        fs::write(&file1, data1).unwrap();
+        fs::write(&file2, data2).unwrap();
 
-        write_hmac_file(&key, &file1).unwrap();
-        write_hmac_file(&key, &file2).unwrap();
+        write_hmac_file(&key, data1.as_bytes(), &file1).unwrap();
+        write_hmac_file(&key, data2.as_bytes(), &file2).unwrap();
 
         let config = IntegrityConfig {
             enabled: true,
             action: IntegrityAction::Reject,
         };
 
-        assert!(verify_hmac_file(&key, &file1, &config).is_ok());
-        assert!(verify_hmac_file(&key, &file2, &config).is_ok());
+        assert!(verify_hmac_file(&key, data1.as_bytes(), &file1, &config).is_ok());
+        assert!(verify_hmac_file(&key, data2.as_bytes(), &file2, &config).is_ok());
 
         // Tamper with file1 only — file2 should still pass
-        fs::write(&file1, "tampered").unwrap();
-        assert!(verify_hmac_file(&key, &file1, &config).is_err());
-        assert!(verify_hmac_file(&key, &file2, &config).is_ok());
+        let tampered = "tampered";
+        fs::write(&file1, tampered).unwrap();
+        assert!(verify_hmac_file(&key, tampered.as_bytes(), &file1, &config).is_err());
+        assert!(verify_hmac_file(&key, data2.as_bytes(), &file2, &config).is_ok());
+    }
+
+    // ==================== hex::encode compatibility ====================
+
+    #[test]
+    fn test_compute_hmac_hex_encodes() {
+        let key = derive_hmac_key(b"secret");
+        let hmac = compute_hmac(&key, b"data");
+        let hex_str = hex::encode(hmac);
+        assert_eq!(hex_str.len(), 64); // 32 bytes -> 64 hex chars
     }
 }
