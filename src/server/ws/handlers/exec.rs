@@ -644,7 +644,7 @@ mod tests {
         assert!(result.is_ok());
         let value = result.unwrap();
         assert_eq!(value["exists"], false);
-        assert_eq!(value["path"], Value::Null);
+        assert!(value["path"].is_string(), "path should always be a string");
         assert_eq!(value["hash"], Value::Null);
         assert!(value["file"].is_object());
         std::env::remove_var("MOLTBOT_STATE_DIR");

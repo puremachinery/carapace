@@ -163,8 +163,12 @@ pub fn apply_resource_limits(config: &ProcessSandboxConfig) -> Result<(), Sandbo
     // RLIMIT_CPU -- max CPU seconds
     set_rlimit(libc::RLIMIT_CPU, config.max_cpu_seconds)?;
 
-    // RLIMIT_AS -- max virtual memory (bytes)
-    set_rlimit(libc::RLIMIT_AS, config.max_memory_bytes())?;
+    // RLIMIT_AS -- max virtual memory (bytes).
+    // Best-effort: macOS does not support setrlimit for RLIMIT_AS and
+    // returns EINVAL regardless of the values passed.
+    if let Err(e) = set_rlimit(libc::RLIMIT_AS, config.max_memory_bytes()) {
+        tracing::debug!("RLIMIT_AS not supported on this platform: {e}");
+    }
 
     // RLIMIT_NOFILE -- max open file descriptors
     set_rlimit(libc::RLIMIT_NOFILE, config.max_fds)?;
@@ -174,9 +178,33 @@ pub fn apply_resource_limits(config: &ProcessSandboxConfig) -> Result<(), Sandbo
 
 #[cfg(unix)]
 fn set_rlimit(resource: libc::c_int, limit: u64) -> Result<(), SandboxError> {
+    // Get current limits so we can respect the existing hard limit.
+    // Unprivileged processes cannot raise the hard limit.
+    let mut current = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    let ret = unsafe { libc::getrlimit(resource, &mut current) };
+    if ret != 0 {
+        let errno = std::io::Error::last_os_error();
+        return Err(SandboxError::ResourceLimit {
+            resource: rlimit_name(resource).to_string(),
+            detail: format!("getrlimit failed: {errno}"),
+        });
+    }
+
+    let requested = limit as libc::rlim_t;
+    let hard = current.rlim_max;
+
+    // Set soft limit to the requested value (capped at hard limit).
+    // Leave hard limit unchanged to avoid EINVAL on macOS / non-root.
     let rlim = libc::rlimit {
-        rlim_cur: limit as libc::rlim_t,
-        rlim_max: limit as libc::rlim_t,
+        rlim_cur: if hard == libc::RLIM_INFINITY || requested < hard {
+            requested
+        } else {
+            hard
+        },
+        rlim_max: hard,
     };
     let ret = unsafe { libc::setrlimit(resource, &rlim) };
     if ret != 0 {
