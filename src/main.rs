@@ -582,7 +582,18 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             axum_server::tls_rustls::RustlsConfig::from_config(tls_result.server_config);
         let addr = resolved.address;
 
+        let handle = axum_server::Handle::new();
+        let shutdown_handle = handle.clone();
+
+        // Spawn a task that awaits the shutdown signal, performs cleanup,
+        // then tells axum_server to gracefully shut down via its Handle API.
+        tokio::spawn(async move {
+            shutdown_signal(shutdown_tx, ws_state.clone()).await;
+            shutdown_handle.graceful_shutdown(Some(Duration::from_secs(30)));
+        });
+
         axum_server::bind_rustls(addr, rustls_config)
+            .handle(handle)
             .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await?;
     } else {

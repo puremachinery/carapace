@@ -136,10 +136,8 @@ pub struct EncryptedParts {
 /// Parse an `enc:v1:NONCE:CIPHERTEXT:SALT` string into its components.
 pub fn parse_encrypted(encrypted: &str) -> Result<EncryptedParts, SecretError> {
     let rest = encrypted.strip_prefix(ENC_PREFIX).ok_or_else(|| {
-        SecretError::BadFormat(format!(
-            "expected prefix, got '{}'",
-            &encrypted[..encrypted.len().min(10)]
-        ))
+        let preview: String = encrypted.chars().take(10).collect();
+        SecretError::BadFormat(format!("expected prefix, got '{}'", preview))
     })?;
 
     let segments: Vec<&str> = rest.splitn(3, ':').collect();
@@ -262,11 +260,28 @@ pub fn is_encrypted(value: &str) -> bool {
     value.starts_with(ENC_PREFIX)
 }
 
+/// Maximum recursion depth for `resolve_secrets` to prevent stack overflow
+/// on programmatically constructed JSON trees.
+const MAX_RESOLVE_DEPTH: usize = 64;
+
 /// Walk a JSON value tree and decrypt all `enc:v1:` strings in-place.
 ///
 /// Uses the password to re-derive keys from embedded salts so that values
 /// encrypted with different salts can all be resolved.
 pub fn resolve_secrets(config: &mut Value, store: &SecretStore, password: &[u8]) {
+    resolve_secrets_inner(config, store, password, 0);
+}
+
+/// Internal recursive implementation with depth tracking.
+fn resolve_secrets_inner(config: &mut Value, store: &SecretStore, password: &[u8], depth: usize) {
+    if depth > MAX_RESOLVE_DEPTH {
+        tracing::warn!(
+            "resolve_secrets: maximum recursion depth ({}) exceeded, skipping deeper nodes",
+            MAX_RESOLVE_DEPTH
+        );
+        return;
+    }
+
     match config {
         Value::String(s) => {
             if is_encrypted(s) {
@@ -280,12 +295,12 @@ pub fn resolve_secrets(config: &mut Value, store: &SecretStore, password: &[u8])
         }
         Value::Object(map) => {
             for (_, v) in map.iter_mut() {
-                resolve_secrets(v, store, password);
+                resolve_secrets_inner(v, store, password, depth + 1);
             }
         }
         Value::Array(arr) => {
             for item in arr.iter_mut() {
-                resolve_secrets(item, store, password);
+                resolve_secrets_inner(item, store, password, depth + 1);
             }
         }
         _ => {}

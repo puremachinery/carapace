@@ -641,9 +641,18 @@ impl ProfileStore {
     /// in plaintext so that callers never see encrypted values.
     pub fn save(&self) -> Result<(), AuthProfileError> {
         let guard = self.profiles.read();
+        self.save_profiles(&guard)
+    }
+
+    /// Internal save that operates on an already-borrowed slice of profiles.
+    ///
+    /// This avoids the TOCTOU race where a caller drops its write lock before
+    /// `save()` re-acquires a read lock -- another thread could interleave and
+    /// mutate the data between the two lock acquisitions.  Callers that already
+    /// hold a write guard should use this method directly.
+    fn save_profiles(&self, profiles: &[AuthProfile]) -> Result<(), AuthProfileError> {
         // Clone so we can encrypt without mutating in-memory state
-        let mut to_save = guard.clone();
-        drop(guard);
+        let mut to_save = profiles.to_vec();
 
         // Encrypt token fields if we have a SecretStore
         if let Some(ref store) = self.secret_store {
@@ -683,14 +692,20 @@ impl ProfileStore {
     /// (prefixed with `enc:v1:`) are skipped to avoid double-encryption.
     fn encrypt_tokens(tokens: &mut OAuthTokens, store: &SecretStore) {
         if !is_encrypted(&tokens.access_token) {
-            if let Ok(encrypted) = store.encrypt(&tokens.access_token) {
-                tokens.access_token = encrypted;
+            match store.encrypt(&tokens.access_token) {
+                Ok(encrypted) => tokens.access_token = encrypted,
+                Err(e) => {
+                    tracing::warn!("Failed to encrypt access_token for profile: {}", e);
+                }
             }
         }
         if let Some(ref rt) = tokens.refresh_token {
             if !is_encrypted(rt) {
-                if let Ok(encrypted) = store.encrypt(rt) {
-                    tokens.refresh_token = Some(encrypted);
+                match store.encrypt(rt) {
+                    Ok(encrypted) => tokens.refresh_token = Some(encrypted),
+                    Err(e) => {
+                        tracing::warn!("Failed to encrypt refresh_token for profile: {}", e);
+                    }
                 }
             }
         }
@@ -707,7 +722,8 @@ impl ProfileStore {
             match store.decrypt_rekey(&tokens.access_token, password) {
                 Ok(plaintext) => tokens.access_token = plaintext,
                 Err(e) => {
-                    tracing::warn!("Failed to decrypt access_token for profile: {}", e);
+                    tracing::warn!("Failed to decrypt access_token for profile: {}; clearing token to prevent opaque downstream errors", e);
+                    tokens.access_token = String::new();
                 }
             }
         }
@@ -716,7 +732,8 @@ impl ProfileStore {
                 match store.decrypt_rekey(rt, password) {
                     Ok(plaintext) => tokens.refresh_token = Some(plaintext),
                     Err(e) => {
-                        tracing::warn!("Failed to decrypt refresh_token for profile: {}", e);
+                        tracing::warn!("Failed to decrypt refresh_token for profile: {}; clearing token to prevent opaque downstream errors", e);
+                        tokens.refresh_token = Some(String::new());
                     }
                 }
             }
@@ -730,8 +747,7 @@ impl ProfileStore {
             return Err(AuthProfileError::MaxProfilesExceeded);
         }
         guard.push(profile);
-        drop(guard);
-        self.save()
+        self.save_profiles(&guard)
     }
 
     /// Remove a profile by ID. Returns `true` if a profile was removed.
@@ -740,9 +756,8 @@ impl ProfileStore {
         let before = guard.len();
         guard.retain(|p| p.id != id);
         let removed = guard.len() < before;
-        drop(guard);
         if removed {
-            self.save()?;
+            self.save_profiles(&guard)?;
         }
         Ok(removed)
     }
@@ -767,8 +782,7 @@ impl ProfileStore {
             .find(|p| p.id == id)
             .ok_or(AuthProfileError::ProfileNotFound)?;
         profile.tokens = tokens;
-        drop(guard);
-        self.save()
+        self.save_profiles(&guard)
     }
 
     /// Update the last-used timestamp for a profile.
@@ -782,9 +796,8 @@ impl ProfileStore {
         if let Some(profile) = guard.iter_mut().find(|p| p.id == id) {
             profile.last_used_ms = Some(now_ms);
         }
-        drop(guard);
         // Best-effort save; ignore errors for a timestamp update
-        let _ = self.save();
+        let _ = self.save_profiles(&guard);
     }
 }
 

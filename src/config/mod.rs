@@ -469,6 +469,9 @@ pub fn validate_config(config: &Value) -> Vec<ValidationIssue> {
             "plugins",
             "anthropic",
             "sessions",
+            "openai",
+            "google",
+            "providers",
         ];
 
         for key in obj.keys() {
