@@ -27,14 +27,7 @@ unmaintained = "none"
 yanked = "deny"
 
 # Advisories to ignore (add RUSTSEC IDs with justification if needed).
-# wasmtime 18.0.4 has known advisories; upgrade to 24+ is tracked separately
-# as it requires significant API migration. WASM plugins run in a sandboxed
-# engine with limited capabilities, reducing practical impact.
-ignore = [
-    { id = "RUSTSEC-2024-0438", reason = "wasmtime 18→24+ upgrade tracked separately; Windows-only device filename issue" },
-    { id = "RUSTSEC-2025-0046", reason = "wasmtime 18→24+ upgrade tracked separately; fd_renumber panic in WASIp1" },
-    { id = "RUSTSEC-2025-0118", reason = "wasmtime 18→24+ upgrade tracked separately; shared linear memory unsoundness" },
-]
+ignore = []
 
 # ──────────────────────────────────────────────────────────────────────────────
 # License checks — allowlist of acceptable licenses

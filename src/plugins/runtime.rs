@@ -596,20 +596,17 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginInstanceHandle<B> {
         R: wasmtime::component::ComponentNamedList + Lift + Send + Sync + 'static,
     {
         // Step 1: look up the exported interface index
-        let (_item, iface_idx) =
-            self.component
-                .export_index(None, iface_name)
-                .ok_or_else(|| {
-                    BindingError::CallError(format!(
-                        "exported interface '{}' not found",
-                        iface_name
-                    ))
-                })?;
+        let iface_idx = self
+            .component
+            .get_export_index(None, iface_name)
+            .ok_or_else(|| {
+                BindingError::CallError(format!("exported interface '{}' not found", iface_name))
+            })?;
 
         // Step 2: look up the function within that interface
-        let (_item, func_idx) = self
+        let func_idx = self
             .component
-            .export_index(Some(&iface_idx), func_name)
+            .get_export_index(Some(&iface_idx), func_name)
             .ok_or_else(|| {
                 BindingError::CallError(format!(
                     "function '{}' not found in interface '{}'",

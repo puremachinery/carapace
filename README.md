@@ -8,7 +8,7 @@ A hardened alternative to openclaw / moltbot / clawdbot — for when your molt n
 
 - **Multi-provider LLM engine** — Anthropic, OpenAI, Ollama, Google Gemini, AWS Bedrock, Venice AI with streaming, tool dispatch, and cancellation
 - **Multi-channel messaging** — Telegram, Discord, Slack with platform-specific tools (25 total: 10 built-in + 15 channel-specific)
-- **WASM plugin runtime** — wasmtime 29 with Ed25519 signature verification, capability sandboxing, and fuel-based CPU limits
+- **WASM plugin runtime** — wasmtime 41 with Ed25519 signature verification, capability sandboxing, and fuel-based CPU limits
 - **Security by default** — fail-closed auth, localhost-only binding, encrypted secrets (AES-256-GCM), SSRF/DNS-rebinding defense, prompt guard, inbound message classifier, OS-level sandboxing (Seatbelt/Landlock), output content security
 - **Infrastructure** — TLS, mTLS for gateway clustering, mDNS discovery, config hot-reload, Tailscale integration, Prometheus metrics, structured audit logging
 
@@ -26,12 +26,12 @@ Carapace is hardened against every major vulnerability class reported in the [Ja
 | No process sandboxing | Seatbelt (macOS) / Landlock (Linux) + rlimits |
 | SSRF / DNS rebinding | Private IP blocking + post-resolution validation |
 
-See [CHANGELOG.md](CHANGELOG.md) for the full security feature list.
+See [docs/security.md](docs/security.md) for the full security model.
 
 ## Requirements
 
 - Rust 1.93+ (MSRV enforced in CI)
-- wasmtime 29 (included as dependency)
+- wasmtime 41 (included as dependency)
 
 ### Recommended Tools
 
@@ -42,10 +42,44 @@ cargo install cargo-watch     # File watcher (optional)
 cargo install cargo-tarpaulin # Coverage (optional)
 ```
 
-## Quick Start
+## Getting Started
+
+### With Ollama (free, local)
+
+1. [Install Ollama](https://ollama.com) and pull a model:
+   ```bash
+   ollama pull llama3.2
+   ```
+
+2. Build and run carapace:
+   ```bash
+   OLLAMA_BASE_URL=http://localhost:11434 cargo run
+   ```
+
+3. Connect via WebSocket at `ws://127.0.0.1:18789/ws`.
+
+### With a cloud provider
+
+Set one API key and run:
+
+```bash
+export ANTHROPIC_API_KEY="sk-ant-..."   # or OPENAI_API_KEY, GOOGLE_API_KEY, VENICE_API_KEY
+cargo run
+```
+
+### Other local servers (vLLM, llama.cpp, LM Studio, MLX)
+
+Any OpenAI-compatible server works — point the OpenAI provider at it:
+
+```bash
+OPENAI_BASE_URL=http://localhost:8000/v1 OPENAI_API_KEY=unused cargo run
+```
+
+## Development
 
 ```bash
 just          # Show all available recipes
+just run      # Run the gateway server (debug build)
 just build    # Build the project
 just test     # Run tests with nextest
 just lint     # Run clippy
