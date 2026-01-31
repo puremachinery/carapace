@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 
 use crate::auth;
-use crate::channels::{ChannelInfo, ChannelRegistry, ChannelStatus};
+use crate::channels::{ChannelRegistry, ChannelStatus};
 use crate::config;
 use crate::server::ws::{map_validation_issues, persist_config_file, read_config_snapshot};
 

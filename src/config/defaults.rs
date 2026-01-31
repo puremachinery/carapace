@@ -151,9 +151,6 @@ const DEFAULT_SUBAGENT_MAX_CONCURRENT: u32 = 8;
 /// Default agent timeout in seconds.
 const DEFAULT_AGENT_TIMEOUT_SECONDS: u32 = 300;
 
-/// Default max output tokens per LLM call.
-const DEFAULT_MAX_TOKENS: u32 = 8192;
-
 /// Default context window size in tokens.
 const DEFAULT_CONTEXT_TOKENS: u32 = 200_000;
 

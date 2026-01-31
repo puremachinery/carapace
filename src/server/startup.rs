@@ -15,7 +15,6 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
-use crate::channels::ChannelRegistry;
 use crate::config;
 use crate::cron;
 use crate::hooks::registry::HookRegistry;

@@ -26,18 +26,18 @@ use std::time::Duration;
 use parking_lot::RwLock;
 use thiserror::Error;
 use wasmtime::component::{Component, ComponentType, Lift, Linker, Lower};
-use wasmtime::{AsContextMut, Config, Engine, Store, StoreContextMut};
+use wasmtime::{Config, Engine, Store, StoreContextMut};
 
 use crate::credentials::{CredentialBackend, CredentialStore};
 
 use super::bindings::{
     BindingError, ChannelCapabilities, ChannelInfo, ChannelPluginInstance, ChatType,
-    DeliveryResult, HookEvent, HookPluginInstance, HookResult, OutboundContext, PluginError,
-    PluginRegistry, ServicePluginInstance, ToolContext, ToolDefinition, ToolPluginInstance,
-    ToolResult, WebhookPluginInstance, WebhookRequest, WebhookResponse, WitHost,
+    DeliveryResult, HookEvent, HookPluginInstance, HookResult, OutboundContext, PluginRegistry,
+    ServicePluginInstance, ToolContext, ToolDefinition, ToolPluginInstance, ToolResult,
+    WebhookPluginInstance, WebhookRequest, WebhookResponse, WitHost,
 };
 use super::capabilities::{RateLimiterRegistry, SsrfConfig};
-use super::host::{HostError, HttpRequest, HttpResponse, MediaFetchResult, PluginHostContext};
+use super::host::{HostError, HttpRequest, PluginHostContext};
 use super::loader::{LoadedPlugin, PluginKind, PluginLoader, PluginManifest};
 use super::permissions::{
     compute_effective_permissions, validate_declared_permissions, PermissionConfig,

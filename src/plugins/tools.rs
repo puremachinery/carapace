@@ -4,12 +4,12 @@
 //! Supports both built-in tools and plugin-provided tools.
 
 use parking_lot::RwLock;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::bindings::{ToolContext, ToolDefinition, ToolPluginInstance, ToolResult};
+use super::bindings::{ToolContext, ToolDefinition, ToolPluginInstance};
 
 /// Tool invocation context
 #[derive(Debug, Clone)]

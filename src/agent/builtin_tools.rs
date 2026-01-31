@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use serde_json::{json, Value};
 
-use crate::plugins::tools::{BuiltinTool, ToolInvokeContext, ToolInvokeResult};
+use crate::plugins::tools::{BuiltinTool, ToolInvokeResult};
 
 /// Return all built-in tool definitions.
 ///
@@ -792,6 +792,7 @@ fn resolve_sessions_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugins::tools::ToolInvokeContext;
     use serde_json::json;
 
     // -- current_time tests --

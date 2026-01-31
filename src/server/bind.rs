@@ -10,7 +10,6 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::process::Command;
 use thiserror::Error;
-use tracing::debug;
 
 /// Default gateway port
 pub const DEFAULT_PORT: u16 = 18789;

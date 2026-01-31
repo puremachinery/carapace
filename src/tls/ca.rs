@@ -8,7 +8,6 @@
 //! - Node identity extraction from certificate CN/SAN
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use chrono::Datelike;
 use parking_lot::RwLock;
@@ -16,7 +15,7 @@ use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, KeyUsagePurpose,
     SanType,
 };
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::CertificateDer;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
@@ -608,6 +607,7 @@ pub fn default_ca_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustls::pki_types::PrivateKeyDer;
     use tempfile::TempDir;
 
     #[test]

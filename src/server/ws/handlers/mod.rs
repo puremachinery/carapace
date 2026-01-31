@@ -22,28 +22,27 @@ mod usage;
 mod voicewake;
 mod wizard;
 
-pub(super) use channels::*;
+use channels::*;
 pub(super) use config::*;
 pub(super) use cron::*;
-pub(super) use device::*;
+use device::*;
 pub(super) use exec::*;
-pub(super) use logs::*;
-pub(super) use misc::*;
+use logs::*;
+use misc::*;
 pub(super) use node::*;
 pub(super) use sessions::*;
-pub(super) use skills::*;
-pub(super) use system::*;
+use skills::*;
+use system::*;
 pub(super) use talk::*;
 pub(super) use tts::*;
 pub(super) use update::*;
-pub(crate) use update::{apply_staged_update, cleanup_old_binaries, ApplyResult};
+pub(crate) use update::{apply_staged_update, cleanup_old_binaries};
 pub(super) use usage::*;
 pub(super) use voicewake::*;
 
 // Re-export types needed outside the handlers module
 pub(crate) use config::{
     broadcast_config_changed, map_validation_issues, persist_config_file, read_config_snapshot,
-    ConfigIssue, ConfigSnapshot,
 };
 pub use sessions::AgentRunRegistry;
 pub use sessions::AgentRunStatus;

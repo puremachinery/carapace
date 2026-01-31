@@ -3,9 +3,6 @@
 //! This library provides the core functionality for the carapace gateway,
 //! including HTTP/WebSocket servers, plugin system, and channel management.
 //!
-#![allow(dead_code)]
-#![allow(unused_imports)]
-
 pub mod agent;
 pub mod auth;
 pub mod channels;
