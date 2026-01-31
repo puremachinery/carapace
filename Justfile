@@ -79,8 +79,7 @@ watch-lint:
 
 # Setup git hooks for pre-commit (fmt, clippy) and pre-push (tests)
 setup-hooks:
-    git config core.hooksPath .githooks
-    @echo "✓ Git hooks enabled (.githooks/pre-commit, .githooks/pre-push)"
+    @echo "Hooks are stored locally in .git/hooks"
 
 # Run pre-commit checks manually
 pre-commit: fmt-check lint
