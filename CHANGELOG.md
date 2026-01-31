@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Cron timezone support:** cron expressions honour the optional `tz`
+  field (any IANA timezone). DST transitions handled correctly.
 - **Cron job persistence:** jobs survive process restarts via
   `state_dir/cron/jobs.json`. Stale runtime state cleared on load.
 - **Bedrock provider wiring:** AWS Bedrock models available via config or
