@@ -132,6 +132,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let ws_state = server::ws::build_ws_state_from_config().await?;
     let ws_state = configure_ws_with_llm(ws_state, &cfg)?;
     let ws_state = register_console_channel(ws_state)?;
+    let ws_state = register_signal_channel_if_configured(ws_state, &cfg)?;
 
     let http_config = server::http::build_http_config(&cfg);
     let tls_setup = setup_optional_tls(&cfg)?;
@@ -140,6 +141,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     spawn_network_services(&cfg, &tls_setup, resolved.address.port(), &shutdown_rx);
+    spawn_signal_receive_loop_if_configured(&cfg, &ws_state, &shutdown_rx);
 
     if let Some(tls_result) = tls_setup {
         launch_tls_server(
@@ -228,6 +230,105 @@ fn register_console_channel(
         .map_err(|_| "WsServerState Arc should have single owner at startup")?;
     info!("Console channel registered");
     Ok(Arc::new(inner.with_plugin_registry(plugin_reg)))
+}
+
+/// Resolved Signal configuration (shared between registration and receive loop).
+struct SignalConfig {
+    base_url: String,
+    phone_number: String,
+}
+
+/// Resolve Signal configuration from config file and/or environment variables.
+/// Returns `None` if Signal is not configured or is explicitly disabled.
+///
+/// Activates when both a base URL and phone number are provided (via config or
+/// env vars). The `enabled: false` field is an explicit kill switch to disable
+/// without removing config.
+fn resolve_signal_config(cfg: &Value) -> Option<SignalConfig> {
+    let signal_cfg = cfg.get("signal");
+
+    // Explicit kill switch
+    if signal_cfg
+        .and_then(|s| s.get("enabled"))
+        .and_then(|v| v.as_bool())
+        == Some(false)
+    {
+        return None;
+    }
+
+    let base_url = signal_cfg
+        .and_then(|s| s.get("baseUrl"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("SIGNAL_CLI_URL").ok())?;
+
+    let phone_number = signal_cfg
+        .and_then(|s| s.get("phoneNumber"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("SIGNAL_PHONE_NUMBER").ok())?;
+
+    Some(SignalConfig {
+        base_url,
+        phone_number,
+    })
+}
+
+/// Optionally register the Signal channel plugin if configured.
+///
+/// If configured, creates a `SignalChannel` and registers it in both the plugin registry
+/// and channel registry.
+fn register_signal_channel_if_configured(
+    ws_state: Arc<server::ws::WsServerState>,
+    cfg: &Value,
+) -> Result<Arc<server::ws::WsServerState>, Box<dyn std::error::Error>> {
+    let sc = match resolve_signal_config(cfg) {
+        Some(c) => c,
+        None => return Ok(ws_state),
+    };
+
+    if let Some(registry) = ws_state.plugin_registry() {
+        registry.register_channel(
+            "signal".to_string(),
+            Arc::new(channels::signal::SignalChannel::new(
+                sc.base_url.clone(),
+                sc.phone_number.clone(),
+            )),
+        );
+    }
+
+    ws_state.channel_registry().register(
+        channels::ChannelInfo::new("signal", "Signal")
+            .with_status(channels::ChannelStatus::Connecting),
+    );
+
+    info!(
+        base_url = %sc.base_url,
+        phone = %sc.phone_number,
+        "Signal channel registered"
+    );
+
+    Ok(ws_state)
+}
+
+/// Spawn the Signal receive loop if the channel is configured.
+fn spawn_signal_receive_loop_if_configured(
+    cfg: &Value,
+    ws_state: &Arc<server::ws::WsServerState>,
+    shutdown_rx: &tokio::sync::watch::Receiver<bool>,
+) {
+    let sc = match resolve_signal_config(cfg) {
+        Some(c) => c,
+        None => return,
+    };
+
+    tokio::spawn(channels::signal_receive::signal_receive_loop(
+        sc.base_url,
+        sc.phone_number,
+        ws_state.clone(),
+        ws_state.channel_registry().clone(),
+        shutdown_rx.clone(),
+    ));
 }
 
 /// Parse TLS configuration and set up certificates if enabled.

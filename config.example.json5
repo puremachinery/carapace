@@ -73,6 +73,13 @@
   //   // apiKey: "optional-key",                  // for remote instances with auth
   // },
 
+  // --- Signal channel (via signal-cli REST API) ------------------------------
+  // signal: {
+  //   baseUrl: "http://localhost:8080",           // signal-cli-rest-api address
+  //   phoneNumber: "+15551234567",                // registered Signal number
+  //   // enabled: false,                          // set to false to disable without removing config
+  // },
+
   // --- Agents -----------------------------------------------------------
   // agents: {
   //   list: [

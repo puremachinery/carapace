@@ -1,6 +1,6 @@
 ---
 source: src/server/ws/golden_tests.rs
-assertion_line: 384
+assertion_line: 393
 expression: normalized
 ---
 {
@@ -8,7 +8,7 @@ expression: normalized
   "result": {
     "channels": {
       "connected": 0,
-      "total": 0
+      "total": "<COUNT>"
     },
     "runtime": {
       "arch": "<ARCH>",

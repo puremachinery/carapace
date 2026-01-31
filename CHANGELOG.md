@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Signal channel:** Built-in channel plugin wrapping signal-cli-rest-api.
+  Outbound via `POST /v2/send` with text and base64 media attachments. Inbound
+  via polling `GET /v1/receive/{number}` every 2s with automatic agent dispatch.
+  Config via `signal` section in config.json5 or `SIGNAL_CLI_URL` +
+  `SIGNAL_PHONE_NUMBER` env vars.
+- **Local LLM documentation:** "Other local servers" README section covering
+  vLLM, llama.cpp, LM Studio, and MLX. Commented config example in
+  config.example.json5 for OpenAI-compatible and Ollama providers.
+
 ## [0.1.0] - Unreleased
 
 ### Added
