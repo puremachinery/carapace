@@ -1,6 +1,6 @@
 ---
 source: src/server/ws/golden_tests.rs
-assertion_line: 341
+assertion_line: 384
 expression: normalized
 ---
 {
@@ -11,9 +11,9 @@ expression: normalized
       "total": 0
     },
     "runtime": {
-      "arch": "aarch64",
+      "arch": "<ARCH>",
       "name": "carapace",
-      "platform": "macos"
+      "platform": "<PLATFORM>"
     },
     "sessions": {
       "count": "<SESSION_COUNT>",

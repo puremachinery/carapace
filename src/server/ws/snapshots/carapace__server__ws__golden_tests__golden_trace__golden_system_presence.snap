@@ -1,6 +1,6 @@
 ---
 source: src/server/ws/golden_tests.rs
-assertion_line: 695
+assertion_line: 700
 expression: normalized
 ---
 {
@@ -8,7 +8,7 @@ expression: normalized
   "result": [
     {
       "mode": "test",
-      "platform": "test",
+      "platform": "<PLATFORM>",
       "reason": "connect",
       "roles": [
         "admin"

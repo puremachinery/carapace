@@ -1,6 +1,6 @@
 ---
 source: src/server/ws/golden_tests.rs
-assertion_line: 554
+assertion_line: 569
 expression: normalized
 ---
 {
@@ -8,7 +8,6 @@ expression: normalized
   "result": {
     "enabled": true,
     "jobs": 0,
-    "nextRunAtMs": null,
-    "storePath": ":memory:"
+    "nextRunAtMs": null
   }
 }
