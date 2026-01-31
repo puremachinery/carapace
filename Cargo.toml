@@ -11,6 +11,7 @@ clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "fs", "signal", "io-util", "process"] }
 axum = { version = "0.7", features = ["ws"] }
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
 reqwest = { version = "0.12", features = ["rustls-tls", "stream", "json", "blocking", "multipart"], default-features = false }
 hickory-resolver = "0.24"
 url = "2"

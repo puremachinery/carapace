@@ -11,7 +11,7 @@
 pub mod executor;
 pub mod tick;
 
-use chrono::{Datelike, TimeZone, Timelike, Utc};
+use chrono::{Datelike, Offset, TimeZone, Timelike, Utc};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -1100,6 +1100,15 @@ impl CronExpr {
         Ok(result)
     }
 
+    /// Check whether raw time components match this cron expression.
+    fn matches_components(&self, minute: u32, hour: u32, day: u32, month: u32, dow: u32) -> bool {
+        self.minutes.contains(&minute)
+            && self.hours.contains(&hour)
+            && self.days_of_month.contains(&day)
+            && self.months.contains(&month)
+            && self.days_of_week.contains(&dow)
+    }
+
     /// Check if a `chrono::DateTime<Utc>` matches this cron expression.
     pub fn matches(&self, dt: &chrono::DateTime<Utc>) -> bool {
         let minute = dt.minute();
@@ -1110,11 +1119,7 @@ impl CronExpr {
         // cron: Sun=0, Mon=1 .. Sat=6 via weekday().num_days_from_sunday()
         let dow = dt.weekday().num_days_from_sunday();
 
-        self.minutes.contains(&minute)
-            && self.hours.contains(&hour)
-            && self.days_of_month.contains(&day)
-            && self.months.contains(&month)
-            && self.days_of_week.contains(&dow)
+        self.matches_components(minute, hour, day, month, dow)
     }
 
     /// Find the next minute (as UTC `DateTime`) after `after` that matches this expression.
@@ -1154,6 +1159,63 @@ impl CronExpr {
     }
 }
 
+/// Find the next UTC minute after `after` whose local-time representation in
+/// `tz` matches `expr`.
+///
+/// Uses brute-force minute iteration (same budget as `CronExpr::next_after`)
+/// but converts each UTC candidate to the target timezone before matching.
+///
+/// **Fall-back deduplication:** during a DST fall-back two consecutive UTC
+/// instants map to the same local clock reading. We fire only on the *first*
+/// occurrence by checking whether the UTC offset decreased compared to one
+/// hour earlier at the same local time.
+fn next_after_in_tz(
+    expr: &CronExpr,
+    after: &chrono::DateTime<Utc>,
+    tz: chrono_tz::Tz,
+) -> Option<chrono::DateTime<Utc>> {
+    use chrono::Duration as CDuration;
+
+    // Start from the next whole UTC minute after `after`.
+    let mut candidate = *after + CDuration::seconds(60 - after.second() as i64)
+        - CDuration::nanoseconds(after.nanosecond() as i64);
+    candidate = candidate
+        .with_second(0)
+        .unwrap_or(candidate)
+        .with_nanosecond(0)
+        .unwrap_or(candidate);
+    if candidate <= *after {
+        candidate += CDuration::minutes(1);
+    }
+
+    let max_iterations = 2_100_000u32;
+    for _ in 0..max_iterations {
+        let local = candidate.with_timezone(&tz);
+        let minute = local.minute();
+        let hour = local.hour();
+        let day = local.day();
+        let month = local.month();
+        let dow = local.weekday().num_days_from_sunday();
+
+        if expr.matches_components(minute, hour, day, month, dow) {
+            // Fall-back dedup: if offset decreased vs one hour ago AND the
+            // local clock reading was the same, this is the second occurrence
+            // of an ambiguous wall-clock time — skip it.
+            let one_hour_ago = candidate - CDuration::hours(1);
+            let local_ago = one_hour_ago.with_timezone(&tz);
+            let offset_now = local.offset().fix().local_minus_utc();
+            let offset_ago = local_ago.offset().fix().local_minus_utc();
+            if offset_now < offset_ago && local_ago.hour() == hour && local_ago.minute() == minute {
+                candidate += CDuration::minutes(1);
+                continue;
+            }
+            return Some(candidate);
+        }
+        candidate += CDuration::minutes(1);
+    }
+    None
+}
+
 /// Compute the next run time for a schedule.
 fn compute_next_run(schedule: &CronSchedule, now: u64) -> Option<u64> {
     match schedule {
@@ -1182,14 +1244,6 @@ fn compute_next_run(schedule: &CronSchedule, now: u64) -> Option<u64> {
             }
         }
         CronSchedule::Cron { expr, tz } => {
-            if let Some(tz_val) = tz {
-                if !tz_val.eq_ignore_ascii_case("UTC") {
-                    tracing::warn!(
-                        tz = %tz_val,
-                        "timezone support is not implemented; cron expression will be evaluated in UTC"
-                    );
-                }
-            }
             let parsed = match CronExpr::parse(expr) {
                 Ok(p) => p,
                 Err(e) => {
@@ -1197,9 +1251,25 @@ fn compute_next_run(schedule: &CronSchedule, now: u64) -> Option<u64> {
                     return None;
                 }
             };
-            // Convert `now` (ms since epoch) to a chrono DateTime<Utc>
             let now_dt = Utc.timestamp_millis_opt(now as i64).single()?;
-            let next_dt = parsed.next_after(&now_dt)?;
+
+            // Determine timezone: None or "UTC" → fast path, otherwise parse IANA tz.
+            let timezone: Option<chrono_tz::Tz> = match tz.as_deref() {
+                None => None,
+                Some(s) if s.eq_ignore_ascii_case("UTC") => None,
+                Some(tz_str) => match tz_str.parse::<chrono_tz::Tz>() {
+                    Ok(t) => Some(t),
+                    Err(_) => {
+                        tracing::error!(tz = %tz_str, "invalid IANA timezone for cron expression");
+                        return None;
+                    }
+                },
+            };
+
+            let next_dt = match timezone {
+                None => parsed.next_after(&now_dt)?,
+                Some(tz_val) => next_after_in_tz(&parsed, &now_dt, tz_val)?,
+            };
             Some(next_dt.timestamp_millis() as u64)
         }
     }
@@ -2294,6 +2364,135 @@ mod tests {
         let loaded = s2.list(true);
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].name, "renamed");
+    }
+
+    // ---------------------------------------------------------------
+    // Timezone tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_compute_next_run_cron_tz_none_unchanged() {
+        // tz=None should behave identically to the pre-timezone code path.
+        let now_dt = utc(2025, 6, 15, 10, 0);
+        let now = now_dt.timestamp_millis() as u64;
+        let schedule = CronSchedule::Cron {
+            expr: "30 10 * * *".to_string(),
+            tz: None,
+        };
+        let next = compute_next_run(&schedule, now).unwrap();
+        let expected = utc(2025, 6, 15, 10, 30).timestamp_millis() as u64;
+        assert_eq!(next, expected);
+    }
+
+    #[test]
+    fn test_compute_next_run_cron_tz_utc_unchanged() {
+        // tz=Some("UTC") should be identical to tz=None.
+        let now_dt = utc(2025, 6, 15, 10, 0);
+        let now = now_dt.timestamp_millis() as u64;
+        let schedule_none = CronSchedule::Cron {
+            expr: "30 10 * * *".to_string(),
+            tz: None,
+        };
+        let schedule_utc = CronSchedule::Cron {
+            expr: "30 10 * * *".to_string(),
+            tz: Some("UTC".to_string()),
+        };
+        assert_eq!(
+            compute_next_run(&schedule_none, now),
+            compute_next_run(&schedule_utc, now),
+        );
+    }
+
+    #[test]
+    fn test_compute_next_run_cron_eastern_winter() {
+        // "0 9 * * *" with tz=America/New_York in January.
+        // 9 AM ET in winter (EST = UTC-5) → 14:00 UTC.
+        let now_dt = utc(2025, 1, 15, 0, 0);
+        let now = now_dt.timestamp_millis() as u64;
+        let schedule = CronSchedule::Cron {
+            expr: "0 9 * * *".to_string(),
+            tz: Some("America/New_York".to_string()),
+        };
+        let next = compute_next_run(&schedule, now).unwrap();
+        let expected = utc(2025, 1, 15, 14, 0).timestamp_millis() as u64;
+        assert_eq!(next, expected);
+    }
+
+    #[test]
+    fn test_compute_next_run_cron_eastern_summer() {
+        // "0 9 * * *" with tz=America/New_York in July.
+        // 9 AM ET in summer (EDT = UTC-4) → 13:00 UTC.
+        let now_dt = utc(2025, 7, 15, 0, 0);
+        let now = now_dt.timestamp_millis() as u64;
+        let schedule = CronSchedule::Cron {
+            expr: "0 9 * * *".to_string(),
+            tz: Some("America/New_York".to_string()),
+        };
+        let next = compute_next_run(&schedule, now).unwrap();
+        let expected = utc(2025, 7, 15, 13, 0).timestamp_millis() as u64;
+        assert_eq!(next, expected);
+    }
+
+    #[test]
+    fn test_compute_next_run_cron_invalid_tz() {
+        // Bad timezone string → None.
+        let now_dt = utc(2025, 6, 15, 0, 0);
+        let now = now_dt.timestamp_millis() as u64;
+        let schedule = CronSchedule::Cron {
+            expr: "0 9 * * *".to_string(),
+            tz: Some("Not/A_Timezone".to_string()),
+        };
+        assert_eq!(compute_next_run(&schedule, now), None);
+    }
+
+    #[test]
+    fn test_compute_next_run_cron_spring_forward_skip() {
+        // US spring forward 2025: Mar 9 at 2:00 AM ET clocks jump to 3:00 AM.
+        // "30 2 * * *" with tz=America/New_York — 2:30 AM doesn't exist on Mar 9.
+        // The next valid 2:30 AM should be Mar 10.
+        let now_dt = utc(2025, 3, 9, 0, 0);
+        let now = now_dt.timestamp_millis() as u64;
+        let schedule = CronSchedule::Cron {
+            expr: "30 2 * * *".to_string(),
+            tz: Some("America/New_York".to_string()),
+        };
+        let next = compute_next_run(&schedule, now).unwrap();
+        // Mar 10 is EDT (UTC-4): 2:30 AM EDT → 06:30 UTC.
+        let expected = utc(2025, 3, 10, 6, 30).timestamp_millis() as u64;
+        assert_eq!(next, expected);
+    }
+
+    #[test]
+    fn test_compute_next_run_cron_fall_back_first_only() {
+        // US fall back 2025: Nov 2 at 2:00 AM ET clocks go back to 1:00 AM.
+        // "30 1 * * *" with tz=America/New_York.
+        // 1:30 AM EDT (first) = 05:30 UTC. 1:30 AM EST (second) = 06:30 UTC.
+        // We should fire at the first occurrence: 05:30 UTC.
+        let now_dt = utc(2025, 11, 2, 0, 0);
+        let now = now_dt.timestamp_millis() as u64;
+        let schedule = CronSchedule::Cron {
+            expr: "30 1 * * *".to_string(),
+            tz: Some("America/New_York".to_string()),
+        };
+        let next = compute_next_run(&schedule, now).unwrap();
+        let expected = utc(2025, 11, 2, 5, 30).timestamp_millis() as u64;
+        assert_eq!(next, expected);
+    }
+
+    #[test]
+    fn test_compute_next_run_cron_fall_back_no_double() {
+        // After the first 1:30 AM fires (05:30 UTC on Nov 2), the next
+        // occurrence should be Nov 3, not the second 1:30 AM (06:30 UTC).
+        // Nov 3 is regular EST: 1:30 AM EST = 06:30 UTC.
+        let after_first = utc(2025, 11, 2, 5, 30);
+        let now = after_first.timestamp_millis() as u64;
+        let schedule = CronSchedule::Cron {
+            expr: "30 1 * * *".to_string(),
+            tz: Some("America/New_York".to_string()),
+        };
+        let next = compute_next_run(&schedule, now).unwrap();
+        let expected = utc(2025, 11, 3, 6, 30).timestamp_millis() as u64;
+        assert_eq!(next, expected);
     }
 
     #[test]
