@@ -3,13 +3,6 @@
 //! This library provides the core functionality for the carapace gateway,
 //! including HTTP/WebSocket servers, plugin system, and channel management.
 //!
-// TODO: rename legacy moltbot identifiers to carapace (non-urgent, cosmetic):
-//   - `x-moltbot-*` HTTP headers → `x-carapace-*`
-//   - `~/.moltbot/` state dir → `~/.config/carapace/`
-//   - `MOLTBOT_*` env vars → `CARAPACE_*`
-//   - `_moltbot._tcp.local.` mDNS service type → `_carapace._tcp.local.`
-//   - `moltbot` keyring service name → `carapace`
-
 #![allow(dead_code)]
 #![allow(unused_imports)]
 
