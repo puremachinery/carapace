@@ -641,6 +641,7 @@ fn parse_agent_request(
             session_key: None,
             timeout_seconds: None,
             allow_unsafe_external_content: None,
+            venice_parameters: None,
         }
     } else {
         match serde_json::from_slice(body) {
@@ -731,6 +732,7 @@ fn dispatch_agent_run(
                 .clone()
                 .unwrap_or_else(|| crate::agent::DEFAULT_MODEL.to_string()),
             deliver: validated.deliver,
+            extra: validated.venice_parameters.clone(),
             ..Default::default()
         };
         crate::agent::spawn_run(

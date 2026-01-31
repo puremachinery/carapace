@@ -537,6 +537,7 @@ mod tests {
             tools: vec![],
             max_tokens: 2048,
             temperature: Some(0.7),
+            extra: None,
         };
         let body = provider.build_body(&request);
         assert_eq!(body["model"], "llama3");
@@ -574,6 +575,7 @@ mod tests {
             }],
             max_tokens: 4096,
             temperature: None,
+            extra: None,
         };
         let body = provider.build_body(&request);
         assert!(body["tools"].is_array());
@@ -622,6 +624,7 @@ mod tests {
             tools: vec![],
             max_tokens: 1024,
             temperature: None,
+            extra: None,
         };
         let body = provider.build_body(&request);
         let messages = body["messages"].as_array().unwrap();
@@ -661,6 +664,7 @@ mod tests {
             tools: vec![],
             max_tokens: 1024,
             temperature: None,
+            extra: None,
         };
         let body = provider.build_body(&request);
         let messages = body["messages"].as_array().unwrap();
@@ -678,6 +682,7 @@ mod tests {
             tools: vec![],
             max_tokens: 1024,
             temperature: None,
+            extra: None,
         };
         let body = provider.build_body(&request);
         assert_eq!(body["stream"], true);

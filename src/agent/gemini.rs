@@ -563,6 +563,7 @@ mod tests {
             tools: vec![],
             max_tokens: 1024,
             temperature: Some(0.7),
+            extra: None,
         };
         let body = provider.build_body(&request);
 
@@ -601,6 +602,7 @@ mod tests {
             tools: vec![],
             max_tokens: 1024,
             temperature: None,
+            extra: None,
         };
         let body = provider.build_body(&request);
 
@@ -635,6 +637,7 @@ mod tests {
             }],
             max_tokens: 4096,
             temperature: None,
+            extra: None,
         };
         let body = provider.build_body(&request);
 
@@ -681,6 +684,7 @@ mod tests {
             tools: vec![],
             max_tokens: 1024,
             temperature: None,
+            extra: None,
         };
         let body = provider.build_body(&request);
         let contents = body["contents"].as_array().unwrap();
@@ -742,6 +746,7 @@ mod tests {
             tools: vec![],
             max_tokens: 1024,
             temperature: None,
+            extra: None,
         };
         let body = provider.build_body(&request);
         let contents = body["contents"].as_array().unwrap();
@@ -769,6 +774,7 @@ mod tests {
             tools: vec![],
             max_tokens: 1024,
             temperature: None,
+            extra: None,
         };
         let body = provider.build_body(&request);
         let contents = body["contents"].as_array().unwrap();

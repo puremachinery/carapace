@@ -78,6 +78,7 @@ pub struct AgentRequest {
     pub session_key: Option<String>,
     pub timeout_seconds: Option<f64>,
     pub allow_unsafe_external_content: Option<bool>,
+    pub venice_parameters: Option<serde_json::Value>,
 }
 
 /// Response body for POST /hooks/agent
@@ -149,6 +150,7 @@ pub struct ValidatedAgentRequest {
     pub session_key: String,
     pub timeout_seconds: Option<u32>,
     pub allow_unsafe_external_content: bool,
+    pub venice_parameters: Option<serde_json::Value>,
 }
 
 /// Channel aliases mapping
@@ -240,6 +242,12 @@ pub fn validate_agent_request(
         session_key,
         timeout_seconds,
         allow_unsafe_external_content: req.allow_unsafe_external_content.unwrap_or(false),
+        venice_parameters: match &req.venice_parameters {
+            Some(v) if !v.is_object() => {
+                return Err("venice_parameters must be an object".to_string());
+            }
+            other => other.clone(),
+        },
     })
 }
 
@@ -349,6 +357,7 @@ mod tests {
             session_key: None,
             timeout_seconds: None,
             allow_unsafe_external_content: None,
+            venice_parameters: None,
         };
         let result = validate_agent_request(&req, &[]).unwrap();
         assert_eq!(result.message, "Do something");
@@ -373,6 +382,7 @@ mod tests {
             session_key: None,
             timeout_seconds: None,
             allow_unsafe_external_content: None,
+            venice_parameters: None,
         };
         let result = validate_agent_request(&req, &[]);
         assert_eq!(result.unwrap_err(), "message required");
@@ -392,6 +402,7 @@ mod tests {
             session_key: None,
             timeout_seconds: None,
             allow_unsafe_external_content: None,
+            venice_parameters: None,
         };
         let result = validate_agent_request(&req, &[]);
         assert_eq!(result.unwrap_err(), "message required");
@@ -411,6 +422,7 @@ mod tests {
             session_key: None,
             timeout_seconds: None,
             allow_unsafe_external_content: None,
+            venice_parameters: None,
         };
         let result = validate_agent_request(&req, &[]);
         assert_eq!(result.unwrap_err(), "model required");
@@ -430,6 +442,7 @@ mod tests {
             session_key: None,
             timeout_seconds: None,
             allow_unsafe_external_content: None,
+            venice_parameters: None,
         };
         let result = validate_agent_request(&req, &["imessage".to_string()]).unwrap();
         assert_eq!(result.channel, "imessage");
@@ -449,6 +462,7 @@ mod tests {
             session_key: None,
             timeout_seconds: None,
             allow_unsafe_external_content: None,
+            venice_parameters: None,
         };
         let result = validate_agent_request(&req, &["telegram".to_string(), "discord".to_string()]);
         assert!(result.unwrap_err().contains("channel must be"));
@@ -468,6 +482,7 @@ mod tests {
             session_key: None,
             timeout_seconds: Some(60.7),
             allow_unsafe_external_content: None,
+            venice_parameters: None,
         };
         let result = validate_agent_request(&req, &[]).unwrap();
         assert_eq!(result.timeout_seconds, Some(60));
@@ -487,6 +502,7 @@ mod tests {
             session_key: None,
             timeout_seconds: Some(-1.0),
             allow_unsafe_external_content: None,
+            venice_parameters: None,
         };
         let result = validate_agent_request(&req, &[]).unwrap();
         assert_eq!(result.timeout_seconds, None);
@@ -506,6 +522,7 @@ mod tests {
             session_key: Some("my-custom-session".to_string()),
             timeout_seconds: None,
             allow_unsafe_external_content: None,
+            venice_parameters: None,
         };
         let result = validate_agent_request(&req, &[]).unwrap();
         assert_eq!(result.session_key, "my-custom-session");
@@ -525,9 +542,53 @@ mod tests {
             session_key: None,
             timeout_seconds: None,
             allow_unsafe_external_content: None,
+            venice_parameters: None,
         };
         let result = validate_agent_request(&req, &[]).unwrap();
         assert!(!result.deliver);
+    }
+
+    #[test]
+    fn test_validate_agent_request_venice_parameters_rejects_non_object() {
+        let req = AgentRequest {
+            message: Some("test".to_string()),
+            name: None,
+            channel: None,
+            to: None,
+            model: None,
+            thinking: None,
+            deliver: None,
+            wake_mode: None,
+            session_key: None,
+            timeout_seconds: None,
+            allow_unsafe_external_content: None,
+            venice_parameters: Some(serde_json::json!("not an object")),
+        };
+        let result = validate_agent_request(&req, &[]);
+        assert_eq!(result.unwrap_err(), "venice_parameters must be an object");
+    }
+
+    #[test]
+    fn test_validate_agent_request_venice_parameters_accepts_object() {
+        let req = AgentRequest {
+            message: Some("test".to_string()),
+            name: None,
+            channel: None,
+            to: None,
+            model: None,
+            thinking: None,
+            deliver: None,
+            wake_mode: None,
+            session_key: None,
+            timeout_seconds: None,
+            allow_unsafe_external_content: None,
+            venice_parameters: Some(serde_json::json!({"enable_web_search": "on"})),
+        };
+        let result = validate_agent_request(&req, &[]).unwrap();
+        assert_eq!(
+            result.venice_parameters,
+            Some(serde_json::json!({"enable_web_search": "on"}))
+        );
     }
 
     #[test]

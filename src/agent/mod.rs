@@ -101,6 +101,12 @@ pub struct AgentConfig {
     pub output_sanitizer: output_sanitizer::OutputSanitizerConfig,
     /// Inbound message classifier configuration (off by default).
     pub classifier: Option<classifier::ClassifierConfig>,
+    /// Provider-specific parameters injected into the request body.
+    ///
+    /// Populated from the `venice_parameters` key in WS/HTTP requests.
+    /// The Venice provider writes this as `body["venice_parameters"]`;
+    /// other providers ignore it.
+    pub extra: Option<serde_json::Value>,
 }
 
 impl Default for AgentConfig {
@@ -118,6 +124,7 @@ impl Default for AgentConfig {
             process_sandbox: sandbox::ProcessSandboxConfig::default(),
             output_sanitizer: output_sanitizer::OutputSanitizerConfig::default(),
             classifier: None,
+            extra: None,
         }
     }
 }

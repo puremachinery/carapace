@@ -35,6 +35,16 @@ impl VeniceProvider {
             inner: self.inner.with_base_url(url)?,
         })
     }
+
+    /// Build the OpenAI-format request body, injecting `venice_parameters`
+    /// from `request.extra` when present.
+    fn build_venice_body(&self, request: &CompletionRequest) -> serde_json::Value {
+        let mut body = self.inner.build_body(request);
+        if let Some(ref venice_params) = request.extra {
+            body["venice_parameters"] = venice_params.clone();
+        }
+        body
+    }
 }
 
 #[async_trait]
@@ -43,9 +53,7 @@ impl LlmProvider for VeniceProvider {
         &self,
         request: CompletionRequest,
     ) -> Result<mpsc::Receiver<StreamEvent>, AgentError> {
-        let body = self.inner.build_body(&request);
-        // Venice uses the standard OpenAI body; venice_parameters would be
-        // injected here from config if needed in the future.
+        let body = self.build_venice_body(&request);
         self.inner.complete_with_body(body).await
     }
 }
@@ -145,6 +153,7 @@ mod tests {
             tools: vec![],
             max_tokens: 1024,
             temperature: None,
+            extra: None,
         };
         let body = provider.inner.build_body(&request);
         assert_eq!(body["model"], "llama-3.3-70b");
@@ -166,6 +175,7 @@ mod tests {
             tools: vec![],
             max_tokens: 4096,
             temperature: Some(0.3),
+            extra: None,
         };
         let body = provider.inner.build_body(&request);
         assert_eq!(body["model"], "deepseek-r1-671b");
@@ -194,10 +204,62 @@ mod tests {
             }],
             max_tokens: 2048,
             temperature: None,
+            extra: None,
         };
         let body = provider.inner.build_body(&request);
         let tools = body["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["function"]["name"], "search");
+    }
+
+    #[test]
+    fn test_venice_parameters_injected_into_body() {
+        let provider = VeniceProvider::new("test-key".to_string()).unwrap();
+        let venice_params = json!({
+            "enable_web_search": "on",
+            "include_venice_system_prompt": false
+        });
+        let request = CompletionRequest {
+            model: "llama-3.3-70b".to_string(),
+            messages: vec![LlmMessage {
+                role: LlmRole::User,
+                content: vec![ContentBlock::Text {
+                    text: "Hello".to_string(),
+                }],
+            }],
+            system: None,
+            tools: vec![],
+            max_tokens: 1024,
+            temperature: None,
+            extra: Some(venice_params.clone()),
+        };
+        let body = provider.build_venice_body(&request);
+        assert_eq!(body["venice_parameters"], venice_params);
+        assert_eq!(body["venice_parameters"]["enable_web_search"], "on");
+        assert_eq!(
+            body["venice_parameters"]["include_venice_system_prompt"],
+            false
+        );
+    }
+
+    #[test]
+    fn test_venice_parameters_absent_when_extra_is_none() {
+        let provider = VeniceProvider::new("test-key".to_string()).unwrap();
+        let request = CompletionRequest {
+            model: "llama-3.3-70b".to_string(),
+            messages: vec![LlmMessage {
+                role: LlmRole::User,
+                content: vec![ContentBlock::Text {
+                    text: "Hello".to_string(),
+                }],
+            }],
+            system: None,
+            tools: vec![],
+            max_tokens: 1024,
+            temperature: None,
+            extra: None,
+        };
+        let body = provider.build_venice_body(&request);
+        assert!(body.get("venice_parameters").is_none());
     }
 }

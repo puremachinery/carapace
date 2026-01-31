@@ -393,6 +393,7 @@ mod tests {
             tools: vec![],
             max_tokens: 1024,
             temperature: Some(0.7),
+            extra: None,
         };
         let body = provider.build_body(&request);
         assert_eq!(body["model"], "claude-sonnet-4-20250514");
@@ -422,6 +423,7 @@ mod tests {
             }],
             max_tokens: 4096,
             temperature: None,
+            extra: None,
         };
         let body = provider.build_body(&request);
         assert!(body["tools"].is_array());

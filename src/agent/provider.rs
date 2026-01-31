@@ -54,6 +54,9 @@ pub struct CompletionRequest {
     pub tools: Vec<ToolDefinition>,
     pub max_tokens: u32,
     pub temperature: Option<f64>,
+    /// Provider-specific extension payload (e.g. Venice's `venice_parameters`).
+    /// Providers that don't recognise it simply ignore it.
+    pub extra: Option<serde_json::Value>,
 }
 
 /// A message in the LLM conversation.

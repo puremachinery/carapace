@@ -193,6 +193,7 @@ pub async fn classify_message(
         tools: vec![],
         max_tokens: 256,
         temperature: Some(0.0),
+        extra: None,
     };
 
     let mut rx = provider.complete(request).await?;

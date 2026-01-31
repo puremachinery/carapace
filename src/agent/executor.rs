@@ -350,6 +350,7 @@ fn build_turn_request(
         tools,
         max_tokens: config.max_tokens,
         temperature: config.temperature,
+        extra: config.extra.clone(),
     }
 }
 

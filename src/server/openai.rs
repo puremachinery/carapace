@@ -294,6 +294,7 @@ async fn call_llm_provider(
         tools: vec![],
         max_tokens: 8192,
         temperature: None,
+        extra: None,
     };
 
     let mut rx = provider
@@ -342,6 +343,7 @@ async fn stream_llm_provider(
         tools: vec![],
         max_tokens: 8192,
         temperature: None,
+        extra: None,
     };
 
     let rx = match provider.complete(request).await {

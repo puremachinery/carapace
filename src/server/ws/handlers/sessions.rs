@@ -1582,6 +1582,10 @@ pub(super) fn handle_agent(
                 .and_then(|v| v.get("deliver"))
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
+            extra: params
+                .and_then(|v| v.get("venice_parameters"))
+                .filter(|v| v.is_object())
+                .cloned(),
             ..Default::default()
         };
         crate::agent::spawn_run(
@@ -1939,6 +1943,7 @@ fn trigger_agent_if_enabled(
     idempotency_key: &str,
     message: &str,
     session_key: &str,
+    extra: Option<serde_json::Value>,
 ) -> (Option<String>, &'static str) {
     if !trigger_agent {
         return (None, "sent");
@@ -1973,6 +1978,7 @@ fn trigger_agent_if_enabled(
         let config = crate::agent::AgentConfig {
             model: crate::agent::DEFAULT_MODEL.to_string(),
             deliver: true,
+            extra,
             ..Default::default()
         };
         crate::agent::spawn_run(
@@ -2077,6 +2083,10 @@ pub(super) fn handle_chat_send(
         chat_params.idempotency_key,
         chat_params.message,
         &session.session_key,
+        params
+            .and_then(|v| v.get("venice_parameters"))
+            .filter(|v| v.is_object())
+            .cloned(),
     );
 
     Ok(json!({
