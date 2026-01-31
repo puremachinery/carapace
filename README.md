@@ -2,17 +2,17 @@
 
 > **Under active development.** Kicking the tires is welcome, but don't expect everything to work yet.
 
-A security-focused, open-source personal AI assistant. Runs on your machine. Works through Telegram, Discord, Slack, and webhooks. Supports Anthropic, OpenAI, Ollama, Gemini, Bedrock, and Venice AI. Extensible via WASM plugins. Written in Rust.
+A security-focused, open-source personal AI assistant. Runs on your machine. Works through Signal, webhooks, and console today — Telegram, Discord, and Slack planned via WASM plugins. Supports Anthropic, OpenAI, Ollama, Gemini, Bedrock, and Venice AI. Extensible via WASM plugins. Written in Rust.
 
 A hardened alternative to openclaw / moltbot / clawdbot — for when your molt needs a hard shell.
 
 ## Features
 
 - **Multi-provider LLM engine** — Anthropic, OpenAI, Ollama, Google Gemini, AWS Bedrock, Venice AI with streaming, tool dispatch, and cancellation
-- **Multi-channel messaging** — Telegram, Discord, Slack with platform-specific tools (25 total: 10 built-in + 15 channel-specific)
-- **WASM plugin runtime** — wasmtime 41 with Ed25519 signature verification, capability sandboxing, and fuel-based CPU limits
-- **Security by default** — fail-closed auth, localhost-only binding, encrypted secrets (AES-256-GCM), SSRF/DNS-rebinding defense, prompt guard, inbound message classifier, OS-level sandboxing (Seatbelt/Landlock), output content security
-- **Infrastructure** — TLS, mTLS for gateway clustering, mDNS discovery, config hot-reload, Tailscale integration, Prometheus metrics, structured audit logging
+- **Multi-channel messaging** — Signal, console, and webhooks today; Telegram, Discord, Slack planned via WASM plugins. 10 built-in tools + 15 channel-specific tool schemas
+- **WASM plugin runtime** — wasmtime 41 with Ed25519 signature verification and capability sandboxing
+- **Security by default** — localhost-only binding, SSRF/DNS-rebinding defense, prompt guard, inbound message classifier, exec approval flow, output content security. Auth denies by default when no credentials configured (control endpoint gating in progress). Secret encryption primitives (AES-256-GCM + PBKDF2) implemented, config-level wiring in progress. OS-level sandbox primitives (Seatbelt/Landlock/rlimits) implemented, subprocess wiring in progress
+- **Infrastructure** — TLS, mTLS, mDNS discovery, config hot-reload, Tailscale integration, Prometheus metrics. Gateway clustering and audit logging are partially implemented
 
 ## Security
 
@@ -20,12 +20,12 @@ Carapace is hardened against every major vulnerability class reported in the [Ja
 
 | Threat | Carapace defense |
 |---|---|
-| Unauthenticated access | Denied by default (fail-closed) |
+| Unauthenticated access | Denied by default when credentials configured; control endpoint gating in progress |
 | Exposed network ports | Localhost-only binding (127.0.0.1) |
-| Plaintext secret storage | AES-256-GCM at rest, zeroized in memory |
+| Plaintext secret storage | AES-256-GCM + PBKDF2 primitives implemented; config-level auto-seal in progress |
 | Skills supply chain | Ed25519 signatures + WASM capability sandbox |
 | Prompt injection | Prompt guard + inbound classifier + exec approval flow + tool policies |
-| No process sandboxing | Seatbelt (macOS) / Landlock (Linux) + rlimits |
+| No process sandboxing | Seatbelt / Landlock / rlimits primitives implemented; subprocess wiring in progress |
 | SSRF / DNS rebinding | Private IP blocking + post-resolution validation |
 
 See [docs/security.md](docs/security.md) for the full security model.
@@ -129,7 +129,7 @@ just watch    # Watch for changes and run tests
 
 ## Testing
 
-2,472 lib tests + 10 integration tests. Zero Clippy warnings. Cross-platform CI (Linux, macOS, Windows).
+4,748 tests (nextest). Zero Clippy warnings. Cross-platform CI (Linux, macOS, Windows).
 
 ```bash
 cargo nextest run       # or: just test
@@ -148,7 +148,7 @@ Format, Clippy, nextest (cross-platform), MSRV 1.93, cargo-audit, cargo-deny, gi
 src/
 ├── agent/          # LLM execution engine, prompt guard, classifier, sandbox, output sanitizer
 ├── auth/           # Token, password, and Tailscale authentication
-├── channels/       # Channel registry (Telegram, Discord, Slack)
+├── channels/       # Channel registry, console channel, Signal channel
 ├── cli/            # CLI subcommands (start, config, backup, tls, etc.)
 ├── config/         # JSON5 config with $include, env substitution, hot reload
 ├── credentials/    # Platform-native credential storage (Keychain, Secret Service, Windows)
@@ -157,7 +157,7 @@ src/
 ├── exec/           # Exec approval workflow (request, wait, resolve)
 ├── gateway/        # Gateway connections with mTLS support
 ├── hooks/          # Webhook mappings
-├── logging/        # Structured logging, ring buffer, secret masking
+├── logging/        # Structured logging, ring buffer
 ├── media/          # SSRF-protected media fetch/store
 ├── messages/       # Outbound message pipeline and delivery loop
 ├── nodes/          # Node pairing state machine
