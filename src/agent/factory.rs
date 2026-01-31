@@ -212,11 +212,75 @@ pub fn build_providers(cfg: &Value) -> Result<Option<MultiProvider>, Box<dyn std
         |p, url| p.with_base_url(url),
     )?;
 
+    // Bedrock
+    let bedrock = {
+        let bedrock_cfg = cfg.get("bedrock");
+        // Check explicit disable
+        if bedrock_cfg
+            .and_then(|b| b.get("enabled"))
+            .and_then(|v| v.as_bool())
+            != Some(false)
+        {
+            let region = std::env::var("AWS_REGION")
+                .ok()
+                .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
+                .or_else(|| {
+                    bedrock_cfg
+                        .and_then(|b| b.get("region"))
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                });
+
+            let access_key = std::env::var("AWS_ACCESS_KEY_ID").ok().or_else(|| {
+                bedrock_cfg
+                    .and_then(|b| b.get("accessKeyId"))
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            });
+
+            let secret_key = std::env::var("AWS_SECRET_ACCESS_KEY").ok().or_else(|| {
+                bedrock_cfg
+                    .and_then(|b| b.get("secretAccessKey"))
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            });
+
+            let session_token = std::env::var("AWS_SESSION_TOKEN").ok().or_else(|| {
+                bedrock_cfg
+                    .and_then(|b| b.get("sessionToken"))
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            });
+
+            match (region, access_key, secret_key) {
+                (Some(r), Some(ak), Some(sk)) => {
+                    match agent::bedrock::BedrockProvider::new(r, ak, sk) {
+                        Ok(mut p) => {
+                            if let Some(tok) = session_token {
+                                p = p.with_session_token(tok);
+                            }
+                            info!("Bedrock provider configured");
+                            Some(Arc::new(p) as Arc<dyn agent::LlmProvider>)
+                        }
+                        Err(e) => {
+                            warn!("Bedrock provider init failed: {}", e);
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        }
+    };
+
     // Build multi-provider dispatcher
     let multi_provider = MultiProvider::new(anthropic_provider, openai_provider)
         .with_ollama(ollama_provider)
         .with_gemini(gemini_provider)
-        .with_venice(venice_provider);
+        .with_venice(venice_provider)
+        .with_bedrock(bedrock);
 
     if multi_provider.has_any_provider() {
         Ok(Some(multi_provider))
@@ -235,6 +299,7 @@ pub struct ProviderFingerprint {
     pub ollama: Option<(bool, Option<String>)>,
     pub gemini: Option<(String, Option<String>)>,
     pub venice: Option<(String, Option<String>)>,
+    pub bedrock: Option<String>,
 }
 
 /// Compute a fingerprint of the provider configuration from config + env vars.
@@ -300,6 +365,27 @@ pub fn fingerprint_providers(cfg: &Value) -> ProviderFingerprint {
             .map(|s| s.to_string())
     });
 
+    let bedrock_cfg = cfg.get("bedrock");
+    let bedrock_enabled = bedrock_cfg
+        .and_then(|b| b.get("enabled"))
+        .and_then(|v| v.as_bool())
+        != Some(false);
+    let bedrock_region = std::env::var("AWS_REGION")
+        .ok()
+        .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
+        .or_else(|| {
+            bedrock_cfg
+                .and_then(|b| b.get("region"))
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        });
+    let bedrock_access_key = std::env::var("AWS_ACCESS_KEY_ID").ok().or_else(|| {
+        bedrock_cfg
+            .and_then(|b| b.get("accessKeyId"))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    });
+
     ProviderFingerprint {
         anthropic: anthropic_key.map(|k| (hash_key_prefix(&k), anthropic_url)),
         openai: openai_key.map(|k| (hash_key_prefix(&k), openai_url)),
@@ -310,6 +396,17 @@ pub fn fingerprint_providers(cfg: &Value) -> ProviderFingerprint {
         },
         gemini: google_key.map(|k| (hash_key_prefix(&k), google_url)),
         venice: venice_key.map(|k| (hash_key_prefix(&k), venice_url)),
+        bedrock: if bedrock_enabled {
+            match (bedrock_region, bedrock_access_key) {
+                (Some(r), Some(ak)) => {
+                    let combined = format!("{}{}", r, ak);
+                    Some(hash_key_prefix(&combined))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        },
     }
 }
 
@@ -336,6 +433,7 @@ mod tests {
         assert!(fp.ollama.is_none());
         assert!(fp.gemini.is_none());
         assert!(fp.venice.is_none());
+        assert!(fp.bedrock.is_none());
     }
 
     #[test]
@@ -377,6 +475,65 @@ mod tests {
         let (configured, url) = fp.ollama.unwrap();
         assert!(configured);
         assert_eq!(url.as_deref(), Some("http://localhost:11434"));
+    }
+
+    #[test]
+    fn test_fingerprint_bedrock_configured() {
+        let cfg = json!({
+            "bedrock": {
+                "region": "us-east-1",
+                "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+                "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+            }
+        });
+        let fp = fingerprint_providers(&cfg);
+        assert!(fp.bedrock.is_some());
+        assert_eq!(fp.bedrock.as_ref().unwrap().len(), 16); // 8 bytes = 16 hex chars
+    }
+
+    #[test]
+    fn test_fingerprint_bedrock_detects_change() {
+        let cfg1 = json!({
+            "bedrock": {
+                "region": "us-east-1",
+                "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+                "secretAccessKey": "secret1"
+            }
+        });
+        let cfg2 = json!({
+            "bedrock": {
+                "region": "us-west-2",
+                "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+                "secretAccessKey": "secret1"
+            }
+        });
+        let fp1 = fingerprint_providers(&cfg1);
+        let fp2 = fingerprint_providers(&cfg2);
+        assert_ne!(fp1.bedrock, fp2.bedrock);
+    }
+
+    #[test]
+    fn test_fingerprint_bedrock_disabled() {
+        let cfg = json!({
+            "bedrock": {
+                "region": "us-east-1",
+                "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+                "secretAccessKey": "secret",
+                "enabled": false
+            }
+        });
+        let fp = fingerprint_providers(&cfg);
+        assert!(fp.bedrock.is_none());
+    }
+
+    #[test]
+    fn test_fingerprint_bedrock_partial_creds() {
+        // Only region, missing access key — should be None
+        let cfg = json!({
+            "bedrock": { "region": "us-east-1" }
+        });
+        let fp = fingerprint_providers(&cfg);
+        assert!(fp.bedrock.is_none());
     }
 
     #[test]

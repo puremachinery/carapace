@@ -57,6 +57,10 @@ const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "openai",
     "google",
     "providers",
+    "bedrock",
+    "venice",
+    "signal",
+    "classifier",
 ];
 
 /// Validate a config value against the full schema.
@@ -96,6 +100,7 @@ pub fn validate_schema(config: &Value) -> Vec<SchemaIssue> {
     validate_session(obj, &mut issues);
     validate_cron(obj, &mut issues);
     validate_prompt_guard(obj, &mut issues);
+    validate_output_sanitizer(obj, &mut issues);
     validate_skills_signature(obj, &mut issues);
     validate_skills_sandbox(obj, &mut issues);
     validate_session_integrity(obj, &mut issues);
@@ -391,6 +396,45 @@ fn validate_prompt_guard(obj: &serde_json::Map<String, Value>, issues: &mut Vec<
                     });
                 }
             }
+        }
+    }
+}
+
+fn validate_output_sanitizer(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIssue>) {
+    let agents = match obj.get("agents").and_then(|v| v.as_object()) {
+        Some(a) => a,
+        None => return,
+    };
+
+    let output = agents
+        .get("outputSanitizer")
+        .or_else(|| agents.get("output_sanitizer"))
+        .and_then(|v| v.as_object());
+    let output = match output {
+        Some(o) => o,
+        None => return,
+    };
+
+    if let Some(enabled) = output
+        .get("sanitizeHtml")
+        .or_else(|| output.get("sanitize_html"))
+    {
+        if !enabled.is_boolean() {
+            issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: ".agents.outputSanitizer.sanitizeHtml".to_string(),
+                message: "sanitizeHtml must be a boolean".to_string(),
+            });
+        }
+    }
+
+    if let Some(policy) = output.get("cspPolicy").or_else(|| output.get("csp_policy")) {
+        if !policy.is_string() {
+            issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: ".agents.outputSanitizer.cspPolicy".to_string(),
+                message: "cspPolicy must be a string".to_string(),
+            });
         }
     }
 }
@@ -742,6 +786,41 @@ mod tests {
         assert!(issues
             .iter()
             .any(|i| i.path == ".agents.defaults.maxConcurrent"));
+    }
+
+    #[test]
+    fn test_agents_output_sanitizer_valid() {
+        let cfg = json!({
+            "agents": {
+                "outputSanitizer": {
+                    "sanitizeHtml": false,
+                    "cspPolicy": "default-src 'self'"
+                }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(!issues
+            .iter()
+            .any(|i| i.path.starts_with(".agents.outputSanitizer")));
+    }
+
+    #[test]
+    fn test_agents_output_sanitizer_invalid_types() {
+        let cfg = json!({
+            "agents": {
+                "outputSanitizer": {
+                    "sanitizeHtml": "false",
+                    "cspPolicy": 123
+                }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(issues
+            .iter()
+            .any(|i| i.path == ".agents.outputSanitizer.sanitizeHtml"));
+        assert!(issues
+            .iter()
+            .any(|i| i.path == ".agents.outputSanitizer.cspPolicy"));
     }
 
     // --- session retention ---

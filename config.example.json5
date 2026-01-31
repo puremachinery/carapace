@@ -73,6 +73,15 @@
   //   // apiKey: "optional-key",                  // for remote instances with auth
   // },
 
+  // --- AWS Bedrock provider ------------------------------------------------
+  // bedrock: {
+  //   region: "us-east-1",                          // or AWS_REGION / AWS_DEFAULT_REGION
+  //   accessKeyId: "${AWS_ACCESS_KEY_ID}",
+  //   secretAccessKey: "${AWS_SECRET_ACCESS_KEY}",
+  //   // sessionToken: "${AWS_SESSION_TOKEN}",      // for temporary credentials
+  //   // enabled: false,                            // explicit kill switch
+  // },
+
   // --- Signal channel (via signal-cli REST API) ------------------------------
   // signal: {
   //   baseUrl: "http://localhost:8080",           // signal-cli-rest-api address

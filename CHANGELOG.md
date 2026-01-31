@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Bedrock provider wiring:** AWS Bedrock models available via config or
+  standard AWS env vars (`AWS_REGION`, `AWS_ACCESS_KEY_ID`,
+  `AWS_SECRET_ACCESS_KEY`). Optional session token and explicit kill switch.
 - **Signal channel:** Built-in channel plugin wrapping signal-cli-rest-api.
   Outbound via `POST /v2/send` with text and base64 media attachments. Inbound
   via polling `GET /v1/receive/{number}` every 2s with automatic agent dispatch.
