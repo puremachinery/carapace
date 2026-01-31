@@ -346,6 +346,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use carapace::agent::provider::{CompletionRequest, StopReason, StreamEvent, TokenUsage};
 use carapace::agent::{AgentError, LlmProvider};
@@ -359,6 +360,7 @@ impl LlmProvider for MockLlmProvider {
     async fn complete(
         &self,
         _request: CompletionRequest,
+        _cancel_token: CancellationToken,
     ) -> Result<mpsc::Receiver<StreamEvent>, AgentError> {
         let (tx, rx) = mpsc::channel(8);
         tokio::spawn(async move {

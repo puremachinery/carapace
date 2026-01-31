@@ -234,7 +234,7 @@ fn process_envelope(envelope: &SignalEnvelope, state: &Arc<WsServerState>) {
     if let Some(provider) = state.llm_provider() {
         let cfg = crate::config::load_config().unwrap_or(Value::Object(serde_json::Map::new()));
         let mut config = crate::agent::AgentConfig::default();
-        crate::agent::apply_agent_config_from_settings(&mut config, &cfg);
+        crate::agent::apply_agent_config_from_settings(&mut config, &cfg, None);
         config.deliver = true;
         crate::agent::spawn_run(
             run_id.clone(),

@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::agent::provider::*;
 use crate::agent::AgentError;
@@ -102,19 +103,28 @@ impl OpenAiProvider {
     pub(crate) async fn complete_with_body(
         &self,
         body: Value,
+        cancel_token: CancellationToken,
     ) -> Result<mpsc::Receiver<StreamEvent>, AgentError> {
+        if cancel_token.is_cancelled() {
+            return Err(AgentError::Cancelled);
+        }
         let url = format!("{}/v1/chat/completions", self.base_url);
 
-        let response = self
-            .client
-            .post(&url)
-            .header("authorization", format!("Bearer {}", self.api_key))
-            .header("content-type", "application/json")
-            .header("accept", "text/event-stream")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| AgentError::Provider(format!("HTTP request failed: {e}")))?;
+        let response = tokio::select! {
+            _ = cancel_token.cancelled() => {
+                return Err(AgentError::Cancelled);
+            }
+            response = self
+                .client
+                .post(&url)
+                .header("authorization", format!("Bearer {}", self.api_key))
+                .header("content-type", "application/json")
+                .header("accept", "text/event-stream")
+                .json(&body)
+                .send() => {
+                    response.map_err(|e| AgentError::Provider(format!("HTTP request failed: {e}")))?
+                }
+        };
 
         if !response.status().is_success() {
             let status = response.status();
@@ -131,8 +141,9 @@ impl OpenAiProvider {
 
         // Spawn a task to read the SSE stream and forward events
         let stream = response.bytes_stream();
+        let cancel = cancel_token.clone();
         tokio::spawn(async move {
-            if let Err(e) = process_sse_stream(stream, &tx).await {
+            if let Err(e) = process_sse_stream(stream, &tx, &cancel).await {
                 let _ = tx
                     .send(StreamEvent::Error {
                         message: e.to_string(),
@@ -266,9 +277,10 @@ impl LlmProvider for OpenAiProvider {
     async fn complete(
         &self,
         request: CompletionRequest,
+        cancel_token: CancellationToken,
     ) -> Result<mpsc::Receiver<StreamEvent>, AgentError> {
         let body = self.build_body(&request);
-        self.complete_with_body(body).await
+        self.complete_with_body(body, cancel_token).await
     }
 }
 
@@ -283,15 +295,20 @@ const MAX_SSE_BUFFER_BYTES: usize = 1_048_576;
 pub async fn process_ollama_sse_stream<S>(
     stream: S,
     tx: &mpsc::Sender<StreamEvent>,
+    cancel_token: &CancellationToken,
 ) -> Result<(), String>
 where
     S: futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
 {
-    process_sse_stream(stream, tx).await
+    process_sse_stream(stream, tx, cancel_token).await
 }
 
 /// Process an OpenAI SSE byte stream into StreamEvents.
-async fn process_sse_stream<S>(mut stream: S, tx: &mpsc::Sender<StreamEvent>) -> Result<(), String>
+async fn process_sse_stream<S>(
+    mut stream: S,
+    tx: &mpsc::Sender<StreamEvent>,
+    cancel_token: &CancellationToken,
+) -> Result<(), String>
 where
     S: futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
 {
@@ -302,7 +319,14 @@ where
     let mut accumulated_usage = TokenUsage::default();
     let mut got_done = false;
 
-    while let Some(chunk) = stream.next().await {
+    loop {
+        let chunk = tokio::select! {
+            _ = cancel_token.cancelled() => return Ok(()),
+            chunk = stream.next() => chunk,
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
         let chunk = chunk.map_err(|e| format!("stream read error: {e}"))?;
         buffer.push_str(&String::from_utf8_lossy(&chunk));
 
@@ -907,7 +931,7 @@ mod tests {
         let stream = mock_sse_stream(vec![sse_data]);
         let (tx, mut rx) = mpsc::channel(64);
 
-        let result = process_sse_stream(stream, &tx).await;
+        let result = process_sse_stream(stream, &tx, &CancellationToken::new()).await;
         assert!(result.is_ok(), "expected Ok, got: {:?}", result);
 
         let mut events = Vec::new();
@@ -956,7 +980,7 @@ mod tests {
         let stream = mock_sse_stream(vec![sse_data]);
         let (tx, mut rx) = mpsc::channel(64);
 
-        let result = process_sse_stream(stream, &tx).await;
+        let result = process_sse_stream(stream, &tx, &CancellationToken::new()).await;
         assert!(result.is_ok(), "expected Ok, got: {:?}", result);
 
         let mut events = Vec::new();
@@ -995,7 +1019,7 @@ mod tests {
         let stream = mock_sse_stream(vec![sse_data]);
         let (tx, _rx) = mpsc::channel(64);
 
-        let result = process_sse_stream(stream, &tx).await;
+        let result = process_sse_stream(stream, &tx, &CancellationToken::new()).await;
         assert!(result.is_err(), "expected Err for truncated stream, got Ok");
         let err_msg = result.unwrap_err();
         assert!(

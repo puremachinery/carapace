@@ -728,7 +728,7 @@ fn dispatch_agent_run(
     if let Some(provider) = ws.llm_provider() {
         let cfg = crate::config::load_config().unwrap_or(Value::Object(serde_json::Map::new()));
         let mut config = crate::agent::AgentConfig::default();
-        crate::agent::apply_agent_config_from_settings(&mut config, &cfg);
+        crate::agent::apply_agent_config_from_settings(&mut config, &cfg, None);
         config.model = validated
             .model
             .clone()

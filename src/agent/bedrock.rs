@@ -10,6 +10,7 @@ use hmac::{Hmac, Mac};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::agent::provider::*;
 use crate::agent::AgentError;
@@ -257,7 +258,11 @@ impl LlmProvider for BedrockProvider {
     async fn complete(
         &self,
         request: CompletionRequest,
+        cancel_token: CancellationToken,
     ) -> Result<mpsc::Receiver<StreamEvent>, AgentError> {
+        if cancel_token.is_cancelled() {
+            return Err(AgentError::Cancelled);
+        }
         let body_value = self.build_body(&request);
         let body_bytes = serde_json::to_vec(&body_value)
             .map_err(|e| AgentError::Provider(format!("failed to serialize request body: {e}")))?;
@@ -283,11 +288,16 @@ impl LlmProvider for BedrockProvider {
             http_request = http_request.header(name.as_str(), value.as_str());
         }
 
-        let response = http_request
-            .body(body_bytes)
-            .send()
-            .await
-            .map_err(|e| AgentError::Provider(format!("HTTP request failed: {e}")))?;
+        let response = tokio::select! {
+            _ = cancel_token.cancelled() => {
+                return Err(AgentError::Cancelled);
+            }
+            response = http_request
+                .body(body_bytes)
+                .send() => {
+                    response.map_err(|e| AgentError::Provider(format!("HTTP request failed: {e}")))?
+                }
+        };
 
         if !response.status().is_success() {
             let status = response.status();
@@ -300,10 +310,14 @@ impl LlmProvider for BedrockProvider {
             )));
         }
 
-        let response_body: Value = response
-            .json()
-            .await
-            .map_err(|e| AgentError::Provider(format!("failed to parse Bedrock response: {e}")))?;
+        let response_body: Value = tokio::select! {
+            _ = cancel_token.cancelled() => {
+                return Err(AgentError::Cancelled);
+            }
+            body = response.json() => {
+                body.map_err(|e| AgentError::Provider(format!("failed to parse Bedrock response: {e}")))?
+            }
+        };
 
         let (tx, rx) = mpsc::channel(64);
 

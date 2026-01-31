@@ -133,14 +133,34 @@ impl Default for AgentConfig {
 
 /// Apply agent config overrides from the global configuration object.
 ///
-/// This allows runtime toggles for prompt guard and output sanitization.
-pub fn apply_agent_config_from_settings(config: &mut AgentConfig, settings: &Value) {
+/// This allows runtime toggles for safety features, tool policy, and classifier
+/// settings, with optional per-agent overrides.
+pub fn apply_agent_config_from_settings(
+    config: &mut AgentConfig,
+    settings: &Value,
+    agent_id: Option<&str>,
+) {
+    // Global classifier config (top-level)
+    if let Some(classifier_value) = settings.get("classifier") {
+        match serde_json::from_value(classifier_value.clone()) {
+            Ok(cfg) => config.classifier = Some(cfg),
+            Err(e) => {
+                warn!(error = %e, "invalid classifier config; classifier disabled");
+                config.classifier = None;
+            }
+        }
+    }
+
     let agents = match settings.get("agents").and_then(|v| v.as_object()) {
         Some(a) => a,
         None => return,
     };
 
-    if let Some(pg_value) = agents.get("promptGuard") {
+    // Global prompt guard/output sanitizer defaults
+    if let Some(pg_value) = agents
+        .get("promptGuard")
+        .or_else(|| agents.get("prompt_guard"))
+    {
         match serde_json::from_value(pg_value.clone()) {
             Ok(pg_cfg) => {
                 config.prompt_guard = pg_cfg;
@@ -162,6 +182,161 @@ pub fn apply_agent_config_from_settings(config: &mut AgentConfig, settings: &Val
             Err(e) => {
                 warn!(error = %e, "invalid agents.outputSanitizer config; using defaults");
             }
+        }
+    }
+
+    // Apply defaults from agents.defaults
+    if let Some(defaults) = agents.get("defaults").and_then(|v| v.as_object()) {
+        apply_agent_overrides(config, defaults);
+    }
+
+    // Apply per-agent overrides (by id or default entry)
+    if let Some(entry) = select_agent_entry(agents, agent_id) {
+        apply_agent_overrides(config, entry);
+    }
+}
+
+fn select_agent_entry<'a>(
+    agents: &'a serde_json::Map<String, Value>,
+    agent_id: Option<&str>,
+) -> Option<&'a serde_json::Map<String, Value>> {
+    let list = agents.get("list").and_then(|v| v.as_array())?;
+
+    if let Some(id) = agent_id {
+        if let Some(found) = list.iter().find(|entry| {
+            entry
+                .get("id")
+                .and_then(|v| v.as_str())
+                .is_some_and(|v| v == id)
+        }) {
+            return found.as_object();
+        }
+    }
+
+    if let Some(default_entry) = list.iter().find(|entry| {
+        entry
+            .get("default")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    }) {
+        return default_entry.as_object();
+    }
+
+    if let Some(id) = agent_id {
+        warn!(agent_id = %id, "agentId not found and no default agent configured");
+    }
+
+    None
+}
+
+fn apply_agent_overrides(config: &mut AgentConfig, agent_obj: &serde_json::Map<String, Value>) {
+    if let Some(model) = agent_obj.get("model").and_then(|v| v.as_str()) {
+        if !model.trim().is_empty() {
+            config.model = model.to_string();
+        }
+    }
+
+    if let Some(system) = agent_obj.get("system").and_then(|v| v.as_str()) {
+        if !system.trim().is_empty() {
+            config.system = Some(system.to_string());
+        }
+    }
+
+    if let Some(max_turns) = agent_obj
+        .get("maxTurns")
+        .or_else(|| agent_obj.get("max_turns"))
+        .and_then(|v| v.as_u64())
+    {
+        if max_turns > 0 {
+            config.max_turns = max_turns.min(u32::MAX as u64) as u32;
+        }
+    }
+
+    if let Some(max_tokens) = agent_obj
+        .get("maxTokens")
+        .or_else(|| agent_obj.get("max_tokens"))
+        .and_then(|v| v.as_u64())
+    {
+        if max_tokens > 0 {
+            config.max_tokens = max_tokens.min(u32::MAX as u64) as u32;
+        }
+    }
+
+    if let Some(temp) = agent_obj.get("temperature").and_then(|v| v.as_f64()) {
+        config.temperature = Some(temp);
+    }
+
+    if let Some(deliver) = agent_obj.get("deliver").and_then(|v| v.as_bool()) {
+        config.deliver = deliver;
+    }
+
+    // Tool policy config (preferred: tools.policy/list)
+    if let Some(tools_cfg) = agent_obj.get("tools") {
+        config.tool_policy = ToolPolicy::from_config(Some(tools_cfg));
+    } else if let Some(policy_str) = agent_obj.get("toolPolicy").and_then(|v| v.as_str()) {
+        if let Some(policy) = parse_tool_policy_string(policy_str) {
+            config.tool_policy = policy;
+        }
+    }
+
+    if let Some(exfiltration_guard) = agent_obj
+        .get("exfiltrationGuard")
+        .or_else(|| agent_obj.get("exfiltration_guard"))
+        .and_then(|v| v.as_bool())
+    {
+        config.exfiltration_guard = exfiltration_guard;
+    }
+
+    if let Some(pg_value) = agent_obj
+        .get("promptGuard")
+        .or_else(|| agent_obj.get("prompt_guard"))
+    {
+        match serde_json::from_value(pg_value.clone()) {
+            Ok(pg_cfg) => config.prompt_guard = pg_cfg,
+            Err(e) => warn!(error = %e, "invalid agent promptGuard config; using defaults"),
+        }
+    }
+
+    if let Some(os_value) = agent_obj
+        .get("outputSanitizer")
+        .or_else(|| agent_obj.get("output_sanitizer"))
+    {
+        match serde_json::from_value(os_value.clone()) {
+            Ok(os_cfg) => config.output_sanitizer = os_cfg,
+            Err(e) => warn!(error = %e, "invalid agent outputSanitizer config; using defaults"),
+        }
+    }
+
+    if let Some(sandbox_value) = agent_obj
+        .get("sandbox")
+        .or_else(|| agent_obj.get("processSandbox"))
+        .or_else(|| agent_obj.get("process_sandbox"))
+    {
+        config.process_sandbox = sandbox::ProcessSandboxConfig::from_config(Some(sandbox_value));
+    }
+
+    if let Some(classifier_value) = agent_obj.get("classifier") {
+        match serde_json::from_value(classifier_value.clone()) {
+            Ok(cfg) => config.classifier = Some(cfg),
+            Err(e) => warn!(error = %e, "invalid agent classifier config; classifier disabled"),
+        }
+    }
+}
+
+fn parse_tool_policy_string(value: &str) -> Option<ToolPolicy> {
+    let normalized = value.to_lowercase().replace('_', "");
+    match normalized.as_str() {
+        "allowall" => Some(ToolPolicy::AllowAll),
+        "allowlist" | "denylist" => {
+            warn!(
+                policy = %value,
+                "toolPolicy requires tools.list; ignoring string-only policy"
+            );
+            None
+        }
+        _ => {
+            warn!(policy = %value, "unrecognized toolPolicy value; ignoring");
+            None
         }
     }
 }
@@ -288,6 +463,7 @@ mod tests {
         async fn complete(
             &self,
             _request: CompletionRequest,
+            _cancel_token: CancellationToken,
         ) -> Result<mpsc::Receiver<StreamEvent>, AgentError> {
             panic!("{}", self.message);
         }
@@ -303,6 +479,7 @@ mod tests {
         async fn complete(
             &self,
             _request: CompletionRequest,
+            _cancel_token: CancellationToken,
         ) -> Result<mpsc::Receiver<StreamEvent>, AgentError> {
             panic!("{}", self.message);
         }

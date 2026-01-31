@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::agent::AgentError;
 
@@ -108,6 +109,7 @@ pub trait LlmProvider: Send + Sync {
     async fn complete(
         &self,
         request: CompletionRequest,
+        cancel_token: CancellationToken,
     ) -> Result<mpsc::Receiver<StreamEvent>, AgentError>;
 }
 
@@ -247,6 +249,7 @@ impl LlmProvider for MultiProvider {
     async fn complete(
         &self,
         mut request: CompletionRequest,
+        cancel_token: CancellationToken,
     ) -> Result<mpsc::Receiver<StreamEvent>, AgentError> {
         let provider = self.select_provider(&request.model)?;
 
@@ -274,7 +277,7 @@ impl LlmProvider for MultiProvider {
             request.model = crate::agent::bedrock::strip_bedrock_prefix(&request.model).to_string();
         }
 
-        provider.complete(request).await
+        provider.complete(request, cancel_token).await
     }
 }
 

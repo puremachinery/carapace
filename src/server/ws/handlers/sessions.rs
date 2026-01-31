@@ -789,7 +789,29 @@ fn truncate_preview(text: &str, max_len: usize) -> String {
     out
 }
 
-fn build_session_metadata(params: Option<&Value>) -> sessions::SessionMetadata {
+fn normalize_channel_param(
+    channel: &str,
+    channel_registry: &channels::ChannelRegistry,
+) -> Option<String> {
+    let trimmed = channel.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let normalized = trimmed.to_ascii_lowercase();
+    if channel_registry.get(&normalized).is_some() {
+        return Some(normalized);
+    }
+    tracing::warn!(
+        channel = %trimmed,
+        "unsupported channel requested for session metadata"
+    );
+    None
+}
+
+fn build_session_metadata(
+    params: Option<&Value>,
+    channel_registry: &channels::ChannelRegistry,
+) -> sessions::SessionMetadata {
     let mut meta = sessions::SessionMetadata::default();
     if let Some(label) = read_string_param(params, "label") {
         meta.name = Some(label);
@@ -801,7 +823,9 @@ fn build_session_metadata(params: Option<&Value>) -> sessions::SessionMetadata {
         meta.agent_id = Some(agent_id);
     }
     if let Some(channel) = read_string_param(params, "channel") {
-        meta.channel = Some(channel);
+        if let Some(normalized) = normalize_channel_param(&channel, channel_registry) {
+            meta.channel = Some(normalized);
+        }
     }
     if let Some(user_id) = read_string_param(params, "userId") {
         meta.user_id = Some(user_id);
@@ -848,7 +872,7 @@ pub(super) fn handle_sessions_patch(
 ) -> Result<Value, ErrorShape> {
     let key = extract_session_key(params)
         .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "key is required", None))?;
-    let updates = build_session_metadata(params);
+    let updates = build_session_metadata(params, state.channel_registry());
     let has_updates = has_metadata_updates(&updates);
 
     let session = match state.session_store.get_session_by_key(&key) {
@@ -1484,7 +1508,7 @@ fn setup_agent_session(
     params: Option<&Value>,
     agent_params: &AgentRequestParams<'_>,
 ) -> Result<(String, String, CancellationToken), ErrorShape> {
-    let metadata = build_session_metadata(params);
+    let metadata = build_session_metadata(params, state.channel_registry());
     let session = state
         .session_store
         .get_or_create_session(agent_params.session_key, metadata)
@@ -1574,7 +1598,10 @@ pub(super) fn handle_agent(
             .unwrap_or(crate::agent::DEFAULT_MODEL);
         let cfg = config::load_config().unwrap_or(Value::Object(serde_json::Map::new()));
         let mut config = crate::agent::AgentConfig::default();
-        crate::agent::apply_agent_config_from_settings(&mut config, &cfg);
+        let agent_id = params
+            .and_then(|v| v.get("agentId"))
+            .and_then(|v| v.as_str());
+        crate::agent::apply_agent_config_from_settings(&mut config, &cfg, agent_id);
         config.model = model.to_string();
         config.system = params
             .and_then(|v| v.get("system"))
@@ -1977,7 +2004,7 @@ fn trigger_agent_if_enabled(
     let status = if let Some(provider) = state.llm_provider() {
         let cfg = config::load_config().unwrap_or(Value::Object(serde_json::Map::new()));
         let mut config = crate::agent::AgentConfig::default();
-        crate::agent::apply_agent_config_from_settings(&mut config, &cfg);
+        crate::agent::apply_agent_config_from_settings(&mut config, &cfg, None);
         config.model = crate::agent::DEFAULT_MODEL.to_string();
         config.deliver = true;
         config.extra = extra;

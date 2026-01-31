@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::agent::provider::*;
 use crate::agent::AgentError;
@@ -175,7 +176,11 @@ impl LlmProvider for GeminiProvider {
     async fn complete(
         &self,
         request: CompletionRequest,
+        cancel_token: CancellationToken,
     ) -> Result<mpsc::Receiver<StreamEvent>, AgentError> {
+        if cancel_token.is_cancelled() {
+            return Err(AgentError::Cancelled);
+        }
         let body = self.build_body(&request);
 
         // Strip any prefix (gemini/, models/) to get the bare model name for the URL
@@ -185,15 +190,20 @@ impl LlmProvider for GeminiProvider {
             self.base_url, model_name, self.api_key
         );
 
-        let response = self
-            .client
-            .post(&url)
-            .header("content-type", "application/json")
-            .header("accept", "text/event-stream")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| AgentError::Provider(format!("HTTP request failed: {e}")))?;
+        let response = tokio::select! {
+            _ = cancel_token.cancelled() => {
+                return Err(AgentError::Cancelled);
+            }
+            response = self
+                .client
+                .post(&url)
+                .header("content-type", "application/json")
+                .header("accept", "text/event-stream")
+                .json(&body)
+                .send() => {
+                    response.map_err(|e| AgentError::Provider(format!("HTTP request failed: {e}")))?
+                }
+        };
 
         if !response.status().is_success() {
             let status = response.status();
@@ -210,8 +220,9 @@ impl LlmProvider for GeminiProvider {
 
         // Spawn a task to read the SSE stream and forward events
         let stream = response.bytes_stream();
+        let cancel = cancel_token.clone();
         tokio::spawn(async move {
-            if let Err(e) = process_gemini_sse_stream(stream, &tx).await {
+            if let Err(e) = process_gemini_sse_stream(stream, &tx, &cancel).await {
                 let _ = tx
                     .send(StreamEvent::Error {
                         message: e.to_string(),
@@ -232,6 +243,7 @@ const MAX_SSE_BUFFER_BYTES: usize = 1_048_576;
 async fn process_gemini_sse_stream<S>(
     mut stream: S,
     tx: &mpsc::Sender<StreamEvent>,
+    cancel_token: &CancellationToken,
 ) -> Result<(), String>
 where
     S: futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
@@ -240,7 +252,14 @@ where
     let mut accumulated_usage = TokenUsage::default();
     let mut last_finish_reason: Option<String> = None;
 
-    while let Some(chunk) = stream.next().await {
+    loop {
+        let chunk = tokio::select! {
+            _ = cancel_token.cancelled() => return Ok(()),
+            chunk = stream.next() => chunk,
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
         let chunk = chunk.map_err(|e| format!("stream read error: {e}"))?;
         buffer.push_str(&String::from_utf8_lossy(&chunk));
 
@@ -1036,7 +1055,7 @@ mod tests {
         let stream = mock_sse_stream(vec![sse_data]);
         let (tx, mut rx) = mpsc::channel(64);
 
-        let result = process_gemini_sse_stream(stream, &tx).await;
+        let result = process_gemini_sse_stream(stream, &tx, &CancellationToken::new()).await;
         assert!(result.is_ok(), "expected Ok, got: {:?}", result);
 
         let mut events = Vec::new();
@@ -1079,7 +1098,7 @@ mod tests {
         let stream = mock_sse_stream(vec![sse_data]);
         let (tx, mut rx) = mpsc::channel(64);
 
-        let result = process_gemini_sse_stream(stream, &tx).await;
+        let result = process_gemini_sse_stream(stream, &tx, &CancellationToken::new()).await;
         assert!(result.is_ok(), "expected Ok, got: {:?}", result);
 
         let mut events = Vec::new();
@@ -1118,7 +1137,7 @@ mod tests {
         let stream = mock_sse_stream(vec![sse_data]);
         let (tx, mut rx) = mpsc::channel(64);
 
-        let result = process_gemini_sse_stream(stream, &tx).await;
+        let result = process_gemini_sse_stream(stream, &tx, &CancellationToken::new()).await;
         assert!(result.is_ok(), "expected Ok, got: {:?}", result);
 
         let mut events = Vec::new();
@@ -1148,7 +1167,7 @@ mod tests {
         let stream = mock_sse_stream(vec![sse_data]);
         let (tx, mut rx) = mpsc::channel(64);
 
-        let result = process_gemini_sse_stream(stream, &tx).await;
+        let result = process_gemini_sse_stream(stream, &tx, &CancellationToken::new()).await;
         assert!(result.is_ok());
 
         let mut events = Vec::new();

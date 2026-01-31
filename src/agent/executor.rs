@@ -223,12 +223,14 @@ fn build_assistant_message(
 
 /// Execute pending tool calls with exfiltration guard and tool-policy checks,
 /// broadcast results, and return the corresponding history messages.
+#[allow(clippy::too_many_arguments)]
 fn execute_tools_with_guards(
     pending_tool_calls: &[(String, String, Value)],
     config: &AgentConfig,
     state: &Arc<WsServerState>,
     session_id: &str,
     session_key: &str,
+    message_channel: Option<&str>,
     run_id: &str,
     seq: &AtomicU64,
 ) -> Vec<ChatMessage> {
@@ -263,6 +265,7 @@ fn execute_tools_with_guards(
                 tools_registry,
                 session_key,
                 None,
+                message_channel,
                 sandbox,
             )
         } else {
@@ -323,6 +326,7 @@ fn build_turn_request(
     history: &[ChatMessage],
     config: &AgentConfig,
     state: &Arc<WsServerState>,
+    message_channel: Option<&str>,
 ) -> CompletionRequest {
     let (system, messages) = if config.prompt_guard.enabled && config.prompt_guard.tagging.enabled {
         build_context_with_tagging(
@@ -335,7 +339,7 @@ fn build_turn_request(
     };
 
     let tools = if let Some(tools_registry) = state.tools_registry() {
-        let all_tools = tools::list_provider_tools(tools_registry);
+        let all_tools = tools::list_provider_tools(tools_registry, message_channel);
         config
             .tool_policy
             .filter_tools_with_guard(all_tools, config.exfiltration_guard)
@@ -428,6 +432,7 @@ async fn execute_single_turn(
     run_id: &str,
     session_key: &str,
     session_id: &str,
+    message_channel: Option<&str>,
     seq: &AtomicU64,
     history: &mut Vec<ChatMessage>,
     accumulated_text: &mut String,
@@ -447,11 +452,18 @@ async fn execute_single_turn(
         return Err(AgentError::Cancelled);
     }
 
-    let request = build_turn_request(history, config, state);
+    let request = build_turn_request(history, config, state, message_channel);
 
     // Call LLM (with per-turn timeout)
-    let mut rx = match tokio::time::timeout(TURN_TIMEOUT, provider.complete(request)).await {
-        Ok(result) => result.map_err(|e| AgentError::Provider(e.to_string()))?,
+    let mut rx = match tokio::time::timeout(
+        TURN_TIMEOUT,
+        provider.complete(request, cancel_token.clone()),
+    )
+    .await
+    {
+        Ok(Ok(rx)) => rx,
+        Ok(Err(AgentError::Cancelled)) => return Err(AgentError::Cancelled),
+        Ok(Err(e)) => return Err(AgentError::Provider(e.to_string())),
         Err(_) => {
             return Err(AgentError::Provider(format!(
                 "LLM turn timed out after {}s",
@@ -542,6 +554,7 @@ async fn execute_single_turn(
             state,
             session_id,
             session_key,
+            message_channel,
             run_id,
             seq,
         );
@@ -591,6 +604,7 @@ pub async fn execute_run(
         .session_store()
         .get_session_by_key(&session_key)
         .map_err(|e| AgentError::SessionNotFound(format!("{session_key}: {e}")))?;
+    let message_channel = session.metadata.channel.clone();
 
     // 2b. Pre-flight system prompt check
     if config.prompt_guard.enabled && config.prompt_guard.preflight.enabled {
@@ -712,6 +726,7 @@ pub async fn execute_run(
             &run_id,
             &session_key,
             &session.id,
+            message_channel.as_deref(),
             &seq,
             &mut history,
             &mut accumulated_text,
@@ -865,6 +880,7 @@ mod tests {
         async fn complete(
             &self,
             _request: crate::agent::provider::CompletionRequest,
+            _cancel_token: CancellationToken,
         ) -> Result<mpsc::Receiver<StreamEvent>, crate::agent::AgentError> {
             let events = {
                 let mut responses = self.responses.lock();
@@ -1159,6 +1175,7 @@ mod tests {
         async fn complete(
             &self,
             _request: crate::agent::provider::CompletionRequest,
+            _cancel_token: CancellationToken,
         ) -> Result<mpsc::Receiver<StreamEvent>, crate::agent::AgentError> {
             let events = {
                 let mut responses = self.events.lock();

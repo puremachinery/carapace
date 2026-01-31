@@ -6,7 +6,7 @@
 use parking_lot::RwLock;
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use super::bindings::{ToolContext, ToolDefinition, ToolPluginInstance};
@@ -203,12 +203,21 @@ impl ToolsRegistry {
         // Plugin tools
         {
             let plugins = self.plugin_tools.read();
-            for (_plugin_id, instance) in plugins.iter() {
-                if let Ok(tool_defs) = instance.get_definitions() {
-                    for def in tool_defs {
-                        if self.is_allowed(&def.name) {
-                            definitions.push(def);
+            for (plugin_id, instance) in plugins.iter() {
+                match instance.get_definitions() {
+                    Ok(tool_defs) => {
+                        for def in tool_defs {
+                            if self.is_allowed(&def.name) {
+                                definitions.push(def);
+                            }
                         }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            plugin_id = %plugin_id,
+                            error = %err,
+                            "tool definitions unavailable"
+                        );
                     }
                 }
             }
@@ -217,7 +226,49 @@ impl ToolsRegistry {
         definitions
     }
 
-    /// Invoke a tool by name
+    /// Get available tool definitions for a specific message channel.
+    ///
+    /// Channel-specific built-ins are only included when a channel is provided.
+    /// Channel tools take precedence over other definitions with the same name.
+    pub fn list_tools_for_channel(&self, message_channel: Option<&str>) -> Vec<ToolDefinition> {
+        let mut definitions = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+
+        if let Some(channel) = message_channel {
+            for tool in crate::agent::builtin_tools::channel_specific_tools(Some(channel)) {
+                if self.is_allowed(&tool.name) {
+                    let key = tool.name.to_lowercase();
+                    if seen.insert(key) {
+                        definitions.push(ToolDefinition {
+                            name: tool.name,
+                            description: tool.description,
+                            input_schema: serde_json::to_string(&tool.input_schema)
+                                .unwrap_or_else(|_| "{}".to_string()),
+                        });
+                    }
+                }
+            }
+        }
+
+        for def in self.list_tools() {
+            let key = def.name.to_lowercase();
+            if seen.contains(&key) {
+                tracing::warn!(
+                    tool = %def.name,
+                    "tool definition skipped because channel tool with same name takes precedence"
+                );
+                continue;
+            }
+            seen.insert(key);
+            definitions.push(def);
+        }
+
+        definitions
+    }
+
+    /// Invoke a tool by name.
+    ///
+    /// Channel-specific tools take precedence when a message channel is set.
     pub fn invoke(
         &self,
         tool_name: &str,
@@ -229,10 +280,25 @@ impl ToolsRegistry {
             return ToolInvokeResult::not_found(tool_name);
         }
 
-        // Check built-in tools first
+        // Check channel-specific built-in tools first
+        if let Some(channel) = ctx.message_channel.as_deref() {
+            for tool in crate::agent::builtin_tools::channel_specific_tools(Some(channel)) {
+                if tool.name.eq_ignore_ascii_case(tool_name) {
+                    return (tool.handler)(args, ctx);
+                }
+            }
+        }
+
+        // Check built-in tools next
         {
             let tools = self.builtin_tools.read();
             if let Some(tool) = tools.get(tool_name) {
+                return (tool.handler)(args, ctx);
+            }
+            if let Some((_name, tool)) = tools
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(tool_name))
+            {
                 return (tool.handler)(args, ctx);
             }
         }
@@ -240,37 +306,51 @@ impl ToolsRegistry {
         // Check plugin tools
         {
             let plugins = self.plugin_tools.read();
-            for (_plugin_id, instance) in plugins.iter() {
-                if let Ok(definitions) = instance.get_definitions() {
-                    if definitions.iter().any(|d| d.name == tool_name) {
-                        let tool_ctx = ToolContext {
-                            agent_id: ctx.agent_id.clone(),
-                            session_key: Some(ctx.session_key.clone()),
-                            message_channel: ctx.message_channel.clone(),
-                            sandboxed: ctx.sandboxed,
-                        };
+            for (plugin_id, instance) in plugins.iter() {
+                match instance.get_definitions() {
+                    Ok(definitions) => {
+                        if let Some(def) = definitions
+                            .iter()
+                            .find(|d| d.name.eq_ignore_ascii_case(tool_name))
+                        {
+                            let tool_ctx = ToolContext {
+                                agent_id: ctx.agent_id.clone(),
+                                session_key: Some(ctx.session_key.clone()),
+                                message_channel: ctx.message_channel.clone(),
+                                sandboxed: ctx.sandboxed,
+                            };
 
-                        let params =
-                            serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string());
-                        match instance.invoke(tool_name, &params, tool_ctx) {
-                            Ok(result) => {
-                                if result.success {
-                                    let result_value = result
-                                        .result
-                                        .as_ref()
-                                        .and_then(|s| serde_json::from_str(s).ok())
-                                        .unwrap_or(Value::Null);
-                                    return ToolInvokeResult::success(result_value);
-                                } else {
-                                    return ToolInvokeResult::tool_error(
-                                        result.error.unwrap_or_else(|| "Unknown error".to_string()),
-                                    );
+                            let params =
+                                serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string());
+                            match instance.invoke(&def.name, &params, tool_ctx) {
+                                Ok(result) => {
+                                    if result.success {
+                                        let result_value = result
+                                            .result
+                                            .as_ref()
+                                            .and_then(|s| serde_json::from_str(s).ok())
+                                            .unwrap_or(Value::Null);
+                                        return ToolInvokeResult::success(result_value);
+                                    } else {
+                                        return ToolInvokeResult::tool_error(
+                                            result
+                                                .error
+                                                .unwrap_or_else(|| "Unknown error".to_string()),
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    return ToolInvokeResult::tool_error(e.to_string());
                                 }
                             }
-                            Err(e) => {
-                                return ToolInvokeResult::tool_error(e.to_string());
-                            }
                         }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            plugin_id = %plugin_id,
+                            error = %err,
+                            "tool definitions unavailable"
+                        );
                     }
                 }
             }
@@ -280,7 +360,10 @@ impl ToolsRegistry {
         ToolInvokeResult::not_found(tool_name)
     }
 
-    /// Check if a tool exists (and is allowed)
+    /// Check if a tool exists (and is allowed).
+    ///
+    /// Channel-specific tools are excluded; use `has_tool_for_channel` when
+    /// availability depends on a message channel.
     pub fn has_tool(&self, tool_name: &str) -> bool {
         if !self.is_allowed(tool_name) {
             return false;
@@ -292,21 +375,56 @@ impl ToolsRegistry {
             if tools.contains_key(tool_name) {
                 return true;
             }
+            if tools
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case(tool_name))
+            {
+                return true;
+            }
         }
 
         // Check plugin tools
         {
             let plugins = self.plugin_tools.read();
-            for (_plugin_id, instance) in plugins.iter() {
-                if let Ok(definitions) = instance.get_definitions() {
-                    if definitions.iter().any(|d| d.name == tool_name) {
-                        return true;
+            for (plugin_id, instance) in plugins.iter() {
+                match instance.get_definitions() {
+                    Ok(definitions) => {
+                        if definitions
+                            .iter()
+                            .any(|d| d.name.eq_ignore_ascii_case(tool_name))
+                        {
+                            return true;
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            plugin_id = %plugin_id,
+                            error = %err,
+                            "tool definitions unavailable"
+                        );
                     }
                 }
             }
         }
 
         false
+    }
+
+    /// Check if a tool exists (and is allowed) for a specific message channel.
+    pub fn has_tool_for_channel(&self, tool_name: &str, message_channel: Option<&str>) -> bool {
+        if !self.is_allowed(tool_name) {
+            return false;
+        }
+
+        if let Some(channel) = message_channel {
+            for tool in crate::agent::builtin_tools::channel_specific_tools(Some(channel)) {
+                if tool.name.eq_ignore_ascii_case(tool_name) {
+                    return true;
+                }
+            }
+        }
+
+        self.has_tool(tool_name)
     }
 
     /// Get the count of registered tools
@@ -433,6 +551,55 @@ mod tests {
 
         assert!(!tools.is_empty());
         assert!(tools.iter().any(|t| t.name == "time"));
+    }
+
+    #[test]
+    fn test_has_tool_for_channel() {
+        let registry = ToolsRegistry::new();
+        assert!(!registry.has_tool("telegram_edit_message"));
+        assert!(!registry.has_tool_for_channel("telegram_edit_message", None));
+        assert!(registry.has_tool_for_channel("telegram_edit_message", Some("telegram")));
+    }
+
+    #[test]
+    fn test_channel_tool_precedence_over_builtin() {
+        let registry = ToolsRegistry::new();
+
+        registry.register_builtin_tool(BuiltinTool {
+            name: "telegram_edit_message".to_string(),
+            description: "Shadow tool".to_string(),
+            input_schema: serde_json::json!({"type": "object", "properties": {}}),
+            handler: Box::new(|_args, _ctx| {
+                ToolInvokeResult::success(serde_json::json!({ "source": "builtin" }))
+            }),
+        });
+
+        let tools = registry.list_tools_for_channel(Some("telegram"));
+        let matching: Vec<_> = tools
+            .iter()
+            .filter(|t| t.name == "telegram_edit_message")
+            .collect();
+        assert_eq!(matching.len(), 1, "expected deduped tool definitions");
+
+        let ctx = ToolInvokeContext {
+            message_channel: Some("telegram".to_string()),
+            ..ToolInvokeContext::default()
+        };
+        let result = registry.invoke(
+            "telegram_edit_message",
+            serde_json::json!({"message_id": "1", "text": "hi"}),
+            &ctx,
+        );
+        match result {
+            ToolInvokeResult::Success { result, .. } => {
+                assert!(
+                    result.get("message_id").is_some(),
+                    "expected channel tool result"
+                );
+                assert!(result.get("source").is_none(), "builtin should not run");
+            }
+            _ => panic!("Expected success result"),
+        }
     }
 
     #[test]

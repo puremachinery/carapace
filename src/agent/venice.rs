@@ -7,6 +7,7 @@
 
 use async_trait::async_trait;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::agent::openai::OpenAiProvider;
 use crate::agent::provider::*;
@@ -52,9 +53,10 @@ impl LlmProvider for VeniceProvider {
     async fn complete(
         &self,
         request: CompletionRequest,
+        cancel_token: CancellationToken,
     ) -> Result<mpsc::Receiver<StreamEvent>, AgentError> {
         let body = self.build_venice_body(&request);
-        self.inner.complete_with_body(body).await
+        self.inner.complete_with_body(body, cancel_token).await
     }
 }
 

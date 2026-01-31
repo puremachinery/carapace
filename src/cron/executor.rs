@@ -93,7 +93,7 @@ pub async fn execute_payload(
             // Build agent config
             let cfg = crate::config::load_config().unwrap_or(Value::Object(serde_json::Map::new()));
             let mut config = crate::agent::AgentConfig::default();
-            crate::agent::apply_agent_config_from_settings(&mut config, &cfg);
+            crate::agent::apply_agent_config_from_settings(&mut config, &cfg, None);
             config.model = model
                 .clone()
                 .unwrap_or_else(|| crate::agent::DEFAULT_MODEL.to_string());

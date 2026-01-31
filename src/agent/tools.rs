@@ -34,6 +34,7 @@ pub fn execute_tool_call(
         session_key,
         agent_id,
         None,
+        None,
     )
 }
 
@@ -48,6 +49,7 @@ pub fn execute_tool_call_with_sandbox(
     tools_registry: &ToolsRegistry,
     session_key: &str,
     agent_id: Option<&str>,
+    message_channel: Option<&str>,
     sandbox_config: Option<&ProcessSandboxConfig>,
 ) -> ToolCallResult {
     let sandboxed = sandbox_config.is_some_and(|c| c.enabled);
@@ -65,7 +67,7 @@ pub fn execute_tool_call_with_sandbox(
     let ctx = ToolInvokeContext {
         agent_id: agent_id.map(|s| s.to_string()),
         session_key: session_key.to_string(),
-        message_channel: None,
+        message_channel: message_channel.map(|s| s.to_string()),
         account_id: None,
         sandboxed,
         dry_run: false,
@@ -84,9 +86,12 @@ pub fn execute_tool_call_with_sandbox(
 }
 
 /// Convert plugin tool definitions to LLM provider tool definitions.
-pub fn list_provider_tools(tools_registry: &ToolsRegistry) -> Vec<ToolDefinition> {
+pub fn list_provider_tools(
+    tools_registry: &ToolsRegistry,
+    message_channel: Option<&str>,
+) -> Vec<ToolDefinition> {
     tools_registry
-        .list_tools()
+        .list_tools_for_channel(message_channel)
         .into_iter()
         .map(|t| ToolDefinition {
             name: t.name,
@@ -138,14 +143,14 @@ mod tests {
         // Create a registry with no tools via allowlist that blocks everything
         let registry = ToolsRegistry::new();
         registry.set_allowlist(vec!["__nonexistent__".to_string()]);
-        let tools = list_provider_tools(&registry);
+        let tools = list_provider_tools(&registry, None);
         assert!(tools.is_empty(), "expected no tools, got {}", tools.len());
     }
 
     #[test]
     fn test_list_provider_tools_with_entries() {
         let registry = ToolsRegistry::new();
-        let tools = list_provider_tools(&registry);
+        let tools = list_provider_tools(&registry, None);
         assert!(!tools.is_empty(), "default registry should have tools");
         // Should contain the "time" builtin
         assert!(
@@ -181,5 +186,25 @@ mod tests {
             }
             ToolCallResult::Error { message } => panic!("expected success, got error: {message}"),
         }
+    }
+
+    #[test]
+    fn test_list_provider_tools_includes_channel_tools() {
+        let registry = ToolsRegistry::new();
+        let tools = list_provider_tools(&registry, Some("telegram"));
+        assert!(
+            tools.iter().any(|t| t.name == "telegram_edit_message"),
+            "expected telegram tool in provider list"
+        );
+    }
+
+    #[test]
+    fn test_list_provider_tools_excludes_channel_tools_without_channel() {
+        let registry = ToolsRegistry::new();
+        let tools = list_provider_tools(&registry, None);
+        assert!(
+            !tools.iter().any(|t| t.name == "telegram_edit_message"),
+            "channel tools should not appear without channel"
+        );
     }
 }

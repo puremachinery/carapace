@@ -196,7 +196,10 @@ pub async fn classify_message(
         extra: None,
     };
 
-    let mut rx = provider.complete(request).await?;
+    // TODO: plumb cancellation from the calling context.
+    let mut rx = provider
+        .complete(request, tokio_util::sync::CancellationToken::new())
+        .await?;
 
     // Collect the full response text
     let mut response_text = String::new();
@@ -619,6 +622,7 @@ mod tests {
             async fn complete(
                 &self,
                 _request: CompletionRequest,
+                _cancel_token: tokio_util::sync::CancellationToken,
             ) -> Result<mpsc::Receiver<StreamEvent>, AgentError> {
                 let (tx, rx) = mpsc::channel(64);
                 tokio::spawn(async move {
@@ -664,6 +668,7 @@ mod tests {
             async fn complete(
                 &self,
                 _request: CompletionRequest,
+                _cancel_token: tokio_util::sync::CancellationToken,
             ) -> Result<mpsc::Receiver<StreamEvent>, AgentError> {
                 let (tx, rx) = mpsc::channel(64);
                 tokio::spawn(async move {
@@ -713,6 +718,7 @@ mod tests {
             async fn complete(
                 &self,
                 _request: CompletionRequest,
+                _cancel_token: tokio_util::sync::CancellationToken,
             ) -> Result<mpsc::Receiver<StreamEvent>, AgentError> {
                 let (tx, rx) = mpsc::channel(64);
                 tokio::spawn(async move {

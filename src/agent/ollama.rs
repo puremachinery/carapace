@@ -12,6 +12,7 @@
 use async_trait::async_trait;
 use serde_json::Value;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::agent::provider::*;
 use crate::agent::AgentError;
@@ -298,7 +299,11 @@ impl LlmProvider for OllamaProvider {
     async fn complete(
         &self,
         request: CompletionRequest,
+        cancel_token: CancellationToken,
     ) -> Result<mpsc::Receiver<StreamEvent>, AgentError> {
+        if cancel_token.is_cancelled() {
+            return Err(AgentError::Cancelled);
+        }
         let body = self.build_body(&request);
         let url = format!("{}/v1/chat/completions", self.base_url);
 
@@ -313,11 +318,16 @@ impl LlmProvider for OllamaProvider {
             http_request = http_request.header("authorization", format!("Bearer {key}"));
         }
 
-        let response = http_request
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| AgentError::Provider(format!("HTTP request failed: {e}")))?;
+        let response = tokio::select! {
+            _ = cancel_token.cancelled() => {
+                return Err(AgentError::Cancelled);
+            }
+            response = http_request
+                .json(&body)
+                .send() => {
+                    response.map_err(|e| AgentError::Provider(format!("HTTP request failed: {e}")))?
+                }
+        };
 
         if !response.status().is_success() {
             let status = response.status();
@@ -336,8 +346,11 @@ impl LlmProvider for OllamaProvider {
         // Reuses the OpenAI SSE stream processor since Ollama's
         // /v1/chat/completions returns the same SSE format.
         let stream = response.bytes_stream();
+        let cancel = cancel_token.clone();
         tokio::spawn(async move {
-            if let Err(e) = crate::agent::openai::process_ollama_sse_stream(stream, &tx).await {
+            if let Err(e) =
+                crate::agent::openai::process_ollama_sse_stream(stream, &tx, &cancel).await
+            {
                 let _ = tx
                     .send(StreamEvent::Error {
                         message: e.to_string(),

@@ -298,7 +298,8 @@ async fn call_llm_provider(
     };
 
     let mut rx = provider
-        .complete(request)
+        // TODO: plumb request-level cancellation into provider calls.
+        .complete(request, tokio_util::sync::CancellationToken::new())
         .await
         .map_err(|e| format!("LLM provider error: {}", e))?;
 
@@ -346,7 +347,11 @@ async fn stream_llm_provider(
         extra: None,
     };
 
-    let rx = match provider.complete(request).await {
+    let rx = match provider
+        // TODO: plumb request-level cancellation into provider calls.
+        .complete(request, tokio_util::sync::CancellationToken::new())
+        .await
+    {
         Ok(rx) => rx,
         Err(e) => {
             return build_error_sse_response(e.to_string());
@@ -1297,6 +1302,7 @@ mod tests {
         async fn complete(
             &self,
             _request: CompletionRequest,
+            _cancel_token: tokio_util::sync::CancellationToken,
         ) -> Result<mpsc::Receiver<StreamEvent>, AgentError> {
             let events = {
                 let lock = self.events.lock();
