@@ -332,6 +332,16 @@ mod golden_trace {
         if key == "currentVersion" && (val.is_string() || val.is_null()) {
             *val = json!("<VERSION>");
         }
+
+        // Replace architecture field for cross-platform stability.
+        if key == "arch" && val.is_string() {
+            *val = json!("<ARCH>");
+        }
+
+        // Replace platform field for cross-platform stability.
+        if key == "platform" && val.is_string() {
+            *val = json!("<PLATFORM>");
+        }
     }
 
     // ───────────────────────── macro ─────────────────────────
