@@ -20,12 +20,11 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs;
-use tracing::debug;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::server::control::{self, ControlState};
@@ -67,6 +66,12 @@ pub struct HttpConfig {
     pub gateway_token: Option<String>,
     /// Gateway auth password
     pub gateway_password: Option<String>,
+    /// Gateway auth mode
+    pub gateway_auth_mode: auth::AuthMode,
+    /// Whether Tailscale auth is allowed for gateway endpoints
+    pub gateway_allow_tailscale: bool,
+    /// Trusted proxy IPs for local-direct detection
+    pub trusted_proxies: Vec<String>,
     /// Control UI base path (empty string or "/path")
     pub control_ui_base_path: String,
     /// Control UI enabled
@@ -94,6 +99,9 @@ impl Default for HttpConfig {
             hooks_max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             gateway_token: None,
             gateway_password: None,
+            gateway_auth_mode: auth::AuthMode::Token,
+            gateway_allow_tailscale: false,
+            trusted_proxies: Vec::new(),
             control_ui_base_path: String::new(),
             control_ui_enabled: false,
             control_ui_dist_path: PathBuf::from("dist/control-ui"),
@@ -121,6 +129,15 @@ pub fn build_http_config(cfg: &Value) -> HttpConfig {
     let auth_obj = gateway
         .and_then(|g| g.get("auth"))
         .and_then(|v| v.as_object());
+    let trusted_proxies = gateway
+        .and_then(|g| g.get("trustedProxies"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let control_ui_obj = gateway
         .and_then(|g| g.get("controlUi"))
         .and_then(|v| v.as_object());
@@ -155,6 +172,48 @@ pub fn build_http_config(cfg: &Value) -> HttpConfig {
     let gateway_password = std::env::var("MOLTBOT_GATEWAY_PASSWORD")
         .ok()
         .or(cfg_password);
+    let auth_mode = auth_obj
+        .and_then(|a| a.get("mode"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let allow_tailscale = auth_obj
+        .and_then(|a| a.get("allowTailscale"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let has_both_gateway_credentials = gateway_password.is_some() && gateway_token.is_some();
+    let resolved_auth_mode = match auth_mode {
+        "none" | "local" => auth::AuthMode::None,
+        "password" => auth::AuthMode::Password,
+        "token" => auth::AuthMode::Token,
+        "" => {
+            if has_both_gateway_credentials {
+                warn!(
+                    "gateway auth mode not set; both token and password configured, defaulting to password auth"
+                );
+            }
+            if gateway_password.is_some() {
+                auth::AuthMode::Password
+            } else {
+                auth::AuthMode::Token
+            }
+        }
+        other => {
+            warn!(
+                "unknown gateway auth mode '{}'; falling back to token/password autodetect",
+                other
+            );
+            if has_both_gateway_credentials {
+                warn!(
+                    "gateway auth mode not set; both token and password configured, defaulting to password auth"
+                );
+            }
+            if gateway_password.is_some() {
+                auth::AuthMode::Password
+            } else {
+                auth::AuthMode::Token
+            }
+        }
+    };
 
     let control_ui_enabled = control_ui_obj
         .and_then(|c| c.get("enabled"))
@@ -187,6 +246,9 @@ pub fn build_http_config(cfg: &Value) -> HttpConfig {
         hooks_enabled,
         gateway_token,
         gateway_password,
+        gateway_auth_mode: resolved_auth_mode,
+        gateway_allow_tailscale: allow_tailscale,
+        trusted_proxies,
         control_ui_enabled,
         control_ui_dist_path,
         openai_chat_completions_enabled,
@@ -355,20 +417,23 @@ pub fn create_router_with_state(
             responses_enabled: config.openai_responses_enabled,
             gateway_token: config.gateway_token.clone(),
             gateway_password: config.gateway_password.clone(),
+            gateway_auth_mode: config.gateway_auth_mode.clone(),
+            gateway_allow_tailscale: config.gateway_allow_tailscale,
+            trusted_proxies: config.trusted_proxies.clone(),
             llm_provider: llm_provider.clone(),
         };
 
         if config.openai_chat_completions_enabled {
-            router =
-                router.route(
-                    "/v1/chat/completions",
-                    post(move |headers, body| {
-                        let state = openai_state.clone();
-                        async move {
-                            openai::chat_completions_handler(State(state), headers, body).await
-                        }
-                    }),
-                );
+            router = router.route(
+                "/v1/chat/completions",
+                post(move |connect_info, headers, body| {
+                    let state = openai_state.clone();
+                    async move {
+                        openai::chat_completions_handler(State(state), connect_info, headers, body)
+                            .await
+                    }
+                }),
+            );
         }
 
         let openai_state2 = OpenAiState {
@@ -376,15 +441,20 @@ pub fn create_router_with_state(
             responses_enabled: config.openai_responses_enabled,
             gateway_token: config.gateway_token.clone(),
             gateway_password: config.gateway_password.clone(),
+            gateway_auth_mode: config.gateway_auth_mode.clone(),
+            gateway_allow_tailscale: config.gateway_allow_tailscale,
+            trusted_proxies: config.trusted_proxies.clone(),
             llm_provider,
         };
 
         if config.openai_responses_enabled {
             router = router.route(
                 "/v1/responses",
-                post(move |headers, body| {
+                post(move |connect_info, headers, body| {
                     let state = openai_state2.clone();
-                    async move { openai::responses_handler(State(state), headers, body).await }
+                    async move {
+                        openai::responses_handler(State(state), connect_info, headers, body).await
+                    }
                 }),
             );
         }
@@ -443,6 +513,9 @@ fn register_session_routes(
     let control_state = ControlState {
         gateway_token: config.gateway_token.clone(),
         gateway_password: config.gateway_password.clone(),
+        gateway_auth_mode: config.gateway_auth_mode.clone(),
+        gateway_allow_tailscale: config.gateway_allow_tailscale,
+        trusted_proxies: config.trusted_proxies.clone(),
         channel_registry: channel_registry.clone(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         start_time,
@@ -455,23 +528,29 @@ fn register_session_routes(
     router
         .route(
             "/control/status",
-            get(move |headers| {
+            get(move |connect_info, headers| {
                 let state = control_state_status.clone();
-                async move { control::status_handler(State(state), headers).await }
+                async move {
+                    control::status_handler(State(state), connect_info, headers).await
+                }
             }),
         )
         .route(
             "/control/channels",
-            get(move |headers| {
+            get(move |connect_info, headers| {
                 let state = control_state_channels.clone();
-                async move { control::channels_handler(State(state), headers).await }
+                async move {
+                    control::channels_handler(State(state), connect_info, headers).await
+                }
             }),
         )
         .route(
             "/control/config",
-            post(move |headers, body| {
+            post(move |connect_info, headers, body| {
                 let state = control_state_config.clone();
-                async move { control::config_handler(State(state), headers, body).await }
+                async move {
+                    control::config_handler(State(state), connect_info, headers, body).await
+                }
             }),
         )
 }
@@ -983,7 +1062,7 @@ async fn tools_invoke_handler(
 ) -> Response {
     // Check gateway auth (requires loopback if no auth configured)
     // If ConnectInfo is unavailable (e.g., in tests), treat as non-loopback
-    let remote_addr = connect_info.map(|ci| ci.0.ip());
+    let remote_addr = connect_info.map(|ci| ci.0);
     if let Some(err) = check_gateway_auth(&state.config, &headers, remote_addr) {
         return err;
     }
@@ -1098,7 +1177,7 @@ async fn tools_invoke_handler(
 fn check_gateway_auth(
     config: &HttpConfig,
     headers: &HeaderMap,
-    remote_addr: Option<IpAddr>,
+    remote_addr: Option<SocketAddr>,
 ) -> Option<Response> {
     // Extract bearer token
     let provided = headers
@@ -1107,37 +1186,24 @@ fn check_gateway_auth(
         .and_then(|s| s.strip_prefix("Bearer "))
         .map(|s| s.trim());
 
-    // Check token auth
-    if let Some(token) = &config.gateway_token {
-        if !token.is_empty() {
-            if let Some(provided) = provided {
-                if auth::timing_safe_eq(provided, token) {
-                    return None;
-                }
-            }
-            return Some(unauthorized_response());
-        }
-    }
-
-    // Check password auth
-    if let Some(password) = &config.gateway_password {
-        if !password.is_empty() {
-            if let Some(provided) = provided {
-                if auth::timing_safe_eq(provided, password) {
-                    return None;
-                }
-            }
-            return Some(unauthorized_response());
-        }
-    }
-
-    // No auth configured - only allow loopback requests
-    // This prevents accidental exposure when binding to 0.0.0.0
-    if auth::is_loopback_request(remote_addr, headers) {
+    let resolved = auth::ResolvedGatewayAuth {
+        mode: config.gateway_auth_mode.clone(),
+        token: config.gateway_token.clone(),
+        password: config.gateway_password.clone(),
+        allow_tailscale: config.gateway_allow_tailscale,
+    };
+    // HTTP bearer header is used for either token or password auth.
+    let auth_result = auth::authorize_gateway_request(
+        &resolved,
+        provided,
+        provided,
+        headers,
+        remote_addr,
+        &config.trusted_proxies,
+    );
+    if auth_result.ok {
         return None;
     }
-
-    // Non-loopback request without auth configured - reject
     Some(unauthorized_response())
 }
 
@@ -1634,7 +1700,7 @@ mod tests {
 
     #[test]
     fn test_is_loopback_addr() {
-        use std::net::{Ipv4Addr, Ipv6Addr};
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
         assert!(auth::is_loopback_addr(IpAddr::V4(Ipv4Addr::new(
             127, 0, 0, 1
@@ -1673,9 +1739,7 @@ mod tests {
     }
 
     #[test]
-    fn test_gateway_auth_no_config_loopback_allowed() {
-        use std::net::Ipv4Addr;
-
+    fn test_gateway_auth_no_config_loopback_rejected() {
         let config = HttpConfig {
             gateway_token: None,
             gateway_password: None,
@@ -1683,22 +1747,16 @@ mod tests {
         };
         let headers = HeaderMap::new();
 
-        // Loopback address should be allowed
-        let result = check_gateway_auth(
-            &config,
-            &headers,
-            Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
-        );
+        // Loopback address should be rejected by default (fail-closed).
+        let result = check_gateway_auth(&config, &headers, Some("127.0.0.1:1234".parse().unwrap()));
         assert!(
-            result.is_none(),
-            "Loopback should be allowed when no auth configured"
+            result.is_some(),
+            "Loopback should be rejected when no auth configured"
         );
     }
 
     #[test]
     fn test_gateway_auth_no_config_non_loopback_rejected() {
-        use std::net::Ipv4Addr;
-
         let config = HttpConfig {
             gateway_token: None,
             gateway_password: None,
@@ -1710,7 +1768,7 @@ mod tests {
         let result = check_gateway_auth(
             &config,
             &headers,
-            Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100))),
+            Some("192.168.1.100:5555".parse().unwrap()),
         );
         assert!(
             result.is_some(),
@@ -1737,8 +1795,6 @@ mod tests {
 
     #[test]
     fn test_gateway_auth_with_token_allows_any_address() {
-        use std::net::Ipv4Addr;
-
         let config = HttpConfig {
             gateway_token: Some("valid-token".to_string()),
             gateway_password: None,
@@ -1752,33 +1808,63 @@ mod tests {
         );
 
         // Non-loopback address with valid token should be allowed
-        let result = check_gateway_auth(
-            &config,
-            &headers,
-            Some(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
-        );
+        let result = check_gateway_auth(&config, &headers, Some("8.8.8.8:443".parse().unwrap()));
         assert!(result.is_none(), "Valid token should allow any address");
     }
 
     #[test]
-    fn test_gateway_auth_no_config_loopback_with_proxy_headers_rejected() {
-        use std::net::Ipv4Addr;
-
+    fn test_gateway_auth_mode_none_allows_loopback() {
         let config = HttpConfig {
             gateway_token: None,
             gateway_password: None,
+            gateway_auth_mode: auth::AuthMode::None,
             ..Default::default()
         };
 
         let mut headers = HeaderMap::new();
+        headers.insert("host", "localhost".parse().unwrap());
+
+        let result = check_gateway_auth(&config, &headers, Some("127.0.0.1:4321".parse().unwrap()));
+        assert!(
+            result.is_none(),
+            "Loopback should be allowed in auth mode none"
+        );
+    }
+
+    #[test]
+    fn test_gateway_auth_mode_none_loopback_requires_local_host() {
+        let config = HttpConfig {
+            gateway_token: None,
+            gateway_password: None,
+            gateway_auth_mode: auth::AuthMode::None,
+            ..Default::default()
+        };
+
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "example.com".parse().unwrap());
+
+        let result = check_gateway_auth(&config, &headers, Some("127.0.0.1:4321".parse().unwrap()));
+        assert!(
+            result.is_some(),
+            "Loopback without a local Host header should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_gateway_auth_mode_none_loopback_with_proxy_headers_rejected() {
+        let config = HttpConfig {
+            gateway_token: None,
+            gateway_password: None,
+            gateway_auth_mode: auth::AuthMode::None,
+            ..Default::default()
+        };
+
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "localhost".parse().unwrap());
         headers.insert("x-forwarded-for", "203.0.113.50".parse().unwrap());
 
         // Loopback with proxy headers should be rejected (could be spoofed)
-        let result = check_gateway_auth(
-            &config,
-            &headers,
-            Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
-        );
+        let result = check_gateway_auth(&config, &headers, Some("127.0.0.1:9000".parse().unwrap()));
         assert!(
             result.is_some(),
             "Loopback with proxy headers should be rejected"

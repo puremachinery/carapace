@@ -6,6 +6,8 @@
 //! - OpenAI compatibility endpoints
 //! - Control endpoints
 
+use axum::extract::ConnectInfo;
+use carapace::auth::AuthMode;
 use carapace::channels::{ChannelInfo, ChannelRegistry, ChannelStatus};
 use carapace::hooks::{
     HookAction, HookMapping, HookMappingContext, HookMappingResult, HookRegistry,
@@ -13,6 +15,11 @@ use carapace::hooks::{
 use carapace::plugins::{ToolInvokeContext, ToolInvokeResult, ToolsRegistry};
 use serde_json::json;
 use std::collections::HashMap;
+use std::net::SocketAddr;
+
+fn loopback_connect_info() -> Option<ConnectInfo<SocketAddr>> {
+    Some(ConnectInfo("127.0.0.1:1234".parse().unwrap()))
+}
 
 // ============================================================================
 // Hook Registry Tests
@@ -432,8 +439,13 @@ async fn test_responses_disabled_returns_404() {
     }))
     .unwrap();
 
-    let response =
-        responses_handler(State(state), auth_headers(), axum::body::Bytes::from(body)).await;
+    let response = responses_handler(
+        State(state),
+        loopback_connect_info(),
+        auth_headers(),
+        axum::body::Bytes::from(body),
+    )
+    .await;
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
@@ -451,7 +463,13 @@ async fn test_responses_no_auth_returns_401() {
 
     // No Authorization header
     let headers = HeaderMap::new();
-    let response = responses_handler(State(state), headers, axum::body::Bytes::from(body)).await;
+    let response = responses_handler(
+        State(state),
+        loopback_connect_info(),
+        headers,
+        axum::body::Bytes::from(body),
+    )
+    .await;
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
@@ -474,7 +492,13 @@ async fn test_responses_wrong_token_returns_401() {
     let mut headers = HeaderMap::new();
     headers.insert("authorization", "Bearer wrong-token".parse().unwrap());
 
-    let response = responses_handler(State(state), headers, axum::body::Bytes::from(body)).await;
+    let response = responses_handler(
+        State(state),
+        loopback_connect_info(),
+        headers,
+        axum::body::Bytes::from(body),
+    )
+    .await;
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
@@ -490,8 +514,13 @@ async fn test_responses_basic_text_input() {
     }))
     .unwrap();
 
-    let response =
-        responses_handler(State(state), auth_headers(), axum::body::Bytes::from(body)).await;
+    let response = responses_handler(
+        State(state),
+        loopback_connect_info(),
+        auth_headers(),
+        axum::body::Bytes::from(body),
+    )
+    .await;
 
     assert_eq!(response.status(), StatusCode::OK);
 
@@ -544,8 +573,13 @@ async fn test_responses_items_input_with_user_message() {
     }))
     .unwrap();
 
-    let response =
-        responses_handler(State(state), auth_headers(), axum::body::Bytes::from(body)).await;
+    let response = responses_handler(
+        State(state),
+        loopback_connect_info(),
+        auth_headers(),
+        axum::body::Bytes::from(body),
+    )
+    .await;
 
     assert_eq!(response.status(), StatusCode::OK);
 
@@ -570,8 +604,13 @@ async fn test_responses_missing_model_returns_400() {
     }))
     .unwrap();
 
-    let response =
-        responses_handler(State(state), auth_headers(), axum::body::Bytes::from(body)).await;
+    let response = responses_handler(
+        State(state),
+        loopback_connect_info(),
+        auth_headers(),
+        axum::body::Bytes::from(body),
+    )
+    .await;
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
@@ -591,8 +630,13 @@ async fn test_responses_missing_input_returns_400() {
     }))
     .unwrap();
 
-    let response =
-        responses_handler(State(state), auth_headers(), axum::body::Bytes::from(body)).await;
+    let response = responses_handler(
+        State(state),
+        loopback_connect_info(),
+        auth_headers(),
+        axum::body::Bytes::from(body),
+    )
+    .await;
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
@@ -608,8 +652,13 @@ async fn test_responses_invalid_json_returns_400() {
     let state = responses_state_enabled_no_provider();
     let body = b"not valid json at all".to_vec();
 
-    let response =
-        responses_handler(State(state), auth_headers(), axum::body::Bytes::from(body)).await;
+    let response = responses_handler(
+        State(state),
+        loopback_connect_info(),
+        auth_headers(),
+        axum::body::Bytes::from(body),
+    )
+    .await;
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
@@ -629,8 +678,13 @@ async fn test_responses_empty_body_returns_400() {
     let state = responses_state_enabled_no_provider();
     let body = Vec::new();
 
-    let response =
-        responses_handler(State(state), auth_headers(), axum::body::Bytes::from(body)).await;
+    let response = responses_handler(
+        State(state),
+        loopback_connect_info(),
+        auth_headers(),
+        axum::body::Bytes::from(body),
+    )
+    .await;
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
@@ -649,8 +703,13 @@ async fn test_responses_items_no_user_message_returns_400() {
     }))
     .unwrap();
 
-    let response =
-        responses_handler(State(state), auth_headers(), axum::body::Bytes::from(body)).await;
+    let response = responses_handler(
+        State(state),
+        loopback_connect_info(),
+        auth_headers(),
+        axum::body::Bytes::from(body),
+    )
+    .await;
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
@@ -677,8 +736,13 @@ async fn test_responses_tool_choice_required_without_tools_returns_400() {
     }))
     .unwrap();
 
-    let response =
-        responses_handler(State(state), auth_headers(), axum::body::Bytes::from(body)).await;
+    let response = responses_handler(
+        State(state),
+        loopback_connect_info(),
+        auth_headers(),
+        axum::body::Bytes::from(body),
+    )
+    .await;
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
@@ -715,8 +779,13 @@ async fn test_responses_tool_choice_unknown_function_returns_400() {
     }))
     .unwrap();
 
-    let response =
-        responses_handler(State(state), auth_headers(), axum::body::Bytes::from(body)).await;
+    let response = responses_handler(
+        State(state),
+        loopback_connect_info(),
+        auth_headers(),
+        axum::body::Bytes::from(body),
+    )
+    .await;
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
@@ -737,6 +806,7 @@ async fn test_responses_tool_choice_unknown_function_returns_400() {
 async fn test_responses_password_auth_accepted() {
     let state = OpenAiState {
         responses_enabled: true,
+        gateway_auth_mode: AuthMode::Password,
         gateway_password: Some("my-secret".to_string()),
         llm_provider: Some(Arc::new(MockLlmProvider)),
         ..Default::default()
@@ -750,7 +820,13 @@ async fn test_responses_password_auth_accepted() {
     let mut headers = HeaderMap::new();
     headers.insert("authorization", "Bearer my-secret".parse().unwrap());
 
-    let response = responses_handler(State(state), headers, axum::body::Bytes::from(body)).await;
+    let response = responses_handler(
+        State(state),
+        loopback_connect_info(),
+        headers,
+        axum::body::Bytes::from(body),
+    )
+    .await;
 
     assert_eq!(response.status(), StatusCode::OK);
 }
@@ -766,8 +842,13 @@ async fn test_responses_model_echoed_in_response() {
     }))
     .unwrap();
 
-    let response =
-        responses_handler(State(state), auth_headers(), axum::body::Bytes::from(body)).await;
+    let response = responses_handler(
+        State(state),
+        loopback_connect_info(),
+        auth_headers(),
+        axum::body::Bytes::from(body),
+    )
+    .await;
 
     assert_eq!(response.status(), StatusCode::OK);
 

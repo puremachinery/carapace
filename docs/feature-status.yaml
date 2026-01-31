@@ -43,8 +43,8 @@ feature_inventory_markdown: |
   - [x] **Token auth** — SHA-256 hashed token verification
   - [x] **Password auth** — timing-safe password comparison
   - [x] **Tailscale auth** — whois verification against tailnet ACLs
-  - [~] **Localhost bypass** — direct localhost connections trusted
-  - [~] **Fail-closed default** — denies by default
+  - [x] **Localhost bypass** — AuthMode::None allows local-direct requests only
+  - [x] **Fail-closed default** — denies by default when no auth configured
   - [x] **Timing-safe comparison** — SHA-256 hash-then-compare (no length leak)
 
   ### Channels (`src/channels/`)

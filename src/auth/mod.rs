@@ -10,8 +10,10 @@ use serde_json::Value;
 use std::net::{IpAddr, SocketAddr};
 use std::process::Command;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum AuthMode {
+    None,
+    #[default]
     Token,
     Password,
 }
@@ -37,6 +39,7 @@ impl Default for ResolvedGatewayAuth {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GatewayAuthMethod {
+    Local,
     Token,
     Password,
     Tailscale,
@@ -135,7 +138,7 @@ where
     let user_name = header_value(headers, "tailscale-user-name");
 
     let client_ip = parse_forwarded_for(header_value(headers, "x-forwarded-for"))?;
-    let whois_login = whois_lookup(&client_ip)?;
+    let whois_login = whois_lookup(&client_ip.to_string())?;
 
     if normalize_login(&whois_login) != normalize_login(&user_login) {
         tracing::debug!(
@@ -160,33 +163,27 @@ pub fn verify_tailscale_auth(
     verify_tailscale_auth_with_whois(headers, remote_addr, tailscale_whois_login)
 }
 
-/// Authorize a gateway connect attempt (WS/HTTP compatible).
-///
-/// Mirrors the Node.js gateway behavior for token/password + Tailscale auth.
-pub fn authorize_gateway_connect(
+fn normalize_credential(value: Option<&str>) -> Option<&str> {
+    value.filter(|s| !s.is_empty())
+}
+
+fn authorize_gateway_credentials(
     auth: &ResolvedGatewayAuth,
     token: Option<&str>,
     password: Option<&str>,
-    headers: &HeaderMap,
-    remote_addr: SocketAddr,
-    trusted_proxies: &[String],
 ) -> GatewayAuthResult {
-    let local_direct = is_local_direct_request(remote_addr, headers, trusted_proxies);
-
-    if auth.allow_tailscale && !local_direct {
-        if let Some(ts_auth) = verify_tailscale_auth(headers, remote_addr) {
-            return GatewayAuthResult {
-                ok: true,
-                method: Some(GatewayAuthMethod::Tailscale),
-                user: Some(ts_auth.user_login),
-                reason: None,
-            };
-        }
-    }
+    let token = normalize_credential(token);
+    let password = normalize_credential(password);
 
     match auth.mode {
+        AuthMode::None => GatewayAuthResult {
+            ok: false,
+            method: None,
+            user: None,
+            reason: Some(GatewayAuthFailure::Unauthorized),
+        },
         AuthMode::Token => {
-            let Some(expected) = auth.token.as_deref() else {
+            let Some(expected) = normalize_credential(auth.token.as_deref()) else {
                 return GatewayAuthResult {
                     ok: false,
                     method: None,
@@ -218,7 +215,7 @@ pub fn authorize_gateway_connect(
             }
         }
         AuthMode::Password => {
-            let Some(expected) = auth.password.as_deref() else {
+            let Some(expected) = normalize_credential(auth.password.as_deref()) else {
                 return GatewayAuthResult {
                     ok: false,
                     method: None,
@@ -250,6 +247,59 @@ pub fn authorize_gateway_connect(
             }
         }
     }
+}
+
+/// Authorize a gateway request with an optional remote address.
+pub fn authorize_gateway_request(
+    auth: &ResolvedGatewayAuth,
+    token: Option<&str>,
+    password: Option<&str>,
+    headers: &HeaderMap,
+    remote_addr: Option<SocketAddr>,
+    trusted_proxies: &[String],
+) -> GatewayAuthResult {
+    match remote_addr {
+        Some(remote_addr) => {
+            authorize_gateway_connect(auth, token, password, headers, remote_addr, trusted_proxies)
+        }
+        None => authorize_gateway_credentials(auth, token, password),
+    }
+}
+
+/// Authorize a gateway connect attempt (WS/HTTP compatible).
+///
+/// Mirrors the Node.js gateway behavior for token/password + Tailscale auth.
+pub fn authorize_gateway_connect(
+    auth: &ResolvedGatewayAuth,
+    token: Option<&str>,
+    password: Option<&str>,
+    headers: &HeaderMap,
+    remote_addr: SocketAddr,
+    trusted_proxies: &[String],
+) -> GatewayAuthResult {
+    let local_direct = is_local_direct_request(remote_addr, headers, trusted_proxies);
+
+    if matches!(auth.mode, AuthMode::None) && local_direct {
+        return GatewayAuthResult {
+            ok: true,
+            method: Some(GatewayAuthMethod::Local),
+            user: None,
+            reason: None,
+        };
+    }
+
+    if auth.allow_tailscale && !local_direct {
+        if let Some(ts_auth) = verify_tailscale_auth(headers, remote_addr) {
+            return GatewayAuthResult {
+                ok: true,
+                method: Some(GatewayAuthMethod::Tailscale),
+                user: Some(ts_auth.user_login),
+                reason: None,
+            };
+        }
+    }
+
+    authorize_gateway_credentials(auth, token, password)
 }
 
 /// Check if the request is from loopback (HTTP-only helper).
@@ -350,33 +400,54 @@ fn get_host_name(host_header: Option<String>) -> String {
     trimmed.split(':').next().unwrap_or_default().to_string()
 }
 
-fn normalize_ip(raw: &str) -> Option<String> {
+fn normalize_ip_addr(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
+        other => other,
+    }
+}
+
+fn normalize_ip(raw: &str) -> Option<IpAddr> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
     }
-    if let Some(stripped) = trimmed.strip_prefix("::ffff:") {
-        return Some(stripped.to_string());
+    if trimmed.starts_with('[') {
+        if let Some(end) = trimmed.find(']') {
+            if let Ok(ip) = trimmed[1..end].parse::<IpAddr>() {
+                return Some(normalize_ip_addr(ip));
+            }
+        }
     }
-    Some(trimmed.to_string())
+    if let Ok(ip) = trimmed.parse::<IpAddr>() {
+        return Some(normalize_ip_addr(ip));
+    }
+    if let Ok(sock) = trimmed.parse::<SocketAddr>() {
+        return Some(normalize_ip_addr(sock.ip()));
+    }
+    None
 }
 
-fn parse_forwarded_for(value: Option<String>) -> Option<String> {
+fn parse_forwarded_for(value: Option<String>) -> Option<IpAddr> {
     let raw = value?;
     let first = raw.split(',').next()?.trim();
     normalize_ip(first)
 }
 
-fn is_loopback_address(ip: &str) -> bool {
-    ip == "127.0.0.1" || ip.starts_with("127.") || ip == "::1" || ip.starts_with("::ffff:127.")
+fn is_loopback_address(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => v6.is_loopback() || v6.to_ipv4().is_some_and(|v4| v4.is_loopback()),
+    }
 }
 
-fn is_trusted_proxy(remote: Option<&str>, trusted: &[String]) -> bool {
-    let remote = remote.and_then(normalize_ip);
-    if remote.is_none() || trusted.is_empty() {
+fn is_trusted_proxy(remote: Option<IpAddr>, trusted: &[String]) -> bool {
+    let Some(remote) = remote else {
+        return false;
+    };
+    if trusted.is_empty() {
         return false;
     }
-    let remote = remote.unwrap();
     trusted
         .iter()
         .filter_map(|p| normalize_ip(p))
@@ -384,13 +455,14 @@ fn is_trusted_proxy(remote: Option<&str>, trusted: &[String]) -> bool {
 }
 
 fn resolve_client_ip(
-    remote: &str,
+    remote: IpAddr,
     forwarded_for: Option<String>,
     real_ip: Option<String>,
     trusted: &[String],
-) -> Option<String> {
+) -> Option<IpAddr> {
+    let remote = normalize_ip_addr(remote);
     if !is_trusted_proxy(Some(remote), trusted) {
-        return normalize_ip(remote);
+        return Some(remote);
     }
     parse_forwarded_for(forwarded_for).or_else(|| normalize_ip(&real_ip.unwrap_or_default()))
 }
@@ -401,23 +473,24 @@ pub fn is_local_direct_request(
     headers: &HeaderMap,
     trusted: &[String],
 ) -> bool {
-    let remote_ip = remote_addr.ip().to_string();
+    let remote_ip = normalize_ip_addr(remote_addr.ip());
     let forwarded_for = header_value(headers, "x-forwarded-for");
     let real_ip = header_value(headers, "x-real-ip");
     let has_forwarded = forwarded_for.is_some() || real_ip.is_some();
-    let host = get_host_name(header_value(headers, "host"));
+    let host = get_host_name(header_value(headers, "host")).to_lowercase();
     let host_is_local = host == "localhost" || host == "127.0.0.1" || host == "::1";
     let host_is_tailscale = host.ends_with(".ts.net");
-    let client_ip = resolve_client_ip(&remote_ip, forwarded_for, real_ip, trusted);
+    let client_ip = resolve_client_ip(remote_ip, forwarded_for, real_ip, trusted);
     if !client_ip
         .as_ref()
-        .map(|ip| is_loopback_address(ip))
+        .copied()
+        .map(is_loopback_address)
         .unwrap_or(false)
     {
         return false;
     }
     (host_is_local || host_is_tailscale)
-        && (!has_forwarded || is_trusted_proxy(Some(&remote_ip), trusted))
+        && (!has_forwarded || is_trusted_proxy(Some(remote_ip), trusted))
 }
 
 #[cfg(test)]
@@ -578,6 +651,36 @@ mod tests {
         assert_eq!(result.method, Some(GatewayAuthMethod::Token));
         assert!(result.user.is_none());
         assert!(result.reason.is_none());
+    }
+
+    #[test]
+    fn test_gateway_auth_local_bypass_allows_loopback() {
+        let auth = ResolvedGatewayAuth {
+            mode: AuthMode::None,
+            token: None,
+            password: None,
+            allow_tailscale: false,
+        };
+        let headers = make_headers(&[("host", "localhost")]);
+        let addr = "127.0.0.1:1234".parse().unwrap();
+        let result = authorize_gateway_connect(&auth, None, None, &headers, addr, &[]);
+        assert!(result.ok);
+        assert_eq!(result.method, Some(GatewayAuthMethod::Local));
+    }
+
+    #[test]
+    fn test_gateway_auth_local_bypass_rejects_remote() {
+        let auth = ResolvedGatewayAuth {
+            mode: AuthMode::None,
+            token: None,
+            password: None,
+            allow_tailscale: false,
+        };
+        let headers = make_headers(&[("host", "localhost")]);
+        let addr = "8.8.8.8:1234".parse().unwrap();
+        let result = authorize_gateway_connect(&auth, None, None, &headers, addr, &[]);
+        assert!(!result.ok);
+        assert_eq!(result.reason, Some(GatewayAuthFailure::Unauthorized));
     }
 
     // --- Token mode: invalid token ---
@@ -809,7 +912,7 @@ mod tests {
             &no_trusted_proxies(),
         );
         assert!(!result.ok, "Empty token should be rejected");
-        assert_eq!(result.reason, Some(GatewayAuthFailure::TokenMismatch));
+        assert_eq!(result.reason, Some(GatewayAuthFailure::TokenMissing));
     }
 
     // --- Edge case: empty password ---
@@ -831,7 +934,7 @@ mod tests {
             &no_trusted_proxies(),
         );
         assert!(!result.ok, "Empty password should be rejected");
-        assert_eq!(result.reason, Some(GatewayAuthFailure::PasswordMismatch));
+        assert_eq!(result.reason, Some(GatewayAuthFailure::PasswordMissing));
     }
 
     // --- Edge case: whitespace-only token ---
@@ -977,7 +1080,7 @@ mod tests {
     // --- Both empty-string config and empty-string request should match ---
 
     #[test]
-    fn test_gateway_auth_token_both_empty_matches() {
+    fn test_gateway_auth_token_both_empty_rejected() {
         let auth = ResolvedGatewayAuth {
             mode: AuthMode::Token,
             token: Some(String::new()),
@@ -992,11 +1095,8 @@ mod tests {
             remote_addr(),
             &no_trusted_proxies(),
         );
-        assert!(
-            result.ok,
-            "Empty token config + empty token request = match (timing_safe_eq on empty strings)"
-        );
-        assert_eq!(result.method, Some(GatewayAuthMethod::Token));
+        assert!(!result.ok);
+        assert_eq!(result.reason, Some(GatewayAuthFailure::TokenMissingConfig));
     }
 
     // --- GatewayAuthFailure message coverage ---

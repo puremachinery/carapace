@@ -6,7 +6,7 @@
 
 use axum::{
     body::Body,
-    extract::State,
+    extract::{ConnectInfo, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -14,6 +14,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -21,6 +22,7 @@ use crate::agent::provider::{
     CompletionRequest, ContentBlock, LlmMessage, LlmRole, StopReason, StreamEvent, TokenUsage,
 };
 use crate::agent::LlmProvider;
+use crate::auth;
 
 /// OpenAI chat completions request
 #[derive(Debug, Deserialize)]
@@ -210,6 +212,12 @@ pub struct OpenAiState {
     pub gateway_token: Option<String>,
     /// Gateway auth password
     pub gateway_password: Option<String>,
+    /// Gateway auth mode
+    pub gateway_auth_mode: auth::AuthMode,
+    /// Whether Tailscale auth is allowed for gateway endpoints
+    pub gateway_allow_tailscale: bool,
+    /// Trusted proxy IPs for local-direct detection
+    pub trusted_proxies: Vec<String>,
     /// LLM provider for making actual API calls
     pub llm_provider: Option<Arc<dyn LlmProvider>>,
 }
@@ -457,6 +465,7 @@ fn build_error_sse_response(error_msg: String) -> Response {
 /// POST /v1/chat/completions handler
 pub async fn chat_completions_handler(
     State(state): State<OpenAiState>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
@@ -466,7 +475,8 @@ pub async fn chat_completions_handler(
     }
 
     // Check auth
-    if let Some(err) = check_openai_auth(&state, &headers) {
+    let remote_addr = connect_info.map(|ci| ci.0);
+    if let Some(err) = check_openai_auth(&state, &headers, remote_addr) {
         return err;
     }
 
@@ -582,7 +592,11 @@ pub async fn chat_completions_handler(
 }
 
 /// Check OpenAI endpoint authentication
-fn check_openai_auth(state: &OpenAiState, headers: &HeaderMap) -> Option<Response> {
+fn check_openai_auth(
+    state: &OpenAiState,
+    headers: &HeaderMap,
+    remote_addr: Option<SocketAddr>,
+) -> Option<Response> {
     // Extract bearer token
     let provided = headers
         .get("authorization")
@@ -590,35 +604,24 @@ fn check_openai_auth(state: &OpenAiState, headers: &HeaderMap) -> Option<Respons
         .and_then(|s| s.strip_prefix("Bearer "))
         .map(|s| s.trim());
 
-    // Check token auth
-    if let Some(token) = &state.gateway_token {
-        if !token.is_empty() {
-            if let Some(provided) = provided {
-                if crate::auth::timing_safe_eq(provided, token) {
-                    return None;
-                }
-            }
-            return Some(
-                (StatusCode::UNAUTHORIZED, Json(OpenAiError::unauthorized())).into_response(),
-            );
-        }
+    let resolved = crate::auth::ResolvedGatewayAuth {
+        mode: state.gateway_auth_mode.clone(),
+        token: state.gateway_token.clone(),
+        password: state.gateway_password.clone(),
+        allow_tailscale: state.gateway_allow_tailscale,
+    };
+    // HTTP bearer header is used for either token or password auth.
+    let auth_result = crate::auth::authorize_gateway_request(
+        &resolved,
+        provided,
+        provided,
+        headers,
+        remote_addr,
+        &state.trusted_proxies,
+    );
+    if auth_result.ok {
+        return None;
     }
-
-    // Check password auth
-    if let Some(password) = &state.gateway_password {
-        if !password.is_empty() {
-            if let Some(provided) = provided {
-                if crate::auth::timing_safe_eq(provided, password) {
-                    return None;
-                }
-            }
-            return Some(
-                (StatusCode::UNAUTHORIZED, Json(OpenAiError::unauthorized())).into_response(),
-            );
-        }
-    }
-
-    // No auth configured - require token for OpenAI endpoints (unlike tools/invoke which allows loopback)
     Some((StatusCode::UNAUTHORIZED, Json(OpenAiError::unauthorized())).into_response())
 }
 
@@ -813,6 +816,7 @@ fn responses_input_to_chat_messages(
 /// POST /v1/responses handler
 pub async fn responses_handler(
     State(state): State<OpenAiState>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
@@ -822,7 +826,8 @@ pub async fn responses_handler(
     }
 
     // Check auth
-    if let Some(err) = check_openai_auth(&state, &headers) {
+    let remote_addr = connect_info.map(|ci| ci.0);
+    if let Some(err) = check_openai_auth(&state, &headers, remote_addr) {
         return err;
     }
 
@@ -987,6 +992,12 @@ fn validate_tool_choice(req: &ResponsesRequest) -> Option<Response> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::extract::ConnectInfo;
+    use std::net::SocketAddr;
+
+    fn loopback_connect_info() -> Option<ConnectInfo<SocketAddr>> {
+        Some(ConnectInfo("127.0.0.1:1234".parse().unwrap()))
+    }
 
     #[test]
     fn test_parse_agent_id() {
@@ -1422,8 +1433,13 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", "Bearer test-token".parse().unwrap());
 
-        let response =
-            chat_completions_handler(State(state), headers, axum::body::Bytes::from(body)).await;
+        let response = chat_completions_handler(
+            State(state),
+            loopback_connect_info(),
+            headers,
+            axum::body::Bytes::from(body),
+        )
+        .await;
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -1449,8 +1465,13 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", "Bearer test-token".parse().unwrap());
 
-        let response =
-            chat_completions_handler(State(state), headers, axum::body::Bytes::from(body)).await;
+        let response = chat_completions_handler(
+            State(state),
+            loopback_connect_info(),
+            headers,
+            axum::body::Bytes::from(body),
+        )
+        .await;
 
         assert_eq!(response.status(), StatusCode::OK);
 
@@ -1489,8 +1510,13 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", "Bearer test-token".parse().unwrap());
 
-        let response =
-            chat_completions_handler(State(state), headers, axum::body::Bytes::from(body)).await;
+        let response = chat_completions_handler(
+            State(state),
+            loopback_connect_info(),
+            headers,
+            axum::body::Bytes::from(body),
+        )
+        .await;
 
         assert_eq!(response.status(), StatusCode::OK);
 
@@ -1521,8 +1547,13 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", "Bearer test-token".parse().unwrap());
 
-        let response =
-            chat_completions_handler(State(state), headers, axum::body::Bytes::from(body)).await;
+        let response = chat_completions_handler(
+            State(state),
+            loopback_connect_info(),
+            headers,
+            axum::body::Bytes::from(body),
+        )
+        .await;
 
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
 
@@ -1570,8 +1601,13 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", "Bearer test-token".parse().unwrap());
 
-        let response =
-            chat_completions_handler(State(state), headers, axum::body::Bytes::from(body)).await;
+        let response = chat_completions_handler(
+            State(state),
+            loopback_connect_info(),
+            headers,
+            axum::body::Bytes::from(body),
+        )
+        .await;
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
@@ -1612,8 +1648,13 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", "Bearer test-token".parse().unwrap());
 
-        let response =
-            chat_completions_handler(State(state), headers, axum::body::Bytes::from(body)).await;
+        let response = chat_completions_handler(
+            State(state),
+            loopback_connect_info(),
+            headers,
+            axum::body::Bytes::from(body),
+        )
+        .await;
 
         // Should fail because there's no user message
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -1705,8 +1746,13 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", "Bearer test-token".parse().unwrap());
 
-        let response =
-            responses_handler(State(state), headers, axum::body::Bytes::from(body)).await;
+        let response = responses_handler(
+            State(state),
+            loopback_connect_info(),
+            headers,
+            axum::body::Bytes::from(body),
+        )
+        .await;
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 
@@ -1740,8 +1786,13 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", "Bearer test-token".parse().unwrap());
 
-        let response =
-            responses_handler(State(state), headers, axum::body::Bytes::from(body)).await;
+        let response = responses_handler(
+            State(state),
+            loopback_connect_info(),
+            headers,
+            axum::body::Bytes::from(body),
+        )
+        .await;
 
         assert_eq!(response.status(), StatusCode::OK);
 
@@ -1784,8 +1835,13 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", "Bearer test-token".parse().unwrap());
 
-        let response =
-            responses_handler(State(state), headers, axum::body::Bytes::from(body)).await;
+        let response = responses_handler(
+            State(state),
+            loopback_connect_info(),
+            headers,
+            axum::body::Bytes::from(body),
+        )
+        .await;
 
         assert_eq!(response.status(), StatusCode::OK);
 
@@ -1819,8 +1875,13 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", "Bearer test-token".parse().unwrap());
 
-        let response =
-            responses_handler(State(state), headers, axum::body::Bytes::from(body)).await;
+        let response = responses_handler(
+            State(state),
+            loopback_connect_info(),
+            headers,
+            axum::body::Bytes::from(body),
+        )
+        .await;
 
         assert_eq!(response.status(), StatusCode::OK);
 
@@ -1856,8 +1917,13 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", "Bearer test-token".parse().unwrap());
 
-        let response =
-            responses_handler(State(state), headers, axum::body::Bytes::from(body)).await;
+        let response = responses_handler(
+            State(state),
+            loopback_connect_info(),
+            headers,
+            axum::body::Bytes::from(body),
+        )
+        .await;
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
@@ -1886,8 +1952,13 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", "Bearer test-token".parse().unwrap());
 
-        let response =
-            responses_handler(State(state), headers, axum::body::Bytes::from(body)).await;
+        let response = responses_handler(
+            State(state),
+            loopback_connect_info(),
+            headers,
+            axum::body::Bytes::from(body),
+        )
+        .await;
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
@@ -1911,8 +1982,13 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", "Bearer test-token".parse().unwrap());
 
-        let response =
-            responses_handler(State(state), headers, axum::body::Bytes::from(body)).await;
+        let response = responses_handler(
+            State(state),
+            loopback_connect_info(),
+            headers,
+            axum::body::Bytes::from(body),
+        )
+        .await;
 
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
 
@@ -1944,8 +2020,13 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", "Bearer test-token".parse().unwrap());
 
-        let response =
-            responses_handler(State(state), headers, axum::body::Bytes::from(body)).await;
+        let response = responses_handler(
+            State(state),
+            loopback_connect_info(),
+            headers,
+            axum::body::Bytes::from(body),
+        )
+        .await;
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }

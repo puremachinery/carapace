@@ -6,13 +6,14 @@
 //! - POST /control/config - Config updates
 
 use axum::{
-    extract::State,
+    extract::{ConnectInfo, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use crate::auth;
@@ -27,6 +28,12 @@ pub struct ControlState {
     pub gateway_token: Option<String>,
     /// Gateway auth password
     pub gateway_password: Option<String>,
+    /// Gateway auth mode
+    pub gateway_auth_mode: auth::AuthMode,
+    /// Whether Tailscale auth is allowed for gateway endpoints
+    pub gateway_allow_tailscale: bool,
+    /// Trusted proxy IPs for local-direct detection
+    pub trusted_proxies: Vec<String>,
     /// Channel registry
     pub channel_registry: Arc<ChannelRegistry>,
     /// Gateway version
@@ -40,6 +47,9 @@ impl Default for ControlState {
         ControlState {
             gateway_token: None,
             gateway_password: None,
+            gateway_auth_mode: auth::AuthMode::Token,
+            gateway_allow_tailscale: false,
+            trusted_proxies: Vec::new(),
             channel_registry: Arc::new(ChannelRegistry::new()),
             version: env!("CARGO_PKG_VERSION").to_string(),
             start_time: chrono::Utc::now().timestamp(),
@@ -165,9 +175,14 @@ impl ControlError {
 }
 
 /// GET /control/status - Gateway status
-pub async fn status_handler(State(state): State<ControlState>, headers: HeaderMap) -> Response {
+pub async fn status_handler(
+    State(state): State<ControlState>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+) -> Response {
     // Check auth
-    if let Some(err) = check_control_auth(&state, &headers) {
+    let remote_addr = connect_info.map(|ci| ci.0);
+    if let Some(err) = check_control_auth(&state, &headers, remote_addr) {
         return err;
     }
 
@@ -210,9 +225,14 @@ pub async fn status_handler(State(state): State<ControlState>, headers: HeaderMa
 }
 
 /// GET /control/channels - Channel status
-pub async fn channels_handler(State(state): State<ControlState>, headers: HeaderMap) -> Response {
+pub async fn channels_handler(
+    State(state): State<ControlState>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+) -> Response {
     // Check auth
-    if let Some(err) = check_control_auth(&state, &headers) {
+    let remote_addr = connect_info.map(|ci| ci.0);
+    if let Some(err) = check_control_auth(&state, &headers, remote_addr) {
         return err;
     }
 
@@ -248,11 +268,13 @@ pub async fn channels_handler(State(state): State<ControlState>, headers: Header
 /// POST /control/config - Update configuration
 pub async fn config_handler(
     State(state): State<ControlState>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
     // Check auth
-    if let Some(err) = check_control_auth(&state, &headers) {
+    let remote_addr = connect_info.map(|ci| ci.0);
+    if let Some(err) = check_control_auth(&state, &headers, remote_addr) {
         return err;
     }
 
@@ -398,7 +420,11 @@ fn set_value_at_path(root: &mut Value, path: &str, value: Value) {
 }
 
 /// Check control endpoint authentication
-fn check_control_auth(state: &ControlState, headers: &HeaderMap) -> Option<Response> {
+fn check_control_auth(
+    state: &ControlState,
+    headers: &HeaderMap,
+    remote_addr: Option<SocketAddr>,
+) -> Option<Response> {
     // Extract bearer token
     let provided = headers
         .get("authorization")
@@ -406,37 +432,25 @@ fn check_control_auth(state: &ControlState, headers: &HeaderMap) -> Option<Respo
         .and_then(|s| s.strip_prefix("Bearer "))
         .map(|s| s.trim());
 
-    // Check token auth
-    if let Some(token) = &state.gateway_token {
-        if !token.is_empty() {
-            if let Some(provided) = provided {
-                if auth::timing_safe_eq(provided, token) {
-                    return None;
-                }
-            }
-            return Some(
-                (StatusCode::UNAUTHORIZED, Json(ControlError::unauthorized())).into_response(),
-            );
-        }
+    let resolved = auth::ResolvedGatewayAuth {
+        mode: state.gateway_auth_mode.clone(),
+        token: state.gateway_token.clone(),
+        password: state.gateway_password.clone(),
+        allow_tailscale: state.gateway_allow_tailscale,
+    };
+    // HTTP bearer header is used for either token or password auth.
+    let auth_result = auth::authorize_gateway_request(
+        &resolved,
+        provided,
+        provided,
+        headers,
+        remote_addr,
+        &state.trusted_proxies,
+    );
+    if auth_result.ok {
+        return None;
     }
-
-    // Check password auth
-    if let Some(password) = &state.gateway_password {
-        if !password.is_empty() {
-            if let Some(provided) = provided {
-                if auth::timing_safe_eq(provided, password) {
-                    return None;
-                }
-            }
-            return Some(
-                (StatusCode::UNAUTHORIZED, Json(ControlError::unauthorized())).into_response(),
-            );
-        }
-    }
-
-    // No auth configured - allow control endpoints (they're internal)
-    // In production, you should configure gateway auth
-    None
+    Some((StatusCode::UNAUTHORIZED, Json(ControlError::unauthorized())).into_response())
 }
 
 #[cfg(test)]

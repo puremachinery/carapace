@@ -1016,10 +1016,33 @@ async fn resolve_gateway_auth_config(
     let token = env_token.or(token_cfg).or(creds.token);
     let password = env_password.or(password_cfg).or(creds.password);
 
+    let has_both_credentials = token.is_some() && password.is_some();
     let resolved_mode = match mode {
+        "none" | "local" => auth::AuthMode::None,
         "password" => auth::AuthMode::Password,
         "token" => auth::AuthMode::Token,
-        _ => {
+        "" => {
+            if has_both_credentials {
+                warn!(
+                    "gateway auth mode not set; both token and password configured, defaulting to password auth"
+                );
+            }
+            if password.is_some() {
+                auth::AuthMode::Password
+            } else {
+                auth::AuthMode::Token
+            }
+        }
+        other => {
+            warn!(
+                "unknown gateway auth mode '{}'; falling back to token/password autodetect",
+                other
+            );
+            if has_both_credentials {
+                warn!(
+                    "gateway auth mode not set; both token and password configured, defaulting to password auth"
+                );
+            }
             if password.is_some() {
                 auth::AuthMode::Password
             } else {

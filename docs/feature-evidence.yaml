@@ -1406,26 +1406,33 @@ features:
       - "src/auth/mod.rs::test_tailscale_auth_*"
 
   - feature: "localhost bypass"
-    status: "partial"
+    status: "verified_done"
     runtime_wiring:
-      - "src/server/http.rs::check_gateway_auth (loopback allowed when no auth configured)"
-      - "src/auth/mod.rs::is_loopback_request"
-      - "src/auth/mod.rs::is_local_direct_request (WS local detection)"
+      - "src/auth/mod.rs::authorize_gateway_connect (AuthMode::None + local-direct)"
+      - "src/auth/mod.rs::is_local_direct_request (host/proxy/loopback checks)"
+      - "src/server/http.rs::check_gateway_auth (authorize_gateway_request)"
+      - "src/server/control.rs::check_control_auth (authorize_gateway_request)"
+      - "src/server/openai.rs::check_openai_auth (authorize_gateway_request)"
     tests:
-      - "src/server/http.rs::test_gateway_auth_no_config_loopback_allowed"
-      - "src/auth/mod.rs::test_is_loopback_request"
-    notes:
-      - "WS gateway auth still required; no loopback bypass in authorize_gateway_connect"
+      - "src/auth/mod.rs::test_gateway_auth_local_bypass_allows_loopback"
+      - "src/auth/mod.rs::test_gateway_auth_local_bypass_rejects_remote"
+      - "src/server/http.rs::test_gateway_auth_mode_none_allows_loopback"
+      - "src/server/http.rs::test_gateway_auth_mode_none_loopback_requires_local_host"
+      - "src/server/http.rs::test_gateway_auth_mode_none_loopback_with_proxy_headers_rejected"
 
   - feature: "fail-closed default"
-    status: "partial"
+    status: "verified_done"
     runtime_wiring:
-      - "src/auth/mod.rs::authorize_gateway_connect (missing config rejects)"
-      - "src/server/openai.rs::check_openai_auth (always requires auth)"
-      - "src/server/http.rs::check_gateway_auth (rejects non-loopback when no auth configured)"
-    notes:
-      - "Control endpoints allow unauthenticated access when no auth configured"
-      - "Loopback HTTP access is allowed without auth"
+      - "src/auth/mod.rs::authorize_gateway_connect (TokenMissingConfig/PasswordMissingConfig)"
+      - "src/auth/mod.rs::authorize_gateway_request (no addr still requires auth)"
+      - "src/server/http.rs::check_gateway_auth (rejects when no auth configured)"
+      - "src/server/control.rs::check_control_auth (rejects when no auth configured)"
+      - "src/server/openai.rs::check_openai_auth (rejects when no auth configured)"
+    tests:
+      - "src/auth/mod.rs::test_gateway_auth_default_config_rejects"
+      - "src/server/http.rs::test_gateway_auth_no_config_loopback_rejected"
+      - "src/server/http.rs::test_gateway_auth_no_config_non_loopback_rejected"
+      - "src/server/http.rs::test_gateway_auth_no_config_no_addr_rejected"
 
   - feature: "timing-safe comparison"
     status: "verified_done"
