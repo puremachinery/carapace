@@ -36,14 +36,13 @@ use system::*;
 pub(super) use talk::*;
 pub(super) use tts::*;
 pub(super) use update::*;
-pub(crate) use update::{apply_staged_update, cleanup_old_binaries, ApplyResult};
+pub(crate) use update::{apply_staged_update, cleanup_old_binaries};
 pub(super) use usage::*;
 pub(super) use voicewake::*;
 
 // Re-export types needed outside the handlers module
 pub(crate) use config::{
     broadcast_config_changed, map_validation_issues, persist_config_file, read_config_snapshot,
-    ConfigIssue, ConfigSnapshot,
 };
 pub use sessions::AgentRunRegistry;
 pub use sessions::AgentRunStatus;

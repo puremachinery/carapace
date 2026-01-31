@@ -10,7 +10,6 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::PathBuf;
-use std::sync::Arc;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -1765,12 +1764,6 @@ impl SessionStore {
     pub fn session_count(&self) -> usize {
         self.sessions.read().len()
     }
-}
-
-/// Create a shared session store (test helper)
-#[cfg(test)]
-pub fn create_store() -> Arc<SessionStore> {
-    Arc::new(SessionStore::new())
 }
 
 /// Generate a session key from agent ID and metadata
