@@ -59,6 +59,8 @@ tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 
 [features]
+gateway = []
+auth-profiles = []
 keychain-tests = []
 secret-service-tests = []
 

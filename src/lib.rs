@@ -23,6 +23,7 @@ pub mod cron;
 pub mod devices;
 pub mod discovery;
 pub mod exec;
+#[cfg(feature = "gateway")]
 pub mod gateway;
 pub mod hooks;
 pub mod links;
