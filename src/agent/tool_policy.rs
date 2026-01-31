@@ -125,7 +125,14 @@ impl ToolPolicy {
         match policy_str {
             "allow-list" => ToolPolicy::AllowList(list),
             "deny-list" => ToolPolicy::DenyList(list),
-            _ => ToolPolicy::AllowAll,
+            "allow-all" => ToolPolicy::AllowAll,
+            other => {
+                tracing::warn!(
+                    policy = %other,
+                    "unrecognized tool policy value, falling back to AllowAll"
+                );
+                ToolPolicy::AllowAll
+            }
         }
     }
 }

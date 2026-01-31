@@ -233,7 +233,17 @@ pub fn filter_output(text: &str, config: &PostflightConfig) -> PostflightResult 
     let compiled_custom: Vec<Regex> = config
         .custom_patterns
         .iter()
-        .filter_map(|p| Regex::new(p).ok())
+        .filter_map(|p| match Regex::new(p) {
+            Ok(re) => Some(re),
+            Err(e) => {
+                tracing::warn!(
+                    pattern = %p,
+                    error = %e,
+                    "invalid postflight custom regex pattern, skipping"
+                );
+                None
+            }
+        })
         .collect();
 
     for re in &compiled_custom {

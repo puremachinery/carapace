@@ -244,9 +244,6 @@ impl PairedDevice {
 pub struct DeviceToken {
     /// Token hash for secure storage
     pub token_hash: String,
-    /// Plaintext token (stored for reuse)
-    #[serde(default)]
-    pub token: String,
     /// Device ID this token belongs to
     pub device_id: String,
     /// Role this token is valid for
@@ -270,7 +267,6 @@ impl DeviceToken {
         let now = now_ms();
         (
             Self {
-                token: token.clone(),
                 token_hash,
                 device_id,
                 role,
@@ -1079,24 +1075,7 @@ impl DevicePairingRegistry {
             return Err(DevicePairingError::ScopeNotAllowed);
         }
 
-        // Reuse existing token if valid and scopes match
-        if let Some(existing) = store.tokens.values().find(|token| {
-            token.device_id == device_id
-                && token.role == role
-                && !token.revoked
-                && now_ms() < token.expires_at_ms
-                && scopes_allow(&scopes, &token.scopes)
-        }) {
-            if !existing.token.is_empty() {
-                return Ok(IssuedDeviceToken {
-                    token: existing.token.clone(),
-                    role: existing.role.clone(),
-                    scopes: existing.scopes.clone(),
-                    issued_at_ms: existing.issued_at_ms,
-                });
-            }
-        }
-
+        // Plaintext token is no longer stored; always rotate to issue a fresh one.
         drop(store);
         self.rotate_token(device_id, role, scopes)
     }

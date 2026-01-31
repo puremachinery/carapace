@@ -8,6 +8,8 @@
 //! **Off by default.**  Fail-open on errors — classification failures never
 //! block message processing.
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -15,6 +17,11 @@ use crate::agent::provider::{
     CompletionRequest, ContentBlock, LlmMessage, LlmRole, StreamEvent, TokenUsage,
 };
 use crate::agent::{AgentError, LlmProvider};
+
+/// Consecutive classifier failure count for circuit breaker.
+static CONSECUTIVE_FAILURES: AtomicU32 = AtomicU32::new(0);
+/// Maximum consecutive failures before circuit opens.
+const MAX_CONSECUTIVE_FAILURES: u32 = 5;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -82,6 +89,7 @@ pub enum AttackCategory {
     DataExfiltration,
     ToolAbuse,
     Clean,
+    Unknown,
 }
 
 impl std::fmt::Display for AttackCategory {
@@ -93,6 +101,7 @@ impl std::fmt::Display for AttackCategory {
             AttackCategory::DataExfiltration => write!(f, "data_exfiltration"),
             AttackCategory::ToolAbuse => write!(f, "tool_abuse"),
             AttackCategory::Clean => write!(f, "clean"),
+            AttackCategory::Unknown => write!(f, "unknown"),
         }
     }
 }
@@ -154,6 +163,20 @@ pub async fn classify_message(
     config: &ClassifierConfig,
     provider: &dyn LlmProvider,
 ) -> Result<ClassifierVerdict, AgentError> {
+    // Circuit breaker: if too many consecutive failures, skip the LLM call.
+    if CONSECUTIVE_FAILURES.load(Ordering::Relaxed) >= MAX_CONSECUTIVE_FAILURES {
+        tracing::warn!(
+            consecutive_failures = MAX_CONSECUTIVE_FAILURES,
+            "classifier circuit breaker open — returning Unknown without calling LLM"
+        );
+        return Ok(ClassifierVerdict {
+            category: AttackCategory::Unknown,
+            confidence: 0.0,
+            reasoning: "circuit breaker open: too many consecutive classifier failures".to_string(),
+            raw_response: String::new(),
+        });
+    }
+
     let model = if config.model.is_empty() {
         "gpt-4o-mini".to_string()
     } else {
@@ -183,13 +206,25 @@ pub async fn classify_message(
             StreamEvent::TextDelta { text } => response_text.push_str(&text),
             StreamEvent::Stop { .. } => break,
             StreamEvent::Error { message } => {
+                CONSECUTIVE_FAILURES.fetch_add(1, Ordering::Relaxed);
                 return Ok(fail_open(&format!("LLM error: {message}")));
             }
             _ => {}
         }
     }
 
-    parse_verdict(&response_text)
+    let verdict = parse_verdict(&response_text);
+
+    match &verdict {
+        Ok(_) => {
+            CONSECUTIVE_FAILURES.store(0, Ordering::Relaxed);
+        }
+        Err(_) => {
+            CONSECUTIVE_FAILURES.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    verdict
 }
 
 /// Parse the LLM response into a `ClassifierVerdict`.
@@ -211,7 +246,7 @@ fn parse_verdict(raw: &str) -> Result<ClassifierVerdict, AgentError> {
         .get("category")
         .and_then(|v| v.as_str())
         .and_then(parse_category)
-        .unwrap_or(AttackCategory::Clean);
+        .unwrap_or(AttackCategory::Unknown);
 
     let confidence = parsed
         .get("confidence")
@@ -490,10 +525,10 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_verdict_unknown_category_defaults_clean() {
+    fn test_parse_verdict_unknown_category_defaults_unknown() {
         let raw = r#"{"category": "unknown_thing", "confidence": 0.9, "reasoning": "test"}"#;
         let verdict = parse_verdict(raw).unwrap();
-        assert_eq!(verdict.category, AttackCategory::Clean);
+        assert_eq!(verdict.category, AttackCategory::Unknown);
     }
 
     #[test]

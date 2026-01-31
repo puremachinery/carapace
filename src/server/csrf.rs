@@ -307,23 +307,8 @@ fn extract_session_id(headers: &HeaderMap) -> Option<String> {
         }
     }
 
-    // Fallback: use a hash of client characteristics
-    // This is a simplification - real sessions need proper management
-    let mut hasher = Sha256::new();
-
-    if let Some(ua) = headers.get(header::USER_AGENT) {
-        hasher.update(ua.as_bytes());
-    }
-
-    // Add some entropy from the current time window (10-minute buckets)
-    let window = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() / 600)
-        .unwrap_or(0);
-    hasher.update(window.to_le_bytes());
-
-    let hash = hasher.finalize();
-    Some(URL_SAFE_NO_PAD.encode(&hash[..16]))
+    // No session cookie found — require a real session ID.
+    None
 }
 
 /// Extract CSRF token from request
