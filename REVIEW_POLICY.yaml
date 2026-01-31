@@ -230,6 +230,20 @@ review_types:
       note: "Prefer automated linters (prettier, scalafmt, black, etc.)"
 
   # ============================================================================
+  # FEATURE VERIFICATION
+  # ============================================================================
+  feature:
+    status_verification:
+      description: "Verify claimed feature completeness against feature-status.yaml and runtime wiring"
+      enabled: true
+      frequency: "every_pr"
+      severity: "high"
+      only_if:
+        - "feature_verification"
+      change_triggers:
+        - "feature-status.yaml"
+
+  # ============================================================================
   # PERFORMANCE
   # ============================================================================
   performance:
@@ -328,6 +342,7 @@ project_flags:
   - "handles_pii"
   - "has_wasm_plugins"     # WASM plugin system with signature verification and capability sandbox
   - "has_crypto"           # HMAC-SHA256, Ed25519 signatures, AES-GCM encryption
+  - "feature_verification" # Enforce feature status review from feature-status.yaml
   # Uncomment flags that apply to this project:
   # - "has_database"       # Traditional SQL/NoSQL database
   # - "prototype"
@@ -394,6 +409,8 @@ agent_instructions: |
        in a SINGLE pass over the relevant files
      - Report and track findings SEPARATELY per subcategory
      - Do NOT combine reviews across different categories into one pass
+     - For feature.status_verification, use feature-status.yaml as the feature inventory and
+       require evidence for "complete": runtime wiring, config surface, and tests
   8. Prioritize categories by highest severity among their due subcategories:
      critical > high > medium > low
   9. After completing reviews:
