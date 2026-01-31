@@ -342,6 +342,7 @@ fn now_ms() -> u64 {
 
 /// Start a new wizard
 pub(super) fn handle_wizard_start(params: Option<&Value>) -> Result<Value, ErrorShape> {
+    tracing::debug!("wizard.start: stub response");
     let wizard_type = params
         .and_then(|v| v.get("type"))
         .and_then(|v| v.as_str())
@@ -378,6 +379,7 @@ pub(super) fn handle_wizard_start(params: Option<&Value>) -> Result<Value, Error
     let current_step = session.steps.first().cloned();
 
     Ok(json!({
+        "stub": true,
         "ok": true,
         "wizardId": session.id,
         "type": session.wizard_type,
@@ -390,6 +392,7 @@ pub(super) fn handle_wizard_start(params: Option<&Value>) -> Result<Value, Error
 
 /// Advance to the next wizard step
 pub(super) fn handle_wizard_next(params: Option<&Value>) -> Result<Value, ErrorShape> {
+    tracing::debug!("wizard.next: stub response");
     let wizard_id = params
         .and_then(|v| v.get("wizardId"))
         .and_then(|v| v.as_str())
@@ -446,6 +449,7 @@ pub(super) fn handle_wizard_next(params: Option<&Value>) -> Result<Value, ErrorS
     if wizard.current_step >= wizard.total_steps {
         wizard.complete = true;
         let result = json!({
+            "stub": true,
             "ok": true,
             "wizardId": wizard.id,
             "step": wizard.current_step,
@@ -459,6 +463,7 @@ pub(super) fn handle_wizard_next(params: Option<&Value>) -> Result<Value, ErrorS
     let current_step = wizard.steps.get(wizard.current_step).cloned();
 
     Ok(json!({
+        "stub": true,
         "ok": true,
         "wizardId": wizard.id,
         "step": wizard.current_step,
@@ -470,6 +475,7 @@ pub(super) fn handle_wizard_next(params: Option<&Value>) -> Result<Value, ErrorS
 
 /// Go back to the previous wizard step
 pub(super) fn handle_wizard_back(params: Option<&Value>) -> Result<Value, ErrorShape> {
+    tracing::debug!("wizard.back: stub response");
     let wizard_id = params
         .and_then(|v| v.get("wizardId"))
         .and_then(|v| v.as_str())
@@ -496,6 +502,7 @@ pub(super) fn handle_wizard_back(params: Option<&Value>) -> Result<Value, ErrorS
     let previous_input = step_id.and_then(|id| wizard.data.get(&id).cloned());
 
     Ok(json!({
+        "stub": true,
         "ok": true,
         "wizardId": wizard.id,
         "step": wizard.current_step,
@@ -508,6 +515,7 @@ pub(super) fn handle_wizard_back(params: Option<&Value>) -> Result<Value, ErrorS
 
 /// Cancel an active wizard
 pub(super) fn handle_wizard_cancel(params: Option<&Value>) -> Result<Value, ErrorShape> {
+    tracing::debug!("wizard.cancel: stub response");
     let wizard_id = params
         .and_then(|v| v.get("wizardId"))
         .and_then(|v| v.as_str());
@@ -525,6 +533,7 @@ pub(super) fn handle_wizard_cancel(params: Option<&Value>) -> Result<Value, Erro
     if let Some(id) = id_to_cancel {
         if let Some(wizard) = manager.cancel_wizard(&id) {
             return Ok(json!({
+                "stub": true,
                 "ok": true,
                 "cancelled": true,
                 "wizardId": wizard.id,
@@ -534,6 +543,7 @@ pub(super) fn handle_wizard_cancel(params: Option<&Value>) -> Result<Value, Erro
     }
 
     Ok(json!({
+        "stub": true,
         "ok": true,
         "cancelled": false,
         "reason": "no active wizard"

@@ -5,5 +5,7 @@ expression: normalized
 ---
 {
   "ok": true,
-  "result": null
+  "result": {
+    "stub": true
+  }
 }

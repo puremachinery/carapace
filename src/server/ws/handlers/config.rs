@@ -336,8 +336,10 @@ pub(super) fn handle_config_patch(params: Option<&Value>) -> Result<Value, Error
 }
 
 pub(super) fn handle_config_schema() -> Result<Value, ErrorShape> {
+    tracing::debug!("config.schema: stub response");
     // Return JSON schema for config
     Ok(json!({
+        "stub": true,
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
         "properties": {

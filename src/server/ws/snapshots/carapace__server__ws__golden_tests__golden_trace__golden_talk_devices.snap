@@ -29,6 +29,7 @@ expression: normalized
         "id": "built-in-speakers",
         "name": "Built-in Speakers"
       }
-    ]
+    ],
+    "stub": true
   }
 }
