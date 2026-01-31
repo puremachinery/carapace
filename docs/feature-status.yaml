@@ -63,8 +63,8 @@ feature_inventory_markdown: |
   - [x] **backup** — tar.gz archive of state directory
   - [x] **restore** — extract backup with path traversal protection
   - [x] **reset** — clear sessions/cron/usage/memory
-  - [~] **setup** — interactive configuration wizard
-  - [-] **pair** — device pairing initiation
+  - [x] **setup** — interactive configuration wizard
+  - [x] **pair** — device pairing initiation
   - [x] **update** — version check and self-update
   - [x] **tls init-ca / issue-cert / revoke-cert / show-ca** — cluster CA management
 

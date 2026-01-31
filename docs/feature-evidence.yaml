@@ -1246,20 +1246,16 @@ features:
       - "src/cli/mod.rs::handle_reset"
 
   - feature: "setup"
-    status: "partial"
+    status: "verified_done"
     runtime_wiring:
-      - "src/cli/mod.rs::handle_setup (writes default config)"
+      - "src/cli/mod.rs::handle_setup (interactive provider + API key wiring)"
     tests:
       - "src/cli/mod.rs::test_handle_setup_*"
-    notes:
-      - "Not interactive; writes minimal default config"
 
   - feature: "pair"
-    status: "verified_missing"
+    status: "verified_done"
     runtime_wiring:
-      - "src/cli/mod.rs::handle_pair (POST /api/nodes/pair)"
-    notes:
-      - "No HTTP /api/nodes/pair route implemented; pairing exists only over WS"
+      - "src/cli/mod.rs::handle_pair (WS node.pair.request + node.pair.approve)"
 
   - feature: "update"
     status: "verified_done"

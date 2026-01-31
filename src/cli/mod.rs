@@ -230,8 +230,15 @@ use crate::credentials;
 use crate::logging::buffer::LogLevel;
 use crate::server::bind::DEFAULT_PORT;
 use futures_util::{SinkExt, StreamExt};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{DigitallySignedStruct, Error as RustlsError, SignatureScheme};
 use serde_json::Value;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use std::io::IsTerminal;
+use tokio_tungstenite::{
+    connect_async, connect_async_tls_with_config, tungstenite::Message, Connector,
+};
+use url::{Host, Url};
 
 /// Secrets that should be redacted when printing config.
 /// Kept in sync with logging/redact.rs SECRET_KEY_NAMES.
@@ -398,6 +405,75 @@ type WsStream =
 type WsRead = futures_util::stream::SplitStream<WsStream>;
 type WsWrite = futures_util::stream::SplitSink<WsStream, Message>;
 
+#[derive(Debug)]
+struct InsecureCertVerifier;
+
+impl ServerCertVerifier for InsecureCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, RustlsError> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::ECDSA_NISTP521_SHA512,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PSS_SHA384,
+            SignatureScheme::RSA_PSS_SHA512,
+            SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA512,
+            SignatureScheme::ED25519,
+            SignatureScheme::ED448,
+        ]
+    }
+}
+
+async fn connect_ws(
+    ws_url: &str,
+    trust_invalid: bool,
+) -> Result<WsStream, Box<dyn std::error::Error>> {
+    if trust_invalid && ws_url.starts_with("wss://") {
+        let config = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(std::sync::Arc::new(InsecureCertVerifier))
+            .with_no_client_auth();
+        let connector = Connector::Rustls(std::sync::Arc::new(config));
+        let (stream, _) =
+            connect_async_tls_with_config(ws_url, None, false, Some(connector)).await?;
+        Ok(stream)
+    } else {
+        let (stream, _) = connect_async(ws_url).await?;
+        Ok(stream)
+    }
+}
+
 struct GatewayAuth {
     token: Option<String>,
     password: Option<String>,
@@ -485,6 +561,24 @@ fn is_loopback_host(host: &str) -> bool {
     host.parse::<std::net::IpAddr>()
         .map(|ip| ip.is_loopback())
         .unwrap_or(false)
+}
+
+fn ws_url_from_http(url: &Url) -> Result<String, Box<dyn std::error::Error>> {
+    let scheme = match url.scheme() {
+        "https" => "wss",
+        "http" => "ws",
+        _ => return Err("invalid URL scheme".into()),
+    };
+    let host = match url.host() {
+        Some(Host::Domain(name)) => name.to_string(),
+        Some(Host::Ipv4(addr)) => addr.to_string(),
+        Some(Host::Ipv6(addr)) => format!("[{}]", addr),
+        None => return Err("missing host in gateway URL".into()),
+    };
+    let port = url
+        .port_or_known_default()
+        .ok_or("missing port in gateway URL")?;
+    Ok(format!("{scheme}://{host}:{port}/ws"))
 }
 
 async fn read_ws_json(
@@ -1094,6 +1188,38 @@ pub fn handle_reset(
 // Setup / Pair / Update handlers
 // ---------------------------------------------------------------------------
 
+fn prompt_line(prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
+    use std::io::{self, Write};
+
+    print!("{}", prompt);
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    Ok(input.trim().to_string())
+}
+
+fn prompt_with_default(prompt: &str, default: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let line = prompt_line(&format!("{prompt} [{default}]: "))?;
+    if line.is_empty() {
+        Ok(default.to_string())
+    } else {
+        Ok(line)
+    }
+}
+
+fn prompt_yes_no(prompt: &str, default_yes: bool) -> Result<bool, Box<dyn std::error::Error>> {
+    let suffix = if default_yes { "Y/n" } else { "y/N" };
+    let line = prompt_line(&format!("{prompt} ({suffix}): "))?;
+    if line.is_empty() {
+        return Ok(default_yes);
+    }
+    match line.trim().to_lowercase().as_str() {
+        "y" | "yes" => Ok(true),
+        "n" | "no" => Ok(false),
+        _ => Ok(default_yes),
+    }
+}
+
 /// Run the `setup` subcommand -- interactive first-run wizard.
 pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
     let config_path = config::get_config_path();
@@ -1112,8 +1238,10 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
         std::fs::create_dir_all(parent)?;
     }
 
+    let interactive = std::io::stdin().is_terminal();
+
     // Build a minimal default config.
-    let default_config = serde_json::json!({
+    let mut config = serde_json::json!({
         "gateway": {
             "port": 3001,
             "bind": "loopback"
@@ -1125,19 +1253,77 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Check for API keys in environment.
-    if std::env::var("ANTHROPIC_API_KEY").is_ok() {
-        println!("Anthropic API key detected in environment");
-    }
-    if std::env::var("OPENAI_API_KEY").is_ok() {
-        println!("OpenAI API key detected in environment");
-    }
-    if std::env::var("GOOGLE_API_KEY").is_ok() {
-        println!("Google API key detected in environment");
+    if interactive {
+        println!("Carapace setup wizard");
+        println!("---------------------");
+
+        let default_provider = if std::env::var("ANTHROPIC_API_KEY").is_ok() {
+            "anthropic"
+        } else if std::env::var("OPENAI_API_KEY").is_ok() {
+            "openai"
+        } else {
+            "anthropic"
+        };
+
+        let provider = loop {
+            let selection =
+                prompt_with_default("Select provider (anthropic/openai)", default_provider)?;
+            let normalized = selection.trim().to_lowercase();
+            match normalized.as_str() {
+                "anthropic" | "claude" => break "anthropic",
+                "openai" | "gpt" => break "openai",
+                _ => {
+                    eprintln!("Please enter either \"anthropic\" or \"openai\".");
+                }
+            }
+        };
+
+        let (env_var, default_model) = match provider {
+            "openai" => ("OPENAI_API_KEY", "gpt-4o"),
+            _ => ("ANTHROPIC_API_KEY", "claude-sonnet-4-20250514"),
+        };
+
+        let env_key = std::env::var(env_var).ok();
+        let api_key = if env_key.is_some() {
+            let use_env = prompt_yes_no(&format!("Use API key from ${env_var}?"), true)?;
+            if use_env {
+                Some(format!("${{{env_var}}}"))
+            } else {
+                let entered = prompt_line("Enter API key (input is visible): ")?;
+                if entered.is_empty() {
+                    None
+                } else {
+                    Some(entered)
+                }
+            }
+        } else {
+            let entered = prompt_line("Enter API key (input is visible, leave blank to skip): ")?;
+            if entered.is_empty() {
+                None
+            } else {
+                Some(entered)
+            }
+        };
+
+        if api_key.is_none() {
+            println!("No API key provided. You can set it later via ${env_var}.");
+        }
+
+        config["agents"]["defaults"]["model"] = serde_json::json!(default_model);
+        match provider {
+            "openai" => {
+                let value = api_key.clone().unwrap_or_else(|| format!("${{{env_var}}}"));
+                config["openai"] = serde_json::json!({ "apiKey": value });
+            }
+            _ => {
+                let value = api_key.clone().unwrap_or_else(|| format!("${{{env_var}}}"));
+                config["anthropic"] = serde_json::json!({ "apiKey": value });
+            }
+        }
     }
 
     // Write the config file using json5 (pretty-formatted).
-    let content = json5::to_string(&default_config)?;
+    let content = json5::to_string(&config)?;
     std::fs::write(&config_path, &content)?;
 
     println!("Config written to {}", config_path.display());
@@ -1152,8 +1338,12 @@ pub async fn handle_pair(
     name: Option<&str>,
     trust: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Validate the URL.
-    if !url.starts_with("http://") && !url.starts_with("https://") {
+    // Validate and parse the URL.
+    let parsed_url = Url::parse(url).map_err(|e| {
+        eprintln!("Invalid URL: {} ({})", url, e);
+        "invalid URL".to_string()
+    })?;
+    if parsed_url.scheme() != "http" && parsed_url.scheme() != "https" {
         eprintln!("Invalid URL: {} (must start with http:// or https://)", url);
         return Err("invalid URL scheme".into());
     }
@@ -1164,57 +1354,97 @@ pub async fn handle_pair(
         None => std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string()),
     };
 
-    // Generate a pairing token.
-    let token = uuid::Uuid::new_v4().to_string();
-
-    println!("Pairing with: {}", url);
-    println!("Device name: {}", device_name);
-    println!("Pairing token: {}", token);
-
-    // Build the request body.
-    let body = serde_json::json!({
-        "name": device_name,
-        "token": token,
-        "version": env!("CARGO_PKG_VERSION"),
-    });
-
-    // Build the HTTP client (optionally accepting invalid certs).
-    let client = if trust {
-        reqwest::Client::builder()
-            .danger_accept_invalid_certs(true)
-            .timeout(std::time::Duration::from_secs(10))
-            .build()?
-    } else {
-        reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()?
-    };
-
-    // Attempt to connect to the gateway.
-    let pair_url = format!("{}/api/nodes/pair", url.trim_end_matches('/'));
-    let response = match client.post(&pair_url).json(&body).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("Connection error: {}", e);
-            return Err(e.into());
-        }
-    };
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body_text = response.text().await.unwrap_or_default();
-        eprintln!("Pairing failed (HTTP {}): {}", status, body_text);
-        return Err(format!("HTTP {}", status).into());
+    let ws_url = ws_url_from_http(&parsed_url)?;
+    let host = parsed_url.host_str().ok_or("missing host in gateway URL")?;
+    let auth = resolve_gateway_auth().await;
+    if auth.token.is_none() && auth.password.is_none() && !is_loopback_host(host) {
+        eprintln!("Gateway auth token/password required for pairing.");
+        eprintln!("Set gateway.auth.token or gateway.auth.password in config.");
+        eprintln!("You can also export MOLTBOT_GATEWAY_TOKEN or MOLTBOT_GATEWAY_PASSWORD.");
+        return Err("missing gateway auth".into());
     }
 
-    // Parse response and save pairing info.
-    let resp_body: Value = response.json().await?;
-    let node_id = resp_body
-        .get("node_id")
+    println!("Pairing with: {}", parsed_url);
+    println!("Device name: {}", device_name);
+
+    let ws_stream = match connect_ws(&ws_url, trust).await {
+        Ok(stream) => stream,
+        Err(err) => {
+            eprintln!("Connection error: {}", err);
+            return Err(err);
+        }
+    };
+    let (mut ws_write, mut ws_read) = ws_stream.split();
+
+    let mut connect_params = serde_json::json!({
+        "minProtocol": 3,
+        "maxProtocol": 3,
+        "client": {
+            "id": "cli",
+            "version": env!("CARGO_PKG_VERSION"),
+            "platform": std::env::consts::OS,
+            "mode": "cli"
+        },
+        "scopes": ["operator.pairing"]
+    });
+    if let Some(token) = auth.token {
+        connect_params["auth"] = serde_json::json!({ "token": token });
+    } else if let Some(password) = auth.password {
+        connect_params["auth"] = serde_json::json!({ "password": password });
+    }
+
+    let connect_frame = serde_json::json!({
+        "type": "req",
+        "id": "connect-1",
+        "method": "connect",
+        "params": connect_params
+    });
+    ws_write
+        .send(Message::Text(serde_json::to_string(&connect_frame)?))
+        .await?;
+    await_ws_response(&mut ws_read, &mut ws_write, "connect-1").await?;
+
+    let node_id = format!("node-{}", uuid::Uuid::new_v4());
+    let pair_frame = serde_json::json!({
+        "type": "req",
+        "id": "pair-1",
+        "method": "node.pair.request",
+        "params": {
+            "nodeId": node_id,
+            "displayName": device_name,
+            "platform": std::env::consts::OS,
+            "version": env!("CARGO_PKG_VERSION"),
+            "silent": false
+        }
+    });
+    ws_write
+        .send(Message::Text(serde_json::to_string(&pair_frame)?))
+        .await?;
+    let pair_response = await_ws_response(&mut ws_read, &mut ws_write, "pair-1").await?;
+    let request_id = pair_response
+        .get("request")
+        .and_then(|v| v.get("requestId"))
         .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
+        .ok_or("pairing request missing requestId")?;
+
+    let approve_frame = serde_json::json!({
+        "type": "req",
+        "id": "pair-2",
+        "method": "node.pair.approve",
+        "params": { "requestId": request_id }
+    });
+    ws_write
+        .send(Message::Text(serde_json::to_string(&approve_frame)?))
+        .await?;
+    let approve_response = await_ws_response(&mut ws_read, &mut ws_write, "pair-2").await?;
+    let node_token = approve_response
+        .get("node")
+        .and_then(|v| v.get("token"))
+        .and_then(|v| v.as_str())
+        .ok_or("pairing approval missing token")?;
 
     println!("Paired successfully! Node ID: {}", node_id);
+    println!("Node token: {}", node_token);
 
     // Save pairing to state dir.
     let state_dir = resolve_state_dir();
@@ -1222,9 +1452,9 @@ pub async fn handle_pair(
     let pairing_path = state_dir.join("pairing.json");
     let pairing_data = serde_json::json!({
         "node_id": node_id,
-        "gateway_url": url,
+        "gateway_url": parsed_url.as_str(),
         "device_name": device_name,
-        "token": token,
+        "token": node_token,
         "paired_at": chrono::Utc::now().to_rfc3339(),
     });
     std::fs::write(&pairing_path, serde_json::to_string_pretty(&pairing_data)?)?;
