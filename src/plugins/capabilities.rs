@@ -464,11 +464,6 @@ impl SsrfProtection {
         false
     }
 
-    /// Check if an IP address is private/internal (default config)
-    fn is_private_ip(ip: &IpAddr) -> bool {
-        Self::is_private_ip_with_config(ip, &SsrfConfig::default())
-    }
-
     /// Check if an IP address is private/internal with custom config
     fn is_private_ip_with_config(ip: &IpAddr, config: &SsrfConfig) -> bool {
         match ip {

@@ -192,6 +192,7 @@ impl SecurityHeadersConfigBuilder {
 /// Shared state for security headers middleware
 #[derive(Clone)]
 pub struct SecurityHeadersLayer {
+    #[allow(dead_code)] // stored for Clone
     config: Arc<SecurityHeadersConfig>,
 }
 

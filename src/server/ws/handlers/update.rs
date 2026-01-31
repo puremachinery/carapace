@@ -20,6 +20,7 @@ use super::super::*;
 struct GitHubAsset {
     name: String,
     browser_download_url: String,
+    #[allow(dead_code)] // deserialized from GitHub API
     size: u64,
 }
 

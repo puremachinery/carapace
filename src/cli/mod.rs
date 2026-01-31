@@ -1182,28 +1182,6 @@ async fn download_and_install_binary(
     Ok(())
 }
 
-/// Determine the platform asset name for update downloads.
-fn platform_asset_name() -> String {
-    format!(
-        "carapace-{}-{}",
-        std::env::consts::OS,
-        std::env::consts::ARCH
-    )
-}
-
-/// Compare two semver version strings. Returns `Ordering`.
-/// Only handles simple `MAJOR.MINOR.PATCH` format.
-fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
-    let parse = |s: &str| -> (u64, u64, u64) {
-        let parts: Vec<&str> = s.split('.').collect();
-        let major = parts.first().and_then(|p| p.parse().ok()).unwrap_or(0);
-        let minor = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(0);
-        let patch = parts.get(2).and_then(|p| p.parse().ok()).unwrap_or(0);
-        (major, minor, patch)
-    };
-    parse(a).cmp(&parse(b))
-}
-
 /// Count files matching a given extension in a directory (non-recursive top level).
 fn count_files_in_dir(dir: &Path, extension: &str) -> usize {
     std::fs::read_dir(dir)
@@ -2324,57 +2302,10 @@ mod tests {
     }
 
     #[test]
-    fn test_compare_versions() {
-        use std::cmp::Ordering;
-
-        assert_eq!(compare_versions("0.1.0", "0.1.0"), Ordering::Equal);
-        assert_eq!(compare_versions("0.1.0", "0.2.0"), Ordering::Less);
-        assert_eq!(compare_versions("0.2.0", "0.1.0"), Ordering::Greater);
-        assert_eq!(compare_versions("1.0.0", "0.9.9"), Ordering::Greater);
-        assert_eq!(compare_versions("0.1.1", "0.1.0"), Ordering::Greater);
-        assert_eq!(compare_versions("0.0.1", "0.0.2"), Ordering::Less);
-    }
-
-    #[test]
-    fn test_platform_asset_name() {
-        let name = platform_asset_name();
-        assert!(
-            name.starts_with("carapace-"),
-            "Asset name should start with 'carapace-'"
-        );
-        // Should contain an OS identifier.
-        let has_os = name.contains("linux") || name.contains("macos") || name.contains("windows");
-        assert!(
-            has_os,
-            "Asset name should contain an OS identifier: {}",
-            name
-        );
-        // Should contain an architecture identifier.
-        let has_arch = name.contains("x86_64") || name.contains("aarch64");
-        assert!(
-            has_arch,
-            "Asset name should contain an architecture identifier: {}",
-            name
-        );
-    }
-
-    #[test]
     fn test_update_version_comparison_up_to_date() {
         let current = "0.1.0";
         let latest = "0.1.0";
         assert_eq!(current, latest, "Same versions should be equal");
-    }
-
-    #[test]
-    fn test_update_version_comparison_update_available() {
-        let current = "0.1.0";
-        let latest = "0.2.0";
-        assert_ne!(current, latest, "Different versions should not be equal");
-        assert_eq!(
-            compare_versions(current, latest),
-            std::cmp::Ordering::Less,
-            "Current should be less than latest when update is available"
-        );
     }
 
     // ====================================================================
