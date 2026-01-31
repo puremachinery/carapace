@@ -398,14 +398,33 @@ type WsStream =
 type WsRead = futures_util::stream::SplitStream<WsStream>;
 type WsWrite = futures_util::stream::SplitSink<WsStream, Message>;
 
-async fn resolve_gateway_token() -> Option<String> {
-    if let Ok(token) = std::env::var("MOLTBOT_GATEWAY_TOKEN") {
-        let token = token.trim().to_string();
-        if !token.is_empty() {
-            return Some(token);
-        }
-    }
+struct GatewayAuth {
+    token: Option<String>,
+    password: Option<String>,
+}
 
+async fn resolve_gateway_auth() -> GatewayAuth {
+    let token_env = std::env::var("MOLTBOT_GATEWAY_TOKEN").ok().and_then(|v| {
+        let token = v.trim().to_string();
+        if token.is_empty() {
+            None
+        } else {
+            Some(token)
+        }
+    });
+    let password_env = std::env::var("MOLTBOT_GATEWAY_PASSWORD")
+        .ok()
+        .and_then(|v| {
+            let password = v.trim().to_string();
+            if password.is_empty() {
+                None
+            } else {
+                Some(password)
+            }
+        });
+
+    let mut token_cfg = None;
+    let mut password_cfg = None;
     if let Ok(cfg) = config::load_config() {
         if let Some(token) = cfg
             .get("gateway")
@@ -415,22 +434,57 @@ async fn resolve_gateway_token() -> Option<String> {
         {
             let token = token.trim().to_string();
             if !token.is_empty() {
-                return Some(token);
+                token_cfg = Some(token);
+            }
+        }
+        if let Some(password) = cfg
+            .get("gateway")
+            .and_then(|v| v.get("auth"))
+            .and_then(|v| v.get("password"))
+            .and_then(|v| v.as_str())
+        {
+            let password = password.trim().to_string();
+            if !password.is_empty() {
+                password_cfg = Some(password);
             }
         }
     }
 
+    let mut token_creds = None;
+    let mut password_creds = None;
     let state_dir = crate::server::ws::resolve_state_dir();
     if let Ok(creds) = credentials::read_gateway_auth(state_dir).await {
-        if let Some(token) = creds.token {
-            let token = token.trim().to_string();
-            if !token.is_empty() {
-                return Some(token);
+        token_creds = creds.token.and_then(|v| {
+            let token = v.trim().to_string();
+            if token.is_empty() {
+                None
+            } else {
+                Some(token)
             }
-        }
+        });
+        password_creds = creds.password.and_then(|v| {
+            let password = v.trim().to_string();
+            if password.is_empty() {
+                None
+            } else {
+                Some(password)
+            }
+        });
     }
 
-    None
+    GatewayAuth {
+        token: token_env.or(token_cfg).or(token_creds),
+        password: password_env.or(password_cfg).or(password_creds),
+    }
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
 }
 
 async fn read_ws_json(
@@ -506,14 +560,18 @@ pub async fn handle_logs(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let port = resolve_port(port);
 
-    let token = match resolve_gateway_token().await {
-        Some(token) => token,
-        None => {
-            eprintln!("Gateway auth token not found.");
-            eprintln!("Set gateway.auth.token in config or MOLTBOT_GATEWAY_TOKEN.");
-            std::process::exit(1);
-        }
-    };
+    if !is_loopback_host(host) {
+        eprintln!("Remote logs require a paired device identity.");
+        eprintln!("The CLI logs command only supports loopback connections for now.");
+        eprintln!("Use --host 127.0.0.1 or connect via the control UI.");
+        std::process::exit(1);
+    }
+
+    let auth = resolve_gateway_auth().await;
+    if auth.token.is_none() && auth.password.is_none() {
+        eprintln!("No gateway auth credentials found.");
+        eprintln!("Attempting local-direct connection (if enabled)...");
+    }
 
     let ws_url = format!("ws://{}:{}/ws", host, port);
     let (ws_stream, _) = match connect_async(&ws_url).await {
@@ -538,7 +596,11 @@ pub async fn handle_logs(
             "mode": "cli"
         }
     });
-    connect_params["auth"] = serde_json::json!({ "token": token });
+    if let Some(token) = auth.token {
+        connect_params["auth"] = serde_json::json!({ "token": token });
+    } else if let Some(password) = auth.password {
+        connect_params["auth"] = serde_json::json!({ "password": password });
+    }
 
     let connect_frame = serde_json::json!({
         "type": "req",
@@ -551,7 +613,14 @@ pub async fn handle_logs(
         .await?;
 
     if let Err(err) = await_ws_response(&mut ws_read, &mut ws_write, "connect-1").await {
-        eprintln!("WebSocket connect failed: {}", err);
+        let err_msg = err.to_string();
+        if err_msg.contains("device identity required") {
+            eprintln!("WebSocket connect failed: {err_msg}");
+            eprintln!("This gateway requires a paired device for WebSocket access.");
+            eprintln!("Set gateway.auth.token for local CLI access or use the control UI.");
+            std::process::exit(1);
+        }
+        eprintln!("WebSocket connect failed: {}", err_msg);
         std::process::exit(1);
     }
 
