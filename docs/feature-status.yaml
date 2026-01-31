@@ -61,7 +61,7 @@ feature_inventory_markdown: |
   - [~] **logs** — tail logs via WebSocket
   - [x] **version** — show version + build info
   - [x] **backup** — tar.gz archive of state directory
-  - [~] **restore** — extract backup with path traversal protection
+  - [x] **restore** — extract backup with path traversal protection
   - [x] **reset** — clear sessions/cron/usage/memory
   - [~] **setup** — interactive configuration wizard
   - [-] **pair** — device pairing initiation
