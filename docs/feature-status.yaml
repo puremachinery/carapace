@@ -1,0 +1,284 @@
+# Feature status inventory for carapace.
+# Single-marker status scheme.
+version: "3.2"
+source: "single-marker verification scheme (2026-01-31)"
+
+status_legend:
+  "[ ]": "Not sure — believed done, not yet verified"
+  "[~]": "Partial — incomplete or missing behavior"
+  "[s]": "Stub — placeholder response only"
+  "[-]": "Verified missing — confirmed absent"
+  "[x]": "Verified done — confirmed working"
+
+feature_inventory_markdown: |
+  ## Feature Inventory
+
+  Comprehensive list of every feature in the system, grouped by module.
+  Markers follow the status_legend.
+
+  ### Agent (`src/agent/`)
+
+  - [x] **Anthropic provider** — streaming, tool use, cancellation (`anthropic.rs`)
+  - [x] **OpenAI provider** — streaming, tool use, cancellation (`openai.rs`)
+  - [x] **Ollama provider** — streaming, tool use, cancellation (`ollama.rs`)
+  - [x] **Gemini provider** — streaming, tool use, cancellation (`gemini.rs`)
+  - [x] **Bedrock provider** — SigV4 signing, tool use, streaming via emitted events (`bedrock.rs`) wired via `factory.rs`
+  - [x] **Venice AI provider** — OpenAI-compat wrapper, model prefix stripping (`venice.rs`). Wired in factory.rs, reads VENICE_API_KEY.
+  - [x] **Provider auto-discovery** — env vars + config resolution (`factory.rs`)
+  - [x] **Base URL override** — custom API endpoints for all providers
+  - [x] **Agent execution loop** — turn loop, tool dispatch, max turns/tokens, cancellation (`mod.rs`)
+  - [x] **Agent supervisor** — panic recovery, spawn_run, timeout enforcement
+  - [x] **Tool dispatch** — built-in tools (10) + plugin tools, policy enforcement (`tool.rs`)
+  - [x] **Tool policy** — allow-all / allow-list / deny-list per config (`tool_policy.rs`)
+  - [x] **Prompt guard — preflight** — regex injection/escalation/exfiltration patterns (`prompt_guard/preflight.rs`)
+  - [x] **Prompt guard — postflight** — output content scanning with custom patterns (`prompt_guard/postflight.rs`)
+  - [x] **Inbound message classifier** — LLM-based attack classification, circuit breaker (`classifier.rs`)
+  - [x] **Output content sanitizer** — HTML/script/XSS stripping, CSP enforcement (`output_sanitizer.rs`)
+  - [x] **Exfiltration guard** — filters tool definitions + blocks sensitive tools at dispatch (`exfiltration.rs`)
+  - [~] **OS-level process sandbox** — Seatbelt (macOS), Landlock (Linux), rlimits (`sandbox.rs`)
+  - [x] **Channel-specific tools** — 15 platform-specific tool schemas (`channel_tools.rs`)
+
+  ### Authentication (`src/auth/`)
+
+  - [x] **Token auth** — SHA-256 hashed token verification
+  - [x] **Password auth** — timing-safe password comparison
+  - [x] **Tailscale auth** — whois verification against tailnet ACLs
+  - [~] **Localhost bypass** — direct localhost connections trusted
+  - [~] **Fail-closed default** — denies by default
+  - [x] **Timing-safe comparison** — SHA-256 hash-then-compare (no length leak)
+
+  ### Channels (`src/channels/`)
+
+  - [x] **Channel registry** — thread-safe channel tracking, status enum
+  - [x] **Console channel** — built-in testing channel
+  - [-] **Telegram/Discord/Slack** — via WASM plugin system (not in core). No plugins shipped; channel integrations do not exist yet.
+
+  ### CLI (`src/cli/`)
+
+  - [x] **start** — launch gateway server
+  - [x] **config show/get/set/path** — configuration management
+  - [x] **status** — gateway health check via HTTP
+  - [~] **logs** — tail logs via WebSocket
+  - [x] **version** — show version + build info
+  - [x] **backup** — tar.gz archive of state directory
+  - [~] **restore** — extract backup with path traversal protection
+  - [x] **reset** — clear sessions/cron/usage/memory
+  - [~] **setup** — interactive configuration wizard
+  - [-] **pair** — device pairing initiation
+  - [x] **update** — version check and self-update
+  - [x] **tls init-ca / issue-cert / revoke-cert / show-ca** — cluster CA management
+
+  ### Config (`src/config/`)
+
+  - [x] **JSON5 parsing** — comments, trailing commas
+  - [x] **$include directive** — max depth 10, circular reference detection
+  - [x] **Env var substitution** — `${VAR}` pattern replacement
+  - [x] **Config cache** — 200ms TTL in-memory cache
+  - [x] **Hot reload** — file watcher infrastructure (`watcher.rs`)
+  - [x] **Schema validation** — error/warning severity
+  - [x] **Config defaults** — fallback values
+  - [~] **Secret encryption** — AES-256-GCM at rest with PBKDF2 key derivation (`secrets.rs`)
+
+  ### Credentials (`src/credentials/`)
+
+  - [x] **macOS Keychain** — keyring crate integration
+  - [x] **Linux Secret Service** — D-Bus API
+  - [x] **Windows Credential Manager** — native API
+  - [x] **Env-only fallback** — when keychain unavailable
+  - [x] **Quotas and rate limiting** — 100 per plugin, 10 writes/min
+  - [x] **Key/value size limits** — 64B key, 64KB value
+
+  ### Cron (`src/cron/`)
+
+  - [x] **At schedule** — one-time execution at unix timestamp
+  - [x] **Every schedule** — interval-based recurring
+  - [x] **Cron expression** — 5-field format (min hr day mon dow)
+  - [~] **Job quotas** — max 500 enforced, but LRU eviction not implemented (rejects at limit instead of evicting oldest)
+  - [x] **Payload types** — SystemEvent broadcast, AgentTurn spawn
+  - [x] **Background tick loop** — async task runner
+  - [~] **Executor** — payload execution with session/run creation (`executor.rs`). AgentTurn accepts but ignores: thinking, timeout_seconds, allow_unsafe_external_content, deliver, channel, to, best_effort_deliver.
+
+  ### Devices (`src/devices/`)
+
+  - [x] **Pairing state machine** — Pending/Approved/Rejected/Expired
+  - [x] **Token generation** — SHA-256 hashed, no plaintext storage
+  - [x] **Token expiry** — 90 days
+  - [x] **Quotas** — 50 devices, 25 pending, 200 tokens
+  - [x] **Persistent storage** — JSON with atomic writes
+
+  ### Discovery (`src/discovery/`)
+
+  - [x] **mDNS service registration** — _moltbot._tcp.local.
+  - [x] **TXT record metadata** — version, fingerprint, device name
+  - [x] **Discovery modes** — Off/Minimal/Full
+  - [x] **Lifecycle management** — graceful shutdown
+
+  ### Exec (`src/exec/`)
+
+  - [x] **Approval request creation** — async oneshot channels
+  - [x] **Approval decisions** — AllowOnce/AllowAlways/Deny
+  - [x] **Timeout support** — configurable approval wait
+  - [x] **Cleanup of expired entries**
+
+  ### Gateway (`src/gateway/`) — feature-gated
+
+  - [~] **Remote gateway connection** — WebSocket + SSH tunnel transports
+  - [~] **TOFU fingerprint verification** — trust-on-first-use
+  - [~] **mTLS support** — mutual TLS with CA verification
+  - [~] **Reconnection with backoff** — exponential backoff
+  - [~] **Protocol v3** — JSON-RPC handshake
+
+  ### Hooks (`src/hooks/`)
+
+  - [x] **Webhook endpoints** — /hooks/wake, /hooks/agent, /hooks/<mapping>
+  - [x] **Hook registry** — mapping storage and routing
+  - [x] **Hook authentication** — token-based auth
+  - [x] **Template evaluation** — {{expr}} replacement with JSON escaping
+
+  ### Links (`src/links/`)
+
+  - [x] **URL extraction** — regex-based, code block aware
+  - [x] **HTML-to-text conversion** — custom regex-based (not html2text crate)
+  - [x] **SSRF-protected fetching** — uses media module protections
+  - [~] **LRU cache** — 100 entries, 1hr TTL
+  - [x] **Title/meta extraction** — HTML metadata parsing
+  - [x] **Safe UTF-8 truncation** — char-boundary-aware
+
+  ### Logging (`src/logging/`)
+
+  - [x] **JSON format** — structured production logs
+  - [x] **Plaintext format** — human-readable dev logs
+  - [x] **Output destinations** — stdout, stderr, file
+  - [x] **Log buffer layer** — ring buffer for /logs endpoint
+  - [~] **Secret masking** — redacts API keys (9 keywords)
+  - [~] **Audit logging** — framework in place (audit.rs module exists, callers emit structured events)
+
+  ### Media (`src/media/`)
+
+  - [x] **SSRF protection** — blocks private IPs, localhost, metadata endpoints
+  - [x] **DNS rebinding defense** — post-resolution IP validation (hickory_resolver)
+  - [x] **Redirect blocking** — prevents redirect-based bypass
+  - [x] **Streaming with size limits** — configurable max size (50MB default)
+  - [~] **Temp file storage** — TTL-based expiration with cleanup (1hr TTL)
+  - [~] **Image analysis (Claude Vision)** — Anthropic image understanding
+  - [~] **Image analysis (GPT-4 Vision)** — OpenAI image understanding
+  - [~] **Audio transcription (Whisper)** — OpenAI Whisper API
+  - [~] **Analysis caching** — .analysis.json sidecar files
+
+  ### Messages (`src/messages/`)
+
+  - [x] **Outbound message pipeline** — per-channel queuing, idempotency keys
+  - [x] **Delivery status tracking** — queued/sending/sent/failed/cancelled
+  - [x] **Retry support** — retry with error tracking
+  - [x] **Delivery loop** — async message dispatch with notify
+
+  ### Nodes (`src/nodes/`)
+
+  - [x] **Node pairing state machine** — Pending/Approved/Rejected/Expired
+  - [x] **Node token generation** — SHA-256 hashed
+  - [x] **Token expiry** — 30 days
+  - [x] **Quotas** — 100 nodes, 50 pending, 500 tokens (with LRU eviction)
+  - [~] **Capabilities and permissions** — per-node feature negotiation
+  - [x] **Repair flow** — preserves created_at on re-pairing
+
+  ### Plugins (`src/plugins/`)
+
+  - [x] **WASM component model** — wasmtime 41 runtime
+  - [x] **Ed25519 signature verification** — plugin authenticity (required by default)
+  - [x] **Plugin loader** — .wasm file loading with manifest
+  - [x] **Credential isolation** — plugin ID prefixing
+  - [x] **SSRF protection** — private IP/localhost blocking
+  - [x] **Config access enforcement** — plugins.<id>.* only
+  - [~] **Resource limits** — 64MB memory, 30s timeout, fuel-based CPU
+  - [x] **HTTP rate limiting** — 100 req/min per plugin
+  - [x] **Log rate limiting** — 1000 msg/min per plugin
+  - [x] **Permission enforcement** — declared + override permissions
+  - [~] **Tool dispatch** — tool invocation routing with collision warnings
+  - [~] **Hook dispatch** — lifecycle hook routing
+  - [~] **Webhook dispatch** — HTTP webhook routing
+  - [x] **Builtin tools** — 10 core tools (current_time, web_fetch, memory_read/write/list, message_send, session_list/read, config_read, math_eval)
+
+  ### Server (`src/server/`)
+
+  - [x] **HTTP server** — Axum framework
+  - [x] **WebSocket server** — Protocol v3, JSON-RPC
+  - [x] **Bind mode** — Loopback/LAN/WAN, localhost-only default
+  - [x] **Health endpoint** — /health status check
+  - [x] **Metrics endpoint** — /metrics Prometheus format
+  - [x] **OpenAI API compatibility** — /v1/chat/completions drop-in
+  - [~] **CSRF protection** — session-bound token validation (no fallback)
+  - [x] **Rate limiting** — per-IP quotas
+  - [x] **Resource monitoring** — CPU/memory tracking
+  - [x] **Content Security Policy** — CSP headers
+  - [x] **Control API** — status, channels, config handlers
+  - [x] **Graceful shutdown** — 30s drain period
+
+  #### WebSocket Handlers
+
+  - [~] **agent.run / agent.cancel** — LLM execution + cancellation
+  - [~] **session.create/load/list/fork/rename/delete/switch** — session management
+  - [~] **config.get/update/reload/validate** — configuration
+  - [~] **exec.approve/deny/list** — exec approval workflow
+  - [-] **system.info** — system information
+  - [x] **logs.tail** — streaming log buffer
+  - [x] **skills.status** — skill listing
+  - [x] **cron.*** — cron job CRUD + lifecycle
+  - [x] **tts.speak / tts.voices** — text-to-speech
+  - [x] **voicewake.get / voicewake.keywords** — wake word config
+  - [s] **config.schema** — stub: returns minimal placeholder
+  - [s] **system.last-heartbeat / set-heartbeats** — stub: returns null / discards
+  - [s] **system.wake** — stub: accepts target, no action
+  - [s] **talk.devices** — stub: returns hardcoded device list
+  - [s] **tts.stop** — stub: returns stopped=true without stopping
+  - [s] **voicewake.test** — stub: returns hardcoded detection=false
+  - [~] **wizard** — framework works, collected config not applied
+
+  ### Sessions (`src/sessions/`)
+
+  - [x] **JSONL format** — append-friendly history
+  - [x] **Compaction** — truncate old messages
+  - [x] **HMAC integrity** — SHA-256 HMAC (metadata only, not history)
+  - [x] **Session archiving + restoration**
+  - [x] **Session filters** — list/search by criteria
+  - [x] **File locking** — concurrent-safe operations (flock RAII)
+  - [x] **Retention policies** — age-based cleanup
+  - [~] **Scoping** — multi-tenant session isolation
+
+  ### Tailscale (`src/tailscale/`)
+
+  - [x] **Tailscale serve** — tailnet HTTPS proxy
+  - [x] **Tailscale funnel** — public internet exposure
+  - [x] **CLI wrapper** — async command execution
+  - [x] **Status parsing** — JSON status extraction
+  - [x] **Lifecycle management** — setup / wait / teardown
+
+  ### TLS (`src/tls/`)
+
+  - [x] **Self-signed cert generation** — rcgen, 365-day validity
+  - [x] **Auto-generation on startup**
+  - [x] **TLS certificate loading** — PEM format
+  - [x] **SHA-256 fingerprint** — TOFU verification
+  - [x] **mTLS server config** — client cert verification
+  - [x] **mTLS client config** — presents node certificate
+  - [x] **Cluster CA generation** — ECDSA P-256 (`ca.rs`)
+  - [x] **Node certificate issuance** — signed by cluster CA
+  - [x] **Certificate revocation (CRL)** — CRL generation and updates (advisory only, not enforced by rustls)
+  - [x] **Restrictive key permissions** — 0600 on private keys. Not explicitly verified in code.
+
+  ### Usage (`src/usage/`)
+
+  - [~] **Daily/monthly summaries** — aggregated usage data
+  - [x] **Session usage tracking** — per-session totals
+  - [~] **Provider/model breakdown** — per-provider and per-model aggregation
+  - [x] **Cost calculation** — per-million-token pricing
+  - [~] **Persistent JSON storage** — pretty JSON format
+  - [~] **Enable/disable tracking** — privacy control
+
+  ### Tests & CI
+
+  - [~] **Unit tests** — 4,614 tests across all modules
+  - [x] **Integration tests** — tests/*.rs
+  - [x] **Golden snapshot tests** — insta-based snapshot testing
+  - [x] **Cross-platform CI** — Linux, macOS, Windows matrix
+  - [x] **MSRV enforcement** — Rust 1.93
+  - [x] **Security scanning** — cargo-audit, cargo-deny, gitleaks, trivy, cargo-geiger

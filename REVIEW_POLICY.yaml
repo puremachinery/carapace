@@ -241,7 +241,8 @@ review_types:
       only_if:
         - "feature_verification"
       change_triggers:
-        - "feature-status.yaml"
+        - "docs/feature-status.yaml"
+        - "docs/feature-evidence.yaml"
 
   # ============================================================================
   # PERFORMANCE
@@ -409,8 +410,8 @@ agent_instructions: |
        in a SINGLE pass over the relevant files
      - Report and track findings SEPARATELY per subcategory
      - Do NOT combine reviews across different categories into one pass
-     - For feature.status_verification, use feature-status.yaml as the feature inventory and
-       require evidence for "complete": runtime wiring, config surface, and tests
+    - For feature.status_verification, use docs/feature-status.yaml as the feature inventory and
+      require evidence for "complete" in docs/feature-evidence.yaml: runtime wiring, config surface, and tests
   8. Prioritize categories by highest severity among their due subcategories:
      critical > high > medium > low
   9. After completing reviews:
