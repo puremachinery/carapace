@@ -1572,22 +1572,22 @@ pub(super) fn handle_agent(
             .and_then(|v| v.get("model"))
             .and_then(|v| v.as_str())
             .unwrap_or(crate::agent::DEFAULT_MODEL);
-        let config = crate::agent::AgentConfig {
-            model: model.to_string(),
-            system: params
-                .and_then(|v| v.get("system"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            deliver: params
-                .and_then(|v| v.get("deliver"))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
-            extra: params
-                .and_then(|v| v.get("venice_parameters"))
-                .filter(|v| v.is_object())
-                .cloned(),
-            ..Default::default()
-        };
+        let cfg = config::load_config().unwrap_or(Value::Object(serde_json::Map::new()));
+        let mut config = crate::agent::AgentConfig::default();
+        crate::agent::apply_agent_config_from_settings(&mut config, &cfg);
+        config.model = model.to_string();
+        config.system = params
+            .and_then(|v| v.get("system"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        config.deliver = params
+            .and_then(|v| v.get("deliver"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        config.extra = params
+            .and_then(|v| v.get("venice_parameters"))
+            .filter(|v| v.is_object())
+            .cloned();
         crate::agent::spawn_run(
             run_id.clone(),
             session_key_out.clone(),
@@ -1975,12 +1975,12 @@ fn trigger_agent_if_enabled(
 
     // Spawn the agent executor if an LLM provider is configured
     let status = if let Some(provider) = state.llm_provider() {
-        let config = crate::agent::AgentConfig {
-            model: crate::agent::DEFAULT_MODEL.to_string(),
-            deliver: true,
-            extra,
-            ..Default::default()
-        };
+        let cfg = config::load_config().unwrap_or(Value::Object(serde_json::Map::new()));
+        let mut config = crate::agent::AgentConfig::default();
+        crate::agent::apply_agent_config_from_settings(&mut config, &cfg);
+        config.model = crate::agent::DEFAULT_MODEL.to_string();
+        config.deliver = true;
+        config.extra = extra;
         crate::agent::spawn_run(
             run_id.clone(),
             session_key.to_string(),

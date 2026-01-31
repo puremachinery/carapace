@@ -26,6 +26,8 @@ pub mod venice;
 use std::sync::Arc;
 
 use futures_util::FutureExt;
+use serde_json::Value;
+use tracing::warn;
 
 use crate::server::ws::{AgentRunStatus, WsServerState};
 pub use executor::execute_run;
@@ -125,6 +127,41 @@ impl Default for AgentConfig {
             output_sanitizer: output_sanitizer::OutputSanitizerConfig::default(),
             classifier: None,
             extra: None,
+        }
+    }
+}
+
+/// Apply agent config overrides from the global configuration object.
+///
+/// This allows runtime toggles for prompt guard and output sanitization.
+pub fn apply_agent_config_from_settings(config: &mut AgentConfig, settings: &Value) {
+    let agents = match settings.get("agents").and_then(|v| v.as_object()) {
+        Some(a) => a,
+        None => return,
+    };
+
+    if let Some(pg_value) = agents.get("promptGuard") {
+        match serde_json::from_value(pg_value.clone()) {
+            Ok(pg_cfg) => {
+                config.prompt_guard = pg_cfg;
+            }
+            Err(e) => {
+                warn!(error = %e, "invalid agents.promptGuard config; using defaults");
+            }
+        }
+    }
+
+    let output_value = agents
+        .get("outputSanitizer")
+        .or_else(|| agents.get("output_sanitizer"));
+    if let Some(os_value) = output_value {
+        match serde_json::from_value(os_value.clone()) {
+            Ok(os_cfg) => {
+                config.output_sanitizer = os_cfg;
+            }
+            Err(e) => {
+                warn!(error = %e, "invalid agents.outputSanitizer config; using defaults");
+            }
         }
     }
 }

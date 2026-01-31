@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Deserialize;
+use serde_json::Value;
 use tracing::{debug, error, info, warn};
 
 use crate::channels::{ChannelRegistry, ChannelStatus};
@@ -231,10 +232,10 @@ fn process_envelope(envelope: &SignalEnvelope, state: &Arc<WsServerState>) {
     }
 
     if let Some(provider) = state.llm_provider() {
-        let config = crate::agent::AgentConfig {
-            deliver: true,
-            ..Default::default()
-        };
+        let cfg = crate::config::load_config().unwrap_or(Value::Object(serde_json::Map::new()));
+        let mut config = crate::agent::AgentConfig::default();
+        crate::agent::apply_agent_config_from_settings(&mut config, &cfg);
+        config.deliver = true;
         crate::agent::spawn_run(
             run_id.clone(),
             session.session_key.clone(),

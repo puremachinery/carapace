@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use crate::cron::CronPayload;
 use crate::server::ws::{SystemEvent, WsServerState};
+use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 /// Outcome of executing a cron payload.
@@ -90,12 +91,12 @@ pub async fn execute_payload(
                 .map_err(|e| format!("failed to append message: {}", e))?;
 
             // Build agent config
-            let config = crate::agent::AgentConfig {
-                model: model
-                    .clone()
-                    .unwrap_or_else(|| crate::agent::DEFAULT_MODEL.to_string()),
-                ..Default::default()
-            };
+            let cfg = crate::config::load_config().unwrap_or(Value::Object(serde_json::Map::new()));
+            let mut config = crate::agent::AgentConfig::default();
+            crate::agent::apply_agent_config_from_settings(&mut config, &cfg);
+            config.model = model
+                .clone()
+                .unwrap_or_else(|| crate::agent::DEFAULT_MODEL.to_string());
 
             // Register the agent run
             let cancel_token = CancellationToken::new();
