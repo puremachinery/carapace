@@ -29,7 +29,7 @@ impl Default for SignatureConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            require_signature: false,
+            require_signature: true,
             trusted_publishers: Vec::new(),
         }
     }
@@ -504,7 +504,7 @@ mod tests {
     fn test_config_default() {
         let config = SignatureConfig::default();
         assert!(config.enabled);
-        assert!(!config.require_signature);
+        assert!(config.require_signature);
         assert!(config.trusted_publishers.is_empty());
     }
 

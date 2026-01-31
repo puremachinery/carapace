@@ -776,6 +776,7 @@ impl PluginLoader {
     }
 
     /// Load a plugin from bytes with a manifest
+    #[cfg(test)]
     pub fn load_plugin_from_bytes(
         &self,
         manifest: PluginManifest,
