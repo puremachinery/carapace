@@ -58,6 +58,21 @@
     // baseUrl: "https://api.anthropic.com",  // override with ANTHROPIC_BASE_URL env var
   },
 
+  // --- OpenAI / OpenAI-compatible provider ----------------------------------
+  // openai: {
+  //   apiKey: "${OPENAI_API_KEY}",
+  //   // baseUrl: "https://api.openai.com",       // default
+  //   // For local servers (vLLM, llama.cpp, LM Studio, MLX):
+  //   // baseUrl: "http://localhost:8000/v1",
+  //   // apiKey: "unused",                         // required but ignored by most local servers
+  // },
+
+  // --- Ollama provider ------------------------------------------------------
+  // ollama: {
+  //   // baseUrl: "http://localhost:11434",       // default
+  //   // apiKey: "optional-key",                  // for remote instances with auth
+  // },
+
   // --- Agents -----------------------------------------------------------
   // agents: {
   //   list: [
