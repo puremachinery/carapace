@@ -13,9 +13,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::agent::provider::{
-    CompletionRequest, ContentBlock, LlmMessage, LlmRole, StreamEvent, TokenUsage,
-};
+use crate::agent::provider::{CompletionRequest, ContentBlock, LlmMessage, LlmRole, StreamEvent};
 use crate::agent::{AgentError, LlmProvider};
 
 /// Consecutive classifier failure count for circuit breaker.
@@ -319,6 +317,7 @@ fn fail_open(reason: &str) -> ClassifierVerdict {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::provider::TokenUsage;
 
     // ==================== Config defaults ====================
 

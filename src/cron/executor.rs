@@ -100,7 +100,7 @@ pub async fn execute_payload(
             // Register the agent run
             let cancel_token = CancellationToken::new();
             {
-                use crate::server::ws::{AgentRunRegistry, AgentRunStatus};
+                use crate::server::ws::AgentRunStatus;
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()

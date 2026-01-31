@@ -15,10 +15,8 @@ use super::super::*;
 
 // Re-export types for use by other modules
 pub use crate::cron::{
-    CronError, CronEvent, CronEventAction, CronIsolation, CronJob, CronJobCreate, CronJobPatch,
-    CronJobState, CronJobStatus, CronPayload, CronRemoveResult, CronRunLogEntry, CronRunMode,
-    CronRunReason, CronRunResult, CronSchedule, CronScheduler, CronSessionTarget, CronStatus,
-    CronWakeMode,
+    CronError, CronIsolation, CronJobCreate, CronJobPatch, CronJobStatus, CronPayload, CronRunMode,
+    CronSchedule, CronScheduler, CronSessionTarget, CronWakeMode,
 };
 
 /// Get the cron scheduler status.

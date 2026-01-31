@@ -5,7 +5,6 @@
 
 use serde::Serialize;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Instant;
 
 use parking_lot::Mutex;

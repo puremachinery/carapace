@@ -18,9 +18,7 @@ use uuid::Uuid;
 use super::super::*;
 
 // Re-export types for use by other modules
-pub use crate::exec::{
-    ExecApprovalDecision, ExecApprovalManager, ExecApprovalRecord, ExecApprovalRequestPayload,
-};
+pub use crate::exec::{ExecApprovalDecision, ExecApprovalRequestPayload};
 
 /// Default timeout for approval requests (2 minutes).
 const DEFAULT_APPROVAL_TIMEOUT_MS: u64 = 120_000;

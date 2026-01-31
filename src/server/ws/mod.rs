@@ -10,18 +10,14 @@ use base64::Engine as _;
 use ed25519_dalek::{Signature, VerifyingKey};
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::env;
-use std::fs;
-use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::LazyLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
@@ -50,12 +46,11 @@ pub use handlers::AgentRunStatus;
 pub use handlers::sessions::AgentRun;
 
 // Re-export update functions for use by CLI
-pub(crate) use handlers::{apply_staged_update, cleanup_old_binaries, ApplyResult};
+pub(crate) use handlers::{apply_staged_update, cleanup_old_binaries};
 
 // Re-export config persistence types for use by control endpoint
 pub(crate) use handlers::{
     broadcast_config_changed, map_validation_issues, persist_config_file, read_config_snapshot,
-    ConfigIssue, ConfigSnapshot,
 };
 
 const PROTOCOL_VERSION: u32 = 3;

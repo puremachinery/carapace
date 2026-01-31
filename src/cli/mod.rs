@@ -456,7 +456,7 @@ pub fn handle_version() {
 // Backup / Restore / Reset handlers
 // ---------------------------------------------------------------------------
 
-use std::io::{Read as IoRead, Write as IoWrite};
+use std::io::Read as IoRead;
 use std::path::{Path, PathBuf};
 
 /// Resolve the state directory (same logic as `server::ws::resolve_state_dir`

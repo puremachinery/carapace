@@ -26,9 +26,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::bindings::{
-    BindingError, HookEvent, HookPluginInstance, HookResult, PluginRegistry, ToolContext,
-    ToolDefinition, ToolPluginInstance, ToolResult, WebhookPluginInstance, WebhookRequest,
-    WebhookResponse,
+    BindingError, HookEvent, PluginRegistry, ToolContext, ToolDefinition, ToolResult,
+    WebhookRequest, WebhookResponse,
 };
 
 /// Dispatch errors
