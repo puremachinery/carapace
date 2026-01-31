@@ -98,6 +98,23 @@ OLLAMA_BASE_URL=http://localhost:8000 cargo run
 Or configure via `config.json5` — see [`config.example.json5`](config.example.json5)
 for the `openai` and `ollama` provider sections.
 
+### Signal
+
+Requires [signal-cli-rest-api](https://github.com/bbernhard/signal-cli-rest-api):
+
+```bash
+docker run -d -p 8080:8080 -v $HOME/.local/share/signal-api:/home/.local/share/signal-cli \
+  -e MODE=native bbernhard/signal-cli-rest-api
+```
+
+Then configure carapace:
+
+```bash
+SIGNAL_CLI_URL=http://localhost:8080 SIGNAL_PHONE_NUMBER=+15551234567 cargo run
+```
+
+Or via `config.json5` — see `config.example.json5` for the `signal` section.
+
 ## Development
 
 ```bash
