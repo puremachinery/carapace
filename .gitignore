@@ -6,6 +6,11 @@ TODO.md
 GTM.md
 .local
 
+# Agent guidelines (per-contributor preference)
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+
 # AI Review System
 .review_state.yaml
 .review_history/

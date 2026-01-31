@@ -16,7 +16,7 @@ build-release:
 
 # Run all tests with nextest (faster, better output)
 test:
-    cargo nextest run
+    cargo nextest run --all-targets
 
 # Run all tests with standard cargo test
 test-cargo:

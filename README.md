@@ -129,7 +129,7 @@ just watch    # Watch for changes and run tests
 
 ## Testing
 
-4,748 tests (nextest). Zero Clippy warnings. Cross-platform CI (Linux, macOS, Windows).
+Thousands of tests (4,700+ via nextest). Zero Clippy warnings. Cross-platform CI (Linux, macOS, Windows).
 
 ```bash
 cargo nextest run       # or: just test

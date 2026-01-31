@@ -276,7 +276,7 @@ feature_inventory_markdown: |
 
   ### Tests & CI
 
-  - [~] **Unit tests** — 4,614 tests across all modules
+  - [x] **Unit tests** — 4,764 tests across all modules (`cargo nextest run --all-targets`)
   - [x] **Integration tests** — tests/*.rs
   - [x] **Golden snapshot tests** — insta-based snapshot testing
   - [x] **Cross-platform CI** — Linux, macOS, Windows matrix
