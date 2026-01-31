@@ -62,6 +62,12 @@ pub struct RevokedCert {
 }
 
 /// Persisted certificate revocation list.
+///
+/// NOTE: CRL generation and persistence work correctly, but rustls does not
+/// enforce CRL checks during the TLS handshake. Revocation status is checked
+/// at the application layer via [`ClusterCA::is_revoked`]. A future rustls
+/// release or a custom `ServerCertVerifier` would be needed for TLS-level
+/// enforcement.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CertRevocationList {
@@ -285,7 +291,14 @@ impl ClusterCA {
         let crl_path = ca_dir.join(CRL_FILENAME);
         let crl = if crl_path.exists() {
             let content = std::fs::read_to_string(&crl_path).unwrap_or_else(|_| "{}".to_string());
-            serde_json::from_str(&content).unwrap_or_else(|_| CertRevocationList::new())
+            serde_json::from_str(&content).unwrap_or_else(|e| {
+                warn!(
+                    path = %crl_path.display(),
+                    error = %e,
+                    "CRL file is corrupted or unreadable; starting with an empty revocation list"
+                );
+                CertRevocationList::new()
+            })
         } else {
             CertRevocationList::new()
         };

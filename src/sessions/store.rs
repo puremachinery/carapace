@@ -1659,15 +1659,15 @@ impl SessionStore {
         // Atomic rename
         fs::rename(&temp_path, &meta_path)?;
 
-        // Write HMAC sidecar if integrity is enabled
+        // Write HMAC sidecar if integrity is enabled.
+        // NOTE: The HMAC covers session metadata only, not conversation history.
         if let Some(ref key) = self.hmac_key {
-            if let Err(e) = super::integrity::write_hmac_file(key, &serialized, &meta_path) {
-                tracing::warn!(
-                    session_id = %session.id,
-                    error = %e,
-                    "failed to write session HMAC sidecar"
-                );
-            }
+            super::integrity::write_hmac_file(key, &serialized, &meta_path).map_err(|e| {
+                SessionStoreError::Io(format!(
+                    "failed to write HMAC sidecar for session {}: {}",
+                    session.id, e
+                ))
+            })?;
         }
 
         Ok(())

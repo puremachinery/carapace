@@ -44,9 +44,35 @@ pub async fn execute_payload(
         CronPayload::AgentTurn {
             message,
             model,
-            timeout_seconds: _,
-            ..
+            thinking,
+            timeout_seconds,
+            allow_unsafe_external_content,
+            deliver,
+            channel,
+            to,
+            best_effort_deliver,
         } => {
+            if thinking.is_some() {
+                tracing::warn!(job_id = %job_id, "AgentTurn 'thinking' field is accepted but not yet acted on");
+            }
+            if timeout_seconds.is_some() {
+                tracing::warn!(job_id = %job_id, "AgentTurn 'timeout_seconds' field is accepted but not yet acted on");
+            }
+            if allow_unsafe_external_content.is_some() {
+                tracing::warn!(job_id = %job_id, "AgentTurn 'allow_unsafe_external_content' field is accepted but not yet acted on");
+            }
+            if deliver.is_some() {
+                tracing::warn!(job_id = %job_id, "AgentTurn 'deliver' field is accepted but not yet acted on");
+            }
+            if channel.is_some() {
+                tracing::warn!(job_id = %job_id, "AgentTurn 'channel' field is accepted but not yet acted on");
+            }
+            if to.is_some() {
+                tracing::warn!(job_id = %job_id, "AgentTurn 'to' field is accepted but not yet acted on");
+            }
+            if best_effort_deliver.is_some() {
+                tracing::warn!(job_id = %job_id, "AgentTurn 'best_effort_deliver' field is accepted but not yet acted on");
+            }
             let session_key = format!("cron:{}", job_id);
             let run_id = uuid::Uuid::new_v4().to_string();
 

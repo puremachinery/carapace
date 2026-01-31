@@ -419,10 +419,13 @@ struct IdempotencyEntry {
     created_at: i64,
 }
 
-/// Message pipeline for queuing outbound messages
+/// Message pipeline for queuing and tracking outbound messages.
 ///
-/// This is a skeleton implementation - actual delivery logic
-/// will be added when channel implementations are ready.
+/// Provides per-channel FIFO queues with idempotency-key deduplication,
+/// TTL-based expiration, retry tracking, and cancellation support.
+/// Delivery workers call [`next_for_channel`](Self::next_for_channel) to
+/// dequeue messages and [`mark_sent`](Self::mark_sent) /
+/// [`mark_failed`](Self::mark_failed) to report outcomes.
 pub struct MessagePipeline {
     /// Queued messages by channel
     queues: RwLock<HashMap<String, VecDeque<QueuedMessage>>>,

@@ -12,10 +12,9 @@ pub mod executor;
 pub mod tick;
 
 use chrono::{Datelike, TimeZone, Timelike, Utc};
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
@@ -302,27 +301,12 @@ pub enum CronEventAction {
     Finished,
 }
 
-/// Store file format for persisting jobs.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CronStoreFile {
-    pub version: u32,
-    pub jobs: Vec<CronJob>,
-}
-
-impl Default for CronStoreFile {
-    fn default() -> Self {
-        Self {
-            version: 1,
-            jobs: Vec::new(),
-        }
-    }
-}
-
 /// The cron scheduler service.
+///
+/// All jobs are held in memory only. Jobs do not survive a process restart.
 #[derive(Debug)]
 pub struct CronScheduler {
     enabled: bool,
-    store_path: PathBuf,
     pub(crate) jobs: RwLock<Vec<CronJob>>,
     run_log: RwLock<Vec<CronRunLogEntry>>,
     event_tx: Option<mpsc::UnboundedSender<CronEvent>>,
@@ -330,10 +314,11 @@ pub struct CronScheduler {
 
 impl CronScheduler {
     /// Create a new cron scheduler.
-    pub fn new(store_path: PathBuf, enabled: bool) -> Self {
+    ///
+    /// Jobs are held in memory only and will not survive a process restart.
+    pub fn new(enabled: bool) -> Self {
         Self {
             enabled,
-            store_path,
             jobs: RwLock::new(Vec::new()),
             run_log: RwLock::new(Vec::new()),
             event_tx: None,
@@ -344,7 +329,6 @@ impl CronScheduler {
     pub fn in_memory() -> Self {
         Self {
             enabled: true,
-            store_path: PathBuf::from(":memory:"),
             jobs: RwLock::new(Vec::new()),
             run_log: RwLock::new(Vec::new()),
             event_tx: None,
@@ -374,7 +358,6 @@ impl CronScheduler {
 
         CronStatus {
             enabled: self.enabled,
-            store_path: self.store_path.to_string_lossy().to_string(),
             jobs: enabled_jobs,
             next_run_at_ms,
         }
@@ -725,8 +708,6 @@ impl CronScheduler {
 #[serde(rename_all = "camelCase")]
 pub struct CronStatus {
     pub enabled: bool,
-    #[serde(rename = "storePath")]
-    pub store_path: String,
     pub jobs: usize,
     #[serde(rename = "nextRunAtMs", skip_serializing_if = "Option::is_none")]
     pub next_run_at_ms: Option<u64>,
@@ -792,8 +773,10 @@ pub enum CronError {
 }
 
 /// Create a shared cron scheduler.
-pub fn create_scheduler(store_path: PathBuf, enabled: bool) -> Arc<CronScheduler> {
-    Arc::new(CronScheduler::new(store_path, enabled))
+///
+/// Jobs are held in memory only and will not survive a process restart.
+pub fn create_scheduler(enabled: bool) -> Arc<CronScheduler> {
+    Arc::new(CronScheduler::new(enabled))
 }
 
 /// A parsed cron expression (5-field: minute hour day-of-month month day-of-week).
@@ -1060,7 +1043,15 @@ fn compute_next_run(schedule: &CronSchedule, now: u64) -> Option<u64> {
                 Some(anchor + (periods + 1) * every_ms)
             }
         }
-        CronSchedule::Cron { expr, tz: _ } => {
+        CronSchedule::Cron { expr, tz } => {
+            if let Some(tz_val) = tz {
+                if !tz_val.eq_ignore_ascii_case("UTC") {
+                    tracing::warn!(
+                        tz = %tz_val,
+                        "timezone support is not implemented; cron expression will be evaluated in UTC"
+                    );
+                }
+            }
             let parsed = match CronExpr::parse(expr) {
                 Ok(p) => p,
                 Err(e) => {

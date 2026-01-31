@@ -551,7 +551,7 @@ impl WsServerState {
             }),
             state_versions: Mutex::new(StateVersionTracker::default()),
             exec_manager: exec::ExecApprovalManager::new(),
-            cron_scheduler: cron::CronScheduler::new(state_dir.join("cron"), true),
+            cron_scheduler: cron::CronScheduler::new(true),
             agent_run_registry: Mutex::new(handlers::AgentRunRegistry::new()),
             system_event_history: Mutex::new(Vec::new()),
             llm_provider: parking_lot::RwLock::new(None),

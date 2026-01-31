@@ -18,7 +18,7 @@ pub use crate::cron::{
     CronError, CronEvent, CronEventAction, CronIsolation, CronJob, CronJobCreate, CronJobPatch,
     CronJobState, CronJobStatus, CronPayload, CronRemoveResult, CronRunLogEntry, CronRunMode,
     CronRunReason, CronRunResult, CronSchedule, CronScheduler, CronSessionTarget, CronStatus,
-    CronStoreFile, CronWakeMode,
+    CronWakeMode,
 };
 
 /// Get the cron scheduler status.
@@ -26,7 +26,6 @@ pub(super) fn handle_cron_status(state: &WsServerState) -> Result<Value, ErrorSh
     let status = state.cron_scheduler.status();
     Ok(json!({
         "enabled": status.enabled,
-        "storePath": status.store_path,
         "jobs": status.jobs,
         "nextRunAtMs": status.next_run_at_ms
     }))

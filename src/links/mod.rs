@@ -473,16 +473,25 @@ fn collapse_whitespace(text: &str) -> String {
     collapsed.trim().to_string()
 }
 
-/// Truncate text to approximately `max_len` characters, breaking at a word boundary.
+/// Truncate text to approximately `max_len` bytes, breaking at a word boundary.
+///
+/// Uses `is_char_boundary()` to find a safe truncation point so that slicing
+/// never panics on multi-byte UTF-8 characters.
 fn truncate_preview(text: &str, max_len: usize) -> String {
     if text.len() <= max_len {
         return text.to_string();
     }
 
-    // Find the last space before max_len to avoid cutting mid-word
-    let truncated = &text[..max_len];
+    // Walk backward from max_len to find a char boundary
+    let mut end = max_len;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+
+    // Find the last space before `end` to avoid cutting mid-word
+    let truncated = &text[..end];
     if let Some(last_space) = truncated.rfind(' ') {
-        if last_space > max_len / 2 {
+        if last_space > end / 2 {
             return format!("{}...", &text[..last_space]);
         }
     }
