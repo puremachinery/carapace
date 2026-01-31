@@ -354,8 +354,10 @@ fn substitute_env_vars(value: &mut Value) -> Result<(), ConfigError> {
 /// Substitute environment variables in a single string
 fn substitute_env_in_string(s: &str) -> Result<String, ConfigError> {
     // Regex pattern for env vars: ${VAR} where VAR is uppercase with underscores and digits
-    static ENV_VAR_PATTERN: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"\$\$?\{([A-Z_][A-Z0-9_]*)\}").unwrap());
+    static ENV_VAR_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"\$\$?\{([A-Z_][A-Z0-9_]*)\}")
+            .expect("failed to compile regex: env_var_pattern")
+    });
 
     let mut result = String::with_capacity(s.len());
     let mut last_end = 0;

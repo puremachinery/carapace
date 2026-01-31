@@ -748,10 +748,13 @@ pub async fn execute_run(
 fn sanitize_provider_error(message: &str) -> String {
     use std::sync::LazyLock;
 
-    static API_KEY_RE: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"(sk-ant-|sk-|key-)[A-Za-z0-9_-]{10,}").unwrap());
+    static API_KEY_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"(sk-ant-|sk-|key-)[A-Za-z0-9_-]{10,}")
+            .expect("failed to compile regex: api_key_pattern")
+    });
     static AUTH_HEADER_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(r"(?i)(authorization|x-api-key):\s*(bearer\s+)?\S+").unwrap()
+        regex::Regex::new(r"(?i)(authorization|x-api-key):\s*(bearer\s+)?\S+")
+            .expect("failed to compile regex: auth_header_pattern")
     });
 
     // Strip anything that looks like an API key (sk-ant-..., sk-..., key-...)

@@ -231,6 +231,7 @@ use crate::server::bind::DEFAULT_PORT;
 use serde_json::Value;
 
 /// Secrets that should be redacted when printing config.
+/// Kept in sync with logging/redact.rs SECRET_KEY_NAMES.
 const SECRET_KEYS: &[&str] = &[
     "apiKey",
     "apikey",
@@ -239,6 +240,9 @@ const SECRET_KEYS: &[&str] = &[
     "secret",
     "password",
     "credentials",
+    "client_secret",
+    "refresh_token",
+    "access_token",
 ];
 
 /// Run the `config show` subcommand.

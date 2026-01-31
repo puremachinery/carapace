@@ -36,8 +36,10 @@ fn resolve_log_file(path: &Path) -> PathBuf {
     if path.exists() {
         return path.to_path_buf();
     }
-    static ROLLING_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"^moltbot-\d{4}-\d{2}-\d{2}\.log$").unwrap());
+    static ROLLING_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"^moltbot-\d{4}-\d{2}-\d{2}\.log$")
+            .expect("failed to compile regex: rolling_log_filename")
+    });
     let file_name = path.file_name().and_then(|v| v.to_str()).unwrap_or("");
     if !ROLLING_RE.is_match(file_name) {
         return path.to_path_buf();

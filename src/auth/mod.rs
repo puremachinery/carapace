@@ -87,12 +87,18 @@ pub struct TailscaleAuth {
 }
 
 /// Timing-safe string equality.
+///
+/// Both inputs are hashed with SHA-256 before comparison so that the
+/// constant-time loop always operates on 32-byte values, eliminating the
+/// length side-channel that an early-return on mismatched lengths would leak.
 pub fn timing_safe_eq(a: &str, b: &str) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
+    use sha2::{Digest, Sha256};
+
+    let hash_a = Sha256::digest(a.as_bytes());
+    let hash_b = Sha256::digest(b.as_bytes());
+
     let mut out = 0u8;
-    for (x, y) in a.bytes().zip(b.bytes()) {
+    for (x, y) in hash_a.iter().zip(hash_b.iter()) {
         out |= x ^ y;
     }
     out == 0

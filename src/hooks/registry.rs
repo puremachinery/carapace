@@ -419,10 +419,30 @@ fn matches_mapping(
     true
 }
 
+/// Escape a string value for safe interpolation into JSON templates.
+///
+/// Escapes backslashes, double quotes, and control characters (newline,
+/// carriage return, tab) so that a substituted value cannot break the
+/// surrounding JSON structure.
+fn json_escape_value(raw: &str) -> String {
+    let mut escaped = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            c => escaped.push(c),
+        }
+    }
+    escaped
+}
+
 /// Evaluate a template string against a context
 fn evaluate_template(template: &str, ctx: &HookMappingContext) -> Result<String, HookMappingError> {
     // Simple template engine: replace {{path}} with context values
-    let re = Regex::new(r"\{\{([^}]+)\}\}").unwrap();
+    let re = Regex::new(r"\{\{([^}]+)\}\}").expect("failed to compile regex: template_expression");
     let mut result = template.to_string();
 
     for cap in re.captures_iter(template) {
@@ -430,7 +450,7 @@ fn evaluate_template(template: &str, ctx: &HookMappingContext) -> Result<String,
         let expr = cap[1].trim();
 
         let value = resolve_template_expr(expr, ctx);
-        result = result.replace(full_match, &value);
+        result = result.replace(full_match, &json_escape_value(&value));
     }
 
     Ok(result)

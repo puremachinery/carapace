@@ -41,38 +41,51 @@ impl PostflightResult {
 // PII patterns
 // ---------------------------------------------------------------------------
 
-static RE_EMAIL: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}").unwrap());
-
-static RE_PHONE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b").unwrap()
+static RE_EMAIL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
+        .expect("failed to compile regex: email")
 });
 
-static RE_SSN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b\d{3}-\d{2}-\d{4}\b").unwrap());
+static RE_PHONE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b")
+        .expect("failed to compile regex: phone")
+});
 
-static RE_CREDIT_CARD: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b").unwrap());
+static RE_SSN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b\d{3}-\d{2}-\d{4}\b").expect("failed to compile regex: ssn"));
+
+static RE_CREDIT_CARD: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b")
+        .expect("failed to compile regex: credit_card")
+});
 
 // ---------------------------------------------------------------------------
 // Credential patterns (reuses patterns from logging/redact.rs)
 // ---------------------------------------------------------------------------
 
-static RE_API_KEY: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(sk-[a-zA-Z0-9]{20,})").unwrap());
+static RE_API_KEY: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(sk-[a-zA-Z0-9]{20,})").expect("failed to compile regex: api_key")
+});
 
-static RE_BEARER: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(Bearer\s+[a-zA-Z0-9._\-]{10,})").unwrap());
+static RE_BEARER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(Bearer\s+[a-zA-Z0-9._\-]{10,})").expect("failed to compile regex: bearer")
+});
 
-static RE_BASIC_AUTH: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(Basic\s+[a-zA-Z0-9+/=]{10,})").unwrap());
+static RE_BASIC_AUTH: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(Basic\s+[a-zA-Z0-9+/=]{10,})").expect("failed to compile regex: basic_auth")
+});
 
-static RE_PASSWORD_PARAM: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)(password|passwd|pwd)\s*[=:]\s*\S+").unwrap());
+static RE_PASSWORD_PARAM: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(password|passwd|pwd)\s*[=:]\s*\S+")
+        .expect("failed to compile regex: password_param")
+});
 
-static RE_AWS_KEY: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"AKIA[A-Z0-9]{16}").unwrap());
+static RE_AWS_KEY: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"AKIA[A-Z0-9]{16}").expect("failed to compile regex: aws_key"));
 
-static RE_GITHUB_TOKEN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"gh[pousr]_[A-Za-z0-9_]{36,}").unwrap());
+static RE_GITHUB_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"gh[pousr]_[A-Za-z0-9_]{36,}").expect("failed to compile regex: github_token")
+});
 
 /// Validate a credit card number using the Luhn algorithm.
 fn luhn_check(digits: &str) -> bool {

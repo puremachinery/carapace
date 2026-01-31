@@ -19,17 +19,21 @@ const SECRET_KEY_NAMES: &[&str] = &[
     "access_token",
 ];
 
-static RE_OPENAI_KEY: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"sk-[a-zA-Z0-9]{20,}").unwrap());
+static RE_OPENAI_KEY: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"sk-[a-zA-Z0-9]{20,}").expect("failed to compile regex: openai_key")
+});
 
-static RE_BEARER: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"Bearer [a-zA-Z0-9._\-]+").unwrap());
+static RE_BEARER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"Bearer [a-zA-Z0-9._\-]+").expect("failed to compile regex: bearer")
+});
 
-static RE_BASIC_AUTH: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"Basic [a-zA-Z0-9+/=]+").unwrap());
+static RE_BASIC_AUTH: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"Basic [a-zA-Z0-9+/=]+").expect("failed to compile regex: basic_auth")
+});
 
-static RE_QUERY_SECRET: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(key|token)=([a-zA-Z0-9]{40,})").unwrap());
+static RE_QUERY_SECRET: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(key|token)=([a-zA-Z0-9]{40,})").expect("failed to compile regex: query_secret")
+});
 
 pub struct Redactor;
 

@@ -44,32 +44,38 @@ impl PreflightResult {
 static INJECTION_PATTERNS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
     vec![
         (
-            Regex::new(r"(?i)ignore\s+(all\s+)?previous\s+instructions").unwrap(),
+            Regex::new(r"(?i)ignore\s+(all\s+)?previous\s+instructions")
+                .expect("failed to compile regex: ignore_previous_instructions"),
             "Prompt injection: 'ignore previous instructions' pattern",
         ),
         (
-            Regex::new(r"(?i)you\s+are\s+now\s+(?:a|an|the)\s+").unwrap(),
+            Regex::new(r"(?i)you\s+are\s+now\s+(?:a|an|the)\s+")
+                .expect("failed to compile regex: role_switch_you_are_now"),
             "Prompt injection: role-switching 'you are now' pattern",
         ),
         (
-            Regex::new(r"(?i)disregard\s+(all\s+)?prior\s+(instructions|context)").unwrap(),
+            Regex::new(r"(?i)disregard\s+(all\s+)?prior\s+(instructions|context)")
+                .expect("failed to compile regex: disregard_prior_instructions"),
             "Prompt injection: 'disregard prior instructions' pattern",
         ),
         (
             Regex::new(r"(?i)forget\s+(everything|all)\s+(you|that)\s+(know|learned|were\s+told)")
-                .unwrap(),
+                .expect("failed to compile regex: forget_everything"),
             "Prompt injection: 'forget everything' pattern",
         ),
         (
-            Regex::new(r"(?i)new\s+instructions?\s*:").unwrap(),
+            Regex::new(r"(?i)new\s+instructions?\s*:")
+                .expect("failed to compile regex: new_instructions"),
             "Prompt injection: 'new instructions:' pattern",
         ),
         (
-            Regex::new(r"(?i)override\s+(your|the|all)\s+(rules|instructions|guidelines)").unwrap(),
+            Regex::new(r"(?i)override\s+(your|the|all)\s+(rules|instructions|guidelines)")
+                .expect("failed to compile regex: override_rules"),
             "Prompt injection: 'override rules' pattern",
         ),
         (
-            Regex::new(r"(?i)system\s+prompt\s*:").unwrap(),
+            Regex::new(r"(?i)system\s+prompt\s*:")
+                .expect("failed to compile regex: embedded_system_prompt"),
             "Prompt injection: embedded 'system prompt:' marker",
         ),
     ]
@@ -78,28 +84,31 @@ static INJECTION_PATTERNS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(
 static PRIVILEGE_ESCALATION_PATTERNS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
     vec![
         (
-            Regex::new(r"(?i)bypass\s+safety").unwrap(),
+            Regex::new(r"(?i)bypass\s+safety").expect("failed to compile regex: bypass_safety"),
             "Privilege escalation: 'bypass safety' pattern",
         ),
         (
-            Regex::new(r"(?i)unrestricted\s+mode").unwrap(),
+            Regex::new(r"(?i)unrestricted\s+mode")
+                .expect("failed to compile regex: unrestricted_mode"),
             "Privilege escalation: 'unrestricted mode' pattern",
         ),
         (
             Regex::new(r"(?i)disable\s+(all\s+)?(safety|content)\s+(filters?|guardrails?)")
-                .unwrap(),
+                .expect("failed to compile regex: disable_safety_filters"),
             "Privilege escalation: 'disable safety filters' pattern",
         ),
         (
-            Regex::new(r"(?i)jailbreak").unwrap(),
+            Regex::new(r"(?i)jailbreak").expect("failed to compile regex: jailbreak_keyword"),
             "Privilege escalation: 'jailbreak' keyword",
         ),
         (
-            Regex::new(r"(?i)developer\s+mode\s+(enabled|on|activated)").unwrap(),
+            Regex::new(r"(?i)developer\s+mode\s+(enabled|on|activated)")
+                .expect("failed to compile regex: developer_mode_enabled"),
             "Privilege escalation: 'developer mode enabled' pattern",
         ),
         (
-            Regex::new(r"(?i)no\s+(restrictions?|limitations?|boundaries)").unwrap(),
+            Regex::new(r"(?i)no\s+(restrictions?|limitations?|boundaries)")
+                .expect("failed to compile regex: no_restrictions"),
             "Privilege escalation: 'no restrictions' pattern",
         ),
     ]
@@ -108,25 +117,27 @@ static PRIVILEGE_ESCALATION_PATTERNS: LazyLock<Vec<(Regex, &'static str)>> = Laz
 static EXFILTRATION_PATTERNS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
     vec![
         (
-            Regex::new(r"!\[([^\]]*)\]\(https?://[^\s)]+\?[^\s)]*data=").unwrap(),
+            Regex::new(r"!\[([^\]]*)\]\(https?://[^\s)]+\?[^\s)]*data=")
+                .expect("failed to compile regex: markdown_image_data_param"),
             "Exfiltration: markdown image injection with data parameter",
         ),
         (
-            Regex::new(r"!\[([^\]]*)\]\(https?://[^\s)]*\{[^\s)]*\}").unwrap(),
+            Regex::new(r"!\[([^\]]*)\]\(https?://[^\s)]*\{[^\s)]*\}")
+                .expect("failed to compile regex: markdown_image_template_vars"),
             "Exfiltration: markdown image injection with template variables",
         ),
         (
             Regex::new(r"(?i)send\s+(this|the|all|that)\s+(data|info|information|content)\s+to")
-                .unwrap(),
+                .expect("failed to compile regex: send_data_to"),
             "Exfiltration: 'send this data to' instruction pattern",
         ),
         (
-            Regex::new(r"(?i)exfiltrate").unwrap(),
+            Regex::new(r"(?i)exfiltrate").expect("failed to compile regex: exfiltrate_keyword"),
             "Exfiltration: 'exfiltrate' keyword",
         ),
         (
             Regex::new(r"(?i)encode\s+(the|this|all)?\s*(data|info|content)\s+(as|into|in)\s+(base64|hex|url)")
-                .unwrap(),
+                .expect("failed to compile regex: encode_data_as_base64"),
             "Exfiltration: 'encode data as base64/hex' pattern",
         ),
     ]

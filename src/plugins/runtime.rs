@@ -1315,9 +1315,9 @@ impl<B: CredentialBackend + Send + Sync + 'static> ChannelAdapter<B> {
     }
 }
 
-// Manual Send/Sync implementations for adapters
-// These are safe because we only hold Arc<PluginInstanceHandle> which protects concurrent access
-// via interior RwLock on the store.
+// SAFETY: ChannelAdapter only holds an Arc<PluginInstanceHandle<B>> whose interior
+// wasmtime Store is guarded by an RwLock.  All access goes through the lock,
+// so sharing across threads is safe.
 unsafe impl<B: CredentialBackend + Send + Sync + 'static> Send for ChannelAdapter<B> {}
 unsafe impl<B: CredentialBackend + Send + Sync + 'static> Sync for ChannelAdapter<B> {}
 
@@ -1382,6 +1382,9 @@ impl<B: CredentialBackend + Send + Sync + 'static> ToolAdapter<B> {
     }
 }
 
+// SAFETY: ToolAdapter only holds an Arc<PluginInstanceHandle<B>> whose interior
+// wasmtime Store is guarded by an RwLock.  All access goes through the lock,
+// so sharing across threads is safe.
 unsafe impl<B: CredentialBackend + Send + Sync + 'static> Send for ToolAdapter<B> {}
 unsafe impl<B: CredentialBackend + Send + Sync + 'static> Sync for ToolAdapter<B> {}
 
@@ -1429,6 +1432,9 @@ impl<B: CredentialBackend + Send + Sync + 'static> WebhookAdapter<B> {
     }
 }
 
+// SAFETY: WebhookAdapter only holds an Arc<PluginInstanceHandle<B>> whose interior
+// wasmtime Store is guarded by an RwLock.  All access goes through the lock,
+// so sharing across threads is safe.
 unsafe impl<B: CredentialBackend + Send + Sync + 'static> Send for WebhookAdapter<B> {}
 unsafe impl<B: CredentialBackend + Send + Sync + 'static> Sync for WebhookAdapter<B> {}
 
@@ -1473,6 +1479,9 @@ impl<B: CredentialBackend + Send + Sync + 'static> ServiceAdapter<B> {
     }
 }
 
+// SAFETY: ServiceAdapter only holds an Arc<PluginInstanceHandle<B>> whose interior
+// wasmtime Store is guarded by an RwLock.  All access goes through the lock,
+// so sharing across threads is safe.
 unsafe impl<B: CredentialBackend + Send + Sync + 'static> Send for ServiceAdapter<B> {}
 unsafe impl<B: CredentialBackend + Send + Sync + 'static> Sync for ServiceAdapter<B> {}
 
@@ -1515,6 +1524,9 @@ impl<B: CredentialBackend + Send + Sync + 'static> HookAdapter<B> {
     }
 }
 
+// SAFETY: HookAdapter only holds an Arc<PluginInstanceHandle<B>> whose interior
+// wasmtime Store is guarded by an RwLock.  All access goes through the lock,
+// so sharing across threads is safe.
 unsafe impl<B: CredentialBackend + Send + Sync + 'static> Send for HookAdapter<B> {}
 unsafe impl<B: CredentialBackend + Send + Sync + 'static> Sync for HookAdapter<B> {}
 

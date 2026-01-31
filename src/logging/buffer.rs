@@ -606,7 +606,8 @@ mod tests {
         );
 
         // Filter for ws targets
-        let filter = LogFilter::new().with_pattern(Regex::new("^ws::").unwrap());
+        let filter = LogFilter::new()
+            .with_pattern(Regex::new("^ws::").expect("failed to compile regex: ws_target_filter"));
         let result = buffer.query(&filter);
         assert_eq!(result.entries.len(), 2);
         assert!(result.entries[0].target.starts_with("ws::"));
@@ -723,7 +724,7 @@ mod tests {
         // Filter for ws targets at warn level or above
         let filter = LogFilter::new()
             .with_level(LogLevel::Warn)
-            .with_pattern(Regex::new("^ws::").unwrap());
+            .with_pattern(Regex::new("^ws::").expect("failed to compile regex: ws_target_filter"));
         let result = buffer.query(&filter);
         assert_eq!(result.entries.len(), 2);
         assert_eq!(result.entries[0].level, LogLevel::Warn);

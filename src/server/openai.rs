@@ -419,7 +419,11 @@ fn build_chunk(
 
 /// Serialize a chunk into an SSE `data:` line.
 fn format_sse_chunk(chunk: &ChatCompletionChunk) -> String {
-    format!("data: {}\n\n", serde_json::to_string(chunk).unwrap())
+    let json = serde_json::to_string(chunk).unwrap_or_else(|e| {
+        tracing::error!(error = %e, "failed to serialize SSE chunk");
+        r#"{"error":"serialization_failed"}"#.to_string()
+    });
+    format!("data: {}\n\n", json)
 }
 
 /// Build an SSE response with standard headers.

@@ -165,33 +165,42 @@ const TAG_SPECIFIC_ATTRS: &[(&str, &str)] = &[
 // ---------------------------------------------------------------------------
 
 /// Matches any HTML tag (opening, closing, or self-closing).
-static RE_HTML_TAG: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?si)<(/?)([a-zA-Z][a-zA-Z0-9]*)\b([^>]*)(/?)>").unwrap());
+static RE_HTML_TAG: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?si)<(/?)([a-zA-Z][a-zA-Z0-9]*)\b([^>]*)(/?)>")
+        .expect("failed to compile regex: html_tag")
+});
 
 /// Matches HTML comments.
-static RE_HTML_COMMENT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)<!--.*?-->").unwrap());
+static RE_HTML_COMMENT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?s)<!--.*?-->").expect("failed to compile regex: html_comment"));
 
 /// Matches on* event handler attributes (e.g. onclick="...", onerror='...').
-static RE_EVENT_HANDLER: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"(?i)\bon[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)"#).unwrap());
+static RE_EVENT_HANDLER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)\bon[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)"#)
+        .expect("failed to compile regex: event_handler")
+});
 
 /// Matches `style` attributes that contain `@import` or `url(...)` with
 /// `javascript:` — dangerous CSS injection vectors.
 static RE_STYLE_DANGEROUS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)style\s*=\s*(?:"[^"]*(?:@import|expression\s*\(|javascript:)[^"]*"|'[^']*(?:@import|expression\s*\(|javascript:)[^']*')"#).unwrap()
+    Regex::new(r#"(?i)style\s*=\s*(?:"[^"]*(?:@import|expression\s*\(|javascript:)[^"]*"|'[^']*(?:@import|expression\s*\(|javascript:)[^']*')"#).expect("failed to compile regex: style_dangerous")
 });
 
 /// Matches `javascript:` scheme in attribute values.
 static RE_JAVASCRIPT_URL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)(?:href|src|action|formaction)\s*=\s*(?:"[^"]*javascript\s*:[^"]*"|'[^']*javascript\s*:[^']*')"#).unwrap()
+    Regex::new(r#"(?i)(?:href|src|action|formaction)\s*=\s*(?:"[^"]*javascript\s*:[^"]*"|'[^']*javascript\s*:[^']*')"#).expect("failed to compile regex: javascript_url")
 });
 
 /// Matches all `data:` URLs in src/href (double-quoted).
-static RE_DATA_URL_DQ: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"(?i)(?:href|src)\s*=\s*"(data:[^"]*)""#).unwrap());
+static RE_DATA_URL_DQ: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)(?:href|src)\s*=\s*"(data:[^"]*)""#)
+        .expect("failed to compile regex: data_url_double_quoted")
+});
 /// Matches all `data:` URLs in src/href (single-quoted).
-static RE_DATA_URL_SQ: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"(?i)(?:href|src)\s*=\s*'(data:[^']*)'"#).unwrap());
+static RE_DATA_URL_SQ: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)(?:href|src)\s*=\s*'(data:[^']*)'"#)
+        .expect("failed to compile regex: data_url_single_quoted")
+});
 
 /// Image MIME types allowed in `data:` URLs.
 const ALLOWED_DATA_IMAGE_PREFIXES: &[&str] = &[
@@ -214,24 +223,31 @@ fn is_allowed_data_url(uri: &str) -> bool {
 }
 
 /// Matches `<style` blocks that contain `@import`.
-static RE_STYLE_TAG_IMPORT: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?si)<style[^>]*>.*?@import.*?</style>").unwrap());
+static RE_STYLE_TAG_IMPORT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?si)<style[^>]*>.*?@import.*?</style>")
+        .expect("failed to compile regex: style_tag_import")
+});
 
 // -- Markdown-specific patterns --
 
 /// Matches raw HTML blocks in Markdown (any line starting with `<` that looks
 /// like a tag).  This is intentionally broad to catch inline HTML.
-static RE_MD_HTML_BLOCK: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?m)^[ ]{0,3}</?[a-zA-Z][a-zA-Z0-9]*\b[^>]*>.*$").unwrap());
+static RE_MD_HTML_BLOCK: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^[ ]{0,3}</?[a-zA-Z][a-zA-Z0-9]*\b[^>]*>.*$")
+        .expect("failed to compile regex: markdown_html_block")
+});
 
 /// Matches Markdown autolinks with dangerous schemes: `<javascript:...>` or
 /// `<data:...>` (non-image).
-static RE_MD_DANGEROUS_AUTOLINK: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)<(?:javascript|vbscript|data):[^>]+>").unwrap());
+static RE_MD_DANGEROUS_AUTOLINK: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)<(?:javascript|vbscript|data):[^>]+>")
+        .expect("failed to compile regex: markdown_dangerous_autolink")
+});
 
 /// Matches inline Markdown links/images with dangerous href/src.
 static RE_MD_DANGEROUS_LINK: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\[([^\]]*)\]\(\s*(?:javascript|vbscript|data)\s*:[^)]*\)").unwrap()
+    Regex::new(r"(?i)\[([^\]]*)\]\(\s*(?:javascript|vbscript|data)\s*:[^)]*\)")
+        .expect("failed to compile regex: markdown_dangerous_link")
 });
 
 // ---------------------------------------------------------------------------
@@ -371,8 +387,8 @@ fn sanitize_attributes(tag: &str, attrs: &str) -> String {
     });
 
     // Parse remaining attributes and filter to allowlist
-    let attr_re =
-        Regex::new(r#"([a-zA-Z][a-zA-Z0-9\-]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|(\S+))"#).unwrap();
+    let attr_re = Regex::new(r#"([a-zA-Z][a-zA-Z0-9\-]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|(\S+))"#)
+        .expect("failed to compile regex: html_attribute");
 
     let mut safe_attrs = Vec::new();
     for cap in attr_re.captures_iter(&cleaned) {

@@ -89,9 +89,23 @@ impl ToolDispatcher {
             for def in definitions {
                 // Namespace tool names to avoid collisions
                 let namespaced_name = format!("{}_{}", plugin_id, def.name);
-                map.insert(namespaced_name, plugin_id.clone());
+                if let Some(existing) = map.insert(namespaced_name.clone(), plugin_id.clone()) {
+                    tracing::warn!(
+                        tool = %namespaced_name,
+                        new_plugin = %plugin_id,
+                        existing_plugin = %existing,
+                        "tool name collision: overwriting existing mapping"
+                    );
+                }
                 // Also store the original name for plugins that want shorter names
-                map.insert(def.name.clone(), plugin_id.clone());
+                if let Some(existing) = map.insert(def.name.clone(), plugin_id.clone()) {
+                    tracing::warn!(
+                        tool = %def.name,
+                        new_plugin = %plugin_id,
+                        existing_plugin = %existing,
+                        "tool name collision: overwriting existing mapping"
+                    );
+                }
             }
         }
 

@@ -649,9 +649,14 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
         let temp_path = temp_dir.join(&file_name);
 
         // Write to file
-        tokio::fs::write(&temp_path, &bytes)
-            .await
-            .map_err(|e| HostError::MediaFetch(format!("Failed to write temp file: {}", e)))?;
+        if let Err(e) = tokio::fs::write(&temp_path, &bytes).await {
+            // Best-effort cleanup of partial file
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err(HostError::MediaFetch(format!(
+                "Failed to write temp file: {}",
+                e
+            )));
+        }
 
         Ok(MediaFetchResult {
             ok: true,
