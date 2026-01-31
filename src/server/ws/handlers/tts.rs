@@ -445,8 +445,10 @@ pub(super) fn handle_tts_configure(params: Option<&Value>) -> Result<Value, Erro
 
 /// Stop any ongoing TTS playback
 pub(super) fn handle_tts_stop() -> Result<Value, ErrorShape> {
+    tracing::debug!("tts.stop: stub response");
     // In a real implementation, this would stop audio playback
     Ok(json!({
+        "stub": true,
         "ok": true,
         "stopped": true
     }))

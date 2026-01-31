@@ -187,9 +187,11 @@ pub(super) fn handle_talk_configure(params: Option<&Value>) -> Result<Value, Err
 
 /// List available audio devices
 pub(super) fn handle_talk_devices() -> Result<Value, ErrorShape> {
+    tracing::debug!("talk.devices: stub response");
     // In a real implementation, this would enumerate audio devices
     // For now, return simulated devices
     Ok(json!({
+        "stub": true,
         "inputDevices": [
             { "id": "default", "name": "Default Input", "default": true },
             { "id": "built-in-mic", "name": "Built-in Microphone", "default": false }

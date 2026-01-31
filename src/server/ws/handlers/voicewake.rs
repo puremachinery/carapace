@@ -236,6 +236,7 @@ pub(super) fn handle_voicewake_keywords() -> Result<Value, ErrorShape> {
 
 /// Test voicewake detection (for calibration)
 pub(super) fn handle_voicewake_test(params: Option<&Value>) -> Result<Value, ErrorShape> {
+    tracing::debug!("voicewake.test: stub response");
     let audio_data = params
         .and_then(|v| v.get("audioData"))
         .and_then(|v| v.as_str());
@@ -245,6 +246,7 @@ pub(super) fn handle_voicewake_test(params: Option<&Value>) -> Result<Value, Err
     // In a real implementation, this would process audio through wake word detection
     // For now, return a simulated result
     Ok(json!({
+        "stub": true,
         "ok": true,
         "detected": false,
         "confidence": 0.0,

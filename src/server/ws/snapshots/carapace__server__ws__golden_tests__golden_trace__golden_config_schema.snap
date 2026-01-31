@@ -18,6 +18,7 @@ expression: normalized
         "type": "object"
       }
     },
+    "stub": true,
     "type": "object"
   }
 }

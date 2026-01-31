@@ -204,9 +204,10 @@ fn fallback_mode(text: &str) -> Option<String> {
 /// Handle last-heartbeat - returns heartbeat info
 /// Per Node semantics: returns getLastHeartbeatEvent() which is the last heartbeat event object or null
 pub(super) fn handle_last_heartbeat() -> Result<Value, ErrorShape> {
+    tracing::debug!("system.last-heartbeat: stub response");
     // Node returns the last heartbeat event object, or null if none
     // For now, return null since we don't track heartbeat events yet
-    Ok(json!(null))
+    Ok(json!({ "stub": true }))
 }
 
 pub(super) fn handle_set_heartbeats(params: Option<&Value>) -> Result<Value, ErrorShape> {
@@ -214,17 +215,24 @@ pub(super) fn handle_set_heartbeats(params: Option<&Value>) -> Result<Value, Err
         .and_then(|v| v.get("enabled"))
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
+    tracing::debug!(
+        enabled,
+        "system.set-heartbeats: stub response; enabled flag accepted but not acted on"
+    );
     Ok(json!({
+        "stub": true,
         "ok": true,
         "enabled": enabled
     }))
 }
 
 pub(super) fn handle_wake(params: Option<&Value>) -> Result<Value, ErrorShape> {
+    tracing::debug!("system.wake: stub response");
     let target = params
         .and_then(|v| v.get("target"))
         .and_then(|v| v.as_str());
     Ok(json!({
+        "stub": true,
         "ok": true,
         "target": target
     }))
