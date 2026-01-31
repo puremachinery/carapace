@@ -154,11 +154,6 @@ impl WizardManager {
         }
     }
 
-    /// Remove a completed/cancelled wizard
-    fn remove_wizard(&mut self, id: &str) -> Option<WizardSession> {
-        self.wizards.remove(id)
-    }
-
     /// Get the currently active wizard (if any)
     fn active_wizard(&self) -> Option<&WizardSession> {
         self.wizards.values().find(|w| !w.complete && !w.cancelled)

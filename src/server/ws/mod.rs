@@ -1165,6 +1165,7 @@ struct NodeSession {
 #[derive(Debug)]
 struct PendingInvoke {
     node_id: String,
+    #[allow(dead_code)] // populated, read later
     command: String,
     responder: oneshot::Sender<NodeInvokeResult>,
 }
@@ -1300,8 +1301,10 @@ struct ConnectParams {
     #[serde(default)]
     auth: Option<AuthParams>,
     #[serde(default)]
+    #[allow(dead_code)] // deserialized from client
     locale: Option<String>,
     #[serde(default)]
+    #[allow(dead_code)] // deserialized from client
     user_agent: Option<String>,
 }
 

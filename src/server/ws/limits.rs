@@ -130,12 +130,6 @@ impl ConnectionTracker {
     pub fn total(&self) -> usize {
         self.inner.total.load(Ordering::SeqCst)
     }
-
-    /// Current connection count for a specific IP.
-    pub fn count_for_ip(&self, ip: IpAddr) -> usize {
-        let map = self.inner.per_ip.read();
-        map.get(&ip).copied().unwrap_or(0)
-    }
 }
 
 impl Default for ConnectionTracker {
@@ -197,7 +191,6 @@ mod tests {
         let guard = tracker.try_acquire(ip(10, 0, 0, 1));
         assert!(guard.is_ok());
         assert_eq!(tracker.total(), 1);
-        assert_eq!(tracker.count_for_ip(ip(10, 0, 0, 1)), 1);
     }
 
     #[test]
@@ -220,7 +213,6 @@ mod tests {
         let result = tracker.try_acquire(ip(10, 0, 0, 1));
         assert_eq!(result.err(), Some(LimitExceeded::PerIpLimit));
         assert_eq!(tracker.total(), 2);
-        assert_eq!(tracker.count_for_ip(ip(10, 0, 0, 1)), 2);
     }
 
     #[test]
@@ -228,11 +220,9 @@ mod tests {
         let tracker = ConnectionTracker::with_limits(10, 10);
         let guard = tracker.try_acquire(ip(10, 0, 0, 1)).unwrap();
         assert_eq!(tracker.total(), 1);
-        assert_eq!(tracker.count_for_ip(ip(10, 0, 0, 1)), 1);
 
         drop(guard);
         assert_eq!(tracker.total(), 0);
-        assert_eq!(tracker.count_for_ip(ip(10, 0, 0, 1)), 0);
     }
 
     #[test]
@@ -249,7 +239,6 @@ mod tests {
         );
         // IP 10.0.0.2 still has room
         let _g4 = tracker.try_acquire(ip(10, 0, 0, 2)).unwrap();
-        assert_eq!(tracker.count_for_ip(ip(10, 0, 0, 2)), 2);
         assert_eq!(tracker.total(), 4);
     }
 
@@ -264,9 +253,6 @@ mod tests {
         let _g2 = tracker.try_acquire(loopback_v4).unwrap();
         let _g3 = tracker.try_acquire(loopback_v6).unwrap();
         assert_eq!(tracker.total(), 3);
-        // Loopback IPs should not appear in the per-IP map
-        assert_eq!(tracker.count_for_ip(loopback_v4), 0);
-        assert_eq!(tracker.count_for_ip(loopback_v6), 0);
 
         // But a non-loopback IP at per-IP limit of 1 should be rejected
         let _g4 = tracker.try_acquire(ip(10, 0, 0, 1)).unwrap();

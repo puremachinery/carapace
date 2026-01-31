@@ -1767,7 +1767,8 @@ impl SessionStore {
     }
 }
 
-/// Create a shared session store
+/// Create a shared session store (test helper)
+#[cfg(test)]
 pub fn create_store() -> Arc<SessionStore> {
     Arc::new(SessionStore::new())
 }

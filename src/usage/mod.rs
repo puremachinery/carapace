@@ -925,10 +925,6 @@ pub fn reset_session(session_key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    // Mutex to serialize tests that use the global tracker
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn create_test_tracker() -> UsageTracker {
         let temp_dir = std::env::temp_dir();
