@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Cron job persistence:** jobs survive process restarts via
+  `state_dir/cron/jobs.json`. Stale runtime state cleared on load.
 - **Bedrock provider wiring:** AWS Bedrock models available via config or
   standard AWS env vars (`AWS_REGION`, `AWS_ACCESS_KEY_ID`,
   `AWS_SECRET_ACCESS_KEY`). Optional session token and explicit kill switch.

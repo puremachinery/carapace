@@ -546,7 +546,12 @@ impl WsServerState {
             }),
             state_versions: Mutex::new(StateVersionTracker::default()),
             exec_manager: exec::ExecApprovalManager::new(),
-            cron_scheduler: cron::CronScheduler::new(true),
+            cron_scheduler: {
+                let scheduler =
+                    cron::CronScheduler::new(true, Some(state_dir.join("cron").join("jobs.json")));
+                scheduler.load();
+                scheduler
+            },
             agent_run_registry: Mutex::new(handlers::AgentRunRegistry::new()),
             system_event_history: Mutex::new(Vec::new()),
             llm_provider: parking_lot::RwLock::new(None),

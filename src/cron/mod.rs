@@ -15,7 +15,10 @@ use chrono::{Datelike, TimeZone, Timelike, Utc};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::fs::{self, File};
+use std::io::Write;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -303,25 +306,34 @@ pub enum CronEventAction {
 
 /// The cron scheduler service.
 ///
-/// All jobs are held in memory only. Jobs do not survive a process restart.
+/// When `persist_path` is `Some`, jobs are flushed to disk on every mutation
+/// and reloaded on startup. When `None` (the `in_memory()` constructor),
+/// behaviour is identical to the original in-memory-only scheduler.
 #[derive(Debug)]
 pub struct CronScheduler {
     enabled: bool,
     pub(crate) jobs: RwLock<Vec<CronJob>>,
     run_log: RwLock<Vec<CronRunLogEntry>>,
     event_tx: Option<mpsc::UnboundedSender<CronEvent>>,
+    persist_path: Option<PathBuf>,
+    /// Whether we have already ensured the persist directory exists.
+    dir_ensured: AtomicBool,
 }
 
 impl CronScheduler {
     /// Create a new cron scheduler.
     ///
-    /// Jobs are held in memory only and will not survive a process restart.
-    pub fn new(enabled: bool) -> Self {
+    /// When `persist_path` is `Some`, jobs are flushed to disk on every
+    /// mutation. Call [`load()`](Self::load) after construction to restore
+    /// previously persisted jobs.
+    pub fn new(enabled: bool, persist_path: Option<PathBuf>) -> Self {
         Self {
             enabled,
             jobs: RwLock::new(Vec::new()),
             run_log: RwLock::new(Vec::new()),
             event_tx: None,
+            persist_path,
+            dir_ensured: AtomicBool::new(false),
         }
     }
 
@@ -332,6 +344,8 @@ impl CronScheduler {
             jobs: RwLock::new(Vec::new()),
             run_log: RwLock::new(Vec::new()),
             event_tx: None,
+            persist_path: None,
+            dir_ensured: AtomicBool::new(false),
         }
     }
 
@@ -339,6 +353,113 @@ impl CronScheduler {
     pub fn with_event_channel(mut self, tx: mpsc::UnboundedSender<CronEvent>) -> Self {
         self.event_tx = Some(tx);
         self
+    }
+
+    /// Load persisted jobs from disk.
+    ///
+    /// If `persist_path` is `None` or the file does not exist, this is a no-op.
+    /// Stale runtime state (`running_at_ms`) is cleared and `next_run_at_ms` is
+    /// recomputed for enabled jobs. Errors are logged but never propagated —
+    /// the scheduler starts empty on failure.
+    pub fn load(&self) {
+        let path = match &self.persist_path {
+            Some(p) => p,
+            None => return,
+        };
+
+        let data = match fs::read(path) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                tracing::error!(path = %path.display(), error = %e, "failed to read cron jobs file");
+                return;
+            }
+        };
+
+        let mut loaded: Vec<CronJob> = match serde_json::from_slice(&data) {
+            Ok(jobs) => jobs,
+            Err(e) => {
+                tracing::error!(path = %path.display(), error = %e, "failed to parse cron jobs file");
+                return;
+            }
+        };
+
+        let now = now_ms();
+        for job in &mut loaded {
+            // Clear stale runtime state — the process just started, nothing is running.
+            job.state.running_at_ms = None;
+            // Recompute next run time for enabled jobs.
+            if job.enabled {
+                job.state.next_run_at_ms = compute_next_run(&job.schedule, now);
+            }
+        }
+
+        let count = loaded.len();
+        *self.jobs.write() = loaded;
+        tracing::info!(count, path = %path.display(), "loaded cron jobs from disk");
+    }
+
+    /// Flush the current jobs list to disk via atomic write.
+    ///
+    /// No-op when `persist_path` is `None`. Errors are logged but never
+    /// propagated — persistence is best-effort.
+    ///
+    /// Note: this performs synchronous `sync_data` (fsync) on every call.
+    /// For high-frequency mutation patterns a debounced/batched flush would
+    /// reduce I/O overhead, but for the expected cron-job cardinality (≤500
+    /// jobs, mutations at human timescales) this is acceptable.
+    fn flush_to_disk(&self) {
+        let path = match &self.persist_path {
+            Some(p) => p,
+            None => return,
+        };
+
+        // Ensure parent directory exists (once per scheduler lifetime).
+        if !self.dir_ensured.load(Ordering::Relaxed) {
+            if let Some(parent) = path.parent() {
+                if let Err(e) = fs::create_dir_all(parent) {
+                    tracing::error!(path = %parent.display(), error = %e, "failed to create cron dir");
+                    return;
+                }
+            }
+            self.dir_ensured.store(true, Ordering::Relaxed);
+        }
+
+        // Construct tmp path by appending ".tmp" so it is stable regardless
+        // of how many dots the filename contains.
+        let tmp_path = {
+            let mut s = path.as_os_str().to_os_string();
+            s.push(".tmp");
+            PathBuf::from(s)
+        };
+
+        // Serialize while holding a read lock.
+        let mut data = {
+            let jobs = self.jobs.read();
+            match serde_json::to_vec_pretty(&*jobs) {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to serialize cron jobs");
+                    return;
+                }
+            }
+        };
+        data.push(b'\n');
+
+        // Write to tmp file, sync data, rename.
+        let write_result = (|| -> std::io::Result<()> {
+            let mut file = File::create(&tmp_path)?;
+            file.write_all(&data)?;
+            file.sync_data()?;
+            fs::rename(&tmp_path, path)?;
+            Ok(())
+        })();
+
+        if let Err(e) = write_result {
+            tracing::error!(path = %path.display(), error = %e, "failed to flush cron jobs to disk");
+            // Best-effort cleanup of tmp file.
+            let _ = fs::remove_file(&tmp_path);
+        }
     }
 
     /// Check if the scheduler is enabled.
@@ -428,6 +549,8 @@ impl CronScheduler {
             jobs.push(job.clone());
         }
 
+        self.flush_to_disk();
+
         self.emit_event(CronEvent {
             job_id: job_id.clone(),
             action: CronEventAction::Added,
@@ -493,6 +616,8 @@ impl CronScheduler {
         let job = job.clone();
         drop(jobs);
 
+        self.flush_to_disk();
+
         self.emit_event(CronEvent {
             job_id: id.to_string(),
             action: CronEventAction::Updated,
@@ -512,6 +637,7 @@ impl CronScheduler {
         drop(jobs);
 
         if removed {
+            self.flush_to_disk();
             self.emit_event(CronEvent {
                 job_id: id.to_string(),
                 action: CronEventAction::Removed,
@@ -566,16 +692,19 @@ impl CronScheduler {
 
         // Clone payload before dropping the lock
         let payload = job.payload.clone();
+        let next_run_at_ms = job.state.next_run_at_ms;
         let job_id = id.to_string();
+
+        drop(jobs);
+
+        self.flush_to_disk();
 
         self.emit_event(CronEvent {
             job_id: job_id.clone(),
             action: CronEventAction::Started,
-            next_run_at_ms: job.state.next_run_at_ms,
+            next_run_at_ms,
             details: None,
         });
-
-        drop(jobs);
 
         // Actual execution is handled by the caller (cron executor / tick loop).
         // This method returns the payload for async execution.
@@ -657,6 +786,8 @@ impl CronScheduler {
         let job_id_owned = job_id.to_string();
         drop(jobs);
 
+        self.flush_to_disk();
+
         // Record run log
         let log_entry = CronRunLogEntry {
             ts: now,
@@ -700,6 +831,20 @@ impl CronScheduler {
         if let Some(tx) = &self.event_tx {
             let _ = tx.send(event);
         }
+    }
+
+    /// Test helper: mutate a job's runtime state and flush to disk.
+    ///
+    /// Avoids tests reaching into `self.jobs.write()` directly, which
+    /// couples them to the internal lock type.
+    #[cfg(test)]
+    fn set_job_running_for_test(&self, job_id: &str, running_at_ms: Option<u64>) {
+        let mut jobs = self.jobs.write();
+        if let Some(job) = jobs.iter_mut().find(|j| j.id == job_id) {
+            job.state.running_at_ms = running_at_ms;
+        }
+        drop(jobs);
+        self.flush_to_disk();
     }
 }
 
@@ -770,13 +915,6 @@ pub enum CronError {
     StoreError(String),
     #[error("job limit exceeded (max {0})")]
     LimitExceeded(usize),
-}
-
-/// Create a shared cron scheduler.
-///
-/// Jobs are held in memory only and will not survive a process restart.
-pub fn create_scheduler(enabled: bool) -> Arc<CronScheduler> {
-    Arc::new(CronScheduler::new(enabled))
 }
 
 /// A parsed cron expression (5-field: minute hour day-of-month month day-of-week).
@@ -2036,5 +2174,188 @@ mod tests {
         // Total jobs must never exceed MAX_JOBS
         let total = scheduler.jobs.read().len();
         assert_eq!(total, CronScheduler::MAX_JOBS);
+    }
+
+    // ---------------------------------------------------------------
+    // Persistence tests
+    // ---------------------------------------------------------------
+
+    /// Helper: create a simple CronJobCreate for persistence tests.
+    fn test_job_create(name: &str) -> CronJobCreate {
+        CronJobCreate {
+            name: name.to_string(),
+            agent_id: None,
+            description: Some(format!("desc for {name}")),
+            enabled: true,
+            delete_after_run: None,
+            schedule: CronSchedule::Every {
+                every_ms: 60_000,
+                anchor_ms: None,
+            },
+            session_target: CronSessionTarget::Main,
+            wake_mode: CronWakeMode::Now,
+            payload: CronPayload::SystemEvent {
+                text: format!("hello from {name}"),
+            },
+            isolation: None,
+        }
+    }
+
+    #[test]
+    fn test_flush_and_load_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cron").join("jobs.json");
+
+        let s1 = CronScheduler::new(true, Some(path.clone()));
+        let job_a = s1.add(test_job_create("alpha")).unwrap();
+        let job_b = s1.add(test_job_create("beta")).unwrap();
+
+        // Simulate a running job so we can verify it gets cleared on load.
+        s1.set_job_running_for_test(&job_a.id, Some(12345));
+
+        // New scheduler loads from disk.
+        let s2 = CronScheduler::new(true, Some(path));
+        s2.load();
+
+        let loaded = s2.list(true);
+        assert_eq!(loaded.len(), 2);
+
+        let a = loaded.iter().find(|j| j.id == job_a.id).unwrap();
+        assert_eq!(a.name, "alpha");
+        assert_eq!(a.description.as_deref(), Some("desc for alpha"));
+        assert!(
+            a.state.running_at_ms.is_none(),
+            "running_at_ms should be cleared on load"
+        );
+        assert!(
+            a.state.next_run_at_ms.is_some(),
+            "next_run_at_ms should be recomputed"
+        );
+
+        let b = loaded.iter().find(|j| j.id == job_b.id).unwrap();
+        assert_eq!(b.name, "beta");
+    }
+
+    #[test]
+    fn test_load_nonexistent_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cron").join("jobs.json");
+
+        let s = CronScheduler::new(true, Some(path));
+        s.load(); // should not panic or error
+        assert!(s.list(true).is_empty());
+    }
+
+    #[test]
+    fn test_load_corrupt_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cron").join("jobs.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"this is not json!!!").unwrap();
+
+        let s = CronScheduler::new(true, Some(path));
+        s.load(); // should not panic
+        assert!(s.list(true).is_empty());
+    }
+
+    #[test]
+    fn test_remove_flushes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cron").join("jobs.json");
+
+        let s1 = CronScheduler::new(true, Some(path.clone()));
+        let job = s1.add(test_job_create("to-remove")).unwrap();
+        s1.remove(&job.id);
+
+        // Fresh load should see an empty list.
+        let s2 = CronScheduler::new(true, Some(path));
+        s2.load();
+        assert!(s2.list(true).is_empty());
+    }
+
+    #[test]
+    fn test_update_flushes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cron").join("jobs.json");
+
+        let s1 = CronScheduler::new(true, Some(path.clone()));
+        let job = s1.add(test_job_create("original")).unwrap();
+        s1.update(
+            &job.id,
+            CronJobPatch {
+                name: Some("renamed".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let s2 = CronScheduler::new(true, Some(path));
+        s2.load();
+        let loaded = s2.list(true);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "renamed");
+    }
+
+    #[test]
+    fn test_in_memory_no_writes() {
+        let s = CronScheduler::in_memory();
+        assert!(
+            s.persist_path.is_none(),
+            "in_memory should have no persist_path"
+        );
+
+        // All mutation paths succeed without disk I/O.
+        let job = s.add(test_job_create("ghost")).unwrap();
+        s.update(
+            &job.id,
+            CronJobPatch {
+                name: Some("updated".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        s.run(&job.id, Some(CronRunMode::Force)).unwrap();
+        s.mark_run_finished(&job.id, CronJobStatus::Ok, 1, None)
+            .unwrap();
+        s.remove(&job.id);
+    }
+
+    #[test]
+    fn test_run_flushes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cron").join("jobs.json");
+
+        let s1 = CronScheduler::new(true, Some(path.clone()));
+        let job = s1.add(test_job_create("runner")).unwrap();
+        s1.run(&job.id, Some(CronRunMode::Force)).unwrap();
+
+        // Read raw JSON to verify running_at_ms was persisted (load() would
+        // clear it, so we inspect the file directly).
+        let data = fs::read(&path).unwrap();
+        let on_disk: Vec<CronJob> = serde_json::from_slice(&data).unwrap();
+        let disk_job = on_disk.iter().find(|j| j.id == job.id).unwrap();
+        assert!(
+            disk_job.state.running_at_ms.is_some(),
+            "run() should persist running_at_ms"
+        );
+    }
+
+    #[test]
+    fn test_mark_run_finished_flushes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cron").join("jobs.json");
+
+        let s1 = CronScheduler::new(true, Some(path.clone()));
+        let job = s1.add(test_job_create("finisher")).unwrap();
+        s1.run(&job.id, Some(CronRunMode::Force)).unwrap();
+        s1.mark_run_finished(&job.id, CronJobStatus::Ok, 100, None)
+            .unwrap();
+
+        // Load in fresh scheduler — last_status and last_duration_ms survive.
+        let s2 = CronScheduler::new(true, Some(path));
+        s2.load();
+        let loaded = s2.get(&job.id).unwrap();
+        assert_eq!(loaded.state.last_status, Some(CronJobStatus::Ok));
+        assert_eq!(loaded.state.last_duration_ms, Some(100));
     }
 }
