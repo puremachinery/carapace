@@ -71,11 +71,32 @@ cargo run
 
 ### Other local servers (vLLM, llama.cpp, LM Studio, MLX)
 
-Any OpenAI-compatible server works — point the OpenAI provider at it:
+Any OpenAI-compatible server works — point the OpenAI provider at it.
+HTTP is allowed for loopback addresses (`localhost` / `127.0.0.1` / `::1`).
 
 ```bash
+# vLLM
 OPENAI_BASE_URL=http://localhost:8000/v1 OPENAI_API_KEY=unused cargo run
+
+# llama.cpp server (llama-server --port 8080)
+OPENAI_BASE_URL=http://localhost:8080/v1 OPENAI_API_KEY=unused cargo run
+
+# LM Studio (default port 1234)
+OPENAI_BASE_URL=http://localhost:1234/v1 OPENAI_API_KEY=unused cargo run
+
+# MLX (default port 8080)
+OPENAI_BASE_URL=http://localhost:8080/v1 OPENAI_API_KEY=unused cargo run
 ```
+
+You can also use the Ollama provider with non-Ollama servers that expose an
+OpenAI-compatible `/v1/chat/completions` endpoint:
+
+```bash
+OLLAMA_BASE_URL=http://localhost:8000 cargo run
+```
+
+Or configure via `config.json5` — see [`config.example.json5`](config.example.json5)
+for the `openai` and `ollama` provider sections.
 
 ## Development
 

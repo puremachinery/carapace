@@ -41,9 +41,12 @@ impl OpenAiProvider {
     pub fn with_base_url(mut self, url: String) -> Result<Self, AgentError> {
         let parsed = url::Url::parse(&url)
             .map_err(|e| AgentError::InvalidBaseUrl(format!("invalid URL \"{url}\": {e}")))?;
-        if parsed.scheme() != "https" {
+        let host = parsed.host_str().unwrap_or("");
+        let is_loopback =
+            host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]";
+        if parsed.scheme() != "https" && !is_loopback {
             return Err(AgentError::InvalidBaseUrl(format!(
-                "base URL must use https scheme, got \"{}\"",
+                "base URL must use https scheme (or http for localhost), got \"{}\"",
                 parsed.scheme()
             )));
         }
@@ -1052,6 +1055,38 @@ mod tests {
         let result = OpenAiProvider::new("test-key".to_string())
             .unwrap()
             .with_base_url("http://insecure.example.com".to_string());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("https"), "error should mention https: {err}");
+        assert!(
+            err.contains("or http for localhost"),
+            "error should mention localhost exception: {err}"
+        );
+    }
+
+    #[test]
+    fn test_base_url_allows_http_localhost() {
+        let provider = OpenAiProvider::new("test-key".to_string())
+            .unwrap()
+            .with_base_url("http://localhost:8000/v1".to_string())
+            .unwrap();
+        assert_eq!(provider.base_url, "http://localhost:8000/v1");
+    }
+
+    #[test]
+    fn test_base_url_allows_http_127() {
+        let provider = OpenAiProvider::new("test-key".to_string())
+            .unwrap()
+            .with_base_url("http://127.0.0.1:8000/v1".to_string())
+            .unwrap();
+        assert_eq!(provider.base_url, "http://127.0.0.1:8000/v1");
+    }
+
+    #[test]
+    fn test_base_url_rejects_http_remote() {
+        let result = OpenAiProvider::new("test-key".to_string())
+            .unwrap()
+            .with_base_url("http://192.168.1.100:8000".to_string());
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("https"), "error should mention https: {err}");
