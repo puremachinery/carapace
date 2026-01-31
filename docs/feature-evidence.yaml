@@ -1213,11 +1213,10 @@ features:
       - "src/server/http.rs::test_health_endpoint"
 
   - feature: "logs"
-    status: "partial"
+    status: "verified_done"
     runtime_wiring:
-      - "src/cli/mod.rs::handle_logs (LOG_BUFFER or log file)"
-    notes:
-      - "CLI does not use WebSocket logs.tail; falls back to file or buffer"
+      - "src/cli/mod.rs::handle_logs (WebSocket logs.tail)"
+      - "src/server/ws/handlers/logs.rs::handle_logs_tail"
 
   - feature: "version"
     status: "verified_done"

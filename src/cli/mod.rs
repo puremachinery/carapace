@@ -226,9 +226,12 @@ pub enum ConfigCommand {
 // ---------------------------------------------------------------------------
 
 use crate::config;
-use crate::logging::buffer::LOG_BUFFER;
+use crate::credentials;
+use crate::logging::buffer::LogLevel;
 use crate::server::bind::DEFAULT_PORT;
+use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
+use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 /// Secrets that should be redacted when printing config.
 /// Kept in sync with logging/redact.rs SECRET_KEY_NAMES.
@@ -372,6 +375,130 @@ pub async fn handle_status(
 }
 
 /// Run the `logs` subcommand -- fetch recent logs from a running instance.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LogsTailEntry {
+    timestamp: u64,
+    level: LogLevel,
+    target: String,
+    message: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LogsTailResponse {
+    #[serde(default)]
+    entries: Vec<LogsTailEntry>,
+    #[serde(default)]
+    truncated: bool,
+}
+
+type WsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+type WsRead = futures_util::stream::SplitStream<WsStream>;
+type WsWrite = futures_util::stream::SplitSink<WsStream, Message>;
+
+async fn resolve_gateway_token() -> Option<String> {
+    if let Ok(token) = std::env::var("MOLTBOT_GATEWAY_TOKEN") {
+        let token = token.trim().to_string();
+        if !token.is_empty() {
+            return Some(token);
+        }
+    }
+
+    if let Ok(cfg) = config::load_config() {
+        if let Some(token) = cfg
+            .get("gateway")
+            .and_then(|v| v.get("auth"))
+            .and_then(|v| v.get("token"))
+            .and_then(|v| v.as_str())
+        {
+            let token = token.trim().to_string();
+            if !token.is_empty() {
+                return Some(token);
+            }
+        }
+    }
+
+    let state_dir = crate::server::ws::resolve_state_dir();
+    if let Ok(creds) = credentials::read_gateway_auth(state_dir).await {
+        if let Some(token) = creds.token {
+            let token = token.trim().to_string();
+            if !token.is_empty() {
+                return Some(token);
+            }
+        }
+    }
+
+    None
+}
+
+async fn read_ws_json(
+    reader: &mut WsRead,
+    writer: &mut WsWrite,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    while let Some(msg) = reader.next().await {
+        match msg? {
+            Message::Text(text) => return Ok(serde_json::from_str(&text)?),
+            Message::Binary(bytes) => {
+                if let Ok(text) = String::from_utf8(bytes) {
+                    return Ok(serde_json::from_str(&text)?);
+                }
+            }
+            Message::Ping(data) => {
+                writer.send(Message::Pong(data)).await?;
+            }
+            Message::Pong(_) => {}
+            Message::Close(frame) => {
+                let reason = frame
+                    .as_ref()
+                    .map(|f| f.reason.to_string())
+                    .unwrap_or_default();
+                let msg = if reason.is_empty() {
+                    "WebSocket closed".to_string()
+                } else {
+                    format!("WebSocket closed: {}", reason)
+                };
+                return Err(msg.into());
+            }
+            _ => {}
+        }
+    }
+
+    Err("WebSocket closed".into())
+}
+
+async fn await_ws_response(
+    reader: &mut WsRead,
+    writer: &mut WsWrite,
+    request_id: &str,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    loop {
+        let frame = read_ws_json(reader, writer).await?;
+        let frame_type = frame.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if frame_type == "event" {
+            continue;
+        }
+        if frame_type != "res" {
+            continue;
+        }
+        let id = frame.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        if id != request_id {
+            continue;
+        }
+        let ok = frame.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+        if ok {
+            return Ok(frame.get("payload").cloned().unwrap_or(Value::Null));
+        }
+        let message = frame
+            .get("error")
+            .and_then(|v| v.get("message"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("request failed");
+        return Err(message.to_string().into());
+    }
+}
+
 pub async fn handle_logs(
     host: &str,
     port: Option<u16>,
@@ -379,62 +506,85 @@ pub async fn handle_logs(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let port = resolve_port(port);
 
-    // First, try the local in-process log buffer (only works if we *are* the
-    // running process, which normally we are not). This is a graceful no-op for
-    // the common CLI case.
-    let buffer_entries = LOG_BUFFER.len();
-    if buffer_entries > 0 {
-        let filter = crate::logging::buffer::LogFilter::new().with_limit(lines);
-        let result = LOG_BUFFER.query(&filter);
-        for entry in &result.entries {
-            println!(
-                "{} [{}] {}: {}",
-                format_timestamp(entry.timestamp),
-                entry.level,
-                entry.target,
-                entry.message
-            );
+    let token = match resolve_gateway_token().await {
+        Some(token) => token,
+        None => {
+            eprintln!("Gateway auth token not found.");
+            eprintln!("Set gateway.auth.token in config or MOLTBOT_GATEWAY_TOKEN.");
+            std::process::exit(1);
         }
-        return Ok(());
-    }
+    };
 
-    // Otherwise, try to read from the log file on disk.
-    let log_path = crate::server::ws::resolve_state_dir()
-        .join("logs")
-        .join("moltbot.log");
-
-    if log_path.exists() {
-        let content = std::fs::read_to_string(&log_path)?;
-        let all_lines: Vec<&str> = content.lines().collect();
-        let start = all_lines.len().saturating_sub(lines);
-        for line in &all_lines[start..] {
-            println!("{}", line);
-        }
-        return Ok(());
-    }
-
-    // Last resort: hit the health endpoint to confirm the server is running,
-    // then inform the user that log streaming is not yet available via this path.
-    let url = format!("http://{}:{}/health", host, port);
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()?;
-
-    match client.get(&url).send().await {
-        Ok(resp) if resp.status().is_success() => {
-            eprintln!(
-                "Server is running at {}:{}, but no log file found at {}",
-                host,
-                port,
-                log_path.display()
-            );
-            eprintln!("Hint: enable file logging or use the WebSocket logs.tail method.");
-        }
-        _ => {
+    let ws_url = format!("ws://{}:{}/ws", host, port);
+    let (ws_stream, _) = match connect_async(&ws_url).await {
+        Ok(conn) => conn,
+        Err(err) => {
             eprintln!("Could not connect to carapace at {}:{}", host, port);
+            eprintln!("  Error: {}", err);
+            eprintln!();
             eprintln!("Is the server running? Start it with: carapace start");
             std::process::exit(1);
         }
+    };
+    let (mut ws_write, mut ws_read) = ws_stream.split();
+
+    let mut connect_params = serde_json::json!({
+        "minProtocol": 3,
+        "maxProtocol": 3,
+        "client": {
+            "id": "cli",
+            "version": env!("CARGO_PKG_VERSION"),
+            "platform": std::env::consts::OS,
+            "mode": "cli"
+        }
+    });
+    connect_params["auth"] = serde_json::json!({ "token": token });
+
+    let connect_frame = serde_json::json!({
+        "type": "req",
+        "id": "connect-1",
+        "method": "connect",
+        "params": connect_params
+    });
+    ws_write
+        .send(Message::Text(serde_json::to_string(&connect_frame)?))
+        .await?;
+
+    if let Err(err) = await_ws_response(&mut ws_read, &mut ws_write, "connect-1").await {
+        eprintln!("WebSocket connect failed: {}", err);
+        std::process::exit(1);
+    }
+
+    let logs_frame = serde_json::json!({
+        "type": "req",
+        "id": "logs-1",
+        "method": "logs.tail",
+        "params": { "limit": lines }
+    });
+    ws_write
+        .send(Message::Text(serde_json::to_string(&logs_frame)?))
+        .await?;
+
+    let payload = match await_ws_response(&mut ws_read, &mut ws_write, "logs-1").await {
+        Ok(payload) => payload,
+        Err(err) => {
+            eprintln!("logs.tail failed: {}", err);
+            std::process::exit(1);
+        }
+    };
+
+    let response: LogsTailResponse = serde_json::from_value(payload)?;
+    for entry in response.entries {
+        println!(
+            "{} [{}] {}: {}",
+            format_timestamp(entry.timestamp),
+            entry.level,
+            entry.target,
+            entry.message
+        );
+    }
+    if response.truncated {
+        eprintln!("(log output truncated; reduce scope or increase --lines)");
     }
 
     Ok(())

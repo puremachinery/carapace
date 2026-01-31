@@ -58,7 +58,7 @@ feature_inventory_markdown: |
   - [x] **start** — launch gateway server
   - [x] **config show/get/set/path** — configuration management
   - [x] **status** — gateway health check via HTTP
-  - [~] **logs** — tail logs via WebSocket
+  - [x] **logs** — tail logs via WebSocket
   - [x] **version** — show version + build info
   - [x] **backup** — tar.gz archive of state directory
   - [x] **restore** — extract backup with path traversal protection
