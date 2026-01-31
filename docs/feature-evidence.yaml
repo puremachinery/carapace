@@ -1,0 +1,1644 @@
+# Evidence for verified feature statuses (done/partial/missing).
+# Keep this focused on audited entries in docs/feature-status.yaml.
+
+version: "1.0"
+updated_at: "2026-01-31"
+
+features:
+  - feature: "logs.tail"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/server/ws/handlers/logs.rs (LOG_BUFFER query + response)"
+      - "src/logging/buffer.rs (LOG_BUFFER + LogBufferLayer)"
+    tests:
+      - "src/server/ws/golden_tests.rs::golden_logs_tail"
+      - "src/server/ws/snapshots/carapace__server__ws__golden_tests__golden_trace__golden_logs_tail.snap"
+
+  - feature: "skills.status"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/server/ws/handlers/skills.rs::handle_skills_status"
+      - "src/server/ws/handlers/mod.rs (dispatch + READ_METHODS)"
+    tests:
+      - "src/server/ws/golden_tests.rs::golden_skills_status"
+      - "src/server/ws/snapshots/carapace__server__ws__golden_tests__golden_trace__golden_skills_status.snap"
+
+  - feature: "cron.*"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/server/ws/handlers/cron.rs (cron.* handlers)"
+      - "src/cron/mod.rs (CronScheduler)"
+      - "src/cron/tick.rs (cron_tick_loop)"
+      - "src/server/startup.rs (spawn_background_tasks cron loop)"
+    tests:
+      - "src/server/ws/golden_tests.rs::golden_cron_lifecycle"
+      - "src/server/ws/snapshots/carapace__server__ws__golden_tests__golden_trace__cron_lifecycle_2_add.snap"
+      - "src/server/ws/snapshots/carapace__server__ws__golden_tests__golden_trace__cron_lifecycle_3_list_with_job.snap"
+      - "src/server/ws/snapshots/carapace__server__ws__golden_tests__golden_trace__cron_lifecycle_4_status.snap"
+      - "src/cron/mod.rs (scheduler unit tests)"
+      - "src/cron/tick.rs (tick loop tests)"
+
+  - feature: "cron.at schedule"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/cron/mod.rs (CronSchedule::At + compute_next_run)"
+    tests:
+      - "src/cron/mod.rs::test_compute_next_run_at_schedule"
+
+  - feature: "cron.every schedule"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/cron/mod.rs (CronSchedule::Every + compute_next_run)"
+    tests:
+      - "src/cron/mod.rs::test_compute_next_run_every_schedule"
+
+  - feature: "cron.cron expression"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/cron/mod.rs (CronExpr parser + compute_next_run CronSchedule::Cron)"
+    tests:
+      - "src/cron/mod.rs (CronExpr parse tests)"
+      - "src/cron/mod.rs::test_compute_next_run_cron_schedule"
+
+  - feature: "cron.job quotas"
+    status: "partial"
+    runtime_wiring:
+      - "src/cron/mod.rs (CronScheduler::MAX_JOBS + add limit enforcement)"
+    tests:
+      - "src/cron/mod.rs::test_cron_scheduler_job_limit"
+    notes:
+      - "When limit is reached, add() returns LimitExceeded; no LRU eviction"
+
+  - feature: "cron.payload types"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/cron/mod.rs (CronPayload enum)"
+      - "src/cron/executor.rs::execute_payload (SystemEvent + AgentTurn)"
+    tests:
+      - "src/cron/executor.rs::test_execute_system_event"
+      - "src/cron/executor.rs::test_execute_agent_turn_no_provider"
+
+  - feature: "cron.background tick loop"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/cron/tick.rs::cron_tick_loop"
+      - "src/server/startup.rs::spawn_background_tasks (cron loop spawn)"
+    tests:
+      - "src/cron/tick.rs::test_tick_loop_shutdown"
+      - "src/cron/tick.rs::test_tick_loop_executes_due_jobs"
+
+  - feature: "cron.executor"
+    status: "partial"
+    runtime_wiring:
+      - "src/cron/executor.rs::execute_payload"
+    tests:
+      - "src/cron/executor.rs (executor tests)"
+    notes:
+      - "AgentTurn fields (thinking, timeout_seconds, allow_unsafe_external_content, deliver, channel, to, best_effort_deliver) are accepted but ignored"
+
+  - feature: "devices.pairing state machine"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/devices/mod.rs (PairingState + DevicePairingRequest state transitions)"
+      - "src/devices/mod.rs::DevicePairingRegistry (request_pairing/approve/reject)"
+    tests:
+      - "src/devices/mod.rs::test_pairing_state_transitions"
+      - "src/devices/mod.rs::test_approve_request"
+      - "src/devices/mod.rs::test_reject_request"
+
+  - feature: "devices.token generation"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/devices/mod.rs::DeviceToken::new (SHA-256 hash, no plaintext storage)"
+      - "src/devices/mod.rs::hash_token"
+    tests:
+      - "src/devices/mod.rs::test_token_verification"
+
+  - feature: "devices.token expiry"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/devices/mod.rs (DEVICE_TOKEN_EXPIRY_MS + DeviceToken::is_valid)"
+    tests:
+      - "src/devices/mod.rs::test_token_verification"
+
+  - feature: "devices.quotas"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/devices/mod.rs (MAX_PAIRED_DEVICES/MAX_PENDING_REQUESTS/MAX_DEVICE_TOKENS)"
+      - "src/devices/mod.rs (pending request limit + paired device eviction)"
+    tests:
+      - "src/devices/mod.rs::test_max_pending_requests_limit"
+      - "src/devices/mod.rs::test_paired_device_limit_evicts_oldest"
+
+  - feature: "devices.persistent storage"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/devices/mod.rs::DevicePairingRegistry::save (atomic write via temp + rename)"
+      - "src/devices/mod.rs::DevicePairingRegistry::load_or_create (JSON load + backup on corruption)"
+
+  - feature: "discovery.mdns service registration"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/discovery/mod.rs::register_mdns_service (SERVICE_TYPE _moltbot._tcp.local.)"
+      - "src/discovery/mod.rs::start_mdns"
+      - "src/main.rs::spawn_network_services (run_mdns_lifecycle)"
+    tests:
+      - "src/discovery/mod.rs::test_service_type_constant"
+      - "src/discovery/mod.rs::test_start_mdns_off_returns_none"
+
+  - feature: "discovery.txt record metadata"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/discovery/mod.rs::build_txt_properties (version/fingerprint/device)"
+    tests:
+      - "src/discovery/mod.rs::test_build_txt_properties_minimal"
+      - "src/discovery/mod.rs::test_build_txt_properties_full"
+
+  - feature: "discovery.modes"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/discovery/mod.rs::DiscoveryMode (Off/Minimal/Full + parse)"
+      - "src/discovery/mod.rs::build_discovery_config"
+    tests:
+      - "src/discovery/mod.rs::test_discovery_mode_parse_off"
+      - "src/discovery/mod.rs::test_discovery_mode_parse_minimal"
+      - "src/discovery/mod.rs::test_discovery_mode_parse_full"
+      - "src/discovery/mod.rs::test_build_discovery_config_mode_full"
+
+  - feature: "discovery.lifecycle management"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/discovery/mod.rs::run_mdns_lifecycle (shutdown-driven cleanup)"
+      - "src/discovery/mod.rs::MdnsHandle::shutdown"
+      - "src/main.rs::spawn_network_services (shutdown wiring)"
+
+  - feature: "exec.approval request creation"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/exec/mod.rs::ExecApprovalManager::create_record"
+      - "src/exec/mod.rs::ExecApprovalManager::wait_for_decision (oneshot channel)"
+      - "src/server/ws/handlers/exec.rs (exec.request -> wait_for_decision)"
+    tests:
+      - "src/exec/mod.rs::test_create_record"
+      - "src/exec/mod.rs::test_resolve_pending_approval"
+
+  - feature: "exec.approval decisions"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/exec/mod.rs::ExecApprovalDecision"
+      - "src/exec/mod.rs::ExecApprovalManager::resolve"
+      - "src/server/ws/handlers/exec.rs (exec.approve/exec.deny)"
+    tests:
+      - "src/exec/mod.rs::test_exec_approval_decision_from_str"
+      - "src/exec/mod.rs::test_exec_approval_decision_as_str"
+      - "src/exec/mod.rs::test_resolve_pending_approval"
+
+  - feature: "exec.timeout support"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/exec/mod.rs::ExecApprovalManager::wait_for_decision (tokio::time::timeout)"
+    tests:
+      - "src/exec/mod.rs::test_approval_timeout"
+
+  - feature: "exec.cleanup of expired entries"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/exec/mod.rs::ExecApprovalManager::cleanup_expired"
+      - "src/cron/tick.rs::cron_tick_loop (cleanup_expired per tick)"
+
+  - feature: "gateway.remote connection"
+    status: "partial"
+    runtime_wiring:
+      - "src/gateway/mod.rs::connect_to_gateway (direct WebSocket)"
+      - "src/gateway/mod.rs::GatewayTransport::SshTunnel + setup_ssh_tunnel (SSH config, not used in connection loop)"
+      - "src/gateway/mod.rs::run_gateway_lifecycle (connection loop)"
+    tests:
+      - "src/gateway/mod.rs::test_build_gateway_config_with_gateways"
+      - "src/gateway/mod.rs::test_build_gateway_config_ssh_transport"
+    notes:
+      - "run_gateway_lifecycle is not invoked by main/server startup"
+      - "SSH tunnel transport is parsed but not used in run_single_gateway_connection"
+
+  - feature: "gateway.tofu fingerprint verification"
+    status: "partial"
+    runtime_wiring:
+      - "src/gateway/mod.rs::verify_fingerprint"
+      - "src/gateway/mod.rs::verify_stream_fingerprint (connect_to_gateway)"
+    tests:
+      - "src/gateway/mod.rs::test_fingerprint_tofu_first_connect"
+      - "src/gateway/mod.rs::test_fingerprint_tofu_match"
+      - "src/gateway/mod.rs::test_fingerprint_tofu_mismatch"
+    notes:
+      - "Gateway lifecycle is not wired into startup, so TOFU is unused at runtime"
+
+  - feature: "gateway.mtls support"
+    status: "partial"
+    runtime_wiring:
+      - "src/gateway/mod.rs::connect_to_gateway_mtls"
+      - "src/gateway/mod.rs::build_gateway_config (mtls config parsing)"
+    tests:
+      - "src/gateway/mod.rs::test_build_gateway_config_mtls"
+      - "src/gateway/mod.rs::test_build_gateway_config_mtls_defaults"
+    notes:
+      - "No runtime path selects connect_to_gateway_mtls"
+
+  - feature: "gateway.reconnection with backoff"
+    status: "partial"
+    runtime_wiring:
+      - "src/gateway/mod.rs::run_gateway_lifecycle"
+      - "src/gateway/mod.rs::handle_connection_failure (exponential backoff)"
+      - "src/gateway/mod.rs::run_single_gateway_connection"
+    notes:
+      - "Gateway lifecycle is not wired into startup"
+
+  - feature: "gateway.protocol v3"
+    status: "partial"
+    runtime_wiring:
+      - "src/gateway/mod.rs::send_gateway_handshake (protocolVersion=3)"
+      - "src/gateway/mod.rs::receive_handshake_response"
+    notes:
+      - "Handshake only runs via connect_to_gateway/connect_to_gateway_mtls, which are not invoked by runtime"
+
+  - feature: "hooks.webhook endpoints"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/server/http.rs (routes: /hooks/wake, /hooks/agent, /hooks/*path)"
+      - "src/server/http.rs::hooks_wake_handler"
+      - "src/server/http.rs::hooks_agent_handler"
+      - "src/server/http.rs::hooks_mapping_handler"
+    tests:
+      - "src/server/http.rs::test_hooks_wake_success"
+      - "src/server/http.rs::test_hooks_agent_success"
+
+  - feature: "hooks.hook registry"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/hooks/registry.rs::HookRegistry (register/find_match/evaluate)"
+      - "src/server/http.rs::execute_hook_mapping (HookRegistry usage)"
+    tests:
+      - "src/hooks/registry.rs::test_evaluate_agent_mapping"
+      - "src/hooks/registry.rs::test_evaluate_wake_mapping"
+
+  - feature: "hooks.hook authentication"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/hooks/auth.rs::extract_hooks_token"
+      - "src/hooks/auth.rs::validate_hooks_token"
+      - "src/server/http.rs::check_hooks_auth"
+    tests:
+      - "src/hooks/auth.rs::test_extract_bearer_token"
+      - "src/hooks/auth.rs::test_validate_hooks_token"
+      - "src/server/http.rs::test_hooks_wake_unauthorized"
+
+  - feature: "hooks.template evaluation"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/hooks/registry.rs::evaluate_template"
+      - "src/hooks/registry.rs::json_escape_value"
+    tests:
+      - "src/hooks/registry.rs::test_evaluate_template_array_access"
+      - "src/hooks/registry.rs::test_evaluate_template_header_access"
+      - "src/hooks/registry.rs::test_template_builtins"
+
+  - feature: "links.url extraction"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/links/mod.rs::LinkUnderstanding::extract_urls"
+      - "src/links/mod.rs::remove_code_blocks"
+    tests:
+      - "src/links/mod.rs::test_extract_simple_https_url"
+      - "src/links/mod.rs::test_extract_skips_inline_code"
+      - "src/links/mod.rs::test_extract_skips_fenced_code_block"
+
+  - feature: "links.html-to-text conversion"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/links/mod.rs::html_to_text"
+    tests:
+      - "src/links/mod.rs::test_html_to_text_simple"
+      - "src/links/mod.rs::test_html_to_text_removes_script"
+      - "src/links/mod.rs::test_html_to_text_decodes_entities"
+
+  - feature: "links.ssrf-protected fetching"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/links/mod.rs::LinkUnderstanding::fetch_and_summarize (MediaFetcher)"
+      - "src/media/mod.rs::MediaFetcher (SSRF protections)"
+
+  - feature: "links.lru cache"
+    status: "partial"
+    runtime_wiring:
+      - "src/links/mod.rs::LinkCache (max entries + TTL)"
+      - "src/links/mod.rs::LinkUnderstanding::fetch_and_summarize (cache get/insert)"
+    tests:
+      - "src/links/mod.rs::test_cache_eviction_at_capacity"
+      - "src/links/mod.rs::test_cache_ttl_expiration"
+    notes:
+      - "Cache eviction is insertion-order; access does not update LRU position"
+
+  - feature: "links.title/meta extraction"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/links/mod.rs::extract_title"
+      - "src/links/mod.rs::extract_meta_description"
+    tests:
+      - "src/links/mod.rs::test_extract_title_basic"
+      - "src/links/mod.rs::test_extract_meta_description_basic"
+
+  - feature: "links.safe utf-8 truncation"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/links/mod.rs::truncate_preview (is_char_boundary)"
+    tests:
+      - "src/links/mod.rs::test_truncate_at_word_boundary"
+
+  - feature: "logging.json format"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/logging/mod.rs::init_logging (LogFormat::Json)"
+    tests:
+      - "src/logging/mod.rs::test_json_format_structure"
+
+  - feature: "logging.plaintext format"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/logging/mod.rs::init_logging (LogFormat::Plaintext)"
+    tests:
+      - "src/logging/mod.rs::test_log_config_development"
+
+  - feature: "logging.output destinations"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/logging/mod.rs::LogOutput (Stdout/Stderr/File)"
+      - "src/logging/mod.rs::init_logging (writer selection)"
+    tests:
+      - "src/logging/mod.rs::test_log_output_file"
+
+  - feature: "logging.log buffer layer"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/logging/buffer.rs::LogBufferLayer"
+      - "src/logging/mod.rs::init_logging (buffer layer added)"
+      - "src/server/ws/handlers/logs.rs (LOG_BUFFER queries)"
+    tests:
+      - "src/logging/buffer.rs (buffer tests)"
+
+  - feature: "logging.secret masking"
+    status: "partial"
+    runtime_wiring:
+      - "src/logging/redact.rs (redaction utilities)"
+    tests:
+      - "src/logging/redact.rs::test_openai_key_is_redacted"
+      - "src/logging/redact.rs::test_json_known_keys_redacted"
+    notes:
+      - "Redactor is not wired into the logging subscriber or HTTP error paths"
+
+  - feature: "logging.audit logging"
+    status: "partial"
+    runtime_wiring:
+      - "src/logging/audit.rs (AuditLog + audit events)"
+      - "src/agent/executor.rs (audit events for prompt guard/classifier)"
+      - "src/plugins/runtime.rs (audit events for capability denial)"
+    tests:
+      - "src/logging/audit.rs (audit event serialization tests)"
+    notes:
+      - "AuditLog::init is never called; audit() no-ops unless initialized"
+
+  - feature: "media.ssrf protection"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/media/fetch.rs::MediaFetcher::fetch_with_config (SsrfProtection validation)"
+    tests:
+      - "src/media/fetch.rs::test_fetch_blocks_localhost"
+      - "src/media/fetch.rs::test_fetch_blocks_private_ipv4"
+      - "src/media/fetch.rs::test_fetch_blocks_cloud_metadata"
+
+  - feature: "media.dns rebinding defense"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/media/fetch.rs::resolve_and_validate_dns (hickory_resolver + IP validation)"
+      - "src/media/fetch.rs::fetch_with_config (client.resolve pinning)"
+
+  - feature: "media.redirect blocking"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/media/fetch.rs::fetch_with_config (reqwest::redirect::Policy::none)"
+
+  - feature: "media.streaming with size limits"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/media/fetch.rs::read_response_with_limit (streaming size enforcement)"
+      - "src/media/fetch.rs::fetch_with_config (content-length guard)"
+
+  - feature: "media.temp file storage"
+    status: "partial"
+    runtime_wiring:
+      - "src/media/store.rs::MediaStore (store + cleanup + start_cleanup_task)"
+    tests:
+      - "src/media/store.rs::test_cleanup_expired"
+      - "src/media/store.rs::test_store_and_get"
+    notes:
+      - "MediaStore is not instantiated by runtime; no background cleanup task wired"
+
+  - feature: "media.image analysis (claude vision)"
+    status: "partial"
+    runtime_wiring:
+      - "src/media/analysis.rs::AnthropicMediaAnalyzer (analyze_image)"
+    tests:
+      - "src/media/analysis.rs::test_anthropic_analyze_empty_image"
+      - "src/media/analysis.rs::test_validate_image_mime_unsupported"
+    notes:
+      - "No runtime path constructs a MediaAnalyzer for image analysis"
+
+  - feature: "media.image analysis (gpt-4 vision)"
+    status: "partial"
+    runtime_wiring:
+      - "src/media/analysis.rs::OpenAiMediaAnalyzer (analyze_image)"
+    tests:
+      - "src/media/analysis.rs::test_openai_analyze_empty_image"
+      - "src/media/analysis.rs::test_validate_image_mime_unsupported"
+    notes:
+      - "No runtime path constructs a MediaAnalyzer for image analysis"
+
+  - feature: "media.audio transcription (whisper)"
+    status: "partial"
+    runtime_wiring:
+      - "src/media/analysis.rs::OpenAiMediaAnalyzer::transcribe_audio"
+    tests:
+      - "src/media/analysis.rs::test_openai_transcribe_empty_audio"
+      - "src/media/analysis.rs::test_openai_transcribe_wrong_mime"
+    notes:
+      - "No runtime path constructs a MediaAnalyzer for audio transcription"
+
+  - feature: "media.analysis caching"
+    status: "partial"
+    runtime_wiring:
+      - "src/media/analysis.rs::analyze (analysis_cache_path + read/write cached analysis)"
+    tests:
+      - "src/media/analysis.rs::test_analysis_cache_path"
+      - "src/media/analysis.rs::test_write_and_read_cached_analysis"
+    notes:
+      - "analyze() is not invoked by runtime or tools"
+
+  - feature: "messages.outbound message pipeline"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/messages/outbound.rs::MessagePipeline (per-channel queues + idempotency)"
+      - "src/server/startup.rs::spawn_background_tasks (delivery loop spawn)"
+    tests:
+      - "src/messages/outbound.rs::test_pipeline_queue_and_get"
+      - "src/messages/outbound.rs::test_idempotency_duplicate_returns_original"
+
+  - feature: "messages.delivery status tracking"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/messages/outbound.rs::DeliveryStatus"
+      - "src/messages/outbound.rs::MessagePipeline::{mark_sending,mark_sent,mark_failed}"
+    tests:
+      - "src/messages/outbound.rs::test_queued_message_status_transitions"
+      - "src/messages/outbound.rs::test_pipeline_mark_retry_resets_status_in_both_stores"
+
+  - feature: "messages.retry support"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/messages/delivery.rs::handle_delivery_result (retryable failures)"
+      - "src/messages/outbound.rs::MessagePipeline::mark_retry"
+    tests:
+      - "src/messages/outbound.rs::test_queued_message_mark_retry_resets_to_queued"
+      - "src/messages/delivery.rs::test_delivery_retries_on_retryable_failure_resets_status"
+
+  - feature: "messages.delivery loop"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/messages/delivery.rs::delivery_loop"
+      - "src/server/startup.rs::spawn_background_tasks (delivery loop spawn)"
+    tests:
+      - "src/messages/delivery.rs::test_delivery_sends_text_message"
+
+  - feature: "nodes.pairing state machine"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/nodes/mod.rs (PairingState + NodePairingRequest transitions)"
+      - "src/server/ws/handlers/node.rs (node.pairing handlers)"
+    tests:
+      - "src/nodes/mod.rs::test_pairing_state_transitions"
+      - "src/nodes/mod.rs::test_approve_request"
+      - "src/nodes/mod.rs::test_reject_request"
+
+  - feature: "nodes.token generation"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/nodes/mod.rs::NodeToken::new (SHA-256 hash, no plaintext storage)"
+      - "src/nodes/mod.rs::hash_token"
+    tests:
+      - "src/nodes/mod.rs::test_token_verification"
+
+  - feature: "nodes.token expiry"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/nodes/mod.rs (NODE_TOKEN_EXPIRY_MS + NodeToken::is_valid)"
+    tests:
+      - "src/nodes/mod.rs::test_token_verification"
+
+  - feature: "nodes.quotas"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/nodes/mod.rs (MAX_PAIRED_NODES/MAX_PENDING_REQUESTS/MAX_NODE_TOKENS)"
+      - "src/nodes/mod.rs (paired-node/token eviction logic)"
+    tests:
+      - "src/nodes/mod.rs::test_max_pending_requests_limit"
+      - "src/nodes/mod.rs::test_paired_node_limit_evicts_oldest"
+
+  - feature: "nodes.capabilities and permissions"
+    status: "partial"
+    runtime_wiring:
+      - "src/nodes/mod.rs (caps + permissions fields stored on requests/paired nodes)"
+      - "src/server/ws/handlers/node.rs (caps/permissions surfaced in responses)"
+    tests:
+      - "src/nodes/mod.rs::test_extended_fields_carried_to_paired_node"
+    notes:
+      - "No enforcement/negotiation logic uses caps/permissions for access control"
+
+  - feature: "nodes.repair flow"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/nodes/mod.rs (is_repair flag + created_at_ms preservation)"
+    tests:
+      - "src/nodes/mod.rs::test_already_paired_node_can_request_repair"
+      - "src/nodes/mod.rs::test_repair_preserves_created_at_ms"
+
+  - feature: "plugins.wasm component model"
+    status: "verified_done"
+    runtime_wiring:
+      - "Cargo.toml (wasmtime = 41 with component-model)"
+      - "src/plugins/runtime.rs (wasm_component_model(true) + wasmtime::component APIs)"
+
+  - feature: "plugins.ed25519 signature verification"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/plugins/signature.rs::verify_skill_signature"
+      - "src/plugins/loader.rs (signature verification on load)"
+    tests:
+      - "src/plugins/signature.rs::test_verify_skill_signature_success"
+      - "src/plugins/signature.rs::test_verify_skill_signature_tampered"
+
+  - feature: "plugins.plugin loader"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/plugins/loader.rs::PluginLoader::load_all"
+      - "src/plugins/loader.rs::PluginLoader::load_plugin"
+    tests:
+      - "src/plugins/loader.rs::test_load_all_empty_dir"
+      - "src/plugins/loader.rs::test_plugin_manifest_validation"
+
+  - feature: "plugins.credential isolation"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/plugins/capabilities.rs::CredentialEnforcer"
+      - "src/plugins/host.rs (credential_get/set prefixing)"
+    tests:
+      - "src/plugins/capabilities.rs::test_credential_prefix_key"
+      - "src/plugins/capabilities.rs::test_credential_prefix_key_sanitizes_plugin_id"
+
+  - feature: "plugins.ssrf protection"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/plugins/capabilities.rs::SsrfProtection"
+      - "src/plugins/host.rs (http_fetch/media_fetch validation)"
+    tests:
+      - "src/plugins/capabilities.rs::test_ssrf_blocks_localhost"
+      - "src/plugins/capabilities.rs::test_ssrf_blocks_private_ipv4"
+
+  - feature: "plugins.config access enforcement"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/plugins/capabilities.rs::ConfigEnforcer"
+      - "src/plugins/host.rs (config_get scoped to plugins.<id>.*)"
+    tests:
+      - "src/plugins/capabilities.rs::test_config_check_access_allowed"
+      - "src/plugins/capabilities.rs::test_config_check_access_denied"
+
+  - feature: "plugins.resource limits"
+    status: "partial"
+    runtime_wiring:
+      - "src/plugins/runtime.rs (fuel budget + DEFAULT_EXECUTION_TIMEOUT constants)"
+    tests:
+      - "src/plugins/runtime.rs::test_default_fuel_budget_is_reasonable"
+      - "src/plugins/runtime.rs::test_engine_has_fuel_enabled"
+    notes:
+      - "No Store resource limiter is set for MAX_PLUGIN_MEMORY_BYTES"
+      - "Epoch-based wall-clock timeout is configured but no epoch ticker is wired"
+
+  - feature: "plugins.http rate limiting"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/plugins/capabilities.rs::RateLimiterRegistry::check_http_request"
+      - "src/plugins/host.rs (http_fetch/media_fetch rate limit)"
+    tests:
+      - "src/plugins/host.rs::test_http_fetch_rate_limit"
+
+  - feature: "plugins.log rate limiting"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/plugins/capabilities.rs::RateLimiterRegistry::check_log_message"
+      - "src/plugins/host.rs::log_with_limit"
+    tests:
+      - "src/plugins/host.rs::test_logging_rate_limit"
+
+  - feature: "plugins.permission enforcement"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/plugins/permissions.rs (effective permissions + enforcer)"
+      - "src/plugins/runtime.rs (validate_declared_permissions + compute_effective_permissions)"
+      - "src/plugins/host.rs (PermissionEnforcer checks)"
+    tests:
+      - "src/plugins/permissions.rs::test_permission_enforcer_media_allowed"
+      - "src/plugins/permissions.rs::test_permission_enforcer_media_denied"
+
+  - feature: "plugins.tool dispatch"
+    status: "partial"
+    runtime_wiring:
+      - "src/plugins/dispatch.rs::ToolDispatcher (namespacing + collision warnings)"
+      - "src/plugins/runtime.rs (register_tool into PluginRegistry)"
+    tests:
+      - "src/plugins/dispatch.rs::test_tool_dispatcher_creation"
+      - "src/plugins/tests.rs::test_tool_dispatcher"
+    notes:
+      - "ToolDispatcher is not wired to /tools/invoke or agent tool routing"
+
+  - feature: "plugins.hook dispatch"
+    status: "partial"
+    runtime_wiring:
+      - "src/plugins/dispatch.rs::HookDispatcher"
+      - "src/plugins/runtime.rs (register_hook into PluginRegistry)"
+    tests:
+      - "src/plugins/dispatch.rs::test_hook_dispatcher_creation"
+      - "src/plugins/tests.rs::test_hook_dispatcher"
+    notes:
+      - "HookDispatcher is not wired into runtime event lifecycle"
+
+  - feature: "plugins.webhook dispatch"
+    status: "partial"
+    runtime_wiring:
+      - "src/plugins/dispatch.rs::WebhookDispatcher"
+      - "src/plugins/runtime.rs (register_webhook into PluginRegistry)"
+    tests:
+      - "src/plugins/dispatch.rs::test_webhook_dispatcher_creation"
+      - "src/plugins/tests.rs::test_webhook_dispatcher"
+    notes:
+      - "No HTTP routes invoke WebhookDispatcher (/plugins/<id>/* not registered)"
+
+  - feature: "plugins.builtin tools"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/plugins/tools.rs::ToolsRegistry::new (registers builtins)"
+      - "src/agent/builtin_tools.rs (core tool definitions)"
+    tests:
+      - "src/plugins/tools.rs::test_tools_registry_default_tools"
+
+  - feature: "server.http server"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/server/http.rs (axum Router + handlers)"
+    tests:
+      - "src/server/http.rs::test_tools_invoke_success"
+
+  - feature: "server.websocket server"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/server/ws/mod.rs (JSON-RPC protocol handling)"
+      - "src/server/ws/handlers/mod.rs (method dispatch)"
+    tests:
+      - "src/server/ws/golden_tests.rs::golden_sessions_list"
+
+  - feature: "server.bind mode"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/server/bind.rs (BindMode + resolve_bind_address)"
+      - "src/main.rs (bind config parsing)"
+    tests:
+      - "src/server/bind.rs::test_resolve_loopback"
+      - "src/server/bind.rs::test_bind_mode_display_name"
+
+  - feature: "server.health endpoint"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/server/http.rs (routes /health, /health/live, /health/ready)"
+      - "src/server/health.rs (HealthChecker)"
+    tests:
+      - "src/server/http.rs::test_health_endpoint"
+
+  - feature: "server.metrics endpoint"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/server/http.rs (route /metrics)"
+      - "src/server/metrics.rs::metrics_handler"
+    tests:
+      - "src/server/metrics.rs::test_metrics_handler_response"
+
+  - feature: "server.openai api compatibility"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/server/openai.rs (handlers for /v1/chat/completions and /v1/responses)"
+      - "src/server/http.rs (OpenAI routes wiring)"
+    tests:
+      - "src/server/openai.rs::test_chat_completions_non_streaming_with_provider"
+
+  - feature: "server.csrf protection"
+    status: "partial"
+    runtime_wiring:
+      - "src/server/csrf.rs (token generation + middleware)"
+      - "src/server/http.rs (csrf_middleware wiring)"
+    tests:
+      - "src/server/csrf.rs::test_token_store_generate_and_validate"
+    notes:
+      - "MiddlewareConfig::default disables CSRF by default for API compatibility"
+
+  - feature: "server.rate limiting"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/server/ratelimit.rs (RateLimiter + middleware)"
+      - "src/server/http.rs (rate_limit_middleware wiring)"
+    tests:
+      - "src/server/ratelimit.rs::test_rate_limiter_blocks_after_limit"
+
+  - feature: "server.resource monitoring"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/server/resource_monitor.rs::run_monitor_loop"
+      - "src/server/startup.rs::spawn_monitoring_and_retention"
+    tests:
+      - "src/server/resource_monitor.rs::test_sample_updates_gauges"
+
+  - feature: "server.csp headers"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/server/headers.rs (Content-Security-Policy header)"
+      - "src/server/http.rs (security_headers_middleware wiring)"
+    tests:
+      - "src/server/headers.rs::test_default_security_headers"
+
+  - feature: "server.control api"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/server/control.rs (status/channels/config handlers)"
+      - "src/server/http.rs (control routes)"
+    tests:
+      - "src/server/control.rs::test_gateway_status_response_serialization"
+
+  - feature: "server.graceful shutdown"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/server/startup.rs (axum::serve with graceful shutdown)"
+      - "src/main.rs (graceful_shutdown 30s)"
+    tests:
+      - "src/server/ws/tests.rs::test_shutdown_watch_channel_propagates"
+
+  - feature: "ws.agent.run / agent.cancel"
+    status: "partial"
+    runtime_wiring:
+      - "src/server/ws/handlers/sessions.rs::handle_chat_send (agent run)"
+      - "src/server/ws/handlers/sessions.rs::handle_chat_abort (cancellation)"
+      - "src/server/ws/handlers/mod.rs (methods: agent, chat.send, chat.abort)"
+    notes:
+      - "No agent.run/agent.cancel method names; uses agent + chat.abort instead"
+
+  - feature: "ws.session management"
+    status: "partial"
+    runtime_wiring:
+      - "src/server/ws/handlers/sessions.rs (sessions.list/preview/patch/reset/delete)"
+      - "src/server/ws/handlers/mod.rs (sessions.* methods)"
+    notes:
+      - "No sessions.create/load/fork/rename/switch methods; patch covers rename/metadata only"
+
+  - feature: "ws.config.get/update/reload/validate"
+    status: "partial"
+    runtime_wiring:
+      - "src/server/ws/handlers/config.rs (config.get/set/apply/patch/reload)"
+      - "src/server/ws/handlers/mod.rs (config.* methods)"
+    notes:
+      - "No config.update or config.validate methods; update split across set/apply/patch"
+
+  - feature: "ws.exec.approve/deny/list"
+    status: "partial"
+    runtime_wiring:
+      - "src/server/ws/handlers/exec.rs (exec.approvals.get/set, exec.approval.request/resolve)"
+      - "src/server/ws/handlers/mod.rs (exec.* methods)"
+    notes:
+      - "Method names differ from approve/deny/list; approval resolves via exec.approval.resolve"
+
+  - feature: "ws.system.info"
+    status: "verified_missing"
+    runtime_wiring:
+      - "src/server/ws/handlers/mod.rs (no system.info method)"
+
+  - feature: "tailscale.serve"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/tailscale/mod.rs::setup_serve"
+      - "src/main.rs::spawn_network_services (run_tailscale_lifecycle)"
+    tests:
+      - "src/tailscale/mod.rs::test_build_serve_args"
+
+  - feature: "tailscale.funnel"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/tailscale/mod.rs::setup_funnel"
+      - "src/main.rs::spawn_network_services (run_tailscale_lifecycle)"
+    tests:
+      - "src/tailscale/mod.rs::test_build_funnel_args"
+
+  - feature: "tailscale.cli wrapper"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/tailscale/mod.rs::run_command (async CLI execution)"
+    tests:
+      - "src/tailscale/mod.rs::test_build_teardown_args"
+
+  - feature: "tailscale.status parsing"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/tailscale/mod.rs::parse_status"
+    tests:
+      - "src/tailscale/mod.rs::test_parse_status_running"
+
+  - feature: "tailscale.lifecycle management"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/tailscale/mod.rs::run_tailscale_lifecycle"
+      - "src/tailscale/mod.rs::perform_teardown_if_configured"
+      - "src/main.rs::spawn_network_services"
+
+  - feature: "tls.self-signed cert generation"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/tls/mod.rs::generate_self_signed_cert"
+    tests:
+      - "src/tls/mod.rs::test_generate_self_signed_cert"
+
+  - feature: "tls.auto-generation on startup"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/tls/mod.rs::setup_tls (auto_generate paths)"
+      - "src/main.rs (setup_tls on startup)"
+    tests:
+      - "src/tls/mod.rs::test_setup_tls_auto_generate"
+
+  - feature: "tls.certificate loading"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/tls/mod.rs::load_certs"
+      - "src/tls/mod.rs::load_private_key"
+    tests:
+      - "src/tls/mod.rs::test_load_generated_certs"
+
+  - feature: "tls.sha-256 fingerprint"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/tls/mod.rs::compute_cert_fingerprint"
+    tests:
+      - "src/tls/mod.rs::test_compute_fingerprint"
+
+  - feature: "tls.mtls server config"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/tls/mod.rs::setup_mtls (server config)"
+    tests:
+      - "src/tls/mod.rs::test_setup_mtls_with_valid_certs"
+
+  - feature: "tls.mtls client config"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/tls/mod.rs::setup_mtls (client config)"
+    tests:
+      - "src/tls/mod.rs::test_setup_mtls_with_valid_certs"
+
+  - feature: "tls.cluster ca generation"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/tls/ca.rs::ClusterCA::generate"
+    tests:
+      - "src/tls/ca.rs::test_generate_cluster_ca"
+
+  - feature: "tls.node certificate issuance"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/tls/ca.rs::ClusterCA::issue_node_cert"
+    tests:
+      - "src/tls/ca.rs::test_issue_node_cert"
+
+  - feature: "tls.certificate revocation (crl)"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/tls/ca.rs::CertRevocationList (revoke + persistence)"
+    tests:
+      - "src/tls/ca.rs::test_crl_operations"
+      - "src/tls/ca.rs::test_crl_persistence"
+
+  - feature: "tls.restrictive key permissions"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/tls/mod.rs (set_permissions 0600 on private key)"
+      - "src/tls/ca.rs (set_permissions 0600 on CA/node keys)"
+    tests:
+      - "src/tls/mod.rs::test_key_file_permissions"
+      - "src/tls/ca.rs::test_ca_key_permissions"
+
+  - feature: "tts.speak / tts.voices"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/server/ws/handlers/tts.rs::handle_tts_speak"
+      - "src/server/ws/handlers/tts.rs::handle_tts_voices"
+    tests:
+      - "src/server/ws/golden_tests.rs::golden_tts_providers"
+      - "src/server/ws/golden_tests.rs::golden_tts_status"
+      - "src/server/ws/handlers/tts.rs (unit tests)"
+
+  - feature: "voicewake.get / voicewake.keywords"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/server/ws/handlers/voicewake.rs::handle_voicewake_get"
+      - "src/server/ws/handlers/voicewake.rs::handle_voicewake_keywords"
+    tests:
+      - "src/server/ws/golden_tests.rs::golden_voicewake_get"
+      - "src/server/ws/golden_tests.rs::golden_voicewake_keywords"
+      - "src/server/ws/handlers/voicewake.rs (unit tests)"
+
+  - feature: "sessions.JSONL history"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/sessions/store.rs (session_history_path uses .jsonl)"
+      - "src/sessions/store.rs (append_message / append_messages)"
+    tests:
+      - "src/sessions/integrity.rs (JSONL HMAC tests)"
+      - "src/sessions/file_lock.rs (JSONL lock tests)"
+
+  - feature: "sessions.compaction"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/sessions/store.rs::compact_session"
+      - "src/server/ws/handlers/sessions.rs::handle_sessions_compact"
+    tests:
+      - "src/sessions/store.rs (compaction tests)"
+
+  - feature: "sessions.HMAC integrity"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/server/ws/mod.rs (sessions.integrity config + HMAC key)"
+      - "src/sessions/store.rs (HMAC sidecar write + verify on load)"
+      - "src/sessions/integrity.rs (HMAC helpers)"
+    tests:
+      - "src/sessions/integrity.rs (HMAC unit tests)"
+
+  - feature: "sessions.archiving + restoration"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/server/ws/handlers/sessions.rs (sessions.archive/restore/archives/delete)"
+      - "src/sessions/store.rs (archive_session + restore_session)"
+    tests:
+      - "src/sessions/store.rs (archive/restore unit tests)"
+      - "src/server/ws/handlers/sessions.rs (archive/restore handler tests)"
+
+  - feature: "sessions.filters"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/server/ws/handlers/sessions.rs (sessions.list filters + search)"
+      - "src/sessions/store.rs (SessionFilter + list_sessions)"
+    tests:
+      - "src/sessions/store.rs (SessionFilter tests + date range tests)"
+
+  - feature: "sessions.file locking"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/sessions/file_lock.rs (FileLock RAII + flock)"
+      - "src/sessions/store.rs (FileLock on meta/history writes)"
+    tests:
+      - "src/sessions/file_lock.rs (locking tests)"
+
+  - feature: "sessions.retention policies"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/sessions/store.rs (cleanup_expired)"
+      - "src/sessions/retention.rs (retention loop + config)"
+      - "src/server/startup.rs (spawn retention cleanup)"
+    tests:
+      - "src/sessions/retention.rs (config + loop tests)"
+
+  - feature: "usage.session tracking"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/server/ws/handlers/usage.rs (record_usage + handle_usage_session)"
+      - "src/server/ws/handlers/mod.rs (usage.session dispatch)"
+    tests:
+      - "src/server/ws/handlers/usage.rs (usage session tests)"
+
+  - feature: "usage.cost calculation"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/agent/executor.rs (estimate_cost -> record_usage)"
+      - "src/usage/mod.rs (ModelPricing + calculate_cost)"
+    tests:
+      - "src/usage/mod.rs (calculate_cost tests)"
+      - "src/agent/executor.rs (estimate_cost tests)"
+
+  - feature: "tests.integration"
+    status: "verified_done"
+    runtime_wiring:
+      - "tests/http_endpoints_test.rs"
+      - "tests/plugin_e2e.rs"
+      - "tests/ssrf_test.rs"
+    tests:
+      - "tests/http_endpoints_test.rs"
+      - "tests/plugin_e2e.rs"
+      - "tests/ssrf_test.rs"
+
+  - feature: "tests.golden snapshots"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/server/ws/golden_tests.rs (insta snapshots)"
+      - "src/server/ws/snapshots/ (insta snapshots)"
+    tests:
+      - "src/server/ws/golden_tests.rs"
+
+  - feature: "ci.cross-platform matrix"
+    status: "verified_done"
+    runtime_wiring:
+      - ".github/workflows/ci.yml (test job matrix)"
+    tests:
+      - ".github/workflows/ci.yml"
+
+  - feature: "ci.msrv enforcement"
+    status: "verified_done"
+    runtime_wiring:
+      - ".github/workflows/ci.yml (msrv job)"
+    tests:
+      - ".github/workflows/ci.yml"
+
+  - feature: "ci.security scanning"
+    status: "verified_done"
+    runtime_wiring:
+      - ".github/workflows/ci.yml (audit/deny/gitleaks/trivy/geiger)"
+    tests:
+      - ".github/workflows/ci.yml"
+
+  - feature: "ollama provider"
+    status: "partial"
+    runtime_wiring:
+      - "src/agent/ollama.rs (OpenAI-compat SSE + tool use)"
+      - "src/agent/factory.rs (ollama provider wiring)"
+    notes:
+      - "No provider-level cancellation/abort path"
+
+  - feature: "gemini provider"
+    status: "partial"
+    runtime_wiring:
+      - "src/agent/gemini.rs (SSE stream + tool use)"
+      - "src/agent/factory.rs (gemini provider wiring)"
+    notes:
+      - "No provider-level cancellation/abort path"
+
+  - feature: "bedrock provider"
+    status: "verified_missing"
+    runtime_wiring:
+      - "src/agent/bedrock.rs (SigV4 + Converse implementation)"
+    notes:
+      - "Not wired in src/agent/factory.rs (credentials not read/constructed)"
+
+  - feature: "anthropic provider"
+    status: "partial"
+    runtime_wiring:
+      - "src/agent/anthropic.rs (SSE stream + tool use)"
+      - "src/agent/factory.rs (anthropic provider wiring)"
+      - "src/agent/provider.rs (MultiProvider default routing to Anthropic)"
+    tests:
+      - "src/agent/anthropic.rs (unit tests: build_body + SSE parsing/stream handling)"
+      - "src/agent/provider.rs::test_multi_provider_select_anthropic_model"
+    notes:
+      - "No provider-level cancellation/abort path"
+
+  - feature: "openai provider"
+    status: "partial"
+    runtime_wiring:
+      - "src/agent/openai.rs (SSE stream + tool use)"
+      - "src/agent/factory.rs (openai provider wiring)"
+    notes:
+      - "No provider-level cancellation/abort path"
+
+  - feature: "venice provider"
+    status: "partial"
+    runtime_wiring:
+      - "src/agent/venice.rs (OpenAI-compat wrapper + tool use)"
+      - "src/agent/factory.rs (venice provider wiring)"
+    notes:
+      - "No provider-level cancellation/abort path"
+
+  - feature: "exfiltration guard"
+    status: "partial"
+    runtime_wiring:
+      - "src/agent/exfiltration.rs (exfiltration-sensitive tool set)"
+      - "src/agent/tool_policy.rs (filter tools when exfiltration_guard is enabled)"
+      - "src/agent/executor.rs (block dispatch for sensitive tools)"
+    tests:
+      - "src/agent/exfiltration.rs (unit tests)"
+      - "src/agent/executor.rs (exfiltration guard tests)"
+    notes:
+      - "No private IP/localhost output filtering; guard only blocks exfiltration-sensitive tools"
+
+  - feature: "OS-level process sandbox"
+    status: "partial"
+    runtime_wiring:
+      - "src/agent/sandbox.rs (process sandbox config, rlimits, seatbelt/landlock helpers)"
+      - "src/agent/executor.rs (passes process_sandbox into tool dispatch)"
+      - "src/agent/tools.rs (sets sandboxed flag on ToolInvokeContext)"
+    tests:
+      - "src/agent/sandbox.rs (config + seatbelt/landlock helper tests)"
+    notes:
+      - "apply_sandbox / sandbox_command_prefix are not invoked in tool subprocess execution"
+
+  - feature: "channel-specific tools"
+    status: "partial"
+    runtime_wiring:
+      - "src/agent/channel_tools.rs (15 channel tool schemas + handlers)"
+      - "src/agent/builtin_tools.rs::channel_specific_tools (re-export helper)"
+    tests:
+      - "src/agent/channel_tools.rs (gating + schema + per-tool tests)"
+    notes:
+      - "Tools are not registered in ToolsRegistry or injected into provider tool lists"
+
+  - feature: "channel registry"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/channels/mod.rs (ChannelRegistry + ChannelStatus)"
+      - "src/server/ws/handlers/channels.rs (channels.status / channels.logout)"
+      - "src/server/control.rs (control channels status)"
+      - "src/messages/delivery.rs (delivery gate checks is_connected)"
+    tests:
+      - "src/channels/mod.rs (registry unit tests)"
+
+  - feature: "console channel"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/channels/console.rs (ConsoleChannel plugin)"
+      - "src/main.rs::register_console_channel (plugin registry + channel registry)"
+    tests:
+      - "src/channels/console.rs (unit tests)"
+
+  - feature: "telegram/discord/slack channels"
+    status: "verified_missing"
+    runtime_wiring:
+      - "src/channels/mod.rs (only console/signal/webhook modules in core)"
+      - "src/plugins/loader.rs (WASM plugin loader; no built-in channel plugins)"
+    notes:
+      - "No Telegram/Discord/Slack channel plugin implementations shipped in repo"
+
+  - feature: "start"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/main.rs (None|Start -> run_server)"
+    tests:
+      - "src/cli/mod.rs::test_cli_start_subcommand"
+
+  - feature: "config show/get/set/path"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/cli/mod.rs (handle_config_show/get/set/path)"
+      - "src/server/ws/mod.rs::persist_config_file (atomic write)"
+
+  - feature: "status"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/cli/mod.rs::handle_status (/health)"
+      - "src/server/http.rs (GET /health)"
+    tests:
+      - "src/server/http.rs::test_health_endpoint"
+
+  - feature: "logs"
+    status: "partial"
+    runtime_wiring:
+      - "src/cli/mod.rs::handle_logs (LOG_BUFFER or log file)"
+    notes:
+      - "CLI does not use WebSocket logs.tail; falls back to file or buffer"
+
+  - feature: "version"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/cli/mod.rs::handle_version"
+    tests:
+      - "src/cli/mod.rs::test_cli_version_subcommand"
+
+  - feature: "backup"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/cli/mod.rs::handle_backup (tar.gz + marker)"
+    tests:
+      - "src/cli/mod.rs::test_backup_creates_valid_archive"
+
+  - feature: "restore"
+    status: "partial"
+    runtime_wiring:
+      - "src/cli/mod.rs::handle_restore (restore_files_from_tar)"
+    tests:
+      - "src/cli/mod.rs::test_backup_restore_round_trip"
+    notes:
+      - "No explicit path traversal sanitization on tar entry paths"
+
+  - feature: "reset"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/cli/mod.rs::handle_reset"
+
+  - feature: "setup"
+    status: "partial"
+    runtime_wiring:
+      - "src/cli/mod.rs::handle_setup (writes default config)"
+    tests:
+      - "src/cli/mod.rs::test_handle_setup_*"
+    notes:
+      - "Not interactive; writes minimal default config"
+
+  - feature: "pair"
+    status: "verified_missing"
+    runtime_wiring:
+      - "src/cli/mod.rs::handle_pair (POST /api/nodes/pair)"
+    notes:
+      - "No HTTP /api/nodes/pair route implemented; pairing exists only over WS"
+
+  - feature: "update"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/cli/mod.rs::handle_update (GitHub releases + staged update)"
+      - "src/server/ws/handlers/update.rs::apply_staged_update"
+
+  - feature: "tls init-ca / issue-cert / revoke-cert / show-ca"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/cli/mod.rs::handle_tls_*"
+      - "src/tls/ca.rs (ClusterCA implementation)"
+
+  - feature: "JSON5 parsing"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/config/mod.rs::parse_json5"
+    tests:
+      - "src/config/mod.rs::test_parse_json5_basic"
+
+  - feature: "$include directive"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/config/mod.rs::resolve_includes (depth + circular detection)"
+    tests:
+      - "src/config/mod.rs::test_include_single_file"
+      - "src/config/mod.rs::test_include_multiple_files"
+
+  - feature: "Env var substitution"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/config/mod.rs::substitute_env_vars"
+    tests:
+      - "src/config/mod.rs::test_env_var_substitution"
+
+  - feature: "Config cache"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/config/mod.rs (CONFIG_CACHE + load_config TTL)"
+
+  - feature: "Hot reload"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/config/watcher.rs (ConfigWatcher)"
+      - "src/server/startup.rs (spawn config watcher)"
+    tests:
+      - "src/config/watcher.rs (ConfigWatcher tests)"
+
+  - feature: "Schema validation"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/config/schema.rs (validate_schema)"
+      - "src/main.rs::load_and_validate_config"
+    tests:
+      - "src/config/schema.rs (schema validation tests)"
+
+  - feature: "Config defaults"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/config/defaults.rs::apply_defaults"
+      - "src/config/mod.rs::load_config_uncached"
+
+  - feature: "Secret encryption"
+    status: "partial"
+    runtime_wiring:
+      - "src/config/secrets.rs (SecretStore + encrypt/decrypt)"
+    tests:
+      - "src/config/secrets.rs (encryption tests)"
+    notes:
+      - "SecretStore is not wired into config loading; encrypted values are not auto-resolved"
+
+  - feature: "macOS Keychain"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/credentials/macos.rs (MacOsCredentialBackend via keyring)"
+    tests:
+      - "src/credentials/macos.rs::test_error_mapping"
+
+  - feature: "Linux Secret Service"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/credentials/linux.rs (LinuxCredentialBackend via keyring)"
+    tests:
+      - "src/credentials/linux.rs::test_error_mapping"
+
+  - feature: "Windows Credential Manager"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/credentials/windows.rs (WindowsCredentialBackend via keyring)"
+    tests:
+      - "src/credentials/windows.rs::test_error_mapping"
+
+  - feature: "Env-only fallback"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/credentials/mod.rs::CredentialStore::new (env_only_mode)"
+    tests:
+      - "src/credentials/mod.rs::test_env_only_mode"
+
+  - feature: "Quotas and rate limiting"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/credentials/mod.rs::RateLimitTracker"
+      - "src/credentials/mod.rs::CredentialStore::plugin_set (quota + rate limit)"
+    tests:
+      - "src/credentials/mod.rs::test_rate_limit_tracker"
+      - "src/credentials/mod.rs::test_plugin_quota_incremented_on_new_keys"
+
+  - feature: "Key/value size limits"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/credentials/mod.rs (MAX_KEY_LENGTH/MAX_VALUE_LENGTH checks)"
+    tests:
+      - "src/credentials/mod.rs::test_key_too_long_validation"
+      - "src/credentials/mod.rs::test_value_too_long_validation"
+
+  - feature: "token auth"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/auth/mod.rs::authorize_gateway_connect (token branch + timing_safe_eq)"
+      - "src/server/ws/mod.rs::authorize_connection (gateway auth enforcement)"
+      - "src/server/http.rs::check_gateway_auth (HTTP bearer token auth)"
+    tests:
+      - "src/auth/mod.rs::test_gateway_auth_token_*"
+
+  - feature: "password auth"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/auth/mod.rs::authorize_gateway_connect (password branch + timing_safe_eq)"
+      - "src/server/http.rs::check_gateway_auth (HTTP bearer password auth)"
+      - "src/server/openai.rs::check_openai_auth (OpenAI endpoints password auth)"
+    tests:
+      - "src/auth/mod.rs::test_gateway_auth_password_*"
+
+  - feature: "tailscale auth"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/auth/mod.rs::verify_tailscale_auth(_with_whois)"
+      - "src/server/ws/mod.rs::resolve_gateway_auth_config (allow_tailscale wiring)"
+      - "src/server/ws/mod.rs::authorize_connection (tailscale accepted)"
+    tests:
+      - "src/auth/mod.rs::test_tailscale_auth_*"
+
+  - feature: "localhost bypass"
+    status: "partial"
+    runtime_wiring:
+      - "src/server/http.rs::check_gateway_auth (loopback allowed when no auth configured)"
+      - "src/auth/mod.rs::is_loopback_request"
+      - "src/auth/mod.rs::is_local_direct_request (WS local detection)"
+    tests:
+      - "src/server/http.rs::test_gateway_auth_no_config_loopback_allowed"
+      - "src/auth/mod.rs::test_is_loopback_request"
+    notes:
+      - "WS gateway auth still required; no loopback bypass in authorize_gateway_connect"
+
+  - feature: "fail-closed default"
+    status: "partial"
+    runtime_wiring:
+      - "src/auth/mod.rs::authorize_gateway_connect (missing config rejects)"
+      - "src/server/openai.rs::check_openai_auth (always requires auth)"
+      - "src/server/http.rs::check_gateway_auth (rejects non-loopback when no auth configured)"
+    notes:
+      - "Control endpoints allow unauthenticated access when no auth configured"
+      - "Loopback HTTP access is allowed without auth"
+
+  - feature: "timing-safe comparison"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/auth/mod.rs::timing_safe_eq (SHA-256 hash-then-compare)"
+      - "src/server/http.rs::check_gateway_auth"
+      - "src/server/control.rs::check_control_auth"
+    tests:
+      - "src/auth/mod.rs::test_timing_safe_eq"
+
+  - feature: "sessions.scoping"
+    status: "partial"
+    runtime_wiring:
+      - "src/sessions/scoping.rs (scope + reset policy)"
+    notes:
+      - "Session key resolution does not apply scoping in WS/HTTP/channel routing"
+      - "Reset policy not enforced in runtime paths"
+
+  - feature: "usage.daily/monthly summaries"
+    status: "partial"
+    runtime_wiring:
+      - "src/usage/mod.rs (daily + monthly aggregation)"
+      - "src/server/ws/handlers/usage.rs (daily_summaries only)"
+    notes:
+      - "WS usage path does not use persistent tracker"
+      - "Monthly summaries not exposed in WS usage handlers"
+
+  - feature: "usage.provider/model breakdown"
+    status: "partial"
+    runtime_wiring:
+      - "src/usage/mod.rs (by_provider + by_model aggregation)"
+      - "src/server/ws/handlers/usage.rs (providers only)"
+    notes:
+      - "Model-level breakdown not surfaced in WS usage handlers"
+
+  - feature: "usage.persistent JSON storage"
+    status: "partial"
+    runtime_wiring:
+      - "src/usage/mod.rs (UsageTracker load/save usage.json)"
+    notes:
+      - "WS usage handlers use in-memory state only"
+
+  - feature: "usage.enable/disable tracking"
+    status: "partial"
+    runtime_wiring:
+      - "src/usage/mod.rs (enable/disable + save)"
+      - "src/server/ws/handlers/usage.rs (enable/disable handlers)"
+    notes:
+      - "WS toggles are not persisted to usage.json"
+      - "record_usage re-enables when config says enabled"
+
+  - feature: "tests.unit tests"
+    status: "partial"
+    runtime_wiring:
+      - "tests/ (integration-style unit tests)"
+      - "src/** (#[cfg(test)] unit tests)"
+    notes:
+      - "Large suite exists, but count/coverage not verified"
+
+  - feature: "provider auto-discovery"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/agent/factory.rs (env vars + config resolution)"
+    tests:
+      - "src/agent/factory.rs (fingerprint tests)"
+
+  - feature: "provider base URL override"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/agent/anthropic.rs::with_base_url"
+      - "src/agent/openai.rs::with_base_url"
+      - "src/agent/gemini.rs::with_base_url"
+      - "src/agent/ollama.rs::with_base_url"
+      - "src/agent/venice.rs::with_base_url"
+      - "src/agent/factory.rs (reads *_BASE_URL)"
+    tests:
+      - "src/agent/anthropic.rs (base URL tests)"
+      - "src/agent/openai.rs (base URL tests)"
+      - "src/agent/gemini.rs (base URL tests)"
+      - "src/agent/ollama.rs (base URL tests)"
+      - "src/agent/venice.rs (base URL tests)"
+
+  - feature: "agent.execution loop"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/agent/executor.rs (execute_run loop + execute_single_turn)"
+      - "src/agent/mod.rs (spawn_run supervisor)"
+    tests:
+      - "src/agent/executor.rs (execute_run tests)"
+      - "src/agent/mod.rs (spawn_run tests)"
+
+  - feature: "agent.supervisor"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/agent/mod.rs (spawn_run + supervisor task)"
+    tests:
+      - "src/agent/mod.rs (spawn_run panic recovery tests)"
+
+  - feature: "agent.tool dispatch"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/agent/executor.rs (execute_tools_with_guards)"
+      - "src/agent/tools.rs (execute_tool_call + list_provider_tools)"
+      - "src/plugins/tools.rs (tool registry invoke)"
+    tests:
+      - "src/agent/tools.rs (tool dispatch tests)"
+      - "src/agent/executor.rs (tool policy tests)"
+
+  - feature: "agent.tool policy"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/agent/tool_policy.rs (AllowAll/AllowList/DenyList)"
+      - "src/agent/executor.rs (dispatch enforcement)"
+    tests:
+      - "src/agent/tool_policy.rs (policy tests)"
+      - "src/agent/executor.rs (policy enforcement tests)"
+
+  - feature: "prompt guard preflight"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/agent/prompt_guard/preflight.rs (regex checks)"
+      - "src/agent/executor.rs (preflight enforcement)"
+    tests:
+      - "src/agent/prompt_guard/preflight.rs (preflight tests)"
+
+  - feature: "prompt guard postflight"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/agent/prompt_guard/postflight.rs (PII/credential scan)"
+      - "src/agent/executor.rs (postflight enforcement)"
+    tests:
+      - "src/agent/prompt_guard/postflight.rs (postflight tests)"
+
+  - feature: "inbound message classifier"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/agent/classifier.rs (classify_message + circuit breaker)"
+      - "src/agent/executor.rs (classifier enforcement)"
+    tests:
+      - "src/agent/classifier.rs (classifier tests)"
+
+  - feature: "output content sanitizer"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/agent/output_sanitizer.rs (sanitize_output + CSP policy)"
+      - "src/agent/executor.rs (sanitize output before persisting)"
+    tests:
+      - "src/agent/output_sanitizer.rs (sanitizer tests)"
+
+  - feature: "anthropic provider"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/agent/anthropic.rs::complete (cancel token + SSE streaming)"
+      - "src/agent/anthropic.rs::process_sse_stream (stream parsing)"
+    tests:
+      - "src/agent/anthropic.rs::test_complete_stream_with_message_stop_returns_ok"
+
+  - feature: "openai provider"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/agent/openai.rs::complete_with_body (cancel token + SSE streaming)"
+      - "src/agent/openai.rs::process_sse_stream (stream parsing)"
+    tests:
+      - "src/agent/openai.rs::test_complete_text_stream"
+
+  - feature: "ollama provider"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/agent/ollama.rs::complete (OpenAI-compat streaming + cancellation)"
+      - "src/agent/openai.rs::process_ollama_sse_stream (shared SSE parser)"
+    tests:
+      - "src/agent/ollama.rs::test_build_body_with_tools"
+
+  - feature: "gemini provider"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/agent/gemini.rs::complete (cancel token + SSE streaming)"
+      - "src/agent/gemini.rs::process_gemini_sse_stream (stream parsing)"
+    tests:
+      - "src/agent/gemini.rs::test_build_body_with_tools"
+
+  - feature: "venice provider"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/agent/venice.rs::complete (OpenAI-compatible streaming + cancellation)"
+      - "src/agent/openai.rs::complete_with_body (shared transport)"
+    tests:
+      - "src/agent/venice.rs::test_venice_parameters_injected_into_body"
+
+  - feature: "bedrock provider"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/agent/bedrock.rs::complete (SigV4 signing + event emission)"
+      - "src/agent/factory.rs (bedrock config + MultiProvider wiring)"
+    tests:
+      - "src/agent/bedrock.rs::test_is_bedrock_model_colon_prefix"
+
+  - feature: "exfiltration guard"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/agent/exfiltration.rs (sensitive tool registry)"
+      - "src/agent/tool_policy.rs (definition filtering)"
+      - "src/agent/executor.rs (dispatch blocking)"
+      - "src/agent/mod.rs (config wiring)"
+    tests:
+      - "src/agent/executor.rs::test_exfiltration_guard_blocks_sensitive_tool"
+
+  - feature: "channel-specific tools"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/agent/channel_tools.rs (Telegram/Discord/Slack tool schemas)"
+      - "src/plugins/tools.rs::list_tools_for_channel (conditional tool listing)"
+      - "src/plugins/tools.rs::invoke (channel tool dispatch)"
+    tests:
+      - "src/agent/channel_tools.rs::test_channel_tools_telegram_returns_five"
+      - "src/agent/tools.rs::test_list_provider_tools_includes_channel_tools"

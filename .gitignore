@@ -4,6 +4,7 @@
 .DS_Store
 TODO.md
 GTM.md
+.local
 
 # AI Review System
 .review_state.yaml
