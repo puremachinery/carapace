@@ -1,5 +1,7 @@
 # carapace
 
+> **Under active development.** Kicking the tires is welcome, but don't expect everything to work yet.
+
 A security-focused, open-source personal AI assistant. Runs on your machine. Works through Telegram, Discord, Slack, and webhooks. Supports Anthropic, OpenAI, Ollama, Gemini, Bedrock, and Venice AI. Extensible via WASM plugins. Written in Rust.
 
 A hardened alternative to openclaw / moltbot / clawdbot — for when your molt needs a hard shell.
