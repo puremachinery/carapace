@@ -457,7 +457,7 @@ pub fn handle_version() {
 // ---------------------------------------------------------------------------
 
 use std::io::Read as IoRead;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// Resolve the state directory (same logic as `server::ws::resolve_state_dir`
 /// but duplicated here to avoid pulling in the full server module for CLI-only
@@ -629,6 +629,13 @@ fn validate_backup_file(archive_path: &PathBuf) -> Result<Vec<String>, Box<dyn s
     for entry_result in archive.entries()? {
         let entry = entry_result?;
         let path = entry.path()?;
+        if !is_safe_archive_path(&path) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid path in backup: {}", path.display()),
+            )
+            .into());
+        }
         let path_str = path.to_string_lossy().to_string();
 
         if path_str == BACKUP_MARKER {
@@ -682,6 +689,13 @@ fn restore_files_from_tar(
     for entry_result in archive.entries()? {
         let mut entry = entry_result?;
         let path = entry.path()?.to_path_buf();
+        if !is_safe_archive_path(&path) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid path in backup: {}", path.display()),
+            )
+            .into());
+        }
         let path_str = path.to_string_lossy().to_string();
 
         if path_str == BACKUP_MARKER {
@@ -731,6 +745,16 @@ fn restore_files_from_tar(
     }
 
     Ok((restored, restored_sessions))
+}
+
+fn is_safe_archive_path(path: &Path) -> bool {
+    for component in path.components() {
+        match component {
+            Component::Normal(_) | Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return false,
+        }
+    }
+    true
 }
 
 /// Extract a single tar entry to a target path, creating parent directories.
@@ -1985,6 +2009,16 @@ mod tests {
 
         let restored_usage = std::fs::read_to_string(target_state.join("usage.json")).unwrap();
         assert_eq!(restored_usage, r#"{"totalTokens":100}"#);
+    }
+
+    #[test]
+    fn test_is_safe_archive_path_rejects_traversal() {
+        assert!(!is_safe_archive_path(Path::new("../evil.json")));
+        assert!(!is_safe_archive_path(Path::new(
+            "sessions/../config/evil.json"
+        )));
+        assert!(!is_safe_archive_path(Path::new("/etc/passwd")));
+        assert!(is_safe_archive_path(Path::new("sessions/ok.json")));
     }
 
     // -----------------------------------------------------------------------

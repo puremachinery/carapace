@@ -1234,13 +1234,12 @@ features:
       - "src/cli/mod.rs::test_backup_creates_valid_archive"
 
   - feature: "restore"
-    status: "partial"
+    status: "verified_done"
     runtime_wiring:
       - "src/cli/mod.rs::handle_restore (restore_files_from_tar)"
     tests:
       - "src/cli/mod.rs::test_backup_restore_round_trip"
-    notes:
-      - "No explicit path traversal sanitization on tar entry paths"
+      - "src/cli/mod.rs::test_is_safe_archive_path_rejects_traversal"
 
   - feature: "reset"
     status: "verified_done"
