@@ -6,6 +6,27 @@ expression: normalized
 {
   "ok": true,
   "result": {
-    "jobs": []
+    "jobs": [
+      {
+        "createdAtMs": "<TIMESTAMP>",
+        "enabled": true,
+        "id": "<UUID>",
+        "name": "golden-test-job",
+        "payload": {
+          "kind": "systemEvent",
+          "text": "test golden"
+        },
+        "schedule": {
+          "expr": "*/5 * * * *",
+          "kind": "cron"
+        },
+        "sessionTarget": "main",
+        "state": {
+          "nextRunAtMs": "<TIMESTAMP>"
+        },
+        "updatedAtMs": "<TIMESTAMP>",
+        "wakeMode": "now"
+      }
+    ]
   }
 }

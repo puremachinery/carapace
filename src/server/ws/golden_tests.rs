@@ -7,6 +7,7 @@
 
 #[cfg(test)]
 mod golden_trace {
+    use crate::logging::buffer::{LogLevel, LOG_BUFFER};
     use crate::server::ws::handlers::dispatch_method;
     use crate::server::ws::*;
     use serde_json::{json, Value};
@@ -291,6 +292,14 @@ mod golden_trace {
             *val = json!("<TIMESTAMP>");
         }
 
+        if (key == "cursor" || key == "seq") && val.is_number() {
+            *val = json!(format!("<{}>", key.to_uppercase()));
+        }
+
+        if (key == "size" || key == "total") && val.is_number() {
+            *val = json!("<COUNT>");
+        }
+
         // Replace UUID-like string fields.
         if key == "id" || key == "connId" || key == "sessionId" || key.ends_with("Id") {
             if let Some(s) = val.as_str() {
@@ -548,8 +557,8 @@ mod golden_trace {
             "cron.add",
             Some(&json!({
                 "name": "golden-test-job",
-                "schedule": "*/5 * * * *",
-                "payload": { "type": "agent", "prompt": "test golden" }
+                "schedule": { "kind": "cron", "expr": "*/5 * * * *" },
+                "payload": { "kind": "systemEvent", "text": "test golden" }
             })),
             &state,
             &conn,
@@ -695,7 +704,29 @@ mod golden_trace {
 
     // ───────────────────────── Additional read-only snapshots ─────────────────────────
 
-    golden_test!(golden_logs_tail, "logs.tail", json!({}));
+    #[tokio::test]
+    async fn golden_logs_tail() {
+        let state = test_state();
+        let conn = admin_conn();
+        register_conn(&state, &conn);
+
+        LOG_BUFFER.clear();
+        LOG_BUFFER.push_with_seq(
+            LogLevel::Info,
+            "golden.logs.tail".to_string(),
+            "golden log line".to_string(),
+            None,
+            None,
+        );
+
+        let params_val: Value = json!({
+            "limit": 10,
+            "pattern": "^golden\\.logs\\.tail$"
+        });
+        let result = dispatch_method("logs.tail", Some(&params_val), &state, &conn).await;
+        let normalized = normalize_for_snapshot(&result);
+        insta::assert_json_snapshot!("golden_logs_tail", normalized);
+    }
 
     golden_test!(golden_system_presence, "system-presence", json!({}));
 

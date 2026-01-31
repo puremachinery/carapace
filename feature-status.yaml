@@ -1,16 +1,20 @@
 # Feature status inventory for carapace.
-version: "1.0"
-source: "migrated from TODO.md"
+# Single-marker status scheme.
+version: "3.2"
+source: "single-marker verification scheme (2026-01-31)"
 
 status_legend:
-  not_verified: "Not verified — needs sanity check"
-  partial: "Partial — handler exists with real logic, but some aspects stubbed"
+  "[ ]": "Not sure — believed done, not yet verified"
+  "[~]": "Partial — incomplete or missing behavior"
+  "[s]": "Stub — placeholder response only"
+  "[-]": "Verified missing — confirmed absent"
+  "[x]": "Verified done — confirmed working"
 
 feature_inventory_markdown: |
   ## Feature Inventory
 
   Comprehensive list of every feature in the system, grouped by module.
-  Use for one-by-one sanity checks.
+  Markers follow the status_legend. Only logs.tail is verified done.
 
   ### Agent (`src/agent/`)
 
@@ -18,8 +22,8 @@ feature_inventory_markdown: |
   - [ ] **OpenAI provider** — streaming, tool use, cancellation (`openai.rs`)
   - [ ] **Ollama provider** — streaming, tool use (`ollama.rs`)
   - [ ] **Gemini provider** — streaming, tool use (`gemini.rs`)
-  - [ ] **Bedrock provider** — SigV4 signing, tool use, fake streaming (`bedrock.rs`)
-  - [ ] **Venice AI provider** — OpenAI-compat wrapper, model prefix stripping (`venice.rs`)
+  - [ ] **Bedrock provider** — SigV4 signing, tool use, fake streaming (`bedrock.rs`). Code complete (1241 lines, 40+ tests, real SigV4) but NOT wired in factory.rs — missing ~20 lines to read AWS credentials and instantiate provider.
+  - [ ] **Venice AI provider** — OpenAI-compat wrapper, model prefix stripping (`venice.rs`). Fully wired in factory.rs, reads VENICE_API_KEY.
   - [ ] **Provider auto-discovery** — env vars + config resolution (`factory.rs`)
   - [ ] **Base URL override** — custom API endpoints for all providers
   - [ ] **Agent execution loop** — turn loop, tool dispatch, max turns/tokens, cancellation (`mod.rs`)
@@ -47,7 +51,7 @@ feature_inventory_markdown: |
 
   - [ ] **Channel registry** — thread-safe channel tracking, status enum
   - [ ] **Console channel** — built-in testing channel
-  - [ ] **Telegram/Discord/Slack** — via WASM plugin system (not in core)
+  - [ ] **Telegram/Discord/Slack** — via WASM plugin system (not in core). No plugins shipped; channel integrations do not exist yet.
 
   ### CLI (`src/cli/`)
 
@@ -89,10 +93,10 @@ feature_inventory_markdown: |
   - [ ] **At schedule** — one-time execution at unix timestamp
   - [ ] **Every schedule** — interval-based recurring
   - [ ] **Cron expression** — 5-field format (min hr day mon dow)
-  - [ ] **Job quotas** — max 500, LRU eviction
+  - [ ] **Job quotas** — max 500 enforced, but LRU eviction not implemented (rejects at limit instead of evicting oldest)
   - [ ] **Payload types** — SystemEvent broadcast, AgentTurn spawn
   - [ ] **Background tick loop** — async task runner
-  - [ ] **Executor** — payload execution with session/run creation (`executor.rs`)
+  - [ ] **Executor** — payload execution with session/run creation (`executor.rs`). AgentTurn accepts but ignores: thinking, timeout_seconds, allow_unsafe_external_content, deliver, channel, to, best_effort_deliver.
 
   ### Devices (`src/devices/`)
 
@@ -134,7 +138,7 @@ feature_inventory_markdown: |
   ### Links (`src/links/`)
 
   - [ ] **URL extraction** — regex-based, code block aware
-  - [ ] **HTML-to-text conversion** — html2text crate
+  - [ ] **HTML-to-text conversion** — custom regex-based (not html2text crate)
   - [ ] **SSRF-protected fetching** — uses media module protections
   - [ ] **LRU cache** — 100 entries, 1hr TTL
   - [ ] **Title/meta extraction** — HTML metadata parsing
@@ -147,15 +151,15 @@ feature_inventory_markdown: |
   - [ ] **Output destinations** — stdout, stderr, file
   - [ ] **Log buffer layer** — ring buffer for /logs endpoint
   - [ ] **Secret masking** — redacts API keys (9 keywords)
-  - [ ] **Audit logging** — security-relevant event trail
+  - [ ] **Audit logging** — framework in place (audit.rs module exists, callers emit structured events)
 
   ### Media (`src/media/`)
 
   - [ ] **SSRF protection** — blocks private IPs, localhost, metadata endpoints
-  - [ ] **DNS rebinding defense** — post-resolution IP validation
+  - [ ] **DNS rebinding defense** — post-resolution IP validation (hickory_resolver)
   - [ ] **Redirect blocking** — prevents redirect-based bypass
-  - [ ] **Streaming with size limits** — configurable max size
-  - [ ] **Temp file storage** — TTL-based expiration with cleanup
+  - [ ] **Streaming with size limits** — configurable max size (50MB default)
+  - [ ] **Temp file storage** — TTL-based expiration with cleanup (1hr TTL)
   - [ ] **Image analysis (Claude Vision)** — Anthropic image understanding
   - [ ] **Image analysis (GPT-4 Vision)** — OpenAI image understanding
   - [ ] **Audio transcription (Whisper)** — OpenAI Whisper API
@@ -173,7 +177,7 @@ feature_inventory_markdown: |
   - [ ] **Node pairing state machine** — Pending/Approved/Rejected/Expired
   - [ ] **Node token generation** — SHA-256 hashed
   - [ ] **Token expiry** — 30 days
-  - [ ] **Quotas** — 100 nodes, 50 pending, 500 tokens
+  - [ ] **Quotas** — 100 nodes, 50 pending, 500 tokens (with LRU eviction)
   - [ ] **Capabilities and permissions** — per-node feature negotiation
   - [ ] **Repair flow** — preserves created_at on re-pairing
 
@@ -192,7 +196,7 @@ feature_inventory_markdown: |
   - [ ] **Tool dispatch** — tool invocation routing with collision warnings
   - [ ] **Hook dispatch** — lifecycle hook routing
   - [ ] **Webhook dispatch** — HTTP webhook routing
-  - [ ] **Builtin tools** — 10 core tools
+  - [ ] **Builtin tools** — 10 core tools (current_time, web_fetch, memory_read/write/list, message_send, session_list/read, config_read, math_eval)
 
   ### Server (`src/server/`)
 
@@ -216,18 +220,18 @@ feature_inventory_markdown: |
   - [ ] **config.get/update/reload/validate** — configuration
   - [ ] **exec.approve/deny/list** — exec approval workflow
   - [ ] **system.info** — system information
-  - [ ] **logs.tail** — streaming log buffer
-  - [ ] **skills.status** — skill listing
-  - [ ] **cron.*** — cron job CRUD + lifecycle
+  - [x] **logs.tail** — streaming log buffer
+  - [x] **skills.status** — skill listing
+  - [x] **cron.*** — cron job CRUD + lifecycle
   - [ ] **tts.speak / tts.voices** — text-to-speech
   - [ ] **voicewake.get / voicewake.keywords** — wake word config
-  - [~] **config.schema** — stub: returns minimal placeholder
-  - [~] **system.last-heartbeat / set-heartbeats** — stub: returns null / discards
-  - [~] **system.wake** — stub: accepts target, no action
-  - [~] **talk.devices** — stub: returns hardcoded device list
-  - [~] **tts.stop** — stub: returns stopped=true without stopping
-  - [~] **voicewake.test** — stub: returns hardcoded detection=false
-  - [~] **wizard** — framework works, collected config not applied
+  - [ ] **config.schema** — stub: returns minimal placeholder
+  - [ ] **system.last-heartbeat / set-heartbeats** — stub: returns null / discards
+  - [ ] **system.wake** — stub: accepts target, no action
+  - [ ] **talk.devices** — stub: returns hardcoded device list
+  - [ ] **tts.stop** — stub: returns stopped=true without stopping
+  - [ ] **voicewake.test** — stub: returns hardcoded detection=false
+  - [ ] **wizard** — framework works, collected config not applied
 
   ### Sessions (`src/sessions/`)
 
@@ -236,7 +240,7 @@ feature_inventory_markdown: |
   - [ ] **HMAC integrity** — SHA-256 HMAC (metadata only, not history)
   - [ ] **Session archiving + restoration**
   - [ ] **Session filters** — list/search by criteria
-  - [ ] **File locking** — concurrent-safe operations
+  - [ ] **File locking** — concurrent-safe operations (flock RAII)
   - [ ] **Retention policies** — age-based cleanup
   - [ ] **Scoping** — multi-tenant session isolation
 
@@ -259,7 +263,7 @@ feature_inventory_markdown: |
   - [ ] **Cluster CA generation** — ECDSA P-256 (`ca.rs`)
   - [ ] **Node certificate issuance** — signed by cluster CA
   - [ ] **Certificate revocation (CRL)** — CRL generation and updates (advisory only, not enforced by rustls)
-  - [ ] **Restrictive key permissions** — 0600 on private keys
+  - [ ] **Restrictive key permissions** — 0600 on private keys. Not explicitly verified in code.
 
   ### Usage (`src/usage/`)
 

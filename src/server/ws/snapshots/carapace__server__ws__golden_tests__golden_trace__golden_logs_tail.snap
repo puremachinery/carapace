@@ -6,11 +6,21 @@ expression: normalized
 {
   "ok": true,
   "result": {
-    "cursor": 0,
-    "file": "<PATH>",
-    "lines": [],
+    "cursor": "<CURSOR>",
+    "entries": [
+      {
+        "level": "info",
+        "message": "golden log line",
+        "seq": "<SEQ>",
+        "target": "golden.logs.tail",
+        "timestamp": "<TIMESTAMP>"
+      }
+    ],
+    "lines": [
+      "golden log line"
+    ],
     "reset": false,
-    "size": 0,
+    "size": "<COUNT>",
     "truncated": false
   }
 }

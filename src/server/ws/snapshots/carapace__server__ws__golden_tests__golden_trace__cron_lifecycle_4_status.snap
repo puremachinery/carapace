@@ -7,7 +7,7 @@ expression: normalized
   "ok": true,
   "result": {
     "enabled": true,
-    "jobs": 0,
-    "nextRunAtMs": null
+    "jobs": 1,
+    "nextRunAtMs": "<TIMESTAMP>"
   }
 }
