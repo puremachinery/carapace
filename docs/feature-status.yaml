@@ -151,7 +151,7 @@ feature_inventory_markdown: |
   - [x] **Output destinations** — stdout, stderr, file
   - [x] **Log buffer layer** — ring buffer for /logs endpoint
   - [x] **Secret masking** — redacts API keys in log output and buffer
-  - [~] **Audit logging** — framework in place (audit.rs module exists, callers emit structured events)
+  - [x] **Audit logging** — initialized at startup; events emitted for security-relevant actions
 
   ### Media (`src/media/`)
 

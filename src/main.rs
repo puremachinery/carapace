@@ -128,6 +128,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&state_dir)?;
     std::fs::create_dir_all(state_dir.join("sessions"))?;
     std::fs::create_dir_all(state_dir.join("cron"))?;
+    logging::audit::AuditLog::init(state_dir.clone()).await;
 
     let resolved = resolve_bind_config(&cfg)?;
     let ws_state = server::ws::build_ws_state_from_config().await?;

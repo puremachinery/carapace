@@ -19,6 +19,7 @@ use std::sync::Arc;
 use crate::auth;
 use crate::channels::{ChannelRegistry, ChannelStatus};
 use crate::config;
+use crate::logging::audit::{audit, AuditEvent};
 use crate::server::ws::{map_validation_issues, persist_config_file, read_config_snapshot};
 
 /// Control endpoint state
@@ -377,6 +378,15 @@ pub async fn config_handler(
         )
             .into_response();
     }
+
+    let actor = remote_addr
+        .map(|addr| addr.ip().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    audit(AuditEvent::ConfigChanged {
+        key_path: req.path.clone(),
+        actor,
+        method: "control_api".to_string(),
+    });
 
     // Re-read to get the new hash
     let new_snapshot = read_config_snapshot();

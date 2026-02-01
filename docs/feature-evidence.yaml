@@ -395,15 +395,17 @@ features:
       - "Redaction applied to log output writers and logs.tail buffer"
 
   - feature: "logging.audit logging"
-    status: "partial"
+    status: "verified_done"
     runtime_wiring:
       - "src/logging/audit.rs (AuditLog + audit events)"
       - "src/agent/executor.rs (audit events for prompt guard/classifier)"
       - "src/plugins/runtime.rs (audit events for capability denial)"
+      - "src/main.rs (AuditLog::init)"
+      - "src/server/control.rs (ConfigChanged audit event)"
     tests:
       - "src/logging/audit.rs (audit event serialization tests)"
     notes:
-      - "AuditLog::init is never called; audit() no-ops unless initialized"
+      - "AuditLog is initialized on gateway startup; audit() emits to audit.jsonl"
 
   - feature: "media.ssrf protection"
     status: "verified_done"
