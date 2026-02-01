@@ -634,15 +634,14 @@ features:
       - "src/plugins/capabilities.rs::test_config_check_access_denied"
 
   - feature: "plugins.resource limits"
-    status: "partial"
+    status: "verified_done"
     runtime_wiring:
-      - "src/plugins/runtime.rs (fuel budget + DEFAULT_EXECUTION_TIMEOUT constants)"
+      - "src/plugins/runtime.rs (Store::limiter + MAX_PLUGIN_MEMORY_BYTES)"
+      - "src/plugins/runtime.rs (epoch ticker + epoch deadlines)"
+      - "src/plugins/runtime.rs (fuel budget + DEFAULT_EXECUTION_TIMEOUT)"
     tests:
       - "src/plugins/runtime.rs::test_default_fuel_budget_is_reasonable"
       - "src/plugins/runtime.rs::test_engine_has_fuel_enabled"
-    notes:
-      - "No Store resource limiter is set for MAX_PLUGIN_MEMORY_BYTES"
-      - "Epoch-based wall-clock timeout is configured but no epoch ticker is wired"
 
   - feature: "plugins.http rate limiting"
     status: "verified_done"

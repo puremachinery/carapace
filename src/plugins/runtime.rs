@@ -20,13 +20,14 @@
 //! - Execution timeout (30s per call)
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::RwLock;
 use thiserror::Error;
 use wasmtime::component::{Component, ComponentType, Lift, Linker, Lower};
-use wasmtime::{Config, Engine, Store, StoreContextMut};
+use wasmtime::{Config, Engine, ResourceLimiter, Store, StoreContextMut};
 
 use crate::credentials::{CredentialBackend, CredentialStore};
 
@@ -47,8 +48,14 @@ use super::permissions::{
 /// Maximum memory per plugin instance (64MB)
 pub const MAX_PLUGIN_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Maximum table entries per plugin instance.
+pub const MAX_PLUGIN_TABLE_ELEMENTS: usize = 100_000;
+
 /// Default execution timeout per function call (30s)
 pub const DEFAULT_EXECUTION_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Epoch tick interval for wall-clock timeout enforcement.
+pub const DEFAULT_EPOCH_TICK_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Default fuel budget per WASM function call (1 billion instructions).
 ///
@@ -56,6 +63,73 @@ pub const DEFAULT_EXECUTION_TIMEOUT: Duration = Duration::from_secs(30);
 /// wall-clock timeout. A tight infinite loop will exhaust fuel before the
 /// epoch deadline fires, giving a clearer error message.
 pub const DEFAULT_FUEL_BUDGET: u64 = 1_000_000_000;
+
+fn compute_epoch_deadline_ticks(timeout: Duration) -> u64 {
+    let interval_ms = DEFAULT_EPOCH_TICK_INTERVAL.as_millis().max(1);
+    let timeout_ms = timeout.as_millis().max(1);
+    let ticks = timeout_ms.div_ceil(interval_ms);
+    ticks as u64
+}
+
+struct EpochTicker {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl EpochTicker {
+    fn start(engine: Engine, interval: Duration) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = stop.clone();
+        let handle = std::thread::Builder::new()
+            .name("plugin-epoch-ticker".to_string())
+            .spawn(move || {
+                while !stop_clone.load(Ordering::SeqCst) {
+                    std::thread::sleep(interval);
+                    engine.increment_epoch();
+                }
+            })
+            .expect("failed to spawn plugin epoch ticker thread");
+
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for EpochTicker {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+struct PluginResourceLimiter {
+    max_memory_bytes: usize,
+    max_table_elements: usize,
+}
+
+impl ResourceLimiter for PluginResourceLimiter {
+    fn memory_growing(
+        &mut self,
+        _current: usize,
+        desired: usize,
+        _maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        Ok(desired <= self.max_memory_bytes)
+    }
+
+    fn table_growing(
+        &mut self,
+        _current: usize,
+        desired: usize,
+        _maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        Ok(desired <= self.max_table_elements)
+    }
+}
 
 // ============== WIT Component Model Types ==============
 //
@@ -159,7 +233,6 @@ struct WitChannelInfo {
 #[derive(Clone, Copy, Debug, ComponentType, Lift, Lower)]
 #[component(enum)]
 #[repr(u8)]
-#[allow(dead_code)]
 enum WitChatType {
     #[component(name = "dm")]
     Dm,
@@ -170,6 +243,13 @@ enum WitChatType {
     #[component(name = "thread")]
     Thread,
 }
+
+const ALL_WIT_CHAT_TYPES: [WitChatType; 4] = [
+    WitChatType::Dm,
+    WitChatType::Group,
+    WitChatType::Channel,
+    WitChatType::Thread,
+];
 
 /// WIT `channel-capabilities` record returned by `channel-meta.get-capabilities` export.
 #[derive(Clone, Debug, ComponentType, Lift, Lower)]
@@ -363,6 +443,8 @@ impl From<WitChatType> for ChatType {
 
 impl From<WitChannelCapabilities> for ChannelCapabilities {
     fn from(wit: WitChannelCapabilities) -> Self {
+        // Keep all WIT variants referenced; they are constructed by Wasmtime at runtime.
+        let _ = ALL_WIT_CHAT_TYPES;
         Self {
             chat_types: wit.chat_types.into_iter().map(ChatType::from).collect(),
             polls: wit.polls,
@@ -529,6 +611,9 @@ pub struct HostState<B: CredentialBackend + Send + Sync + 'static> {
 
     /// Host context for capability access
     pub host_ctx: Arc<PluginHostContext<B>>,
+
+    /// Resource limiter for this plugin instance
+    limiter: PluginResourceLimiter,
 }
 
 // Note: Full WASI integration will be added when we upgrade to wasmtime with
@@ -558,6 +643,12 @@ pub struct PluginRuntime<B: CredentialBackend + 'static> {
     /// Fine-grained permission configuration
     permission_config: PermissionConfig,
 
+    /// Epoch deadline ticks for wall-clock timeouts
+    epoch_deadline_ticks: u64,
+
+    /// Epoch ticker for wall-clock timeouts (kept for drop)
+    _epoch_ticker: EpochTicker,
+
     /// Loaded plugin instances by ID
     instances: RwLock<HashMap<String, Arc<PluginInstanceHandle<B>>>>,
 
@@ -569,6 +660,9 @@ pub struct PluginRuntime<B: CredentialBackend + 'static> {
 pub struct PluginInstanceHandle<B: CredentialBackend + Send + Sync + 'static> {
     /// Plugin manifest
     pub manifest: PluginManifest,
+
+    /// Epoch deadline ticks for wall-clock timeouts
+    epoch_deadline_ticks: u64,
 
     /// The wasmtime store with plugin state
     store: RwLock<Store<HostState<B>>>,
@@ -636,6 +730,8 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginInstanceHandle<B> {
     {
         let mut store = self.store.write();
 
+        store.set_epoch_deadline(self.epoch_deadline_ticks);
+
         // Set fuel budget for this call
         if let Err(e) = store.set_fuel(DEFAULT_FUEL_BUDGET) {
             return Err(BindingError::CallError(format!(
@@ -655,15 +751,23 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginInstanceHandle<B> {
         })
         .map_err(|e: wasmtime::Error| {
             let msg = e.to_string();
-            if msg.contains("fuel") {
+            let msg_lower = msg.to_lowercase();
+            if msg_lower.contains("fuel") {
                 BindingError::CallError(format!(
                     "WASM fuel exhausted during '{}.{}' (budget: {} instructions)",
                     iface_name, func_name, DEFAULT_FUEL_BUDGET
                 ))
+            } else if msg_lower.contains("epoch") || msg_lower.contains("interrupt") {
+                BindingError::CallError(format!(
+                    "WASM execution timed out during '{}.{}' (timeout: {}s)",
+                    iface_name,
+                    func_name,
+                    DEFAULT_EXECUTION_TIMEOUT.as_secs()
+                ))
             } else {
                 BindingError::CallError(format!(
                     "call to '{}.{}' failed: {}",
-                    iface_name, func_name, e
+                    iface_name, func_name, msg
                 ))
             }
         })?;
@@ -698,6 +802,8 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginInstanceHandle<B> {
     {
         let mut store = self.store.write();
 
+        store.set_epoch_deadline(self.epoch_deadline_ticks);
+
         // Set fuel budget for this call
         if let Err(e) = store.set_fuel(DEFAULT_FUEL_BUDGET) {
             return Err(BindingError::CallError(format!(
@@ -714,15 +820,23 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginInstanceHandle<B> {
         })
         .map_err(|e: wasmtime::Error| {
             let msg = e.to_string();
-            if msg.contains("fuel") {
+            let msg_lower = msg.to_lowercase();
+            if msg_lower.contains("fuel") {
                 BindingError::CallError(format!(
                     "WASM fuel exhausted during '{}.{}' (budget: {} instructions)",
                     iface_name, func_name, DEFAULT_FUEL_BUDGET
                 ))
+            } else if msg_lower.contains("epoch") || msg_lower.contains("interrupt") {
+                BindingError::CallError(format!(
+                    "WASM execution timed out during '{}.{}' (timeout: {}s)",
+                    iface_name,
+                    func_name,
+                    DEFAULT_EXECUTION_TIMEOUT.as_secs()
+                ))
             } else {
                 BindingError::CallError(format!(
                     "call to '{}.{}' failed: {}",
-                    iface_name, func_name, e
+                    iface_name, func_name, msg
                 ))
             }
         })?;
@@ -804,10 +918,14 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
         config.wasm_component_model(true);
         config.async_support(true);
         config.consume_fuel(true);
+        config.epoch_interruption(true);
         // Memory limits are enforced per-instance via resource limiter
 
         let engine =
             Engine::new(&config).map_err(|e| RuntimeError::WasmtimeError(e.to_string()))?;
+
+        let epoch_deadline_ticks = compute_epoch_deadline_ticks(DEFAULT_EXECUTION_TIMEOUT);
+        let epoch_ticker = EpochTicker::start(engine.clone(), DEFAULT_EPOCH_TICK_INTERVAL);
 
         Ok(Self {
             engine,
@@ -817,6 +935,8 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
             ssrf_config,
             sandbox_config,
             permission_config,
+            epoch_deadline_ticks,
+            _epoch_ticker: epoch_ticker,
             instances: RwLock::new(HashMap::new()),
             registry: Arc::new(PluginRegistry::new()),
         })
@@ -920,13 +1040,19 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
         let host_state = HostState {
             plugin_id: plugin_id.to_string(),
             host_ctx,
+            limiter: PluginResourceLimiter {
+                max_memory_bytes: MAX_PLUGIN_MEMORY_BYTES as usize,
+                max_table_elements: MAX_PLUGIN_TABLE_ELEMENTS,
+            },
         };
 
         // Create the store with host state
         let mut store = Store::new(&self.engine, host_state);
+        // SECURITY: enforce per-instance memory limits for plugin code.
+        store.limiter(|state| &mut state.limiter);
 
         // Set epoch deadline for wall-clock timeout enforcement
-        store.set_epoch_deadline(1);
+        store.set_epoch_deadline(self.epoch_deadline_ticks);
 
         // Set initial fuel budget (replenished before each call)
         if let Err(e) = store.set_fuel(DEFAULT_FUEL_BUDGET) {
@@ -956,6 +1082,7 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
         // Create the instance handle
         let handle = Arc::new(PluginInstanceHandle {
             manifest: loaded.manifest.clone(),
+            epoch_deadline_ticks: self.epoch_deadline_ticks,
             store: RwLock::new(store),
             instance,
             component,
@@ -1908,6 +2035,27 @@ mod tests {
         const _: () = assert!(DEFAULT_FUEL_BUDGET <= 10_000_000_000); // not unbounded
     }
 
+    #[test]
+    fn test_compute_epoch_deadline_ticks() {
+        let ticks = compute_epoch_deadline_ticks(DEFAULT_EXECUTION_TIMEOUT);
+        let interval_ms = DEFAULT_EPOCH_TICK_INTERVAL.as_millis().max(1);
+        let timeout_ms = DEFAULT_EXECUTION_TIMEOUT.as_millis().max(1);
+        let expected = timeout_ms.div_ceil(interval_ms);
+        assert_eq!(ticks, expected as u64);
+    }
+
+    #[test]
+    fn test_plugin_resource_limiter_bounds() {
+        let mut limiter = PluginResourceLimiter {
+            max_memory_bytes: 1024,
+            max_table_elements: 10,
+        };
+        assert!(limiter.memory_growing(0, 1024, None).unwrap());
+        assert!(!limiter.memory_growing(0, 1025, None).unwrap());
+        assert!(limiter.table_growing(0, 10, None).unwrap());
+        assert!(!limiter.table_growing(0, 11, None).unwrap());
+    }
+
     #[tokio::test]
     async fn test_engine_has_fuel_enabled() {
         let runtime = create_test_runtime().await;
@@ -1922,6 +2070,10 @@ mod tests {
                     runtime.credential_store.clone(),
                     runtime.rate_limiters.clone(),
                 )),
+                limiter: PluginResourceLimiter {
+                    max_memory_bytes: MAX_PLUGIN_MEMORY_BYTES as usize,
+                    max_table_elements: MAX_PLUGIN_TABLE_ELEMENTS,
+                },
             },
         );
         // If fuel is not enabled on the engine, set_fuel would return an error
@@ -1944,6 +2096,10 @@ mod tests {
                     runtime.credential_store.clone(),
                     runtime.rate_limiters.clone(),
                 )),
+                limiter: PluginResourceLimiter {
+                    max_memory_bytes: MAX_PLUGIN_MEMORY_BYTES as usize,
+                    max_table_elements: MAX_PLUGIN_TABLE_ELEMENTS,
+                },
             },
         );
         // Setting zero fuel should succeed (but any execution would trap immediately)

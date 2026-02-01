@@ -189,7 +189,7 @@ feature_inventory_markdown: |
   - [x] **Credential isolation** — plugin ID prefixing
   - [x] **SSRF protection** — private IP/localhost blocking
   - [x] **Config access enforcement** — plugins.<id>.* only
-  - [~] **Resource limits** — 64MB memory, 30s timeout, fuel-based CPU
+  - [x] **Resource limits** — 64MB memory, 30s timeout, fuel-based CPU, epoch ticker
   - [x] **HTTP rate limiting** — 100 req/min per plugin
   - [x] **Log rate limiting** — 1000 msg/min per plugin
   - [x] **Permission enforcement** — declared + override permissions
