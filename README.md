@@ -2,17 +2,17 @@
 
 > **Under active development.** Kicking the tires is welcome, but don't expect everything to work yet.
 
-A security-focused, open-source personal AI assistant. Runs on your machine. Works through Signal, webhooks, and console today — Telegram, Discord, and Slack planned via WASM plugins. Supports Anthropic, OpenAI, Ollama, Gemini, Bedrock, and Venice AI. Extensible via WASM plugins. Written in Rust.
+A security-focused, open-source personal AI assistant. Runs on your machine. Works through Signal, Telegram, Discord, Slack, webhooks, and console. Supports Anthropic, OpenAI, Ollama, Gemini, Bedrock, and Venice AI. Extensible via WASM plugins. Written in Rust.
 
 A hardened alternative to openclaw / moltbot / clawdbot — for when your molt needs a hard shell.
 
 ## Features
 
 - **Multi-provider LLM engine** — Anthropic, OpenAI, Ollama, Google Gemini, AWS Bedrock, Venice AI with streaming, tool dispatch, and cancellation
-- **Multi-channel messaging** — Signal, console, and webhooks today; Telegram, Discord, Slack planned via WASM plugins. 10 built-in tools + 15 channel-specific tool schemas
-- **WASM plugin runtime** — wasmtime 41 with Ed25519 signature verification and capability sandboxing
-- **Security by default** — localhost-only binding, SSRF/DNS-rebinding defense, prompt guard, inbound message classifier, exec approval flow, output content security. Auth denies by default when no credentials configured (control endpoint gating in progress). Secret encryption primitives (AES-256-GCM + PBKDF2) implemented, config-level wiring in progress. OS-level sandbox primitives (Seatbelt/Landlock/rlimits) implemented, subprocess wiring in progress
-- **Infrastructure** — TLS, mTLS, mDNS discovery, config hot-reload, Tailscale integration, Prometheus metrics. Gateway clustering and audit logging are partially implemented
+- **Multi-channel messaging** — Signal, Telegram, Discord, Slack, console, and webhooks. 10 built-in tools + 15 channel-specific tool schemas
+- **WASM plugin runtime** — wasmtime 41 with Ed25519 signature verification, capability sandboxing, resource limits (64MB memory, fuel CPU budget, epoch wall-clock timeout), and permission enforcement
+- **Security by default** — localhost-only binding, SSRF/DNS-rebinding defense, prompt guard, inbound message classifier, exec approval flow, output content security. Auth denies by default when no credentials configured; CSRF-protected control endpoints. AES-256-GCM secret encryption at rest with PBKDF2 key derivation. OS-level sandbox primitives (Seatbelt/Landlock/rlimits) implemented, subprocess wiring in progress
+- **Infrastructure** — TLS, mTLS, mDNS discovery, config hot-reload, Tailscale integration, Prometheus metrics, audit logging. Gateway clustering is partially implemented
 
 ## Security
 
@@ -20,10 +20,10 @@ Carapace is hardened against every major vulnerability class reported in the [Ja
 
 | Threat | Carapace defense |
 |---|---|
-| Unauthenticated access | Denied by default when credentials configured; control endpoint gating in progress |
+| Unauthenticated access | Denied by default when credentials configured; CSRF-protected control endpoints |
 | Exposed network ports | Localhost-only binding (127.0.0.1) |
-| Plaintext secret storage | AES-256-GCM + PBKDF2 primitives implemented; config-level auto-seal in progress |
-| Skills supply chain | Ed25519 signatures + WASM capability sandbox |
+| Plaintext secret storage | AES-256-GCM encryption at rest with PBKDF2 key derivation |
+| Skills supply chain | Ed25519 signatures + WASM capability sandbox + resource limits |
 | Prompt injection | Prompt guard + inbound classifier + exec approval flow + tool policies |
 | No process sandboxing | Seatbelt / Landlock / rlimits primitives implemented; subprocess wiring in progress |
 | SSRF / DNS rebinding | Private IP blocking + post-resolution validation |
@@ -178,7 +178,7 @@ Format, Clippy, nextest (cross-platform), MSRV 1.93, cargo-audit, cargo-deny, gi
 src/
 ├── agent/          # LLM execution engine, prompt guard, classifier, sandbox, output sanitizer
 ├── auth/           # Token, password, and Tailscale authentication
-├── channels/       # Channel registry, console channel, Signal channel
+├── channels/       # Channel registry, Signal, Telegram, Discord, Slack, console
 ├── cli/            # CLI subcommands (start, config, backup, tls, etc.)
 ├── config/         # JSON5 config with $include, env substitution, hot reload
 ├── credentials/    # Platform-native credential storage (Keychain, Secret Service, Windows)

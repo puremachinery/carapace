@@ -77,7 +77,7 @@ graph TB
     subgraph "Plugin Boundary"
         PluginSig["Ed25519 Signature Verification"]
         PluginCaps["Capability Sandbox<br/>(deny-by-default: HTTP, creds, media)"]
-        PluginFuel["WASM Fuel Limits<br/>(CPU budget per call)"]
+        PluginRes["Resource Limits<br/>(64MB memory, fuel CPU budget,<br/>30s epoch wall-clock timeout)"]
         PluginPerms["Fine-Grained Permissions<br/>(URL patterns, credential scopes)"]
     end
 
@@ -90,7 +90,7 @@ graph TB
     LLM --> ExtAPI
     ToolDispatch --> Audit
 
-    Skills --> PluginSig --> PluginCaps --> PluginFuel
+    Skills --> PluginSig --> PluginCaps --> PluginRes
     PluginCaps --> PluginPerms
 
     Secrets --> Keychain
@@ -281,6 +281,7 @@ Even with access controls, prompt injection can occur via:
 
 The control UI (`/control/*` endpoints) requires:
 - Gateway authentication (token or password)
+- CSRF protection (double-submit cookie with `__Host-` prefix, `SameSite=Strict`, origin/host validation)
 - Protected config paths blocked from modification:
   - `gateway.auth.*`
   - `hooks.token`
@@ -300,7 +301,10 @@ for prefix in blocked_prefixes {
 ## Plugin Security
 
 Plugins run in WASM sandboxes (`src/plugins/runtime.rs`) with:
-- Capability-based permissions
+- Capability-based permissions (deny-by-default for HTTP, credentials, media)
+- Resource limits: 64MB memory (via `ResourceLimiter`), fuel-based CPU budget (1B instructions), 30s wall-clock timeout (epoch interruption)
+- HTTP rate limiting (100 req/min) and log rate limiting (1000 msg/min)
+- Fine-grained permission enforcement (URL patterns, credential scopes)
 - Namespaced tool/webhook paths
 - No direct filesystem access (must use host functions)
 

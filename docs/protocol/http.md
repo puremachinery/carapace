@@ -236,8 +236,15 @@ Errors:
 
 ## Health / Status
 
-No dedicated HTTP health endpoint is wired in the gateway HTTP server.
-Health is exposed over the WebSocket protocol (`health` method) and via WS events.
+### GET `/health`
+
+Returns gateway health status. No authentication required.
+
+Response:
+- 200 OK
+```json
+{ "status": "ok" }
+```
 
 ## Additional HTTP Handlers
 

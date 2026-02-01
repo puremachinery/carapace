@@ -122,6 +122,10 @@ All keys are optional. Unknown keys are rejected (strict schema).
 - `plugins` – plugin load/allowlist/config
 - `venice` – Venice AI provider settings (apiKey, baseUrl)
 - `classifier` – inbound message classifier (mode, model, blockThreshold)
+- `signal` – Signal channel settings (via signal-cli REST API)
+- `telegram` – Telegram Bot API settings (botToken, baseUrl)
+- `discord` – Discord Bot API settings (botToken, baseUrl)
+- `slack` – Slack Web API settings (botToken, baseUrl)
 
 ### Notable subkeys
 
