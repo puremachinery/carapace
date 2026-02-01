@@ -61,13 +61,12 @@ features:
       - "src/cron/mod.rs::test_compute_next_run_cron_schedule"
 
   - feature: "cron.job quotas"
-    status: "partial"
+    status: "verified_done"
     runtime_wiring:
-      - "src/cron/mod.rs (CronScheduler::MAX_JOBS + add limit enforcement)"
+      - "src/cron/mod.rs (CronScheduler::MAX_JOBS + LRU eviction on add)"
     tests:
       - "src/cron/mod.rs::test_cron_scheduler_job_limit"
-    notes:
-      - "When limit is reached, add() returns LimitExceeded; no LRU eviction"
+      - "src/cron/mod.rs::test_cron_job_limit_enforced_under_concurrent_access"
 
   - feature: "cron.payload types"
     status: "verified_done"
