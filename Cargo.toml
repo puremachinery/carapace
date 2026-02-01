@@ -28,7 +28,7 @@ wasmtime = { version = "41", features = ["component-model"] }
 thiserror = "1"
 parking_lot = "0.12"
 base64 = "0.22"
-ed25519-dalek = { version = "2", features = ["std"] }
+ed25519-dalek = { version = "2", features = ["std", "zeroize"] }
 futures-util = "0.3"
 tokio-util = "0.7"
 async-stream = "0.3"

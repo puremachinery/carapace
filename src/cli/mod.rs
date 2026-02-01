@@ -62,6 +62,18 @@ pub enum Command {
         /// Host of the running instance.
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
+
+        /// Use TLS (wss://) for remote connections.
+        #[arg(long)]
+        tls: bool,
+
+        /// Accept invalid TLS certificates (only with --tls).
+        #[arg(long)]
+        trust: bool,
+
+        /// Allow plaintext ws:// for non-loopback hosts (unsafe).
+        #[arg(long)]
+        allow_plaintext: bool,
     },
 
     /// Print version, build date, and git commit information.
@@ -229,16 +241,23 @@ use crate::config;
 use crate::credentials;
 use crate::logging::buffer::LogLevel;
 use crate::server::bind::DEFAULT_PORT;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use base64::Engine;
+use ed25519_dalek::{Signer, SigningKey};
 use futures_util::{SinkExt, StreamExt};
+use getrandom::getrandom;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, Error as RustlsError, SignatureScheme};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::io::IsTerminal;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio_tungstenite::{
     connect_async, connect_async_tls_with_config, tungstenite::Message, Connector,
 };
 use url::{Host, Url};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// Secrets that should be redacted when printing config.
 /// Kept in sync with logging/redact.rs SECRET_KEY_NAMES.
@@ -563,6 +582,325 @@ fn is_loopback_host(host: &str) -> bool {
         .unwrap_or(false)
 }
 
+#[derive(Debug, serde::Serialize, serde::Deserialize, Zeroize, ZeroizeOnDrop)]
+struct StoredDeviceIdentity {
+    device_id: String,
+    public_key: String,
+    secret_key: String,
+}
+
+const DEVICE_IDENTITY_FILENAME: &str = "device-identity.json";
+const CONNECT_CHALLENGE_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn device_identity_path(state_dir: &Path) -> PathBuf {
+    state_dir.join(DEVICE_IDENTITY_FILENAME)
+}
+
+fn strict_device_identity_mode() -> bool {
+    env_flag_enabled("MOLTBOT_DEVICE_IDENTITY_STRICT")
+        || env_flag_enabled("CARAPACE_DEVICE_IDENTITY_STRICT")
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+async fn load_or_create_device_identity(
+    state_dir: &Path,
+) -> Result<StoredDeviceIdentity, Box<dyn std::error::Error>> {
+    std::fs::create_dir_all(state_dir)?;
+    let identity_path = device_identity_path(state_dir);
+    let strict = strict_device_identity_mode();
+
+    match credentials::read_device_identity(state_dir.to_path_buf()).await {
+        Ok(Some(data)) => {
+            let identity: StoredDeviceIdentity = serde_json::from_str(&data)?;
+            validate_device_identity(&identity)?;
+            if identity_path.exists() {
+                if let Err(err) = std::fs::remove_file(&identity_path) {
+                    eprintln!(
+                        "Warning: failed to remove legacy device identity file: {}",
+                        err
+                    );
+                }
+            }
+            return Ok(identity);
+        }
+        Ok(None) => {}
+        Err(err) => {
+            if strict && should_fallback_to_file(&err) {
+                return Err(format!(
+                    "credential store unavailable ({err}); strict device identity mode enabled"
+                )
+                .into());
+            }
+            if !should_fallback_to_file(&err) {
+                return Err(err.into());
+            }
+            warn_credential_store_fallback(&err);
+        }
+    }
+
+    if identity_path.exists() {
+        if strict {
+            return Err(format!(
+                "legacy device identity file present at {}; strict device identity mode enabled",
+                identity_path.display()
+            )
+            .into());
+        }
+        let data = std::fs::read_to_string(&identity_path)?;
+        let identity: StoredDeviceIdentity = serde_json::from_str(&data)?;
+        validate_device_identity(&identity)?;
+        if let Err(err) = credentials::write_device_identity(
+            state_dir.to_path_buf(),
+            &serde_json::to_string(&identity)?,
+        )
+        .await
+        {
+            if strict && should_fallback_to_file(&err) {
+                return Err(format!(
+                    "credential store unavailable ({err}); strict device identity mode enabled"
+                )
+                .into());
+            }
+            if !should_fallback_to_file(&err) {
+                return Err(err.into());
+            }
+            warn_credential_store_fallback(&err);
+            write_device_identity_file(&identity_path, &identity)?;
+            return Ok(identity);
+        }
+        let _ = std::fs::remove_file(&identity_path);
+        return Ok(identity);
+    }
+
+    let identity = generate_device_identity()?;
+    if let Err(err) = credentials::write_device_identity(
+        state_dir.to_path_buf(),
+        &serde_json::to_string(&identity)?,
+    )
+    .await
+    {
+        if strict && should_fallback_to_file(&err) {
+            return Err(format!(
+                "credential store unavailable ({err}); strict device identity mode enabled"
+            )
+            .into());
+        }
+        if !should_fallback_to_file(&err) {
+            return Err(err.into());
+        }
+        warn_credential_store_fallback(&err);
+        write_device_identity_file(&identity_path, &identity)?;
+    }
+    Ok(identity)
+}
+
+fn should_fallback_to_file(err: &credentials::CredentialError) -> bool {
+    matches!(
+        err,
+        credentials::CredentialError::StoreUnavailable(_)
+            | credentials::CredentialError::StoreLocked
+            | credentials::CredentialError::AccessDenied
+    )
+}
+
+fn warn_credential_store_fallback(err: &credentials::CredentialError) {
+    match err {
+        credentials::CredentialError::StoreLocked => {
+            eprintln!("Warning: credential store is locked; using legacy device identity file.");
+        }
+        credentials::CredentialError::AccessDenied => {
+            eprintln!(
+                "Warning: credential store access denied; using legacy device identity file."
+            );
+        }
+        credentials::CredentialError::StoreUnavailable(_) => {
+            eprintln!("Warning: credential store unavailable; using legacy device identity file.");
+        }
+        _ => {
+            eprintln!("Warning: credential store error; using legacy device identity file.");
+        }
+    }
+}
+
+fn write_device_identity_file(
+    path: &Path,
+    identity: &StoredDeviceIdentity,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let contents = serde_json::to_string_pretty(identity)?;
+    #[cfg(unix)]
+    {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(contents.as_bytes())?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, contents)?;
+    }
+    Ok(())
+}
+
+fn validate_device_identity(
+    identity: &StoredDeviceIdentity,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let signing_key = signing_key_from_identity(identity)?;
+    let public_key = signing_key.verifying_key().to_bytes();
+    let public_key_b64 = encode_base64_url(&public_key);
+    if public_key_b64 != identity.public_key {
+        return Err("device identity public key mismatch".into());
+    }
+    let derived_id = derive_device_id(&public_key);
+    if derived_id != identity.device_id {
+        return Err("device identity mismatch".into());
+    }
+    Ok(())
+}
+
+fn generate_device_identity() -> Result<StoredDeviceIdentity, Box<dyn std::error::Error>> {
+    let mut seed = [0u8; 32];
+    getrandom(&mut seed)?;
+    let signing_key = SigningKey::from_bytes(&seed);
+    let public_key = signing_key.verifying_key().to_bytes();
+    let device_id = derive_device_id(&public_key);
+    let secret_key = encode_base64_url(&seed);
+    seed.zeroize();
+    Ok(StoredDeviceIdentity {
+        device_id,
+        public_key: encode_base64_url(&public_key),
+        secret_key,
+    })
+}
+
+fn signing_key_from_identity(
+    identity: &StoredDeviceIdentity,
+) -> Result<SigningKey, Box<dyn std::error::Error>> {
+    let secret_raw = Zeroizing::new(decode_base64_any(&identity.secret_key)?);
+    if secret_raw.len() != 32 {
+        return Err("device identity secret key invalid".into());
+    }
+    let mut secret = [0u8; 32];
+    secret.copy_from_slice(&secret_raw);
+    let signing_key = SigningKey::from_bytes(&secret);
+    secret.zeroize();
+    Ok(signing_key)
+}
+
+fn build_device_identity_for_connect(
+    identity: &StoredDeviceIdentity,
+    client_id: &str,
+    client_mode: &str,
+    role: &str,
+    scopes: &[String],
+    token: Option<&str>,
+    nonce: Option<&str>,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let signed_at_ms = current_time_ms();
+    let payload = build_device_auth_payload(DeviceAuthPayload {
+        device_id: identity.device_id.clone(),
+        client_id: client_id.to_string(),
+        client_mode: client_mode.to_string(),
+        role: role.to_string(),
+        scopes: scopes.to_vec(),
+        signed_at_ms,
+        token: token.map(|value| value.to_string()),
+        nonce: nonce.map(|value| value.to_string()),
+    });
+    let signature = sign_device_payload(identity, &payload)?;
+    let mut device = serde_json::json!({
+        "id": identity.device_id.clone(),
+        "publicKey": identity.public_key.clone(),
+        "signature": signature,
+        "signedAt": signed_at_ms,
+    });
+    if let Some(nonce) = nonce {
+        device["nonce"] = Value::String(nonce.to_string());
+    }
+    Ok(device)
+}
+
+fn sign_device_payload(
+    identity: &StoredDeviceIdentity,
+    payload: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let signing_key = signing_key_from_identity(identity)?;
+    let signature = signing_key.sign(payload.as_bytes());
+    Ok(encode_base64_url(&signature.to_bytes()))
+}
+
+struct DeviceAuthPayload {
+    device_id: String,
+    client_id: String,
+    client_mode: String,
+    role: String,
+    scopes: Vec<String>,
+    signed_at_ms: i64,
+    token: Option<String>,
+    nonce: Option<String>,
+}
+
+fn build_device_auth_payload(params: DeviceAuthPayload) -> String {
+    let version = if params.nonce.is_some() { "v2" } else { "v1" };
+    let scopes = params.scopes.join(",");
+    let token = params.token.unwrap_or_default();
+    let mut base = vec![
+        version.to_string(),
+        params.device_id,
+        params.client_id,
+        params.client_mode,
+        params.role,
+        scopes,
+        params.signed_at_ms.to_string(),
+        token,
+    ];
+    if let Some(nonce) = params.nonce {
+        base.push(nonce);
+    }
+    base.join("|")
+}
+
+fn encode_base64_url(bytes: &[u8]) -> String {
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn decode_base64_any(input: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    if let Ok(bytes) = URL_SAFE_NO_PAD.decode(input.as_bytes()) {
+        return Ok(bytes);
+    }
+    STANDARD
+        .decode(input.as_bytes())
+        .map_err(|_| "base64 decode failed".into())
+}
+
+fn derive_device_id(public_key: &[u8]) -> String {
+    let digest = Sha256::digest(public_key);
+    hex::encode(digest)
+}
+
+fn current_time_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
 fn ws_url_from_http(url: &Url) -> Result<String, Box<dyn std::error::Error>> {
     let scheme = match url.scheme() {
         "https" => "wss",
@@ -616,6 +954,41 @@ async fn read_ws_json(
     Err("WebSocket closed".into())
 }
 
+async fn await_connect_challenge(
+    reader: &mut WsRead,
+    writer: &mut WsWrite,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let deadline = tokio::time::Instant::now() + CONNECT_CHALLENGE_TIMEOUT;
+    tokio::time::timeout_at(deadline, async {
+        loop {
+            let frame = read_ws_json(reader, writer).await?;
+            let frame_type = frame.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if frame_type == "event" {
+                let event = frame.get("event").and_then(|v| v.as_str()).unwrap_or("");
+                if event == "connect.challenge" {
+                    let nonce = frame
+                        .get("payload")
+                        .and_then(|v| v.get("nonce"))
+                        .and_then(|v| v.as_str())
+                        .ok_or("connect.challenge missing nonce")?;
+                    return Ok(nonce.to_string());
+                }
+                continue;
+            }
+            if frame_type == "res" {
+                let message = frame
+                    .get("error")
+                    .and_then(|v| v.get("message"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unexpected response before connect");
+                return Err(message.to_string().into());
+            }
+        }
+    })
+    .await
+    .map_err(|_| -> Box<dyn std::error::Error> { "connect.challenge timed out".into() })?
+}
+
 async fn await_ws_response(
     reader: &mut WsRead,
     writer: &mut WsWrite,
@@ -647,18 +1020,105 @@ async fn await_ws_response(
     }
 }
 
+#[derive(Debug)]
+struct WsError {
+    code: Option<String>,
+    message: String,
+    details: Option<Value>,
+}
+
+impl std::fmt::Display for WsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for WsError {}
+
+async fn await_ws_response_with_error(
+    reader: &mut WsRead,
+    writer: &mut WsWrite,
+    request_id: &str,
+) -> Result<Value, WsError> {
+    loop {
+        let frame = match read_ws_json(reader, writer).await {
+            Ok(frame) => frame,
+            Err(err) => {
+                return Err(WsError {
+                    code: None,
+                    message: err.to_string(),
+                    details: None,
+                });
+            }
+        };
+        let frame_type = frame.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if frame_type == "event" {
+            continue;
+        }
+        if frame_type != "res" {
+            continue;
+        }
+        let id = frame.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        if id != request_id {
+            continue;
+        }
+        let ok = frame.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+        if ok {
+            return Ok(frame.get("payload").cloned().unwrap_or(Value::Null));
+        }
+        let error = frame.get("error").cloned().unwrap_or(Value::Null);
+        let code = error
+            .get("code")
+            .and_then(|v| v.as_str())
+            .map(|v| v.to_string());
+        let message = error
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("request failed")
+            .to_string();
+        let details = error.get("details").cloned();
+        return Err(WsError {
+            code,
+            message,
+            details,
+        });
+    }
+}
+
+fn extract_pairing_request_id(details: &Value) -> Option<String> {
+    if let Some(id) = details.get("requestId").and_then(|value| value.as_str()) {
+        return Some(id.to_string());
+    }
+    details
+        .get("details")
+        .and_then(|value| value.get("requestId"))
+        .and_then(|value| value.as_str())
+        .map(|id| id.to_string())
+}
+
 pub async fn handle_logs(
     host: &str,
     port: Option<u16>,
     lines: usize,
+    tls: bool,
+    trust: bool,
+    allow_plaintext: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let port = resolve_port(port);
 
-    if !is_loopback_host(host) {
-        eprintln!("Remote logs require a paired device identity.");
-        eprintln!("The CLI logs command only supports loopback connections for now.");
-        eprintln!("Use --host 127.0.0.1 or connect via the control UI.");
+    let is_loopback = is_loopback_host(host);
+    if !is_loopback && !tls && !allow_plaintext {
+        eprintln!("Remote logs require TLS or explicit plaintext opt-in.");
+        eprintln!("Use --tls for wss:// or pass --allow-plaintext to override.");
         std::process::exit(1);
+    }
+    if !is_loopback && !tls && allow_plaintext {
+        eprintln!(
+            "Warning: using plaintext WebSocket to remote host; credentials will be sent unencrypted."
+        );
+    }
+    if trust && !tls {
+        eprintln!("Warning: --trust has no effect without --tls.");
     }
 
     let auth = resolve_gateway_auth().await;
@@ -667,8 +1127,15 @@ pub async fn handle_logs(
         eprintln!("Attempting local-direct connection (if enabled)...");
     }
 
-    let ws_url = format!("ws://{}:{}/ws", host, port);
-    let (ws_stream, _) = match connect_async(&ws_url).await {
+    let state_dir = resolve_state_dir();
+    let device_identity = load_or_create_device_identity(&state_dir).await?;
+
+    let ws_url = if tls {
+        format!("wss://{}:{}/ws", host, port)
+    } else {
+        format!("ws://{}:{}/ws", host, port)
+    };
+    let ws_stream = match connect_ws(&ws_url, trust).await {
         Ok(conn) => conn,
         Err(err) => {
             eprintln!("Could not connect to carapace at {}:{}", host, port);
@@ -680,6 +1147,10 @@ pub async fn handle_logs(
     };
     let (mut ws_write, mut ws_read) = ws_stream.split();
 
+    let nonce = await_connect_challenge(&mut ws_read, &mut ws_write).await?;
+
+    let role = "operator";
+    let scopes = vec!["operator.read".to_string()];
     let mut connect_params = serde_json::json!({
         "minProtocol": 3,
         "maxProtocol": 3,
@@ -688,13 +1159,26 @@ pub async fn handle_logs(
             "version": env!("CARGO_PKG_VERSION"),
             "platform": std::env::consts::OS,
             "mode": "cli"
-        }
+        },
+        "role": role,
+        "scopes": scopes.clone()
     });
-    if let Some(token) = auth.token {
+    let GatewayAuth { token, password } = auth;
+    let token_for_signature = token.clone();
+    if let Some(token) = token {
         connect_params["auth"] = serde_json::json!({ "token": token });
-    } else if let Some(password) = auth.password {
+    } else if let Some(password) = password {
         connect_params["auth"] = serde_json::json!({ "password": password });
     }
+    connect_params["device"] = build_device_identity_for_connect(
+        &device_identity,
+        "cli",
+        "cli",
+        role,
+        &scopes,
+        token_for_signature.as_deref(),
+        Some(&nonce),
+    )?;
 
     let connect_frame = serde_json::json!({
         "type": "req",
@@ -706,16 +1190,23 @@ pub async fn handle_logs(
         .send(Message::Text(serde_json::to_string(&connect_frame)?))
         .await?;
 
-    if let Err(err) = await_ws_response(&mut ws_read, &mut ws_write, "connect-1").await {
-        let err_msg = err.to_string();
-        if err_msg.contains("device identity required") {
-            eprintln!("WebSocket connect failed: {err_msg}");
+    if let Err(err) = await_ws_response_with_error(&mut ws_read, &mut ws_write, "connect-1").await {
+        if err.code.as_deref() == Some("NOT_PAIRED") && err.message.contains("pairing required") {
+            eprintln!("Device pairing required for this CLI.");
+            if let Some(details) = err.details.as_ref() {
+                if let Some(request_id) = extract_pairing_request_id(details) {
+                    eprintln!("Pairing request ID: {}", request_id);
+                }
+            }
+            eprintln!("Approve the request in the control UI, then retry.");
+        } else if err.message.contains("device identity required") {
+            eprintln!("WebSocket connect failed: {}", err.message);
             eprintln!("This gateway requires a paired device for WebSocket access.");
             eprintln!("Set gateway.auth.token for local CLI access or use the control UI.");
-            std::process::exit(1);
+        } else {
+            eprintln!("WebSocket connect failed: {}", err.message);
         }
-        eprintln!("WebSocket connect failed: {}", err_msg);
-        std::process::exit(1);
+        return Err(Box::new(err));
     }
 
     let logs_frame = serde_json::json!({
@@ -1355,13 +1846,6 @@ pub async fn handle_pair(
     };
 
     let ws_url = ws_url_from_http(&parsed_url)?;
-    let host = parsed_url.host_str().ok_or("missing host in gateway URL")?;
-    if !is_loopback_host(host) {
-        eprintln!("Remote pairing requires a paired device identity.");
-        eprintln!("The CLI pairing flow only supports loopback gateways for now.");
-        eprintln!("Use --host 127.0.0.1 or pair via the control UI.");
-        return Err("remote pairing requires device identity".into());
-    }
 
     if trust {
         if parsed_url.scheme() == "https" {
@@ -1381,6 +1865,9 @@ pub async fn handle_pair(
         return Err("missing gateway auth".into());
     }
 
+    let state_dir = resolve_state_dir();
+    let device_identity = load_or_create_device_identity(&state_dir).await?;
+
     println!("Pairing with: {}", parsed_url);
     println!("Device name: {}", device_name);
 
@@ -1393,6 +1880,10 @@ pub async fn handle_pair(
     };
     let (mut ws_write, mut ws_read) = ws_stream.split();
 
+    let nonce = await_connect_challenge(&mut ws_read, &mut ws_write).await?;
+
+    let role = "operator";
+    let scopes = vec!["operator.pairing".to_string()];
     let mut connect_params = serde_json::json!({
         "minProtocol": 3,
         "maxProtocol": 3,
@@ -1402,13 +1893,25 @@ pub async fn handle_pair(
             "platform": std::env::consts::OS,
             "mode": "cli"
         },
-        "scopes": ["operator.pairing"]
+        "role": role,
+        "scopes": scopes.clone()
     });
-    if let Some(token) = auth.token {
+    let GatewayAuth { token, password } = auth;
+    let token_for_signature = token.clone();
+    if let Some(token) = token {
         connect_params["auth"] = serde_json::json!({ "token": token });
-    } else if let Some(password) = auth.password {
+    } else if let Some(password) = password {
         connect_params["auth"] = serde_json::json!({ "password": password });
     }
+    connect_params["device"] = build_device_identity_for_connect(
+        &device_identity,
+        "cli",
+        "cli",
+        role,
+        &scopes,
+        token_for_signature.as_deref(),
+        Some(&nonce),
+    )?;
 
     let connect_frame = serde_json::json!({
         "type": "req",
@@ -1419,7 +1922,23 @@ pub async fn handle_pair(
     ws_write
         .send(Message::Text(serde_json::to_string(&connect_frame)?))
         .await?;
-    await_ws_response(&mut ws_read, &mut ws_write, "connect-1").await?;
+    if let Err(err) = await_ws_response_with_error(&mut ws_read, &mut ws_write, "connect-1").await {
+        if err.code.as_deref() == Some("NOT_PAIRED") && err.message.contains("pairing required") {
+            eprintln!("Device pairing required for this CLI.");
+            if let Some(details) = err.details.as_ref() {
+                if let Some(request_id) = extract_pairing_request_id(details) {
+                    eprintln!("Pairing request ID: {}", request_id);
+                }
+            }
+            eprintln!("Approve the request in the control UI, then retry.");
+        } else if err.message.contains("device identity required") {
+            eprintln!("WebSocket connect failed: {}", err.message);
+            eprintln!("This gateway requires a paired device for WebSocket access.");
+        } else {
+            eprintln!("WebSocket connect failed: {}", err.message);
+        }
+        return Err(Box::new(err));
+    }
 
     let node_id = format!("node-{}", uuid::Uuid::new_v4());
     let pair_frame = serde_json::json!({
@@ -1464,7 +1983,6 @@ pub async fn handle_pair(
     println!("Node token: {}", node_token);
 
     // Save pairing to state dir.
-    let state_dir = resolve_state_dir();
     std::fs::create_dir_all(&state_dir)?;
     let pairing_path = state_dir.join("pairing.json");
     let pairing_data = serde_json::json!({
@@ -1933,6 +2451,7 @@ pub fn handle_tls_show_ca(ca_dir_opt: Option<&str>) -> Result<(), Box<dyn std::e
 mod tests {
     use super::*;
     use clap::Parser;
+    use ed25519_dalek::{Signature, VerifyingKey};
 
     #[test]
     fn test_cli_no_args_defaults_to_none() {
@@ -2025,10 +2544,16 @@ mod tests {
                 lines,
                 port,
                 ref host,
+                tls,
+                trust,
+                allow_plaintext,
             }) => {
                 assert_eq!(lines, 50);
                 assert_eq!(port, None);
                 assert_eq!(host, "127.0.0.1");
+                assert!(!tls);
+                assert!(!trust);
+                assert!(!allow_plaintext);
             }
             other => panic!("Expected Logs, got {:?}", other),
         }
@@ -2054,6 +2579,75 @@ mod tests {
             }
             other => panic!("Expected Logs, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_device_identity_round_trip() {
+        let identity = generate_device_identity().unwrap();
+        validate_device_identity(&identity).unwrap();
+        let signing_key = signing_key_from_identity(&identity).unwrap();
+        let public_key = signing_key.verifying_key().to_bytes();
+        assert_eq!(encode_base64_url(&public_key), identity.public_key);
+    }
+
+    #[test]
+    fn test_device_auth_payload_format_v2() {
+        let payload = build_device_auth_payload(DeviceAuthPayload {
+            device_id: "device-1".to_string(),
+            client_id: "cli".to_string(),
+            client_mode: "cli".to_string(),
+            role: "operator".to_string(),
+            scopes: vec!["operator.read".to_string(), "operator.write".to_string()],
+            signed_at_ms: 1234,
+            token: Some("tok".to_string()),
+            nonce: Some("nonce-1".to_string()),
+        });
+        assert_eq!(
+            payload,
+            "v2|device-1|cli|cli|operator|operator.read,operator.write|1234|tok|nonce-1"
+        );
+    }
+
+    #[test]
+    fn test_device_signature_verifies() {
+        let identity = generate_device_identity().unwrap();
+        let payload = build_device_auth_payload(DeviceAuthPayload {
+            device_id: identity.device_id.clone(),
+            client_id: "cli".to_string(),
+            client_mode: "cli".to_string(),
+            role: "operator".to_string(),
+            scopes: vec!["operator.read".to_string()],
+            signed_at_ms: 42,
+            token: Some("tok".to_string()),
+            nonce: Some("nonce".to_string()),
+        });
+        let signature = sign_device_payload(&identity, &payload).unwrap();
+        let public_key_raw = decode_base64_any(&identity.public_key).unwrap();
+        let sig_raw = decode_base64_any(&signature).unwrap();
+        let pubkey_bytes: [u8; 32] = public_key_raw.as_slice().try_into().unwrap();
+        let sig_bytes: [u8; 64] = sig_raw.as_slice().try_into().unwrap();
+        let verifying_key = VerifyingKey::from_bytes(&pubkey_bytes).unwrap();
+        let sig = Signature::from_bytes(&sig_bytes);
+        verifying_key
+            .verify_strict(payload.as_bytes(), &sig)
+            .unwrap();
+    }
+
+    #[test]
+    fn test_decode_base64_any_accepts_urlsafe_and_standard() {
+        let bytes = b"hello-world";
+        let urlsafe = URL_SAFE_NO_PAD.encode(bytes);
+        let standard = STANDARD.encode(bytes);
+        assert_eq!(decode_base64_any(&urlsafe).unwrap(), bytes);
+        assert_eq!(decode_base64_any(&standard).unwrap(), bytes);
+    }
+
+    #[test]
+    fn test_extract_pairing_request_id() {
+        let direct = serde_json::json!({ "requestId": "abc" });
+        let nested = serde_json::json!({ "details": { "requestId": "xyz" } });
+        assert_eq!(extract_pairing_request_id(&direct), Some("abc".to_string()));
+        assert_eq!(extract_pairing_request_id(&nested), Some("xyz".to_string()));
     }
 
     #[test]

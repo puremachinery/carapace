@@ -244,6 +244,22 @@ pub async fn read_gateway_auth(state_dir: PathBuf) -> Result<GatewayAuthSecrets,
     Ok(GatewayAuthSecrets { token, password })
 }
 
+/// Read CLI device identity (JSON) from the credential store.
+pub async fn read_device_identity(state_dir: PathBuf) -> Result<Option<String>, CredentialError> {
+    let backend = default_backend();
+    let store = CredentialStore::new(backend, state_dir).await?;
+    let key = CredentialKey::new("device", "cli", "identity");
+    store.get(&key).await
+}
+
+/// Write CLI device identity (JSON) to the credential store.
+pub async fn write_device_identity(state_dir: PathBuf, value: &str) -> Result<(), CredentialError> {
+    let backend = default_backend();
+    let store = CredentialStore::new(backend, state_dir).await?;
+    let key = CredentialKey::new("device", "cli", "identity");
+    store.set(&key, value, None).await
+}
+
 #[cfg(target_os = "macos")]
 fn default_backend() -> macos::MacOsCredentialBackend {
     macos::MacOsCredentialBackend::new()
