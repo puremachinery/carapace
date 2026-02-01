@@ -178,7 +178,7 @@ feature_inventory_markdown: |
   - [x] **Node token generation** — SHA-256 hashed
   - [x] **Token expiry** — 30 days
   - [x] **Quotas** — 100 nodes, 50 pending, 500 tokens (with LRU eviction)
-  - [~] **Capabilities and permissions** — per-node feature negotiation
+  - [x] **Capabilities and permissions** — per-node feature negotiation + runtime enforcement
   - [x] **Repair flow** — preserves created_at on re-pairing
 
   ### Plugins (`src/plugins/`)

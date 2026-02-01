@@ -648,6 +648,92 @@ fn validate_node_invoke_params(params: &Value) -> Result<NodeInvokeParams<'_>, E
     })
 }
 
+fn required_permission_for_command(command: &str) -> Option<&'static str> {
+    if command.starts_with("camera.") {
+        return Some("camera");
+    }
+    if command.starts_with("screen.") {
+        return Some("screen");
+    }
+    if command.starts_with("location.") {
+        return Some("location");
+    }
+    if command.starts_with("sms.") {
+        return Some("sms");
+    }
+    if command.starts_with("file.") {
+        return Some("filesystem");
+    }
+    if command == "system.notify" {
+        return Some("notification");
+    }
+    if command.starts_with("system.") {
+        return Some("exec");
+    }
+    if command.starts_with("browser.") {
+        return Some("browser");
+    }
+    None
+}
+
+fn required_capability_for_command(command: &str) -> Option<&'static str> {
+    if command.starts_with("camera.") {
+        return Some("camera");
+    }
+    if command.starts_with("screen.") {
+        return Some("screen");
+    }
+    if command.starts_with("location.") {
+        return Some("location");
+    }
+    if command.starts_with("sms.") {
+        return Some("sms");
+    }
+    None
+}
+
+fn permission_value(map: &HashMap<String, bool>, key: &str) -> Option<bool> {
+    if let Some(value) = map.get(key) {
+        return Some(*value);
+    }
+    map.iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(key))
+        .map(|(_, v)| *v)
+}
+
+fn permissions_allow(
+    key: &str,
+    live: Option<&HashMap<String, bool>>,
+    paired: Option<&HashMap<String, bool>>,
+) -> bool {
+    if let Some(map) = paired.filter(|m| !m.is_empty()) {
+        if let Some(value) = permission_value(map, key) {
+            if !value {
+                return false;
+            }
+        }
+    }
+    if let Some(map) = live.filter(|m| !m.is_empty()) {
+        if let Some(value) = permission_value(map, key) {
+            if !value {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn caps_allow(key: &str, live: &[String], paired: Option<&Vec<String>>) -> bool {
+    let effective = if !live.is_empty() {
+        live
+    } else if let Some(paired) = paired.filter(|caps| !caps.is_empty()) {
+        paired
+    } else {
+        return true;
+    };
+    effective.iter().any(|cap| cap.eq_ignore_ascii_case(key))
+}
+
 /// Verify the target node is connected and the command is in the node's allowlist.
 /// Returns the connection ID on success.
 fn validate_node_command(
@@ -655,7 +741,7 @@ fn validate_node_command(
     command: &str,
     state: &WsServerState,
 ) -> Result<String, ErrorShape> {
-    let (conn_id, commands) = {
+    let (conn_id, commands, live_caps, live_permissions) = {
         let registry = state.node_registry.lock();
         let node = registry.get(node_id).ok_or_else(|| {
             error_shape(
@@ -666,7 +752,12 @@ fn validate_node_command(
                 })),
             )
         })?;
-        (node.conn_id.clone(), node.commands.clone())
+        (
+            node.conn_id.clone(),
+            node.commands.clone(),
+            node.caps.clone(),
+            node.permissions.clone(),
+        )
     };
 
     if commands.is_empty() {
@@ -682,6 +773,40 @@ fn validate_node_command(
             "command not allowlisted",
             Some(json!({ "nodeId": node_id, "command": command })),
         ));
+    }
+
+    if let Some(permission_key) = required_permission_for_command(command) {
+        let paired = state.node_pairing.get_paired_node(node_id);
+        let paired_permissions = paired.as_ref().and_then(|n| n.permissions.as_ref());
+        if !permissions_allow(
+            permission_key,
+            live_permissions.as_ref(),
+            paired_permissions,
+        ) {
+            return Err(error_shape(
+                ERROR_INVALID_REQUEST,
+                "node permission denied",
+                Some(json!({
+                    "nodeId": node_id,
+                    "command": command,
+                    "requiredPermission": permission_key
+                })),
+            ));
+        }
+    }
+    if let Some(capability_key) = required_capability_for_command(command) {
+        let paired = state.node_pairing.get_paired_node(node_id);
+        if !caps_allow(capability_key, &live_caps, paired.as_ref().map(|n| &n.caps)) {
+            return Err(error_shape(
+                ERROR_INVALID_REQUEST,
+                "node capability missing",
+                Some(json!({
+                    "nodeId": node_id,
+                    "command": command,
+                    "requiredCapability": capability_key
+                })),
+            ));
+        }
     }
 
     Ok(conn_id)

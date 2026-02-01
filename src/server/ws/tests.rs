@@ -130,6 +130,251 @@ async fn test_handle_node_invoke_enforces_allowlist() {
     assert_eq!(err.code, ERROR_INVALID_REQUEST);
 }
 
+#[tokio::test]
+async fn test_handle_node_invoke_allows_unmapped_commands() {
+    let state = Arc::new(WsServerState::new(WsServerConfig::default()));
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let node_conn = ConnectionContext {
+        conn_id: "conn-2".to_string(),
+        role: "node".to_string(),
+        scopes: vec![],
+        client: ClientInfo {
+            id: "node-2".to_string(),
+            version: "1.0".to_string(),
+            platform: "test".to_string(),
+            mode: "test".to_string(),
+            display_name: None,
+            device_family: None,
+            model_identifier: None,
+            instance_id: None,
+        },
+        device_id: Some("node-2".to_string()),
+    };
+    state.register_connection(&node_conn, tx, None);
+    {
+        let mut registry = state.node_registry.lock();
+        registry.register(NodeSession {
+            node_id: "node-2".to_string(),
+            conn_id: "conn-2".to_string(),
+            display_name: None,
+            platform: Some("test".to_string()),
+            version: Some("1.0".to_string()),
+            device_family: None,
+            model_identifier: None,
+            remote_ip: None,
+            caps: vec![],
+            commands: HashSet::from(["custom.action".to_string()]),
+            permissions: None,
+            path_env: None,
+            connected_at_ms: now_ms(),
+        });
+    }
+
+    let outcome = state
+        .node_pairing
+        .request_pairing_with_status(
+            "node-2".to_string(),
+            None,
+            vec!["custom.action".to_string()],
+            None,
+            None,
+        )
+        .unwrap();
+    let _ = state
+        .node_pairing
+        .approve_request(&outcome.request.request_id)
+        .unwrap();
+
+    let node_state = Arc::clone(&state);
+    let node_conn = node_conn.clone();
+    let responder = tokio::spawn(async move {
+        if let Some(Message::Text(text)) = rx.recv().await {
+            let value: Value = serde_json::from_str(&text).unwrap();
+            let invoke_id = value
+                .get("payload")
+                .and_then(|v| v.get("id"))
+                .and_then(|v| v.as_str())
+                .unwrap()
+                .to_string();
+            let params = json!({
+                "id": invoke_id,
+                "nodeId": "node-2",
+                "ok": true,
+                "payload": { "ok": true }
+            });
+            let _ = handle_node_invoke_result(Some(&params), node_state.as_ref(), &node_conn);
+        }
+    });
+
+    let ok_params = json!({
+        "nodeId": "node-2",
+        "command": "custom.action",
+        "idempotencyKey": "req-custom-1"
+    });
+    assert!(handle_node_invoke(Some(&ok_params), state.as_ref())
+        .await
+        .is_ok());
+    let _ = responder.await;
+}
+
+#[tokio::test]
+async fn test_handle_node_invoke_allows_missing_paired_permission_key() {
+    let state = Arc::new(WsServerState::new(WsServerConfig::default()));
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let node_conn = ConnectionContext {
+        conn_id: "conn-3".to_string(),
+        role: "node".to_string(),
+        scopes: vec![],
+        client: ClientInfo {
+            id: "node-3".to_string(),
+            version: "1.0".to_string(),
+            platform: "test".to_string(),
+            mode: "test".to_string(),
+            display_name: None,
+            device_family: None,
+            model_identifier: None,
+            instance_id: None,
+        },
+        device_id: Some("node-3".to_string()),
+    };
+    state.register_connection(&node_conn, tx, None);
+    {
+        let mut registry = state.node_registry.lock();
+        registry.register(NodeSession {
+            node_id: "node-3".to_string(),
+            conn_id: "conn-3".to_string(),
+            display_name: None,
+            platform: Some("test".to_string()),
+            version: Some("1.0".to_string()),
+            device_family: None,
+            model_identifier: None,
+            remote_ip: None,
+            caps: vec![],
+            commands: HashSet::from(["system.run".to_string()]),
+            permissions: None,
+            path_env: None,
+            connected_at_ms: now_ms(),
+        });
+    }
+
+    let builder = crate::nodes::NodePairingRequestBuilder {
+        node_id: "node-3".to_string(),
+        commands: vec!["system.run".to_string()],
+        permissions: Some(HashMap::from([("camera".to_string(), true)])),
+        ..Default::default()
+    };
+    let outcome = state
+        .node_pairing
+        .request_pairing_with_builder(builder)
+        .unwrap();
+    let request_id = outcome.request.request_id.clone();
+    let _ = state.node_pairing.approve_request(&request_id).unwrap();
+
+    let node_state = Arc::clone(&state);
+    let node_conn = node_conn.clone();
+    let responder = tokio::spawn(async move {
+        if let Some(Message::Text(text)) = rx.recv().await {
+            let value: Value = serde_json::from_str(&text).unwrap();
+            let invoke_id = value
+                .get("payload")
+                .and_then(|v| v.get("id"))
+                .and_then(|v| v.as_str())
+                .unwrap()
+                .to_string();
+            let params = json!({
+                "id": invoke_id,
+                "nodeId": "node-3",
+                "ok": true,
+                "payload": { "ok": true }
+            });
+            let _ = handle_node_invoke_result(Some(&params), node_state.as_ref(), &node_conn);
+        }
+    });
+
+    let ok_params = json!({
+        "nodeId": "node-3",
+        "command": "system.run",
+        "idempotencyKey": "req-missing-perm-1"
+    });
+    assert!(handle_node_invoke(Some(&ok_params), state.as_ref())
+        .await
+        .is_ok());
+    let _ = responder.await;
+}
+
+#[tokio::test]
+async fn test_handle_node_invoke_enforces_permissions() {
+    let state = Arc::new(WsServerState::new(WsServerConfig::default()));
+    {
+        let mut registry = state.node_registry.lock();
+        let mut permissions = HashMap::new();
+        permissions.insert("camera".to_string(), false);
+        permissions.insert("exec".to_string(), true);
+        registry.register(NodeSession {
+            node_id: "node-perms".to_string(),
+            conn_id: "conn-perms".to_string(),
+            display_name: None,
+            platform: Some("test".to_string()),
+            version: Some("1.0".to_string()),
+            device_family: None,
+            model_identifier: None,
+            remote_ip: None,
+            caps: vec!["camera".to_string(), "exec".to_string()],
+            commands: HashSet::from(["camera.snap".to_string(), "system.run".to_string()]),
+            permissions: Some(permissions),
+            path_env: None,
+            connected_at_ms: now_ms(),
+        });
+    }
+
+    let params = json!({
+        "nodeId": "node-perms",
+        "command": "camera.snap",
+        "idempotencyKey": "req-perms-1"
+    });
+    let err = handle_node_invoke(Some(&params), state.as_ref())
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, ERROR_INVALID_REQUEST);
+    assert_eq!(err.message, "node permission denied");
+}
+
+#[tokio::test]
+async fn test_handle_node_invoke_enforces_caps() {
+    let state = Arc::new(WsServerState::new(WsServerConfig::default()));
+    {
+        let mut registry = state.node_registry.lock();
+        let mut permissions = HashMap::new();
+        permissions.insert("camera".to_string(), true);
+        registry.register(NodeSession {
+            node_id: "node-caps".to_string(),
+            conn_id: "conn-caps".to_string(),
+            display_name: None,
+            platform: Some("test".to_string()),
+            version: Some("1.0".to_string()),
+            device_family: None,
+            model_identifier: None,
+            remote_ip: None,
+            caps: vec!["location".to_string()],
+            commands: HashSet::from(["camera.snap".to_string()]),
+            permissions: Some(permissions),
+            path_env: None,
+            connected_at_ms: now_ms(),
+        });
+    }
+
+    let params = json!({
+        "nodeId": "node-caps",
+        "command": "camera.snap",
+        "idempotencyKey": "req-caps-1"
+    });
+    let err = handle_node_invoke(Some(&params), state.as_ref())
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, ERROR_INVALID_REQUEST);
+    assert_eq!(err.message, "node capability missing");
+}
+
 #[test]
 fn test_normalize_platform_id() {
     assert_eq!(normalize_platform_id(Some("Darwin"), None), "macos");

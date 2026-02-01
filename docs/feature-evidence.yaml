@@ -565,14 +565,15 @@ features:
       - "src/nodes/mod.rs::test_paired_node_limit_evicts_oldest"
 
   - feature: "nodes.capabilities and permissions"
-    status: "partial"
+    status: "verified_done"
     runtime_wiring:
       - "src/nodes/mod.rs (caps + permissions fields stored on requests/paired nodes)"
-      - "src/server/ws/handlers/node.rs (caps/permissions surfaced in responses)"
+      - "src/server/ws/handlers/node.rs (caps/permissions enforced for node.invoke)"
     tests:
       - "src/nodes/mod.rs::test_extended_fields_carried_to_paired_node"
-    notes:
-      - "No enforcement/negotiation logic uses caps/permissions for access control"
+      - "src/server/ws/tests.rs::test_handle_node_invoke_enforces_permissions"
+      - "src/server/ws/tests.rs::test_handle_node_invoke_enforces_caps"
+      - "src/server/ws/tests.rs::test_handle_node_invoke_allows_missing_paired_permission_key"
 
   - feature: "nodes.repair flow"
     status: "verified_done"
