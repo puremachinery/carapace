@@ -55,7 +55,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         Some(Command::Status { port, host }) => cli::handle_status(&host, port).await,
 
-        Some(Command::Logs { lines, port, host }) => cli::handle_logs(&host, port, lines).await,
+        Some(Command::Logs {
+            lines,
+            port,
+            host,
+            tls,
+            trust,
+            allow_plaintext,
+        }) => cli::handle_logs(&host, port, lines, tls, trust, allow_plaintext).await,
 
         Some(Command::Version) => {
             cli::handle_version();

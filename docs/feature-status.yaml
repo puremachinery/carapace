@@ -64,7 +64,7 @@ feature_inventory_markdown: |
   - [x] **restore** — extract backup with path traversal protection
   - [x] **reset** — clear sessions/cron/usage/memory
   - [x] **setup** — interactive configuration wizard
-  - [~] **pair** — device pairing initiation (CLI loopback-only until device identity support)
+  - [x] **pair** — device identity handshake + node pairing initiation (remote gateways supported)
   - [x] **update** — version check and self-update
   - [x] **tls init-ca / issue-cert / revoke-cert / show-ca** — cluster CA management
 
