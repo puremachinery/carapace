@@ -231,7 +231,7 @@ feature_inventory_markdown: |
   - [s] **talk.devices** — stub: returns hardcoded device list
   - [s] **tts.stop** — stub: returns stopped=true without stopping
   - [s] **voicewake.test** — stub: returns hardcoded detection=false
-  - [~] **wizard** — framework works, collected config not applied
+  - [x] **wizard** — setup/channel/agent wizards apply config
 
   ### Sessions (`src/sessions/`)
 

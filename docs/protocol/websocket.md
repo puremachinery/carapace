@@ -250,8 +250,10 @@ Compatibility aliases:
 ### Wizard
 - `wizard.start` - Start onboarding wizard
 - `wizard.next` - Advance wizard step
+- `wizard.back` - Return to previous wizard step
 - `wizard.cancel` - Cancel wizard
 - `wizard.status` - Get wizard status
+- `wizard.list` - List active wizards
 
 ### Talk Mode
 - `talk.mode` - Set talk mode (off, push-to-talk, voice-activated, continuous)

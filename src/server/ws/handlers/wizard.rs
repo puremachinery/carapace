@@ -4,6 +4,7 @@
 //! and other system components.
 
 use parking_lot::RwLock;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -12,6 +13,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 use super::super::*;
+use super::config::{map_validation_issues, read_config_snapshot, write_config_file};
+use crate::config;
 
 /// Available wizard types
 pub const WIZARD_TYPES: [&str; 6] = [
@@ -148,6 +151,7 @@ impl WizardManager {
         if let Some(wizard) = self.wizards.get_mut(id) {
             wizard.cancelled = true;
             wizard.last_activity = now_ms();
+            wizard.data.clear();
             Some(wizard.clone())
         } else {
             None
@@ -335,9 +339,302 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+fn set_value_at_path(root: &mut Value, path: &str, value: Value) {
+    let parts: Vec<&str> = path.split('.').collect();
+    let mut current = root;
+
+    for (i, part) in parts.iter().enumerate() {
+        if i == parts.len() - 1 {
+            if let Value::Object(map) = current {
+                map.insert(part.to_string(), value);
+            }
+            return;
+        }
+
+        if !current.get(*part).is_some_and(|v| v.is_object()) {
+            if let Value::Object(map) = current {
+                map.insert(part.to_string(), Value::Object(serde_json::Map::new()));
+            }
+        }
+        current = current.get_mut(*part).expect("just inserted");
+    }
+}
+
+fn normalize_string(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+fn validate_step_input(step: &WizardStep, input: Option<&Value>) -> Result<(), ErrorShape> {
+    if step.required && input.is_none() {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            "input is required for this step",
+            None,
+        ));
+    }
+
+    let Some(input) = input else {
+        return Ok(());
+    };
+
+    match step.input_type.as_str() {
+        "confirm" => {
+            if !input.is_boolean() {
+                return Err(error_shape(
+                    ERROR_INVALID_REQUEST,
+                    "confirm input must be a boolean",
+                    None,
+                ));
+            }
+        }
+        "select" => {
+            let Some(selection) = input.as_str() else {
+                return Err(error_shape(
+                    ERROR_INVALID_REQUEST,
+                    "select input must be a string",
+                    None,
+                ));
+            };
+            if let Some(options) = &step.options {
+                if !options.iter().any(|option| option.value == selection) {
+                    return Err(error_shape(
+                        ERROR_INVALID_REQUEST,
+                        "input is not a valid option",
+                        None,
+                    ));
+                }
+            }
+        }
+        _ => {
+            let Some(value) = input.as_str() else {
+                return Err(error_shape(
+                    ERROR_INVALID_REQUEST,
+                    "input must be a string",
+                    None,
+                ));
+            };
+
+            if let Some(validation) = &step.validation {
+                if let Some(min) = validation.min_length {
+                    if value.len() < min {
+                        return Err(error_shape(
+                            ERROR_INVALID_REQUEST,
+                            "input is shorter than the minimum length",
+                            None,
+                        ));
+                    }
+                }
+                if let Some(max) = validation.max_length {
+                    if value.len() > max {
+                        return Err(error_shape(
+                            ERROR_INVALID_REQUEST,
+                            "input exceeds the maximum length",
+                            None,
+                        ));
+                    }
+                }
+                if let Some(pattern) = &validation.pattern {
+                    let regex = Regex::new(pattern).map_err(|err| {
+                        error_shape(
+                            ERROR_INVALID_REQUEST,
+                            &format!("invalid validation pattern: {}", err),
+                            None,
+                        )
+                    })?;
+                    if !regex.is_match(value) {
+                        return Err(error_shape(
+                            ERROR_INVALID_REQUEST,
+                            "input does not match the required pattern",
+                            None,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn require_wizard_string(
+    data: &HashMap<String, Value>,
+    key: &str,
+    label: &str,
+) -> Result<String, ErrorShape> {
+    data.get(key).and_then(normalize_string).ok_or_else(|| {
+        error_shape(
+            ERROR_INVALID_REQUEST,
+            &format!("{} is required", label),
+            None,
+        )
+    })
+}
+
+fn apply_agent_wizard(config_value: &mut Value, name: Option<&str>, description: Option<&str>) {
+    let Value::Object(root) = config_value else {
+        return;
+    };
+
+    let agents = root
+        .entry("agents")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if !agents.is_object() {
+        *agents = Value::Object(serde_json::Map::new());
+    }
+    let agents_map = agents.as_object_mut().expect("just ensured object");
+    let list_value = agents_map
+        .entry("list")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if !list_value.is_array() {
+        *list_value = Value::Array(Vec::new());
+    }
+    let list = list_value.as_array_mut().expect("just ensured array");
+
+    let mut target_index = list
+        .iter()
+        .position(|agent| {
+            agent
+                .get("default")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
+        .or_else(|| {
+            list.iter()
+                .position(|agent| agent.get("id").and_then(Value::as_str) == Some("default"))
+        });
+
+    if target_index.is_none() {
+        if list.is_empty() {
+            list.push(json!({
+                "id": "default",
+                "default": true,
+                "identity": {}
+            }));
+            target_index = Some(0);
+        } else {
+            target_index = Some(0);
+        }
+    }
+
+    let Some(index) = target_index else {
+        return;
+    };
+
+    let agent = &mut list[index];
+    if !agent.is_object() {
+        *agent = Value::Object(serde_json::Map::new());
+    }
+    let agent_map = agent.as_object_mut().expect("just ensured object");
+    let identity = agent_map
+        .entry("identity")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if !identity.is_object() {
+        *identity = Value::Object(serde_json::Map::new());
+    }
+    let identity_map = identity.as_object_mut().expect("just ensured object");
+    if let Some(name) = name {
+        identity_map.insert("name".to_string(), Value::String(name.to_string()));
+    }
+    if let Some(description) = description {
+        identity_map.insert(
+            "description".to_string(),
+            Value::String(description.to_string()),
+        );
+    }
+}
+
+fn apply_wizard_config(
+    wizard_type: &str,
+    data: &HashMap<String, Value>,
+    config_value: &mut Value,
+) -> Result<bool, ErrorShape> {
+    if !config_value.is_object() {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            "config root must be an object",
+            None,
+        ));
+    }
+
+    match wizard_type {
+        "setup" => {
+            let provider = require_wizard_string(data, "provider", "provider")?;
+            let api_key = require_wizard_string(data, "api_key", "api_key")?;
+            match provider.as_str() {
+                "anthropic" => set_value_at_path(config_value, "anthropic.apiKey", json!(api_key)),
+                "openai" => set_value_at_path(config_value, "openai.apiKey", json!(api_key)),
+                _ => return Err(error_shape(ERROR_INVALID_REQUEST, "unknown provider", None)),
+            }
+            Ok(true)
+        }
+        "channel" => {
+            let channel = require_wizard_string(data, "channel_type", "channel_type")?;
+            let token = require_wizard_string(data, "channel_token", "channel_token")?;
+            match channel.as_str() {
+                "telegram" => {
+                    set_value_at_path(config_value, "telegram.botToken", json!(token));
+                    set_value_at_path(config_value, "telegram.enabled", json!(true));
+                }
+                "discord" => {
+                    set_value_at_path(config_value, "discord.botToken", json!(token));
+                    set_value_at_path(config_value, "discord.enabled", json!(true));
+                }
+                "slack" => {
+                    set_value_at_path(config_value, "slack.botToken", json!(token));
+                    set_value_at_path(config_value, "slack.enabled", json!(true));
+                }
+                _ => {
+                    return Err(error_shape(
+                        ERROR_INVALID_REQUEST,
+                        "unknown channel type",
+                        None,
+                    ))
+                }
+            }
+            Ok(true)
+        }
+        "agent" => {
+            let name = data.get("agent_name").and_then(normalize_string);
+            let description = data.get("agent_personality").and_then(normalize_string);
+            apply_agent_wizard(config_value, name.as_deref(), description.as_deref());
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn persist_wizard_config(
+    wizard_type: &str,
+    data: &HashMap<String, Value>,
+) -> Result<Option<String>, ErrorShape> {
+    let snapshot = read_config_snapshot();
+    let mut config_value = snapshot.config.clone();
+    let applied = apply_wizard_config(wizard_type, data, &mut config_value)?;
+
+    if !applied {
+        return Ok(None);
+    }
+
+    let issues = map_validation_issues(config::validate_config(&config_value));
+    if !issues.is_empty() {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            "invalid config",
+            Some(json!({ "issues": issues })),
+        ));
+    }
+
+    let path = config::get_config_path();
+    write_config_file(&path, &config_value)?;
+    Ok(Some(path.display().to_string()))
+}
+
 /// Start a new wizard
 pub(super) fn handle_wizard_start(params: Option<&Value>) -> Result<Value, ErrorShape> {
-    tracing::debug!("wizard.start: stub response");
     let wizard_type = params
         .and_then(|v| v.get("type"))
         .and_then(|v| v.as_str())
@@ -374,7 +671,6 @@ pub(super) fn handle_wizard_start(params: Option<&Value>) -> Result<Value, Error
     let current_step = session.steps.first().cloned();
 
     Ok(json!({
-        "stub": true,
         "ok": true,
         "wizardId": session.id,
         "type": session.wizard_type,
@@ -387,7 +683,6 @@ pub(super) fn handle_wizard_start(params: Option<&Value>) -> Result<Value, Error
 
 /// Advance to the next wizard step
 pub(super) fn handle_wizard_next(params: Option<&Value>) -> Result<Value, ErrorShape> {
-    tracing::debug!("wizard.next: stub response");
     let wizard_id = params
         .and_then(|v| v.get("wizardId"))
         .and_then(|v| v.as_str())
@@ -395,82 +690,86 @@ pub(super) fn handle_wizard_next(params: Option<&Value>) -> Result<Value, ErrorS
 
     let input = params.and_then(|v| v.get("input")).cloned();
 
-    let mut manager = WIZARD_STATE.write();
-    let wizard = manager
-        .get_wizard_mut(wizard_id)
-        .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "wizard not found", None))?;
+    let (wizard_type, wizard_data, total_steps, next_step) = {
+        let mut manager = WIZARD_STATE.write();
+        let wizard = manager
+            .get_wizard_mut(wizard_id)
+            .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "wizard not found", None))?;
 
-    if wizard.complete {
-        return Err(error_shape(
-            ERROR_INVALID_REQUEST,
-            "wizard is already complete",
-            None,
-        ));
-    }
-
-    if wizard.cancelled {
-        return Err(error_shape(
-            ERROR_INVALID_REQUEST,
-            "wizard was cancelled",
-            None,
-        ));
-    }
-
-    // Validate and store current step input
-    if let Some(current_step) = wizard.steps.get(wizard.current_step) {
-        let step_id = current_step.id.clone();
-
-        // Check if required input is provided
-        if current_step.required && input.is_none() {
+        if wizard.complete {
             return Err(error_shape(
                 ERROR_INVALID_REQUEST,
-                "input is required for this step",
+                "wizard is already complete",
                 None,
             ));
         }
 
-        // Store the input
-        if let Some(value) = input {
-            wizard.data.insert(step_id, value);
+        if wizard.cancelled {
+            return Err(error_shape(
+                ERROR_INVALID_REQUEST,
+                "wizard was cancelled",
+                None,
+            ));
+        }
+
+        // Validate and store current step input
+        if let Some(current_step) = wizard.steps.get(wizard.current_step) {
+            validate_step_input(current_step, input.as_ref())?;
+            let step_id = current_step.id.clone();
+            if let Some(value) = input {
+                wizard.data.insert(step_id, value);
+            }
+        }
+
+        wizard.last_activity = now_ms();
+        let next_step = wizard.current_step + 1;
+
+        if next_step < wizard.total_steps {
+            wizard.current_step = next_step;
+            let current_step = wizard.steps.get(wizard.current_step).cloned();
+            return Ok(json!({
+                "ok": true,
+                "wizardId": wizard.id,
+                "step": wizard.current_step,
+                "totalSteps": wizard.total_steps,
+                "currentStep": current_step,
+                "complete": false
+            }));
+        }
+
+        (
+            wizard.wizard_type.clone(),
+            wizard.data.clone(),
+            wizard.total_steps,
+            next_step,
+        )
+    };
+
+    let applied_path = persist_wizard_config(&wizard_type, &wizard_data)?;
+
+    {
+        let mut manager = WIZARD_STATE.write();
+        if let Some(wizard) = manager.get_wizard_mut(wizard_id) {
+            wizard.complete = true;
+            wizard.current_step = next_step;
+            wizard.data.clear();
+            wizard.last_activity = now_ms();
         }
     }
 
-    wizard.last_activity = now_ms();
-
-    // Advance to next step
-    wizard.current_step += 1;
-
-    // Check if wizard is complete
-    if wizard.current_step >= wizard.total_steps {
-        wizard.complete = true;
-        let result = json!({
-            "stub": true,
-            "ok": true,
-            "wizardId": wizard.id,
-            "step": wizard.current_step,
-            "totalSteps": wizard.total_steps,
-            "complete": true,
-            "data": wizard.data
-        });
-        return Ok(result);
-    }
-
-    let current_step = wizard.steps.get(wizard.current_step).cloned();
-
     Ok(json!({
-        "stub": true,
         "ok": true,
-        "wizardId": wizard.id,
-        "step": wizard.current_step,
-        "totalSteps": wizard.total_steps,
-        "currentStep": current_step,
-        "complete": false
+        "wizardId": wizard_id,
+        "step": next_step,
+        "totalSteps": total_steps,
+        "complete": true,
+        "applied": applied_path.is_some(),
+        "configPath": applied_path
     }))
 }
 
 /// Go back to the previous wizard step
 pub(super) fn handle_wizard_back(params: Option<&Value>) -> Result<Value, ErrorShape> {
-    tracing::debug!("wizard.back: stub response");
     let wizard_id = params
         .and_then(|v| v.get("wizardId"))
         .and_then(|v| v.as_str())
@@ -497,7 +796,6 @@ pub(super) fn handle_wizard_back(params: Option<&Value>) -> Result<Value, ErrorS
     let previous_input = step_id.and_then(|id| wizard.data.get(&id).cloned());
 
     Ok(json!({
-        "stub": true,
         "ok": true,
         "wizardId": wizard.id,
         "step": wizard.current_step,
@@ -510,7 +808,6 @@ pub(super) fn handle_wizard_back(params: Option<&Value>) -> Result<Value, ErrorS
 
 /// Cancel an active wizard
 pub(super) fn handle_wizard_cancel(params: Option<&Value>) -> Result<Value, ErrorShape> {
-    tracing::debug!("wizard.cancel: stub response");
     let wizard_id = params
         .and_then(|v| v.get("wizardId"))
         .and_then(|v| v.as_str());
@@ -528,7 +825,6 @@ pub(super) fn handle_wizard_cancel(params: Option<&Value>) -> Result<Value, Erro
     if let Some(id) = id_to_cancel {
         if let Some(wizard) = manager.cancel_wizard(&id) {
             return Ok(json!({
-                "stub": true,
                 "ok": true,
                 "cancelled": true,
                 "wizardId": wizard.id,
@@ -538,7 +834,6 @@ pub(super) fn handle_wizard_cancel(params: Option<&Value>) -> Result<Value, Erro
     }
 
     Ok(json!({
-        "stub": true,
         "ok": true,
         "cancelled": false,
         "reason": "no active wizard"
@@ -731,5 +1026,63 @@ mod tests {
         // List wizards
         let result = handle_wizard_list().unwrap();
         assert_eq!(result["count"], 1);
+    }
+
+    #[test]
+    fn test_apply_setup_wizard_updates_config() {
+        let mut data = HashMap::new();
+        data.insert("provider".to_string(), json!("anthropic"));
+        data.insert("api_key".to_string(), json!("sk-test"));
+        let mut config_value = json!({});
+
+        let applied = apply_wizard_config("setup", &data, &mut config_value).unwrap();
+        assert!(applied);
+        assert_eq!(
+            config_value["anthropic"]["apiKey"],
+            Value::String("sk-test".to_string())
+        );
+    }
+
+    #[test]
+    fn test_apply_channel_wizard_updates_config() {
+        let mut data = HashMap::new();
+        data.insert("channel_type".to_string(), json!("telegram"));
+        data.insert("channel_token".to_string(), json!("bot:token"));
+        let mut config_value = json!({});
+
+        let applied = apply_wizard_config("channel", &data, &mut config_value).unwrap();
+        assert!(applied);
+        assert_eq!(
+            config_value["telegram"]["botToken"],
+            Value::String("bot:token".to_string())
+        );
+        assert_eq!(config_value["telegram"]["enabled"], Value::Bool(true));
+    }
+
+    #[test]
+    fn test_apply_agent_wizard_updates_identity() {
+        let mut data = HashMap::new();
+        data.insert("agent_name".to_string(), json!("Nova"));
+        data.insert("agent_personality".to_string(), json!("Helpful and calm."));
+        let mut config_value = json!({
+            "agents": {
+                "list": [{
+                    "id": "default",
+                    "default": true,
+                    "identity": { "name": "Old" }
+                }]
+            }
+        });
+
+        let applied = apply_wizard_config("agent", &data, &mut config_value).unwrap();
+        assert!(applied);
+        assert_eq!(
+            config_value["agents"]["list"][0]["identity"]["name"],
+            Value::String("Nova".to_string())
+        );
+        assert_eq!(
+            config_value["agents"]["list"][0]["identity"]["description"],
+            Value::String("Helpful and calm.".to_string())
+        );
     }
 }

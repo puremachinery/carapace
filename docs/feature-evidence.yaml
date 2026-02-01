@@ -1277,6 +1277,17 @@ features:
     tests:
       - "src/cli/mod.rs::test_handle_setup_*"
 
+  - feature: "wizard"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/server/ws/handlers/wizard.rs::handle_wizard_next + persist_wizard_config"
+      - "src/server/ws/handlers/wizard.rs::apply_wizard_config (setup/channel/agent updates)"
+      - "src/server/ws/handlers/config.rs::write_config_file (wizard persistence)"
+    tests:
+      - "src/server/ws/handlers/wizard.rs::test_apply_setup_wizard_updates_config"
+      - "src/server/ws/handlers/wizard.rs::test_apply_channel_wizard_updates_config"
+      - "src/server/ws/handlers/wizard.rs::test_apply_agent_wizard_updates_identity"
+
   - feature: "pair"
     status: "verified_done"
     runtime_wiring:
