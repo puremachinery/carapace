@@ -551,6 +551,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "clap",
+ "crc32fast",
  "dirs",
  "ed25519-dalek",
  "flate2",
