@@ -1256,6 +1256,8 @@ features:
     status: "verified_done"
     runtime_wiring:
       - "src/cli/mod.rs::handle_pair (WS node.pair.request + node.pair.approve)"
+    notes:
+      - "CLI pairing is loopback-only until device identity support is implemented"
 
   - feature: "update"
     status: "verified_done"

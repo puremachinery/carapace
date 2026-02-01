@@ -1356,8 +1356,25 @@ pub async fn handle_pair(
 
     let ws_url = ws_url_from_http(&parsed_url)?;
     let host = parsed_url.host_str().ok_or("missing host in gateway URL")?;
+    if !is_loopback_host(host) {
+        eprintln!("Remote pairing requires a paired device identity.");
+        eprintln!("The CLI pairing flow only supports loopback gateways for now.");
+        eprintln!("Use --host 127.0.0.1 or pair via the control UI.");
+        return Err("remote pairing requires device identity".into());
+    }
+
+    if trust {
+        if parsed_url.scheme() == "https" {
+            eprintln!(
+                "Warning: --trust disables TLS certificate verification; use only for local/self-signed gateways."
+            );
+        } else {
+            eprintln!("Warning: --trust has no effect for http URLs.");
+        }
+    }
+
     let auth = resolve_gateway_auth().await;
-    if auth.token.is_none() && auth.password.is_none() && !is_loopback_host(host) {
+    if auth.token.is_none() && auth.password.is_none() {
         eprintln!("Gateway auth token/password required for pairing.");
         eprintln!("Set gateway.auth.token or gateway.auth.password in config.");
         eprintln!("You can also export MOLTBOT_GATEWAY_TOKEN or MOLTBOT_GATEWAY_PASSWORD.");
