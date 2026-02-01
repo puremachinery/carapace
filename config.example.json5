@@ -1,7 +1,7 @@
 // Carapace gateway configuration
 //
-// Copy this file to ~/.moltbot/moltbot.json5 and edit to taste.
-// Override the path with MOLTBOT_CONFIG_PATH or MOLTBOT_STATE_DIR env vars.
+// Copy this file to ~/.config/carapace/carapace.json5 and edit to taste.
+// Override the path with CARAPACE_CONFIG_PATH or CARAPACE_STATE_DIR env vars.
 //
 // Format: JSON5 (comments, trailing commas, unquoted keys are all valid)
 // Docs:   docs/protocol/config.md
@@ -15,10 +15,10 @@
     auth: {
       // Uncomment one:
       // mode: "token",
-      // token: "${MOLTBOT_GATEWAY_TOKEN}",
+      // token: "${CARAPACE_GATEWAY_TOKEN}",
 
       // mode: "password",
-      // password: "${MOLTBOT_GATEWAY_PASSWORD}",
+      // password: "${CARAPACE_GATEWAY_PASSWORD}",
 
       // Allow Tailscale-authenticated connections (requires tailscale.mode = "serve")
       // allowTailscale: true,

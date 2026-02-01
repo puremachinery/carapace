@@ -566,7 +566,7 @@ mod tests {
     async fn test_reload_validation_with_temp_config() {
         use std::io::Write;
         let dir = tempfile::TempDir::new().unwrap();
-        let config_path = dir.path().join("moltbot.json5");
+        let config_path = dir.path().join("carapace.json5");
 
         // Write a valid config
         {
@@ -575,7 +575,7 @@ mod tests {
         }
 
         // Set the env var to point to our test config
-        let _guard = EnvVarGuard::set("MOLTBOT_CONFIG_PATH", config_path.to_str().unwrap());
+        let _guard = EnvVarGuard::set("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
         let result = perform_reload(&ReloadMode::Hot);
         assert!(result.success);
         assert_eq!(result.mode, "hot");
@@ -585,7 +585,7 @@ mod tests {
     async fn test_reload_invalid_config_fails() {
         use std::io::Write;
         let dir = tempfile::TempDir::new().unwrap();
-        let config_path = dir.path().join("moltbot.json5");
+        let config_path = dir.path().join("carapace.json5");
 
         // Write an invalid config (not valid JSON5)
         {
@@ -593,7 +593,7 @@ mod tests {
             f.write_all(b"this is not valid json5 {{{{").unwrap();
         }
 
-        let _guard = EnvVarGuard::set("MOLTBOT_CONFIG_PATH", config_path.to_str().unwrap());
+        let _guard = EnvVarGuard::set("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
         let result = perform_reload(&ReloadMode::Hybrid);
         assert!(!result.success);
         assert_eq!(result.mode, "hybrid");

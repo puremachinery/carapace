@@ -281,7 +281,7 @@ mod tests {
     use std::sync::Arc;
 
     /// Create a WsServerState backed by a temp directory so tests work on all
-    /// platforms (including Windows CI where writing to ~/.moltbot may fail).
+    /// platforms (including Windows CI where writing to ~/.config/carapace may fail).
     fn make_test_state() -> (Arc<WsServerState>, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(sessions::SessionStore::with_base_path(

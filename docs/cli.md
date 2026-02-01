@@ -75,7 +75,7 @@ Manage cluster CA and node certs:
 
 The CLI will try, in order:
 
-1. Environment variables: `MOLTBOT_GATEWAY_TOKEN` / `MOLTBOT_GATEWAY_PASSWORD`
+1. Environment variables: `CARAPACE_GATEWAY_TOKEN` / `CARAPACE_GATEWAY_PASSWORD`
 2. Config file: `gateway.auth.token` / `gateway.auth.password`
 3. Credential store (OS keychain/secret service)
 
@@ -86,12 +86,12 @@ If nothing is found, local-direct access may still work when configured.
 The CLI generates and stores a device identity for WebSocket access:
 
 - Stored in the OS credential store when available.
-- Legacy on-disk fallback: `~/.moltbot/device-identity.json` (owner-only perms).
+- Legacy on-disk fallback: `<config dir>/device-identity.json` (e.g.
+  `~/.config/carapace/device-identity.json` on Linux; owner-only perms).
 - A gateway-issued `connect.challenge` nonce is signed and sent in `connect`.
 
-Strict mode: set one of these env vars to *disallow* fallback to the legacy file:
+Strict mode: set this env var to *disallow* fallback to the legacy file:
 
-- `MOLTBOT_DEVICE_IDENTITY_STRICT=1`
 - `CARAPACE_DEVICE_IDENTITY_STRICT=1`
 
 When strict mode is enabled:
@@ -100,11 +100,11 @@ When strict mode is enabled:
 
 ## State Directories
 
-Default state directory: `~/.moltbot/`
+Default state directory: platform config directory (e.g. `~/.config/carapace/` on Linux).
 
 Override with:
 
-- `MOLTBOT_STATE_DIR=/path/to/state`
+- `CARAPACE_STATE_DIR=/path/to/state`
 
 ## Examples
 
@@ -120,5 +120,5 @@ carapace logs --host 10.0.0.12 --port 18789 --allow-plaintext
 
 ### Pair with a remote gateway
 ```
-MOLTBOT_GATEWAY_TOKEN=... carapace pair https://gateway.local:3001 --name "Ops CLI" --trust
+CARAPACE_GATEWAY_TOKEN=... carapace pair https://gateway.local:3001 --name "Ops CLI" --trust
 ```

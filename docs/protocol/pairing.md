@@ -131,8 +131,10 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 
 Pairing state is stored under the Gateway state directory:
 
+Examples below use the Linux config directory (`~/.config/carapace`).
+
 ```
-~/.moltbot/
+~/.config/carapace/
 ├── nodes/
 │   ├── paired.json      # Paired nodes with hashed tokens
 │   └── pending.json     # Pending requests (auto-expire)

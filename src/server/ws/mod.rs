@@ -73,17 +73,17 @@ const ERROR_RATE_LIMITED: &str = "RATE_LIMITED";
 
 const ALLOWED_CLIENT_IDS: [&str; 12] = [
     "webchat-ui",
-    "moltbot-control-ui",
+    "carapace-control-ui",
     "webchat",
     "cli",
     "gateway-client",
-    "moltbot-macos",
-    "moltbot-ios",
-    "moltbot-android",
+    "carapace-macos",
+    "carapace-ios",
+    "carapace-android",
     "node-host",
     "test",
     "fingerprint",
-    "moltbot-probe",
+    "carapace-probe",
 ];
 
 const ALLOWED_CLIENT_MODES: [&str; 7] =
@@ -904,8 +904,8 @@ pub async fn build_ws_state_from_config() -> Result<Arc<WsServerState>, WsConfig
 
     if integrity_enabled {
         // Derive HMAC key from the gateway auth token (server secret)
-        let server_secret = std::env::var("MOLTBOT_GATEWAY_TOKEN")
-            .or_else(|_| std::env::var("MOLTBOT_SERVER_SECRET"))
+        let server_secret = std::env::var("CARAPACE_GATEWAY_TOKEN")
+            .or_else(|_| std::env::var("CARAPACE_SERVER_SECRET"))
             .unwrap_or_default();
 
         if !server_secret.is_empty() {
@@ -934,7 +934,7 @@ pub async fn build_ws_state_from_config() -> Result<Arc<WsServerState>, WsConfig
         } else {
             tracing::warn!(
                 "sessions.integrity.enabled is true but no server secret found \
-                 (set MOLTBOT_GATEWAY_TOKEN or MOLTBOT_SERVER_SECRET)"
+                 (set CARAPACE_GATEWAY_TOKEN or CARAPACE_SERVER_SECRET)"
             );
         }
     }
@@ -1003,8 +1003,8 @@ async fn resolve_gateway_auth_config(
         .and_then(|v| v.as_str())
         .unwrap_or("off");
 
-    let env_token = env::var("MOLTBOT_GATEWAY_TOKEN").ok();
-    let env_password = env::var("MOLTBOT_GATEWAY_PASSWORD").ok();
+    let env_token = env::var("CARAPACE_GATEWAY_TOKEN").ok();
+    let env_password = env::var("CARAPACE_GATEWAY_PASSWORD").ok();
 
     let state_dir = resolve_state_dir();
     let mut creds = credentials::read_gateway_auth(state_dir).await?;
@@ -2061,7 +2061,7 @@ fn authenticate_connection(
         .as_ref()
         .and_then(|a| a.password.as_ref())
         .is_some();
-    let is_control_ui = connect_params.client.id == "moltbot-control-ui";
+    let is_control_ui = connect_params.client.id == "carapace-control-ui";
     let allow_control_ui_bypass = is_control_ui
         && (state.config.control_ui_allow_insecure_auth
             || state.config.control_ui_disable_device_auth);
@@ -2724,7 +2724,7 @@ fn now_ms() -> u64 {
 }
 
 fn server_version() -> String {
-    std::env::var("MOLTBOT_VERSION")
+    std::env::var("CARAPACE_VERSION")
         .or_else(|_| std::env::var("npm_package_version"))
         .unwrap_or_else(|_| "dev".to_string())
 }
@@ -3319,10 +3319,10 @@ fn resolve_node_command_allowlist(
 }
 
 pub(crate) fn resolve_state_dir() -> PathBuf {
-    if let Ok(dir) = env::var("MOLTBOT_STATE_DIR") {
+    if let Ok(dir) = env::var("CARAPACE_STATE_DIR") {
         return PathBuf::from(dir);
     }
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".moltbot")
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from(".config"))
+        .join("carapace")
 }

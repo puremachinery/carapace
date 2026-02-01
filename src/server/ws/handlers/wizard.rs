@@ -173,7 +173,7 @@ fn setup_wizard_steps() -> Vec<WizardStep> {
     vec![
         WizardStep {
             id: "welcome".to_string(),
-            title: "Welcome to Moltbot".to_string(),
+            title: "Welcome to Carapace".to_string(),
             description: Some("Let's get you set up with your AI assistant.".to_string()),
             input_type: "confirm".to_string(),
             options: None,

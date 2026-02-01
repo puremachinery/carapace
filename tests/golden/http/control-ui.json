@@ -12,7 +12,7 @@
       "methods": ["GET", "HEAD"]
     },
     "avatar": {
-      "path": "/__moltbot_avatar__/<agentId>",
+      "path": "/__carapace_avatar__/<agentId>",
       "description": "Agent avatar image or metadata endpoint",
       "methods": ["GET", "HEAD"]
     }
@@ -52,9 +52,9 @@
           "Cache-Control": "no-cache"
         },
         "body_contains": [
-          "__MOLTBOT_CONTROL_UI_BASE_PATH__",
-          "__MOLTBOT_ASSISTANT_NAME__",
-          "__MOLTBOT_ASSISTANT_AVATAR__"
+          "__CARAPACE_CONTROL_UI_BASE_PATH__",
+          "__CARAPACE_ASSISTANT_NAME__",
+          "__CARAPACE_ASSISTANT_AVATAR__"
         ]
       },
       "notes": ["index.html has runtime config injected in <head>"]
@@ -155,7 +155,7 @@
       "description": "Retrieve agent avatar as local file",
       "request": {
         "method": "GET",
-        "path": "/__moltbot_avatar__/main"
+        "path": "/__carapace_avatar__/main"
       },
       "response": {
         "status": 200,
@@ -171,7 +171,7 @@
       "description": "Get avatar metadata (URL for remote/data avatars)",
       "request": {
         "method": "GET",
-        "path": "/__moltbot_avatar__/main?meta=1"
+        "path": "/__carapace_avatar__/main?meta=1"
       },
       "response": {
         "status": 200,
@@ -198,7 +198,7 @@
       "description": "HEAD request for avatar existence check",
       "request": {
         "method": "HEAD",
-        "path": "/__moltbot_avatar__/main"
+        "path": "/__carapace_avatar__/main"
       },
       "response": {
         "status": 200,
@@ -210,7 +210,7 @@
       "description": "No avatar configured for agent",
       "request": {
         "method": "GET",
-        "path": "/__moltbot_avatar__/unknown-agent"
+        "path": "/__carapace_avatar__/unknown-agent"
       },
       "response": {
         "status": 404,
@@ -222,7 +222,7 @@
       "description": "Invalid agent ID format returns 404",
       "request": {
         "method": "GET",
-        "path": "/__moltbot_avatar__/invalid..agent"
+        "path": "/__carapace_avatar__/invalid..agent"
       },
       "response": {
         "status": 404,
@@ -236,7 +236,7 @@
       "config_note": "When avatar is remote URL or data URI",
       "request": {
         "method": "GET",
-        "path": "/__moltbot_avatar__/remote-avatar-agent"
+        "path": "/__carapace_avatar__/remote-avatar-agent"
       },
       "response": {
         "status": 404
@@ -249,7 +249,7 @@
       "config_note": "When basePath is '/ui'",
       "request": {
         "method": "GET",
-        "path": "/ui/__moltbot_avatar__/main"
+        "path": "/ui/__carapace_avatar__/main"
       },
       "response": {
         "status": 200

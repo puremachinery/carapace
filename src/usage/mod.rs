@@ -14,12 +14,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Default path for usage data storage
 fn default_usage_path() -> PathBuf {
-    if let Ok(dir) = std::env::var("MOLTBOT_STATE_DIR") {
+    if let Ok(dir) = std::env::var("CARAPACE_STATE_DIR") {
         return PathBuf::from(dir).join("usage.json");
     }
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".moltbot")
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from(".config"))
+        .join("carapace")
         .join("usage.json")
 }
 

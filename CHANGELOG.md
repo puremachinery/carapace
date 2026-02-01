@@ -25,6 +25,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   vLLM, llama.cpp, LM Studio, and MLX. Commented config example in
   config.example.json5 for OpenAI-compatible and Ollama providers.
 
+### Changed
+
+- **Carapace naming:** Env vars now use `CARAPACE_*`, the credentials service
+  name is `carapace`, and default state/config paths use the platform config
+  directory. Existing installs should migrate data or set
+  `CARAPACE_STATE_DIR`/`CARAPACE_CONFIG_PATH`.
+
 ## [0.1.0] - Unreleased
 
 ### Added
@@ -48,7 +55,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Secret Service, Windows Credential Manager.
 - **TLS:** Self-signed certificate auto-generation, configurable cert/key paths,
   SHA-256 fingerprint display.
-- **mDNS discovery:** `_moltbot._tcp.local.` Bonjour broadcast with off,
+- **mDNS discovery:** `_carapace._tcp.local.` Bonjour broadcast with off,
   minimal, and full modes.
 - **Config system:** JSON5 with `$include` directive, environment variable
   substitution, hot reload via file watcher and SIGHUP, defaults pipeline.

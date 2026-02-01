@@ -4,7 +4,7 @@
 
 A security-focused, open-source personal AI assistant. Runs on your machine. Works through Signal, Telegram, Discord, Slack, webhooks, and console. Supports Anthropic, OpenAI, Ollama, Gemini, Bedrock, and Venice AI. Extensible via WASM plugins. Written in Rust.
 
-A hardened alternative to openclaw / moltbot / clawdbot — for when your molt needs a hard shell.
+A hardened alternative to openclaw / clawdbot — for when your assistant needs a hard shell.
 
 ## Features
 
@@ -16,7 +16,7 @@ A hardened alternative to openclaw / moltbot / clawdbot — for when your molt n
 
 ## Security
 
-Carapace is hardened against every major vulnerability class reported in the [January 2026 moltbot security disclosures](https://www.theregister.com/2026/01/27/clawdbot_moltbot_security_concerns/):
+Carapace is hardened against every major vulnerability class reported in the January 2026 openclaw security disclosures:
 
 | Threat | Carapace defense |
 |---|---|

@@ -499,7 +499,7 @@ struct GatewayAuth {
 }
 
 async fn resolve_gateway_auth() -> GatewayAuth {
-    let token_env = std::env::var("MOLTBOT_GATEWAY_TOKEN").ok().and_then(|v| {
+    let token_env = std::env::var("CARAPACE_GATEWAY_TOKEN").ok().and_then(|v| {
         let token = v.trim().to_string();
         if token.is_empty() {
             None
@@ -507,7 +507,7 @@ async fn resolve_gateway_auth() -> GatewayAuth {
             Some(token)
         }
     });
-    let password_env = std::env::var("MOLTBOT_GATEWAY_PASSWORD")
+    let password_env = std::env::var("CARAPACE_GATEWAY_PASSWORD")
         .ok()
         .and_then(|v| {
             let password = v.trim().to_string();
@@ -597,8 +597,7 @@ fn device_identity_path(state_dir: &Path) -> PathBuf {
 }
 
 fn strict_device_identity_mode() -> bool {
-    env_flag_enabled("MOLTBOT_DEVICE_IDENTITY_STRICT")
-        || env_flag_enabled("CARAPACE_DEVICE_IDENTITY_STRICT")
+    env_flag_enabled("CARAPACE_DEVICE_IDENTITY_STRICT")
 }
 
 fn env_flag_enabled(name: &str) -> bool {
@@ -1267,12 +1266,12 @@ use std::path::{Component, Path, PathBuf};
 /// but duplicated here to avoid pulling in the full server module for CLI-only
 /// commands).
 fn resolve_state_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("MOLTBOT_STATE_DIR") {
+    if let Ok(dir) = std::env::var("CARAPACE_STATE_DIR") {
         return PathBuf::from(dir);
     }
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".moltbot")
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from(".config"))
+        .join("carapace")
 }
 
 /// Resolve the memory store directory.
@@ -1326,7 +1325,7 @@ pub fn handle_backup(output: Option<&str>) -> Result<(), Box<dyn std::error::Err
     if config_path.exists() {
         let name = config_path
             .file_name()
-            .unwrap_or_else(|| std::ffi::OsStr::new("moltbot.json"));
+            .unwrap_or_else(|| std::ffi::OsStr::new("carapace.json"));
         archive.append_path_with_name(&config_path, Path::new("config").join(name))?;
         included_sections.push("config");
     }
@@ -1861,7 +1860,7 @@ pub async fn handle_pair(
     if auth.token.is_none() && auth.password.is_none() {
         eprintln!("Gateway auth token/password required for pairing.");
         eprintln!("Set gateway.auth.token or gateway.auth.password in config.");
-        eprintln!("You can also export MOLTBOT_GATEWAY_TOKEN or MOLTBOT_GATEWAY_PASSWORD.");
+        eprintln!("You can also export CARAPACE_GATEWAY_TOKEN or CARAPACE_GATEWAY_PASSWORD.");
         return Err("missing gateway auth".into());
     }
 
@@ -2059,10 +2058,10 @@ async fn fetch_release_info(
 ) -> Result<(Value, reqwest::Client), Box<dyn std::error::Error>> {
     let api_url = match version {
         Some(v) => format!(
-            "https://api.github.com/repos/moltbot/carapace/releases/tags/v{}",
+            "https://api.github.com/repos/puremachinery/carapace/releases/tags/v{}",
             v
         ),
-        None => "https://api.github.com/repos/moltbot/carapace/releases/latest".to_string(),
+        None => "https://api.github.com/repos/puremachinery/carapace/releases/latest".to_string(),
     };
 
     let client = reqwest::Client::builder()
@@ -3170,13 +3169,13 @@ mod tests {
     #[test]
     fn test_handle_setup_errors_when_config_exists_no_force() {
         let temp = tempfile::TempDir::new().unwrap();
-        let config_path = temp.path().join("moltbot.json");
+        let config_path = temp.path().join("carapace.json");
         std::fs::write(&config_path, "{}").unwrap();
 
         // Point config to our temp file.
-        std::env::set_var("MOLTBOT_CONFIG_PATH", config_path.to_str().unwrap());
+        std::env::set_var("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
         let result = handle_setup(false);
-        std::env::remove_var("MOLTBOT_CONFIG_PATH");
+        std::env::remove_var("CARAPACE_CONFIG_PATH");
 
         assert!(
             result.is_err(),
@@ -3187,12 +3186,12 @@ mod tests {
     #[test]
     fn test_handle_setup_force_creates_config() {
         let temp = tempfile::TempDir::new().unwrap();
-        let config_path = temp.path().join("moltbot.json");
+        let config_path = temp.path().join("carapace.json");
         std::fs::write(&config_path, "{}").unwrap();
 
-        std::env::set_var("MOLTBOT_CONFIG_PATH", config_path.to_str().unwrap());
+        std::env::set_var("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
         let result = handle_setup(true);
-        std::env::remove_var("MOLTBOT_CONFIG_PATH");
+        std::env::remove_var("CARAPACE_CONFIG_PATH");
 
         assert!(
             result.is_ok(),
@@ -3204,11 +3203,11 @@ mod tests {
     #[test]
     fn test_handle_setup_creates_valid_json5_config() {
         let temp = tempfile::TempDir::new().unwrap();
-        let config_path = temp.path().join("moltbot.json");
+        let config_path = temp.path().join("carapace.json");
 
-        std::env::set_var("MOLTBOT_CONFIG_PATH", config_path.to_str().unwrap());
+        std::env::set_var("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
         let result = handle_setup(false);
-        std::env::remove_var("MOLTBOT_CONFIG_PATH");
+        std::env::remove_var("CARAPACE_CONFIG_PATH");
 
         assert!(result.is_ok(), "Setup should succeed");
 
@@ -3220,11 +3219,11 @@ mod tests {
     #[test]
     fn test_handle_setup_default_values() {
         let temp = tempfile::TempDir::new().unwrap();
-        let config_path = temp.path().join("moltbot.json");
+        let config_path = temp.path().join("carapace.json");
 
-        std::env::set_var("MOLTBOT_CONFIG_PATH", config_path.to_str().unwrap());
+        std::env::set_var("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
         let result = handle_setup(false);
-        std::env::remove_var("MOLTBOT_CONFIG_PATH");
+        std::env::remove_var("CARAPACE_CONFIG_PATH");
 
         assert!(result.is_ok());
 

@@ -28,7 +28,7 @@ cargo test          # fallback
 Run the server in development mode with relaxed defaults:
 
 ```sh
-MOLTBOT_DEV=1 cargo run
+CARAPACE_DEV=1 cargo run
 ```
 
 ## Development Workflow

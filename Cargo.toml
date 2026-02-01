@@ -3,7 +3,7 @@ name = "carapace"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.93"
-description = "A security-focused personal AI assistant — hardened alternative to openclaw/moltbot/clawdbot"
+description = "A security-focused personal AI assistant — hardened alternative to openclaw/clawdbot"
 license = "MIT"
 
 [dependencies]

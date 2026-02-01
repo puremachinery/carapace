@@ -1,7 +1,7 @@
 //! mDNS service discovery module
 //!
 //! Advertises the gateway on the local network via mDNS/DNS-SD (Bonjour)
-//! so that clients can discover it automatically. Uses the `_moltbot._tcp.local.`
+//! so that clients can discover it automatically. Uses the `_carapace._tcp.local.`
 //! service type.
 //!
 //! Three discovery modes are supported:
@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use tracing::{debug, error, info, warn};
 
 /// mDNS service type for the gateway
-pub const SERVICE_TYPE: &str = "_moltbot._tcp.local.";
+pub const SERVICE_TYPE: &str = "_carapace._tcp.local.";
 
 /// Discovery mode
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -639,7 +639,7 @@ mod tests {
 
     #[test]
     fn test_service_type_constant() {
-        assert_eq!(SERVICE_TYPE, "_moltbot._tcp.local.");
+        assert_eq!(SERVICE_TYPE, "_carapace._tcp.local.");
         assert!(SERVICE_TYPE.starts_with("_"));
         assert!(SERVICE_TYPE.ends_with(".local."));
     }

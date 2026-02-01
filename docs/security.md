@@ -179,9 +179,11 @@ fn validate_session_id(session_id: &str) -> Result<(), SessionStoreError> {
 
 ## Sensitive Data Locations
 
+Example uses the Linux config directory (`~/.config/carapace`).
+
 ```
-~/.moltbot/
-├── moltbot.json           # Config (may contain tokens)
+~/.config/carapace/
+├── carapace.json           # Config (may contain tokens)
 ├── credentials/            # Channel credentials, allowlists
 │   ├── whatsapp/          # WhatsApp session data
 │   └── *-allowFrom.json   # Pairing allowlists

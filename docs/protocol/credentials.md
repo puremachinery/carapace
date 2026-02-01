@@ -1,7 +1,7 @@
 # Credential Storage
 
 This document describes how carapace stores secrets and how to migrate legacy
-plaintext credentials from the Node.js moltbot gateway.
+plaintext credentials from the Node.js openclaw gateway.
 
 ## Scope
 
@@ -13,34 +13,37 @@ Secrets covered:
 - WhatsApp Web session material (treated as secret data)
 
 Non-secrets (allowed to remain on disk as plaintext metadata):
-- Config files (`moltbot.json`) and include files
+- Config files (`carapace.json`) and include files
 - Profile ordering/usage stats metadata (no secret fields)
 
 ## Legacy Plaintext Locations (Node Gateway)
 
 Current sources to migrate, based on the Node implementation:
 
-- `~/.moltbot/credentials/oauth.json`
+Paths below are under the platform config directory (examples use Linux
+`~/.config/carapace`).
+
+- `~/.config/carapace/credentials/oauth.json`
   - OAuth credentials keyed by provider.
   - Loaded via `resolveOAuthPath()` and merged into auth profiles.
-- `~/.moltbot/agents/<agentId>/agent/auth-profiles.json`
+- `~/.config/carapace/agents/<agentId>/agent/auth-profiles.json`
   - Primary auth store; contains API keys, tokens, OAuth credentials.
-- `~/.moltbot/agents/<agentId>/agent/auth.json`
+- `~/.config/carapace/agents/<agentId>/agent/auth.json`
   - Legacy auth store (same data shape as auth profiles, older format).
-- `~/.moltbot/credentials/github-copilot.token.json`
+- `~/.config/carapace/credentials/github-copilot.token.json`
   - Cached GitHub Copilot API token (`token`, `expiresAt`, `updatedAt`).
-- `~/.moltbot/credentials/whatsapp/<accountId>/creds.json`
+- `~/.config/carapace/credentials/whatsapp/<accountId>/creds.json`
   - WhatsApp Web session credentials (Baileys state).
-  - Legacy default account may use `~/.moltbot/credentials/creds.json`.
+  - Legacy default account may use `~/.config/carapace/credentials/creds.json`.
   - Additional per-session JSON files may exist in the same directory.
-- `~/.moltbot/credentials/<channel>-pairing.json`
+- `~/.config/carapace/credentials/<channel>-pairing.json`
   - Pending pairing requests (short-lived but sensitive).
-- `~/.moltbot/credentials/<channel>-allowFrom.json`
+- `~/.config/carapace/credentials/<channel>-allowFrom.json`
   - Allowlist entries for pairing-based channels.
 
 Notes:
-- The credentials directory can be overridden by `MOLTBOT_OAUTH_DIR`.
-- The state directory can be overridden by `MOLTBOT_STATE_DIR`.
+- The credentials directory can be overridden by `CARAPACE_OAUTH_DIR`.
+- The state directory can be overridden by `CARAPACE_STATE_DIR`.
 
 ## Storage API (Rust)
 
@@ -48,7 +51,7 @@ Notes:
 
 Use a single service/namespace for all secrets and stable account keys:
 
-- **Service name:** `moltbot`
+- **Service name:** `carapace`
 - **Account key:** `kind:<agentId>:<id>`
 
 Examples:
@@ -121,7 +124,7 @@ Minimum JSON schema per secret type:
 
 To support listing and migration without relying on secret-store listing APIs:
 
-- Store a non-secret index at `~/.moltbot/credentials/index.json` containing:
+- Store a non-secret index at `~/.config/carapace/credentials/index.json` containing:
   - secret key IDs (`kind`, `agentId`, `id`)
   - provider info (for auth profiles)
   - last updated timestamp
@@ -134,7 +137,7 @@ No secret fields are written to this file.
 
 - **Recommended crate:** `keyring` (uses Keychain on macOS)
 - **Alternative:** `security-framework` if direct API access is needed
-- **Service:** `moltbot`
+- **Service:** `carapace`
 - **Account:** `kind:<agentId>:<id>`
 - **Storage:** JSON string payloads
 
@@ -144,7 +147,7 @@ No secret fields are written to this file.
 - **Alternative:** `secret-service` when attribute queries are required
 - **Collection:** `default`
 - **Attributes (if using secret-service directly):**
-  - `application = moltbot`
+  - `application = carapace`
   - `kind = <kind>`
   - `agentId = <agentId>`
   - `id = <id>`
@@ -160,8 +163,8 @@ No secret fields are written to this file.
 
 - **Recommended crate:** `keyring` (uses Credential Manager on Windows)
 - **Alternative:** `windows-credentials` for direct access
-- **Target name:** `moltbot:<kind>:<agentId>:<id>`
-- **Username:** `moltbot` (static)
+- **Target name:** `carapace:<kind>:<agentId>:<id>`
+- **Username:** `carapace` (static)
 - **Storage:** JSON string payloads
 
 ## Migration from Plaintext
@@ -169,8 +172,8 @@ No secret fields are written to this file.
 ### Strategy
 
 1. Locate legacy credential roots:
-   - `stateDir = MOLTBOT_STATE_DIR ?? ~/.moltbot`
-   - `credentialsDir = MOLTBOT_OAUTH_DIR ?? ${stateDir}/credentials`
+   - `stateDir = CARAPACE_STATE_DIR ?? ~/.config/carapace`
+   - `credentialsDir = CARAPACE_OAUTH_DIR ?? ${stateDir}/credentials`
    - `agentDir = ${stateDir}/agents/<agentId>/agent`
 2. Load legacy files; for each secret:
    - Write to OS secret store under the new key namespace.
@@ -229,7 +232,7 @@ secret store (using the same `auth-profile` keys).
 **Implementation notes:**
 - At startup, attempt a test read/write to detect locked state
 - Log `WARN` if credentials unavailable; list which features are degraded
-- Provide `moltbot doctor` check for credential store health
+- Provide `carapace doctor` check for credential store health
 
 ### Timeout and Retry Policy
 
@@ -320,7 +323,7 @@ Migration may fail partway through (crash, power loss, etc.).
 - If stored value is not valid JSON, treat as corrupt
 - Log error with key name (not value)
 - Return `None` from `credential-get`, do not crash
-- Provide `moltbot credential repair <key>` command for manual fix
+- Provide `carapace credential repair <key>` command for manual fix
 
 **Empty or missing values:**
 - Treat empty string as "not set" (same as missing)

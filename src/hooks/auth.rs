@@ -2,7 +2,7 @@
 //!
 //! Hooks use a separate token from gateway auth. Supports:
 //! - Authorization: Bearer <token>
-//! - X-Moltbot-Token: <token>
+//! - X-Carapace-Token: <token>
 //! - ?token=<token> (deprecated, logs warning)
 
 use axum::http::{HeaderMap, Uri};
@@ -20,8 +20,8 @@ pub fn extract_hooks_token(headers: &HeaderMap, uri: &Uri) -> Option<(String, bo
         }
     }
 
-    // 2. Check X-Moltbot-Token header
-    if let Some(token) = headers.get("x-moltbot-token") {
+    // 2. Check X-Carapace-Token header
+    if let Some(token) = headers.get("x-carapace-token") {
         if let Ok(token_str) = token.to_str() {
             return Some((token_str.trim().to_string(), false));
         }
@@ -82,9 +82,12 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_x_moltbot_token() {
+    fn test_extract_x_carapace_token() {
         let mut headers = HeaderMap::new();
-        headers.insert("x-moltbot-token", HeaderValue::from_static("another-token"));
+        headers.insert(
+            "x-carapace-token",
+            HeaderValue::from_static("another-token"),
+        );
         let uri: Uri = "/hooks/wake".parse().unwrap();
 
         let result = extract_hooks_token(&headers, &uri);
@@ -107,7 +110,7 @@ mod tests {
             "authorization",
             HeaderValue::from_static("Bearer bearer-token"),
         );
-        headers.insert("x-moltbot-token", HeaderValue::from_static("header-token"));
+        headers.insert("x-carapace-token", HeaderValue::from_static("header-token"));
         let uri: Uri = "/hooks/wake?token=query-token".parse().unwrap();
 
         let result = extract_hooks_token(&headers, &uri);

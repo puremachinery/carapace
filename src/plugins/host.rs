@@ -645,7 +645,7 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
 
         // Create temporary file
         let temp_dir = std::env::temp_dir();
-        let file_name = format!("moltbot-media-{}", uuid::Uuid::new_v4());
+        let file_name = format!("carapace-media-{}", uuid::Uuid::new_v4());
         let temp_path = temp_dir.join(&file_name);
 
         // Write to file

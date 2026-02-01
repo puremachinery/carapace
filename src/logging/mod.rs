@@ -15,7 +15,7 @@
 //!
 //! # Environment Variables
 //!
-//! - `MOLTBOT_LOG` - Primary log level/filter (takes precedence)
+//! - `CARAPACE_LOG` - Primary log level/filter (takes precedence)
 //! - `RUST_LOG` - Fallback log level/filter
 //!
 //! # Examples
@@ -136,10 +136,10 @@ pub enum LoggingError {
 
 /// Build an EnvFilter from environment variables or default level.
 ///
-/// Checks MOLTBOT_LOG first, then RUST_LOG, falling back to the default level.
+/// Checks CARAPACE_LOG first, then RUST_LOG, falling back to the default level.
 fn build_env_filter(default_level: Level) -> Result<EnvFilter, LoggingError> {
-    // Check MOLTBOT_LOG first, then RUST_LOG
-    if let Ok(filter) = std::env::var("MOLTBOT_LOG") {
+    // Check CARAPACE_LOG first, then RUST_LOG
+    if let Ok(filter) = std::env::var("CARAPACE_LOG") {
         return Ok(EnvFilter::try_new(filter)?);
     }
     if let Ok(filter) = std::env::var("RUST_LOG") {
@@ -399,7 +399,7 @@ mod tests {
     fn test_env_filter_default() {
         let _lock = TEST_LOCK.lock().unwrap();
         // Clear env vars for this test
-        std::env::remove_var("MOLTBOT_LOG");
+        std::env::remove_var("CARAPACE_LOG");
         std::env::remove_var("RUST_LOG");
 
         // Filter should be created successfully with default level
@@ -411,18 +411,18 @@ mod tests {
     }
 
     #[test]
-    fn test_env_filter_moltbot_log() {
+    fn test_env_filter_carapace_log() {
         let _lock = TEST_LOCK.lock().unwrap();
-        std::env::set_var("MOLTBOT_LOG", "debug");
+        std::env::set_var("CARAPACE_LOG", "debug");
         let filter = build_env_filter(Level::INFO);
-        assert!(filter.is_ok(), "Should create filter from MOLTBOT_LOG");
-        std::env::remove_var("MOLTBOT_LOG");
+        assert!(filter.is_ok(), "Should create filter from CARAPACE_LOG");
+        std::env::remove_var("CARAPACE_LOG");
     }
 
     #[test]
     fn test_env_filter_rust_log_fallback() {
         let _lock = TEST_LOCK.lock().unwrap();
-        std::env::remove_var("MOLTBOT_LOG");
+        std::env::remove_var("CARAPACE_LOG");
         std::env::set_var("RUST_LOG", "warn");
         let filter = build_env_filter(Level::INFO);
         assert!(
@@ -433,30 +433,30 @@ mod tests {
     }
 
     #[test]
-    fn test_env_filter_moltbot_takes_precedence() {
+    fn test_env_filter_carapace_takes_precedence() {
         let _lock = TEST_LOCK.lock().unwrap();
-        std::env::set_var("MOLTBOT_LOG", "error");
+        std::env::set_var("CARAPACE_LOG", "error");
         std::env::set_var("RUST_LOG", "debug");
-        // MOLTBOT_LOG should take precedence (both are valid, so just verify creation)
+        // CARAPACE_LOG should take precedence (both are valid, so just verify creation)
         let filter = build_env_filter(Level::INFO);
         assert!(
             filter.is_ok(),
-            "Should create filter with MOLTBOT_LOG taking precedence"
+            "Should create filter with CARAPACE_LOG taking precedence"
         );
-        std::env::remove_var("MOLTBOT_LOG");
+        std::env::remove_var("CARAPACE_LOG");
         std::env::remove_var("RUST_LOG");
     }
 
     #[test]
     fn test_env_filter_complex_directive() {
         let _lock = TEST_LOCK.lock().unwrap();
-        std::env::set_var("MOLTBOT_LOG", "gateway=debug,ws=info,http=warn");
+        std::env::set_var("CARAPACE_LOG", "gateway=debug,ws=info,http=warn");
         let filter = build_env_filter(Level::INFO);
         assert!(
             filter.is_ok(),
-            "Should parse complex directive from MOLTBOT_LOG"
+            "Should parse complex directive from CARAPACE_LOG"
         );
-        std::env::remove_var("MOLTBOT_LOG");
+        std::env::remove_var("CARAPACE_LOG");
     }
 
     #[test]

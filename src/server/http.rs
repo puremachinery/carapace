@@ -110,9 +110,7 @@ impl Default for HttpConfig {
             control_ui_enabled: false,
             control_ui_dist_path: PathBuf::from("dist/control-ui"),
             valid_channels: Vec::new(),
-            agents_dir: dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".moltbot/agents"),
+            agents_dir: crate::server::ws::resolve_state_dir().join("agents"),
             openai_chat_completions_enabled: false,
             openai_responses_enabled: false,
             control_endpoints_enabled: false,
@@ -123,7 +121,7 @@ impl Default for HttpConfig {
 /// Build an `HttpConfig` from the loaded JSON configuration.
 ///
 /// Maps gateway.* keys from config and checks environment variables
-/// (MOLTBOT_GATEWAY_TOKEN, MOLTBOT_GATEWAY_PASSWORD) with env taking precedence.
+/// (CARAPACE_GATEWAY_TOKEN, CARAPACE_GATEWAY_PASSWORD) with env taking precedence.
 pub fn build_http_config(cfg: &Value) -> Result<HttpConfig, String> {
     let gateway = cfg.get("gateway").and_then(|v| v.as_object());
 
@@ -172,8 +170,8 @@ pub fn build_http_config(cfg: &Value) -> Result<HttpConfig, String> {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let gateway_token = std::env::var("MOLTBOT_GATEWAY_TOKEN").ok().or(cfg_token);
-    let gateway_password = std::env::var("MOLTBOT_GATEWAY_PASSWORD")
+    let gateway_token = std::env::var("CARAPACE_GATEWAY_TOKEN").ok().or(cfg_token);
+    let gateway_password = std::env::var("CARAPACE_GATEWAY_PASSWORD")
         .ok()
         .or(cfg_password);
     let auth_mode = auth_obj
@@ -581,7 +579,7 @@ fn register_admin_routes(router: Router<AppState>, config: &HttpConfig) -> Route
         .route(&base, get(control_ui_redirect))
         .route(&format!("{}/", base), get(control_ui_index))
         .route(
-            &format!("{}/__moltbot_avatar__/:agent_id", base),
+            &format!("{}/__carapace_avatar__/:agent_id", base),
             get(avatar_handler),
         )
         .route(&format!("{}/*path", base), get(control_ui_static))
@@ -1237,11 +1235,11 @@ async fn tools_invoke_handler(
 
     // Extract context from headers
     let message_channel = headers
-        .get("x-moltbot-message-channel")
+        .get("x-carapace-message-channel")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
     let account_id = headers
-        .get("x-moltbot-account-id")
+        .get("x-carapace-account-id")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
@@ -1388,8 +1386,8 @@ async fn control_ui_static(
     let file_path = dist_path.join(safe_path);
 
     // Check if it's the avatar endpoint
-    if safe_path.starts_with("__moltbot_avatar__/") {
-        let agent_id = safe_path.trim_start_matches("__moltbot_avatar__/");
+    if safe_path.starts_with("__carapace_avatar__/") {
+        let agent_id = safe_path.trim_start_matches("__carapace_avatar__/");
         return serve_avatar(&state, agent_id).await;
     }
 
@@ -1425,9 +1423,9 @@ async fn serve_index_html(state: &AppState, headers: &HeaderMap) -> Response {
             };
 
             let mut injected = content
-                .replace("__MOLTBOT_CONTROL_UI_BASE_PATH__", &base_path)
-                .replace("__MOLTBOT_ASSISTANT_NAME__", "Moltbot")
-                .replace("__MOLTBOT_ASSISTANT_AVATAR__", "");
+                .replace("__CARAPACE_CONTROL_UI_BASE_PATH__", &base_path)
+                .replace("__CARAPACE_ASSISTANT_NAME__", "Carapace")
+                .replace("__CARAPACE_ASSISTANT_AVATAR__", "");
 
             if let Some(store) = &state.csrf_store {
                 let config = store.config();
@@ -1550,7 +1548,7 @@ pub struct AvatarQuery {
     pub meta: Option<String>,
 }
 
-/// GET /__moltbot_avatar__/:agent_id - Serve agent avatar
+/// GET /__carapace_avatar__/:agent_id - Serve agent avatar
 async fn avatar_handler(
     State(state): State<AppState>,
     Path(agent_id): Path<String>,
@@ -1613,7 +1611,7 @@ async fn serve_avatar_metadata(state: &AppState, agent_id: &str) -> Response {
             } else {
                 state.config.control_ui_base_path.clone()
             };
-            let url = format!("{}/__moltbot_avatar__/{}", base, agent_id);
+            let url = format!("{}/__carapace_avatar__/{}", base, agent_id);
             return (
                 StatusCode::OK,
                 [

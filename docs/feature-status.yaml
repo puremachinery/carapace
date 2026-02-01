@@ -108,7 +108,7 @@ feature_inventory_markdown: |
 
   ### Discovery (`src/discovery/`)
 
-  - [x] **mDNS service registration** — _moltbot._tcp.local.
+  - [x] **mDNS service registration** — _carapace._tcp.local.
   - [x] **TXT record metadata** — version, fingerprint, device name
   - [x] **Discovery modes** — Off/Minimal/Full
   - [x] **Lifecycle management** — graceful shutdown

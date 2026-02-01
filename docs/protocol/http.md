@@ -31,7 +31,7 @@ The path **must not** be `/`.
 Hooks require a **hooks token** (not gateway auth). Accepted forms:
 
 - `Authorization: Bearer <hooks-token>`
-- `X-Moltbot-Token: <hooks-token>`
+- `X-Carapace-Token: <hooks-token>`
 - `?token=<hooks-token>` (deprecated; logs a warning)
 
 ### Common behavior
@@ -119,7 +119,7 @@ Auth: **gateway auth** (Bearer token/password or Tailscale Serve).
 Request body (subset supported):
 ```json
 {
-  "model": "moltbot",
+  "model": "carapace",
   "stream": false,
   "messages": [
     {"role": "system", "content": "You are..."},
@@ -136,7 +136,7 @@ Response (non-stream):
   "id": "chatcmpl_<id>",
   "object": "chat.completion",
   "created": 1700000000,
-  "model": "moltbot",
+  "model": "carapace",
   "choices": [
     {"index": 0, "message": {"role": "assistant", "content": "..."}, "finish_reason": "stop"}
   ],
@@ -175,8 +175,8 @@ Auth: **gateway auth** (Bearer token/password or Tailscale Serve).
 Request headers:
 - `Authorization: Bearer <token>`
 - Optional policy hints:
-  - `X-Moltbot-Message-Channel: <channel>`
-  - `X-Moltbot-Account-Id: <accountId>`
+  - `X-Carapace-Message-Channel: <channel>`
+  - `X-Carapace-Account-Id: <accountId>`
 
 Request body:
 ```json

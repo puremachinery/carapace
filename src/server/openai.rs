@@ -27,7 +27,7 @@ use crate::auth;
 /// OpenAI chat completions request
 #[derive(Debug, Deserialize)]
 pub struct ChatCompletionsRequest {
-    /// Model identifier (e.g., "moltbot", "moltbot:agent-id")
+    /// Model identifier (e.g., "carapace", "carapace:agent-id")
     #[serde(default = "default_model")]
     pub model: String,
     /// Array of conversation messages
@@ -40,7 +40,7 @@ pub struct ChatCompletionsRequest {
 }
 
 fn default_model() -> String {
-    "moltbot".to_string()
+    "carapace".to_string()
 }
 
 /// Chat message in OpenAI format
@@ -223,10 +223,10 @@ pub struct OpenAiState {
 }
 
 /// Parse agent ID from model string
-/// Supports: "moltbot", "moltbot:agent-id", "agent:agent-id"
+/// Supports: "carapace", "carapace:agent-id", "agent:agent-id"
 pub fn parse_agent_id(model: &str) -> Option<String> {
-    if model.starts_with("moltbot:") {
-        Some(model.strip_prefix("moltbot:").unwrap().to_string())
+    if model.starts_with("carapace:") {
+        Some(model.strip_prefix("carapace:").unwrap().to_string())
     } else if model.starts_with("agent:") {
         Some(model.strip_prefix("agent:").unwrap().to_string())
     } else {
@@ -505,8 +505,8 @@ pub async fn chat_completions_handler(
 
     // Parse agent ID from model or headers
     let _agent_id = headers
-        .get("x-moltbot-agent-id")
-        .or_else(|| headers.get("x-moltbot-agent"))
+        .get("x-carapace-agent-id")
+        .or_else(|| headers.get("x-carapace-agent"))
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
         .or_else(|| parse_agent_id(&req.model));
@@ -543,8 +543,8 @@ pub async fn chat_completions_handler(
     }
 
     // Use the requested model, falling back to the default
-    let model = if req.model == "moltbot"
-        || req.model.starts_with("moltbot:")
+    let model = if req.model == "carapace"
+        || req.model.starts_with("carapace:")
         || req.model.starts_with("agent:")
     {
         crate::agent::DEFAULT_MODEL.to_string()
@@ -892,9 +892,9 @@ pub async fn responses_handler(
             .into_response();
     }
 
-    // Resolve the model name, mapping moltbot aliases to the default
-    let model = if req.model == "moltbot"
-        || req.model.starts_with("moltbot:")
+    // Resolve the model name, mapping carapace aliases to the default
+    let model = if req.model == "carapace"
+        || req.model.starts_with("carapace:")
         || req.model.starts_with("agent:")
     {
         crate::agent::DEFAULT_MODEL.to_string()
@@ -1001,9 +1001,9 @@ mod tests {
 
     #[test]
     fn test_parse_agent_id() {
-        assert_eq!(parse_agent_id("moltbot"), None);
+        assert_eq!(parse_agent_id("carapace"), None);
         assert_eq!(
-            parse_agent_id("moltbot:email-agent"),
+            parse_agent_id("carapace:email-agent"),
             Some("email-agent".to_string())
         );
         assert_eq!(parse_agent_id("agent:main"), Some("main".to_string()));
@@ -1066,7 +1066,7 @@ mod tests {
             id: "chatcmpl_test".to_string(),
             object: "chat.completion".to_string(),
             created: 1700000000,
-            model: "moltbot".to_string(),
+            model: "carapace".to_string(),
             choices: vec![ChatChoice {
                 index: 0,
                 message: ChatMessage {
@@ -1492,7 +1492,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_chat_completions_moltbot_model_maps_to_default() {
+    async fn test_chat_completions_carapace_model_maps_to_default() {
         let provider = Arc::new(MockLlmProvider::text_response("ok", 10, 5));
         let state = OpenAiState {
             chat_completions_enabled: true,
@@ -1502,7 +1502,7 @@ mod tests {
         };
 
         let body = serde_json::to_vec(&serde_json::json!({
-            "model": "moltbot",
+            "model": "carapace",
             "messages": [{"role": "user", "content": "test"}]
         }))
         .unwrap();
@@ -1525,7 +1525,7 @@ mod tests {
             .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
 
-        // Model should be mapped from "moltbot" to the default model
+        // Model should be mapped from "carapace" to the default model
         assert_eq!(parsed["model"], crate::agent::DEFAULT_MODEL);
     }
 
@@ -1738,7 +1738,7 @@ mod tests {
         };
 
         let body = serde_json::to_vec(&serde_json::json!({
-            "model": "moltbot",
+            "model": "carapace",
             "input": "Hello"
         }))
         .unwrap();
@@ -1778,7 +1778,7 @@ mod tests {
         };
 
         let body = serde_json::to_vec(&serde_json::json!({
-            "model": "moltbot",
+            "model": "carapace",
             "input": "Hello"
         }))
         .unwrap();
@@ -1866,7 +1866,7 @@ mod tests {
         };
 
         let body = serde_json::to_vec(&serde_json::json!({
-            "model": "moltbot",
+            "model": "carapace",
             "input": "Hello",
             "instructions": "Be very helpful"
         }))
@@ -1907,7 +1907,7 @@ mod tests {
         };
 
         let body = serde_json::to_vec(&serde_json::json!({
-            "model": "moltbot",
+            "model": "carapace",
             "input": [
                 {"type": "message", "role": "system", "content": "Be helpful"}
             ]
@@ -1941,7 +1941,7 @@ mod tests {
         // Items list has only system messages; instructions also provided.
         // has_user_message check catches this first, returning 400.
         let body = serde_json::to_vec(&serde_json::json!({
-            "model": "moltbot",
+            "model": "carapace",
             "input": [
                 {"type": "message", "role": "system", "content": "System only"}
             ],
@@ -1974,7 +1974,7 @@ mod tests {
         };
 
         let body = serde_json::to_vec(&serde_json::json!({
-            "model": "moltbot",
+            "model": "carapace",
             "input": "Hello"
         }))
         .unwrap();
@@ -2012,7 +2012,7 @@ mod tests {
         };
 
         let body = serde_json::to_vec(&serde_json::json!({
-            "model": "moltbot",
+            "model": "carapace",
             "input": "Hello"
         }))
         .unwrap();

@@ -13,9 +13,9 @@ expression: normalized
         "enabled": true,
         "id": "default",
         "identity": {
-          "name": "Moltbot"
+          "name": "Carapace"
         },
-        "name": "Moltbot"
+        "name": "Carapace"
       }
     ],
     "count": 1,

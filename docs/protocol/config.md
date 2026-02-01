@@ -1,15 +1,17 @@
 # Config File Format
 
 This document describes the config file format as implemented by the carapace
-gateway. The format is compatible with the original Node.js moltbot gateway.
+gateway. The format is compatible with the original Node.js openclaw gateway.
 
 ## File Location
 
 Default config path:
 
-- `~/.moltbot/moltbot.json`
-- If `MOLTBOT_STATE_DIR` is set, defaults to `${MOLTBOT_STATE_DIR}/moltbot.json`
-- Override with `MOLTBOT_CONFIG_PATH`
+- Uses the platform config directory (e.g. `~/.config/carapace` on Linux,
+  `~/Library/Application Support/carapace` on macOS, `%APPDATA%\\carapace` on Windows).
+- `~/.config/carapace/carapace.json`
+- If `CARAPACE_STATE_DIR` is set, defaults to `${CARAPACE_STATE_DIR}/carapace.json`
+- Override with `CARAPACE_CONFIG_PATH`
 
 The file is parsed as **JSON5** (comments, trailing commas allowed).
 
@@ -180,4 +182,3 @@ Defaults are applied after validation. Key defaults include:
 - JSON5 parse errors produce an invalid config snapshot.
 - `$include` errors raise `ConfigIncludeError` / `CircularIncludeError`.
 - Missing env vars in `${VAR}` substitution raise `MissingEnvVarError`.
-

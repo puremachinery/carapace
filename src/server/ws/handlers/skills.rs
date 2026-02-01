@@ -35,7 +35,7 @@ fn ensure_object(value: &mut Value) -> Result<&mut serde_json::Map<String, Value
 }
 
 fn resolve_workspace_dir(cfg: &Value) -> PathBuf {
-    if let Ok(dir) = env::var("MOLTBOT_WORKSPACE_DIR") {
+    if let Ok(dir) = env::var("CARAPACE_WORKSPACE_DIR") {
         if !dir.trim().is_empty() {
             return PathBuf::from(dir);
         }

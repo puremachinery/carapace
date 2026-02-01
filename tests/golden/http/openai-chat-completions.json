@@ -18,9 +18,9 @@
     "properties": {
       "model": {
         "type": "string",
-        "default": "moltbot",
-        "description": "Model identifier. Can include agent ID as 'moltbot:<agentId>' or 'agent:<agentId>'",
-        "examples": ["moltbot", "moltbot:email-agent", "agent:main"]
+        "default": "carapace",
+        "description": "Model identifier. Can include agent ID as 'carapace:<agentId>' or 'agent:<agentId>'",
+        "examples": ["carapace", "carapace:email-agent", "agent:main"]
       },
       "messages": {
         "type": "array",
@@ -160,17 +160,17 @@
     }
   },
   "headers": {
-    "X-Moltbot-Agent-Id": {
+    "X-Carapace-Agent-Id": {
       "description": "Override agent ID (alternative to model field)",
-      "aliases": ["X-Moltbot-Agent"]
+      "aliases": ["X-Carapace-Agent"]
     },
-    "X-Moltbot-Session-Key": {
+    "X-Carapace-Session-Key": {
       "description": "Explicit session key for conversation context"
     }
   },
   "session_key_resolution": {
     "priority": [
-      "X-Moltbot-Session-Key header if present",
+      "X-Carapace-Session-Key header if present",
       "Auto-generated: openai-user:<user> if user field provided",
       "Auto-generated: openai:<uuid> otherwise"
     ],
@@ -185,7 +185,7 @@
         "path": "/v1/chat/completions",
         "headers": { "Authorization": "Bearer {{gateway_token}}" },
         "body": {
-          "model": "moltbot",
+          "model": "carapace",
           "messages": [
             { "role": "user", "content": "Hello" }
           ]
@@ -220,7 +220,7 @@
         "path": "/v1/chat/completions",
         "headers": { "Authorization": "Bearer {{gateway_token}}" },
         "body": {
-          "model": "moltbot",
+          "model": "carapace",
           "messages": [{ "role": "user", "content": "Hello" }],
           "stream": true
         }
@@ -241,7 +241,7 @@
         "path": "/v1/chat/completions",
         "headers": { "Authorization": "Bearer {{gateway_token}}" },
         "body": {
-          "model": "moltbot",
+          "model": "carapace",
           "messages": [
             { "role": "system", "content": "You are a helpful assistant." },
             { "role": "user", "content": "Hi" }
@@ -258,7 +258,7 @@
         "path": "/v1/chat/completions",
         "headers": { "Authorization": "Bearer {{gateway_token}}" },
         "body": {
-          "model": "moltbot:email-agent",
+          "model": "carapace:email-agent",
           "messages": [{ "role": "user", "content": "Send summary" }]
         }
       },
@@ -273,10 +273,10 @@
         "path": "/v1/chat/completions",
         "headers": {
           "Authorization": "Bearer {{gateway_token}}",
-          "X-Moltbot-Agent-Id": "special-agent"
+          "X-Carapace-Agent-Id": "special-agent"
         },
         "body": {
-          "model": "moltbot:email-agent",
+          "model": "carapace:email-agent",
           "messages": [{ "role": "user", "content": "test" }]
         }
       },
@@ -291,7 +291,7 @@
         "path": "/v1/chat/completions",
         "headers": { "Authorization": "Bearer {{gateway_token}}" },
         "body": {
-          "model": "moltbot",
+          "model": "carapace",
           "messages": [
             { "role": "system", "content": "You are helpful" }
           ]
@@ -329,7 +329,7 @@
       "request": {
         "method": "POST",
         "path": "/v1/chat/completions",
-        "body": { "model": "moltbot", "messages": [] }
+        "body": { "model": "carapace", "messages": [] }
       },
       "response": {
         "status": 401,
@@ -353,7 +353,7 @@
         "path": "/v1/chat/completions",
         "headers": { "Authorization": "Bearer {{gateway_token}}" },
         "body": {
-          "model": "moltbot",
+          "model": "carapace",
           "messages": [
             {
               "role": "user",

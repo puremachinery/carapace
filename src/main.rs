@@ -190,9 +190,9 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Initialize logging based on the MOLTBOT_DEV environment variable.
+/// Initialize logging based on the CARAPACE_DEV environment variable.
 fn init_logging_from_env() -> Result<(), Box<dyn std::error::Error>> {
-    let log_config = if std::env::var("MOLTBOT_DEV")
+    let log_config = if std::env::var("CARAPACE_DEV")
         .map(|v| !v.is_empty() && v != "0" && v.to_lowercase() != "false")
         .unwrap_or(false)
     {

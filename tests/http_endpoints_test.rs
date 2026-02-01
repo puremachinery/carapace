@@ -434,7 +434,7 @@ fn auth_headers() -> HeaderMap {
 async fn test_responses_disabled_returns_404() {
     let state = responses_state_disabled();
     let body = serde_json::to_vec(&json!({
-        "model": "moltbot",
+        "model": "carapace",
         "input": "Hello"
     }))
     .unwrap();
@@ -456,7 +456,7 @@ async fn test_responses_disabled_returns_404() {
 async fn test_responses_no_auth_returns_401() {
     let state = responses_state_enabled();
     let body = serde_json::to_vec(&json!({
-        "model": "moltbot",
+        "model": "carapace",
         "input": "Hello"
     }))
     .unwrap();
@@ -484,7 +484,7 @@ async fn test_responses_no_auth_returns_401() {
 async fn test_responses_wrong_token_returns_401() {
     let state = responses_state_enabled();
     let body = serde_json::to_vec(&json!({
-        "model": "moltbot",
+        "model": "carapace",
         "input": "Hello"
     }))
     .unwrap();
@@ -509,7 +509,7 @@ async fn test_responses_wrong_token_returns_401() {
 async fn test_responses_basic_text_input() {
     let state = responses_state_enabled();
     let body = serde_json::to_vec(&json!({
-        "model": "moltbot",
+        "model": "carapace",
         "input": "Hello, how are you?"
     }))
     .unwrap();
@@ -532,7 +532,7 @@ async fn test_responses_basic_text_input() {
     // Verify response shape
     assert_eq!(parsed["object"], "response");
     assert_eq!(parsed["status"], "completed");
-    // "moltbot" is mapped to the default model by the handler
+    // "carapace" is mapped to the default model by the handler
     assert!(parsed["model"].as_str().is_some());
     assert!(parsed["id"].as_str().unwrap().starts_with("resp_"));
     assert!(parsed["created_at"].as_i64().is_some());
@@ -566,7 +566,7 @@ async fn test_responses_basic_text_input() {
 async fn test_responses_items_input_with_user_message() {
     let state = responses_state_enabled();
     let body = serde_json::to_vec(&json!({
-        "model": "moltbot",
+        "model": "carapace",
         "input": [
             { "type": "message", "role": "user", "content": "What is 2+2?" }
         ]
@@ -626,7 +626,7 @@ async fn test_responses_missing_input_returns_400() {
     let state = responses_state_enabled_no_provider();
     // Missing "input" field entirely
     let body = serde_json::to_vec(&json!({
-        "model": "moltbot"
+        "model": "carapace"
     }))
     .unwrap();
 
@@ -696,7 +696,7 @@ async fn test_responses_items_no_user_message_returns_400() {
     let state = responses_state_enabled_no_provider();
     // Items array with only a system message, no user message
     let body = serde_json::to_vec(&json!({
-        "model": "moltbot",
+        "model": "carapace",
         "input": [
             { "type": "message", "role": "system", "content": "Be concise" }
         ]
@@ -730,7 +730,7 @@ async fn test_responses_items_no_user_message_returns_400() {
 async fn test_responses_tool_choice_required_without_tools_returns_400() {
     let state = responses_state_enabled_no_provider();
     let body = serde_json::to_vec(&json!({
-        "model": "moltbot",
+        "model": "carapace",
         "input": "Hello",
         "tool_choice": "required"
     }))
@@ -761,7 +761,7 @@ async fn test_responses_tool_choice_required_without_tools_returns_400() {
 async fn test_responses_tool_choice_unknown_function_returns_400() {
     let state = responses_state_enabled_no_provider();
     let body = serde_json::to_vec(&json!({
-        "model": "moltbot",
+        "model": "carapace",
         "input": "Hello",
         "tools": [
             {
@@ -812,7 +812,7 @@ async fn test_responses_password_auth_accepted() {
         ..Default::default()
     };
     let body = serde_json::to_vec(&json!({
-        "model": "moltbot",
+        "model": "carapace",
         "input": "Hello"
     }))
     .unwrap();

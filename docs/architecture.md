@@ -65,7 +65,7 @@ graph TB
     end
 
     subgraph "Storage"
-        FS[(File System<br/>~/.moltbot/)]
+        FS[(Config Dir<br/>~/.config/carapace (Linux))]
     end
 
     %% Client connections

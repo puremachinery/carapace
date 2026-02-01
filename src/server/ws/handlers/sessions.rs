@@ -1663,7 +1663,7 @@ pub(super) fn handle_agent_identity_get(params: Option<&Value>) -> Result<Value,
                 let name = identity
                     .and_then(|v| v.get("name"))
                     .and_then(|v| v.as_str())
-                    .unwrap_or("Moltbot");
+                    .unwrap_or("Carapace");
                 let description = identity
                     .and_then(|v| v.get("description"))
                     .and_then(|v| v.as_str());
@@ -1702,7 +1702,7 @@ pub(super) fn handle_agent_identity_get(params: Option<&Value>) -> Result<Value,
             let name = identity
                 .and_then(|v| v.get("name"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("Moltbot");
+                .unwrap_or("Carapace");
             let description = identity
                 .and_then(|v| v.get("description"))
                 .and_then(|v| v.as_str());
@@ -1716,7 +1716,7 @@ pub(super) fn handle_agent_identity_get(params: Option<&Value>) -> Result<Value,
             // No agents configured — return hardcoded default
             Ok(json!({
                 "agentId": "default",
-                "name": "Moltbot",
+                "name": "Carapace",
                 "description": null,
             }))
         }
@@ -2787,7 +2787,7 @@ mod tests {
         // With no config, should return hardcoded default
         let result = handle_agent_identity_get(None).unwrap();
         assert_eq!(result["agentId"], "default");
-        assert_eq!(result["name"], "Moltbot");
+        assert_eq!(result["name"], "Carapace");
     }
 
     #[test]

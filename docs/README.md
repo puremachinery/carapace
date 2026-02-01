@@ -1,7 +1,7 @@
 # carapace Documentation
 
 A security-focused, open-source personal AI assistant — hardened alternative to
-openclaw / moltbot / clawdbot.
+openclaw / clawdbot.
 
 ## Architecture & Security
 

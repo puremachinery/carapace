@@ -5,7 +5,7 @@
 //! - Linux: Secret Service
 //! - Windows: Credential Manager
 //!
-//! Key namespace: Service name `moltbot`, account key format `kind:<agentId>:<id>`
+//! Key namespace: Service name `carapace`, account key format `kind:<agentId>:<id>`
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -27,7 +27,7 @@ use tokio::sync::RwLock;
 use tokio::time::timeout;
 
 /// Service name for all credentials
-pub const SERVICE_NAME: &str = "moltbot";
+pub const SERVICE_NAME: &str = "carapace";
 
 /// Maximum key length for plugin credentials
 pub const MAX_KEY_LENGTH: usize = 64;

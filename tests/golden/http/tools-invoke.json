@@ -4,7 +4,7 @@
   "source_files": [
     "src/gateway/tools-invoke-http.ts",
     "src/gateway/http-utils.ts",
-    "src/agents/moltbot-tools.ts",
+    "src/agents/carapace-tools.ts",
     "src/agents/pi-tools.policy.ts"
   ],
   "endpoint": "/tools/invoke",
@@ -117,10 +117,10 @@
     }
   },
   "headers": {
-    "X-Moltbot-Message-Channel": {
+    "X-Carapace-Message-Channel": {
       "description": "Message channel for policy inheritance (e.g., 'telegram', 'slack')"
     },
-    "X-Moltbot-Account-Id": {
+    "X-Carapace-Account-Id": {
       "description": "Account ID for group-based tool policy resolution"
     }
   },
@@ -240,7 +240,7 @@
         "path": "/tools/invoke",
         "headers": {
           "Authorization": "Bearer {{gateway_token}}",
-          "X-Moltbot-Message-Channel": "telegram"
+          "X-Carapace-Message-Channel": "telegram"
         },
         "body": {
           "tool": "time"

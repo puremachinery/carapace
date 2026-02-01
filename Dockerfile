@@ -20,7 +20,7 @@ RUN apt-get update \
 COPY --from=builder /build/target/release/carapace /usr/local/bin/carapace
 
 # State directory for sessions, cron, config
-ENV MOLTBOT_STATE_DIR=/data
+ENV CARAPACE_STATE_DIR=/data
 RUN mkdir -p /data
 
 EXPOSE 18789

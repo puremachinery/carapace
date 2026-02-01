@@ -514,11 +514,11 @@ impl Default for SessionStore {
 }
 
 impl SessionStore {
-    /// Create a new session store with default path (~/.moltbot/sessions/)
+    /// Create a new session store with default path (~/.config/carapace/sessions/)
     pub fn new() -> Self {
-        let base_path = dirs::home_dir()
-            .map(|p| p.join(".moltbot").join("sessions"))
-            .unwrap_or_else(|| PathBuf::from(".moltbot/sessions"));
+        let base_path = dirs::config_dir()
+            .map(|p| p.join("carapace").join("sessions"))
+            .unwrap_or_else(|| PathBuf::from(".config/carapace/sessions"));
         Self::with_base_path(base_path)
     }
 

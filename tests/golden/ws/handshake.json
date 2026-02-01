@@ -1,6 +1,6 @@
 {
   "$schema": "golden-trace-v1",
-  "description": "WebSocket connection handshake protocol - based on moltbot gateway source code",
+  "description": "WebSocket connection handshake protocol - based on openclaw gateway source code",
   "source_files": [
     "src/gateway/server/ws-connection.ts",
     "src/gateway/server/ws-connection/message-handler.ts",
@@ -66,7 +66,7 @@
             }
           },
           "notes": [
-            "client.id must be one of: webchat-ui, moltbot-control-ui, webchat, cli, gateway-client, moltbot-macos, moltbot-ios, moltbot-android, node-host, test, fingerprint, moltbot-probe",
+            "client.id must be one of: webchat-ui, carapace-control-ui, webchat, cli, gateway-client, carapace-macos, carapace-ios, carapace-android, node-host, test, fingerprint, carapace-probe",
             "client.mode must be one of: webchat, cli, ui, backend, node, probe, test",
             "Token auth allows skipping device identity for local connections"
           ]
@@ -137,7 +137,7 @@
               "minProtocol": 3,
               "maxProtocol": 3,
               "client": {
-                "id": "moltbot-macos",
+                "id": "carapace-macos",
                 "displayName": "My Mac",
                 "version": "2024.1.0",
                 "platform": "darwin",
@@ -344,7 +344,7 @@
         "type": "object",
         "required": ["id", "version", "platform", "mode"],
         "properties": {
-          "id": { "type": "string", "enum": ["webchat-ui", "moltbot-control-ui", "webchat", "cli", "gateway-client", "moltbot-macos", "moltbot-ios", "moltbot-android", "node-host", "test", "fingerprint", "moltbot-probe"] },
+          "id": { "type": "string", "enum": ["webchat-ui", "carapace-control-ui", "webchat", "cli", "gateway-client", "carapace-macos", "carapace-ios", "carapace-android", "node-host", "test", "fingerprint", "carapace-probe"] },
           "displayName": { "type": "string" },
           "version": { "type": "string", "minLength": 1 },
           "platform": { "type": "string", "minLength": 1 },
@@ -393,7 +393,7 @@
         "type": "object",
         "required": ["version", "connId"],
         "properties": {
-          "version": { "type": "string", "description": "Server version from MOLTBOT_VERSION env or package.json" },
+          "version": { "type": "string", "description": "Server version from CARAPACE_VERSION env or package.json" },
           "commit": { "type": "string", "description": "Git commit hash from GIT_COMMIT env" },
           "host": { "type": "string", "description": "Server hostname from os.hostname()" },
           "connId": { "type": "string", "description": "Unique connection ID (UUID)" }

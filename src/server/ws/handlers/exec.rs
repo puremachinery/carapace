@@ -646,7 +646,7 @@ mod tests {
     fn test_handle_exec_approvals_get() {
         let _lock = TEST_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("MOLTBOT_STATE_DIR", tmp.path());
+        std::env::set_var("CARAPACE_STATE_DIR", tmp.path());
         let result = handle_exec_approvals_get();
         assert!(result.is_ok());
         let value = result.unwrap();
@@ -654,7 +654,7 @@ mod tests {
         assert!(value["path"].is_string(), "path should always be a string");
         assert_eq!(value["hash"], Value::Null);
         assert!(value["file"].is_object());
-        std::env::remove_var("MOLTBOT_STATE_DIR");
+        std::env::remove_var("CARAPACE_STATE_DIR");
     }
 
     #[test]
@@ -672,7 +672,7 @@ mod tests {
     fn test_handle_exec_approvals_set_validates_file() {
         let _lock = TEST_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("MOLTBOT_STATE_DIR", tmp.path());
+        std::env::set_var("CARAPACE_STATE_DIR", tmp.path());
 
         let params = json!({ "file": "not an object" });
         let result = handle_exec_approvals_set(Some(&params));
@@ -686,14 +686,14 @@ mod tests {
         assert!(value["hash"].is_string());
         assert!(value["path"].is_string());
 
-        std::env::remove_var("MOLTBOT_STATE_DIR");
+        std::env::remove_var("CARAPACE_STATE_DIR");
     }
 
     #[test]
     fn test_exec_approvals_roundtrip() {
         let _lock = TEST_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("MOLTBOT_STATE_DIR", tmp.path());
+        std::env::set_var("CARAPACE_STATE_DIR", tmp.path());
 
         // Set approvals
         let file_data = json!({ "mode": "allow", "rules": [{"pattern": "ls"}] });
@@ -710,14 +710,14 @@ mod tests {
         assert_eq!(get_result["file"]["rules"][0]["pattern"], "ls");
         assert!(get_result["path"].is_string());
 
-        std::env::remove_var("MOLTBOT_STATE_DIR");
+        std::env::remove_var("CARAPACE_STATE_DIR");
     }
 
     #[test]
     fn test_exec_approvals_base_hash_concurrency() {
         let _lock = TEST_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("MOLTBOT_STATE_DIR", tmp.path());
+        std::env::set_var("CARAPACE_STATE_DIR", tmp.path());
 
         // Initial write (no file exists yet, no baseHash required)
         let params = json!({ "file": { "mode": "ask", "rules": [] } });
@@ -745,7 +745,7 @@ mod tests {
         // Hash should have changed
         assert_ne!(value["hash"].as_str().unwrap(), correct_hash);
 
-        std::env::remove_var("MOLTBOT_STATE_DIR");
+        std::env::remove_var("CARAPACE_STATE_DIR");
     }
 
     #[tokio::test]

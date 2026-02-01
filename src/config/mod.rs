@@ -1,7 +1,7 @@
 //! Configuration parsing module
 //!
 //! Handles JSON5 configuration with includes, environment variable substitution,
-//! and caching. Matches moltbot's format for drop-in compatibility.
+//! and caching. Matches the legacy openclaw format for compatibility.
 
 pub mod defaults;
 pub mod schema;
@@ -27,7 +27,7 @@ const MAX_INCLUDE_DEPTH: usize = 10;
 const DEFAULT_CACHE_TTL_MS: u64 = 200;
 
 /// Env var for config secret encryption/decryption.
-const CONFIG_PASSWORD_ENV: &str = "MOLTBOT_CONFIG_PASSWORD";
+const CONFIG_PASSWORD_ENV: &str = "CARAPACE_CONFIG_PASSWORD";
 
 /// JSON pointer paths that should be encrypted at rest.
 const CONFIG_SECRET_PATHS: &[&str] = &[
@@ -90,40 +90,40 @@ struct CachedConfig {
 static CONFIG_CACHE: LazyLock<RwLock<Option<CachedConfig>>> = LazyLock::new(|| RwLock::new(None));
 
 /// Get the config file path.
-/// Priority: MOLTBOT_CONFIG_PATH > MOLTBOT_STATE_DIR/moltbot.json5 > ~/.moltbot/moltbot.json5
+/// Priority: CARAPACE_CONFIG_PATH > CARAPACE_STATE_DIR/carapace.json5 > ~/.config/carapace/carapace.json5
 /// Falls back to .json extension if the .json5 file doesn't exist.
 pub fn get_config_path() -> PathBuf {
-    if let Ok(path) = env::var("MOLTBOT_CONFIG_PATH") {
+    if let Ok(path) = env::var("CARAPACE_CONFIG_PATH") {
         return PathBuf::from(path);
     }
 
-    if let Ok(state_dir) = env::var("MOLTBOT_STATE_DIR") {
+    if let Ok(state_dir) = env::var("CARAPACE_STATE_DIR") {
         let dir = PathBuf::from(state_dir);
-        let json5 = dir.join("moltbot.json5");
+        let json5 = dir.join("carapace.json5");
         if json5.exists() {
             return json5;
         }
-        return dir.join("moltbot.json");
+        return dir.join("carapace.json");
     }
 
-    let base = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".moltbot");
-    let json5 = base.join("moltbot.json5");
+    let base = dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from(".config"))
+        .join("carapace");
+    let json5 = base.join("carapace.json5");
     if json5.exists() {
         return json5;
     }
-    base.join("moltbot.json")
+    base.join("carapace.json")
 }
 
 /// Get the cache TTL duration
 fn get_cache_ttl() -> Option<Duration> {
     // Check if caching is disabled
-    if env::var("MOLTBOT_DISABLE_CONFIG_CACHE").is_ok() {
+    if env::var("CARAPACE_DISABLE_CONFIG_CACHE").is_ok() {
         return None;
     }
 
-    let ms = env::var("MOLTBOT_CONFIG_CACHE_MS")
+    let ms = env::var("CARAPACE_CONFIG_CACHE_MS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(DEFAULT_CACHE_TTL_MS);
@@ -808,8 +808,8 @@ mod tests {
     #[test]
     fn test_config_cache_ttl_default() {
         let _lock = ENV_LOCK.lock().unwrap();
-        env::remove_var("MOLTBOT_CONFIG_CACHE_MS");
-        env::remove_var("MOLTBOT_DISABLE_CONFIG_CACHE");
+        env::remove_var("CARAPACE_CONFIG_CACHE_MS");
+        env::remove_var("CARAPACE_DISABLE_CONFIG_CACHE");
 
         let ttl = get_cache_ttl();
         assert_eq!(ttl, Some(Duration::from_millis(200)));
@@ -819,60 +819,63 @@ mod tests {
     fn test_config_cache_ttl_custom() {
         let _lock = ENV_LOCK.lock().unwrap();
         // Ensure disabled cache env var is not set
-        env::remove_var("MOLTBOT_DISABLE_CONFIG_CACHE");
-        env::set_var("MOLTBOT_CONFIG_CACHE_MS", "500");
+        env::remove_var("CARAPACE_DISABLE_CONFIG_CACHE");
+        env::set_var("CARAPACE_CONFIG_CACHE_MS", "500");
 
         let ttl = get_cache_ttl();
         assert_eq!(ttl, Some(Duration::from_millis(500)));
 
-        env::remove_var("MOLTBOT_CONFIG_CACHE_MS");
+        env::remove_var("CARAPACE_CONFIG_CACHE_MS");
     }
 
     #[test]
     fn test_config_cache_disabled() {
         let _lock = ENV_LOCK.lock().unwrap();
-        env::set_var("MOLTBOT_DISABLE_CONFIG_CACHE", "1");
+        env::set_var("CARAPACE_DISABLE_CONFIG_CACHE", "1");
 
         let ttl = get_cache_ttl();
         assert!(ttl.is_none());
 
-        env::remove_var("MOLTBOT_DISABLE_CONFIG_CACHE");
+        env::remove_var("CARAPACE_DISABLE_CONFIG_CACHE");
     }
 
     #[test]
     fn test_get_config_path_default() {
         let _lock = ENV_LOCK.lock().unwrap();
-        env::remove_var("MOLTBOT_CONFIG_PATH");
-        env::remove_var("MOLTBOT_STATE_DIR");
+        env::remove_var("CARAPACE_CONFIG_PATH");
+        env::remove_var("CARAPACE_STATE_DIR");
 
         let path = get_config_path();
         // Falls back to .json when .json5 doesn't exist on disk
-        assert!(path.ends_with(".moltbot/moltbot.json"));
+        let expected_base = dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from(".config"))
+            .join("carapace");
+        assert_eq!(path, expected_base.join("carapace.json"));
     }
 
     #[test]
     fn test_get_config_path_override() {
         let _lock = ENV_LOCK.lock().unwrap();
-        env::remove_var("MOLTBOT_STATE_DIR");
-        env::set_var("MOLTBOT_CONFIG_PATH", "/custom/path/config.json");
+        env::remove_var("CARAPACE_STATE_DIR");
+        env::set_var("CARAPACE_CONFIG_PATH", "/custom/path/config.json");
 
         let path = get_config_path();
         assert_eq!(path, PathBuf::from("/custom/path/config.json"));
 
-        env::remove_var("MOLTBOT_CONFIG_PATH");
+        env::remove_var("CARAPACE_CONFIG_PATH");
     }
 
     #[test]
     fn test_get_config_path_state_dir() {
         let _lock = ENV_LOCK.lock().unwrap();
-        env::remove_var("MOLTBOT_CONFIG_PATH");
-        env::set_var("MOLTBOT_STATE_DIR", "/custom/state");
+        env::remove_var("CARAPACE_CONFIG_PATH");
+        env::set_var("CARAPACE_STATE_DIR", "/custom/state");
 
         let path = get_config_path();
         // Falls back to .json when .json5 doesn't exist on disk
-        assert_eq!(path, PathBuf::from("/custom/state/moltbot.json"));
+        assert_eq!(path, PathBuf::from("/custom/state/carapace.json"));
 
-        env::remove_var("MOLTBOT_STATE_DIR");
+        env::remove_var("CARAPACE_STATE_DIR");
     }
 
     #[test]
@@ -906,7 +909,7 @@ mod tests {
     #[test]
     fn test_secret_encryption_round_trip() {
         let _lock = ENV_LOCK.lock().unwrap();
-        env::set_var("MOLTBOT_CONFIG_PASSWORD", "test-password");
+        env::set_var("CARAPACE_CONFIG_PASSWORD", "test-password");
 
         let dir = TempDir::new().unwrap();
         let main_path = create_temp_config(
@@ -934,7 +937,7 @@ mod tests {
         assert_eq!(reloaded["anthropic"]["apiKey"], "sk-test");
         assert_eq!(reloaded["gateway"]["auth"]["token"], "token123");
 
-        env::remove_var("MOLTBOT_CONFIG_PASSWORD");
+        env::remove_var("CARAPACE_CONFIG_PASSWORD");
     }
 
     #[test]

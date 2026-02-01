@@ -776,12 +776,12 @@ fn parse_primary(tokens: &[Token], pos: &mut usize) -> Result<f64, String> {
 
 /// Resolve the sessions base path, matching the server's convention.
 fn resolve_sessions_path() -> PathBuf {
-    if let Ok(state_dir) = std::env::var("MOLTBOT_STATE_DIR") {
+    if let Ok(state_dir) = std::env::var("CARAPACE_STATE_DIR") {
         return PathBuf::from(state_dir).join("sessions");
     }
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".moltbot")
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from(".config"))
+        .join("carapace")
         .join("sessions")
 }
 

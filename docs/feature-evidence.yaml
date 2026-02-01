@@ -150,7 +150,7 @@ features:
   - feature: "discovery.mdns service registration"
     status: "verified_done"
     runtime_wiring:
-      - "src/discovery/mod.rs::register_mdns_service (SERVICE_TYPE _moltbot._tcp.local.)"
+      - "src/discovery/mod.rs::register_mdns_service (SERVICE_TYPE _carapace._tcp.local.)"
       - "src/discovery/mod.rs::start_mdns"
       - "src/main.rs::spawn_network_services (run_mdns_lifecycle)"
     tests:
