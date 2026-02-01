@@ -108,14 +108,18 @@ graph TB
 - [x] Device identity verification (public key + signature)
 
 ```rust
-// Constant-time comparison prevents timing attacks
-pub fn constant_time_eq(a: &str, b: &str) -> bool {
-    if a.len() != b.len() { return false; }
-    let mut result = 0u8;
-    for (x, y) in a.bytes().zip(b.bytes()) {
-        result |= x ^ y;
+// Constant-time comparison prevents timing attacks.
+// Both inputs are SHA-256 hashed first so the XOR loop always
+// compares fixed-length digests — no length side-channel.
+pub fn timing_safe_eq(a: &str, b: &str) -> bool {
+    use sha2::{Digest, Sha256};
+    let hash_a = Sha256::digest(a.as_bytes());
+    let hash_b = Sha256::digest(b.as_bytes());
+    let mut out = 0u8;
+    for (x, y) in hash_a.iter().zip(hash_b.iter()) {
+        out |= x ^ y;
     }
-    result == 0
+    out == 0
 }
 ```
 
@@ -391,6 +395,17 @@ The send path uses `mpsc::UnboundedSender<Message>` (`src/server/ws/mod.rs`). If
 ### Resolved
 
 - **Unbounded cron job creation**: Fixed. `CronScheduler::add()` enforces a hard cap of 500 jobs (`CronError::LimitExceeded`).
+- **Unknown auth mode fall-through**: Unknown `gateway.auth.mode` values now return a hard error instead of silently falling back to auto-detect.
+- **CSRF disabled by default**: `enable_csrf` now defaults to `true` in `MiddlewareConfig`.
+- **Duplicate timing-safe comparison**: Removed the length-leaking `timing_safe_equal` from CSRF module; all call sites now use the SHA-256-based `timing_safe_eq` from `auth`.
+- **Credential store read failure swallowed**: `read_gateway_auth` errors now propagate at startup instead of defaulting to empty credentials.
+- **Device token issuance fallback**: `ensure_device_token` returns `Result`; failures send an error response and close the connection instead of proceeding with a phantom credential.
+- **Whitespace-only credentials accepted**: `normalize_credential` now trims and rejects whitespace-only tokens and passwords.
+- **`PermissionEnforcer::permissive()` reachable from builder**: Plugin host builder now requires an explicit `PermissionEnforcer` instead of falling back to permissive.
+- **Sandbox default disabled on missing field**: `SandboxConfig::enabled` now defaults to `true` via a custom serde default function instead of `bool::default()` (`false`).
+- **Exec approvals parse failure fall-through**: Invalid JSON in the exec approvals file now falls back to `deny` mode with a warning instead of `ask`.
+- **Credential memory not zeroed on drop**: `GatewayAuthSecrets` derives `ZeroizeOnDrop`; `ResolvedGatewayAuth` has a manual `Drop` impl that zeroizes token and password fields.
+- **AuthMode::None + Tailscale interaction**: Added tests confirming `AuthMode::None` correctly bypasses Tailscale checks for local connections and rejects remote connections regardless of `allow_tailscale`.
 
 ## Security Contacts
 
