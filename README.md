@@ -35,6 +35,36 @@ See [docs/security.md](docs/security.md) for the full security model.
 - Rust 1.93+ (MSRV enforced in CI)
 - wasmtime 41 (included as dependency)
 
+## Install
+
+### Prebuilt binaries (GitHub Releases)
+
+Download the matching binary from the GitHub Releases page:
+
+- `carapace-x86_64-linux`
+- `carapace-aarch64-linux`
+- `carapace-x86_64-darwin`
+- `carapace-aarch64-darwin`
+- `carapace-x86_64-windows.exe`
+
+Optionally verify with cosign (signatures and certificates are published alongside each release):
+
+```bash
+cosign verify-blob \
+  --certificate carapace-x86_64-linux.pem \
+  --signature carapace-x86_64-linux.sig \
+  --certificate-identity-regexp "https://github.com/puremachinery/carapace/.github/workflows/release.yml@refs/tags/v.*" \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+  carapace-x86_64-linux
+```
+
+Then make it executable (macOS/Linux) and move it into your PATH:
+
+```bash
+chmod +x carapace-x86_64-linux
+sudo mv carapace-x86_64-linux /usr/local/bin/carapace
+```
+
 ### Recommended Tools
 
 ```bash

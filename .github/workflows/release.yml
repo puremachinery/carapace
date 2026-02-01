@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -81,6 +82,22 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign release artifacts
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for artifact in artifacts/*; do
+            if [ -f "$artifact" ]; then
+              cosign sign-blob --yes \
+                --output-signature "${artifact}.sig" \
+                --output-certificate "${artifact}.pem" \
+                "$artifact"
+            fi
+          done
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
