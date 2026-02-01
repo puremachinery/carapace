@@ -325,15 +325,14 @@ features:
       - "src/media/mod.rs::MediaFetcher (SSRF protections)"
 
   - feature: "links.lru cache"
-    status: "partial"
+    status: "verified_done"
     runtime_wiring:
-      - "src/links/mod.rs::LinkCache (max entries + TTL)"
+      - "src/links/mod.rs::LinkCache (LruCache + TTL)"
       - "src/links/mod.rs::LinkUnderstanding::fetch_and_summarize (cache get/insert)"
     tests:
       - "src/links/mod.rs::test_cache_eviction_at_capacity"
+      - "src/links/mod.rs::test_cache_eviction_is_lru"
       - "src/links/mod.rs::test_cache_ttl_expiration"
-    notes:
-      - "Cache eviction is insertion-order; access does not update LRU position"
 
   - feature: "links.title/meta extraction"
     status: "verified_done"

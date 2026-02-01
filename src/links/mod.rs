@@ -28,7 +28,8 @@
 //! let summaries = lu.process_message("Visit https://example.com").await;
 //! ```
 
-use std::collections::HashMap;
+use lru::LruCache;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -90,7 +91,7 @@ pub struct LinkConfig {
     /// Request timeout in milliseconds (default: 15s)
     pub timeout_ms: u64,
 
-    /// Maximum number of cached link summaries (default: 100)
+    /// Maximum number of cached link summaries (default: 100). Set to 0 to disable caching.
     pub cache_max_entries: usize,
 
     /// Cache TTL in seconds (default: 3600 = 1 hour)
@@ -146,65 +147,45 @@ pub struct LinkSummary {
 // Cache
 // ---------------------------------------------------------------------------
 
-/// Internal LRU-style cache for link summaries.
-///
-/// Uses a `HashMap` with insertion-order tracking via a parallel `Vec` of keys
-/// to enforce the max-entries cap with LRU eviction.
+/// Internal LRU cache for link summaries.
 #[derive(Debug)]
 struct LinkCache {
-    entries: HashMap<String, LinkSummary>,
-    /// Keys in insertion order (oldest first). Used for LRU eviction.
-    order: Vec<String>,
-    max_entries: usize,
+    entries: Option<LruCache<String, LinkSummary>>,
     ttl_secs: u64,
 }
 
 impl LinkCache {
     fn new(max_entries: usize, ttl_secs: u64) -> Self {
-        Self {
-            entries: HashMap::new(),
-            order: Vec::new(),
-            max_entries,
-            ttl_secs,
-        }
+        // Disable cache entirely when max_entries is 0.
+        let entries = NonZeroUsize::new(max_entries).map(LruCache::new);
+        Self { entries, ttl_secs }
     }
 
     /// Get a cached entry if it exists and has not expired.
     fn get(&mut self, url: &str) -> Option<LinkSummary> {
+        let cache = self.entries.as_mut()?;
         let now = current_epoch_secs();
-        if let Some(entry) = self.entries.get(url) {
+        if let Some(entry) = cache.get(url) {
             if now.saturating_sub(entry.fetched_at) < self.ttl_secs {
                 return Some(entry.clone());
             }
             // Expired — remove it
-            self.entries.remove(url);
-            self.order.retain(|k| k != url);
+            cache.pop(url);
         }
         None
     }
 
     /// Insert a summary into the cache, evicting the oldest entry if at capacity.
     fn insert(&mut self, summary: LinkSummary) {
-        let url = summary.url.clone();
-
-        // If already present, remove old position in order vec
-        if self.entries.contains_key(&url) {
-            self.order.retain(|k| k != &url);
-        }
-
-        // Evict oldest if at capacity
-        while self.entries.len() >= self.max_entries && !self.order.is_empty() {
-            let oldest = self.order.remove(0);
-            self.entries.remove(&oldest);
-        }
-
-        self.entries.insert(url.clone(), summary);
-        self.order.push(url);
+        let Some(cache) = self.entries.as_mut() else {
+            return;
+        };
+        cache.put(summary.url.clone(), summary);
     }
 
     /// Return the current number of (non-evicted) entries.
     fn len(&self) -> usize {
-        self.entries.len()
+        self.entries.as_ref().map(|cache| cache.len()).unwrap_or(0)
     }
 }
 
@@ -966,6 +947,26 @@ mod tests {
     }
 
     #[test]
+    fn test_cache_eviction_is_lru() {
+        let mut cache = LinkCache::new(3, 3600);
+
+        cache.insert(make_test_summary("https://a.com"));
+        cache.insert(make_test_summary("https://b.com"));
+        cache.insert(make_test_summary("https://c.com"));
+
+        // Touch a.com so it becomes most recently used.
+        assert!(cache.get("https://a.com").is_some());
+
+        cache.insert(make_test_summary("https://d.com"));
+
+        // b.com should be evicted (least recently used).
+        assert!(cache.get("https://b.com").is_none());
+        assert!(cache.get("https://a.com").is_some());
+        assert!(cache.get("https://c.com").is_some());
+        assert!(cache.get("https://d.com").is_some());
+    }
+
+    #[test]
     fn test_cache_ttl_expiration() {
         let mut cache = LinkCache::new(10, 3600);
 
@@ -1020,6 +1021,14 @@ mod tests {
 
         cache.insert(make_test_summary("https://b.com"));
         assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn test_cache_disabled_when_zero() {
+        let mut cache = LinkCache::new(0, 3600);
+        cache.insert(make_test_summary("https://disabled.com"));
+        assert_eq!(cache.len(), 0);
+        assert!(cache.get("https://disabled.com").is_none());
     }
 
     // -- Config defaults --------------------------------------------------
