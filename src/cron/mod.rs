@@ -506,6 +506,14 @@ impl CronScheduler {
     /// Maximum number of cron jobs allowed.
     const MAX_JOBS: usize = 500;
 
+    fn last_used_at(job: &CronJob) -> u64 {
+        job.state
+            .last_run_at_ms
+            .unwrap_or(0)
+            .max(job.updated_at_ms)
+            .max(job.created_at_ms)
+    }
+
     /// Add a new job.
     pub fn add(&self, input: CronJobCreate) -> Result<CronJob, CronError> {
         let now = now_ms();
@@ -541,16 +549,38 @@ impl CronScheduler {
             },
         };
 
+        let mut evicted_job: Option<CronJob> = None;
         {
             let mut jobs = self.jobs.write();
             if jobs.len() >= Self::MAX_JOBS {
-                return Err(CronError::LimitExceeded(Self::MAX_JOBS));
+                let eviction = jobs
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, job)| job.state.running_at_ms.is_none())
+                    .min_by_key(|(_, job)| Self::last_used_at(job))
+                    .map(|(idx, _)| idx);
+                if let Some(idx) = eviction {
+                    evicted_job = Some(jobs.remove(idx));
+                } else {
+                    return Err(CronError::LimitExceeded(Self::MAX_JOBS));
+                }
             }
             jobs.push(job.clone());
         }
 
         self.flush_to_disk();
 
+        if let Some(evicted) = evicted_job {
+            self.emit_event(CronEvent {
+                job_id: evicted.id,
+                action: CronEventAction::Removed,
+                next_run_at_ms: None,
+                details: Some(serde_json::json!({
+                    "reason": "evicted",
+                    "evictedBy": job_id,
+                })),
+            });
+        }
         self.emit_event(CronEvent {
             job_id: job_id.clone(),
             action: CronEventAction::Added,
@@ -1574,8 +1604,9 @@ mod tests {
         let scheduler = CronScheduler::in_memory();
 
         // Fill to the limit
+        let mut existing_ids = Vec::new();
         for i in 0..CronScheduler::MAX_JOBS {
-            scheduler
+            let job = scheduler
                 .add(CronJobCreate {
                     name: format!("Job {}", i),
                     agent_id: None,
@@ -1591,9 +1622,10 @@ mod tests {
                     isolation: None,
                 })
                 .unwrap();
+            existing_ids.push(job.id);
         }
 
-        // One more should fail
+        // One more should evict the least recently used job
         let result = scheduler.add(CronJobCreate {
             name: "Over Limit".to_string(),
             agent_id: None,
@@ -1608,27 +1640,15 @@ mod tests {
             },
             isolation: None,
         });
-        assert!(matches!(result, Err(CronError::LimitExceeded(500))));
-
-        // Removing one and adding should succeed
-        let jobs = scheduler.list(true);
-        scheduler.remove(&jobs[0].id);
-        assert!(scheduler
-            .add(CronJobCreate {
-                name: "After Remove".to_string(),
-                agent_id: None,
-                description: None,
-                enabled: false,
-                delete_after_run: None,
-                schedule: CronSchedule::At { at_ms: 0 },
-                session_target: CronSessionTarget::Main,
-                wake_mode: CronWakeMode::Now,
-                payload: CronPayload::SystemEvent {
-                    text: "t".to_string(),
-                },
-                isolation: None,
-            })
-            .is_ok());
+        let new_job = result.unwrap();
+        assert_eq!(scheduler.jobs.read().len(), CronScheduler::MAX_JOBS);
+        assert!(scheduler.get(&new_job.id).is_some());
+        let remaining_ids: std::collections::HashSet<_> =
+            scheduler.list(true).into_iter().map(|j| j.id).collect();
+        assert!(
+            existing_ids.iter().any(|id| !remaining_ids.contains(id)),
+            "expected at least one existing job to be evicted"
+        );
     }
 
     #[test]
@@ -2233,13 +2253,9 @@ mod tests {
         let successes = results.iter().filter(|r| r.is_ok()).count();
         let failures = results.iter().filter(|r| r.is_err()).count();
 
-        // Exactly one thread should succeed; the rest must be rejected
-        assert_eq!(successes, 1, "exactly one concurrent add should succeed");
-        assert_eq!(
-            failures,
-            num_threads - 1,
-            "all other concurrent adds should be rejected"
-        );
+        // All concurrent adds should succeed via eviction.
+        assert_eq!(successes, num_threads);
+        assert_eq!(failures, 0);
 
         // Total jobs must never exceed MAX_JOBS
         let total = scheduler.jobs.read().len();
