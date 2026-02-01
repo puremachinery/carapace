@@ -59,8 +59,17 @@ fn read_exec_approvals_snapshot() -> ExecApprovalsSnapshot {
     match fs::read_to_string(&path) {
         Ok(raw) => {
             let hash = Some(sha256_hex(&raw));
-            let file = serde_json::from_str::<Value>(&raw)
-                .unwrap_or(json!({ "mode": "ask", "rules": [] }));
+            let file = match serde_json::from_str::<Value>(&raw) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path_str,
+                        error = %e,
+                        "exec approvals file has invalid JSON; falling back to deny mode"
+                    );
+                    json!({ "mode": "deny", "rules": [] })
+                }
+            };
             ExecApprovalsSnapshot {
                 path: path_str,
                 exists: true,

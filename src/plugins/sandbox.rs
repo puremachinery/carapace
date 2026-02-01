@@ -55,7 +55,8 @@ pub struct CapabilityPolicy {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxConfig {
     /// Master switch — when `false`, capability checks are skipped.
-    #[serde(default)]
+    /// Defaults to `true` so the sandbox is active unless explicitly disabled.
+    #[serde(default = "sandbox_enabled_default")]
     pub enabled: bool,
     /// Default policy for skills without explicit overrides.
     #[serde(default)]
@@ -63,6 +64,10 @@ pub struct SandboxConfig {
     /// Per-skill overrides (keyed by skill name).
     #[serde(default)]
     pub overrides: HashMap<String, CapabilityPolicy>,
+}
+
+fn sandbox_enabled_default() -> bool {
+    true
 }
 
 impl Default for SandboxConfig {

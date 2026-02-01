@@ -49,7 +49,7 @@ notify = { version = "6", default-features = false, features = ["macos_fsevent"]
 flate2 = "1"
 tar = "0.4"
 aes-gcm = "0.10"
-zeroize = "1"
+zeroize = { version = "1", features = ["derive"] }
 libc = "0.2"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 urlencoding = "2"

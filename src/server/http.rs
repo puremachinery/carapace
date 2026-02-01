@@ -120,7 +120,7 @@ impl Default for HttpConfig {
 ///
 /// Maps gateway.* keys from config and checks environment variables
 /// (MOLTBOT_GATEWAY_TOKEN, MOLTBOT_GATEWAY_PASSWORD) with env taking precedence.
-pub fn build_http_config(cfg: &Value) -> HttpConfig {
+pub fn build_http_config(cfg: &Value) -> Result<HttpConfig, String> {
     let gateway = cfg.get("gateway").and_then(|v| v.as_object());
 
     let hooks_obj = gateway
@@ -198,20 +198,10 @@ pub fn build_http_config(cfg: &Value) -> HttpConfig {
             }
         }
         other => {
-            warn!(
-                "unknown gateway auth mode '{}'; falling back to token/password autodetect",
+            return Err(format!(
+                "unknown gateway auth mode '{}'; expected one of: none, local, token, password",
                 other
-            );
-            if has_both_gateway_credentials {
-                warn!(
-                    "gateway auth mode not set; both token and password configured, defaulting to password auth"
-                );
-            }
-            if gateway_password.is_some() {
-                auth::AuthMode::Password
-            } else {
-                auth::AuthMode::Token
-            }
+            ));
         }
     };
 
@@ -241,7 +231,7 @@ pub fn build_http_config(cfg: &Value) -> HttpConfig {
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    HttpConfig {
+    Ok(HttpConfig {
         hooks_token,
         hooks_enabled,
         gateway_token,
@@ -255,7 +245,7 @@ pub fn build_http_config(cfg: &Value) -> HttpConfig {
         openai_responses_enabled,
         control_endpoints_enabled,
         ..Default::default()
-    }
+    })
 }
 
 /// Shared state for HTTP handlers
@@ -301,7 +291,7 @@ impl Default for MiddlewareConfig {
             csrf: CsrfConfig::default(),
             rate_limit: RateLimitConfig::default(),
             enable_security_headers: true,
-            enable_csrf: false, // Disabled by default for API compatibility
+            enable_csrf: true,
             enable_rate_limit: true,
         }
     }

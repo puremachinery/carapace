@@ -135,7 +135,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let ws_state = register_console_channel(ws_state)?;
     let ws_state = register_signal_channel_if_configured(ws_state, &cfg)?;
 
-    let http_config = server::http::build_http_config(&cfg);
+    let http_config = server::http::build_http_config(&cfg)?;
     let tls_setup = setup_optional_tls(&cfg)?;
 
     log_startup_banner(&tls_setup, &resolved, &state_dir, &ws_state);

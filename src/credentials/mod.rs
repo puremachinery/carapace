@@ -224,7 +224,7 @@ impl CredentialKey {
 }
 
 /// Gateway auth secrets loaded from the credential store
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 pub struct GatewayAuthSecrets {
     pub token: Option<String>,
     pub password: Option<String>,

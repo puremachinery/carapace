@@ -1006,15 +1006,11 @@ async fn resolve_gateway_auth_config(
     let env_password = env::var("MOLTBOT_GATEWAY_PASSWORD").ok();
 
     let state_dir = resolve_state_dir();
-    let creds = match credentials::read_gateway_auth(state_dir).await {
-        Ok(creds) => creds,
-        Err(err) => {
-            warn!("failed to read gateway credentials: {}", err);
-            credentials::GatewayAuthSecrets::default()
-        }
-    };
-    let token = env_token.or(token_cfg).or(creds.token);
-    let password = env_password.or(password_cfg).or(creds.password);
+    let mut creds = credentials::read_gateway_auth(state_dir).await?;
+    let token = env_token.or(token_cfg).or(std::mem::take(&mut creds.token));
+    let password = env_password
+        .or(password_cfg)
+        .or(std::mem::take(&mut creds.password));
 
     let has_both_credentials = token.is_some() && password.is_some();
     let resolved_mode = match mode {
@@ -1034,20 +1030,15 @@ async fn resolve_gateway_auth_config(
             }
         }
         other => {
-            warn!(
-                "unknown gateway auth mode '{}'; falling back to token/password autodetect",
-                other
-            );
-            if has_both_credentials {
-                warn!(
-                    "gateway auth mode not set; both token and password configured, defaulting to password auth"
-                );
-            }
-            if password.is_some() {
-                auth::AuthMode::Password
-            } else {
-                auth::AuthMode::Token
-            }
+            return Err(WsConfigError::Config(
+                config::ConfigError::ValidationError {
+                    path: "gateway.auth.mode".to_string(),
+                    message: format!(
+                    "unknown gateway auth mode '{}'; expected one of: none, local, token, password",
+                    other
+                ),
+                },
+            ));
         }
     };
 
@@ -1584,9 +1575,23 @@ async fn handle_socket(
     };
 
     let conn_id = Uuid::new_v4().to_string();
-    let issued_token = device_id
-        .as_ref()
-        .map(|id| ensure_device_token(&state, id, &role, &scopes));
+    let issued_token = match device_id.as_ref() {
+        Some(id) => match ensure_device_token(&state, id, &role, &scopes) {
+            Ok(token) => Some(token),
+            Err(err) => {
+                warn!("failed to issue device token for {}: {}", id, err);
+                let err_resp = error_shape(
+                    ERROR_INVALID_REQUEST,
+                    &format!("device token issuance failed: {}", err),
+                    None,
+                );
+                let _ = send_response(&tx, &req_id, false, None, Some(err_resp));
+                let _ = send_close(&tx, 1008, "device token issuance failed");
+                return;
+            }
+        },
+        None => None,
+    };
 
     if role == "node" {
         finalize_node_commands(&state, &mut connect_params);
@@ -2621,16 +2626,10 @@ fn ensure_device_token(
     device_id: &str,
     role: &str,
     scopes: &[String],
-) -> devices::IssuedDeviceToken {
+) -> Result<devices::IssuedDeviceToken, devices::DevicePairingError> {
     state
         .device_registry
         .ensure_token(device_id, role.to_string(), scopes.to_vec())
-        .unwrap_or_else(|_| devices::IssuedDeviceToken {
-            token: Uuid::new_v4().to_string(),
-            role: role.to_string(),
-            scopes: scopes.to_vec(),
-            issued_at_ms: now_ms(),
-        })
 }
 
 fn verify_device_token(

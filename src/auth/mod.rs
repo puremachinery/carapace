@@ -26,6 +26,14 @@ pub struct ResolvedGatewayAuth {
     pub allow_tailscale: bool,
 }
 
+impl Drop for ResolvedGatewayAuth {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.token.zeroize();
+        self.password.zeroize();
+    }
+}
+
 impl Default for ResolvedGatewayAuth {
     fn default() -> Self {
         Self {
@@ -164,7 +172,7 @@ pub fn verify_tailscale_auth(
 }
 
 fn normalize_credential(value: Option<&str>) -> Option<&str> {
-    value.filter(|s| !s.is_empty())
+    value.filter(|s| !s.trim().is_empty())
 }
 
 fn authorize_gateway_credentials(
@@ -621,6 +629,10 @@ mod tests {
         "192.168.1.50:9999".parse().unwrap()
     }
 
+    fn loopback() -> SocketAddr {
+        "127.0.0.1:1234".parse().unwrap()
+    }
+
     fn empty_headers() -> HeaderMap {
         HeaderMap::new()
     }
@@ -956,7 +968,7 @@ mod tests {
             &no_trusted_proxies(),
         );
         assert!(!result.ok, "Whitespace-only token should be rejected");
-        assert_eq!(result.reason, Some(GatewayAuthFailure::TokenMismatch));
+        assert_eq!(result.reason, Some(GatewayAuthFailure::TokenMissing));
     }
 
     // --- Edge case: whitespace-only password ---
@@ -978,7 +990,7 @@ mod tests {
             &no_trusted_proxies(),
         );
         assert!(!result.ok, "Whitespace-only password should be rejected");
-        assert_eq!(result.reason, Some(GatewayAuthFailure::PasswordMismatch));
+        assert_eq!(result.reason, Some(GatewayAuthFailure::PasswordMissing));
     }
 
     // --- Token mode ignores password field ---
@@ -1356,6 +1368,107 @@ mod tests {
         assert!(
             !result.ok,
             "Password comparison should not trim whitespace implicitly"
+        );
+    }
+
+    // --- Whitespace-only configured credentials treated as missing ---
+
+    #[test]
+    fn test_gateway_auth_token_both_whitespace_rejected() {
+        let auth = ResolvedGatewayAuth {
+            mode: AuthMode::Token,
+            token: Some("   ".to_string()),
+            password: None,
+            allow_tailscale: false,
+        };
+        let result = authorize_gateway_connect(
+            &auth,
+            Some("   "),
+            None,
+            &empty_headers(),
+            remote_addr(),
+            &no_trusted_proxies(),
+        );
+        assert!(
+            !result.ok,
+            "Whitespace-only token config should be treated as missing"
+        );
+        assert_eq!(result.reason, Some(GatewayAuthFailure::TokenMissingConfig));
+    }
+
+    #[test]
+    fn test_gateway_auth_password_both_whitespace_rejected() {
+        let auth = ResolvedGatewayAuth {
+            mode: AuthMode::Password,
+            token: None,
+            password: Some("   ".to_string()),
+            allow_tailscale: false,
+        };
+        let result = authorize_gateway_connect(
+            &auth,
+            None,
+            Some("   "),
+            &empty_headers(),
+            remote_addr(),
+            &no_trusted_proxies(),
+        );
+        assert!(
+            !result.ok,
+            "Whitespace-only password config should be treated as missing"
+        );
+        assert_eq!(
+            result.reason,
+            Some(GatewayAuthFailure::PasswordMissingConfig)
+        );
+    }
+
+    // --- AuthMode::None + allow_tailscale interaction ---
+
+    #[test]
+    fn test_gateway_auth_mode_none_ignores_tailscale_for_local() {
+        let auth = ResolvedGatewayAuth {
+            mode: AuthMode::None,
+            token: None,
+            password: None,
+            allow_tailscale: true,
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "localhost".parse().unwrap());
+        let result = authorize_gateway_connect(
+            &auth,
+            None,
+            None,
+            &headers,
+            loopback(),
+            &no_trusted_proxies(),
+        );
+        assert!(result.ok);
+        assert_eq!(
+            result.method,
+            Some(GatewayAuthMethod::Local),
+            "Local request in None mode returns Local, not Tailscale"
+        );
+    }
+
+    #[test]
+    fn test_gateway_auth_mode_none_rejects_remote_even_with_tailscale() {
+        let auth = ResolvedGatewayAuth {
+            mode: AuthMode::None,
+            token: None,
+            password: None,
+            allow_tailscale: true,
+        };
+        let result = authorize_gateway_connect(
+            &auth,
+            None,
+            None,
+            &empty_headers(),
+            remote_addr(),
+            &no_trusted_proxies(),
+        );
+        assert!(
+            !result.ok,
+            "AuthMode::None should reject remote requests even when allow_tailscale is true"
         );
     }
 }

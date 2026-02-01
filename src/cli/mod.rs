@@ -529,8 +529,8 @@ async fn resolve_gateway_auth() -> GatewayAuth {
     let mut token_creds = None;
     let mut password_creds = None;
     let state_dir = crate::server::ws::resolve_state_dir();
-    if let Ok(creds) = credentials::read_gateway_auth(state_dir).await {
-        token_creds = creds.token.and_then(|v| {
+    if let Ok(mut creds) = credentials::read_gateway_auth(state_dir).await {
+        token_creds = std::mem::take(&mut creds.token).and_then(|v| {
             let token = v.trim().to_string();
             if token.is_empty() {
                 None
@@ -538,7 +538,7 @@ async fn resolve_gateway_auth() -> GatewayAuth {
                 Some(token)
             }
         });
-        password_creds = creds.password.and_then(|v| {
+        password_creds = std::mem::take(&mut creds.password).and_then(|v| {
             let password = v.trim().to_string();
             if password.is_empty() {
                 None

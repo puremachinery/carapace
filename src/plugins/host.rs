@@ -775,7 +775,7 @@ impl<B: CredentialBackend + 'static> PluginHostContextBuilder<B> {
 
         let permission_enforcer = self
             .permission_enforcer
-            .unwrap_or_else(|| PermissionEnforcer::permissive(&plugin_id));
+            .ok_or_else(|| HostError::Config("Permission enforcer not configured".to_string()))?;
 
         Ok(PluginHostContext::with_permissions(
             plugin_id,
@@ -1147,6 +1147,7 @@ mod tests {
         let ctx = PluginHostContextBuilder::new()
             .credential_store(credential_store)
             .allow_tailscale(true)
+            .permission_enforcer(PermissionEnforcer::permissive("test-plugin"))
             .build("test-plugin".to_string())
             .unwrap();
 

@@ -245,7 +245,7 @@ impl CsrfTokenStore {
         }
 
         // Timing-safe comparison
-        if !timing_safe_equal(&stored_token.value, provided_token) {
+        if !crate::auth::timing_safe_eq(&stored_token.value, provided_token) {
             return Err(CsrfError::TokenInvalid);
         }
 
@@ -278,18 +278,6 @@ fn generate_random_bytes(len: usize) -> Result<Vec<u8>, CsrfError> {
 }
 
 /// Timing-safe string comparison
-fn timing_safe_equal(a: &str, b: &str) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-
-    let mut result: u8 = 0;
-    for (x, y) in a.bytes().zip(b.bytes()) {
-        result |= x ^ y;
-    }
-    result == 0
-}
-
 /// Extract session ID from cookies
 fn extract_session_id(headers: &HeaderMap) -> Option<String> {
     // Look for a session cookie or generate from client info
@@ -669,10 +657,11 @@ mod tests {
 
     #[test]
     fn test_timing_safe_equal() {
-        assert!(timing_safe_equal("secret", "secret"));
-        assert!(!timing_safe_equal("secret", "secret1"));
-        assert!(!timing_safe_equal("secret1", "secret"));
-        assert!(!timing_safe_equal("", "secret"));
+        use crate::auth::timing_safe_eq;
+        assert!(timing_safe_eq("secret", "secret"));
+        assert!(!timing_safe_eq("secret", "secret1"));
+        assert!(!timing_safe_eq("secret1", "secret"));
+        assert!(!timing_safe_eq("", "secret"));
     }
 
     #[test]
