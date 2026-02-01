@@ -6,8 +6,12 @@
 use std::sync::Arc;
 
 use crate::cron::CronPayload;
+use crate::messages::outbound::{
+    MessageContent, MessageMetadata, OutboundContext, OutboundMessage,
+};
 use crate::server::ws::{SystemEvent, WsServerState};
 use serde_json::Value;
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 /// Outcome of executing a cron payload.
@@ -53,34 +57,38 @@ pub async fn execute_payload(
             to,
             best_effort_deliver,
         } => {
-            if thinking.is_some() {
-                tracing::warn!(job_id = %job_id, "AgentTurn 'thinking' field is accepted but not yet acted on");
-            }
-            if timeout_seconds.is_some() {
-                tracing::warn!(job_id = %job_id, "AgentTurn 'timeout_seconds' field is accepted but not yet acted on");
-            }
-            if allow_unsafe_external_content.is_some() {
-                tracing::warn!(job_id = %job_id, "AgentTurn 'allow_unsafe_external_content' field is accepted but not yet acted on");
-            }
-            if deliver.is_some() {
-                tracing::warn!(job_id = %job_id, "AgentTurn 'deliver' field is accepted but not yet acted on");
-            }
-            if channel.is_some() {
-                tracing::warn!(job_id = %job_id, "AgentTurn 'channel' field is accepted but not yet acted on");
-            }
-            if to.is_some() {
-                tracing::warn!(job_id = %job_id, "AgentTurn 'to' field is accepted but not yet acted on");
-            }
-            if best_effort_deliver.is_some() {
-                tracing::warn!(job_id = %job_id, "AgentTurn 'best_effort_deliver' field is accepted but not yet acted on");
-            }
             let session_key = format!("cron:{}", job_id);
             let run_id = uuid::Uuid::new_v4().to_string();
+
+            let normalized_channel = channel
+                .as_ref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_ascii_lowercase());
+            let normalized_to = to
+                .as_ref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
+
+            let mut metadata = crate::sessions::SessionMetadata::default();
+            if let Some(ref value) = normalized_channel {
+                metadata.channel = Some(value.clone());
+            }
+            if let Some(ref value) = normalized_to {
+                metadata.chat_id = Some(value.clone());
+            }
+            if let Some(ref value) = thinking {
+                metadata.thinking_level = Some(value.clone());
+            }
+            if let Some(ref value) = model {
+                metadata.model = Some(value.clone());
+            }
 
             // Ensure session exists
             let session = state
                 .session_store()
-                .get_or_create_session(&session_key, crate::sessions::SessionMetadata::default())
+                .get_or_create_session(&session_key, metadata)
                 .map_err(|e| format!("failed to create session: {}", e))?;
 
             // Append user message
@@ -97,6 +105,12 @@ pub async fn execute_payload(
             config.model = model
                 .clone()
                 .unwrap_or_else(|| crate::agent::DEFAULT_MODEL.to_string());
+            if let Some(&allow) = allow_unsafe_external_content.as_ref() {
+                config.exfiltration_guard = !allow;
+            }
+            if let Some(&deliver) = deliver.as_ref() {
+                config.deliver = deliver;
+            }
 
             // Register the agent run
             let cancel_token = CancellationToken::new();
@@ -122,19 +136,105 @@ pub async fn execute_payload(
                 });
             }
 
-            // Spawn agent execution
-            if let Some(provider) = state.llm_provider() {
-                crate::agent::spawn_run(
-                    run_id.clone(),
-                    session_key,
-                    config,
-                    state.clone(),
-                    provider.clone(),
-                    cancel_token,
-                );
-            } else {
-                return Err("no LLM provider configured".to_string());
+            if let Some(&timeout) = timeout_seconds.as_ref() {
+                if timeout > 0 {
+                    let run_id = run_id.clone();
+                    let cancel_token = cancel_token.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_secs(timeout as u64)).await;
+                        tracing::warn!(
+                            run_id = %run_id,
+                            timeout_seconds = timeout,
+                            "cron agent run exceeded timeout; cancelling"
+                        );
+                        cancel_token.cancel();
+                    });
+                }
             }
+
+            let provider = state
+                .llm_provider()
+                .ok_or_else(|| "no LLM provider configured".to_string())?;
+
+            if deliver.unwrap_or(false) {
+                match (normalized_channel.clone(), normalized_to.clone()) {
+                    (Some(channel_id), Some(recipient_id)) => {
+                        let delivery_pipeline = Arc::clone(state.message_pipeline());
+                        let delivery_run_id = run_id.clone();
+                        let delivery_message_id = format!("cron-deliver:{delivery_run_id}");
+                        let retry_enabled = best_effort_deliver.unwrap_or(false);
+                        let waiter = {
+                            let mut registry = state.agent_run_registry.lock();
+                            registry.add_waiter(&run_id)
+                        };
+                        if let Some(waiter) = waiter {
+                            tokio::spawn(async move {
+                                let result = match waiter.await {
+                                    Ok(result) => result,
+                                    Err(_) => {
+                                        tracing::warn!(
+                                            run_id = %delivery_run_id,
+                                            "cron delivery waiter dropped before completion"
+                                        );
+                                        return;
+                                    }
+                                };
+                                if result.status != crate::server::ws::AgentRunStatus::Completed {
+                                    return;
+                                }
+                                let Some(content) = result.response else {
+                                    return;
+                                };
+                                let metadata = MessageMetadata {
+                                    recipient_id: Some(recipient_id),
+                                    ..Default::default()
+                                };
+                                let outbound =
+                                    OutboundMessage::new(channel_id, MessageContent::text(content))
+                                        .with_metadata(metadata);
+                                let mut ctx =
+                                    OutboundContext::new().with_trace_id(&delivery_message_id);
+                                if retry_enabled {
+                                    ctx = ctx.with_retries(3);
+                                }
+                                if let Err(err) = delivery_pipeline.queue_with_idempotency(
+                                    outbound,
+                                    ctx,
+                                    Some(&delivery_message_id),
+                                ) {
+                                    tracing::warn!(
+                                        run_id = %delivery_run_id,
+                                        error = %err,
+                                        "failed to queue cron delivery message"
+                                    );
+                                }
+                            });
+                        }
+                    }
+                    (None, _) => {
+                        tracing::warn!(
+                            job_id = %job_id,
+                            "cron delivery requested without channel; skipping"
+                        );
+                    }
+                    (_, None) => {
+                        tracing::warn!(
+                            job_id = %job_id,
+                            "cron delivery requested without recipient; skipping"
+                        );
+                    }
+                }
+            }
+
+            // Spawn agent execution
+            crate::agent::spawn_run(
+                run_id.clone(),
+                session_key,
+                config,
+                state.clone(),
+                provider,
+                cancel_token,
+            );
 
             Ok(CronRunOutcome::Spawned { run_id })
         }
@@ -193,5 +293,34 @@ mod tests {
         let result = execute_payload("job-2", &payload, &state).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("no LLM provider"));
+    }
+
+    #[tokio::test]
+    async fn test_agent_turn_applies_session_metadata() {
+        let (state, _tmp) = make_test_state();
+
+        let payload = CronPayload::AgentTurn {
+            message: "hello".to_string(),
+            model: Some("model-x".to_string()),
+            thinking: Some("deep".to_string()),
+            timeout_seconds: Some(10),
+            allow_unsafe_external_content: Some(false),
+            deliver: Some(true),
+            channel: Some("Signal".to_string()),
+            to: Some("123".to_string()),
+            best_effort_deliver: Some(true),
+        };
+
+        let result = execute_payload("job-meta", &payload, &state).await;
+        assert!(result.is_err());
+
+        let session = state
+            .session_store()
+            .get_session_by_key("cron:job-meta")
+            .unwrap();
+        assert_eq!(session.metadata.channel, Some("signal".to_string()));
+        assert_eq!(session.metadata.chat_id, Some("123".to_string()));
+        assert_eq!(session.metadata.thinking_level, Some("deep".to_string()));
+        assert_eq!(session.metadata.model, Some("model-x".to_string()));
     }
 }

@@ -87,13 +87,13 @@ features:
       - "src/cron/tick.rs::test_tick_loop_executes_due_jobs"
 
   - feature: "cron.executor"
-    status: "partial"
+    status: "verified_done"
     runtime_wiring:
       - "src/cron/executor.rs::execute_payload"
     tests:
-      - "src/cron/executor.rs (executor tests)"
-    notes:
-      - "AgentTurn fields (thinking, timeout_seconds, allow_unsafe_external_content, deliver, channel, to, best_effort_deliver) are accepted but ignored"
+      - "src/cron/executor.rs::test_execute_system_event"
+      - "src/cron/executor.rs::test_execute_agent_turn_no_provider"
+      - "src/cron/executor.rs::test_agent_turn_applies_session_metadata"
 
   - feature: "devices.pairing state machine"
     status: "verified_done"
