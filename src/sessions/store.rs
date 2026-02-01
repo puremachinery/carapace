@@ -750,6 +750,18 @@ impl SessionStore {
         if updates.description.is_some() {
             session.metadata.description = updates.description;
         }
+        if updates.agent_id.is_some() {
+            session.metadata.agent_id = updates.agent_id;
+        }
+        if updates.channel.is_some() {
+            session.metadata.channel = updates.channel;
+        }
+        if updates.chat_id.is_some() {
+            session.metadata.chat_id = updates.chat_id;
+        }
+        if updates.user_id.is_some() {
+            session.metadata.user_id = updates.user_id;
+        }
         if updates.model.is_some() {
             session.metadata.model = updates.model;
         }
@@ -2082,6 +2094,10 @@ mod tests {
                 &session.id,
                 SessionMetadata {
                     name: Some("Updated Name".into()),
+                    agent_id: Some("agent-2".into()),
+                    channel: Some("signal".into()),
+                    chat_id: Some("123".into()),
+                    user_id: Some("user-1".into()),
                     model: Some("claude-3".into()),
                     ..Default::default()
                 },
@@ -2089,6 +2105,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(updated.metadata.name, Some("Updated Name".into()));
+        assert_eq!(updated.metadata.agent_id, Some("agent-2".into()));
+        assert_eq!(updated.metadata.channel, Some("signal".into()));
+        assert_eq!(updated.metadata.chat_id, Some("123".into()));
+        assert_eq!(updated.metadata.user_id, Some("user-1".into()));
         assert_eq!(updated.metadata.model, Some("claude-3".into()));
         assert!(updated.updated_at > session.updated_at);
     }

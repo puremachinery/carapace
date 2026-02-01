@@ -85,11 +85,31 @@ pub async fn execute_payload(
                 metadata.model = Some(value.clone());
             }
 
+            let has_metadata_updates = normalized_channel.is_some()
+                || normalized_to.is_some()
+                || thinking.is_some()
+                || model.is_some();
+
             // Ensure session exists
-            let session = state
-                .session_store()
-                .get_or_create_session(&session_key, metadata)
-                .map_err(|e| format!("failed to create session: {}", e))?;
+            let session = match state.session_store().get_session_by_key(&session_key) {
+                Ok(existing) => {
+                    if has_metadata_updates {
+                        state
+                            .session_store()
+                            .patch_session(&existing.id, metadata.clone())
+                            .map_err(|e| format!("failed to update session: {}", e))?
+                    } else {
+                        existing
+                    }
+                }
+                Err(crate::sessions::SessionStoreError::NotFound(_)) => state
+                    .session_store()
+                    .get_or_create_session(&session_key, metadata)
+                    .map_err(|e| format!("failed to create session: {}", e))?,
+                Err(err) => {
+                    return Err(format!("failed to load session: {}", err));
+                }
+            };
 
             // Append user message
             let msg = crate::sessions::ChatMessage::user(&session.id, message);
@@ -109,6 +129,7 @@ pub async fn execute_payload(
                 config.exfiltration_guard = !allow;
             }
             if let Some(&deliver) = deliver.as_ref() {
+                // Delivery for cron runs is handled via a completion waiter below.
                 config.deliver = deliver;
             }
 
@@ -140,15 +161,25 @@ pub async fn execute_payload(
                 if timeout > 0 {
                     let run_id = run_id.clone();
                     let cancel_token = cancel_token.clone();
-                    tokio::spawn(async move {
-                        tokio::time::sleep(Duration::from_secs(timeout as u64)).await;
-                        tracing::warn!(
-                            run_id = %run_id,
-                            timeout_seconds = timeout,
-                            "cron agent run exceeded timeout; cancelling"
-                        );
-                        cancel_token.cancel();
-                    });
+                    let waiter = {
+                        let mut registry = state.agent_run_registry.lock();
+                        registry.add_waiter(&run_id)
+                    };
+                    if let Some(waiter) = waiter {
+                        tokio::spawn(async move {
+                            tokio::select! {
+                                _ = tokio::time::sleep(Duration::from_secs(timeout as u64)) => {
+                                    tracing::warn!(
+                                        run_id = %run_id,
+                                        timeout_seconds = timeout,
+                                        "cron agent run exceeded timeout; cancelling"
+                                    );
+                                    cancel_token.cancel();
+                                }
+                                _ = waiter => {}
+                            }
+                        });
+                    }
                 }
             }
 
@@ -322,5 +353,46 @@ mod tests {
         assert_eq!(session.metadata.chat_id, Some("123".to_string()));
         assert_eq!(session.metadata.thinking_level, Some("deep".to_string()));
         assert_eq!(session.metadata.model, Some("model-x".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_agent_turn_updates_existing_metadata() {
+        let (state, _tmp) = make_test_state();
+
+        let initial = sessions::SessionMetadata {
+            channel: Some("signal".to_string()),
+            chat_id: Some("111".to_string()),
+            thinking_level: Some("shallow".to_string()),
+            model: Some("old-model".to_string()),
+            ..Default::default()
+        };
+        state
+            .session_store()
+            .get_or_create_session("cron:job-update", initial)
+            .unwrap();
+
+        let payload = CronPayload::AgentTurn {
+            message: "hello".to_string(),
+            model: Some("new-model".to_string()),
+            thinking: Some("deep".to_string()),
+            timeout_seconds: Some(10),
+            allow_unsafe_external_content: Some(false),
+            deliver: Some(true),
+            channel: Some("Discord".to_string()),
+            to: Some("999".to_string()),
+            best_effort_deliver: Some(true),
+        };
+
+        let result = execute_payload("job-update", &payload, &state).await;
+        assert!(result.is_err());
+
+        let session = state
+            .session_store()
+            .get_session_by_key("cron:job-update")
+            .unwrap();
+        assert_eq!(session.metadata.channel, Some("discord".to_string()));
+        assert_eq!(session.metadata.chat_id, Some("999".to_string()));
+        assert_eq!(session.metadata.thinking_level, Some("deep".to_string()));
+        assert_eq!(session.metadata.model, Some("new-model".to_string()));
     }
 }
