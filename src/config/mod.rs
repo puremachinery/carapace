@@ -18,12 +18,33 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 /// Maximum depth for $include directives to prevent infinite recursion
 const MAX_INCLUDE_DEPTH: usize = 10;
 
 /// Default config cache TTL in milliseconds
 const DEFAULT_CACHE_TTL_MS: u64 = 200;
+
+/// Env var for config secret encryption/decryption.
+const CONFIG_PASSWORD_ENV: &str = "MOLTBOT_CONFIG_PASSWORD";
+
+/// JSON pointer paths that should be encrypted at rest.
+const CONFIG_SECRET_PATHS: &[&str] = &[
+    "/gateway/auth/token",
+    "/gateway/auth/password",
+    "/gateway/hooks/token",
+    "/anthropic/apiKey",
+    "/openai/apiKey",
+    "/google/apiKey",
+    "/venice/apiKey",
+    "/ollama/apiKey",
+    "/providers/ollama/apiKey",
+    "/bedrock/accessKeyId",
+    "/bedrock/secretAccessKey",
+    "/bedrock/sessionToken",
+    "/models/providers/openai/apiKey",
+];
 
 /// Configuration errors
 #[derive(Error, Debug)]
@@ -107,6 +128,50 @@ fn get_cache_ttl() -> Option<Duration> {
     Some(Duration::from_millis(ms))
 }
 
+fn config_password() -> Option<Zeroizing<Vec<u8>>> {
+    let password = env::var(CONFIG_PASSWORD_ENV).ok()?;
+    if password.is_empty() {
+        return None;
+    }
+    Some(Zeroizing::new(password.into_bytes()))
+}
+
+fn resolve_config_secrets(value: &mut Value) {
+    let Some(password) = config_password() else {
+        if secrets::contains_encrypted_values(value) {
+            tracing::warn!(
+                "{} is not set; encrypted config values will remain locked",
+                CONFIG_PASSWORD_ENV
+            );
+            secrets::scrub_encrypted_values(value);
+        }
+        return;
+    };
+    let store = secrets::SecretStore::for_decrypt(password.as_ref());
+    secrets::resolve_secrets(value, &store, password.as_ref());
+}
+
+pub(crate) fn seal_config_secrets(value: &mut Value) -> Result<(), String> {
+    let Some(password) = config_password() else {
+        return Ok(());
+    };
+    let store = secrets::SecretStore::new(password.as_ref())
+        .map_err(|err| format!("failed to initialize config secret store: {}", err))?;
+    let mut paths = Vec::new();
+    for &path in CONFIG_SECRET_PATHS {
+        match value.pointer(path) {
+            Some(Value::String(_)) => paths.push(path),
+            Some(_) => tracing::warn!("config secret path '{}' is not a string, skipping", path),
+            None => {}
+        }
+    }
+    if paths.is_empty() {
+        return Ok(());
+    }
+    secrets::seal_secrets(value, &store, &paths)
+        .map_err(|err| format!("failed to encrypt config secrets: {}", err))
+}
+
 /// Load and parse the configuration file with caching.
 /// Returns empty object `{}` if file doesn't exist.
 ///
@@ -171,6 +236,9 @@ pub fn load_config_uncached(path: &Path) -> Result<Value, ConfigError> {
     // Apply config defaults (fill in missing sections/fields with
     // production-ready values — mirrors clawdbot's apply* pipeline).
     defaults::apply_defaults(&mut value);
+
+    // Resolve encrypted secrets if configured.
+    resolve_config_secrets(&mut value);
 
     Ok(value)
 }
@@ -830,6 +898,40 @@ mod tests {
         );
 
         env::remove_var("TEST_OPENAI_KEY");
+    }
+
+    #[test]
+    fn test_secret_encryption_round_trip() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        env::set_var("MOLTBOT_CONFIG_PASSWORD", "test-password");
+
+        let dir = TempDir::new().unwrap();
+        let main_path = create_temp_config(
+            &dir,
+            "config.json5",
+            r#"{
+                "anthropic": { "apiKey": "sk-test" },
+                "gateway": { "auth": { "token": "token123" } }
+            }"#,
+        );
+
+        let mut config = load_config_uncached(&main_path).unwrap();
+        assert_eq!(config["anthropic"]["apiKey"], "sk-test");
+        assert_eq!(config["gateway"]["auth"]["token"], "token123");
+
+        seal_config_secrets(&mut config).unwrap();
+        let sealed = config["anthropic"]["apiKey"].as_str().unwrap();
+        assert!(secrets::is_encrypted(sealed));
+
+        let content = serde_json::to_string_pretty(&config).unwrap();
+        let mut file = File::create(&main_path).unwrap();
+        file.write_all(content.as_bytes()).unwrap();
+
+        let reloaded = load_config_uncached(&main_path).unwrap();
+        assert_eq!(reloaded["anthropic"]["apiKey"], "sk-test");
+        assert_eq!(reloaded["gateway"]["auth"]["token"], "token123");
+
+        env::remove_var("MOLTBOT_CONFIG_PASSWORD");
     }
 
     #[test]

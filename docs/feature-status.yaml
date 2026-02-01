@@ -77,7 +77,7 @@ feature_inventory_markdown: |
   - [x] **Hot reload** — file watcher infrastructure (`watcher.rs`)
   - [x] **Schema validation** — error/warning severity
   - [x] **Config defaults** — fallback values
-  - [~] **Secret encryption** — AES-256-GCM at rest with PBKDF2 key derivation (`secrets.rs`)
+  - [x] **Secret encryption** — AES-256-GCM at rest with PBKDF2 key derivation
 
   ### Credentials (`src/credentials/`)
 

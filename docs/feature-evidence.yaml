@@ -1321,13 +1321,15 @@ features:
       - "src/config/mod.rs::load_config_uncached"
 
   - feature: "Secret encryption"
-    status: "partial"
+    status: "verified_done"
     runtime_wiring:
-      - "src/config/secrets.rs (SecretStore + encrypt/decrypt)"
+      - "src/config/secrets.rs (SecretStore + encrypt/decrypt/resolve/scrub)"
+      - "src/config/mod.rs::resolve_config_secrets (decrypt on load)"
+      - "src/config/mod.rs::seal_config_secrets (encrypt on write)"
+      - "src/server/ws/handlers/config.rs::persist_config_file (seals before write)"
     tests:
-      - "src/config/secrets.rs (encryption tests)"
-    notes:
-      - "SecretStore is not wired into config loading; encrypted values are not auto-resolved"
+      - "src/config/secrets.rs (encryption + scrub tests)"
+      - "src/config/mod.rs::test_secret_encryption_round_trip"
 
   - feature: "macOS Keychain"
     status: "verified_done"

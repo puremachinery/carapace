@@ -10,7 +10,7 @@ use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
-use hmac::Hmac;
+use pbkdf2::pbkdf2_hmac;
 use serde_json::Value;
 use sha2::Sha256;
 use thiserror::Error;
@@ -79,6 +79,15 @@ impl SecretStore {
     pub fn from_password_and_salt(password: &[u8], salt: &[u8; SALT_LEN]) -> Self {
         let key = Zeroizing::new(derive_key(password, salt));
         Self { key, salt: *salt }
+    }
+
+    /// Create a store for rekey-based decryption without random salt generation.
+    ///
+    /// Note: `decrypt()` will always fail for real ciphertexts because the
+    /// stored salt is zeroed; use `decrypt_rekey()` for actual decryption.
+    pub fn for_decrypt(password: &[u8]) -> Self {
+        let salt = [0u8; SALT_LEN];
+        Self::from_password_and_salt(password, &salt)
     }
 
     /// Encrypt a plaintext string, returning the `enc:v1:...` formatted string.
@@ -216,43 +225,9 @@ fn decrypt_with_key(
 ///
 /// Uses 600,000 iterations per OWASP recommendations.
 pub fn derive_key(password: &[u8], salt: &[u8]) -> [u8; 32] {
-    pbkdf2_hmac_sha256(password, salt, PBKDF2_ITERATIONS)
-}
-
-/// PBKDF2-HMAC-SHA256 implementation (RFC 8018 section 5.2).
-///
-/// `dk_len` is fixed at 32 bytes (one block for SHA-256) so we only
-/// need a single iteration of the outer loop.
-fn pbkdf2_hmac_sha256(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 32] {
-    use hmac::Mac;
-
-    type HmacSha256 = Hmac<Sha256>;
-
-    let mut mac =
-        <HmacSha256 as hmac::Mac>::new_from_slice(password).expect("HMAC can take key of any size");
-    mac.update(salt);
-    mac.update(&1u32.to_be_bytes());
-    let u1 = mac.finalize().into_bytes();
-
-    let mut result = [0u8; 32];
-    result.copy_from_slice(&u1);
-
-    let mut u_prev = u1;
-
-    for _ in 1..iterations {
-        let mut mac = <HmacSha256 as hmac::Mac>::new_from_slice(password)
-            .expect("HMAC can take key of any size");
-        mac.update(&u_prev);
-        let u_i = mac.finalize().into_bytes();
-
-        for (r, u) in result.iter_mut().zip(u_i.iter()) {
-            *r ^= u;
-        }
-
-        u_prev = u_i;
-    }
-
-    result
+    let mut out = [0u8; 32];
+    pbkdf2_hmac::<Sha256>(password, salt, PBKDF2_ITERATIONS, &mut out);
+    out
 }
 
 /// Check whether a string value is in encrypted format.
@@ -263,6 +238,65 @@ pub fn is_encrypted(value: &str) -> bool {
 /// Maximum recursion depth for `resolve_secrets` to prevent stack overflow
 /// on programmatically constructed JSON trees.
 const MAX_RESOLVE_DEPTH: usize = 64;
+
+/// Maximum recursion depth for config scans.
+const MAX_SCAN_DEPTH: usize = 64;
+
+/// Check if any values in the config tree are encrypted.
+pub fn contains_encrypted_values(config: &Value) -> bool {
+    contains_encrypted_inner(config, 0)
+}
+
+fn contains_encrypted_inner(config: &Value, depth: usize) -> bool {
+    if depth > MAX_SCAN_DEPTH {
+        tracing::warn!(
+            "contains_encrypted_values: maximum recursion depth ({}) exceeded, stopping scan",
+            MAX_SCAN_DEPTH
+        );
+        return false;
+    }
+
+    match config {
+        Value::String(s) => is_encrypted(s),
+        Value::Object(map) => map.values().any(|v| contains_encrypted_inner(v, depth + 1)),
+        Value::Array(arr) => arr.iter().any(|v| contains_encrypted_inner(v, depth + 1)),
+        _ => false,
+    }
+}
+
+/// Replace encrypted values with nulls in-place.
+pub fn scrub_encrypted_values(config: &mut Value) {
+    scrub_encrypted_inner(config, 0);
+}
+
+fn scrub_encrypted_inner(config: &mut Value, depth: usize) {
+    if depth > MAX_SCAN_DEPTH {
+        tracing::warn!(
+            "scrub_encrypted_values: maximum recursion depth ({}) exceeded, stopping scan",
+            MAX_SCAN_DEPTH
+        );
+        return;
+    }
+
+    match config {
+        Value::String(s) => {
+            if is_encrypted(s) {
+                *config = Value::Null;
+            }
+        }
+        Value::Object(map) => {
+            for (_, v) in map.iter_mut() {
+                scrub_encrypted_inner(v, depth + 1);
+            }
+        }
+        Value::Array(arr) => {
+            for item in arr.iter_mut() {
+                scrub_encrypted_inner(item, depth + 1);
+            }
+        }
+        _ => {}
+    }
+}
 
 /// Walk a JSON value tree and decrypt all `enc:v1:` strings in-place.
 ///
@@ -285,11 +319,17 @@ fn resolve_secrets_inner(config: &mut Value, store: &SecretStore, password: &[u8
     match config {
         Value::String(s) => {
             if is_encrypted(s) {
-                match store.decrypt_rekey(s, password) {
+                let encrypted = s.clone();
+                let mut scrub = false;
+                match store.decrypt_rekey(&encrypted, password) {
                     Ok(plaintext) => *s = plaintext,
                     Err(e) => {
                         tracing::warn!("Failed to decrypt config secret: {}", e);
+                        scrub = true;
                     }
+                }
+                if scrub {
+                    *config = Value::Null;
                 }
             }
         }
@@ -675,6 +715,34 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_secrets_bad_password_scrubs_value() {
+        let store = SecretStore::new(b"correct-password").unwrap();
+        let encrypted = store.encrypt("super-secret").unwrap();
+
+        let mut config = json!({ "apiKey": encrypted });
+        let wrong_store = SecretStore::for_decrypt(b"wrong-password");
+
+        resolve_secrets(&mut config, &wrong_store, b"wrong-password");
+
+        assert!(
+            config["apiKey"].is_null(),
+            "bad password should scrub secrets"
+        );
+    }
+
+    #[test]
+    fn test_scrub_encrypted_values_replaces_with_null() {
+        let store = SecretStore::new(b"password").unwrap();
+        let encrypted = store.encrypt("secret").unwrap();
+
+        let mut config = json!({ "apiKey": encrypted, "name": "bot" });
+        scrub_encrypted_values(&mut config);
+
+        assert!(config["apiKey"].is_null());
+        assert_eq!(config["name"], "bot");
+    }
+
+    #[test]
     fn test_seal_secrets_single_path() {
         let store = SecretStore::new(b"password").unwrap();
         let mut config = json!({
@@ -839,19 +907,36 @@ mod tests {
 
     #[test]
     fn test_pbkdf2_known_vector() {
-        let key = pbkdf2_hmac_sha256(b"password", b"salt", 1);
-        assert_eq!(key.len(), 32);
-        let key2 = pbkdf2_hmac_sha256(b"password", b"salt", 1);
+        let mut key = [0u8; 32];
+        pbkdf2_hmac::<Sha256>(b"password", b"salt", 1, &mut key);
+        let expected = "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b";
+        assert_eq!(hex::encode(key), expected);
+        let mut key2 = [0u8; 32];
+        pbkdf2_hmac::<Sha256>(b"password", b"salt", 1, &mut key2);
         assert_eq!(key, key2, "PBKDF2 must be deterministic");
     }
 
     #[test]
     fn test_pbkdf2_more_iterations_changes_output() {
-        let k1 = pbkdf2_hmac_sha256(b"password", b"salt", 1);
-        let k2 = pbkdf2_hmac_sha256(b"password", b"salt", 2);
+        let mut k1 = [0u8; 32];
+        let mut k2 = [0u8; 32];
+        pbkdf2_hmac::<Sha256>(b"password", b"salt", 1, &mut k1);
+        pbkdf2_hmac::<Sha256>(b"password", b"salt", 2, &mut k2);
         assert_ne!(
             k1, k2,
             "different iteration counts must produce different keys"
         );
+    }
+
+    #[test]
+    fn test_contains_encrypted_values_detects_ciphertext() {
+        let store = SecretStore::new(b"password").unwrap();
+        let encrypted = store.encrypt("secret").unwrap();
+
+        let config = json!({ "apiKey": encrypted, "name": "bot" });
+        assert!(contains_encrypted_values(&config));
+
+        let plain = json!({ "apiKey": "plaintext", "name": "bot" });
+        assert!(!contains_encrypted_values(&plain));
     }
 }

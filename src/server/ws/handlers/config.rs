@@ -160,7 +160,9 @@ pub(crate) fn persist_config_file(path: &PathBuf, config_value: &Value) -> Resul
             .map_err(|err| format!("failed to create config dir: {}", err))?;
     }
 
-    let content = serde_json::to_string_pretty(config_value)
+    let mut config_value = config_value.clone();
+    config::seal_config_secrets(&mut config_value)?;
+    let content = serde_json::to_string_pretty(&config_value)
         .map_err(|err| format!("failed to serialize config: {}", err))?;
     let tmp_path = path.with_extension("json.tmp");
     {
