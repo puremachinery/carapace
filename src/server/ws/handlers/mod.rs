@@ -100,6 +100,48 @@ pub(super) fn handle_status(state: &WsServerState) -> Value {
     build_status_response(state)
 }
 
+pub(super) fn canonicalize_ws_method_name(method: &str) -> &str {
+    match method {
+        "agent.run" => "agent",
+        "agent.cancel" => "chat.abort",
+        "session.list" => "sessions.list",
+        "session.preview" => "sessions.preview",
+        "session.patch" => "sessions.patch",
+        "session.reset" => "sessions.reset",
+        "session.delete" => "sessions.delete",
+        "session.compact" => "sessions.compact",
+        "session.archive" => "sessions.archive",
+        "session.restore" => "sessions.restore",
+        "session.archives" => "sessions.archives",
+        "session.archive.delete" => "sessions.archive.delete",
+        "session.export_user" => "sessions.export_user",
+        "session.purge_user" => "sessions.purge_user",
+        "config.update" => "config.patch",
+        "exec.list" | "exec.approvals.list" => "exec.approvals.get",
+        "exec.approve" | "exec.deny" => "exec.approval.resolve",
+        _ => method,
+    }
+}
+
+fn with_decision_override(params: Option<&Value>, decision: &str) -> Option<Value> {
+    let mut value = params.cloned().unwrap_or_else(|| json!({}));
+    if let Value::Object(ref mut map) = value {
+        map.entry("decision".to_string())
+            .or_insert_with(|| Value::String(decision.to_string()));
+    }
+    Some(value)
+}
+
+fn normalize_ws_request<'a>(method: &'a str, params: Option<&Value>) -> (&'a str, Option<Value>) {
+    let canonical = canonicalize_ws_method_name(method);
+    let params = match method {
+        "exec.approve" => with_decision_override(params, "allow-once"),
+        "exec.deny" => with_decision_override(params, "deny"),
+        _ => None,
+    };
+    (canonical, params)
+}
+
 /// Methods exclusively for the `node` role
 ///
 /// These methods can ONLY be called by node connections.
@@ -111,11 +153,12 @@ pub(super) const NODE_ONLY_METHODS: [&str; 3] = ["node.invoke.result", "node.eve
 ///
 /// Per Node.js gateway: config.*, wizard.*, update.*, skills.install/update,
 /// channels.logout, sessions.*, and cron.* require operator.admin for operators.
-const OPERATOR_ADMIN_REQUIRED_METHODS: [&str; 38] = [
+const OPERATOR_ADMIN_REQUIRED_METHODS: [&str; 39] = [
     "config.get",
     "config.set",
     "config.apply",
     "config.patch",
+    "config.validate",
     "config.schema",
     "config.reload",
     "sessions.patch",
@@ -164,6 +207,7 @@ const READ_METHODS: &[&str] = &[
     "status",
     "last-heartbeat",
     "config.get",
+    "config.validate",
     "config.schema",
     "sessions.list",
     "sessions.preview",
@@ -570,6 +614,7 @@ fn dispatch_config(
         "config.set" => Some(handle_config_set(params)),
         "config.apply" => Some(handle_config_apply(params)),
         "config.patch" => Some(handle_config_patch(params)),
+        "config.validate" => Some(handle_config_validate(params)),
         "config.schema" => Some(handle_config_schema()),
         "config.reload" => Some(handle_config_reload(state)),
         _ => None,
@@ -689,6 +734,10 @@ pub(super) async fn dispatch_method(
     state: &Arc<WsServerState>,
     conn: &ConnectionContext,
 ) -> Result<Value, ErrorShape> {
+    let original_method = method;
+    let (method, params_override) = normalize_ws_request(method, params);
+    let params = params_override.as_ref().or(params);
+
     // Check authorization before dispatching
     check_method_authorization(method, conn)?;
 
@@ -790,7 +839,7 @@ pub(super) async fn dispatch_method(
         _ => Err(error_shape(
             ERROR_UNAVAILABLE,
             "method unavailable",
-            Some(json!({ "method": method })),
+            Some(json!({ "method": original_method })),
         )),
     }
 }

@@ -337,6 +337,43 @@ pub(super) fn handle_config_patch(params: Option<&Value>) -> Result<Value, Error
     }))
 }
 
+pub(super) fn handle_config_validate(params: Option<&Value>) -> Result<Value, ErrorShape> {
+    let raw = params.and_then(|v| v.get("raw")).and_then(|v| v.as_str());
+
+    let parsed = if let Some(raw) = raw {
+        json5::from_str::<Value>(raw)
+            .map_err(|err| error_shape(ERROR_INVALID_REQUEST, &err.to_string(), None))?
+    } else {
+        params
+            .and_then(|v| v.get("config"))
+            .cloned()
+            .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "raw or config is required", None))?
+    };
+
+    if !parsed.is_object() {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            "config.validate value must be an object",
+            None,
+        ));
+    }
+
+    let issues = map_validation_issues(config::validate_config(&parsed));
+    if !issues.is_empty() {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            "invalid config",
+            Some(json!({ "issues": issues })),
+        ));
+    }
+
+    Ok(json!({
+        "ok": true,
+        "valid": true,
+        "issues": []
+    }))
+}
+
 pub(super) fn handle_config_schema() -> Result<Value, ErrorShape> {
     tracing::debug!("config.schema: stub response");
     // Return JSON schema for config
@@ -407,4 +444,19 @@ pub fn broadcast_config_changed(state: &WsServerState, mode: &str) {
         "ts": now_ms()
     });
     broadcast_event(state, "config.changed", payload);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_handle_config_validate_accepts_object() {
+        let params = json!({ "config": {} });
+        let result = handle_config_validate(Some(&params));
+        assert!(result.is_ok());
+        let value = result.unwrap();
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["valid"], true);
+    }
 }

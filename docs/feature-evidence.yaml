@@ -817,13 +817,13 @@ features:
       - "src/server/ws/tests.rs::test_shutdown_watch_channel_propagates"
 
   - feature: "ws.agent.run / agent.cancel"
-    status: "partial"
+    status: "verified_done"
     runtime_wiring:
       - "src/server/ws/handlers/sessions.rs::handle_chat_send (agent run)"
       - "src/server/ws/handlers/sessions.rs::handle_chat_abort (cancellation)"
-      - "src/server/ws/handlers/mod.rs (methods: agent, chat.send, chat.abort)"
+      - "src/server/ws/handlers/mod.rs::canonicalize_ws_method_name (agent.run/agent.cancel aliases)"
     notes:
-      - "No agent.run/agent.cancel method names; uses agent + chat.abort instead"
+      - "agent.run aliases to agent; agent.cancel aliases to chat.abort"
 
   - feature: "ws.session management"
     status: "partial"
@@ -831,23 +831,25 @@ features:
       - "src/server/ws/handlers/sessions.rs (sessions.list/preview/patch/reset/delete)"
       - "src/server/ws/handlers/mod.rs (sessions.* methods)"
     notes:
+      - "session.* aliases map to sessions.* for existing handlers"
       - "No sessions.create/load/fork/rename/switch methods; patch covers rename/metadata only"
 
   - feature: "ws.config.get/update/reload/validate"
-    status: "partial"
+    status: "verified_done"
     runtime_wiring:
-      - "src/server/ws/handlers/config.rs (config.get/set/apply/patch/reload)"
-      - "src/server/ws/handlers/mod.rs (config.* methods)"
+      - "src/server/ws/handlers/config.rs (config.get/set/apply/patch/validate/reload)"
+      - "src/server/ws/handlers/mod.rs::canonicalize_ws_method_name (config.update alias)"
     notes:
-      - "No config.update or config.validate methods; update split across set/apply/patch"
+      - "config.update aliases to config.patch"
 
   - feature: "ws.exec.approve/deny/list"
-    status: "partial"
+    status: "verified_done"
     runtime_wiring:
       - "src/server/ws/handlers/exec.rs (exec.approvals.get/set, exec.approval.request/resolve)"
-      - "src/server/ws/handlers/mod.rs (exec.* methods)"
+      - "src/server/ws/handlers/mod.rs::canonicalize_ws_method_name (exec.approve/deny/list aliases)"
     notes:
-      - "Method names differ from approve/deny/list; approval resolves via exec.approval.resolve"
+      - "exec.list aliases to exec.approvals.get; exec.approve/deny alias to exec.approval.resolve"
+      - "exec.approve/deny inject default decision values (allow-once/deny) when missing"
 
   - feature: "ws.system.info"
     status: "verified_missing"

@@ -186,6 +186,7 @@ Note: Method dispatch is implemented in `src/server/ws/handlers/mod.rs`.
 - `config.set` - Set configuration value
 - `config.apply` - Apply configuration changes
 - `config.patch` - Patch configuration object
+- `config.validate` - Validate configuration without persisting
 - `config.schema` - Get configuration schema
 
 ### Agent
@@ -211,6 +212,14 @@ Note: Method dispatch is implemented in `src/server/ws/handlers/mod.rs`.
 - `sessions.archive.delete` - Delete an archive file without affecting session metadata
 - `sessions.export_user` - Export all sessions and histories for a user (GDPR data portability)
 - `sessions.purge_user` - Delete all sessions and histories for a user (GDPR right to erasure)
+
+Compatibility aliases:
+- `agent.run` → `agent`
+- `agent.cancel` → `chat.abort`
+- `session.*` → `sessions.*`
+- `config.update` → `config.patch`
+- `exec.list` / `exec.approvals.list` → `exec.approvals.get`
+- `exec.approve` / `exec.deny` → `exec.approval.resolve` (defaults decision to allow-once/deny when missing)
 
 ### TTS (Text-to-Speech)
 - `tts.status` - Get TTS status

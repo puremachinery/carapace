@@ -215,10 +215,10 @@ feature_inventory_markdown: |
 
   #### WebSocket Handlers
 
-  - [~] **agent.run / agent.cancel** — LLM execution + cancellation
+  - [x] **agent.run / agent.cancel** — LLM execution + cancellation
   - [~] **session.create/load/list/fork/rename/delete/switch** — session management
-  - [~] **config.get/update/reload/validate** — configuration
-  - [~] **exec.approve/deny/list** — exec approval workflow
+  - [x] **config.get/update/reload/validate** — configuration
+  - [x] **exec.approve/deny/list** — exec approval workflow
   - [-] **system.info** — system information
   - [x] **logs.tail** — streaming log buffer
   - [x] **skills.status** — skill listing

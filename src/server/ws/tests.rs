@@ -14,6 +14,34 @@ fn test_error_shape() {
 }
 
 #[test]
+fn test_canonicalize_ws_method_name_aliases() {
+    assert_eq!(canonicalize_ws_method_name("agent.run"), "agent");
+    assert_eq!(canonicalize_ws_method_name("agent.cancel"), "chat.abort");
+    assert_eq!(canonicalize_ws_method_name("session.list"), "sessions.list");
+    assert_eq!(canonicalize_ws_method_name("config.update"), "config.patch");
+    assert_eq!(
+        canonicalize_ws_method_name("exec.list"),
+        "exec.approvals.get"
+    );
+    assert_eq!(
+        canonicalize_ws_method_name("exec.approvals.list"),
+        "exec.approvals.get"
+    );
+    assert_eq!(
+        canonicalize_ws_method_name("exec.approve"),
+        "exec.approval.resolve"
+    );
+    assert_eq!(
+        canonicalize_ws_method_name("exec.deny"),
+        "exec.approval.resolve"
+    );
+    assert_eq!(
+        canonicalize_ws_method_name("config.validate"),
+        "config.validate"
+    );
+}
+
+#[test]
 fn test_get_value_at_path() {
     let root = json!({
         "gateway": {
