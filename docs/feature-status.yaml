@@ -140,7 +140,7 @@ feature_inventory_markdown: |
   - [x] **URL extraction** — regex-based, code block aware
   - [x] **HTML-to-text conversion** — custom regex-based (not html2text crate)
   - [x] **SSRF-protected fetching** — uses media module protections
-  - [~] **LRU cache** — 100 entries, 1hr TTL
+  - [x] **LRU cache** — 100 entries, 1hr TTL
   - [x] **Title/meta extraction** — HTML metadata parsing
   - [x] **Safe UTF-8 truncation** — char-boundary-aware
 
