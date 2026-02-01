@@ -491,6 +491,7 @@ async fn launch_tls_server(
         Arc::new(plugins::tools::ToolsRegistry::new()),
         ws_state.channel_registry().clone(),
         Some(ws_state.clone()),
+        true,
     );
 
     let ws_router = Router::new()

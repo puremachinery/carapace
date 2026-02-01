@@ -334,6 +334,7 @@ pub async fn run_server_with_config(
         config.tools_registry,
         config.ws_state.channel_registry().clone(),
         Some(config.ws_state.clone()),
+        false,
     );
 
     // Build WS router and merge

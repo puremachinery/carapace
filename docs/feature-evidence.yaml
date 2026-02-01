@@ -743,14 +743,20 @@ features:
       - "src/server/openai.rs::test_chat_completions_non_streaming_with_provider"
 
   - feature: "server.csrf protection"
-    status: "partial"
+    status: "verified_done"
     runtime_wiring:
       - "src/server/csrf.rs (token generation + middleware)"
       - "src/server/http.rs (csrf_middleware wiring)"
+      - "src/server/http.rs (control UI CSRF bootstrap + cookie issuance)"
     tests:
       - "src/server/csrf.rs::test_token_store_generate_and_validate"
+      - "src/server/csrf.rs::test_missing_origin_rejected_when_session_present"
+      - "src/server/csrf.rs::test_ensure_csrf_cookies_sets_session_and_token"
+      - "src/server/csrf.rs::test_missing_host_rejected_when_session_present"
     notes:
-      - "MiddlewareConfig::default disables CSRF by default for API compatibility"
+      - "Control UI injects a bootstrap script to attach X-CSRF-Token headers; CSRF enforced for /control/ when a session cookie exists"
+      - "Control UI requires TLS when CSRF secure cookies are enabled"
+      - "Cookie names downgrade to non-__Host variants when secure cookies are disabled"
 
   - feature: "server.rate limiting"
     status: "verified_done"

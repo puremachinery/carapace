@@ -206,7 +206,7 @@ feature_inventory_markdown: |
   - [x] **Health endpoint** — /health status check
   - [x] **Metrics endpoint** — /metrics Prometheus format
   - [x] **OpenAI API compatibility** — /v1/chat/completions drop-in
-  - [~] **CSRF protection** — session-bound token validation (no fallback)
+  - [x] **CSRF protection** — session-bound token validation for control endpoints
   - [x] **Rate limiting** — per-IP quotas
   - [x] **Resource monitoring** — CPU/memory tracking
   - [x] **Content Security Policy** — CSP headers
