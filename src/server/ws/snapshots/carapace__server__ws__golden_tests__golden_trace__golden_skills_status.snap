@@ -1,20 +1,13 @@
 ---
 source: src/server/ws/golden_tests.rs
-assertion_line: 418
+assertion_line: 469
 expression: normalized
 ---
 {
   "ok": true,
   "result": {
     "managedSkillsDir": "<PATH>",
-    "skills": [
-      {
-        "enabled": true,
-        "installId": null,
-        "name": "my-skill",
-        "requestedAt": "<TIMESTAMP>"
-      }
-    ],
+    "skills": [],
     "workspaceDir": "<PATH>"
   }
 }
