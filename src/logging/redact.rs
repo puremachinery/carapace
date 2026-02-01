@@ -63,16 +63,36 @@ impl Default for Redactor {
     }
 }
 
-pub struct RedactingWriter<W> {
+pub struct RedactingWriter<W: Write> {
     inner: W,
     buffer: Vec<u8>,
 }
 
-impl<W> RedactingWriter<W> {
+const MAX_BUFFER_BYTES: usize = 8192;
+
+impl<W: Write> RedactingWriter<W> {
     pub fn new(inner: W) -> Self {
         Self {
             inner,
             buffer: Vec::new(),
+        }
+    }
+
+    fn flush_buffer(&mut self) -> io::Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        let text = String::from_utf8_lossy(&self.buffer);
+        let redacted = redact_string(&text);
+        self.inner.write_all(redacted.as_bytes())?;
+        self.zeroize_buffer();
+        Ok(())
+    }
+
+    fn zeroize_buffer(&mut self) {
+        if !self.buffer.is_empty() {
+            self.buffer.fill(0);
+            self.buffer.clear();
         }
     }
 }
@@ -84,6 +104,9 @@ impl<W: Write> Write for RedactingWriter<W> {
         }
 
         self.buffer.extend_from_slice(buf);
+        if self.buffer.len() > MAX_BUFFER_BYTES {
+            self.flush_buffer()?;
+        }
         while let Some(pos) = self.buffer.iter().position(|b| *b == b'\n') {
             let mut line = self.buffer.drain(..=pos).collect::<Vec<u8>>();
             let has_newline = matches!(line.last(), Some(b'\n'));
@@ -96,19 +119,22 @@ impl<W: Write> Write for RedactingWriter<W> {
             if has_newline {
                 self.inner.write_all(b"\n")?;
             }
+            line.fill(0);
         }
 
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        if !self.buffer.is_empty() {
-            let text = String::from_utf8_lossy(&self.buffer);
-            let redacted = redact_string(&text);
-            self.inner.write_all(redacted.as_bytes())?;
-            self.buffer.clear();
-        }
+        self.flush_buffer()?;
         self.inner.flush()
+    }
+}
+
+impl<W: Write> Drop for RedactingWriter<W> {
+    fn drop(&mut self) {
+        let _ = self.flush_buffer();
+        let _ = self.inner.flush();
     }
 }
 
@@ -380,6 +406,22 @@ mod tests {
         assert!(!output.contains("abc.def.ghi"));
         assert!(output.contains("[REDACTED]"));
         assert!(output.contains("ok"));
+    }
+
+    #[test]
+    fn test_redacting_writer_flushes_on_max_buffer() {
+        let mut inner: Vec<u8> = Vec::new();
+        let chunk = "Bearer abc.def.ghi ";
+        let repeat = (MAX_BUFFER_BYTES / chunk.len()) + 2;
+        let payload = chunk.repeat(repeat);
+        {
+            let mut writer = RedactingWriter::new(&mut inner);
+            write!(writer, "{}", payload).unwrap();
+            writer.flush().unwrap();
+        }
+        let output = String::from_utf8(inner).unwrap();
+        assert!(!output.contains("abc.def.ghi"));
+        assert!(output.contains("[REDACTED]"));
     }
 
     #[test]
