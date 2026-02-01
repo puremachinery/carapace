@@ -15,6 +15,7 @@ openclaw / moltbot / clawdbot.
 - [Pairing](protocol/pairing.md) — Node and device pairing flows
 - [Configuration](protocol/config.md) — Config file format, environment variables
 - [Credentials](protocol/credentials.md) — Secret storage and migration
+- [CLI Guide](cli.md) — Subcommands, flags, and device identity notes
 
 ## Quick Links
 
