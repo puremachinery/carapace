@@ -96,7 +96,7 @@ feature_inventory_markdown: |
   - [x] **Job quotas** — max 500 enforced with LRU eviction when at limit
   - [x] **Payload types** — SystemEvent broadcast, AgentTurn spawn
   - [x] **Background tick loop** — async task runner
-  - [~] **Executor** — payload execution with session/run creation (`executor.rs`). AgentTurn accepts but ignores: thinking, timeout_seconds, allow_unsafe_external_content, deliver, channel, to, best_effort_deliver.
+  - [x] **Executor** — payload execution with session/run creation (`executor.rs`)
 
   ### Devices (`src/devices/`)
 
