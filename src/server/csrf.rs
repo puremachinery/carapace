@@ -2,7 +2,7 @@
 //!
 //! Provides Cross-Site Request Forgery protection for state-changing routes:
 //! - Token generation (cryptographically random)
-//! - Token validation middleware for POST to /hooks/*, /tools/*
+//! - Token validation middleware for POST to /control/*
 //! - Token stored in session/cookie
 
 use axum::{
@@ -28,6 +28,12 @@ const DEFAULT_TOKEN_TTL: Duration = Duration::from_secs(3600);
 /// Default cookie name for CSRF token
 const DEFAULT_COOKIE_NAME: &str = "__Host-csrf";
 
+/// Default cookie name for CSRF session ID (insecure / non-TLS)
+const DEFAULT_SESSION_COOKIE: &str = "session";
+
+/// Default cookie name for CSRF session ID (secure / TLS)
+const DEFAULT_SESSION_COOKIE_HOST: &str = "__Host-session";
+
 /// Default header name for CSRF token
 const DEFAULT_HEADER_NAME: &str = "x-csrf-token";
 
@@ -48,6 +54,12 @@ pub enum CsrfError {
 
     #[error("Origin mismatch: expected {expected}, got {actual}")]
     OriginMismatch { expected: String, actual: String },
+
+    #[error("Origin missing")]
+    OriginMissing,
+
+    #[error("Origin host missing")]
+    OriginHostMissing,
 }
 
 /// CSRF protection configuration
@@ -89,7 +101,7 @@ impl Default for CsrfConfig {
             token_ttl: DEFAULT_TOKEN_TTL,
             check_origin: true,
             allowed_origins: Vec::new(),
-            protected_prefixes: vec!["/hooks/".to_string(), "/tools/".to_string()],
+            protected_prefixes: vec!["/control/".to_string()],
             enabled: true,
             secure_cookie: true,
             same_site: SameSite::Strict,
@@ -277,25 +289,40 @@ fn generate_random_bytes(len: usize) -> Result<Vec<u8>, CsrfError> {
     Ok(bytes)
 }
 
-/// Timing-safe string comparison
-/// Extract session ID from cookies
-fn extract_session_id(headers: &HeaderMap) -> Option<String> {
-    // Look for a session cookie or generate from client info
-    // In a real implementation, this would use a proper session management system
-    if let Some(cookie) = headers.get(header::COOKIE) {
-        if let Ok(cookie_str) = cookie.to_str() {
-            // Parse cookies and look for session ID
-            for part in cookie_str.split(';') {
-                let part = part.trim();
-                if let Some(value) = part.strip_prefix("session=") {
-                    return Some(value.to_string());
-                }
-            }
-        }
-    }
+/// Extract a cookie value by name from the request headers.
+fn extract_cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    let cookie = headers.get(header::COOKIE)?;
+    let cookie_str = cookie.to_str().ok()?;
+    let prefix = format!("{}=", name);
 
-    // No session cookie found — require a real session ID.
-    None
+    cookie_str
+        .split(';')
+        .map(|part| part.trim())
+        .find_map(|part| part.strip_prefix(&prefix).map(|value| value.to_string()))
+}
+
+pub fn csrf_cookie_name(config: &CsrfConfig) -> &str {
+    if config.secure_cookie {
+        &config.cookie_name
+    } else {
+        config
+            .cookie_name
+            .strip_prefix("__Host-")
+            .unwrap_or(&config.cookie_name)
+    }
+}
+
+fn session_cookie_name(config: &CsrfConfig) -> &str {
+    if config.secure_cookie {
+        DEFAULT_SESSION_COOKIE_HOST
+    } else {
+        DEFAULT_SESSION_COOKIE
+    }
+}
+
+/// Extract session ID from cookies
+fn extract_session_id(headers: &HeaderMap, config: &CsrfConfig) -> Option<String> {
+    extract_cookie_value(headers, session_cookie_name(config))
 }
 
 /// Extract CSRF token from request
@@ -304,18 +331,6 @@ fn extract_csrf_token(headers: &HeaderMap, config: &CsrfConfig) -> Option<String
     if let Some(token) = headers.get(&config.header_name) {
         if let Ok(token_str) = token.to_str() {
             return Some(token_str.to_string());
-        }
-    }
-
-    // Check cookie
-    if let Some(cookie) = headers.get(header::COOKIE) {
-        if let Ok(cookie_str) = cookie.to_str() {
-            for part in cookie_str.split(';') {
-                let part = part.trim();
-                if let Some(value) = part.strip_prefix(&format!("{}=", config.cookie_name)) {
-                    return Some(value.to_string());
-                }
-            }
         }
     }
 
@@ -367,15 +382,12 @@ fn check_origin(
                 });
             }
 
-            // No host to compare against - allow if origin is in allowed list
-            // or if no allowed list is configured (same-origin assumed)
-            Ok(())
+            // No host to compare against; fail closed unless explicitly allowed.
+            Err(CsrfError::OriginHostMissing)
         }
         None => {
-            // No Origin header - this is suspicious for cross-origin requests
-            // but may be legitimate for same-origin requests
             debug!("No Origin header in CSRF-protected request");
-            Ok(())
+            Err(CsrfError::OriginMissing)
         }
     }
 }
@@ -431,26 +443,23 @@ fn should_validate_csrf(method: &Method, path: &str, config: &CsrfConfig) -> boo
 fn extract_origin_session_and_token(
     headers: &HeaderMap,
     config: &CsrfConfig,
-) -> Result<(String, String), Response<Body>> {
+) -> Result<Option<(String, String)>, Response<Body>> {
     // Get Host header for origin check
     let host = headers
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.split(':').next().unwrap_or(s));
 
+    // Extract session ID
+    let session_id = match extract_session_id(headers, config) {
+        Some(id) => id,
+        None => return Ok(None),
+    };
+
     // Check Origin header
     if let Err(e) = check_origin(headers, config, host) {
         warn!("CSRF origin check failed: {}", e);
         return Err(csrf_error_response(e));
-    }
-
-    // Extract session ID
-    let session_id = match extract_session_id(headers) {
-        Some(id) => id,
-        None => {
-            warn!("CSRF: No session ID found");
-            return Err(csrf_error_response(CsrfError::TokenMissing));
-        }
     };
 
     // Extract token
@@ -462,7 +471,7 @@ fn extract_origin_session_and_token(
         }
     };
 
-    Ok((session_id, provided_token))
+    Ok(Some((session_id, provided_token)))
 }
 
 /// Perform origin checking, token extraction, and token validation.
@@ -475,7 +484,10 @@ fn extract_and_validate_token(
     config: &CsrfConfig,
     store: &CsrfTokenStore,
 ) -> Result<(), Response<Body>> {
-    let (session_id, provided_token) = extract_origin_session_and_token(headers, config)?;
+    let Some((session_id, provided_token)) = extract_origin_session_and_token(headers, config)?
+    else {
+        return Ok(());
+    };
 
     if let Err(e) = store.validate_token(&session_id, &provided_token) {
         warn!("CSRF validation failed: {}", e);
@@ -523,6 +535,8 @@ fn csrf_error_response(error: CsrfError) -> Response<Body> {
         CsrfError::TokenInvalid => "CSRF token invalid",
         CsrfError::TokenExpired => "CSRF token expired",
         CsrfError::OriginMismatch { .. } => "Origin mismatch",
+        CsrfError::OriginMissing => "Origin missing",
+        CsrfError::OriginHostMissing => "Origin host missing",
         CsrfError::GenerationFailed => "Internal error",
     };
 
@@ -547,11 +561,66 @@ pub fn csrf_cookie_header(token: &CsrfToken, config: &CsrfConfig) -> String {
 
     let secure = if config.secure_cookie { "; Secure" } else { "" };
     let max_age = config.token_ttl.as_secs();
+    let cookie_name = csrf_cookie_name(config);
 
     format!(
-        "{}={}; Path=/; HttpOnly; SameSite={}{}; Max-Age={}",
-        config.cookie_name, token.value, same_site, secure, max_age
+        "{}={}; Path=/; SameSite={}{}; Max-Age={}",
+        cookie_name, token.value, same_site, secure, max_age
     )
+}
+
+fn generate_session_id() -> Result<String, CsrfError> {
+    let session_bytes = generate_random_bytes(TOKEN_BYTES)?;
+    Ok(URL_SAFE_NO_PAD.encode(&session_bytes))
+}
+
+fn session_cookie_header(session_id: &str, config: &CsrfConfig) -> String {
+    let same_site = match config.same_site {
+        SameSite::Strict => "Strict",
+        SameSite::Lax => "Lax",
+        SameSite::None => "None",
+    };
+
+    let secure = if config.secure_cookie { "; Secure" } else { "" };
+    let max_age = config.token_ttl.as_secs();
+
+    let cookie_name = session_cookie_name(config);
+    format!(
+        "{}={}; Path=/; HttpOnly; SameSite={}{}; Max-Age={}",
+        cookie_name, session_id, same_site, secure, max_age
+    )
+}
+
+pub fn ensure_csrf_cookies(
+    headers: &HeaderMap,
+    store: &CsrfTokenStore,
+) -> Result<Vec<String>, CsrfError> {
+    let config = store.config();
+    if !config.enabled {
+        return Ok(Vec::new());
+    }
+
+    let existing_session = extract_session_id(headers, config);
+    let session_missing = existing_session.is_none();
+    let session_id = match existing_session {
+        Some(id) => id,
+        None => generate_session_id()?,
+    };
+
+    let mut set_cookies = Vec::new();
+    if session_missing {
+        set_cookies.push(session_cookie_header(&session_id, config));
+    }
+
+    let token = store
+        .get_token(&session_id)
+        .unwrap_or(store.generate_token(&session_id)?);
+    let existing_token = extract_cookie_value(headers, csrf_cookie_name(config));
+    if existing_token.as_deref() != Some(token.value.as_str()) {
+        set_cookies.push(csrf_cookie_header(&token, config));
+    }
+
+    Ok(set_cookies)
 }
 
 /// Convenience function to create CSRF layer
@@ -627,9 +696,9 @@ mod tests {
     fn test_config_requires_protection() {
         let config = CsrfConfig::default();
 
-        assert!(config.requires_protection("/hooks/wake"));
-        assert!(config.requires_protection("/hooks/agent"));
-        assert!(config.requires_protection("/tools/invoke"));
+        assert!(config.requires_protection("/control/status"));
+        assert!(!config.requires_protection("/hooks/wake"));
+        assert!(!config.requires_protection("/tools/invoke"));
         assert!(!config.requires_protection("/api/status"));
         assert!(!config.requires_protection("/"));
     }
@@ -682,10 +751,10 @@ mod tests {
 
         let header = csrf_cookie_header(&token, &config);
         assert!(header.contains("__Host-csrf=test-token-value"));
-        assert!(header.contains("HttpOnly"));
         assert!(header.contains("SameSite=Strict"));
         assert!(header.contains("Secure"));
         assert!(header.contains("Max-Age=3600"));
+        assert!(!header.contains("HttpOnly"));
     }
 
     #[test]
@@ -756,7 +825,7 @@ mod tests {
         );
 
         let token = extract_csrf_token(&headers, &config);
-        assert_eq!(token, Some("cookie-token".to_string()));
+        assert_eq!(token, None);
     }
 
     #[test]
@@ -766,9 +835,93 @@ mod tests {
         headers.insert("x-csrf-token", "header-token".parse().unwrap());
         headers.insert(header::COOKIE, "__Host-csrf=cookie-token".parse().unwrap());
 
-        // Header should take precedence
+        // Header should be used; cookie is ignored.
         let token = extract_csrf_token(&headers, &config);
         assert_eq!(token, Some("header-token".to_string()));
+    }
+
+    #[test]
+    fn test_missing_session_skips_csrf_validation() {
+        let store = CsrfTokenStore::new(CsrfConfig::default());
+        let headers = HeaderMap::new();
+
+        assert!(extract_and_validate_token(&headers, store.config(), &store).is_ok());
+    }
+
+    #[test]
+    fn test_missing_origin_rejected_when_session_present() {
+        let store = CsrfTokenStore::new(CsrfConfig::default());
+        let token = store.generate_token("session-1").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "localhost".parse().unwrap());
+        headers.insert("x-csrf-token", token.value.parse().unwrap());
+        headers.insert(
+            header::COOKIE,
+            format!("__Host-session=session-1; __Host-csrf={}", token.value)
+                .parse()
+                .unwrap(),
+        );
+
+        let response = extract_and_validate_token(&headers, store.config(), &store)
+            .expect_err("origin should be required when session cookie exists");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn test_missing_host_rejected_when_session_present() {
+        let store = CsrfTokenStore::new(CsrfConfig::default());
+        let token = store.generate_token("session-1").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ORIGIN, "https://example.com".parse().unwrap());
+        headers.insert("x-csrf-token", token.value.parse().unwrap());
+        headers.insert(
+            header::COOKIE,
+            format!("__Host-session=session-1; __Host-csrf={}", token.value)
+                .parse()
+                .unwrap(),
+        );
+
+        let response = extract_and_validate_token(&headers, store.config(), &store)
+            .expect_err("host should be required when session cookie exists");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn test_ensure_csrf_cookies_sets_session_and_token() {
+        let store = CsrfTokenStore::new(CsrfConfig::default());
+        let headers = HeaderMap::new();
+
+        let cookies = ensure_csrf_cookies(&headers, &store).unwrap();
+        assert_eq!(cookies.len(), 2);
+        assert!(cookies.iter().any(|c| c.starts_with("__Host-session=")));
+        assert!(cookies.iter().any(|c| c.starts_with("__Host-csrf=")));
+    }
+
+    #[test]
+    fn test_ensure_csrf_cookies_noop_when_present() {
+        let store = CsrfTokenStore::new(CsrfConfig::default());
+        let token = store.generate_token("session-1").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            format!("__Host-session=session-1; __Host-csrf={}", token.value)
+                .parse()
+                .unwrap(),
+        );
+
+        let cookies = ensure_csrf_cookies(&headers, &store).unwrap();
+        assert!(cookies.is_empty());
+    }
+
+    #[test]
+    fn test_cookie_names_when_insecure() {
+        let config = CsrfConfig {
+            secure_cookie: false,
+            ..Default::default()
+        };
+
+        assert_eq!(csrf_cookie_name(&config), "csrf");
+        assert_eq!(session_cookie_name(&config), "session");
     }
 
     #[test]

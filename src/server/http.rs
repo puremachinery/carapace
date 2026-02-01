@@ -11,7 +11,7 @@
 
 use axum::{
     extract::{ConnectInfo, Path, Query, State},
-    http::{header, HeaderMap, StatusCode, Uri},
+    http::{header, HeaderMap, HeaderValue, StatusCode, Uri},
     middleware,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -28,7 +28,9 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::server::control::{self, ControlState};
-use crate::server::csrf::{csrf_middleware, CsrfConfig, CsrfTokenStore};
+use crate::server::csrf::{
+    csrf_cookie_name, csrf_middleware, ensure_csrf_cookies, CsrfConfig, CsrfTokenStore,
+};
 use crate::server::headers::{security_headers_middleware, SecurityHeadersConfig};
 use crate::server::openai::{self, OpenAiState};
 use crate::server::ratelimit::{rate_limit_middleware, RateLimitConfig, RateLimiter};
@@ -265,6 +267,10 @@ pub struct AppState {
     pub ws_state: Option<Arc<WsServerState>>,
     /// Health checker for deep diagnostics
     pub health_checker: Option<Arc<crate::server::health::HealthChecker>>,
+    /// CSRF token store for control UI
+    pub csrf_store: Option<CsrfTokenStore>,
+    /// Whether the HTTP server is running with TLS enabled
+    pub tls_enabled: bool,
 }
 
 /// Middleware configuration for the HTTP server
@@ -325,13 +331,14 @@ impl MiddlewareConfig {
 
 /// Create the HTTP router with all endpoints (without middleware)
 pub fn create_router(config: HttpConfig) -> Router {
-    create_router_with_middleware(config, MiddlewareConfig::none())
+    create_router_with_middleware(config, MiddlewareConfig::none(), false)
 }
 
 /// Create the HTTP router with all endpoints and middleware
 pub fn create_router_with_middleware(
     config: HttpConfig,
     middleware_config: MiddlewareConfig,
+    tls_enabled: bool,
 ) -> Router {
     create_router_with_state(
         config,
@@ -340,6 +347,7 @@ pub fn create_router_with_middleware(
         Arc::new(ToolsRegistry::new()),
         Arc::new(ChannelRegistry::new()),
         None,
+        tls_enabled,
     )
 }
 
@@ -351,6 +359,7 @@ pub fn create_router_with_state(
     tools_registry: Arc<ToolsRegistry>,
     channel_registry: Arc<ChannelRegistry>,
     ws_state: Option<Arc<WsServerState>>,
+    tls_enabled: bool,
 ) -> Router {
     let start_time = chrono::Utc::now().timestamp();
 
@@ -364,6 +373,12 @@ pub fn create_router_with_state(
         ))
     });
 
+    let csrf_store = if middleware_config.enable_csrf {
+        Some(CsrfTokenStore::new(middleware_config.csrf.clone()))
+    } else {
+        None
+    };
+
     let state = AppState {
         config: Arc::new(config.clone()),
         hook_registry,
@@ -372,6 +387,8 @@ pub fn create_router_with_state(
         start_time,
         ws_state,
         health_checker,
+        csrf_store: csrf_store.clone(),
+        tls_enabled,
     };
 
     let mut router: Router<AppState> = Router::new();
@@ -475,8 +492,7 @@ pub fn create_router_with_state(
     }
 
     // CSRF protection middleware
-    if middleware_config.enable_csrf {
-        let csrf_store = CsrfTokenStore::new(middleware_config.csrf);
+    if let Some(csrf_store) = csrf_store {
         stateless_router =
             stateless_router.layer(middleware::from_fn_with_state(csrf_store, csrf_middleware));
     }
@@ -1230,12 +1246,22 @@ async fn control_ui_redirect(State(state): State<AppState>) -> Response {
 }
 
 /// Serve index.html for /ui/
-async fn control_ui_index(State(state): State<AppState>) -> Response {
-    serve_index_html(&state).await
+async fn control_ui_index(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(response) = control_ui_tls_guard(&state) {
+        return response;
+    }
+    serve_index_html(&state, &headers).await
 }
 
 /// Serve static files or fallback to index.html
-async fn control_ui_static(State(state): State<AppState>, Path(path): Path<String>) -> Response {
+async fn control_ui_static(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(response) = control_ui_tls_guard(&state) {
+        return response;
+    }
     let dist_path = &state.config.control_ui_dist_path;
 
     // Security: prevent path traversal
@@ -1258,11 +1284,11 @@ async fn control_ui_static(State(state): State<AppState>, Path(path): Path<Strin
     }
 
     // SPA fallback: serve index.html for unknown paths
-    serve_index_html(&state).await
+    serve_index_html(&state, &headers).await
 }
 
 /// Serve index.html with injected configuration
-async fn serve_index_html(state: &AppState) -> Response {
+async fn serve_index_html(state: &AppState, headers: &HeaderMap) -> Response {
     let dist_path = &state.config.control_ui_dist_path;
     let index_path = dist_path.join("index.html");
 
@@ -1283,12 +1309,20 @@ async fn serve_index_html(state: &AppState) -> Response {
                 state.config.control_ui_base_path.clone()
             };
 
-            let injected = content
+            let mut injected = content
                 .replace("__MOLTBOT_CONTROL_UI_BASE_PATH__", &base_path)
                 .replace("__MOLTBOT_ASSISTANT_NAME__", "Moltbot")
                 .replace("__MOLTBOT_ASSISTANT_AVATAR__", "");
 
-            (
+            if let Some(store) = &state.csrf_store {
+                let config = store.config();
+                if config.enabled {
+                    let script = csrf_bootstrap_script(config);
+                    injected = inject_html_script(&injected, &script);
+                }
+            }
+
+            let mut response = (
                 StatusCode::OK,
                 [
                     (header::CONTENT_TYPE, "text/html; charset=utf-8"),
@@ -1296,7 +1330,25 @@ async fn serve_index_html(state: &AppState) -> Response {
                 ],
                 injected,
             )
-                .into_response()
+                .into_response();
+
+            if let Some(store) = &state.csrf_store {
+                match ensure_csrf_cookies(headers, store) {
+                    Ok(cookies) => {
+                        let response_headers = response.headers_mut();
+                        for cookie in cookies {
+                            if let Ok(value) = HeaderValue::from_str(&cookie) {
+                                response_headers.append(header::SET_COOKIE, value);
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        warn!("Failed to set CSRF cookies: {}", err);
+                    }
+                }
+            }
+
+            response
         }
         Err(_) => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1304,6 +1356,40 @@ async fn serve_index_html(state: &AppState) -> Response {
         )
             .into_response(),
     }
+}
+
+fn control_ui_tls_guard(state: &AppState) -> Option<Response> {
+    let store = state.csrf_store.as_ref()?;
+    let config = store.config();
+    if config.enabled && config.secure_cookie && !state.tls_enabled {
+        return Some(
+            (
+                StatusCode::FORBIDDEN,
+                "Control UI requires TLS when CSRF secure cookies are enabled.",
+            )
+                .into_response(),
+        );
+    }
+    None
+}
+
+fn csrf_bootstrap_script(config: &CsrfConfig) -> String {
+    let cookie_name = csrf_cookie_name(config);
+    format!(
+        r#"<script>(function(){{var cookieName='{cookie}';var headerName='{header}';function readCookie(name){{var parts=document.cookie?document.cookie.split(';'):[];for(var i=0;i<parts.length;i++){{var part=parts[i].trim();if(part.indexOf(name+'=')===0){{return part.substring(name.length+1);}}}}return '';}}function getToken(){{return readCookie(cookieName);}}function addHeader(headers,token){{if(!token){{return headers;}}var lower=headerName.toLowerCase();if(headers instanceof Headers){{if(!headers.has(headerName)){{headers.set(headerName,token);}}return headers;}}if(Array.isArray(headers)){{for(var i=0;i<headers.length;i++){{if(String(headers[i][0]).toLowerCase()===lower){{return headers;}}}}headers.push([headerName,token]);return headers;}}headers=headers||{{}};for(var key in headers){{if(Object.prototype.hasOwnProperty.call(headers,key)&&String(key).toLowerCase()===lower){{return headers;}}}}headers[headerName]=token;return headers;}}if(window.fetch){{var origFetch=window.fetch.bind(window);window.fetch=function(input,init){{var token=getToken();if(token){{init=init||{{}};if(input instanceof Request){{var baseHeaders=new Headers(input.headers);init.headers=addHeader(baseHeaders,token);var req=new Request(input,init);return origFetch(req);}}init.headers=addHeader(init.headers,token);}}return origFetch(input,init);}};}}if(window.XMLHttpRequest){{var origOpen=XMLHttpRequest.prototype.open;var origSend=XMLHttpRequest.prototype.send;XMLHttpRequest.prototype.open=function(){{this.__csrfToken=getToken();return origOpen.apply(this,arguments);}};XMLHttpRequest.prototype.send=function(){{if(this.__csrfToken){{try{{this.setRequestHeader(headerName,this.__csrfToken);}}catch(e){{}}}}return origSend.apply(this,arguments);}};}}}})();</script>"#,
+        cookie = cookie_name,
+        header = config.header_name
+    )
+}
+
+fn inject_html_script(html: &str, script: &str) -> String {
+    if html.contains("</head>") {
+        return html.replace("</head>", &format!("{}</head>", script));
+    }
+    if html.contains("</body>") {
+        return html.replace("</body>", &format!("{}</body>", script));
+    }
+    format!("{}{}", html, script)
 }
 
 /// Serve a static file
