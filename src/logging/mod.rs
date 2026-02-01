@@ -46,6 +46,7 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+use crate::logging::redact::RedactingMakeWriter;
 use tracing::Level;
 use tracing_subscriber::fmt::time::UtcTime;
 use tracing_subscriber::layer::SubscriberExt;
@@ -180,13 +181,14 @@ pub fn init_logging(config: LogConfig) -> Result<(), LoggingError> {
 
     match (&config.format, &config.output) {
         (LogFormat::Json, LogOutput::Stdout) => {
+            let writer = RedactingMakeWriter::new(io::stdout);
             let layer = tracing_subscriber::fmt::layer()
                 .json()
                 .with_timer(timer)
                 .with_target(true)
                 .with_current_span(true)
                 .with_span_list(true)
-                .with_writer(io::stdout)
+                .with_writer(writer)
                 .with_filter(filter);
 
             tracing_subscriber::registry()
@@ -195,13 +197,14 @@ pub fn init_logging(config: LogConfig) -> Result<(), LoggingError> {
                 .init();
         }
         (LogFormat::Json, LogOutput::Stderr) => {
+            let writer = RedactingMakeWriter::new(io::stderr);
             let layer = tracing_subscriber::fmt::layer()
                 .json()
                 .with_timer(timer)
                 .with_target(true)
                 .with_current_span(true)
                 .with_span_list(true)
-                .with_writer(io::stderr)
+                .with_writer(writer)
                 .with_filter(filter);
 
             tracing_subscriber::registry()
@@ -211,13 +214,14 @@ pub fn init_logging(config: LogConfig) -> Result<(), LoggingError> {
         }
         (LogFormat::Json, LogOutput::File(path)) => {
             let file = File::create(path)?;
+            let writer = RedactingMakeWriter::new(file);
             let layer = tracing_subscriber::fmt::layer()
                 .json()
                 .with_timer(timer)
                 .with_target(true)
                 .with_current_span(true)
                 .with_span_list(true)
-                .with_writer(file)
+                .with_writer(writer)
                 .with_filter(filter);
 
             tracing_subscriber::registry()
@@ -226,6 +230,7 @@ pub fn init_logging(config: LogConfig) -> Result<(), LoggingError> {
                 .init();
         }
         (LogFormat::Plaintext, LogOutput::Stdout) => {
+            let writer = RedactingMakeWriter::new(io::stdout);
             let layer = tracing_subscriber::fmt::layer()
                 .with_timer(timer)
                 .with_target(true)
@@ -233,7 +238,7 @@ pub fn init_logging(config: LogConfig) -> Result<(), LoggingError> {
                 .with_thread_names(false)
                 .with_file(false)
                 .with_line_number(false)
-                .with_writer(io::stdout)
+                .with_writer(writer)
                 .with_filter(filter);
 
             tracing_subscriber::registry()
@@ -242,6 +247,7 @@ pub fn init_logging(config: LogConfig) -> Result<(), LoggingError> {
                 .init();
         }
         (LogFormat::Plaintext, LogOutput::Stderr) => {
+            let writer = RedactingMakeWriter::new(io::stderr);
             let layer = tracing_subscriber::fmt::layer()
                 .with_timer(timer)
                 .with_target(true)
@@ -249,7 +255,7 @@ pub fn init_logging(config: LogConfig) -> Result<(), LoggingError> {
                 .with_thread_names(false)
                 .with_file(false)
                 .with_line_number(false)
-                .with_writer(io::stderr)
+                .with_writer(writer)
                 .with_filter(filter);
 
             tracing_subscriber::registry()
@@ -259,6 +265,7 @@ pub fn init_logging(config: LogConfig) -> Result<(), LoggingError> {
         }
         (LogFormat::Plaintext, LogOutput::File(path)) => {
             let file = File::create(path)?;
+            let writer = RedactingMakeWriter::new(file);
             let layer = tracing_subscriber::fmt::layer()
                 .with_timer(timer)
                 .with_target(true)
@@ -266,7 +273,7 @@ pub fn init_logging(config: LogConfig) -> Result<(), LoggingError> {
                 .with_thread_names(false)
                 .with_file(false)
                 .with_line_number(false)
-                .with_writer(file)
+                .with_writer(writer)
                 .with_filter(filter);
 
             tracing_subscriber::registry()
@@ -301,32 +308,35 @@ fn init_logging_internal(config: LogConfig) -> Result<(), LoggingError> {
 
     match (&config.format, &config.output) {
         (LogFormat::Json, LogOutput::Stdout) => {
+            let writer = RedactingMakeWriter::new(io::stdout);
             let layer = tracing_subscriber::fmt::layer()
                 .json()
                 .with_timer(timer)
                 .with_target(true)
                 .with_current_span(true)
                 .with_span_list(true)
-                .with_writer(io::stdout)
+                .with_writer(writer)
                 .with_filter(filter);
 
             subscriber.with(layer).try_init()?;
         }
         (LogFormat::Plaintext, LogOutput::Stdout) => {
+            let writer = RedactingMakeWriter::new(io::stdout);
             let layer = tracing_subscriber::fmt::layer()
                 .with_timer(timer)
                 .with_target(true)
-                .with_writer(io::stdout)
+                .with_writer(writer)
                 .with_filter(filter);
 
             subscriber.with(layer).try_init()?;
         }
         _ => {
             // For testing, just use stdout plaintext
+            let writer = RedactingMakeWriter::new(io::stdout);
             let layer = tracing_subscriber::fmt::layer()
                 .with_timer(timer)
                 .with_target(true)
-                .with_writer(io::stdout)
+                .with_writer(writer)
                 .with_filter(filter);
 
             subscriber.with(layer).try_init()?;

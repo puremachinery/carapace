@@ -150,7 +150,7 @@ feature_inventory_markdown: |
   - [x] **Plaintext format** — human-readable dev logs
   - [x] **Output destinations** — stdout, stderr, file
   - [x] **Log buffer layer** — ring buffer for /logs endpoint
-  - [~] **Secret masking** — redacts API keys (9 keywords)
+  - [x] **Secret masking** — redacts API keys in log output and buffer
   - [~] **Audit logging** — framework in place (audit.rs module exists, callers emit structured events)
 
   ### Media (`src/media/`)

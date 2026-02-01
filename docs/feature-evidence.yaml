@@ -382,14 +382,17 @@ features:
       - "src/logging/buffer.rs (buffer tests)"
 
   - feature: "logging.secret masking"
-    status: "partial"
+    status: "verified_done"
     runtime_wiring:
       - "src/logging/redact.rs (redaction utilities)"
+      - "src/logging/mod.rs::init_logging (RedactingMakeWriter)"
+      - "src/logging/buffer.rs::LogBufferLayer (message/field redaction)"
     tests:
       - "src/logging/redact.rs::test_openai_key_is_redacted"
       - "src/logging/redact.rs::test_json_known_keys_redacted"
+      - "src/logging/redact.rs::test_redacting_writer_redacts_lines"
     notes:
-      - "Redactor is not wired into the logging subscriber or HTTP error paths"
+      - "Redaction applied to log output writers and logs.tail buffer"
 
   - feature: "logging.audit logging"
     status: "partial"

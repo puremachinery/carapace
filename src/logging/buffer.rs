@@ -3,6 +3,7 @@
 //! This module provides a ring buffer that captures log entries from the tracing
 //! subscriber, enabling real-time log streaming via the `logs.tail` WebSocket method.
 
+use crate::logging::redact::{redact_json_value, redact_string};
 use parking_lot::RwLock;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -443,15 +444,19 @@ where
             .id()
             .and_then(|id| ctx.span(id).map(|span| span.metadata().name().to_string()));
 
-        // Convert fields to JSON if not empty
+        let message = redact_string(&visitor.message);
+
+        // Convert fields to JSON if not empty, with redaction
         let fields = if visitor.fields.is_empty() {
             None
         } else {
-            Some(serde_json::Value::Object(visitor.fields))
+            let mut value = serde_json::Value::Object(visitor.fields);
+            redact_json_value(&mut value);
+            Some(value)
         };
 
         // Push to global buffer
-        LOG_BUFFER.push_with_seq(level, target, visitor.message, span, fields);
+        LOG_BUFFER.push_with_seq(level, target, message, span, fields);
     }
 
     fn on_new_span(&self, _attrs: &Attributes<'_>, _id: &Id, _ctx: Context<'_, S>) {

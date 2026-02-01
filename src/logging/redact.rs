@@ -5,7 +5,9 @@
 
 use regex::Regex;
 use serde_json::Value;
+use std::io::{self, Write};
 use std::sync::LazyLock;
+use tracing_subscriber::fmt::MakeWriter;
 
 const SECRET_KEY_NAMES: &[&str] = &[
     "apikey",
@@ -58,6 +60,77 @@ impl Redactor {
 impl Default for Redactor {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+pub struct RedactingWriter<W> {
+    inner: W,
+    buffer: Vec<u8>,
+}
+
+impl<W> RedactingWriter<W> {
+    pub fn new(inner: W) -> Self {
+        Self {
+            inner,
+            buffer: Vec::new(),
+        }
+    }
+}
+
+impl<W: Write> Write for RedactingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        self.buffer.extend_from_slice(buf);
+        while let Some(pos) = self.buffer.iter().position(|b| *b == b'\n') {
+            let mut line = self.buffer.drain(..=pos).collect::<Vec<u8>>();
+            let has_newline = matches!(line.last(), Some(b'\n'));
+            if has_newline {
+                line.pop();
+            }
+            let text = String::from_utf8_lossy(&line);
+            let redacted = redact_string(&text);
+            self.inner.write_all(redacted.as_bytes())?;
+            if has_newline {
+                self.inner.write_all(b"\n")?;
+            }
+        }
+
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if !self.buffer.is_empty() {
+            let text = String::from_utf8_lossy(&self.buffer);
+            let redacted = redact_string(&text);
+            self.inner.write_all(redacted.as_bytes())?;
+            self.buffer.clear();
+        }
+        self.inner.flush()
+    }
+}
+
+pub struct RedactingMakeWriter<M> {
+    inner: M,
+}
+
+impl<M> RedactingMakeWriter<M> {
+    pub fn new(inner: M) -> Self {
+        Self { inner }
+    }
+}
+
+impl<'a, M> MakeWriter<'a> for RedactingMakeWriter<M>
+where
+    M: MakeWriter<'a>,
+    M::Writer: Write,
+{
+    type Writer = RedactingWriter<M::Writer>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        RedactingWriter::new(self.inner.make_writer())
     }
 }
 
@@ -131,6 +204,7 @@ impl<T: std::fmt::Display> std::fmt::Display for RedactedDisplay<T> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::io::Write;
 
     #[test]
     fn test_openai_key_is_redacted() {
@@ -292,6 +366,20 @@ mod tests {
         let msg = "all good, nothing secret here";
         let displayed = format!("{}", RedactedDisplay(msg));
         assert_eq!(displayed, msg);
+    }
+
+    #[test]
+    fn test_redacting_writer_redacts_lines() {
+        let mut inner: Vec<u8> = Vec::new();
+        {
+            let mut writer = RedactingWriter::new(&mut inner);
+            write!(writer, "Authorization: Bearer abc.def.ghi\nok").unwrap();
+            writer.flush().unwrap();
+        }
+        let output = String::from_utf8(inner).unwrap();
+        assert!(!output.contains("abc.def.ghi"));
+        assert!(output.contains("[REDACTED]"));
+        assert!(output.contains("ok"));
     }
 
     #[test]
