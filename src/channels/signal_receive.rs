@@ -12,6 +12,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::channels::{ChannelRegistry, ChannelStatus};
 use crate::server::ws::WsServerState;
+use crate::sessions::{get_or_create_scoped_session, SessionMetadata};
 
 /// Interval between receive polls.
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -175,20 +176,31 @@ fn process_envelope(envelope: &SignalEnvelope, state: &Arc<WsServerState>) {
         "Signal inbound message"
     );
 
-    // Build a session key scoped to Signal + sender
-    let session_key = format!("signal:{}", sender);
+    let cfg = crate::config::load_config().unwrap_or(Value::Object(serde_json::Map::new()));
+    let group_id = data_message
+        .group_info
+        .as_ref()
+        .and_then(|group| group.group_id.clone());
+    let peer_id = group_id.as_deref().unwrap_or(sender).to_string();
 
-    let metadata = crate::sessions::SessionMetadata {
+    let metadata = SessionMetadata {
         channel: Some("signal".to_string()),
+        user_id: Some(sender.to_string()),
+        chat_id: group_id,
         ..Default::default()
     };
 
-    // Get or create the session
-    let session = match state
-        .session_store()
-        .get_or_create_session(&session_key, metadata)
-    {
-        Ok(s) => s,
+    let session_store = state.session_store();
+    let session = match get_or_create_scoped_session(
+        session_store,
+        &cfg,
+        "signal",
+        sender,
+        peer_id.as_str(),
+        None,
+        metadata,
+    ) {
+        Ok(session) => session,
         Err(e) => {
             error!("Failed to get/create Signal session for {}: {}", sender, e);
             return;
@@ -232,7 +244,6 @@ fn process_envelope(envelope: &SignalEnvelope, state: &Arc<WsServerState>) {
     }
 
     if let Some(provider) = state.llm_provider() {
-        let cfg = crate::config::load_config().unwrap_or(Value::Object(serde_json::Map::new()));
         let mut config = crate::agent::AgentConfig::default();
         crate::agent::apply_agent_config_from_settings(&mut config, &cfg, None);
         config.deliver = true;

@@ -851,6 +851,9 @@ fn build_session_metadata(
             meta.channel = Some(normalized);
         }
     }
+    if let Some(chat_id) = read_string_param(params, "chatId") {
+        meta.chat_id = Some(chat_id);
+    }
     if let Some(user_id) = read_string_param(params, "userId") {
         meta.user_id = Some(user_id);
     }
@@ -1796,7 +1799,7 @@ pub(super) fn handle_sessions_archive_delete(
 /// ## Parameters
 /// - `message` (required): The user message to send to the agent
 /// - `idempotencyKey` (required): Unique key for this request (becomes run ID)
-/// - `sessionKey` (optional): Session key (defaults to "default")
+/// - `sessionKey` (optional): Session key (derived via scoping when omitted)
 /// - `stream` (optional): Whether to stream responses (defaults to true)
 /// - Additional session metadata fields (label, model, thinkingLevel, etc.)
 ///
@@ -1814,7 +1817,7 @@ pub(super) fn handle_sessions_archive_delete(
 struct AgentRequestParams<'a> {
     message: &'a str,
     idempotency_key: &'a str,
-    session_key: &'a str,
+    session_key: Option<String>,
     stream: bool,
 }
 
@@ -1843,8 +1846,8 @@ fn parse_agent_request_params<'a>(
         .and_then(|v| v.as_str())
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
-        .or(default_session_key)
-        .unwrap_or("default");
+        .map(|s| s.to_string())
+        .or_else(|| default_session_key.map(|s| s.to_string()));
     let stream = params
         .and_then(|v| v.get("stream"))
         .and_then(|v| v.as_bool())
@@ -1858,30 +1861,17 @@ fn parse_agent_request_params<'a>(
     })
 }
 
-/// Create/validate the session and register the agent run.
+/// Register the agent run and append the user message.
 /// Returns (run_id, session_key, cancel_token).
 fn setup_agent_session(
     state: &Arc<WsServerState>,
-    params: Option<&Value>,
-    agent_params: &AgentRequestParams<'_>,
+    session: sessions::Session,
+    message: &str,
+    idempotency_key: &str,
 ) -> Result<(String, String, CancellationToken), ErrorShape> {
-    let metadata = build_session_metadata(params, state.channel_registry());
-    let session = state
-        .session_store
-        .get_or_create_session(agent_params.session_key, metadata)
-        .map_err(|err| {
-            error_shape(
-                ERROR_UNAVAILABLE,
-                &format!("session create failed: {}", err),
-                None,
-            )
-        })?;
     state
         .session_store
-        .append_message(sessions::ChatMessage::user(
-            session.id.clone(),
-            agent_params.message,
-        ))
+        .append_message(sessions::ChatMessage::user(session.id.clone(), message))
         .map_err(|err| {
             error_shape(
                 ERROR_UNAVAILABLE,
@@ -1893,10 +1883,10 @@ fn setup_agent_session(
     // Create the agent run
     let cancel_token = CancellationToken::new();
     let run = AgentRun {
-        run_id: agent_params.idempotency_key.to_string(),
+        run_id: idempotency_key.to_string(),
         session_key: session.session_key.clone(),
         status: AgentRunStatus::Queued,
-        message: agent_params.message.to_string(),
+        message: message.to_string(),
         response: String::new(),
         error: None,
         created_at: now_ms(),
@@ -1925,6 +1915,7 @@ pub(super) fn handle_agent(
 ) -> Result<Value, ErrorShape> {
     let default_session_key = state.default_session_key(&conn.conn_id);
     let agent_params = parse_agent_request_params(params, default_session_key.as_deref())?;
+    let cfg = config::load_config().unwrap_or(Value::Object(serde_json::Map::new()));
 
     // Check for duplicate idempotencyKey — return existing run status
     {
@@ -1945,8 +1936,48 @@ pub(super) fn handle_agent(
         }
     }
 
-    let (run_id, session_key_out, cancel_token) =
-        setup_agent_session(&state, params, &agent_params)?;
+    let mut metadata = build_session_metadata(params, state.channel_registry());
+    let channel = metadata
+        .channel
+        .clone()
+        .unwrap_or_else(|| "default".to_string());
+    let sender_id = metadata
+        .user_id
+        .clone()
+        .unwrap_or_else(|| conn.client.id.to_string());
+    if metadata.user_id.is_none() {
+        metadata.user_id = Some(sender_id.clone());
+    }
+    let peer_id = params
+        .and_then(|v| v.get("chatId").or_else(|| v.get("to")))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(sender_id.as_str())
+        .to_string();
+    let explicit_key = agent_params.session_key.as_deref();
+    let session = sessions::get_or_create_scoped_session(
+        state.session_store(),
+        &cfg,
+        channel.as_str(),
+        sender_id.as_str(),
+        peer_id.as_str(),
+        explicit_key,
+        metadata,
+    )
+    .map_err(|err| {
+        error_shape(
+            ERROR_UNAVAILABLE,
+            &format!("session create failed: {}", err),
+            None,
+        )
+    })?;
+    let (run_id, session_key_out, cancel_token) = setup_agent_session(
+        &state,
+        session,
+        agent_params.message,
+        agent_params.idempotency_key,
+    )?;
 
     // Spawn the agent executor if an LLM provider is configured
     let status = if let Some(provider) = state.llm_provider() {
@@ -1954,7 +1985,6 @@ pub(super) fn handle_agent(
             .and_then(|v| v.get("model"))
             .and_then(|v| v.as_str())
             .unwrap_or(crate::agent::DEFAULT_MODEL);
-        let cfg = config::load_config().unwrap_or(Value::Object(serde_json::Map::new()));
         let mut config = crate::agent::AgentConfig::default();
         let agent_id = params
             .and_then(|v| v.get("agentId"))
@@ -2390,6 +2420,26 @@ pub(super) fn handle_chat_send(
 ) -> Result<Value, ErrorShape> {
     let chat_params = parse_chat_send_params(params)?;
     let default_session_key = state.default_session_key(&conn.conn_id);
+    let cfg = config::load_config().unwrap_or(Value::Object(serde_json::Map::new()));
+    let mut metadata = build_session_metadata(params, state.channel_registry());
+    let channel = metadata
+        .channel
+        .clone()
+        .unwrap_or_else(|| "default".to_string());
+    let sender_id = metadata
+        .user_id
+        .clone()
+        .unwrap_or_else(|| conn.client.id.to_string());
+    if metadata.user_id.is_none() {
+        metadata.user_id = Some(sender_id.clone());
+    }
+    let peer_id = params
+        .and_then(|v| v.get("chatId").or_else(|| v.get("to")))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(sender_id.as_str())
+        .to_string();
 
     // Check for duplicate idempotencyKey — return existing run status
     {
@@ -2411,26 +2461,52 @@ pub(super) fn handle_chat_send(
     }
 
     let session = if let Some(session_id) = chat_params.session_id {
-        state
+        let session = state
             .session_store
             .get_session(session_id)
-            .map_err(|err| error_shape(ERROR_INVALID_REQUEST, &err.to_string(), None))?
+            .map_err(|err| error_shape(ERROR_INVALID_REQUEST, &err.to_string(), None))?;
+        let reset_channel = session
+            .metadata
+            .channel
+            .as_deref()
+            .unwrap_or(channel.as_str());
+        let channel_config =
+            sessions::scoping::ChannelSessionConfig::from_config(&cfg, reset_channel);
+        if sessions::scoping::should_reset_session(session.updated_at, &channel_config.reset) {
+            state
+                .session_store
+                .reset_session(&session.id)
+                .map_err(|err| {
+                    error_shape(
+                        ERROR_UNAVAILABLE,
+                        &format!("session reset failed: {}", err),
+                        None,
+                    )
+                })?
+        } else {
+            session
+        }
     } else {
-        let key = chat_params
+        let explicit_key = chat_params
             .session_key
             .as_deref()
-            .or(default_session_key.as_deref())
-            .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "sessionKey is required", None))?;
-        state
-            .session_store
-            .get_or_create_session(key, sessions::SessionMetadata::default())
-            .map_err(|err| {
-                error_shape(
-                    ERROR_UNAVAILABLE,
-                    &format!("session create failed: {}", err),
-                    None,
-                )
-            })?
+            .or(default_session_key.as_deref());
+        sessions::get_or_create_scoped_session(
+            state.session_store(),
+            &cfg,
+            channel.as_str(),
+            sender_id.as_str(),
+            peer_id.as_str(),
+            explicit_key,
+            metadata,
+        )
+        .map_err(|err| {
+            error_shape(
+                ERROR_UNAVAILABLE,
+                &format!("session create failed: {}", err),
+                None,
+            )
+        })?
     };
 
     // Create and append the user message

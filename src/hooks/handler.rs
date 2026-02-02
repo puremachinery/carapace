@@ -6,7 +6,6 @@
 //! - POST /hooks/<mapping> - Custom hook mappings
 
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 /// Wake mode for scheduling wake events
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -147,7 +146,7 @@ pub struct ValidatedAgentRequest {
     pub thinking: Option<String>,
     pub deliver: bool,
     pub wake_mode: WakeMode,
-    pub session_key: String,
+    pub session_key: Option<String>,
     pub timeout_seconds: Option<u32>,
     pub allow_unsafe_external_content: bool,
     pub venice_parameters: Option<serde_json::Value>,
@@ -210,11 +209,7 @@ pub fn validate_agent_request(
         ));
     }
 
-    // Generate session key if not provided
-    let session_key = req
-        .session_key
-        .clone()
-        .unwrap_or_else(|| format!("hook:{}", Uuid::new_v4()));
+    let session_key = req.session_key.clone();
 
     // Parse timeout_seconds (floor to integer, ignore invalid values)
     let timeout_seconds = req.timeout_seconds.and_then(|t| {
@@ -365,7 +360,7 @@ mod tests {
         assert_eq!(result.channel, "last");
         assert!(result.deliver);
         assert_eq!(result.wake_mode, WakeMode::Now);
-        assert!(result.session_key.starts_with("hook:"));
+        assert!(result.session_key.is_none());
     }
 
     #[test]
@@ -525,7 +520,7 @@ mod tests {
             venice_parameters: None,
         };
         let result = validate_agent_request(&req, &[]).unwrap();
-        assert_eq!(result.session_key, "my-custom-session");
+        assert_eq!(result.session_key.as_deref(), Some("my-custom-session"));
     }
 
     #[test]
