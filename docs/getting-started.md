@@ -17,7 +17,7 @@ It’s intentionally practical: copy/paste steps, then customize.
 export CARAPACE_GATEWAY_TOKEN="$(openssl rand -hex 32)"
 ```
 
-2) Create a minimal config:
+2) Create a minimal config (save as `carapace.json5`):
 
 ```json5
 {
@@ -39,7 +39,7 @@ CARAPACE_CONFIG_PATH=./carapace.json5 cargo run
 4) Verify:
 
 ```bash
-curl -H "Authorization: Bearer ${CARAPACE_GATEWAY_TOKEN}" http://localhost:8080/health
+curl -H "Authorization: Bearer ${CARAPACE_GATEWAY_TOKEN}" http://localhost:18789/health
 ```
 
 Expected response:
@@ -47,6 +47,8 @@ Expected response:
 ```json
 { "status": "ok", "version": "x.y.z", "uptimeSeconds": 12 }
 ```
+
+If you set `gateway.port`, use that port instead of `18789`.
 
 ## Configuration Basics
 

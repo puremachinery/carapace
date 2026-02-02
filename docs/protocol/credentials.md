@@ -144,7 +144,7 @@ No secret fields are written to this file.
 ### Linux Keyutils (kernel keyring)
 
 - **Recommended crate:** `keyring` (Keyutils backend)
-- **Alternative:** `secret-service` when attribute queries are required
+- **Alternative:** `secret-service` when attribute queries are required (not used by default)
 - **Collection:** kernel keyring (no D-Bus dependency)
 
 **Fallback behavior if keyring storage is unavailable:**
@@ -219,13 +219,13 @@ secret store (using the same `auth-profile` keys).
 | Platform | Interactive Mode | Daemon Mode |
 |----------|-----------------|-------------|
 | macOS    | System prompts for keychain unlock | Fail with clear error; require unlock before daemon start |
-| Linux    | Secret Service unavailable: warn and continue with env-only credentials | Same; no automatic prompt possible |
+| Linux    | Keyutils unavailable: warn and continue with env-only credentials | Same; no automatic prompt possible |
 | Windows  | Credential Manager always available if user is logged in | N/A (Windows services run in session 0) |
 
 **Implementation notes:**
 - At startup, attempt a test read/write to detect locked state
 - Log `WARN` if credentials unavailable; list which features are degraded
-- Provide `carapace doctor` check for credential store health
+- Consider adding a `carapace doctor` check for credential store health
 
 ### Timeout and Retry Policy
 
@@ -238,14 +238,14 @@ Keychain operations may block (e.g., waiting for user unlock prompt).
 | `delete`  | 5s      | 2       | None |
 
 **Retryable errors:**
-- Temporary D-Bus disconnection (Linux)
+- Transient keyring backend errors (Linux keyutils)
 - Keychain temporarily locked during transition
 - Transient I/O errors
 
 **Non-retryable errors:**
 - Keychain permanently locked (requires user action)
 - Access denied (permission error)
-- Secret store service not installed
+- Keyring backend unavailable (e.g., kernel keyring disabled or unsupported)
 
 ### Credential Rotation Atomicity
 

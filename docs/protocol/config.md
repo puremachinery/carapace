@@ -9,8 +9,8 @@ Default config path:
 
 - Uses the platform config directory (e.g. `~/.config/carapace` on Linux,
   `~/Library/Application Support/carapace` on macOS, `%APPDATA%\\carapace` on Windows).
-- `~/.config/carapace/carapace.json`
-- If `CARAPACE_STATE_DIR` is set, defaults to `${CARAPACE_STATE_DIR}/carapace.json`
+- `~/.config/carapace/carapace.json5` (falls back to `.json` if `.json5` does not exist)
+- If `CARAPACE_STATE_DIR` is set, defaults to `${CARAPACE_STATE_DIR}/carapace.json5` (falls back to `.json`)
 - Override with `CARAPACE_CONFIG_PATH`
 
 The file is parsed as **JSON5** (comments, trailing commas allowed).
@@ -19,7 +19,7 @@ The file is parsed as **JSON5** (comments, trailing commas allowed).
 
 1. Read config file (JSON5).
 2. Resolve `$include` directives (see below).
-3. Apply `config.env` entries into `process.env` **before** substitution.
+3. Apply `env` entries into `process.env` **before** substitution.
 4. Substitute `${VAR}` references in string values.
 5. Validate against the schema.
 6. Apply defaults.
@@ -111,7 +111,7 @@ All keys are optional. Unknown keys are rejected (strict schema).
 - `messages` – messaging behavior defaults
 - `commands` – command policy/config
 - `approvals` – exec approval settings
-- `session` – session behavior
+- `sessions` – session behavior (retention, cleanup)
 - `cron` – cron scheduler settings
 - `hooks` – HTTP hooks config
 - `web` – web provider settings (WhatsApp Web)
@@ -147,8 +147,11 @@ This is a condensed map; refer to the JSON schema for full detail.
   - `apiKey`, `baseUrl`
 - `classifier`
   - `enabled`, `mode` (`off` | `warn` | `block`), `model`, `blockThreshold`
+- `sessions`
+  - `retention.enabled`, `retention.days`, `retention.intervalHours`
+  - Legacy: `sessions.retentionDays`, `session.retention.*`
 - `telegram`
-  - `webhookSecret` (validates `X-Telegram-Bot-Api-Secret-Token`)
+  - `webhookSecret` (required for inbound webhooks; validates `X-Telegram-Bot-Api-Secret-Token`)
 - `discord`
   - `gatewayEnabled` (connect to the Gateway for inbound messages)
   - `gatewayIntents` (intents bitmask, default includes MESSAGE_CONTENT)

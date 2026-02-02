@@ -1,6 +1,6 @@
 # Gateway HTTP API
 
-This document describes the gateway HTTP endpoints wired in the current Node gateway implementation.
+This document describes the gateway HTTP endpoints wired in the current Rust gateway implementation.
 It focuses on endpoints handled directly by the gateway server and the Control UI.
 
 ## Authentication Overview
@@ -122,7 +122,7 @@ Common behavior:
 ### POST `/channels/telegram/webhook`
 Telegram Bot API webhook endpoint.
 
-- Auth: optional `X-Telegram-Bot-Api-Secret-Token` when `telegram.webhookSecret` is set.
+- Auth: requires `X-Telegram-Bot-Api-Secret-Token` matching `telegram.webhookSecret`.
 - Body: Telegram Update JSON.
 - Response: `200 OK` on success (ignored updates still return 200).
 
@@ -134,7 +134,24 @@ Slack Events API endpoint.
 - Body: Slack Events API JSON.
 - Response:
   - `200 OK` with `{ "challenge": "..." }` for `url_verification`.
-  - `200 OK` for event callbacks.
+- `200 OK` for event callbacks.
+
+## Plugin Webhooks
+
+Plugins can register webhook paths. The gateway routes any request under
+`/plugins/<plugin-id>/...` to the owning plugin.
+
+Common behavior:
+- Method: **any**
+- Max body size: `hooks.maxBodyBytes` (default 256 KB)
+- Auth: **none at the gateway layer** — plugins must validate their own secrets
+  (e.g., shared tokens or signatures).
+- Response: status, headers, and body are forwarded from the plugin.
+
+### `ANY /plugins/<plugin-id>/*`
+
+- Path is matched against the plugin’s registered webhook paths.
+- `404 Not Found` if no plugin claims the path.
 
 ## OpenAI-Compatible
 

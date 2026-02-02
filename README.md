@@ -135,7 +135,7 @@ webhooks and gateway configuration) live in:
 
 - `docs/channels.md`
 
-### Getting Started
+### Full Setup Guide
 
 End‑to‑end setup, auth, TLS, and ops guidance:
 
@@ -194,7 +194,7 @@ src/
 ├── channels/       # Channel registry, Signal, Telegram, Discord, Slack, console
 ├── cli/            # CLI subcommands (start, config, backup, tls, etc.)
 ├── config/         # JSON5 config with $include, env substitution, hot reload
-├── credentials/    # Platform-native credential storage (Keychain, Secret Service, Windows)
+├── credentials/    # Platform-native credential storage (Keychain, Keyutils, Windows)
 ├── cron/           # Cron scheduler, background tick loop
 ├── devices/        # Device pairing state machine
 ├── exec/           # Exec approval workflow (request, wait, resolve)

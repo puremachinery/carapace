@@ -71,7 +71,7 @@ graph TB
         Secrets["AES-256-GCM Encrypted Secrets<br/>(PBKDF2, 600K iterations)"]
         Sessions["HMAC-SHA256 Session Integrity"]
         Audit["Append-Only Audit Log<br/>(JSONL, 19 event types)"]
-        Keychain["Platform Keychain<br/>(macOS / Linux / Windows)"]
+        Keychain["Platform Credential Store<br/>(Keychain / Keyutils / Windows)"]
     end
 
     subgraph "Plugin Boundary"
@@ -342,7 +342,6 @@ The following issues were identified during security review. Each includes analy
 | Issue | Recommendation | Effort | Risk if deferred |
 |-------|---------------|--------|------------------|
 | Streaming buffer stall | Fix later | Moderate | Low (self-harm only) |
-| Heartbeat parity | Fix when needed | Trivial | None (stub is valid) |
 | Cron scope granularity | Defer | Low | None (write-gate exists) |
 | Compaction TOCTOU | Defer | Moderate | None (idempotent, no concurrent trigger) |
 
@@ -371,16 +370,6 @@ What's missing is a **dedicated scope** (e.g., `operator.cron`) to grant an oper
 3. **The fix has real complexity cost.** Per-session locking requires either a `DashMap<SessionId, Mutex>` or a lock striping scheme, adding code, potential deadlock surface area, and memory overhead for a race condition that essentially can't happen via the WebSocket API (requests are processed sequentially per connection).
 
 **Counterargument addressed**: A future background auto-compaction feature would make this a real race. If auto-compaction is ever added, per-session locking should be added *at that time*. Designing for hypothetical future concurrency now adds complexity without benefit.
-
-### Heartbeat parity with Node.js
-
-**Status**: Deferred until a client depends on it.
-
-`handle_last_heartbeat()` (`src/server/ws/handlers/system.rs`) returns `null` — it's a stub. `handle_set_heartbeats()` accepts `enabled` and `interval` params but doesn't persist or act on them. The Node.js reference implementation tracks a global last-heartbeat timestamp updated on any client heartbeat tick.
-
-**Why defer**: This is a behavioral compatibility gap, not a security or correctness issue. Returning `null` is a valid "no heartbeat received yet" state. If any client depends on a real value, the fix is straightforward: add an `AtomicI64` to `WsServerState`, update it on each tick event, and return it from `handle_last_heartbeat()` (~10 lines of code).
-
-**Counterargument addressed**: The per-connection vs. global distinction only matters if a client asks "when was the last heartbeat from *any* connection?" vs. "when was *my* last heartbeat?" Since `last-heartbeat` is documented as a global query in Node.js and the Rust implementation doesn't track it at all, there's no semantic mismatch — just a missing feature. When implemented, it should match Node.js global semantics.
 
 ### Streaming buffer stall risk
 
@@ -412,6 +401,7 @@ The send path uses `mpsc::UnboundedSender<Message>` (`src/server/ws/mod.rs`). If
 - **Exec approvals parse failure fall-through**: Invalid JSON in the exec approvals file now falls back to `deny` mode with a warning instead of `ask`.
 - **Credential memory not zeroed on drop**: `GatewayAuthSecrets` derives `ZeroizeOnDrop`; `ResolvedGatewayAuth` has a manual `Drop` impl that zeroizes token and password fields.
 - **AuthMode::None + Tailscale interaction**: Added tests confirming `AuthMode::None` correctly bypasses Tailscale checks for local connections and rejects remote connections regardless of `allow_tailscale`.
+- **Heartbeat state persistence**: `last-heartbeat` now returns the last heartbeat timestamp and `set-heartbeats` updates interval/enablement in state.
 
 ## Security Contacts
 

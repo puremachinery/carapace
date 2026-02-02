@@ -77,7 +77,7 @@ The CLI will try, in order:
 
 1. Environment variables: `CARAPACE_GATEWAY_TOKEN` / `CARAPACE_GATEWAY_PASSWORD`
 2. Config file: `gateway.auth.token` / `gateway.auth.password`
-3. Credential store (OS keychain/secret service)
+3. Credential store (OS keychain/keyutils)
 
 If nothing is found, local-direct access may still work when configured.
 

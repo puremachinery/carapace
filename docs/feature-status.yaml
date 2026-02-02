@@ -82,7 +82,7 @@ feature_inventory_markdown: |
   ### Credentials (`src/credentials/`)
 
   - [x] **macOS Keychain** — keyring crate integration
-  - [x] **Linux Secret Service** — D-Bus API
+  - [x] **Linux Keyutils** — kernel keyring
   - [x] **Windows Credential Manager** — native API
   - [x] **Env-only fallback** — when keychain unavailable
   - [x] **Quotas and rate limiting** — 100 per plugin, 10 writes/min

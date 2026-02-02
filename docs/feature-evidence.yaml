@@ -1438,10 +1438,10 @@ features:
     tests:
       - "src/credentials/macos.rs::test_error_mapping"
 
-  - feature: "Linux Secret Service"
+  - feature: "Linux Keyutils"
     status: "verified_done"
     runtime_wiring:
-      - "src/credentials/linux.rs (LinuxCredentialBackend via keyring)"
+      - "src/credentials/linux.rs (LinuxCredentialBackend via keyring/keyutils)"
     tests:
       - "src/credentials/linux.rs::test_error_mapping"
 

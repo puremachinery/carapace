@@ -4,8 +4,8 @@ This guide explains how to configure inbound/outbound messaging for Signal,
 Telegram, Discord, and Slack. It focuses on the *carapace* gateway wiring and
 the minimum external setup needed to make each channel usable.
 
-All examples assume `config.json5` (see `config.example.json5`) and the default
-HTTP bind on port 8080. Adjust paths/ports for your deployment.
+All examples assume `carapace.json5` (see `config.example.json5`) and the default
+gateway HTTP port 18789. Adjust paths/ports for your deployment.
 
 ## Common Notes
 
@@ -14,6 +14,7 @@ HTTP bind on port 8080. Adjust paths/ports for your deployment.
 - Secrets are encrypted at rest when config encryption is enabled.
 - Channel tools (agent actions) are available when `session.metadata.channel`
   is set for the conversation.
+- Signal’s REST API defaults to port 8080; this is separate from the gateway port.
 
 ## Signal (signal-cli-rest-api)
 
