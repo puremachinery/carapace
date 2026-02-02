@@ -396,8 +396,8 @@ pub(super) fn handle_config_schema() -> Result<Value, ErrorShape> {
 /// validating it, and updating the config cache. The reload mode used is
 /// read from the current config's `gateway.reload.mode` (defaulting to "hot"
 /// for manual reloads).
-pub(super) fn handle_config_reload(state: &WsServerState) -> Result<Value, ErrorShape> {
-    use crate::config::watcher::{perform_reload, ReloadMode};
+pub(super) async fn handle_config_reload(state: &WsServerState) -> Result<Value, ErrorShape> {
+    use crate::config::watcher::{perform_reload_async, ReloadMode};
 
     // Determine reload mode from current config
     let current_config =
@@ -415,7 +415,7 @@ pub(super) fn handle_config_reload(state: &WsServerState) -> Result<Value, Error
         other => other,
     };
 
-    let result = perform_reload(&mode);
+    let result = perform_reload_async(&mode).await;
 
     if result.success {
         // Broadcast config.changed event to all WS clients

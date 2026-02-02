@@ -13,6 +13,7 @@ use serde_json::Value;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::watch;
+use tokio::task;
 use tracing::{debug, error, info, warn};
 
 /// Reload mode for the gateway config.
@@ -232,6 +233,25 @@ pub fn perform_reload(mode: &ReloadMode) -> ReloadResult {
     process_config_reload_event(mode, outcome)
 }
 
+/// Perform a config reload on a blocking thread to avoid stalling async tasks.
+pub async fn perform_reload_async(mode: &ReloadMode) -> ReloadResult {
+    info!("Config reload triggered (mode={:?})", mode);
+    let outcome = task::spawn_blocking(super::reload_config).await;
+    match outcome {
+        Ok(result) => process_config_reload_event(mode, result),
+        Err(err) => {
+            let error_msg = format!("Config reload task failed: {err}");
+            error!("{error_msg}");
+            ReloadResult {
+                success: false,
+                mode: mode_label(mode).to_string(),
+                warnings: Vec::new(),
+                error: Some(error_msg),
+            }
+        }
+    }
+}
+
 /// Create a filesystem watcher that forwards config-file events to `fs_tx`.
 ///
 /// Returns the `RecommendedWatcher` and the directory being watched, or an
@@ -315,11 +335,11 @@ fn init_fs_watcher(
 }
 
 /// Perform a debounced reload and broadcast the resulting event.
-fn execute_reload_and_broadcast(
+async fn execute_reload_and_broadcast(
     mode: &ReloadMode,
     event_tx: &tokio::sync::broadcast::Sender<ConfigEvent>,
 ) {
-    let result = perform_reload(mode);
+    let result = perform_reload_async(mode).await;
     let event = if result.success {
         ConfigEvent::Reloaded(result)
     } else {
@@ -363,7 +383,7 @@ async fn run_debounce_loop(
 
             _ = &mut debounce_sleep, if debounce_active => {
                 debounce_active = false;
-                execute_reload_and_broadcast(mode, event_tx);
+                execute_reload_and_broadcast(mode, event_tx).await;
             }
         }
     }

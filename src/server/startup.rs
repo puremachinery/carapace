@@ -145,7 +145,7 @@ fn spawn_sighup_handler(
                         config::watcher::ReloadMode::Off => config::watcher::ReloadMode::Hot,
                         other => other,
                     };
-                    let result = config::watcher::perform_reload(&mode);
+                    let result = config::watcher::perform_reload_async(&mode).await;
                     if result.success {
                         crate::server::ws::broadcast_config_changed(
                             &ws_state_for_sighup,

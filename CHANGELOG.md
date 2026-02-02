@@ -31,6 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   name is `carapace`, and default state/config paths use the platform config
   directory. Existing installs should migrate data or set
   `CARAPACE_STATE_DIR`/`CARAPACE_CONFIG_PATH`.
+- **Config reload:** reload runs on a blocking thread to avoid stalling the async
+  runtime during file I/O.
 
 ## [0.1.0] - Unreleased
 

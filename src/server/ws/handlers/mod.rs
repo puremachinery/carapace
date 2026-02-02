@@ -623,7 +623,7 @@ fn check_operator_authorization(
 fn dispatch_config(
     method: &str,
     params: Option<&Value>,
-    state: &Arc<WsServerState>,
+    _state: &Arc<WsServerState>,
 ) -> Option<Result<Value, ErrorShape>> {
     match method {
         "config.get" => Some(handle_config_get(params)),
@@ -632,7 +632,6 @@ fn dispatch_config(
         "config.patch" => Some(handle_config_patch(params)),
         "config.validate" => Some(handle_config_validate(params)),
         "config.schema" => Some(handle_config_schema()),
-        "config.reload" => Some(handle_config_reload(state)),
         _ => None,
     }
 }
@@ -769,6 +768,10 @@ pub(super) async fn dispatch_method(
         "health" => return Ok(handle_health()),
         "status" => return Ok(handle_status(state)),
         _ => {}
+    }
+
+    if method == "config.reload" {
+        return handle_config_reload(state).await;
     }
 
     // Sync sub-dispatchers
