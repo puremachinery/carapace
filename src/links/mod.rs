@@ -28,8 +28,7 @@
 //! let summaries = lu.process_message("Visit https://example.com").await;
 //! ```
 
-use lru::LruCache;
-use std::num::NonZeroUsize;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -150,28 +149,57 @@ pub struct LinkSummary {
 /// Internal LRU cache for link summaries.
 #[derive(Debug)]
 struct LinkCache {
-    entries: Option<LruCache<String, LinkSummary>>,
+    entries: Option<HashMap<String, LinkSummary>>,
+    order: VecDeque<String>,
     ttl_secs: u64,
+    max_entries: usize,
 }
 
 impl LinkCache {
     fn new(max_entries: usize, ttl_secs: u64) -> Self {
         // Disable cache entirely when max_entries is 0.
-        let entries = NonZeroUsize::new(max_entries).map(LruCache::new);
-        Self { entries, ttl_secs }
+        let entries = if max_entries == 0 {
+            None
+        } else {
+            Some(HashMap::new())
+        };
+        Self {
+            entries,
+            order: VecDeque::new(),
+            ttl_secs,
+            max_entries,
+        }
     }
 
     /// Get a cached entry if it exists and has not expired.
     fn get(&mut self, url: &str) -> Option<LinkSummary> {
-        let cache = self.entries.as_mut()?;
         let now = current_epoch_secs();
-        if let Some(entry) = cache.get(url) {
-            if now.saturating_sub(entry.fetched_at) < self.ttl_secs {
-                return Some(entry.clone());
+        let mut cached: Option<LinkSummary> = None;
+        let mut expired = false;
+
+        {
+            let cache = self.entries.as_mut()?;
+            if let Some(entry) = cache.get(url) {
+                if now.saturating_sub(entry.fetched_at) < self.ttl_secs {
+                    cached = Some(entry.clone());
+                } else {
+                    expired = true;
+                }
             }
-            // Expired — remove it
-            cache.pop(url);
+            if expired {
+                cache.remove(url);
+            }
         }
+
+        if let Some(entry) = cached {
+            self.touch(url);
+            return Some(entry);
+        }
+
+        if expired {
+            self.remove_from_order(url);
+        }
+
         None
     }
 
@@ -180,12 +208,46 @@ impl LinkCache {
         let Some(cache) = self.entries.as_mut() else {
             return;
         };
-        cache.put(summary.url.clone(), summary);
+        let key = summary.url.clone();
+        let exists = cache.contains_key(&key);
+        cache.insert(key.clone(), summary);
+        if exists {
+            self.touch(&key);
+        } else {
+            self.order.push_back(key);
+            self.evict_if_needed();
+        }
     }
 
     /// Return the current number of (non-evicted) entries.
     fn len(&self) -> usize {
         self.entries.as_ref().map(|cache| cache.len()).unwrap_or(0)
+    }
+
+    fn touch(&mut self, url: &str) {
+        if let Some(pos) = self.order.iter().position(|k| k == url) {
+            self.order.remove(pos);
+        }
+        self.order.push_back(url.to_string());
+    }
+
+    fn remove_from_order(&mut self, url: &str) {
+        if let Some(pos) = self.order.iter().position(|k| k == url) {
+            self.order.remove(pos);
+        }
+    }
+
+    fn evict_if_needed(&mut self) {
+        let Some(cache) = self.entries.as_mut() else {
+            return;
+        };
+        while cache.len() > self.max_entries {
+            if let Some(oldest) = self.order.pop_front() {
+                cache.remove(&oldest);
+            } else {
+                break;
+            }
+        }
     }
 }
 

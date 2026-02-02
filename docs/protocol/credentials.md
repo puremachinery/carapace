@@ -141,22 +141,15 @@ No secret fields are written to this file.
 - **Account:** `kind:<agentId>:<id>`
 - **Storage:** JSON string payloads
 
-### Linux Secret Service (D-Bus)
+### Linux Keyutils (kernel keyring)
 
-- **Recommended crate:** `keyring` (Secret Service backend)
+- **Recommended crate:** `keyring` (Keyutils backend)
 - **Alternative:** `secret-service` when attribute queries are required
-- **Collection:** `default`
-- **Attributes (if using secret-service directly):**
-  - `application = carapace`
-  - `kind = <kind>`
-  - `agentId = <agentId>`
-  - `id = <id>`
-  - `provider = <provider>` (auth profiles only)
+- **Collection:** kernel keyring (no D-Bus dependency)
 
-**Fallback behavior if Secret Service is unavailable:**
+**Fallback behavior if keyring storage is unavailable:**
 - Do not persist secrets to disk.
-- Log a clear error and instruct the operator to install a Secret Service provider
-  (e.g., GNOME Keyring or KWallet).
+- Log a clear error instructing the operator to enable kernel keyring support.
 - Continue only with environment-sourced credentials for the current session.
 
 ### Windows Credential Manager

@@ -23,7 +23,7 @@ dirs = "5"
 uuid = { version = "1", features = ["v4"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter", "time"] }
-keyring = "2"
+keyring = { version = "2.3.3", default-features = false, features = ["platform-macos", "platform-windows", "linux-default-keyutils"] }
 wasmtime = { version = "41", features = ["component-model"] }
 thiserror = "1"
 parking_lot = "0.12"
@@ -44,8 +44,8 @@ mdns-sd = "0.11"
 rcgen = "0.13"
 tokio-rustls = "0.26"
 rustls = "0.23"
-rustls-pemfile = "2"
-axum-server = { version = "0.7", features = ["tls-rustls"] }
+rustls-pki-types = "1"
+axum-server = { version = "0.8", features = ["tls-rustls"] }
 notify = { version = "6", default-features = false, features = ["macos_fsevent"] }
 flate2 = "1"
 tar = "0.4"
@@ -55,7 +55,6 @@ libc = "0.2"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 urlencoding = "2"
 crc32fast = "1"
-lru = "0.12"
 
 [dev-dependencies]
 insta = { version = "1", features = ["json"] }

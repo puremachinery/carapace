@@ -10,12 +10,12 @@
 
 pub mod ca;
 
-use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::Datelike;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls_pki_types::pem::PemObject;
+use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tracing::{debug, info, warn};
@@ -318,13 +318,11 @@ pub fn generate_self_signed_cert(cert_path: &Path, key_path: &Path) -> Result<()
 
 /// Load certificates from a PEM file
 pub fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, TlsError> {
-    let file = std::fs::File::open(path).map_err(|e| TlsError::CertReadError {
-        path: path.display().to_string(),
-        message: e.to_string(),
-    })?;
-    let mut reader = BufReader::new(file);
-
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut reader)
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(path)
+        .map_err(|e| TlsError::CertReadError {
+            path: path.display().to_string(),
+            message: e.to_string(),
+        })?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| TlsError::CertReadError {
             path: path.display().to_string(),
@@ -347,42 +345,19 @@ pub fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, TlsError>
 ///
 /// Supports PKCS#8 and RSA/EC keys.
 pub fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, TlsError> {
-    let file = std::fs::File::open(path).map_err(|e| TlsError::KeyReadError {
-        path: path.display().to_string(),
-        message: e.to_string(),
-    })?;
-    let mut reader = BufReader::new(file);
-
-    // Try reading any private key format
-    loop {
-        match rustls_pemfile::read_one(&mut reader) {
-            Ok(Some(rustls_pemfile::Item::Pkcs8Key(key))) => {
-                debug!("Loaded PKCS#8 private key from {}", path.display());
-                return Ok(PrivateKeyDer::Pkcs8(key));
-            }
-            Ok(Some(rustls_pemfile::Item::Pkcs1Key(key))) => {
-                debug!("Loaded PKCS#1 (RSA) private key from {}", path.display());
-                return Ok(PrivateKeyDer::Pkcs1(key));
-            }
-            Ok(Some(rustls_pemfile::Item::Sec1Key(key))) => {
-                debug!("Loaded SEC1 (EC) private key from {}", path.display());
-                return Ok(PrivateKeyDer::Sec1(key));
-            }
-            Ok(Some(_)) => {
-                // Skip non-key items (e.g., certificates)
-                continue;
-            }
-            Ok(None) => break,
-            Err(e) => {
-                return Err(TlsError::KeyReadError {
-                    path: path.display().to_string(),
-                    message: e.to_string(),
-                });
-            }
+    match PrivateKeyDer::from_pem_file(path) {
+        Ok(key) => {
+            debug!("Loaded private key from {}", path.display());
+            Ok(key)
         }
+        Err(rustls_pki_types::pem::Error::NoItemsFound) => {
+            Err(TlsError::NoKeyFound(path.display().to_string()))
+        }
+        Err(e) => Err(TlsError::KeyReadError {
+            path: path.display().to_string(),
+            message: e.to_string(),
+        }),
     }
-
-    Err(TlsError::NoKeyFound(path.display().to_string()))
 }
 
 /// Compute the SHA-256 fingerprint of a DER-encoded certificate.
