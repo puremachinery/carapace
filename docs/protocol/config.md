@@ -112,6 +112,7 @@ All keys are optional. Unknown keys are rejected (strict schema).
 - `commands` – command policy/config
 - `approvals` – exec approval settings
 - `sessions` – session behavior (retention, cleanup)
+- `usage` – usage tracking configuration (pricing overrides)
 - `cron` – cron scheduler settings
 - `hooks` – HTTP hooks config
 - `web` – web provider settings (WhatsApp Web)
@@ -150,6 +151,9 @@ This is a condensed map; refer to the JSON schema for full detail.
 - `sessions`
   - `retention.enabled`, `retention.days`, `retention.intervalHours`
   - Legacy: `sessions.retentionDays`, `session.retention.*`
+- `usage`
+  - `pricing.default` – fallback pricing (`inputCostPerMTok`, `outputCostPerMTok`)
+  - `pricing.overrides[]` – per-model overrides (`match`, `matchType`, `inputCostPerMTok`, `outputCostPerMTok`)
 - `telegram`
   - `webhookSecret` (required for inbound webhooks; validates `X-Telegram-Bot-Api-Secret-Token`)
 - `discord`

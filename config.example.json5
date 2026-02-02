@@ -138,6 +138,18 @@
   //   },
   // },
 
+  // --- Usage tracking ---------------------------------------------------
+  // usage: {
+  //   pricing: {
+  //     // Default pricing (USD per million tokens).
+  //     default: { inputCostPerMTok: 3.0, outputCostPerMTok: 15.0 },
+  //     // Override pricing by model name (matchType: "contains" | "exact").
+  //     overrides: [
+  //       { match: "gpt-4o", matchType: "contains", inputCostPerMTok: 5.0, outputCostPerMTok: 15.0 },
+  //     ],
+  //   },
+  // },
+
   // --- Logging ----------------------------------------------------------
   // logging: {
   //   level: "info",          // "trace" | "debug" | "info" | "warn" | "error"

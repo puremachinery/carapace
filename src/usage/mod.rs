@@ -29,6 +29,9 @@ static USAGE_TRACKER: LazyLock<RwLock<UsageTracker>> = LazyLock::new(|| {
     RwLock::new(tracker)
 });
 
+static PRICING_CONFIG: LazyLock<RwLock<PricingConfig>> =
+    LazyLock::new(|| RwLock::new(PricingConfig::default()));
+
 const DAY_MS: u64 = 86_400_000;
 const USAGE_DAILY_RETENTION_DAYS: u64 = 365;
 const USAGE_MONTHLY_RETENTION_MONTHS: u64 = 24;
@@ -56,6 +59,35 @@ const DEFAULT_USAGE_RETENTION: UsageRetention = UsageRetention {
     max_sessions: USAGE_MAX_SESSIONS,
 };
 
+#[derive(Debug, Clone, Default)]
+struct PricingConfig {
+    default: Option<ModelPricing>,
+    overrides: Vec<PricingOverride>,
+}
+
+#[derive(Debug, Clone)]
+struct PricingOverride {
+    pattern: String,
+    match_type: MatchType,
+    pricing: ModelPricing,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MatchType {
+    Contains,
+    Exact,
+}
+
+impl MatchType {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "contains" => Some(MatchType::Contains),
+            "exact" => Some(MatchType::Exact),
+            _ => None,
+        }
+    }
+}
+
 /// Model pricing information (cost per million tokens)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelPricing {
@@ -76,9 +108,47 @@ impl ModelPricing {
 
 /// Default pricing table for known models
 pub fn get_model_pricing(model: &str) -> Option<ModelPricing> {
-    // Normalize model name for matching
     let model_lower = model.to_lowercase();
+    let config = PRICING_CONFIG.read();
+    lookup_pricing(model, &model_lower, &config)
+}
 
+fn lookup_pricing(model: &str, model_lower: &str, config: &PricingConfig) -> Option<ModelPricing> {
+    if let Some(pricing) = pricing_override(model, model_lower, &config.overrides) {
+        return Some(pricing);
+    }
+
+    if let Some(pricing) = builtin_pricing(model_lower) {
+        return Some(pricing);
+    }
+
+    if let Some(default) = config.default.clone() {
+        return Some(default);
+    }
+
+    None
+}
+
+fn pricing_override(
+    model: &str,
+    model_lower: &str,
+    overrides: &[PricingOverride],
+) -> Option<ModelPricing> {
+    for override_entry in overrides {
+        let matches = match override_entry.match_type {
+            MatchType::Contains => model_lower.contains(&override_entry.pattern),
+            MatchType::Exact => model.eq_ignore_ascii_case(&override_entry.pattern),
+        };
+
+        if matches {
+            return Some(override_entry.pricing.clone());
+        }
+    }
+
+    None
+}
+
+fn builtin_pricing(model_lower: &str) -> Option<ModelPricing> {
     // Claude models
     if model_lower.contains("claude-3-5-sonnet") || model_lower.contains("claude-3.5-sonnet") {
         return Some(ModelPricing {
@@ -166,6 +236,73 @@ fn default_pricing() -> ModelPricing {
         input_cost_per_mtok: 3.0,
         output_cost_per_mtok: 15.0,
     }
+}
+
+fn parse_pricing_config(config: &serde_json::Value) -> PricingConfig {
+    let usage = match config.get("usage").and_then(|v| v.as_object()) {
+        Some(obj) => obj,
+        None => return PricingConfig::default(),
+    };
+
+    let pricing = match usage.get("pricing").and_then(|v| v.as_object()) {
+        Some(obj) => obj,
+        None => return PricingConfig::default(),
+    };
+
+    let default = pricing
+        .get("default")
+        .and_then(|v| v.as_object())
+        .and_then(parse_pricing_object);
+
+    let mut overrides = Vec::new();
+    if let Some(entries) = pricing.get("overrides").and_then(|v| v.as_array()) {
+        for entry in entries {
+            if let Some(override_entry) = parse_pricing_override(entry) {
+                overrides.push(override_entry);
+            }
+        }
+    }
+
+    PricingConfig { default, overrides }
+}
+
+fn parse_pricing_override(value: &serde_json::Value) -> Option<PricingOverride> {
+    let obj = value.as_object()?;
+    let pattern = obj.get("match").and_then(|v| v.as_str())?.to_string();
+    let pattern = pattern.trim().to_string();
+    if pattern.is_empty() {
+        return None;
+    }
+
+    let match_type = obj
+        .get("matchType")
+        .and_then(|v| v.as_str())
+        .and_then(MatchType::parse)
+        .unwrap_or(MatchType::Contains);
+
+    let pricing = parse_pricing_object(obj)?;
+    Some(PricingOverride {
+        pattern: pattern.to_lowercase(),
+        match_type,
+        pricing,
+    })
+}
+
+fn parse_pricing_object(obj: &serde_json::Map<String, serde_json::Value>) -> Option<ModelPricing> {
+    let input = obj.get("inputCostPerMTok").and_then(parse_number);
+    let output = obj.get("outputCostPerMTok").and_then(parse_number);
+
+    match (input, output) {
+        (Some(input_cost_per_mtok), Some(output_cost_per_mtok)) => Some(ModelPricing {
+            input_cost_per_mtok,
+            output_cost_per_mtok,
+        }),
+        _ => None,
+    }
+}
+
+fn parse_number(value: &serde_json::Value) -> Option<f64> {
+    value.as_f64().or_else(|| value.as_u64().map(|v| v as f64))
 }
 
 /// Get current timestamp in milliseconds
@@ -1033,6 +1170,12 @@ pub fn record_usage(
     tracker.maybe_save();
 }
 
+/// Update model pricing overrides from config (global tracker).
+pub fn update_pricing_from_config(config: &serde_json::Value) {
+    let mut pricing = PRICING_CONFIG.write();
+    *pricing = parse_pricing_config(config);
+}
+
 /// Get current usage status (global tracker)
 pub fn get_status() -> UsageStatus {
     let tracker = USAGE_TRACKER.read();
@@ -1474,6 +1617,46 @@ mod tests {
         assert!(tracker.data.monthly.contains_key(&month));
         assert_eq!(tracker.data.sessions.len(), 1);
         assert!(tracker.data.sessions.contains_key("newer"));
+    }
+
+    #[test]
+    fn test_pricing_override_precedence() {
+        let config = serde_json::json!({
+            "usage": {
+                "pricing": {
+                    "default": { "inputCostPerMTok": 1.0, "outputCostPerMTok": 2.0 },
+                    "overrides": [
+                        { "match": "gpt-4", "matchType": "contains", "inputCostPerMTok": 30.0, "outputCostPerMTok": 60.0 },
+                        { "match": "gpt-4o", "matchType": "exact", "inputCostPerMTok": 5.0, "outputCostPerMTok": 15.0 }
+                    ]
+                }
+            }
+        });
+
+        let pricing = parse_pricing_config(&config);
+        let model = "gpt-4o";
+        let model_lower = model.to_lowercase();
+        let matched = lookup_pricing(model, &model_lower, &pricing).unwrap();
+        assert!((matched.input_cost_per_mtok - 5.0).abs() < 0.001);
+        assert!((matched.output_cost_per_mtok - 15.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_pricing_default_fallback() {
+        let config = serde_json::json!({
+            "usage": {
+                "pricing": {
+                    "default": { "inputCostPerMTok": 4.0, "outputCostPerMTok": 8.0 }
+                }
+            }
+        });
+
+        let pricing = parse_pricing_config(&config);
+        let model = "custom-model";
+        let model_lower = model.to_lowercase();
+        let matched = lookup_pricing(model, &model_lower, &pricing).unwrap();
+        assert!((matched.input_cost_per_mtok - 4.0).abs() < 0.001);
+        assert!((matched.output_cost_per_mtok - 8.0).abs() < 0.001);
     }
 
     #[test]

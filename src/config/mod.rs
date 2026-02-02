@@ -219,6 +219,7 @@ pub fn load_config_uncached(path: &Path) -> Result<Value, ConfigError> {
     if !path.exists() {
         let mut empty = Value::Object(serde_json::Map::new());
         defaults::apply_defaults(&mut empty);
+        crate::usage::update_pricing_from_config(&empty);
         return Ok(empty);
     }
 
@@ -244,6 +245,8 @@ pub fn load_config_uncached(path: &Path) -> Result<Value, ConfigError> {
 
     // Resolve encrypted secrets if configured.
     resolve_config_secrets(&mut value);
+
+    crate::usage::update_pricing_from_config(&value);
 
     Ok(value)
 }

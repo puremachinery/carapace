@@ -55,6 +55,7 @@ const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "canvasHost",
     "talk",
     "gateway",
+    "usage",
     "skills",
     "plugins",
     "anthropic",
@@ -112,6 +113,7 @@ pub fn validate_schema(config: &Value) -> Vec<SchemaIssue> {
     validate_skills_signature(obj, &mut issues);
     validate_skills_sandbox(obj, &mut issues);
     validate_session_integrity(obj, &mut issues);
+    validate_usage(obj, &mut issues);
 
     // Run agent config lint if prompt guard config lint is enabled
     if let Some(agents) = obj.get("agents") {
@@ -575,6 +577,117 @@ fn validate_session_integrity(obj: &serde_json::Map<String, Value>, issues: &mut
     }
 }
 
+fn validate_usage(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIssue>) {
+    let usage = match obj.get("usage").and_then(|v| v.as_object()) {
+        Some(u) => u,
+        None => return,
+    };
+
+    let pricing = match usage.get("pricing") {
+        Some(value) => match value.as_object() {
+            Some(p) => p,
+            None => {
+                issues.push(SchemaIssue {
+                    severity: Severity::Warning,
+                    path: ".usage.pricing".to_string(),
+                    message: "pricing must be an object".to_string(),
+                });
+                return;
+            }
+        },
+        None => return,
+    };
+
+    if let Some(default) = pricing.get("default") {
+        match default.as_object() {
+            Some(obj) => {
+                if let Some(input) = obj.get("inputCostPerMTok") {
+                    check_non_negative_number(
+                        input,
+                        ".usage.pricing.default.inputCostPerMTok",
+                        issues,
+                    );
+                }
+                if let Some(output) = obj.get("outputCostPerMTok") {
+                    check_non_negative_number(
+                        output,
+                        ".usage.pricing.default.outputCostPerMTok",
+                        issues,
+                    );
+                }
+            }
+            None => issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: ".usage.pricing.default".to_string(),
+                message: "default must be an object".to_string(),
+            }),
+        }
+    }
+
+    if let Some(overrides) = pricing.get("overrides") {
+        let list = match overrides.as_array() {
+            Some(list) => list,
+            None => {
+                issues.push(SchemaIssue {
+                    severity: Severity::Warning,
+                    path: ".usage.pricing.overrides".to_string(),
+                    message: "overrides must be an array".to_string(),
+                });
+                return;
+            }
+        };
+
+        for (idx, entry) in list.iter().enumerate() {
+            let entry_obj = match entry.as_object() {
+                Some(obj) => obj,
+                None => {
+                    issues.push(SchemaIssue {
+                        severity: Severity::Warning,
+                        path: format!(".usage.pricing.overrides[{}]", idx),
+                        message: "override entry must be an object".to_string(),
+                    });
+                    continue;
+                }
+            };
+
+            match entry_obj.get("match").and_then(|v| v.as_str()) {
+                Some(value) if !value.trim().is_empty() => {}
+                _ => issues.push(SchemaIssue {
+                    severity: Severity::Warning,
+                    path: format!(".usage.pricing.overrides[{}].match", idx),
+                    message: "match must be a non-empty string".to_string(),
+                }),
+            }
+
+            if let Some(match_type) = entry_obj.get("matchType").and_then(|v| v.as_str()) {
+                if !matches!(match_type, "contains" | "exact") {
+                    issues.push(SchemaIssue {
+                        severity: Severity::Warning,
+                        path: format!(".usage.pricing.overrides[{}].matchType", idx),
+                        message: "matchType should be \"contains\" or \"exact\"".to_string(),
+                    });
+                }
+            }
+
+            if let Some(input) = entry_obj.get("inputCostPerMTok") {
+                check_non_negative_number(
+                    input,
+                    &format!(".usage.pricing.overrides[{}].inputCostPerMTok", idx),
+                    issues,
+                );
+            }
+
+            if let Some(output) = entry_obj.get("outputCostPerMTok") {
+                check_non_negative_number(
+                    output,
+                    &format!(".usage.pricing.overrides[{}].outputCostPerMTok", idx),
+                    issues,
+                );
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -609,6 +722,27 @@ fn check_positive_number(value: &Value, path: &str, issues: &mut Vec<SchemaIssue
                 severity: Severity::Warning,
                 path: path.to_string(),
                 message: "value must be a positive number (> 0)".to_string(),
+            });
+        }
+        None => {
+            issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: path.to_string(),
+                message: "value must be a number".to_string(),
+            });
+        }
+    }
+}
+
+/// Check that a value is a non-negative number (>= 0).
+fn check_non_negative_number(value: &Value, path: &str, issues: &mut Vec<SchemaIssue>) {
+    match value.as_f64() {
+        Some(n) if n >= 0.0 => {}
+        Some(_) => {
+            issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: path.to_string(),
+                message: "value must be a non-negative number (>= 0)".to_string(),
             });
         }
         None => {
