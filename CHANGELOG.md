@@ -33,6 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CARAPACE_STATE_DIR`/`CARAPACE_CONFIG_PATH`.
 - **Config reload:** reload runs on a blocking thread to avoid stalling the async
   runtime during file I/O.
+- **Session retention cleanup:** cleanup runs on a blocking thread to avoid
+  stalling the async runtime during filesystem operations.
 
 ## [0.1.0] - Unreleased
 

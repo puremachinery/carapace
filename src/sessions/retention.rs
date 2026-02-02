@@ -112,7 +112,7 @@ pub async fn retention_cleanup_loop(
     }
 
     // Run the first cleanup immediately after the startup delay.
-    run_cleanup(&store, config.retention_days);
+    run_cleanup(store.clone(), config.retention_days).await;
 
     // Then run on the configured interval.
     let mut ticker = tokio::time::interval(interval);
@@ -129,7 +129,7 @@ pub async fn retention_cleanup_loop(
             break;
         }
 
-        run_cleanup(&store, config.retention_days);
+        run_cleanup(store.clone(), config.retention_days).await;
     }
 }
 
@@ -147,9 +147,11 @@ async fn wait_for_startup_delay(shutdown: &mut watch::Receiver<bool>) -> bool {
 }
 
 /// Execute a single cleanup pass, logging the result.
-fn run_cleanup(store: &SessionStore, retention_days: u32) {
-    match store.cleanup_expired(retention_days) {
-        Ok(deleted) => {
+async fn run_cleanup(store: Arc<SessionStore>, retention_days: u32) {
+    let outcome =
+        tokio::task::spawn_blocking(move || store.cleanup_expired(retention_days)).await;
+    match outcome {
+        Ok(Ok(deleted)) => {
             if deleted > 0 {
                 info!(
                     deleted,
@@ -162,8 +164,11 @@ fn run_cleanup(store: &SessionStore, retention_days: u32) {
                 );
             }
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             warn!(error = %e, "Retention cleanup failed");
+        }
+        Err(e) => {
+            warn!(error = %e, "Retention cleanup task failed");
         }
     }
 }
