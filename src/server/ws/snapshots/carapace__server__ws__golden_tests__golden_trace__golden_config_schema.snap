@@ -1,6 +1,5 @@
 ---
 source: src/server/ws/golden_tests.rs
-assertion_line: 739
 expression: normalized
 ---
 {
@@ -38,6 +37,7 @@ expression: normalized
       "canvasHost",
       "talk",
       "gateway",
+      "usage",
       "skills",
       "plugins",
       "anthropic",
@@ -172,6 +172,9 @@ expression: normalized
         "type": "object"
       },
       "update": {
+        "type": "object"
+      },
+      "usage": {
         "type": "object"
       },
       "venice": {
