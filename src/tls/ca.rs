@@ -39,7 +39,7 @@ const CA_CERT_FILENAME: &str = "cluster-ca.pem";
 const CA_KEY_FILENAME: &str = "cluster-ca-key.pem";
 
 /// CRL filename.
-const CRL_FILENAME: &str = "cluster-crl.json";
+pub const CRL_FILENAME: &str = "cluster-crl.json";
 
 // ============================================================================
 // CRL types
@@ -62,11 +62,9 @@ pub struct RevokedCert {
 
 /// Persisted certificate revocation list.
 ///
-/// NOTE: CRL generation and persistence work correctly, but rustls does not
-/// enforce CRL checks during the TLS handshake. Revocation status is checked
-/// at the application layer via [`ClusterCA::is_revoked`]. A future rustls
-/// release or a custom `ServerCertVerifier` would be needed for TLS-level
-/// enforcement.
+/// NOTE: CRL entries are enforced during the mTLS handshake by the gateway's
+/// custom client-certificate verifier. Application-layer checks are still
+/// available via [`ClusterCA::is_revoked`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CertRevocationList {

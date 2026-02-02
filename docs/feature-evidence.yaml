@@ -1008,9 +1008,11 @@ features:
     status: "verified_done"
     runtime_wiring:
       - "src/tls/ca.rs::CertRevocationList (revoke + persistence)"
+      - "src/tls/mod.rs::CrlClientCertVerifier (mTLS handshake enforcement)"
     tests:
       - "src/tls/ca.rs::test_crl_operations"
       - "src/tls/ca.rs::test_crl_persistence"
+      - "src/tls/mod.rs::test_mtls_revoked_client_cert_rejected"
 
   - feature: "tls.restrictive key permissions"
     status: "verified_done"

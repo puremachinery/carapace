@@ -10,12 +10,15 @@
 
 pub mod ca;
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::Datelike;
+use rustls::client::danger::HandshakeSignatureValid;
+use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls_pki_types::pem::PemObject;
-use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tracing::{debug, info, warn};
@@ -389,6 +392,8 @@ pub struct MtlsConfig {
     pub enabled: bool,
     /// Path to the cluster CA certificate PEM file.
     pub ca_cert: Option<PathBuf>,
+    /// Optional path to a CRL file for revocation checks.
+    pub crl_path: Option<PathBuf>,
     /// Path to this node's certificate PEM file.
     pub node_cert: Option<PathBuf>,
     /// Path to this node's private key PEM file.
@@ -402,6 +407,7 @@ impl Default for MtlsConfig {
         Self {
             enabled: false,
             ca_cert: None,
+            crl_path: None,
             node_cert: None,
             node_key: None,
             require_client_cert: true,
@@ -414,6 +420,7 @@ impl Default for MtlsConfig {
 /// Looks for `gateway.mtls` object with keys:
 /// - `enabled` (bool, default false)
 /// - `caCert` (string, path to CA certificate PEM)
+/// - `crlPath` (string, optional path to CRL JSON file)
 /// - `nodeCert` (string, path to node certificate PEM)
 /// - `nodeKey` (string, path to node private key PEM)
 /// - `requireClientCert` (bool, default true)
@@ -438,6 +445,11 @@ pub fn parse_mtls_config(cfg: &serde_json::Value) -> MtlsConfig {
         .and_then(|v| v.as_str())
         .map(PathBuf::from);
 
+    let crl_path = mtls_obj
+        .get("crlPath")
+        .and_then(|v| v.as_str())
+        .map(PathBuf::from);
+
     let node_cert = mtls_obj
         .get("nodeCert")
         .and_then(|v| v.as_str())
@@ -456,6 +468,7 @@ pub fn parse_mtls_config(cfg: &serde_json::Value) -> MtlsConfig {
     MtlsConfig {
         enabled,
         ca_cert,
+        crl_path,
         node_cert,
         node_key,
         require_client_cert,
@@ -472,6 +485,117 @@ pub struct MtlsSetupResult {
     pub node_fingerprint: String,
     /// SHA-256 fingerprint of the CA certificate.
     pub ca_fingerprint: String,
+}
+
+#[derive(Debug)]
+struct CrlClientCertVerifier {
+    inner: Arc<dyn ClientCertVerifier>,
+    revoked: HashSet<String>,
+}
+
+impl CrlClientCertVerifier {
+    fn new(inner: Arc<dyn ClientCertVerifier>, revoked: HashSet<String>) -> Self {
+        Self { inner, revoked }
+    }
+
+    fn is_revoked(&self, cert: &CertificateDer<'_>) -> bool {
+        if self.revoked.is_empty() {
+            return false;
+        }
+        let fingerprint = compute_cert_fingerprint(cert).to_ascii_lowercase();
+        self.revoked.contains(&fingerprint)
+    }
+}
+
+impl ClientCertVerifier for CrlClientCertVerifier {
+    fn offer_client_auth(&self) -> bool {
+        self.inner.offer_client_auth()
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        self.inner.client_auth_mandatory()
+    }
+
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        self.inner.root_hint_subjects()
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        now: UnixTime,
+    ) -> Result<ClientCertVerified, rustls::Error> {
+        let verified = self
+            .inner
+            .verify_client_cert(end_entity, intermediates, now)?;
+        if self.is_revoked(end_entity) {
+            return Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::Revoked,
+            ));
+        }
+        Ok(verified)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+
+    fn requires_raw_public_keys(&self) -> bool {
+        self.inner.requires_raw_public_keys()
+    }
+}
+
+fn load_crl_fingerprints(crl_path: Option<&Path>, warn_on_missing: bool) -> HashSet<String> {
+    let Some(path) = crl_path else {
+        return HashSet::new();
+    };
+
+    if !path.exists() {
+        if warn_on_missing {
+            warn!(path = %path.display(), "CRL file not found; revocation checks will be skipped");
+        }
+        return HashSet::new();
+    }
+
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(e) => {
+            warn!(path = %path.display(), error = %e, "failed to read CRL file");
+            return HashSet::new();
+        }
+    };
+
+    let crl: ca::CertRevocationList = match serde_json::from_str(&content) {
+        Ok(crl) => crl,
+        Err(e) => {
+            warn!(path = %path.display(), error = %e, "failed to parse CRL file");
+            return HashSet::new();
+        }
+    };
+
+    crl.entries
+        .into_iter()
+        .map(|entry| entry.fingerprint.to_ascii_lowercase())
+        .collect()
 }
 
 /// Set up mTLS for gateway-to-gateway communication.
@@ -511,6 +635,12 @@ pub fn setup_mtls(config: &MtlsConfig) -> Result<MtlsSetupResult, TlsError> {
             .map_err(|e| TlsError::ConfigBuildError(format!("failed to add CA cert: {}", e)))?;
     }
 
+    let crl_path = config
+        .crl_path
+        .clone()
+        .or_else(|| ca_cert_path.parent().map(|dir| dir.join(ca::CRL_FILENAME)));
+    let revoked = load_crl_fingerprints(crl_path.as_deref(), config.crl_path.is_some());
+
     // -- Server config: verify client certs against the cluster CA --
     let client_verifier = if config.require_client_cert {
         rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store.clone()))
@@ -526,6 +656,8 @@ pub fn setup_mtls(config: &MtlsConfig) -> Result<MtlsSetupResult, TlsError> {
                 TlsError::ConfigBuildError(format!("failed to build client verifier: {}", e))
             })?
     };
+
+    let client_verifier = Arc::new(CrlClientCertVerifier::new(client_verifier, revoked));
 
     let server_config = rustls::ServerConfig::builder()
         .with_client_cert_verifier(client_verifier)
@@ -809,6 +941,7 @@ mod tests {
         let config = MtlsConfig::default();
         assert!(!config.enabled);
         assert!(config.ca_cert.is_none());
+        assert!(config.crl_path.is_none());
         assert!(config.node_cert.is_none());
         assert!(config.node_key.is_none());
         assert!(config.require_client_cert);
@@ -820,6 +953,7 @@ mod tests {
         let mtls = parse_mtls_config(&cfg);
         assert!(!mtls.enabled);
         assert!(mtls.ca_cert.is_none());
+        assert!(mtls.crl_path.is_none());
         assert!(mtls.node_cert.is_none());
         assert!(mtls.node_key.is_none());
         assert!(mtls.require_client_cert);
@@ -832,6 +966,7 @@ mod tests {
                 "mtls": {
                     "enabled": true,
                     "caCert": "/path/to/ca.pem",
+                    "crlPath": "/path/to/crl.json",
                     "nodeCert": "/path/to/node-cert.pem",
                     "nodeKey": "/path/to/node-key.pem",
                     "requireClientCert": false
@@ -841,6 +976,7 @@ mod tests {
         let mtls = parse_mtls_config(&cfg);
         assert!(mtls.enabled);
         assert_eq!(mtls.ca_cert, Some(PathBuf::from("/path/to/ca.pem")));
+        assert_eq!(mtls.crl_path, Some(PathBuf::from("/path/to/crl.json")));
         assert_eq!(
             mtls.node_cert,
             Some(PathBuf::from("/path/to/node-cert.pem"))
@@ -861,6 +997,7 @@ mod tests {
         let mtls = parse_mtls_config(&cfg);
         assert!(mtls.enabled);
         assert!(mtls.ca_cert.is_none());
+        assert!(mtls.crl_path.is_none());
         assert!(mtls.node_cert.is_none());
         assert!(mtls.node_key.is_none());
         assert!(mtls.require_client_cert); // default true
@@ -871,6 +1008,7 @@ mod tests {
         let config = MtlsConfig {
             enabled: true,
             ca_cert: None,
+            crl_path: None,
             node_cert: Some(PathBuf::from("/some/cert.pem")),
             node_key: Some(PathBuf::from("/some/key.pem")),
             require_client_cert: true,
@@ -884,6 +1022,7 @@ mod tests {
         let config = MtlsConfig {
             enabled: true,
             ca_cert: Some(PathBuf::from("/some/ca.pem")),
+            crl_path: None,
             node_cert: None,
             node_key: Some(PathBuf::from("/some/key.pem")),
             require_client_cert: true,
@@ -897,6 +1036,7 @@ mod tests {
         let config = MtlsConfig {
             enabled: true,
             ca_cert: Some(PathBuf::from("/some/ca.pem")),
+            crl_path: None,
             node_cert: Some(PathBuf::from("/some/cert.pem")),
             node_key: None,
             require_client_cert: true,
@@ -917,6 +1057,7 @@ mod tests {
         let config = MtlsConfig {
             enabled: true,
             ca_cert: Some(ca.ca_cert_path()),
+            crl_path: None,
             node_cert: Some(node_cert.cert_path.clone()),
             node_key: Some(node_cert.key_path.clone()),
             require_client_cert: true,
@@ -926,6 +1067,39 @@ mod tests {
         assert!(!result.node_fingerprint.is_empty());
         assert!(!result.ca_fingerprint.is_empty());
         assert_ne!(result.node_fingerprint, result.ca_fingerprint);
+    }
+
+    #[test]
+    fn test_mtls_revoked_client_cert_rejected() {
+        let dir = TempDir::new().unwrap();
+
+        let ca = ca::ClusterCA::generate(dir.path()).unwrap();
+        let node_dir = dir.path().join("nodes");
+        let node_cert = ca.issue_node_cert("node-revoked", &node_dir).unwrap();
+
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+        let ca_certs = load_certs(&ca.ca_cert_path()).unwrap();
+        let node_certs = load_certs(&node_cert.cert_path).unwrap();
+
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.add(ca_certs[0].clone()).unwrap();
+
+        let client_verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store))
+            .build()
+            .unwrap();
+
+        let mut revoked = HashSet::new();
+        revoked.insert(compute_cert_fingerprint(&node_certs[0]).to_ascii_lowercase());
+        let verifier = CrlClientCertVerifier::new(client_verifier, revoked);
+
+        let result = verifier.verify_client_cert(&node_certs[0], &[], UnixTime::now());
+        assert!(matches!(
+            result,
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::Revoked
+            ))
+        ));
     }
 
     #[test]
@@ -939,6 +1113,7 @@ mod tests {
         let config = MtlsConfig {
             enabled: true,
             ca_cert: Some(ca.ca_cert_path()),
+            crl_path: None,
             node_cert: Some(node_cert.cert_path.clone()),
             node_key: Some(node_cert.key_path.clone()),
             require_client_cert: false,

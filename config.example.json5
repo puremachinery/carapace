@@ -28,6 +28,24 @@
     //   mode: "serve",      // "off" | "serve"
     // },
 
+    // TLS for public HTTP/WS
+    // tls: {
+    //   enabled: false,
+    //   // certPath: "/path/to/cert.pem",
+    //   // keyPath: "/path/to/key.pem",
+    //   // autoGenerate: true,
+    // },
+
+    // mTLS for gateway-to-gateway connections
+    // mtls: {
+    //   enabled: false,
+    //   // caCert: "/path/to/cluster-ca.pem",
+    //   // nodeCert: "/path/to/node-cert.pem",
+    //   // nodeKey: "/path/to/node-key.pem",
+    //   // crlPath: "/path/to/cluster-crl.json",
+    //   // requireClientCert: true,
+    // },
+
     // Webhook / hooks API
     hooks: {
       enabled: false,

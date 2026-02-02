@@ -1789,6 +1789,7 @@ mod tests {
                 "mtls": {
                     "enabled": true,
                     "caCert": "/path/to/ca.pem",
+                    "crlPath": "/path/to/crl.json",
                     "nodeCert": "/path/to/node-cert.pem",
                     "nodeKey": "/path/to/node-key.pem",
                     "requireClientCert": false
@@ -1800,6 +1801,10 @@ mod tests {
         assert_eq!(
             config.mtls.ca_cert,
             Some(std::path::PathBuf::from("/path/to/ca.pem"))
+        );
+        assert_eq!(
+            config.mtls.crl_path,
+            Some(std::path::PathBuf::from("/path/to/crl.json"))
         );
         assert_eq!(
             config.mtls.node_cert,
@@ -1824,6 +1829,7 @@ mod tests {
         let config = build_gateway_config(&cfg);
         assert!(!config.mtls.enabled);
         assert!(config.mtls.ca_cert.is_none());
+        assert!(config.mtls.crl_path.is_none());
         assert!(config.mtls.require_client_cert); // default true
     }
 

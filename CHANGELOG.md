@@ -45,6 +45,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to session metadata.
 - **Session creation:** session key creation now uses an advisory lock to avoid
   duplicate keys across concurrent processes.
+- **mTLS revocation enforcement:** gateway rejects client certificates listed
+  in the cluster CRL (`gateway.mtls.crlPath`).
 
 ## [0.1.0] - Unreleased
 

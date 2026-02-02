@@ -262,7 +262,7 @@ feature_inventory_markdown: |
   - [x] **mTLS client config** — presents node certificate
   - [x] **Cluster CA generation** — ECDSA P-256 (`ca.rs`)
   - [x] **Node certificate issuance** — signed by cluster CA
-  - [x] **Certificate revocation (CRL)** — CRL generation and updates (advisory only, not enforced by rustls)
+  - [x] **Certificate revocation (CRL)** — CRL generation, updates, and enforcement in mTLS handshakes
   - [x] **Restrictive key permissions** — 0600 on private keys. Not explicitly verified in code.
 
   ### Usage (`src/usage/`)

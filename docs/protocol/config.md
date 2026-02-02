@@ -135,7 +135,8 @@ All keys are optional. Unknown keys are rejected (strict schema).
 This is a condensed map; refer to the JSON schema for full detail.
 
 - `gateway`
-  - `port`, `mode`, `bind`, `controlUi`, `auth`, `trustedProxies`, `tailscale`, `remote`, `reload`, `tls`, `http.endpoints`, `nodes`
+  - `port`, `mode`, `bind`, `controlUi`, `auth`, `trustedProxies`, `tailscale`, `remote`, `reload`, `tls`, `mtls`, `http.endpoints`, `nodes`
+  - `mtls` – gateway-to-gateway mTLS (`enabled`, `caCert`, `nodeCert`, `nodeKey`, `crlPath`, `requireClientCert`)
 - `hooks`
   - `enabled`, `path`, `token`, `maxBodyBytes`, `mappings`, `gmail`, `internal`
 - `browser`
