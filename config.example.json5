@@ -131,7 +131,11 @@
 
   // --- Sessions ---------------------------------------------------------
   // sessions: {
-  //   retentionDays: 90,       // auto-delete sessions older than N days (default: unlimited)
+  //   retention: {
+  //     enabled: true,         // auto-delete old sessions (default: true)
+  //     days: 30,              // delete sessions older than N days (default: 30)
+  //     intervalHours: 6,      // cleanup cadence in hours (default: 6)
+  //   },
   // },
 
   // --- Logging ----------------------------------------------------------

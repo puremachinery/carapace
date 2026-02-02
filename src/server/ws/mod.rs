@@ -1212,10 +1212,25 @@ fn parse_ws_server_options(
         .unwrap_or_default();
 
     let sessions_obj = cfg.get("sessions").and_then(|v| v.as_object());
+    let legacy_session_obj = cfg.get("session").and_then(|v| v.as_object());
     let session_retention_days = sessions_obj
-        .and_then(|s| s.get("retentionDays"))
+        .and_then(|s| s.get("retention"))
+        .and_then(|r| r.get("days"))
         .and_then(|v| v.as_u64())
-        .map(|d| d as u32);
+        .map(|d| d as u32)
+        .or_else(|| {
+            sessions_obj
+                .and_then(|s| s.get("retentionDays"))
+                .and_then(|v| v.as_u64())
+                .map(|d| d as u32)
+        })
+        .or_else(|| {
+            legacy_session_obj
+                .and_then(|s| s.get("retention"))
+                .and_then(|r| r.get("days"))
+                .and_then(|v| v.as_u64())
+                .map(|d| d as u32)
+        });
 
     let ws_obj = gateway
         .and_then(|g| g.get("ws"))

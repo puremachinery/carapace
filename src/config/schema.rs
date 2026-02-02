@@ -295,26 +295,46 @@ fn validate_agents(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schema
 }
 
 fn validate_session(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIssue>) {
-    let session = match obj.get("session").and_then(|v| v.as_object()) {
-        Some(s) => s,
-        None => return,
-    };
+    let sessions = obj.get("sessions").and_then(|v| v.as_object());
+    let legacy_session = obj.get("session").and_then(|v| v.as_object());
 
-    let retention = match session.get("retention").and_then(|v| v.as_object()) {
-        Some(r) => r,
-        None => return,
-    };
-
-    if let Some(days) = retention.get("days") {
-        check_positive_integer(days, ".session.retention.days", issues);
+    if let Some(retention) = sessions
+        .and_then(|s| s.get("retention"))
+        .and_then(|v| v.as_object())
+    {
+        if let Some(days) = retention.get("days") {
+            check_positive_integer(days, ".sessions.retention.days", issues);
+        }
+        if let Some(enabled) = retention.get("enabled") {
+            if !enabled.is_boolean() {
+                issues.push(SchemaIssue {
+                    severity: Severity::Warning,
+                    path: ".sessions.retention.enabled".to_string(),
+                    message: "enabled must be a boolean".to_string(),
+                });
+            }
+        }
     }
-    if let Some(enabled) = retention.get("enabled") {
-        if !enabled.is_boolean() {
-            issues.push(SchemaIssue {
-                severity: Severity::Warning,
-                path: ".session.retention.enabled".to_string(),
-                message: "enabled must be a boolean".to_string(),
-            });
+
+    if let Some(days) = sessions.and_then(|s| s.get("retentionDays")) {
+        check_positive_integer(days, ".sessions.retentionDays", issues);
+    }
+
+    if let Some(retention) = legacy_session
+        .and_then(|s| s.get("retention"))
+        .and_then(|v| v.as_object())
+    {
+        if let Some(days) = retention.get("days") {
+            check_positive_integer(days, ".session.retention.days", issues);
+        }
+        if let Some(enabled) = retention.get("enabled") {
+            if !enabled.is_boolean() {
+                issues.push(SchemaIssue {
+                    severity: Severity::Warning,
+                    path: ".session.retention.enabled".to_string(),
+                    message: "enabled must be a boolean".to_string(),
+                });
+            }
         }
     }
 }
@@ -835,18 +855,27 @@ mod tests {
 
     #[test]
     fn test_session_retention_valid() {
-        let cfg = json!({ "session": { "retention": { "days": 30, "enabled": true } } });
+        let cfg = json!({ "sessions": { "retention": { "days": 30, "enabled": true } } });
         let issues = validate_schema(&cfg);
-        assert!(!issues.iter().any(|i| i.path.starts_with(".session")));
+        assert!(!issues.iter().any(|i| i.path.starts_with(".sessions")));
     }
 
     #[test]
     fn test_session_retention_enabled_non_bool() {
-        let cfg = json!({ "session": { "retention": { "enabled": "true" } } });
+        let cfg = json!({ "sessions": { "retention": { "enabled": "true" } } });
         let issues = validate_schema(&cfg);
         assert!(issues
             .iter()
-            .any(|i| i.path == ".session.retention.enabled"));
+            .any(|i| i.path == ".sessions.retention.enabled"));
+    }
+
+    #[test]
+    fn test_sessions_retention_days_legacy() {
+        let cfg = json!({ "sessions": { "retentionDays": 45 } });
+        let issues = validate_schema(&cfg);
+        assert!(!issues
+            .iter()
+            .any(|i| i.path.starts_with(".sessions.retentionDays")));
     }
 
     // --- cron ---
