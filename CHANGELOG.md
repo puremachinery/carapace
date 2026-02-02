@@ -41,6 +41,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to avoid stalling the async runtime during credential reads/writes.
 - **Usage tracking:** old daily/monthly/session usage entries are pruned with
   retention windows and size caps to keep usage.json bounded.
+- **Config hot paths:** shared config snapshots reduce repeated loads in
+  inbound channel dispatch and media analysis.
 - **Usage pricing:** model pricing can be overridden via `usage.pricing` in the
   config file.
 - **Session integrity:** HMAC sidecars now cover chat history files in addition

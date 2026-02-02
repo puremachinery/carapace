@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde_json::{json, Value};
 
@@ -210,7 +211,8 @@ fn handle_media_analyze(args: Value) -> ToolInvokeResult {
             use crate::media::fetch::{FetchConfig, MediaFetcher};
             use crate::media::{MediaStore, StoreConfig};
 
-            let cfg = crate::config::load_config().unwrap_or_else(|_| json!({}));
+            let cfg =
+                crate::config::load_config_shared().unwrap_or_else(|_| Arc::new(json!({})));
 
             let (media_path, mime_type) = if let Some(url) = url {
                 let config = FetchConfig::default().with_max_size(max_bytes);
@@ -245,8 +247,8 @@ fn handle_media_analyze(args: Value) -> ToolInvokeResult {
             let media_type = MediaType::from_mime(&mime_type)
                 .ok_or_else(|| format!("unsupported MIME type: {}", mime_type))?;
 
-            let openai_key = resolve_openai_media_key(&cfg);
-            let anthropic_key = resolve_anthropic_media_key(&cfg);
+            let openai_key = resolve_openai_media_key(cfg.as_ref());
+            let anthropic_key = resolve_anthropic_media_key(cfg.as_ref());
 
             let provider = match provider_override.as_deref() {
                 Some("openai") => "openai",
@@ -285,7 +287,7 @@ fn handle_media_analyze(args: Value) -> ToolInvokeResult {
                             .to_string()
                     })?;
                     let mut analyzer = OpenAiMediaAnalyzer::new(key).map_err(|e| e.to_string())?;
-                    if let Some(base_url) = resolve_openai_base_url(&cfg) {
+                    if let Some(base_url) = resolve_openai_base_url(cfg.as_ref()) {
                         analyzer = analyzer.with_base_url(base_url);
                     }
                     if let Some(model) = model_override.clone() {
@@ -308,7 +310,7 @@ fn handle_media_analyze(args: Value) -> ToolInvokeResult {
                     })?;
                     let mut analyzer =
                         AnthropicMediaAnalyzer::new(key).map_err(|e| e.to_string())?;
-                    if let Some(base_url) = resolve_anthropic_base_url(&cfg) {
+                    if let Some(base_url) = resolve_anthropic_base_url(cfg.as_ref()) {
                         analyzer = analyzer.with_base_url(base_url);
                     }
                     if let Some(model) = model_override.clone() {

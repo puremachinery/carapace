@@ -15,7 +15,7 @@ use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use zeroize::Zeroizing;
@@ -84,7 +84,7 @@ pub enum ConfigError {
 
 /// Cached configuration entry
 struct CachedConfig {
-    value: Value,
+    value: Arc<Value>,
     loaded_at: Instant,
 }
 
@@ -183,6 +183,11 @@ pub(crate) fn seal_config_secrets(value: &mut Value) -> Result<(), String> {
 /// The returned value has all config defaults applied so that missing
 /// sections/fields have production-ready values.
 pub fn load_config() -> Result<Value, ConfigError> {
+    Ok(load_config_shared()?.as_ref().clone())
+}
+
+/// Load and parse the configuration file with caching, returning a shared value.
+pub fn load_config_shared() -> Result<Arc<Value>, ConfigError> {
     let path = get_config_path();
 
     // Check cache first
@@ -190,24 +195,25 @@ pub fn load_config() -> Result<Value, ConfigError> {
         let cache = CONFIG_CACHE.read();
         if let Some(cached) = cache.as_ref() {
             if cached.loaded_at.elapsed() < ttl {
-                return Ok(cached.value.clone());
+                return Ok(Arc::clone(&cached.value));
             }
         }
     }
 
     // Load fresh config
     let config = load_config_uncached(&path)?;
+    let shared = Arc::new(config);
 
     // Update cache if caching is enabled
     if get_cache_ttl().is_some() {
         let mut cache = CONFIG_CACHE.write();
         *cache = Some(CachedConfig {
-            value: config.clone(),
+            value: Arc::clone(&shared),
             loaded_at: Instant::now(),
         });
     }
 
-    Ok(config)
+    Ok(shared)
 }
 
 /// Load config without using the cache.
@@ -481,7 +487,7 @@ pub fn clear_cache() {
 pub fn update_cache(value: Value) {
     let mut cache = CONFIG_CACHE.write();
     *cache = Some(CachedConfig {
-        value,
+        value: Arc::new(value),
         loaded_at: Instant::now(),
     });
 }

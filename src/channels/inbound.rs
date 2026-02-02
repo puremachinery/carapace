@@ -21,7 +21,8 @@ pub fn dispatch_inbound_text(
     text: &str,
     chat_id: Option<String>,
 ) -> Result<String, String> {
-    let cfg = crate::config::load_config().unwrap_or(Value::Object(serde_json::Map::new()));
+    let cfg = crate::config::load_config_shared()
+        .unwrap_or_else(|_| Arc::new(Value::Object(serde_json::Map::new())));
     let effective_peer_id = if peer_id.is_empty() {
         sender_id
     } else {
@@ -38,7 +39,7 @@ pub fn dispatch_inbound_text(
     let session_store = state.session_store();
     let session = get_or_create_scoped_session(
         session_store,
-        &cfg,
+        cfg.as_ref(),
         channel,
         sender_id,
         effective_peer_id,
@@ -82,7 +83,7 @@ pub fn dispatch_inbound_text(
 
     if let Some(provider) = state.llm_provider() {
         let mut config = crate::agent::AgentConfig::default();
-        crate::agent::apply_agent_config_from_settings(&mut config, &cfg, None);
+        crate::agent::apply_agent_config_from_settings(&mut config, cfg.as_ref(), None);
         config.deliver = true;
         crate::agent::spawn_run(
             run_id.clone(),

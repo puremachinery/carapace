@@ -176,7 +176,8 @@ fn process_envelope(envelope: &SignalEnvelope, state: &Arc<WsServerState>) {
         "Signal inbound message"
     );
 
-    let cfg = crate::config::load_config().unwrap_or(Value::Object(serde_json::Map::new()));
+    let cfg = crate::config::load_config_shared()
+        .unwrap_or_else(|_| Arc::new(Value::Object(serde_json::Map::new())));
     let group_id = data_message
         .group_info
         .as_ref()
@@ -193,7 +194,7 @@ fn process_envelope(envelope: &SignalEnvelope, state: &Arc<WsServerState>) {
     let session_store = state.session_store();
     let session = match get_or_create_scoped_session(
         session_store,
-        &cfg,
+        cfg.as_ref(),
         "signal",
         sender,
         peer_id.as_str(),
