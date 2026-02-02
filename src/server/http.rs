@@ -261,6 +261,8 @@ pub struct AppState {
     pub tools_registry: Arc<ToolsRegistry>,
     /// Channel registry
     pub channel_registry: Arc<ChannelRegistry>,
+    /// Cached plugin webhook dispatcher
+    pub plugin_webhook_dispatcher: Option<Arc<WebhookDispatcher>>,
     /// Gateway start time (Unix timestamp)
     pub start_time: i64,
     /// WebSocket server state (for agent dispatch from hooks)
@@ -373,6 +375,11 @@ pub fn create_router_with_state(
         ))
     });
 
+    let plugin_webhook_dispatcher = ws_state
+        .as_ref()
+        .and_then(|ws| ws.plugin_registry().cloned())
+        .map(|registry| Arc::new(WebhookDispatcher::new(registry)));
+
     let csrf_store = if middleware_config.enable_csrf {
         Some(CsrfTokenStore::new(middleware_config.csrf.clone()))
     } else {
@@ -384,6 +391,7 @@ pub fn create_router_with_state(
         hook_registry,
         tools_registry,
         channel_registry: channel_registry.clone(),
+        plugin_webhook_dispatcher,
         start_time,
         ws_state,
         health_checker,
@@ -1220,11 +1228,11 @@ async fn plugins_webhook_handler(
             .into_response();
     }
 
-    let Some(ws_state) = state.ws_state.as_ref() else {
-        return (StatusCode::NOT_FOUND, "Not Found").into_response();
-    };
-    let Some(plugin_registry) = ws_state.plugin_registry().cloned() else {
-        return (StatusCode::NOT_FOUND, "Not Found").into_response();
+    let dispatcher = match &state.plugin_webhook_dispatcher {
+        Some(dispatcher) => dispatcher.clone(),
+        None => {
+            return (StatusCode::NOT_FOUND, "Not Found").into_response();
+        }
     };
 
     let full_path = if path.is_empty() {
@@ -1255,8 +1263,7 @@ async fn plugins_webhook_handler(
         query: uri.query().map(|q| q.to_string()),
     };
 
-    let dispatcher = WebhookDispatcher::new(plugin_registry);
-    if let Err(err) = dispatcher.refresh_path_map() {
+    if let Err(err) = dispatcher.refresh_path_map_if_stale() {
         warn!(error = %err, "Failed to refresh plugin webhook paths");
     }
 

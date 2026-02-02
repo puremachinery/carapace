@@ -21,6 +21,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -186,6 +187,10 @@ pub struct WebhookDispatcher {
     registry: Arc<PluginRegistry>,
     /// Cache of path -> plugin ID mapping
     path_map: parking_lot::RwLock<HashMap<String, String>>,
+    /// Last time the path map was refreshed
+    last_refresh: parking_lot::RwLock<Option<Instant>>,
+    /// Minimum interval between refreshes
+    refresh_interval: Duration,
 }
 
 impl WebhookDispatcher {
@@ -194,6 +199,8 @@ impl WebhookDispatcher {
         Self {
             registry,
             path_map: parking_lot::RwLock::new(HashMap::new()),
+            last_refresh: parking_lot::RwLock::new(None),
+            refresh_interval: Duration::from_secs(5),
         }
     }
 
@@ -209,6 +216,25 @@ impl WebhookDispatcher {
                 let full_path = format!("/plugins/{}{}", plugin_id, path);
                 map.insert(full_path, plugin_id.clone());
             }
+        }
+
+        let mut last_refresh = self.last_refresh.write();
+        *last_refresh = Some(Instant::now());
+        Ok(())
+    }
+
+    /// Refresh the path map if the cache is stale.
+    pub fn refresh_path_map_if_stale(&self) -> Result<(), DispatchError> {
+        let should_refresh = {
+            let last_refresh = self.last_refresh.read();
+            match *last_refresh {
+                Some(ts) => ts.elapsed() >= self.refresh_interval,
+                None => true,
+            }
+        };
+
+        if should_refresh {
+            self.refresh_path_map()?;
         }
 
         Ok(())
