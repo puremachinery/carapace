@@ -41,6 +41,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retention windows and size caps to keep usage.json bounded.
 - **Usage pricing:** model pricing can be overridden via `usage.pricing` in the
   config file.
+- **Session integrity:** HMAC sidecars now cover chat history files in addition
+  to session metadata.
 
 ## [0.1.0] - Unreleased
 

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -605,6 +605,66 @@ impl SessionStore {
         Ok(self.base_path.join(format!("{}.jsonl", session_id)))
     }
 
+    fn verify_history_hmac(
+        &self,
+        history_path: &Path,
+        session_id: &str,
+    ) -> Result<(), SessionStoreError> {
+        if let Some(ref key) = self.hmac_key {
+            let integrity_config = super::integrity::IntegrityConfig {
+                enabled: true,
+                action: self.integrity_action,
+            };
+            match super::integrity::verify_hmac_path(key, history_path, &integrity_config) {
+                Ok(()) => {}
+                Err(super::integrity::IntegrityError::Rejected { file }) => {
+                    return Err(SessionStoreError::Io(format!(
+                        "session history integrity verification failed for {}",
+                        file
+                    )));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        error = %e,
+                        "session history integrity verification issue"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn write_history_hmac(
+        &self,
+        history_path: &Path,
+        session_id: &str,
+    ) -> Result<(), SessionStoreError> {
+        if let Some(ref key) = self.hmac_key {
+            super::integrity::write_hmac_file_for_path(key, history_path).map_err(|e| {
+                SessionStoreError::Io(format!(
+                    "failed to write HMAC sidecar for history {}: {}",
+                    session_id, e
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
+    fn delete_history_hmac(
+        &self,
+        history_path: &Path,
+        session_id: &str,
+    ) -> Result<(), SessionStoreError> {
+        if let Err(e) = super::integrity::delete_hmac_sidecar(history_path) {
+            return Err(SessionStoreError::Io(format!(
+                "failed to remove HMAC sidecar for history {}: {}",
+                session_id, e
+            )));
+        }
+        Ok(())
+    }
+
     /// Create a new session
     pub fn create_session(
         &self,
@@ -802,6 +862,7 @@ impl SessionStore {
         if history_path.exists() {
             fs::remove_file(&history_path)?;
         }
+        self.delete_history_hmac(&history_path, session_id)?;
 
         // Reset message count and compaction metadata
         session.message_count = 0;
@@ -838,6 +899,13 @@ impl SessionStore {
         if history_path.exists() {
             fs::remove_file(&history_path)?;
         }
+        if let Err(e) = super::integrity::delete_hmac_sidecar(&meta_path) {
+            return Err(SessionStoreError::Io(format!(
+                "failed to remove HMAC sidecar for session {}: {}",
+                session_id, e
+            )));
+        }
+        self.delete_history_hmac(&history_path, session_id)?;
 
         // Remove from caches
         {
@@ -993,6 +1061,8 @@ impl SessionStore {
             .map_err(|e| std::io::Error::other(e.to_string()))?
             .sync_all()?;
 
+        self.write_history_hmac(&history_path, &session_id)?;
+
         // Update session message count
         self.increment_message_count(&session_id)?;
 
@@ -1036,6 +1106,8 @@ impl SessionStore {
             .map_err(|e| std::io::Error::other(e.to_string()))?
             .sync_all()?;
 
+        self.write_history_hmac(&history_path, session_id)?;
+
         // Update message count
         for _ in messages {
             self.increment_message_count(session_id)?;
@@ -1056,6 +1128,8 @@ impl SessionStore {
         if !history_path.exists() {
             return Ok(Vec::new());
         }
+
+        self.verify_history_hmac(&history_path, session_id)?;
 
         let file = File::open(&history_path)?;
         let reader = BufReader::new(file);
@@ -1108,6 +1182,7 @@ impl SessionStore {
         if history_path.exists() {
             fs::remove_file(&history_path)?;
         }
+        self.delete_history_hmac(&history_path, session_id)?;
 
         // Reset message count
         {
@@ -1201,6 +1276,8 @@ impl SessionStore {
 
         // Atomic rename
         fs::rename(&temp_path, &history_path)?;
+
+        self.write_history_hmac(&history_path, session_id)?;
 
         // Update session metadata
         session.status = SessionStatus::Active;
@@ -1349,6 +1426,7 @@ impl SessionStore {
             if history_path.exists() {
                 fs::remove_file(&history_path)?;
             }
+            self.delete_history_hmac(&history_path, session_id)?;
         }
 
         // Update cache
@@ -1408,6 +1486,8 @@ impl SessionStore {
             }
             writer.flush()?;
         }
+
+        self.write_history_hmac(&history_path, session_id)?;
 
         let message_count = archived.messages.len();
 
@@ -1671,7 +1751,6 @@ impl SessionStore {
         fs::rename(&temp_path, &meta_path)?;
 
         // Write HMAC sidecar if integrity is enabled.
-        // NOTE: The HMAC covers session metadata only, not conversation history.
         if let Some(ref key) = self.hmac_key {
             super::integrity::write_hmac_file(key, &serialized, &meta_path).map_err(|e| {
                 SessionStoreError::Io(format!(
@@ -1798,6 +1877,7 @@ fn now_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sessions::integrity;
     use tempfile::TempDir;
 
     fn create_test_store() -> (SessionStore, TempDir) {
@@ -2188,6 +2268,34 @@ mod tests {
         assert_eq!(limited.len(), 2);
         assert_eq!(limited[0].content, "Second");
         assert_eq!(limited[1].content, "Third");
+    }
+
+    #[test]
+    fn test_history_hmac_is_written_and_verified() {
+        let temp_dir = TempDir::new().unwrap();
+        let key = integrity::derive_hmac_key(b"history-secret");
+        let store = SessionStore::with_base_path(temp_dir.path().to_path_buf())
+            .with_hmac_key(key)
+            .with_integrity_action(integrity::IntegrityAction::Reject);
+
+        let session = store
+            .create_session("agent-1", SessionMetadata::default())
+            .unwrap();
+
+        store
+            .append_message(ChatMessage::user(&session.id, "Hello"))
+            .unwrap();
+
+        let history_path = store.session_history_path(&session.id).unwrap();
+        let sidecar = history_path.with_extension("jsonl.hmac");
+        assert!(sidecar.exists(), "history HMAC sidecar should exist");
+
+        let history = store.get_history(&session.id, None, None).unwrap();
+        assert_eq!(history.len(), 1);
+
+        fs::write(&history_path, "tampered\n").unwrap();
+        let result = store.get_history(&session.id, None, None);
+        assert!(result.is_err(), "tampered history should be rejected");
     }
 
     #[test]

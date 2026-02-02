@@ -5,6 +5,7 @@
 
 use std::fs;
 use std::io;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use hkdf::Hkdf;
@@ -80,6 +81,20 @@ pub fn compute_hmac(key: &[u8; 32], data: &[u8]) -> [u8; 32] {
     mac.finalize().into_bytes().into()
 }
 
+/// Compute HMAC-SHA256 over data read from a reader.
+pub fn compute_hmac_reader<R: Read>(key: &[u8; 32], reader: &mut R) -> Result<[u8; 32], io::Error> {
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC-SHA256 accepts any key length");
+    let mut buf = [0u8; 8192];
+    loop {
+        let read = reader.read(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        mac.update(&buf[..read]);
+    }
+    Ok(mac.finalize().into_bytes().into())
+}
+
 /// Verify HMAC-SHA256 over the given data.
 pub fn verify_hmac(key: &[u8; 32], data: &[u8], expected: &[u8]) -> bool {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC-SHA256 accepts any key length");
@@ -107,6 +122,25 @@ pub fn write_hmac_file(key: &[u8; 32], data: &[u8], file_path: &Path) -> Result<
     Ok(())
 }
 
+/// Write an HMAC sidecar file for the data currently stored at `file_path`.
+pub fn write_hmac_file_for_path(key: &[u8; 32], file_path: &Path) -> Result<(), io::Error> {
+    let mut file = fs::File::open(file_path)?;
+    let hmac = compute_hmac_reader(key, &mut file)?;
+    let sidecar = hmac_path(file_path);
+    fs::write(&sidecar, hex::encode(hmac))?;
+    Ok(())
+}
+
+/// Delete the HMAC sidecar file for the given data file, if it exists.
+pub fn delete_hmac_sidecar(file_path: &Path) -> Result<(), io::Error> {
+    let sidecar = hmac_path(file_path);
+    match fs::remove_file(&sidecar) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 /// Verify the HMAC sidecar file for the given data.
 ///
 /// The caller provides the data bytes directly (e.g., the file content that
@@ -127,7 +161,29 @@ pub fn verify_hmac_file(
     if !config.enabled {
         return Ok(());
     }
+    let computed = compute_hmac(key, data);
+    verify_hmac_digest(&computed, file_path, config)
+}
 
+/// Verify the HMAC sidecar file for the data stored at `file_path`.
+pub fn verify_hmac_path(
+    key: &[u8; 32],
+    file_path: &Path,
+    config: &IntegrityConfig,
+) -> Result<(), IntegrityError> {
+    if !config.enabled {
+        return Ok(());
+    }
+    let mut file = fs::File::open(file_path)?;
+    let computed = compute_hmac_reader(key, &mut file)?;
+    verify_hmac_digest(&computed, file_path, config)
+}
+
+fn verify_hmac_digest(
+    computed: &[u8; 32],
+    file_path: &Path,
+    config: &IntegrityConfig,
+) -> Result<(), IntegrityError> {
     let sidecar = hmac_path(file_path);
     let file_name = file_path
         .file_name()
@@ -142,7 +198,7 @@ pub fn verify_hmac_file(
                     reason: format!("invalid hex in HMAC sidecar: {e}"),
                 })?;
 
-            if !verify_hmac(key, data, &stored_hmac) {
+            if stored_hmac.as_slice() != computed {
                 let msg = format!("HMAC verification failed for {file_name} — possible tampering");
 
                 match config.action {
@@ -167,8 +223,7 @@ pub fn verify_hmac_file(
                         "no HMAC sidecar found — auto-migrating (writing HMAC)"
                     );
                     // Auto-migrate: write the HMAC sidecar
-                    let hmac = compute_hmac(key, data);
-                    if let Err(e) = fs::write(&sidecar, hex::encode(hmac)) {
+                    if let Err(e) = fs::write(&sidecar, hex::encode(computed)) {
                         tracing::warn!(
                             file = %file_name,
                             error = %e,
@@ -244,6 +299,18 @@ mod tests {
     }
 
     #[test]
+    fn test_compute_hmac_reader_matches_buffer() {
+        let key = derive_hmac_key(b"test-secret");
+        let data = b"streamed bytes for hmac";
+        let mut reader = io::Cursor::new(data.as_slice());
+
+        let from_buffer = compute_hmac(&key, data);
+        let from_reader = compute_hmac_reader(&key, &mut reader).unwrap();
+
+        assert_eq!(from_buffer, from_reader);
+    }
+
+    #[test]
     fn test_verify_hmac_wrong_data() {
         let key = derive_hmac_key(b"test-secret");
         let data = b"original data";
@@ -303,6 +370,25 @@ mod tests {
         };
 
         let result = verify_hmac_file(&key, data.as_bytes(), &file_path, &config);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_verify_hmac_path_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let file_path = dir.path().join("history.jsonl");
+        let data = "line1\nline2\n";
+        fs::write(&file_path, data).unwrap();
+
+        let key = derive_hmac_key(b"test-secret");
+        write_hmac_file_for_path(&key, &file_path).unwrap();
+
+        let config = IntegrityConfig {
+            enabled: true,
+            action: IntegrityAction::Reject,
+        };
+
+        let result = verify_hmac_path(&key, &file_path, &config);
         assert!(result.is_ok());
     }
 
@@ -383,6 +469,30 @@ mod tests {
         // Now verification should pass
         let result = verify_hmac_file(&key, data.as_bytes(), &file_path, &config);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_missing_hmac_path_warn_auto_migrates() {
+        let dir = TempDir::new().unwrap();
+        let file_path = dir.path().join("history.jsonl");
+        let data = "line1\n";
+        fs::write(&file_path, data).unwrap();
+
+        let key = derive_hmac_key(b"test-secret");
+
+        let config = IntegrityConfig {
+            enabled: true,
+            action: IntegrityAction::Warn,
+        };
+
+        let result = verify_hmac_path(&key, &file_path, &config);
+        assert!(result.is_ok());
+
+        let sidecar = dir.path().join("history.jsonl.hmac");
+        assert!(
+            sidecar.exists(),
+            "auto-migration should create HMAC sidecar"
+        );
     }
 
     #[test]
