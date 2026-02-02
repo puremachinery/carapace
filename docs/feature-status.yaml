@@ -159,7 +159,7 @@ feature_inventory_markdown: |
   - [x] **DNS rebinding defense** — post-resolution IP validation (hickory_resolver)
   - [x] **Redirect blocking** — prevents redirect-based bypass
   - [x] **Streaming with size limits** — configurable max size (50MB default)
-  - [~] **Temp file storage** — TTL-based expiration with cleanup (1hr TTL)
+  - [x] **Temp file storage** — TTL-based expiration with cleanup (1hr TTL)
   - [~] **Image analysis (Claude Vision)** — Anthropic image understanding
   - [~] **Image analysis (GPT-4 Vision)** — OpenAI image understanding
   - [~] **Audio transcription (Whisper)** — OpenAI Whisper API

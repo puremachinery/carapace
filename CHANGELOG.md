@@ -49,6 +49,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in the cluster CRL (`gateway.mtls.crlPath`).
 - **Remote gateway lifecycle:** startup now wires gateway.remote connections
   with SSH transport, TOFU pinning, mTLS selection, and reconnect backoff.
+- **Media temp storage:** media store now loads existing files and runs cleanup
+  in the background at startup, including sidecar cache removal.
 
 ## [0.1.0] - Unreleased
 

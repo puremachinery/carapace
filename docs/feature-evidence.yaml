@@ -446,14 +446,15 @@ features:
       - "src/media/fetch.rs::fetch_with_config (content-length guard)"
 
   - feature: "media.temp file storage"
-    status: "partial"
+    status: "verified_done"
     runtime_wiring:
       - "src/media/store.rs::MediaStore (store + cleanup + start_cleanup_task)"
+      - "src/main.rs::init_media_store_cleanup (startup wiring)"
     tests:
       - "src/media/store.rs::test_cleanup_expired"
       - "src/media/store.rs::test_store_and_get"
-    notes:
-      - "MediaStore is not instantiated by runtime; no background cleanup task wired"
+      - "src/media/store.rs::test_cleanup_removes_sidecar"
+      - "src/media/store.rs::test_load_existing_entries_on_startup"
 
   - feature: "media.image analysis (claude vision)"
     status: "partial"

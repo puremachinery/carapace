@@ -170,11 +170,16 @@ impl MediaStore {
             .await
             .map_err(|e| StoreError::Io(format!("Failed to create base directory: {}", e)))?;
 
-        Ok(Self {
+        let store = Self {
             config,
             entries: Arc::new(RwLock::new(HashMap::new())),
             initialized: true,
-        })
+        };
+
+        store.load_existing_entries().await?;
+        let _ = store.cleanup().await?;
+
+        Ok(store)
     }
 
     /// Create a new MediaStore with default configuration
@@ -319,11 +324,17 @@ impl MediaStore {
                 entries.remove(&id);
             }
 
-            // Delete file
+            // Delete file and sidecar cache
             if path.exists() {
                 fs::remove_file(path)
                     .await
                     .map_err(|e| StoreError::Io(format!("Failed to remove file: {}", e)))?;
+            }
+            let sidecar = analysis_cache_path(path);
+            if sidecar.exists() {
+                fs::remove_file(&sidecar)
+                    .await
+                    .map_err(|e| StoreError::Io(format!("Failed to remove sidecar: {}", e)))?;
             }
 
             tracing::debug!(path = %path.display(), "Removed media file");
@@ -404,6 +415,16 @@ impl MediaStore {
                     );
                 }
             }
+            let sidecar = analysis_cache_path(&path);
+            if sidecar.exists() {
+                if let Err(e) = fs::remove_file(&sidecar).await {
+                    tracing::warn!(
+                        path = %sidecar.display(),
+                        error = %e,
+                        "Failed to remove expired media sidecar"
+                    );
+                }
+            }
         }
     }
 
@@ -450,6 +471,75 @@ impl MediaStore {
                 }
             }
         })
+    }
+}
+
+impl MediaStore {
+    async fn load_existing_entries(&self) -> Result<(), StoreError> {
+        let mut dir = fs::read_dir(&self.config.base_dir)
+            .await
+            .map_err(|e| StoreError::Io(format!("Failed to read base directory: {}", e)))?;
+
+        while let Some(entry) = dir
+            .next_entry()
+            .await
+            .map_err(|e| StoreError::Io(format!("Failed to read directory entry: {}", e)))?
+        {
+            let path = entry.path();
+            if is_analysis_sidecar(&path) {
+                continue;
+            }
+
+            let file_type = match entry.file_type().await {
+                Ok(ft) => ft,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "Failed to read media file type"
+                    );
+                    continue;
+                }
+            };
+            if file_type.is_dir() {
+                continue;
+            }
+
+            let metadata = match entry.metadata().await {
+                Ok(meta) => meta,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "Failed to read media file metadata"
+                    );
+                    continue;
+                }
+            };
+
+            let created_at = metadata
+                .modified()
+                .map(DateTime::<Utc>::from)
+                .unwrap_or_else(|_| Utc::now());
+            let size = metadata.len();
+            let file_id = path
+                .file_stem()
+                .or_else(|| path.file_name())
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+            let metadata = MediaMetadata {
+                path: path.clone(),
+                mime_type: None,
+                size,
+                created_at,
+            };
+
+            let mut entries = self.entries.write();
+            entries.insert(file_id, StoreEntry { metadata });
+        }
+
+        Ok(())
     }
 }
 
@@ -514,6 +604,19 @@ fn mime_type_to_extension(mime_type: Option<&str>) -> &'static str {
         }
         None => ".bin",
     }
+}
+
+fn analysis_cache_path(media_path: &Path) -> PathBuf {
+    let mut cache_path = media_path.as_os_str().to_owned();
+    cache_path.push(".analysis.json");
+    PathBuf::from(cache_path)
+}
+
+fn is_analysis_sidecar(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.ends_with(".analysis.json"))
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -622,6 +725,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cleanup_removes_sidecar() {
+        let (store, _temp_dir) = create_test_store().await;
+
+        let metadata = store.store(b"test".to_vec(), None).await.unwrap();
+        let sidecar = analysis_cache_path(&metadata.path);
+        fs::write(&sidecar, b"{}").await.unwrap();
+        assert!(sidecar.exists());
+
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        let removed = store.cleanup().await.unwrap();
+        assert_eq!(removed, 1);
+        assert!(!sidecar.exists());
+    }
+
+    #[tokio::test]
     async fn test_cleanup_keeps_fresh_files() {
         let temp_dir = tempdir().unwrap();
         let config = StoreConfig::default()
@@ -652,6 +771,22 @@ mod tests {
 
         assert_eq!(store.file_count(), 2);
         assert_eq!(store.total_size(), 10);
+    }
+
+    #[tokio::test]
+    async fn test_load_existing_entries_on_startup() {
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("existing.bin");
+        fs::write(&file_path, b"data").await.unwrap();
+
+        let config = StoreConfig::default()
+            .with_base_dir(temp_dir.path().to_path_buf())
+            .with_ttl(Duration::from_secs(3600));
+        let store = MediaStore::new(config).await.unwrap();
+
+        assert_eq!(store.file_count(), 1);
+        let found = store.get(&file_path).await.unwrap();
+        assert!(found.is_some());
     }
 
     #[tokio::test]
