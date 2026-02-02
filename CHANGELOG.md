@@ -47,6 +47,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   duplicate keys across concurrent processes.
 - **mTLS revocation enforcement:** gateway rejects client certificates listed
   in the cluster CRL (`gateway.mtls.crlPath`).
+- **Remote gateway lifecycle:** startup now wires gateway.remote connections
+  with SSH transport, TOFU pinning, mTLS selection, and reconnect backoff.
 
 ## [0.1.0] - Unreleased
 

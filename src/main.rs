@@ -11,6 +11,7 @@ mod cron;
 mod devices;
 mod discovery;
 mod exec;
+mod gateway;
 mod hooks;
 mod logging;
 mod media;
@@ -136,6 +137,11 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(state_dir.join("sessions"))?;
     std::fs::create_dir_all(state_dir.join("cron"))?;
     logging::audit::AuditLog::init(state_dir.clone()).await;
+    let gateway_registry = Arc::new(gateway::GatewayRegistry::new(state_dir.clone()));
+    if let Err(e) = gateway_registry.load() {
+        warn!(error = %e, "failed to load gateway registry");
+    }
+    let gateway_config = gateway::build_gateway_config(&cfg);
 
     let resolved = resolve_bind_config(&cfg)?;
     let plugin_registry = Arc::new(plugins::PluginRegistry::new());
@@ -161,6 +167,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     spawn_network_services(&cfg, &tls_setup, resolved.address.port(), &shutdown_rx);
     spawn_signal_receive_loop_if_configured(&cfg, &ws_state, &shutdown_rx);
     spawn_discord_gateway_loop_if_configured(&cfg, &ws_state, &shutdown_rx);
+    spawn_gateway_lifecycle(gateway_registry.clone(), gateway_config, &shutdown_rx);
 
     if let Some(tls_result) = tls_setup {
         launch_tls_server(
@@ -651,6 +658,23 @@ fn spawn_discord_gateway_loop_if_configured(
         ws_state.channel_registry().clone(),
         shutdown_rx.clone(),
     ));
+}
+
+fn spawn_gateway_lifecycle(
+    registry: Arc<gateway::GatewayRegistry>,
+    config: gateway::GatewayConfig,
+    shutdown_rx: &tokio::sync::watch::Receiver<bool>,
+) {
+    if !config.enabled {
+        return;
+    }
+
+    let rx = shutdown_rx.clone();
+    tokio::spawn(async move {
+        if let Err(e) = gateway::run_gateway_lifecycle(registry, config, rx).await {
+            warn!(error = %e, "remote gateway lifecycle exited with error");
+        }
+    });
 }
 
 /// Parse TLS configuration and set up certificates if enabled.

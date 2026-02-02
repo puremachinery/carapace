@@ -285,6 +285,15 @@ impl GatewayConnection {
     }
 }
 
+/// Result of establishing a gateway connection.
+#[derive(Debug)]
+pub struct GatewayConnectResult {
+    pub conn: GatewayConnection,
+    pub peer_node_id: Option<String>,
+    pub tofu_fingerprint: Option<String>,
+    pub tunnel: Option<SshTunnel>,
+}
+
 // ============================================================================
 // Gateway registry
 // ============================================================================
@@ -458,6 +467,29 @@ impl GatewayRegistry {
         self.gateways.read().iter().find(|g| g.id == id).cloned()
     }
 
+    /// Update a gateway entry by ID and persist changes. Returns `true` if updated.
+    pub fn update_entry<F>(&self, id: &str, update: F) -> Result<bool, GatewayError>
+    where
+        F: FnOnce(&mut GatewayEntry),
+    {
+        let mut gateways = self.gateways.write();
+        let mut updated = false;
+        for entry in gateways.iter_mut() {
+            if entry.id == id {
+                update(entry);
+                updated = true;
+                break;
+            }
+        }
+        drop(gateways);
+
+        if updated {
+            self.save()?;
+        }
+
+        Ok(updated)
+    }
+
     /// Update the runtime connection state for a gateway.
     pub fn update_connection_state(&self, id: &str, state: GatewayConnectionState) {
         self.connections.write().insert(id.to_string(), state);
@@ -611,17 +643,85 @@ async fn receive_handshake_response(conn: &GatewayConnection) -> Result<(), Gate
 fn verify_stream_fingerprint(
     entry: &GatewayEntry,
     ws_stream: &WsStream,
-) -> Result<(), GatewayError> {
+) -> Result<Option<String>, GatewayError> {
     let actual_fp = extract_tls_fingerprint(ws_stream);
     if let Some(ref fp) = actual_fp {
         let verified = verify_fingerprint(entry.fingerprint.as_deref(), fp)?;
+        if entry.fingerprint.is_none() {
+            info!(fingerprint = %verified, "TLS fingerprint pinned via TOFU");
+            return Ok(Some(verified));
+        }
         info!(fingerprint = %verified, "TLS fingerprint verified");
-    } else if entry.fingerprint.is_some() {
+        return Ok(None);
+    }
+
+    if entry.fingerprint.is_some() {
         return Err(GatewayError::ConnectionFailed(
             "expected TLS connection for fingerprint verification but got plaintext".into(),
         ));
     }
-    Ok(())
+
+    Ok(None)
+}
+
+fn url_requires_tls(url: &str) -> Result<bool, GatewayError> {
+    let parsed = url::Url::parse(url)
+        .map_err(|e| GatewayError::ConnectionFailed(format!("invalid URL: {}", e)))?;
+    Ok(parsed.scheme() == "wss")
+}
+
+async fn connect_ws_with_optional_stream(
+    url: &str,
+    stream: Option<TcpStream>,
+    connector: Option<tokio_tungstenite::Connector>,
+) -> Result<WsStream, GatewayError> {
+    if let Some(stream) = stream {
+        let (ws_stream, _response) =
+            tokio_tungstenite::client_async_tls_with_config(url, stream, None, connector)
+                .await
+                .map_err(|e| {
+                    GatewayError::ConnectionFailed(format!("WebSocket connect failed: {}", e))
+                })?;
+        return Ok(ws_stream);
+    }
+
+    if let Some(connector) = connector {
+        let (ws_stream, _response) =
+            tokio_tungstenite::connect_async_tls_with_config(url, None, false, Some(connector))
+                .await
+                .map_err(|e| {
+                    GatewayError::ConnectionFailed(format!("WebSocket connect failed: {}", e))
+                })?;
+        return Ok(ws_stream);
+    }
+
+    let (ws_stream, _response) = tokio_tungstenite::connect_async(url)
+        .await
+        .map_err(|e| GatewayError::ConnectionFailed(format!("WebSocket connect failed: {}", e)))?;
+    Ok(ws_stream)
+}
+
+async fn finalize_gateway_connect(
+    entry: &GatewayEntry,
+    auth_token: &str,
+    client_id: &str,
+    ws_stream: WsStream,
+    tunnel: Option<SshTunnel>,
+) -> Result<GatewayConnectResult, GatewayError> {
+    let tofu_fingerprint = verify_stream_fingerprint(entry, &ws_stream)?;
+    let peer_node_id = extract_peer_node_identity(&ws_stream);
+
+    let conn = GatewayConnection::new_with_stream(entry.id.clone(), ws_stream);
+
+    send_gateway_handshake(&conn, auth_token, client_id).await?;
+    receive_handshake_response(&conn).await?;
+
+    Ok(GatewayConnectResult {
+        conn,
+        peer_node_id,
+        tofu_fingerprint,
+        tunnel,
+    })
 }
 
 /// Connect to a remote gateway via direct WebSocket.
@@ -636,7 +736,7 @@ pub async fn connect_to_gateway(
     entry: &GatewayEntry,
     auth_token: &str,
     client_id: &str,
-) -> Result<GatewayConnection, GatewayError> {
+) -> Result<GatewayConnectResult, GatewayError> {
     validate_gateway_params(entry, auth_token, client_id)?;
 
     info!(
@@ -648,26 +748,16 @@ pub async fn connect_to_gateway(
 
     // Establish the WebSocket connection (TLS handled by tokio-tungstenite
     // when the URL scheme is wss://).
-    let (ws_stream, _response) = tokio_tungstenite::connect_async(&entry.url)
-        .await
-        .map_err(|e| GatewayError::ConnectionFailed(format!("WebSocket connect failed: {}", e)))?;
+    let ws_stream = connect_ws_with_optional_stream(&entry.url, None, None).await?;
 
-    // Verify TLS fingerprint via TOFU
-    verify_stream_fingerprint(entry, &ws_stream)?;
-
-    // Build the connection handle (splits the stream)
-    let conn = GatewayConnection::new_with_stream(entry.id.clone(), ws_stream);
-
-    // Send JSON-RPC handshake and wait for response
-    send_gateway_handshake(&conn, auth_token, client_id).await?;
-    receive_handshake_response(&conn).await?;
+    let result = finalize_gateway_connect(entry, auth_token, client_id, ws_stream, None).await?;
 
     info!(
         gateway_id = %entry.id,
         "gateway WebSocket connected and handshake completed"
     );
 
-    Ok(conn)
+    Ok(result)
 }
 
 /// Connect to a remote gateway using mTLS.
@@ -680,8 +770,13 @@ pub async fn connect_to_gateway_mtls(
     auth_token: &str,
     client_id: &str,
     client_config: std::sync::Arc<rustls::ClientConfig>,
-) -> Result<(GatewayConnection, Option<String>), GatewayError> {
+) -> Result<GatewayConnectResult, GatewayError> {
     validate_gateway_params(entry, auth_token, client_id)?;
+    if !url_requires_tls(&entry.url)? {
+        return Err(GatewayError::ConfigError(
+            "mTLS requires a wss:// gateway URL".to_string(),
+        ));
+    }
 
     info!(
         gateway_id = %entry.id,
@@ -693,36 +788,106 @@ pub async fn connect_to_gateway_mtls(
     // Build the TLS connector with our mTLS client config
     let connector = tokio_tungstenite::Connector::Rustls(client_config);
 
-    let (ws_stream, _response) =
-        tokio_tungstenite::connect_async_tls_with_config(&entry.url, None, false, Some(connector))
-            .await
-            .map_err(|e| {
-                GatewayError::ConnectionFailed(format!("mTLS WebSocket connect failed: {}", e))
-            })?;
+    let ws_stream = connect_ws_with_optional_stream(&entry.url, None, Some(connector))
+        .await
+        .map_err(|e| {
+            GatewayError::ConnectionFailed(format!("mTLS WebSocket connect failed: {}", e))
+        })?;
 
-    // Extract peer node identity from the TLS connection
-    let peer_node_id = extract_peer_node_identity(&ws_stream);
-    if let Some(ref id) = peer_node_id {
-        info!(
-            gateway_id = %entry.id,
-            peer_node_id = %id,
-            "mTLS peer identified"
-        );
-    }
-
-    // Build the connection handle
-    let conn = GatewayConnection::new_with_stream(entry.id.clone(), ws_stream);
-
-    // Send JSON-RPC handshake and wait for response
-    send_gateway_handshake(&conn, auth_token, client_id).await?;
-    receive_handshake_response(&conn).await?;
+    let result = finalize_gateway_connect(entry, auth_token, client_id, ws_stream, None).await?;
 
     info!(
         gateway_id = %entry.id,
         "mTLS gateway WebSocket connected and handshake completed"
     );
 
-    Ok((conn, peer_node_id))
+    Ok(result)
+}
+
+async fn connect_to_gateway_via_ssh(
+    entry: &GatewayEntry,
+    auth_token: &str,
+    client_id: &str,
+    mtls_client_config: Option<std::sync::Arc<rustls::ClientConfig>>,
+) -> Result<GatewayConnectResult, GatewayError> {
+    let GatewayTransport::SshTunnel {
+        ssh_host,
+        ssh_port,
+        ssh_user,
+        remote_port,
+    } = &entry.transport
+    else {
+        return Err(GatewayError::TunnelFailed(
+            "ssh transport required but not configured".to_string(),
+        ));
+    };
+
+    validate_gateway_params(entry, auth_token, client_id)?;
+
+    let ssh_config = SshTunnelConfig {
+        ssh_host: ssh_host.clone(),
+        ssh_port: *ssh_port,
+        ssh_user: ssh_user.clone(),
+        remote_port: *remote_port,
+        local_port: 0,
+    };
+
+    let tunnel = setup_ssh_tunnel(&ssh_config).await?;
+    let stream = TcpStream::connect(("127.0.0.1", tunnel.local_port()))
+        .await
+        .map_err(|e| {
+            GatewayError::TunnelFailed(format!("failed to connect to SSH tunnel: {}", e))
+        })?;
+
+    let connector = mtls_client_config.map(tokio_tungstenite::Connector::Rustls);
+
+    let ws_stream = connect_ws_with_optional_stream(&entry.url, Some(stream), connector)
+        .await
+        .map_err(|e| {
+            GatewayError::ConnectionFailed(format!("SSH WebSocket connect failed: {}", e))
+        })?;
+
+    info!(
+        gateway_id = %entry.id,
+        local_port = tunnel.local_port(),
+        "gateway SSH tunnel connected"
+    );
+
+    let result =
+        finalize_gateway_connect(entry, auth_token, client_id, ws_stream, Some(tunnel)).await?;
+
+    info!(
+        gateway_id = %entry.id,
+        "gateway SSH WebSocket connected and handshake completed"
+    );
+
+    Ok(result)
+}
+
+async fn connect_to_gateway_with_transport(
+    entry: &GatewayEntry,
+    auth_token: &str,
+    client_id: &str,
+    mtls_client_config: Option<std::sync::Arc<rustls::ClientConfig>>,
+) -> Result<GatewayConnectResult, GatewayError> {
+    if mtls_client_config.is_some() && !url_requires_tls(&entry.url)? {
+        return Err(GatewayError::ConfigError(
+            "mTLS requires a wss:// gateway URL".to_string(),
+        ));
+    }
+
+    match &entry.transport {
+        GatewayTransport::DirectWs => {
+            if let Some(client_config) = mtls_client_config {
+                connect_to_gateway_mtls(entry, auth_token, client_id, client_config).await
+            } else {
+                connect_to_gateway(entry, auth_token, client_id).await
+            }
+        }
+        GatewayTransport::SshTunnel { .. } => {
+            connect_to_gateway_via_ssh(entry, auth_token, client_id, mtls_client_config).await
+        }
+    }
 }
 
 /// Extract the peer's node identity from an mTLS WebSocket stream.
@@ -828,12 +993,20 @@ impl SshTunnel {
     }
 }
 
+fn allocate_local_port() -> Result<u16, GatewayError> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .map_err(|e| GatewayError::TunnelFailed(format!("failed to allocate local port: {}", e)))?;
+    let port = listener
+        .local_addr()
+        .map_err(|e| GatewayError::TunnelFailed(format!("failed to read local port: {}", e)))?;
+    Ok(port.port())
+}
+
 /// Set up an SSH tunnel to a remote gateway using `ssh -L`.
 ///
 /// Spawns an `ssh` child process that forwards traffic from a local port to the
-/// remote gateway port. If `config.local_port` is `0`, the system assigns an
-/// ephemeral port automatically (the caller should use a known port in practice
-/// until dynamic port detection is implemented).
+/// remote gateway port. If `config.local_port` is `0`, a free local port is
+/// selected automatically.
 pub async fn setup_ssh_tunnel(config: &SshTunnelConfig) -> Result<SshTunnel, GatewayError> {
     if config.ssh_host.is_empty() {
         return Err(GatewayError::TunnelFailed("ssh_host is empty".to_string()));
@@ -850,10 +1023,7 @@ pub async fn setup_ssh_tunnel(config: &SshTunnelConfig) -> Result<SshTunnel, Gat
     }
 
     let local_port = if config.local_port == 0 {
-        // When 0 is requested, pick a high ephemeral port.
-        // A proper implementation would bind to 0 and read back the assigned port;
-        // for now we use a deterministic fallback.
-        0
+        allocate_local_port()?
     } else {
         config.local_port
     };
@@ -1154,9 +1324,10 @@ async fn handle_connection_failure(
 /// Connects to the given gateway entry, monitors the connection, and
 /// reconnects on failure until shutdown or max attempts are reached.
 async fn run_single_gateway_connection(
-    entry: GatewayEntry,
+    mut entry: GatewayEntry,
     reg: Arc<GatewayRegistry>,
     cfg: GatewayConfig,
+    mtls_client_config: Option<Arc<rustls::ClientConfig>>,
     mut rx: tokio::sync::watch::Receiver<bool>,
 ) {
     let gateway_id = entry.id.clone();
@@ -1169,15 +1340,50 @@ async fn run_single_gateway_connection(
 
         reg.update_connection_state(&gateway_id, GatewayConnectionState::Connecting);
 
-        match connect_to_gateway(&entry, &cfg.auth_token, &gateway_id).await {
-            Ok(conn) => {
+        match connect_to_gateway_with_transport(
+            &entry,
+            &cfg.auth_token,
+            &gateway_id,
+            mtls_client_config.clone(),
+        )
+        .await
+        {
+            Ok(result) => {
                 reg.update_connection_state(
                     &gateway_id,
                     GatewayConnectionState::Connected { since_ms: now_ms() },
                 );
                 attempts = 0;
 
-                let shutdown = run_gateway_read_loop(&conn, &gateway_id, &mut rx).await;
+                let connected_at = now_ms();
+                if let Some(fp) = result.tofu_fingerprint.clone() {
+                    entry.fingerprint = Some(fp);
+                }
+                entry.last_connected_ms = Some(connected_at);
+                if let Err(e) = reg.update_entry(&gateway_id, |entry| {
+                    entry.last_connected_ms = Some(connected_at);
+                    if let Some(fp) = result.tofu_fingerprint.clone() {
+                        entry.fingerprint = Some(fp);
+                    }
+                }) {
+                    warn!(
+                        gateway_id = %gateway_id,
+                        error = %e,
+                        "failed to persist gateway metadata"
+                    );
+                }
+
+                let tunnel = result.tunnel;
+                let shutdown = run_gateway_read_loop(&result.conn, &gateway_id, &mut rx).await;
+                if let Some(mut tunnel) = tunnel {
+                    if let Err(e) = tunnel.shutdown().await {
+                        warn!(
+                            gateway_id = %gateway_id,
+                            error = %e,
+                            "failed to shut down SSH tunnel"
+                        );
+                    }
+                }
                 if shutdown {
                     break;
                 }
@@ -1217,6 +1423,7 @@ fn seed_registry_from_config(registry: &GatewayRegistry, config: &GatewayConfig)
 fn spawn_auto_connect_tasks(
     registry: &Arc<GatewayRegistry>,
     config: &GatewayConfig,
+    mtls_client_config: Option<Arc<rustls::ClientConfig>>,
     shutdown_rx: &tokio::sync::watch::Receiver<bool>,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let auto_connect: Vec<GatewayEntry> = registry
@@ -1235,8 +1442,9 @@ fn spawn_auto_connect_tasks(
     for entry in auto_connect {
         let reg = Arc::clone(registry);
         let cfg = config.clone();
+        let mtls = mtls_client_config.clone();
         let rx = shutdown_rx.clone();
-        let handle = tokio::spawn(run_single_gateway_connection(entry, reg, cfg, rx));
+        let handle = tokio::spawn(run_single_gateway_connection(entry, reg, cfg, mtls, rx));
         handles.push(handle);
     }
     handles
@@ -1264,7 +1472,16 @@ pub async fn run_gateway_lifecycle(
     info!("remote gateway lifecycle starting");
 
     seed_registry_from_config(&registry, &config);
-    let handles = spawn_auto_connect_tasks(&registry, &config, &shutdown_rx);
+    let mtls_client_config = if config.mtls.enabled {
+        let setup = crate::tls::setup_mtls(&config.mtls).map_err(|e| {
+            GatewayError::ConfigError(format!("failed to set up mTLS client config: {}", e))
+        })?;
+        Some(setup.client_config)
+    } else {
+        None
+    };
+
+    let handles = spawn_auto_connect_tasks(&registry, &config, mtls_client_config, &shutdown_rx);
 
     // Wait for shutdown
     loop {
@@ -1946,6 +2163,12 @@ mod tests {
     // ====================================================================
     // SSH tunnel: shutdown (validate struct construction)
     // ====================================================================
+
+    #[test]
+    fn test_allocate_local_port() {
+        let port = allocate_local_port().unwrap();
+        assert!(port > 0);
+    }
 
     #[tokio::test]
     async fn test_ssh_tunnel_shutdown() {

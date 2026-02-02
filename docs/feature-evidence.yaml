@@ -225,57 +225,50 @@ features:
       - "src/cron/tick.rs::cron_tick_loop (cleanup_expired per tick)"
 
   - feature: "gateway.remote connection"
-    status: "partial"
+    status: "verified_done"
     runtime_wiring:
-      - "src/gateway/mod.rs::connect_to_gateway (direct WebSocket)"
-      - "src/gateway/mod.rs::GatewayTransport::SshTunnel + setup_ssh_tunnel (SSH config, not used in connection loop)"
+      - "src/main.rs::spawn_gateway_lifecycle (startup wiring)"
       - "src/gateway/mod.rs::run_gateway_lifecycle (connection loop)"
+      - "src/gateway/mod.rs::connect_to_gateway_with_transport (direct + SSH)"
+      - "src/gateway/mod.rs::setup_ssh_tunnel"
     tests:
       - "src/gateway/mod.rs::test_build_gateway_config_with_gateways"
       - "src/gateway/mod.rs::test_build_gateway_config_ssh_transport"
-    notes:
-      - "run_gateway_lifecycle is not invoked by main/server startup"
-      - "SSH tunnel transport is parsed but not used in run_single_gateway_connection"
 
   - feature: "gateway.tofu fingerprint verification"
-    status: "partial"
+    status: "verified_done"
     runtime_wiring:
       - "src/gateway/mod.rs::verify_fingerprint"
       - "src/gateway/mod.rs::verify_stream_fingerprint (connect_to_gateway)"
+      - "src/gateway/mod.rs::run_single_gateway_connection (persist pin)"
     tests:
       - "src/gateway/mod.rs::test_fingerprint_tofu_first_connect"
       - "src/gateway/mod.rs::test_fingerprint_tofu_match"
       - "src/gateway/mod.rs::test_fingerprint_tofu_mismatch"
-    notes:
-      - "Gateway lifecycle is not wired into startup, so TOFU is unused at runtime"
 
   - feature: "gateway.mtls support"
-    status: "partial"
+    status: "verified_done"
     runtime_wiring:
       - "src/gateway/mod.rs::connect_to_gateway_mtls"
       - "src/gateway/mod.rs::build_gateway_config (mtls config parsing)"
+      - "src/gateway/mod.rs::connect_to_gateway_with_transport (runtime selection)"
+      - "src/gateway/mod.rs::run_gateway_lifecycle (startup wiring)"
     tests:
       - "src/gateway/mod.rs::test_build_gateway_config_mtls"
       - "src/gateway/mod.rs::test_build_gateway_config_mtls_defaults"
-    notes:
-      - "No runtime path selects connect_to_gateway_mtls"
 
   - feature: "gateway.reconnection with backoff"
-    status: "partial"
+    status: "verified_done"
     runtime_wiring:
       - "src/gateway/mod.rs::run_gateway_lifecycle"
       - "src/gateway/mod.rs::handle_connection_failure (exponential backoff)"
       - "src/gateway/mod.rs::run_single_gateway_connection"
-    notes:
-      - "Gateway lifecycle is not wired into startup"
 
   - feature: "gateway.protocol v3"
-    status: "partial"
+    status: "verified_done"
     runtime_wiring:
       - "src/gateway/mod.rs::send_gateway_handshake (protocolVersion=3)"
       - "src/gateway/mod.rs::receive_handshake_response"
-    notes:
-      - "Handshake only runs via connect_to_gateway/connect_to_gateway_mtls, which are not invoked by runtime"
 
   - feature: "hooks.webhook endpoints"
     status: "verified_done"

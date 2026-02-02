@@ -122,11 +122,11 @@ feature_inventory_markdown: |
 
   ### Gateway (`src/gateway/`) — feature-gated
 
-  - [~] **Remote gateway connection** — WebSocket + SSH tunnel transports
-  - [~] **TOFU fingerprint verification** — trust-on-first-use
-  - [~] **mTLS support** — mutual TLS with CA verification
-  - [~] **Reconnection with backoff** — exponential backoff
-  - [~] **Protocol v3** — JSON-RPC handshake
+  - [x] **Remote gateway connection** — WebSocket + SSH tunnel transports
+  - [x] **TOFU fingerprint verification** — trust-on-first-use
+  - [x] **mTLS support** — mutual TLS with CA verification
+  - [x] **Reconnection with backoff** — exponential backoff
+  - [x] **Protocol v3** — JSON-RPC handshake
 
   ### Hooks (`src/hooks/`)
 

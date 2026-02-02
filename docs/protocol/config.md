@@ -137,6 +137,10 @@ This is a condensed map; refer to the JSON schema for full detail.
 - `gateway`
   - `port`, `mode`, `bind`, `controlUi`, `auth`, `trustedProxies`, `tailscale`, `remote`, `reload`, `tls`, `mtls`, `http.endpoints`, `nodes`
   - `mtls` – gateway-to-gateway mTLS (`enabled`, `caCert`, `nodeCert`, `nodeKey`, `crlPath`, `requireClientCert`)
+  - `remote` – outbound gateway connections (`enabled`, `authToken`, `autoReconnect`,
+    `reconnectIntervalMs`, `maxReconnectAttempts`, `gateways[]`)
+    - `gateways[]` entries: `name`, `url`, `fingerprint` (TOFU pin), `autoConnect`,
+      optional `ssh` (`host`, `port`, `user`, `remotePort`)
 - `hooks`
   - `enabled`, `path`, `token`, `maxBodyBytes`, `mappings`, `gmail`, `internal`
 - `browser`

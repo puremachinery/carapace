@@ -68,6 +68,34 @@
 
     // Trusted reverse proxy IPs (for X-Forwarded-For)
     // trustedProxies: ["127.0.0.1", "::1"],
+
+    // Outbound remote gateway connections
+    // remote: {
+    //   enabled: false,
+    //   // authToken: "${CARAPACE_GATEWAY_TOKEN}",
+    //   // autoReconnect: true,
+    //   // reconnectIntervalMs: 30000,
+    //   // maxReconnectAttempts: 10,
+    //   // gateways: [
+    //   //   {
+    //   //     name: "home",
+    //   //     url: "wss://home.example.com:18789/ws",
+    //   //     // fingerprint: "AB:CD:EF:01:23:45:...",
+    //   //     autoConnect: true,
+    //   //   },
+    //   //   {
+    //   //     name: "via-bastion",
+    //   //     url: "wss://gateway.internal:18789/ws",
+    //   //     autoConnect: true,
+    //   //     ssh: {
+    //   //       host: "bastion.example.com",
+    //   //       port: 22,
+    //   //       user: "deployer",
+    //   //       remotePort: 18789,
+    //   //     },
+    //   //   },
+    //   // ],
+    // },
   },
 
   // --- LLM provider -----------------------------------------------------
