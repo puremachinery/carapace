@@ -41,11 +41,6 @@ Carapace is hardened against every major vulnerability class reported in the Jan
 
 See [docs/security.md](docs/security.md) for the full security model.
 
-## Requirements
-
-- Rust 1.93+ (MSRV enforced in CI)
-- wasmtime 41 (included as dependency)
-
 ## Install
 
 ### Prebuilt binaries (GitHub Releases)
@@ -76,16 +71,26 @@ chmod +x carapace-x86_64-linux
 sudo mv carapace-x86_64-linux /usr/local/bin/carapace
 ```
 
-### Recommended Tools
+### Install script (macOS/Linux)
+
+The install script copies the binary and creates a `cara` symlink:
 
 ```bash
-cargo install just            # Task runner
-cargo install cargo-nextest   # Faster test runner
-cargo install cargo-watch     # File watcher (optional)
-cargo install cargo-tarpaulin # Coverage (optional)
+sudo ./scripts/install.sh --binary ./carapace-x86_64-linux
+```
+
+### Install script (Windows PowerShell)
+
+The install script copies the binary and creates a `cara.cmd` shim:
+
+```powershell
+.\scripts\install.ps1 -BinaryPath .\carapace-x86_64-windows.exe
 ```
 
 ## Getting Started
+
+These examples assume the prebuilt `carapace` binary. If you're running from
+source, replace `carapace` with `cargo run`.
 
 ### With Ollama (free, local)
 
@@ -94,9 +99,9 @@ cargo install cargo-tarpaulin # Coverage (optional)
    ollama pull llama3.2
    ```
 
-2. Build and run carapace:
+2. Run carapace:
    ```bash
-   OLLAMA_BASE_URL=http://localhost:11434 cargo run
+   OLLAMA_BASE_URL=http://localhost:11434 carapace
    ```
 
 3. Connect via WebSocket at `ws://127.0.0.1:18789/ws`.
@@ -107,7 +112,7 @@ Set one API key and run:
 
 ```bash
 export ANTHROPIC_API_KEY="sk-ant-..."   # or OPENAI_API_KEY, GOOGLE_API_KEY, VENICE_API_KEY
-cargo run
+carapace
 ```
 
 ### Other local servers (vLLM, llama.cpp, LM Studio, MLX)
@@ -117,23 +122,23 @@ HTTP is allowed for loopback addresses (`localhost` / `127.0.0.1` / `::1`).
 
 ```bash
 # vLLM
-OPENAI_BASE_URL=http://localhost:8000/v1 OPENAI_API_KEY=unused cargo run
+OPENAI_BASE_URL=http://localhost:8000/v1 OPENAI_API_KEY=unused carapace
 
 # llama.cpp server (llama-server --port 8080)
-OPENAI_BASE_URL=http://localhost:8080/v1 OPENAI_API_KEY=unused cargo run
+OPENAI_BASE_URL=http://localhost:8080/v1 OPENAI_API_KEY=unused carapace
 
 # LM Studio (default port 1234)
-OPENAI_BASE_URL=http://localhost:1234/v1 OPENAI_API_KEY=unused cargo run
+OPENAI_BASE_URL=http://localhost:1234/v1 OPENAI_API_KEY=unused carapace
 
 # MLX (default port 8080)
-OPENAI_BASE_URL=http://localhost:8080/v1 OPENAI_API_KEY=unused cargo run
+OPENAI_BASE_URL=http://localhost:8080/v1 OPENAI_API_KEY=unused carapace
 ```
 
 You can also use the Ollama provider with non-Ollama servers that expose an
 OpenAI-compatible `/v1/chat/completions` endpoint:
 
 ```bash
-OLLAMA_BASE_URL=http://localhost:8000 cargo run
+OLLAMA_BASE_URL=http://localhost:8000 carapace
 ```
 
 Or configure via `config.json5` — see [`config.example.json5`](config.example.json5)
@@ -164,12 +169,28 @@ docker run -d -p 8080:8080 -v $HOME/.local/share/signal-api:/home/.local/share/s
 Then configure carapace:
 
 ```bash
-SIGNAL_CLI_URL=http://localhost:8080 SIGNAL_PHONE_NUMBER=+15551234567 cargo run
+SIGNAL_CLI_URL=http://localhost:8080 SIGNAL_PHONE_NUMBER=+15551234567 carapace
 ```
 
 Or via `config.json5` — see `config.example.json5` for the `signal` section.
 
+## Build Requirements (from source)
+
+Not required if you use prebuilt release binaries.
+
+- Rust 1.93+ (MSRV enforced in CI)
+- wasmtime 41 (included as dependency)
+
 ## Development
+
+### Recommended Tools (contributors)
+
+```bash
+cargo install just            # Task runner
+cargo install cargo-nextest   # Faster test runner
+cargo install cargo-watch     # File watcher (optional)
+cargo install cargo-tarpaulin # Coverage (optional)
+```
 
 ```bash
 just          # Show all available recipes
