@@ -121,6 +121,7 @@ mod golden_trace {
             Value::Object(map) => {
                 normalize_session_fields(map);
                 normalize_config_fields(map);
+                normalize_skills_fields(map);
                 normalize_approvals_fields(map);
                 normalize_count_fields(map);
                 normalize_usage_fields(map);
@@ -186,6 +187,13 @@ mod golden_trace {
             if let Some(Value::String(_)) = map.get("key") {
                 map.insert("value".to_string(), json!("<CONFIG_VALUE>"));
             }
+        }
+    }
+
+    /// Normalize skills.status response fields.
+    fn normalize_skills_fields(map: &mut serde_json::Map<String, Value>) {
+        if let Some(Value::Array(_)) = map.get("skills") {
+            map.insert("skills".to_string(), json!([]));
         }
     }
 
