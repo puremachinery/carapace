@@ -225,7 +225,7 @@ secret store (using the same `auth-profile` keys).
 **Implementation notes:**
 - At startup, attempt a test read/write to detect locked state
 - Log `WARN` if credentials unavailable; list which features are degraded
-- Consider adding a `carapace doctor` check for credential store health
+- Consider adding a `cara doctor` check for credential store health
 
 ### Timeout and Retry Policy
 
@@ -316,7 +316,7 @@ Migration may fail partway through (crash, power loss, etc.).
 - If stored value is not valid JSON, treat as corrupt
 - Log error with key name (not value)
 - Return `None` from `credential-get`, do not crash
-- Provide `carapace credential repair <key>` command for manual fix
+- Provide `cara credential repair <key>` command for manual fix
 
 **Empty or missing values:**
 - Treat empty string as "not set" (same as missing)

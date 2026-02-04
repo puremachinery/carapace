@@ -244,7 +244,7 @@ async fn fetch_latest_release() {
         state.current_version.clone()
     };
 
-    let user_agent = format!("carapace/{}", current_version);
+    let user_agent = format!("cara/{}", current_version);
 
     let result: Result<GitHubRelease, String> = async {
         let client = reqwest::Client::new();
@@ -481,7 +481,7 @@ pub(super) fn handle_update_configure(params: Option<&Value>) -> Result<Value, E
 
 /// Build the expected release asset name for the current platform.
 ///
-/// GitHub release assets follow the pattern `carapace-{os}-{arch}` (with `.exe`
+/// GitHub release assets follow the pattern `cara-{os}-{arch}` (with `.exe`
 /// on Windows). We map Rust's `std::env::consts` values to the names used in
 /// the release workflow.
 fn expected_asset_name() -> String {
@@ -495,7 +495,7 @@ fn expected_asset_name() -> String {
     } else {
         ""
     };
-    format!("carapace-{os}-{arch}{ext}")
+    format!("cara-{os}-{arch}{ext}")
 }
 
 /// Compute the SHA-256 hex digest of an in-memory byte buffer.
@@ -545,7 +545,7 @@ fn verify_checksum(actual_hash: &str, checksum_text: &str) -> Result<(), String>
 /// The function:
 /// 1. Re-fetches the latest release to obtain the asset list.
 /// 2. Locates the asset matching the current platform.
-/// 3. Downloads the binary to `{state_dir}/updates/carapace-{version}`.
+/// 3. Downloads the binary to `{state_dir}/updates/cara-{version}`.
 /// 4. If a `.sha256` checksum asset exists, downloads it and verifies integrity.
 /// 5. On Unix, sets executable permissions.
 ///
@@ -556,7 +556,7 @@ async fn download_and_stage(version: &str) -> Result<String, String> {
         let state = UPDATE_STATE.read();
         state.current_version.clone()
     };
-    let user_agent = format!("carapace/{}", current_version);
+    let user_agent = format!("cara/{}", current_version);
 
     // Fetch release metadata (with asset list) ----------------------------
     let client = reqwest::Client::new();
@@ -592,7 +592,7 @@ async fn download_and_stage(version: &str) -> Result<String, String> {
             )
         })?;
 
-    // Check for a companion checksum asset (e.g. carapace-darwin-aarch64.sha256)
+    // Check for a companion checksum asset (e.g. cara-darwin-aarch64.sha256)
     let checksum_name = format!("{wanted}.sha256");
     let checksum_asset = release.assets.iter().find(|a| a.name == checksum_name);
 
@@ -602,7 +602,7 @@ async fn download_and_stage(version: &str) -> Result<String, String> {
         .await
         .map_err(|e| format!("failed to create updates directory: {e}"))?;
 
-    let staged_name = format!("carapace-{version}");
+    let staged_name = format!("cara-{version}");
     let staged_path = updates_dir.join(&staged_name);
 
     // Download the binary -------------------------------------------------
@@ -957,11 +957,8 @@ mod tests {
     #[test]
     fn test_expected_asset_name() {
         let name = expected_asset_name();
-        // Must start with "carapace-"
-        assert!(
-            name.starts_with("carapace-"),
-            "unexpected asset name: {name}"
-        );
+        // Must start with "cara-"
+        assert!(name.starts_with("cara-"), "unexpected asset name: {name}");
         // Must contain a platform identifier
         let os = std::env::consts::OS;
         let expected_os = match os {
@@ -1078,8 +1075,8 @@ mod tests {
     #[test]
     fn test_cleanup_old_binaries_removes_bak_files() {
         let dir = tempfile::tempdir().expect("failed to create temp dir");
-        let bak_file = dir.path().join("carapace.bak");
-        let old_file = dir.path().join("carapace.old");
+        let bak_file = dir.path().join("cara.bak");
+        let old_file = dir.path().join("cara.old");
         std::fs::write(&bak_file, b"backup").expect("write bak");
         std::fs::write(&old_file, b"old").expect("write old");
         cleanup_old_binaries();
@@ -1114,7 +1111,7 @@ mod tests {
             parts.len() >= 3,
             "asset name should have at least 3 dash-separated parts: {name}"
         );
-        assert_eq!(parts[0], "carapace");
+        assert_eq!(parts[0], "cara");
     }
 
     #[test]
@@ -1136,12 +1133,12 @@ mod tests {
     fn test_staged_path_construction() {
         let updates_dir = resolve_state_dir().join("updates");
         let version = "1.2.3";
-        let staged_name = format!("carapace-{version}");
+        let staged_name = format!("cara-{version}");
         let staged_path = updates_dir.join(&staged_name);
         let path_str = staged_path.to_string_lossy();
         assert!(
-            path_str.contains("updates") && path_str.contains("carapace-1.2.3"),
-            "staged path should contain updates/carapace-VERSION: {}",
+            path_str.contains("updates") && path_str.contains("cara-1.2.3"),
+            "staged path should contain updates/cara-VERSION: {}",
             staged_path.display()
         );
     }
@@ -1149,8 +1146,8 @@ mod tests {
     #[test]
     fn test_staged_path_different_versions() {
         let updates_dir = resolve_state_dir().join("updates");
-        let path_a = updates_dir.join("carapace-1.0.0");
-        let path_b = updates_dir.join("carapace-2.0.0");
+        let path_a = updates_dir.join("cara-1.0.0");
+        let path_b = updates_dir.join("cara-2.0.0");
         assert_ne!(
             path_a, path_b,
             "different versions should have different paths"
@@ -1200,11 +1197,11 @@ mod tests {
         let result = ApplyResult {
             applied: true,
             sha256: "abc123".to_string(),
-            binary_path: "/usr/bin/carapace".to_string(),
+            binary_path: "/usr/bin/cara".to_string(),
         };
         assert!(result.applied);
         assert_eq!(result.sha256, "abc123");
-        assert_eq!(result.binary_path, "/usr/bin/carapace");
+        assert_eq!(result.binary_path, "/usr/bin/cara");
     }
 
     #[test]
@@ -1276,7 +1273,7 @@ mod tests {
         let data = b"hello";
         let hash = sha256_bytes(data);
         // GNU coreutils format: "<hash>  <filename>"
-        let checksum_text = format!("{}  carapace-darwin-aarch64", hash);
+        let checksum_text = format!("{}  cara-darwin-aarch64", hash);
         let result = verify_checksum(&hash, &checksum_text);
         assert!(result.is_ok(), "GNU format should match: {:?}", result);
     }
@@ -1362,8 +1359,8 @@ mod tests {
             "checksum name should end with .sha256: {checksum_name}"
         );
         assert!(
-            checksum_name.starts_with("carapace-"),
-            "checksum name should start with carapace-: {checksum_name}"
+            checksum_name.starts_with("cara-"),
+            "checksum name should start with cara-: {checksum_name}"
         );
     }
 }

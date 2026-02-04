@@ -74,6 +74,6 @@ name = "carapace"
 path = "src/lib.rs"
 
 [[bin]]
-name = "carapace"
+name = "cara"
 path = "src/main.rs"
 test = false

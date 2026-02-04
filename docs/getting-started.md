@@ -5,7 +5,7 @@ It’s intentionally practical: copy/paste steps, then customize.
 
 ## Prerequisites
 
-- A `carapace` binary on your PATH (from GitHub Releases)
+- A `cara` binary on your PATH (from GitHub Releases)
 - A supported LLM provider API key (OpenAI/Anthropic/etc), or Ollama
 - Optional: TLS certs if exposing the gateway publicly
 
@@ -35,13 +35,13 @@ export CARAPACE_GATEWAY_TOKEN="$(openssl rand -hex 32)"
 3) Run the gateway:
 
 ```bash
-CARAPACE_CONFIG_PATH=./carapace.json5 carapace
+CARAPACE_CONFIG_PATH=./carapace.json5 cara
 ```
 
 4) Verify:
 
 ```bash
-carapace status --host 127.0.0.1 --port 18789
+cara status --host 127.0.0.1 --port 18789
 ```
 
 Or:
@@ -150,20 +150,20 @@ Then visit `/ui` on the gateway host.
 Use the CLI:
 
 ```bash
-carapace logs --follow
+cara logs --follow
 ```
 
 ### Backups
 
 ```bash
-carapace backup --out ./carapace-backup.tar.gz
-carapace restore --path ./carapace-backup.tar.gz
+cara backup --out ./carapace-backup.tar.gz
+cara restore --path ./carapace-backup.tar.gz
 ```
 
 ### Update
 
 ```bash
-carapace update
+cara update
 ```
 
 ## Troubleshooting

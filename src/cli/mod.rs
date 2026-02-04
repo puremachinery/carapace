@@ -20,7 +20,7 @@ use clap::{Parser, Subcommand};
 /// Carapace gateway server for AI assistants.
 #[derive(Parser, Debug)]
 #[command(
-    name = "carapace",
+    name = "cara",
     version = env!("CARGO_PKG_VERSION"),
     about = "Carapace — a secure gateway server for AI assistants"
 )]
@@ -343,7 +343,7 @@ pub async fn handle_status(
             eprintln!("Could not connect to carapace at {}:{}", host, port);
             eprintln!("  Error: {}", e);
             eprintln!();
-            eprintln!("Is the server running? Start it with: carapace start");
+            eprintln!("Is the server running? Start it with: cara start");
             std::process::exit(1);
         }
     };
@@ -1140,7 +1140,7 @@ pub async fn handle_logs(
             eprintln!("Could not connect to carapace at {}:{}", host, port);
             eprintln!("  Error: {}", err);
             eprintln!();
-            eprintln!("Is the server running? Start it with: carapace start");
+            eprintln!("Is the server running? Start it with: cara start");
             std::process::exit(1);
         }
     };
@@ -1245,7 +1245,7 @@ pub async fn handle_logs(
 
 /// Run the `version` subcommand.
 pub fn handle_version() {
-    println!("carapace {}", env!("CARGO_PKG_VERSION"));
+    println!("cara {}", env!("CARGO_PKG_VERSION"));
     println!("  Build date: {}", env!("CARAPACE_BUILD_DATE"));
     println!("  Git commit: {}", env!("CARAPACE_GIT_HASH"));
     println!(
@@ -1467,7 +1467,7 @@ fn validate_backup_file(archive_path: &PathBuf) -> Result<Vec<String>, Box<dyn s
 
     if !found_marker {
         eprintln!("Invalid backup: archive does not contain a carapace backup marker.");
-        eprintln!("The file may be corrupt or was not created by `carapace backup`.");
+        eprintln!("The file may be corrupt or was not created by `cara backup`.");
         std::process::exit(1);
     }
 
@@ -1817,7 +1817,7 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
     std::fs::write(&config_path, &content)?;
 
     println!("Config written to {}", config_path.display());
-    println!("Start the server with: carapace start");
+    println!("Start the server with: cara start");
 
     Ok(())
 }
@@ -2031,7 +2031,7 @@ pub async fn handle_update(
                 "Update available: v{} -> v{}",
                 current_version, latest_version
             );
-            println!("Run `carapace update` to install");
+            println!("Run `cara update` to install");
         }
         return Ok(());
     }
@@ -2071,7 +2071,7 @@ async fn fetch_release_info(
     let response = match client
         .get(&api_url)
         .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", format!("carapace/{}", current_version))
+        .header("User-Agent", format!("cara/{}", current_version))
         .send()
         .await
     {
@@ -2101,11 +2101,7 @@ async fn download_and_install_binary(
     target_version: &str,
     html_url: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let asset_name = format!(
-        "carapace-{}-{}",
-        std::env::consts::OS,
-        std::env::consts::ARCH
-    );
+    let asset_name = format!("cara-{}-{}", std::env::consts::OS, std::env::consts::ARCH);
 
     let assets = release
         .get("assets")
@@ -2142,7 +2138,7 @@ async fn download_and_install_binary(
 
     let dl_response = client
         .get(download_url)
-        .header("User-Agent", format!("carapace/{}", current_version))
+        .header("User-Agent", format!("cara/{}", current_version))
         .send()
         .await?;
 
@@ -2160,7 +2156,7 @@ async fn download_and_install_binary(
     let state_dir = crate::server::ws::resolve_state_dir();
     let updates_dir = state_dir.join("updates");
     std::fs::create_dir_all(&updates_dir)?;
-    let staged_path = updates_dir.join(format!("carapace-{}", target_version));
+    let staged_path = updates_dir.join(format!("cara-{}", target_version));
     std::fs::write(&staged_path, &bytes)?;
 
     #[cfg(unix)]
@@ -2178,7 +2174,7 @@ async fn download_and_install_binary(
             println!("  Binary: {}", result.binary_path);
             println!("  SHA-256: {}", result.sha256);
             crate::server::ws::cleanup_old_binaries();
-            println!("Restart carapace to use v{}.", target_version);
+            println!("Restart cara to use v{}.", target_version);
         }
         Err(e) => {
             eprintln!("Failed to apply update: {}", e);
@@ -2454,25 +2450,25 @@ mod tests {
 
     #[test]
     fn test_cli_no_args_defaults_to_none() {
-        let cli = Cli::try_parse_from(["carapace"]).unwrap();
+        let cli = Cli::try_parse_from(["cara"]).unwrap();
         assert!(cli.command.is_none());
     }
 
     #[test]
     fn test_cli_start_subcommand() {
-        let cli = Cli::try_parse_from(["carapace", "start"]).unwrap();
+        let cli = Cli::try_parse_from(["cara", "start"]).unwrap();
         assert!(matches!(cli.command, Some(Command::Start)));
     }
 
     #[test]
     fn test_cli_version_subcommand() {
-        let cli = Cli::try_parse_from(["carapace", "version"]).unwrap();
+        let cli = Cli::try_parse_from(["cara", "version"]).unwrap();
         assert!(matches!(cli.command, Some(Command::Version)));
     }
 
     #[test]
     fn test_cli_config_show() {
-        let cli = Cli::try_parse_from(["carapace", "config", "show"]).unwrap();
+        let cli = Cli::try_parse_from(["cara", "config", "show"]).unwrap();
         match cli.command {
             Some(Command::Config(ConfigCommand::Show)) => {}
             other => panic!("Expected Config(Show), got {:?}", other),
@@ -2481,7 +2477,7 @@ mod tests {
 
     #[test]
     fn test_cli_config_get() {
-        let cli = Cli::try_parse_from(["carapace", "config", "get", "gateway.port"]).unwrap();
+        let cli = Cli::try_parse_from(["cara", "config", "get", "gateway.port"]).unwrap();
         match cli.command {
             Some(Command::Config(ConfigCommand::Get { ref key })) => {
                 assert_eq!(key, "gateway.port");
@@ -2492,8 +2488,7 @@ mod tests {
 
     #[test]
     fn test_cli_config_set() {
-        let cli =
-            Cli::try_parse_from(["carapace", "config", "set", "gateway.port", "9000"]).unwrap();
+        let cli = Cli::try_parse_from(["cara", "config", "set", "gateway.port", "9000"]).unwrap();
         match cli.command {
             Some(Command::Config(ConfigCommand::Set { ref key, ref value })) => {
                 assert_eq!(key, "gateway.port");
@@ -2505,7 +2500,7 @@ mod tests {
 
     #[test]
     fn test_cli_config_path() {
-        let cli = Cli::try_parse_from(["carapace", "config", "path"]).unwrap();
+        let cli = Cli::try_parse_from(["cara", "config", "path"]).unwrap();
         assert!(matches!(
             cli.command,
             Some(Command::Config(ConfigCommand::Path))
@@ -2514,7 +2509,7 @@ mod tests {
 
     #[test]
     fn test_cli_status_defaults() {
-        let cli = Cli::try_parse_from(["carapace", "status"]).unwrap();
+        let cli = Cli::try_parse_from(["cara", "status"]).unwrap();
         match cli.command {
             Some(Command::Status { port, ref host }) => {
                 assert_eq!(port, None);
@@ -2526,7 +2521,7 @@ mod tests {
 
     #[test]
     fn test_cli_status_with_port() {
-        let cli = Cli::try_parse_from(["carapace", "status", "--port", "9000"]).unwrap();
+        let cli = Cli::try_parse_from(["cara", "status", "--port", "9000"]).unwrap();
         match cli.command {
             Some(Command::Status { port, .. }) => {
                 assert_eq!(port, Some(9000));
@@ -2537,7 +2532,7 @@ mod tests {
 
     #[test]
     fn test_cli_logs_defaults() {
-        let cli = Cli::try_parse_from(["carapace", "logs"]).unwrap();
+        let cli = Cli::try_parse_from(["cara", "logs"]).unwrap();
         match cli.command {
             Some(Command::Logs {
                 lines,
@@ -2560,7 +2555,7 @@ mod tests {
 
     #[test]
     fn test_cli_logs_with_lines() {
-        let cli = Cli::try_parse_from(["carapace", "logs", "--lines", "100"]).unwrap();
+        let cli = Cli::try_parse_from(["cara", "logs", "--lines", "100"]).unwrap();
         match cli.command {
             Some(Command::Logs { lines, .. }) => {
                 assert_eq!(lines, 100);
@@ -2571,7 +2566,7 @@ mod tests {
 
     #[test]
     fn test_cli_logs_with_short_flag() {
-        let cli = Cli::try_parse_from(["carapace", "logs", "-n", "25"]).unwrap();
+        let cli = Cli::try_parse_from(["cara", "logs", "-n", "25"]).unwrap();
         match cli.command {
             Some(Command::Logs { lines, .. }) => {
                 assert_eq!(lines, 25);
@@ -2738,7 +2733,7 @@ mod tests {
 
     #[test]
     fn test_cli_backup_no_args() {
-        let cli = Cli::try_parse_from(["carapace", "backup"]).unwrap();
+        let cli = Cli::try_parse_from(["cara", "backup"]).unwrap();
         match cli.command {
             Some(Command::Backup { output }) => {
                 assert!(output.is_none());
@@ -2749,8 +2744,8 @@ mod tests {
 
     #[test]
     fn test_cli_backup_with_output() {
-        let cli = Cli::try_parse_from(["carapace", "backup", "--output", "/tmp/my-backup.tar.gz"])
-            .unwrap();
+        let cli =
+            Cli::try_parse_from(["cara", "backup", "--output", "/tmp/my-backup.tar.gz"]).unwrap();
         match cli.command {
             Some(Command::Backup { output }) => {
                 assert_eq!(output.as_deref(), Some("/tmp/my-backup.tar.gz"));
@@ -2761,7 +2756,7 @@ mod tests {
 
     #[test]
     fn test_cli_backup_with_short_flag() {
-        let cli = Cli::try_parse_from(["carapace", "backup", "-o", "/tmp/backup.tar.gz"]).unwrap();
+        let cli = Cli::try_parse_from(["cara", "backup", "-o", "/tmp/backup.tar.gz"]).unwrap();
         match cli.command {
             Some(Command::Backup { output }) => {
                 assert_eq!(output.as_deref(), Some("/tmp/backup.tar.gz"));
@@ -2772,13 +2767,13 @@ mod tests {
 
     #[test]
     fn test_cli_restore_requires_path() {
-        let result = Cli::try_parse_from(["carapace", "restore"]);
+        let result = Cli::try_parse_from(["cara", "restore"]);
         assert!(result.is_err(), "restore should require a path argument");
     }
 
     #[test]
     fn test_cli_restore_with_path() {
-        let cli = Cli::try_parse_from(["carapace", "restore", "/tmp/backup.tar.gz"]).unwrap();
+        let cli = Cli::try_parse_from(["cara", "restore", "/tmp/backup.tar.gz"]).unwrap();
         match cli.command {
             Some(Command::Restore { ref path, force }) => {
                 assert_eq!(path, "/tmp/backup.tar.gz");
@@ -2791,7 +2786,7 @@ mod tests {
     #[test]
     fn test_cli_restore_with_force() {
         let cli =
-            Cli::try_parse_from(["carapace", "restore", "/tmp/backup.tar.gz", "--force"]).unwrap();
+            Cli::try_parse_from(["cara", "restore", "/tmp/backup.tar.gz", "--force"]).unwrap();
         match cli.command {
             Some(Command::Restore { force, .. }) => {
                 assert!(force);
@@ -2802,7 +2797,7 @@ mod tests {
 
     #[test]
     fn test_cli_reset_no_flags() {
-        let cli = Cli::try_parse_from(["carapace", "reset"]).unwrap();
+        let cli = Cli::try_parse_from(["cara", "reset"]).unwrap();
         match cli.command {
             Some(Command::Reset {
                 sessions,
@@ -2825,7 +2820,7 @@ mod tests {
 
     #[test]
     fn test_cli_reset_all_force() {
-        let cli = Cli::try_parse_from(["carapace", "reset", "--all", "--force"]).unwrap();
+        let cli = Cli::try_parse_from(["cara", "reset", "--all", "--force"]).unwrap();
         match cli.command {
             Some(Command::Reset { all, force, .. }) => {
                 assert!(all);
@@ -2838,7 +2833,7 @@ mod tests {
     #[test]
     fn test_cli_reset_individual_flags() {
         let cli = Cli::try_parse_from([
-            "carapace",
+            "cara",
             "reset",
             "--sessions",
             "--cron",
@@ -3146,7 +3141,7 @@ mod tests {
 
     #[test]
     fn test_cli_setup_no_force() {
-        let cli = Cli::try_parse_from(["carapace", "setup"]).unwrap();
+        let cli = Cli::try_parse_from(["cara", "setup"]).unwrap();
         match cli.command {
             Some(Command::Setup { force }) => {
                 assert!(!force);
@@ -3157,7 +3152,7 @@ mod tests {
 
     #[test]
     fn test_cli_setup_with_force() {
-        let cli = Cli::try_parse_from(["carapace", "setup", "--force"]).unwrap();
+        let cli = Cli::try_parse_from(["cara", "setup", "--force"]).unwrap();
         match cli.command {
             Some(Command::Setup { force }) => {
                 assert!(force);
@@ -3250,7 +3245,7 @@ mod tests {
 
     #[test]
     fn test_cli_pair_basic() {
-        let cli = Cli::try_parse_from(["carapace", "pair", "https://gateway.local:3001"]).unwrap();
+        let cli = Cli::try_parse_from(["cara", "pair", "https://gateway.local:3001"]).unwrap();
         match cli.command {
             Some(Command::Pair {
                 ref url,
@@ -3268,7 +3263,7 @@ mod tests {
     #[test]
     fn test_cli_pair_with_name_and_trust() {
         let cli = Cli::try_parse_from([
-            "carapace",
+            "cara",
             "pair",
             "https://gateway.local:3001",
             "--name",
@@ -3372,7 +3367,7 @@ mod tests {
 
     #[test]
     fn test_cli_update_check() {
-        let cli = Cli::try_parse_from(["carapace", "update", "--check"]).unwrap();
+        let cli = Cli::try_parse_from(["cara", "update", "--check"]).unwrap();
         match cli.command {
             Some(Command::Update { check, version }) => {
                 assert!(check);
@@ -3384,7 +3379,7 @@ mod tests {
 
     #[test]
     fn test_cli_update_with_version() {
-        let cli = Cli::try_parse_from(["carapace", "update", "--version", "0.2.0"]).unwrap();
+        let cli = Cli::try_parse_from(["cara", "update", "--version", "0.2.0"]).unwrap();
         match cli.command {
             Some(Command::Update { check, version }) => {
                 assert!(!check);
@@ -3407,7 +3402,7 @@ mod tests {
 
     #[test]
     fn test_cli_tls_init_ca() {
-        let cli = Cli::try_parse_from(["carapace", "tls", "init-ca"]).unwrap();
+        let cli = Cli::try_parse_from(["cara", "tls", "init-ca"]).unwrap();
         match cli.command {
             Some(Command::Tls(TlsCommand::InitCa { output })) => {
                 assert!(output.is_none());
@@ -3418,8 +3413,7 @@ mod tests {
 
     #[test]
     fn test_cli_tls_init_ca_with_output() {
-        let cli =
-            Cli::try_parse_from(["carapace", "tls", "init-ca", "--output", "/tmp/ca"]).unwrap();
+        let cli = Cli::try_parse_from(["cara", "tls", "init-ca", "--output", "/tmp/ca"]).unwrap();
         match cli.command {
             Some(Command::Tls(TlsCommand::InitCa { output })) => {
                 assert_eq!(output.as_deref(), Some("/tmp/ca"));
@@ -3430,7 +3424,7 @@ mod tests {
 
     #[test]
     fn test_cli_tls_issue_cert() {
-        let cli = Cli::try_parse_from(["carapace", "tls", "issue-cert", "node-east-1"]).unwrap();
+        let cli = Cli::try_parse_from(["cara", "tls", "issue-cert", "node-east-1"]).unwrap();
         match cli.command {
             Some(Command::Tls(TlsCommand::IssueCert {
                 node_id,
@@ -3448,7 +3442,7 @@ mod tests {
     #[test]
     fn test_cli_tls_issue_cert_with_options() {
         let cli = Cli::try_parse_from([
-            "carapace",
+            "cara",
             "tls",
             "issue-cert",
             "node-west-2",
@@ -3475,7 +3469,7 @@ mod tests {
     #[test]
     fn test_cli_tls_revoke_cert() {
         let cli = Cli::try_parse_from([
-            "carapace",
+            "cara",
             "tls",
             "revoke-cert",
             "AA:BB:CC:DD",
@@ -3502,7 +3496,7 @@ mod tests {
     #[test]
     fn test_cli_tls_revoke_cert_with_reason() {
         let cli = Cli::try_parse_from([
-            "carapace",
+            "cara",
             "tls",
             "revoke-cert",
             "AA:BB:CC:DD",
@@ -3530,7 +3524,7 @@ mod tests {
 
     #[test]
     fn test_cli_tls_show_ca() {
-        let cli = Cli::try_parse_from(["carapace", "tls", "show-ca"]).unwrap();
+        let cli = Cli::try_parse_from(["cara", "tls", "show-ca"]).unwrap();
         match cli.command {
             Some(Command::Tls(TlsCommand::ShowCa { ca_dir })) => {
                 assert!(ca_dir.is_none());
@@ -3541,8 +3535,7 @@ mod tests {
 
     #[test]
     fn test_cli_tls_show_ca_with_dir() {
-        let cli =
-            Cli::try_parse_from(["carapace", "tls", "show-ca", "--ca-dir", "/tmp/ca"]).unwrap();
+        let cli = Cli::try_parse_from(["cara", "tls", "show-ca", "--ca-dir", "/tmp/ca"]).unwrap();
         match cli.command {
             Some(Command::Tls(TlsCommand::ShowCa { ca_dir })) => {
                 assert_eq!(ca_dir.as_deref(), Some("/tmp/ca"));

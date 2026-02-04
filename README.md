@@ -54,74 +54,58 @@ See [docs/security.md](docs/security.md) for the full security model.
 
 Download the matching binary from the GitHub Releases page:
 
-- `carapace-x86_64-linux`
-- `carapace-aarch64-linux`
-- `carapace-x86_64-darwin`
-- `carapace-aarch64-darwin`
-- `carapace-x86_64-windows.exe`
+- `cara-x86_64-linux`
+- `cara-aarch64-linux`
+- `cara-x86_64-darwin`
+- `cara-aarch64-darwin`
+- `cara-x86_64-windows.exe`
 
 Optionally verify with cosign (signatures and certificates are published alongside each release):
 
 ```bash
 cosign verify-blob \
-  --certificate carapace-x86_64-linux.pem \
-  --signature carapace-x86_64-linux.sig \
+  --certificate cara-x86_64-linux.pem \
+  --signature cara-x86_64-linux.sig \
   --certificate-identity-regexp "https://github.com/puremachinery/carapace/.github/workflows/release.yml@refs/tags/v.*" \
   --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-  carapace-x86_64-linux
+  cara-x86_64-linux
 ```
 
-### Install (macOS/Linux)
+### Install (macOS/Linux, manual)
 
 Make it executable and move it into your PATH:
 
 ```bash
-chmod +x carapace-x86_64-linux
-sudo mv carapace-x86_64-linux /usr/local/bin/carapace
+chmod +x cara-x86_64-linux
+sudo mv cara-x86_64-linux /usr/local/bin/cara
 ```
 
-Optional: create a `cara` alias (macOS/Linux):
-
-```bash
-sudo ln -sf /usr/local/bin/carapace /usr/local/bin/cara
-```
-
-### Install (Windows)
+### Install (Windows, manual)
 
 Copy the binary into a folder on your PATH:
 
 ```powershell
-$installDir = "$env:LOCALAPPDATA\\carapace\\bin"
+$installDir = "$env:LOCALAPPDATA\\cara\\bin"
 New-Item -ItemType Directory -Force -Path $installDir | Out-Null
-Copy-Item .\\carapace-x86_64-windows.exe (Join-Path $installDir "carapace.exe")
-```
-
-Optional: create a `cara` alias:
-
-```powershell
-'@echo off
-"%~dp0carapace.exe" %*
-' | Set-Content -Encoding ASCII -Path (Join-Path $installDir "cara.cmd")
+Copy-Item .\\cara-x86_64-windows.exe (Join-Path $installDir "cara.exe")
 ```
 
 ### Install helper (macOS/Linux)
 
-If you cloned the repo, the install script copies the binary and creates a
-`cara` symlink (use `--no-cara` to skip the alias):
+If you cloned the repo, the install script copies the binary into place:
 
 ```bash
-sudo ./scripts/install.sh --binary ./carapace-x86_64-linux
+sudo ./scripts/install.sh --binary ./cara-x86_64-linux
 ```
 
 If you downloaded only the release binary, use the manual steps above.
 
 ### Install helper (Windows PowerShell)
 
-If you cloned the repo, the install script copies the binary and creates a
-`cara.cmd` shim (use `-NoCara` to skip the alias):
+If you cloned the repo, the install script copies the binary into place:
 
 ```powershell
-.\scripts\install.ps1 -BinaryPath .\carapace-x86_64-windows.exe
+.\scripts\install.ps1 -BinaryPath .\cara-x86_64-windows.exe
 ```
 
 If you downloaded only the release binary, use the manual steps above.
@@ -132,17 +116,17 @@ If you downloaded only the release binary, use the manual steps above.
 
 1. Create a minimal config interactively:
    ```bash
-   carapace setup
+   cara setup
    ```
 
 2. Start the gateway:
    ```bash
-   carapace
+   cara
    ```
 
 3. Check status:
    ```bash
-   carapace status --host 127.0.0.1 --port 18789
+   cara status --host 127.0.0.1 --port 18789
    ```
 
 ### With Ollama (free, local)
@@ -152,9 +136,9 @@ If you downloaded only the release binary, use the manual steps above.
    ollama pull llama3.2
    ```
 
-2. Run carapace:
+2. Run cara:
    ```bash
-   OLLAMA_BASE_URL=http://localhost:11434 carapace
+   OLLAMA_BASE_URL=http://localhost:11434 cara
    ```
 
 3. Connect a channel (Signal/Telegram/Discord/Slack/webhooks) or enable the
@@ -166,7 +150,7 @@ Set one API key and run:
 
 ```bash
 export ANTHROPIC_API_KEY="sk-ant-..."   # or OPENAI_API_KEY, GOOGLE_API_KEY, VENICE_API_KEY
-carapace
+cara
 ```
 
 Then connect a channel or enable the Control UI — see `docs/channels.md` and
@@ -179,23 +163,23 @@ HTTP is allowed for loopback addresses (`localhost` / `127.0.0.1` / `::1`).
 
 ```bash
 # vLLM
-OPENAI_BASE_URL=http://localhost:8000/v1 OPENAI_API_KEY=unused carapace
+OPENAI_BASE_URL=http://localhost:8000/v1 OPENAI_API_KEY=unused cara
 
 # llama.cpp server (llama-server --port 8080)
-OPENAI_BASE_URL=http://localhost:8080/v1 OPENAI_API_KEY=unused carapace
+OPENAI_BASE_URL=http://localhost:8080/v1 OPENAI_API_KEY=unused cara
 
 # LM Studio (default port 1234)
-OPENAI_BASE_URL=http://localhost:1234/v1 OPENAI_API_KEY=unused carapace
+OPENAI_BASE_URL=http://localhost:1234/v1 OPENAI_API_KEY=unused cara
 
 # MLX (default port 8080)
-OPENAI_BASE_URL=http://localhost:8080/v1 OPENAI_API_KEY=unused carapace
+OPENAI_BASE_URL=http://localhost:8080/v1 OPENAI_API_KEY=unused cara
 ```
 
 You can also use the Ollama provider with non-Ollama servers that expose an
 OpenAI-compatible `/v1/chat/completions` endpoint:
 
 ```bash
-OLLAMA_BASE_URL=http://localhost:8000 carapace
+OLLAMA_BASE_URL=http://localhost:8000 cara
 ```
 
 Or configure via `config.json5` — see [`config.example.json5`](config.example.json5)
@@ -226,7 +210,7 @@ docker run -d -p 8080:8080 -v $HOME/.local/share/signal-api:/home/.local/share/s
 Then configure carapace:
 
 ```bash
-SIGNAL_CLI_URL=http://localhost:8080 SIGNAL_PHONE_NUMBER=+15551234567 carapace
+SIGNAL_CLI_URL=http://localhost:8080 SIGNAL_PHONE_NUMBER=+15551234567 cara
 ```
 
 Or via `config.json5` — see `config.example.json5` for the `signal` section.

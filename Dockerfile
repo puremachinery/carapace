@@ -17,7 +17,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /build/target/release/carapace /usr/local/bin/carapace
+COPY --from=builder /build/target/release/cara /usr/local/bin/cara
 
 RUN groupadd --system carapace && useradd --system --gid carapace carapace
 
@@ -32,4 +32,4 @@ EXPOSE 18789
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD curl -f http://localhost:18789/health || exit 1
 
-ENTRYPOINT ["carapace"]
+ENTRYPOINT ["cara"]

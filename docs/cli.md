@@ -1,4 +1,4 @@
-# carapace CLI Guide
+# cara CLI Guide
 
 This guide covers the CLI subcommands, common flags, and behavior that is not obvious
 from `--help`, including recent changes around device identity and TLS requirements.
@@ -20,14 +20,14 @@ Manage configuration values.
 Health/status check via HTTP.
 
 ```
-carapace status --host 127.0.0.1 --port 18789
+cara status --host 127.0.0.1 --port 18789
 ```
 
 ### logs
 Fetch recent log lines via WebSocket (`logs.tail`).
 
 ```
-carapace logs -n 50 --host 127.0.0.1 --port 18789
+cara logs -n 50 --host 127.0.0.1 --port 18789
 ```
 
 Remote hosts require TLS or explicit plaintext opt-in:
@@ -52,7 +52,7 @@ Interactive first-run configuration wizard.
 Pair this CLI with a gateway.
 
 ```
-carapace pair https://gateway.local:3001 --name "My CLI" --trust
+cara pair https://gateway.local:3001 --name "My CLI" --trust
 ```
 
 Notes:
@@ -110,15 +110,15 @@ Override with:
 
 ### Tail logs over TLS (self-signed gateway)
 ```
-carapace logs --host gateway.local --port 3001 --tls --trust -n 200
+cara logs --host gateway.local --port 3001 --tls --trust -n 200
 ```
 
 ### Allow plaintext logs (unsafe)
 ```
-carapace logs --host 10.0.0.12 --port 18789 --allow-plaintext
+cara logs --host 10.0.0.12 --port 18789 --allow-plaintext
 ```
 
 ### Pair with a remote gateway
 ```
-CARAPACE_GATEWAY_TOKEN=... carapace pair https://gateway.local:3001 --name "Ops CLI" --trust
+CARAPACE_GATEWAY_TOKEN=... cara pair https://gateway.local:3001 --name "Ops CLI" --trust
 ```

@@ -3,19 +3,18 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-Usage: install.sh --binary <path> [--dir <install-dir>] [--no-cara]
+Usage: install.sh --binary <path> [--dir <install-dir>]
 
-Installs the carapace binary and optionally creates a `cara` symlink.
+Installs the cara binary.
 
 Examples:
-  ./scripts/install.sh --binary ./carapace-x86_64-linux
-  sudo ./scripts/install.sh --binary ./carapace-x86_64-linux --dir /usr/local/bin
+  ./scripts/install.sh --binary ./cara-x86_64-linux
+  sudo ./scripts/install.sh --binary ./cara-x86_64-linux --dir /usr/local/bin
 USAGE
 }
 
 binary_path=""
 install_dir="/usr/local/bin"
-create_cara=1
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -26,10 +25,6 @@ while [[ $# -gt 0 ]]; do
     --dir)
       install_dir="${2:-}"
       shift 2
-      ;;
-    --no-cara)
-      create_cara=0
-      shift
       ;;
     -h|--help)
       usage
@@ -56,15 +51,8 @@ fi
 
 mkdir -p "$install_dir"
 
-cp "$binary_path" "$install_dir/carapace"
-chmod 0755 "$install_dir/carapace"
+cp "$binary_path" "$install_dir/cara"
+chmod 0755 "$install_dir/cara"
 
-if [[ "$create_cara" -eq 1 ]]; then
-  ln -sf "$install_dir/carapace" "$install_dir/cara"
-fi
-
-echo "Installed: $install_dir/carapace"
-if [[ "$create_cara" -eq 1 ]]; then
-  echo "Alias:     $install_dir/cara"
-fi
+echo "Installed: $install_dir/cara"
 echo "Ensure $install_dir is on your PATH."

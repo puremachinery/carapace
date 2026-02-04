@@ -29,6 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **CLI binary rename:** the command is now `cara` and release assets are
+  named `cara-<os>-<arch>`.
 - **Carapace naming:** Env vars now use `CARAPACE_*`, the credentials service
   name is `carapace`, and default state/config paths use the platform config
   directory. Existing installs should migrate data or set
