@@ -1,0 +1,23 @@
+---
+source: src/server/ws/golden_tests.rs
+assertion_line: 401
+expression: normalized
+---
+{
+  "ok": true,
+  "result": {
+    "active": "<TALK_ACTIVE>",
+    "autoRespond": "<TALK_AUTORESPOND>",
+    "availableModes": [
+      "off",
+      "push-to-talk",
+      "voice-activated",
+      "continuous"
+    ],
+    "inputDevice": "<TALK_INPUTDEVICE>",
+    "mode": "<TALK_MODE>",
+    "outputDevice": "<TALK_OUTPUTDEVICE>",
+    "silenceTimeoutMs": "<TALK_SILENCETIMEOUTMS>",
+    "vadThreshold": "<TALK_VADTHRESHOLD>"
+  }
+}

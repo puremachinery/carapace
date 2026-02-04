@@ -1,0 +1,13 @@
+---
+source: src/server/ws/golden_tests.rs
+assertion_line: 583
+expression: normalized
+---
+{
+  "error": {
+    "code": "INVALID_REQUEST",
+    "message": "idempotencyKey is required",
+    "retryable": false
+  },
+  "ok": false
+}

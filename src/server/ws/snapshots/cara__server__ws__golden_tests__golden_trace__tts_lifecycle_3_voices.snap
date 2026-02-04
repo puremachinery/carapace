@@ -1,0 +1,44 @@
+---
+source: src/server/ws/golden_tests.rs
+assertion_line: 676
+expression: normalized
+---
+{
+  "ok": true,
+  "result": {
+    "current": null,
+    "provider": "system",
+    "voices": [
+      {
+        "gender": "female",
+        "id": "samantha",
+        "name": "Samantha"
+      },
+      {
+        "gender": "male",
+        "id": "alex",
+        "name": "Alex"
+      },
+      {
+        "gender": "female",
+        "id": "victoria",
+        "name": "Victoria"
+      },
+      {
+        "gender": "female",
+        "id": "karen",
+        "name": "Karen"
+      },
+      {
+        "gender": "male",
+        "id": "daniel",
+        "name": "Daniel"
+      },
+      {
+        "gender": "female",
+        "id": "moira",
+        "name": "Moira"
+      }
+    ]
+  }
+}

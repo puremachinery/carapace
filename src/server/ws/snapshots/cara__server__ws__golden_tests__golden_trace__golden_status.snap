@@ -1,0 +1,27 @@
+---
+source: src/server/ws/golden_tests.rs
+assertion_line: 393
+expression: normalized
+---
+{
+  "ok": true,
+  "result": {
+    "channels": {
+      "connected": 0,
+      "total": "<COUNT>"
+    },
+    "runtime": {
+      "arch": "<ARCH>",
+      "name": "carapace",
+      "platform": "<PLATFORM>"
+    },
+    "sessions": {
+      "count": "<SESSION_COUNT>",
+      "recent": "<RECENT_LIST>"
+    },
+    "status": "ok",
+    "ts": "<TIMESTAMP>",
+    "uptimeMs": "<TIMESTAMP>",
+    "version": "<VERSION>"
+  }
+}

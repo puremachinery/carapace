@@ -1,0 +1,26 @@
+---
+source: src/server/ws/golden_tests.rs
+assertion_line: 693
+expression: normalized
+---
+{
+  "ok": true,
+  "result": {
+    "cursor": "<CURSOR>",
+    "entries": [
+      {
+        "level": "info",
+        "message": "golden log line",
+        "seq": "<SEQ>",
+        "target": "golden.logs.tail",
+        "timestamp": "<TIMESTAMP>"
+      }
+    ],
+    "lines": [
+      "golden log line"
+    ],
+    "reset": false,
+    "size": "<COUNT>",
+    "truncated": false
+  }
+}

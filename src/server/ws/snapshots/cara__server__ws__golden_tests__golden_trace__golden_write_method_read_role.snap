@@ -1,0 +1,13 @@
+---
+source: src/server/ws/golden_tests.rs
+assertion_line: 512
+expression: normalized
+---
+{
+  "error": {
+    "code": "INVALID_REQUEST",
+    "message": "method 'config.set' requires role 'write', connection has role 'read'",
+    "retryable": false
+  },
+  "ok": false
+}

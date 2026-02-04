@@ -1,0 +1,33 @@
+---
+source: src/server/ws/golden_tests.rs
+assertion_line: 397
+expression: normalized
+---
+{
+  "ok": true,
+  "result": {
+    "current": "<TTS_CURRENT>",
+    "providers": [
+      {
+        "available": true,
+        "id": "system",
+        "name": "System Voice"
+      },
+      {
+        "available": false,
+        "id": "elevenlabs",
+        "name": "ElevenLabs"
+      },
+      {
+        "available": false,
+        "id": "openai",
+        "name": "OpenAI TTS"
+      },
+      {
+        "available": false,
+        "id": "google",
+        "name": "Google Cloud TTS"
+      }
+    ]
+  }
+}

@@ -1,0 +1,12 @@
+---
+source: src/server/ws/golden_tests.rs
+assertion_line: 701
+expression: normalized
+---
+{
+  "ok": true,
+  "result": {
+    "count": 0,
+    "wizards": []
+  }
+}

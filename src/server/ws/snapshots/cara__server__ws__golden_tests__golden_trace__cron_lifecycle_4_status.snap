@@ -1,0 +1,13 @@
+---
+source: src/server/ws/golden_tests.rs
+assertion_line: 569
+expression: normalized
+---
+{
+  "ok": true,
+  "result": {
+    "enabled": true,
+    "jobs": 1,
+    "nextRunAtMs": "<TIMESTAMP>"
+  }
+}

@@ -1,0 +1,32 @@
+---
+source: src/server/ws/golden_tests.rs
+assertion_line: 548
+expression: normalized
+---
+{
+  "ok": true,
+  "result": {
+    "jobs": [
+      {
+        "createdAtMs": "<TIMESTAMP>",
+        "enabled": true,
+        "id": "<UUID>",
+        "name": "golden-test-job",
+        "payload": {
+          "kind": "systemEvent",
+          "text": "test golden"
+        },
+        "schedule": {
+          "expr": "*/5 * * * *",
+          "kind": "cron"
+        },
+        "sessionTarget": "main",
+        "state": {
+          "nextRunAtMs": "<TIMESTAMP>"
+        },
+        "updatedAtMs": "<TIMESTAMP>",
+        "wakeMode": "now"
+      }
+    ]
+  }
+}

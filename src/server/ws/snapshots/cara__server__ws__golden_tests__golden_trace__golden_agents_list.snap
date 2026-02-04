@@ -1,0 +1,26 @@
+---
+source: src/server/ws/golden_tests.rs
+assertion_line: 383
+expression: normalized
+---
+{
+  "ok": true,
+  "result": {
+    "agents": [
+      {
+        "default": true,
+        "description": "Default assistant",
+        "enabled": true,
+        "id": "default",
+        "identity": {
+          "name": "Carapace"
+        },
+        "name": "Carapace"
+      }
+    ],
+    "count": 1,
+    "defaultId": "default",
+    "mainKey": "main",
+    "scope": "per-sender"
+  }
+}

@@ -1,0 +1,16 @@
+---
+source: src/server/ws/golden_tests.rs
+assertion_line: 697
+expression: normalized
+---
+{
+  "ok": true,
+  "result": {
+    "keywords": [
+      "hey claude",
+      "ok claude",
+      "claude",
+      "jarvis"
+    ]
+  }
+}

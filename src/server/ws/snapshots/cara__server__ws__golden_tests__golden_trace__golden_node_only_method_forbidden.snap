@@ -1,0 +1,13 @@
+---
+source: src/server/ws/golden_tests.rs
+assertion_line: 495
+expression: normalized
+---
+{
+  "error": {
+    "code": "INVALID_REQUEST",
+    "message": "method 'skills.bins' is only allowed for node role",
+    "retryable": false
+  },
+  "ok": false
+}

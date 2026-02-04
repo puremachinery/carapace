@@ -1,0 +1,21 @@
+---
+source: src/server/ws/golden_tests.rs
+assertion_line: 438
+expression: normalized
+---
+{
+  "ok": true,
+  "result": {
+    "autoUpdate": true,
+    "channel": "stable",
+    "checking": false,
+    "currentVersion": "<VERSION>",
+    "downloadUrl": null,
+    "installing": false,
+    "lastCheckAt": null,
+    "lastError": null,
+    "latestVersion": null,
+    "releaseNotes": null,
+    "updateAvailable": false
+  }
+}

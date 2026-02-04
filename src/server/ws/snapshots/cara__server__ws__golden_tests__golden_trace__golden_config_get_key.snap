@@ -1,0 +1,12 @@
+---
+source: src/server/ws/golden_tests.rs
+assertion_line: 346
+expression: normalized
+---
+{
+  "ok": true,
+  "result": {
+    "key": "gateway.port",
+    "value": "<CONFIG_VALUE>"
+  }
+}

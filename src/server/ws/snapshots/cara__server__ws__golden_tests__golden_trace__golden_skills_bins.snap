@@ -1,0 +1,11 @@
+---
+source: src/server/ws/golden_tests.rs
+assertion_line: 429
+expression: normalized
+---
+{
+  "ok": true,
+  "result": {
+    "bins": []
+  }
+}

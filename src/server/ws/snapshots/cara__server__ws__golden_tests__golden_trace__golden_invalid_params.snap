@@ -1,0 +1,13 @@
+---
+source: src/server/ws/golden_tests.rs
+assertion_line: 478
+expression: normalized
+---
+{
+  "error": {
+    "code": "INVALID_REQUEST",
+    "message": "name is required",
+    "retryable": false
+  },
+  "ok": false
+}

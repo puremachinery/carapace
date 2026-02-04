@@ -1,0 +1,20 @@
+---
+source: src/server/ws/golden_tests.rs
+assertion_line: 345
+expression: normalized
+---
+{
+  "ok": true,
+  "result": {
+    "config": "<CONFIG_DATA>",
+    "exists": "<CONFIG_EXISTS>",
+    "hash": "<CONFIG_HASH>",
+    "issues": "<CONFIG_ISSUES>",
+    "legacyIssues": [],
+    "parsed": "<CONFIG_PARSED>",
+    "path": "<PATH>",
+    "raw": "<CONFIG_RAW>",
+    "valid": "<CONFIG_VALID>",
+    "warnings": []
+  }
+}

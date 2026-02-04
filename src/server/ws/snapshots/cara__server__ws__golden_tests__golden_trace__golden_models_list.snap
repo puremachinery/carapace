@@ -1,0 +1,26 @@
+---
+source: src/server/ws/golden_tests.rs
+assertion_line: 382
+expression: normalized
+---
+{
+  "ok": true,
+  "result": {
+    "models": [
+      {
+        "alias": "sonnet",
+        "id": "<UUID>",
+        "label": "Claude Sonnet 4",
+        "model": "claude-sonnet-4-20250514",
+        "provider": "anthropic"
+      },
+      {
+        "alias": "opus",
+        "id": "<UUID>",
+        "label": "Claude Opus 4",
+        "model": "claude-opus-4-20250514",
+        "provider": "anthropic"
+      }
+    ]
+  }
+}

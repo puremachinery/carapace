@@ -1,0 +1,16 @@
+---
+source: src/server/ws/golden_tests.rs
+assertion_line: 688
+expression: normalized
+---
+{
+  "ok": true,
+  "result": {
+    "enabled": "<TTS_ENABLED>",
+    "pitch": "<TTS_PITCH>",
+    "provider": "<TTS_PROVIDER>",
+    "rate": "<TTS_RATE>",
+    "voice": "<TTS_VOICE>",
+    "volume": "<TTS_VOLUME>"
+  }
+}
