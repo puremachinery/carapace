@@ -41,6 +41,13 @@ Carapace is hardened against every major vulnerability class reported in the Jan
 
 See [docs/security.md](docs/security.md) for the full security model.
 
+## Docs
+
+- [Getting started](docs/getting-started.md) — install, first run, and ops
+- [Channel setup](docs/channels.md) — Signal, Telegram, Discord, Slack, webhooks
+- [CLI guide](docs/cli.md) — subcommands, flags, and device identity
+- [Documentation index](docs/README.md) — architecture, protocol, security
+
 ## Install
 
 ### Prebuilt binaries (GitHub Releases)
@@ -64,33 +71,79 @@ cosign verify-blob \
   carapace-x86_64-linux
 ```
 
-Then make it executable (macOS/Linux) and move it into your PATH:
+### Install (macOS/Linux)
+
+Make it executable and move it into your PATH:
 
 ```bash
 chmod +x carapace-x86_64-linux
 sudo mv carapace-x86_64-linux /usr/local/bin/carapace
 ```
 
-### Install script (macOS/Linux)
+Optional: create a `cara` alias (macOS/Linux):
 
-The install script copies the binary and creates a `cara` symlink:
+```bash
+sudo ln -sf /usr/local/bin/carapace /usr/local/bin/cara
+```
+
+### Install (Windows)
+
+Copy the binary into a folder on your PATH:
+
+```powershell
+$installDir = "$env:LOCALAPPDATA\\carapace\\bin"
+New-Item -ItemType Directory -Force -Path $installDir | Out-Null
+Copy-Item .\\carapace-x86_64-windows.exe (Join-Path $installDir "carapace.exe")
+```
+
+Optional: create a `cara` alias:
+
+```powershell
+'@echo off
+"%~dp0carapace.exe" %*
+' | Set-Content -Encoding ASCII -Path (Join-Path $installDir "cara.cmd")
+```
+
+### Install helper (macOS/Linux)
+
+If you cloned the repo, the install script copies the binary and creates a
+`cara` symlink (use `--no-cara` to skip the alias):
 
 ```bash
 sudo ./scripts/install.sh --binary ./carapace-x86_64-linux
 ```
 
-### Install script (Windows PowerShell)
+If you downloaded only the release binary, use the manual steps above.
 
-The install script copies the binary and creates a `cara.cmd` shim:
+### Install helper (Windows PowerShell)
+
+If you cloned the repo, the install script copies the binary and creates a
+`cara.cmd` shim (use `-NoCara` to skip the alias):
 
 ```powershell
 .\scripts\install.ps1 -BinaryPath .\carapace-x86_64-windows.exe
 ```
 
+If you downloaded only the release binary, use the manual steps above.
+
 ## Getting Started
 
-These examples assume the prebuilt `carapace` binary. If you're running from
-source, replace `carapace` with `cargo run`.
+### First run (setup wizard)
+
+1. Create a minimal config interactively:
+   ```bash
+   carapace setup
+   ```
+
+2. Start the gateway:
+   ```bash
+   carapace
+   ```
+
+3. Check status:
+   ```bash
+   carapace status --host 127.0.0.1 --port 18789
+   ```
 
 ### With Ollama (free, local)
 
@@ -104,7 +157,8 @@ source, replace `carapace` with `cargo run`.
    OLLAMA_BASE_URL=http://localhost:11434 carapace
    ```
 
-3. Connect via WebSocket at `ws://127.0.0.1:18789/ws`.
+3. Connect a channel (Signal/Telegram/Discord/Slack/webhooks) or enable the
+   Control UI — see `docs/channels.md` and `docs/getting-started.md`.
 
 ### With a cloud provider
 
@@ -114,6 +168,9 @@ Set one API key and run:
 export ANTHROPIC_API_KEY="sk-ant-..."   # or OPENAI_API_KEY, GOOGLE_API_KEY, VENICE_API_KEY
 carapace
 ```
+
+Then connect a channel or enable the Control UI — see `docs/channels.md` and
+`docs/getting-started.md`.
 
 ### Other local servers (vLLM, llama.cpp, LM Studio, MLX)
 
@@ -174,84 +231,12 @@ SIGNAL_CLI_URL=http://localhost:8080 SIGNAL_PHONE_NUMBER=+15551234567 carapace
 
 Or via `config.json5` — see `config.example.json5` for the `signal` section.
 
-## Build Requirements (from source)
+## Contributing
 
-Not required if you use prebuilt release binaries.
+If you want to build from source or contribute, start here:
 
-- Rust 1.93+ (MSRV enforced in CI)
-- wasmtime 41 (included as dependency)
-
-## Development
-
-### Recommended Tools (contributors)
-
-```bash
-cargo install just            # Task runner
-cargo install cargo-nextest   # Faster test runner
-cargo install cargo-watch     # File watcher (optional)
-cargo install cargo-tarpaulin # Coverage (optional)
-```
-
-```bash
-just          # Show all available recipes
-just run      # Run the gateway server (debug build)
-just build    # Build the project
-just test     # Run tests with nextest
-just lint     # Run clippy
-just check    # Run lint + fmt-check + test
-just watch    # Watch for changes and run tests
-```
-
-## Testing
-
-Thousands of tests (4,700+ via nextest). Zero Clippy warnings. Cross-platform CI (Linux, macOS, Windows).
-
-```bash
-cargo nextest run       # or: just test
-cargo test              # or: just test-cargo
-just test-one test_name # Run specific test
-just test-coverage      # With coverage
-```
-
-## CI Pipeline
-
-Format, Clippy, nextest (cross-platform), MSRV 1.93, cargo-audit, cargo-deny, gitleaks, trivy, hadolint, cargo-geiger.
-
-## Project Structure
-
-```
-src/
-├── agent/          # LLM execution engine, prompt guard, classifier, sandbox, output sanitizer
-├── auth/           # Token, password, and Tailscale authentication
-├── channels/       # Channel registry, Signal, Telegram, Discord, Slack, console
-├── cli/            # CLI subcommands (start, config, backup, tls, etc.)
-├── config/         # JSON5 config with $include, env substitution, hot reload
-├── credentials/    # Platform-native credential storage (Keychain, Keyutils, Windows)
-├── cron/           # Cron scheduler, background tick loop
-├── devices/        # Device pairing state machine
-├── exec/           # Exec approval workflow (request, wait, resolve)
-├── gateway/        # Gateway connections with mTLS support
-├── hooks/          # Webhook mappings
-├── logging/        # Structured logging, ring buffer
-├── media/          # SSRF-protected media fetch/store
-├── messages/       # Outbound message pipeline and delivery loop
-├── nodes/          # Node pairing state machine
-├── plugins/        # WASM plugin runtime, permissions, signature verification
-├── server/         # HTTP + WebSocket server, handlers, rate limiting, CSP
-├── sessions/       # Session storage (JSONL, compaction, HMAC integrity)
-├── tls/            # TLS, mTLS, cluster CA management
-└── usage/          # Token counting, cost calculation, model pricing
-
-tests/
-├── golden/         # Golden test traces
-└── *.rs            # Integration tests
-```
-
-## Documentation
-
-- [Architecture](docs/architecture.md) — component diagrams, request flows, agent execution pipeline
-- [Security](docs/security.md) — threat model, trust boundaries, implementation checklist
-- [Full documentation index](docs/README.md)
+- [CONTRIBUTING.md](CONTRIBUTING.md)
+- [docs/README.md](docs/README.md)
 
 ## License
 

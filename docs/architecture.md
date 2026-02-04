@@ -112,6 +112,12 @@ graph TB
     Media --> FS
 ```
 
+## Plugin ABI (WIT)
+
+The WASM plugin interface contract lives in `wit/plugin.wit`. It defines the
+types, capabilities, and security expectations for plugin-host interactions and
+is the authoritative ABI spec for the plugin runtime.
+
 ## Request Flow
 
 ```mermaid

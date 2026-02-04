@@ -5,9 +5,11 @@ It’s intentionally practical: copy/paste steps, then customize.
 
 ## Prerequisites
 
-- Rust toolchain (stable)
+- A `carapace` binary on your PATH (from GitHub Releases)
 - A supported LLM provider API key (OpenAI/Anthropic/etc), or Ollama
 - Optional: TLS certs if exposing the gateway publicly
+
+If you want to build from source, see [CONTRIBUTING.md](../CONTRIBUTING.md).
 
 ## Quick Start (Local, Token Auth)
 
@@ -33,10 +35,16 @@ export CARAPACE_GATEWAY_TOKEN="$(openssl rand -hex 32)"
 3) Run the gateway:
 
 ```bash
-CARAPACE_CONFIG_PATH=./carapace.json5 cargo run
+CARAPACE_CONFIG_PATH=./carapace.json5 carapace
 ```
 
 4) Verify:
+
+```bash
+carapace status --host 127.0.0.1 --port 18789
+```
+
+Or:
 
 ```bash
 curl -H "Authorization: Bearer ${CARAPACE_GATEWAY_TOKEN}" http://localhost:18789/health
