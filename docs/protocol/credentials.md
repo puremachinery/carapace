@@ -268,8 +268,12 @@ Current behavior:
 4. On verification failure, attempt rollback to the previous value (or delete if the prior value is known absent)
 5. Update index.json only after successful write
 
-Planned improvements:
-- Support a `{key}:pending` staging key for critical credentials
+Staged rotation (implemented):
+1. Write the new value to `{key}:pending`
+2. Validate out-of-band (e.g., test the new credential)
+3. Promote with `commit_pending` (moves pending to active) or `discard_pending`
+
+Currently this is exposed via the internal credential store APIs; no CLI command is wired yet.
 
 **Failure modes:**
 - If step 2 fails: credential unchanged, operation returns error

@@ -25,8 +25,8 @@ Error formats vary by endpoint; each section calls out the exact JSON shape.
 ## Hooks
 
 Hooks are enabled only when `gateway.hooks.enabled=true`.
-The base path is `/hooks`. Configurable `gateway.hooks.path` and `gateway.hooks.maxBodyBytes`
-are planned but not wired yet in the current build.
+The base path is `/hooks` by default and is configurable via `gateway.hooks.path`.
+Max body size is configurable via `gateway.hooks.maxBodyBytes`.
 The path **must not** be `/`.
 
 ### Auth
@@ -39,7 +39,7 @@ Hooks require a **hooks token** (not gateway auth). Accepted forms:
 ### Common behavior
 - Method: **POST** only
 - Content-Type: `application/json`
-- Max body size: 256 KB (override via `gateway.hooks.maxBodyBytes` is planned)
+- Max body size: 256 KB (override via `gateway.hooks.maxBodyBytes`)
 - Errors:
   - 401 Unauthorized (token missing/mismatch)
   - 405 Method Not Allowed
@@ -119,7 +119,7 @@ validation mechanism.
 
 Common behavior:
 - Method: **POST**
-- Max body size: 256 KB (override via `gateway.hooks.maxBodyBytes` is planned)
+- Max body size: 256 KB (override via `gateway.hooks.maxBodyBytes`)
 
 ### POST `/channels/telegram/webhook`
 Telegram Bot API webhook endpoint.
@@ -145,7 +145,7 @@ Plugins can register webhook paths. The gateway routes any request under
 
 Common behavior:
 - Method: **any**
-- Max body size: 256 KB (override via `gateway.hooks.maxBodyBytes` is planned)
+- Max body size: 256 KB (override via `gateway.hooks.maxBodyBytes`)
 - Auth: **none at the gateway layer** — plugins must validate their own secrets
   (e.g., shared tokens or signatures).
 - Response: status, headers, and body are forwarded from the plugin.
@@ -256,8 +256,7 @@ Responses:
 ## Control UI
 
 The Control UI is served as static assets + SPA.
-Current base path is `/ui`. A configurable `gateway.controlUi.basePath` is planned but not
-wired yet in the current build.
+Base path is `/ui` by default and configurable via `gateway.controlUi.basePath`.
 
 ### GET/HEAD `{basePath}/...`
 - A request to `{basePath}` redirects to `{basePath}/`.

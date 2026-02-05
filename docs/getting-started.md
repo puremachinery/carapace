@@ -137,7 +137,7 @@ Enable the Control UI:
 ```
 
 Then visit `/ui` on the gateway host.
-`gateway.controlUi.basePath` is planned but not wired yet in the current build.
+You can override the base path via `gateway.controlUi.basePath`.
 
 ## Operations
 

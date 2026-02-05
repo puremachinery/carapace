@@ -136,16 +136,15 @@ This is a condensed map; refer to the JSON schema for full detail.
 
 - `gateway`
   - `port`, `mode`, `bind`, `controlUi`, `hooks`, `auth`, `trustedProxies`, `tailscale`, `remote`, `reload`, `tls`, `mtls`, `http.endpoints`, `nodes`
-  - `controlUi`: `enabled`, `path` (wired); `basePath` (planned)
+  - `controlUi`: `enabled`, `path`, `basePath`
   - `mtls` – gateway-to-gateway mTLS (`enabled`, `caCert`, `nodeCert`, `nodeKey`, `crlPath`, `requireClientCert`)
   - `remote` – outbound gateway connections (`enabled`, `authToken`, `autoReconnect`,
     `reconnectIntervalMs`, `maxReconnectAttempts`, `gateways[]`)
     - `gateways[]` entries: `name`, `url`, `fingerprint` (TOFU pin), `autoConnect`,
       optional `ssh` (`host`, `port`, `user`, `remotePort`)
 - `gateway.hooks`
-  - `enabled`, `token` (wired)
-  - `path`, `maxBodyBytes` (planned; not wired yet)
-  - Note: top-level `hooks` is legacy and ignored by the Rust gateway
+  - `enabled`, `token`, `path`, `maxBodyBytes`
+  - Note: top-level `hooks` is legacy but still supported; `gateway.hooks` wins if both are set
 - `browser`
   - `enabled`, `controlUrl`, `cdpUrl`, `profiles` (names must match `/^[a-z0-9-]+$/`)
 - `plugins`
