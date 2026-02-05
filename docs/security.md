@@ -269,7 +269,7 @@ Even with access controls, prompt injection can occur via:
 - Files the agent reads
 - Messages from "trusted" but compromised accounts
 
-**Mitigations** (implemented at agent layer, not gateway):
+**Mitigations** (agent layer, not gateway):
 - Inbound message classifier (LLM-based, off/warn/block modes) — secondary LLM
   call classifies messages for prompt injection, social engineering, instruction
   override, data exfiltration, and tool abuse before the main agent loop. Fail-open

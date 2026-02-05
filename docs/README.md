@@ -1,7 +1,6 @@
 # carapace Documentation
 
-A security-focused, open-source personal AI assistant — hardened alternative to
-openclaw / clawdbot.
+A security-focused, open-source personal AI assistant.
 
 ## Start Here
 
@@ -20,7 +19,7 @@ openclaw / clawdbot.
 - [HTTP API](protocol/http.md) — REST endpoints, hooks, OpenAI compatibility
 - [Pairing](protocol/pairing.md) — Node and device pairing flows
 - [Configuration](protocol/config.md) — Config file format, environment variables
-- [Credentials](protocol/credentials.md) — Secret storage and migration
+- [Credentials](protocol/credentials.md) — Secret storage
 - [CLI Guide](cli.md) — Subcommands, flags, and device identity notes
 
 ## Quick Links

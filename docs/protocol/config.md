@@ -1,8 +1,6 @@
 # Config File Format
 
-This document describes the config file format as implemented by the carapace
-gateway. The format is derived from the original Node.js openclaw gateway and
-is compatible on a best-effort basis (new fields and defaults may diverge).
+This document describes the config file format used by the carapace gateway.
 
 ## File Location
 
@@ -144,7 +142,6 @@ This is a condensed map; refer to the JSON schema for full detail.
       optional `ssh` (`host`, `port`, `user`, `remotePort`)
 - `gateway.hooks`
   - `enabled`, `token`, `path`, `maxBodyBytes`
-  - Note: top-level `hooks` is legacy but still supported; `gateway.hooks` wins if both are set
 - `browser`
   - `enabled`, `controlUrl`, `cdpUrl`, `profiles` (names must match `/^[a-z0-9-]+$/`)
 - `plugins`
