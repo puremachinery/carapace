@@ -13,7 +13,7 @@ Endpoints fall into two buckets:
 Gateway auth uses a bearer token in the `Authorization` header:
 
 ```
-Authorization: Bearer <token>
+Authorization: Bearer ${CARAPACE_GATEWAY_TOKEN}
 ```
 
 If gateway auth mode is `password`, the same bearer token is treated as the password.
@@ -30,9 +30,9 @@ The path **must not** be `/`.
 ### Auth
 Hooks require a **hooks token** (not gateway auth). Accepted forms:
 
-- `Authorization: Bearer <hooks-token>`
-- `X-Carapace-Token: <hooks-token>`
-- `?token=<hooks-token>` (deprecated; logs a warning)
+- `Authorization: Bearer ${CARAPACE_HOOKS_TOKEN}`
+- `X-Carapace-Token: ${CARAPACE_HOOKS_TOKEN}`
+- `?token=${CARAPACE_HOOKS_TOKEN}` (deprecated; logs a warning)
 
 ### Common behavior
 - Method: **POST** only
@@ -48,7 +48,7 @@ Hooks require a **hooks token** (not gateway auth). Accepted forms:
 Error body format for JSON parse/validation errors:
 
 ```json
-{ "ok": false, "error": "<message>" }
+{ "ok": false, "error": "{message}" }
 ```
 
 #### POST `{basePath}/wake`
@@ -94,11 +94,11 @@ Request body:
 Responses:
 - 202 Accepted
 ```json
-{ "ok": true, "runId": "<id>" }
+{ "ok": true, "runId": "{id}" }
 ```
 - 400 Bad Request (invalid payload)
 ```json
-{ "ok": false, "error": "<message>" }
+{ "ok": false, "error": "{message}" }
 ```
 
 #### POST `{basePath}/*` (hook mappings)
@@ -139,7 +139,7 @@ Slack Events API endpoint.
 ## Plugin Webhooks
 
 Plugins can register webhook paths. The gateway routes any request under
-`/plugins/<plugin-id>/...` to the owning plugin.
+`/plugins/{plugin_id}/...` to the owning plugin.
 
 Common behavior:
 - Method: **any**
@@ -148,7 +148,7 @@ Common behavior:
   (e.g., shared tokens or signatures).
 - Response: status, headers, and body are forwarded from the plugin.
 
-### `ANY /plugins/<plugin-id>/*`
+### `ANY /plugins/{plugin_id}/*`
 
 - Path is matched against the plugin’s registered webhook paths.
 - `404 Not Found` if no plugin claims the path.
@@ -177,7 +177,7 @@ Response (non-stream):
 - 200 OK
 ```json
 {
-  "id": "chatcmpl_<id>",
+  "id": "chatcmpl_{id}",
   "object": "chat.completion",
   "created": 1700000000,
   "model": "carapace",
@@ -190,7 +190,7 @@ Response (non-stream):
 
 Streaming:
 - Content-Type: `text/event-stream`
-- Emits `data: <json>` chunks
+- Emits `data: {json}` chunks
 - Terminates with `data: [DONE]`
 
 Errors:
@@ -206,7 +206,7 @@ Errors:
 ```
 - 500 Internal Server Error
 ```json
-{ "error": {"message": "<error>", "type": "api_error"} }
+{ "error": {"message": "{error}", "type": "api_error"} }
 ```
 
 ## Tools Invoke
@@ -217,10 +217,10 @@ Executes a single tool by name (when enabled).
 Auth: **gateway auth** (Bearer token/password or Tailscale Serve).
 
 Request headers:
-- `Authorization: Bearer <token>`
+- `Authorization: Bearer ${CARAPACE_GATEWAY_TOKEN}`
 - Optional policy hints:
-  - `X-Carapace-Message-Channel: <channel>`
-  - `X-Carapace-Account-Id: <accountId>`
+  - `X-Carapace-Message-Channel: {channel}`
+  - `X-Carapace-Account-Id: {account_id}`
 
 Request body:
 ```json
@@ -240,11 +240,11 @@ Responses:
 ```
 - 404 Not Found (tool not available)
 ```json
-{ "ok": false, "error": {"type": "not_found", "message": "Tool not available: <tool>"} }
+{ "ok": false, "error": {"type": "not_found", "message": "Tool not available: {tool}"} }
 ```
 - 400 Bad Request (invalid body or tool error)
 ```json
-{ "ok": false, "error": {"type": "tool_error", "message": "<message>"} }
+{ "ok": false, "error": {"type": "tool_error", "message": "{message}"} }
 ```
 - 401 Unauthorized
 ```json
@@ -254,13 +254,13 @@ Responses:
 ## Control UI
 
 The Control UI is served as static assets + SPA.
-Base path is `gateway.controlUi.basePath` (normalized to `""` or `"/path"`).
+Base path is `gateway.controlUi.basePath` (normalized to `"/path"`). If unset or empty, the
+default UI path is `/ui`.
 
 ### GET/HEAD `{basePath}/...`
-- If `basePath` is set, a request to `{basePath}` redirects to `{basePath}/`.
+- A request to `{basePath}` redirects to `{basePath}/`.
 - Assets are served from the `dist/control-ui` directory.
 - Unknown paths fall back to `index.html` for SPA routing.
-- If `basePath` is not set, `/ui` is explicitly rejected with 404.
 
 ### GET/HEAD `{basePath}/avatar/{agentId}`
 Serves local avatar file for a valid agent ID.
@@ -271,7 +271,7 @@ Serves local avatar file for a valid agent ID.
 
 Metadata response:
 ```json
-{ "avatarUrl": "<url-or-null>" }
+{ "avatarUrl": "{url-or-null}" }
 ```
 
 Errors:

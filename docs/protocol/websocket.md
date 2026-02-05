@@ -168,7 +168,9 @@ Error:
 
 Base methods (108+) plus channel plugin methods. Channel plugins may add additional methods.
 
-Note: Method dispatch is implemented in `src/server/ws/handlers/mod.rs`.
+Note: This list is a snapshot of the Rust implementation and may drift. The source of truth is
+`src/server/ws/handlers/mod.rs` (and related dispatchers). If this document and the code disagree,
+the code wins.
 
 ### Health & Status
 - `health` - Get gateway health status

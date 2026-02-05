@@ -63,7 +63,7 @@ messages.
 3) Set the webhook URL on Telegram to:
 
 ```
-https://<your-host>/channels/telegram/webhook
+https://YOUR_HOST/channels/telegram/webhook
 ```
 
 Configure Telegram to send `X-Telegram-Bot-Api-Secret-Token` with the same
@@ -84,7 +84,7 @@ messages.
 2) Enable **Events API** and set the request URL to:
 
 ```
-https://<your-host>/channels/slack/events
+https://YOUR_HOST/channels/slack/events
 ```
 
 3) Configure the Slack signing secret in carapace:

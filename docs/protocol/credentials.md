@@ -3,6 +3,14 @@
 This document describes how carapace stores secrets and how to migrate legacy
 plaintext credentials from the Node.js openclaw gateway.
 
+## Status
+
+This document mixes implemented behavior with planned design. Status tags:
+
+- **Implemented** — present in the Rust gateway today.
+- **Planned** — not implemented yet.
+- **Partially implemented** — some pieces exist; remainder is planned.
+
 ## Scope
 
 Secrets covered:
@@ -26,33 +34,33 @@ Paths below are under the platform config directory (examples use Linux
 - `~/.config/carapace/credentials/oauth.json`
   - OAuth credentials keyed by provider.
   - Loaded via `resolveOAuthPath()` and merged into auth profiles.
-- `~/.config/carapace/agents/<agentId>/agent/auth-profiles.json`
+- `~/.config/carapace/agents/{agentId}/agent/auth-profiles.json`
   - Primary auth store; contains API keys, tokens, OAuth credentials.
-- `~/.config/carapace/agents/<agentId>/agent/auth.json`
+- `~/.config/carapace/agents/{agentId}/agent/auth.json`
   - Legacy auth store (same data shape as auth profiles, older format).
 - `~/.config/carapace/credentials/github-copilot.token.json`
   - Cached GitHub Copilot API token (`token`, `expiresAt`, `updatedAt`).
-- `~/.config/carapace/credentials/whatsapp/<accountId>/creds.json`
+- `~/.config/carapace/credentials/whatsapp/{accountId}/creds.json`
   - WhatsApp Web session credentials (Baileys state).
   - Legacy default account may use `~/.config/carapace/credentials/creds.json`.
   - Additional per-session JSON files may exist in the same directory.
-- `~/.config/carapace/credentials/<channel>-pairing.json`
+- `~/.config/carapace/credentials/{channel}-pairing.json`
   - Pending pairing requests (short-lived but sensitive).
-- `~/.config/carapace/credentials/<channel>-allowFrom.json`
+- `~/.config/carapace/credentials/{channel}-allowFrom.json`
   - Allowlist entries for pairing-based channels.
 
 Notes:
 - The credentials directory can be overridden by `CARAPACE_OAUTH_DIR`.
 - The state directory can be overridden by `CARAPACE_STATE_DIR`.
 
-## Storage API (Rust)
+## Storage API (Rust) — Implemented
 
 ### Key namespace (all platforms)
 
 Use a single service/namespace for all secrets and stable account keys:
 
 - **Service name:** `carapace`
-- **Account key:** `kind:<agentId>:<id>`
+- **Account key:** `kind:{agentId}:{id}`
 
 Examples:
 - `auth-profile:main:anthropic:default`
@@ -110,7 +118,7 @@ Minimum JSON schema per secret type:
 
 - **WhatsApp Web session key**
   ```json
-  { "key": "<base64-encoded symmetric key>", "format": "v1" }
+  { "key": "{base64-encoded symmetric key}", "format": "v1" }
   ```
   The symmetric key is used to encrypt/decrypt the WhatsApp session bundle on disk.
 
@@ -120,7 +128,7 @@ Minimum JSON schema per secret type:
   ```
   Store the JSON as-is from legacy files to avoid schema drift.
 
-### Non-secret metadata (plaintext)
+### Non-secret metadata (plaintext) — Implemented
 
 To support listing and migration without relying on secret-store listing APIs:
 
@@ -131,14 +139,14 @@ To support listing and migration without relying on secret-store listing APIs:
 
 No secret fields are written to this file.
 
-## Platform Backends
+## Platform Backends — Implemented
 
 ### macOS Keychain
 
 - **Recommended crate:** `keyring` (uses Keychain on macOS)
 - **Alternative:** `security-framework` if direct API access is needed
 - **Service:** `carapace`
-- **Account:** `kind:<agentId>:<id>`
+- **Account:** `kind:{agentId}:{id}`
 - **Storage:** JSON string payloads
 
 ### Linux Keyutils (kernel keyring)
@@ -156,18 +164,18 @@ No secret fields are written to this file.
 
 - **Recommended crate:** `keyring` (uses Credential Manager on Windows)
 - **Alternative:** `windows-credentials` for direct access
-- **Target name:** `carapace:<kind>:<agentId>:<id>`
+- **Target name:** `carapace:{kind}:{agentId}:{id}`
 - **Username:** `carapace` (static)
 - **Storage:** JSON string payloads
 
-## Migration from Plaintext
+## Migration from Plaintext — Planned
 
 ### Strategy
 
 1. Locate legacy credential roots:
    - `stateDir = CARAPACE_STATE_DIR ?? ~/.config/carapace`
    - `credentialsDir = CARAPACE_OAUTH_DIR ?? ${stateDir}/credentials`
-   - `agentDir = ${stateDir}/agents/<agentId>/agent`
+   - `agentDir = ${stateDir}/agents/{agentId}/agent`
 2. Load legacy files; for each secret:
    - Write to OS secret store under the new key namespace.
    - Record the key in `credentials/index.json` (non-secret metadata).
@@ -178,26 +186,26 @@ No secret fields are written to this file.
 ### File-by-file mapping
 
 - `credentials/oauth.json`
-  - For each provider entry, create `auth-profile:<agentId>:<provider>:default`.
-- `agents/<agentId>/agent/auth-profiles.json`
-  - For each profile entry, create `auth-profile:<agentId>:<profileId>`.
+  - For each provider entry, create `auth-profile:{agentId}:{provider}:default`.
+- `agents/{agentId}/agent/auth-profiles.json`
+  - For each profile entry, create `auth-profile:{agentId}:{profileId}`.
   - Rewrite the file to remove secret fields, keeping only non-secret metadata
     (profile IDs, provider, type, order, lastGood, usageStats).
-- `agents/<agentId>/agent/auth.json` (legacy)
+- `agents/{agentId}/agent/auth.json` (legacy)
   - Same mapping as above, then delete the legacy file.
 - `credentials/github-copilot.token.json`
   - Store as `copilot:token:default`, then delete the plaintext file.
-- `credentials/whatsapp/<accountId>/...`
+- `credentials/whatsapp/{accountId}/...`
   - Generate a per-account symmetric key in the secret store:
-    `whatsapp:session-key:<accountId>`.
+    `whatsapp:session-key:{accountId}`.
   - Encrypt the WhatsApp session bundle on disk (format: `whatsapp/session.enc`).
   - Delete plaintext session files after successful encryption.
-- `credentials/<channel>-pairing.json`
-  - Store as `pairing:store:<channel>`, then delete plaintext.
-- `credentials/<channel>-allowFrom.json`
-  - Store as `pairing:allowFrom:<channel>`, then delete plaintext.
+- `credentials/{channel}-pairing.json`
+  - Store as `pairing:store:{channel}`, then delete plaintext.
+- `credentials/{channel}-allowFrom.json`
+  - Store as `pairing:allowFrom:{channel}`, then delete plaintext.
 
-### External CLI credentials (read-only)
+### External CLI credentials (read-only) — Planned
 
 The Node gateway can sync external CLI credentials from:
 - `~/.claude/.credentials.json` (Claude Code)
@@ -208,7 +216,10 @@ These files are owned by their respective CLIs. Do not delete or migrate them.
 Instead, the Rust gateway should continue to read and import them into the
 secret store (using the same `auth-profile` keys).
 
-## Edge Cases and Error Handling
+## Edge Cases and Error Handling — Partially implemented
+
+Implemented today: retry policy + backoff, index file locking, and basic credential
+store health checks. The remainder of this section is planned unless noted.
 
 ### Locked Keychain / Unavailable Secret Store
 
@@ -227,7 +238,7 @@ secret store (using the same `auth-profile` keys).
 - Log `WARN` if credentials unavailable; list which features are degraded
 - Consider adding a `cara doctor` check for credential store health
 
-### Timeout and Retry Policy
+### Timeout and Retry Policy — Implemented
 
 Keychain operations may block (e.g., waiting for user unlock prompt).
 
@@ -247,33 +258,29 @@ Keychain operations may block (e.g., waiting for user unlock prompt).
 - Access denied (permission error)
 - Keyring backend unavailable (e.g., kernel keyring disabled or unsupported)
 
-### Credential Rotation Atomicity
+### Credential Rotation Atomicity — Partially implemented
 
-When updating an existing credential:
+Current behavior:
 
-1. Read current value and store in memory
+1. Read current value (best-effort) and store in memory
 2. Write new value to secret store
 3. Verify new value can be read back
-4. If verification fails, attempt to restore old value
-5. Update index.json only after successful write
+4. Update index.json only after successful write
+
+Planned improvements:
+- Attempt rollback to the previous value on verification failure
+- Support a `{key}:pending` staging key for critical credentials
 
 **Failure modes:**
 - If step 2 fails: credential unchanged, operation returns error
-- If step 3 fails: log error, attempt rollback, return error
-- If step 4 fails (rollback fails): log CRITICAL, credential may be lost
+- If step 3 fails: log error, return error (no rollback yet)
 
-For critical credentials (gateway auth tokens), consider:
-- Writing to a new key first (`<key>:pending`)
-- Verifying the new key
-- Atomically updating the index to point to new key
-- Deleting old key
-
-### Concurrent Access
+### Concurrent Access — Implemented
 
 Multiple processes may access credentials simultaneously:
 
 **Index file (`credentials/index.json`):**
-- Use file locking (`flock`/`LockFileEx`) for writes
+- Use a lock file for writes (not OS-level `flock`/`LockFileEx`)
 - Reads do not require locks (eventual consistency acceptable)
 - Lock timeout: 5 seconds, then fail with clear error
 
@@ -284,15 +291,15 @@ Multiple processes may access credentials simultaneously:
 **Plugin credential isolation:**
 - Prefix enforcement happens in the host, not the WASM plugin
 - Even if a plugin attempts key injection (`../other-plugin:token`), the host
-  sanitizes the key and always prepends `<plugin-id>:`
+  sanitizes the key and always prepends `{plugin_id}:`
 
-### Migration Failure Recovery
+### Migration Failure Recovery — Planned
 
 Migration may fail partway through (crash, power loss, etc.).
 
 **State tracking:**
 - Create `credentials/migration.state` before starting migration
-- Record: `{ "version": 1, "startedAt": <ts>, "completed": [] }`
+- Record: `{ "version": 1, "startedAt": {ts}, "completed": [] }`
 - Append each successfully migrated key to `completed` array
 - Delete state file only after full migration success
 
@@ -305,10 +312,10 @@ Migration may fail partway through (crash, power loss, etc.).
 - After migration, verify all keys in index.json are readable
 - If any key unreadable, log WARN but continue (operator may need to re-enter)
 
-### Corruption Handling
+### Corruption Handling — Planned
 
 **Corrupted index.json:**
-- If JSON parse fails, rename to `index.json.corrupt.<timestamp>`
+- If JSON parse fails, rename to `index.json.corrupt.{timestamp}`
 - Rebuild index by scanning secret store (if platform supports listing)
 - On platforms without listing (macOS), log error; manual recovery required
 
@@ -316,13 +323,13 @@ Migration may fail partway through (crash, power loss, etc.).
 - If stored value is not valid JSON, treat as corrupt
 - Log error with key name (not value)
 - Return `None` from `credential-get`, do not crash
-- Provide `cara credential repair <key>` command for manual fix
+- Provide `cara credential repair {key}` command for manual fix
 
 **Empty or missing values:**
 - Treat empty string as "not set" (same as missing)
 - `credential-get` returns `None` for empty values
 
-### Plugin Credential Limits
+### Plugin Credential Limits — Implemented
 
 To prevent abuse by malicious or buggy plugins:
 
@@ -334,6 +341,6 @@ To prevent abuse by malicious or buggy plugins:
 | Rate limit (writes) | 10/minute per plugin | Host rejects with retryable error |
 
 **Quota tracking:**
-- Store credential count in index.json under `plugins.<id>.count`
+- Store credential count in index.json under `plugins.{id}.count`
 - Decrement on delete, increment on create
 - Rate limit tracked in memory (resets on restart)

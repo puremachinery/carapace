@@ -137,6 +137,7 @@ Enable the Control UI:
 ```
 
 Then visit `/ui` on the gateway host.
+If you set `gateway.controlUi.basePath`, use that path instead.
 
 ## Operations
 

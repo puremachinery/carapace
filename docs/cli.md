@@ -12,8 +12,8 @@ Starts the gateway server (default when no subcommand is given).
 Manage configuration values.
 
 - `config show` — print resolved config as JSON (secrets redacted).
-- `config get <key>` — read value by dot path.
-- `config set <key> <value>` — set a value (JSON interpreted, string fallback).
+- `config get {key}` — read value by dot path.
+- `config set {key} {value}` — set a value (JSON interpreted, string fallback).
 - `config path` — print the config file path.
 
 ### status
@@ -86,7 +86,7 @@ If nothing is found, local-direct access may still work when configured.
 The CLI generates and stores a device identity for WebSocket access:
 
 - Stored in the OS credential store when available.
-- Legacy on-disk fallback: `<config dir>/device-identity.json` (e.g.
+- Legacy on-disk fallback: `{config_dir}/device-identity.json` (e.g.
   `~/.config/carapace/device-identity.json` on Linux; owner-only perms).
 - A gateway-issued `connect.challenge` nonce is signed and sent in `connect`.
 
