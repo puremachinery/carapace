@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as IoWrite;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
@@ -411,37 +411,136 @@ impl<B: CredentialBackend> CredentialStore<B> {
         self.env_only_mode
     }
 
-    /// Load or create the credential index
-    fn load_or_create_index(path: &PathBuf) -> Result<CredentialIndex, CredentialError> {
-        if !path.exists() {
-            return Ok(CredentialIndex::new());
-        }
+    fn backup_path(path: &Path) -> PathBuf {
+        path.with_extension("json.bak")
+    }
 
-        let content =
-            fs::read_to_string(path).map_err(|e| CredentialError::IoError(e.to_string()))?;
+    fn corrupt_path(path: &Path) -> PathBuf {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        path.with_extension(format!("corrupt.{}", timestamp))
+    }
 
-        match serde_json::from_str::<CredentialIndex>(&content) {
-            Ok(index) => Ok(index),
-            Err(e) => {
-                // Corrupted index - rename and create new
-                let timestamp = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_millis())
-                    .unwrap_or(0);
-                let corrupt_path = path.with_extension(format!("corrupt.{}", timestamp));
+    fn recalculate_plugin_quotas(index: &mut CredentialIndex) {
+        let mut quotas: HashMap<String, PluginQuota> = HashMap::new();
+        for entry in index.entries.values() {
+            let plugin_key = if let Some(provider) = &entry.provider {
+                if provider.starts_with("plugin:") {
+                    Some(provider.clone())
+                } else {
+                    None
+                }
+            } else if entry.key.kind.starts_with("plugin:") {
+                Some(entry.key.kind.clone())
+            } else {
+                None
+            };
 
-                tracing::warn!(
-                    "Credential index corrupted ({}), moving to {:?}",
-                    e,
-                    corrupt_path
-                );
-
-                fs::rename(path, &corrupt_path)
-                    .map_err(|e| CredentialError::IoError(e.to_string()))?;
-
-                Ok(CredentialIndex::new())
+            if let Some(plugin_key) = plugin_key {
+                let quota = quotas.entry(plugin_key).or_default();
+                quota.count += 1;
             }
         }
+        index.plugins = quotas;
+    }
+
+    fn load_index_file(path: &Path) -> Result<CredentialIndex, CredentialError> {
+        let content =
+            fs::read_to_string(path).map_err(|e| CredentialError::IoError(e.to_string()))?;
+        let mut index: CredentialIndex = serde_json::from_str(&content)
+            .map_err(|e| CredentialError::JsonError(e.to_string()))?;
+
+        if index.version != CredentialIndex::VERSION {
+            tracing::warn!(
+                found = index.version,
+                expected = CredentialIndex::VERSION,
+                "Credential index version mismatch"
+            );
+            return Err(CredentialError::IndexCorrupted);
+        }
+
+        let mut removed = 0usize;
+        index.entries.retain(|account_key, entry| {
+            let expected = entry.key.to_account_key();
+            let valid = account_key == &expected;
+            if !valid {
+                removed += 1;
+            }
+            valid
+        });
+
+        if removed > 0 {
+            tracing::warn!(removed, "Removed invalid credential index entries");
+        }
+
+        Self::recalculate_plugin_quotas(&mut index);
+
+        Ok(index)
+    }
+
+    /// Load or create the credential index
+    fn load_or_create_index(path: &PathBuf) -> Result<CredentialIndex, CredentialError> {
+        let backup_path = Self::backup_path(path);
+
+        if path.exists() {
+            match Self::load_index_file(path) {
+                Ok(index) => return Ok(index),
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "Credential index invalid; attempting recovery"
+                    );
+                }
+            }
+        }
+
+        if backup_path.exists() {
+            match Self::load_index_file(&backup_path) {
+                Ok(index) => {
+                    tracing::warn!(
+                        "Restoring credential index from backup at {:?}",
+                        backup_path
+                    );
+
+                    if path.exists() {
+                        let corrupt_path = Self::corrupt_path(path);
+                        if let Err(err) = fs::rename(path, &corrupt_path) {
+                            tracing::warn!(
+                                error = %err,
+                                "Failed to move corrupted index to {:?}",
+                                corrupt_path
+                            );
+                        }
+                    }
+
+                    if let Err(err) = fs::copy(&backup_path, path) {
+                        tracing::warn!(
+                            error = %err,
+                            "Failed to restore index backup to {:?}",
+                            path
+                        );
+                    }
+
+                    return Ok(index);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "Credential index backup invalid; starting fresh"
+                    );
+                }
+            }
+        }
+
+        if path.exists() {
+            let corrupt_path = Self::corrupt_path(path);
+            tracing::warn!("Credential index corrupted, moving to {:?}", corrupt_path);
+            fs::rename(path, &corrupt_path).map_err(|e| CredentialError::IoError(e.to_string()))?;
+        }
+
+        Ok(CredentialIndex::new())
     }
 
     /// Save the index with file locking
@@ -495,6 +594,17 @@ impl<B: CredentialBackend> CredentialStore<B> {
         // Write the file atomically
         let temp_path = self.index_path.with_extension("tmp");
         let result = (|| {
+            let backup_path = Self::backup_path(&self.index_path);
+            if self.index_path.exists() {
+                if let Err(err) = fs::copy(&self.index_path, &backup_path) {
+                    tracing::warn!(
+                        error = %err,
+                        "Failed to write credential index backup to {:?}",
+                        backup_path
+                    );
+                }
+            }
+
             let mut file =
                 File::create(&temp_path).map_err(|e| CredentialError::IoError(e.to_string()))?;
             IoWrite::write_all(&mut file, content.as_bytes())
@@ -503,6 +613,16 @@ impl<B: CredentialBackend> CredentialStore<B> {
                 .map_err(|e| CredentialError::IoError(e.to_string()))?;
             fs::rename(&temp_path, &self.index_path)
                 .map_err(|e| CredentialError::IoError(e.to_string()))?;
+
+            if !backup_path.exists() {
+                if let Err(err) = fs::copy(&self.index_path, &backup_path) {
+                    tracing::warn!(
+                        error = %err,
+                        "Failed to create initial credential index backup at {:?}",
+                        backup_path
+                    );
+                }
+            }
             Ok(())
         })();
 
@@ -1055,9 +1175,25 @@ mod tests {
         let creds_dir = temp_dir.path().join("credentials");
         fs::create_dir_all(&creds_dir).unwrap();
 
-        // Write corrupted index
         let index_path = creds_dir.join("index.json");
+        let backup_path = creds_dir.join("index.json.bak");
+
+        // Write corrupted index
         fs::write(&index_path, "{ invalid json }").unwrap();
+
+        // Write a valid backup
+        let key = CredentialKey::new("test", "agent", "id");
+        let mut index = CredentialIndex::new();
+        index.entries.insert(
+            key.to_account_key(),
+            IndexEntry {
+                key: key.clone(),
+                provider: None,
+                last_updated: 1,
+            },
+        );
+        let content = serde_json::to_string_pretty(&index).unwrap();
+        fs::write(&backup_path, content).unwrap();
 
         // Create store - should recover
         let backend = mock_backend();
@@ -1065,11 +1201,38 @@ mod tests {
             .await
             .unwrap();
 
-        // Should work normally
-        let key = CredentialKey::new("test", "agent", "id");
-        store.set(&key, "value", None).await.unwrap();
+        let keys = store.list_keys().await;
+        assert!(keys.iter().any(|k| k.to_account_key() == "test:agent:id"));
 
         // Check that corrupt file was renamed
+        let entries: Vec<_> = fs::read_dir(&creds_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("index.corrupt.")
+            })
+            .collect();
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_corrupted_index_without_backup() {
+        let temp_dir = tempdir().unwrap();
+        let creds_dir = temp_dir.path().join("credentials");
+        fs::create_dir_all(&creds_dir).unwrap();
+
+        let index_path = creds_dir.join("index.json");
+        fs::write(&index_path, "{ invalid json }").unwrap();
+
+        let backend = mock_backend();
+        let store = CredentialStore::new(backend, temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
+
+        assert!(store.list_keys().await.is_empty());
+
         let entries: Vec<_> = fs::read_dir(&creds_dir)
             .unwrap()
             .filter_map(|e| e.ok())
