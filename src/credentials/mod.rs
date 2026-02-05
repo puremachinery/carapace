@@ -546,7 +546,22 @@ impl<B: CredentialBackend> CredentialStore<B> {
         }
 
         // Read-write-verify pattern for atomicity
-        let _old_value = self.backend.get_raw(key).await.ok().flatten();
+        let prior_value = self
+            .with_retry(&RetryPolicy::for_get(), || async {
+                self.backend.get_raw(key).await
+            })
+            .await;
+        let (old_value, old_value_known) = match prior_value {
+            Ok(value) => (value, true),
+            Err(err) => {
+                tracing::warn!(
+                    key = %key,
+                    error = %err,
+                    "Failed to read existing credential before write; rollback may be limited"
+                );
+                (None, false)
+            }
+        };
 
         // Write new value with retry
         self.with_retry(&RetryPolicy::for_set(), || async {
@@ -557,12 +572,42 @@ impl<B: CredentialBackend> CredentialStore<B> {
         // Verify the write succeeded
         let verified = self.backend.get_raw(key).await?;
         if verified.as_deref() != Some(value) {
-            // Attempt to restore old value (best effort)
-            // Note: if this fails, the credential may be lost (logged as CRITICAL in caller)
-            tracing::error!(
-                key = %key,
-                "Credential verification failed after write"
-            );
+            tracing::error!(key = %key, "Credential verification failed after write");
+
+            // Attempt to restore old value (best effort).
+            if let Some(previous) = old_value {
+                if let Err(err) = self
+                    .with_retry(&RetryPolicy::for_set(), || async {
+                        self.backend.set_raw(key, &previous).await
+                    })
+                    .await
+                {
+                    tracing::error!(
+                        key = %key,
+                        error = %err,
+                        "Credential rollback failed; credential may be lost"
+                    );
+                }
+            } else if old_value_known {
+                if let Err(err) = self
+                    .with_retry(&RetryPolicy::for_delete(), || async {
+                        self.backend.delete_raw(key).await
+                    })
+                    .await
+                {
+                    tracing::error!(
+                        key = %key,
+                        error = %err,
+                        "Credential rollback delete failed; credential may be lost"
+                    );
+                }
+            } else {
+                tracing::warn!(
+                    key = %key,
+                    "Skipping rollback delete because prior value is unknown"
+                );
+            }
+
             return Err(CredentialError::VerificationFailed);
         }
 

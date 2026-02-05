@@ -258,22 +258,22 @@ Keychain operations may block (e.g., waiting for user unlock prompt).
 - Access denied (permission error)
 - Keyring backend unavailable (e.g., kernel keyring disabled or unsupported)
 
-### Credential Rotation Atomicity — Partially implemented
+### Credential Rotation Atomicity — Implemented (rollback best-effort)
 
 Current behavior:
 
 1. Read current value (best-effort) and store in memory
 2. Write new value to secret store
 3. Verify new value can be read back
-4. Update index.json only after successful write
+4. On verification failure, attempt rollback to the previous value (or delete if the prior value is known absent)
+5. Update index.json only after successful write
 
 Planned improvements:
-- Attempt rollback to the previous value on verification failure
 - Support a `{key}:pending` staging key for critical credentials
 
 **Failure modes:**
 - If step 2 fails: credential unchanged, operation returns error
-- If step 3 fails: log error, return error (no rollback yet)
+- If step 3 fails: log error, attempt rollback, return error (skip delete if prior value is unknown)
 
 ### Concurrent Access — Implemented
 
@@ -312,12 +312,15 @@ Migration may fail partway through (crash, power loss, etc.).
 - After migration, verify all keys in index.json are readable
 - If any key unreadable, log WARN but continue (operator may need to re-enter)
 
-### Corruption Handling — Planned
+### Corruption Handling — Partially implemented
 
-**Corrupted index.json:**
+**Corrupted index.json (implemented):**
 - If JSON parse fails, rename to `index.json.corrupt.{timestamp}`
+- Create a new empty index
+
+**Planned:**
 - Rebuild index by scanning secret store (if platform supports listing)
-- On platforms without listing (macOS), log error; manual recovery required
+- On platforms without listing (macOS), document manual recovery workflow
 
 **Invalid JSON in secret store:**
 - If stored value is not valid JSON, treat as corrupt
