@@ -315,8 +315,11 @@ Migration may fail partway through (crash, power loss, etc.).
 ### Corruption Handling — Partially implemented
 
 **Corrupted index.json (implemented):**
-- If JSON parse fails, rename to `index.json.corrupt.{timestamp}`
-- Create a new empty index
+- If JSON parse or validation fails, attempt to restore from `index.json.bak`
+- If backup is valid, restore it to `index.json`
+- If no valid backup exists, rename to `index.corrupt.{timestamp}` and create a new empty index
+- On each save, write a best-effort backup of the previous index to `index.json.bak`
+- On the first save, create a backup from the new index if none exists
 
 **Planned:**
 - Rebuild index by scanning secret store (if platform supports listing)
