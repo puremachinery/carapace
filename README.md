@@ -48,11 +48,29 @@ See [docs/security.md](docs/security.md) for the full security model.
 - [CLI guide](docs/cli.md) — subcommands, flags, and device identity
 - [Documentation index](docs/README.md) — architecture, protocol, security
 
+## Status (Preview)
+
+This project is in preview. Automated tests cover core paths, but manual smoke tests are still
+in progress. Expect gaps and sharp edges.
+
+Known working paths (automated tests; manual smoke tests pending):
+
+- WebSocket protocol handlers (golden trace tests)
+- OpenAI-compatible HTTP endpoints (`/v1/chat/completions`, `/v1/responses`)
+- Ollama provider integration
+- Config loading, defaults, and validation
+
+Not yet verified (manual smoke tests pending):
+
+- Public internet deployments (TLS/mTLS, reverse proxy, auth hardening)
+- End-to-end channel flows (Signal/Telegram/Discord/Slack) in real environments
+- Control UI across browsers
+
 ## Install
 
-### Prebuilt binaries (GitHub Releases)
+### Prebuilt binaries (coming soon)
 
-Download the matching binary from the GitHub Releases page:
+Releases are not published yet. For now, build from source. Planned release artifacts:
 
 - `cara-x86_64-linux`
 - `cara-aarch64-linux`
@@ -60,7 +78,8 @@ Download the matching binary from the GitHub Releases page:
 - `cara-aarch64-darwin`
 - `cara-x86_64-windows.exe`
 
-Optionally verify with cosign (signatures and certificates are published alongside each release):
+When releases land, you can verify with cosign (signatures and certificates will be published
+alongside each release):
 
 ```bash
 cosign verify-blob \
@@ -69,6 +88,13 @@ cosign verify-blob \
   --certificate-identity-regexp "https://github.com/puremachinery/carapace/.github/workflows/release.yml@refs/tags/v.*" \
   --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
   cara-x86_64-linux
+```
+
+### Build from source (current)
+
+```bash
+cargo build --release
+./target/release/cara --help
 ```
 
 ### Install (macOS/Linux, manual)
@@ -98,7 +124,7 @@ If you cloned the repo, the install script copies the binary into place:
 sudo ./scripts/install.sh --binary ./cara-x86_64-linux
 ```
 
-If you downloaded only the release binary, use the manual steps above.
+If you have a release binary (once available), use the manual steps above.
 
 ### Install helper (Windows PowerShell)
 
@@ -108,7 +134,7 @@ If you cloned the repo, the install script copies the binary into place:
 .\scripts\install.ps1 -BinaryPath .\cara-x86_64-windows.exe
 ```
 
-If you downloaded only the release binary, use the manual steps above.
+If you have a release binary (once available), use the manual steps above.
 
 ## Getting Started
 
