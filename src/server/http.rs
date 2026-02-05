@@ -127,7 +127,8 @@ pub fn build_http_config(cfg: &Value) -> Result<HttpConfig, String> {
 
     let hooks_obj = gateway
         .and_then(|g| g.get("hooks"))
-        .and_then(|v| v.as_object());
+        .and_then(|v| v.as_object())
+        .or_else(|| cfg.get("hooks").and_then(|v| v.as_object()));
     let auth_obj = gateway
         .and_then(|g| g.get("auth"))
         .and_then(|v| v.as_object());
@@ -159,6 +160,19 @@ pub fn build_http_config(cfg: &Value) -> Result<HttpConfig, String> {
         .and_then(|h| h.get("token"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+
+    let hooks_path = hooks_obj
+        .and_then(|h| h.get("path"))
+        .and_then(|v| v.as_str())
+        .map(normalize_hooks_path)
+        .unwrap_or_else(|| DEFAULT_HOOKS_PATH.to_string());
+
+    let hooks_max_body_bytes = hooks_obj
+        .and_then(|h| h.get("maxBodyBytes"))
+        .and_then(|v| v.as_u64())
+        .and_then(|v| usize::try_from(v).ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_MAX_BODY_BYTES);
 
     // Auth: env vars take precedence over config
     let cfg_token = auth_obj
@@ -217,6 +231,11 @@ pub fn build_http_config(cfg: &Value) -> Result<HttpConfig, String> {
         .and_then(|v| v.as_str())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("dist/control-ui"));
+    let control_ui_base_path = control_ui_obj
+        .and_then(|c| c.get("basePath"))
+        .and_then(|v| v.as_str())
+        .map(normalize_control_ui_base_path)
+        .unwrap_or_default();
 
     let openai_chat_completions_enabled = openai_obj
         .and_then(|o| o.get("chatCompletions"))
@@ -236,11 +255,14 @@ pub fn build_http_config(cfg: &Value) -> Result<HttpConfig, String> {
     Ok(HttpConfig {
         hooks_token,
         hooks_enabled,
+        hooks_path,
+        hooks_max_body_bytes,
         gateway_token,
         gateway_password,
         gateway_auth_mode: resolved_auth_mode,
         gateway_allow_tailscale: allow_tailscale,
         trusted_proxies,
+        control_ui_base_path,
         control_ui_enabled,
         control_ui_dist_path,
         openai_chat_completions_enabled,
@@ -356,7 +378,7 @@ pub fn create_router_with_middleware(
 /// Create the HTTP router with custom registries
 pub fn create_router_with_state(
     config: HttpConfig,
-    middleware_config: MiddlewareConfig,
+    mut middleware_config: MiddlewareConfig,
     hook_registry: Arc<HookRegistry>,
     tools_registry: Arc<ToolsRegistry>,
     channel_registry: Arc<ChannelRegistry>,
@@ -400,6 +422,16 @@ pub fn create_router_with_state(
     };
 
     let mut router: Router<AppState> = Router::new();
+
+    let hooks_prefix = format!("{}/", normalize_hooks_path(&config.hooks_path));
+    let default_hooks_prefix = format!("{}/", DEFAULT_HOOKS_PATH);
+    if hooks_prefix != default_hooks_prefix {
+        for limit in &mut middleware_config.rate_limit.route_limits {
+            if limit.prefix == default_hooks_prefix {
+                limit.prefix = hooks_prefix.clone();
+            }
+        }
+    }
 
     // Hooks routes (when enabled)
     if config.hooks_enabled {
@@ -605,6 +637,23 @@ fn normalize_hooks_path(path: &str) -> String {
     if trimmed.is_empty() || trimmed == "/" {
         return "/hooks".to_string();
     }
+    let mut result = trimmed.to_string();
+    if !result.starts_with('/') {
+        result = format!("/{}", result);
+    }
+    if result.ends_with('/') {
+        result.pop();
+    }
+    result
+}
+
+/// Normalize control UI base path (empty string uses default /ui).
+fn normalize_control_ui_base_path(path: &str) -> String {
+    let trimmed = path.trim();
+    if trimmed.is_empty() || trimmed == "/" {
+        return String::new();
+    }
+
     let mut result = trimmed.to_string();
     if !result.starts_with('/') {
         result = format!("/{}", result);
@@ -2069,6 +2118,16 @@ mod tests {
         assert_eq!(normalize_hooks_path(""), "/hooks");
         assert_eq!(normalize_hooks_path("/"), "/hooks");
         assert_eq!(normalize_hooks_path("  /api  "), "/api");
+    }
+
+    #[test]
+    fn test_normalize_control_ui_base_path() {
+        assert_eq!(normalize_control_ui_base_path(""), "");
+        assert_eq!(normalize_control_ui_base_path("/"), "");
+        assert_eq!(normalize_control_ui_base_path("ui"), "/ui");
+        assert_eq!(normalize_control_ui_base_path("/ui/"), "/ui");
+        assert_eq!(normalize_control_ui_base_path("/admin/ui"), "/admin/ui");
+        assert_eq!(normalize_control_ui_base_path("  /admin  "), "/admin");
     }
 
     #[test]

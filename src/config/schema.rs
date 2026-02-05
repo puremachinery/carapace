@@ -215,6 +215,76 @@ fn validate_gateway(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schem
             check_positive_number(burst, ".gateway.ws.messageBurst", issues);
         }
     }
+
+    // .gateway.hooks sub-section
+    if let Some(hooks) = gateway.get("hooks").and_then(|v| v.as_object()) {
+        if let Some(max_bytes) = hooks.get("maxBodyBytes") {
+            check_positive_integer(max_bytes, ".gateway.hooks.maxBodyBytes", issues);
+        }
+
+        if let Some(enabled) = hooks.get("enabled") {
+            if !enabled.is_boolean() {
+                issues.push(SchemaIssue {
+                    severity: Severity::Warning,
+                    path: ".gateway.hooks.enabled".to_string(),
+                    message: "enabled must be a boolean".to_string(),
+                });
+            }
+        }
+
+        if let Some(path) = hooks.get("path") {
+            if !path.is_string() {
+                issues.push(SchemaIssue {
+                    severity: Severity::Warning,
+                    path: ".gateway.hooks.path".to_string(),
+                    message: "path must be a string".to_string(),
+                });
+            }
+        }
+
+        if let Some(token) = hooks.get("token") {
+            if !token.is_string() {
+                issues.push(SchemaIssue {
+                    severity: Severity::Warning,
+                    path: ".gateway.hooks.token".to_string(),
+                    message: "token must be a string".to_string(),
+                });
+            }
+        }
+    }
+
+    // .gateway.controlUi sub-section
+    if let Some(control_ui) = gateway.get("controlUi").and_then(|v| v.as_object()) {
+        if let Some(enabled) = control_ui.get("enabled") {
+            if !enabled.is_boolean() {
+                issues.push(SchemaIssue {
+                    severity: Severity::Warning,
+                    path: ".gateway.controlUi.enabled".to_string(),
+                    message: "enabled must be a boolean".to_string(),
+                });
+            }
+        }
+
+        if let Some(path) = control_ui.get("path") {
+            if !path.is_string() {
+                issues.push(SchemaIssue {
+                    severity: Severity::Warning,
+                    path: ".gateway.controlUi.path".to_string(),
+                    message: "path must be a string".to_string(),
+                });
+            }
+        }
+
+        if let Some(base_path) = control_ui.get("basePath") {
+            if !base_path.is_string() {
+                issues.push(SchemaIssue {
+                    severity: Severity::Warning,
+                    path: ".gateway.controlUi.basePath".to_string(),
+                    message: "basePath must be a string".to_string(),
+                });
+            }
+        }
+    }
 }
 
 fn validate_hooks(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIssue>) {
