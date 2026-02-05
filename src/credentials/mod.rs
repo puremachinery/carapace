@@ -41,6 +41,9 @@ pub const MAX_CREDENTIALS_PER_PLUGIN: usize = 100;
 /// Rate limit for writes per plugin (per minute)
 pub const WRITE_RATE_LIMIT_PER_MINUTE: usize = 10;
 
+/// Suffix used for staged credential rotation.
+const PENDING_SUFFIX: &str = ":pending";
+
 /// Credential store errors
 #[derive(Debug, Clone, PartialEq)]
 pub enum CredentialError {
@@ -423,6 +426,20 @@ impl<B: CredentialBackend> CredentialStore<B> {
         path.with_extension(format!("corrupt.{}", timestamp))
     }
 
+    fn pending_key_for(key: &CredentialKey) -> Result<CredentialKey, CredentialError> {
+        if key.id.ends_with(PENDING_SUFFIX) {
+            return Err(CredentialError::Internal(
+                "pending key cannot be staged again".to_string(),
+            ));
+        }
+
+        Ok(CredentialKey {
+            kind: key.kind.clone(),
+            agent_id: key.agent_id.clone(),
+            id: format!("{}{}", key.id, PENDING_SUFFIX),
+        })
+    }
+
     fn recalculate_plugin_quotas(index: &mut CredentialIndex) {
         let mut quotas: HashMap<String, PluginQuota> = HashMap::new();
         for entry in index.entries.values() {
@@ -748,6 +765,140 @@ impl<B: CredentialBackend> CredentialStore<B> {
         self.save_index().await?;
 
         Ok(())
+    }
+
+    /// Stage a credential update under a pending key.
+    pub async fn set_pending(
+        &self,
+        key: &CredentialKey,
+        value: &str,
+        provider: Option<String>,
+    ) -> Result<(), CredentialError> {
+        let pending_key = Self::pending_key_for(key)?;
+        self.set(&pending_key, value, provider).await
+    }
+
+    /// Get a staged credential value (if any).
+    pub async fn get_pending(
+        &self,
+        key: &CredentialKey,
+    ) -> Result<Option<String>, CredentialError> {
+        let pending_key = Self::pending_key_for(key)?;
+        self.get(&pending_key).await
+    }
+
+    /// Promote a staged credential into the active key.
+    pub async fn commit_pending(
+        &self,
+        key: &CredentialKey,
+        provider: Option<String>,
+    ) -> Result<(), CredentialError> {
+        if self.env_only_mode {
+            return Err(CredentialError::StoreUnavailable(
+                "Operating in env-only mode".to_string(),
+            ));
+        }
+
+        let pending_key = Self::pending_key_for(key)?;
+        let pending_value = self.get(&pending_key).await?;
+        let Some(pending_value) = pending_value else {
+            let mut index = self.index.write().await;
+            let removed = index
+                .entries
+                .remove(&pending_key.to_account_key())
+                .is_some();
+            drop(index);
+            if removed {
+                if let Err(err) = self.save_index().await {
+                    tracing::warn!(
+                        key = %pending_key,
+                        error = %err,
+                        "Failed to prune pending index entry after missing commit"
+                    );
+                }
+            }
+            return Err(CredentialError::NotFound);
+        };
+
+        let (pending_provider, existing_provider) = {
+            let index = self.index.read().await;
+            (
+                index
+                    .entries
+                    .get(&pending_key.to_account_key())
+                    .and_then(|entry| entry.provider.clone()),
+                index
+                    .entries
+                    .get(&key.to_account_key())
+                    .and_then(|entry| entry.provider.clone()),
+            )
+        };
+
+        let resolved_provider = provider.or(pending_provider).or(existing_provider);
+
+        self.set(key, &pending_value, resolved_provider).await?;
+
+        if let Err(err) = self.delete(&pending_key).await {
+            match err {
+                CredentialError::NotFound => {
+                    let mut index = self.index.write().await;
+                    index.entries.remove(&pending_key.to_account_key());
+                    drop(index);
+                    if let Err(err) = self.save_index().await {
+                        tracing::warn!(
+                            key = %pending_key,
+                            error = %err,
+                            "Failed to prune pending index entry after commit"
+                        );
+                    }
+                }
+                _ => {
+                    tracing::warn!(
+                        key = %pending_key,
+                        error = %err,
+                        "Failed to delete pending credential after commit"
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Discard a staged credential update if it exists.
+    pub async fn discard_pending(&self, key: &CredentialKey) -> Result<(), CredentialError> {
+        if self.env_only_mode {
+            return Err(CredentialError::StoreUnavailable(
+                "Operating in env-only mode".to_string(),
+            ));
+        }
+
+        let pending_key = Self::pending_key_for(key)?;
+        let pending_value = self.get(&pending_key).await?;
+        if pending_value.is_none() {
+            let mut index = self.index.write().await;
+            let removed = index
+                .entries
+                .remove(&pending_key.to_account_key())
+                .is_some();
+            drop(index);
+            if removed {
+                let _ = self.save_index().await;
+            }
+            return Ok(());
+        }
+
+        match self.delete(&pending_key).await {
+            Ok(()) => Ok(()),
+            Err(CredentialError::NotFound) => {
+                let mut index = self.index.write().await;
+                index.entries.remove(&pending_key.to_account_key());
+                drop(index);
+                let _ = self.save_index().await;
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// Delete a credential with retry logic
@@ -1349,6 +1500,128 @@ mod tests {
 
         let result = store.set(&key, &long_value, None).await;
         assert!(matches!(result, Err(CredentialError::ValueTooLong)));
+    }
+
+    #[tokio::test]
+    async fn test_pending_rotation_commit() {
+        let temp_dir = tempdir().unwrap();
+        let backend = mock_backend();
+        let store = CredentialStore::new(backend, temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
+
+        let key = CredentialKey::new("gateway", "token", "default");
+        store.set(&key, "old", None).await.unwrap();
+        store.set_pending(&key, "new", None).await.unwrap();
+
+        let current = store.get(&key).await.unwrap();
+        assert_eq!(current, Some("old".to_string()));
+
+        let pending = store.get_pending(&key).await.unwrap();
+        assert_eq!(pending, Some("new".to_string()));
+
+        store.commit_pending(&key, None).await.unwrap();
+
+        let current = store.get(&key).await.unwrap();
+        assert_eq!(current, Some("new".to_string()));
+
+        let pending = store.get_pending(&key).await.unwrap();
+        assert_eq!(pending, None);
+    }
+
+    #[tokio::test]
+    async fn test_pending_rotation_missing() {
+        let temp_dir = tempdir().unwrap();
+        let backend = mock_backend();
+        let store = CredentialStore::new(backend, temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
+
+        let key = CredentialKey::new("gateway", "token", "default");
+        let result = store.commit_pending(&key, None).await;
+        assert!(matches!(result, Err(CredentialError::NotFound)));
+    }
+
+    #[tokio::test]
+    async fn test_pending_key_rejected() {
+        let temp_dir = tempdir().unwrap();
+        let backend = mock_backend();
+        let store = CredentialStore::new(backend, temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
+
+        let key = CredentialKey::new("gateway", "token", "default:pending");
+        let result = store.set_pending(&key, "value", None).await;
+        assert!(matches!(result, Err(CredentialError::Internal(_))));
+    }
+
+    #[tokio::test]
+    async fn test_commit_pending_preserves_provider() {
+        let temp_dir = tempdir().unwrap();
+        let backend = mock_backend();
+        let store = CredentialStore::new(backend, temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
+
+        let key = CredentialKey::new("gateway", "token", "default");
+        store
+            .set(&key, "old", Some("provider-x".to_string()))
+            .await
+            .unwrap();
+        store.set_pending(&key, "new", None).await.unwrap();
+
+        store.commit_pending(&key, None).await.unwrap();
+
+        let index = store.index.read().await;
+        let entry = index.entries.get(&key.to_account_key()).unwrap();
+        assert_eq!(entry.provider.as_deref(), Some("provider-x"));
+    }
+
+    #[tokio::test]
+    async fn test_commit_pending_prunes_stale_index() {
+        let temp_dir = tempdir().unwrap();
+        let backend = mock_backend();
+        let store = CredentialStore::new(backend, temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
+
+        let key = CredentialKey::new("gateway", "token", "default");
+        store.set_pending(&key, "new", None).await.unwrap();
+
+        let pending_key = CredentialKey::new(
+            key.kind.clone(),
+            key.agent_id.clone(),
+            format!("{}{}", key.id, PENDING_SUFFIX),
+        );
+        store.backend.delete_raw(&pending_key).await.unwrap();
+
+        let result = store.commit_pending(&key, None).await;
+        assert!(matches!(result, Err(CredentialError::NotFound)));
+
+        let index = store.index.read().await;
+        assert!(!index.entries.contains_key(&pending_key.to_account_key()));
+    }
+
+    #[tokio::test]
+    async fn test_pending_rotation_env_only_mode() {
+        let temp_dir = tempdir().unwrap();
+        let backend = MockCredentialBackend::new(false);
+        let store = CredentialStore::new(backend, temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
+
+        let key = CredentialKey::new("gateway", "token", "default");
+        let commit_result = store.commit_pending(&key, None).await;
+        assert!(matches!(
+            commit_result,
+            Err(CredentialError::StoreUnavailable(_))
+        ));
+
+        let discard_result = store.discard_pending(&key).await;
+        assert!(matches!(
+            discard_result,
+            Err(CredentialError::StoreUnavailable(_))
+        ));
     }
 
     #[tokio::test]
