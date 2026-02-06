@@ -286,13 +286,13 @@ The control UI (`/control/*` endpoints) requires:
 - CSRF protection (double-submit cookie with `__Host-` prefix, `SameSite=Strict`, origin/host validation)
 - Protected config paths blocked from modification:
   - `gateway.auth.*`
-  - `hooks.token`
+  - `gateway.hooks.token`
   - `credentials.*`
   - `secrets.*`
 
 ```rust
 // From src/server/control.rs
-let blocked_prefixes = ["gateway.auth", "hooks.token", "credentials", "secrets"];
+let blocked_prefixes = ["gateway.auth", "gateway.hooks.token", "credentials", "secrets"];
 for prefix in blocked_prefixes {
     if req.path.starts_with(prefix) {
         return Err(forbidden("Cannot modify protected configuration"));

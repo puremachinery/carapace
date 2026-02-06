@@ -33,7 +33,7 @@ Carapace is hardened against every major vulnerability class reported in the Jan
 |---|---|
 | Unauthenticated access | Denied by default when credentials configured; CSRF-protected control endpoints |
 | Exposed network ports | Localhost-only binding (127.0.0.1) |
-| Plaintext secret storage | AES-256-GCM encryption at rest with PBKDF2 key derivation |
+| Plaintext secret storage | OS credential store (Keychain / Keyutils / Credential Manager) with AES-256-GCM fallback |
 | Skills supply chain | Ed25519 signatures + WASM capability sandbox + resource limits |
 | Prompt injection | Prompt guard + inbound classifier + exec approval flow + tool policies |
 | No process sandboxing | Seatbelt / Landlock / rlimits primitives implemented; subprocess wiring in progress |
