@@ -12,7 +12,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 axum = { version = "0.8", features = ["ws"] }
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
-reqwest = { version = "0.12", features = ["rustls-tls", "stream", "json", "blocking", "multipart"], default-features = false }
+reqwest = { version = "0.13", features = ["rustls", "stream", "json", "blocking", "multipart", "form"], default-features = false }
 hickory-resolver = "0.24"
 url = "2"
 serde = { version = "1", features = ["derive"] }
