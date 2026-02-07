@@ -2889,7 +2889,7 @@ enum InboundText {
 
 fn message_to_text(msg: Message) -> Result<InboundText, &'static str> {
     match msg {
-        Message::Text(text) => Ok(InboundText::Text(text)),
+        Message::Text(text) => Ok(InboundText::Text(text.to_string())),
         Message::Binary(_) => Err("binary messages not supported"),
         Message::Close(_) => Ok(InboundText::Close),
         Message::Ping(_) | Message::Pong(_) => Ok(InboundText::Control),
@@ -2907,13 +2907,13 @@ fn error_shape(code: &'static str, message: &str, details: Option<Value>) -> Err
 
 fn send_json<T: Serialize>(tx: &mpsc::UnboundedSender<Message>, payload: &T) -> Result<(), ()> {
     let text = serde_json::to_string(payload).map_err(|_| ())?;
-    tx.send(Message::Text(text)).map_err(|_| ())
+    tx.send(Message::Text(text.into())).map_err(|_| ())
 }
 
 /// Send a pre-serialized JSON string as a WebSocket text message.
 /// Used by broadcast paths to avoid re-serializing the same frame per connection.
 fn send_text(tx: &mpsc::UnboundedSender<Message>, text: String) -> Result<(), ()> {
-    tx.send(Message::Text(text)).map_err(|_| ())
+    tx.send(Message::Text(text.into())).map_err(|_| ())
 }
 
 fn send_event_to_connection(

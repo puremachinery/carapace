@@ -212,7 +212,7 @@ mod tests {
 
     fn generate_keypair() -> (SigningKey, VerifyingKey) {
         let mut secret = [0u8; 32];
-        getrandom::getrandom(&mut secret).expect("failed to generate random bytes");
+        getrandom::fill(&mut secret).expect("failed to generate random bytes");
         let signing_key = SigningKey::from_bytes(&secret);
         let verifying_key = signing_key.verifying_key();
         (signing_key, verifying_key)

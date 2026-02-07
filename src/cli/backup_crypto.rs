@@ -129,8 +129,8 @@ pub fn encrypt_backup(
 
     let mut salt = [0u8; SALT_LEN];
     let mut nonce_bytes = [0u8; NONCE_LEN];
-    getrandom::getrandom(&mut salt).map_err(|_| BackupCryptoError::KeyDerivationFailed)?;
-    getrandom::getrandom(&mut nonce_bytes).map_err(|_| BackupCryptoError::KeyDerivationFailed)?;
+    getrandom::fill(&mut salt).map_err(|_| BackupCryptoError::KeyDerivationFailed)?;
+    getrandom::fill(&mut nonce_bytes).map_err(|_| BackupCryptoError::KeyDerivationFailed)?;
 
     let mut key = derive_key(passphrase.as_bytes(), &salt);
 

@@ -264,7 +264,7 @@ async fn send_json(write: &Arc<Mutex<WsWrite>>, payload: &Value) -> Result<(), S
     let text = serde_json::to_string(payload).map_err(|e| e.to_string())?;
     let mut writer = write.lock().await;
     writer
-        .send(Message::Text(text))
+        .send(Message::Text(text.into()))
         .await
         .map_err(|e| e.to_string())
 }

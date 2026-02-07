@@ -245,7 +245,7 @@ use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use ed25519_dalek::{Signer, SigningKey};
 use futures_util::{SinkExt, StreamExt};
-use getrandom::getrandom;
+use getrandom::fill;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, Error as RustlsError, SignatureScheme};
@@ -775,7 +775,7 @@ fn validate_device_identity(
 
 fn generate_device_identity() -> Result<StoredDeviceIdentity, Box<dyn std::error::Error>> {
     let mut seed = [0u8; 32];
-    getrandom(&mut seed)?;
+    fill(&mut seed)?;
     let signing_key = SigningKey::from_bytes(&seed);
     let public_key = signing_key.verifying_key().to_bytes();
     let device_id = derive_device_id(&public_key);
@@ -926,7 +926,7 @@ async fn read_ws_json(
         match msg? {
             Message::Text(text) => return Ok(serde_json::from_str(&text)?),
             Message::Binary(bytes) => {
-                if let Ok(text) = String::from_utf8(bytes) {
+                if let Ok(text) = String::from_utf8(bytes.to_vec()) {
                     return Ok(serde_json::from_str(&text)?);
                 }
             }
@@ -1186,7 +1186,7 @@ pub async fn handle_logs(
         "params": connect_params
     });
     ws_write
-        .send(Message::Text(serde_json::to_string(&connect_frame)?))
+        .send(Message::Text(serde_json::to_string(&connect_frame)?.into()))
         .await?;
 
     if let Err(err) = await_ws_response_with_error(&mut ws_read, &mut ws_write, "connect-1").await {
@@ -1215,7 +1215,7 @@ pub async fn handle_logs(
         "params": { "limit": lines }
     });
     ws_write
-        .send(Message::Text(serde_json::to_string(&logs_frame)?))
+        .send(Message::Text(serde_json::to_string(&logs_frame)?.into()))
         .await?;
 
     let payload = match await_ws_response(&mut ws_read, &mut ws_write, "logs-1").await {
@@ -1919,7 +1919,7 @@ pub async fn handle_pair(
         "params": connect_params
     });
     ws_write
-        .send(Message::Text(serde_json::to_string(&connect_frame)?))
+        .send(Message::Text(serde_json::to_string(&connect_frame)?.into()))
         .await?;
     if let Err(err) = await_ws_response_with_error(&mut ws_read, &mut ws_write, "connect-1").await {
         if err.code.as_deref() == Some("NOT_PAIRED") && err.message.contains("pairing required") {
@@ -1953,7 +1953,7 @@ pub async fn handle_pair(
         }
     });
     ws_write
-        .send(Message::Text(serde_json::to_string(&pair_frame)?))
+        .send(Message::Text(serde_json::to_string(&pair_frame)?.into()))
         .await?;
     let pair_response = await_ws_response(&mut ws_read, &mut ws_write, "pair-1").await?;
     let request_id = pair_response
@@ -1969,7 +1969,7 @@ pub async fn handle_pair(
         "params": { "requestId": request_id }
     });
     ws_write
-        .send(Message::Text(serde_json::to_string(&approve_frame)?))
+        .send(Message::Text(serde_json::to_string(&approve_frame)?.into()))
         .await?;
     let approve_response = await_ws_response(&mut ws_read, &mut ws_write, "pair-2").await?;
     let node_token = approve_response

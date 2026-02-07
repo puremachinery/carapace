@@ -285,7 +285,7 @@ impl CsrfTokenStore {
 /// Generate cryptographically random bytes using getrandom
 fn generate_random_bytes(len: usize) -> Result<Vec<u8>, CsrfError> {
     let mut bytes = vec![0u8; len];
-    getrandom::getrandom(&mut bytes).map_err(|_| CsrfError::GenerationFailed)?;
+    getrandom::fill(&mut bytes).map_err(|_| CsrfError::GenerationFailed)?;
     Ok(bytes)
 }
 

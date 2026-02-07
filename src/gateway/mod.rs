@@ -268,7 +268,7 @@ impl GatewayConnection {
         writer
             .lock()
             .await
-            .send(tokio_tungstenite::tungstenite::Message::Text(text))
+            .send(tokio_tungstenite::tungstenite::Message::Text(text.into()))
             .await
             .map_err(|e| GatewayError::ConnectionFailed(e.to_string()))
     }
@@ -590,7 +590,7 @@ async fn send_gateway_handshake(
         .lock()
         .await
         .send(tokio_tungstenite::tungstenite::Message::Text(
-            handshake_text,
+            handshake_text.into(),
         ))
         .await
         .map_err(|e| GatewayError::ConnectionFailed(format!("handshake send failed: {}", e)))

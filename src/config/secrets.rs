@@ -70,7 +70,7 @@ impl SecretStore {
     /// Create a new `SecretStore` by deriving a key from a password and a random salt.
     pub fn new(password: &[u8]) -> Result<Self, SecretError> {
         let mut salt = [0u8; SALT_LEN];
-        getrandom::getrandom(&mut salt).map_err(|e| SecretError::RandomFailure(e.to_string()))?;
+        getrandom::fill(&mut salt).map_err(|e| SecretError::RandomFailure(e.to_string()))?;
         let key = Zeroizing::new(derive_key(password, &salt));
         Ok(Self { key, salt })
     }
@@ -93,8 +93,7 @@ impl SecretStore {
     /// Encrypt a plaintext string, returning the `enc:v1:...` formatted string.
     pub fn encrypt(&self, plaintext: &str) -> Result<String, SecretError> {
         let mut nonce_bytes = [0u8; NONCE_LEN];
-        getrandom::getrandom(&mut nonce_bytes)
-            .map_err(|e| SecretError::RandomFailure(e.to_string()))?;
+        getrandom::fill(&mut nonce_bytes).map_err(|e| SecretError::RandomFailure(e.to_string()))?;
         let nonce = Nonce::from_slice(&nonce_bytes);
 
         let cipher = Aes256Gcm::new(self.key.as_ref().into());

@@ -968,7 +968,7 @@ async fn migrate_whatsapp_account<B: CredentialBackend>(
 
     if key_bytes.is_none() {
         let mut raw_key = vec![0u8; 32];
-        getrandom::getrandom(&mut raw_key).map_err(|e| CredentialError::IoError(e.to_string()))?;
+        getrandom::fill(&mut raw_key).map_err(|e| CredentialError::IoError(e.to_string()))?;
         let key_payload = json!({
             "key": BASE64.encode(&raw_key),
             "format": "v1"

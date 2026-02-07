@@ -238,7 +238,7 @@ impl OAuthProvider {
 fn generate_code_verifier() -> Result<String, AuthProfileError> {
     // 32 random bytes -> 43 base64url chars (without padding)
     let mut buf = [0u8; 32];
-    getrandom::getrandom(&mut buf)
+    getrandom::fill(&mut buf)
         .map_err(|e| AuthProfileError::PkceError(format!("RNG failed: {}", e)))?;
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf))
 }
