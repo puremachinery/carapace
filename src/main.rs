@@ -159,6 +159,8 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let ws_state = register_discord_channel_if_configured(ws_state, &cfg)?;
     let ws_state = register_slack_channel_if_configured(ws_state, &cfg)?;
 
+    server::ws::spawn_heartbeat_task(ws_state.clone());
+
     let http_config = server::http::build_http_config(&cfg)?;
     let tls_setup = setup_optional_tls(&cfg)?;
 

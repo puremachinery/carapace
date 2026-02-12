@@ -1031,7 +1031,6 @@ pub async fn build_ws_state_from_config() -> Result<Arc<WsServerState>, WsConfig
     }
 
     let state = Arc::new(state);
-    spawn_heartbeat_task(state.clone());
     Ok(state)
 }
 
@@ -1827,7 +1826,7 @@ fn spawn_tick_task(
     })
 }
 
-fn spawn_heartbeat_task(state: Arc<WsServerState>) -> tokio::task::JoinHandle<()> {
+pub fn spawn_heartbeat_task(state: Arc<WsServerState>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             let snapshot = state.heartbeat_snapshot();
