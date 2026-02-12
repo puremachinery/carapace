@@ -184,12 +184,18 @@ impl ToolsRegistry {
     /// Set the shared plugin registry for tool dispatch.
     pub fn set_plugin_registry(&self, registry: Arc<PluginRegistry>) {
         let dispatcher = Arc::new(ToolDispatcher::new(registry.clone()));
-        let mut guard = self.plugin_registry.write();
-        *guard = Some(registry);
-        let mut dispatcher_guard = self.plugin_dispatcher.write();
-        *dispatcher_guard = Some(dispatcher.clone());
-        let mut last_refresh = self.plugin_dispatcher_last_refresh.write();
-        *last_refresh = None;
+        {
+            let mut guard = self.plugin_registry.write();
+            *guard = Some(registry);
+        }
+        {
+            let mut dispatcher_guard = self.plugin_dispatcher.write();
+            *dispatcher_guard = Some(dispatcher.clone());
+        }
+        {
+            let mut last_refresh = self.plugin_dispatcher_last_refresh.write();
+            *last_refresh = None;
+        }
         self.refresh_plugin_dispatcher(&dispatcher);
     }
 
