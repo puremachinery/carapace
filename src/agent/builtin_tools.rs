@@ -139,11 +139,7 @@ fn media_analyze_tool() -> BuiltinTool {
                     "description": "Optional max tokens for image analysis responses."
                 }
             },
-            "additionalProperties": false,
-            "oneOf": [
-                { "required": ["url"] },
-                { "required": ["path"] }
-            ]
+            "additionalProperties": false
         }),
         handler: Box::new(|args, _ctx| handle_media_analyze(args)),
     }
