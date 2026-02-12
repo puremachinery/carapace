@@ -937,6 +937,12 @@ pub async fn execute_run(
     }
 
     // 4. Broadcast completion and mark run done
+    let delivery_text = if config.deliver {
+        Some(accumulated_text.clone())
+    } else {
+        None
+    };
+
     finalize_run(
         &state,
         &run_id,
@@ -948,6 +954,35 @@ pub async fn execute_run(
         accumulated_text,
         &config.output_sanitizer.csp_policy,
     );
+
+    // 5. Deliver response to originating channel if requested
+    if let Some(text) = delivery_text {
+        if !text.is_empty() {
+            if let (Some(channel_id), Some(chat_id)) = (&message_channel, &session.metadata.chat_id)
+            {
+                let metadata = crate::messages::outbound::MessageMetadata {
+                    recipient_id: Some(chat_id.clone()),
+                    ..Default::default()
+                };
+                let outbound = crate::messages::outbound::OutboundMessage::new(
+                    channel_id.clone(),
+                    crate::messages::outbound::MessageContent::text(text),
+                )
+                .with_metadata(metadata);
+                let ctx = crate::messages::outbound::OutboundContext::new()
+                    .with_trace_id(&run_id)
+                    .with_source("agent");
+                if let Err(err) = state.message_pipeline().queue(outbound, ctx) {
+                    tracing::warn!(
+                        run_id = %run_id,
+                        channel = %channel_id,
+                        error = %err,
+                        "failed to queue agent response for delivery"
+                    );
+                }
+            }
+        }
+    }
 
     Ok(())
 }
