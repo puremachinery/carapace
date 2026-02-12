@@ -50,21 +50,27 @@ See [docs/security.md](docs/security.md) for the full security model.
 
 ## Status (Preview)
 
-This project is in preview. Automated tests cover core paths, but manual smoke tests are still
-in progress. Expect gaps and sharp edges.
+This project is in preview. Core paths are tested and verified. Expect gaps and sharp edges.
 
-Known working paths (automated tests; manual smoke tests pending):
+Known working:
 
+- Setup wizard from clean state
+- Anthropic LLM provider (via OpenAI-compatible API)
+- Token auth enforcement
+- Discord channel (end-to-end: inbound message, agent run, outbound reply)
+- Health endpoint (`/health`)
+- Restart persistence (sessions, cron, config)
 - WebSocket protocol handlers (golden trace tests)
 - OpenAI-compatible HTTP endpoints (`/v1/chat/completions`, `/v1/responses`)
-- Ollama provider integration
 - Config loading, defaults, and validation
 
-Not yet verified (manual smoke tests pending):
+Known gaps:
 
+- Control UI frontend (backend wired, no frontend built/bundled yet)
+- No CLI chat/message command (console channel registered but no `cara chat` subcommand)
+- Telegram is webhook-only (no long-polling; requires a tunnel or public endpoint for inbound)
+- Signal, Slack channels (not yet smoke-tested in real environments)
 - Public internet deployments (TLS/mTLS, reverse proxy, auth hardening)
-- End-to-end channel flows (Signal/Telegram/Discord/Slack) in real environments
-- Control UI across browsers
 
 ## Install
 
