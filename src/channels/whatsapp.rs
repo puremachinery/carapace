@@ -688,9 +688,13 @@ impl WhatsAppClient {
                     about: Some(info.status),
                 });
             }
-            WEvent::JoinedGroup(_) => {
+            WEvent::JoinedGroup(conv) => {
+                let jid = conv.get()
+                    .and_then(|c| c.new_jid.clone())
+                    .or_else(|| conv.get().and_then(|c| c.old_jid.clone()))
+                    .unwrap_or_else(|| "unknown".to_string());
                 let _ = tx.send(WhatsAppEvent::JoinedGroup {
-                    jid: "unknown".to_string(),
+                    jid,
                 });
             }
             WEvent::GroupInfoUpdate { jid, update: _ } => {

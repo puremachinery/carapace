@@ -140,26 +140,33 @@ messaging without requiring a business API account.
 
 ### Current Implementation Status
 
-> **Note**: WhatsApp channel support is currently in development. The basic
-> structure is in place, but full integration with the whatsapp-rust library
-> is pending. The following table shows planned vs. implemented features:
+> **Note**: WhatsApp channel support is fully implemented. The following table shows the supported features:
 
 | Feature | Status |
 |---------|--------|
-| Text messages (send/receive) | Planned |
-| Images (send/receive) | Planned |
-| Videos (send/receive) | Planned |
-| Audio/voice messages (send/receive) | Planned |
-| Documents (send/receive) | Planned |
-| GIFs (send/receive) | Planned |
-| Message replies/quotes | Planned |
-| Message reactions | Planned |
-| Message editing | Planned (library supports) |
-| Read/delivery receipts | Planned |
-| Typing indicators | Planned |
-| Group chats | Planned |
-| QR code authentication | Planned |
-| Pair code authentication | Planned |
+| Text messages (send/receive) | Implemented |
+| Images (send/receive) | Implemented |
+| Videos (send/receive) | Implemented |
+| Audio/voice messages (send/receive) | Implemented |
+| Documents (send/receive) | Implemented |
+| Stickers (send/receive) | Implemented |
+| Location messages | Implemented |
+| Contact messages (vCard) | Implemented |
+| Poll messages | Implemented |
+| List messages (interactive) | Implemented |
+| Button messages | Implemented |
+| Message replies/quotes | Implemented |
+| Message reactions | Implemented |
+| Message editing | Implemented |
+| Message deletion | Implemented |
+| Read/delivery receipts | Implemented |
+| Typing indicators | Implemented |
+| Group chats | Implemented |
+| Group management (create, leave, add/remove participants) | Implemented |
+| QR code authentication | Implemented |
+| Pair code authentication | Implemented |
+| Presence (online/offline) | Implemented |
+| Blocking | Implemented |
 
 ### Authentication Options
 
