@@ -19,3 +19,9 @@ GEMINI.md
 fuzz/target
 fuzz/corpus
 fuzz/artifacts
+
+# Environment
+.envrc
+test_config.json5
+test_vertex_config.json5
+.direnv

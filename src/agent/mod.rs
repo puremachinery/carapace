@@ -22,6 +22,7 @@ pub mod sandbox;
 pub mod tool_policy;
 pub mod tools;
 pub mod venice;
+pub mod vertex;
 
 use std::sync::Arc;
 

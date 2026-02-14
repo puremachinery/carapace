@@ -70,6 +70,7 @@ const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "discord",
     "slack",
     "classifier",
+    "vertex",
 ];
 
 /// Validate a config value against the full schema.
@@ -114,6 +115,7 @@ pub fn validate_schema(config: &Value) -> Vec<SchemaIssue> {
     validate_skills_sandbox(obj, &mut issues);
     validate_session_integrity(obj, &mut issues);
     validate_usage(obj, &mut issues);
+    validate_vertex(obj, &mut issues);
 
     // Run agent config lint if prompt guard config lint is enabled
     if let Some(agents) = obj.get("agents") {
@@ -743,6 +745,33 @@ fn validate_usage(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaI
                     issues,
                 );
             }
+        }
+    }
+}
+
+fn validate_vertex(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIssue>) {
+    let vertex = match obj.get("vertex").and_then(|v| v.as_object()) {
+        Some(v) => v,
+        None => return,
+    };
+
+    if let Some(project_id) = vertex.get("projectId") {
+        if !project_id.is_string() {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: ".vertex.projectId".to_string(),
+                message: "projectId must be a string".to_string(),
+            });
+        }
+    }
+
+    if let Some(location) = vertex.get("location") {
+        if !location.is_string() {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: ".vertex.location".to_string(),
+                message: "location must be a string".to_string(),
+            });
         }
     }
 }

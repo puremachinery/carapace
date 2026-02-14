@@ -17,6 +17,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::env;
 use tracing::debug;
 
 // ---------------------------------------------------------------------------
@@ -46,6 +47,9 @@ struct ConfigWithDefaults {
 
     #[serde(default)]
     messages: MessagesDefaults,
+
+    #[serde(default)]
+    vertex: VertexDefaults,
 }
 
 // ---------------------------------------------------------------------------
@@ -486,6 +490,37 @@ fn default_ack_reaction_scope() -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Vertex defaults
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VertexDefaults {
+    #[serde(default = "default_vertex_project_id")]
+    project_id: Option<String>,
+
+    #[serde(default = "default_vertex_location")]
+    location: String,
+}
+
+impl Default for VertexDefaults {
+    fn default() -> Self {
+        Self {
+            project_id: default_vertex_project_id(),
+            location: default_vertex_location(),
+        }
+    }
+}
+
+fn default_vertex_project_id() -> Option<String> {
+    env::var("VERTEX_PROJECT_ID").ok()
+}
+
+fn default_vertex_location() -> String {
+    env::var("VERTEX_LOCATION").unwrap_or_else(|_| "us-central1".to_string())
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -516,6 +551,7 @@ pub fn apply_defaults(config: &mut Value) {
                 logging: LoggingDefaults::default(),
                 cron: CronDefaults::default(),
                 messages: MessagesDefaults::default(),
+                vertex: VertexDefaults::default(),
             }
         }
     };
