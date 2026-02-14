@@ -14,6 +14,12 @@
 //! - `update` -- check for updates or self-update
 
 pub mod backup_crypto;
+pub mod skill;
+
+pub use skill::{
+    handle_skill_build, handle_skill_generate_key, handle_skill_package, handle_skill_sign,
+    handle_skill_template,
+};
 
 use clap::{Parser, Subcommand};
 
@@ -158,6 +164,10 @@ pub enum Command {
     /// Manage mTLS certificates for gateway-to-gateway communication.
     #[command(subcommand)]
     Tls(TlsCommand),
+
+    /// Build, sign, and package skills for the carapace gateway.
+    #[command(subcommand)]
+    Skill(SkillCommand),
 }
 
 #[derive(Subcommand, Debug)]
@@ -231,6 +241,104 @@ pub enum ConfigCommand {
 
     /// Print the resolved configuration file path.
     Path,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SkillCommand {
+    /// Build a skill from source code.
+    Build {
+        /// Source directory containing the skill source code.
+        #[arg(short, long)]
+        source: String,
+
+        /// Output path for the compiled WASM file.
+        #[arg(short, long)]
+        output: Option<String>,
+
+        /// Skill ID (used for manifest, defaults to directory name).
+        #[arg(short, long)]
+        id: Option<String>,
+
+        /// Skill name (used for manifest, defaults to id).
+        #[arg(short, long)]
+        name: Option<String>,
+
+        /// Skill version (semver format, e.g., "1.0.0").
+        #[arg(short, long)]
+        version: Option<String>,
+
+        /// Skill description.
+        #[arg(short, long)]
+        description: Option<String>,
+    },
+
+    /// Sign a pre-built skill WASM file.
+    Sign {
+        /// Input WASM file path.
+        #[arg(short, long)]
+        input: String,
+
+        /// Output WASM file path (defaults to input with .signed suffix).
+        #[arg(short, long)]
+        output: Option<String>,
+
+        /// Output directory for signed skill (creates skills-manifest.json).
+        #[arg(long)]
+        output_dir: Option<String>,
+
+        /// Ed25519 signing key as hex string (64 chars).
+        #[arg(short, long, required = true)]
+        key: String,
+    },
+
+    /// Generate a new Ed25519 signing key pair.
+    GenerateKey {
+        /// Output file path for the key pair (JSON format).
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+
+    /// Package a skill: fetch from URL, build (optional), sign, and output.
+    Package {
+        /// GitHub repository URL or direct WASM URL.
+        #[arg(short, long, required = true)]
+        url: String,
+
+        /// Output directory for the packaged skill.
+        #[arg(short, long)]
+        output: Option<String>,
+
+        /// Ed25519 signing key as hex string.
+        #[arg(short, long)]
+        key: Option<String>,
+
+        /// Generate a new key if --key is not provided.
+        #[arg(long)]
+        generate_key: bool,
+
+        /// Skill name (for direct WASM URLs, derived from filename otherwise).
+        #[arg(short, long)]
+        name: Option<String>,
+
+        /// Skill version (semver format).
+        #[arg(short, long)]
+        version: Option<String>,
+    },
+
+    /// Generate a skill project template.
+    Template {
+        /// Output directory (defaults to ./my-skill).
+        #[arg(short, long)]
+        output: Option<String>,
+
+        /// Skill type: tool, channel, webhook, service, hook, provider.
+        #[arg(short, long, default_value = "tool")]
+        kind: String,
+
+        /// Skill ID (defaults to directory name).
+        #[arg(short, long)]
+        id: Option<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------
