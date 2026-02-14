@@ -34,7 +34,7 @@ use clap::Parser;
 use serde_json::Value;
 use tracing::{error, info, warn};
 
-use cli::{Cli, Command, ConfigCommand, TlsCommand};
+use cli::{Cli, Command, ConfigCommand, SkillCommand, TlsCommand};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -121,6 +121,70 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 TlsCommand::ShowCa { ca_dir } => {
                     cli::handle_tls_show_ca(ca_dir.as_deref())?;
                 }
+            }
+            Ok(())
+        }
+
+        Some(Command::Skill(sub)) => {
+            match sub {
+                SkillCommand::Build {
+                    source,
+                    output,
+                    id,
+                    name,
+                    version,
+                    description,
+                } => cli::handle_skill_build(
+                    &source,
+                    output.as_deref(),
+                    id.as_deref(),
+                    name.as_deref(),
+                    version.as_deref(),
+                    description.as_deref(),
+                )?,
+
+                SkillCommand::Sign {
+                    input,
+                    output,
+                    output_dir,
+                    key,
+                } => cli::handle_skill_sign(
+                    &input,
+                    output.as_deref(),
+                    output_dir.as_deref(),
+                    &key,
+                )?,
+
+                SkillCommand::GenerateKey { output } => {
+                    cli::handle_skill_generate_key(output.as_deref())?
+                }
+
+                SkillCommand::Package {
+                    url,
+                    output,
+                    key,
+                    generate_key,
+                    name,
+                    version,
+                } => cli::handle_skill_package(
+                    &url,
+                    output.as_deref(),
+                    key.as_deref(),
+                    generate_key,
+                    name.as_deref(),
+                    version.as_deref(),
+                )
+                .await?,
+
+                SkillCommand::Template {
+                    output,
+                    kind,
+                    id,
+                } => cli::handle_skill_template(
+                    output.as_deref(),
+                    &kind,
+                    id.as_deref(),
+                )?,
             }
             Ok(())
         }
