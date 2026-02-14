@@ -258,7 +258,7 @@ The system must automatically determine *how* to run a discovered model without 
    - Create functions to map `Model` resource fields to `ResponseAdapter` variants.
    - Implement "Short ID" generation (last segment of resource name).
 3. **Implement `discovery` module**:
-   - `fetch_all_models()`
+   - `fetch_all_models()`Whitelist
    - `update_cache()`
 4. **Add CLI Command**: `list-models`.
 5. **Update `VertexProvider`** to:
