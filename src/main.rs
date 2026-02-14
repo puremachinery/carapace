@@ -93,6 +93,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cli::handle_update(check, version.as_deref()).await
         }
 
+        Some(Command::Chat { new, port }) => {
+            init_logging_from_env()?;
+            cli::chat::handle_chat(new, port).await
+        }
+
         Some(Command::Tls(sub)) => {
             match sub {
                 TlsCommand::InitCa { output } => {

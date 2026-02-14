@@ -14,6 +14,7 @@
 //! - `update` -- check for updates or self-update
 
 pub mod backup_crypto;
+pub mod chat;
 
 use clap::{Parser, Subcommand};
 
@@ -153,6 +154,17 @@ pub enum Command {
         /// Install a specific version (e.g., "0.2.0").
         #[arg(long)]
         version: Option<String>,
+    },
+
+    /// Start an interactive chat session.
+    Chat {
+        /// Start a new session instead of resuming.
+        #[arg(long)]
+        new: bool,
+
+        /// Port of a running instance to connect to.
+        #[arg(short, long)]
+        port: Option<u16>,
     },
 
     /// Manage mTLS certificates for gateway-to-gateway communication.
@@ -419,10 +431,10 @@ struct LogsTailResponse {
     truncated: bool,
 }
 
-type WsStream =
+pub(crate) type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
-type WsRead = futures_util::stream::SplitStream<WsStream>;
-type WsWrite = futures_util::stream::SplitSink<WsStream, Message>;
+pub(crate) type WsRead = futures_util::stream::SplitStream<WsStream>;
+pub(crate) type WsWrite = futures_util::stream::SplitSink<WsStream, Message>;
 
 #[derive(Debug)]
 struct InsecureCertVerifier;
@@ -474,7 +486,7 @@ impl ServerCertVerifier for InsecureCertVerifier {
     }
 }
 
-async fn connect_ws(
+pub(crate) async fn connect_ws(
     ws_url: &str,
     trust_invalid: bool,
 ) -> Result<WsStream, Box<dyn std::error::Error>> {
@@ -493,12 +505,12 @@ async fn connect_ws(
     }
 }
 
-struct GatewayAuth {
-    token: Option<String>,
-    password: Option<String>,
+pub(crate) struct GatewayAuth {
+    pub(crate) token: Option<String>,
+    pub(crate) password: Option<String>,
 }
 
-async fn resolve_gateway_auth() -> GatewayAuth {
+pub(crate) async fn resolve_gateway_auth() -> GatewayAuth {
     let token_env = std::env::var("CARAPACE_GATEWAY_TOKEN").ok().and_then(|v| {
         let token = v.trim().to_string();
         if token.is_empty() {
@@ -583,7 +595,7 @@ fn is_loopback_host(host: &str) -> bool {
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, Zeroize, ZeroizeOnDrop)]
-struct StoredDeviceIdentity {
+pub(crate) struct StoredDeviceIdentity {
     device_id: String,
     public_key: String,
     secret_key: String,
@@ -612,7 +624,7 @@ fn env_flag_enabled(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-async fn load_or_create_device_identity(
+pub(crate) async fn load_or_create_device_identity(
     state_dir: &Path,
 ) -> Result<StoredDeviceIdentity, Box<dyn std::error::Error>> {
     std::fs::create_dir_all(state_dir)?;
@@ -802,7 +814,7 @@ fn signing_key_from_identity(
     Ok(signing_key)
 }
 
-fn build_device_identity_for_connect(
+pub(crate) fn build_device_identity_for_connect(
     identity: &StoredDeviceIdentity,
     client_id: &str,
     client_mode: &str,
@@ -918,7 +930,7 @@ fn ws_url_from_http(url: &Url) -> Result<String, Box<dyn std::error::Error>> {
     Ok(format!("{scheme}://{host}:{port}/ws"))
 }
 
-async fn read_ws_json(
+pub(crate) async fn read_ws_json(
     reader: &mut WsRead,
     writer: &mut WsWrite,
 ) -> Result<Value, Box<dyn std::error::Error>> {
@@ -953,7 +965,7 @@ async fn read_ws_json(
     Err("WebSocket closed".into())
 }
 
-async fn await_connect_challenge(
+pub(crate) async fn await_connect_challenge(
     reader: &mut WsRead,
     writer: &mut WsWrite,
 ) -> Result<String, Box<dyn std::error::Error>> {
@@ -988,7 +1000,7 @@ async fn await_connect_challenge(
     .map_err(|_| -> Box<dyn std::error::Error> { "connect.challenge timed out".into() })?
 }
 
-async fn await_ws_response(
+pub(crate) async fn await_ws_response(
     reader: &mut WsRead,
     writer: &mut WsWrite,
     request_id: &str,
@@ -1020,10 +1032,10 @@ async fn await_ws_response(
 }
 
 #[derive(Debug)]
-struct WsError {
-    code: Option<String>,
-    message: String,
-    details: Option<Value>,
+pub(crate) struct WsError {
+    pub(crate) code: Option<String>,
+    pub(crate) message: String,
+    pub(crate) details: Option<Value>,
 }
 
 impl std::fmt::Display for WsError {
@@ -1034,7 +1046,7 @@ impl std::fmt::Display for WsError {
 
 impl std::error::Error for WsError {}
 
-async fn await_ws_response_with_error(
+pub(crate) async fn await_ws_response_with_error(
     reader: &mut WsRead,
     writer: &mut WsWrite,
     request_id: &str,
@@ -1265,7 +1277,7 @@ use std::path::{Component, Path, PathBuf};
 /// Resolve the state directory (same logic as `server::ws::resolve_state_dir`
 /// but duplicated here to avoid pulling in the full server module for CLI-only
 /// commands).
-fn resolve_state_dir() -> PathBuf {
+pub(crate) fn resolve_state_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("CARAPACE_STATE_DIR") {
         return PathBuf::from(dir);
     }
@@ -2270,7 +2282,7 @@ fn redact_secrets(mut value: Value) -> Value {
 
 /// Resolve the port to use for connecting to a running instance.
 /// Tries (in order): explicit flag, config file value, DEFAULT_PORT.
-fn resolve_port(explicit: Option<u16>) -> u16 {
+pub(crate) fn resolve_port(explicit: Option<u16>) -> u16 {
     if let Some(p) = explicit {
         return p;
     }
