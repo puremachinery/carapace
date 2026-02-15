@@ -53,26 +53,14 @@ fn generate_session_key(new_session: bool) -> String {
 }
 
 /// Check if a gateway is already reachable on the given port.
-async fn health_check(port: u16) -> bool {
+async fn health_check(client: &reqwest::Client, port: u16) -> bool {
     let url = format!("http://127.0.0.1:{}/health", port);
-    match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(2))
-        .build()
-    {
-        Ok(client) => client
-            .get(&url)
-            .send()
-            .await
-            .map(|resp| resp.status().is_success())
-            .unwrap_or(false),
-        Err(e) => {
-            eprintln!(
-                "Warning: could not create http client for health check: {}",
-                e
-            );
-            false
-        }
-    }
+    client
+        .get(&url)
+        .send()
+        .await
+        .map(|resp| resp.status().is_success())
+        .unwrap_or(false)
 }
 
 async fn init_media_store_cleanup() {
@@ -138,11 +126,15 @@ async fn start_embedded_gateway(
 }
 
 /// Wait for the gateway health endpoint to become available.
-async fn wait_for_health(port: u16, timeout: std::time::Duration) -> bool {
+async fn wait_for_health(
+    client: &reqwest::Client,
+    port: u16,
+    timeout: std::time::Duration,
+) -> bool {
     let start = tokio::time::Instant::now();
     let interval = std::time::Duration::from_millis(100);
     while start.elapsed() < timeout {
-        if health_check(port).await {
+        if health_check(client, port).await {
             return true;
         }
         tokio::time::sleep(interval).await;
@@ -211,13 +203,37 @@ pub async fn handle_chat(
     port: Option<u16>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let port = resolve_port(port);
+    let health_client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+    {
+        Ok(client) => Some(client),
+        Err(e) => {
+            eprintln!(
+                "Warning: could not create http client for health checks: {}",
+                e
+            );
+            None
+        }
+    };
 
     // Check if gateway is already running.
     let mut embedded_server_handle = None;
-    if !health_check(port).await {
+    let already_running = if let Some(client) = health_client.as_ref() {
+        health_check(client, port).await
+    } else {
+        false
+    };
+
+    if !already_running {
         eprintln!("Starting embedded gateway on port {}...", port);
         let handle = start_embedded_gateway(port).await?;
-        if !wait_for_health(port, std::time::Duration::from_secs(10)).await {
+        let health_ready = if let Some(client) = health_client.as_ref() {
+            wait_for_health(client, port, std::time::Duration::from_secs(10)).await
+        } else {
+            false
+        };
+        if !health_ready {
             eprintln!("Gateway failed to start within 10 seconds.");
             handle.shutdown().await;
             return Err("gateway startup timeout".into());
