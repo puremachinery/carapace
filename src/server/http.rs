@@ -37,6 +37,7 @@ use crate::server::headers::{security_headers_middleware, SecurityHeadersConfig}
 use crate::server::openai::{self, OpenAiState};
 use crate::server::ratelimit::{rate_limit_middleware, RateLimitConfig, RateLimiter};
 
+use crate::agent::LlmProvider;
 use crate::auth;
 use crate::channels::{inbound, slack_inbound, telegram_inbound, ChannelRegistry};
 use crate::hooks::auth::{extract_hooks_token, validate_hooks_token};
@@ -389,148 +390,33 @@ pub fn create_router_with_state(
     tls_enabled: bool,
 ) -> Router {
     let start_time = chrono::Utc::now().timestamp();
+    remap_default_hooks_rate_limit_prefix(&config, &mut middleware_config);
 
-    // Extract LLM provider before moving ws_state into AppState
     let llm_provider = ws_state.as_ref().and_then(|ws| ws.llm_provider());
-
-    // Build health checker if ws_state provides a state directory
-    let health_checker = ws_state.as_ref().map(|_| {
-        Arc::new(crate::server::health::HealthChecker::new(
-            crate::server::ws::resolve_state_dir(),
-        ))
-    });
-
-    let plugin_webhook_dispatcher = ws_state
-        .as_ref()
-        .and_then(|ws| ws.plugin_registry().cloned())
-        .map(|registry| Arc::new(WebhookDispatcher::new(registry)));
-
     let csrf_store = if middleware_config.enable_csrf {
         Some(CsrfTokenStore::new(middleware_config.csrf.clone()))
     } else {
         None
     };
-
-    let state = AppState {
-        config: Arc::new(config.clone()),
-        hook_registry,
-        tools_registry,
-        channel_registry: channel_registry.clone(),
-        plugin_webhook_dispatcher,
+    let state = build_app_state(
+        &config,
         start_time,
-        ws_state,
-        health_checker,
-        csrf_store: csrf_store.clone(),
         tls_enabled,
-    };
+        AppStateComponents {
+            hook_registry,
+            tools_registry,
+            channel_registry: channel_registry.clone(),
+            ws_state,
+            csrf_store: csrf_store.clone(),
+        },
+    );
 
     let mut router: Router<AppState> = Router::new();
-
-    let hooks_prefix = format!("{}/", normalize_hooks_path(&config.hooks_path));
-    let default_hooks_prefix = format!("{}/", DEFAULT_HOOKS_PATH);
-    if hooks_prefix != default_hooks_prefix {
-        for limit in &mut middleware_config.rate_limit.route_limits {
-            if limit.prefix == default_hooks_prefix {
-                limit.prefix = hooks_prefix.clone();
-            }
-        }
-    }
-
-    // Hooks routes (when enabled)
-    if config.hooks_enabled {
-        let hooks_path = normalize_hooks_path(&config.hooks_path);
-        router = router
-            .route(&format!("{}/wake", hooks_path), post(hooks_wake_handler))
-            .route(&format!("{}/agent", hooks_path), post(hooks_agent_handler))
-            .route(
-                &format!("{}/{{*path}}", hooks_path),
-                post(hooks_mapping_handler),
-            );
-    }
-
-    let channel_router = Router::new()
-        .route("/channels/telegram/webhook", post(telegram_webhook_handler))
-        .route("/channels/slack/events", post(slack_events_handler))
-        .layer(DefaultBodyLimit::max(config.hooks_max_body_bytes));
-    router = router.merge(channel_router);
-
-    // Plugin webhook routes (always enabled when plugins are registered)
-    let plugin_router = Router::new()
-        .route("/plugins/{*path}", any(plugins_webhook_handler))
-        .layer(DefaultBodyLimit::max(config.hooks_max_body_bytes));
-    router = router.merge(plugin_router);
-
-    // Health checks (unauthenticated, always enabled)
-    router = router
-        .route("/health", get(health_handler))
-        .route("/health/live", get(health_handler))
-        .route("/health/ready", get(health_ready_handler));
-
-    // Metrics (Prometheus scrape endpoint, unauthenticated)
-    router = router.route("/metrics", get(crate::server::metrics::metrics_handler));
-
-    // Tools API
-    router = router.route("/tools/invoke", post(tools_invoke_handler));
-
-    // OpenAI compatibility endpoints
-    if config.openai_chat_completions_enabled || config.openai_responses_enabled {
-        let openai_state = OpenAiState {
-            chat_completions_enabled: config.openai_chat_completions_enabled,
-            responses_enabled: config.openai_responses_enabled,
-            gateway_token: config.gateway_token.clone(),
-            gateway_password: config.gateway_password.clone(),
-            gateway_auth_mode: config.gateway_auth_mode.clone(),
-            gateway_allow_tailscale: config.gateway_allow_tailscale,
-            trusted_proxies: config.trusted_proxies.clone(),
-            llm_provider: llm_provider.clone(),
-        };
-
-        if config.openai_chat_completions_enabled {
-            router = router.route(
-                "/v1/chat/completions",
-                post(
-                    move |connect_info: MaybeConnectInfo, headers: HeaderMap, body: Bytes| {
-                        let state = openai_state.clone();
-                        async move {
-                            openai::chat_completions_handler(
-                                State(state),
-                                connect_info,
-                                headers,
-                                body,
-                            )
-                            .await
-                        }
-                    },
-                ),
-            );
-        }
-
-        let openai_state2 = OpenAiState {
-            chat_completions_enabled: config.openai_chat_completions_enabled,
-            responses_enabled: config.openai_responses_enabled,
-            gateway_token: config.gateway_token.clone(),
-            gateway_password: config.gateway_password.clone(),
-            gateway_auth_mode: config.gateway_auth_mode.clone(),
-            gateway_allow_tailscale: config.gateway_allow_tailscale,
-            trusted_proxies: config.trusted_proxies.clone(),
-            llm_provider,
-        };
-
-        if config.openai_responses_enabled {
-            router = router.route(
-                "/v1/responses",
-                post(
-                    move |connect_info: MaybeConnectInfo, headers: HeaderMap, body: Bytes| {
-                        let state = openai_state2.clone();
-                        async move {
-                            openai::responses_handler(State(state), connect_info, headers, body)
-                                .await
-                        }
-                    },
-                ),
-            );
-        }
-    }
+    router = register_hooks_routes(router, &config);
+    router = register_channel_webhook_routes(router, &config);
+    router = register_plugin_webhook_routes(router, &config);
+    router = register_core_routes(router);
+    router = register_openai_routes(router, &config, llm_provider);
 
     // Control endpoints
     if config.control_endpoints_enabled {
@@ -542,12 +428,183 @@ pub fn create_router_with_state(
         router = register_admin_routes(router, &config);
     }
 
-    // Convert to stateless Router and apply middleware layers
+    apply_http_middleware_layers(router, state, middleware_config, csrf_store)
+}
+
+fn remap_default_hooks_rate_limit_prefix(
+    config: &HttpConfig,
+    middleware_config: &mut MiddlewareConfig,
+) {
+    let hooks_prefix = format!("{}/", normalize_hooks_path(&config.hooks_path));
+    let default_hooks_prefix = format!("{}/", DEFAULT_HOOKS_PATH);
+    if hooks_prefix != default_hooks_prefix {
+        for limit in &mut middleware_config.rate_limit.route_limits {
+            if limit.prefix == default_hooks_prefix {
+                limit.prefix = hooks_prefix.clone();
+            }
+        }
+    }
+}
+
+struct AppStateComponents {
+    hook_registry: Arc<HookRegistry>,
+    tools_registry: Arc<ToolsRegistry>,
+    channel_registry: Arc<ChannelRegistry>,
+    ws_state: Option<Arc<WsServerState>>,
+    csrf_store: Option<CsrfTokenStore>,
+}
+
+fn build_app_state(
+    config: &HttpConfig,
+    start_time: i64,
+    tls_enabled: bool,
+    components: AppStateComponents,
+) -> AppState {
+    let AppStateComponents {
+        hook_registry,
+        tools_registry,
+        channel_registry,
+        ws_state,
+        csrf_store,
+    } = components;
+    let health_checker = ws_state.as_ref().map(|_| {
+        Arc::new(crate::server::health::HealthChecker::new(
+            crate::server::ws::resolve_state_dir(),
+        ))
+    });
+    let plugin_webhook_dispatcher = ws_state
+        .as_ref()
+        .and_then(|ws| ws.plugin_registry().cloned())
+        .map(|registry| Arc::new(WebhookDispatcher::new(registry)));
+
+    AppState {
+        config: Arc::new(config.clone()),
+        hook_registry,
+        tools_registry,
+        channel_registry,
+        plugin_webhook_dispatcher,
+        start_time,
+        ws_state,
+        health_checker,
+        csrf_store,
+        tls_enabled,
+    }
+}
+
+fn register_hooks_routes(router: Router<AppState>, config: &HttpConfig) -> Router<AppState> {
+    if !config.hooks_enabled {
+        return router;
+    }
+    let hooks_path = normalize_hooks_path(&config.hooks_path);
+    router
+        .route(&format!("{}/wake", hooks_path), post(hooks_wake_handler))
+        .route(&format!("{}/agent", hooks_path), post(hooks_agent_handler))
+        .route(
+            &format!("{}/{{*path}}", hooks_path),
+            post(hooks_mapping_handler),
+        )
+}
+
+fn register_channel_webhook_routes(
+    router: Router<AppState>,
+    config: &HttpConfig,
+) -> Router<AppState> {
+    let channel_router = Router::new()
+        .route("/channels/telegram/webhook", post(telegram_webhook_handler))
+        .route("/channels/slack/events", post(slack_events_handler))
+        .layer(DefaultBodyLimit::max(config.hooks_max_body_bytes));
+    router.merge(channel_router)
+}
+
+fn register_plugin_webhook_routes(
+    router: Router<AppState>,
+    config: &HttpConfig,
+) -> Router<AppState> {
+    let plugin_router = Router::new()
+        .route("/plugins/{*path}", any(plugins_webhook_handler))
+        .layer(DefaultBodyLimit::max(config.hooks_max_body_bytes));
+    router.merge(plugin_router)
+}
+
+fn register_core_routes(router: Router<AppState>) -> Router<AppState> {
+    router
+        .route("/health", get(health_handler))
+        .route("/health/live", get(health_handler))
+        .route("/health/ready", get(health_ready_handler))
+        .route("/metrics", get(crate::server::metrics::metrics_handler))
+        .route("/tools/invoke", post(tools_invoke_handler))
+}
+
+fn build_openai_state(
+    config: &HttpConfig,
+    llm_provider: Option<Arc<dyn LlmProvider>>,
+) -> OpenAiState {
+    OpenAiState {
+        chat_completions_enabled: config.openai_chat_completions_enabled,
+        responses_enabled: config.openai_responses_enabled,
+        gateway_token: config.gateway_token.clone(),
+        gateway_password: config.gateway_password.clone(),
+        gateway_auth_mode: config.gateway_auth_mode.clone(),
+        gateway_allow_tailscale: config.gateway_allow_tailscale,
+        trusted_proxies: config.trusted_proxies.clone(),
+        llm_provider,
+    }
+}
+
+fn register_openai_routes(
+    mut router: Router<AppState>,
+    config: &HttpConfig,
+    llm_provider: Option<Arc<dyn LlmProvider>>,
+) -> Router<AppState> {
+    if !config.openai_chat_completions_enabled && !config.openai_responses_enabled {
+        return router;
+    }
+
+    let openai_state = build_openai_state(config, llm_provider);
+    if config.openai_chat_completions_enabled {
+        let chat_state = openai_state.clone();
+        router = router.route(
+            "/v1/chat/completions",
+            post(
+                move |connect_info: MaybeConnectInfo, headers: HeaderMap, body: Bytes| {
+                    let state = chat_state.clone();
+                    async move {
+                        openai::chat_completions_handler(State(state), connect_info, headers, body)
+                            .await
+                    }
+                },
+            ),
+        );
+    }
+
+    if config.openai_responses_enabled {
+        let responses_state = openai_state.clone();
+        router = router.route(
+            "/v1/responses",
+            post(
+                move |connect_info: MaybeConnectInfo, headers: HeaderMap, body: Bytes| {
+                    let state = responses_state.clone();
+                    async move {
+                        openai::responses_handler(State(state), connect_info, headers, body).await
+                    }
+                },
+            ),
+        );
+    }
+
+    router
+}
+
+fn apply_http_middleware_layers(
+    router: Router<AppState>,
+    state: AppState,
+    middleware_config: MiddlewareConfig,
+    csrf_store: Option<CsrfTokenStore>,
+) -> Router {
     // Order matters: last added = first executed
     // The order here is: rate_limit -> csrf -> security_headers -> handler
     let mut stateless_router: Router = router.with_state(state);
 
-    // Rate limiting middleware (applied first to reject overloaded requests early)
     if middleware_config.enable_rate_limit {
         let limiter = RateLimiter::new(middleware_config.rate_limit);
         stateless_router = stateless_router.layer(middleware::from_fn_with_state(
@@ -555,14 +612,10 @@ pub fn create_router_with_state(
             rate_limit_middleware,
         ));
     }
-
-    // CSRF protection middleware
     if let Some(csrf_store) = csrf_store {
         stateless_router =
             stateless_router.layer(middleware::from_fn_with_state(csrf_store, csrf_middleware));
     }
-
-    // Security headers middleware (applied last, runs after handler)
     if middleware_config.enable_security_headers {
         let headers_config = Arc::new(middleware_config.security_headers);
         stateless_router = stateless_router.layer(middleware::from_fn_with_state(
