@@ -166,7 +166,9 @@ If you have a release binary (once available), use the manual steps above.
    ```bash
    cara chat
    ```
-   Use `/help` for REPL commands (`/new`, `/exit`, `/quit`).
+   Use `/help` for a list of REPL commands:
+   - `/new` — start a fresh session
+   - `/exit` or `/quit` — exit chat
 
 ### With Ollama (free, local)
 
