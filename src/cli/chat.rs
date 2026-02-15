@@ -331,7 +331,7 @@ async fn run_chat_session(new_session: bool, port: u16) -> Result<(), Box<dyn st
                             match frame {
                                 Ok(f) => f,
                                 Err(e) => {
-                                    eprintln!("\\nConnection lost: {}", e);
+                                    eprintln!("\nConnection lost: {}", e);
                                     return Err(e);
                                 }
                             }
@@ -355,12 +355,12 @@ async fn run_chat_session(new_session: bool, port: u16) -> Result<(), Box<dyn st
                                         .is_err()
                                     {
                                         eprintln!(
-                                            "\\nWarning: could not send abort message to gateway."
+                                            "\nWarning: could not send abort message to gateway."
                                         );
                                     }
                                 }
                                 Err(e) => {
-                                    eprintln!("\\nError: failed to serialize abort message: {}", e);
+                                    eprintln!("\nError: failed to serialize abort message: {}", e);
                                 }
                             }
                             eprintln!("Aborted current run.");
@@ -383,7 +383,7 @@ async fn run_chat_session(new_session: bool, port: u16) -> Result<(), Box<dyn st
                                 .and_then(|e| e.get("message"))
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("request failed");
-                            eprintln!("\\nError: {}", msg);
+                            eprintln!("\nError: {}", msg);
                             break;
                         }
 
@@ -440,7 +440,7 @@ async fn run_chat_session(new_session: bool, port: u16) -> Result<(), Box<dyn st
                                         .and_then(|d| d.get("message"))
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("unknown error");
-                                    eprintln!("\\nError: {}", msg);
+                                    eprintln!("\nError: {}", msg);
                                     break;
                                 }
                                 "final" => {
@@ -462,7 +462,7 @@ async fn run_chat_session(new_session: bool, port: u16) -> Result<(), Box<dyn st
                                         .get("errorMessage")
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("unknown error");
-                                    eprintln!("\\nError: {}", msg);
+                                    eprintln!("\nError: {}", msg);
                                     break;
                                 }
                                 _ => {}
