@@ -12,7 +12,7 @@ use uuid::Uuid;
 use super::{
     await_connect_challenge, await_ws_response_with_error, build_device_identity_for_connect,
     connect_ws, load_or_create_device_identity, read_ws_json, resolve_gateway_auth, resolve_port,
-    resolve_state_dir, GatewayAuth,
+    resolve_state_dir, GatewayAuth, WsRead, WsWrite,
 };
 
 const CHAT_CLIENT_ID: &str = "cli";
@@ -186,6 +186,163 @@ async fn write_stdout(text: &str) -> std::io::Result<()> {
     .map_err(|e| std::io::Error::other(format!("stdout write task failed: {}", e)))?
 }
 
+async fn stream_chat_response(
+    req_id: &str,
+    expected_run_id: &str,
+    msg_counter: u64,
+    ws_read: &mut WsRead,
+    ws_write: &mut WsWrite,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut got_output = false;
+    loop {
+        let frame = tokio::select! {
+            frame = read_ws_json(ws_read, ws_write) => {
+                match frame {
+                    Ok(f) => f,
+                    Err(e) => {
+                        eprintln!("\nConnection lost: {}", e);
+                        return Err(e);
+                    }
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!();
+                let abort_frame = serde_json::json!({
+                    "type": "req",
+                    "id": format!("abort-{}", msg_counter),
+                    "method": "chat.abort",
+                    "params": {
+                        "runId": expected_run_id,
+                        "reason": "user_interrupt"
+                    }
+                });
+                match serde_json::to_string(&abort_frame) {
+                    Ok(abort_msg) => {
+                        if ws_write
+                            .send(Message::Text(abort_msg.into()))
+                            .await
+                            .is_err()
+                        {
+                            eprintln!("\nWarning: could not send abort message to gateway.");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("\nError: failed to serialize abort message: {}", e);
+                    }
+                }
+                eprintln!("Aborted current run.");
+                break;
+            }
+        };
+
+        let frame_type = frame.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        if frame_type == "res" {
+            let response_id = frame.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            if response_id != req_id {
+                continue;
+            }
+
+            let ok = frame.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+            if !ok {
+                let msg = frame
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("request failed");
+                eprintln!("\nError: {}", msg);
+                break;
+            }
+
+            let status = frame
+                .get("payload")
+                .and_then(|p| p.get("status"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if status == "queued" {
+                eprintln!("[chat: queued] no provider is currently available.");
+                break;
+            }
+
+            continue;
+        }
+
+        if frame_type != "event" {
+            continue;
+        }
+
+        let event = frame.get("event").and_then(|v| v.as_str()).unwrap_or("");
+        let payload = frame.get("payload").cloned().unwrap_or(Value::Null);
+        let run_id = payload.get("runId").and_then(|v| v.as_str()).unwrap_or("");
+        if run_id != expected_run_id {
+            continue;
+        }
+
+        match event {
+            "agent" => {
+                let stream = payload.get("stream").and_then(|v| v.as_str()).unwrap_or("");
+                match stream {
+                    "text" => {
+                        if let Some(delta) = payload
+                            .get("data")
+                            .and_then(|d| d.get("delta"))
+                            .and_then(|v| v.as_str())
+                        {
+                            write_stdout(delta).await?;
+                            got_output = true;
+                        }
+                    }
+                    "tool_use" => {
+                        let name = tool_name_from_payload(&payload);
+                        eprintln!("[tool: {}]", name);
+                    }
+                    "tool_result" => {
+                        let name = tool_name_from_payload(&payload);
+                        eprintln!("[tool: {} → done]", name);
+                    }
+                    "error" => {
+                        let msg = payload
+                            .get("data")
+                            .and_then(|d| d.get("message"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown error");
+                        eprintln!("\nError: {}", msg);
+                        break;
+                    }
+                    "final" => {
+                        print_final_newline_if_needed(got_output).await?;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            "chat" => {
+                let state = payload.get("state").and_then(|v| v.as_str()).unwrap_or("");
+                match state {
+                    "final" => {
+                        print_final_newline_if_needed(got_output).await?;
+                        break;
+                    }
+                    "error" => {
+                        let msg = payload
+                            .get("errorMessage")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown error");
+                        eprintln!("\nError: {}", msg);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            _ => {
+                // Ignore heartbeat, config changes, etc.
+            }
+        }
+    }
+
+    Ok(())
+}
+
 async fn run_chat_session(new_session: bool, port: u16) -> Result<(), Box<dyn std::error::Error>> {
     // Connect via WebSocket
     let ws_url = format!("ws://127.0.0.1:{}/ws", port);
@@ -319,156 +476,14 @@ async fn run_chat_session(new_session: bool, port: u16) -> Result<(), Box<dyn st
                     .send(Message::Text(serde_json::to_string(&chat_frame)?.into()))
                     .await?;
 
-                // Stream response
-                let mut got_output = false;
-                loop {
-                    let frame = tokio::select! {
-                        frame = read_ws_json(&mut ws_read, &mut ws_write) => {
-                            match frame {
-                                Ok(f) => f,
-                                Err(e) => {
-                                    eprintln!("\nConnection lost: {}", e);
-                                    return Err(e);
-                                }
-                            }
-                        }
-                        _ = tokio::signal::ctrl_c() => {
-                            eprintln!();
-                            let abort_frame = serde_json::json!({
-                                "type": "req",
-                                "id": format!("abort-{}", msg_counter),
-                                "method": "chat.abort",
-                                "params": {
-                                    "runId": expected_run_id.clone(),
-                                    "reason": "user_interrupt"
-                                }
-                            });
-                            match serde_json::to_string(&abort_frame) {
-                                Ok(abort_msg) => {
-                                    if ws_write
-                                        .send(Message::Text(abort_msg.into()))
-                                        .await
-                                        .is_err()
-                                    {
-                                        eprintln!(
-                                            "\nWarning: could not send abort message to gateway."
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!("\nError: failed to serialize abort message: {}", e);
-                                }
-                            }
-                            eprintln!("Aborted current run.");
-                            break;
-                        }
-                    };
-
-                    let frame_type = frame.get("type").and_then(|v| v.as_str()).unwrap_or("");
-
-                    if frame_type == "res" {
-                        let response_id = frame.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                        if response_id != req_id {
-                            continue;
-                        }
-
-                        let ok = frame.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
-                        if !ok {
-                            let msg = frame
-                                .get("error")
-                                .and_then(|e| e.get("message"))
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("request failed");
-                            eprintln!("\nError: {}", msg);
-                            break;
-                        }
-
-                        let status = frame
-                            .get("payload")
-                            .and_then(|p| p.get("status"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        if status == "queued" {
-                            eprintln!("[chat: queued] no provider is currently available.");
-                            break;
-                        }
-
-                        continue;
-                    }
-
-                    if frame_type != "event" {
-                        continue;
-                    }
-
-                    let event = frame.get("event").and_then(|v| v.as_str()).unwrap_or("");
-                    let payload = frame.get("payload").cloned().unwrap_or(Value::Null);
-                    let run_id = payload.get("runId").and_then(|v| v.as_str()).unwrap_or("");
-                    if run_id != expected_run_id {
-                        continue;
-                    }
-
-                    match event {
-                        "agent" => {
-                            let stream =
-                                payload.get("stream").and_then(|v| v.as_str()).unwrap_or("");
-                            match stream {
-                                "text" => {
-                                    if let Some(delta) = payload
-                                        .get("data")
-                                        .and_then(|d| d.get("delta"))
-                                        .and_then(|v| v.as_str())
-                                    {
-                                        write_stdout(delta).await?;
-                                        got_output = true;
-                                    }
-                                }
-                                "tool_use" => {
-                                    let name = tool_name_from_payload(&payload);
-                                    eprintln!("[tool: {}]", name);
-                                }
-                                "tool_result" => {
-                                    let name = tool_name_from_payload(&payload);
-                                    eprintln!("[tool: {} \u{2192} done]", name);
-                                }
-                                "error" => {
-                                    let msg = payload
-                                        .get("data")
-                                        .and_then(|d| d.get("message"))
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("unknown error");
-                                    eprintln!("\nError: {}", msg);
-                                    break;
-                                }
-                                "final" => {
-                                    print_final_newline_if_needed(got_output).await?;
-                                    break;
-                                }
-                                _ => {}
-                            }
-                        }
-                        "chat" => {
-                            let state = payload.get("state").and_then(|v| v.as_str()).unwrap_or("");
-                            match state {
-                                "final" => {
-                                    print_final_newline_if_needed(got_output).await?;
-                                    break;
-                                }
-                                "error" => {
-                                    let msg = payload
-                                        .get("errorMessage")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("unknown error");
-                                    eprintln!("\nError: {}", msg);
-                                    break;
-                                }
-                                _ => {}
-                            }
-                        }
-                        _ => {
-                            // Ignore heartbeat, config changes, etc.
-                        }
-                    }
-                }
+                stream_chat_response(
+                    &req_id,
+                    &expected_run_id,
+                    msg_counter,
+                    &mut ws_read,
+                    &mut ws_write,
+                )
+                .await?;
             }
         }
     }
