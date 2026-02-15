@@ -140,6 +140,6 @@ CARAPACE_GATEWAY_TOKEN=... cara pair https://gateway.local:3001 --name "Ops CLI"
 ```
 
 ### Start a fresh local chat session
-```
+```bash
 cara chat --new
 ```

@@ -60,14 +60,14 @@ If you set `gateway.port`, use that port instead of `18789`.
 
 5) Open a local interactive chat REPL:
 
-```bash
-cara chat
-```
+   ```bash
+   cara chat
+   ```
 
-Helpful REPL commands:
-- `/help` — show available commands
-- `/new` — start a fresh chat session
-- `/exit` or `/quit` — leave chat
+   Helpful REPL commands:
+   - `/help` — show available commands
+   - `/new` — start a fresh chat session
+   - `/exit` or `/quit` — leave chat
 
 ## Configuration Basics
 
