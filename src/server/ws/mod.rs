@@ -1676,65 +1676,90 @@ async fn handle_socket(
         }
     });
 
+    let handshake =
+        match perform_socket_handshake(&mut receiver, &tx, &state, remote_addr, &headers).await {
+            Ok(handshake) => handshake,
+            Err(()) => {
+                drop(tx);
+                let _ = send_task.await;
+                return;
+            }
+        };
+    let conn = ConnectionContext {
+        conn_id: handshake.conn_id,
+        role: handshake.role,
+        scopes: handshake.scopes,
+        client: handshake.connect_params.client,
+        device_id: handshake.device_id,
+    };
+    run_connection_lifecycle(
+        &mut receiver,
+        &tx,
+        &state,
+        conn,
+        handshake.remote_ip_for_presence,
+        handshake.json_depth_limit,
+    )
+    .await;
+
+    drop(tx);
+    let _ = send_task.await;
+}
+
+struct HandshakeContext {
+    conn_id: String,
+    role: String,
+    scopes: Vec<String>,
+    connect_params: ConnectParams,
+    device_id: Option<String>,
+    remote_ip_for_presence: Option<String>,
+    json_depth_limit: usize,
+}
+
+async fn perform_socket_handshake(
+    receiver: &mut futures_util::stream::SplitStream<WebSocket>,
+    tx: &mpsc::UnboundedSender<Message>,
+    state: &Arc<WsServerState>,
+    remote_addr: SocketAddr,
+    headers: &HeaderMap,
+) -> Result<HandshakeContext, ()> {
     let nonce = Uuid::new_v4().to_string();
-    send_challenge(&tx, &nonce);
+    send_challenge(tx, &nonce);
 
     let json_depth_limit = state.config.max_json_depth.unwrap_or(MAX_JSON_DEPTH);
-
     let (req_id, mut connect_params) =
-        match receive_initial_handshake(&mut receiver, &tx, json_depth_limit).await {
-            Ok(result) => result,
-            Err(()) => return,
-        };
+        receive_initial_handshake(receiver, tx, json_depth_limit).await?;
 
     let is_local =
-        auth::is_local_direct_request(remote_addr, &headers, &state.config.trusted_proxies);
-
-    let (role, scopes) = match validate_connect_params(&tx, &req_id, &mut connect_params, is_local)
-    {
-        Ok(result) => result,
-        Err(()) => return,
-    };
-
-    let device_id = match authenticate_connection(
-        &state,
-        &tx,
+        auth::is_local_direct_request(remote_addr, headers, &state.config.trusted_proxies);
+    let (role, scopes) = validate_connect_params(tx, &req_id, &mut connect_params, is_local)?;
+    let device_id = authenticate_connection(
+        state,
+        tx,
         &req_id,
         &connect_params,
-        &headers,
+        headers,
         remote_addr,
         &nonce,
         is_local,
         &role,
         &scopes,
-    ) {
-        Ok(id) => id,
-        Err(()) => return,
-    };
+    )?;
 
     let conn_id = Uuid::new_v4().to_string();
-    let issued_token = match device_id.as_ref() {
-        Some(id) => match ensure_device_token(&state, id, &role, &scopes) {
-            Ok(token) => Some(token),
-            Err(err) => {
-                warn!("failed to issue device token for {}: {}", id, err);
-                let err_resp = error_shape(
-                    ERROR_INVALID_REQUEST,
-                    &format!("device token issuance failed: {}", err),
-                    None,
-                );
-                let _ = send_response(&tx, &req_id, false, None, Some(err_resp));
-                let _ = send_close(&tx, 1008, "device token issuance failed");
-                return;
-            }
-        },
-        None => None,
-    };
+    let issued_token = issue_device_token_for_connection(
+        state,
+        tx,
+        &req_id,
+        device_id.as_deref(),
+        &role,
+        &scopes,
+    )?;
 
     if role == "node" {
-        finalize_node_commands(&state, &mut connect_params);
+        finalize_node_commands(state, &mut connect_params);
         register_node_session(
-            &state,
+            state,
             &connect_params,
             &conn_id,
             device_id.clone(),
@@ -1748,28 +1773,64 @@ async fn handle_socket(
     } else {
         Some(remote_addr.ip().to_string())
     };
+    let hello = build_hello_response(state, &conn_id, issued_token);
+    let _ = send_response(tx, &req_id, true, Some(json!(hello)), None);
 
-    let hello = build_hello_response(&state, &conn_id, issued_token);
-    let _ = send_response(&tx, &req_id, true, Some(json!(hello)), None);
-
-    let conn = ConnectionContext {
-        conn_id: conn_id.clone(),
+    Ok(HandshakeContext {
+        conn_id,
         role,
         scopes,
-        client: connect_params.client.clone(),
+        connect_params,
         device_id,
-    };
+        remote_ip_for_presence,
+        json_depth_limit,
+    })
+}
 
+fn issue_device_token_for_connection(
+    state: &Arc<WsServerState>,
+    tx: &mpsc::UnboundedSender<Message>,
+    req_id: &str,
+    device_id: Option<&str>,
+    role: &str,
+    scopes: &[String],
+) -> Result<Option<devices::IssuedDeviceToken>, ()> {
+    match device_id {
+        Some(id) => match ensure_device_token(state, id, role, scopes) {
+            Ok(token) => Ok(Some(token)),
+            Err(err) => {
+                warn!("failed to issue device token for {}: {}", id, err);
+                let err_resp = error_shape(
+                    ERROR_INVALID_REQUEST,
+                    &format!("device token issuance failed: {}", err),
+                    None,
+                );
+                let _ = send_response(tx, req_id, false, None, Some(err_resp));
+                let _ = send_close(tx, 1008, "device token issuance failed");
+                Err(())
+            }
+        },
+        None => Ok(None),
+    }
+}
+
+async fn run_connection_lifecycle(
+    receiver: &mut futures_util::stream::SplitStream<WebSocket>,
+    tx: &mpsc::UnboundedSender<Message>,
+    state: &Arc<WsServerState>,
+    conn: ConnectionContext,
+    remote_ip_for_presence: Option<String>,
+    json_depth_limit: usize,
+) {
     state.register_connection(&conn, tx.clone(), remote_ip_for_presence);
 
     let tick_task = spawn_tick_task(tx.clone(), state.clone());
-    let mut ws_rate_limiter = create_ws_rate_limiter(&state);
+    let mut ws_rate_limiter = create_ws_rate_limiter(state);
     let mut ws_rate_warn_count: u32 = 0;
-
     run_message_loop(
-        &mut receiver,
-        &tx,
-        &state,
+        receiver,
+        tx,
+        state,
         &conn,
         json_depth_limit,
         &mut ws_rate_limiter,
@@ -1778,9 +1839,6 @@ async fn handle_socket(
     .await;
 
     tick_task.abort();
-    drop(tx);
-    let _ = send_task.await;
-
     state.unregister_connection(&conn.conn_id);
     state.node_registry.lock().unregister(&conn.conn_id);
 }
