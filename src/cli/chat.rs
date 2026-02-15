@@ -197,6 +197,291 @@ async fn write_stdout(text: &str) -> std::io::Result<()> {
     .map_err(|e| std::io::Error::other(format!("stdout write task failed: {}", e)))?
 }
 
+async fn run_chat_session(new_session: bool, port: u16) -> Result<(), Box<dyn std::error::Error>> {
+    // Connect via WebSocket
+    let ws_url = format!("ws://127.0.0.1:{}/ws", port);
+    let ws_stream = match connect_ws(&ws_url, false).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Failed to connect to gateway: {}", e);
+            return Err(e);
+        }
+    };
+    let (mut ws_write, mut ws_read) = ws_stream.split();
+
+    // Handshake
+    let auth = resolve_gateway_auth().await;
+    let state_dir = resolve_state_dir();
+    let device_identity = load_or_create_device_identity(&state_dir).await?;
+
+    let nonce = await_connect_challenge(&mut ws_read, &mut ws_write).await?;
+
+    let role = "operator";
+    let scopes = vec!["operator.write".to_string()];
+    let mut connect_params = serde_json::json!({
+        "minProtocol": 3,
+        "maxProtocol": 3,
+        "client": {
+            "id": CHAT_CLIENT_ID,
+            "version": env!("CARGO_PKG_VERSION"),
+            "platform": std::env::consts::OS,
+            "mode": CHAT_CLIENT_MODE
+        },
+        "role": role,
+        "scopes": scopes.clone()
+    });
+    let GatewayAuth { token, password } = auth;
+    let token_for_sig = token.clone();
+    if let Some(token) = token {
+        connect_params["auth"] = serde_json::json!({ "token": token });
+    } else if let Some(password) = password {
+        connect_params["auth"] = serde_json::json!({ "password": password });
+    }
+    connect_params["device"] = build_device_identity_for_connect(
+        &device_identity,
+        CHAT_CLIENT_ID,
+        CHAT_CLIENT_MODE,
+        role,
+        &scopes,
+        token_for_sig.as_deref(),
+        Some(&nonce),
+    )?;
+
+    let connect_frame = serde_json::json!({
+        "type": "req",
+        "id": "connect-1",
+        "method": "connect",
+        "params": connect_params
+    });
+    ws_write
+        .send(Message::Text(serde_json::to_string(&connect_frame)?.into()))
+        .await?;
+
+    if let Err(err) = await_ws_response_with_error(&mut ws_read, &mut ws_write, "connect-1").await {
+        eprintln!("WebSocket connect failed: {}", err.message);
+        return Err(Box::new(err));
+    }
+
+    // REPL
+    let mut session_key = generate_session_key(new_session);
+    let mut msg_counter: u64 = 0;
+
+    eprintln!();
+    eprintln!(
+        "  cara v{} \u{2014} type /help for commands, Ctrl+D to exit",
+        env!("CARGO_PKG_VERSION")
+    );
+    eprintln!();
+
+    loop {
+        print_prompt().await?;
+
+        let line = read_line().await;
+
+        let line = match line {
+            Some(l) => l,
+            None => {
+                // EOF (Ctrl+D)
+                eprintln!();
+                break;
+            }
+        };
+
+        match parse_repl_input(&line) {
+            ReplCommand::Exit => break,
+            ReplCommand::Help => {
+                print_help();
+                continue;
+            }
+            ReplCommand::New => {
+                session_key = generate_session_key(true);
+                eprintln!("Session reset.");
+                continue;
+            }
+            ReplCommand::Message(msg) => {
+                if msg.is_empty() {
+                    continue;
+                }
+
+                msg_counter += 1;
+                let req_id = format!("chat-{}", msg_counter);
+                let expected_run_id = Uuid::new_v4().to_string();
+
+                let chat_frame = serde_json::json!({
+                    "type": "req",
+                    "id": req_id.clone(),
+                    "method": "chat.send",
+                    "params": {
+                        "message": msg,
+                        "sessionKey": session_key.clone(),
+                        "idempotencyKey": expected_run_id.clone(),
+                        "stream": true,
+                        "triggerAgent": true
+                    }
+                });
+                ws_write
+                    .send(Message::Text(serde_json::to_string(&chat_frame)?.into()))
+                    .await?;
+
+                // Stream response
+                let mut got_output = false;
+                loop {
+                    let frame = tokio::select! {
+                        frame = read_ws_json(&mut ws_read, &mut ws_write) => {
+                            match frame {
+                                Ok(f) => f,
+                                Err(e) => {
+                                    eprintln!("\\nConnection lost: {}", e);
+                                    return Err(e);
+                                }
+                            }
+                        }
+                        _ = tokio::signal::ctrl_c() => {
+                            eprintln!();
+                            let abort_frame = serde_json::json!({
+                                "type": "req",
+                                "id": format!("abort-{}", msg_counter),
+                                "method": "chat.abort",
+                                "params": {
+                                    "runId": expected_run_id.clone(),
+                                    "reason": "user_interrupt"
+                                }
+                            });
+                            match serde_json::to_string(&abort_frame) {
+                                Ok(abort_msg) => {
+                                    if ws_write
+                                        .send(Message::Text(abort_msg.into()))
+                                        .await
+                                        .is_err()
+                                    {
+                                        eprintln!(
+                                            "\\nWarning: could not send abort message to gateway."
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("\\nError: failed to serialize abort message: {}", e);
+                                }
+                            }
+                            eprintln!("Aborted current run.");
+                            break;
+                        }
+                    };
+
+                    let frame_type = frame.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+                    if frame_type == "res" {
+                        let response_id = frame.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                        if response_id != req_id {
+                            continue;
+                        }
+
+                        let ok = frame.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+                        if !ok {
+                            let msg = frame
+                                .get("error")
+                                .and_then(|e| e.get("message"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("request failed");
+                            eprintln!("\\nError: {}", msg);
+                            break;
+                        }
+
+                        let status = frame
+                            .get("payload")
+                            .and_then(|p| p.get("status"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        if status == "queued" {
+                            eprintln!("[chat: queued] no provider is currently available.");
+                            break;
+                        }
+
+                        continue;
+                    }
+
+                    if frame_type != "event" {
+                        continue;
+                    }
+
+                    let event = frame.get("event").and_then(|v| v.as_str()).unwrap_or("");
+                    let payload = frame.get("payload").cloned().unwrap_or(Value::Null);
+                    let run_id = payload.get("runId").and_then(|v| v.as_str()).unwrap_or("");
+                    if run_id != expected_run_id {
+                        continue;
+                    }
+
+                    match event {
+                        "agent" => {
+                            let stream =
+                                payload.get("stream").and_then(|v| v.as_str()).unwrap_or("");
+                            match stream {
+                                "text" => {
+                                    if let Some(delta) = payload
+                                        .get("data")
+                                        .and_then(|d| d.get("delta"))
+                                        .and_then(|v| v.as_str())
+                                    {
+                                        write_stdout(delta).await?;
+                                        got_output = true;
+                                    }
+                                }
+                                "tool_use" => {
+                                    let name = tool_name_from_payload(&payload);
+                                    eprintln!("[tool: {}]", name);
+                                }
+                                "tool_result" => {
+                                    let name = tool_name_from_payload(&payload);
+                                    eprintln!("[tool: {} \u{2192} done]", name);
+                                }
+                                "error" => {
+                                    let msg = payload
+                                        .get("data")
+                                        .and_then(|d| d.get("message"))
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("unknown error");
+                                    eprintln!("\\nError: {}", msg);
+                                    break;
+                                }
+                                "final" => {
+                                    print_final_newline_if_needed(got_output).await?;
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
+                        "chat" => {
+                            let state = payload.get("state").and_then(|v| v.as_str()).unwrap_or("");
+                            match state {
+                                "final" => {
+                                    print_final_newline_if_needed(got_output).await?;
+                                    break;
+                                }
+                                "error" => {
+                                    let msg = payload
+                                        .get("errorMessage")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("unknown error");
+                                    eprintln!("\\nError: {}", msg);
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
+                        _ => {
+                            // Ignore heartbeat, config changes, etc.
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Best-effort WebSocket close before returning.
+    let _ = ws_write.send(Message::Close(None)).await;
+    Ok(())
+}
+
 /// Entry point for `cara chat`.
 pub async fn handle_chat(
     new_session: bool,
@@ -240,293 +525,8 @@ pub async fn handle_chat(
         }
         embedded_server_handle = Some(handle);
     }
-    let result = async {
-        // Connect via WebSocket
-        let ws_url = format!("ws://127.0.0.1:{}/ws", port);
-        let ws_stream = match connect_ws(&ws_url, false).await {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("Failed to connect to gateway: {}", e);
-                return Err(e);
-            }
-        };
-        let (mut ws_write, mut ws_read) = ws_stream.split();
 
-        // Handshake
-        let auth = resolve_gateway_auth().await;
-        let state_dir = resolve_state_dir();
-        let device_identity = load_or_create_device_identity(&state_dir).await?;
-
-        let nonce = await_connect_challenge(&mut ws_read, &mut ws_write).await?;
-
-        let role = "operator";
-        let scopes = vec!["operator.write".to_string()];
-        let mut connect_params = serde_json::json!({
-            "minProtocol": 3,
-            "maxProtocol": 3,
-            "client": {
-                "id": CHAT_CLIENT_ID,
-                "version": env!("CARGO_PKG_VERSION"),
-                "platform": std::env::consts::OS,
-                "mode": CHAT_CLIENT_MODE
-            },
-            "role": role,
-            "scopes": scopes.clone()
-        });
-        let GatewayAuth { token, password } = auth;
-        let token_for_sig = token.clone();
-        if let Some(token) = token {
-            connect_params["auth"] = serde_json::json!({ "token": token });
-        } else if let Some(password) = password {
-            connect_params["auth"] = serde_json::json!({ "password": password });
-        }
-        connect_params["device"] = build_device_identity_for_connect(
-            &device_identity,
-            CHAT_CLIENT_ID,
-            CHAT_CLIENT_MODE,
-            role,
-            &scopes,
-            token_for_sig.as_deref(),
-            Some(&nonce),
-        )?;
-
-        let connect_frame = serde_json::json!({
-            "type": "req",
-            "id": "connect-1",
-            "method": "connect",
-            "params": connect_params
-        });
-        ws_write
-            .send(Message::Text(serde_json::to_string(&connect_frame)?.into()))
-            .await?;
-
-        if let Err(err) =
-            await_ws_response_with_error(&mut ws_read, &mut ws_write, "connect-1").await
-        {
-            eprintln!("WebSocket connect failed: {}", err.message);
-            return Err(Box::new(err));
-        }
-
-        // REPL
-        let mut session_key = generate_session_key(new_session);
-        let mut msg_counter: u64 = 0;
-
-        eprintln!();
-        eprintln!(
-            "  cara v{} \u{2014} type /help for commands, Ctrl+D to exit",
-            env!("CARGO_PKG_VERSION")
-        );
-        eprintln!();
-
-        loop {
-            print_prompt().await?;
-
-            let line = read_line().await;
-
-            let line = match line {
-                Some(l) => l,
-                None => {
-                    // EOF (Ctrl+D)
-                    eprintln!();
-                    break;
-                }
-            };
-
-            match parse_repl_input(&line) {
-                ReplCommand::Exit => break,
-                ReplCommand::Help => {
-                    print_help();
-                    continue;
-                }
-                ReplCommand::New => {
-                    session_key = generate_session_key(true);
-                    eprintln!("Session reset.");
-                    continue;
-                }
-                ReplCommand::Message(msg) => {
-                    if msg.is_empty() {
-                        continue;
-                    }
-
-                    msg_counter += 1;
-                    let req_id = format!("chat-{}", msg_counter);
-                    let expected_run_id = Uuid::new_v4().to_string();
-
-                    let chat_frame = serde_json::json!({
-                        "type": "req",
-                        "id": req_id.clone(),
-                        "method": "chat.send",
-                        "params": {
-                            "message": msg,
-                            "sessionKey": session_key.clone(),
-                            "idempotencyKey": expected_run_id.clone(),
-                            "stream": true,
-                            "triggerAgent": true
-                        }
-                    });
-                    ws_write
-                        .send(Message::Text(serde_json::to_string(&chat_frame)?.into()))
-                        .await?;
-
-                    // Stream response
-                    let mut got_output = false;
-                    loop {
-                        let frame = tokio::select! {
-                            frame = read_ws_json(&mut ws_read, &mut ws_write) => {
-                                match frame {
-                                    Ok(f) => f,
-                                    Err(e) => {
-                                        eprintln!("\nConnection lost: {}", e);
-                                        return Err(e);
-                                    }
-                                }
-                            }
-                            _ = tokio::signal::ctrl_c() => {
-                                eprintln!();
-                                let abort_frame = serde_json::json!({
-                                    "type": "req",
-                                    "id": format!("abort-{}", msg_counter),
-                                    "method": "chat.abort",
-                                    "params": {
-                                        "runId": expected_run_id.clone(),
-                                        "reason": "user_interrupt"
-                                    }
-                                });
-                                match serde_json::to_string(&abort_frame) {
-                                    Ok(abort_msg) => {
-                                        if ws_write
-                                            .send(Message::Text(abort_msg.into()))
-                                            .await
-                                            .is_err()
-                                        {
-                                            eprintln!(
-                                                "\nWarning: could not send abort message to gateway."
-                                            );
-                                        }
-                                    }
-                                    Err(e) => {
-                                        eprintln!("\nError: failed to serialize abort message: {}", e);
-                                    }
-                                }
-                                eprintln!("Aborted current run.");
-                                break;
-                            }
-                        };
-
-                        let frame_type = frame.get("type").and_then(|v| v.as_str()).unwrap_or("");
-
-                        if frame_type == "res" {
-                            let response_id = frame.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                            if response_id != req_id {
-                                continue;
-                            }
-
-                            let ok = frame.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
-                            if !ok {
-                                let msg = frame
-                                    .get("error")
-                                    .and_then(|e| e.get("message"))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("request failed");
-                                eprintln!("\nError: {}", msg);
-                                break;
-                            }
-
-                            let status = frame
-                                .get("payload")
-                                .and_then(|p| p.get("status"))
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
-                            if status == "queued" {
-                                eprintln!("[chat: queued] no provider is currently available.");
-                                break;
-                            }
-
-                            continue;
-                        }
-
-                        if frame_type != "event" {
-                            continue;
-                        }
-
-                        let event = frame.get("event").and_then(|v| v.as_str()).unwrap_or("");
-                        let payload = frame.get("payload").cloned().unwrap_or(Value::Null);
-                        let run_id = payload.get("runId").and_then(|v| v.as_str()).unwrap_or("");
-                        if run_id != expected_run_id {
-                            continue;
-                        }
-
-                        match event {
-                            "agent" => {
-                                let stream =
-                                    payload.get("stream").and_then(|v| v.as_str()).unwrap_or("");
-                                match stream {
-                                    "text" => {
-                                        if let Some(delta) = payload
-                                            .get("data")
-                                            .and_then(|d| d.get("delta"))
-                                            .and_then(|v| v.as_str())
-                                        {
-                                            write_stdout(delta).await?;
-                                            got_output = true;
-                                        }
-                                    }
-                                    "tool_use" => {
-                                        let name = tool_name_from_payload(&payload);
-                                        eprintln!("[tool: {}]", name);
-                                    }
-                                    "tool_result" => {
-                                        let name = tool_name_from_payload(&payload);
-                                        eprintln!("[tool: {} \u{2192} done]", name);
-                                    }
-                                    "error" => {
-                                        let msg = payload
-                                            .get("data")
-                                            .and_then(|d| d.get("message"))
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("unknown error");
-                                        eprintln!("\nError: {}", msg);
-                                        break;
-                                    }
-                                    "final" => {
-                                        print_final_newline_if_needed(got_output).await?;
-                                        break;
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            "chat" => {
-                                let state = payload.get("state").and_then(|v| v.as_str()).unwrap_or("");
-                                match state {
-                                    "final" => {
-                                        print_final_newline_if_needed(got_output).await?;
-                                        break;
-                                    }
-                                    "error" => {
-                                        let msg = payload
-                                            .get("errorMessage")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("unknown error");
-                                        eprintln!("\nError: {}", msg);
-                                        break;
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            _ => {
-                                // Ignore heartbeat, config changes, etc.
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Best-effort WebSocket close before returning.
-        let _ = ws_write.send(Message::Close(None)).await;
-        Ok(())
-    }
-    .await;
+    let result = run_chat_session(new_session, port).await;
 
     if let Some(handle) = embedded_server_handle {
         handle.shutdown().await;
@@ -534,7 +534,6 @@ pub async fn handle_chat(
 
     result
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
