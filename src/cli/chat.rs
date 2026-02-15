@@ -69,7 +69,10 @@ async fn health_check(port: u16) -> bool {
 async fn init_media_store_cleanup() {
     let store = match crate::media::MediaStore::new(crate::media::StoreConfig::default()).await {
         Ok(store) => store,
-        Err(_) => return,
+        Err(e) => {
+            eprintln!("Warning: could not initialize media store cleanup: {}", e);
+            return;
+        }
     };
     let store = std::sync::Arc::new(store);
     let _cleanup = store.clone().start_cleanup_task();
@@ -148,12 +151,29 @@ async fn read_line() -> Option<String> {
         match std::io::stdin().read_line(&mut line) {
             Ok(0) => None, // EOF
             Ok(_) => Some(line),
-            Err(_) => None,
+            Err(e) => {
+                eprintln!("\nError reading from stdin: {}", e);
+                None
+            }
         }
     })
     .await
     .ok()
     .flatten()
+}
+
+fn tool_name_from_payload(payload: &Value) -> &str {
+    payload
+        .get("data")
+        .and_then(|d| d.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+}
+
+fn print_final_newline_if_needed(got_output: bool) {
+    if got_output {
+        println!();
+    }
 }
 
 /// Print the prompt and flush stdout.
@@ -335,7 +355,7 @@ pub async fn handle_chat(
                             let _ = ws_write
                                 .send(Message::Text(
                                     serde_json::to_string(&abort_frame)
-                                        .unwrap_or_else(|_| "{}".to_string())
+                                        .expect("abort frame should be serializable")
                                         .into(),
                                 ))
                                 .await;
@@ -404,19 +424,11 @@ pub async fn handle_chat(
                                     }
                                 }
                                 "tool_use" => {
-                                    let name = payload
-                                        .get("data")
-                                        .and_then(|d| d.get("name"))
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("unknown");
+                                    let name = tool_name_from_payload(&payload);
                                     eprintln!("[tool: {}]", name);
                                 }
                                 "tool_result" => {
-                                    let name = payload
-                                        .get("data")
-                                        .and_then(|d| d.get("name"))
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("unknown");
+                                    let name = tool_name_from_payload(&payload);
                                     eprintln!("[tool: {} \u{2192} done]", name);
                                 }
                                 "error" => {
@@ -429,9 +441,7 @@ pub async fn handle_chat(
                                     break;
                                 }
                                 "final" => {
-                                    if got_output {
-                                        println!();
-                                    }
+                                    print_final_newline_if_needed(got_output);
                                     break;
                                 }
                                 _ => {}
@@ -441,9 +451,7 @@ pub async fn handle_chat(
                             let state = payload.get("state").and_then(|v| v.as_str()).unwrap_or("");
                             match state {
                                 "final" => {
-                                    if got_output {
-                                        println!();
-                                    }
+                                    print_final_newline_if_needed(got_output);
                                     break;
                                 }
                                 "error" => {
