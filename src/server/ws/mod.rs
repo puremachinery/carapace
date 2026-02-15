@@ -977,7 +977,7 @@ pub enum WsConfigError {
     Devices(#[from] devices::DevicePairingError),
 }
 
-pub async fn build_ws_state_from_config() -> Result<Arc<WsServerState>, WsConfigError> {
+pub async fn build_ws_state_owned_from_config() -> Result<WsServerState, WsConfigError> {
     let cfg = config::load_config()?;
     let state_dir = resolve_state_dir();
     if let Err(err) = credentials::migrate_plaintext_credentials(state_dir.clone()).await {
@@ -1030,8 +1030,11 @@ pub async fn build_ws_state_from_config() -> Result<Arc<WsServerState>, WsConfig
         }
     }
 
-    let state = Arc::new(state);
     Ok(state)
+}
+
+pub async fn build_ws_state_from_config() -> Result<Arc<WsServerState>, WsConfigError> {
+    Ok(Arc::new(build_ws_state_owned_from_config().await?))
 }
 
 pub async fn build_ws_config_from_files() -> Result<WsServerConfig, WsConfigError> {

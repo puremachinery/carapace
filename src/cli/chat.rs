@@ -41,7 +41,7 @@ fn print_help() {
     eprintln!("Commands:");
     eprintln!("  /new   — start a new session");
     eprintln!("  /help  — show this help");
-    eprintln!("  /exit  — quit (or press Ctrl+D)");
+    eprintln!("  /exit or /quit  — quit (or press Ctrl+D)");
 }
 
 fn generate_session_key(new_session: bool) -> String {
@@ -66,8 +66,17 @@ async fn health_check(port: u16) -> bool {
     }
 }
 
+async fn init_media_store_cleanup() {
+    let store = match crate::media::MediaStore::new(crate::media::StoreConfig::default()).await {
+        Ok(store) => store,
+        Err(_) => return,
+    };
+    let store = std::sync::Arc::new(store);
+    let _cleanup = store.clone().start_cleanup_task();
+}
+
 /// Start the gateway in-process as a background task.
-/// Returns the port the gateway is listening on.
+/// Returns a `ServerHandle` for the started gateway.
 async fn start_embedded_gateway(
     port: u16,
 ) -> Result<crate::server::startup::ServerHandle, Box<dyn std::error::Error>> {
@@ -78,16 +87,14 @@ async fn start_embedded_gateway(
     std::fs::create_dir_all(&state_dir)?;
     std::fs::create_dir_all(state_dir.join("sessions"))?;
     std::fs::create_dir_all(state_dir.join("cron"))?;
+    crate::logging::audit::AuditLog::init(state_dir.clone()).await;
+    init_media_store_cleanup().await;
 
-    let ws_state = crate::server::ws::build_ws_state_from_config().await?;
+    let ws_state = crate::server::ws::build_ws_state_owned_from_config().await?;
 
     // Configure LLM providers
     let ws_state = match crate::agent::factory::build_providers(&cfg)? {
-        Some(multi_provider) => {
-            let inner = std::sync::Arc::try_unwrap(ws_state)
-                .map_err(|_| "WsServerState Arc should have single owner")?;
-            std::sync::Arc::new(inner.with_llm_provider(std::sync::Arc::new(multi_provider)))
-        }
+        Some(multi_provider) => ws_state.with_llm_provider(std::sync::Arc::new(multi_provider)),
         None => ws_state,
     };
 
@@ -95,10 +102,8 @@ async fn start_embedded_gateway(
     let plugin_registry = std::sync::Arc::new(crate::plugins::PluginRegistry::new());
     let tools_registry = std::sync::Arc::new(crate::plugins::tools::ToolsRegistry::new());
     tools_registry.set_plugin_registry(plugin_registry.clone());
-    let inner = std::sync::Arc::try_unwrap(ws_state)
-        .map_err(|_| "WsServerState Arc should have single owner")?;
     let ws_state = std::sync::Arc::new(
-        inner
+        ws_state
             .with_tools_registry(tools_registry.clone())
             .with_plugin_registry(plugin_registry.clone()),
     );
