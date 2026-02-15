@@ -64,11 +64,11 @@ Known working:
 - WebSocket protocol handlers (golden trace tests)
 - OpenAI-compatible HTTP endpoints (`/v1/chat/completions`, `/v1/responses`)
 - Config loading, defaults, and validation
+- Interactive CLI chat REPL (`cara chat`)
 
 Known gaps:
 
 - Control UI frontend (backend wired, no frontend built/bundled yet)
-- No CLI chat/message command (console channel registered but no `cara chat` subcommand)
 - Telegram is webhook-only (no long-polling; requires a tunnel or public endpoint for inbound)
 - Signal, Slack channels (not yet smoke-tested in real environments)
 - Public internet deployments (TLS/mTLS, reverse proxy, auth hardening)
@@ -161,6 +161,14 @@ If you have a release binary (once available), use the manual steps above.
    ```bash
    cara status --host 127.0.0.1 --port 18789
    ```
+
+4. Open a local interactive chat session:
+   ```bash
+   cara chat
+   ```
+   Use `/help` for a list of REPL commands:
+   - `/new` — start a fresh session
+   - `/exit` or `/quit` — exit chat
 
 ### With Ollama (free, local)
 

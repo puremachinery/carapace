@@ -60,6 +60,22 @@ Notes:
 - Performs the device-identity challenge/response during WS connect.
 - If pairing is required, the CLI prints a `requestId` to approve in the control UI.
 
+### chat
+Start an interactive chat REPL (`chat.send` over WebSocket).
+
+```bash
+cara chat
+```
+
+Options:
+- `--new` — start a new session key instead of resuming `cli-chat`.
+- `--port` / `-p` — connect to a specific local gateway port.
+
+REPL commands:
+- `/help` — show command help.
+- `/new` — start a fresh session.
+- `/exit` or `/quit` — exit chat.
+
 ### update
 Check for or install updates from GitHub releases.
 
@@ -121,4 +137,9 @@ cara logs --host 10.0.0.12 --port 18789 --allow-plaintext
 ### Pair with a remote gateway
 ```
 CARAPACE_GATEWAY_TOKEN=... cara pair https://gateway.local:3001 --name "Ops CLI" --trust
+```
+
+### Start a fresh local chat session
+```bash
+cara chat --new
 ```
