@@ -20,6 +20,7 @@ use crate::cron;
 use crate::hooks::registry::HookRegistry;
 use crate::messages;
 use crate::plugins::tools::ToolsRegistry;
+use crate::plugins::PluginRegistry;
 use crate::server::http::{HttpConfig, MiddlewareConfig};
 use crate::server::ws::WsServerState;
 use crate::sessions;
@@ -56,6 +57,63 @@ impl ServerConfig {
             spawn_background_tasks: false,
         }
     }
+}
+
+/// Build the runtime `WsServerState` used by server startup paths.
+///
+/// Shared by `main.rs` and embedded CLI startup to avoid drift in provider and
+/// registry wiring.
+pub async fn build_ws_state_with_runtime_dependencies(
+    cfg: &Value,
+    tools_registry: Arc<ToolsRegistry>,
+    plugin_registry: Arc<PluginRegistry>,
+) -> Result<Arc<WsServerState>, Box<dyn std::error::Error>> {
+    let ws_state = crate::server::ws::build_ws_state_owned_from_value(cfg).await?;
+    let ws_state = match crate::agent::factory::build_providers(cfg)? {
+        Some(multi_provider) => ws_state.with_llm_provider(Arc::new(multi_provider)),
+        None => {
+            info!(
+                "No LLM provider configured (set ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_API_KEY, and/or configure Ollama to enable)"
+            );
+            ws_state
+        }
+    };
+
+    tools_registry.set_plugin_registry(plugin_registry.clone());
+    Ok(Arc::new(
+        ws_state
+            .with_tools_registry(tools_registry)
+            .with_plugin_registry(plugin_registry),
+    ))
+}
+
+/// Prepare runtime state storage and shared local startup services.
+///
+/// Shared by normal server startup and embedded chat startup to keep state
+/// directory creation, audit initialization, and media cleanup wiring in one
+/// place.
+pub async fn prepare_runtime_environment() -> Result<std::path::PathBuf, Box<dyn std::error::Error>>
+{
+    let state_dir = crate::server::ws::resolve_state_dir();
+    tokio::fs::create_dir_all(&state_dir).await?;
+    tokio::fs::create_dir_all(state_dir.join("sessions")).await?;
+    tokio::fs::create_dir_all(state_dir.join("cron")).await?;
+    crate::logging::audit::AuditLog::init(state_dir.clone()).await;
+    init_media_store_cleanup().await;
+    Ok(state_dir)
+}
+
+async fn init_media_store_cleanup() {
+    let store = match crate::media::MediaStore::new(crate::media::StoreConfig::default()).await {
+        Ok(store) => store,
+        Err(e) => {
+            warn!(error = %e, "failed to initialize media store");
+            return;
+        }
+    };
+    let store = Arc::new(store);
+    let _cleanup = store.clone().start_cleanup_task();
+    info!("media store cleanup task started");
 }
 
 /// Handle to a running server.  Returned by [`run_server_with_config`].
