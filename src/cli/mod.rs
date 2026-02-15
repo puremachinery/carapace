@@ -2588,6 +2588,30 @@ mod tests {
     }
 
     #[test]
+    fn test_cli_chat_defaults() {
+        let cli = Cli::try_parse_from(["cara", "chat"]).unwrap();
+        match cli.command {
+            Some(Command::Chat { new, port }) => {
+                assert!(!new);
+                assert_eq!(port, None);
+            }
+            other => panic!("Expected Chat, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_chat_with_new_and_port() {
+        let cli = Cli::try_parse_from(["cara", "chat", "--new", "--port", "9000"]).unwrap();
+        match cli.command {
+            Some(Command::Chat { new, port }) => {
+                assert!(new);
+                assert_eq!(port, Some(9000));
+            }
+            other => panic!("Expected Chat, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn test_device_identity_round_trip() {
         let identity = generate_device_identity().unwrap();
         validate_device_identity(&identity).unwrap();

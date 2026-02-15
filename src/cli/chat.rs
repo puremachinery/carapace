@@ -15,6 +15,9 @@ use super::{
     resolve_state_dir, GatewayAuth,
 };
 
+const CHAT_CLIENT_ID: &str = "cli";
+const CHAT_CLIENT_MODE: &str = "cli";
+
 /// REPL commands recognised in the input loop.
 #[derive(Debug, PartialEq)]
 enum ReplCommand {
@@ -194,15 +197,15 @@ pub async fn handle_chat(
     let nonce = await_connect_challenge(&mut ws_read, &mut ws_write).await?;
 
     let role = "operator";
-    let scopes = vec!["operator.admin".to_string()];
+    let scopes = vec!["operator.write".to_string()];
     let mut connect_params = serde_json::json!({
         "minProtocol": 3,
         "maxProtocol": 3,
         "client": {
-            "id": "cli-chat",
+            "id": CHAT_CLIENT_ID,
             "version": env!("CARGO_PKG_VERSION"),
             "platform": std::env::consts::OS,
-            "mode": "cli"
+            "mode": CHAT_CLIENT_MODE
         },
         "role": role,
         "scopes": scopes.clone()
@@ -216,8 +219,8 @@ pub async fn handle_chat(
     }
     connect_params["device"] = build_device_identity_for_connect(
         &device_identity,
-        "cli-chat",
-        "cli",
+        CHAT_CLIENT_ID,
+        CHAT_CLIENT_MODE,
         role,
         &scopes,
         token_for_sig.as_deref(),
@@ -282,16 +285,16 @@ pub async fn handle_chat(
 
                 msg_counter += 1;
                 let req_id = format!("chat-{}", msg_counter);
-                let idempotency_key = Uuid::new_v4().to_string();
+                let expected_run_id = Uuid::new_v4().to_string();
 
                 let chat_frame = serde_json::json!({
                     "type": "req",
-                    "id": req_id,
+                    "id": req_id.clone(),
                     "method": "chat.send",
                     "params": {
                         "message": msg,
-                        "sessionKey": session_key,
-                        "idempotencyKey": idempotency_key,
+                        "sessionKey": session_key.clone(),
+                        "idempotencyKey": expected_run_id.clone(),
                         "stream": true,
                         "triggerAgent": true
                     }
@@ -315,6 +318,23 @@ pub async fn handle_chat(
                         }
                         _ = tokio::signal::ctrl_c() => {
                             eprintln!();
+                            let abort_frame = serde_json::json!({
+                                "type": "req",
+                                "id": format!("abort-{}", msg_counter),
+                                "method": "chat.abort",
+                                "params": {
+                                    "runId": expected_run_id.clone(),
+                                    "reason": "user_interrupt"
+                                }
+                            });
+                            let _ = ws_write
+                                .send(Message::Text(
+                                    serde_json::to_string(&abort_frame)
+                                        .unwrap_or_else(|_| "{}".to_string())
+                                        .into(),
+                                ))
+                                .await;
+                            eprintln!("Aborted current run.");
                             break;
                         }
                     };
@@ -322,7 +342,32 @@ pub async fn handle_chat(
                     let frame_type = frame.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
                     if frame_type == "res" {
-                        // Ack for our request — continue waiting for events
+                        let response_id = frame.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                        if response_id != req_id {
+                            continue;
+                        }
+
+                        let ok = frame.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+                        if !ok {
+                            let msg = frame
+                                .get("error")
+                                .and_then(|e| e.get("message"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("request failed");
+                            eprintln!("\nError: {}", msg);
+                            break;
+                        }
+
+                        let status = frame
+                            .get("payload")
+                            .and_then(|p| p.get("status"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        if status == "queued" {
+                            eprintln!("[chat: queued] no provider is currently available.");
+                            break;
+                        }
+
                         continue;
                     }
 
@@ -332,6 +377,10 @@ pub async fn handle_chat(
 
                     let event = frame.get("event").and_then(|v| v.as_str()).unwrap_or("");
                     let payload = frame.get("payload").cloned().unwrap_or(Value::Null);
+                    let run_id = payload.get("runId").and_then(|v| v.as_str()).unwrap_or("");
+                    if run_id != expected_run_id {
+                        continue;
+                    }
 
                     match event {
                         "agent" => {
