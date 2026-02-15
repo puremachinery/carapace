@@ -55,14 +55,18 @@ fn generate_session_key(new_session: bool) -> String {
 /// Check if a gateway is already reachable on the given port.
 async fn health_check(port: u16) -> bool {
     let url = format!("http://127.0.0.1:{}/health", port);
-    let client = reqwest::Client::builder()
+    match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(2))
         .build()
-        .ok();
-    if let Some(client) = client {
-        client.get(&url).send().await.is_ok()
-    } else {
-        false
+    {
+        Ok(client) => client.get(&url).send().await.is_ok(),
+        Err(e) => {
+            eprintln!(
+                "Warning: could not create http client for health check: {}",
+                e
+            );
+            false
+        }
     }
 }
 
@@ -83,8 +87,13 @@ async fn init_media_store_cleanup() {
 async fn start_embedded_gateway(
     port: u16,
 ) -> Result<crate::server::startup::ServerHandle, Box<dyn std::error::Error>> {
-    let cfg =
-        crate::config::load_config().unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
+    let cfg = crate::config::load_config().unwrap_or_else(|e| {
+        eprintln!(
+            "Warning: could not load config file: {}. Proceeding with default configuration.",
+            e
+        );
+        Value::Object(serde_json::Map::new())
+    });
 
     let state_dir = crate::server::ws::resolve_state_dir();
     std::fs::create_dir_all(&state_dir)?;
