@@ -102,23 +102,15 @@ async fn start_embedded_gateway(
     crate::logging::audit::AuditLog::init(state_dir.clone()).await;
     init_media_store_cleanup().await;
 
-    let ws_state = crate::server::ws::build_ws_state_owned_from_config().await?;
-
-    // Configure LLM providers
-    let ws_state = match crate::agent::factory::build_providers(&cfg)? {
-        Some(multi_provider) => ws_state.with_llm_provider(std::sync::Arc::new(multi_provider)),
-        None => ws_state,
-    };
-
     // Set up plugin/tools registries
     let plugin_registry = std::sync::Arc::new(crate::plugins::PluginRegistry::new());
     let tools_registry = std::sync::Arc::new(crate::plugins::tools::ToolsRegistry::new());
-    tools_registry.set_plugin_registry(plugin_registry.clone());
-    let ws_state = std::sync::Arc::new(
-        ws_state
-            .with_tools_registry(tools_registry.clone())
-            .with_plugin_registry(plugin_registry.clone()),
-    );
+    let ws_state = crate::server::startup::build_ws_state_with_runtime_dependencies(
+        &cfg,
+        tools_registry.clone(),
+        plugin_registry.clone(),
+    )
+    .await?;
 
     let hook_registry = std::sync::Arc::new(crate::hooks::registry::HookRegistry::new());
 
@@ -361,13 +353,22 @@ pub async fn handle_chat(
                                     "reason": "user_interrupt"
                                 }
                             });
-                            let _ = ws_write
-                                .send(Message::Text(
-                                    serde_json::to_string(&abort_frame)
-                                        .expect("abort frame should be serializable")
-                                        .into(),
-                                ))
-                                .await;
+                            match serde_json::to_string(&abort_frame) {
+                                Ok(abort_msg) => {
+                                    if ws_write
+                                        .send(Message::Text(abort_msg.into()))
+                                        .await
+                                        .is_err()
+                                    {
+                                        eprintln!(
+                                            "\nWarning: could not send abort message to gateway."
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("\nError: failed to serialize abort message: {}", e);
+                                }
+                            }
                             eprintln!("Aborted current run.");
                             break;
                         }

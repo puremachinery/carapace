@@ -154,10 +154,12 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let tools_registry = Arc::new(plugins::tools::ToolsRegistry::new());
     let hook_registry = Arc::new(hooks::registry::HookRegistry::new());
 
-    let ws_state = server::ws::build_ws_state_from_config().await?;
-    let ws_state = configure_ws_with_llm(ws_state, &cfg)?;
-    let ws_state =
-        configure_ws_with_registries(ws_state, tools_registry.clone(), plugin_registry.clone())?;
+    let ws_state = server::startup::build_ws_state_with_runtime_dependencies(
+        &cfg,
+        tools_registry.clone(),
+        plugin_registry.clone(),
+    )
+    .await?;
     let ws_state = register_console_channel(ws_state)?;
     let ws_state = register_signal_channel_if_configured(ws_state, &cfg)?;
     let ws_state = register_telegram_channel_if_configured(ws_state, &cfg)?;
@@ -237,40 +239,6 @@ fn resolve_bind_config(
 
     let bind_mode = server::bind::parse_bind_mode(bind_str);
     Ok(server::bind::resolve_bind_with_metadata(&bind_mode, port)?)
-}
-
-/// Configure LLM providers on the WsServerState via the provider factory.
-fn configure_ws_with_llm(
-    ws_state: Arc<server::ws::WsServerState>,
-    cfg: &Value,
-) -> Result<Arc<server::ws::WsServerState>, Box<dyn std::error::Error>> {
-    match agent::factory::build_providers(cfg)? {
-        Some(multi_provider) => {
-            let inner = Arc::try_unwrap(ws_state)
-                .map_err(|_| "WsServerState Arc should have single owner at startup")?;
-            Ok(Arc::new(inner.with_llm_provider(Arc::new(multi_provider))))
-        }
-        None => {
-            info!("No LLM provider configured (set ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_API_KEY, and/or configure Ollama to enable)");
-            Ok(ws_state)
-        }
-    }
-}
-
-/// Attach shared registries (tools + plugins) to the WsServerState.
-fn configure_ws_with_registries(
-    ws_state: Arc<server::ws::WsServerState>,
-    tools_registry: Arc<plugins::tools::ToolsRegistry>,
-    plugin_registry: Arc<plugins::PluginRegistry>,
-) -> Result<Arc<server::ws::WsServerState>, Box<dyn std::error::Error>> {
-    tools_registry.set_plugin_registry(plugin_registry.clone());
-    let inner = Arc::try_unwrap(ws_state)
-        .map_err(|_| "WsServerState Arc should have single owner at startup")?;
-    Ok(Arc::new(
-        inner
-            .with_tools_registry(tools_registry)
-            .with_plugin_registry(plugin_registry),
-    ))
 }
 
 /// Register the built-in console channel (for testing/demo) on the WsServerState.

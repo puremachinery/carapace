@@ -20,6 +20,7 @@ use crate::cron;
 use crate::hooks::registry::HookRegistry;
 use crate::messages;
 use crate::plugins::tools::ToolsRegistry;
+use crate::plugins::PluginRegistry;
 use crate::server::http::{HttpConfig, MiddlewareConfig};
 use crate::server::ws::WsServerState;
 use crate::sessions;
@@ -56,6 +57,34 @@ impl ServerConfig {
             spawn_background_tasks: false,
         }
     }
+}
+
+/// Build the runtime `WsServerState` used by server startup paths.
+///
+/// Shared by `main.rs` and embedded CLI startup to avoid drift in provider and
+/// registry wiring.
+pub async fn build_ws_state_with_runtime_dependencies(
+    cfg: &Value,
+    tools_registry: Arc<ToolsRegistry>,
+    plugin_registry: Arc<PluginRegistry>,
+) -> Result<Arc<WsServerState>, Box<dyn std::error::Error>> {
+    let ws_state = crate::server::ws::build_ws_state_owned_from_config().await?;
+    let ws_state = match crate::agent::factory::build_providers(cfg)? {
+        Some(multi_provider) => ws_state.with_llm_provider(Arc::new(multi_provider)),
+        None => {
+            info!(
+                "No LLM provider configured (set ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_API_KEY, and/or configure Ollama to enable)"
+            );
+            ws_state
+        }
+    };
+
+    tools_registry.set_plugin_registry(plugin_registry.clone());
+    Ok(Arc::new(
+        ws_state
+            .with_tools_registry(tools_registry)
+            .with_plugin_registry(plugin_registry),
+    ))
 }
 
 /// Handle to a running server.  Returned by [`run_server_with_config`].
