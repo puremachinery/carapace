@@ -96,9 +96,9 @@ async fn start_embedded_gateway(
     });
 
     let state_dir = crate::server::ws::resolve_state_dir();
-    std::fs::create_dir_all(&state_dir)?;
-    std::fs::create_dir_all(state_dir.join("sessions"))?;
-    std::fs::create_dir_all(state_dir.join("cron"))?;
+    tokio::fs::create_dir_all(&state_dir).await?;
+    tokio::fs::create_dir_all(state_dir.join("sessions")).await?;
+    tokio::fs::create_dir_all(state_dir.join("cron")).await?;
     crate::logging::audit::AuditLog::init(state_dir.clone()).await;
     init_media_store_cleanup().await;
 
@@ -171,16 +171,33 @@ fn tool_name_from_payload(payload: &Value) -> &str {
         .unwrap_or("unknown")
 }
 
-fn print_final_newline_if_needed(got_output: bool) {
+async fn print_final_newline_if_needed(got_output: bool) -> std::io::Result<()> {
     if got_output {
-        println!();
+        write_stdout("\n").await?;
     }
+    Ok(())
 }
 
 /// Print the prompt and flush stdout.
-fn print_prompt() {
-    eprint!("> ");
-    let _ = std::io::stderr().flush();
+async fn print_prompt() -> std::io::Result<()> {
+    tokio::task::spawn_blocking(|| {
+        let mut stderr = std::io::stderr();
+        stderr.write_all(b"> ")?;
+        stderr.flush()
+    })
+    .await
+    .map_err(|e| std::io::Error::other(format!("stderr write task failed: {}", e)))?
+}
+
+async fn write_stdout(text: &str) -> std::io::Result<()> {
+    let text = text.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let mut stdout = std::io::stdout();
+        stdout.write_all(text.as_bytes())?;
+        stdout.flush()
+    })
+    .await
+    .map_err(|e| std::io::Error::other(format!("stdout write task failed: {}", e)))?
 }
 
 /// Entry point for `cara chat`.
@@ -280,7 +297,7 @@ pub async fn handle_chat(
     eprintln!();
 
     loop {
-        print_prompt();
+        print_prompt().await?;
 
         let line = read_line().await;
 
@@ -428,8 +445,7 @@ pub async fn handle_chat(
                                         .and_then(|d| d.get("delta"))
                                         .and_then(|v| v.as_str())
                                     {
-                                        print!("{}", delta);
-                                        let _ = std::io::stdout().flush();
+                                        write_stdout(delta).await?;
                                         got_output = true;
                                     }
                                 }
@@ -451,7 +467,7 @@ pub async fn handle_chat(
                                     break;
                                 }
                                 "final" => {
-                                    print_final_newline_if_needed(got_output);
+                                    print_final_newline_if_needed(got_output).await?;
                                     break;
                                 }
                                 _ => {}
@@ -461,7 +477,7 @@ pub async fn handle_chat(
                             let state = payload.get("state").and_then(|v| v.as_str()).unwrap_or("");
                             match state {
                                 "final" => {
-                                    print_final_newline_if_needed(got_output);
+                                    print_final_newline_if_needed(got_output).await?;
                                     break;
                                 }
                                 "error" => {
