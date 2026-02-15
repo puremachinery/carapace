@@ -68,7 +68,7 @@ pub async fn build_ws_state_with_runtime_dependencies(
     tools_registry: Arc<ToolsRegistry>,
     plugin_registry: Arc<PluginRegistry>,
 ) -> Result<Arc<WsServerState>, Box<dyn std::error::Error>> {
-    let ws_state = crate::server::ws::build_ws_state_owned_from_config().await?;
+    let ws_state = crate::server::ws::build_ws_state_owned_from_value(cfg).await?;
     let ws_state = match crate::agent::factory::build_providers(cfg)? {
         Some(multi_provider) => ws_state.with_llm_provider(Arc::new(multi_provider)),
         None => {

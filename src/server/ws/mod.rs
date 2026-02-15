@@ -977,13 +977,12 @@ pub enum WsConfigError {
     Devices(#[from] devices::DevicePairingError),
 }
 
-pub async fn build_ws_state_owned_from_config() -> Result<WsServerState, WsConfigError> {
-    let cfg = config::load_config()?;
+pub async fn build_ws_state_owned_from_value(cfg: &Value) -> Result<WsServerState, WsConfigError> {
     let state_dir = resolve_state_dir();
     if let Err(err) = credentials::migrate_plaintext_credentials(state_dir.clone()).await {
         tracing::warn!(error = %err, "Credential migration failed");
     }
-    let config = build_ws_config_from_files().await?;
+    let config = build_ws_config_from_value(cfg).await?;
     let mut state = WsServerState::new_persistent(config, state_dir)?;
 
     // Wire session integrity HMAC key from config
@@ -1033,16 +1032,20 @@ pub async fn build_ws_state_owned_from_config() -> Result<WsServerState, WsConfi
     Ok(state)
 }
 
+pub async fn build_ws_state_owned_from_config() -> Result<WsServerState, WsConfigError> {
+    let cfg = config::load_config()?;
+    build_ws_state_owned_from_value(&cfg).await
+}
+
 pub async fn build_ws_state_from_config() -> Result<Arc<WsServerState>, WsConfigError> {
     Ok(Arc::new(build_ws_state_owned_from_config().await?))
 }
 
-pub async fn build_ws_config_from_files() -> Result<WsServerConfig, WsConfigError> {
-    let cfg = config::load_config()?;
+pub async fn build_ws_config_from_value(cfg: &Value) -> Result<WsServerConfig, WsConfigError> {
     let gateway = cfg.get("gateway").and_then(|v| v.as_object());
 
-    let resolved_auth = resolve_gateway_auth_config(gateway, &cfg).await?;
-    let options = parse_ws_server_options(gateway, &cfg);
+    let resolved_auth = resolve_gateway_auth_config(gateway, cfg).await?;
+    let options = parse_ws_server_options(gateway, cfg);
 
     Ok(WsServerConfig {
         auth: WsAuthConfig {
@@ -1061,6 +1064,11 @@ pub async fn build_ws_config_from_files() -> Result<WsServerConfig, WsConfigErro
         ws_message_rate: options.ws_message_rate,
         ws_message_burst: options.ws_message_burst,
     })
+}
+
+pub async fn build_ws_config_from_files() -> Result<WsServerConfig, WsConfigError> {
+    let cfg = config::load_config()?;
+    build_ws_config_from_value(&cfg).await
 }
 
 /// Resolve gateway auth configuration from config objects, environment variables,
