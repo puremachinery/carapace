@@ -178,20 +178,13 @@ fn build_session_metadata(
     thinking: &Option<String>,
     model: &Option<String>,
 ) -> crate::sessions::SessionMetadata {
-    let mut metadata = crate::sessions::SessionMetadata::default();
-    if let Some(ref value) = *normalized_channel {
-        metadata.channel = Some(value.clone());
+    crate::sessions::SessionMetadata {
+        channel: normalized_channel.clone(),
+        chat_id: normalized_to.clone(),
+        thinking_level: thinking.clone(),
+        model: model.clone(),
+        ..Default::default()
     }
-    if let Some(ref value) = *normalized_to {
-        metadata.chat_id = Some(value.clone());
-    }
-    if let Some(ref value) = *thinking {
-        metadata.thinking_level = Some(value.clone());
-    }
-    if let Some(ref value) = *model {
-        metadata.model = Some(value.clone());
-    }
-    metadata
 }
 
 fn has_metadata_updates(

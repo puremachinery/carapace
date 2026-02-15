@@ -1685,20 +1685,29 @@ async fn handle_socket(
                 return;
             }
         };
+    let HandshakeContext {
+        conn_id,
+        role,
+        scopes,
+        connect_params,
+        device_id,
+        remote_ip_for_presence,
+        json_depth_limit,
+    } = handshake;
     let conn = ConnectionContext {
-        conn_id: handshake.conn_id,
-        role: handshake.role,
-        scopes: handshake.scopes,
-        client: handshake.connect_params.client,
-        device_id: handshake.device_id,
+        conn_id,
+        role,
+        scopes,
+        client: connect_params.client,
+        device_id,
     };
     run_connection_lifecycle(
         &mut receiver,
         &tx,
         &state,
         conn,
-        handshake.remote_ip_for_presence,
-        handshake.json_depth_limit,
+        remote_ip_for_presence,
+        json_depth_limit,
     )
     .await;
 
