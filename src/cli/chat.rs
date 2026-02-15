@@ -132,6 +132,11 @@ enum ReadLineResult {
     Interrupted,
 }
 
+enum StreamLoopControl {
+    Continue,
+    Break,
+}
+
 async fn read_line() -> ReadLineResult {
     tokio::task::spawn_blocking(|| {
         let mut line = String::new();
@@ -186,165 +191,7 @@ async fn write_stdout(text: &str) -> std::io::Result<()> {
     .map_err(|e| std::io::Error::other(format!("stdout write task failed: {}", e)))?
 }
 
-async fn stream_chat_response(
-    req_id: &str,
-    expected_run_id: &str,
-    msg_counter: u64,
-    ws_read: &mut WsRead,
-    ws_write: &mut WsWrite,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut got_output = false;
-    loop {
-        let frame = tokio::select! {
-            frame = read_ws_json(ws_read, ws_write) => {
-                match frame {
-                    Ok(f) => f,
-                    Err(e) => {
-                        eprintln!("\nConnection lost: {}", e);
-                        return Err(e);
-                    }
-                }
-            }
-            _ = tokio::signal::ctrl_c() => {
-                eprintln!();
-                let abort_frame = serde_json::json!({
-                    "type": "req",
-                    "id": format!("abort-{}", msg_counter),
-                    "method": "chat.abort",
-                    "params": {
-                        "runId": expected_run_id,
-                        "reason": "user_interrupt"
-                    }
-                });
-                match serde_json::to_string(&abort_frame) {
-                    Ok(abort_msg) => {
-                        if ws_write
-                            .send(Message::Text(abort_msg.into()))
-                            .await
-                            .is_err()
-                        {
-                            eprintln!("\nWarning: could not send abort message to gateway.");
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("\nError: failed to serialize abort message: {}", e);
-                    }
-                }
-                eprintln!("Aborted current run.");
-                break;
-            }
-        };
-
-        let frame_type = frame.get("type").and_then(|v| v.as_str()).unwrap_or("");
-
-        if frame_type == "res" {
-            let response_id = frame.get("id").and_then(|v| v.as_str()).unwrap_or("");
-            if response_id != req_id {
-                continue;
-            }
-
-            let ok = frame.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
-            if !ok {
-                let msg = frame
-                    .get("error")
-                    .and_then(|e| e.get("message"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("request failed");
-                eprintln!("\nError: {}", msg);
-                break;
-            }
-
-            let status = frame
-                .get("payload")
-                .and_then(|p| p.get("status"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if status == "queued" {
-                eprintln!("[chat: queued] no provider is currently available.");
-                break;
-            }
-
-            continue;
-        }
-
-        if frame_type != "event" {
-            continue;
-        }
-
-        let event = frame.get("event").and_then(|v| v.as_str()).unwrap_or("");
-        let payload = frame.get("payload").cloned().unwrap_or(Value::Null);
-        let run_id = payload.get("runId").and_then(|v| v.as_str()).unwrap_or("");
-        if run_id != expected_run_id {
-            continue;
-        }
-
-        match event {
-            "agent" => {
-                let stream = payload.get("stream").and_then(|v| v.as_str()).unwrap_or("");
-                match stream {
-                    "text" => {
-                        if let Some(delta) = payload
-                            .get("data")
-                            .and_then(|d| d.get("delta"))
-                            .and_then(|v| v.as_str())
-                        {
-                            write_stdout(delta).await?;
-                            got_output = true;
-                        }
-                    }
-                    "tool_use" => {
-                        let name = tool_name_from_payload(&payload);
-                        eprintln!("[tool: {}]", name);
-                    }
-                    "tool_result" => {
-                        let name = tool_name_from_payload(&payload);
-                        eprintln!("[tool: {} → done]", name);
-                    }
-                    "error" => {
-                        let msg = payload
-                            .get("data")
-                            .and_then(|d| d.get("message"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown error");
-                        eprintln!("\nError: {}", msg);
-                        break;
-                    }
-                    "final" => {
-                        print_final_newline_if_needed(got_output).await?;
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-            "chat" => {
-                let state = payload.get("state").and_then(|v| v.as_str()).unwrap_or("");
-                match state {
-                    "final" => {
-                        print_final_newline_if_needed(got_output).await?;
-                        break;
-                    }
-                    "error" => {
-                        let msg = payload
-                            .get("errorMessage")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown error");
-                        eprintln!("\nError: {}", msg);
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-            _ => {
-                // Ignore heartbeat, config changes, etc.
-            }
-        }
-    }
-
-    Ok(())
-}
-
-async fn run_chat_session(new_session: bool, port: u16) -> Result<(), Box<dyn std::error::Error>> {
-    // Connect via WebSocket
+async fn connect_and_handshake(port: u16) -> Result<(WsWrite, WsRead), Box<dyn std::error::Error>> {
     let ws_url = format!("ws://127.0.0.1:{}/ws", port);
     let ws_stream = match connect_ws(&ws_url, false).await {
         Ok(s) => s,
@@ -355,11 +202,9 @@ async fn run_chat_session(new_session: bool, port: u16) -> Result<(), Box<dyn st
     };
     let (mut ws_write, mut ws_read) = ws_stream.split();
 
-    // Handshake
     let auth = resolve_gateway_auth().await;
     let state_dir = resolve_state_dir();
     let device_identity = load_or_create_device_identity(&state_dir).await?;
-
     let nonce = await_connect_challenge(&mut ws_read, &mut ws_write).await?;
 
     let role = "operator";
@@ -407,6 +252,192 @@ async fn run_chat_session(new_session: bool, port: u16) -> Result<(), Box<dyn st
         eprintln!("WebSocket connect failed: {}", err.message);
         return Err(Box::new(err));
     }
+
+    Ok((ws_write, ws_read))
+}
+
+async fn send_abort_request(msg_counter: u64, expected_run_id: &str, ws_write: &mut WsWrite) {
+    let abort_frame = serde_json::json!({
+        "type": "req",
+        "id": format!("abort-{}", msg_counter),
+        "method": "chat.abort",
+        "params": {
+            "runId": expected_run_id,
+            "reason": "user_interrupt"
+        }
+    });
+    match serde_json::to_string(&abort_frame) {
+        Ok(abort_msg) => {
+            if ws_write
+                .send(Message::Text(abort_msg.into()))
+                .await
+                .is_err()
+            {
+                eprintln!("\nWarning: could not send abort message to gateway.");
+            }
+        }
+        Err(e) => {
+            eprintln!("\nError: failed to serialize abort message: {}", e);
+        }
+    }
+}
+
+fn handle_response_frame(frame: &Value, req_id: &str) -> StreamLoopControl {
+    let response_id = frame.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    if response_id != req_id {
+        return StreamLoopControl::Continue;
+    }
+
+    let ok = frame.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+    if !ok {
+        let msg = frame
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("request failed");
+        eprintln!("\nError: {}", msg);
+        return StreamLoopControl::Break;
+    }
+
+    let status = frame
+        .get("payload")
+        .and_then(|p| p.get("status"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if status == "queued" {
+        eprintln!("[chat: queued] no provider is currently available.");
+        return StreamLoopControl::Break;
+    }
+
+    StreamLoopControl::Continue
+}
+
+async fn handle_agent_stream_event(
+    payload: &Value,
+    got_output: &mut bool,
+) -> Result<StreamLoopControl, Box<dyn std::error::Error>> {
+    let stream = payload.get("stream").and_then(|v| v.as_str()).unwrap_or("");
+    match stream {
+        "text" => {
+            if let Some(delta) = payload
+                .get("data")
+                .and_then(|d| d.get("delta"))
+                .and_then(|v| v.as_str())
+            {
+                write_stdout(delta).await?;
+                *got_output = true;
+            }
+            Ok(StreamLoopControl::Continue)
+        }
+        "tool_use" => {
+            let name = tool_name_from_payload(payload);
+            eprintln!("[tool: {}]", name);
+            Ok(StreamLoopControl::Continue)
+        }
+        "tool_result" => {
+            let name = tool_name_from_payload(payload);
+            eprintln!("[tool: {} → done]", name);
+            Ok(StreamLoopControl::Continue)
+        }
+        "error" => {
+            let msg = payload
+                .get("data")
+                .and_then(|d| d.get("message"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error");
+            eprintln!("\nError: {}", msg);
+            Ok(StreamLoopControl::Break)
+        }
+        "final" => {
+            print_final_newline_if_needed(*got_output).await?;
+            Ok(StreamLoopControl::Break)
+        }
+        _ => Ok(StreamLoopControl::Continue),
+    }
+}
+
+async fn handle_chat_state_event(
+    payload: &Value,
+    got_output: bool,
+) -> Result<StreamLoopControl, Box<dyn std::error::Error>> {
+    let state = payload.get("state").and_then(|v| v.as_str()).unwrap_or("");
+    match state {
+        "final" => {
+            print_final_newline_if_needed(got_output).await?;
+            Ok(StreamLoopControl::Break)
+        }
+        "error" => {
+            let msg = payload
+                .get("errorMessage")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error");
+            eprintln!("\nError: {}", msg);
+            Ok(StreamLoopControl::Break)
+        }
+        _ => Ok(StreamLoopControl::Continue),
+    }
+}
+
+async fn handle_event_frame(
+    frame: &Value,
+    expected_run_id: &str,
+    got_output: &mut bool,
+) -> Result<StreamLoopControl, Box<dyn std::error::Error>> {
+    let payload = frame.get("payload").cloned().unwrap_or(Value::Null);
+    let run_id = payload.get("runId").and_then(|v| v.as_str()).unwrap_or("");
+    if run_id != expected_run_id {
+        return Ok(StreamLoopControl::Continue);
+    }
+
+    match frame.get("event").and_then(|v| v.as_str()).unwrap_or("") {
+        "agent" => handle_agent_stream_event(&payload, got_output).await,
+        "chat" => handle_chat_state_event(&payload, *got_output).await,
+        _ => Ok(StreamLoopControl::Continue),
+    }
+}
+
+async fn stream_chat_response(
+    req_id: &str,
+    expected_run_id: &str,
+    msg_counter: u64,
+    ws_read: &mut WsRead,
+    ws_write: &mut WsWrite,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut got_output = false;
+    loop {
+        let frame = tokio::select! {
+            frame = read_ws_json(ws_read, ws_write) => {
+                match frame {
+                    Ok(f) => f,
+                    Err(e) => {
+                        eprintln!("\nConnection lost: {}", e);
+                        return Err(e);
+                    }
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!();
+                send_abort_request(msg_counter, expected_run_id, ws_write).await;
+                eprintln!("Aborted current run.");
+                break;
+            }
+        };
+
+        let control = match frame.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+            "res" => handle_response_frame(&frame, req_id),
+            "event" => handle_event_frame(&frame, expected_run_id, &mut got_output).await?,
+            _ => StreamLoopControl::Continue,
+        };
+        if let StreamLoopControl::Break = control {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_chat_session(new_session: bool, port: u16) -> Result<(), Box<dyn std::error::Error>> {
+    let (mut ws_write, mut ws_read) = connect_and_handshake(port).await?;
 
     // REPL
     let mut session_key = generate_session_key(new_session);
