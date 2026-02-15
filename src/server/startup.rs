@@ -87,6 +87,35 @@ pub async fn build_ws_state_with_runtime_dependencies(
     ))
 }
 
+/// Prepare runtime state storage and shared local startup services.
+///
+/// Shared by normal server startup and embedded chat startup to keep state
+/// directory creation, audit initialization, and media cleanup wiring in one
+/// place.
+pub async fn prepare_runtime_environment() -> Result<std::path::PathBuf, Box<dyn std::error::Error>>
+{
+    let state_dir = crate::server::ws::resolve_state_dir();
+    tokio::fs::create_dir_all(&state_dir).await?;
+    tokio::fs::create_dir_all(state_dir.join("sessions")).await?;
+    tokio::fs::create_dir_all(state_dir.join("cron")).await?;
+    crate::logging::audit::AuditLog::init(state_dir.clone()).await;
+    init_media_store_cleanup().await;
+    Ok(state_dir)
+}
+
+async fn init_media_store_cleanup() {
+    let store = match crate::media::MediaStore::new(crate::media::StoreConfig::default()).await {
+        Ok(store) => store,
+        Err(e) => {
+            warn!(error = %e, "failed to initialize media store");
+            return;
+        }
+    };
+    let store = Arc::new(store);
+    let _cleanup = store.clone().start_cleanup_task();
+    info!("media store cleanup task started");
+}
+
 /// Handle to a running server.  Returned by [`run_server_with_config`].
 pub struct ServerHandle {
     local_addr: SocketAddr,

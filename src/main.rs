@@ -137,12 +137,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     init_logging_from_env()?;
     let cfg = load_and_validate_config()?;
 
-    let state_dir = server::ws::resolve_state_dir();
-    std::fs::create_dir_all(&state_dir)?;
-    std::fs::create_dir_all(state_dir.join("sessions"))?;
-    std::fs::create_dir_all(state_dir.join("cron"))?;
-    logging::audit::AuditLog::init(state_dir.clone()).await;
-    init_media_store_cleanup().await;
+    let state_dir = server::startup::prepare_runtime_environment().await?;
     let gateway_registry = Arc::new(gateway::GatewayRegistry::new(state_dir.clone()));
     if let Err(e) = gateway_registry.load() {
         warn!(error = %e, "failed to load gateway registry");
@@ -651,19 +646,6 @@ fn spawn_gateway_lifecycle(
             warn!(error = %e, "remote gateway lifecycle exited with error");
         }
     });
-}
-
-async fn init_media_store_cleanup() {
-    let store = match media::MediaStore::new(media::StoreConfig::default()).await {
-        Ok(store) => store,
-        Err(e) => {
-            warn!(error = %e, "failed to initialize media store");
-            return;
-        }
-    };
-    let store = Arc::new(store);
-    let _cleanup = store.clone().start_cleanup_task();
-    info!("media store cleanup task started");
 }
 
 /// Parse TLS configuration and set up certificates if enabled.

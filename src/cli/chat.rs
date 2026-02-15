@@ -63,18 +63,6 @@ async fn health_check(client: &reqwest::Client, port: u16) -> bool {
         .unwrap_or(false)
 }
 
-async fn init_media_store_cleanup() {
-    let store = match crate::media::MediaStore::new(crate::media::StoreConfig::default()).await {
-        Ok(store) => store,
-        Err(e) => {
-            eprintln!("Warning: could not initialize media store cleanup: {}", e);
-            return;
-        }
-    };
-    let store = std::sync::Arc::new(store);
-    let _cleanup = store.clone().start_cleanup_task();
-}
-
 /// Start the gateway in-process as a background task.
 /// Returns a `ServerHandle` for the started gateway.
 async fn start_embedded_gateway(
@@ -88,12 +76,7 @@ async fn start_embedded_gateway(
         Value::Object(serde_json::Map::new())
     });
 
-    let state_dir = crate::server::ws::resolve_state_dir();
-    tokio::fs::create_dir_all(&state_dir).await?;
-    tokio::fs::create_dir_all(state_dir.join("sessions")).await?;
-    tokio::fs::create_dir_all(state_dir.join("cron")).await?;
-    crate::logging::audit::AuditLog::init(state_dir.clone()).await;
-    init_media_store_cleanup().await;
+    crate::server::startup::prepare_runtime_environment().await?;
 
     // Set up plugin/tools registries
     let plugin_registry = std::sync::Arc::new(crate::plugins::PluginRegistry::new());
@@ -143,21 +126,27 @@ async fn wait_for_health(
 }
 
 /// Read a line from stdin in a blocking task.
-async fn read_line() -> Option<String> {
+enum ReadLineResult {
+    Line(String),
+    Eof,
+    Interrupted,
+}
+
+async fn read_line() -> ReadLineResult {
     tokio::task::spawn_blocking(|| {
         let mut line = String::new();
         match std::io::stdin().read_line(&mut line) {
-            Ok(0) => None, // EOF
-            Ok(_) => Some(line),
+            Ok(0) => ReadLineResult::Eof,
+            Ok(_) => ReadLineResult::Line(line),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => ReadLineResult::Interrupted,
             Err(e) => {
                 eprintln!("\nError reading from stdin: {}", e);
-                None
+                ReadLineResult::Eof
             }
         }
     })
     .await
-    .ok()
-    .flatten()
+    .unwrap_or(ReadLineResult::Eof)
 }
 
 fn tool_name_from_payload(payload: &Value) -> &str {
@@ -276,11 +265,18 @@ async fn run_chat_session(new_session: bool, port: u16) -> Result<(), Box<dyn st
     loop {
         print_prompt().await?;
 
-        let line = read_line().await;
+        let line_result = tokio::select! {
+            line = read_line() => line,
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!();
+                ReadLineResult::Interrupted
+            }
+        };
 
-        let line = match line {
-            Some(l) => l,
-            None => {
+        let line = match line_result {
+            ReadLineResult::Line(l) => l,
+            ReadLineResult::Interrupted => continue,
+            ReadLineResult::Eof => {
                 // EOF (Ctrl+D)
                 eprintln!();
                 break;
