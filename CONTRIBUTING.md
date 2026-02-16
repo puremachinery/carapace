@@ -12,6 +12,10 @@ everything you need to get started, follow our conventions, and submit changes.
   ```sh
   cargo install cargo-nextest
   ```
+- **just (recommended):** Task runner used for local contributor workflows.
+  ```sh
+  cargo install just
+  ```
 
 ### Clone, Build, and Test
 
@@ -21,6 +25,7 @@ cd carapace
 cargo build
 cargo nextest run   # preferred
 cargo test          # fallback
+just setup-hooks    # install repository-managed git hooks
 ```
 
 ### Development Mode
@@ -38,10 +43,12 @@ CARAPACE_DEV=1 cargo run
 3. Run `cargo fmt` before committing.
 4. Run `cargo clippy -- -D warnings` before committing.
 5. Run `cargo nextest run` to verify all tests pass.
-6. Push your branch and open a pull request.
+6. If your PR changes workflows or docs, run `just workflow-lint` and/or `just docs-check`.
+7. Push your branch and open a pull request.
 
-Pre-commit hooks enforce formatting and lint checks automatically. Pre-push
-hooks run the full test suite via `cargo nextest run`.
+Pre-commit hooks enforce formatting, lint checks, and staged secret scanning.
+Pre-push hooks run `cargo nextest run --all-targets` for code-impacting pushes
+and skip test runs for docs/website/meta-only pushes.
 
 ## Code Style
 
