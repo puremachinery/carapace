@@ -24,11 +24,11 @@ jobs:
       rust_runtime: ${{ steps.filter.outputs.rust_runtime }}
       docker: ${{ steps.filter.outputs.docker }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 2
       - id: filter
-        uses: dorny/paths-filter@v3
+        uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3
         with:
           filters: |
             docs:
@@ -61,8 +61,8 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust_runtime == 'true'
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
           components: rustfmt
       - run: cargo fmt --all --check
@@ -73,11 +73,11 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust_runtime == 'true'
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
   build:
@@ -86,9 +86,9 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust_runtime == 'true'
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
       - run: cargo build --all-targets
 
   test:
@@ -101,10 +101,10 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@nextest
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - uses: taiki-e/install-action@602dc500e2b7e0e2486b4ce53909ba048de44e08 # nextest
       - run: cargo nextest run --all-targets
 
   msrv:
@@ -113,9 +113,9 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust_runtime == 'true'
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.93.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@a0b273b48ed29de4470960879e8381ff45632f26 # 1.93.0
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
       - run: cargo check --all-targets
 
   audit:
@@ -124,8 +124,8 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust_runtime == 'true'
     steps:
-      - uses: actions/checkout@v4
-      - uses: taiki-e/install-action@cargo-audit
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: taiki-e/install-action@468f60710537884ebb9b0e713dad1957996a55f2 # cargo-audit
       - run: cargo audit
 
   deny:
@@ -134,18 +134,18 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust_runtime == 'true'
     steps:
-      - uses: actions/checkout@v4
-      - uses: taiki-e/install-action@cargo-deny
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: taiki-e/install-action@f63130e3904c76fd4045473e61389a5266ee4cc0 # cargo-deny
       - run: cargo deny check
 
   gitleaks:
     name: Secret Scan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
-      - uses: gitleaks/gitleaks-action@v2
+      - uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -155,8 +155,8 @@ jobs:
     needs: changes
     if: needs.changes.outputs.docker == 'true'
     steps:
-      - uses: actions/checkout@v4
-      - uses: hadolint/hadolint-action@v3.1.0
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: hadolint/hadolint-action@54c9adbab1582c2ef04b2016b760714a4bfde3cf # v3.1.0
         with:
           dockerfile: Dockerfile
 
@@ -166,16 +166,16 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust_runtime == 'true' || needs.changes.outputs.docker == 'true'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Run Trivy filesystem scan
-        uses: aquasecurity/trivy-action@0.33.1
+        uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8 # 0.33.1
         with:
           scan-type: fs
           scan-ref: .
           severity: CRITICAL,HIGH
           exit-code: 1
       - name: Run Trivy config scan
-        uses: aquasecurity/trivy-action@0.33.1
+        uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8 # 0.33.1
         with:
           scan-type: config
           scan-ref: .
@@ -188,15 +188,15 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust_runtime == 'true'
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
       - name: Install cargo-geiger
         run: cargo install cargo-geiger
       - name: Report unsafe usage
         run: cargo geiger --all-targets --output-format ascii 2>&1 | tee geiger-report.txt
       - name: Upload geiger report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: geiger-report
           path: geiger-report.txt
@@ -207,7 +207,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.workflow == 'true'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Run actionlint
         uses: rhysd/actionlint@393031adb9afb225ee52ae2ccd7a5af5525e03e8 # v1.7.11
         with:
@@ -219,7 +219,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.docs == 'true'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Basic markdown sanity check
         run: |
           echo "Checking Markdown files for hard tabs"
