@@ -47,7 +47,6 @@ jobs:
               - "Cargo.toml"
               - "Cargo.lock"
               - "build.rs"
-              - "Justfile"
               - "deny.toml"
               - "config.example.json5"
               - ".cargo/**"
