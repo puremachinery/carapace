@@ -1074,17 +1074,18 @@ mod tests {
         assert_eq!(args, vec!["-f".to_string()]);
     }
 
-    #[test]
-    fn test_build_sandboxed_std_command_applies_env_filter() {
-        let config = ProcessSandboxConfig {
+    fn env_filter_test_config() -> ProcessSandboxConfig {
+        ProcessSandboxConfig {
             enabled: true,
             env_filter: vec![
                 "PATH".to_string(),
                 "CARAPACE_SANDBOX_TEST_MISSING".to_string(),
             ],
             ..Default::default()
-        };
-        let command = build_sandboxed_std_command("hostname", &["-f"], Some(&config));
+        }
+    }
+
+    fn assert_env_filter_applied(command: &std::process::Command) {
         let envs: Vec<(String, Option<String>)> = command
             .get_envs()
             .map(|(key, value)| {
@@ -1109,38 +1110,17 @@ mod tests {
     }
 
     #[test]
-    fn test_build_sandboxed_tokio_command_applies_env_filter() {
-        let config = ProcessSandboxConfig {
-            enabled: true,
-            env_filter: vec![
-                "PATH".to_string(),
-                "CARAPACE_SANDBOX_TEST_MISSING".to_string(),
-            ],
-            ..Default::default()
-        };
-        let command = build_sandboxed_tokio_command("hostname", &["-f"], Some(&config));
-        let std_cmd = command.as_std();
-        let envs: Vec<(String, Option<String>)> = std_cmd
-            .get_envs()
-            .map(|(key, value)| {
-                (
-                    key.to_string_lossy().into_owned(),
-                    value.map(|v| v.to_string_lossy().into_owned()),
-                )
-            })
-            .collect();
+    fn test_build_sandboxed_std_command_applies_env_filter() {
+        let config = env_filter_test_config();
+        let command = build_sandboxed_std_command("hostname", &["-f"], Some(&config));
+        assert_env_filter_applied(&command);
+    }
 
-        assert!(
-            envs.iter()
-                .any(|(key, value)| key == "PATH" && value.is_some()),
-            "expected PATH to be preserved by env_filter"
-        );
-        assert!(
-            !envs
-                .iter()
-                .any(|(key, _)| key == "CARAPACE_SANDBOX_TEST_MISSING"),
-            "unexpected missing variable entry in filtered environment"
-        );
+    #[test]
+    fn test_build_sandboxed_tokio_command_applies_env_filter() {
+        let config = env_filter_test_config();
+        let command = build_sandboxed_tokio_command("hostname", &["-f"], Some(&config));
+        assert_env_filter_applied(command.as_std());
     }
 
     #[test]
