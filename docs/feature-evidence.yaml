@@ -2,7 +2,7 @@
 # Keep this focused on audited entries in docs/feature-status.yaml.
 
 version: "1.0"
-updated_at: "2026-02-02"
+updated_at: "2026-02-16"
 
 features:
   - feature: "logs.tail"
@@ -1234,8 +1234,9 @@ features:
       - "src/agent/sandbox.rs::test_default_tailscale_cli_sandbox_config_limits"
     notes:
       - "2026-02-16 local precheck: targeted nextest coverage for new probe/tailscale wrapper paths passed (sandbox/tailscale/auth/bind)."
-      - "tool subprocess inheritance is still partial: no in-child Linux landlock application for arbitrary child processes"
-      - "gateway SSH tunnel subprocess (`src/gateway/mod.rs::setup_ssh_tunnel`) is not yet sandbox-wrapped"
+      - "wrapped subprocesses now apply in-child constraints via `src/agent/sandbox.rs::configure_sandboxed_command` (`pre_exec` + `apply_sandbox` on Unix)."
+      - "tool subprocess inheritance is still partial: gateway SSH tunnel subprocess (`src/gateway/mod.rs::setup_ssh_tunnel`) is not yet sandbox-wrapped."
+      - "non-macOS/Linux probe fallbacks (`src/discovery/mod.rs::hostname::run_hostname_command`, `src/server/bind.rs::detect_tailscale_ip`) are not sandbox-wrapped."
 
   - feature: "channel-specific tools"
     status: "partial"
