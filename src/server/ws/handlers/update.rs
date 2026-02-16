@@ -726,6 +726,23 @@ pub(super) async fn handle_update_install() -> Result<Value, ErrorShape> {
 
     match result {
         Ok(staged_path) => {
+            // In test builds, never mutate the active test binary on disk.
+            // Replacing `current_exe()` can break nextest child process invocations.
+            if cfg!(test) {
+                state.update_available = false;
+                return Ok(json!({
+                    "ok": true,
+                    "status": "success",
+                    "version": version,
+                    "stagedPath": staged_path,
+                    "applied": false,
+                    "sha256": Value::Null,
+                    "binaryPath": Value::Null,
+                    "restartRequired": false,
+                    "message": "Update staged successfully (apply skipped in tests)."
+                }));
+            }
+
             // Apply the staged binary atomically
             match apply_staged_update(&staged_path) {
                 Ok(apply_result) => {
