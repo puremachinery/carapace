@@ -68,6 +68,11 @@ main,
   margin: 0 auto;
 }
 
+.error-page-main {
+  max-width: 48rem;
+  margin-top: 5rem;
+}
+
 .site-header {
   display: flex;
   align-items: center;
@@ -124,6 +129,11 @@ h1 {
   font-size: clamp(2rem, 6vw, 3.6rem);
   line-height: 1.05;
   max-width: 14ch;
+}
+
+.error-page-title {
+  font-size: clamp(1.8rem, 6vw, 2.6rem);
+  max-width: none;
 }
 
 .lede {
