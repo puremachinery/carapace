@@ -9,8 +9,8 @@
 //!   and `setrlimit` for resource limits.
 //! - **Linux**: Uses landlock (Linux 5.13+) for filesystem access control and
 //!   `setrlimit` / `prctl` for resource limits.
-//! - **Windows**: Uses Job Objects for per-process working set limits.
-//! - **Other**: Unsupported for sandbox-required subprocess paths (fail-closed).
+//! - **Other (including Windows currently)**: Unsupported for sandbox-required
+//!   subprocess paths (fail-closed).
 //!
 //! ## Configuration
 //!
@@ -473,12 +473,6 @@ fn create_windows_job(config: &ProcessSandboxConfig) -> Result<Job, SandboxError
         .map_err(|e| SandboxError::Platform(format!("failed to create Windows job object: {e}")))
 }
 
-#[cfg(target_os = "windows")]
-fn windows_job_objects_available(config: &ProcessSandboxConfig) -> Result<(), SandboxError> {
-    let _ = create_windows_job(config)?;
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // Linux: landlock filesystem access control
 // ---------------------------------------------------------------------------
@@ -788,7 +782,6 @@ pub fn apply_landlock(_config: &ProcessSandboxConfig) -> Result<(), SandboxError
 ///
 /// On macOS: resource limits only (Seatbelt is applied via command prefix).
 /// On Linux: resource limits + landlock.
-/// On Windows: process isolation is applied at spawn-time via Job Objects.
 pub fn apply_sandbox(config: &ProcessSandboxConfig) -> Result<(), SandboxError> {
     if !config.enabled {
         tracing::debug!("process sandbox is disabled");
@@ -844,12 +837,7 @@ pub fn ensure_sandbox_supported(config: Option<&ProcessSandboxConfig>) -> Result
         Ok(())
     }
 
-    #[cfg(target_os = "windows")]
-    {
-        windows_job_objects_available(config)
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         Err(SandboxError::Unsupported)
     }
@@ -1023,8 +1011,12 @@ pub fn run_sandboxed_std_command_output(
             cmd.stdin(Stdio::null());
             cmd.stdout(Stdio::piped());
             cmd.stderr(Stdio::piped());
-            let child = cmd.spawn()?;
-            assign_windows_job_to_std_child(&child, cfg)?;
+            let mut child = cmd.spawn()?;
+            if let Err(err) = assign_windows_job_to_std_child(&child, cfg) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(err);
+            }
             return child.wait_with_output();
         }
     }
@@ -1050,7 +1042,11 @@ pub async fn run_sandboxed_tokio_command_output(
             cmd.stdout(Stdio::piped());
             cmd.stderr(Stdio::piped());
             let mut child = cmd.spawn()?;
-            assign_windows_job_to_tokio_child(&child, cfg)?;
+            if let Err(err) = assign_windows_job_to_tokio_child(&child, cfg) {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                return Err(err);
+            }
             return child.wait_with_output().await;
         }
     }
@@ -1075,7 +1071,13 @@ pub fn spawn_sandboxed_tokio_command(
     #[cfg(target_os = "windows")]
     {
         if let Some(cfg) = config.filter(|cfg| cfg.enabled) {
-            assign_windows_job_to_tokio_child(&child, cfg)?;
+            let mut child = child;
+            if let Err(err) = assign_windows_job_to_tokio_child(&child, cfg) {
+                let _ = child.start_kill();
+                let _ = child.try_wait();
+                return Err(err);
+            }
+            return Ok(child);
         }
     }
 
@@ -1627,7 +1629,7 @@ mod tests {
         assert_eq!(err.to_string(), "sandbox not supported on this platform");
     }
 
-    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn test_ensure_sandbox_supported_supported_platform() {
         let config = ProcessSandboxConfig {
@@ -1637,7 +1639,7 @@ mod tests {
         assert!(ensure_sandbox_supported(Some(&config)).is_ok());
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     #[test]
     fn test_ensure_sandbox_supported_unsupported_platform() {
         let config = ProcessSandboxConfig::default();
