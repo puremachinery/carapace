@@ -165,7 +165,7 @@ h1 {
   border-radius: 0.6rem;
   border: 1px solid transparent;
   font-weight: 600;
-  transition: transform 140ms ease, box-shadow 140ms ease, background-color 140ms ease;
+  transition: transform 140ms ease, box-shadow 140ms ease;
 }
 
 .button:hover {
