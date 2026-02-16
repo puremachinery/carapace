@@ -15,6 +15,7 @@ pub mod slack_inbound;
 pub mod telegram;
 pub mod telegram_inbound;
 pub mod webhook;
+pub mod whatsapp;
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};

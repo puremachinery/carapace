@@ -132,6 +132,101 @@ Implementation references:
 - `src/channels/discord_gateway.rs`
 - `src/main.rs::spawn_discord_gateway_loop_if_configured`
 
+## WhatsApp (WhatsApp Web Protocol)
+
+WhatsApp uses the unofficial WhatsApp Web protocol via the `whatsapp-rust`
+library (based on whatsmeow and Baileys). This provides end-to-end encrypted
+messaging without requiring a business API account.
+
+### Current Implementation Status
+
+> **Note**: WhatsApp channel support is fully implemented. The following table shows the supported features:
+
+| Feature | Status |
+|---------|--------|
+| Text messages (send/receive) | Implemented |
+| Images (send/receive) | Implemented |
+| Videos (send/receive) | Implemented |
+| Audio/voice messages (send/receive) | Implemented |
+| Documents (send/receive) | Implemented |
+| Stickers (send/receive) | Implemented |
+| Location messages | Implemented |
+| Contact messages (vCard) | Implemented |
+| Poll messages | Implemented |
+| List messages (interactive) | Implemented |
+| Button messages | Implemented |
+| Message replies/quotes | Implemented |
+| Message reactions | Implemented |
+| Message editing | Implemented |
+| Message deletion | Implemented |
+| Read/delivery receipts | Implemented |
+| Typing indicators | Implemented |
+| Group chats | Implemented |
+| Group management (create, leave, add/remove participants) | Implemented |
+| QR code authentication | Implemented |
+| Pair code authentication | Implemented |
+| Presence (online/offline) | Implemented |
+| Blocking | Implemented |
+
+### Authentication Options
+
+1. **QR Code (default)**: Scan a QR code from your WhatsApp mobile app
+2. **Pair Code**: Link using your phone number and a verification code
+
+### Configuration
+
+```json5
+{
+  "whatsapp": {
+    "phoneNumber": "+15551234567",     // E.164 format for pair code auth
+    "usePairCode": false,               // set true to use pair code instead of QR
+    "sessionPath": "~/.config/carapace/whatsapp_session.db",
+    "enabled": true
+  }
+}
+```
+
+### Planned Features
+
+The whatsapp-rust library supports the following capabilities that will be
+integrated:
+
+- **Messaging**:
+  - End-to-end encrypted messages (Signal Protocol)
+  - One-on-one and group chats
+  - Message editing and reactions
+  - Quoting/replying to messages
+  - Delivery, read, and played receipts
+
+- **Media**:
+  - Upload and download images, videos, documents, GIFs, and audio
+  - Automatic encryption and decryption
+
+- **Contacts & Groups**:
+  - Check if phone numbers are on WhatsApp
+  - Fetch profile pictures and user info
+  - Query group metadata and participants
+  - List all groups you're participating in
+
+- **Presence & Chat State**:
+  - Set online/offline presence
+  - Typing indicators (composing, recording, paused)
+  - Block and unblock contacts
+
+### Security Considerations
+
+> **Warning**: This is an unofficial implementation using the WhatsApp Web
+> protocol. Using custom WhatsApp clients may violate Meta's Terms of Service
+> and could result in account suspension. Use at your own risk.
+
+- Session data is stored locally and encrypted at rest
+- End-to-end encryption is preserved (Signal Protocol)
+- Credentials are stored in the system keychain when available
+
+Implementation references:
+- `src/channels/whatsapp.rs`
+- Uses: `whatsapp-rust` crate (v0.2+)
+
 ## Environment Variables
 
 All channel config can be supplied via environment variables:
@@ -140,6 +235,7 @@ All channel config can be supplied via environment variables:
 - `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET`, `TELEGRAM_BASE_URL`
 - `DISCORD_BOT_TOKEN`, `DISCORD_BASE_URL`, `DISCORD_GATEWAY_URL`, `DISCORD_GATEWAY_INTENTS`
 - `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, `SLACK_BASE_URL`
+- `WHATSAPP_PHONE_NUMBER`, `WHATSAPP_USE_PAIR_CODE`, `WHATSAPP_SESSION_PATH`
 
 ## Inbound Session Routing
 

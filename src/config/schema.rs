@@ -69,6 +69,7 @@ const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "telegram",
     "discord",
     "slack",
+    "whatsapp",
     "classifier",
 ];
 

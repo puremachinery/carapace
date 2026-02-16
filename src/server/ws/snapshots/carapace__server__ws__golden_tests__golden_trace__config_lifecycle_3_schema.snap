@@ -51,6 +51,7 @@ expression: normalized
       "telegram",
       "discord",
       "slack",
+      "whatsapp",
       "classifier"
     ],
     "properties": {
@@ -181,6 +182,9 @@ expression: normalized
         "type": "object"
       },
       "web": {
+        "type": "object"
+      },
+      "whatsapp": {
         "type": "object"
       },
       "wizard": {

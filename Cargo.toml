@@ -57,6 +57,15 @@ tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 urlencoding = "2"
 crc32fast = "1"
 
+# WhatsApp channel support (using git for latest fixes)
+whatsapp-rust = { git = "https://github.com/jlucaso1/whatsapp-rust", branch = "main" }
+whatsapp-rust-sqlite-storage = { git = "https://github.com/jlucaso1/whatsapp-rust", branch = "main" }
+whatsapp-rust-tokio-transport = { git = "https://github.com/jlucaso1/whatsapp-rust", branch = "main" }
+whatsapp-rust-ureq-http-client = { git = "https://github.com/jlucaso1/whatsapp-rust", branch = "main" }
+wacore = { git = "https://github.com/jlucaso1/whatsapp-rust", branch = "main" }
+wacore-binary = { git = "https://github.com/jlucaso1/whatsapp-rust", branch = "main" }
+waproto = { git = "https://github.com/jlucaso1/whatsapp-rust", branch = "main" }
+
 [dev-dependencies]
 insta = { version = "1", features = ["json"] }
 tokio-test = "0.4"
