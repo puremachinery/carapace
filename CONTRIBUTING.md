@@ -47,8 +47,9 @@ CARAPACE_DEV=1 cargo run
 7. Push your branch and open a pull request.
 
 Pre-commit hooks enforce formatting, lint checks, and staged secret scanning.
-Pre-push hooks run `cargo nextest run --all-targets` for code-impacting pushes
-and skip test runs for docs/website/meta-only pushes.
+Pre-push hooks run shell checks for script-only pushes, run
+`cargo nextest run --all-targets` for Rust-impacting pushes, and skip checks
+for docs/website/meta-only pushes.
 
 ## Code Style
 

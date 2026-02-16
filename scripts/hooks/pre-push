@@ -1,5 +1,8 @@
 #!/bin/bash
-# Pre-push hook: run tests unless the push only changes docs/site/meta files.
+# Pre-push hook:
+# - docs/site/meta-only pushes: skip checks
+# - script-only pushes: run shell syntax/lint checks
+# - Rust-impacting pushes: run cargo nextest
 # Install via: just setup-hooks
 
 set -euo pipefail
@@ -29,6 +32,64 @@ is_docs_or_site_only_path() {
             return 1
             ;;
     esac
+}
+
+is_rust_impacting_path() {
+    case "$1" in
+        src/*|tests/*|benches/*|examples/*|fuzz/*|Cargo.toml|Cargo.lock|build.rs|rust-toolchain|rust-toolchain.toml|.cargo/*)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+is_script_path() {
+    case "$1" in
+        scripts/*|*.sh)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+run_script_checks() {
+    local -a shell_targets=()
+    local path
+
+    for path in "${changed_files[@]}"; do
+        case "$path" in
+            *.sh|scripts/hooks/pre-commit|scripts/hooks/pre-push)
+                if [ -f "$path" ]; then
+                    shell_targets+=("$path")
+                fi
+                ;;
+        esac
+    done
+
+    if [ "${#shell_targets[@]}" -eq 0 ]; then
+        echo "Script-only changes detected, but no shell scripts to validate."
+        return 0
+    fi
+
+    echo "Running bash -n on changed shell scripts..."
+    if ! bash -n "${shell_targets[@]}"; then
+        echo "Shell syntax check failed."
+        return 1
+    fi
+
+    if command -v shellcheck >/dev/null 2>&1; then
+        echo "Running shellcheck on changed shell scripts..."
+        if ! shellcheck "${shell_targets[@]}"; then
+            echo "shellcheck reported issues."
+            return 1
+        fi
+    else
+        echo "shellcheck not installed; skipping shell lint."
+    fi
 }
 
 declare -a changed_files=()
@@ -89,20 +150,47 @@ if [ "${#changed_files[@]}" -eq 0 ]; then
     exit 0
 fi
 
-needs_tests=0
+needs_nextest=0
+needs_script_checks=0
 for path in "${changed_files[@]}"; do
-    if ! is_docs_or_site_only_path "$path"; then
-        needs_tests=1
-        break
+    if is_docs_or_site_only_path "$path"; then
+        continue
     fi
+
+    if is_rust_impacting_path "$path"; then
+        needs_nextest=1
+        continue
+    fi
+
+    if is_script_path "$path"; then
+        needs_script_checks=1
+        continue
+    fi
+
+    # Unknown paths are treated as code-impacting to stay conservative.
+    needs_nextest=1
 done
 
-if [ "$needs_tests" -eq 0 ]; then
-    echo "Docs/website/meta-only changes detected; skipping cargo nextest."
+if [ "$needs_nextest" -eq 0 ] && [ "$needs_script_checks" -eq 0 ]; then
+    echo "Docs/website/meta-only changes detected; skipping checks."
     exit 0
 fi
 
-echo "Code-impacting changes detected. Running tests before push..."
+if [ "$needs_script_checks" -eq 1 ]; then
+    echo "Script changes detected. Running shell checks..."
+    if ! run_script_checks; then
+        echo "Script checks failed. Fix issues before pushing."
+        exit 1
+    fi
+fi
+
+if [ "$needs_nextest" -eq 0 ]; then
+    echo "No Rust-impacting changes detected; skipping cargo nextest."
+    echo "All applicable checks passed, pushing..."
+    exit 0
+fi
+
+echo "Rust-impacting changes detected. Running tests before push..."
 
 if ! command -v cargo-nextest >/dev/null 2>&1; then
     echo "cargo-nextest is required. Install with: cargo install cargo-nextest"
