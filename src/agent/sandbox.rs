@@ -34,6 +34,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
+use std::process::Command;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -554,6 +555,46 @@ pub fn sandbox_command_prefix(config: &ProcessSandboxConfig) -> Option<Vec<Strin
     }
 }
 
+/// Build argv for a subprocess with optional sandbox wrapping.
+///
+/// On macOS with sandboxing enabled this prepends `sandbox-exec -p <profile>`
+/// and then appends the target program + args. On other platforms (or when
+/// sandboxing is disabled), this returns the original program + args.
+pub fn sandbox_command_argv(
+    program: &str,
+    args: &[&str],
+    config: Option<&ProcessSandboxConfig>,
+) -> Vec<String> {
+    let mut argv = Vec::new();
+    if let Some(cfg) = config {
+        if cfg.enabled {
+            if let Some(prefix) = sandbox_command_prefix(cfg) {
+                argv.extend(prefix);
+            }
+        }
+    }
+    argv.push(program.to_string());
+    argv.extend(args.iter().map(|arg| (*arg).to_string()));
+    argv
+}
+
+/// Build a standard-library command with optional sandbox wrapping.
+///
+/// This helper centralizes subprocess argv construction so runtime call sites
+/// can opt into sandbox prefix behavior consistently.
+pub fn build_sandboxed_std_command(
+    program: &str,
+    args: &[&str],
+    config: Option<&ProcessSandboxConfig>,
+) -> Command {
+    let argv = sandbox_command_argv(program, args, config);
+    let mut cmd = Command::new(&argv[0]);
+    if argv.len() > 1 {
+        cmd.args(&argv[1..]);
+    }
+    cmd
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -833,6 +874,16 @@ mod tests {
         assert!(sandbox_command_prefix(&config).is_none());
     }
 
+    #[test]
+    fn test_sandbox_command_argv_disabled() {
+        let config = ProcessSandboxConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let argv = sandbox_command_argv("hostname", &["-f"], Some(&config));
+        assert_eq!(argv, vec!["hostname".to_string(), "-f".to_string()]);
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn test_sandbox_command_prefix_macos() {
@@ -843,6 +894,17 @@ mod tests {
         assert_eq!(prefix[0], "sandbox-exec");
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_sandbox_command_argv_macos_includes_prefix_and_target() {
+        let config = ProcessSandboxConfig::default();
+        let argv = sandbox_command_argv("hostname", &["-f"], Some(&config));
+        assert!(!argv.is_empty());
+        assert_eq!(argv[0], "sandbox-exec");
+        assert!(argv.contains(&"hostname".to_string()));
+        assert!(argv.contains(&"-f".to_string()));
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn test_sandbox_command_prefix_linux_is_none() {
@@ -850,6 +912,14 @@ mod tests {
         let config = ProcessSandboxConfig::default();
         let prefix = sandbox_command_prefix(&config);
         assert!(prefix.is_none());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn test_sandbox_command_argv_non_macos_passthrough() {
+        let config = ProcessSandboxConfig::default();
+        let argv = sandbox_command_argv("hostname", &["-f"], Some(&config));
+        assert_eq!(argv, vec!["hostname".to_string(), "-f".to_string()]);
     }
 
     // ==================== SandboxError ====================
