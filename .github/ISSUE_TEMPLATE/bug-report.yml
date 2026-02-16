@@ -10,6 +10,8 @@ body:
     attributes:
       value: |
         Thanks for reporting this. Please include enough detail for us to reproduce quickly.
+        If this is a security vulnerability, do not file it here. Use private security reporting:
+        https://github.com/puremachinery/carapace/security/policy
 
   - type: input
     id: version
@@ -36,7 +38,6 @@ body:
       options:
         - onboarding
         - channel
-        - security
         - docs
         - cli
         - server/runtime
