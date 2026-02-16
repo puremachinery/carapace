@@ -28,6 +28,7 @@ use uuid::Uuid;
 
 use crate::agent::sandbox::{
     default_ssh_tunnel_sandbox_config, ensure_sandbox_supported, spawn_sandboxed_tokio_command,
+    SandboxedTokioChild,
 };
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -951,7 +952,7 @@ impl Default for SshTunnelConfig {
 
 /// Handle to a running SSH tunnel subprocess.
 pub struct SshTunnel {
-    child: tokio::process::Child,
+    child: SandboxedTokioChild,
     local_port: u16,
 }
 

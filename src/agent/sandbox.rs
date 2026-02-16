@@ -55,7 +55,8 @@ use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::System::JobObjects::{
     JobObjectExtendedLimitInformation, SetInformationJobObject,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
-    JOB_OBJECT_LIMIT_PROCESS_MEMORY, JOB_OBJECT_LIMIT_PROCESS_TIME, JOB_OBJECT_LIMIT_WORKINGSET,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+    JOB_OBJECT_LIMIT_PROCESS_TIME, JOB_OBJECT_LIMIT_WORKINGSET,
 };
 
 // ---------------------------------------------------------------------------
@@ -529,7 +530,8 @@ fn configure_windows_job_limits(
     info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_WORKINGSET
         | JOB_OBJECT_LIMIT_PROCESS_MEMORY
         | JOB_OBJECT_LIMIT_PROCESS_TIME
-        | JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+        | JOB_OBJECT_LIMIT_ACTIVE_PROCESS
+        | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
     info.BasicLimitInformation.MinimumWorkingSetSize = min_working_set;
     info.BasicLimitInformation.MaximumWorkingSetSize = max_working_set;
     info.BasicLimitInformation.PerProcessUserTimeLimit = windows_cpu_time_limit_100ns(config);
@@ -723,14 +725,16 @@ fn build_windows_sandboxed_tokio_command(
 async fn spawn_windows_tokio_child_with_job(
     cmd: &mut tokio::process::Command,
     config: &ProcessSandboxConfig,
-) -> std::io::Result<tokio::process::Child> {
+) -> std::io::Result<SandboxedTokioChild> {
     let mut child = cmd.spawn()?;
-    if let Err(err) = assign_windows_job_to_tokio_child(&child, config) {
-        let _ = child.kill().await;
-        let _ = child.wait().await;
-        return Err(err);
+    match assign_windows_job_to_tokio_child(&child, config) {
+        Ok(job) => Ok(SandboxedTokioChild::with_windows_job(child, job)),
+        Err(err) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            Err(err)
+        }
     }
-    Ok(child)
 }
 
 // ---------------------------------------------------------------------------
@@ -1234,25 +1238,74 @@ pub fn build_sandboxed_tokio_command(
     cmd
 }
 
+/// Spawned sandboxed child process handle.
+///
+/// On Windows this retains the assigned Job Object for the lifetime of the
+/// child handle so process limits remain active.
+pub struct SandboxedTokioChild {
+    child: tokio::process::Child,
+    #[cfg(target_os = "windows")]
+    _job: Option<Job>,
+}
+
+impl SandboxedTokioChild {
+    fn new(child: tokio::process::Child) -> Self {
+        Self {
+            child,
+            #[cfg(target_os = "windows")]
+            _job: None,
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn with_windows_job(child: tokio::process::Child, job: Job) -> Self {
+        Self {
+            child,
+            _job: Some(job),
+        }
+    }
+
+    /// Check whether the child has exited.
+    pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.child.try_wait()
+    }
+
+    /// Send a kill signal to the child process.
+    pub async fn kill(&mut self) -> std::io::Result<()> {
+        self.child.kill().await
+    }
+
+    /// Wait for the child process to exit.
+    pub async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.child.wait().await
+    }
+
+    /// Wait for the child process to exit and collect stdout/stderr.
+    pub async fn wait_with_output(self) -> std::io::Result<Output> {
+        self.child.wait_with_output().await
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn assign_windows_job_to_std_child(
     child: &std::process::Child,
     config: &ProcessSandboxConfig,
-) -> std::io::Result<()> {
+) -> std::io::Result<Job> {
     let job = create_windows_job(config).map_err(|e| std::io::Error::other(e.to_string()))?;
     job.assign_process(child.as_raw_handle() as isize)
         .map_err(|e| {
             std::io::Error::other(format!(
                 "failed to assign process to Windows job object: {e}"
             ))
-        })
+        })?;
+    Ok(job)
 }
 
 #[cfg(target_os = "windows")]
 fn assign_windows_job_to_tokio_child(
     child: &tokio::process::Child,
     config: &ProcessSandboxConfig,
-) -> std::io::Result<()> {
+) -> std::io::Result<Job> {
     let Some(raw_handle) = child.raw_handle() else {
         return Err(std::io::Error::other("missing child process handle"));
     };
@@ -1261,7 +1314,8 @@ fn assign_windows_job_to_tokio_child(
         std::io::Error::other(format!(
             "failed to assign process to Windows job object: {e}"
         ))
-    })
+    })?;
+    Ok(job)
 }
 
 /// Execute a sandboxed std command and capture output.
@@ -1281,11 +1335,14 @@ pub fn run_sandboxed_std_command_output(
             cmd.stdout(Stdio::piped());
             cmd.stderr(Stdio::piped());
             let mut child = cmd.spawn()?;
-            if let Err(err) = assign_windows_job_to_std_child(&child, cfg) {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(err);
-            }
+            let _job = match assign_windows_job_to_std_child(&child, cfg) {
+                Ok(job) => job,
+                Err(err) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(err);
+                }
+            };
             return child.wait_with_output();
         }
     }
@@ -1328,7 +1385,7 @@ pub async fn spawn_sandboxed_tokio_command(
     args: &[&str],
     config: Option<&ProcessSandboxConfig>,
     kill_on_drop: bool,
-) -> std::io::Result<tokio::process::Child> {
+) -> std::io::Result<SandboxedTokioChild> {
     #[cfg(target_os = "windows")]
     {
         if let Some(cfg) = config.filter(|cfg| cfg.enabled) {
@@ -1340,7 +1397,7 @@ pub async fn spawn_sandboxed_tokio_command(
 
     let mut cmd = build_sandboxed_tokio_command(program, args, config);
     cmd.kill_on_drop(kill_on_drop);
-    cmd.spawn()
+    cmd.spawn().map(SandboxedTokioChild::new)
 }
 
 // ---------------------------------------------------------------------------
