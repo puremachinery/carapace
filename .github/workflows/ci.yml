@@ -6,14 +6,65 @@ on:
   pull_request:
     branches: [main, master]
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
 jobs:
+  changes:
+    name: Detect Changed Categories
+    runs-on: ubuntu-latest
+    outputs:
+      docs: ${{ steps.filter.outputs.docs }}
+      website: ${{ steps.filter.outputs.website }}
+      workflow: ${{ steps.filter.outputs.workflow }}
+      rust_runtime: ${{ steps.filter.outputs.rust_runtime }}
+      docker: ${{ steps.filter.outputs.docker }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            docs:
+              - "docs/**"
+              - "**/*.md"
+              - "LICENSE"
+              - "CHANGELOG.md"
+              - ".github/**/*.md"
+            website:
+              - "website/**"
+              - "CNAME"
+            workflow:
+              - ".github/workflows/**"
+            rust_runtime:
+              - "src/**"
+              - "tests/**"
+              - "fuzz/**"
+              - "wit/**"
+              - "Cargo.toml"
+              - "Cargo.lock"
+              - "build.rs"
+              - "Justfile"
+              - "deny.toml"
+              - "config.example.json5"
+              - ".cargo/**"
+            docker:
+              - "Dockerfile"
+              - ".dockerignore"
+              - ".hadolint.yaml"
+
   fmt:
     name: Format
     runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.rust_runtime == 'true'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -24,6 +75,8 @@ jobs:
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.rust_runtime == 'true'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -35,6 +88,8 @@ jobs:
   build:
     name: Build
     runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.rust_runtime == 'true'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -44,6 +99,8 @@ jobs:
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    needs: changes
+    if: needs.changes.outputs.rust_runtime == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -58,6 +115,8 @@ jobs:
   msrv:
     name: MSRV
     runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.rust_runtime == 'true'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.93.0
@@ -67,6 +126,8 @@ jobs:
   audit:
     name: Security Audit
     runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.rust_runtime == 'true'
     steps:
       - uses: actions/checkout@v4
       - uses: taiki-e/install-action@cargo-audit
@@ -75,6 +136,8 @@ jobs:
   deny:
     name: Dependency Check
     runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.rust_runtime == 'true'
     steps:
       - uses: actions/checkout@v4
       - uses: taiki-e/install-action@cargo-deny
@@ -94,6 +157,8 @@ jobs:
   hadolint:
     name: Dockerfile Lint
     runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.docker == 'true'
     steps:
       - uses: actions/checkout@v4
       - uses: hadolint/hadolint-action@v3.1.0
@@ -103,6 +168,8 @@ jobs:
   trivy:
     name: Trivy Scan
     runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.rust_runtime == 'true' || needs.changes.outputs.docker == 'true'
     steps:
       - uses: actions/checkout@v4
       - name: Run Trivy filesystem scan
@@ -123,6 +190,8 @@ jobs:
   geiger:
     name: Unsafe Code Audit
     runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.rust_runtime == 'true'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -136,3 +205,126 @@ jobs:
         with:
           name: geiger-report
           path: geiger-report.txt
+
+  workflow-lint:
+    name: Workflow Lint
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.workflow == 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rhysd/actionlint@v1
+
+  docs-check:
+    name: Docs Check
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.docs == 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Basic markdown sanity check
+        run: |
+          echo "Checking Markdown files for hard tabs"
+          if grep -RIn $'\t' --include='*.md' .; then
+            echo "Found tab characters in Markdown files; please use spaces."
+            exit 1
+          fi
+
+  website-check:
+    name: Website Check
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.website == 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify website entrypoints exist
+        run: |
+          test -f website/index.html
+          test -f website/styles.css
+
+  ci-required:
+    name: CI Required
+    runs-on: ubuntu-latest
+    if: always()
+    needs:
+      - changes
+      - fmt
+      - clippy
+      - build
+      - test
+      - msrv
+      - audit
+      - deny
+      - gitleaks
+      - hadolint
+      - trivy
+      - geiger
+      - workflow-lint
+      - docs-check
+      - website-check
+    steps:
+      - name: Ensure dependent jobs are success or skipped
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          FMT_RESULT: ${{ needs.fmt.result }}
+          CLIPPY_RESULT: ${{ needs.clippy.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+          MSRV_RESULT: ${{ needs.msrv.result }}
+          AUDIT_RESULT: ${{ needs.audit.result }}
+          DENY_RESULT: ${{ needs.deny.result }}
+          GITLEAKS_RESULT: ${{ needs.gitleaks.result }}
+          HADOLINT_RESULT: ${{ needs.hadolint.result }}
+          TRIVY_RESULT: ${{ needs.trivy.result }}
+          GEIGER_RESULT: ${{ needs.geiger.result }}
+          WORKFLOW_LINT_RESULT: ${{ needs.workflow-lint.result }}
+          DOCS_CHECK_RESULT: ${{ needs.docs-check.result }}
+          WEBSITE_CHECK_RESULT: ${{ needs.website-check.result }}
+        run: |
+          set -euo pipefail
+
+          names=(
+            "changes"
+            "fmt"
+            "clippy"
+            "build"
+            "test"
+            "msrv"
+            "audit"
+            "deny"
+            "gitleaks"
+            "hadolint"
+            "trivy"
+            "geiger"
+            "workflow-lint"
+            "docs-check"
+            "website-check"
+          )
+
+          results=(
+            "$CHANGES_RESULT"
+            "$FMT_RESULT"
+            "$CLIPPY_RESULT"
+            "$BUILD_RESULT"
+            "$TEST_RESULT"
+            "$MSRV_RESULT"
+            "$AUDIT_RESULT"
+            "$DENY_RESULT"
+            "$GITLEAKS_RESULT"
+            "$HADOLINT_RESULT"
+            "$TRIVY_RESULT"
+            "$GEIGER_RESULT"
+            "$WORKFLOW_LINT_RESULT"
+            "$DOCS_CHECK_RESULT"
+            "$WEBSITE_CHECK_RESULT"
+          )
+
+          for i in "${!names[@]}"; do
+            name="${names[$i]}"
+            result="${results[$i]}"
+            echo "${name}: ${result}"
+            if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
+              echo "Job ${name} did not succeed"
+              exit 1
+            fi
+          done
