@@ -11,7 +11,7 @@ body:
       value: |
         Thanks for reporting this. Please include enough detail for us to reproduce quickly.
         If this is a security vulnerability, do not file it here. Use private security reporting:
-        https://github.com/puremachinery/carapace/security/policy
+        https://github.com/puremachinery/carapace/security/advisories/new
 
   - type: input
     id: version
@@ -22,11 +22,17 @@ body:
     validations:
       required: true
 
-  - type: input
+  - type: dropdown
     id: os
     attributes:
       label: Operating system
-      placeholder: macOS 15.4 / Ubuntu 24.04 / Windows 11
+      options:
+        - macOS (Apple Silicon)
+        - macOS (Intel)
+        - Linux (x86_64)
+        - Linux (ARM64)
+        - Windows (x86_64)
+        - Other
     validations:
       required: true
 
