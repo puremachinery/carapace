@@ -799,7 +799,7 @@ pub fn ensure_sandbox_supported(config: Option<&ProcessSandboxConfig>) -> Result
     #[cfg(target_os = "linux")]
     {
         let abi_version = probe_landlock_abi_version()?;
-        return validate_landlock_abi_support(abi_version, config);
+        validate_landlock_abi_support(abi_version, config)
     }
 
     #[cfg(target_os = "macos")]
