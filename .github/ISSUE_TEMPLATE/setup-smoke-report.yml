@@ -1,0 +1,75 @@
+name: Setup smoke report
+description: Report first-run setup results to improve onboarding and reliability.
+title: "smoke: <platform> <pass|fail>"
+labels:
+  - smoke
+  - onboarding
+  - feedback
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for running a setup smoke check. This report is used to improve first-run reliability and docs quality.
+
+  - type: input
+    id: version
+    attributes:
+      label: Carapace version
+      description: Output of `cara version`
+      placeholder: v0.1.0-preview2
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - macOS (Apple Silicon)
+        - macOS (Intel)
+        - Linux (x86_64)
+        - Linux (ARM64)
+        - Windows (x86_64)
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install_method
+    attributes:
+      label: Install method
+      options:
+        - Release binary
+        - Build from source
+        - Other
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Smoke checks run
+      description: Mark all checks you completed.
+      options:
+        - label: `cara status` returned healthy output
+        - label: `/health` endpoint returned success
+        - label: One hook request executed successfully
+        - label: `cara chat` started and exchanged at least one message
+    validations:
+      required: true
+
+  - type: textarea
+    id: result
+    attributes:
+      label: Result summary
+      description: What worked, what failed, and where the biggest friction was.
+      placeholder: Health/status passed, hook setup was confusing, chat flow worked after config fix.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs or errors
+      description: Paste terminal output and errors (redact secrets).
+      render: text

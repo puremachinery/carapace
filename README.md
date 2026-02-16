@@ -48,6 +48,7 @@ See [docs/security-comparison.md](docs/security-comparison.md) for a threat-by-t
 - [Channel setup](docs/channels.md) — Signal, Telegram, Discord, Slack, webhooks
 - [CLI guide](docs/cli.md) — subcommands, flags, and device identity
 - [Documentation index](docs/README.md) — architecture, protocol, security
+- [Report feedback or bugs](https://github.com/puremachinery/carapace/issues/new/choose) — setup smoke reports, bug reports, and feature requests
 
 ## Status (Preview)
 
@@ -85,8 +86,8 @@ Download from the [latest release](https://github.com/puremachinery/carapace/rel
 - `cara-aarch64-darwin`
 - `cara-x86_64-windows.exe`
 
-When releases land, you can verify with cosign (signatures and certificates will be published
-alongside each release):
+Release binaries include Sigstore signatures and certificates (`.sig` + `.pem`).
+You can verify with cosign:
 
 ```bash
 cosign verify-blob \
@@ -131,7 +132,7 @@ If you cloned the repo, the install script copies the binary into place:
 sudo ./scripts/install.sh --binary ./cara-x86_64-linux
 ```
 
-If you have a release binary (once available), use the manual steps above.
+If you downloaded a release binary, use the manual steps above.
 
 ### Install helper (Windows PowerShell)
 
@@ -141,7 +142,7 @@ If you cloned the repo, the install script copies the binary into place:
 .\scripts\install.ps1 -BinaryPath .\cara-x86_64-windows.exe
 ```
 
-If you have a release binary (once available), use the manual steps above.
+If you downloaded a release binary, use the manual steps above.
 
 ## Getting Started
 
