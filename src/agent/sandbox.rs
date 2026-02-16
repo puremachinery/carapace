@@ -217,14 +217,6 @@ fn default_ssh_tunnel_allowed_paths() -> Vec<String> {
     #[cfg(target_os = "windows")]
     {
         push_unique_path(&mut paths, r"C:\Windows\System32\OpenSSH");
-        if let Some(home) = std::env::var("USERPROFILE")
-            .ok()
-            .filter(|home| !home.is_empty())
-        {
-            push_unique_path(&mut paths, &home);
-            let ssh_dir = format!(r"{home}\.ssh");
-            push_unique_path(&mut paths, &ssh_dir);
-        }
     }
 
     paths
@@ -1275,13 +1267,12 @@ pub async fn spawn_sandboxed_tokio_command(
 ) -> std::io::Result<tokio::process::Child> {
     let mut cmd = build_sandboxed_tokio_command(program, args, config);
     cmd.kill_on_drop(kill_on_drop);
-    let child = cmd.spawn()?;
 
     #[cfg(target_os = "windows")]
     {
         if let Some(cfg) = config.filter(|cfg| cfg.enabled) {
             validate_windows_allowed_program(program, cfg)?;
-            let mut child = child;
+            let mut child = cmd.spawn()?;
             if let Err(err) = assign_windows_job_to_tokio_child(&child, cfg) {
                 let _ = child.kill().await;
                 let _ = child.wait().await;
@@ -1291,7 +1282,7 @@ pub async fn spawn_sandboxed_tokio_command(
         }
     }
 
-    Ok(child)
+    cmd.spawn()
 }
 
 // ---------------------------------------------------------------------------
