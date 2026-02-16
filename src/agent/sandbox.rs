@@ -33,6 +33,8 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -136,30 +138,31 @@ fn default_probe_allowed_paths() -> Vec<String> {
     default_allowed_paths()
 }
 
-#[cfg(target_os = "macos")]
 fn default_tailscale_allowed_paths() -> Vec<String> {
     let mut paths = default_probe_allowed_paths();
-    if !paths.iter().any(|p| p == "/var/run") {
-        paths.push("/var/run".to_string());
-    }
-    paths
-}
 
-#[cfg(target_os = "linux")]
-fn default_tailscale_allowed_paths() -> Vec<String> {
-    let mut paths = default_probe_allowed_paths();
-    if !paths.iter().any(|p| p == "/run") {
-        paths.push("/run".to_string());
+    #[cfg(target_os = "linux")]
+    {
+        // On many Linux systems, /var/run is a symlink to /run. Keep both
+        // to avoid distro-specific path assumptions.
+        if !paths.iter().any(|p| p == "/run") {
+            paths.push("/run".to_string());
+        }
+        if !paths.iter().any(|p| p == "/var/run") {
+            paths.push("/var/run".to_string());
+        }
     }
-    if !paths.iter().any(|p| p == "/var/run") {
-        paths.push("/var/run".to_string());
-    }
-    paths
-}
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn default_tailscale_allowed_paths() -> Vec<String> {
-    default_probe_allowed_paths()
+    #[cfg(target_os = "macos")]
+    {
+        // Tailscale CLI may need daemon IPC paths on Unix hosts.
+        if !paths.iter().any(|p| p == "/var/run") {
+            paths.push("/var/run".to_string());
+        }
+    }
+
+    // On non-Unix targets, this returns probe defaults unchanged.
+    paths
 }
 
 /// Build a conservative sandbox profile for short-lived runtime probe commands.
@@ -677,16 +680,49 @@ pub fn sandbox_command_argv(
     argv
 }
 
+/// Apply common sandbox command configuration to a child command.
+///
+/// This applies environment filtering (when configured) and, on Unix,
+/// installs a `pre_exec` hook to enforce in-child sandbox constraints such as
+/// rlimits and Linux landlock.
+fn configure_sandboxed_command(cmd: &mut Command, config: Option<&ProcessSandboxConfig>) {
+    let Some(cfg) = config.filter(|cfg| cfg.enabled) else {
+        return;
+    };
+
+    if !cfg.env_filter.is_empty() {
+        cmd.env_clear();
+        for var in &cfg.env_filter {
+            if let Ok(value) = std::env::var(var) {
+                cmd.env(var, value);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        let cfg = cfg.clone();
+        // SAFETY: `pre_exec` runs in the child process immediately before
+        // exec. The closure only applies deterministic sandbox setup and
+        // returns an IO error on failure.
+        unsafe {
+            cmd.pre_exec(move || {
+                apply_sandbox(&cfg).map_err(|e| std::io::Error::other(e.to_string()))?;
+                Ok(())
+            });
+        }
+    }
+}
+
 /// Build a standard-library command with optional sandbox wrapping.
 ///
-/// This helper centralizes subprocess argv construction so runtime call sites
-/// can opt into sandbox prefix behavior consistently.
+/// This helper centralizes subprocess sandbox setup for runtime call sites.
 ///
 /// Platform behavior:
 /// - macOS: prepends `sandbox-exec -p <profile>` when sandboxing is enabled
-/// - Linux: no prefix (Linux uses in-process sandbox primitives)
+/// - Linux: no prefix (sandbox is applied via in-child `pre_exec`)
 /// - Other: no prefix
-/// - Any platform with sandbox disabled: no prefix
+/// - When configured, applies `env_filter` before spawning
 pub fn build_sandboxed_std_command(
     program: &str,
     args: &[&str],
@@ -697,12 +733,13 @@ pub fn build_sandboxed_std_command(
     if argv.len() > 1 {
         cmd.args(&argv[1..]);
     }
+    configure_sandboxed_command(&mut cmd, config);
     cmd
 }
 
 /// Build a Tokio command with optional sandbox wrapping.
 ///
-/// This mirrors `build_sandboxed_std_command` for async subprocess call sites.
+/// Mirrors `build_sandboxed_std_command` for async subprocess call sites.
 pub fn build_sandboxed_tokio_command(
     program: &str,
     args: &[&str],
@@ -713,6 +750,7 @@ pub fn build_sandboxed_tokio_command(
     if argv.len() > 1 {
         cmd.args(&argv[1..]);
     }
+    configure_sandboxed_command(cmd.as_std_mut(), config);
     cmd
 }
 
@@ -1034,6 +1072,55 @@ mod tests {
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
         assert_eq!(args, vec!["-f".to_string()]);
+    }
+
+    fn env_filter_test_config() -> ProcessSandboxConfig {
+        ProcessSandboxConfig {
+            enabled: true,
+            env_filter: vec![
+                "PATH".to_string(),
+                "CARAPACE_SANDBOX_TEST_MISSING".to_string(),
+            ],
+            ..Default::default()
+        }
+    }
+
+    fn assert_env_filter_applied(command: &std::process::Command) {
+        let envs: Vec<(String, Option<String>)> = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+
+        assert!(
+            envs.iter()
+                .any(|(key, value)| key == "PATH" && value.is_some()),
+            "expected PATH to be preserved by env_filter"
+        );
+        assert!(
+            !envs
+                .iter()
+                .any(|(key, _)| key == "CARAPACE_SANDBOX_TEST_MISSING"),
+            "unexpected missing variable entry in filtered environment"
+        );
+    }
+
+    #[test]
+    fn test_build_sandboxed_std_command_applies_env_filter() {
+        let config = env_filter_test_config();
+        let command = build_sandboxed_std_command("hostname", &["-f"], Some(&config));
+        assert_env_filter_applied(&command);
+    }
+
+    #[test]
+    fn test_build_sandboxed_tokio_command_applies_env_filter() {
+        let config = env_filter_test_config();
+        let command = build_sandboxed_tokio_command("hostname", &["-f"], Some(&config));
+        assert_env_filter_applied(command.as_std());
     }
 
     #[test]
