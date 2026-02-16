@@ -7,6 +7,12 @@
   --accent: #13b7a6;
   --accent-strong: #0f766e;
   --highlight: #f59e0b;
+  --accent-light: #14b8a6;
+  --accent-lighter: #2dd4bf;
+  --button-primary-text: #03140f;
+  --button-primary-shadow: rgba(20, 184, 166, 0.32);
+  --button-secondary-border: rgba(45, 212, 191, 0.38);
+  --surface-translucent: rgba(15, 23, 42, 0.68);
   --border: rgba(148, 163, 184, 0.28);
   --shadow: rgba(2, 6, 23, 0.42);
 }
@@ -162,21 +168,27 @@ h1 {
   transition: transform 140ms ease, box-shadow 140ms ease, background-color 140ms ease;
 }
 
-.button:hover,
-.button:focus-visible {
+.button:hover {
   transform: translateY(-1px);
 }
 
+.button:focus-visible {
+  transform: translateY(-1px);
+  outline: 2px solid var(--highlight);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.3);
+}
+
 .button-primary {
-  color: #03140f;
-  background: linear-gradient(140deg, #14b8a6 0%, #2dd4bf 90%);
-  box-shadow: 0 8px 20px rgba(20, 184, 166, 0.32);
+  color: var(--button-primary-text);
+  background: linear-gradient(140deg, var(--accent-light) 0%, var(--accent-lighter) 90%);
+  box-shadow: 0 8px 20px var(--button-primary-shadow);
 }
 
 .button-secondary {
   color: var(--text);
-  border-color: rgba(45, 212, 191, 0.38);
-  background: rgba(15, 23, 42, 0.68);
+  border-color: var(--button-secondary-border);
+  background: var(--surface-translucent);
 }
 
 .panel {
