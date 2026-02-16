@@ -11,7 +11,8 @@ use serde_json::Value;
 use tracing::{debug, info, warn};
 
 use crate::agent::sandbox::{
-    build_sandboxed_tokio_command, default_tailscale_cli_sandbox_config, ensure_sandbox_supported,
+    default_tailscale_cli_sandbox_config, ensure_sandbox_supported,
+    run_sandboxed_tokio_command_output,
 };
 
 // ============================================================================
@@ -182,8 +183,7 @@ async fn run_command(
     let sandbox = default_tailscale_cli_sandbox_config();
     ensure_sandbox_supported(Some(&sandbox))
         .map_err(|e| TailscaleError::CommandFailed(format!("sandbox unavailable: {e}")))?;
-    build_sandboxed_tokio_command(cli_path, args, Some(&sandbox))
-        .output()
+    run_sandboxed_tokio_command_output(cli_path, args, Some(&sandbox))
         .await
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {

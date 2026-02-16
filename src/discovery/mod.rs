@@ -334,14 +334,14 @@ mod hostname {
     use std::ffi::OsString;
 
     use crate::agent::sandbox::{
-        build_sandboxed_std_command, default_probe_sandbox_config, ensure_sandbox_supported,
+        default_probe_sandbox_config, ensure_sandbox_supported, run_sandboxed_std_command_output,
     };
 
     fn run_hostname_command() -> Result<std::process::Output, std::io::Error> {
         let sandbox = default_probe_sandbox_config();
         ensure_sandbox_supported(Some(&sandbox))
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Unsupported, e.to_string()))?;
-        build_sandboxed_std_command("hostname", &[], Some(&sandbox)).output()
+        run_sandboxed_std_command_output("hostname", &[], Some(&sandbox))
     }
 
     /// Get the system hostname via the `hostname` command.

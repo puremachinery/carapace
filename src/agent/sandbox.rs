@@ -9,8 +9,8 @@
 //!   and `setrlimit` for resource limits.
 //! - **Linux**: Uses landlock (Linux 5.13+) for filesystem access control and
 //!   `setrlimit` / `prctl` for resource limits.
-//! - **Other**: Resource limits only (where `setrlimit` is available), or a
-//!   no-op with a warning log.
+//! - **Windows**: Uses Job Objects for per-process working set limits.
+//! - **Other**: Unsupported for sandbox-required subprocess paths (fail-closed).
 //!
 //! ## Configuration
 //!
@@ -35,8 +35,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
 use std::path::PathBuf;
-use std::process::Command;
+#[cfg(windows)]
+use std::process::Stdio;
+use std::process::{Command, Output};
+#[cfg(windows)]
+use win32job::{ExtendedLimitInfo, Job};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -448,6 +454,32 @@ pub fn macos_sandbox_command_prefix(config: &ProcessSandboxConfig) -> Vec<String
 }
 
 // ---------------------------------------------------------------------------
+// Windows: Job Objects
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "windows")]
+fn windows_working_set_limits(config: &ProcessSandboxConfig) -> (usize, usize) {
+    let max = usize::try_from(config.max_memory_bytes()).unwrap_or(usize::MAX);
+    let min = (1024 * 1024).min(max);
+    (min, max.max(min))
+}
+
+#[cfg(target_os = "windows")]
+fn create_windows_job(config: &ProcessSandboxConfig) -> Result<Job, SandboxError> {
+    let (min_working_set, max_working_set) = windows_working_set_limits(config);
+    let mut info = ExtendedLimitInfo::new();
+    info.limit_working_memory(min_working_set, max_working_set);
+    Job::create_with_limit_info(&info)
+        .map_err(|e| SandboxError::Platform(format!("failed to create Windows job object: {e}")))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_job_objects_available(config: &ProcessSandboxConfig) -> Result<(), SandboxError> {
+    let _ = create_windows_job(config)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Linux: landlock filesystem access control
 // ---------------------------------------------------------------------------
 
@@ -756,7 +788,7 @@ pub fn apply_landlock(_config: &ProcessSandboxConfig) -> Result<(), SandboxError
 ///
 /// On macOS: resource limits only (Seatbelt is applied via command prefix).
 /// On Linux: resource limits + landlock.
-/// On other: resource limits only (may be a no-op).
+/// On Windows: process isolation is applied at spawn-time via Job Objects.
 pub fn apply_sandbox(config: &ProcessSandboxConfig) -> Result<(), SandboxError> {
     if !config.enabled {
         tracing::debug!("process sandbox is disabled");
@@ -812,7 +844,12 @@ pub fn ensure_sandbox_supported(config: Option<&ProcessSandboxConfig>) -> Result
         Ok(())
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
+    {
+        windows_job_objects_available(config)
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         Err(SandboxError::Unsupported)
     }
@@ -937,6 +974,112 @@ pub fn build_sandboxed_tokio_command(
     }
     configure_sandboxed_command(cmd.as_std_mut(), config);
     cmd
+}
+
+#[cfg(target_os = "windows")]
+fn assign_windows_job_to_std_child(
+    child: &std::process::Child,
+    config: &ProcessSandboxConfig,
+) -> std::io::Result<()> {
+    let job = create_windows_job(config).map_err(|e| std::io::Error::other(e.to_string()))?;
+    job.assign_process(child.as_raw_handle() as isize)
+        .map_err(|e| {
+            std::io::Error::other(format!(
+                "failed to assign process to Windows job object: {e}"
+            ))
+        })
+}
+
+#[cfg(target_os = "windows")]
+fn assign_windows_job_to_tokio_child(
+    child: &tokio::process::Child,
+    config: &ProcessSandboxConfig,
+) -> std::io::Result<()> {
+    let Some(raw_handle) = child.raw_handle() else {
+        return Err(std::io::Error::other("missing child process handle"));
+    };
+    let job = create_windows_job(config).map_err(|e| std::io::Error::other(e.to_string()))?;
+    job.assign_process(raw_handle as isize).map_err(|e| {
+        std::io::Error::other(format!(
+            "failed to assign process to Windows job object: {e}"
+        ))
+    })
+}
+
+/// Execute a sandboxed std command and capture output.
+///
+/// On Windows this assigns the spawned child process to a Job Object before
+/// waiting for completion.
+pub fn run_sandboxed_std_command_output(
+    program: &str,
+    args: &[&str],
+    config: Option<&ProcessSandboxConfig>,
+) -> std::io::Result<Output> {
+    let mut cmd = build_sandboxed_std_command(program, args, config);
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(cfg) = config.filter(|cfg| cfg.enabled) {
+            cmd.stdin(Stdio::null());
+            cmd.stdout(Stdio::piped());
+            cmd.stderr(Stdio::piped());
+            let child = cmd.spawn()?;
+            assign_windows_job_to_std_child(&child, cfg)?;
+            return child.wait_with_output();
+        }
+    }
+
+    cmd.output()
+}
+
+/// Execute a sandboxed tokio command and capture output.
+///
+/// On Windows this assigns the spawned child process to a Job Object before
+/// waiting for completion.
+pub async fn run_sandboxed_tokio_command_output(
+    program: &str,
+    args: &[&str],
+    config: Option<&ProcessSandboxConfig>,
+) -> std::io::Result<Output> {
+    let mut cmd = build_sandboxed_tokio_command(program, args, config);
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(cfg) = config.filter(|cfg| cfg.enabled) {
+            cmd.stdin(Stdio::null());
+            cmd.stdout(Stdio::piped());
+            cmd.stderr(Stdio::piped());
+            let mut child = cmd.spawn()?;
+            assign_windows_job_to_tokio_child(&child, cfg)?;
+            return child.wait_with_output().await;
+        }
+    }
+
+    cmd.output().await
+}
+
+/// Spawn a sandboxed tokio child process.
+///
+/// On Windows this assigns the spawned child process to a Job Object before
+/// returning it to the caller.
+pub fn spawn_sandboxed_tokio_command(
+    program: &str,
+    args: &[&str],
+    config: Option<&ProcessSandboxConfig>,
+    kill_on_drop: bool,
+) -> std::io::Result<tokio::process::Child> {
+    let mut cmd = build_sandboxed_tokio_command(program, args, config);
+    cmd.kill_on_drop(kill_on_drop);
+    let child = cmd.spawn()?;
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(cfg) = config.filter(|cfg| cfg.enabled) {
+            assign_windows_job_to_tokio_child(&child, cfg)?;
+        }
+    }
+
+    Ok(child)
 }
 
 // ---------------------------------------------------------------------------
@@ -1484,7 +1627,7 @@ mod tests {
         assert_eq!(err.to_string(), "sandbox not supported on this platform");
     }
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     #[test]
     fn test_ensure_sandbox_supported_supported_platform() {
         let config = ProcessSandboxConfig {
@@ -1494,7 +1637,7 @@ mod tests {
         assert!(ensure_sandbox_supported(Some(&config)).is_ok());
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     #[test]
     fn test_ensure_sandbox_supported_unsupported_platform() {
         let config = ProcessSandboxConfig::default();
