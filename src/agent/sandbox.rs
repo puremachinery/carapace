@@ -172,13 +172,10 @@ fn default_ssh_tunnel_allowed_paths() -> Vec<String> {
     {
         push_unique_path(&mut paths, "/dev");
 
-        if let Some(home) = std::env::var_os("HOME") {
-            let home = home.to_string_lossy().to_string();
-            if !home.is_empty() {
-                push_unique_path(&mut paths, &home);
-                let ssh_dir = format!("{home}/.ssh");
-                push_unique_path(&mut paths, &ssh_dir);
-            }
+        if let Some(home) = std::env::var("HOME").ok().filter(|home| !home.is_empty()) {
+            push_unique_path(&mut paths, &home);
+            let ssh_dir = format!("{home}/.ssh");
+            push_unique_path(&mut paths, &ssh_dir);
         }
     }
 
