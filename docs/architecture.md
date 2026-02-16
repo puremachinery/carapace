@@ -12,10 +12,10 @@ graph TB
         ExtNodes[External Nodes]
     end
 
-    subgraph "Gateway Core"
+    subgraph "Carapace Core"
         subgraph "Transport Layer"
             WS[WS Server<br/>JSON-RPC]
-            HTTP[HTTP Gateway]
+            HTTP[HTTP Service]
         end
 
         subgraph "Security"
@@ -221,7 +221,7 @@ sequenceDiagram
 | Component | Path | Description |
 |-----------|------|-------------|
 | WS Server | `src/server/ws/` | WebSocket JSON-RPC, method dispatch |
-| HTTP Gateway | `src/server/http.rs` | HTTP endpoints, static files |
+| HTTP Service | `src/server/http.rs` | HTTP endpoints, static files |
 | OpenAI Compat | `src/server/openai.rs` | /v1/chat/completions, /v1/responses |
 | Control API | `src/server/control.rs` | /control/status, /control/channels |
 | Auth | `src/auth/mod.rs` | Token/password verification, loopback detection |

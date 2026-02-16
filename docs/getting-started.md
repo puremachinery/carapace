@@ -5,15 +5,45 @@ It’s intentionally practical: copy/paste steps, then customize.
 
 ## Prerequisites
 
-- A `cara` binary on your PATH (from GitHub Releases)
+- A `cara` binary on your PATH (download pre-built binaries from
+  <https://github.com/puremachinery/carapace/releases>)
 - A supported LLM provider API key (OpenAI/Anthropic/etc), or Ollama
-- Optional: TLS certs if exposing the gateway publicly
+- Optional: TLS certs if exposing Carapace publicly
 
 If you want to build from source, see [CONTRIBUTING.md](../CONTRIBUTING.md).
 
+## Install `cara` (Pre-Built Binary)
+
+Download from the latest release:
+<https://github.com/puremachinery/carapace/releases>
+
+Common artifacts:
+- Linux x64: `cara-x86_64-linux`
+- Linux ARM64: `cara-aarch64-linux`
+- macOS Intel: `cara-x86_64-darwin`
+- macOS Apple Silicon: `cara-aarch64-darwin`
+- Windows x64: `cara-x86_64-windows.exe`
+
+macOS/Linux install:
+
+```bash
+chmod +x ./cara-<your-platform>
+sudo mv ./cara-<your-platform> /usr/local/bin/cara
+cara --help
+```
+
+Windows install (PowerShell):
+
+```powershell
+$installDir = "$env:LOCALAPPDATA\cara\bin"
+New-Item -ItemType Directory -Force -Path $installDir | Out-Null
+Copy-Item .\cara-x86_64-windows.exe (Join-Path $installDir "cara.exe")
+cara --help
+```
+
 ## Quick Start (Local, Token Auth)
 
-1) Generate a gateway token:
+1) Generate a Carapace auth token:
 
 ```bash
 export CARAPACE_GATEWAY_TOKEN="$(openssl rand -hex 32)"
@@ -32,7 +62,7 @@ export CARAPACE_GATEWAY_TOKEN="$(openssl rand -hex 32)"
 }
 ```
 
-3) Run the gateway:
+3) Run Carapace:
 
 ```bash
 CARAPACE_CONFIG_PATH=./carapace.json5 cara
@@ -90,8 +120,8 @@ are scrubbed on load.
 
 Minimum recommendations:
 
-- Use gateway auth (`gateway.auth.mode = token` or `password`).
-- Use TLS if the gateway is reachable outside localhost.
+- Use service auth (`gateway.auth.mode = token` or `password`).
+- Use TLS if Carapace is reachable outside localhost.
 - Do **not** expose hooks (`/hooks/*`) without a hooks token.
 - Rotate tokens if the state directory is exposed.
 
@@ -112,15 +142,15 @@ Minimum recommendations:
 
 If you terminate TLS in a reverse proxy:
 
-1) Keep the gateway on localhost or a private network.
-2) Forward `/` to the gateway.
+1) Keep Carapace on localhost or a private network.
+2) Forward `/` to Carapace.
 3) Preserve request headers.
 4) Set `gateway.trustedProxies` to your proxy IPs so local‑direct detection
    works correctly.
 
 ## Hooks (Web API)
 
-Hooks are separate from gateway auth and require a hooks token.
+Hooks are separate from service auth and require a hooks token.
 
 ```json5
 {
@@ -147,7 +177,7 @@ Enable the Control UI:
 }
 ```
 
-Then visit `/ui` on the gateway host.
+Then visit `/ui` on the Carapace host.
 You can override the base path via `gateway.controlUi.basePath`.
 
 ## Operations
@@ -180,7 +210,7 @@ cara update
 
 ## Troubleshooting
 
-- **401 Unauthorized**: check gateway token or hooks token.
+- **401 Unauthorized**: check auth token or hooks token.
 - **403 Forbidden**: CSRF or Origin failure for Control UI endpoints.
 - **LLM requests fail**: verify provider key and model name.
 - **No replies**: ensure an LLM provider is configured; check `/health/ready`.

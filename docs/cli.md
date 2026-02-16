@@ -6,7 +6,7 @@ from `--help`, including recent changes around device identity and TLS requireme
 ## Commands
 
 ### start
-Starts the gateway server (default when no subcommand is given).
+Starts the Carapace service (default when no subcommand is given).
 
 ### config
 Manage configuration values.
@@ -40,7 +40,7 @@ Remote hosts require TLS or explicit plaintext opt-in:
 Prints version/build info.
 
 ### backup / restore
-Create or restore a backup archive of gateway state.
+Create or restore a backup archive of Carapace state.
 
 ### reset
 Remove state data categories. Use `--all` or explicit flags plus `--force`.
@@ -49,14 +49,14 @@ Remove state data categories. Use `--all` or explicit flags plus `--force`.
 Interactive first-run configuration wizard.
 
 ### pair
-Pair this CLI with a gateway.
+Pair this CLI with a Carapace service.
 
 ```
 cara pair https://gateway.local:3001 --name "My CLI" --trust
 ```
 
 Notes:
-- Requires gateway auth (token or password).
+- Requires service auth (token or password).
 - Performs the device-identity challenge/response during WS connect.
 - If pairing is required, the CLI prints a `requestId` to approve in the control UI.
 
@@ -69,7 +69,7 @@ cara chat
 
 Options:
 - `--new` — start a new session key instead of resuming `cli-chat`.
-- `--port` / `-p` — connect to a specific local gateway port.
+- `--port` / `-p` — connect to a specific local Carapace port.
 
 REPL commands:
 - `/help` — show command help.
@@ -104,7 +104,7 @@ The CLI generates and stores a device identity for WebSocket access:
 - Stored in the OS credential store when available.
 - Legacy on-disk fallback: `{config_dir}/device-identity.json` (e.g.
   `~/.config/carapace/device-identity.json` on Linux; owner-only perms).
-- A gateway-issued `connect.challenge` nonce is signed and sent in `connect`.
+- A service-issued `connect.challenge` nonce is signed and sent in `connect`.
 
 Strict mode: set this env var to *disallow* fallback to the legacy file:
 
@@ -124,7 +124,7 @@ Override with:
 
 ## Examples
 
-### Tail logs over TLS (self-signed gateway)
+### Tail logs over TLS (self-signed service cert)
 ```
 cara logs --host gateway.local --port 3001 --tls --trust -n 200
 ```
@@ -134,7 +134,7 @@ cara logs --host gateway.local --port 3001 --tls --trust -n 200
 cara logs --host 10.0.0.12 --port 18789 --allow-plaintext
 ```
 
-### Pair with a remote gateway
+### Pair with a remote Carapace service
 ```
 CARAPACE_GATEWAY_TOKEN=... cara pair https://gateway.local:3001 --name "Ops CLI" --trust
 ```

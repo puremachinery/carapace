@@ -1,6 +1,6 @@
 # Node and Device Pairing
 
-The Gateway manages two separate pairing subsystems for remote entities:
+Carapace manages two separate pairing subsystems for remote entities:
 
 1. **Node pairing** (`node.pair.*`) - For application-level nodes (iOS app, headless services)
 2. **Device pairing** (`device.pair.*`) - For WS connection-level device identity
@@ -37,10 +37,10 @@ Pending requests expire after **5 minutes** (configurable via `PAIRING_EXPIRY_MS
 
 ## How Pairing Works
 
-1. Entity connects to Gateway WS and sends `node.pair.request` (or `device.pair.request`)
-2. Gateway creates a **pending request** and emits `node.pair.requested` event
+1. Entity connects to the Carapace WS endpoint and sends `node.pair.request` (or `device.pair.request`)
+2. Carapace creates a **pending request** and emits `node.pair.requested` event
 3. Operator approves or rejects via CLI or UI
-4. On approval, Gateway issues a **new token** (tokens rotate on re-pair)
+4. On approval, Carapace issues a **new token** (tokens rotate on re-pair)
 5. Entity stores token and uses it for future authentication
 
 ## Protocol Methods
@@ -129,7 +129,7 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 
 ## Storage
 
-Pairing state is stored under the Gateway state directory:
+Pairing state is stored under the Carapace state directory:
 
 Examples below use the Linux config directory (`~/.config/carapace`).
 

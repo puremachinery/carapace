@@ -18,7 +18,7 @@ Carapace is a Rust rewrite of OpenClaw built from the ground up to address these
 
 **Carapace:**
 - **Fails closed.** When no auth token or password is configured, all connections are denied (`TokenMissingConfig` / `PasswordMissingConfig`). There is no "accidentally open" state.
-- **Localhost-only by default.** The gateway binds to `127.0.0.1`. External access requires the operator to explicitly set bind mode to `lan`, `tailnet`, or `all`. A default Carapace instance is unreachable from the internet.
+- **Localhost-only by default.** Carapace binds to `127.0.0.1`. External access requires the operator to explicitly set bind mode to `lan`, `tailnet`, or `all`. A default Carapace instance is unreachable from the internet.
 - **Timing-safe credential comparison.** Auth checks use constant-time SHA-256 digest comparison — no length side-channel.
 - **CSRF protection enabled by default.** Double-submit cookie with `__Host-` prefix, `SameSite=Strict`, origin/host validation.
 
@@ -45,11 +45,11 @@ Carapace is a Rust rewrite of OpenClaw built from the ground up to address these
 
 ### 4. Control UI Token Exfiltration (1-Click RCE)
 
-**How it was exploited (GHSA-g8p2-7wf7-98mq):** OpenClaw's Control UI accepted `gatewayUrl` as a query parameter. A malicious link could redirect the UI to an attacker-controlled server, leaking the auth token. Combined with the gateway's command execution capabilities, this was a 1-click RCE.
+**How it was exploited (GHSA-g8p2-7wf7-98mq):** OpenClaw's Control UI accepted `gatewayUrl` as a query parameter. A malicious link could redirect the UI to an attacker-controlled server, leaking the auth token. Combined with command execution capabilities, this was a 1-click RCE.
 
 **Carapace:**
-- The gateway URL is set server-side only. No query parameter override exists.
-- Control endpoints enforce CSRF protection and require gateway authentication.
+- The service URL is set server-side only. No query parameter override exists.
+- Control endpoints enforce CSRF protection and require service authentication.
 - Sensitive config paths (`gateway.auth`, `gateway.hooks.token`, `credentials`, `secrets`) are blocked from modification via the control API.
 
 ### 5. Prompt Injection

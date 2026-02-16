@@ -34,6 +34,7 @@ jobs:
             docs:
               - "docs/**"
               - "**/*.md"
+              - "website/**"
               - "LICENSE"
               - "CHANGELOG.md"
             workflow:
@@ -46,7 +47,6 @@ jobs:
               - "Cargo.toml"
               - "Cargo.lock"
               - "build.rs"
-              - "Justfile"
               - "deny.toml"
               - "config.example.json5"
               - ".cargo/**"

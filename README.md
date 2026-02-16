@@ -12,7 +12,7 @@ A hardened alternative to openclaw / clawdbot — for when your assistant needs 
 - **Multi-channel messaging** — Signal, Telegram, Discord, Slack, console, and webhooks. 10 built-in tools + 15 channel-specific tool schemas
 - **WASM plugin runtime** — wasmtime 41 with Ed25519 signature verification, capability sandboxing, resource limits (64MB memory, fuel CPU budget, epoch wall-clock timeout), and permission enforcement
 - **Security by default** — localhost-only binding, SSRF/DNS-rebinding defense, prompt guard, inbound message classifier, exec approval flow, output content security. Auth denies by default when no credentials configured; CSRF-protected control endpoints. AES-256-GCM secret encryption at rest with PBKDF2 key derivation. OS-level sandbox primitives (Seatbelt/Landlock/rlimits) implemented, subprocess wiring in progress
-- **Infrastructure** — TLS, mTLS, mDNS discovery, config hot-reload, Tailscale integration, Prometheus metrics, audit logging. Gateway clustering is partially implemented
+- **Infrastructure** — TLS, mTLS, mDNS discovery, config hot-reload, Tailscale integration, Prometheus metrics, audit logging. Multi-node clustering is partially implemented
 
 ## Expectations vs OpenClaw
 
@@ -152,7 +152,7 @@ If you have a release binary (once available), use the manual steps above.
    cara setup
    ```
 
-2. Start the gateway:
+2. Start Carapace:
    ```bash
    cara
    ```
@@ -229,7 +229,7 @@ for the `openai` and `ollama` provider sections.
 ### Channels
 
 Setup guides for Signal, Telegram, Discord, and Slack (including inbound
-webhooks and gateway configuration) live in:
+webhooks and service configuration) live in:
 
 - `docs/channels.md`
 
