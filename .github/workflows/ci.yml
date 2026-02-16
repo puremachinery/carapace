@@ -209,7 +209,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Run actionlint
-        uses: docker://rhysd/actionlint:latest
+        uses: docker://rhysd/actionlint:v1.7.1
         with:
           args: -color -shellcheck=
 
@@ -262,8 +262,8 @@ jobs:
           HADOLINT_RESULT: ${{ needs.hadolint.result }}
           TRIVY_RESULT: ${{ needs.trivy.result }}
           GEIGER_RESULT: ${{ needs.geiger.result }}
-          WORKFLOW_LINT_RESULT: ${{ needs.workflow-lint.result }}
-          DOCS_CHECK_RESULT: ${{ needs.docs-check.result }}
+          WORKFLOW_LINT_RESULT: ${{ needs['workflow-lint'].result }}
+          DOCS_CHECK_RESULT: ${{ needs['docs-check'].result }}
         run: |
           set -euo pipefail
 
