@@ -25,7 +25,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter", "time"] }
 keyring = { version = "2.3.3", default-features = false, features = ["platform-macos", "platform-windows", "linux-default-keyutils"] }
 wasmtime = { version = "41", features = ["component-model"] }
-thiserror = "1"
+thiserror = "2"
 parking_lot = "0.12"
 base64 = "0.22"
 ed25519-dalek = { version = "2", features = ["std", "zeroize"] }
