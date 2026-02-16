@@ -31,6 +31,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **CLI binary rename:** the command is now `cara` and release assets are
   named `cara-<os>-<arch>`.
+- **Tailscale subprocess sandboxing:** Tailscale-related helper subprocesses
+  now use centralized sandbox profiles with explicit platform path allowances,
+  and shared command builders apply both environment filtering and child
+  sandbox constraints consistently.
+- **Self-update test stability:** update/install tests no longer replace the
+  running test binary on disk, preventing nextest child process breakage in CI.
+- **Security/status docs alignment:** feature evidence, feature status, and
+  security comparison docs were updated to reflect current sandbox wiring.
 - **Carapace naming:** Env vars now use `CARAPACE_*`, the credentials service
   name is `carapace`, and default state/config paths use the platform config
   directory. Existing installs should migrate data or set
@@ -188,6 +196,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Auth profile token encryption at rest via platform keychain.
 - cargo-deny, gitleaks, trivy, hadolint, and cargo-geiger in CI.
 - OS-level sandboxing for agent tool subprocesses (Seatbelt, Landlock, rlimits).
+- Tailscale CLI and probe subprocesses now inherit sandbox command wrapping,
+  env filtering, and child-process constraints consistently.
 - Output HTML/Markdown sanitization (XSS, dangerous tags, data URI filtering).
 - mTLS with cluster CA for gateway-to-gateway authentication.
 - Fine-grained WASM plugin permission enforcement (URL, credential, media scopes).
@@ -195,5 +205,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Inbound message classifier with structured attack taxonomy and audit logging
   (`classifier_blocked`, `classifier_warned` events).
 
-[Unreleased]: https://github.com/your-org/carapace/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/your-org/carapace/releases/tag/v0.1.0
+[Unreleased]: https://github.com/puremachinery/carapace/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/puremachinery/carapace/releases/tag/v0.1.0
