@@ -1,0 +1,66 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  schedule:
+    - cron: '0 6 * * 1' # Weekly Monday 6am UTC
+
+concurrency:
+  group: codeql-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            rust:
+              - "src/**"
+              - "tests/**"
+              - "Cargo.toml"
+              - "Cargo.lock"
+              - "build.rs"
+
+  analyze-actions:
+    name: Analyze (actions)
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: actions
+      - uses: github/codeql-action/analyze@v3
+        with:
+          category: /language:actions
+
+  analyze-rust:
+    name: Analyze (rust)
+    runs-on: ubuntu-latest
+    needs: changes
+    if: >-
+      github.event_name != 'pull_request' ||
+      needs.changes.outputs.rust == 'true'
+    permissions:
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: rust
+      - uses: github/codeql-action/analyze@v3
+        with:
+          category: /language:rust
