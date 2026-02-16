@@ -675,7 +675,11 @@ fn resolve_and_validate_windows_allowed_program(
             )
         })?;
         let root_norm = normalize_windows_path(&root_path);
-        if resolved_norm == root_norm || resolved_norm.starts_with(&(root_norm + "\\")) {
+        let mut root_prefix = root_norm.clone();
+        if !root_prefix.ends_with('\\') {
+            root_prefix.push('\\');
+        }
+        if resolved_norm == root_norm || resolved_norm.starts_with(&root_prefix) {
             allowed = true;
             break;
         }
