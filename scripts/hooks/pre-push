@@ -1,7 +1,8 @@
 #!/bin/bash
 # Pre-push hook:
 # - docs/site/meta-only pushes: skip checks
-# - script-only pushes: run shell syntax/lint checks
+# - shell-script-only pushes: run shell syntax/lint checks
+# - non-shell script-only pushes: skip checks
 # - Rust-impacting pushes: run cargo nextest
 # Install via: just setup-hooks
 
@@ -45,6 +46,17 @@ is_rust_impacting_path() {
     esac
 }
 
+is_shell_script_path() {
+    case "$1" in
+        *.sh|scripts/hooks/pre-commit|scripts/hooks/pre-push)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 is_script_path() {
     case "$1" in
         scripts/*|*.sh)
@@ -56,22 +68,20 @@ is_script_path() {
     esac
 }
 
-run_script_checks() {
+run_shell_checks() {
     local -a shell_targets=()
     local path
 
     for path in "${changed_files[@]}"; do
-        case "$path" in
-            *.sh|scripts/hooks/pre-commit|scripts/hooks/pre-push)
-                if [ -f "$path" ]; then
-                    shell_targets+=("$path")
-                fi
-                ;;
-        esac
+        if is_shell_script_path "$path"; then
+            if [ -f "$path" ]; then
+                shell_targets+=("$path")
+            fi
+        fi
     done
 
     if [ "${#shell_targets[@]}" -eq 0 ]; then
-        echo "Script-only changes detected, but no shell scripts to validate."
+        echo "Script-only changes detected, but no shell scripts to validate. Non-shell scripts are not checked by this hook."
         return 0
     fi
 
@@ -90,6 +100,8 @@ run_script_checks() {
     else
         echo "shellcheck not installed; skipping shell lint."
     fi
+
+    return 0
 }
 
 declare -a changed_files=()
@@ -152,6 +164,7 @@ fi
 
 needs_nextest=0
 needs_script_checks=0
+needs_non_shell_script_only=0
 for path in "${changed_files[@]}"; do
     if is_docs_or_site_only_path "$path"; then
         continue
@@ -162,8 +175,13 @@ for path in "${changed_files[@]}"; do
         continue
     fi
 
-    if is_script_path "$path"; then
+    if is_shell_script_path "$path"; then
         needs_script_checks=1
+        continue
+    fi
+
+    if is_script_path "$path"; then
+        needs_non_shell_script_only=1
         continue
     fi
 
@@ -172,14 +190,18 @@ for path in "${changed_files[@]}"; do
 done
 
 if [ "$needs_nextest" -eq 0 ] && [ "$needs_script_checks" -eq 0 ]; then
-    echo "Docs/website/meta-only changes detected; skipping checks."
+    if [ "$needs_non_shell_script_only" -eq 1 ]; then
+        echo "Non-shell script-only changes detected; no shell checks to run."
+    else
+        echo "Docs/website/meta-only changes detected; skipping checks."
+    fi
     exit 0
 fi
 
 if [ "$needs_script_checks" -eq 1 ]; then
-    echo "Script changes detected. Running shell checks..."
-    if ! run_script_checks; then
-        echo "Script checks failed. Fix issues before pushing."
+    echo "Shell script changes detected. Running shell checks..."
+    if ! run_shell_checks; then
+        echo "Shell checks failed. Fix issues before pushing."
         exit 1
     fi
 fi
