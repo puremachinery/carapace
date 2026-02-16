@@ -143,12 +143,17 @@ fn default_tailscale_allowed_paths() -> Vec<String> {
 
     #[cfg(target_os = "linux")]
     {
+        // On many Linux systems, /var/run is a symlink to /run. Keep both
+        // to avoid distro-specific path assumptions.
         if !paths.iter().any(|p| p == "/run") {
             paths.push("/run".to_string());
         }
+        if !paths.iter().any(|p| p == "/var/run") {
+            paths.push("/var/run".to_string());
+        }
     }
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     {
         // Tailscale CLI may need daemon IPC paths on Unix hosts.
         if !paths.iter().any(|p| p == "/var/run") {
