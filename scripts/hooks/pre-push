@@ -25,7 +25,7 @@ is_zero_sha() {
 
 is_docs_or_site_only_path() {
     case "$1" in
-        docs/*|website/*|.github/*|.local/*|*.md|*.MD|*.txt|*.rst|*.adoc|*.yml|*.yaml)
+        docs/*|website/*|.github/*|.local/*|Justfile|justfile|*.md|*.MD|*.txt|*.rst|*.adoc|*.yml|*.yaml)
             return 0
             ;;
         *)
