@@ -25,7 +25,7 @@ if command -v gitleaks >/dev/null 2>&1; then
         exit 1
     fi
 else
-    echo "gitleaks not installed, skipping secret scan (brew install gitleaks)"
+    echo "gitleaks not installed, skipping secret scan. See https://github.com/gitleaks/gitleaks#install"
 fi
 
 echo "Pre-commit checks passed"
