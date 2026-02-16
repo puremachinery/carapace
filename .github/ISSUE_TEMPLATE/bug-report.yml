@@ -1,0 +1,84 @@
+name: Bug report
+description: Report a reproducible defect in Carapace behavior.
+title: "bug: <short summary>"
+labels:
+  - bug
+  - feedback
+  - triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting this. Please include enough detail for us to reproduce quickly.
+        If this is a security vulnerability, do not file it here. Use private security reporting:
+        https://github.com/puremachinery/carapace/security/advisories/new
+
+  - type: input
+    id: version
+    attributes:
+      label: Carapace version
+      description: Output of `cara version`
+      placeholder: v0.1.0-preview2
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - macOS (Apple Silicon)
+        - macOS (Intel)
+        - Linux (x86_64)
+        - Linux (ARM64)
+        - Windows (x86_64)
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Select the primary area impacted.
+      options:
+        - onboarding
+        - channel
+        - docs
+        - cli
+        - server/runtime
+        - plugin/tooling
+        - other
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / screenshots
+      description: Include relevant output and redact secrets.

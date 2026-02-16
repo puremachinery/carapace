@@ -1,0 +1,40 @@
+name: Feature request
+description: Propose a feature or workflow improvement.
+title: "feature: <short summary>"
+labels:
+  - enhancement
+  - feedback
+  - triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Share the concrete problem first, then the feature idea. This helps prioritize by user impact.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: What is hard today, and for whom?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the behavior you want.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds you tried or competing approaches.
+
+  - type: textarea
+    id: success
+    attributes:
+      label: Success criteria
+      description: How should we know this feature is successful once shipped?

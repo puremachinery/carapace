@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability report
+    url: https://github.com/puremachinery/carapace/security/advisories/new
+    about: Please report security vulnerabilities privately through GitHub security reporting.
+  - name: Getting started guide
+    url: https://github.com/puremachinery/carapace/blob/HEAD/docs/getting-started.md
+    about: Installation and first-run instructions for local setup.
