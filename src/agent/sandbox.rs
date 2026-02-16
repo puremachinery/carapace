@@ -586,7 +586,11 @@ fn canonicalize_windows_path(path: &Path) -> PathBuf {
 }
 
 #[cfg(target_os = "windows")]
-fn resolve_windows_executable(program: &str) -> Option<PathBuf> {
+fn resolve_windows_executable_with_env(
+    program: &str,
+    path_var: Option<&std::ffi::OsStr>,
+    path_exts: Option<&str>,
+) -> Option<PathBuf> {
     let program_path = Path::new(program);
     if program_path.components().count() > 1 || program_path.is_absolute() {
         if program_path.is_file() {
@@ -596,16 +600,15 @@ fn resolve_windows_executable(program: &str) -> Option<PathBuf> {
     }
 
     let has_extension = program_path.extension().is_some();
-    let default_exts = ".COM;.EXE;.BAT;.CMD".to_string();
-    let path_exts = std::env::var("PATHEXT").unwrap_or(default_exts);
+    let path_exts = path_exts.unwrap_or(".COM;.EXE;.BAT;.CMD");
     let path_exts: Vec<String> = path_exts
         .split(';')
         .filter(|ext| !ext.is_empty())
         .map(|ext| ext.to_ascii_lowercase())
         .collect();
 
-    let path_var = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
+    let path_var = path_var?;
+    for dir in std::env::split_paths(path_var) {
         if has_extension {
             let candidate = dir.join(program);
             if candidate.is_file() {
@@ -626,12 +629,19 @@ fn resolve_windows_executable(program: &str) -> Option<PathBuf> {
 }
 
 #[cfg(target_os = "windows")]
-fn validate_windows_allowed_program(
+fn resolve_windows_executable(program: &str) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH");
+    let path_exts = std::env::var("PATHEXT").ok();
+    resolve_windows_executable_with_env(program, path_var.as_deref(), path_exts.as_deref())
+}
+
+#[cfg(target_os = "windows")]
+fn resolve_and_validate_windows_allowed_program(
     program: &str,
     config: &ProcessSandboxConfig,
-) -> std::io::Result<()> {
+) -> std::io::Result<Option<PathBuf>> {
     if config.allowed_paths.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
 
     let resolved = resolve_windows_executable(program).ok_or_else(|| {
@@ -659,7 +669,53 @@ fn validate_windows_allowed_program(
         ));
     }
 
-    Ok(())
+    Ok(Some(resolved))
+}
+
+#[cfg(target_os = "windows")]
+fn build_windows_sandboxed_std_command(
+    program: &str,
+    args: &[&str],
+    config: &ProcessSandboxConfig,
+) -> std::io::Result<Command> {
+    if let Some(resolved_program) = resolve_and_validate_windows_allowed_program(program, config)? {
+        let mut cmd = Command::new(resolved_program);
+        cmd.args(args);
+        configure_sandboxed_command(&mut cmd, Some(config));
+        return Ok(cmd);
+    }
+
+    Ok(build_sandboxed_std_command(program, args, Some(config)))
+}
+
+#[cfg(target_os = "windows")]
+fn build_windows_sandboxed_tokio_command(
+    program: &str,
+    args: &[&str],
+    config: &ProcessSandboxConfig,
+) -> std::io::Result<tokio::process::Command> {
+    if let Some(resolved_program) = resolve_and_validate_windows_allowed_program(program, config)? {
+        let mut cmd = tokio::process::Command::new(resolved_program);
+        cmd.args(args);
+        configure_sandboxed_command(cmd.as_std_mut(), Some(config));
+        return Ok(cmd);
+    }
+
+    Ok(build_sandboxed_tokio_command(program, args, Some(config)))
+}
+
+#[cfg(target_os = "windows")]
+async fn spawn_windows_tokio_child_with_job(
+    cmd: &mut tokio::process::Command,
+    config: &ProcessSandboxConfig,
+) -> std::io::Result<tokio::process::Child> {
+    let mut child = cmd.spawn()?;
+    if let Err(err) = assign_windows_job_to_tokio_child(&child, config) {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        return Err(err);
+    }
+    Ok(child)
 }
 
 // ---------------------------------------------------------------------------
@@ -1202,12 +1258,10 @@ pub fn run_sandboxed_std_command_output(
     args: &[&str],
     config: Option<&ProcessSandboxConfig>,
 ) -> std::io::Result<Output> {
-    let mut cmd = build_sandboxed_std_command(program, args, config);
-
     #[cfg(target_os = "windows")]
     {
         if let Some(cfg) = config.filter(|cfg| cfg.enabled) {
-            validate_windows_allowed_program(program, cfg)?;
+            let mut cmd = build_windows_sandboxed_std_command(program, args, cfg)?;
             cmd.stdin(Stdio::null());
             cmd.stdout(Stdio::piped());
             cmd.stderr(Stdio::piped());
@@ -1221,6 +1275,7 @@ pub fn run_sandboxed_std_command_output(
         }
     }
 
+    let mut cmd = build_sandboxed_std_command(program, args, config);
     cmd.output()
 }
 
@@ -1233,25 +1288,19 @@ pub async fn run_sandboxed_tokio_command_output(
     args: &[&str],
     config: Option<&ProcessSandboxConfig>,
 ) -> std::io::Result<Output> {
-    let mut cmd = build_sandboxed_tokio_command(program, args, config);
-
     #[cfg(target_os = "windows")]
     {
         if let Some(cfg) = config.filter(|cfg| cfg.enabled) {
-            validate_windows_allowed_program(program, cfg)?;
+            let mut cmd = build_windows_sandboxed_tokio_command(program, args, cfg)?;
             cmd.stdin(Stdio::null());
             cmd.stdout(Stdio::piped());
             cmd.stderr(Stdio::piped());
-            let mut child = cmd.spawn()?;
-            if let Err(err) = assign_windows_job_to_tokio_child(&child, cfg) {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                return Err(err);
-            }
+            let child = spawn_windows_tokio_child_with_job(&mut cmd, cfg).await?;
             return child.wait_with_output().await;
         }
     }
 
+    let mut cmd = build_sandboxed_tokio_command(program, args, config);
     cmd.output().await
 }
 
@@ -1265,23 +1314,17 @@ pub async fn spawn_sandboxed_tokio_command(
     config: Option<&ProcessSandboxConfig>,
     kill_on_drop: bool,
 ) -> std::io::Result<tokio::process::Child> {
-    let mut cmd = build_sandboxed_tokio_command(program, args, config);
-    cmd.kill_on_drop(kill_on_drop);
-
     #[cfg(target_os = "windows")]
     {
         if let Some(cfg) = config.filter(|cfg| cfg.enabled) {
-            validate_windows_allowed_program(program, cfg)?;
-            let mut child = cmd.spawn()?;
-            if let Err(err) = assign_windows_job_to_tokio_child(&child, cfg) {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                return Err(err);
-            }
-            return Ok(child);
+            let mut cmd = build_windows_sandboxed_tokio_command(program, args, cfg)?;
+            cmd.kill_on_drop(kill_on_drop);
+            return spawn_windows_tokio_child_with_job(&mut cmd, cfg).await;
         }
     }
 
+    let mut cmd = build_sandboxed_tokio_command(program, args, config);
+    cmd.kill_on_drop(kill_on_drop);
     cmd.spawn()
 }
 
@@ -1652,6 +1695,111 @@ mod tests {
         let config = env_filter_test_config();
         let command = build_sandboxed_tokio_command("hostname", &["-f"], Some(&config));
         assert_env_filter_applied(command.as_std());
+    }
+
+    #[cfg(target_os = "windows")]
+    fn windows_test_temp_dir(label: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "carapace-sandbox-{label}-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("failed to create temp test dir");
+        dir
+    }
+
+    #[cfg(target_os = "windows")]
+    fn create_windows_test_executable(path: &std::path::Path) {
+        let parent = path.parent().expect("executable path should have parent");
+        std::fs::create_dir_all(parent).expect("failed to create executable parent dir");
+        std::fs::write(path, b"").expect("failed to create fake executable");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_resolve_windows_executable_with_and_without_extension() {
+        let temp_dir = windows_test_temp_dir("resolve");
+        let exe_path = temp_dir.join("carapace-sandbox-test.exe");
+        create_windows_test_executable(&exe_path);
+
+        let path_var = Some(temp_dir.as_os_str());
+        let path_exts = Some(".EXE");
+        let with_ext =
+            resolve_windows_executable_with_env("carapace-sandbox-test.exe", path_var, path_exts)
+                .expect("expected executable resolution with extension");
+        let without_ext =
+            resolve_windows_executable_with_env("carapace-sandbox-test", path_var, path_exts)
+                .expect("expected executable resolution without extension");
+        assert_eq!(
+            normalize_windows_path(&with_ext),
+            normalize_windows_path(&without_ext),
+            "expected same resolved path with and without extension"
+        );
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_validate_windows_allowed_program_exact_and_subpath() {
+        let temp_dir = windows_test_temp_dir("allowlist");
+        let bin_dir = temp_dir.join("bin");
+        let exe_path = bin_dir.join("safe.exe");
+        create_windows_test_executable(&exe_path);
+        let exe_program = exe_path.to_string_lossy().to_string();
+        let exe_norm = normalize_windows_path(&canonicalize_windows_path(&exe_path));
+        let bin_norm = normalize_windows_path(&canonicalize_windows_path(&bin_dir));
+
+        let exact_config = ProcessSandboxConfig {
+            allowed_paths: vec![exe_norm],
+            ..Default::default()
+        };
+        resolve_and_validate_windows_allowed_program(&exe_program, &exact_config)
+            .expect("exact allowed executable path should pass")
+            .expect("allowlist validation should return resolved program path");
+
+        let parent_config = ProcessSandboxConfig {
+            allowed_paths: vec![bin_norm],
+            ..Default::default()
+        };
+        resolve_and_validate_windows_allowed_program(&exe_program, &parent_config)
+            .expect("allowed parent directory should pass")
+            .expect("allowlist validation should return resolved program path");
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_validate_windows_allowed_program_rejects_outside_allowed_paths() {
+        let temp_dir = windows_test_temp_dir("reject");
+        let allowed_exe = temp_dir.join("allowed").join("safe.exe");
+        let denied_exe = temp_dir.join("denied").join("unsafe.exe");
+        create_windows_test_executable(&allowed_exe);
+        create_windows_test_executable(&denied_exe);
+
+        let config = ProcessSandboxConfig {
+            allowed_paths: vec![allowed_exe
+                .parent()
+                .expect("allowed exe should have parent")
+                .to_string_lossy()
+                .to_string()],
+            ..Default::default()
+        };
+
+        resolve_and_validate_windows_allowed_program(&allowed_exe.to_string_lossy(), &config)
+            .expect("allowlisted executable should pass")
+            .expect("allowlisted executable should resolve");
+
+        let err =
+            resolve_and_validate_windows_allowed_program(&denied_exe.to_string_lossy(), &config)
+                .expect_err("non-allowlisted executable should be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+
+        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]
