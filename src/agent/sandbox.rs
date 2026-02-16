@@ -582,7 +582,14 @@ fn normalize_windows_path(path: &Path) -> String {
 
 #[cfg(target_os = "windows")]
 fn canonicalize_windows_path(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    std::fs::canonicalize(path).unwrap_or_else(|err| {
+        tracing::debug!(
+            path = %path.display(),
+            error = %err,
+            "failed to canonicalize Windows path; using original path"
+        );
+        path.to_path_buf()
+    })
 }
 
 #[cfg(target_os = "windows")]
@@ -639,9 +646,12 @@ fn resolve_windows_executable(program: &str) -> Option<PathBuf> {
 fn resolve_and_validate_windows_allowed_program(
     program: &str,
     config: &ProcessSandboxConfig,
-) -> std::io::Result<Option<PathBuf>> {
+) -> std::io::Result<PathBuf> {
     if config.allowed_paths.is_empty() {
-        return Ok(None);
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "program execution denied by sandbox: allowed_paths is empty",
+        ));
     }
 
     let resolved = resolve_windows_executable(program).ok_or_else(|| {
@@ -669,7 +679,7 @@ fn resolve_and_validate_windows_allowed_program(
         ));
     }
 
-    Ok(Some(resolved))
+    Ok(resolved)
 }
 
 #[cfg(target_os = "windows")]
@@ -678,14 +688,11 @@ fn build_windows_sandboxed_std_command(
     args: &[&str],
     config: &ProcessSandboxConfig,
 ) -> std::io::Result<Command> {
-    if let Some(resolved_program) = resolve_and_validate_windows_allowed_program(program, config)? {
-        let mut cmd = Command::new(resolved_program);
-        cmd.args(args);
-        configure_sandboxed_command(&mut cmd, Some(config));
-        return Ok(cmd);
-    }
-
-    Ok(build_sandboxed_std_command(program, args, Some(config)))
+    let resolved_program = resolve_and_validate_windows_allowed_program(program, config)?;
+    let mut cmd = Command::new(resolved_program);
+    cmd.args(args);
+    configure_sandboxed_command(&mut cmd, Some(config));
+    Ok(cmd)
 }
 
 #[cfg(target_os = "windows")]
@@ -694,14 +701,11 @@ fn build_windows_sandboxed_tokio_command(
     args: &[&str],
     config: &ProcessSandboxConfig,
 ) -> std::io::Result<tokio::process::Command> {
-    if let Some(resolved_program) = resolve_and_validate_windows_allowed_program(program, config)? {
-        let mut cmd = tokio::process::Command::new(resolved_program);
-        cmd.args(args);
-        configure_sandboxed_command(cmd.as_std_mut(), Some(config));
-        return Ok(cmd);
-    }
-
-    Ok(build_sandboxed_tokio_command(program, args, Some(config)))
+    let resolved_program = resolve_and_validate_windows_allowed_program(program, config)?;
+    let mut cmd = tokio::process::Command::new(resolved_program);
+    cmd.args(args);
+    configure_sandboxed_command(cmd.as_std_mut(), Some(config));
+    Ok(cmd)
 }
 
 #[cfg(target_os = "windows")]
@@ -1758,16 +1762,14 @@ mod tests {
             ..Default::default()
         };
         resolve_and_validate_windows_allowed_program(&exe_program, &exact_config)
-            .expect("exact allowed executable path should pass")
-            .expect("allowlist validation should return resolved program path");
+            .expect("exact allowed executable path should pass");
 
         let parent_config = ProcessSandboxConfig {
             allowed_paths: vec![bin_norm],
             ..Default::default()
         };
         resolve_and_validate_windows_allowed_program(&exe_program, &parent_config)
-            .expect("allowed parent directory should pass")
-            .expect("allowlist validation should return resolved program path");
+            .expect("allowed parent directory should pass");
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
@@ -1791,8 +1793,7 @@ mod tests {
         };
 
         resolve_and_validate_windows_allowed_program(&allowed_exe.to_string_lossy(), &config)
-            .expect("allowlisted executable should pass")
-            .expect("allowlisted executable should resolve");
+            .expect("allowlisted executable should pass");
 
         let err =
             resolve_and_validate_windows_allowed_program(&denied_exe.to_string_lossy(), &config)
@@ -1800,6 +1801,18 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
 
         let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_validate_windows_allowed_program_rejects_empty_allowed_paths() {
+        let config = ProcessSandboxConfig {
+            allowed_paths: Vec::new(),
+            ..Default::default()
+        };
+        let err = resolve_and_validate_windows_allowed_program("cmd.exe", &config)
+            .expect_err("empty allowed_paths should deny execution");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
     }
 
     #[test]
