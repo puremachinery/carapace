@@ -64,9 +64,6 @@ and skip test runs for docs/website/meta-only pushes.
   (use serde `rename` or `rename_all` as needed).
 - Place unit tests in inline `#[cfg(test)] mod tests { }` blocks at the bottom
   of each source file.
-- Terminology: in public-facing copy (for example `website/`), describe Carapace
-  as a **personal AI assistant**. Reserve **gateway** wording for technical
-  protocol/internal documentation.
 
 ## Testing
 
