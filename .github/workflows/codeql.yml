@@ -21,11 +21,11 @@ jobs:
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 2
       - id: filter
-        uses: dorny/paths-filter@v3
+        uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3
         with:
           filters: |
             rust:
@@ -41,11 +41,11 @@ jobs:
     permissions:
       security-events: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: github/codeql-action/init@v3
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: github/codeql-action/init@f5c2471be782132e47a6e6f9c725e56730d6e9a3 # v3
         with:
           languages: actions
-      - uses: github/codeql-action/analyze@v3
+      - uses: github/codeql-action/analyze@f5c2471be782132e47a6e6f9c725e56730d6e9a3 # v3
         with:
           category: /language:actions
 
@@ -59,10 +59,10 @@ jobs:
     permissions:
       security-events: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: github/codeql-action/init@v3
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: github/codeql-action/init@f5c2471be782132e47a6e6f9c725e56730d6e9a3 # v3
         with:
           languages: rust
-      - uses: github/codeql-action/analyze@v3
+      - uses: github/codeql-action/analyze@f5c2471be782132e47a6e6f9c725e56730d6e9a3 # v3
         with:
           category: /language:rust
