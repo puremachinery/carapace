@@ -581,14 +581,14 @@ fn normalize_windows_path(path: &Path) -> String {
 }
 
 #[cfg(target_os = "windows")]
-fn canonicalize_windows_path(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|err| {
+fn canonicalize_windows_path(path: &Path) -> std::io::Result<PathBuf> {
+    std::fs::canonicalize(path).map_err(|err| {
         tracing::debug!(
             path = %path.display(),
             error = %err,
-            "failed to canonicalize Windows path; using original path"
+            "failed to canonicalize Windows path"
         );
-        path.to_path_buf()
+        err
     })
 }
 
@@ -597,13 +597,13 @@ fn resolve_windows_executable_with_env(
     program: &str,
     path_var: Option<&std::ffi::OsStr>,
     path_exts: Option<&str>,
-) -> Option<PathBuf> {
+) -> std::io::Result<Option<PathBuf>> {
     let program_path = Path::new(program);
     if program_path.components().count() > 1 || program_path.is_absolute() {
         if program_path.is_file() {
-            return Some(canonicalize_windows_path(program_path));
+            return canonicalize_windows_path(program_path).map(Some);
         }
-        return None;
+        return Ok(None);
     }
 
     let has_extension = program_path.extension().is_some();
@@ -614,12 +614,14 @@ fn resolve_windows_executable_with_env(
         .map(|ext| ext.to_ascii_lowercase())
         .collect();
 
-    let path_var = path_var?;
+    let Some(path_var) = path_var else {
+        return Ok(None);
+    };
     for dir in std::env::split_paths(path_var) {
         if has_extension {
             let candidate = dir.join(program);
             if candidate.is_file() {
-                return Some(canonicalize_windows_path(&candidate));
+                return canonicalize_windows_path(&candidate).map(Some);
             }
             continue;
         }
@@ -627,16 +629,16 @@ fn resolve_windows_executable_with_env(
         for ext in &path_exts {
             let candidate = dir.join(format!("{program}{ext}"));
             if candidate.is_file() {
-                return Some(canonicalize_windows_path(&candidate));
+                return canonicalize_windows_path(&candidate).map(Some);
             }
         }
     }
 
-    None
+    Ok(None)
 }
 
 #[cfg(target_os = "windows")]
-fn resolve_windows_executable(program: &str) -> Option<PathBuf> {
+fn resolve_windows_executable(program: &str) -> std::io::Result<Option<PathBuf>> {
     let path_var = std::env::var_os("PATH");
     let path_exts = std::env::var("PATHEXT").ok();
     resolve_windows_executable_with_env(program, path_var.as_deref(), path_exts.as_deref())
@@ -654,7 +656,7 @@ fn resolve_and_validate_windows_allowed_program(
         ));
     }
 
-    let resolved = resolve_windows_executable(program).ok_or_else(|| {
+    let resolved = resolve_windows_executable(program)?.ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::NotFound,
             format!("unable to resolve Windows executable path for '{program}'"),
@@ -662,11 +664,20 @@ fn resolve_and_validate_windows_allowed_program(
     })?;
     let resolved_norm = normalize_windows_path(&resolved);
 
-    let allowed = config.allowed_paths.iter().any(|root| {
-        let root_path = canonicalize_windows_path(Path::new(root));
+    let mut allowed = false;
+    for root in &config.allowed_paths {
+        let root_path = canonicalize_windows_path(Path::new(root)).map_err(|err| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("invalid sandbox allowed_paths entry '{}': {err}", root),
+            )
+        })?;
         let root_norm = normalize_windows_path(&root_path);
-        resolved_norm == root_norm || resolved_norm.starts_with(&(root_norm + "\\"))
-    });
+        if resolved_norm == root_norm || resolved_norm.starts_with(&(root_norm + "\\")) {
+            allowed = true;
+            break;
+        }
+    }
 
     if !allowed {
         return Err(std::io::Error::new(
@@ -1733,9 +1744,11 @@ mod tests {
         let path_exts = Some(".EXE");
         let with_ext =
             resolve_windows_executable_with_env("carapace-sandbox-test.exe", path_var, path_exts)
+                .expect("expected executable resolution with extension")
                 .expect("expected executable resolution with extension");
         let without_ext =
             resolve_windows_executable_with_env("carapace-sandbox-test", path_var, path_exts)
+                .expect("expected executable resolution without extension")
                 .expect("expected executable resolution without extension");
         assert_eq!(
             normalize_windows_path(&with_ext),
@@ -1754,8 +1767,10 @@ mod tests {
         let exe_path = bin_dir.join("safe.exe");
         create_windows_test_executable(&exe_path);
         let exe_program = exe_path.to_string_lossy().to_string();
-        let exe_norm = normalize_windows_path(&canonicalize_windows_path(&exe_path));
-        let bin_norm = normalize_windows_path(&canonicalize_windows_path(&bin_dir));
+        let exe_norm =
+            normalize_windows_path(&canonicalize_windows_path(&exe_path).expect("canonical exe"));
+        let bin_norm =
+            normalize_windows_path(&canonicalize_windows_path(&bin_dir).expect("canonical dir"));
 
         let exact_config = ProcessSandboxConfig {
             allowed_paths: vec![exe_norm],
