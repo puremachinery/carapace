@@ -35,7 +35,7 @@ feature_inventory_markdown: |
   - [x] **Inbound message classifier** — LLM-based attack classification, circuit breaker (`classifier.rs`)
   - [x] **Output content sanitizer** — HTML/script/XSS stripping, CSP enforcement (`output_sanitizer.rs`)
   - [x] **Exfiltration guard** — filters tool definitions + blocks sensitive tools at dispatch (`exfiltration.rs`)
-  - [~] **OS-level process sandbox** — Seatbelt (macOS), Landlock (Linux), rlimits (`sandbox.rs`), wired for runtime probes + tailscale CLI/whois
+  - [~] **OS-level process sandbox** — Seatbelt (macOS), Landlock (Linux), rlimits (`sandbox.rs`), subprocess wrappers wired across runtime probes/tailscale/whois/SSH tunnel; unsupported OSes fail closed
   - [x] **Channel-specific tools** — 15 platform-specific tool schemas (`channel_tools.rs`)
 
   ### Authentication (`src/auth/`)

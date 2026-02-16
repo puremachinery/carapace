@@ -26,6 +26,10 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+use crate::agent::sandbox::{
+    build_sandboxed_tokio_command, default_ssh_tunnel_sandbox_config, ensure_sandbox_supported,
+};
+
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 // ============================================================================
@@ -1031,7 +1035,12 @@ pub async fn setup_ssh_tunnel(config: &SshTunnelConfig) -> Result<SshTunnel, Gat
         "setting up SSH tunnel"
     );
 
-    let child = tokio::process::Command::new("ssh")
+    let sandbox = default_ssh_tunnel_sandbox_config();
+    ensure_sandbox_supported(Some(&sandbox))
+        .map_err(|e| GatewayError::TunnelFailed(format!("ssh tunnel sandbox unavailable: {e}")))?;
+
+    let mut command = build_sandboxed_tokio_command("ssh", &[], Some(&sandbox));
+    let child = command
         .arg("-N") // no remote command
         .arg("-L")
         .arg(&forward_spec)

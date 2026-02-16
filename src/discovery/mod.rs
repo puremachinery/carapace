@@ -333,20 +333,15 @@ pub async fn run_mdns_lifecycle(
 mod hostname {
     use std::ffi::OsString;
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    use crate::agent::sandbox::{build_sandboxed_std_command, default_probe_sandbox_config};
+    use crate::agent::sandbox::{
+        build_sandboxed_std_command, default_probe_sandbox_config, ensure_sandbox_supported,
+    };
 
     fn run_hostname_command() -> Result<std::process::Output, std::io::Error> {
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        {
-            let sandbox = default_probe_sandbox_config();
-            build_sandboxed_std_command("hostname", &[], Some(&sandbox)).output()
-        }
-
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        {
-            std::process::Command::new("hostname").output()
-        }
+        let sandbox = default_probe_sandbox_config();
+        ensure_sandbox_supported(Some(&sandbox))
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Unsupported, e.to_string()))?;
+        build_sandboxed_std_command("hostname", &[], Some(&sandbox)).output()
     }
 
     /// Get the system hostname via the `hostname` command.
