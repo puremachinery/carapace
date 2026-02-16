@@ -1,6 +1,6 @@
 # Config File Format
 
-This document describes the config file format used by the carapace gateway.
+This document describes the config file format used by the Carapace service.
 
 ## File Location
 
@@ -25,7 +25,7 @@ The file is parsed as **JSON5** (comments, trailing commas allowed).
 7. Normalize paths.
 8. Apply runtime overrides.
 
-If validation fails, the gateway logs errors and falls back to `{}`.
+If validation fails, Carapace logs errors and falls back to `{}`.
 
 ## `$include` Directive
 
@@ -115,10 +115,10 @@ All keys are optional. Unknown keys are rejected (strict schema).
 - `cron` – cron scheduler settings
 - `web` – web provider settings (WhatsApp Web)
 - `channels` – per-channel configs
-- `discovery` – gateway discovery settings
+- `discovery` – service discovery settings
 - `canvasHost` – canvas host server settings
 - `talk` – TTS/voice settings
-- `gateway` – gateway server settings
+- `gateway` – service settings
 - `skills` – skills registry settings
 - `plugins` – plugin load/allowlist/config
 - `venice` – Venice AI provider settings (apiKey, baseUrl)
@@ -135,8 +135,8 @@ This is a condensed map; refer to the JSON schema for full detail.
 - `gateway`
   - `port`, `mode`, `bind`, `controlUi`, `hooks`, `auth`, `trustedProxies`, `tailscale`, `remote`, `reload`, `tls`, `mtls`, `http.endpoints`, `nodes`
   - `controlUi`: `enabled`, `path`, `basePath`
-  - `mtls` – gateway-to-gateway mTLS (`enabled`, `caCert`, `nodeCert`, `nodeKey`, `crlPath`, `requireClientCert`)
-  - `remote` – outbound gateway connections (`enabled`, `authToken`, `autoReconnect`,
+  - `mtls` – service-to-service mTLS (`enabled`, `caCert`, `nodeCert`, `nodeKey`, `crlPath`, `requireClientCert`)
+  - `remote` – outbound service connections (`enabled`, `authToken`, `autoReconnect`,
     `reconnectIntervalMs`, `maxReconnectAttempts`, `gateways[]`)
     - `gateways[]` entries: `name`, `url`, `fingerprint` (TOFU pin), `autoConnect`,
       optional `ssh` (`host`, `port`, `user`, `remotePort`)
@@ -161,9 +161,9 @@ This is a condensed map; refer to the JSON schema for full detail.
 - `telegram`
   - `webhookSecret` (required for inbound webhooks; validates `X-Telegram-Bot-Api-Secret-Token`)
 - `discord`
-  - `gatewayEnabled` (connect to the Gateway for inbound messages)
+  - `gatewayEnabled` (connect to the Discord Gateway for inbound messages)
   - `gatewayIntents` (intents bitmask, default includes MESSAGE_CONTENT)
-  - `gatewayUrl` (override Gateway URL)
+  - `gatewayUrl` (override Discord Gateway URL)
 - `slack`
   - `signingSecret` (validates Events API signatures)
 

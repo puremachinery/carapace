@@ -10,7 +10,7 @@ This document mixes current behavior with planned design. Sections labeled
 ## Scope
 
 Secrets covered:
-- Gateway auth tokens/passwords
+- Service auth tokens/passwords
 - Provider auth profiles (API keys, OAuth access/refresh tokens, bearer tokens)
 - Hooks token and browser control token
 - GitHub Copilot token cache
@@ -62,10 +62,10 @@ Minimum JSON schema per secret type:
     "enterpriseUrl": "..."
   }
   ```
-  Fields mirror the gateway's `AuthProfileCredential` shape; only the fields
+  Fields mirror the service's `AuthProfileCredential` shape; only the fields
   present for the specific `type` are required.
 
-- **Gateway auth**
+- **Service auth**
   ```json
   { "token": "..." }
   ```
@@ -142,7 +142,7 @@ credential store health checks. The remainder of this section is planned unless 
 
 ### Locked Keychain / Unavailable Secret Store
 
-**Scenario:** Gateway starts but the OS secret store is locked or unavailable.
+**Scenario:** Carapace starts but the OS secret store is locked or unavailable.
 
 **Behavior by platform:**
 

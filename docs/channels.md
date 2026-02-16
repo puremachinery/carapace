@@ -1,20 +1,20 @@
 # Channels Setup
 
 This guide explains how to configure inbound/outbound messaging for Signal,
-Telegram, Discord, and Slack. It focuses on the *carapace* gateway wiring and
+Telegram, Discord, and Slack. It focuses on the *carapace* service wiring and
 the minimum external setup needed to make each channel usable.
 
 All examples assume `carapace.json5` (see `config.example.json5`) and the default
-gateway HTTP port 18789. Adjust paths/ports for your deployment.
+service HTTP port 18789. Adjust paths/ports for your deployment.
 
 ## Common Notes
 
 - Inbound webhooks require a public HTTPS URL. If you are behind a reverse
-  proxy, ensure it forwards to the gateway and preserves the request body.
+  proxy, ensure it forwards to Carapace and preserves the request body.
 - Secrets are encrypted at rest when config encryption is enabled.
 - Channel tools (agent actions) are available when `session.metadata.channel`
   is set for the conversation.
-- Signal’s REST API defaults to port 8080; this is separate from the gateway port.
+- Signal’s REST API defaults to port 8080; this is separate from the Carapace port.
 
 ## Signal (signal-cli-rest-api)
 
@@ -98,7 +98,7 @@ https://YOUR_HOST/channels/slack/events
 }
 ```
 
-The gateway validates `X-Slack-Request-Timestamp` and `X-Slack-Signature`.
+Carapace validates `X-Slack-Request-Timestamp` and `X-Slack-Signature`.
 Slack’s `url_verification` handshake is supported.
 
 Implementation references:
@@ -107,7 +107,7 @@ Implementation references:
 
 ## Discord (REST + Gateway)
 
-Discord uses the REST API for outbound delivery and the Gateway WebSocket for
+Discord uses the REST API for outbound delivery and the Discord Gateway WebSocket for
 inbound messages.
 
 1) Create a Discord application and bot token.
@@ -125,7 +125,7 @@ inbound messages.
 }
 ```
 
-The gateway connects to Discord and dispatches `MESSAGE_CREATE` events into
+Carapace connects to Discord and dispatches `MESSAGE_CREATE` events into
 the agent pipeline.
 
 Implementation references:

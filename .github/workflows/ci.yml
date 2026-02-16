@@ -34,6 +34,7 @@ jobs:
             docs:
               - "docs/**"
               - "**/*.md"
+              - "website/**"
               - "LICENSE"
               - "CHANGELOG.md"
             workflow:
@@ -227,6 +228,7 @@ jobs:
             echo "Found tab characters in Markdown files; please use spaces."
             exit 1
           fi
+          bash scripts/check-public-copy.sh
 
   ci-required:
     name: CI Required

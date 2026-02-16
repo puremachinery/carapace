@@ -1,22 +1,22 @@
-# Gateway HTTP API
+# Carapace HTTP API
 
-This document describes the gateway HTTP endpoints wired in the current Rust gateway implementation.
-It focuses on endpoints handled directly by the gateway server and the Control UI.
+This document describes the HTTP endpoints wired in the current Rust Carapace implementation.
+It focuses on endpoints handled directly by the service and the Control UI.
 
 ## Authentication Overview
 
 Endpoints fall into two buckets:
 
-- **Hooks** use a separate hooks token (`gateway.hooks.token`) and do **not** use gateway auth.
-- **Gateway endpoints** use **gateway auth** (token/password) or **Tailscale Serve** when enabled.
+- **Hooks** use a separate hooks token (`gateway.hooks.token`) and do **not** use service auth.
+- **Service endpoints** use **service auth** (token/password) or **Tailscale Serve** when enabled.
 
-Gateway auth uses a bearer token in the `Authorization` header:
+Service auth uses a bearer token in the `Authorization` header:
 
 ```
 Authorization: Bearer ${CARAPACE_GATEWAY_TOKEN}
 ```
 
-If gateway auth mode is `password`, the same bearer token is treated as the password.
+If service auth mode is `password`, the same bearer token is treated as the password.
 If auth mode is `none` (loopback-only), the endpoints are open to local loopback requests.
 If Tailscale Serve auth is enabled, verified Tailscale identity can satisfy auth for non-local requests.
 
@@ -30,7 +30,7 @@ Max body size is configurable via `gateway.hooks.maxBodyBytes`.
 The path **must not** be `/`.
 
 ### Auth
-Hooks require a **hooks token** (not gateway auth). Accepted forms:
+Hooks require a **hooks token** (not service auth). Accepted forms:
 
 - `Authorization: Bearer ${CARAPACE_HOOKS_TOKEN}`
 - `X-Carapace-Token: ${CARAPACE_HOOKS_TOKEN}`
@@ -104,7 +104,7 @@ Responses:
 ```
 
 #### POST `{basePath}/*` (hook mappings)
-If hook mappings are configured, the gateway applies them to the incoming payload.
+If hook mappings are configured, Carapace applies them to the incoming payload.
 Possible responses:
 - 200 OK / 202 Accepted for mapped actions
 - 204 No Content if mapping returns `null`
@@ -114,7 +114,7 @@ Possible responses:
 ## Channel Webhooks
 
 Inbound channel integrations are handled via dedicated HTTP endpoints.
-These are **not** protected by gateway auth; each channel uses its own
+These are **not** protected by service auth; each channel uses its own
 validation mechanism.
 
 Common behavior:
@@ -140,13 +140,13 @@ Slack Events API endpoint.
 
 ## Plugin Webhooks
 
-Plugins can register webhook paths. The gateway routes any request under
+Plugins can register webhook paths. Carapace routes any request under
 `/plugins/{plugin_id}/...` to the owning plugin.
 
 Common behavior:
 - Method: **any**
 - Max body size: 256 KB (override via `gateway.hooks.maxBodyBytes`)
-- Auth: **none at the gateway layer** — plugins must validate their own secrets
+- Auth: **none at the service layer** — plugins must validate their own secrets
   (e.g., shared tokens or signatures).
 - Response: status, headers, and body are forwarded from the plugin.
 
@@ -160,7 +160,7 @@ Common behavior:
 ### POST `/v1/chat/completions`
 OpenAI-style Chat Completions endpoint (when enabled).
 
-Auth: **gateway auth** (Bearer token/password or Tailscale Serve).
+Auth: **service auth** (Bearer token/password or Tailscale Serve).
 
 Request body (subset supported):
 ```json
@@ -216,7 +216,7 @@ Errors:
 ### POST `/tools/invoke`
 Executes a single tool by name (when enabled).
 
-Auth: **gateway auth** (Bearer token/password or Tailscale Serve).
+Auth: **service auth** (Bearer token/password or Tailscale Serve).
 
 Request headers:
 - `Authorization: Bearer ${CARAPACE_GATEWAY_TOKEN}`
@@ -283,7 +283,7 @@ Errors:
 
 ### GET `/health`
 
-Returns gateway health status. No authentication required.
+Returns service health status. No authentication required.
 
 Response:
 - 200 OK
@@ -307,9 +307,9 @@ The following handlers are available but require additional documentation:
 - Each plugin's routes are namespaced under `/plugins/{pluginId}/`
 - Authentication: uses the hooks token (same as `/hooks/*`)
 
-**BREAKING CHANGE from Node gateway:**
-The Node gateway allowed plugins to register arbitrary paths (e.g., `/my-webhook`).
-The Rust gateway enforces namespacing for security isolation. All plugin routes
+**BREAKING CHANGE from Node implementation:**
+The Node implementation allowed plugins to register arbitrary paths (e.g., `/my-webhook`).
+The Rust implementation enforces namespacing for security isolation. All plugin routes
 are prefixed with `/plugins/{pluginId}/`. Existing webhook integrations must
 update their URLs accordingly.
 
@@ -324,7 +324,7 @@ update their URLs accordingly.
 - Tool use and function calling
 
 These endpoints require additional documentation of:
-- Authentication requirements (which use gateway auth vs hooks token vs none)
+- Authentication requirements (which use service auth vs hooks token vs none)
 - Request/response schemas
 - Error handling behavior
 

@@ -85,6 +85,7 @@ docs-check:
         echo "Found tab characters in Markdown files; please use spaces."; \
         exit 1; \
       fi
+    @bash scripts/check-public-copy.sh
 
 # Run the same workflow lint used in CI (requires actionlint).
 workflow-lint:
