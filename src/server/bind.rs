@@ -8,11 +8,14 @@
 //! - Any explicit IP address or `host:port` -> use as-is
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 use std::process::Command;
 use thiserror::Error;
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-use crate::agent::sandbox::{build_sandboxed_std_command, default_probe_sandbox_config};
+use crate::agent::sandbox::{
+    build_sandboxed_std_command, default_probe_sandbox_config, ProcessSandboxConfig,
+};
 
 /// Default gateway port
 pub const DEFAULT_PORT: u16 = 18789;
@@ -215,10 +218,18 @@ fn detect_lan_ip_via_connect() -> Result<IpAddr, BindError> {
 /// Detect the Tailscale IP address (100.x.x.x CGNAT range)
 fn detect_tailscale_ip() -> Result<IpAddr, BindError> {
     // Try using tailscale CLI first
-    let output = Command::new("tailscale")
-        .args(["ip", "-4"])
-        .output()
-        .map_err(|e| BindError::TailscaleDetectionFailed(e.to_string()))?;
+    let output = {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            let sandbox = tailscale_probe_sandbox_config();
+            build_sandboxed_std_command("tailscale", &["ip", "-4"], Some(&sandbox)).output()
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            Command::new("tailscale").args(["ip", "-4"]).output()
+        }
+    }
+    .map_err(|e| BindError::TailscaleDetectionFailed(e.to_string()))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -243,6 +254,26 @@ fn detect_tailscale_ip() -> Result<IpAddr, BindError> {
             "IP {} is not in Tailscale range",
             ip
         )))
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn tailscale_probe_sandbox_config() -> ProcessSandboxConfig {
+    #[cfg(target_os = "linux")]
+    {
+        let mut sandbox = default_probe_sandbox_config();
+        if !sandbox.allowed_paths.iter().any(|p| p == "/run") {
+            sandbox.allowed_paths.push("/run".to_string());
+        }
+        if !sandbox.allowed_paths.iter().any(|p| p == "/var/run") {
+            sandbox.allowed_paths.push("/var/run".to_string());
+        }
+        sandbox
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        default_probe_sandbox_config()
     }
 }
 

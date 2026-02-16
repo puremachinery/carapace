@@ -623,12 +623,11 @@ pub fn sandbox_command_argv(
     config: Option<&ProcessSandboxConfig>,
 ) -> Vec<String> {
     let mut argv = Vec::new();
-    if let Some(cfg) = config {
-        if cfg.enabled {
-            if let Some(prefix) = sandbox_command_prefix(cfg) {
-                argv.extend(prefix);
-            }
-        }
+    if let Some(prefix) = config
+        .filter(|cfg| cfg.enabled)
+        .and_then(sandbox_command_prefix)
+    {
+        argv.extend(prefix);
     }
     argv.push(program.to_string());
     argv.extend(args.iter().map(|arg| (*arg).to_string()));
