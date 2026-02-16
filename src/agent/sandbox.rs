@@ -170,8 +170,6 @@ fn default_ssh_tunnel_allowed_paths() -> Vec<String> {
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
-        push_unique_path(&mut paths, "/etc");
-        push_unique_path(&mut paths, "/etc/ssh");
         push_unique_path(&mut paths, "/dev");
 
         if let Some(home) = std::env::var_os("HOME") {
@@ -584,6 +582,28 @@ pub fn apply_landlock(config: &ProcessSandboxConfig) -> Result<(), SandboxError>
         if fd >= 0 {
             let rule = PathBeneathAttr {
                 allowed_access: ALL_ACCESS, // full access to /tmp
+                parent_fd: fd,
+            };
+            unsafe {
+                libc::syscall(
+                    LANDLOCK_ADD_RULE,
+                    ruleset_fd,
+                    LANDLOCK_RULE_PATH_BENEATH,
+                    &rule as *const PathBeneathAttr,
+                    0u32,
+                );
+                libc::close(fd);
+            }
+        }
+    }
+
+    // Add /dev/null with read/write access for stdio redirection.
+    {
+        let dev_null_path = std::ffi::CString::new("/dev/null").unwrap();
+        let fd = unsafe { libc::open(dev_null_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+        if fd >= 0 {
+            let rule = PathBeneathAttr {
+                allowed_access: LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_WRITE_FILE,
                 parent_fd: fd,
             };
             unsafe {
@@ -1234,7 +1254,7 @@ mod tests {
     #[test]
     fn test_default_ssh_tunnel_sandbox_config_paths_macos() {
         let config = default_ssh_tunnel_sandbox_config();
-        assert!(config.allowed_paths.iter().any(|p| p == "/etc/ssh"));
+        assert!(config.allowed_paths.iter().any(|p| p == "/etc"));
         assert!(config.allowed_paths.iter().any(|p| p == "/dev"));
     }
 
@@ -1258,7 +1278,8 @@ mod tests {
     #[test]
     fn test_default_ssh_tunnel_sandbox_config_paths_linux() {
         let config = default_ssh_tunnel_sandbox_config();
-        assert!(config.allowed_paths.iter().any(|p| p == "/etc/ssh"));
+        assert!(config.allowed_paths.iter().any(|p| p == "/etc"));
+        assert!(config.allowed_paths.iter().any(|p| p == "/dev"));
         assert!(config.allowed_paths.iter().any(|p| p == "/run"));
         assert!(config.allowed_paths.iter().any(|p| p == "/var/run"));
     }
