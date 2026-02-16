@@ -138,30 +138,26 @@ fn default_probe_allowed_paths() -> Vec<String> {
     default_allowed_paths()
 }
 
-#[cfg(target_os = "macos")]
 fn default_tailscale_allowed_paths() -> Vec<String> {
     let mut paths = default_probe_allowed_paths();
-    if !paths.iter().any(|p| p == "/var/run") {
-        paths.push("/var/run".to_string());
-    }
-    paths
-}
 
-#[cfg(target_os = "linux")]
-fn default_tailscale_allowed_paths() -> Vec<String> {
-    let mut paths = default_probe_allowed_paths();
-    if !paths.iter().any(|p| p == "/run") {
-        paths.push("/run".to_string());
+    #[cfg(target_os = "linux")]
+    {
+        if !paths.iter().any(|p| p == "/run") {
+            paths.push("/run".to_string());
+        }
     }
-    if !paths.iter().any(|p| p == "/var/run") {
-        paths.push("/var/run".to_string());
-    }
-    paths
-}
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn default_tailscale_allowed_paths() -> Vec<String> {
-    default_probe_allowed_paths()
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        // Tailscale CLI may need daemon IPC paths on Unix hosts.
+        if !paths.iter().any(|p| p == "/var/run") {
+            paths.push("/var/run".to_string());
+        }
+    }
+
+    // On non-Unix targets, this returns probe defaults unchanged.
+    paths
 }
 
 /// Build a conservative sandbox profile for short-lived runtime probe commands.
