@@ -11,8 +11,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use thiserror::Error;
 
 use crate::agent::sandbox::{
-    build_sandboxed_std_command, default_probe_sandbox_config,
-    default_tailscale_cli_sandbox_config, ensure_sandbox_supported,
+    default_probe_sandbox_config, default_tailscale_cli_sandbox_config, ensure_sandbox_supported,
+    run_sandboxed_std_command_output,
 };
 
 /// Default gateway port
@@ -114,9 +114,9 @@ fn detect_lan_ip_macos() -> Result<IpAddr, BindError> {
     ensure_sandbox_supported(Some(&sandbox)).map_err(|_| BindError::LanDetectionFailed)?;
 
     // Get the default route interface
-    let output = build_sandboxed_std_command("route", &["-n", "get", "default"], Some(&sandbox))
-        .output()
-        .map_err(|_| BindError::LanDetectionFailed)?;
+    let output =
+        run_sandboxed_std_command_output("route", &["-n", "get", "default"], Some(&sandbox))
+            .map_err(|_| BindError::LanDetectionFailed)?;
 
     if !output.status.success() {
         return Err(BindError::LanDetectionFailed);
@@ -133,9 +133,9 @@ fn detect_lan_ip_macos() -> Result<IpAddr, BindError> {
         .ok_or(BindError::LanDetectionFailed)?;
 
     // Get IP address for that interface using ifconfig
-    let ifconfig_output = build_sandboxed_std_command("ifconfig", &[interface], Some(&sandbox))
-        .output()
-        .map_err(|_| BindError::LanDetectionFailed)?;
+    let ifconfig_output =
+        run_sandboxed_std_command_output("ifconfig", &[interface], Some(&sandbox))
+            .map_err(|_| BindError::LanDetectionFailed)?;
 
     if !ifconfig_output.status.success() {
         return Err(BindError::LanDetectionFailed);
@@ -168,9 +168,9 @@ fn detect_lan_ip_linux() -> Result<IpAddr, BindError> {
     ensure_sandbox_supported(Some(&sandbox)).map_err(|_| BindError::LanDetectionFailed)?;
 
     // Get the default route
-    let output = build_sandboxed_std_command("ip", &["route", "get", "1.1.1.1"], Some(&sandbox))
-        .output()
-        .map_err(|_| BindError::LanDetectionFailed)?;
+    let output =
+        run_sandboxed_std_command_output("ip", &["route", "get", "1.1.1.1"], Some(&sandbox))
+            .map_err(|_| BindError::LanDetectionFailed)?;
 
     if !output.status.success() {
         return Err(BindError::LanDetectionFailed);
@@ -223,8 +223,7 @@ fn detect_tailscale_ip() -> Result<IpAddr, BindError> {
         BindError::TailscaleDetectionFailed(format!("sandbox unavailable for tailscale probe: {e}"))
     })?;
 
-    let output = build_sandboxed_std_command("tailscale", &["ip", "-4"], Some(&sandbox))
-        .output()
+    let output = run_sandboxed_std_command_output("tailscale", &["ip", "-4"], Some(&sandbox))
         .map_err(|e| BindError::TailscaleDetectionFailed(e.to_string()))?;
 
     if !output.status.success() {

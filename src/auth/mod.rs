@@ -10,7 +10,8 @@ use serde_json::Value;
 use std::net::{IpAddr, SocketAddr};
 
 use crate::agent::sandbox::{
-    build_sandboxed_std_command, default_tailscale_cli_sandbox_config, ensure_sandbox_supported,
+    default_tailscale_cli_sandbox_config, ensure_sandbox_supported,
+    run_sandboxed_std_command_output,
 };
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -393,9 +394,9 @@ fn tailscale_whois_login(ip: &str) -> Option<String> {
         tracing::debug!(error = %e, "tailscale whois sandbox unavailable on this platform");
         return None;
     }
-    let output = build_sandboxed_std_command("tailscale", &["whois", "--json", ip], Some(&sandbox))
-        .output()
-        .ok()?;
+    let output =
+        run_sandboxed_std_command_output("tailscale", &["whois", "--json", ip], Some(&sandbox))
+            .ok()?;
     if !output.status.success() {
         tracing::debug!(code = ?output.status.code(), "tailscale whois failed");
         return None;

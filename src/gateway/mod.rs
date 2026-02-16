@@ -27,7 +27,8 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::agent::sandbox::{
-    build_sandboxed_tokio_command, default_ssh_tunnel_sandbox_config, ensure_sandbox_supported,
+    default_ssh_tunnel_sandbox_config, ensure_sandbox_supported, spawn_sandboxed_tokio_command,
+    SandboxedTokioChild,
 };
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -951,7 +952,7 @@ impl Default for SshTunnelConfig {
 
 /// Handle to a running SSH tunnel subprocess.
 pub struct SshTunnel {
-    child: tokio::process::Child,
+    child: SandboxedTokioChild,
     local_port: u16,
 }
 
@@ -1039,20 +1040,22 @@ pub async fn setup_ssh_tunnel(config: &SshTunnelConfig) -> Result<SshTunnel, Gat
     ensure_sandbox_supported(Some(&sandbox))
         .map_err(|e| GatewayError::TunnelFailed(format!("ssh tunnel sandbox unavailable: {e}")))?;
 
-    let mut command = build_sandboxed_tokio_command("ssh", &[], Some(&sandbox));
-    let child = command
-        .arg("-N") // no remote command
-        .arg("-L")
-        .arg(&forward_spec)
-        .arg("-p")
-        .arg(config.ssh_port.to_string())
-        .arg("-o")
-        .arg("StrictHostKeyChecking=accept-new")
-        .arg("-o")
-        .arg("ExitOnForwardFailure=yes")
-        .arg(format!("{}@{}", config.ssh_user, config.ssh_host))
-        .kill_on_drop(true)
-        .spawn()
+    let ssh_port = config.ssh_port.to_string();
+    let destination = format!("{}@{}", config.ssh_user, config.ssh_host);
+    let ssh_args = [
+        "-N", // no remote command
+        "-L",
+        forward_spec.as_str(),
+        "-p",
+        ssh_port.as_str(),
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-o",
+        "ExitOnForwardFailure=yes",
+        destination.as_str(),
+    ];
+    let child = spawn_sandboxed_tokio_command("ssh", &ssh_args, Some(&sandbox), true)
+        .await
         .map_err(|e| GatewayError::TunnelFailed(format!("failed to spawn ssh: {}", e)))?;
 
     Ok(SshTunnel { child, local_port })
