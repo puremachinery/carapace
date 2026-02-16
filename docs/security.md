@@ -405,4 +405,9 @@ The send path uses `mpsc::UnboundedSender<Message>` (`src/server/ws/mod.rs`). If
 
 ## Security Contacts
 
-Found a vulnerability? Report to: security@clawd.bot
+Report vulnerabilities privately via GitHub advisories:
+https://github.com/puremachinery/carapace/security/advisories/new
+
+If that form is unavailable, open a public issue titled
+`Security Contact Request` with no vulnerability details so we can move the
+report to a private channel.
