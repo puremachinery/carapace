@@ -1228,15 +1228,18 @@ features:
       - "src/server/bind.rs::detect_lan_ip_macos / detect_lan_ip_linux / detect_tailscale_ip (runtime probe wrappers)"
       - "src/auth/mod.rs::tailscale_whois_login (tailscale whois subprocess wrapper)"
       - "src/tailscale/mod.rs::run_command (tailscale CLI subprocess wrapper)"
+      - "src/gateway/mod.rs::setup_ssh_tunnel (SSH tunnel subprocess wrapper)"
     tests:
       - "src/agent/sandbox.rs (config + seatbelt/landlock helper tests)"
       - "src/agent/sandbox.rs::test_default_probe_sandbox_config_limits"
       - "src/agent/sandbox.rs::test_default_tailscale_cli_sandbox_config_limits"
+      - "src/agent/sandbox.rs::test_default_ssh_tunnel_sandbox_config_limits"
+      - "src/agent/sandbox.rs::test_ensure_sandbox_supported_supported_platform"
     notes:
-      - "2026-02-16 local precheck: targeted nextest coverage for new probe/tailscale wrapper paths passed (sandbox/tailscale/auth/bind)."
+      - "2026-02-16 local precheck: `cargo nextest run` passed (2568/2568)."
       - "wrapped subprocesses now apply in-child constraints via `src/agent/sandbox.rs::configure_sandboxed_command` (`pre_exec` + `apply_sandbox` on Unix)."
-      - "tool subprocess inheritance is still partial: gateway SSH tunnel subprocess (`src/gateway/mod.rs::setup_ssh_tunnel`) is not yet sandbox-wrapped."
-      - "non-macOS/Linux probe fallbacks (`src/discovery/mod.rs::hostname::run_hostname_command`, `src/server/bind.rs::detect_tailscale_ip`) are not sandbox-wrapped."
+      - "runtime subprocess wrappers are now wired for probe, tailscale/whois, and SSH tunnel callsites."
+      - "status remains partial because OS-level sandbox backends are implemented for macOS/Linux only; other targets fail closed via `src/agent/sandbox.rs::ensure_sandbox_supported`."
 
   - feature: "channel-specific tools"
     status: "partial"

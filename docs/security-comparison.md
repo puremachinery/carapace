@@ -75,7 +75,7 @@ Prompt injection remains an industry-wide unsolved problem. No AI system fully p
 - **Resource limits.** RLIMIT_CPU, RLIMIT_AS, RLIMIT_NOFILE per tool execution.
 - **Output content security.** HTML/Markdown sanitizer strips XSS vectors, dangerous tags, and non-image data URIs from agent output.
 
-*Caveat: subprocess sandbox coverage is partial. Runtime probes and tailscale CLI/whois paths are wired, but full child-process coverage is still in progress.*
+*Caveat: OS-level sandbox backends are currently implemented for macOS and Linux. On other targets, sandbox-required subprocess paths fail closed instead of running unsandboxed.*
 
 ### 7. SSRF / DNS Rebinding
 
@@ -114,7 +114,7 @@ Rust does not help with logic bugs, auth bypass, or prompt injection. Those requ
 
 Carapace is in preview. The security architecture is real and tested (~5,000 automated tests, multi-platform CI), but some items are incomplete:
 
-- **Subprocess sandbox wiring.** Seatbelt/Landlock/rlimit primitives are implemented and partially wired. Runtime probe subprocesses and tailscale CLI/whois paths are wrapped; full child-process coverage remains in progress.
+- **Platform backend coverage.** Seatbelt/Landlock/rlimit subprocess wiring is implemented across probe/tailscale/whois/SSH tunnel callsites, but OS-level sandbox backends are currently macOS/Linux only. Unsupported targets fail closed for sandbox-required subprocess paths.
 - **Control UI.** The backend (routes, auth, CSRF) is complete. The frontend is not built yet.
 - **Channels.** Discord is verified end-to-end. Telegram requires a webhook (no long-polling), so it needs a tunnel or public endpoint. Signal and Slack are implemented but not yet smoke-tested in real environments.
 - **Audit log emission.** The audit log module is implemented (append-only JSONL, 19 event types, 50 MB rotation) but event emission is not yet wired into all runtime paths.

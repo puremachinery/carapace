@@ -98,6 +98,12 @@ fn default_allowed_paths() -> Vec<String> {
     ]
 }
 
+fn push_unique_path(paths: &mut Vec<String>, path: &str) {
+    if !paths.iter().any(|p| p == path) {
+        paths.push(path.to_string());
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn default_probe_allowed_paths() -> Vec<String> {
     vec![
@@ -145,23 +151,39 @@ fn default_tailscale_allowed_paths() -> Vec<String> {
     {
         // On many Linux systems, /var/run is a symlink to /run. Keep both
         // to avoid distro-specific path assumptions.
-        if !paths.iter().any(|p| p == "/run") {
-            paths.push("/run".to_string());
-        }
-        if !paths.iter().any(|p| p == "/var/run") {
-            paths.push("/var/run".to_string());
-        }
+        push_unique_path(&mut paths, "/run");
+        push_unique_path(&mut paths, "/var/run");
     }
 
     #[cfg(target_os = "macos")]
     {
         // Tailscale CLI may need daemon IPC paths on Unix hosts.
-        if !paths.iter().any(|p| p == "/var/run") {
-            paths.push("/var/run".to_string());
-        }
+        push_unique_path(&mut paths, "/var/run");
     }
 
     // On non-Unix targets, this returns probe defaults unchanged.
+    paths
+}
+
+fn default_ssh_tunnel_allowed_paths() -> Vec<String> {
+    let mut paths = default_tailscale_allowed_paths();
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        push_unique_path(&mut paths, "/etc");
+        push_unique_path(&mut paths, "/etc/ssh");
+        push_unique_path(&mut paths, "/dev");
+
+        if let Some(home) = std::env::var_os("HOME") {
+            let home = home.to_string_lossy().to_string();
+            if !home.is_empty() {
+                push_unique_path(&mut paths, &home);
+                let ssh_dir = format!("{home}/.ssh");
+                push_unique_path(&mut paths, &ssh_dir);
+            }
+        }
+    }
+
     paths
 }
 
@@ -194,6 +216,22 @@ pub fn default_tailscale_cli_sandbox_config() -> ProcessSandboxConfig {
         max_memory_mb: 256,
         max_fds: 128,
         allowed_paths: default_tailscale_allowed_paths(),
+        network_access: true,
+        env_filter: Vec::new(),
+    }
+}
+
+/// Build a sandbox profile for long-lived SSH tunnel subprocesses.
+///
+/// This profile permits outbound networking and read access to typical SSH
+/// config/key paths while still applying process-level limits.
+pub fn default_ssh_tunnel_sandbox_config() -> ProcessSandboxConfig {
+    ProcessSandboxConfig {
+        enabled: true,
+        max_cpu_seconds: 300,
+        max_memory_mb: 256,
+        max_fds: 256,
+        allowed_paths: default_ssh_tunnel_allowed_paths(),
         network_access: true,
         env_filter: Vec::new(),
     }
@@ -631,6 +669,26 @@ pub fn apply_sandbox(config: &ProcessSandboxConfig) -> Result<(), SandboxError> 
     // not via in-process calls. Resource limits are sufficient here.
 
     Ok(())
+}
+
+/// Ensure the configured sandbox can be meaningfully enforced on this target.
+///
+/// Returns `SandboxError::Unsupported` when sandboxing is enabled on targets
+/// without implemented OS-level process isolation backends.
+pub fn ensure_sandbox_supported(config: Option<&ProcessSandboxConfig>) -> Result<(), SandboxError> {
+    if !config.is_some_and(|cfg| cfg.enabled) {
+        return Ok(());
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        Err(SandboxError::Unsupported)
+    }
 }
 
 /// Build the command wrapper for sandboxed execution.
@@ -1145,6 +1203,17 @@ mod tests {
         assert!(!config.allowed_paths.is_empty());
     }
 
+    #[test]
+    fn test_default_ssh_tunnel_sandbox_config_limits() {
+        let config = default_ssh_tunnel_sandbox_config();
+        assert!(config.enabled);
+        assert_eq!(config.max_cpu_seconds, 300);
+        assert_eq!(config.max_memory_mb, 256);
+        assert_eq!(config.max_fds, 256);
+        assert!(config.network_access);
+        assert!(!config.allowed_paths.is_empty());
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn test_default_probe_sandbox_config_paths_macos() {
@@ -1161,6 +1230,14 @@ mod tests {
         assert!(config.allowed_paths.iter().any(|p| p == "/var/run"));
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_default_ssh_tunnel_sandbox_config_paths_macos() {
+        let config = default_ssh_tunnel_sandbox_config();
+        assert!(config.allowed_paths.iter().any(|p| p == "/etc/ssh"));
+        assert!(config.allowed_paths.iter().any(|p| p == "/dev"));
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn test_default_probe_sandbox_config_paths_linux() {
@@ -1173,6 +1250,15 @@ mod tests {
     #[test]
     fn test_default_tailscale_cli_sandbox_config_paths_linux() {
         let config = default_tailscale_cli_sandbox_config();
+        assert!(config.allowed_paths.iter().any(|p| p == "/run"));
+        assert!(config.allowed_paths.iter().any(|p| p == "/var/run"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_default_ssh_tunnel_sandbox_config_paths_linux() {
+        let config = default_ssh_tunnel_sandbox_config();
+        assert!(config.allowed_paths.iter().any(|p| p == "/etc/ssh"));
         assert!(config.allowed_paths.iter().any(|p| p == "/run"));
         assert!(config.allowed_paths.iter().any(|p| p == "/var/run"));
     }
@@ -1236,6 +1322,21 @@ mod tests {
 
         let err = SandboxError::Unsupported;
         assert_eq!(err.to_string(), "sandbox not supported on this platform");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn test_ensure_sandbox_supported_supported_platform() {
+        let config = ProcessSandboxConfig::default();
+        assert!(ensure_sandbox_supported(Some(&config)).is_ok());
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[test]
+    fn test_ensure_sandbox_supported_unsupported_platform() {
+        let config = ProcessSandboxConfig::default();
+        let err = ensure_sandbox_supported(Some(&config)).unwrap_err();
+        assert!(matches!(err, SandboxError::Unsupported));
     }
 
     // ==================== Integration-style ====================
