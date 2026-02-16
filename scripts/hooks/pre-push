@@ -25,6 +25,7 @@ is_zero_sha() {
 }
 
 is_docs_or_site_only_path() {
+    # Justfile changes are developer-workflow metadata, not runtime behavior.
     case "$1" in
         docs/*|website/*|.github/*|.local/*|Justfile|justfile|*.md|*.MD|*.txt|*.rst|*.adoc|*.yml|*.yaml)
             return 0
