@@ -7,7 +7,7 @@ on:
     branches: [main, master]
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -27,7 +27,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 2
       - id: filter
         uses: dorny/paths-filter@v3
         with:
@@ -37,10 +37,8 @@ jobs:
               - "**/*.md"
               - "LICENSE"
               - "CHANGELOG.md"
-              - ".github/**/*.md"
             website:
               - "website/**"
-              - "CNAME"
             workflow:
               - ".github/workflows/**"
             rust_runtime:
@@ -213,7 +211,10 @@ jobs:
     if: needs.changes.outputs.workflow == 'true'
     steps:
       - uses: actions/checkout@v4
-      - uses: rhysd/actionlint@v1
+      - name: Run actionlint
+        uses: docker://rhysd/actionlint:latest
+        with:
+          args: -color
 
   docs-check:
     name: Docs Check
@@ -225,7 +226,7 @@ jobs:
       - name: Basic markdown sanity check
         run: |
           echo "Checking Markdown files for hard tabs"
-          if grep -RIn $'\t' --include='*.md' .; then
+          if grep -RIn $'\t' --include='*.md' --exclude-dir=.git --exclude-dir=target .; then
             echo "Found tab characters in Markdown files; please use spaces."
             exit 1
           fi
