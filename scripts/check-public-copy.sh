@@ -22,7 +22,7 @@ for t in "${targets[@]}"; do
     fi
 done
 
-pattern="AI operations gateway|operational gateway|gateway server|gateway host|gateway authentication|single-user gateway|(^|[^[:alpha:]])(the|this|a|an)[[:space:]]+gateway([^[:alpha:]]|$)"
+pattern="AI operations gateway|operational gateway|gateway server|gateway host|gateway authentication|single-user gateway|gateway process|gateway wiring|gateway port|carapace gateway|(^|[^[:alpha:]])(the|this|a|an)[[:space:]]+gateway([^[:alpha:]]|$)"
 
 failed=0
 if command -v rg >/dev/null 2>&1; then
