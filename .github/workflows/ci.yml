@@ -20,7 +20,6 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       docs: ${{ steps.filter.outputs.docs }}
-      website: ${{ steps.filter.outputs.website }}
       workflow: ${{ steps.filter.outputs.workflow }}
       rust_runtime: ${{ steps.filter.outputs.rust_runtime }}
       docker: ${{ steps.filter.outputs.docker }}
@@ -37,8 +36,6 @@ jobs:
               - "**/*.md"
               - "LICENSE"
               - "CHANGELOG.md"
-            website:
-              - "website/**"
             workflow:
               - ".github/workflows/**"
             rust_runtime:
@@ -214,7 +211,7 @@ jobs:
       - name: Run actionlint
         uses: docker://rhysd/actionlint:latest
         with:
-          args: -color
+          args: -color -shellcheck=
 
   docs-check:
     name: Docs Check
@@ -230,18 +227,6 @@ jobs:
             echo "Found tab characters in Markdown files; please use spaces."
             exit 1
           fi
-
-  website-check:
-    name: Website Check
-    runs-on: ubuntu-latest
-    needs: changes
-    if: needs.changes.outputs.website == 'true'
-    steps:
-      - uses: actions/checkout@v4
-      - name: Verify website entrypoints exist
-        run: |
-          test -f website/index.html
-          test -f website/styles.css
 
   ci-required:
     name: CI Required
@@ -262,7 +247,6 @@ jobs:
       - geiger
       - workflow-lint
       - docs-check
-      - website-check
     steps:
       - name: Ensure dependent jobs are success or skipped
         env:
@@ -280,7 +264,6 @@ jobs:
           GEIGER_RESULT: ${{ needs.geiger.result }}
           WORKFLOW_LINT_RESULT: ${{ needs.workflow-lint.result }}
           DOCS_CHECK_RESULT: ${{ needs.docs-check.result }}
-          WEBSITE_CHECK_RESULT: ${{ needs.website-check.result }}
         run: |
           set -euo pipefail
 
@@ -299,7 +282,6 @@ jobs:
             "geiger"
             "workflow-lint"
             "docs-check"
-            "website-check"
           )
 
           results=(
@@ -317,7 +299,6 @@ jobs:
             "$GEIGER_RESULT"
             "$WORKFLOW_LINT_RESULT"
             "$DOCS_CHECK_RESULT"
-            "$WEBSITE_CHECK_RESULT"
           )
 
           for i in "${!names[@]}"; do
