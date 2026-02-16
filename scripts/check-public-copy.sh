@@ -22,26 +22,26 @@ for t in "${targets[@]}"; do
     fi
 done
 
-pattern="AI operations gateway|operational gateway|gateway server|gateway host|gateway authentication|single-user gateway|gateway process|gateway wiring|gateway port|carapace gateway|(^|[^[:alpha:]])(the|this|a|an)[[:space:]]+gateway([^[:alpha:]]|$)"
+exceptions='gateway\.|Discord Gateway|Gateway WebSocket|REST[[:space:]]*\+[[:space:]]*Gateway|"gateway"[[:space:]]*:'
 
 failed=0
 if command -v rg >/dev/null 2>&1; then
-    if rg -n --ignore-case "$pattern" "${targets[@]}"; then
+    if rg -n -w -i "gateway" "${targets[@]}" | rg -i -v "$exceptions"; then
         failed=1
     else
         status=$?
         if [ "$status" -ne 1 ]; then
-            echo "Error: rg failed with exit status $status" >&2
+            echo "Error: rg pipeline failed with exit status $status" >&2
             exit "$status"
         fi
     fi
 else
-    if grep -nEi "$pattern" "${targets[@]}"; then
+    if grep -nEiw "gateway" "${targets[@]}" | grep -Eiv "$exceptions"; then
         failed=1
     else
         status=$?
         if [ "$status" -ne 1 ]; then
-            echo "Error: grep failed with exit status $status" >&2
+            echo "Error: grep pipeline failed with exit status $status" >&2
             exit "$status"
         fi
     fi
