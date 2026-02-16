@@ -96,6 +96,63 @@ fn default_allowed_paths() -> Vec<String> {
     ]
 }
 
+#[cfg(target_os = "macos")]
+fn default_probe_allowed_paths() -> Vec<String> {
+    vec![
+        "/tmp".to_string(),
+        "/private/tmp".to_string(),
+        "/bin".to_string(),
+        "/usr/bin".to_string(),
+        "/usr/local/bin".to_string(),
+        "/sbin".to_string(),
+        "/usr/sbin".to_string(),
+        "/usr/lib".to_string(),
+        "/etc".to_string(),
+        "/System".to_string(),
+        "/Library".to_string(),
+        "/private/var".to_string(),
+    ]
+}
+
+#[cfg(target_os = "linux")]
+fn default_probe_allowed_paths() -> Vec<String> {
+    vec![
+        "/tmp".to_string(),
+        "/bin".to_string(),
+        "/usr/bin".to_string(),
+        "/usr/local/bin".to_string(),
+        "/sbin".to_string(),
+        "/usr/sbin".to_string(),
+        "/usr/lib".to_string(),
+        "/lib".to_string(),
+        "/lib64".to_string(),
+        "/etc".to_string(),
+        "/proc".to_string(),
+    ]
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn default_probe_allowed_paths() -> Vec<String> {
+    default_allowed_paths()
+}
+
+/// Build a conservative sandbox profile for short-lived runtime probe commands.
+///
+/// Intended for low-risk helper subprocesses such as `hostname`, `route`,
+/// `ifconfig`, and `ip` that only need local filesystem visibility and no
+/// outbound networking.
+pub fn default_probe_sandbox_config() -> ProcessSandboxConfig {
+    ProcessSandboxConfig {
+        enabled: true,
+        max_cpu_seconds: 5,
+        max_memory_mb: 128,
+        max_fds: 64,
+        allowed_paths: default_probe_allowed_paths(),
+        network_access: false,
+        env_filter: Vec::new(),
+    }
+}
+
 impl Default for ProcessSandboxConfig {
     fn default() -> Self {
         Self {
@@ -582,6 +639,12 @@ pub fn sandbox_command_argv(
 ///
 /// This helper centralizes subprocess argv construction so runtime call sites
 /// can opt into sandbox prefix behavior consistently.
+///
+/// Platform behavior:
+/// - macOS: prepends `sandbox-exec -p <profile>` when sandboxing is enabled
+/// - Linux: no prefix (Linux uses in-process sandbox primitives)
+/// - Other: no prefix
+/// - Any platform with sandbox disabled: no prefix
 pub fn build_sandboxed_std_command(
     program: &str,
     args: &[&str],
@@ -882,6 +945,48 @@ mod tests {
         };
         let argv = sandbox_command_argv("hostname", &["-f"], Some(&config));
         assert_eq!(argv, vec!["hostname".to_string(), "-f".to_string()]);
+    }
+
+    #[test]
+    fn test_build_sandboxed_std_command_disabled_passthrough() {
+        let config = ProcessSandboxConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let command = build_sandboxed_std_command("hostname", &["-f"], Some(&config));
+        assert_eq!(command.get_program(), std::ffi::OsStr::new("hostname"));
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, vec!["-f".to_string()]);
+    }
+
+    #[test]
+    fn test_default_probe_sandbox_config_limits() {
+        let config = default_probe_sandbox_config();
+        assert!(config.enabled);
+        assert_eq!(config.max_cpu_seconds, 5);
+        assert_eq!(config.max_memory_mb, 128);
+        assert_eq!(config.max_fds, 64);
+        assert!(!config.network_access);
+        assert!(!config.allowed_paths.is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_default_probe_sandbox_config_paths_macos() {
+        let config = default_probe_sandbox_config();
+        assert!(config.allowed_paths.iter().any(|p| p == "/private/tmp"));
+        assert!(config.allowed_paths.iter().any(|p| p == "/System"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_default_probe_sandbox_config_paths_linux() {
+        let config = default_probe_sandbox_config();
+        assert!(config.allowed_paths.iter().any(|p| p == "/proc"));
+        assert!(config.allowed_paths.iter().any(|p| p == "/lib64"));
     }
 
     #[cfg(target_os = "macos")]

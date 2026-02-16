@@ -333,40 +333,27 @@ pub async fn run_mdns_lifecycle(
 mod hostname {
     use std::ffi::OsString;
 
-    use crate::agent::sandbox::{build_sandboxed_std_command, ProcessSandboxConfig};
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    use crate::agent::sandbox::{build_sandboxed_std_command, default_probe_sandbox_config};
 
-    fn hostname_probe_sandbox_config() -> ProcessSandboxConfig {
-        ProcessSandboxConfig {
-            enabled: true,
-            max_cpu_seconds: 5,
-            max_memory_mb: 128,
-            max_fds: 64,
-            allowed_paths: vec![
-                "/tmp".to_string(),
-                "/private/tmp".to_string(),
-                "/bin".to_string(),
-                "/usr/bin".to_string(),
-                "/usr/local/bin".to_string(),
-                "/usr/lib".to_string(),
-                "/lib".to_string(),
-                "/lib64".to_string(),
-                "/etc".to_string(),
-                "/System".to_string(),
-                "/Library".to_string(),
-                "/private/var".to_string(),
-            ],
-            network_access: false,
-            env_filter: Vec::new(),
+    fn run_hostname_command() -> Result<std::process::Output, std::io::Error> {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            let sandbox = default_probe_sandbox_config();
+            build_sandboxed_std_command("hostname", &[], Some(&sandbox)).output()
+        }
+
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            std::process::Command::new("hostname").output()
         }
     }
 
     /// Get the system hostname via the `hostname` command.
     /// Falls back to environment variables if the command is not available.
     pub fn get() -> Result<OsString, std::io::Error> {
-        let sandbox = hostname_probe_sandbox_config();
-
         // Try `hostname` command (available on macOS, Linux, and most Unix systems)
-        if let Ok(output) = build_sandboxed_std_command("hostname", &[], Some(&sandbox)).output() {
+        if let Ok(output) = run_hostname_command() {
             if output.status.success() {
                 let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 if !name.is_empty() {

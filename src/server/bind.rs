@@ -12,7 +12,7 @@ use std::process::Command;
 use thiserror::Error;
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-use crate::agent::sandbox::{build_sandboxed_std_command, ProcessSandboxConfig};
+use crate::agent::sandbox::{build_sandboxed_std_command, default_probe_sandbox_config};
 
 /// Default gateway port
 pub const DEFAULT_PORT: u16 = 18789;
@@ -85,39 +85,6 @@ pub fn resolve_bind_address(mode: &BindMode, port: u16) -> Result<SocketAddr, Bi
     }
 }
 
-/// Build a conservative sandbox profile for short-lived network probe commands.
-///
-/// These probes (`route`, `ifconfig`, `ip`) only need read access to common
-/// system paths and do not require outbound networking.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn probe_subprocess_sandbox_config() -> ProcessSandboxConfig {
-    ProcessSandboxConfig {
-        enabled: true,
-        max_cpu_seconds: 5,
-        max_memory_mb: 128,
-        max_fds: 64,
-        allowed_paths: vec![
-            "/tmp".to_string(),
-            "/private/tmp".to_string(),
-            "/bin".to_string(),
-            "/usr/bin".to_string(),
-            "/sbin".to_string(),
-            "/usr/sbin".to_string(),
-            "/usr/local/bin".to_string(),
-            "/usr/lib".to_string(),
-            "/lib".to_string(),
-            "/lib64".to_string(),
-            "/etc".to_string(),
-            "/proc".to_string(),
-            "/System".to_string(),
-            "/Library".to_string(),
-            "/private/var".to_string(),
-        ],
-        network_access: false,
-        env_filter: Vec::new(),
-    }
-}
-
 /// Detect the primary LAN interface IP address
 fn detect_lan_ip() -> Result<IpAddr, BindError> {
     // Try platform-specific detection first
@@ -142,7 +109,7 @@ fn detect_lan_ip() -> Result<IpAddr, BindError> {
 /// Detect LAN IP on macOS using route command
 #[cfg(target_os = "macos")]
 fn detect_lan_ip_macos() -> Result<IpAddr, BindError> {
-    let sandbox = probe_subprocess_sandbox_config();
+    let sandbox = default_probe_sandbox_config();
 
     // Get the default route interface
     let output = build_sandboxed_std_command("route", &["-n", "get", "default"], Some(&sandbox))
@@ -195,7 +162,7 @@ fn detect_lan_ip_macos() -> Result<IpAddr, BindError> {
 /// Detect LAN IP on Linux using ip command
 #[cfg(target_os = "linux")]
 fn detect_lan_ip_linux() -> Result<IpAddr, BindError> {
-    let sandbox = probe_subprocess_sandbox_config();
+    let sandbox = default_probe_sandbox_config();
 
     // Get the default route
     let output = build_sandboxed_std_command("ip", &["route", "get", "1.1.1.1"], Some(&sandbox))
