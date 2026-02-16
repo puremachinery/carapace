@@ -1054,6 +1054,7 @@ pub async fn setup_ssh_tunnel(config: &SshTunnelConfig) -> Result<SshTunnel, Gat
         destination.as_str(),
     ];
     let child = spawn_sandboxed_tokio_command("ssh", &ssh_args, Some(&sandbox), true)
+        .await
         .map_err(|e| GatewayError::TunnelFailed(format!("failed to spawn ssh: {}", e)))?;
 
     Ok(SshTunnel { child, local_port })

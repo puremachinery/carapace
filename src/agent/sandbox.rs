@@ -9,8 +9,11 @@
 //!   and `setrlimit` for resource limits.
 //! - **Linux**: Uses landlock (Linux 5.13+) for filesystem access control and
 //!   `setrlimit` / `prctl` for resource limits.
-//! - **Other (including Windows currently)**: Unsupported for sandbox-required
-//!   subprocess paths (fail-closed).
+//! - **Windows**: Uses Job Objects for process-level limits (CPU, memory,
+//!   process-count) and command allowlisting against configured path roots.
+//!   Network deny mode (`network_access=false`) is not yet enforceable and
+//!   fails closed in support checks.
+//! - **Other**: Unsupported for sandbox-required subprocess paths (fail-closed).
 //!
 //! ## Configuration
 //!
@@ -37,12 +40,23 @@ use serde_json::Value;
 use std::os::unix::process::CommandExt;
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
+#[cfg(not(target_os = "windows"))]
 use std::path::PathBuf;
+#[cfg(target_os = "windows")]
+use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use std::process::Stdio;
 use std::process::{Command, Output};
 #[cfg(windows)]
-use win32job::{ExtendedLimitInfo, Job};
+use win32job::Job;
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::Foundation::HANDLE;
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::System::JobObjects::{
+    JobObjectExtendedLimitInformation, SetInformationJobObject,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+    JOB_OBJECT_LIMIT_PROCESS_MEMORY, JOB_OBJECT_LIMIT_PROCESS_TIME, JOB_OBJECT_LIMIT_WORKINGSET,
+};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -145,7 +159,16 @@ fn default_probe_allowed_paths() -> Vec<String> {
     ]
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(target_os = "windows")]
+fn default_probe_allowed_paths() -> Vec<String> {
+    vec![
+        r"C:\Windows".to_string(),
+        r"C:\Windows\System32".to_string(),
+        r"C:\Windows\System32\WindowsPowerShell\v1.0".to_string(),
+    ]
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 fn default_probe_allowed_paths() -> Vec<String> {
     default_allowed_paths()
 }
@@ -167,6 +190,12 @@ fn default_tailscale_allowed_paths() -> Vec<String> {
         push_unique_path(&mut paths, "/var/run");
     }
 
+    #[cfg(target_os = "windows")]
+    {
+        push_unique_path(&mut paths, r"C:\Program Files\Tailscale");
+        push_unique_path(&mut paths, r"C:\Program Files (x86)\Tailscale");
+    }
+
     // On non-Unix targets, this returns probe defaults unchanged.
     paths
 }
@@ -181,6 +210,19 @@ fn default_ssh_tunnel_allowed_paths() -> Vec<String> {
         if let Some(home) = std::env::var("HOME").ok().filter(|home| !home.is_empty()) {
             push_unique_path(&mut paths, &home);
             let ssh_dir = format!("{home}/.ssh");
+            push_unique_path(&mut paths, &ssh_dir);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        push_unique_path(&mut paths, r"C:\Windows\System32\OpenSSH");
+        if let Some(home) = std::env::var("USERPROFILE")
+            .ok()
+            .filter(|home| !home.is_empty())
+        {
+            push_unique_path(&mut paths, &home);
+            let ssh_dir = format!(r"{home}\.ssh");
             push_unique_path(&mut paths, &ssh_dir);
         }
     }
@@ -465,12 +507,167 @@ fn windows_working_set_limits(config: &ProcessSandboxConfig) -> (usize, usize) {
 }
 
 #[cfg(target_os = "windows")]
-fn create_windows_job(config: &ProcessSandboxConfig) -> Result<Job, SandboxError> {
+fn windows_cpu_time_limit_100ns(config: &ProcessSandboxConfig) -> i64 {
+    let ticks = config.max_cpu_seconds.saturating_mul(10_000_000);
+    i64::try_from(ticks).unwrap_or(i64::MAX)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_active_process_limit(config: &ProcessSandboxConfig) -> u32 {
+    // Windows does not expose an RLIMIT_NOFILE equivalent; map this setting
+    // to a process-count cap so the sandbox still constrains process fan-out.
+    u32::try_from(config.max_fds).unwrap_or(u32::MAX).max(1)
+}
+
+#[cfg(target_os = "windows")]
+fn configure_windows_job_limits(
+    job: &Job,
+    config: &ProcessSandboxConfig,
+) -> Result<(), SandboxError> {
     let (min_working_set, max_working_set) = windows_working_set_limits(config);
-    let mut info = ExtendedLimitInfo::new();
-    info.limit_working_memory(min_working_set, max_working_set);
-    Job::create_with_limit_info(&info)
-        .map_err(|e| SandboxError::Platform(format!("failed to create Windows job object: {e}")))
+    let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+        BasicLimitInformation: Default::default(),
+        IoInfo: Default::default(),
+        ProcessMemoryLimit: 0,
+        JobMemoryLimit: 0,
+        PeakProcessMemoryUsed: 0,
+        PeakJobMemoryUsed: 0,
+    };
+
+    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_WORKINGSET
+        | JOB_OBJECT_LIMIT_PROCESS_MEMORY
+        | JOB_OBJECT_LIMIT_PROCESS_TIME
+        | JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+    info.BasicLimitInformation.MinimumWorkingSetSize = min_working_set;
+    info.BasicLimitInformation.MaximumWorkingSetSize = max_working_set;
+    info.BasicLimitInformation.PerProcessUserTimeLimit = windows_cpu_time_limit_100ns(config);
+    info.BasicLimitInformation.ActiveProcessLimit = windows_active_process_limit(config);
+    info.ProcessMemoryLimit = usize::try_from(config.max_memory_bytes()).unwrap_or(usize::MAX);
+
+    let ret = unsafe {
+        SetInformationJobObject(
+            job.handle() as HANDLE,
+            JobObjectExtendedLimitInformation,
+            &info as *const _ as *const std::ffi::c_void,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    };
+    if ret == 0 {
+        return Err(SandboxError::Platform(format!(
+            "failed to configure Windows job object limits: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn create_windows_job(config: &ProcessSandboxConfig) -> Result<Job, SandboxError> {
+    let job = Job::create()
+        .map_err(|e| SandboxError::Platform(format!("failed to create Windows job object: {e}")))?;
+    configure_windows_job_limits(&job, config)?;
+    Ok(job)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_job_objects_available(config: &ProcessSandboxConfig) -> Result<(), SandboxError> {
+    let _ = create_windows_job(config)?;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn normalize_windows_path(path: &Path) -> String {
+    let mut normalized = path
+        .to_string_lossy()
+        .replace('/', "\\")
+        .to_ascii_lowercase();
+    while normalized.ends_with('\\') && normalized.len() > 3 {
+        normalized.pop();
+    }
+    normalized
+}
+
+#[cfg(target_os = "windows")]
+fn canonicalize_windows_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+#[cfg(target_os = "windows")]
+fn resolve_windows_executable(program: &str) -> Option<PathBuf> {
+    let program_path = Path::new(program);
+    if program_path.components().count() > 1 || program_path.is_absolute() {
+        if program_path.is_file() {
+            return Some(canonicalize_windows_path(program_path));
+        }
+        return None;
+    }
+
+    let has_extension = program_path.extension().is_some();
+    let default_exts = ".COM;.EXE;.BAT;.CMD".to_string();
+    let path_exts = std::env::var("PATHEXT").unwrap_or(default_exts);
+    let path_exts: Vec<String> = path_exts
+        .split(';')
+        .filter(|ext| !ext.is_empty())
+        .map(|ext| ext.to_ascii_lowercase())
+        .collect();
+
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        if has_extension {
+            let candidate = dir.join(program);
+            if candidate.is_file() {
+                return Some(canonicalize_windows_path(&candidate));
+            }
+            continue;
+        }
+
+        for ext in &path_exts {
+            let candidate = dir.join(format!("{program}{ext}"));
+            if candidate.is_file() {
+                return Some(canonicalize_windows_path(&candidate));
+            }
+        }
+    }
+
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn validate_windows_allowed_program(
+    program: &str,
+    config: &ProcessSandboxConfig,
+) -> std::io::Result<()> {
+    if config.allowed_paths.is_empty() {
+        return Ok(());
+    }
+
+    let resolved = resolve_windows_executable(program).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("unable to resolve Windows executable path for '{program}'"),
+        )
+    })?;
+    let resolved_norm = normalize_windows_path(&resolved);
+
+    let allowed = config.allowed_paths.iter().any(|root| {
+        let root_path = canonicalize_windows_path(Path::new(root));
+        let root_norm = normalize_windows_path(&root_path);
+        resolved_norm == root_norm || resolved_norm.starts_with(&(root_norm + "\\"))
+    });
+
+    if !allowed {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "program '{}' resolved to '{}' outside sandbox allowed_paths",
+                program,
+                resolved.display()
+            ),
+        ));
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -818,7 +1015,7 @@ pub fn ensure_sandbox_supported(config: Option<&ProcessSandboxConfig>) -> Result
         return Ok(());
     };
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     let _ = config;
 
     #[cfg(target_os = "linux")]
@@ -837,7 +1034,17 @@ pub fn ensure_sandbox_supported(config: Option<&ProcessSandboxConfig>) -> Result
         Ok(())
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
+    {
+        if !config.network_access {
+            return Err(SandboxError::Platform(
+                "Windows sandbox backend does not yet enforce network_access=false".to_string(),
+            ));
+        }
+        windows_job_objects_available(config)
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         Err(SandboxError::Unsupported)
     }
@@ -1008,6 +1215,7 @@ pub fn run_sandboxed_std_command_output(
     #[cfg(target_os = "windows")]
     {
         if let Some(cfg) = config.filter(|cfg| cfg.enabled) {
+            validate_windows_allowed_program(program, cfg)?;
             cmd.stdin(Stdio::null());
             cmd.stdout(Stdio::piped());
             cmd.stderr(Stdio::piped());
@@ -1038,6 +1246,7 @@ pub async fn run_sandboxed_tokio_command_output(
     #[cfg(target_os = "windows")]
     {
         if let Some(cfg) = config.filter(|cfg| cfg.enabled) {
+            validate_windows_allowed_program(program, cfg)?;
             cmd.stdin(Stdio::null());
             cmd.stdout(Stdio::piped());
             cmd.stderr(Stdio::piped());
@@ -1058,7 +1267,7 @@ pub async fn run_sandboxed_tokio_command_output(
 ///
 /// On Windows this assigns the spawned child process to a Job Object before
 /// returning it to the caller.
-pub fn spawn_sandboxed_tokio_command(
+pub async fn spawn_sandboxed_tokio_command(
     program: &str,
     args: &[&str],
     config: Option<&ProcessSandboxConfig>,
@@ -1071,10 +1280,11 @@ pub fn spawn_sandboxed_tokio_command(
     #[cfg(target_os = "windows")]
     {
         if let Some(cfg) = config.filter(|cfg| cfg.enabled) {
+            validate_windows_allowed_program(program, cfg)?;
             let mut child = child;
             if let Err(err) = assign_windows_job_to_tokio_child(&child, cfg) {
-                let _ = child.start_kill();
-                let _ = child.try_wait();
+                let _ = child.kill().await;
+                let _ = child.wait().await;
                 return Err(err);
             }
             return Ok(child);
@@ -1629,7 +1839,7 @@ mod tests {
         assert_eq!(err.to_string(), "sandbox not supported on this platform");
     }
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     #[test]
     fn test_ensure_sandbox_supported_supported_platform() {
         let config = ProcessSandboxConfig {
@@ -1639,7 +1849,19 @@ mod tests {
         assert!(ensure_sandbox_supported(Some(&config)).is_ok());
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_ensure_sandbox_supported_windows_rejects_network_deny() {
+        let config = ProcessSandboxConfig {
+            network_access: false,
+            ..Default::default()
+        };
+        let err = ensure_sandbox_supported(Some(&config)).unwrap_err();
+        assert!(matches!(err, SandboxError::Platform(_)));
+        assert!(err.to_string().contains("network_access=false"));
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     #[test]
     fn test_ensure_sandbox_supported_unsupported_platform() {
         let config = ProcessSandboxConfig::default();
