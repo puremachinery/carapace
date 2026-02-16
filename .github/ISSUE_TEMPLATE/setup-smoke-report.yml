@@ -5,6 +5,7 @@ labels:
   - smoke
   - onboarding
   - feedback
+  - triage
 body:
   - type: markdown
     attributes:

@@ -19,12 +19,15 @@ jobs:
       - uses: actions/github-script@v7
         env:
           TRIAGE_LABELS_JSON: >-
-            [{"name":"feedback","color":"5319e7","description":"User feedback from setup, usage, or outreach"},
+            [{"name":"triage","color":"fbca04","description":"Needs initial triage and routing"},
+            {"name":"feedback","color":"5319e7","description":"User feedback from setup, usage, or outreach"},
             {"name":"smoke","color":"1d76db","description":"Smoke-test evidence and regressions"},
             {"name":"onboarding","color":"0e8a16","description":"Install/setup/getting-started experience"},
             {"name":"channel","color":"0052cc","description":"Messaging channel integrations and behavior"},
             {"name":"security","color":"b60205","description":"Security controls, vulnerabilities, or hardening"},
-            {"name":"docs","color":"0366d6","description":"Documentation quality, gaps, and corrections"}]
+            {"name":"docs","color":"0366d6","description":"Documentation quality, gaps, and corrections"},
+            {"name":"bug","color":"d73a4a","description":"Something is not working"},
+            {"name":"enhancement","color":"a2eeef","description":"New feature or request"}]
         with:
           script: |
             const desired = JSON.parse(process.env.TRIAGE_LABELS_JSON);

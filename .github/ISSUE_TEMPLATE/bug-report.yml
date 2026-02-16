@@ -3,6 +3,8 @@ description: Report a reproducible defect in Carapace behavior.
 title: "bug: <short summary>"
 labels:
   - bug
+  - feedback
+  - triage
 body:
   - type: markdown
     attributes:

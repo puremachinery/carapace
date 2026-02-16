@@ -4,6 +4,7 @@ title: "feature: <short summary>"
 labels:
   - enhancement
   - feedback
+  - triage
 body:
   - type: markdown
     attributes:
