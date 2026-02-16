@@ -918,12 +918,9 @@ features:
   - feature: "tailscale.cli wrapper"
     status: "verified_done"
     runtime_wiring:
-      - "src/tailscale/mod.rs::run_command (async CLI execution via sandbox argv wrapper)"
-      - "src/agent/sandbox.rs::build_sandboxed_tokio_command"
-      - "src/agent/sandbox.rs::default_tailscale_cli_sandbox_config"
+      - "src/tailscale/mod.rs::run_command (async CLI execution)"
     tests:
       - "src/tailscale/mod.rs::test_build_teardown_args"
-      - "src/agent/sandbox.rs::test_build_sandboxed_tokio_command_disabled_passthrough"
 
   - feature: "tailscale.status parsing"
     status: "verified_done"
@@ -1224,18 +1221,10 @@ features:
       - "src/agent/sandbox.rs (process sandbox config, rlimits, seatbelt/landlock helpers)"
       - "src/agent/executor.rs (passes process_sandbox into tool dispatch)"
       - "src/agent/tools.rs (sets sandboxed flag on ToolInvokeContext)"
-      - "src/discovery/mod.rs::run_hostname_command (probe subprocess wrapper)"
-      - "src/server/bind.rs::detect_lan_ip_macos / detect_lan_ip_linux / detect_tailscale_ip (runtime probe wrappers)"
-      - "src/auth/mod.rs::tailscale_whois_login (tailscale whois subprocess wrapper)"
-      - "src/tailscale/mod.rs::run_command (tailscale CLI subprocess wrapper)"
     tests:
       - "src/agent/sandbox.rs (config + seatbelt/landlock helper tests)"
-      - "src/agent/sandbox.rs::test_default_probe_sandbox_config_limits"
-      - "src/agent/sandbox.rs::test_default_tailscale_cli_sandbox_config_limits"
     notes:
-      - "2026-02-16 local precheck: targeted nextest coverage for new probe/tailscale wrapper paths passed (sandbox/tailscale/auth/bind)."
-      - "tool subprocess inheritance is still partial: no in-child Linux landlock application for arbitrary child processes"
-      - "gateway SSH tunnel subprocess (`src/gateway/mod.rs::setup_ssh_tunnel`) is not yet sandbox-wrapped"
+      - "apply_sandbox / sandbox_command_prefix are not invoked in tool subprocess execution"
 
   - feature: "channel-specific tools"
     status: "partial"

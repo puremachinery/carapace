@@ -136,32 +136,6 @@ fn default_probe_allowed_paths() -> Vec<String> {
     default_allowed_paths()
 }
 
-#[cfg(target_os = "macos")]
-fn default_tailscale_allowed_paths() -> Vec<String> {
-    let mut paths = default_probe_allowed_paths();
-    if !paths.iter().any(|p| p == "/var/run") {
-        paths.push("/var/run".to_string());
-    }
-    paths
-}
-
-#[cfg(target_os = "linux")]
-fn default_tailscale_allowed_paths() -> Vec<String> {
-    let mut paths = default_probe_allowed_paths();
-    if !paths.iter().any(|p| p == "/run") {
-        paths.push("/run".to_string());
-    }
-    if !paths.iter().any(|p| p == "/var/run") {
-        paths.push("/var/run".to_string());
-    }
-    paths
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn default_tailscale_allowed_paths() -> Vec<String> {
-    default_probe_allowed_paths()
-}
-
 /// Build a conservative sandbox profile for short-lived runtime probe commands.
 ///
 /// Intended for low-risk helper subprocesses such as `hostname`, `route`,
@@ -175,23 +149,6 @@ pub fn default_probe_sandbox_config() -> ProcessSandboxConfig {
         max_fds: 64,
         allowed_paths: default_probe_allowed_paths(),
         network_access: false,
-        env_filter: Vec::new(),
-    }
-}
-
-/// Build a sandbox profile for Tailscale CLI helper subprocesses.
-///
-/// This profile is less restrictive than `default_probe_sandbox_config()`
-/// because `tailscale` commands may need local daemon IPC paths and localhost
-/// networking to communicate with tailscaled.
-pub fn default_tailscale_cli_sandbox_config() -> ProcessSandboxConfig {
-    ProcessSandboxConfig {
-        enabled: true,
-        max_cpu_seconds: 10,
-        max_memory_mb: 256,
-        max_fds: 128,
-        allowed_paths: default_tailscale_allowed_paths(),
-        network_access: true,
         env_filter: Vec::new(),
     }
 }
@@ -700,22 +657,6 @@ pub fn build_sandboxed_std_command(
     cmd
 }
 
-/// Build a Tokio command with optional sandbox wrapping.
-///
-/// This mirrors `build_sandboxed_std_command` for async subprocess call sites.
-pub fn build_sandboxed_tokio_command(
-    program: &str,
-    args: &[&str],
-    config: Option<&ProcessSandboxConfig>,
-) -> tokio::process::Command {
-    let argv = sandbox_command_argv(program, args, config);
-    let mut cmd = tokio::process::Command::new(&argv[0]);
-    if argv.len() > 1 {
-        cmd.args(&argv[1..]);
-    }
-    cmd
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1021,22 +962,6 @@ mod tests {
     }
 
     #[test]
-    fn test_build_sandboxed_tokio_command_disabled_passthrough() {
-        let config = ProcessSandboxConfig {
-            enabled: false,
-            ..Default::default()
-        };
-        let command = build_sandboxed_tokio_command("hostname", &["-f"], Some(&config));
-        let std_cmd = command.as_std();
-        assert_eq!(std_cmd.get_program(), std::ffi::OsStr::new("hostname"));
-        let args: Vec<String> = std_cmd
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(args, vec!["-f".to_string()]);
-    }
-
-    #[test]
     fn test_default_probe_sandbox_config_limits() {
         let config = default_probe_sandbox_config();
         assert!(config.enabled);
@@ -1044,17 +969,6 @@ mod tests {
         assert_eq!(config.max_memory_mb, 128);
         assert_eq!(config.max_fds, 64);
         assert!(!config.network_access);
-        assert!(!config.allowed_paths.is_empty());
-    }
-
-    #[test]
-    fn test_default_tailscale_cli_sandbox_config_limits() {
-        let config = default_tailscale_cli_sandbox_config();
-        assert!(config.enabled);
-        assert_eq!(config.max_cpu_seconds, 10);
-        assert_eq!(config.max_memory_mb, 256);
-        assert_eq!(config.max_fds, 128);
-        assert!(config.network_access);
         assert!(!config.allowed_paths.is_empty());
     }
 
@@ -1066,28 +980,12 @@ mod tests {
         assert!(config.allowed_paths.iter().any(|p| p == "/System"));
     }
 
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn test_default_tailscale_cli_sandbox_config_paths_macos() {
-        let config = default_tailscale_cli_sandbox_config();
-        assert!(config.allowed_paths.iter().any(|p| p == "/private/var"));
-        assert!(config.allowed_paths.iter().any(|p| p == "/var/run"));
-    }
-
     #[cfg(target_os = "linux")]
     #[test]
     fn test_default_probe_sandbox_config_paths_linux() {
         let config = default_probe_sandbox_config();
         assert!(config.allowed_paths.iter().any(|p| p == "/proc"));
         assert!(config.allowed_paths.iter().any(|p| p == "/lib64"));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn test_default_tailscale_cli_sandbox_config_paths_linux() {
-        let config = default_tailscale_cli_sandbox_config();
-        assert!(config.allowed_paths.iter().any(|p| p == "/run"));
-        assert!(config.allowed_paths.iter().any(|p| p == "/var/run"));
     }
 
     #[cfg(target_os = "macos")]

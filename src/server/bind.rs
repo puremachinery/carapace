@@ -14,7 +14,7 @@ use thiserror::Error;
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use crate::agent::sandbox::{
-    build_sandboxed_std_command, default_probe_sandbox_config, default_tailscale_cli_sandbox_config,
+    build_sandboxed_std_command, default_probe_sandbox_config, ProcessSandboxConfig,
 };
 
 /// Default gateway port
@@ -221,7 +221,7 @@ fn detect_tailscale_ip() -> Result<IpAddr, BindError> {
     let output = {
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
-            let sandbox = default_tailscale_cli_sandbox_config();
+            let sandbox = tailscale_probe_sandbox_config();
             build_sandboxed_std_command("tailscale", &["ip", "-4"], Some(&sandbox)).output()
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -254,6 +254,26 @@ fn detect_tailscale_ip() -> Result<IpAddr, BindError> {
             "IP {} is not in Tailscale range",
             ip
         )))
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn tailscale_probe_sandbox_config() -> ProcessSandboxConfig {
+    #[cfg(target_os = "linux")]
+    {
+        let mut sandbox = default_probe_sandbox_config();
+        if !sandbox.allowed_paths.iter().any(|p| p == "/run") {
+            sandbox.allowed_paths.push("/run".to_string());
+        }
+        if !sandbox.allowed_paths.iter().any(|p| p == "/var/run") {
+            sandbox.allowed_paths.push("/var/run".to_string());
+        }
+        sandbox
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        default_probe_sandbox_config()
     }
 }
 

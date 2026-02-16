@@ -8,8 +8,7 @@ pub mod profiles;
 use axum::http::HeaderMap;
 use serde_json::Value;
 use std::net::{IpAddr, SocketAddr};
-
-use crate::agent::sandbox::{build_sandboxed_std_command, default_tailscale_cli_sandbox_config};
+use std::process::Command;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum AuthMode {
@@ -386,8 +385,8 @@ fn extract_whois_login(value: &Value) -> Option<String> {
 }
 
 fn tailscale_whois_login(ip: &str) -> Option<String> {
-    let sandbox = default_tailscale_cli_sandbox_config();
-    let output = build_sandboxed_std_command("tailscale", &["whois", "--json", ip], Some(&sandbox))
+    let output = Command::new("tailscale")
+        .args(["whois", "--json", ip])
         .output()
         .ok()?;
     if !output.status.success() {
