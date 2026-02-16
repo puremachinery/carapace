@@ -5,11 +5,41 @@ It’s intentionally practical: copy/paste steps, then customize.
 
 ## Prerequisites
 
-- A `cara` binary on your PATH (from GitHub Releases)
+- A `cara` binary on your PATH (download pre-built binaries from
+  <https://github.com/puremachinery/carapace/releases>)
 - A supported LLM provider API key (OpenAI/Anthropic/etc), or Ollama
 - Optional: TLS certs if exposing Carapace publicly
 
 If you want to build from source, see [CONTRIBUTING.md](../CONTRIBUTING.md).
+
+## Install `cara` (Pre-Built Binary)
+
+Download from the latest release:
+<https://github.com/puremachinery/carapace/releases>
+
+Common artifacts:
+- Linux x64: `cara-x86_64-linux`
+- Linux ARM64: `cara-aarch64-linux`
+- macOS Intel: `cara-x86_64-darwin`
+- macOS Apple Silicon: `cara-aarch64-darwin`
+- Windows x64: `cara-x86_64-windows.exe`
+
+macOS/Linux install:
+
+```bash
+chmod +x ./cara-<your-platform>
+sudo mv ./cara-<your-platform> /usr/local/bin/cara
+cara --help
+```
+
+Windows install (PowerShell):
+
+```powershell
+$installDir = "$env:LOCALAPPDATA\cara\bin"
+New-Item -ItemType Directory -Force -Path $installDir | Out-Null
+Copy-Item .\cara-x86_64-windows.exe (Join-Path $installDir "cara.exe")
+cara --help
+```
 
 ## Quick Start (Local, Token Auth)
 
