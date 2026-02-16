@@ -111,6 +111,7 @@ fn detect_lan_ip() -> Result<IpAddr, BindError> {
 #[cfg(target_os = "macos")]
 fn detect_lan_ip_macos() -> Result<IpAddr, BindError> {
     let sandbox = default_probe_sandbox_config();
+    ensure_sandbox_supported(Some(&sandbox)).map_err(|_| BindError::LanDetectionFailed)?;
 
     // Get the default route interface
     let output = build_sandboxed_std_command("route", &["-n", "get", "default"], Some(&sandbox))
@@ -164,6 +165,7 @@ fn detect_lan_ip_macos() -> Result<IpAddr, BindError> {
 #[cfg(target_os = "linux")]
 fn detect_lan_ip_linux() -> Result<IpAddr, BindError> {
     let sandbox = default_probe_sandbox_config();
+    ensure_sandbox_supported(Some(&sandbox)).map_err(|_| BindError::LanDetectionFailed)?;
 
     // Get the default route
     let output = build_sandboxed_std_command("ip", &["route", "get", "1.1.1.1"], Some(&sandbox))

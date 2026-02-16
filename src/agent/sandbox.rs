@@ -451,21 +451,85 @@ pub fn macos_sandbox_command_prefix(config: &ProcessSandboxConfig) -> Vec<String
 // Linux: landlock filesystem access control
 // ---------------------------------------------------------------------------
 
-/// Apply landlock filesystem restrictions on Linux.
+#[cfg(target_os = "linux")]
+fn probe_landlock_abi_version() -> Result<u32, SandboxError> {
+    // landlock syscall constants.
+    const LANDLOCK_CREATE_RULESET: libc::c_long = 444;
+    const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1;
+
+    let abi_version_raw = unsafe {
+        libc::syscall(
+            LANDLOCK_CREATE_RULESET,
+            std::ptr::null::<libc::c_void>(),
+            0usize,
+            LANDLOCK_CREATE_RULESET_VERSION,
+        )
+    };
+    if abi_version_raw < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ENOSYS) || err.raw_os_error() == Some(libc::EOPNOTSUPP)
+        {
+            return Err(SandboxError::Unsupported);
+        }
+        return Err(SandboxError::Platform(format!(
+            "landlock ABI query failed: {err}"
+        )));
+    }
+
+    Ok(abi_version_raw as u32)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_landlock_abi_support(
+    abi_version: u32,
+    config: &ProcessSandboxConfig,
+) -> Result<(), SandboxError> {
+    if abi_version == 0 {
+        return Err(SandboxError::Unsupported);
+    }
+    if !config.network_access && abi_version < 4 {
+        return Err(SandboxError::Platform(format!(
+            "landlock ABI v4+ required when network_access=false (detected v{abi_version})"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn create_landlock_ruleset(attr_ptr: *const libc::c_void, attr_size: usize) -> libc::c_int {
+    const LANDLOCK_CREATE_RULESET: libc::c_long = 444;
+    libc::syscall(LANDLOCK_CREATE_RULESET, attr_ptr, attr_size, 0u32) as libc::c_int
+}
+
+#[cfg(target_os = "macos")]
+fn macos_seatbelt_available() -> bool {
+    use std::path::Path;
+
+    if Path::new("/usr/bin/sandbox-exec").is_file() {
+        return true;
+    }
+
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|dir| dir.join("sandbox-exec").is_file())
+    })
+}
+
+/// Apply landlock restrictions on Linux.
 ///
-/// Uses landlock ABI v1+ (Linux 5.13+) to restrict filesystem access to
-/// only the configured allowed paths.  Falls back gracefully if landlock
-/// is not available on the running kernel.
+/// Uses landlock ABI v1+ (Linux 5.13+) for filesystem restrictions and
+/// landlock ABI v4+ (Linux 6.2+) to enforce deny-by-default TCP
+/// connect/bind when `network_access` is disabled.
+///
+/// This path is fail-closed: unsupported kernels return `SandboxError::Unsupported`.
 #[cfg(target_os = "linux")]
 pub fn apply_landlock(config: &ProcessSandboxConfig) -> Result<(), SandboxError> {
-    // Landlock ABI v1 constants
-    const LANDLOCK_CREATE_RULESET: libc::c_long = 444;
+    // Landlock syscall constants.
     const LANDLOCK_ADD_RULE: libc::c_long = 445;
     const LANDLOCK_RESTRICT_SELF: libc::c_long = 446;
 
     const LANDLOCK_RULE_PATH_BENEATH: u32 = 1;
 
-    // Filesystem access rights (ABI v1)
+    // Filesystem access rights (ABI v1).
     const LANDLOCK_ACCESS_FS_EXECUTE: u64 = 1 << 0;
     const LANDLOCK_ACCESS_FS_WRITE_FILE: u64 = 1 << 1;
     const LANDLOCK_ACCESS_FS_READ_FILE: u64 = 1 << 2;
@@ -497,10 +561,22 @@ pub fn apply_landlock(config: &ProcessSandboxConfig) -> Result<(), SandboxError>
     const READ_EXECUTE: u64 =
         LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR;
 
+    // Network access rights (ABI v4).
+    const LANDLOCK_ACCESS_NET_BIND_TCP: u64 = 1 << 0;
+    const LANDLOCK_ACCESS_NET_CONNECT_TCP: u64 = 1 << 1;
+    const HANDLED_NET_ACCESS: u64 = LANDLOCK_ACCESS_NET_BIND_TCP | LANDLOCK_ACCESS_NET_CONNECT_TCP;
+
     // landlock_ruleset_attr (ABI v1)
     #[repr(C)]
-    struct RulesetAttr {
+    struct RulesetAttrV1 {
         handled_access_fs: u64,
+    }
+
+    // landlock_ruleset_attr (ABI v4+)
+    #[repr(C)]
+    struct RulesetAttrV4 {
+        handled_access_fs: u64,
+        handled_access_net: u64,
     }
 
     // landlock_path_beneath_attr
@@ -512,26 +588,44 @@ pub fn apply_landlock(config: &ProcessSandboxConfig) -> Result<(), SandboxError>
 
     use std::os::unix::io::RawFd;
 
-    // Create ruleset
-    let attr = RulesetAttr {
-        handled_access_fs: ALL_ACCESS,
+    let abi_version = probe_landlock_abi_version()?;
+
+    validate_landlock_abi_support(abi_version, config)?;
+
+    enum RulesetAttr {
+        V1(RulesetAttrV1),
+        V4(RulesetAttrV4),
+    }
+
+    let attr = if config.network_access {
+        RulesetAttr::V1(RulesetAttrV1 {
+            handled_access_fs: ALL_ACCESS,
+        })
+    } else {
+        RulesetAttr::V4(RulesetAttrV4 {
+            handled_access_fs: ALL_ACCESS,
+            // With no allow-rules for net ports, this denies TCP bind/connect.
+            handled_access_net: HANDLED_NET_ACCESS,
+        })
     };
-    let ruleset_fd: RawFd = unsafe {
-        libc::syscall(
-            LANDLOCK_CREATE_RULESET,
-            &attr as *const RulesetAttr,
-            std::mem::size_of::<RulesetAttr>(),
-            0u32, // flags
-        ) as RawFd
+
+    let (attr_ptr, attr_size) = match &attr {
+        RulesetAttr::V1(v1) => (
+            v1 as *const _ as *const libc::c_void,
+            std::mem::size_of::<RulesetAttrV1>(),
+        ),
+        RulesetAttr::V4(v4) => (
+            v4 as *const _ as *const libc::c_void,
+            std::mem::size_of::<RulesetAttrV4>(),
+        ),
     };
+    let ruleset_fd: RawFd = unsafe { create_landlock_ruleset(attr_ptr, attr_size) } as RawFd;
 
     if ruleset_fd < 0 {
         let err = std::io::Error::last_os_error();
-        // ENOSYS / EOPNOTSUPP => landlock not available
         if err.raw_os_error() == Some(libc::ENOSYS) || err.raw_os_error() == Some(libc::EOPNOTSUPP)
         {
-            tracing::warn!("landlock not available on this kernel, skipping filesystem sandbox");
-            return Ok(());
+            return Err(SandboxError::Unsupported);
         }
         return Err(SandboxError::Platform(format!(
             "landlock_create_ruleset failed: {err}"
@@ -637,8 +731,10 @@ pub fn apply_landlock(config: &ProcessSandboxConfig) -> Result<(), SandboxError>
     }
 
     tracing::debug!(
+        abi = abi_version,
         paths = config.allowed_paths.len(),
-        "landlock filesystem sandbox applied"
+        network_access = config.network_access,
+        "landlock sandbox applied"
     );
     Ok(())
 }
@@ -693,12 +789,26 @@ pub fn apply_sandbox(config: &ProcessSandboxConfig) -> Result<(), SandboxError> 
 /// Returns `SandboxError::Unsupported` when sandboxing is enabled on targets
 /// without implemented OS-level process isolation backends.
 pub fn ensure_sandbox_supported(config: Option<&ProcessSandboxConfig>) -> Result<(), SandboxError> {
-    if !config.is_some_and(|cfg| cfg.enabled) {
+    let Some(config) = config.filter(|cfg| cfg.enabled) else {
         return Ok(());
+    };
+
+    #[cfg(not(target_os = "linux"))]
+    let _ = config;
+
+    #[cfg(target_os = "linux")]
+    {
+        let abi_version = probe_landlock_abi_version()?;
+        validate_landlock_abi_support(abi_version, config)
     }
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     {
+        if !macos_seatbelt_available() {
+            return Err(SandboxError::Platform(
+                "sandbox-exec not found; cannot enforce macOS Seatbelt sandbox".to_string(),
+            ));
+        }
         Ok(())
     }
 
@@ -1281,6 +1391,38 @@ mod tests {
         assert!(config.allowed_paths.iter().any(|p| p == "/var/run"));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_validate_landlock_abi_support_allows_network_enabled_on_v1() {
+        let config = ProcessSandboxConfig {
+            network_access: true,
+            ..Default::default()
+        };
+        assert!(validate_landlock_abi_support(1, &config).is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_validate_landlock_abi_support_rejects_network_disabled_before_v4() {
+        let config = ProcessSandboxConfig {
+            network_access: false,
+            ..Default::default()
+        };
+        let err = validate_landlock_abi_support(3, &config).unwrap_err();
+        assert!(matches!(err, SandboxError::Platform(_)));
+        assert!(err.to_string().contains("ABI v4+"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_validate_landlock_abi_support_allows_network_disabled_on_v4() {
+        let config = ProcessSandboxConfig {
+            network_access: false,
+            ..Default::default()
+        };
+        assert!(validate_landlock_abi_support(4, &config).is_ok());
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn test_sandbox_command_prefix_macos() {
@@ -1345,7 +1487,10 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn test_ensure_sandbox_supported_supported_platform() {
-        let config = ProcessSandboxConfig::default();
+        let config = ProcessSandboxConfig {
+            network_access: true,
+            ..Default::default()
+        };
         assert!(ensure_sandbox_supported(Some(&config)).is_ok());
     }
 
