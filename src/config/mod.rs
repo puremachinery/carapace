@@ -49,6 +49,7 @@ const CONFIG_SECRET_PATHS: &[&str] = &[
     "/discord/botToken",
     "/slack/botToken",
     "/slack/signingSecret",
+    "/whatsapp/sessionPath",
 ];
 
 /// Configuration errors

@@ -161,6 +161,19 @@
   //   // enabled: false,                          // set to false to disable without removing config
   // },
 
+  // --- WhatsApp channel (via WhatsApp Web protocol) -------------------------
+  // whatsapp: {
+  //   // Uses whatsapp-rust library (based on whatsmeow and Baileys)
+  //   // Authentication options:
+  //   // 1. QR code (default): Scan QR code from WhatsApp mobile app
+  //   // 2. Pair code: Link using phone number + verification code
+  //
+  //   // phoneNumber: "+15551234567",             // E.164 format for pair code auth
+  //   // usePairCode: false,                      // set true to use pair code instead of QR
+  //   // sessionPath: "~/.config/carapace/whatsapp_session.db", // session storage
+  //   // enabled: false,                          // set to false to disable without removing config
+  // },
+
   // --- Agents -----------------------------------------------------------
   // agents: {
   //   list: [
