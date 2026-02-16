@@ -16,10 +16,6 @@ if [ -z "${hooks_dir}" ]; then
     exit 1
 fi
 
-if [[ "${hooks_dir}" != /* ]]; then
-    hooks_dir="${repo_root}/${hooks_dir}"
-fi
-
 if [ ! -d "${hooks_dir}" ]; then
     echo "Git hooks directory '${hooks_dir}' not found. Run this script from within a cloned git repository."
     exit 1
