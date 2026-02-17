@@ -55,7 +55,9 @@ Telegram uses the Bot API for outbound delivery. Inbound can run in either mode:
   configure Telegram to send `X-Telegram-Bot-Api-Secret-Token`.
 - **Long-polling fallback** (default for local/private setups): if
   `telegram.webhookSecret` is unset, Carapace automatically uses `getUpdates`
-  polling for inbound messages (no public webhook required).
+  polling for inbound messages (no public webhook required). On startup,
+  Carapace also makes a best-effort `deleteWebhook` call so polling is not
+  starved by a previously registered webhook.
 
 1) Create a Telegram bot token (via BotFather).
 2) Configure carapace:
