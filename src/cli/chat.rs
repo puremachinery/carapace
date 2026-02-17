@@ -528,8 +528,8 @@ pub(crate) async fn verify_chat_roundtrip(
     let session_key = format!("cli-verify-{}", Uuid::new_v4());
     let mut active_run_id: Option<String> = None;
     let mut seen_response = false;
-    // Bound pre-response event count so a misbehaving server cannot enqueue
-    // unbounded frame objects before the verify timeout fires.
+    // Bound only the number of pre-response events buffered.
+    // This prevents unlimited queue growth, but it does not cap per-frame byte size.
     let mut pending_events: Vec<Value> = Vec::with_capacity(MAX_PENDING_VERIFY_EVENTS);
 
     let chat_frame = serde_json::json!({
