@@ -15,12 +15,12 @@ jobs:
     if: |
       (
         github.event_name == 'issue_comment' &&
-        contains(github.event.comment.body, '@claude') &&
+        contains(github.event.comment.body || '', '@claude') &&
         contains(fromJson('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
       ) ||
       (
         github.event_name == 'issues' &&
-        (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')) &&
+        (contains(github.event.issue.body || '', '@claude') || contains(github.event.issue.title || '', '@claude')) &&
         contains(fromJson('["OWNER","MEMBER","COLLABORATOR"]'), github.event.issue.author_association)
       )
     runs-on: ubuntu-latest
@@ -31,7 +31,15 @@ jobs:
       id-token: write
       actions: read
     steps:
-      - name: Checkout repository
+      - name: Checkout repository (PR context)
+        if: ${{ github.event_name == 'issue_comment' && github.event.issue.pull_request }}
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 1
+          ref: refs/pull/${{ github.event.issue.number }}/head
+
+      - name: Checkout repository (issue context)
+        if: ${{ github.event_name == 'issues' || (github.event_name == 'issue_comment' && !github.event.issue.pull_request) }}
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 1

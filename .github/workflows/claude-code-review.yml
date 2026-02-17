@@ -2,12 +2,15 @@ name: Claude Code Review
 
 on:
   pull_request:
-    types: [opened, synchronize, ready_for_review]
+    types: [opened, synchronize, ready_for_review, reopened]
 
 jobs:
   claude-review:
+    concurrency:
+      group: claude-review-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
     # Only run on PRs from the same repo (fork PRs don't have access to secrets)
-    if: github.event.pull_request.head.repo.full_name == github.repository
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.draft == false
 
     runs-on: ubuntu-latest
     permissions:
@@ -21,6 +24,7 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 1
+          ref: refs/pull/${{ github.event.pull_request.number }}/head
 
       - name: Detect workflow self-change
         id: workflow-change
@@ -33,15 +37,17 @@ jobs:
               pull_number: context.payload.pull_request.number,
               per_page: 100,
             });
-            const changed = files.some(
-              (file) => file.filename === ".github/workflows/claude-code-review.yml",
-            );
+            const blocked = new Set([
+              ".github/workflows/claude-code-review.yml",
+              ".github/workflows/claude.yml",
+            ]);
+            const changed = files.some((file) => blocked.has(file.filename));
             core.setOutput("changed", changed ? "true" : "false");
 
       - name: Skip Claude review when workflow changed in PR
         if: steps.workflow-change.outputs.changed == 'true'
         run: |
-          echo "Skipping Claude code review because this PR modifies .github/workflows/claude-code-review.yml."
+          echo "Skipping Claude code review because this PR modifies Claude workflow files."
 
       - name: Run Claude Code Review
         id: claude-review
