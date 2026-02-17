@@ -5,6 +5,7 @@ A security-focused, open-source personal AI assistant.
 ## Start Here
 
 - [Getting Started](getting-started.md) — install, first run, and ops
+- [Cookbook](cookbook/README.md) — task-focused walkthroughs
 - [Channel Setup](channels.md) — Signal, Telegram, Discord, Slack, webhooks
 - [CLI Guide](cli.md) — subcommands, flags, and device identity
 
@@ -28,6 +29,7 @@ A security-focused, open-source personal AI assistant.
 |-------|------|-------------|
 | Trust boundaries | [security.md](security.md#security-layers) | 4-layer defense model |
 | WS handshake | [websocket.md](protocol/websocket.md#connection-lifecycle) | Connect flow, auth methods |
+| Cookbook recipes | [cookbook/README.md](cookbook/README.md) | Goal-oriented setup walkthroughs |
 | HTTP hooks | [http.md](protocol/http.md#hooks) | Webhook configuration |
 | Token security | [pairing.md](protocol/pairing.md#token-security) | SHA-256 hashing, constant-time comparison |
 | Rate limiting | [security.md](security.md#rate-limiting) | Default limits per endpoint |

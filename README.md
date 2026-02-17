@@ -45,6 +45,7 @@ See [docs/security-comparison.md](docs/security-comparison.md) for a threat-by-t
 ## Docs
 
 - [Getting started](docs/getting-started.md) — install, first run, and ops
+- [Cookbook](docs/cookbook/README.md) — practical "do X" walkthroughs
 - [Channel setup](docs/channels.md) — Signal, Telegram, Discord, Slack, webhooks
 - [CLI guide](docs/cli.md) — subcommands, flags, and device identity
 - [Documentation index](docs/README.md) — architecture, protocol, security

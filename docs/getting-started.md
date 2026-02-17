@@ -3,6 +3,9 @@
 This guide covers first‑run setup, security basics, and day‑to‑day operations.
 It’s intentionally practical: copy/paste steps, then customize.
 
+If you prefer outcome-first walkthroughs (for example "add Discord"), see
+the [Cookbook](cookbook/README.md).
+
 ## Prerequisites
 
 - A `cara` binary on your PATH (download pre-built binaries from
