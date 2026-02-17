@@ -523,7 +523,7 @@ pub(crate) async fn verify_chat_roundtrip(
         .map_err(|e| format!("failed to connect to chat endpoint: {e}"))?;
 
     let req_id = format!("verify-{}", Uuid::new_v4());
-    let expected_run_id = Uuid::new_v4().to_string();
+    let idempotency_key = Uuid::new_v4().to_string();
     let session_key = format!("cli-verify-{}", Uuid::new_v4());
     let mut active_run_id: Option<String> = None;
     let mut seen_response = false;
@@ -536,7 +536,7 @@ pub(crate) async fn verify_chat_roundtrip(
         "params": {
             "message": prompt,
             "sessionKey": session_key,
-            "idempotencyKey": expected_run_id,
+            "idempotencyKey": idempotency_key,
             "stream": true,
             "triggerAgent": true
         }
@@ -596,7 +596,7 @@ pub(crate) async fn verify_chat_roundtrip(
                 }
                 "event" => {
                     if !seen_response {
-                        if pending_events.len() >= 1000 {
+                        if pending_events.len() >= 64 {
                             return Err(
                                 "too many server events before response; aborting verification"
                                     .to_string(),

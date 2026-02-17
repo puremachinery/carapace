@@ -1737,10 +1737,6 @@ impl SetupOutcome {
             Self::Hooks => "hooks",
         }
     }
-
-    fn label(self) -> &'static str {
-        self.prompt_key()
-    }
 }
 
 impl VerifyOutcomeSelection {
@@ -2150,6 +2146,19 @@ const VERIFY_ALLOWED_ENV_PLACEHOLDER_KEYS: &[&str] = &[
     "CARAPACE_HOOKS_TOKEN",
 ];
 
+fn is_allowed_verify_placeholder_key(key: &str) -> bool {
+    if VERIFY_ALLOWED_ENV_PLACEHOLDER_KEYS.contains(&key) {
+        return true;
+    }
+    if !key
+        .chars()
+        .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+    {
+        return false;
+    }
+    key.ends_with("_BOT_TOKEN") || key.ends_with("_HOOKS_TOKEN")
+}
+
 fn normalize_optional_input(input: Option<String>) -> Option<String> {
     input
         .map(|value| value.trim().to_string())
@@ -2168,7 +2177,7 @@ fn resolve_env_placeholder(value: &str) -> Option<String> {
     if key.is_empty() {
         return None;
     }
-    if !VERIFY_ALLOWED_ENV_PLACEHOLDER_KEYS.contains(&key) {
+    if !is_allowed_verify_placeholder_key(key) {
         return None;
     }
     std::env::var(key)
@@ -2233,7 +2242,7 @@ fn print_verify_summary(outcome: SetupOutcome, port: u16, checks: &[VerifyCheckR
     println!();
     println!("Outcome verification summary");
     println!("----------------------------");
-    println!("Outcome: {}", outcome.label());
+    println!("Outcome: {}", outcome.prompt_key());
     println!("Gateway port: {}", port);
     println!();
     for check in checks {
@@ -2298,15 +2307,18 @@ async fn verify_channel_send_path(
 }
 
 fn summarize_http_failure_body(status: reqwest::StatusCode, body: &str) -> String {
-    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        return "(body hidden for auth failures)".to_string();
+    if status == reqwest::StatusCode::UNAUTHORIZED
+        || status == reqwest::StatusCode::FORBIDDEN
+        || status.is_server_error()
+    {
+        return "(body hidden for sensitive error status)".to_string();
     }
     let trimmed = body.trim();
     if trimmed.is_empty() {
         return "<empty response body>".to_string();
     }
-    if trimmed.chars().count() > 500 {
-        let excerpt: String = trimmed.chars().take(500).collect();
+    if trimmed.chars().count() > 200 {
+        let excerpt: String = trimmed.chars().take(200).collect();
         return format!("{excerpt}... (truncated)");
     }
     trimmed.to_string()
@@ -2908,7 +2920,7 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
         };
         let verify_prompt = format!(
             "Run outcome verifier now (`cara verify --outcome {}`)?",
-            setup_outcome.label()
+            setup_outcome.prompt_key()
         );
         let run_verify = prompt_yes_no(&verify_prompt, verify_default)?;
 
@@ -4433,6 +4445,16 @@ mod tests {
         assert_eq!(
             resolve_env_placeholder("${CARAPACE_TEST_NON_ALLOWLISTED_SECRET}"),
             None
+        );
+    }
+
+    #[test]
+    fn test_resolve_env_placeholder_allows_custom_bot_token_names() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let _env_guard = set_env_var_scoped("MY_DISCORD_BOT_TOKEN", "custom-token");
+        assert_eq!(
+            resolve_env_placeholder("${MY_DISCORD_BOT_TOKEN}"),
+            Some("custom-token".to_string())
         );
     }
 

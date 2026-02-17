@@ -77,6 +77,10 @@ Options:
 - `--discord-to <channel_id>` — required for Discord send-path check to pass.
 - `--telegram-to <chat_id>` — required for Telegram send-path check to pass.
 
+Notes:
+- `cara verify` currently targets local loopback only (`127.0.0.1`).
+- Discord/Telegram send-path verification sends a real test message to the destination you provide.
+
 ### pair
 Pair this CLI with a Carapace service.
 
