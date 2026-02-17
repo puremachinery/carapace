@@ -77,5 +77,5 @@ cara version
 
 ## Next step
 
-- Continue with [First run](/carapace/first-run.html)
-- Or jump to [Cookbook recipes](/carapace/cookbook/)
+- Continue with [First run](first-run.md)
+- Or jump to [Cookbook recipes](../cookbook/README.md)

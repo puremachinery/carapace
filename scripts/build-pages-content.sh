@@ -23,13 +23,18 @@ rewrite_links() {
 
   body="$(printf '%s' "$body" | sed -E \
     -e 's|href="\.\./CONTRIBUTING\.md"|href="https://github.com/puremachinery/carapace/blob/HEAD/CONTRIBUTING.md"|g' \
-    -e 's|href="cookbook/README\.md"|href="/carapace/cookbook/"|g' \
-    -e 's|href="cookbook/([^":#]+)\.md"|href="/carapace/cookbook/\1.html"|g' \
-    -e 's|href="site/([^":#]+)\.md"|href="/carapace/\1.html"|g')"
+    -e 's|href="cookbook/README\.md"|href="cookbook/"|g' \
+    -e 's|href="cookbook/([^":#]+)\.md"|href="cookbook/\1.html"|g' \
+    -e 's|href="\.\./cookbook/README\.md"|href="cookbook/"|g' \
+    -e 's|href="\.\./cookbook/([^":#]+)\.md"|href="cookbook/\1.html"|g' \
+    -e 's|href="site/([^":#]+)\.md"|href="\1.html"|g')"
 
   if [[ "$kind" == "cookbook" ]]; then
     body="$(printf '%s' "$body" | sed -E \
-      -e 's|href="README\.md"|href="/carapace/cookbook/"|g' \
+      -e 's|href="README\.md"|href="./"|g' \
+      -e 's|href="([A-Za-z0-9._-]+)\.md"|href="\1.html"|g')"
+  elif [[ "$kind" == "docs" ]]; then
+    body="$(printf '%s' "$body" | sed -E \
       -e 's|href="([A-Za-z0-9._-]+)\.md"|href="\1.html"|g')"
   fi
 
@@ -44,6 +49,7 @@ render_markdown_page() {
   local breadcrumbs="$5"
   local kind="$6"
   local request_cta="$7"
+  local rel_prefix="$8"
 
   if [ ! -f "$src" ]; then
     echo "Error: missing source markdown: $src" >&2
@@ -73,21 +79,21 @@ render_markdown_page() {
       href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono&family=Space+Grotesk:wght@400;600;700&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="/carapace/styles.css" />
+    <link rel="stylesheet" href="${rel_prefix}/styles.css" />
   </head>
   <body>
     <div class="bg-shape bg-shape-one" aria-hidden="true"></div>
     <div class="bg-shape bg-shape-two" aria-hidden="true"></div>
 
     <header class="site-header">
-      <a class="brand" href="/carapace/">Carapace</a>
+      <a class="brand" href="${rel_prefix}/">Carapace</a>
       <nav class="nav-links" aria-label="Primary">
-        <a href="/carapace/">Home</a>
-        <a href="/carapace/getting-started.html">Getting Started</a>
-        <a href="/carapace/install.html">Install</a>
-        <a href="/carapace/first-run.html">First Run</a>
-        <a href="/carapace/cookbook/">Cookbook</a>
-        <a href="/carapace/get-unstuck.html">Get Unstuck</a>
+        <a href="${rel_prefix}/">Home</a>
+        <a href="${rel_prefix}/getting-started.html">Getting Started</a>
+        <a href="${rel_prefix}/install.html">Install</a>
+        <a href="${rel_prefix}/first-run.html">First Run</a>
+        <a href="${rel_prefix}/cookbook/">Cookbook</a>
+        <a href="${rel_prefix}/get-unstuck.html">Get Unstuck</a>
         <a href="https://github.com/puremachinery/carapace">GitHub</a>
       </nav>
     </header>
@@ -143,34 +149,38 @@ render_markdown_page \
   "Install, first run, and practical operations for Carapace." \
   "" \
   "docs" \
-  "0"
+  "0" \
+  "."
 
 render_markdown_page \
   "${site_docs_dir}/install.md" \
   "${out_dir}/install.html" \
   "Carapace | Install" \
   "Install Carapace binaries and verify signatures." \
-  "<a href=\"/carapace/getting-started.html\">Getting Started</a> / Install" \
+  "<a href=\"./getting-started.html\">Getting Started</a> / Install" \
   "docs" \
-  "0"
+  "0" \
+  "."
 
 render_markdown_page \
   "${site_docs_dir}/first-run.md" \
   "${out_dir}/first-run.html" \
   "Carapace | First Run" \
   "Run Carapace locally with secure defaults and verify health." \
-  "<a href=\"/carapace/getting-started.html\">Getting Started</a> / First Run" \
+  "<a href=\"./getting-started.html\">Getting Started</a> / First Run" \
   "docs" \
-  "0"
+  "0" \
+  "."
 
 render_markdown_page \
   "${site_docs_dir}/get-unstuck.md" \
   "${out_dir}/get-unstuck.html" \
   "Carapace | Get Unstuck" \
   "Troubleshooting checks, logs, and issue-reporting paths for Carapace." \
-  "<a href=\"/carapace/getting-started.html\">Getting Started</a> / Get Unstuck" \
+  "<a href=\"./getting-started.html\">Getting Started</a> / Get Unstuck" \
   "docs" \
-  "0"
+  "0" \
+  "."
 
 render_markdown_page \
   "${cookbook_dir}/README.md" \
@@ -179,7 +189,8 @@ render_markdown_page \
   "Task-focused Carapace walkthroughs for setup and integrations." \
   "" \
   "cookbook" \
-  "1"
+  "1" \
+  ".."
 
 while IFS= read -r src; do
   file_name="$(basename "$src")"
@@ -200,9 +211,10 @@ while IFS= read -r src; do
     "${out_cookbook_dir}/${stem}.html" \
     "Carapace Cookbook | ${heading}" \
     "Carapace recipe: ${heading}" \
-    "<a href=\"/carapace/cookbook/\">Cookbook</a> / ${heading}" \
+    "<a href=\"./\">Cookbook</a> / ${heading}" \
     "cookbook" \
-    "1"
+    "1" \
+    ".."
 done < <(find "${cookbook_dir}" -maxdepth 1 -type f -name '*.md' | sort)
 
 echo "Generated Pages content in ${out_dir}"

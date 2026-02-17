@@ -6,7 +6,7 @@ Start Carapace in secure local mode, verify health, and get your first response 
 
 ## Prerequisites
 
-- `cara` installed: [/carapace/install.html](/carapace/install.html)
+- `cara` installed: [Install guide](install.md)
 - One provider key set in your shell:
   - `ANTHROPIC_API_KEY` or
   - `OPENAI_API_KEY`
@@ -67,6 +67,6 @@ Expected:
 
 ## 5) Continue
 
-- Need channel setup? Go to [Cookbook](/carapace/cookbook/)
-- Just want Discord first? Use [Add Carapace to Discord](/carapace/cookbook/discord-assistant.html)
-- Stuck? Use [/carapace/get-unstuck.html](/carapace/get-unstuck.html)
+- Need channel setup? Go to [Cookbook](../cookbook/README.md)
+- Just want Discord first? Use [Add Carapace to Discord](../cookbook/discord-assistant.md)
+- Stuck? Use [Get Unstuck](get-unstuck.md)

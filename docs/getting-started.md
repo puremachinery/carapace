@@ -6,9 +6,9 @@ It’s intentionally practical: copy/paste steps, then customize.
 If you prefer outcome-first walkthroughs (for example "add Discord"), see
 the [Cookbook](cookbook/README.md).
 If you want the website flow instead of Markdown docs, use:
-- <https://puremachinery.github.io/carapace/install.html>
-- <https://puremachinery.github.io/carapace/first-run.html>
-- <https://puremachinery.github.io/carapace/get-unstuck.html>
+- [Install](site/install.md)
+- [First Run](site/first-run.md)
+- [Get Unstuck](site/get-unstuck.md)
 
 ## Prerequisites
 
