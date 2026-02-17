@@ -526,6 +526,22 @@ fn set_value_at_path(root: &mut Value, path: &str, value: Value) {
     }
 }
 
+fn get_value_at_path<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
+    let mut current = root;
+    for part in path.split('.') {
+        current = current.get(part)?;
+    }
+    Some(current)
+}
+
+fn get_bool_at_path(root: &Value, path: &str) -> Option<bool> {
+    get_value_at_path(root, path).and_then(Value::as_bool)
+}
+
+fn get_string_at_path<'a>(root: &'a Value, path: &str) -> Option<&'a str> {
+    get_value_at_path(root, path).and_then(Value::as_str)
+}
+
 fn apply_channel_token(config_value: &mut Value, channel_name: &str, token: &str) {
     set_value_at_path(
         config_value,
@@ -810,12 +826,20 @@ fn apply_wizard_config(
             let hooks_enabled = data
                 .get("hooks_enabled")
                 .and_then(Value::as_bool)
-                .unwrap_or(matches!(first_outcome.as_str(), "hooks"));
+                .unwrap_or_else(|| {
+                    if matches!(first_outcome.as_str(), "hooks") {
+                        true
+                    } else {
+                        get_bool_at_path(config_value, "gateway.hooks.enabled").unwrap_or(false)
+                    }
+                });
             let hooks_token = data.get("hooks_token").and_then(normalize_string);
             let control_ui_enabled = data
                 .get("control_ui_enabled")
                 .and_then(Value::as_bool)
-                .unwrap_or(false);
+                .unwrap_or_else(|| {
+                    get_bool_at_path(config_value, "gateway.controlUi.enabled").unwrap_or(false)
+                });
 
             match provider.as_str() {
                 "anthropic" => {
@@ -902,7 +926,15 @@ fn apply_wizard_config(
 
             set_value_at_path(config_value, "gateway.hooks.enabled", json!(hooks_enabled));
             if hooks_enabled {
-                let token = resolve_wizard_auth_secret(hooks_token.as_ref(), 32)?;
+                let token = if let Some(token) = hooks_token.as_deref() {
+                    token.to_string()
+                } else if let Some(existing_token) =
+                    get_string_at_path(config_value, "gateway.hooks.token")
+                {
+                    existing_token.to_string()
+                } else {
+                    resolve_wizard_auth_secret(None, 32)?
+                };
                 set_value_at_path(config_value, "gateway.hooks.token", json!(token));
             }
 
@@ -1480,6 +1512,69 @@ mod tests {
             .as_str()
             .map(|v| !v.is_empty())
             .unwrap_or(false));
+    }
+
+    #[test]
+    fn test_apply_setup_wizard_preserves_existing_optional_toggles_when_unspecified() {
+        let mut data = HashMap::new();
+        data.insert("provider".to_string(), json!("anthropic"));
+        data.insert("api_key".to_string(), json!("sk-test"));
+        data.insert("first_outcome".to_string(), json!("local-chat"));
+
+        let mut config_value = json!({
+            "gateway": {
+                "hooks": {
+                    "enabled": true,
+                    "token": "existing-hooks-token"
+                },
+                "controlUi": {
+                    "enabled": true
+                }
+            }
+        });
+
+        let applied = apply_wizard_config("setup", &data, &mut config_value).unwrap();
+        assert!(applied);
+        assert_eq!(
+            config_value["gateway"]["hooks"]["enabled"],
+            Value::Bool(true)
+        );
+        assert_eq!(
+            config_value["gateway"]["hooks"]["token"],
+            Value::String("existing-hooks-token".to_string())
+        );
+        assert_eq!(
+            config_value["gateway"]["controlUi"]["enabled"],
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn test_apply_setup_wizard_hooks_outcome_reuses_existing_token_when_unspecified() {
+        let mut data = HashMap::new();
+        data.insert("provider".to_string(), json!("anthropic"));
+        data.insert("api_key".to_string(), json!("sk-test"));
+        data.insert("first_outcome".to_string(), json!("hooks"));
+
+        let mut config_value = json!({
+            "gateway": {
+                "hooks": {
+                    "enabled": false,
+                    "token": "existing-hooks-token"
+                }
+            }
+        });
+
+        let applied = apply_wizard_config("setup", &data, &mut config_value).unwrap();
+        assert!(applied);
+        assert_eq!(
+            config_value["gateway"]["hooks"]["enabled"],
+            Value::Bool(true)
+        );
+        assert_eq!(
+            config_value["gateway"]["hooks"]["token"],
+            Value::String("existing-hooks-token".to_string())
+        );
     }
 
     #[test]

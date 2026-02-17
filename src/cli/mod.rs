@@ -1750,7 +1750,7 @@ fn prompt_optional_value_from_env(
         }
     }
 
-    let entered = prompt_line(prompt)?;
+    let entered = prompt_hidden_line(prompt)?;
     if entered.is_empty() {
         Ok(None)
     } else {
@@ -1767,13 +1767,13 @@ fn print_setup_outcome_next_steps(outcome: SetupOutcome, port: u16, hooks_enable
         }
         SetupOutcome::Discord => {
             println!("First-run outcome: Discord assistant");
-            println!("Next step: follow docs/cookbook/discord-assistant.md");
-            println!("Web docs: https://getcara.io/cookbook/discord-assistant.html");
+            println!("Next step: https://getcara.io/cookbook/discord-assistant.html");
+            println!("Repo docs path: docs/cookbook/discord-assistant.md");
         }
         SetupOutcome::Telegram => {
             println!("First-run outcome: Telegram assistant");
-            println!("Next step: follow docs/cookbook/telegram-webhook-assistant.md");
-            println!("Web docs: https://getcara.io/cookbook/telegram-webhook-assistant.html");
+            println!("Next step: https://getcara.io/cookbook/telegram-webhook-assistant.html");
+            println!("Repo docs path: docs/cookbook/telegram-webhook-assistant.md");
         }
         SetupOutcome::Hooks => {
             println!("First-run outcome: hooks automation");
@@ -1802,6 +1802,11 @@ fn prompt_line(prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
     io::stdout().flush()?;
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
+    Ok(input.trim().to_string())
+}
+
+fn prompt_hidden_line(prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let input = rpassword::prompt_password(prompt)?;
     Ok(input.trim().to_string())
 }
 
@@ -1864,7 +1869,7 @@ fn prompt_custom_secret(kind: &str) -> Result<String, Box<dyn std::error::Error>
     const MIN_SECRET_LENGTH: usize = 10;
 
     loop {
-        let entered = prompt_line(&format!("Enter {} (input is visible): ", kind))?;
+        let entered = prompt_hidden_line(&format!("Enter {kind} (input hidden): "))?;
         if entered.is_empty() {
             eprintln!("{} cannot be empty.", kind);
             continue;
@@ -2158,7 +2163,7 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
                 effective_api_key = env_key.clone();
                 Some(format!("${{{env_var}}}"))
             } else {
-                let entered = prompt_line("Enter API key (input is visible): ")?;
+                let entered = prompt_hidden_line("Enter API key (input hidden): ")?;
                 if entered.is_empty() {
                     None
                 } else {
@@ -2167,7 +2172,8 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         } else {
-            let entered = prompt_line("Enter API key (input is visible, leave blank to skip): ")?;
+            let entered =
+                prompt_hidden_line("Enter API key (input hidden, leave blank to skip): ")?;
             if entered.is_empty() {
                 None
             } else {
