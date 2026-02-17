@@ -2156,6 +2156,9 @@ fn is_allowed_verify_placeholder_key(key: &str) -> bool {
 }
 
 fn warn_unsupported_verify_placeholder_key(key: &str) {
+    if cfg!(test) {
+        return;
+    }
     if key.len() > 64 {
         return;
     }
@@ -2176,6 +2179,19 @@ fn normalize_optional_input(input: Option<String>) -> Option<String> {
     input
         .map(|value| value.trim().to_string())
         .filter(|trimmed| !trimmed.is_empty())
+}
+
+fn summarize_destination_for_display(raw: &str) -> String {
+    let sanitized: String = raw
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(120)
+        .collect();
+    if sanitized.is_empty() {
+        "<redacted>".to_string()
+    } else {
+        sanitized
+    }
 }
 
 fn resolve_env_placeholder(value: &str) -> Option<String> {
@@ -2234,6 +2250,7 @@ fn resolve_hooks_token(cfg: &Value) -> Option<String> {
 }
 
 fn infer_setup_outcome_from_config(cfg: &Value) -> SetupOutcome {
+    // Priority is intentional: configured channels first, then hooks, then local chat.
     if channel_outcome_configured(cfg, "discord") {
         return SetupOutcome::Discord;
     }
@@ -2327,42 +2344,13 @@ fn sanitize_channel_delivery_error(raw_error: String) -> String {
     if trimmed.is_empty() {
         return "send path rejected request".to_string();
     }
-    let allowlisted_prefix = [
-        "HTTP ",
-        "Unauthorized",
-        "Forbidden",
-        "Not Found",
-        "Bad Request",
-        "Too Many Requests",
-    ]
-    .iter()
-    .any(|prefix| trimmed.starts_with(prefix));
-    if !allowlisted_prefix {
-        return "send path rejected request (provider details hidden for safety)".to_string();
-    }
-    if trimmed.chars().count() > 120 {
-        let excerpt: String = trimmed.chars().take(120).collect();
-        return format!("{excerpt}... (truncated)");
-    }
-    trimmed.to_string()
+    "send path rejected request (provider details hidden for safety)".to_string()
 }
 
 fn summarize_http_failure_body(status: reqwest::StatusCode, body: &str) -> String {
-    if status == reqwest::StatusCode::UNAUTHORIZED
-        || status == reqwest::StatusCode::FORBIDDEN
-        || status.is_server_error()
-    {
-        return "(body hidden for sensitive error status)".to_string();
-    }
-    let trimmed = body.trim();
-    if trimmed.is_empty() {
-        return "<empty response body>".to_string();
-    }
-    if trimmed.chars().count() > 200 {
-        let excerpt: String = trimmed.chars().take(200).collect();
-        return format!("{excerpt}... (truncated)");
-    }
-    trimmed.to_string()
+    let _ = status;
+    let _ = body;
+    "(body hidden for safety)".to_string()
 }
 
 async fn verify_local_chat_outcome(
@@ -2488,6 +2476,7 @@ async fn verify_hooks_outcome(
         .build()
         .map_err(|e| format!("failed to create hooks verification client: {e}"))?;
     let wake_url = format!("http://127.0.0.1:{port}/hooks/wake");
+    println!("Sending signed hooks wake request (this triggers real hooks processing)...");
     let wake_result = client
         .post(&wake_url)
         .header("Authorization", format!("Bearer {hooks_token}"))
@@ -2578,8 +2567,9 @@ async fn verify_channel_outcome(
             ));
 
             if let Some(destination) = destination {
+                let destination_display = summarize_destination_for_display(&destination);
                 println!(
-                    "Sending verification ping to {channel_label} destination {destination}..."
+                    "Sending verification ping to {channel_label} destination {destination_display}..."
                 );
                 match verify_channel_send_path(outcome, token, destination).await {
                     Ok(()) => checks.push(VerifyCheckResult::pass(
@@ -2651,9 +2641,16 @@ async fn run_outcome_verifier(
     let has_pass = checks
         .iter()
         .any(|check| check.status == VerifyCheckStatus::Pass);
+    let has_skip = checks
+        .iter()
+        .any(|check| check.status == VerifyCheckStatus::Skip);
     if !has_fail && has_pass {
         println!();
-        println!("Outcome verification passed.");
+        if has_skip {
+            println!("Outcome verification passed with skipped checks.");
+        } else {
+            println!("Outcome verification passed.");
+        }
         Ok(())
     } else if !has_fail {
         Err("outcome verification incomplete (no checks passed)".to_string())

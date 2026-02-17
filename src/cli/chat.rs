@@ -18,6 +18,7 @@ use super::{
 const CHAT_CLIENT_ID: &str = "cli";
 const CHAT_CLIENT_MODE: &str = "cli";
 const MAX_PENDING_VERIFY_EVENTS: usize = 64;
+const MAX_VERIFY_ERROR_CHARS: usize = 160;
 
 /// REPL commands recognised in the input loop.
 #[derive(Debug, PartialEq)]
@@ -473,38 +474,55 @@ fn verify_frame_run_id(frame: &Value) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
+fn sanitize_verify_error_message(raw: Option<&str>, fallback: &str) -> String {
+    let Some(message) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return fallback.to_string();
+    };
+    if message.contains('<') || message.contains('{') || message.contains('\n') {
+        return fallback.to_string();
+    }
+    if message.chars().count() > MAX_VERIFY_ERROR_CHARS {
+        let excerpt: String = message.chars().take(MAX_VERIFY_ERROR_CHARS).collect();
+        return format!("{excerpt}... (truncated)");
+    }
+    message.to_string()
+}
+
 fn evaluate_verify_event_frame(
     frame: &Value,
     active_run_id: Option<&str>,
 ) -> Option<Result<(), String>> {
     let payload = frame.get("payload").cloned().unwrap_or(Value::Null);
+    let run_id = payload.get("runId").and_then(|v| v.as_str()).unwrap_or("");
 
     if let Some(expected_run_id) = active_run_id {
-        let run_id = payload.get("runId").and_then(|v| v.as_str()).unwrap_or("");
         if run_id != expected_run_id {
             return None;
         }
+    } else if run_id.is_empty() {
+        // Until we can correlate by runId, ignore unscoped events.
+        return None;
     }
 
     match frame.get("event").and_then(|v| v.as_str()).unwrap_or("") {
         "chat" => match payload.get("state").and_then(|v| v.as_str()).unwrap_or("") {
             "final" => Some(Ok(())),
-            "error" => Some(Err(payload
-                .get("errorMessage")
-                .and_then(|v| v.as_str())
-                .unwrap_or("chat run failed")
-                .to_string())),
+            "error" => Some(Err(sanitize_verify_error_message(
+                payload.get("errorMessage").and_then(|v| v.as_str()),
+                "chat run failed",
+            ))),
             _ => None,
         },
         "agent" => {
             let stream = payload.get("stream").and_then(|v| v.as_str()).unwrap_or("");
             if stream == "error" {
-                Some(Err(payload
-                    .get("data")
-                    .and_then(|d| d.get("message"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("agent stream error")
-                    .to_string()))
+                Some(Err(sanitize_verify_error_message(
+                    payload
+                        .get("data")
+                        .and_then(|d| d.get("message"))
+                        .and_then(|v| v.as_str()),
+                    "agent stream error",
+                )))
             } else {
                 None
             }
@@ -564,12 +582,13 @@ pub(crate) async fn verify_chat_roundtrip(
 
                     let ok = frame.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
                     if !ok {
-                        let msg = frame
-                            .get("error")
-                            .and_then(|e| e.get("message"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("chat.send failed");
-                        return Err(msg.to_string());
+                        return Err(sanitize_verify_error_message(
+                            frame
+                                .get("error")
+                                .and_then(|e| e.get("message"))
+                                .and_then(|v| v.as_str()),
+                            "chat.send failed",
+                        ));
                     }
 
                     let status = frame
