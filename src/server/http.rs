@@ -1076,8 +1076,8 @@ async fn telegram_webhook_handler(
     }
 
     let secret = match telegram_inbound::resolve_webhook_secret(&cfg) {
-        Some(secret) if !secret.is_empty() => secret,
-        _ => {
+        Some(secret) => secret,
+        None => {
             warn!("Telegram webhook secret not configured; rejecting inbound request");
             return StatusCode::UNAUTHORIZED.into_response();
         }

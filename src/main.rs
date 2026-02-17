@@ -626,10 +626,7 @@ fn spawn_telegram_receive_loop_if_configured(
         None => return,
     };
 
-    if channels::telegram_inbound::resolve_webhook_secret(cfg)
-        .as_deref()
-        .is_some_and(|secret| !secret.trim().is_empty())
-    {
+    if channels::telegram_inbound::resolve_webhook_secret(cfg).is_some() {
         info!("Telegram webhook secret configured; inbound webhook mode enabled");
         return;
     }

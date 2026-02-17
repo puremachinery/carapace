@@ -102,11 +102,11 @@ pub async fn telegram_receive_loop(
                             }
                         }
                     }
-                    Err(_) => {
+                    Err(err) => {
                         had_error = true;
                         consecutive_errors += 1;
                         if consecutive_errors <= 3 {
-                            warn!("Telegram getUpdates response parse failed");
+                            warn!("Telegram getUpdates response parse failed: {}", err);
                         }
                         channel_registry.set_error(
                             "telegram",
