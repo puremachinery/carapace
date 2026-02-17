@@ -14,6 +14,7 @@ pub mod slack;
 pub mod slack_inbound;
 pub mod telegram;
 pub mod telegram_inbound;
+pub mod telegram_receive;
 pub mod webhook;
 
 use parking_lot::RwLock;

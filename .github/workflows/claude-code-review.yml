@@ -2,12 +2,15 @@ name: Claude Code Review
 
 on:
   pull_request:
-    types: [opened, synchronize, ready_for_review]
+    types: [opened, synchronize, ready_for_review, reopened]
 
 jobs:
   claude-review:
+    concurrency:
+      group: claude-review-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
     # Only run on PRs from the same repo (fork PRs don't have access to secrets)
-    if: github.event.pull_request.head.repo.full_name == github.repository
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.draft == false
 
     runs-on: ubuntu-latest
     permissions:
@@ -21,6 +24,7 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 1
+          ref: refs/pull/${{ github.event.pull_request.number }}/head
 
       - name: Detect workflow self-change
         id: workflow-change
@@ -33,15 +37,17 @@ jobs:
               pull_number: context.payload.pull_request.number,
               per_page: 100,
             });
-            const changed = files.some(
-              (file) => file.filename === ".github/workflows/claude-code-review.yml",
-            );
+            const blocked = new Set([
+              ".github/workflows/claude-code-review.yml",
+              ".github/workflows/claude.yml",
+            ]);
+            const changed = files.some((file) => blocked.has(file.filename));
             core.setOutput("changed", changed ? "true" : "false");
 
       - name: Skip Claude review when workflow changed in PR
         if: steps.workflow-change.outputs.changed == 'true'
         run: |
-          echo "Skipping Claude code review because this PR modifies .github/workflows/claude-code-review.yml."
+          echo "Skipping Claude code review because this PR modifies Claude workflow files."
 
       - name: Run Claude Code Review
         id: claude-review
@@ -77,10 +83,19 @@ jobs:
             6) Blocking policy:
                - Only in-scope high/medium findings are blocking for this PR.
                - Out-of-scope findings are advisory only.
+            7) Consistency requirement:
+               - If you report any in-scope high/medium finding, do NOT say "LGTM for blocking issues."
+               - If you say "LGTM for blocking issues.", there must be zero in-scope high/medium findings in the entire review comment.
+               - Never place high/medium findings inside "Optional follow-ups (non-blocking)".
 
             Output requirements:
             - Post at most one top-level PR comment via gh pr comment.
-            - If no high/medium findings: start with "LGTM for blocking issues."
+            - Start with exactly one of:
+              - "LGTM for blocking issues." (only when there are zero in-scope high/medium findings)
+              - "Blocking findings present." (required when any in-scope high/medium finding exists)
+            - If "Blocking findings present.": include a "### Blocking findings (required before merge)" section with each in-scope high/medium finding.
+            - Keep advisory out-of-scope high/medium findings in a separate "### Advisory findings (out-of-scope)" section.
+            - Keep "### Optional follow-ups (non-blocking)" limited to low findings only.
             - Keep comments concise and avoid repetitive wording.
             - Only post GitHub comments; do not leave final feedback only in tool output.
           claude_args: |

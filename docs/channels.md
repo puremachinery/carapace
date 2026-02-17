@@ -46,10 +46,18 @@ Implementation references:
 - `src/channels/signal_receive.rs`
 - `src/main.rs::spawn_signal_receive_loop_if_configured`
 
-## Telegram (Bot API + Webhook)
+## Telegram (Bot API + Webhook or Polling)
 
-Telegram uses the Bot API for outbound delivery and a webhook for inbound
-messages.
+Telegram uses the Bot API for outbound delivery. Inbound can run in either mode:
+
+- **Webhook mode** (recommended for public deployments): set
+  `telegram.webhookSecret`, expose `/channels/telegram/webhook` over HTTPS, and
+  configure Telegram to send `X-Telegram-Bot-Api-Secret-Token`.
+- **Long-polling fallback** (default for local/private setups): if
+  `telegram.webhookSecret` is unset, Carapace automatically uses `getUpdates`
+  polling for inbound messages (no public webhook required). On startup,
+  Carapace also makes a best-effort `deleteWebhook` call so polling is not
+  starved by a previously registered webhook.
 
 1) Create a Telegram bot token (via BotFather).
 2) Configure carapace:
@@ -58,24 +66,25 @@ messages.
 {
   "telegram": {
     "botToken": "${TELEGRAM_BOT_TOKEN}",
-    "webhookSecret": "${TELEGRAM_WEBHOOK_SECRET}" // required for inbound webhooks
+    // webhookSecret: "${TELEGRAM_WEBHOOK_SECRET}" // optional; enables webhook mode
   }
 }
 ```
 
-3) Set the webhook URL on Telegram to:
+3) Optional webhook setup (if using webhook mode):
 
 ```
 https://YOUR_HOST/channels/telegram/webhook
 ```
 
-Configure Telegram to send `X-Telegram-Bot-Api-Secret-Token` with the same
-value. Inbound webhooks are rejected if the secret is missing or does not
-match.
+Inbound webhook requests are rejected if the configured secret is missing or
+does not match.
 
 Implementation references:
 - `src/server/http.rs::telegram_webhook_handler`
 - `src/channels/telegram_inbound.rs`
+- `src/channels/telegram_receive.rs`
+- `src/main.rs::spawn_telegram_receive_loop_if_configured`
 
 ## Slack (Web API + Events API)
 

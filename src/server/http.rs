@@ -728,14 +728,6 @@ fn normalize_control_ui_base_path(path: &str) -> String {
     result
 }
 
-fn resolve_telegram_webhook_secret(cfg: &Value) -> Option<String> {
-    cfg.get("telegram")
-        .and_then(|t| t.get("webhookSecret"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .or_else(|| std::env::var("TELEGRAM_WEBHOOK_SECRET").ok())
-}
-
 fn resolve_slack_signing_secret(cfg: &Value) -> Option<String> {
     cfg.get("slack")
         .and_then(|s| s.get("signingSecret"))
@@ -1083,9 +1075,9 @@ async fn telegram_webhook_handler(
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    let secret = match resolve_telegram_webhook_secret(&cfg) {
-        Some(secret) if !secret.is_empty() => secret,
-        _ => {
+    let secret = match telegram_inbound::resolve_webhook_secret(&cfg) {
+        Some(secret) => secret,
+        None => {
             warn!("Telegram webhook secret not configured; rejecting inbound request");
             return StatusCode::UNAUTHORIZED.into_response();
         }

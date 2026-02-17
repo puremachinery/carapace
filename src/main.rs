@@ -32,6 +32,7 @@ use std::time::Duration;
 use axum::routing::get;
 use axum::Router;
 use clap::Parser;
+use serde::Deserialize;
 use serde_json::Value;
 use tracing::{error, info, warn};
 
@@ -179,6 +180,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     spawn_network_services(&cfg, &tls_setup, resolved.address.port(), &shutdown_rx);
     spawn_signal_receive_loop_if_configured(&cfg, &ws_state, &shutdown_rx);
+    spawn_telegram_receive_loop_if_configured(&cfg, &ws_state, &shutdown_rx);
     spawn_discord_gateway_loop_if_configured(&cfg, &ws_state, &shutdown_rx);
     spawn_gateway_lifecycle(gateway_registry.clone(), gateway_config, &shutdown_rx);
 
@@ -612,6 +614,103 @@ fn spawn_signal_receive_loop_if_configured(
         ws_state.channel_registry().clone(),
         shutdown_rx.clone(),
     ));
+}
+
+const TELEGRAM_DELETE_WEBHOOK_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Deserialize)]
+struct TelegramDeleteWebhookResponse {
+    ok: bool,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+fn build_telegram_delete_webhook_url(base_url: &str, bot_token: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    format!("{base}/bot{bot_token}/deleteWebhook?drop_pending_updates=false")
+}
+
+async fn clear_telegram_webhook_before_polling(base_url: &str, bot_token: &str) {
+    let delete_url = build_telegram_delete_webhook_url(base_url, bot_token);
+    let client = match reqwest::Client::builder()
+        .timeout(TELEGRAM_DELETE_WEBHOOK_TIMEOUT)
+        .build()
+    {
+        Ok(client) => client,
+        Err(err) => {
+            warn!(
+                error = %err,
+                "Failed to build Telegram deleteWebhook client; polling may not receive updates if a webhook is still registered"
+            );
+            return;
+        }
+    };
+
+    match client.post(&delete_url).send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            match resp.json::<TelegramDeleteWebhookResponse>().await {
+                Ok(payload) if status.is_success() && payload.ok => {
+                    info!("Telegram deleteWebhook succeeded before enabling polling");
+                }
+                Ok(payload) => {
+                    let description = payload
+                        .description
+                        .unwrap_or_else(|| "unknown Telegram API error".to_string());
+                    warn!(
+                        status = %status,
+                        error = %description,
+                        "Telegram deleteWebhook failed; polling may not receive updates if a webhook is still registered"
+                    );
+                }
+                Err(err) => {
+                    warn!(
+                        status = %status,
+                        error = %err,
+                        "Failed to parse Telegram deleteWebhook response; polling may not receive updates if a webhook is still registered"
+                    );
+                }
+            }
+        }
+        Err(err) => {
+            warn!(
+                error = %err,
+                "Telegram deleteWebhook request failed; polling may not receive updates if a webhook is still registered"
+            );
+        }
+    }
+}
+
+/// Spawn the Telegram long-polling receive loop when webhook auth is not configured.
+fn spawn_telegram_receive_loop_if_configured(
+    cfg: &Value,
+    ws_state: &Arc<server::ws::WsServerState>,
+    shutdown_rx: &tokio::sync::watch::Receiver<bool>,
+) {
+    let tc = match resolve_telegram_config(cfg) {
+        Some(c) => c,
+        None => return,
+    };
+
+    if channels::telegram_inbound::resolve_webhook_secret(cfg).is_some() {
+        info!("Telegram webhook secret configured; inbound webhook mode enabled");
+        return;
+    }
+
+    info!("Telegram webhook secret not configured; enabling long-polling fallback");
+    let ws_state = ws_state.clone();
+    let shutdown_rx = shutdown_rx.clone();
+    tokio::spawn(async move {
+        clear_telegram_webhook_before_polling(&tc.base_url, &tc.bot_token).await;
+        channels::telegram_receive::telegram_receive_loop(
+            tc.base_url,
+            tc.bot_token,
+            ws_state.clone(),
+            ws_state.channel_registry().clone(),
+            shutdown_rx,
+        )
+        .await;
+    });
 }
 
 /// Spawn the Discord gateway loop if configured.
