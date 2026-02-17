@@ -293,7 +293,9 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, Error as RustlsError, SignatureScheme};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::io::IsTerminal;
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio_tungstenite::{
     connect_async, connect_async_tls_with_config, tungstenite::Message, Connector,
@@ -2141,26 +2143,33 @@ impl VerifyCheckResult {
 }
 
 // Keep this list in sync when adding channels that support token placeholders.
-// We permit known token keys and scoped custom channel token aliases.
 const VERIFY_ALLOWED_ENV_PLACEHOLDER_KEYS: &[&str] = &[
     "DISCORD_BOT_TOKEN",
     "TELEGRAM_BOT_TOKEN",
     "CARAPACE_HOOKS_TOKEN",
 ];
+static WARNED_VERIFY_PLACEHOLDER_KEYS: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 
 fn is_allowed_verify_placeholder_key(key: &str) -> bool {
-    if VERIFY_ALLOWED_ENV_PLACEHOLDER_KEYS.contains(&key) {
-        return true;
+    VERIFY_ALLOWED_ENV_PLACEHOLDER_KEYS.contains(&key)
+}
+
+fn warn_unsupported_verify_placeholder_key(key: &str) {
+    if key.len() > 64 {
+        return;
     }
-    if !key
-        .chars()
-        .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
-    {
-        return false;
+    let mut warned = WARNED_VERIFY_PLACEHOLDER_KEYS
+        .lock()
+        .expect("verify placeholder warning lock poisoned");
+    if !warned.insert(key.to_string()) {
+        return;
     }
-    key.ends_with("_DISCORD_BOT_TOKEN")
-        || key.ends_with("_TELEGRAM_BOT_TOKEN")
-        || key.ends_with("_CARAPACE_HOOKS_TOKEN")
+    eprintln!(
+        "Warning: unsupported token placeholder `${{{key}}}` ignored during verification. \
+Use one of: {}",
+        VERIFY_ALLOWED_ENV_PLACEHOLDER_KEYS.join(", ")
+    );
 }
 
 fn normalize_optional_input(input: Option<String>) -> Option<String> {
@@ -2182,6 +2191,7 @@ fn resolve_env_placeholder(value: &str) -> Option<String> {
         return None;
     }
     if !is_allowed_verify_placeholder_key(key) {
+        warn_unsupported_verify_placeholder_key(key);
         return None;
     }
     std::env::var(key)
@@ -2480,7 +2490,7 @@ async fn verify_hooks_outcome(
     let wake_url = format!("http://127.0.0.1:{port}/hooks/wake");
     let wake_result = client
         .post(&wake_url)
-        .header("authorization", format!("Bearer {hooks_token}"))
+        .header("Authorization", format!("Bearer {hooks_token}"))
         .json(&serde_json::json!({ "text": "verify-hook" }))
         .send()
         .await;
@@ -2505,9 +2515,9 @@ async fn verify_hooks_outcome(
                 ),
             ));
         }
-        Err(err) => checks.push(VerifyCheckResult::fail(
+        Err(_err) => checks.push(VerifyCheckResult::fail(
             "Signed /hooks/wake",
-            format!("request failed: {err}"),
+            "network error sending request",
             format!("confirm gateway is reachable on port {port} and retry"),
         )),
     }
@@ -2635,13 +2645,18 @@ async fn run_outcome_verifier(
     }
 
     print_verify_summary(outcome, port, &checks);
-    if checks
+    let has_fail = checks
         .iter()
-        .all(|check| check.status != VerifyCheckStatus::Fail)
-    {
+        .any(|check| check.status == VerifyCheckStatus::Fail);
+    let has_pass = checks
+        .iter()
+        .any(|check| check.status == VerifyCheckStatus::Pass);
+    if !has_fail && has_pass {
         println!();
         println!("Outcome verification passed.");
         Ok(())
+    } else if !has_fail {
+        Err("outcome verification incomplete (no checks passed)".to_string())
     } else {
         Err("outcome verification failed".to_string())
     }
@@ -3632,6 +3647,8 @@ mod tests {
     use std::ffi::OsString;
     use std::sync::{LazyLock, Mutex};
 
+    // Serializes env-var touching tests in this module.
+    // Cross-module env-var tests should use a shared lock if they touch the same keys.
     static ENV_VAR_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     struct EnvVarGuard {
@@ -4487,13 +4504,10 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_env_placeholder_allows_custom_bot_token_names() {
+    fn test_resolve_env_placeholder_rejects_custom_bot_token_names() {
         let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
         let _env_guard = set_env_var_scoped("MY_DISCORD_BOT_TOKEN", "custom-token");
-        assert_eq!(
-            resolve_env_placeholder("${MY_DISCORD_BOT_TOKEN}"),
-            Some("custom-token".to_string())
-        );
+        assert_eq!(resolve_env_placeholder("${MY_DISCORD_BOT_TOKEN}"), None);
     }
 
     #[test]
