@@ -180,7 +180,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     spawn_network_services(&cfg, &tls_setup, resolved.address.port(), &shutdown_rx);
     spawn_signal_receive_loop_if_configured(&cfg, &ws_state, &shutdown_rx);
-    spawn_telegram_receive_loop_if_configured(&cfg, &ws_state, &shutdown_rx).await;
+    spawn_telegram_receive_loop_if_configured(&cfg, &ws_state, &shutdown_rx);
     spawn_discord_gateway_loop_if_configured(&cfg, &ws_state, &shutdown_rx);
     spawn_gateway_lifecycle(gateway_registry.clone(), gateway_config, &shutdown_rx);
 
@@ -682,7 +682,7 @@ async fn clear_telegram_webhook_before_polling(base_url: &str, bot_token: &str) 
 }
 
 /// Spawn the Telegram long-polling receive loop when webhook auth is not configured.
-async fn spawn_telegram_receive_loop_if_configured(
+fn spawn_telegram_receive_loop_if_configured(
     cfg: &Value,
     ws_state: &Arc<server::ws::WsServerState>,
     shutdown_rx: &tokio::sync::watch::Receiver<bool>,
@@ -698,14 +698,19 @@ async fn spawn_telegram_receive_loop_if_configured(
     }
 
     info!("Telegram webhook secret not configured; enabling long-polling fallback");
-    clear_telegram_webhook_before_polling(&tc.base_url, &tc.bot_token).await;
-    tokio::spawn(channels::telegram_receive::telegram_receive_loop(
-        tc.base_url,
-        tc.bot_token,
-        ws_state.clone(),
-        ws_state.channel_registry().clone(),
-        shutdown_rx.clone(),
-    ));
+    let ws_state = ws_state.clone();
+    let shutdown_rx = shutdown_rx.clone();
+    tokio::spawn(async move {
+        clear_telegram_webhook_before_polling(&tc.base_url, &tc.bot_token).await;
+        channels::telegram_receive::telegram_receive_loop(
+            tc.base_url,
+            tc.bot_token,
+            ws_state.clone(),
+            ws_state.channel_registry().clone(),
+            shutdown_rx,
+        )
+        .await;
+    });
 }
 
 /// Spawn the Discord gateway loop if configured.
