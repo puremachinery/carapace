@@ -179,6 +179,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     spawn_network_services(&cfg, &tls_setup, resolved.address.port(), &shutdown_rx);
     spawn_signal_receive_loop_if_configured(&cfg, &ws_state, &shutdown_rx);
+    spawn_telegram_receive_loop_if_configured(&cfg, &ws_state, &shutdown_rx);
     spawn_discord_gateway_loop_if_configured(&cfg, &ws_state, &shutdown_rx);
     spawn_gateway_lifecycle(gateway_registry.clone(), gateway_config, &shutdown_rx);
 
@@ -608,6 +609,35 @@ fn spawn_signal_receive_loop_if_configured(
     tokio::spawn(channels::signal_receive::signal_receive_loop(
         sc.base_url,
         sc.phone_number,
+        ws_state.clone(),
+        ws_state.channel_registry().clone(),
+        shutdown_rx.clone(),
+    ));
+}
+
+/// Spawn the Telegram long-polling receive loop when webhook auth is not configured.
+fn spawn_telegram_receive_loop_if_configured(
+    cfg: &Value,
+    ws_state: &Arc<server::ws::WsServerState>,
+    shutdown_rx: &tokio::sync::watch::Receiver<bool>,
+) {
+    let tc = match resolve_telegram_config(cfg) {
+        Some(c) => c,
+        None => return,
+    };
+
+    if channels::telegram_inbound::resolve_webhook_secret(cfg)
+        .as_deref()
+        .is_some_and(|secret| !secret.trim().is_empty())
+    {
+        info!("Telegram webhook secret configured; inbound webhook mode enabled");
+        return;
+    }
+
+    info!("Telegram webhook secret not configured; enabling long-polling fallback");
+    tokio::spawn(channels::telegram_receive::telegram_receive_loop(
+        tc.base_url,
+        tc.bot_token,
         ws_state.clone(),
         ws_state.channel_registry().clone(),
         shutdown_rx.clone(),

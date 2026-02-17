@@ -138,7 +138,8 @@
   // --- Telegram channel (via Bot API) --------------------------------------
   // telegram: {
   //   botToken: "${TELEGRAM_BOT_TOKEN}",          // Telegram bot token
-  //   // webhookSecret: "${TELEGRAM_WEBHOOK_SECRET}", // required for inbound webhooks
+  //   // webhookSecret: "${TELEGRAM_WEBHOOK_SECRET}", // optional; enables inbound webhook mode
+  //   // if webhookSecret is unset, inbound uses getUpdates long-polling fallback
   //   // baseUrl: "https://api.telegram.org",     // override API base URL
   //   // enabled: false,                          // set to false to disable without removing config
   // },

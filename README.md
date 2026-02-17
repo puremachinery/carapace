@@ -75,7 +75,6 @@ Known working:
 Known gaps:
 
 - Control UI frontend (backend wired, no frontend built/bundled yet)
-- Telegram is webhook-only (no long-polling; requires a tunnel or public endpoint for inbound)
 - Signal, Slack channels (not yet smoke-tested in real environments)
 - Public internet deployments (TLS/mTLS, reverse proxy, auth hardening)
 
