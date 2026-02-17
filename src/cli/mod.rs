@@ -1752,26 +1752,29 @@ fn prompt_port(default_port: u16) -> Result<u16, Box<dyn std::error::Error>> {
 }
 
 fn generate_hex_secret(byte_len: usize) -> Result<String, Box<dyn std::error::Error>> {
-    let mut bytes = vec![0u8; byte_len];
-    fill(&mut bytes)?;
-    Ok(hex::encode(bytes))
+    Ok(crate::crypto::generate_hex_secret(byte_len)?)
 }
 
 fn prompt_custom_secret(kind: &str) -> Result<String, Box<dyn std::error::Error>> {
+    const MIN_SECRET_LENGTH: usize = 10;
+
     loop {
         let entered = prompt_line(&format!("Enter {} (input is visible): ", kind))?;
-        if !entered.is_empty() {
-            return Ok(entered);
+        if entered.is_empty() {
+            eprintln!("{} cannot be empty.", kind);
+            continue;
         }
-        eprintln!("{} cannot be empty.", kind);
-    }
-}
 
-fn truncate_for_display(input: &str, max_chars: usize) -> String {
-    if input.chars().count() <= max_chars {
-        return input.to_string();
+        if entered.chars().count() < MIN_SECRET_LENGTH {
+            eprintln!(
+                "{} must be at least {} characters long.",
+                kind, MIN_SECRET_LENGTH
+            );
+            continue;
+        }
+
+        return Ok(entered);
     }
-    format!("{}...", input.chars().take(max_chars).collect::<String>())
 }
 
 async fn validate_provider_credentials(provider: &str, api_key: &str) -> Result<(), String> {
@@ -1802,16 +1805,14 @@ async fn validate_provider_credentials(provider: &str, api_key: &str) -> Result<
     }
 
     let status = response.status();
-    let body = response.text().await.unwrap_or_default();
-    let details = truncate_for_display(body.trim(), 240);
-    Err(format!(
-        "{provider} credential check failed (HTTP {status}): {}",
-        if details.is_empty() {
-            "no response body".to_string()
-        } else {
-            details
-        }
-    ))
+    let has_body = !response.text().await.unwrap_or_default().trim().is_empty();
+    let mut message = format!("{provider} credential check failed (HTTP {status}).");
+    if has_body {
+        message.push_str(
+            " The provider returned an error message that is hidden because it may contain sensitive information.",
+        );
+    }
+    Err(message)
 }
 
 fn validate_provider_credentials_interactive(
@@ -1849,7 +1850,7 @@ async fn run_setup_post_checks(
     run_status: bool,
     launch_chat: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut setup_server_handle = if run_status {
+    let mut setup_server_handle = if run_status || launch_chat {
         chat::ensure_local_gateway_running(port).await?
     } else {
         None
@@ -1866,7 +1867,7 @@ async fn run_setup_post_checks(
     }
 
     let chat_result = if launch_chat {
-        chat::handle_chat(false, Some(port)).await
+        chat::run_chat_session(false, port).await
     } else {
         Ok(())
     };

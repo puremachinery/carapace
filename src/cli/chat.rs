@@ -464,7 +464,10 @@ async fn stream_chat_response(
     Ok(())
 }
 
-async fn run_chat_session(new_session: bool, port: u16) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) async fn run_chat_session(
+    new_session: bool,
+    port: u16,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (mut ws_write, mut ws_read) = connect_and_handshake(port).await?;
 
     // REPL

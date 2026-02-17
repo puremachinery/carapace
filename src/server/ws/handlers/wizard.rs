@@ -16,7 +16,6 @@ use super::super::*;
 use super::config::{map_validation_issues, read_config_snapshot, write_config_file};
 use crate::config;
 use crate::server::bind::DEFAULT_PORT;
-use getrandom::fill;
 
 /// Available wizard types
 pub const WIZARD_TYPES: [&str; 6] = [
@@ -580,15 +579,23 @@ fn parse_wizard_port(
 }
 
 fn generate_wizard_secret_hex(byte_len: usize) -> Result<String, ErrorShape> {
-    let mut bytes = vec![0u8; byte_len];
-    fill(&mut bytes).map_err(|_| {
+    crate::crypto::generate_hex_secret(byte_len).map_err(|_| {
         error_shape(
             ERROR_INVALID_REQUEST,
             "failed to generate authentication secret",
             None,
         )
-    })?;
-    Ok(hex::encode(bytes))
+    })
+}
+
+fn resolve_wizard_auth_secret(
+    auth_secret: Option<&String>,
+    generated_byte_len: usize,
+) -> Result<String, ErrorShape> {
+    match auth_secret {
+        Some(secret) => Ok(secret.clone()),
+        None => generate_wizard_secret_hex(generated_byte_len),
+    }
 }
 
 fn apply_agent_wizard(config_value: &mut Value, name: Option<&str>, description: Option<&str>) {
@@ -712,7 +719,7 @@ fn apply_wizard_config(
 
             match auth_mode.as_str() {
                 "token" => {
-                    let token = auth_secret.unwrap_or(generate_wizard_secret_hex(32)?);
+                    let token = resolve_wizard_auth_secret(auth_secret.as_ref(), 32)?;
                     set_value_at_path(
                         config_value,
                         "gateway.auth",
@@ -723,7 +730,7 @@ fn apply_wizard_config(
                     );
                 }
                 "password" => {
-                    let password = auth_secret.unwrap_or(generate_wizard_secret_hex(24)?);
+                    let password = resolve_wizard_auth_secret(auth_secret.as_ref(), 24)?;
                     set_value_at_path(
                         config_value,
                         "gateway.auth",
@@ -1232,6 +1239,10 @@ mod tests {
             Value::String("token".to_string())
         );
         assert_eq!(
+            config_value["agents"]["defaults"]["model"],
+            Value::String("claude-sonnet-4-20250514".to_string())
+        );
+        assert_eq!(
             config_value["gateway"]["bind"],
             Value::String("loopback".to_string())
         );
@@ -1265,6 +1276,10 @@ mod tests {
         assert_eq!(
             config_value["gateway"]["auth"]["mode"],
             Value::String("password".to_string())
+        );
+        assert_eq!(
+            config_value["agents"]["defaults"]["model"],
+            Value::String("gpt-4o".to_string())
         );
         assert_eq!(
             config_value["gateway"]["auth"]["password"],
