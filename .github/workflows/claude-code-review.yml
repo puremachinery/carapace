@@ -77,10 +77,19 @@ jobs:
             6) Blocking policy:
                - Only in-scope high/medium findings are blocking for this PR.
                - Out-of-scope findings are advisory only.
+            7) Consistency requirement:
+               - If you report any in-scope high/medium finding, do NOT say "LGTM for blocking issues."
+               - If you say "LGTM for blocking issues.", there must be zero in-scope high/medium findings in the entire review comment.
+               - Never place high/medium findings inside "Optional follow-ups (non-blocking)".
 
             Output requirements:
             - Post at most one top-level PR comment via gh pr comment.
-            - If no high/medium findings: start with "LGTM for blocking issues."
+            - Start with exactly one of:
+              - "LGTM for blocking issues." (only when there are zero in-scope high/medium findings)
+              - "Blocking findings present." (required when any in-scope high/medium finding exists)
+            - If "Blocking findings present.": include a "### Blocking findings (required before merge)" section with each in-scope high/medium finding.
+            - Keep advisory out-of-scope high/medium findings in a separate "### Advisory findings (out-of-scope)" section.
+            - Keep "### Optional follow-ups (non-blocking)" limited to low findings only.
             - Keep comments concise and avoid repetitive wording.
             - Only post GitHub comments; do not leave final feedback only in tool output.
           claude_args: |
