@@ -22,8 +22,30 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: Detect workflow self-change
+        id: workflow-change
+        uses: actions/github-script@e1b2bb3637f7fbae56f17f71d2f90f05091255a6 # v8.0.0
+        with:
+          script: |
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.payload.pull_request.number,
+              per_page: 100,
+            });
+            const changed = files.some(
+              (file) => file.filename === ".github/workflows/claude-code-review.yml",
+            );
+            core.setOutput("changed", changed ? "true" : "false");
+
+      - name: Skip Claude review when workflow changed in PR
+        if: steps.workflow-change.outputs.changed == 'true'
+        run: |
+          echo "Skipping Claude code review because this PR modifies .github/workflows/claude-code-review.yml."
+
       - name: Run Claude Code Review
         id: claude-review
+        if: steps.workflow-change.outputs.changed != 'true'
         uses: anthropics/claude-code-action@2f8ba26a219c06cfb0f468eef8d97055fa814f97 # v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
