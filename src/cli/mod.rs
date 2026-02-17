@@ -277,8 +277,8 @@ pub enum ConfigCommand {
 // Subcommand handlers
 // ---------------------------------------------------------------------------
 
-use crate::channels::discord::DiscordChannel;
-use crate::channels::telegram::TelegramChannel;
+use crate::channels::discord::{DiscordChannel, DISCORD_DEFAULT_API_BASE_URL};
+use crate::channels::telegram::{TelegramChannel, TELEGRAM_DEFAULT_API_BASE_URL};
 use crate::config;
 use crate::credentials;
 use crate::logging::buffer::LogLevel;
@@ -1720,9 +1720,6 @@ pub fn handle_reset(
 // Setup / Pair / Update handlers
 // ---------------------------------------------------------------------------
 
-const DISCORD_API_BASE_URL: &str = "https://discord.com/api/v10";
-const TELEGRAM_API_BASE_URL: &str = "https://api.telegram.org";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SetupOutcome {
     LocalChat,
@@ -2011,7 +2008,7 @@ async fn validate_channel_credentials(channel: &str, token: &str) -> Result<(), 
         "discord" => {
             let token = token.to_string();
             tokio::task::spawn_blocking(move || {
-                DiscordChannel::new(DISCORD_API_BASE_URL.to_string(), token)
+                DiscordChannel::new(DISCORD_DEFAULT_API_BASE_URL.to_string(), token)
                     .validate()
                     .map_err(|err| map_channel_validation_error("Discord", err))
             })
@@ -2021,7 +2018,7 @@ async fn validate_channel_credentials(channel: &str, token: &str) -> Result<(), 
         "telegram" => {
             let token = token.to_string();
             tokio::task::spawn_blocking(move || {
-                TelegramChannel::new(TELEGRAM_API_BASE_URL.to_string(), token)
+                TelegramChannel::new(TELEGRAM_DEFAULT_API_BASE_URL.to_string(), token)
                     .validate()
                     .map_err(|err| map_channel_validation_error("Telegram", err))
             })
@@ -2098,16 +2095,23 @@ fn validate_channel_credentials_interactive(
 #[derive(Debug)]
 struct VerifyCheckResult {
     name: String,
-    passed: bool,
+    status: VerifyCheckStatus,
     detail: String,
     next_step: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerifyCheckStatus {
+    Pass,
+    Fail,
+    Skip,
 }
 
 impl VerifyCheckResult {
     fn pass(name: impl Into<String>, detail: impl Into<String>) -> Self {
         Self {
             name: name.into(),
-            passed: true,
+            status: VerifyCheckStatus::Pass,
             detail: detail.into(),
             next_step: None,
         }
@@ -2120,12 +2124,31 @@ impl VerifyCheckResult {
     ) -> Self {
         Self {
             name: name.into(),
-            passed: false,
+            status: VerifyCheckStatus::Fail,
+            detail: detail.into(),
+            next_step: Some(next_step.into()),
+        }
+    }
+
+    fn skip(
+        name: impl Into<String>,
+        detail: impl Into<String>,
+        next_step: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            status: VerifyCheckStatus::Skip,
             detail: detail.into(),
             next_step: Some(next_step.into()),
         }
     }
 }
+
+const VERIFY_ALLOWED_ENV_PLACEHOLDER_KEYS: &[&str] = &[
+    "DISCORD_BOT_TOKEN",
+    "TELEGRAM_BOT_TOKEN",
+    "CARAPACE_HOOKS_TOKEN",
+];
 
 fn normalize_optional_input(input: Option<String>) -> Option<String> {
     input
@@ -2143,6 +2166,9 @@ fn resolve_env_placeholder(value: &str) -> Option<String> {
     };
     let key = key.trim();
     if key.is_empty() {
+        return None;
+    }
+    if !VERIFY_ALLOWED_ENV_PLACEHOLDER_KEYS.contains(&key) {
         return None;
     }
     std::env::var(key)
@@ -2211,7 +2237,11 @@ fn print_verify_summary(outcome: SetupOutcome, port: u16, checks: &[VerifyCheckR
     println!("Gateway port: {}", port);
     println!();
     for check in checks {
-        let status = if check.passed { "PASS" } else { "FAIL" };
+        let status = match check.status {
+            VerifyCheckStatus::Pass => "PASS",
+            VerifyCheckStatus::Fail => "FAIL",
+            VerifyCheckStatus::Skip => "SKIP",
+        };
         println!("[{}] {}: {}", status, check.name, check.detail);
         if let Some(next_step) = check.next_step.as_deref() {
             println!("      next step: {}", next_step);
@@ -2242,11 +2272,13 @@ async fn verify_channel_send_path(
 
         let delivery = match channel {
             SetupOutcome::Discord => {
-                let channel_impl = DiscordChannel::new(DISCORD_API_BASE_URL.to_string(), token);
+                let channel_impl =
+                    DiscordChannel::new(DISCORD_DEFAULT_API_BASE_URL.to_string(), token);
                 channel_impl.send_text(outbound)
             }
             SetupOutcome::Telegram => {
-                let channel_impl = TelegramChannel::new(TELEGRAM_API_BASE_URL.to_string(), token);
+                let channel_impl =
+                    TelegramChannel::new(TELEGRAM_DEFAULT_API_BASE_URL.to_string(), token);
                 channel_impl.send_text(outbound)
             }
             _ => return Err("unsupported channel send-path verification target".to_string()),
@@ -2265,6 +2297,263 @@ async fn verify_channel_send_path(
     .map_err(|e| format!("send-path verification task failed: {e}"))?
 }
 
+fn summarize_http_failure_body(status: reqwest::StatusCode, body: &str) -> String {
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return "(body hidden for auth failures)".to_string();
+    }
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return "<empty response body>".to_string();
+    }
+    if trimmed.chars().count() > 500 {
+        let excerpt: String = trimmed.chars().take(500).collect();
+        return format!("{excerpt}... (truncated)");
+    }
+    trimmed.to_string()
+}
+
+async fn verify_local_chat_outcome(
+    port: u16,
+    checks: &mut Vec<VerifyCheckResult>,
+) -> Result<(), String> {
+    let mut setup_server_handle = match chat::ensure_local_gateway_running(port).await {
+        Ok(handle) => {
+            checks.push(VerifyCheckResult::pass(
+                "Gateway reachability",
+                format!("service is reachable at 127.0.0.1:{port}"),
+            ));
+            handle
+        }
+        Err(err) => {
+            checks.push(VerifyCheckResult::fail(
+                "Gateway reachability",
+                err.to_string(),
+                format!(
+                    "start the service (`cara start --port {port}`) and retry `cara verify --outcome local-chat --port {port}`"
+                ),
+            ));
+            return Err("outcome verification failed".to_string());
+        }
+    };
+
+    let roundtrip_result = chat::verify_chat_roundtrip(
+        port,
+        "Reply with exactly: verification-ok",
+        Duration::from_secs(45),
+    )
+    .await;
+    if let Some(handle) = setup_server_handle.take() {
+        handle.shutdown().await;
+    }
+
+    match roundtrip_result {
+        Ok(()) => checks.push(VerifyCheckResult::pass(
+            "Local chat roundtrip",
+            "non-interactive chat send reached final state",
+        )),
+        Err(err) => checks.push(VerifyCheckResult::fail(
+            "Local chat roundtrip",
+            err,
+            "check provider API key/model and retry `cara verify --outcome local-chat`",
+        )),
+    }
+    Ok(())
+}
+
+async fn verify_hooks_outcome(
+    port: u16,
+    cfg: &Value,
+    checks: &mut Vec<VerifyCheckResult>,
+) -> Result<(), String> {
+    let mut setup_server_handle = match chat::ensure_local_gateway_running(port).await {
+        Ok(handle) => {
+            checks.push(VerifyCheckResult::pass(
+                "Gateway reachability",
+                format!("service is reachable at 127.0.0.1:{port}"),
+            ));
+            handle
+        }
+        Err(err) => {
+            checks.push(VerifyCheckResult::fail(
+                "Gateway reachability",
+                err.to_string(),
+                format!(
+                    "start the service (`cara start --port {port}`) and retry `cara verify --outcome hooks --port {port}`"
+                ),
+            ));
+            return Err("outcome verification failed".to_string());
+        }
+    };
+
+    let hooks_enabled = cfg
+        .get("gateway")
+        .and_then(|v| v.get("hooks"))
+        .and_then(|v| v.get("enabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !hooks_enabled {
+        checks.push(VerifyCheckResult::fail(
+            "Hooks enabled",
+            "gateway.hooks.enabled is false",
+            "enable `gateway.hooks.enabled` and configure `gateway.hooks.token`, then retry",
+        ));
+    } else {
+        checks.push(VerifyCheckResult::pass(
+            "Hooks enabled",
+            "gateway.hooks.enabled is true",
+        ));
+    }
+
+    let hooks_token = resolve_hooks_token(cfg);
+    let hooks_token = if let Some(token) = hooks_token {
+        checks.push(VerifyCheckResult::pass(
+            "Hooks token",
+            "hooks token resolved from config/environment",
+        ));
+        token
+    } else {
+        checks.push(VerifyCheckResult::fail(
+            "Hooks token",
+            "no hooks token configured",
+            "set `gateway.hooks.token` (or CARAPACE_HOOKS_TOKEN) and retry",
+        ));
+        if let Some(handle) = setup_server_handle.take() {
+            handle.shutdown().await;
+        }
+        return Err("outcome verification failed".to_string());
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("failed to create hooks verification client: {e}"))?;
+    let wake_url = format!("http://127.0.0.1:{port}/hooks/wake");
+    let wake_result = client
+        .post(&wake_url)
+        .header("authorization", format!("Bearer {hooks_token}"))
+        .json(&serde_json::json!({ "text": "verify-hook" }))
+        .send()
+        .await;
+    if let Some(handle) = setup_server_handle.take() {
+        handle.shutdown().await;
+    }
+
+    match wake_result {
+        Ok(resp) if resp.status().is_success() => checks.push(VerifyCheckResult::pass(
+            "Signed /hooks/wake",
+            "received success response from /hooks/wake",
+        )),
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            let safe_body = summarize_http_failure_body(status, &body);
+            checks.push(VerifyCheckResult::fail(
+                "Signed /hooks/wake",
+                format!("request failed with HTTP {status}: {safe_body}"),
+                format!(
+                    "verify hooks auth token and retry `cara verify --outcome hooks --port {port}`"
+                ),
+            ));
+        }
+        Err(err) => checks.push(VerifyCheckResult::fail(
+            "Signed /hooks/wake",
+            format!("request failed: {err}"),
+            format!("confirm gateway is reachable on port {port} and retry"),
+        )),
+    }
+
+    Ok(())
+}
+
+async fn verify_channel_outcome(
+    outcome: SetupOutcome,
+    cfg: &Value,
+    discord_to: Option<String>,
+    telegram_to: Option<String>,
+    checks: &mut Vec<VerifyCheckResult>,
+) -> Result<(), String> {
+    let (channel_label, channel_key, env_var, destination, destination_flag) =
+        if outcome == SetupOutcome::Discord {
+            (
+                "Discord",
+                "discord",
+                "DISCORD_BOT_TOKEN",
+                discord_to,
+                "--discord-to <channel_id>",
+            )
+        } else {
+            (
+                "Telegram",
+                "telegram",
+                "TELEGRAM_BOT_TOKEN",
+                telegram_to,
+                "--telegram-to <chat_id>",
+            )
+        };
+
+    let token = resolve_channel_bot_token(cfg, channel_key, env_var);
+    let token = if let Some(token) = token {
+        checks.push(VerifyCheckResult::pass(
+            format!("{channel_label} credentials"),
+            format!("{channel_label} token is configured"),
+        ));
+        token
+    } else {
+        checks.push(VerifyCheckResult::fail(
+            format!("{channel_label} credentials"),
+            format!("{channel_label} token is not configured"),
+            format!("set `{channel_key}.botToken` or `{env_var}`, then retry `cara verify --outcome {channel_key}`"),
+        ));
+        return Err("outcome verification failed".to_string());
+    };
+
+    match validate_channel_credentials(channel_key, &token).await {
+        Ok(()) => {
+            checks.push(VerifyCheckResult::pass(
+                format!("{channel_label} token check"),
+                "credential validation succeeded",
+            ));
+
+            if let Some(destination) = destination {
+                match verify_channel_send_path(outcome, token, destination).await {
+                    Ok(()) => checks.push(VerifyCheckResult::pass(
+                        format!("{channel_label} send path"),
+                        "test message delivery succeeded",
+                    )),
+                    Err(err) => checks.push(VerifyCheckResult::fail(
+                        format!("{channel_label} send path"),
+                        err,
+                        format!(
+                            "confirm destination and bot permissions, then retry with `{destination_flag}`"
+                        ),
+                    )),
+                }
+            } else {
+                checks.push(VerifyCheckResult::skip(
+                    format!("{channel_label} send path"),
+                    "destination id not provided; send-path test skipped",
+                    format!("rerun with `{destination_flag}` to verify end-to-end delivery"),
+                ));
+            }
+        }
+        Err(err) => {
+            checks.push(VerifyCheckResult::fail(
+                format!("{channel_label} token check"),
+                err,
+                format!("update `{channel_key}.botToken` and retry `cara verify --outcome {channel_key}`"),
+            ));
+            checks.push(VerifyCheckResult::skip(
+                format!("{channel_label} send path"),
+                "not attempted because credential validation failed",
+                format!(
+                    "fix `{channel_key}` credentials first, then rerun with `{destination_flag}`"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 async fn run_outcome_verifier(
     selection: VerifyOutcomeSelection,
     port: u16,
@@ -2279,226 +2568,32 @@ async fn run_outcome_verifier(
 
     match outcome {
         SetupOutcome::LocalChat => {
-            let mut setup_server_handle = match chat::ensure_local_gateway_running(port).await {
-                Ok(handle) => {
-                    checks.push(VerifyCheckResult::pass(
-                        "Gateway reachability",
-                        format!("service is reachable at 127.0.0.1:{port}"),
-                    ));
-                    handle
-                }
-                Err(err) => {
-                    checks.push(VerifyCheckResult::fail(
-                        "Gateway reachability",
-                        err.to_string(),
-                        format!("start the service (`cara start --port {port}`) and retry `cara verify --outcome local-chat --port {port}`"),
-                    ));
-                    print_verify_summary(outcome, port, &checks);
-                    return Err("outcome verification failed".to_string());
-                }
-            };
-
-            let roundtrip_result = chat::verify_chat_roundtrip(
-                port,
-                "Reply with exactly: verification-ok",
-                Duration::from_secs(45),
-            )
-            .await;
-            if let Some(handle) = setup_server_handle.take() {
-                handle.shutdown().await;
-            }
-
-            match roundtrip_result {
-                Ok(()) => checks.push(VerifyCheckResult::pass(
-                    "Local chat roundtrip",
-                    "non-interactive chat send reached final state",
-                )),
-                Err(err) => checks.push(VerifyCheckResult::fail(
-                    "Local chat roundtrip",
-                    err,
-                    "check provider API key/model and retry `cara verify --outcome local-chat`",
-                )),
+            if let Err(err) = verify_local_chat_outcome(port, &mut checks).await {
+                print_verify_summary(outcome, port, &checks);
+                return Err(err);
             }
         }
         SetupOutcome::Hooks => {
-            let mut setup_server_handle = match chat::ensure_local_gateway_running(port).await {
-                Ok(handle) => {
-                    checks.push(VerifyCheckResult::pass(
-                        "Gateway reachability",
-                        format!("service is reachable at 127.0.0.1:{port}"),
-                    ));
-                    handle
-                }
-                Err(err) => {
-                    checks.push(VerifyCheckResult::fail(
-                        "Gateway reachability",
-                        err.to_string(),
-                        format!("start the service (`cara start --port {port}`) and retry `cara verify --outcome hooks --port {port}`"),
-                    ));
-                    print_verify_summary(outcome, port, &checks);
-                    return Err("outcome verification failed".to_string());
-                }
-            };
-
-            let hooks_enabled = cfg
-                .get("gateway")
-                .and_then(|v| v.get("hooks"))
-                .and_then(|v| v.get("enabled"))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            if !hooks_enabled {
-                checks.push(VerifyCheckResult::fail(
-                    "Hooks enabled",
-                    "gateway.hooks.enabled is false",
-                    "enable `gateway.hooks.enabled` and configure `gateway.hooks.token`, then retry",
-                ));
-            } else {
-                checks.push(VerifyCheckResult::pass(
-                    "Hooks enabled",
-                    "gateway.hooks.enabled is true",
-                ));
-            }
-
-            let hooks_token = resolve_hooks_token(cfg);
-            let hooks_token = if let Some(token) = hooks_token {
-                checks.push(VerifyCheckResult::pass(
-                    "Hooks token",
-                    "hooks token resolved from config/environment",
-                ));
-                token
-            } else {
-                checks.push(VerifyCheckResult::fail(
-                    "Hooks token",
-                    "no hooks token configured",
-                    "set `gateway.hooks.token` (or CARAPACE_HOOKS_TOKEN) and retry",
-                ));
-                if let Some(handle) = setup_server_handle.take() {
-                    handle.shutdown().await;
-                }
+            if let Err(err) = verify_hooks_outcome(port, cfg, &mut checks).await {
                 print_verify_summary(outcome, port, &checks);
-                return Err("outcome verification failed".to_string());
-            };
-
-            let client = reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()
-                .map_err(|e| format!("failed to create hooks verification client: {e}"))?;
-            let wake_url = format!("http://127.0.0.1:{port}/hooks/wake");
-            let wake_result = client
-                .post(&wake_url)
-                .header("authorization", format!("Bearer {hooks_token}"))
-                .json(&serde_json::json!({ "text": "verify-hook" }))
-                .send()
-                .await;
-            if let Some(handle) = setup_server_handle.take() {
-                handle.shutdown().await;
-            }
-
-            match wake_result {
-                Ok(resp) if resp.status().is_success() => checks.push(VerifyCheckResult::pass(
-                    "Signed /hooks/wake",
-                    "received success response from /hooks/wake",
-                )),
-                Ok(resp) => {
-                    let status = resp.status();
-                    let body = resp.text().await.unwrap_or_default();
-                    checks.push(VerifyCheckResult::fail(
-                        "Signed /hooks/wake",
-                        format!("request failed with HTTP {status}: {body}"),
-                        format!("verify hooks auth token and retry `cara verify --outcome hooks --port {port}`"),
-                    ));
-                }
-                Err(err) => checks.push(VerifyCheckResult::fail(
-                    "Signed /hooks/wake",
-                    format!("request failed: {err}"),
-                    format!("confirm gateway is reachable on port {port} and retry"),
-                )),
+                return Err(err);
             }
         }
         SetupOutcome::Discord | SetupOutcome::Telegram => {
-            let (channel_label, channel_key, env_var, destination, destination_flag) =
-                if outcome == SetupOutcome::Discord {
-                    (
-                        "Discord",
-                        "discord",
-                        "DISCORD_BOT_TOKEN",
-                        discord_to,
-                        "--discord-to <channel_id>",
-                    )
-                } else {
-                    (
-                        "Telegram",
-                        "telegram",
-                        "TELEGRAM_BOT_TOKEN",
-                        telegram_to,
-                        "--telegram-to <chat_id>",
-                    )
-                };
-
-            let token = resolve_channel_bot_token(cfg, channel_key, env_var);
-            let token = if let Some(token) = token {
-                checks.push(VerifyCheckResult::pass(
-                    format!("{channel_label} credentials"),
-                    format!("{channel_label} token is configured"),
-                ));
-                token
-            } else {
-                checks.push(VerifyCheckResult::fail(
-                    format!("{channel_label} credentials"),
-                    format!("{channel_label} token is not configured"),
-                    format!("set `{channel_key}.botToken` or `{env_var}`, then retry `cara verify --outcome {channel_key}`"),
-                ));
+            if let Err(err) =
+                verify_channel_outcome(outcome, cfg, discord_to, telegram_to, &mut checks).await
+            {
                 print_verify_summary(outcome, port, &checks);
-                return Err("outcome verification failed".to_string());
-            };
-
-            match validate_channel_credentials(channel_key, &token).await {
-                Ok(()) => {
-                    checks.push(VerifyCheckResult::pass(
-                        format!("{channel_label} token check"),
-                        "credential validation succeeded",
-                    ));
-
-                    if let Some(destination) = destination {
-                        match verify_channel_send_path(outcome, token, destination).await {
-                            Ok(()) => checks.push(VerifyCheckResult::pass(
-                                format!("{channel_label} send path"),
-                                "test message delivery succeeded",
-                            )),
-                            Err(err) => checks.push(VerifyCheckResult::fail(
-                                format!("{channel_label} send path"),
-                                err,
-                                format!("confirm destination and bot permissions, then retry with `{destination_flag}`"),
-                            )),
-                        }
-                    } else {
-                        checks.push(VerifyCheckResult::fail(
-                            format!("{channel_label} send path"),
-                            "no destination id provided for send-path test",
-                            format!(
-                                "rerun with `{destination_flag}` to verify end-to-end delivery"
-                            ),
-                        ));
-                    }
-                }
-                Err(err) => {
-                    checks.push(VerifyCheckResult::fail(
-                        format!("{channel_label} token check"),
-                        err,
-                        format!("update `{channel_key}.botToken` and retry `cara verify --outcome {channel_key}`"),
-                    ));
-                    checks.push(VerifyCheckResult::fail(
-                        format!("{channel_label} send path"),
-                        "not attempted because credential validation failed",
-                        format!("fix `{channel_key}` credentials first, then rerun with `{destination_flag}`"),
-                    ));
-                }
+                return Err(err);
             }
         }
     }
 
     print_verify_summary(outcome, port, &checks);
-    if checks.iter().all(|check| check.passed) {
+    if checks
+        .iter()
+        .all(|check| check.status != VerifyCheckStatus::Fail)
+    {
         println!();
         println!("Outcome verification passed.");
         Ok(())
@@ -2721,12 +2816,8 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
                     "DISCORD_BOT_TOKEN",
                     "Enter Discord bot token (leave blank to skip for now): ",
                 )?;
-                let discord_configured = config
-                    .get("discord")
-                    .and_then(|v| v.get("botToken"))
-                    .and_then(|v| v.as_str())
-                    .map(|token| !token.trim().is_empty())
-                    .unwrap_or(false);
+                let discord_configured =
+                    resolve_channel_bot_token_from_config(&config, "discord").is_some();
                 if discord_configured {
                     let destination = prompt_line(
                         "Optional: Discord channel ID for send-path verify (leave blank to skip): ",
@@ -2742,12 +2833,8 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
                     "TELEGRAM_BOT_TOKEN",
                     "Enter Telegram bot token (leave blank to skip for now): ",
                 )?;
-                let telegram_configured = config
-                    .get("telegram")
-                    .and_then(|v| v.get("botToken"))
-                    .and_then(|v| v.as_str())
-                    .map(|token| !token.trim().is_empty())
-                    .unwrap_or(false);
+                let telegram_configured =
+                    resolve_channel_bot_token_from_config(&config, "telegram").is_some();
                 if telegram_configured {
                     let destination = prompt_line(
                         "Optional: Telegram chat ID for send-path verify (leave blank to skip): ",
@@ -3497,6 +3584,42 @@ mod tests {
     use super::*;
     use clap::Parser;
     use ed25519_dalek::{Signature, VerifyingKey};
+    use std::ffi::OsString;
+    use std::sync::{LazyLock, Mutex};
+
+    static ENV_VAR_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    struct EnvVarGuard {
+        key: String,
+        previous: Option<OsString>,
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var(&self.key, value),
+                None => std::env::remove_var(&self.key),
+            }
+        }
+    }
+
+    fn set_env_var_scoped(key: &str, value: &str) -> EnvVarGuard {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        EnvVarGuard {
+            key: key.to_string(),
+            previous,
+        }
+    }
+
+    fn unset_env_var_scoped(key: &str) -> EnvVarGuard {
+        let previous = std::env::var_os(key);
+        std::env::remove_var(key);
+        EnvVarGuard {
+            key: key.to_string(),
+            previous,
+        }
+    }
 
     #[test]
     fn test_cli_no_args_defaults_to_none() {
@@ -4283,30 +4406,40 @@ mod tests {
 
     #[test]
     fn test_resolve_env_placeholder_handles_literal_and_placeholder_values() {
-        let key = "CARAPACE_TEST_RESOLVE_ENV_PLACEHOLDER_VALUE";
-        std::env::set_var(key, "  resolved-value  ");
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let key = "DISCORD_BOT_TOKEN";
+        let _env_guard = set_env_var_scoped(key, "  resolved-value  ");
 
         assert_eq!(
-            resolve_env_placeholder("${CARAPACE_TEST_RESOLVE_ENV_PLACEHOLDER_VALUE}"),
+            resolve_env_placeholder("${DISCORD_BOT_TOKEN}"),
             Some("resolved-value".to_string())
         );
         assert_eq!(
-            resolve_env_placeholder("{CARAPACE_TEST_RESOLVE_ENV_PLACEHOLDER_VALUE}"),
-            Some("{CARAPACE_TEST_RESOLVE_ENV_PLACEHOLDER_VALUE}".to_string())
+            resolve_env_placeholder("{DISCORD_BOT_TOKEN}"),
+            Some("{DISCORD_BOT_TOKEN}".to_string())
         );
         assert_eq!(
-            resolve_env_placeholder("$$${{CARAPACE_TEST_RESOLVE_ENV_PLACEHOLDER_VALUE}"),
-            Some("$$${{CARAPACE_TEST_RESOLVE_ENV_PLACEHOLDER_VALUE}".to_string())
+            resolve_env_placeholder("$$${{DISCORD_BOT_TOKEN}"),
+            Some("$$${{DISCORD_BOT_TOKEN}".to_string())
         );
-
-        std::env::remove_var(key);
     }
 
     #[test]
     fn test_resolve_env_placeholder_missing_var_returns_none() {
-        std::env::remove_var("CARAPACE_TEST_RESOLVE_ENV_PLACEHOLDER_MISSING");
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let _env_guard = unset_env_var_scoped("CARAPACE_TEST_RESOLVE_ENV_PLACEHOLDER_MISSING");
         assert_eq!(
             resolve_env_placeholder("${CARAPACE_TEST_RESOLVE_ENV_PLACEHOLDER_MISSING}"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_resolve_env_placeholder_rejects_non_allowlisted_keys() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let _env_guard = set_env_var_scoped("CARAPACE_TEST_NON_ALLOWLISTED_SECRET", "secret");
+        assert_eq!(
+            resolve_env_placeholder("${CARAPACE_TEST_NON_ALLOWLISTED_SECRET}"),
             None
         );
     }
@@ -4396,14 +4529,13 @@ mod tests {
 
     #[test]
     fn test_handle_setup_errors_when_config_exists_no_force() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
         let temp = tempfile::TempDir::new().unwrap();
         let config_path = temp.path().join("carapace.json");
         std::fs::write(&config_path, "{}").unwrap();
 
-        // Point config to our temp file.
-        std::env::set_var("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
+        let _env_guard = set_env_var_scoped("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
         let result = handle_setup(false);
-        std::env::remove_var("CARAPACE_CONFIG_PATH");
 
         assert!(
             result.is_err(),
@@ -4413,13 +4545,13 @@ mod tests {
 
     #[test]
     fn test_handle_setup_force_creates_config() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
         let temp = tempfile::TempDir::new().unwrap();
         let config_path = temp.path().join("carapace.json");
         std::fs::write(&config_path, "{}").unwrap();
 
-        std::env::set_var("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
+        let _env_guard = set_env_var_scoped("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
         let result = handle_setup(true);
-        std::env::remove_var("CARAPACE_CONFIG_PATH");
 
         assert!(
             result.is_ok(),
@@ -4430,12 +4562,12 @@ mod tests {
 
     #[test]
     fn test_handle_setup_creates_valid_json5_config() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
         let temp = tempfile::TempDir::new().unwrap();
         let config_path = temp.path().join("carapace.json");
 
-        std::env::set_var("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
+        let _env_guard = set_env_var_scoped("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
         let result = handle_setup(false);
-        std::env::remove_var("CARAPACE_CONFIG_PATH");
 
         assert!(result.is_ok(), "Setup should succeed");
 
@@ -4446,12 +4578,12 @@ mod tests {
 
     #[test]
     fn test_handle_setup_default_values() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
         let temp = tempfile::TempDir::new().unwrap();
         let config_path = temp.path().join("carapace.json");
 
-        std::env::set_var("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
+        let _env_guard = set_env_var_scoped("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
         let result = handle_setup(false);
-        std::env::remove_var("CARAPACE_CONFIG_PATH");
 
         assert!(result.is_ok());
 

@@ -464,6 +464,54 @@ async fn stream_chat_response(
     Ok(())
 }
 
+fn verify_frame_run_id(frame: &Value) -> Option<&str> {
+    frame
+        .get("payload")
+        .and_then(|p| p.get("runId"))
+        .and_then(|v| v.as_str())
+        .filter(|value| !value.is_empty())
+}
+
+fn evaluate_verify_event_frame(
+    frame: &Value,
+    active_run_id: Option<&str>,
+) -> Option<Result<(), String>> {
+    let payload = frame.get("payload").cloned().unwrap_or(Value::Null);
+
+    if let Some(expected_run_id) = active_run_id {
+        let run_id = payload.get("runId").and_then(|v| v.as_str()).unwrap_or("");
+        if run_id != expected_run_id {
+            return None;
+        }
+    }
+
+    match frame.get("event").and_then(|v| v.as_str()).unwrap_or("") {
+        "chat" => match payload.get("state").and_then(|v| v.as_str()).unwrap_or("") {
+            "final" => Some(Ok(())),
+            "error" => Some(Err(payload
+                .get("errorMessage")
+                .and_then(|v| v.as_str())
+                .unwrap_or("chat run failed")
+                .to_string())),
+            _ => None,
+        },
+        "agent" => {
+            let stream = payload.get("stream").and_then(|v| v.as_str()).unwrap_or("");
+            if stream == "error" {
+                Some(Err(payload
+                    .get("data")
+                    .and_then(|d| d.get("message"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("agent stream error")
+                    .to_string()))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Execute a non-interactive single chat roundtrip and confirm it reaches final state.
 pub(crate) async fn verify_chat_roundtrip(
     port: u16,
@@ -477,7 +525,9 @@ pub(crate) async fn verify_chat_roundtrip(
     let req_id = format!("verify-{}", Uuid::new_v4());
     let expected_run_id = Uuid::new_v4().to_string();
     let session_key = format!("cli-verify-{}", Uuid::new_v4());
-    let mut active_run_id = expected_run_id.clone();
+    let mut active_run_id: Option<String> = None;
+    let mut seen_response = false;
+    let mut pending_events: Vec<Value> = Vec::new();
 
     let chat_frame = serde_json::json!({
         "type": "req",
@@ -502,76 +552,65 @@ pub(crate) async fn verify_chat_roundtrip(
             let frame = read_ws_json(&mut ws_read, &mut ws_write)
                 .await
                 .map_err(|e| format!("chat stream failed: {e}"))?;
-            let frame_type = frame.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            if frame_type == "res" {
-                let response_id = frame.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                if response_id != req_id {
+            match frame.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+                "res" => {
+                    let response_id = frame.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    if response_id != req_id {
+                        continue;
+                    }
+
+                    let ok = frame.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+                    if !ok {
+                        let msg = frame
+                            .get("error")
+                            .and_then(|e| e.get("message"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("chat.send failed");
+                        return Err(msg.to_string());
+                    }
+
+                    let status = frame
+                        .get("payload")
+                        .and_then(|p| p.get("status"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if status == "queued" {
+                        return Err(
+                            "agent run is queued; no provider currently available".to_string()
+                        );
+                    }
+
+                    active_run_id = verify_frame_run_id(&frame).map(str::to_string);
+                    seen_response = true;
+
+                    for pending in pending_events.drain(..) {
+                        if active_run_id.is_none() {
+                            active_run_id = verify_frame_run_id(&pending).map(str::to_string);
+                        }
+                        if let Some(result) =
+                            evaluate_verify_event_frame(&pending, active_run_id.as_deref())
+                        {
+                            return result;
+                        }
+                    }
+                }
+                "event" => {
+                    if !seen_response {
+                        pending_events.push(frame);
+                        continue;
+                    }
+                    if active_run_id.is_none() {
+                        active_run_id = verify_frame_run_id(&frame).map(str::to_string);
+                    }
+                    if let Some(result) =
+                        evaluate_verify_event_frame(&frame, active_run_id.as_deref())
+                    {
+                        return result;
+                    }
+                }
+                _ => {
                     continue;
                 }
-
-                let ok = frame.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
-                if !ok {
-                    let msg = frame
-                        .get("error")
-                        .and_then(|e| e.get("message"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("chat.send failed");
-                    return Err(msg.to_string());
-                }
-
-                let status = frame
-                    .get("payload")
-                    .and_then(|p| p.get("status"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                if status == "queued" {
-                    return Err("agent run is queued; no provider currently available".to_string());
-                }
-                if let Some(run_id) = frame
-                    .get("payload")
-                    .and_then(|p| p.get("runId"))
-                    .and_then(|v| v.as_str())
-                    .filter(|value| !value.is_empty())
-                {
-                    active_run_id = run_id.to_string();
-                }
-                continue;
-            }
-
-            if frame_type != "event" {
-                continue;
-            }
-
-            let payload = frame.get("payload").cloned().unwrap_or(Value::Null);
-            let run_id = payload.get("runId").and_then(|v| v.as_str()).unwrap_or("");
-            if run_id != active_run_id {
-                continue;
-            }
-
-            match frame.get("event").and_then(|v| v.as_str()).unwrap_or("") {
-                "chat" => match payload.get("state").and_then(|v| v.as_str()).unwrap_or("") {
-                    "final" => return Ok(()),
-                    "error" => {
-                        let msg = payload
-                            .get("errorMessage")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("chat run failed");
-                        return Err(msg.to_string());
-                    }
-                    _ => {}
-                },
-                "agent" => {
-                    let stream = payload.get("stream").and_then(|v| v.as_str()).unwrap_or("");
-                    if stream == "error" {
-                        let msg = payload
-                            .get("data")
-                            .and_then(|d| d.get("message"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("agent stream error");
-                        return Err(msg.to_string());
-                    }
-                }
-                _ => {}
             }
         }
     })
