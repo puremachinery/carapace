@@ -495,12 +495,8 @@ fn evaluate_verify_event_frame(
     let payload = frame.get("payload").cloned().unwrap_or(Value::Null);
     let run_id = payload.get("runId").and_then(|v| v.as_str()).unwrap_or("");
 
-    if let Some(expected_run_id) = active_run_id {
-        if run_id != expected_run_id {
-            return None;
-        }
-    } else if run_id.is_empty() {
-        // Until we can correlate by runId, ignore unscoped events.
+    let expected_run_id = active_run_id?;
+    if run_id != expected_run_id {
         return None;
     }
 
@@ -603,12 +599,15 @@ pub(crate) async fn verify_chat_roundtrip(
                     }
 
                     active_run_id = verify_frame_run_id(&frame).map(str::to_string);
+                    if active_run_id.is_none() {
+                        return Err(
+                            "chat.send response missing runId; cannot correlate verification events"
+                                .to_string(),
+                        );
+                    }
                     seen_response = true;
 
                     for pending in pending_events.drain(..) {
-                        if active_run_id.is_none() {
-                            active_run_id = verify_frame_run_id(&pending).map(str::to_string);
-                        }
                         if let Some(result) =
                             evaluate_verify_event_frame(&pending, active_run_id.as_deref())
                         {
@@ -627,9 +626,6 @@ pub(crate) async fn verify_chat_roundtrip(
                         pending_events.push(frame);
                         continue;
                     }
-                    if active_run_id.is_none() {
-                        active_run_id = verify_frame_run_id(&frame).map(str::to_string);
-                    }
                     if let Some(result) =
                         evaluate_verify_event_frame(&frame, active_run_id.as_deref())
                     {
@@ -644,6 +640,11 @@ pub(crate) async fn verify_chat_roundtrip(
     })
     .await;
 
+    if result.is_err() {
+        if let Some(run_id) = active_run_id.as_deref() {
+            send_abort_request(0, run_id, &mut ws_write).await;
+        }
+    }
     let _ = ws_write.send(Message::Close(None)).await;
 
     match result {

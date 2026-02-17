@@ -80,6 +80,7 @@ Options:
 Notes:
 - `cara verify` currently targets local loopback only (`127.0.0.1`).
 - Discord/Telegram send-path verification sends a real test message to the destination you provide.
+- Hooks verification sends a signed `POST /hooks/wake` and may trigger a real agent run.
 
 ### pair
 Pair this CLI with a Carapace service.

@@ -4564,6 +4564,7 @@ mod tests {
     #[test]
     fn test_infer_setup_outcome_ignores_empty_or_unresolved_channel_tokens() {
         let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let _env_guard = unset_env_var_scoped("CARAPACE_TEST_VERIFY_MISSING_TELEGRAM_TOKEN");
         let empty_discord_token_cfg = serde_json::json!({
             "discord": { "enabled": true, "botToken": "   " },
             "gateway": { "hooks": { "enabled": true } }
