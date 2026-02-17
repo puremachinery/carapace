@@ -1934,6 +1934,29 @@ fn map_channel_validation_error(
     }
 }
 
+fn prompt_and_configure_bot_channel(
+    config: &mut Value,
+    channel_key: &str,
+    channel_label: &str,
+    env_var: &str,
+    prompt: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let token_label = format!("{channel_label} bot token");
+    let channel_token = prompt_optional_value_from_env(env_var, &token_label, prompt)?;
+    if let Some(token) = channel_token {
+        validate_channel_credentials_interactive(channel_key, &token)?;
+        config[channel_key] = serde_json::json!({
+            "enabled": true,
+            "botToken": token
+        });
+    } else {
+        println!(
+            "Skipped {channel_label} token. You can configure it later in `{channel_key}.botToken`."
+        );
+    }
+    Ok(())
+}
+
 async fn validate_channel_credentials(channel: &str, token: &str) -> Result<(), String> {
     match channel {
         "discord" => {
@@ -2212,40 +2235,20 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
         setup_outcome = prompt_setup_outcome()?;
 
         match setup_outcome {
-            SetupOutcome::Discord => {
-                let discord_token = prompt_optional_value_from_env(
-                    "DISCORD_BOT_TOKEN",
-                    "Discord bot token",
-                    "Enter Discord bot token (leave blank to skip for now): ",
-                )?;
-                if let Some(token) = discord_token {
-                    validate_channel_credentials_interactive("discord", &token)?;
-                    config["discord"] = serde_json::json!({
-                        "enabled": true,
-                        "botToken": token
-                    });
-                } else {
-                    println!(
-                        "Skipped Discord token. You can configure it later in `discord.botToken`."
-                    );
-                }
-            }
-            SetupOutcome::Telegram => {
-                let telegram_token = prompt_optional_value_from_env(
-                    "TELEGRAM_BOT_TOKEN",
-                    "Telegram bot token",
-                    "Enter Telegram bot token (leave blank to skip for now): ",
-                )?;
-                if let Some(token) = telegram_token {
-                    validate_channel_credentials_interactive("telegram", &token)?;
-                    config["telegram"] = serde_json::json!({
-                        "enabled": true,
-                        "botToken": token
-                    });
-                } else {
-                    println!("Skipped Telegram token. You can configure it later in `telegram.botToken`.");
-                }
-            }
+            SetupOutcome::Discord => prompt_and_configure_bot_channel(
+                &mut config,
+                "discord",
+                "Discord",
+                "DISCORD_BOT_TOKEN",
+                "Enter Discord bot token (leave blank to skip for now): ",
+            )?,
+            SetupOutcome::Telegram => prompt_and_configure_bot_channel(
+                &mut config,
+                "telegram",
+                "Telegram",
+                "TELEGRAM_BOT_TOKEN",
+                "Enter Telegram bot token (leave blank to skip for now): ",
+            )?,
             SetupOutcome::LocalChat | SetupOutcome::Hooks => {}
         }
 

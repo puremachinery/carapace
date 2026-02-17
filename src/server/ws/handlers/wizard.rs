@@ -526,6 +526,19 @@ fn set_value_at_path(root: &mut Value, path: &str, value: Value) {
     }
 }
 
+fn apply_channel_token(config_value: &mut Value, channel_name: &str, token: &str) {
+    set_value_at_path(
+        config_value,
+        &format!("{channel_name}.botToken"),
+        json!(token),
+    );
+    set_value_at_path(
+        config_value,
+        &format!("{channel_name}.enabled"),
+        json!(true),
+    );
+}
+
 fn normalize_string(value: &Value) -> Option<String> {
     value
         .as_str()
@@ -868,15 +881,13 @@ fn apply_wizard_config(
             match first_outcome.as_str() {
                 "local-chat" => {}
                 "discord" => {
-                    if let Some(token) = channel_token {
-                        set_value_at_path(config_value, "discord.botToken", json!(token));
-                        set_value_at_path(config_value, "discord.enabled", json!(true));
+                    if let Some(token) = channel_token.as_deref() {
+                        apply_channel_token(config_value, "discord", token);
                     }
                 }
                 "telegram" => {
-                    if let Some(token) = channel_token {
-                        set_value_at_path(config_value, "telegram.botToken", json!(token));
-                        set_value_at_path(config_value, "telegram.enabled", json!(true));
+                    if let Some(token) = channel_token.as_deref() {
+                        apply_channel_token(config_value, "telegram", token);
                     }
                 }
                 "hooks" => {}
@@ -906,18 +917,9 @@ fn apply_wizard_config(
             let channel = require_wizard_string(data, "channel_type", "channel_type")?;
             let token = require_wizard_string(data, "channel_token", "channel_token")?;
             match channel.as_str() {
-                "telegram" => {
-                    set_value_at_path(config_value, "telegram.botToken", json!(token));
-                    set_value_at_path(config_value, "telegram.enabled", json!(true));
-                }
-                "discord" => {
-                    set_value_at_path(config_value, "discord.botToken", json!(token));
-                    set_value_at_path(config_value, "discord.enabled", json!(true));
-                }
-                "slack" => {
-                    set_value_at_path(config_value, "slack.botToken", json!(token));
-                    set_value_at_path(config_value, "slack.enabled", json!(true));
-                }
+                "telegram" => apply_channel_token(config_value, "telegram", &token),
+                "discord" => apply_channel_token(config_value, "discord", &token),
+                "slack" => apply_channel_token(config_value, "slack", &token),
                 _ => {
                     return Err(error_shape(
                         ERROR_INVALID_REQUEST,
