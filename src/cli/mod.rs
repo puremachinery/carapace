@@ -2317,8 +2317,21 @@ fn sanitize_channel_delivery_error(raw_error: String) -> String {
     if trimmed.is_empty() {
         return "send path rejected request".to_string();
     }
-    if trimmed.chars().count() > 200 {
-        let excerpt: String = trimmed.chars().take(200).collect();
+    let allowlisted_prefix = [
+        "HTTP ",
+        "Unauthorized",
+        "Forbidden",
+        "Not Found",
+        "Bad Request",
+        "Too Many Requests",
+    ]
+    .iter()
+    .any(|prefix| trimmed.starts_with(prefix));
+    if !allowlisted_prefix {
+        return "send path rejected request (provider details hidden for safety)".to_string();
+    }
+    if trimmed.chars().count() > 120 {
+        let excerpt: String = trimmed.chars().take(120).collect();
         return format!("{excerpt}... (truncated)");
     }
     trimmed.to_string()
@@ -4480,6 +4493,24 @@ mod tests {
         assert_eq!(
             resolve_env_placeholder("${MY_DISCORD_BOT_TOKEN}"),
             Some("custom-token".to_string())
+        );
+    }
+
+    #[test]
+    fn test_sanitize_channel_delivery_error_redacts_untrusted_body() {
+        assert_eq!(
+            sanitize_channel_delivery_error(
+                "<html>stacktrace and debug secrets</html>".to_string()
+            ),
+            "send path rejected request (provider details hidden for safety)"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_channel_delivery_error_allows_short_standard_message() {
+        assert_eq!(
+            sanitize_channel_delivery_error("Unauthorized".to_string()),
+            "Unauthorized"
         );
     }
 
