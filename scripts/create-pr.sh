@@ -45,8 +45,8 @@ if ! command -v gh >/dev/null 2>&1; then
     exit 1
 fi
 
+args=(--base "$base" --title "$title" --body-file "$body_file")
 if [ -n "$head" ]; then
-    gh pr create --base "$base" --head "$head" --title "$title" --body-file "$body_file"
-else
-    gh pr create --base "$base" --title "$title" --body-file "$body_file"
+    args+=(--head "$head")
 fi
+gh pr create "${args[@]}"
