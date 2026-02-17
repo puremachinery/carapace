@@ -14,11 +14,21 @@ Connect Carapace to Discord so inbound messages can trigger agent responses.
 
 ## 1) Create config
 
+Generate a gateway token:
+
+```bash
+export CARAPACE_GATEWAY_TOKEN="$(openssl rand -hex 32)"
+```
+
 ```json5
 {
   "gateway": {
     "bind": "loopback",
-    "port": 18789
+    "port": 18789,
+    "auth": {
+      "mode": "token",
+      "token": "${CARAPACE_GATEWAY_TOKEN}"
+    }
   },
   "anthropic": {
     "apiKey": "${ANTHROPIC_API_KEY}"
@@ -49,6 +59,7 @@ Optional status check:
 
 ```bash
 cara status --host 127.0.0.1 --port 18789
+curl -H "Authorization: Bearer ${CARAPACE_GATEWAY_TOKEN}" http://127.0.0.1:18789/health
 ```
 
 ## 3) Verify

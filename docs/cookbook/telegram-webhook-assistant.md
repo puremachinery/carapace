@@ -15,11 +15,21 @@ webhook endpoint.
 
 ## 1) Create config
 
+Generate a gateway token:
+
+```bash
+export CARAPACE_GATEWAY_TOKEN="$(openssl rand -hex 32)"
+```
+
 ```json5
 {
   "gateway": {
     "bind": "all",
-    "port": 18789
+    "port": 18789,
+    "auth": {
+      "mode": "token",
+      "token": "${CARAPACE_GATEWAY_TOKEN}"
+    }
   },
   "anthropic": {
     "apiKey": "${ANTHROPIC_API_KEY}"
@@ -37,6 +47,12 @@ Start Carapace:
 
 ```bash
 CARAPACE_CONFIG_PATH=./carapace.json5 cara
+```
+
+Optional local auth check:
+
+```bash
+curl -H "Authorization: Bearer ${CARAPACE_GATEWAY_TOKEN}" http://127.0.0.1:18789/health
 ```
 
 Register webhook with Telegram:
@@ -65,6 +81,8 @@ curl -sS "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getWebhookInfo"
   - Fix: Verify public HTTPS reachability to `/channels/telegram/webhook`.
 - Symptom: Inbound requests return unauthorized/ignored.
   - Fix: Ensure `webhookSecret` matches Telegram `secret_token`.
+- Symptom: Local status or health checks return `401 Unauthorized`.
+  - Fix: Use `Authorization: Bearer ${CARAPACE_GATEWAY_TOKEN}` and confirm it matches `gateway.auth.token`.
 - Symptom: Telegram shows webhook error status.
   - Fix: Check `getWebhookInfo` last error message and Carapace logs.
 
@@ -72,3 +90,4 @@ curl -sS "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getWebhookInfo"
 
 Current Telegram inbound support is webhook-based. Local-only inbound without a
 public webhook requires long-polling support, which is planned.
+When `gateway.bind` is `all`, keep `gateway.auth` enabled and use a strong token.
