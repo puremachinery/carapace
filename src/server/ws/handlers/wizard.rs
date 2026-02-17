@@ -15,6 +15,8 @@ use uuid::Uuid;
 use super::super::*;
 use super::config::{map_validation_issues, read_config_snapshot, write_config_file};
 use crate::config;
+use crate::server::bind::DEFAULT_PORT;
+use getrandom::fill;
 
 /// Available wizard types
 pub const WIZARD_TYPES: [&str; 6] = [
@@ -218,6 +220,83 @@ fn setup_wizard_steps() -> Vec<WizardStep> {
                 min_length: Some(10),
                 max_length: Some(256),
                 pattern: None,
+            }),
+        },
+        WizardStep {
+            id: "auth_mode".to_string(),
+            title: "Gateway Auth Mode".to_string(),
+            description: Some("Choose token or password authentication for gateway access."
+                .to_string()),
+            input_type: "select".to_string(),
+            options: Some(vec![
+                WizardOption {
+                    value: "token".to_string(),
+                    label: "Token (recommended)".to_string(),
+                    description: Some("Bearer token auth for CLI/API access.".to_string()),
+                },
+                WizardOption {
+                    value: "password".to_string(),
+                    label: "Password".to_string(),
+                    description: Some("Password auth for gateway access.".to_string()),
+                },
+            ]),
+            required: true,
+            default: Some(Value::String("token".to_string())),
+            validation: None,
+        },
+        WizardStep {
+            id: "auth_secret".to_string(),
+            title: "Gateway Secret".to_string(),
+            description: Some(
+                "Optional. Leave blank to auto-generate a strong secret for the selected auth mode."
+                    .to_string(),
+            ),
+            input_type: "password".to_string(),
+            options: None,
+            required: false,
+            default: None,
+            validation: Some(WizardValidation {
+                min_length: Some(10),
+                max_length: Some(256),
+                pattern: None,
+            }),
+        },
+        WizardStep {
+            id: "bind_mode".to_string(),
+            title: "Gateway Bind Mode".to_string(),
+            description: Some(
+                "Loopback keeps access local. LAN exposes the service on your local network."
+                    .to_string(),
+            ),
+            input_type: "select".to_string(),
+            options: Some(vec![
+                WizardOption {
+                    value: "loopback".to_string(),
+                    label: "Loopback (recommended)".to_string(),
+                    description: Some("Local access only.".to_string()),
+                },
+                WizardOption {
+                    value: "lan".to_string(),
+                    label: "LAN".to_string(),
+                    description: Some("Reachable from devices on your local network.".to_string()),
+                },
+            ]),
+            required: true,
+            default: Some(Value::String("loopback".to_string())),
+            validation: None,
+        },
+        WizardStep {
+            id: "port".to_string(),
+            title: "Gateway Port".to_string(),
+            description: Some("TCP port for the gateway service.".to_string()),
+            input_type: "text".to_string(),
+            options: None,
+            required: true,
+            default: Some(Value::String(DEFAULT_PORT.to_string())),
+            validation: Some(WizardValidation {
+                min_length: Some(1),
+                max_length: Some(5),
+                pattern: Some("^[0-9]{1,5}$".to_string()),
             }),
         },
         WizardStep {
@@ -474,6 +553,44 @@ fn require_wizard_string(
     })
 }
 
+fn parse_wizard_port(
+    data: &HashMap<String, Value>,
+    key: &str,
+    default_port: u16,
+) -> Result<u16, ErrorShape> {
+    let Some(raw) = data.get(key).and_then(normalize_string) else {
+        return Ok(default_port);
+    };
+
+    let port = raw.parse::<u16>().map_err(|_| {
+        error_shape(
+            ERROR_INVALID_REQUEST,
+            "port must be a valid integer between 1 and 65535",
+            None,
+        )
+    })?;
+    if port == 0 {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            "port must be between 1 and 65535",
+            None,
+        ));
+    }
+    Ok(port)
+}
+
+fn generate_wizard_secret_hex(byte_len: usize) -> Result<String, ErrorShape> {
+    let mut bytes = vec![0u8; byte_len];
+    fill(&mut bytes).map_err(|_| {
+        error_shape(
+            ERROR_INVALID_REQUEST,
+            "failed to generate authentication secret",
+            None,
+        )
+    })?;
+    Ok(hex::encode(bytes))
+}
+
 fn apply_agent_wizard(config_value: &mut Value, name: Option<&str>, description: Option<&str>) {
     let Value::Object(root) = config_value else {
         return;
@@ -564,11 +681,80 @@ fn apply_wizard_config(
         "setup" => {
             let provider = require_wizard_string(data, "provider", "provider")?;
             let api_key = require_wizard_string(data, "api_key", "api_key")?;
+            let auth_mode = data
+                .get("auth_mode")
+                .and_then(normalize_string)
+                .unwrap_or_else(|| "token".to_string())
+                .to_lowercase();
+            let auth_secret = data.get("auth_secret").and_then(normalize_string);
+            let bind_mode = data
+                .get("bind_mode")
+                .and_then(normalize_string)
+                .unwrap_or_else(|| "loopback".to_string())
+                .to_lowercase();
+            let port = parse_wizard_port(data, "port", DEFAULT_PORT)?;
+
             match provider.as_str() {
-                "anthropic" => set_value_at_path(config_value, "anthropic.apiKey", json!(api_key)),
-                "openai" => set_value_at_path(config_value, "openai.apiKey", json!(api_key)),
+                "anthropic" => {
+                    set_value_at_path(config_value, "anthropic.apiKey", json!(api_key));
+                    set_value_at_path(
+                        config_value,
+                        "agents.defaults.model",
+                        json!("claude-sonnet-4-20250514"),
+                    );
+                }
+                "openai" => {
+                    set_value_at_path(config_value, "openai.apiKey", json!(api_key));
+                    set_value_at_path(config_value, "agents.defaults.model", json!("gpt-4o"));
+                }
                 _ => return Err(error_shape(ERROR_INVALID_REQUEST, "unknown provider", None)),
             }
+
+            match auth_mode.as_str() {
+                "token" => {
+                    let token = auth_secret.unwrap_or(generate_wizard_secret_hex(32)?);
+                    set_value_at_path(
+                        config_value,
+                        "gateway.auth",
+                        json!({
+                            "mode": "token",
+                            "token": token
+                        }),
+                    );
+                }
+                "password" => {
+                    let password = auth_secret.unwrap_or(generate_wizard_secret_hex(24)?);
+                    set_value_at_path(
+                        config_value,
+                        "gateway.auth",
+                        json!({
+                            "mode": "password",
+                            "password": password
+                        }),
+                    );
+                }
+                _ => {
+                    return Err(error_shape(
+                        ERROR_INVALID_REQUEST,
+                        "auth_mode must be token or password",
+                        None,
+                    ));
+                }
+            }
+
+            match bind_mode.as_str() {
+                "loopback" | "lan" => {
+                    set_value_at_path(config_value, "gateway.bind", json!(bind_mode));
+                }
+                _ => {
+                    return Err(error_shape(
+                        ERROR_INVALID_REQUEST,
+                        "bind_mode must be loopback or lan",
+                        None,
+                    ));
+                }
+            }
+            set_value_at_path(config_value, "gateway.port", json!(port));
             Ok(true)
         }
         "channel" => {
@@ -1041,6 +1227,54 @@ mod tests {
             config_value["anthropic"]["apiKey"],
             Value::String("sk-test".to_string())
         );
+        assert_eq!(
+            config_value["gateway"]["auth"]["mode"],
+            Value::String("token".to_string())
+        );
+        assert_eq!(
+            config_value["gateway"]["bind"],
+            Value::String("loopback".to_string())
+        );
+        assert_eq!(
+            config_value["gateway"]["port"],
+            Value::Number(DEFAULT_PORT.into())
+        );
+        assert!(config_value["gateway"]["auth"]["token"]
+            .as_str()
+            .map(|v| !v.is_empty())
+            .unwrap_or(false));
+    }
+
+    #[test]
+    fn test_apply_setup_wizard_respects_auth_and_bind_overrides() {
+        let mut data = HashMap::new();
+        data.insert("provider".to_string(), json!("openai"));
+        data.insert("api_key".to_string(), json!("sk-openai"));
+        data.insert("auth_mode".to_string(), json!("password"));
+        data.insert("auth_secret".to_string(), json!("my-password"));
+        data.insert("bind_mode".to_string(), json!("lan"));
+        data.insert("port".to_string(), json!("19001"));
+        let mut config_value = json!({});
+
+        let applied = apply_wizard_config("setup", &data, &mut config_value).unwrap();
+        assert!(applied);
+        assert_eq!(
+            config_value["openai"]["apiKey"],
+            Value::String("sk-openai".to_string())
+        );
+        assert_eq!(
+            config_value["gateway"]["auth"]["mode"],
+            Value::String("password".to_string())
+        );
+        assert_eq!(
+            config_value["gateway"]["auth"]["password"],
+            Value::String("my-password".to_string())
+        );
+        assert_eq!(
+            config_value["gateway"]["bind"],
+            Value::String("lan".to_string())
+        );
+        assert_eq!(config_value["gateway"]["port"], Value::Number(19001.into()));
     }
 
     #[test]

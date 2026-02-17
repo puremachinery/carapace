@@ -125,6 +125,34 @@ async fn wait_for_health(
     false
 }
 
+/// Ensure a local gateway is running for CLI operations.
+///
+/// Returns `Some(ServerHandle)` when this call started an embedded gateway and
+/// the caller is responsible for shutting it down. Returns `None` when a
+/// gateway was already reachable.
+pub(crate) async fn ensure_local_gateway_running(
+    port: u16,
+) -> Result<Option<crate::server::startup::ServerHandle>, Box<dyn std::error::Error>> {
+    let health_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()?;
+
+    if health_check(&health_client, port).await {
+        return Ok(None);
+    }
+
+    eprintln!("Starting embedded gateway on port {}...", port);
+    let handle = start_embedded_gateway(port).await?;
+    let health_ready =
+        wait_for_health(&health_client, port, std::time::Duration::from_secs(10)).await;
+    if !health_ready {
+        handle.shutdown().await;
+        return Err("gateway startup timeout".into());
+    }
+
+    Ok(Some(handle))
+}
+
 /// Read a line from stdin in a blocking task.
 enum ReadLineResult {
     Line(String),
@@ -530,43 +558,7 @@ pub async fn handle_chat(
     port: Option<u16>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let port = resolve_port(port);
-    let health_client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(2))
-        .build()
-    {
-        Ok(client) => Some(client),
-        Err(e) => {
-            eprintln!(
-                "Warning: could not create http client for health checks: {}",
-                e
-            );
-            None
-        }
-    };
-
-    // Check if gateway is already running.
-    let mut embedded_server_handle = None;
-    let already_running = if let Some(client) = health_client.as_ref() {
-        health_check(client, port).await
-    } else {
-        false
-    };
-
-    if !already_running {
-        eprintln!("Starting embedded gateway on port {}...", port);
-        let handle = start_embedded_gateway(port).await?;
-        let health_ready = if let Some(client) = health_client.as_ref() {
-            wait_for_health(client, port, std::time::Duration::from_secs(10)).await
-        } else {
-            false
-        };
-        if !health_ready {
-            eprintln!("Gateway failed to start within 10 seconds.");
-            handle.shutdown().await;
-            return Err("gateway startup timeout".into());
-        }
-        embedded_server_handle = Some(handle);
-    }
+    let embedded_server_handle = ensure_local_gateway_running(port).await?;
 
     let result = run_chat_session(new_session, port).await;
 
