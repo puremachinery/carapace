@@ -66,6 +66,7 @@ In another terminal:
 
 ```bash
 cara status --host 127.0.0.1 --port 18789
+cara verify --outcome local-chat --port 18789
 cara chat --port 18789
 ```
 

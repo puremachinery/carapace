@@ -464,6 +464,121 @@ async fn stream_chat_response(
     Ok(())
 }
 
+/// Execute a non-interactive single chat roundtrip and confirm it reaches final state.
+pub(crate) async fn verify_chat_roundtrip(
+    port: u16,
+    prompt: &str,
+    timeout: std::time::Duration,
+) -> Result<(), String> {
+    let (mut ws_write, mut ws_read) = connect_and_handshake(port)
+        .await
+        .map_err(|e| format!("failed to connect to chat endpoint: {e}"))?;
+
+    let req_id = format!("verify-{}", Uuid::new_v4());
+    let expected_run_id = Uuid::new_v4().to_string();
+    let session_key = format!("cli-verify-{}", Uuid::new_v4());
+
+    let chat_frame = serde_json::json!({
+        "type": "req",
+        "id": req_id,
+        "method": "chat.send",
+        "params": {
+            "message": prompt,
+            "sessionKey": session_key,
+            "idempotencyKey": expected_run_id,
+            "stream": true,
+            "triggerAgent": true
+        }
+    });
+
+    ws_write
+        .send(Message::Text(chat_frame.to_string().into()))
+        .await
+        .map_err(|e| format!("failed to send verification request: {e}"))?;
+
+    let result = tokio::time::timeout(timeout, async {
+        loop {
+            let frame = read_ws_json(&mut ws_read, &mut ws_write)
+                .await
+                .map_err(|e| format!("chat stream failed: {e}"))?;
+            let frame_type = frame.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if frame_type == "res" {
+                let response_id = frame.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                if response_id != req_id {
+                    continue;
+                }
+
+                let ok = frame.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+                if !ok {
+                    let msg = frame
+                        .get("error")
+                        .and_then(|e| e.get("message"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("chat.send failed");
+                    return Err(msg.to_string());
+                }
+
+                let status = frame
+                    .get("payload")
+                    .and_then(|p| p.get("status"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if status == "queued" {
+                    return Err("agent run is queued; no provider currently available".to_string());
+                }
+                continue;
+            }
+
+            if frame_type != "event" {
+                continue;
+            }
+
+            let payload = frame.get("payload").cloned().unwrap_or(Value::Null);
+            let run_id = payload.get("runId").and_then(|v| v.as_str()).unwrap_or("");
+            if run_id != expected_run_id {
+                continue;
+            }
+
+            match frame.get("event").and_then(|v| v.as_str()).unwrap_or("") {
+                "chat" => match payload.get("state").and_then(|v| v.as_str()).unwrap_or("") {
+                    "final" => return Ok(()),
+                    "error" => {
+                        let msg = payload
+                            .get("errorMessage")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("chat run failed");
+                        return Err(msg.to_string());
+                    }
+                    _ => {}
+                },
+                "agent" => {
+                    let stream = payload.get("stream").and_then(|v| v.as_str()).unwrap_or("");
+                    if stream == "error" {
+                        let msg = payload
+                            .get("data")
+                            .and_then(|d| d.get("message"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("agent stream error");
+                        return Err(msg.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+    })
+    .await;
+
+    let _ = ws_write.send(Message::Close(None)).await;
+
+    match result {
+        Ok(inner) => inner,
+        Err(_) => Err(format!(
+            "timed out waiting for chat verification response after {} seconds",
+            timeout.as_secs()
+        )),
+    }
+}
+
 pub(crate) async fn run_chat_session(
     new_session: bool,
     port: u16,

@@ -99,6 +99,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cli::chat::handle_chat(new, port).await
         }
 
+        Some(Command::Verify {
+            outcome,
+            port,
+            discord_to,
+            telegram_to,
+        }) => cli::handle_verify(outcome, port, discord_to, telegram_to).await,
+
         Some(Command::Tls(sub)) => {
             match sub {
                 TlsCommand::InitCa { output } => {
