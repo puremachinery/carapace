@@ -84,7 +84,7 @@ jobs:
     name: Build
     runs-on: ubuntu-latest
     needs: changes
-    if: needs.changes.outputs.rust_runtime == 'true'
+    if: needs.changes.outputs.rust_runtime == 'true' && github.event_name == 'push'
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
@@ -105,13 +105,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
       - uses: taiki-e/install-action@602dc500e2b7e0e2486b4ce53909ba048de44e08 # nextest
-      - run: cargo nextest run --all-targets
+        if: github.event_name == 'push' || runner.os == 'Linux'
+      - name: Full test suite
+        if: github.event_name == 'push' || runner.os == 'Linux'
+        run: cargo nextest run --all-targets
+      - name: Cross-platform compile smoke (PR fast path)
+        if: github.event_name == 'pull_request' && runner.os != 'Linux'
+        run: cargo build --all-targets
 
   msrv:
     name: MSRV
     runs-on: ubuntu-latest
     needs: changes
-    if: needs.changes.outputs.rust_runtime == 'true'
+    if: needs.changes.outputs.rust_runtime == 'true' && github.event_name == 'push'
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # 1.93.0
@@ -186,7 +192,7 @@ jobs:
     name: Unsafe Code Audit
     runs-on: ubuntu-latest
     needs: changes
-    if: needs.changes.outputs.rust_runtime == 'true'
+    if: needs.changes.outputs.rust_runtime == 'true' && github.event_name == 'push'
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
