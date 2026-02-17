@@ -527,7 +527,7 @@ pub(crate) async fn verify_chat_roundtrip(
     let session_key = format!("cli-verify-{}", Uuid::new_v4());
     let mut active_run_id: Option<String> = None;
     let mut seen_response = false;
-    let mut pending_events: Vec<Value> = Vec::new();
+    let mut pending_events: Vec<Value> = Vec::with_capacity(64);
 
     let chat_frame = serde_json::json!({
         "type": "req",
@@ -596,6 +596,12 @@ pub(crate) async fn verify_chat_roundtrip(
                 }
                 "event" => {
                     if !seen_response {
+                        if pending_events.len() >= 1000 {
+                            return Err(
+                                "too many server events before response; aborting verification"
+                                    .to_string(),
+                            );
+                        }
                         pending_events.push(frame);
                         continue;
                     }

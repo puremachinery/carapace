@@ -2515,6 +2515,9 @@ async fn verify_channel_outcome(
             ));
 
             if let Some(destination) = destination {
+                println!(
+                    "Sending verification ping to {channel_label} destination {destination}..."
+                );
                 match verify_channel_send_path(outcome, token, destination).await {
                     Ok(()) => checks.push(VerifyCheckResult::pass(
                         format!("{channel_label} send path"),
@@ -4427,11 +4430,8 @@ mod tests {
     #[test]
     fn test_resolve_env_placeholder_missing_var_returns_none() {
         let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
-        let _env_guard = unset_env_var_scoped("CARAPACE_TEST_RESOLVE_ENV_PLACEHOLDER_MISSING");
-        assert_eq!(
-            resolve_env_placeholder("${CARAPACE_TEST_RESOLVE_ENV_PLACEHOLDER_MISSING}"),
-            None
-        );
+        let _env_guard = unset_env_var_scoped("DISCORD_BOT_TOKEN");
+        assert_eq!(resolve_env_placeholder("${DISCORD_BOT_TOKEN}"), None);
     }
 
     #[test]
@@ -4482,6 +4482,7 @@ mod tests {
 
     #[test]
     fn test_infer_setup_outcome_ignores_empty_or_unresolved_channel_tokens() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
         let empty_discord_token_cfg = serde_json::json!({
             "discord": { "enabled": true, "botToken": "   " },
             "gateway": { "hooks": { "enabled": true } }
