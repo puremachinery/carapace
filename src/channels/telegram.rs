@@ -18,6 +18,7 @@ use crate::plugins::{
 const MAX_MEDIA_BYTES: u64 = 50 * 1024 * 1024;
 #[allow(dead_code)]
 const VALIDATION_TIMEOUT_SECS: u64 = 5;
+pub const TELEGRAM_DEFAULT_API_BASE_URL: &str = "https://api.telegram.org";
 
 /// A channel plugin that delivers messages via the Telegram Bot API.
 pub struct TelegramChannel {

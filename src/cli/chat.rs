@@ -17,6 +17,8 @@ use super::{
 
 const CHAT_CLIENT_ID: &str = "cli";
 const CHAT_CLIENT_MODE: &str = "cli";
+const MAX_PENDING_VERIFY_EVENTS: usize = 64;
+const MAX_VERIFY_ERROR_CHARS: usize = 160;
 
 /// REPL commands recognised in the input loop.
 #[derive(Debug, PartialEq)]
@@ -462,6 +464,196 @@ async fn stream_chat_response(
     }
 
     Ok(())
+}
+
+fn verify_frame_run_id(frame: &Value) -> Option<&str> {
+    frame
+        .get("payload")
+        .and_then(|p| p.get("runId"))
+        .and_then(|v| v.as_str())
+        .filter(|value| !value.is_empty())
+}
+
+fn sanitize_verify_error_message(raw: Option<&str>, fallback: &str) -> String {
+    let Some(message) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return fallback.to_string();
+    };
+    if message.contains('<') || message.contains('{') || message.contains('\n') {
+        return fallback.to_string();
+    }
+    if message.chars().count() > MAX_VERIFY_ERROR_CHARS {
+        let excerpt: String = message.chars().take(MAX_VERIFY_ERROR_CHARS).collect();
+        return format!("{excerpt}... (truncated)");
+    }
+    message.to_string()
+}
+
+fn evaluate_verify_event_frame(
+    frame: &Value,
+    active_run_id: Option<&str>,
+) -> Option<Result<(), String>> {
+    let payload = frame.get("payload").cloned().unwrap_or(Value::Null);
+    let run_id = payload.get("runId").and_then(|v| v.as_str()).unwrap_or("");
+
+    let expected_run_id = active_run_id?;
+    if run_id != expected_run_id {
+        return None;
+    }
+
+    match frame.get("event").and_then(|v| v.as_str()).unwrap_or("") {
+        "chat" => match payload.get("state").and_then(|v| v.as_str()).unwrap_or("") {
+            "final" => Some(Ok(())),
+            "error" => Some(Err(sanitize_verify_error_message(
+                payload.get("errorMessage").and_then(|v| v.as_str()),
+                "chat run failed",
+            ))),
+            _ => None,
+        },
+        "agent" => {
+            let stream = payload.get("stream").and_then(|v| v.as_str()).unwrap_or("");
+            if stream == "error" {
+                Some(Err(sanitize_verify_error_message(
+                    payload
+                        .get("data")
+                        .and_then(|d| d.get("message"))
+                        .and_then(|v| v.as_str()),
+                    "agent stream error",
+                )))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Execute a non-interactive single chat roundtrip and confirm it reaches final state.
+pub(crate) async fn verify_chat_roundtrip(
+    port: u16,
+    prompt: &str,
+    timeout: std::time::Duration,
+) -> Result<(), String> {
+    let (mut ws_write, mut ws_read) = connect_and_handshake(port)
+        .await
+        .map_err(|e| format!("failed to connect to chat endpoint: {e}"))?;
+
+    let req_id = format!("verify-{}", Uuid::new_v4());
+    let idempotency_key = Uuid::new_v4().to_string();
+    let session_key = format!("cli-verify-{}", Uuid::new_v4());
+    let mut active_run_id: Option<String> = None;
+    let mut seen_response = false;
+    // Bound only the number of pre-response events buffered.
+    // This prevents unlimited queue growth, but it does not cap per-frame byte size.
+    let mut pending_events: Vec<Value> = Vec::with_capacity(MAX_PENDING_VERIFY_EVENTS);
+
+    let chat_frame = serde_json::json!({
+        "type": "req",
+        "id": req_id,
+        "method": "chat.send",
+        "params": {
+            "message": prompt,
+            "sessionKey": session_key,
+            "idempotencyKey": idempotency_key,
+            "stream": true,
+            "triggerAgent": true
+        }
+    });
+
+    ws_write
+        .send(Message::Text(chat_frame.to_string().into()))
+        .await
+        .map_err(|e| format!("failed to send verification request: {e}"))?;
+
+    let result = tokio::time::timeout(timeout, async {
+        loop {
+            let frame = read_ws_json(&mut ws_read, &mut ws_write)
+                .await
+                .map_err(|e| format!("chat stream failed: {e}"))?;
+            match frame.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+                "res" => {
+                    let response_id = frame.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    if response_id != req_id {
+                        continue;
+                    }
+
+                    let ok = frame.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+                    if !ok {
+                        return Err(sanitize_verify_error_message(
+                            frame
+                                .get("error")
+                                .and_then(|e| e.get("message"))
+                                .and_then(|v| v.as_str()),
+                            "chat.send failed",
+                        ));
+                    }
+
+                    let status = frame
+                        .get("payload")
+                        .and_then(|p| p.get("status"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if status == "queued" {
+                        return Err(
+                            "agent run is queued; no provider currently available".to_string()
+                        );
+                    }
+
+                    active_run_id = verify_frame_run_id(&frame).map(str::to_string);
+                    if active_run_id.is_none() {
+                        return Err(
+                            "chat.send response missing runId; cannot correlate verification events"
+                                .to_string(),
+                        );
+                    }
+                    seen_response = true;
+
+                    for pending in pending_events.drain(..) {
+                        if let Some(result) =
+                            evaluate_verify_event_frame(&pending, active_run_id.as_deref())
+                        {
+                            return result;
+                        }
+                    }
+                }
+                "event" => {
+                    if !seen_response {
+                        if pending_events.len() >= MAX_PENDING_VERIFY_EVENTS {
+                            return Err(
+                                "too many server events before response; aborting verification"
+                                    .to_string(),
+                            );
+                        }
+                        pending_events.push(frame);
+                        continue;
+                    }
+                    if let Some(result) =
+                        evaluate_verify_event_frame(&frame, active_run_id.as_deref())
+                    {
+                        return result;
+                    }
+                }
+                _ => {
+                    continue;
+                }
+            }
+        }
+    })
+    .await;
+
+    if result.is_err() {
+        if let Some(run_id) = active_run_id.as_deref() {
+            send_abort_request(0, run_id, &mut ws_write).await;
+        }
+    }
+    let _ = ws_write.send(Message::Close(None)).await;
+
+    match result {
+        Ok(inner) => inner,
+        Err(_) => Err(format!(
+            "timed out waiting for chat verification response after {} seconds",
+            timeout.as_secs()
+        )),
+    }
 }
 
 pub(crate) async fn run_chat_session(

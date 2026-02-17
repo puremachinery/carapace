@@ -168,7 +168,12 @@ If you downloaded a release binary, use the manual steps above.
    cara status --host 127.0.0.1 --port 18789
    ```
 
-4. Open a local interactive chat session:
+4. Verify your first-run outcome:
+   ```bash
+   cara verify --outcome local-chat --port 18789
+   ```
+
+5. Open a local interactive chat session:
    ```bash
    cara chat
    ```

@@ -30,6 +30,15 @@ pub struct Cli {
     pub command: Option<Command>,
 }
 
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyOutcomeSelection {
+    Auto,
+    LocalChat,
+    Discord,
+    Telegram,
+    Hooks,
+}
+
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Start the gateway server (default when no subcommand is given).
@@ -167,6 +176,25 @@ pub enum Command {
         port: Option<u16>,
     },
 
+    /// Verify that a first-run outcome works end-to-end.
+    Verify {
+        /// Which outcome to verify (default: infer from config).
+        #[arg(long, value_enum, default_value_t = VerifyOutcomeSelection::Auto)]
+        outcome: VerifyOutcomeSelection,
+
+        /// Port of a running instance to connect to.
+        #[arg(short, long)]
+        port: Option<u16>,
+
+        /// Discord channel ID for send-path verification.
+        #[arg(long)]
+        discord_to: Option<String>,
+
+        /// Telegram chat ID for send-path verification.
+        #[arg(long)]
+        telegram_to: Option<String>,
+    },
+
     /// Manage mTLS certificates for gateway-to-gateway communication.
     #[command(subcommand)]
     Tls(TlsCommand),
@@ -249,8 +277,8 @@ pub enum ConfigCommand {
 // Subcommand handlers
 // ---------------------------------------------------------------------------
 
-use crate::channels::discord::DiscordChannel;
-use crate::channels::telegram::TelegramChannel;
+use crate::channels::discord::{DiscordChannel, DISCORD_DEFAULT_API_BASE_URL};
+use crate::channels::telegram::{TelegramChannel, TELEGRAM_DEFAULT_API_BASE_URL};
 use crate::config;
 use crate::credentials;
 use crate::logging::buffer::LogLevel;
@@ -265,7 +293,9 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, Error as RustlsError, SignatureScheme};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::io::IsTerminal;
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio_tungstenite::{
     connect_async, connect_async_tls_with_config, tungstenite::Message, Connector,
@@ -1692,9 +1722,6 @@ pub fn handle_reset(
 // Setup / Pair / Update handlers
 // ---------------------------------------------------------------------------
 
-const DISCORD_API_BASE_URL: &str = "https://discord.com/api/v10";
-const TELEGRAM_API_BASE_URL: &str = "https://api.telegram.org";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SetupOutcome {
     LocalChat,
@@ -1710,6 +1737,18 @@ impl SetupOutcome {
             Self::Discord => "discord",
             Self::Telegram => "telegram",
             Self::Hooks => "hooks",
+        }
+    }
+}
+
+impl VerifyOutcomeSelection {
+    fn resolved(self, cfg: &Value) -> SetupOutcome {
+        match self {
+            Self::Auto => infer_setup_outcome_from_config(cfg),
+            Self::LocalChat => SetupOutcome::LocalChat,
+            Self::Discord => SetupOutcome::Discord,
+            Self::Telegram => SetupOutcome::Telegram,
+            Self::Hooks => SetupOutcome::Hooks,
         }
     }
 }
@@ -1967,7 +2006,7 @@ async fn validate_channel_credentials(channel: &str, token: &str) -> Result<(), 
         "discord" => {
             let token = token.to_string();
             tokio::task::spawn_blocking(move || {
-                DiscordChannel::new(DISCORD_API_BASE_URL.to_string(), token)
+                DiscordChannel::new(DISCORD_DEFAULT_API_BASE_URL.to_string(), token)
                     .validate()
                     .map_err(|err| map_channel_validation_error("Discord", err))
             })
@@ -1977,7 +2016,7 @@ async fn validate_channel_credentials(channel: &str, token: &str) -> Result<(), 
         "telegram" => {
             let token = token.to_string();
             tokio::task::spawn_blocking(move || {
-                TelegramChannel::new(TELEGRAM_API_BASE_URL.to_string(), token)
+                TelegramChannel::new(TELEGRAM_DEFAULT_API_BASE_URL.to_string(), token)
                     .validate()
                     .map_err(|err| map_channel_validation_error("Telegram", err))
             })
@@ -2049,6 +2088,589 @@ fn validate_channel_credentials_interactive(
             }
         }
     }
+}
+
+#[derive(Debug)]
+struct VerifyCheckResult {
+    name: String,
+    status: VerifyCheckStatus,
+    detail: String,
+    next_step: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerifyCheckStatus {
+    Pass,
+    Fail,
+    Skip,
+}
+
+impl VerifyCheckResult {
+    fn pass(name: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            status: VerifyCheckStatus::Pass,
+            detail: detail.into(),
+            next_step: None,
+        }
+    }
+
+    fn fail(
+        name: impl Into<String>,
+        detail: impl Into<String>,
+        next_step: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            status: VerifyCheckStatus::Fail,
+            detail: detail.into(),
+            next_step: Some(next_step.into()),
+        }
+    }
+
+    fn skip(
+        name: impl Into<String>,
+        detail: impl Into<String>,
+        next_step: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            status: VerifyCheckStatus::Skip,
+            detail: detail.into(),
+            next_step: Some(next_step.into()),
+        }
+    }
+}
+
+// Keep this list in sync when adding channels that support token placeholders.
+const VERIFY_ALLOWED_ENV_PLACEHOLDER_KEYS: &[&str] = &[
+    "DISCORD_BOT_TOKEN",
+    "TELEGRAM_BOT_TOKEN",
+    "CARAPACE_HOOKS_TOKEN",
+];
+static WARNED_VERIFY_PLACEHOLDER_KEYS: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn is_allowed_verify_placeholder_key(key: &str) -> bool {
+    VERIFY_ALLOWED_ENV_PLACEHOLDER_KEYS.contains(&key)
+}
+
+fn warn_unsupported_verify_placeholder_key(key: &str) {
+    if cfg!(test) {
+        return;
+    }
+    if key.len() > 64 {
+        return;
+    }
+    let mut warned = WARNED_VERIFY_PLACEHOLDER_KEYS
+        .lock()
+        .expect("verify placeholder warning lock poisoned");
+    if !warned.insert(key.to_string()) {
+        return;
+    }
+    eprintln!(
+        "Warning: unsupported token placeholder `${{{key}}}` ignored during verification. \
+Use one of: {}",
+        VERIFY_ALLOWED_ENV_PLACEHOLDER_KEYS.join(", ")
+    );
+}
+
+fn normalize_optional_input(input: Option<String>) -> Option<String> {
+    input
+        .map(|value| value.trim().to_string())
+        .filter(|trimmed| !trimmed.is_empty())
+}
+
+fn summarize_destination_for_display(raw: &str) -> String {
+    let sanitized: String = raw
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(120)
+        .collect();
+    if sanitized.is_empty() {
+        "<redacted>".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn resolve_env_placeholder(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let Some(key) = trimmed.strip_prefix("${").and_then(|s| s.strip_suffix('}')) else {
+        return Some(trimmed.to_string());
+    };
+    let key = key.trim();
+    if key.is_empty() {
+        return None;
+    }
+    if !is_allowed_verify_placeholder_key(key) {
+        warn_unsupported_verify_placeholder_key(key);
+        return None;
+    }
+    std::env::var(key)
+        .ok()
+        .map(|env_value| env_value.trim().to_string())
+        .filter(|normalized| !normalized.is_empty())
+}
+
+fn resolve_channel_bot_token(cfg: &Value, channel_key: &str, env_var: &str) -> Option<String> {
+    std::env::var(env_var)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|normalized| !normalized.is_empty())
+        .or_else(|| resolve_channel_bot_token_from_config(cfg, channel_key))
+}
+
+fn resolve_channel_bot_token_from_config(cfg: &Value, channel_key: &str) -> Option<String> {
+    cfg.get(channel_key)
+        .and_then(|v| v.get("botToken"))
+        .and_then(|v| v.as_str())
+        .and_then(resolve_env_placeholder)
+}
+
+fn channel_outcome_configured(cfg: &Value, channel_key: &str) -> bool {
+    resolve_channel_bot_token_from_config(cfg, channel_key).is_some()
+}
+
+fn resolve_hooks_token(cfg: &Value) -> Option<String> {
+    std::env::var("CARAPACE_HOOKS_TOKEN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|normalized| !normalized.is_empty())
+        .or_else(|| {
+            cfg.get("gateway")
+                .and_then(|v| v.get("hooks"))
+                .and_then(|v| v.get("token"))
+                .and_then(|v| v.as_str())
+                .and_then(resolve_env_placeholder)
+        })
+}
+
+fn infer_setup_outcome_from_config(cfg: &Value) -> SetupOutcome {
+    // Priority is intentional: configured channels first, then hooks, then local chat.
+    if channel_outcome_configured(cfg, "discord") {
+        return SetupOutcome::Discord;
+    }
+    if channel_outcome_configured(cfg, "telegram") {
+        return SetupOutcome::Telegram;
+    }
+    let hooks_enabled = cfg
+        .get("gateway")
+        .and_then(|v| v.get("hooks"))
+        .and_then(|v| v.get("enabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if hooks_enabled {
+        return SetupOutcome::Hooks;
+    }
+    SetupOutcome::LocalChat
+}
+
+fn print_verify_summary(outcome: SetupOutcome, port: u16, checks: &[VerifyCheckResult]) {
+    println!();
+    println!("Outcome verification summary");
+    println!("----------------------------");
+    println!("Outcome: {}", outcome.prompt_key());
+    println!("Gateway port: {}", port);
+    println!();
+    for check in checks {
+        let status = match check.status {
+            VerifyCheckStatus::Pass => "PASS",
+            VerifyCheckStatus::Fail => "FAIL",
+            VerifyCheckStatus::Skip => "SKIP",
+        };
+        println!("[{}] {}: {}", status, check.name, check.detail);
+        if let Some(next_step) = check.next_step.as_deref() {
+            println!("      next step: {}", next_step);
+        }
+    }
+}
+
+async fn verify_channel_send_path(
+    channel: SetupOutcome,
+    token: String,
+    destination: String,
+) -> Result<(), String> {
+    let message = format!(
+        "Carapace verify ping ({})",
+        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
+    );
+    tokio::task::spawn_blocking(move || {
+        use crate::plugins::{ChannelPluginInstance, OutboundContext};
+        let outbound = OutboundContext {
+            to: destination,
+            text: message,
+            media_url: None,
+            gif_playback: false,
+            reply_to_id: None,
+            thread_id: None,
+            account_id: None,
+        };
+
+        let delivery = match channel {
+            SetupOutcome::Discord => {
+                let channel_impl =
+                    DiscordChannel::new(DISCORD_DEFAULT_API_BASE_URL.to_string(), token);
+                channel_impl.send_text(outbound)
+            }
+            SetupOutcome::Telegram => {
+                let channel_impl =
+                    TelegramChannel::new(TELEGRAM_DEFAULT_API_BASE_URL.to_string(), token);
+                channel_impl.send_text(outbound)
+            }
+            _ => return Err("unsupported channel send-path verification target".to_string()),
+        }
+        .map_err(|e| format!("send invocation failed: {e}"))?;
+
+        if delivery.ok {
+            Ok(())
+        } else {
+            Err(sanitize_channel_delivery_error(
+                delivery
+                    .error
+                    .unwrap_or_else(|| "send path rejected request".to_string()),
+            ))
+        }
+    })
+    .await
+    .map_err(|e| format!("send-path verification task failed: {e}"))?
+}
+
+fn sanitize_channel_delivery_error(raw_error: String) -> String {
+    let trimmed = raw_error.trim();
+    if trimmed.is_empty() {
+        return "send path rejected request".to_string();
+    }
+    "send path rejected request (provider details hidden for safety)".to_string()
+}
+
+fn summarize_http_failure_body(status: reqwest::StatusCode, body: &str) -> String {
+    let _ = status;
+    let _ = body;
+    "(body hidden for safety)".to_string()
+}
+
+async fn verify_local_chat_outcome(
+    port: u16,
+    checks: &mut Vec<VerifyCheckResult>,
+) -> Result<(), String> {
+    let mut setup_server_handle = match chat::ensure_local_gateway_running(port).await {
+        Ok(handle) => {
+            checks.push(VerifyCheckResult::pass(
+                "Gateway reachability",
+                format!("service is reachable at 127.0.0.1:{port}"),
+            ));
+            handle
+        }
+        Err(err) => {
+            checks.push(VerifyCheckResult::fail(
+                "Gateway reachability",
+                err.to_string(),
+                format!(
+                    "start the service (`cara start --port {port}`) and retry `cara verify --outcome local-chat --port {port}`"
+                ),
+            ));
+            return Err("outcome verification failed".to_string());
+        }
+    };
+
+    let roundtrip_result = chat::verify_chat_roundtrip(
+        port,
+        "Reply with exactly: verification-ok",
+        Duration::from_secs(45),
+    )
+    .await;
+    if let Some(handle) = setup_server_handle.take() {
+        handle.shutdown().await;
+    }
+
+    match roundtrip_result {
+        Ok(()) => checks.push(VerifyCheckResult::pass(
+            "Local chat roundtrip",
+            "non-interactive chat send reached final state",
+        )),
+        Err(err) => {
+            checks.push(VerifyCheckResult::fail(
+                "Local chat roundtrip",
+                err,
+                "check provider API key/model and retry `cara verify --outcome local-chat`",
+            ));
+            return Err("outcome verification failed".to_string());
+        }
+    }
+    Ok(())
+}
+
+async fn verify_hooks_outcome(
+    port: u16,
+    cfg: &Value,
+    checks: &mut Vec<VerifyCheckResult>,
+) -> Result<(), String> {
+    let mut setup_server_handle = match chat::ensure_local_gateway_running(port).await {
+        Ok(handle) => {
+            checks.push(VerifyCheckResult::pass(
+                "Gateway reachability",
+                format!("service is reachable at 127.0.0.1:{port}"),
+            ));
+            handle
+        }
+        Err(err) => {
+            checks.push(VerifyCheckResult::fail(
+                "Gateway reachability",
+                err.to_string(),
+                format!(
+                    "start the service (`cara start --port {port}`) and retry `cara verify --outcome hooks --port {port}`"
+                ),
+            ));
+            return Err("outcome verification failed".to_string());
+        }
+    };
+
+    let hooks_enabled = cfg
+        .get("gateway")
+        .and_then(|v| v.get("hooks"))
+        .and_then(|v| v.get("enabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !hooks_enabled {
+        checks.push(VerifyCheckResult::fail(
+            "Hooks enabled",
+            "gateway.hooks.enabled is false",
+            "enable `gateway.hooks.enabled` and configure `gateway.hooks.token`, then retry",
+        ));
+        if let Some(handle) = setup_server_handle.take() {
+            handle.shutdown().await;
+        }
+        return Err("outcome verification failed".to_string());
+    } else {
+        checks.push(VerifyCheckResult::pass(
+            "Hooks enabled",
+            "gateway.hooks.enabled is true",
+        ));
+    }
+
+    let hooks_token = resolve_hooks_token(cfg);
+    let hooks_token = if let Some(token) = hooks_token {
+        checks.push(VerifyCheckResult::pass(
+            "Hooks token",
+            "hooks token resolved from config/environment",
+        ));
+        token
+    } else {
+        checks.push(VerifyCheckResult::fail(
+            "Hooks token",
+            "no hooks token configured",
+            "set `gateway.hooks.token` (or CARAPACE_HOOKS_TOKEN) and retry",
+        ));
+        if let Some(handle) = setup_server_handle.take() {
+            handle.shutdown().await;
+        }
+        return Err("outcome verification failed".to_string());
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("failed to create hooks verification client: {e}"))?;
+    let wake_url = format!("http://127.0.0.1:{port}/hooks/wake");
+    println!("Sending signed hooks wake request (this triggers real hooks processing)...");
+    let wake_result = client
+        .post(&wake_url)
+        .header("Authorization", format!("Bearer {hooks_token}"))
+        .json(&serde_json::json!({ "text": "verify-hook" }))
+        .send()
+        .await;
+    if let Some(handle) = setup_server_handle.take() {
+        handle.shutdown().await;
+    }
+
+    match wake_result {
+        Ok(resp) if resp.status().is_success() => checks.push(VerifyCheckResult::pass(
+            "Signed /hooks/wake",
+            "received success response from /hooks/wake",
+        )),
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            let safe_body = summarize_http_failure_body(status, &body);
+            checks.push(VerifyCheckResult::fail(
+                "Signed /hooks/wake",
+                format!("request failed with HTTP {status}: {safe_body}"),
+                format!(
+                    "verify hooks auth token and retry `cara verify --outcome hooks --port {port}`"
+                ),
+            ));
+        }
+        Err(_err) => checks.push(VerifyCheckResult::fail(
+            "Signed /hooks/wake",
+            "network error sending request",
+            format!("confirm gateway is reachable on port {port} and retry"),
+        )),
+    }
+
+    Ok(())
+}
+
+async fn verify_channel_outcome(
+    outcome: SetupOutcome,
+    cfg: &Value,
+    discord_to: Option<String>,
+    telegram_to: Option<String>,
+    checks: &mut Vec<VerifyCheckResult>,
+) -> Result<(), String> {
+    let (channel_label, channel_key, env_var, destination, destination_flag) = match outcome {
+        SetupOutcome::Discord => (
+            "Discord",
+            "discord",
+            "DISCORD_BOT_TOKEN",
+            discord_to,
+            "--discord-to <channel_id>",
+        ),
+        SetupOutcome::Telegram => (
+            "Telegram",
+            "telegram",
+            "TELEGRAM_BOT_TOKEN",
+            telegram_to,
+            "--telegram-to <chat_id>",
+        ),
+        other => {
+            return Err(format!(
+                "unsupported channel outcome for verification: {other:?}"
+            ))
+        }
+    };
+
+    let token = resolve_channel_bot_token(cfg, channel_key, env_var);
+    let token = if let Some(token) = token {
+        checks.push(VerifyCheckResult::pass(
+            format!("{channel_label} credentials"),
+            format!("{channel_label} token is configured"),
+        ));
+        token
+    } else {
+        checks.push(VerifyCheckResult::fail(
+            format!("{channel_label} credentials"),
+            format!("{channel_label} token is not configured"),
+            format!("set `{channel_key}.botToken` or `{env_var}`, then retry `cara verify --outcome {channel_key}`"),
+        ));
+        return Err("outcome verification failed".to_string());
+    };
+
+    match validate_channel_credentials(channel_key, &token).await {
+        Ok(()) => {
+            checks.push(VerifyCheckResult::pass(
+                format!("{channel_label} token check"),
+                "credential validation succeeded",
+            ));
+
+            if let Some(destination) = destination {
+                let destination_display = summarize_destination_for_display(&destination);
+                println!(
+                    "Sending verification ping to {channel_label} destination {destination_display}..."
+                );
+                match verify_channel_send_path(outcome, token, destination).await {
+                    Ok(()) => checks.push(VerifyCheckResult::pass(
+                        format!("{channel_label} send path"),
+                        "test message delivery succeeded",
+                    )),
+                    Err(err) => checks.push(VerifyCheckResult::fail(
+                        format!("{channel_label} send path"),
+                        err,
+                        format!(
+                            "confirm destination and bot permissions, then retry with `{destination_flag}`"
+                        ),
+                    )),
+                }
+            } else {
+                checks.push(VerifyCheckResult::skip(
+                    format!("{channel_label} send path"),
+                    "destination id not provided; send-path test skipped",
+                    format!("rerun with `{destination_flag}` to verify end-to-end delivery"),
+                ));
+            }
+        }
+        Err(err) => {
+            checks.push(VerifyCheckResult::fail(
+                format!("{channel_label} token check"),
+                err,
+                format!("update `{channel_key}.botToken` and retry `cara verify --outcome {channel_key}`"),
+            ));
+            checks.push(VerifyCheckResult::skip(
+                format!("{channel_label} send path"),
+                "not attempted because credential validation failed",
+                format!(
+                    "fix `{channel_key}` credentials first, then rerun with `{destination_flag}`"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn run_outcome_verifier(
+    selection: VerifyOutcomeSelection,
+    port: u16,
+    discord_to: Option<String>,
+    telegram_to: Option<String>,
+    cfg: &Value,
+) -> Result<(), String> {
+    let mut checks: Vec<VerifyCheckResult> = Vec::new();
+    let outcome = selection.resolved(cfg);
+    let discord_to = normalize_optional_input(discord_to);
+    let telegram_to = normalize_optional_input(telegram_to);
+
+    let result = match outcome {
+        SetupOutcome::LocalChat => verify_local_chat_outcome(port, &mut checks).await,
+        SetupOutcome::Hooks => verify_hooks_outcome(port, cfg, &mut checks).await,
+        SetupOutcome::Discord | SetupOutcome::Telegram => {
+            verify_channel_outcome(outcome, cfg, discord_to, telegram_to, &mut checks).await
+        }
+    };
+    if let Err(err) = result {
+        print_verify_summary(outcome, port, &checks);
+        return Err(err);
+    }
+
+    print_verify_summary(outcome, port, &checks);
+    let has_fail = checks
+        .iter()
+        .any(|check| check.status == VerifyCheckStatus::Fail);
+    let has_pass = checks
+        .iter()
+        .any(|check| check.status == VerifyCheckStatus::Pass);
+    let has_skip = checks
+        .iter()
+        .any(|check| check.status == VerifyCheckStatus::Skip);
+    if !has_fail && has_pass {
+        println!();
+        if has_skip {
+            println!("Outcome verification passed with skipped checks.");
+        } else {
+            println!("Outcome verification passed.");
+        }
+        Ok(())
+    } else if !has_fail {
+        Err("outcome verification incomplete (no checks passed)".to_string())
+    } else {
+        Err("outcome verification failed".to_string())
+    }
+}
+
+pub async fn handle_verify(
+    outcome: VerifyOutcomeSelection,
+    port: Option<u16>,
+    discord_to: Option<String>,
+    telegram_to: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = config::load_config()
+        .map_err(|e| format!("failed to load config: {e}. Run `cara setup` first."))?;
+    let port = resolve_port(port);
+    run_outcome_verifier(outcome, port, discord_to, telegram_to, &cfg)
+        .await
+        .map_err(|err| err.into())
 }
 
 async fn run_setup_post_checks(
@@ -2126,6 +2748,8 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut setup_outcome = SetupOutcome::LocalChat;
     let mut hooks_enabled = false;
+    let mut verify_discord_to: Option<String> = None;
+    let mut verify_telegram_to: Option<String> = None;
 
     if interactive {
         println!("Carapace setup wizard");
@@ -2241,20 +2865,40 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
         setup_outcome = prompt_setup_outcome()?;
 
         match setup_outcome {
-            SetupOutcome::Discord => prompt_and_configure_bot_channel(
-                &mut config,
-                "discord",
-                "Discord",
-                "DISCORD_BOT_TOKEN",
-                "Enter Discord bot token (leave blank to skip for now): ",
-            )?,
-            SetupOutcome::Telegram => prompt_and_configure_bot_channel(
-                &mut config,
-                "telegram",
-                "Telegram",
-                "TELEGRAM_BOT_TOKEN",
-                "Enter Telegram bot token (leave blank to skip for now): ",
-            )?,
+            SetupOutcome::Discord => {
+                prompt_and_configure_bot_channel(
+                    &mut config,
+                    "discord",
+                    "Discord",
+                    "DISCORD_BOT_TOKEN",
+                    "Enter Discord bot token (leave blank to skip for now): ",
+                )?;
+                let discord_configured =
+                    resolve_channel_bot_token_from_config(&config, "discord").is_some();
+                if discord_configured {
+                    let destination = prompt_line(
+                        "Optional: Discord channel ID for send-path verify (leave blank to skip): ",
+                    )?;
+                    verify_discord_to = normalize_optional_input(Some(destination));
+                }
+            }
+            SetupOutcome::Telegram => {
+                prompt_and_configure_bot_channel(
+                    &mut config,
+                    "telegram",
+                    "Telegram",
+                    "TELEGRAM_BOT_TOKEN",
+                    "Enter Telegram bot token (leave blank to skip for now): ",
+                )?;
+                let telegram_configured =
+                    resolve_channel_bot_token_from_config(&config, "telegram").is_some();
+                if telegram_configured {
+                    let destination = prompt_line(
+                        "Optional: Telegram chat ID for send-path verify (leave blank to skip): ",
+                    )?;
+                    verify_telegram_to = normalize_optional_input(Some(destination));
+                }
+            }
             SetupOutcome::LocalChat | SetupOutcome::Hooks => {}
         }
 
@@ -2319,18 +2963,50 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
             "Also launch local assistant chat now (`cara chat`)?"
         };
         let launch_chat = prompt_yes_no(launch_chat_prompt, launch_chat_default)?;
+        let verify_default = match setup_outcome {
+            SetupOutcome::LocalChat | SetupOutcome::Hooks => true,
+            SetupOutcome::Discord => verify_discord_to.is_some(),
+            SetupOutcome::Telegram => verify_telegram_to.is_some(),
+        };
+        let verify_prompt = format!(
+            "Run outcome verifier now (`cara verify --outcome {}`)?",
+            setup_outcome.prompt_key()
+        );
+        let run_verify = prompt_yes_no(&verify_prompt, verify_default)?;
 
-        if run_status || launch_chat {
+        if run_status || launch_chat || run_verify {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
-            if let Err(err) = runtime.block_on(run_setup_post_checks(port, run_status, launch_chat))
-            {
-                eprintln!("Post-setup checks failed: {}", err);
-                eprintln!(
-                    "You can retry manually with: cara status --port {}  and  cara chat --port {}",
-                    port, port
-                );
+            if run_status || launch_chat {
+                if let Err(err) =
+                    runtime.block_on(run_setup_post_checks(port, run_status, launch_chat))
+                {
+                    eprintln!("Post-setup checks failed: {}", err);
+                    eprintln!(
+                        "You can retry manually with: cara status --port {}  and  cara chat --port {}",
+                        port, port
+                    );
+                }
+            }
+
+            if run_verify {
+                let verify_outcome = match setup_outcome {
+                    SetupOutcome::LocalChat => VerifyOutcomeSelection::LocalChat,
+                    SetupOutcome::Discord => VerifyOutcomeSelection::Discord,
+                    SetupOutcome::Telegram => VerifyOutcomeSelection::Telegram,
+                    SetupOutcome::Hooks => VerifyOutcomeSelection::Hooks,
+                };
+                if let Err(err) = runtime.block_on(run_outcome_verifier(
+                    verify_outcome,
+                    port,
+                    verify_discord_to,
+                    verify_telegram_to,
+                    &config,
+                )) {
+                    eprintln!("Outcome verification failed: {}", err);
+                    eprintln!("Fix the failing checks above, then rerun `cara verify`.");
+                }
             }
         }
 
@@ -2965,6 +3641,44 @@ mod tests {
     use super::*;
     use clap::Parser;
     use ed25519_dalek::{Signature, VerifyingKey};
+    use std::ffi::OsString;
+    use std::sync::{LazyLock, Mutex};
+
+    // Serializes env-var touching tests in this module.
+    // Cross-module env-var tests should use a shared lock if they touch the same keys.
+    static ENV_VAR_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    struct EnvVarGuard {
+        key: String,
+        previous: Option<OsString>,
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var(&self.key, value),
+                None => std::env::remove_var(&self.key),
+            }
+        }
+    }
+
+    fn set_env_var_scoped(key: &str, value: &str) -> EnvVarGuard {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        EnvVarGuard {
+            key: key.to_string(),
+            previous,
+        }
+    }
+
+    fn unset_env_var_scoped(key: &str) -> EnvVarGuard {
+        let previous = std::env::var_os(key);
+        std::env::remove_var(key);
+        EnvVarGuard {
+            key: key.to_string(),
+            previous,
+        }
+    }
 
     #[test]
     fn test_cli_no_args_defaults_to_none() {
@@ -3114,6 +3828,54 @@ mod tests {
                 assert_eq!(port, Some(9000));
             }
             other => panic!("Expected Chat, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_verify_defaults() {
+        let cli = Cli::try_parse_from(["cara", "verify"]).unwrap();
+        match cli.command {
+            Some(Command::Verify {
+                outcome,
+                port,
+                discord_to,
+                telegram_to,
+            }) => {
+                assert_eq!(outcome, VerifyOutcomeSelection::Auto);
+                assert_eq!(port, None);
+                assert!(discord_to.is_none());
+                assert!(telegram_to.is_none());
+            }
+            other => panic!("Expected Verify, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_verify_with_options() {
+        let cli = Cli::try_parse_from([
+            "cara",
+            "verify",
+            "--outcome",
+            "discord",
+            "--port",
+            "19000",
+            "--discord-to",
+            "1234567890",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Verify {
+                outcome,
+                port,
+                discord_to,
+                telegram_to,
+            }) => {
+                assert_eq!(outcome, VerifyOutcomeSelection::Discord);
+                assert_eq!(port, Some(19000));
+                assert_eq!(discord_to.as_deref(), Some("1234567890"));
+                assert!(telegram_to.is_none());
+            }
+            other => panic!("Expected Verify, got {:?}", other),
         }
     }
 
@@ -3701,6 +4463,127 @@ mod tests {
         assert_eq!(parse_setup_outcome("unknown"), None);
     }
 
+    #[test]
+    fn test_resolve_env_placeholder_handles_literal_and_placeholder_values() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let key = "DISCORD_BOT_TOKEN";
+        let _env_guard = set_env_var_scoped(key, "  resolved-value  ");
+
+        assert_eq!(
+            resolve_env_placeholder("${DISCORD_BOT_TOKEN}"),
+            Some("resolved-value".to_string())
+        );
+        assert_eq!(
+            resolve_env_placeholder("{DISCORD_BOT_TOKEN}"),
+            Some("{DISCORD_BOT_TOKEN}".to_string())
+        );
+        assert_eq!(
+            resolve_env_placeholder("$$${{DISCORD_BOT_TOKEN}"),
+            Some("$$${{DISCORD_BOT_TOKEN}".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_env_placeholder_missing_var_returns_none() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let _env_guard = unset_env_var_scoped("DISCORD_BOT_TOKEN");
+        assert_eq!(resolve_env_placeholder("${DISCORD_BOT_TOKEN}"), None);
+    }
+
+    #[test]
+    fn test_resolve_env_placeholder_rejects_non_allowlisted_keys() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let _env_guard = set_env_var_scoped("CARAPACE_TEST_NON_ALLOWLISTED_SECRET", "secret");
+        assert_eq!(
+            resolve_env_placeholder("${CARAPACE_TEST_NON_ALLOWLISTED_SECRET}"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_resolve_env_placeholder_rejects_custom_bot_token_names() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let _env_guard = set_env_var_scoped("MY_DISCORD_BOT_TOKEN", "custom-token");
+        assert_eq!(resolve_env_placeholder("${MY_DISCORD_BOT_TOKEN}"), None);
+    }
+
+    #[test]
+    fn test_sanitize_channel_delivery_error_redacts_untrusted_body() {
+        assert_eq!(
+            sanitize_channel_delivery_error(
+                "<html>stacktrace and debug secrets</html>".to_string()
+            ),
+            "send path rejected request (provider details hidden for safety)"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_channel_delivery_error_redacts_short_standard_message() {
+        assert_eq!(
+            sanitize_channel_delivery_error("Unauthorized".to_string()),
+            "send path rejected request (provider details hidden for safety)"
+        );
+    }
+
+    #[test]
+    fn test_infer_setup_outcome_from_config_prefers_discord_then_telegram() {
+        let cfg = serde_json::json!({
+            "discord": { "botToken": "discord-token" },
+            "telegram": { "botToken": "telegram-token" },
+            "gateway": { "hooks": { "enabled": true } }
+        });
+        assert_eq!(infer_setup_outcome_from_config(&cfg), SetupOutcome::Discord);
+
+        let cfg = serde_json::json!({
+            "telegram": { "botToken": "telegram-token" },
+            "gateway": { "hooks": { "enabled": true } }
+        });
+        assert_eq!(
+            infer_setup_outcome_from_config(&cfg),
+            SetupOutcome::Telegram
+        );
+    }
+
+    #[test]
+    fn test_infer_setup_outcome_from_config_hooks_then_local() {
+        let hooks_cfg = serde_json::json!({
+            "gateway": { "hooks": { "enabled": true } }
+        });
+        assert_eq!(
+            infer_setup_outcome_from_config(&hooks_cfg),
+            SetupOutcome::Hooks
+        );
+
+        let local_cfg = serde_json::json!({});
+        assert_eq!(
+            infer_setup_outcome_from_config(&local_cfg),
+            SetupOutcome::LocalChat
+        );
+    }
+
+    #[test]
+    fn test_infer_setup_outcome_ignores_empty_or_unresolved_channel_tokens() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let _env_guard = unset_env_var_scoped("CARAPACE_TEST_VERIFY_MISSING_TELEGRAM_TOKEN");
+        let empty_discord_token_cfg = serde_json::json!({
+            "discord": { "enabled": true, "botToken": "   " },
+            "gateway": { "hooks": { "enabled": true } }
+        });
+        assert_eq!(
+            infer_setup_outcome_from_config(&empty_discord_token_cfg),
+            SetupOutcome::Hooks
+        );
+
+        let unresolved_placeholder_cfg = serde_json::json!({
+            "telegram": { "enabled": true, "botToken": "${CARAPACE_TEST_VERIFY_MISSING_TELEGRAM_TOKEN}" },
+            "gateway": { "hooks": { "enabled": true } }
+        });
+        assert_eq!(
+            infer_setup_outcome_from_config(&unresolved_placeholder_cfg),
+            SetupOutcome::Hooks
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Setup subcommand tests
     // -----------------------------------------------------------------------
@@ -3729,14 +4612,13 @@ mod tests {
 
     #[test]
     fn test_handle_setup_errors_when_config_exists_no_force() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
         let temp = tempfile::TempDir::new().unwrap();
         let config_path = temp.path().join("carapace.json");
         std::fs::write(&config_path, "{}").unwrap();
 
-        // Point config to our temp file.
-        std::env::set_var("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
+        let _env_guard = set_env_var_scoped("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
         let result = handle_setup(false);
-        std::env::remove_var("CARAPACE_CONFIG_PATH");
 
         assert!(
             result.is_err(),
@@ -3746,13 +4628,13 @@ mod tests {
 
     #[test]
     fn test_handle_setup_force_creates_config() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
         let temp = tempfile::TempDir::new().unwrap();
         let config_path = temp.path().join("carapace.json");
         std::fs::write(&config_path, "{}").unwrap();
 
-        std::env::set_var("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
+        let _env_guard = set_env_var_scoped("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
         let result = handle_setup(true);
-        std::env::remove_var("CARAPACE_CONFIG_PATH");
 
         assert!(
             result.is_ok(),
@@ -3763,12 +4645,12 @@ mod tests {
 
     #[test]
     fn test_handle_setup_creates_valid_json5_config() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
         let temp = tempfile::TempDir::new().unwrap();
         let config_path = temp.path().join("carapace.json");
 
-        std::env::set_var("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
+        let _env_guard = set_env_var_scoped("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
         let result = handle_setup(false);
-        std::env::remove_var("CARAPACE_CONFIG_PATH");
 
         assert!(result.is_ok(), "Setup should succeed");
 
@@ -3779,12 +4661,12 @@ mod tests {
 
     #[test]
     fn test_handle_setup_default_values() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
         let temp = tempfile::TempDir::new().unwrap();
         let config_path = temp.path().join("carapace.json");
 
-        std::env::set_var("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
+        let _env_guard = set_env_var_scoped("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
         let result = handle_setup(false);
-        std::env::remove_var("CARAPACE_CONFIG_PATH");
 
         assert!(result.is_ok());
 

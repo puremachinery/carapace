@@ -99,6 +99,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cli::chat::handle_chat(new, port).await
         }
 
+        Some(Command::Verify {
+            outcome,
+            port,
+            discord_to,
+            telegram_to,
+        }) => cli::handle_verify(outcome, port, discord_to, telegram_to).await,
+
         Some(Command::Tls(sub)) => {
             match sub {
                 TlsCommand::InitCa { output } => {
@@ -345,7 +352,7 @@ fn resolve_telegram_config(cfg: &Value) -> Option<TelegramConfig> {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .or_else(|| std::env::var("TELEGRAM_BASE_URL").ok())
-        .unwrap_or_else(|| "https://api.telegram.org".to_string());
+        .unwrap_or_else(|| channels::telegram::TELEGRAM_DEFAULT_API_BASE_URL.to_string());
 
     Some(TelegramConfig {
         base_url,
@@ -378,7 +385,7 @@ fn resolve_discord_config(cfg: &Value) -> Option<DiscordConfig> {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .or_else(|| std::env::var("DISCORD_BASE_URL").ok())
-        .unwrap_or_else(|| "https://discord.com/api/v10".to_string());
+        .unwrap_or_else(|| channels::discord::DISCORD_DEFAULT_API_BASE_URL.to_string());
 
     let gateway_url = discord_cfg
         .and_then(|s| s.get("gatewayUrl"))

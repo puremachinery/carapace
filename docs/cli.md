@@ -56,7 +56,31 @@ It prompts for:
 - optional hooks API token and Control UI toggle.
 
 At the end, it offers immediate smoke checks (`cara status`) and a first action
-(`cara chat`), then prints outcome-specific next steps.
+(`cara chat`), plus outcome verification (`cara verify`), then prints
+outcome-specific next steps.
+
+### verify
+Run first-run outcome checks with pass/fail output and next-step guidance.
+
+```bash
+cara verify --outcome auto --port 18789
+```
+
+Outcomes:
+- `auto` — infer from current config.
+- `local-chat` — verify local reachability + one non-interactive `chat.send` roundtrip.
+- `hooks` — verify signed `POST /hooks/wake` with configured token.
+- `discord` / `telegram` — verify bot credential validity and outbound send path.
+
+Options:
+- `--port` / `-p` — local service port (default: config or `18789`).
+- `--discord-to <channel_id>` — required for Discord send-path check to pass.
+- `--telegram-to <chat_id>` — required for Telegram send-path check to pass.
+
+Notes:
+- `cara verify` currently targets local loopback only (`127.0.0.1`).
+- Discord/Telegram send-path verification sends a real test message to the destination you provide.
+- Hooks verification sends a signed `POST /hooks/wake` and may trigger a real agent run.
 
 ### pair
 Pair this CLI with a Carapace service.
