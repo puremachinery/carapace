@@ -3,10 +3,6 @@ name: Claude Code Review
 on:
   pull_request:
     types: [opened, synchronize, ready_for_review, reopened]
-    paths:
-      - "src/**/*.rs"
-      - "Cargo.toml"
-      - "Cargo.lock"
 
 jobs:
   claude-review:
@@ -31,7 +27,23 @@ jobs:
         uses: anthropics/claude-code-action@2f8ba26a219c06cfb0f468eef8d97055fa814f97 # v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
-          plugins: 'code-review@claude-code-plugins'
-          prompt: '/code-review:code-review ${{ github.repository }}/pull/${{ github.event.pull_request.number }}'
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
 
+            Review this pull request for:
+            - correctness and regressions
+            - security risks
+            - test coverage gaps
+            - maintainability concerns
+
+            Post inline comments for code-specific findings using
+            mcp__github_inline_comment__create_inline_comment.
+
+            Always post one top-level PR comment via `gh pr comment`:
+            - If findings exist: list them by severity with concise fixes.
+            - If no findings: say LGTM and note any residual risks.
+
+            Only post GitHub comments; do not leave final feedback only in tool output.
+          claude_args: |
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh api:*),Bash(git:*),WebSearch"
