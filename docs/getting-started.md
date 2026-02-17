@@ -3,6 +3,13 @@
 This guide covers first‑run setup, security basics, and day‑to‑day operations.
 It’s intentionally practical: copy/paste steps, then customize.
 
+If you prefer outcome-first walkthroughs (for example "add Discord"), see
+the [Cookbook](cookbook/README.md).
+If you want the website flow instead of Markdown docs, use:
+- <https://getcara.io/install.html>
+- <https://getcara.io/first-run.html>
+- <https://getcara.io/get-unstuck.html>
+
 ## Prerequisites
 
 - A `cara` binary on your PATH (download pre-built binaries from
@@ -43,13 +50,7 @@ cara --help
 
 ## Quick Start (Local, Token Auth)
 
-1) Generate a Carapace auth token:
-
-```bash
-export CARAPACE_GATEWAY_TOKEN="$(openssl rand -hex 32)"
-```
-
-2) Create a minimal config (save as `carapace.json5`):
+Create a minimal config (save as `carapace.json5`) for either platform:
 
 ```json5
 {
@@ -62,25 +63,41 @@ export CARAPACE_GATEWAY_TOKEN="$(openssl rand -hex 32)"
 }
 ```
 
-3) Run Carapace:
+### macOS/Linux
 
 ```bash
+export CARAPACE_GATEWAY_TOKEN="$(openssl rand -hex 32)"
 CARAPACE_CONFIG_PATH=./carapace.json5 cara
 ```
 
-4) Verify:
+In another terminal:
 
 ```bash
 cara status --host 127.0.0.1 --port 18789
-```
-
-Or:
-
-```bash
 curl -H "Authorization: Bearer ${CARAPACE_GATEWAY_TOKEN}" http://localhost:18789/health
+cara chat
 ```
 
-Expected response:
+### Windows (PowerShell)
+
+```powershell
+$bytes = [byte[]]::new(32)
+[System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+$env:CARAPACE_GATEWAY_TOKEN = [System.BitConverter]::ToString($bytes).Replace('-', '').ToLower()
+
+$env:CARAPACE_CONFIG_PATH = ".\\carapace.json5"
+cara
+```
+
+In another PowerShell terminal:
+
+```powershell
+cara status --host 127.0.0.1 --port 18789
+curl.exe -H "Authorization: Bearer $env:CARAPACE_GATEWAY_TOKEN" http://127.0.0.1:18789/health
+cara chat
+```
+
+Expected `/health` response:
 
 ```json
 { "status": "ok", "version": "x.y.z", "uptimeSeconds": 12 }
@@ -88,16 +105,10 @@ Expected response:
 
 If you set `gateway.port`, use that port instead of `18789`.
 
-5) Open a local interactive chat REPL:
-
-   ```bash
-   cara chat
-   ```
-
-   Helpful REPL commands:
-   - `/help` — show available commands
-   - `/new` — start a fresh chat session
-   - `/exit` or `/quit` — leave chat
+Helpful REPL commands:
+- `/help` — show available commands
+- `/new` — start a fresh chat session
+- `/exit` or `/quit` — leave chat
 
 ## Configuration Basics
 

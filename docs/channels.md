@@ -4,6 +4,9 @@ This guide explains how to configure inbound/outbound messaging for Signal,
 Telegram, Discord, and Slack. It focuses on the *carapace* service wiring and
 the minimum external setup needed to make each channel usable.
 
+For step-by-step channel onboarding recipes, see the
+[Cookbook](cookbook/README.md).
+
 All examples assume `carapace.json5` (see `config.example.json5`) and the default
 service HTTP port 18789. Adjust paths/ports for your deployment.
 

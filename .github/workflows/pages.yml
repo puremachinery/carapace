@@ -5,6 +5,11 @@ on:
     branches: [main, master]
     paths:
       - "website/**"
+      - "docs/cookbook/**"
+      - "docs/getting-started.md"
+      - "docs/site/**"
+      - "scripts/build-pages-content.sh"
+      - "scripts/check-pages-links.sh"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
 
@@ -29,6 +34,17 @@ jobs:
           rm -rf public
           mkdir -p public
           cp -R website/. public/
+
+      - name: Install Pandoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pandoc
+
+      - name: Render website docs pages from Markdown
+        run: ./scripts/build-pages-content.sh public
+
+      - name: Validate generated internal links
+        run: ./scripts/check-pages-links.sh public
 
       - uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
 
