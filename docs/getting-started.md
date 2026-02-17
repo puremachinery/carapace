@@ -48,60 +48,30 @@ Copy-Item .\cara-x86_64-windows.exe (Join-Path $installDir "cara.exe")
 cara --help
 ```
 
-## Quick Start (Local, Token Auth)
+## Quick Start (Recommended: setup wizard)
 
-Create a minimal config (save as `carapace.json5`) for either platform:
-
-```json5
-{
-  "gateway": {
-    "auth": { "mode": "token", "token": "${CARAPACE_GATEWAY_TOKEN}" }
-  },
-  "openai": {
-    "apiKey": "${OPENAI_API_KEY}"
-  }
-}
-```
-
-### macOS/Linux
+Run the interactive setup:
 
 ```bash
-export CARAPACE_GATEWAY_TOKEN="$(openssl rand -hex 32)"
-CARAPACE_CONFIG_PATH=./carapace.json5 cara
+cara setup
+```
+
+Then start Carapace:
+
+```bash
+cara
 ```
 
 In another terminal:
 
 ```bash
 cara status --host 127.0.0.1 --port 18789
-curl -H "Authorization: Bearer ${CARAPACE_GATEWAY_TOKEN}" http://localhost:18789/health
-cara chat
+cara chat --port 18789
 ```
 
-### Windows (PowerShell)
-
-```powershell
-$bytes = [byte[]]::new(32)
-[System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
-$env:CARAPACE_GATEWAY_TOKEN = [System.BitConverter]::ToString($bytes).Replace('-', '').ToLower()
-
-$env:CARAPACE_CONFIG_PATH = ".\\carapace.json5"
-cara
-```
-
-In another PowerShell terminal:
-
-```powershell
-cara status --host 127.0.0.1 --port 18789
-curl.exe -H "Authorization: Bearer $env:CARAPACE_GATEWAY_TOKEN" http://127.0.0.1:18789/health
-cara chat
-```
-
-Expected `/health` response:
-
-```json
-{ "status": "ok", "version": "x.y.z", "uptimeSeconds": 12 }
-```
+The setup wizard asks for provider/auth/bind settings, first-run outcome
+(`local-chat`, `discord`, `telegram`, `hooks`), and optional hooks/control-ui
+configuration.
 
 If you set `gateway.port`, use that port instead of `18789`.
 
@@ -109,6 +79,9 @@ Helpful REPL commands:
 - `/help` — show available commands
 - `/new` — start a fresh chat session
 - `/exit` or `/quit` — leave chat
+
+Manual config path is still available in [First Run](site/first-run.md) and
+`config.example.json5`.
 
 ## Configuration Basics
 

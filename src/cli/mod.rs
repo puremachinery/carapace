@@ -249,6 +249,8 @@ pub enum ConfigCommand {
 // Subcommand handlers
 // ---------------------------------------------------------------------------
 
+use crate::channels::discord::DiscordChannel;
+use crate::channels::telegram::TelegramChannel;
 use crate::config;
 use crate::credentials;
 use crate::logging::buffer::LogLevel;
@@ -1690,6 +1692,109 @@ pub fn handle_reset(
 // Setup / Pair / Update handlers
 // ---------------------------------------------------------------------------
 
+const DISCORD_API_BASE_URL: &str = "https://discord.com/api/v10";
+const TELEGRAM_API_BASE_URL: &str = "https://api.telegram.org";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetupOutcome {
+    LocalChat,
+    Discord,
+    Telegram,
+    Hooks,
+}
+
+impl SetupOutcome {
+    fn prompt_key(self) -> &'static str {
+        match self {
+            Self::LocalChat => "local-chat",
+            Self::Discord => "discord",
+            Self::Telegram => "telegram",
+            Self::Hooks => "hooks",
+        }
+    }
+}
+
+fn parse_setup_outcome(raw: &str) -> Option<SetupOutcome> {
+    match raw.trim().to_lowercase().as_str() {
+        "local-chat" | "local" | "chat" | "assistant" => Some(SetupOutcome::LocalChat),
+        "discord" => Some(SetupOutcome::Discord),
+        "telegram" => Some(SetupOutcome::Telegram),
+        "hooks" | "webhook" | "webhooks" => Some(SetupOutcome::Hooks),
+        _ => None,
+    }
+}
+
+fn prompt_setup_outcome() -> Result<SetupOutcome, Box<dyn std::error::Error>> {
+    loop {
+        let selection = prompt_with_default(
+            "Pick your first-run outcome (local-chat/discord/telegram/hooks)",
+            SetupOutcome::LocalChat.prompt_key(),
+        )?;
+        if let Some(outcome) = parse_setup_outcome(&selection) {
+            return Ok(outcome);
+        }
+        eprintln!("Please choose one of: local-chat, discord, telegram, hooks.");
+    }
+}
+
+fn prompt_optional_value_from_env(
+    env_var: &str,
+    label: &str,
+    prompt: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let env_value = std::env::var(env_var).ok().filter(|v| !v.trim().is_empty());
+    if let Some(value) = env_value {
+        let use_env = prompt_yes_no(&format!("Use {label} from ${env_var}?"), true)?;
+        if use_env {
+            return Ok(Some(value));
+        }
+    }
+
+    let entered = prompt_line(prompt)?;
+    if entered.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(entered))
+    }
+}
+
+fn print_setup_outcome_next_steps(outcome: SetupOutcome, port: u16, hooks_enabled: bool) {
+    println!();
+    match outcome {
+        SetupOutcome::LocalChat => {
+            println!("First-run outcome: local assistant chat");
+            println!("Next step: run `cara chat --port {port}` when the service is up.");
+        }
+        SetupOutcome::Discord => {
+            println!("First-run outcome: Discord assistant");
+            println!("Next step: follow docs/cookbook/discord-assistant.md");
+            println!("Web docs: https://getcara.io/cookbook/discord-assistant.html");
+        }
+        SetupOutcome::Telegram => {
+            println!("First-run outcome: Telegram assistant");
+            println!("Next step: follow docs/cookbook/telegram-webhook-assistant.md");
+            println!("Web docs: https://getcara.io/cookbook/telegram-webhook-assistant.html");
+        }
+        SetupOutcome::Hooks => {
+            println!("First-run outcome: hooks automation");
+            if hooks_enabled {
+                println!("Next step: send a test hook to http://127.0.0.1:{port}/hooks/wake");
+                println!(
+                    "Example: curl -X POST -H 'Authorization: Bearer <CARAPACE_HOOKS_TOKEN>' \\"
+                );
+                println!(
+                    "  -H 'Content-Type: application/json' http://127.0.0.1:{port}/hooks/wake \\"
+                );
+                println!("  -d '{{\"text\":\"wake\"}}'");
+            } else {
+                println!(
+                    "Hooks outcome selected, but hooks are disabled. Enable `gateway.hooks.enabled` to use it."
+                );
+            }
+        }
+    }
+}
+
 fn prompt_line(prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
     use std::io::{self, Write};
 
@@ -1815,6 +1920,50 @@ async fn validate_provider_credentials(provider: &str, api_key: &str) -> Result<
     Err(message)
 }
 
+async fn validate_channel_credentials(channel: &str, token: &str) -> Result<(), String> {
+    match channel {
+        "discord" => {
+            let token = token.to_string();
+            tokio::task::spawn_blocking(move || {
+                DiscordChannel::new(DISCORD_API_BASE_URL.to_string(), token)
+                    .validate()
+                    .map_err(|err| {
+                        if err.is_auth() {
+                            format!("Discord credential check failed: {}", err.message())
+                        } else {
+                            format!(
+                                "Discord credential check hit a transient error: {}",
+                                err.message()
+                            )
+                        }
+                    })
+            })
+            .await
+            .map_err(|e| format!("Discord credential check task failed: {e}"))?
+        }
+        "telegram" => {
+            let token = token.to_string();
+            tokio::task::spawn_blocking(move || {
+                TelegramChannel::new(TELEGRAM_API_BASE_URL.to_string(), token)
+                    .validate()
+                    .map_err(|err| {
+                        if err.is_auth() {
+                            format!("Telegram credential check failed: {}", err.message())
+                        } else {
+                            format!(
+                                "Telegram credential check hit a transient error: {}",
+                                err.message()
+                            )
+                        }
+                    })
+            })
+            .await
+            .map_err(|e| format!("Telegram credential check task failed: {e}"))?
+        }
+        other => Err(format!("unsupported channel for validation: {other}")),
+    }
+}
+
 fn validate_provider_credentials_interactive(
     provider: &str,
     api_key: &str,
@@ -1830,6 +1979,39 @@ fn validate_provider_credentials_interactive(
         .build()?;
 
     match runtime.block_on(validate_provider_credentials(provider, api_key)) {
+        Ok(()) => {
+            println!("Credential check succeeded.");
+            Ok(())
+        }
+        Err(err) => {
+            eprintln!("Credential check failed: {}", err);
+            if prompt_yes_no("Continue setup and write config anyway?", false)? {
+                Ok(())
+            } else {
+                Err("setup aborted after credential validation failure".into())
+            }
+        }
+    }
+}
+
+fn validate_channel_credentials_interactive(
+    channel: &str,
+    token: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let validate_now = prompt_yes_no(
+        &format!("Validate {channel} credentials now? Recommended."),
+        true,
+    )?;
+    if !validate_now {
+        return Ok(());
+    }
+
+    println!("Checking {} credentials...", channel);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+
+    match runtime.block_on(validate_channel_credentials(channel, token)) {
         Ok(()) => {
             println!("Credential check succeeded.");
             Ok(())
@@ -1917,6 +2099,9 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     });
+
+    let mut setup_outcome = SetupOutcome::LocalChat;
+    let mut hooks_enabled = false;
 
     if interactive {
         println!("Carapace setup wizard");
@@ -2028,6 +2213,71 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
             });
         }
 
+        setup_outcome = prompt_setup_outcome()?;
+
+        match setup_outcome {
+            SetupOutcome::Discord => {
+                let discord_token = prompt_optional_value_from_env(
+                    "DISCORD_BOT_TOKEN",
+                    "Discord bot token",
+                    "Enter Discord bot token (leave blank to skip for now): ",
+                )?;
+                if let Some(token) = discord_token {
+                    validate_channel_credentials_interactive("discord", &token)?;
+                    config["discord"] = serde_json::json!({
+                        "enabled": true,
+                        "botToken": token
+                    });
+                } else {
+                    println!(
+                        "Skipped Discord token. You can configure it later in `discord.botToken`."
+                    );
+                }
+            }
+            SetupOutcome::Telegram => {
+                let telegram_token = prompt_optional_value_from_env(
+                    "TELEGRAM_BOT_TOKEN",
+                    "Telegram bot token",
+                    "Enter Telegram bot token (leave blank to skip for now): ",
+                )?;
+                if let Some(token) = telegram_token {
+                    validate_channel_credentials_interactive("telegram", &token)?;
+                    config["telegram"] = serde_json::json!({
+                        "enabled": true,
+                        "botToken": token
+                    });
+                } else {
+                    println!("Skipped Telegram token. You can configure it later in `telegram.botToken`.");
+                }
+            }
+            SetupOutcome::LocalChat | SetupOutcome::Hooks => {}
+        }
+
+        hooks_enabled = prompt_yes_no(
+            "Enable hooks API (`/hooks`) for automations?",
+            matches!(setup_outcome, SetupOutcome::Hooks),
+        )?;
+        if hooks_enabled {
+            let hooks_token =
+                if prompt_yes_no("Generate a strong hooks token automatically?", true)? {
+                    generate_hex_secret(32)?
+                } else {
+                    prompt_custom_secret("hooks token")?
+                };
+            config["gateway"]["hooks"] = serde_json::json!({
+                "enabled": true,
+                "token": hooks_token
+            });
+        }
+
+        let enable_control_ui =
+            prompt_yes_no("Enable local Control UI dashboard (`/control`)?", false)?;
+        if enable_control_ui {
+            config["gateway"]["controlUi"] = serde_json::json!({
+                "enabled": true
+            });
+        }
+
         config["agents"]["defaults"]["model"] = serde_json::json!(default_model);
         match provider {
             "openai" => {
@@ -2057,7 +2307,13 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or(DEFAULT_PORT);
 
         let run_status = prompt_yes_no("Run setup smoke check now (`cara status`)?", true)?;
-        let launch_chat = prompt_yes_no("Launch interactive chat now (`cara chat`)?", false)?;
+        let launch_chat_default = matches!(setup_outcome, SetupOutcome::LocalChat);
+        let launch_chat_prompt = if launch_chat_default {
+            "Run your first assistant action now (`cara chat`)?"
+        } else {
+            "Also launch local assistant chat now (`cara chat`)?"
+        };
+        let launch_chat = prompt_yes_no(launch_chat_prompt, launch_chat_default)?;
 
         if run_status || launch_chat {
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -2072,6 +2328,8 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
+
+        print_setup_outcome_next_steps(setup_outcome, port, hooks_enabled);
     }
 
     Ok(())
@@ -3415,6 +3673,27 @@ mod tests {
         assert_eq!(format_file_size(1536), "1.5 KB");
         assert_eq!(format_file_size(1048576), "1.0 MB");
         assert_eq!(format_file_size(1073741824), "1.00 GB");
+    }
+
+    #[test]
+    fn test_parse_setup_outcome_aliases() {
+        assert_eq!(
+            parse_setup_outcome("local-chat"),
+            Some(SetupOutcome::LocalChat)
+        );
+        assert_eq!(parse_setup_outcome("local"), Some(SetupOutcome::LocalChat));
+        assert_eq!(parse_setup_outcome("discord"), Some(SetupOutcome::Discord));
+        assert_eq!(
+            parse_setup_outcome("telegram"),
+            Some(SetupOutcome::Telegram)
+        );
+        assert_eq!(parse_setup_outcome("webhooks"), Some(SetupOutcome::Hooks));
+    }
+
+    #[test]
+    fn test_parse_setup_outcome_invalid() {
+        assert_eq!(parse_setup_outcome(""), None);
+        assert_eq!(parse_setup_outcome("unknown"), None);
     }
 
     // -----------------------------------------------------------------------

@@ -48,6 +48,16 @@ Remove state data categories. Use `--all` or explicit flags plus `--force`.
 ### setup
 Interactive first-run configuration wizard.
 
+It prompts for:
+- provider + API key (with optional credential validation),
+- gateway auth mode + generated/custom secret,
+- bind mode + port,
+- first-run outcome (`local-chat`, `discord`, `telegram`, `hooks`),
+- optional hooks API token and Control UI toggle.
+
+At the end, it offers immediate smoke checks (`cara status`) and a first action
+(`cara chat`), then prints outcome-specific next steps.
+
 ### pair
 Pair this CLI with a Carapace service.
 

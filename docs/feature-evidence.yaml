@@ -1345,18 +1345,25 @@ features:
   - feature: "setup"
     status: "verified_done"
     runtime_wiring:
-      - "src/cli/mod.rs::handle_setup (interactive provider + API key wiring)"
+      - "src/cli/mod.rs::handle_setup (provider/auth/bind prompts + first-run outcome wiring for local chat/Discord/Telegram/hooks + optional hooks/control UI config)"
+      - "src/cli/mod.rs::validate_provider_credentials_interactive"
+      - "src/cli/mod.rs::validate_channel_credentials_interactive"
+      - "src/cli/mod.rs::run_setup_post_checks (status/chat smoke action)"
     tests:
       - "src/cli/mod.rs::test_handle_setup_*"
+      - "src/cli/mod.rs::test_parse_setup_outcome_aliases"
+      - "src/cli/mod.rs::test_parse_setup_outcome_invalid"
 
   - feature: "wizard"
     status: "verified_done"
     runtime_wiring:
       - "src/server/ws/handlers/wizard.rs::handle_wizard_next + persist_wizard_config"
-      - "src/server/ws/handlers/wizard.rs::apply_wizard_config (setup/channel/agent updates)"
+      - "src/server/ws/handlers/wizard.rs::apply_wizard_config (setup/channel/agent updates, including first-run outcome + hooks/control UI setup fields)"
       - "src/server/ws/handlers/config.rs::write_config_file (wizard persistence)"
     tests:
       - "src/server/ws/handlers/wizard.rs::test_apply_setup_wizard_updates_config"
+      - "src/server/ws/handlers/wizard.rs::test_apply_setup_wizard_respects_auth_and_bind_overrides"
+      - "src/server/ws/handlers/wizard.rs::test_apply_setup_wizard_hooks_outcome_enables_hooks_by_default"
       - "src/server/ws/handlers/wizard.rs::test_apply_channel_wizard_updates_config"
       - "src/server/ws/handlers/wizard.rs::test_apply_agent_wizard_updates_identity"
 
