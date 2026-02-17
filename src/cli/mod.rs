@@ -2472,24 +2472,27 @@ async fn verify_channel_outcome(
     telegram_to: Option<String>,
     checks: &mut Vec<VerifyCheckResult>,
 ) -> Result<(), String> {
-    let (channel_label, channel_key, env_var, destination, destination_flag) =
-        if outcome == SetupOutcome::Discord {
-            (
-                "Discord",
-                "discord",
-                "DISCORD_BOT_TOKEN",
-                discord_to,
-                "--discord-to <channel_id>",
-            )
-        } else {
-            (
-                "Telegram",
-                "telegram",
-                "TELEGRAM_BOT_TOKEN",
-                telegram_to,
-                "--telegram-to <chat_id>",
-            )
-        };
+    let (channel_label, channel_key, env_var, destination, destination_flag) = match outcome {
+        SetupOutcome::Discord => (
+            "Discord",
+            "discord",
+            "DISCORD_BOT_TOKEN",
+            discord_to,
+            "--discord-to <channel_id>",
+        ),
+        SetupOutcome::Telegram => (
+            "Telegram",
+            "telegram",
+            "TELEGRAM_BOT_TOKEN",
+            telegram_to,
+            "--telegram-to <chat_id>",
+        ),
+        other => {
+            return Err(format!(
+                "unsupported channel outcome for verification: {other:?}"
+            ))
+        }
+    };
 
     let token = resolve_channel_bot_token(cfg, channel_key, env_var);
     let token = if let Some(token) = token {
@@ -2569,27 +2572,16 @@ async fn run_outcome_verifier(
     let discord_to = normalize_optional_input(discord_to);
     let telegram_to = normalize_optional_input(telegram_to);
 
-    match outcome {
-        SetupOutcome::LocalChat => {
-            if let Err(err) = verify_local_chat_outcome(port, &mut checks).await {
-                print_verify_summary(outcome, port, &checks);
-                return Err(err);
-            }
-        }
-        SetupOutcome::Hooks => {
-            if let Err(err) = verify_hooks_outcome(port, cfg, &mut checks).await {
-                print_verify_summary(outcome, port, &checks);
-                return Err(err);
-            }
-        }
+    let result = match outcome {
+        SetupOutcome::LocalChat => verify_local_chat_outcome(port, &mut checks).await,
+        SetupOutcome::Hooks => verify_hooks_outcome(port, cfg, &mut checks).await,
         SetupOutcome::Discord | SetupOutcome::Telegram => {
-            if let Err(err) =
-                verify_channel_outcome(outcome, cfg, discord_to, telegram_to, &mut checks).await
-            {
-                print_verify_summary(outcome, port, &checks);
-                return Err(err);
-            }
+            verify_channel_outcome(outcome, cfg, discord_to, telegram_to, &mut checks).await
         }
+    };
+    if let Err(err) = result {
+        print_verify_summary(outcome, port, &checks);
+        return Err(err);
     }
 
     print_verify_summary(outcome, port, &checks);
