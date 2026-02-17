@@ -106,3 +106,7 @@ pre-commit:
 # Run pre-push hook checks manually.
 pre-push:
     ./scripts/hooks/pre-push origin </dev/null
+
+# Create a PR safely from a markdown body file (avoids shell backtick expansion).
+pr-create TITLE BODY_FILE BASE='master' HEAD='':
+    ./scripts/create-pr.sh "{{TITLE}}" "{{BODY_FILE}}" "{{BASE}}" "{{HEAD}}"
