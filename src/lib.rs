@@ -10,6 +10,7 @@ pub mod cli;
 pub mod config;
 pub mod credentials;
 pub mod cron;
+pub mod crypto;
 pub mod devices;
 pub mod discovery;
 pub mod exec;

@@ -1722,6 +1722,163 @@ fn prompt_yes_no(prompt: &str, default_yes: bool) -> Result<bool, Box<dyn std::e
     }
 }
 
+fn prompt_choice(
+    prompt: &str,
+    default: &str,
+    accepted: &[&str],
+) -> Result<String, Box<dyn std::error::Error>> {
+    loop {
+        let selection = prompt_with_default(prompt, default)?;
+        let normalized = selection.trim().to_lowercase();
+        if accepted
+            .iter()
+            .any(|value| normalized.as_str() == value.to_lowercase())
+        {
+            return Ok(normalized);
+        }
+        eprintln!("Please enter one of: {}", accepted.join(", "));
+    }
+}
+
+fn prompt_port(default_port: u16) -> Result<u16, Box<dyn std::error::Error>> {
+    loop {
+        let raw = prompt_with_default("Gateway port", &default_port.to_string())?;
+        match raw.parse::<u16>() {
+            Ok(0) => eprintln!("Port must be between 1 and 65535."),
+            Ok(port) => return Ok(port),
+            Err(_) => eprintln!("Please enter a valid TCP port (1-65535)."),
+        }
+    }
+}
+
+fn generate_hex_secret(byte_len: usize) -> Result<String, Box<dyn std::error::Error>> {
+    Ok(crate::crypto::generate_hex_secret(byte_len)?)
+}
+
+fn prompt_custom_secret(kind: &str) -> Result<String, Box<dyn std::error::Error>> {
+    const MIN_SECRET_LENGTH: usize = 10;
+
+    loop {
+        let entered = prompt_line(&format!("Enter {} (input is visible): ", kind))?;
+        if entered.is_empty() {
+            eprintln!("{} cannot be empty.", kind);
+            continue;
+        }
+
+        if entered.chars().count() < MIN_SECRET_LENGTH {
+            eprintln!(
+                "{} must be at least {} characters long.",
+                kind, MIN_SECRET_LENGTH
+            );
+            continue;
+        }
+
+        return Ok(entered);
+    }
+}
+
+async fn validate_provider_credentials(provider: &str, api_key: &str) -> Result<(), String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+        .map_err(|e| format!("failed to build validation client: {e}"))?;
+
+    let response = match provider {
+        "openai" => client
+            .get("https://api.openai.com/v1/models")
+            .bearer_auth(api_key)
+            .send()
+            .await
+            .map_err(|e| format!("OpenAI credential check failed: {e}"))?,
+        "anthropic" => client
+            .get("https://api.anthropic.com/v1/models")
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+            .send()
+            .await
+            .map_err(|e| format!("Anthropic credential check failed: {e}"))?,
+        other => return Err(format!("unsupported provider for validation: {other}")),
+    };
+
+    if response.status().is_success() {
+        return Ok(());
+    }
+
+    let status = response.status();
+    let has_body = !response.text().await.unwrap_or_default().trim().is_empty();
+    let mut message = format!("{provider} credential check failed (HTTP {status}).");
+    if has_body {
+        message.push_str(
+            " The provider returned an error message that is hidden because it may contain sensitive information.",
+        );
+    }
+    Err(message)
+}
+
+fn validate_provider_credentials_interactive(
+    provider: &str,
+    api_key: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let validate_now = prompt_yes_no("Validate provider credentials now? Recommended.", true)?;
+    if !validate_now {
+        return Ok(());
+    }
+
+    println!("Checking {} credentials...", provider);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+
+    match runtime.block_on(validate_provider_credentials(provider, api_key)) {
+        Ok(()) => {
+            println!("Credential check succeeded.");
+            Ok(())
+        }
+        Err(err) => {
+            eprintln!("Credential check failed: {}", err);
+            if prompt_yes_no("Continue setup and write config anyway?", false)? {
+                Ok(())
+            } else {
+                Err("setup aborted after credential validation failure".into())
+            }
+        }
+    }
+}
+
+async fn run_setup_post_checks(
+    port: u16,
+    run_status: bool,
+    launch_chat: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut setup_server_handle = if run_status || launch_chat {
+        chat::ensure_local_gateway_running(port).await?
+    } else {
+        None
+    };
+
+    if run_status {
+        let status_result = handle_status("127.0.0.1", Some(port)).await;
+        if status_result.is_err() {
+            if let Some(handle) = setup_server_handle.take() {
+                handle.shutdown().await;
+            }
+        }
+        status_result?;
+    }
+
+    let chat_result = if launch_chat {
+        chat::run_chat_session(false, port).await
+    } else {
+        Ok(())
+    };
+
+    if let Some(handle) = setup_server_handle {
+        handle.shutdown().await;
+    }
+
+    chat_result
+}
+
 /// Run the `setup` subcommand -- interactive first-run wizard.
 pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
     let config_path = config::get_config_path();
@@ -1742,11 +1899,17 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
 
     let interactive = std::io::stdin().is_terminal();
 
+    let default_gateway_token = generate_hex_secret(32)?;
+
     // Build a minimal default config.
     let mut config = serde_json::json!({
         "gateway": {
-            "port": 3001,
-            "bind": "loopback"
+            "port": DEFAULT_PORT,
+            "bind": "loopback",
+            "auth": {
+                "mode": "token",
+                "token": default_gateway_token
+            }
         },
         "agents": {
             "defaults": {
@@ -1774,9 +1937,7 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
             match normalized.as_str() {
                 "anthropic" | "claude" => break "anthropic",
                 "openai" | "gpt" => break "openai",
-                _ => {
-                    eprintln!("Please enter either \"anthropic\" or \"openai\".");
-                }
+                _ => eprintln!("Please enter either \"anthropic\" or \"openai\"."),
             }
         };
 
@@ -1786,15 +1947,18 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
         };
 
         let env_key = std::env::var(env_var).ok();
+        let mut effective_api_key = None;
         let api_key = if env_key.is_some() {
             let use_env = prompt_yes_no(&format!("Use API key from ${env_var}?"), true)?;
             if use_env {
+                effective_api_key = env_key.clone();
                 Some(format!("${{{env_var}}}"))
             } else {
                 let entered = prompt_line("Enter API key (input is visible): ")?;
                 if entered.is_empty() {
                     None
                 } else {
+                    effective_api_key = Some(entered.clone());
                     Some(entered)
                 }
             }
@@ -1803,12 +1967,65 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
             if entered.is_empty() {
                 None
             } else {
+                effective_api_key = Some(entered.clone());
                 Some(entered)
             }
         };
 
         if api_key.is_none() {
             println!("No API key provided. You can set it later via ${env_var}.");
+        }
+
+        if let Some(key) = effective_api_key.as_deref() {
+            validate_provider_credentials_interactive(provider, key)?;
+        }
+
+        let auth_mode = prompt_choice(
+            "Gateway auth mode (token/password)",
+            "token",
+            &["token", "password"],
+        )?;
+        let auth_secret = if auth_mode == "token" {
+            if prompt_yes_no("Generate a strong gateway token automatically?", true)? {
+                generate_hex_secret(32)?
+            } else {
+                prompt_custom_secret("gateway token")?
+            }
+        } else if prompt_yes_no("Generate a strong gateway password automatically?", true)? {
+            generate_hex_secret(24)?
+        } else {
+            prompt_custom_secret("gateway password")?
+        };
+
+        let bind_mode = loop {
+            let bind = prompt_choice(
+                "Gateway bind mode (loopback/lan)",
+                "loopback",
+                &["loopback", "lan"],
+            )?;
+            if bind == "lan" {
+                eprintln!("Warning: LAN bind exposes Carapace to your local network.");
+                eprintln!("Use strong auth and add TLS/reverse proxy before broader exposure.");
+                if !prompt_yes_no("Continue with LAN bind?", false)? {
+                    continue;
+                }
+            }
+            break bind;
+        };
+        let gateway_port = prompt_port(DEFAULT_PORT)?;
+
+        config["gateway"]["bind"] = serde_json::json!(bind_mode);
+        config["gateway"]["port"] = serde_json::json!(gateway_port);
+        if auth_mode == "token" {
+            config["gateway"]["auth"] = serde_json::json!({
+                "mode": "token",
+                "token": auth_secret
+            });
+        } else {
+            config["gateway"]["auth"] = serde_json::json!({
+                "mode": "password",
+                "password": auth_secret
+            });
         }
 
         config["agents"]["defaults"]["model"] = serde_json::json!(default_model);
@@ -1830,6 +2047,32 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Config written to {}", config_path.display());
     println!("Start the server with: cara start");
+
+    if interactive {
+        let port = config
+            .get("gateway")
+            .and_then(|v| v.get("port"))
+            .and_then(|v| v.as_u64())
+            .and_then(|v| u16::try_from(v).ok())
+            .unwrap_or(DEFAULT_PORT);
+
+        let run_status = prompt_yes_no("Run setup smoke check now (`cara status`)?", true)?;
+        let launch_chat = prompt_yes_no("Launch interactive chat now (`cara chat`)?", false)?;
+
+        if run_status || launch_chat {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            if let Err(err) = runtime.block_on(run_setup_post_checks(port, run_status, launch_chat))
+            {
+                eprintln!("Post-setup checks failed: {}", err);
+                eprintln!(
+                    "You can retry manually with: cara status --port {}  and  cara chat --port {}",
+                    port, port
+                );
+            }
+        }
+    }
 
     Ok(())
 }
@@ -3265,12 +3508,23 @@ mod tests {
         let parsed: serde_json::Value = json5::from_str(&content).unwrap();
 
         assert_eq!(
-            parsed["gateway"]["port"], 3001,
-            "Default port should be 3001"
+            parsed["gateway"]["port"], DEFAULT_PORT,
+            "Default port should match server default"
         );
         assert_eq!(
             parsed["gateway"]["bind"], "loopback",
             "Default bind should be loopback"
+        );
+        assert_eq!(
+            parsed["gateway"]["auth"]["mode"], "token",
+            "Default auth mode should be token"
+        );
+        assert!(
+            parsed["gateway"]["auth"]["token"]
+                .as_str()
+                .map(|v| !v.is_empty())
+                .unwrap_or(false),
+            "Default setup should generate a non-empty gateway token"
         );
         assert_eq!(
             parsed["agents"]["defaults"]["model"], "claude-sonnet-4-20250514",

@@ -8,6 +8,7 @@ mod cli;
 mod config;
 mod credentials;
 mod cron;
+mod crypto;
 mod devices;
 mod discovery;
 mod exec;
