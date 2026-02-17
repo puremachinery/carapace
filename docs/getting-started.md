@@ -6,9 +6,9 @@ It’s intentionally practical: copy/paste steps, then customize.
 If you prefer outcome-first walkthroughs (for example "add Discord"), see
 the [Cookbook](cookbook/README.md).
 If you want the website flow instead of Markdown docs, use:
-- [Install](site/install.md)
-- [First Run](site/first-run.md)
-- [Get Unstuck](site/get-unstuck.md)
+- <https://getcara.io/install.html>
+- <https://getcara.io/first-run.html>
+- <https://getcara.io/get-unstuck.html>
 
 ## Prerequisites
 

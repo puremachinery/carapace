@@ -4,6 +4,7 @@ A security-focused, open-source personal AI assistant.
 
 ## Start Here
 
+- [Website](https://getcara.io) — install, first run, cookbook, and troubleshooting
 - [Getting Started](getting-started.md) — install, first run, and ops
 - [Install](site/install.md) — binary downloads and verification
 - [First Run](site/first-run.md) — secure local startup and smoke checks

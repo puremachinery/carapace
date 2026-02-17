@@ -7,5 +7,5 @@ contact_links:
     url: https://github.com/puremachinery/carapace/security/advisories/new
     about: Please report security vulnerabilities privately through GitHub security reporting.
   - name: Getting started guide
-    url: https://puremachinery.github.io/carapace/getting-started.html
+    url: https://getcara.io/getting-started.html
     about: Website getting-started flow (install, first run, and troubleshooting).
