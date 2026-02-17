@@ -2,110 +2,66 @@
 
 ## Outcome
 
-Start Carapace in secure local mode, verify health, and get your first response in `cara chat`.
+Run `cara setup`, start Carapace, and complete your first useful assistant workflow.
 
 ## Prerequisites
 
 - `cara` installed: [Install guide](install.md)
-- One provider key set in your shell:
-  - `ANTHROPIC_API_KEY` or
+- One provider key available in your shell:
+  - `ANTHROPIC_API_KEY`, or
   - `OPENAI_API_KEY`
 
-## macOS/Linux
-
-### 1) Generate service token
+## 1) Run the setup wizard
 
 ```bash
-export CARAPACE_GATEWAY_TOKEN="$(openssl rand -hex 32)"
+cara setup
 ```
 
-### 2) Create minimal config (`carapace.json5`)
+The wizard walks you through:
+- provider + API key (with optional credential validation),
+- gateway auth mode (`token`/`password`) and strong-secret generation,
+- bind + port,
+- first-run outcome:
+  - `local-chat`
+  - `discord`
+  - `telegram`
+  - `hooks`
+- optional hooks token and Control UI toggle.
 
-```json5
-{
-  "gateway": {
-    "bind": "loopback",
-    "port": 18789,
-    "auth": {
-      "mode": "token",
-      "token": "${CARAPACE_GATEWAY_TOKEN}"
-    }
-  },
-  "anthropic": {
-    "apiKey": "${ANTHROPIC_API_KEY}"
-  }
-}
-```
-
-If using OpenAI instead:
-
-```json5
-"openai": {
-  "apiKey": "${OPENAI_API_KEY}"
-}
-```
-
-### 3) Start Carapace
+## 2) Start Carapace
 
 ```bash
-CARAPACE_CONFIG_PATH=./carapace.json5 cara
+cara
 ```
 
-### 4) Smoke checks (expected checkpoints)
+## 3) Run smoke checks
 
 In a second terminal:
 
 ```bash
 cara status --host 127.0.0.1 --port 18789
-curl -H "Authorization: Bearer ${CARAPACE_GATEWAY_TOKEN}" http://127.0.0.1:18789/health
-cara chat
+cara chat --port 18789
 ```
 
 Expected:
 
-- `cara status` shows service healthy.
-- `/health` returns JSON with `"status":"ok"`.
-- `cara chat` opens REPL and returns a model response.
+- `cara status` shows the service healthy.
+- `cara chat` opens the REPL and returns a model response.
 
-## Windows (PowerShell)
+If you set a custom port during setup, use that instead of `18789`.
 
-### 1) Generate service token
+## 4) Complete your chosen first outcome
 
-```powershell
-$bytes = [byte[]]::new(32)
-[System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
-$env:CARAPACE_GATEWAY_TOKEN = [System.BitConverter]::ToString($bytes).Replace('-', '').ToLower()
-```
-
-### 2) Create minimal config (`carapace.json5`)
-
-Use the same config shown in the macOS/Linux path above.
-
-### 3) Start Carapace
-
-```powershell
-$env:CARAPACE_CONFIG_PATH = ".\\carapace.json5"
-cara
-```
-
-### 4) Smoke checks (expected checkpoints)
-
-In a second PowerShell terminal:
-
-```powershell
-cara status --host 127.0.0.1 --port 18789
-curl.exe -H "Authorization: Bearer $env:CARAPACE_GATEWAY_TOKEN" http://127.0.0.1:18789/health
-cara chat
-```
-
-Expected:
-
-- `cara status` shows service healthy.
-- `/health` returns JSON with `"status":"ok"`.
-- `cara chat` opens REPL and returns a model response.
+- `local-chat`:
+  - You can continue in `cara chat`.
+- `discord`:
+  - Continue with [Add Carapace to Discord](../cookbook/discord-assistant.md)
+- `telegram`:
+  - Continue with [Set up Telegram inbound + reply flow](../cookbook/telegram-webhook-assistant.md)
+- `hooks`:
+  - Continue with [Expose hooks safely with token auth](../cookbook/hooks-safe-automation.md)
 
 ## Continue
 
-- Need channel setup? Go to [Cookbook](../cookbook/README.md)
-- Just want Discord first? Use [Add Carapace to Discord](../cookbook/discord-assistant.md)
+- Need a specific task flow? Go to [Cookbook](../cookbook/README.md)
 - Stuck? Use [Get Unstuck](get-unstuck.md)

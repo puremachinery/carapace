@@ -299,9 +299,97 @@ fn setup_wizard_steps() -> Vec<WizardStep> {
             }),
         },
         WizardStep {
+            id: "first_outcome".to_string(),
+            title: "First-Run Outcome".to_string(),
+            description: Some(
+                "Choose what you want to do first (local chat, Discord, Telegram, or hooks)."
+                    .to_string(),
+            ),
+            input_type: "select".to_string(),
+            options: Some(vec![
+                WizardOption {
+                    value: "local-chat".to_string(),
+                    label: "Local chat (recommended)".to_string(),
+                    description: Some("Get the first response in the CLI REPL.".to_string()),
+                },
+                WizardOption {
+                    value: "discord".to_string(),
+                    label: "Discord assistant".to_string(),
+                    description: Some("Configure Discord bot credentials.".to_string()),
+                },
+                WizardOption {
+                    value: "telegram".to_string(),
+                    label: "Telegram assistant".to_string(),
+                    description: Some("Configure Telegram bot credentials.".to_string()),
+                },
+                WizardOption {
+                    value: "hooks".to_string(),
+                    label: "Hooks automation".to_string(),
+                    description: Some("Configure /hooks for automations.".to_string()),
+                },
+            ]),
+            required: true,
+            default: Some(Value::String("local-chat".to_string())),
+            validation: None,
+        },
+        WizardStep {
+            id: "channel_token".to_string(),
+            title: "Channel Bot Token".to_string(),
+            description: Some(
+                "Optional. Used when first outcome is Discord or Telegram. Leave blank to configure later."
+                    .to_string(),
+            ),
+            input_type: "password".to_string(),
+            options: None,
+            required: false,
+            default: None,
+            validation: Some(WizardValidation {
+                min_length: Some(10),
+                max_length: Some(256),
+                pattern: None,
+            }),
+        },
+        WizardStep {
+            id: "hooks_enabled".to_string(),
+            title: "Enable Hooks API".to_string(),
+            description: Some("Expose /hooks endpoints for automations.".to_string()),
+            input_type: "confirm".to_string(),
+            options: None,
+            required: false,
+            default: Some(Value::Bool(false)),
+            validation: None,
+        },
+        WizardStep {
+            id: "hooks_token".to_string(),
+            title: "Hooks Token".to_string(),
+            description: Some(
+                "Optional. If hooks are enabled and this is empty, a strong token is generated."
+                    .to_string(),
+            ),
+            input_type: "password".to_string(),
+            options: None,
+            required: false,
+            default: None,
+            validation: Some(WizardValidation {
+                min_length: Some(10),
+                max_length: Some(256),
+                pattern: None,
+            }),
+        },
+        WizardStep {
+            id: "control_ui_enabled".to_string(),
+            title: "Enable Control UI".to_string(),
+            description: Some("Enable the local web dashboard.".to_string()),
+            input_type: "confirm".to_string(),
+            options: None,
+            required: false,
+            default: Some(Value::Bool(false)),
+            validation: None,
+        },
+        WizardStep {
             id: "complete".to_string(),
             title: "Setup Complete".to_string(),
-            description: Some("You're all set! Start chatting with your assistant.".to_string()),
+            description: Some("You're all set. Run your first assistant workflow.".to_string()),
             input_type: "confirm".to_string(),
             options: None,
             required: true,
@@ -436,6 +524,35 @@ fn set_value_at_path(root: &mut Value, path: &str, value: Value) {
         }
         current = current.get_mut(*part).expect("just inserted");
     }
+}
+
+fn get_value_at_path<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
+    let mut current = root;
+    for part in path.split('.') {
+        current = current.get(part)?;
+    }
+    Some(current)
+}
+
+fn get_bool_at_path(root: &Value, path: &str) -> Option<bool> {
+    get_value_at_path(root, path).and_then(Value::as_bool)
+}
+
+fn get_string_at_path<'a>(root: &'a Value, path: &str) -> Option<&'a str> {
+    get_value_at_path(root, path).and_then(Value::as_str)
+}
+
+fn apply_channel_token(config_value: &mut Value, channel_name: &str, token: &str) {
+    set_value_at_path(
+        config_value,
+        &format!("{channel_name}.botToken"),
+        json!(token),
+    );
+    set_value_at_path(
+        config_value,
+        &format!("{channel_name}.enabled"),
+        json!(true),
+    );
 }
 
 fn normalize_string(value: &Value) -> Option<String> {
@@ -700,6 +817,29 @@ fn apply_wizard_config(
                 .unwrap_or_else(|| "loopback".to_string())
                 .to_lowercase();
             let port = parse_wizard_port(data, "port", DEFAULT_PORT)?;
+            let first_outcome = data
+                .get("first_outcome")
+                .and_then(normalize_string)
+                .unwrap_or_else(|| "local-chat".to_string())
+                .to_lowercase();
+            let channel_token = data.get("channel_token").and_then(normalize_string);
+            let hooks_enabled = data
+                .get("hooks_enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or_else(|| {
+                    if matches!(first_outcome.as_str(), "hooks") {
+                        true
+                    } else {
+                        get_bool_at_path(config_value, "gateway.hooks.enabled").unwrap_or(false)
+                    }
+                });
+            let hooks_token = data.get("hooks_token").and_then(normalize_string);
+            let control_ui_enabled = data
+                .get("control_ui_enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or_else(|| {
+                    get_bool_at_path(config_value, "gateway.controlUi.enabled").unwrap_or(false)
+                });
 
             match provider.as_str() {
                 "anthropic" => {
@@ -762,24 +902,56 @@ fn apply_wizard_config(
                 }
             }
             set_value_at_path(config_value, "gateway.port", json!(port));
+            match first_outcome.as_str() {
+                "local-chat" => {}
+                "discord" => {
+                    if let Some(token) = channel_token.as_deref() {
+                        apply_channel_token(config_value, "discord", token);
+                    }
+                }
+                "telegram" => {
+                    if let Some(token) = channel_token.as_deref() {
+                        apply_channel_token(config_value, "telegram", token);
+                    }
+                }
+                "hooks" => {}
+                _ => {
+                    return Err(error_shape(
+                        ERROR_INVALID_REQUEST,
+                        "first_outcome must be local-chat, discord, telegram, or hooks",
+                        None,
+                    ));
+                }
+            }
+
+            set_value_at_path(config_value, "gateway.hooks.enabled", json!(hooks_enabled));
+            if hooks_enabled {
+                let token = if let Some(token) = hooks_token.as_deref() {
+                    token.to_string()
+                } else if let Some(existing_token) =
+                    get_string_at_path(config_value, "gateway.hooks.token")
+                {
+                    existing_token.to_string()
+                } else {
+                    resolve_wizard_auth_secret(None, 32)?
+                };
+                set_value_at_path(config_value, "gateway.hooks.token", json!(token));
+            }
+
+            set_value_at_path(
+                config_value,
+                "gateway.controlUi.enabled",
+                json!(control_ui_enabled),
+            );
             Ok(true)
         }
         "channel" => {
             let channel = require_wizard_string(data, "channel_type", "channel_type")?;
             let token = require_wizard_string(data, "channel_token", "channel_token")?;
             match channel.as_str() {
-                "telegram" => {
-                    set_value_at_path(config_value, "telegram.botToken", json!(token));
-                    set_value_at_path(config_value, "telegram.enabled", json!(true));
-                }
-                "discord" => {
-                    set_value_at_path(config_value, "discord.botToken", json!(token));
-                    set_value_at_path(config_value, "discord.enabled", json!(true));
-                }
-                "slack" => {
-                    set_value_at_path(config_value, "slack.botToken", json!(token));
-                    set_value_at_path(config_value, "slack.enabled", json!(true));
-                }
+                "telegram" => apply_channel_token(config_value, "telegram", &token),
+                "discord" => apply_channel_token(config_value, "discord", &token),
+                "slack" => apply_channel_token(config_value, "slack", &token),
                 _ => {
                     return Err(error_shape(
                         ERROR_INVALID_REQUEST,
@@ -1250,6 +1422,14 @@ mod tests {
             config_value["gateway"]["port"],
             Value::Number(DEFAULT_PORT.into())
         );
+        assert_eq!(
+            config_value["gateway"]["hooks"]["enabled"],
+            Value::Bool(false)
+        );
+        assert_eq!(
+            config_value["gateway"]["controlUi"]["enabled"],
+            Value::Bool(false)
+        );
         assert!(config_value["gateway"]["auth"]["token"]
             .as_str()
             .map(|v| !v.is_empty())
@@ -1265,6 +1445,11 @@ mod tests {
         data.insert("auth_secret".to_string(), json!("my-password"));
         data.insert("bind_mode".to_string(), json!("lan"));
         data.insert("port".to_string(), json!("19001"));
+        data.insert("first_outcome".to_string(), json!("discord"));
+        data.insert("channel_token".to_string(), json!("discord-bot-token"));
+        data.insert("hooks_enabled".to_string(), json!(true));
+        data.insert("hooks_token".to_string(), json!("hooks-secret-token"));
+        data.insert("control_ui_enabled".to_string(), json!(true));
         let mut config_value = json!({});
 
         let applied = apply_wizard_config("setup", &data, &mut config_value).unwrap();
@@ -1290,6 +1475,106 @@ mod tests {
             Value::String("lan".to_string())
         );
         assert_eq!(config_value["gateway"]["port"], Value::Number(19001.into()));
+        assert_eq!(
+            config_value["discord"]["botToken"],
+            Value::String("discord-bot-token".to_string())
+        );
+        assert_eq!(config_value["discord"]["enabled"], Value::Bool(true));
+        assert_eq!(
+            config_value["gateway"]["hooks"]["enabled"],
+            Value::Bool(true)
+        );
+        assert_eq!(
+            config_value["gateway"]["hooks"]["token"],
+            Value::String("hooks-secret-token".to_string())
+        );
+        assert_eq!(
+            config_value["gateway"]["controlUi"]["enabled"],
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn test_apply_setup_wizard_hooks_outcome_enables_hooks_by_default() {
+        let mut data = HashMap::new();
+        data.insert("provider".to_string(), json!("anthropic"));
+        data.insert("api_key".to_string(), json!("sk-test"));
+        data.insert("first_outcome".to_string(), json!("hooks"));
+        let mut config_value = json!({});
+
+        let applied = apply_wizard_config("setup", &data, &mut config_value).unwrap();
+        assert!(applied);
+        assert_eq!(
+            config_value["gateway"]["hooks"]["enabled"],
+            Value::Bool(true)
+        );
+        assert!(config_value["gateway"]["hooks"]["token"]
+            .as_str()
+            .map(|v| !v.is_empty())
+            .unwrap_or(false));
+    }
+
+    #[test]
+    fn test_apply_setup_wizard_preserves_existing_optional_toggles_when_unspecified() {
+        let mut data = HashMap::new();
+        data.insert("provider".to_string(), json!("anthropic"));
+        data.insert("api_key".to_string(), json!("sk-test"));
+        data.insert("first_outcome".to_string(), json!("local-chat"));
+
+        let mut config_value = json!({
+            "gateway": {
+                "hooks": {
+                    "enabled": true,
+                    "token": "existing-hooks-token"
+                },
+                "controlUi": {
+                    "enabled": true
+                }
+            }
+        });
+
+        let applied = apply_wizard_config("setup", &data, &mut config_value).unwrap();
+        assert!(applied);
+        assert_eq!(
+            config_value["gateway"]["hooks"]["enabled"],
+            Value::Bool(true)
+        );
+        assert_eq!(
+            config_value["gateway"]["hooks"]["token"],
+            Value::String("existing-hooks-token".to_string())
+        );
+        assert_eq!(
+            config_value["gateway"]["controlUi"]["enabled"],
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn test_apply_setup_wizard_hooks_outcome_reuses_existing_token_when_unspecified() {
+        let mut data = HashMap::new();
+        data.insert("provider".to_string(), json!("anthropic"));
+        data.insert("api_key".to_string(), json!("sk-test"));
+        data.insert("first_outcome".to_string(), json!("hooks"));
+
+        let mut config_value = json!({
+            "gateway": {
+                "hooks": {
+                    "enabled": false,
+                    "token": "existing-hooks-token"
+                }
+            }
+        });
+
+        let applied = apply_wizard_config("setup", &data, &mut config_value).unwrap();
+        assert!(applied);
+        assert_eq!(
+            config_value["gateway"]["hooks"]["enabled"],
+            Value::Bool(true)
+        );
+        assert_eq!(
+            config_value["gateway"]["hooks"]["token"],
+            Value::String("existing-hooks-token".to_string())
+        );
     }
 
     #[test]
