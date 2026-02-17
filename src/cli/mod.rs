@@ -1920,6 +1920,20 @@ async fn validate_provider_credentials(provider: &str, api_key: &str) -> Result<
     Err(message)
 }
 
+fn map_channel_validation_error(
+    channel_name: &str,
+    err: crate::channels::ChannelAuthError,
+) -> String {
+    if err.is_auth() {
+        format!("{channel_name} credential check failed: {}", err.message())
+    } else {
+        format!(
+            "{channel_name} credential check hit a transient error: {}",
+            err.message()
+        )
+    }
+}
+
 async fn validate_channel_credentials(channel: &str, token: &str) -> Result<(), String> {
     match channel {
         "discord" => {
@@ -1927,16 +1941,7 @@ async fn validate_channel_credentials(channel: &str, token: &str) -> Result<(), 
             tokio::task::spawn_blocking(move || {
                 DiscordChannel::new(DISCORD_API_BASE_URL.to_string(), token)
                     .validate()
-                    .map_err(|err| {
-                        if err.is_auth() {
-                            format!("Discord credential check failed: {}", err.message())
-                        } else {
-                            format!(
-                                "Discord credential check hit a transient error: {}",
-                                err.message()
-                            )
-                        }
-                    })
+                    .map_err(|err| map_channel_validation_error("Discord", err))
             })
             .await
             .map_err(|e| format!("Discord credential check task failed: {e}"))?
@@ -1946,16 +1951,7 @@ async fn validate_channel_credentials(channel: &str, token: &str) -> Result<(), 
             tokio::task::spawn_blocking(move || {
                 TelegramChannel::new(TELEGRAM_API_BASE_URL.to_string(), token)
                     .validate()
-                    .map_err(|err| {
-                        if err.is_auth() {
-                            format!("Telegram credential check failed: {}", err.message())
-                        } else {
-                            format!(
-                                "Telegram credential check hit a transient error: {}",
-                                err.message()
-                            )
-                        }
-                    })
+                    .map_err(|err| map_channel_validation_error("Telegram", err))
             })
             .await
             .map_err(|e| format!("Telegram credential check task failed: {e}"))?
