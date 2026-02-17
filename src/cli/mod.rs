@@ -1742,12 +1742,7 @@ impl SetupOutcome {
     }
 
     fn label(self) -> &'static str {
-        match self {
-            Self::LocalChat => "local-chat",
-            Self::Discord => "discord",
-            Self::Telegram => "telegram",
-            Self::Hooks => "hooks",
-        }
+        self.prompt_key()
     }
 }
 
@@ -2133,14 +2128,9 @@ impl VerifyCheckResult {
 }
 
 fn normalize_optional_input(input: Option<String>) -> Option<String> {
-    input.and_then(|value| {
-        let trimmed = value.trim().to_string();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed)
-        }
-    })
+    input
+        .map(|value| value.trim().to_string())
+        .filter(|trimmed| !trimmed.is_empty())
 }
 
 fn resolve_env_placeholder(value: &str) -> Option<String> {
@@ -2148,43 +2138,25 @@ fn resolve_env_placeholder(value: &str) -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
-    if !(trimmed.starts_with("${") && trimmed.ends_with('}')) {
+    let Some(key) = trimmed.strip_prefix("${").and_then(|s| s.strip_suffix('}')) else {
         return Some(trimmed.to_string());
-    }
-    let key = trimmed
-        .trim_start_matches("${")
-        .trim_end_matches('}')
-        .trim()
-        .to_string();
+    };
+    let key = key.trim();
     if key.is_empty() {
         return None;
     }
-    std::env::var(&key).ok().and_then(|env_value| {
-        let normalized = env_value.trim().to_string();
-        if normalized.is_empty() {
-            None
-        } else {
-            Some(normalized)
-        }
-    })
+    std::env::var(key)
+        .ok()
+        .map(|env_value| env_value.trim().to_string())
+        .filter(|normalized| !normalized.is_empty())
 }
 
 fn resolve_channel_bot_token(cfg: &Value, channel_key: &str, env_var: &str) -> Option<String> {
-    let env_token = std::env::var(env_var).ok().and_then(|value| {
-        let normalized = value.trim().to_string();
-        if normalized.is_empty() {
-            None
-        } else {
-            Some(normalized)
-        }
-    });
-    if env_token.is_some() {
-        return env_token;
-    }
-    cfg.get(channel_key)
-        .and_then(|v| v.get("botToken"))
-        .and_then(|v| v.as_str())
-        .and_then(resolve_env_placeholder)
+    std::env::var(env_var)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|normalized| !normalized.is_empty())
+        .or_else(|| resolve_channel_bot_token_from_config(cfg, channel_key))
 }
 
 fn resolve_channel_bot_token_from_config(cfg: &Value, channel_key: &str) -> Option<String> {
@@ -2195,29 +2167,14 @@ fn resolve_channel_bot_token_from_config(cfg: &Value, channel_key: &str) -> Opti
 }
 
 fn channel_outcome_configured(cfg: &Value, channel_key: &str) -> bool {
-    cfg.get(channel_key)
-        .and_then(|channel| channel.as_object())
-        .map(|channel| {
-            channel
-                .get("enabled")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-                || channel.get("botToken").is_some()
-        })
-        .unwrap_or(false)
+    resolve_channel_bot_token_from_config(cfg, channel_key).is_some()
 }
 
 fn resolve_hooks_token(cfg: &Value) -> Option<String> {
     std::env::var("CARAPACE_HOOKS_TOKEN")
         .ok()
-        .and_then(|value| {
-            let normalized = value.trim().to_string();
-            if normalized.is_empty() {
-                None
-            } else {
-                Some(normalized)
-            }
-        })
+        .map(|value| value.trim().to_string())
+        .filter(|normalized| !normalized.is_empty())
         .or_else(|| {
             cfg.get("gateway")
                 .and_then(|v| v.get("hooks"))
@@ -2228,12 +2185,10 @@ fn resolve_hooks_token(cfg: &Value) -> Option<String> {
 }
 
 fn infer_setup_outcome_from_config(cfg: &Value) -> SetupOutcome {
-    let discord_token = resolve_channel_bot_token_from_config(cfg, "discord");
-    if channel_outcome_configured(cfg, "discord") && discord_token.is_some() {
+    if channel_outcome_configured(cfg, "discord") {
         return SetupOutcome::Discord;
     }
-    let telegram_token = resolve_channel_bot_token_from_config(cfg, "telegram");
-    if channel_outcome_configured(cfg, "telegram") && telegram_token.is_some() {
+    if channel_outcome_configured(cfg, "telegram") {
         return SetupOutcome::Telegram;
     }
     let hooks_enabled = cfg
@@ -2869,17 +2824,11 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
             SetupOutcome::Discord => verify_discord_to.is_some(),
             SetupOutcome::Telegram => verify_telegram_to.is_some(),
         };
-        let verify_prompt = match setup_outcome {
-            SetupOutcome::LocalChat => {
-                "Run outcome verifier now (`cara verify --outcome local-chat`)?"
-            }
-            SetupOutcome::Discord => "Run outcome verifier now (`cara verify --outcome discord`)?",
-            SetupOutcome::Telegram => {
-                "Run outcome verifier now (`cara verify --outcome telegram`)?"
-            }
-            SetupOutcome::Hooks => "Run outcome verifier now (`cara verify --outcome hooks`)?",
-        };
-        let run_verify = prompt_yes_no(verify_prompt, verify_default)?;
+        let verify_prompt = format!(
+            "Run outcome verifier now (`cara verify --outcome {}`)?",
+            setup_outcome.label()
+        );
+        let run_verify = prompt_yes_no(&verify_prompt, verify_default)?;
 
         if run_status || launch_chat || run_verify {
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -2907,8 +2856,8 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
                 if let Err(err) = runtime.block_on(run_outcome_verifier(
                     verify_outcome,
                     port,
-                    verify_discord_to.clone(),
-                    verify_telegram_to.clone(),
+                    verify_discord_to,
+                    verify_telegram_to,
                     &config,
                 )) {
                     eprintln!("Outcome verification failed: {}", err);
@@ -4330,6 +4279,36 @@ mod tests {
     fn test_parse_setup_outcome_invalid() {
         assert_eq!(parse_setup_outcome(""), None);
         assert_eq!(parse_setup_outcome("unknown"), None);
+    }
+
+    #[test]
+    fn test_resolve_env_placeholder_handles_literal_and_placeholder_values() {
+        let key = "CARAPACE_TEST_RESOLVE_ENV_PLACEHOLDER_VALUE";
+        std::env::set_var(key, "  resolved-value  ");
+
+        assert_eq!(
+            resolve_env_placeholder("${CARAPACE_TEST_RESOLVE_ENV_PLACEHOLDER_VALUE}"),
+            Some("resolved-value".to_string())
+        );
+        assert_eq!(
+            resolve_env_placeholder("{CARAPACE_TEST_RESOLVE_ENV_PLACEHOLDER_VALUE}"),
+            Some("{CARAPACE_TEST_RESOLVE_ENV_PLACEHOLDER_VALUE}".to_string())
+        );
+        assert_eq!(
+            resolve_env_placeholder("$$${{CARAPACE_TEST_RESOLVE_ENV_PLACEHOLDER_VALUE}"),
+            Some("$$${{CARAPACE_TEST_RESOLVE_ENV_PLACEHOLDER_VALUE}".to_string())
+        );
+
+        std::env::remove_var(key);
+    }
+
+    #[test]
+    fn test_resolve_env_placeholder_missing_var_returns_none() {
+        std::env::remove_var("CARAPACE_TEST_RESOLVE_ENV_PLACEHOLDER_MISSING");
+        assert_eq!(
+            resolve_env_placeholder("${CARAPACE_TEST_RESOLVE_ENV_PLACEHOLDER_MISSING}"),
+            None
+        );
     }
 
     #[test]

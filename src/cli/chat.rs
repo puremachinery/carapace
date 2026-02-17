@@ -477,6 +477,7 @@ pub(crate) async fn verify_chat_roundtrip(
     let req_id = format!("verify-{}", Uuid::new_v4());
     let expected_run_id = Uuid::new_v4().to_string();
     let session_key = format!("cli-verify-{}", Uuid::new_v4());
+    let mut active_run_id = expected_run_id.clone();
 
     let chat_frame = serde_json::json!({
         "type": "req",
@@ -526,6 +527,14 @@ pub(crate) async fn verify_chat_roundtrip(
                 if status == "queued" {
                     return Err("agent run is queued; no provider currently available".to_string());
                 }
+                if let Some(run_id) = frame
+                    .get("payload")
+                    .and_then(|p| p.get("runId"))
+                    .and_then(|v| v.as_str())
+                    .filter(|value| !value.is_empty())
+                {
+                    active_run_id = run_id.to_string();
+                }
                 continue;
             }
 
@@ -535,7 +544,7 @@ pub(crate) async fn verify_chat_roundtrip(
 
             let payload = frame.get("payload").cloned().unwrap_or(Value::Null);
             let run_id = payload.get("runId").and_then(|v| v.as_str()).unwrap_or("");
-            if run_id != expected_run_id {
+            if run_id != active_run_id {
                 continue;
             }
 
