@@ -20,6 +20,18 @@ export CARAPACE_GATEWAY_TOKEN="$(openssl rand -hex 32)"
 export CARAPACE_HOOKS_TOKEN="$(openssl rand -hex 32)"
 ```
 
+Windows (PowerShell) alternative:
+
+```powershell
+$bytes = [byte[]]::new(32)
+[System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+$env:CARAPACE_GATEWAY_TOKEN = [System.BitConverter]::ToString($bytes).Replace('-', '').ToLower()
+
+$bytes = [byte[]]::new(32)
+[System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+$env:CARAPACE_HOOKS_TOKEN = [System.BitConverter]::ToString($bytes).Replace('-', '').ToLower()
+```
+
 Create `carapace.json5`:
 
 ```json5

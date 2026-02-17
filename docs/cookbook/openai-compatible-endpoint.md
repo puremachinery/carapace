@@ -19,6 +19,14 @@ Export a gateway token:
 export CARAPACE_GATEWAY_TOKEN="$(openssl rand -hex 32)"
 ```
 
+Windows (PowerShell) alternative:
+
+```powershell
+$bytes = [byte[]]::new(32)
+[System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+$env:CARAPACE_GATEWAY_TOKEN = [System.BitConverter]::ToString($bytes).Replace('-', '').ToLower()
+```
+
 ```json5
 {
   "gateway": {
