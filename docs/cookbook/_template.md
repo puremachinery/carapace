@@ -31,3 +31,7 @@ What this walkthrough gives you when done.
 
 - Symptom: ...
   - Fix: ...
+
+## Need another recipe?
+
+- Open a request: <https://github.com/puremachinery/carapace/issues/new?template=cookbook-recipe-request.yml&title=cookbook%3A+%3Cuse+case%3E>

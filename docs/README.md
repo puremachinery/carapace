@@ -5,6 +5,9 @@ A security-focused, open-source personal AI assistant.
 ## Start Here
 
 - [Getting Started](getting-started.md) — install, first run, and ops
+- [Install](site/install.md) — binary downloads and verification
+- [First Run](site/first-run.md) — secure local startup and smoke checks
+- [Get Unstuck](site/get-unstuck.md) — troubleshooting and report paths
 - [Cookbook](cookbook/README.md) — task-focused walkthroughs
 - [Channel Setup](channels.md) — Signal, Telegram, Discord, Slack, webhooks
 - [CLI Guide](cli.md) — subcommands, flags, and device identity

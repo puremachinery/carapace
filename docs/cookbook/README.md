@@ -27,3 +27,9 @@ Every recipe follows the same structure:
 
 - Telegram local-only mode (no public webhook), after long-polling support is implemented.
 - Calendar assistant workflow, after calendar integration is implemented and stable.
+
+## Request a recipe
+
+Missing your use case? Open a request:
+
+- [Request a cookbook recipe](https://github.com/puremachinery/carapace/issues/new?template=cookbook-recipe-request.yml&title=cookbook%3A+%3Cuse+case%3E)

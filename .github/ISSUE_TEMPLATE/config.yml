@@ -1,5 +1,8 @@
 blank_issues_enabled: false
 contact_links:
+  - name: Cookbook recipe request
+    url: https://github.com/puremachinery/carapace/issues/new?template=cookbook-recipe-request.yml&title=cookbook%3A+%3Cuse+case%3E
+    about: Request a step-by-step walkthrough for your real-world use case.
   - name: Security vulnerability report
     url: https://github.com/puremachinery/carapace/security/advisories/new
     about: Please report security vulnerabilities privately through GitHub security reporting.

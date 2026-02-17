@@ -1,0 +1,44 @@
+name: Cookbook recipe request
+description: Request a new step-by-step walkthrough for a real-world use case.
+title: "cookbook: <use case>"
+labels:
+  - docs
+  - feedback
+  - triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Tell us the outcome you want, and we can prioritize a cookbook walkthrough.
+
+  - type: textarea
+    id: use_case
+    attributes:
+      label: Desired outcome
+      description: What should Carapace do for you when this recipe is complete?
+      placeholder: Set up Carapace to summarize support tickets from Slack each morning.
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment and tools
+      description: Which channels/providers/platforms are involved?
+      placeholder: macOS + Discord + Anthropic; local-first only.
+    validations:
+      required: true
+
+  - type: textarea
+    id: blockers
+    attributes:
+      label: Current blocker
+      description: What stopped you from completing this today?
+      placeholder: Could not figure out which config fields are required for webhook auth.
+
+  - type: textarea
+    id: success
+    attributes:
+      label: Success criteria
+      description: What should a complete recipe include?
+      placeholder: Exact config snippet, commands, expected output, and troubleshooting.

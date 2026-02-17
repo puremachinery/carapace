@@ -6,7 +6,9 @@ on:
     paths:
       - "website/**"
       - "docs/cookbook/**"
-      - "scripts/build-pages-cookbook.sh"
+      - "docs/getting-started.md"
+      - "docs/site/**"
+      - "scripts/build-pages-content.sh"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
 
@@ -37,8 +39,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y pandoc
 
-      - name: Render cookbook pages from Markdown
-        run: ./scripts/build-pages-cookbook.sh public
+      - name: Render website docs pages from Markdown
+        run: ./scripts/build-pages-content.sh public
 
       - uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
 
