@@ -7,7 +7,6 @@ If you are new to Carapace, start with:
 
 ## Ready now
 
-- [5-minute secure local setup + first reply](secure-local-first-reply.md)
 - [Add Carapace to Discord](discord-assistant.md)
 - [Use Carapace as a local OpenAI-compatible endpoint](openai-compatible-endpoint.md)
 - [Expose hooks safely for automation](hooks-safe-automation.md)

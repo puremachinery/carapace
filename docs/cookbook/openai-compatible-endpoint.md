@@ -13,6 +13,12 @@ and call them with standard OpenAI-style HTTP requests.
 
 ## 1) Create config
 
+Export a gateway token:
+
+```bash
+export CARAPACE_GATEWAY_TOKEN="$(openssl rand -hex 32)"
+```
+
 ```json5
 {
   "gateway": {
@@ -36,7 +42,6 @@ and call them with standard OpenAI-style HTTP requests.
 ## 2) Run commands
 
 ```bash
-export CARAPACE_GATEWAY_TOKEN="$(openssl rand -hex 32)"
 CARAPACE_CONFIG_PATH=./carapace.json5 cara
 ```
 

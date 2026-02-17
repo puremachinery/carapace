@@ -211,15 +211,11 @@ h1 {
 }
 
 .doc-main {
-  max-width: 72rem;
+  width: min(72rem, calc(100% - 3rem));
 }
 
 .doc-hero h1 {
   max-width: 20ch;
-}
-
-.doc-panel h2 {
-  margin-top: 0;
 }
 
 .breadcrumbs {
@@ -280,6 +276,10 @@ h1 {
 .md-content h2 {
   font-size: 1.2rem;
   margin-top: 1.4rem;
+}
+
+.doc-panel.md-content > h2:first-of-type {
+  margin-top: 0;
 }
 
 .md-content h3 {

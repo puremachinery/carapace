@@ -1,4 +1,17 @@
 #!/usr/bin/env bash
+# Generate static website docs pages from Markdown sources.
+#
+# Usage:
+#   scripts/build-pages-content.sh [OUT_DIR]
+#
+# Arguments:
+#   OUT_DIR  Optional output directory for generated files (default: "public").
+#
+# Dependencies:
+#   - pandoc (https://pandoc.org/installing.html)
+#
+# This script is used by the Pages workflow to render docs/getting-started.md,
+# docs/site/*.md, and docs/cookbook/*.md into HTML pages for publishing.
 set -euo pipefail
 
 out_dir="${1:-public}"
@@ -17,6 +30,16 @@ site_docs_dir="${repo_root}/docs/site"
 out_cookbook_dir="${out_dir}/cookbook"
 mkdir -p "${out_dir}" "${out_cookbook_dir}"
 
+html_escape() {
+  local value="$1"
+  value="${value//&/&amp;}"
+  value="${value//</&lt;}"
+  value="${value//>/&gt;}"
+  value="${value//\"/&quot;}"
+  value="${value//\'/&#39;}"
+  printf '%s' "$value"
+}
+
 rewrite_links() {
   local body="$1"
   local kind="$2"
@@ -32,10 +55,10 @@ rewrite_links() {
   if [[ "$kind" == "cookbook" ]]; then
     body="$(printf '%s' "$body" | sed -E \
       -e 's|href="README\.md"|href="./"|g' \
-      -e 's|href="([A-Za-z0-9._-]+)\.md"|href="\1.html"|g')"
+      -e 's|href="([A-Za-z0-9._/-]+)\.md"|href="\1.html"|g')"
   elif [[ "$kind" == "docs" ]]; then
     body="$(printf '%s' "$body" | sed -E \
-      -e 's|href="([A-Za-z0-9._-]+)\.md"|href="\1.html"|g')"
+      -e 's|href="([A-Za-z0-9._/-]+)\.md"|href="\1.html"|g')"
   fi
 
   printf '%s' "$body"
@@ -46,10 +69,12 @@ render_markdown_page() {
   local dst="$2"
   local page_title="$3"
   local description="$4"
-  local breadcrumbs="$5"
-  local kind="$6"
-  local request_cta="$7"
-  local rel_prefix="$8"
+  local kind="$5"
+  local request_cta="$6"
+  local rel_prefix="$7"
+  local breadcrumb_parent_href="$8"
+  local breadcrumb_parent_label="$9"
+  local breadcrumb_current_label="${10}"
 
   if [ ! -f "$src" ]; then
     echo "Error: missing source markdown: $src" >&2
@@ -60,6 +85,11 @@ render_markdown_page() {
   body="$(pandoc --from gfm --to html5 "$src")"
   body="$(rewrite_links "$body" "$kind")"
 
+  local page_title_html description_html rel_prefix_html
+  page_title_html="$(html_escape "$page_title")"
+  description_html="$(html_escape "$description")"
+  rel_prefix_html="$(html_escape "$rel_prefix")"
+
   {
     cat <<HTML_HEAD
 <!doctype html>
@@ -67,10 +97,10 @@ render_markdown_page() {
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>${page_title}</title>
-    <meta name="description" content="${description}" />
-    <meta property="og:title" content="${page_title}" />
-    <meta property="og:description" content="${description}" />
+    <title>${page_title_html}</title>
+    <meta name="description" content="${description_html}" />
+    <meta property="og:title" content="${page_title_html}" />
+    <meta property="og:description" content="${description_html}" />
     <meta property="og:type" content="website" />
     <meta name="theme-color" content="#0f172a" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
@@ -79,21 +109,21 @@ render_markdown_page() {
       href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono&family=Space+Grotesk:wght@400;600;700&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="${rel_prefix}/styles.css" />
+    <link rel="stylesheet" href="${rel_prefix_html}/styles.css" />
   </head>
   <body>
     <div class="bg-shape bg-shape-one" aria-hidden="true"></div>
     <div class="bg-shape bg-shape-two" aria-hidden="true"></div>
 
     <header class="site-header">
-      <a class="brand" href="${rel_prefix}/">Carapace</a>
+      <a class="brand" href="${rel_prefix_html}/">Carapace</a>
       <nav class="nav-links" aria-label="Primary">
-        <a href="${rel_prefix}/">Home</a>
-        <a href="${rel_prefix}/getting-started.html">Getting Started</a>
-        <a href="${rel_prefix}/install.html">Install</a>
-        <a href="${rel_prefix}/first-run.html">First Run</a>
-        <a href="${rel_prefix}/cookbook/">Cookbook</a>
-        <a href="${rel_prefix}/get-unstuck.html">Get Unstuck</a>
+        <a href="${rel_prefix_html}/">Home</a>
+        <a href="${rel_prefix_html}/getting-started.html">Getting Started</a>
+        <a href="${rel_prefix_html}/install.html">Install</a>
+        <a href="${rel_prefix_html}/first-run.html">First Run</a>
+        <a href="${rel_prefix_html}/cookbook/">Cookbook</a>
+        <a href="${rel_prefix_html}/get-unstuck.html">Get Unstuck</a>
         <a href="https://github.com/puremachinery/carapace">GitHub</a>
       </nav>
     </header>
@@ -101,8 +131,15 @@ render_markdown_page() {
     <main class="doc-main ${kind}-main">
 HTML_HEAD
 
-    if [ -n "$breadcrumbs" ]; then
-      printf '      <p class="breadcrumbs">%s</p>\n' "$breadcrumbs"
+    if [ -n "$breadcrumb_parent_href" ] && [ -n "$breadcrumb_parent_label" ] && [ -n "$breadcrumb_current_label" ]; then
+      local breadcrumb_parent_href_html breadcrumb_parent_label_html breadcrumb_current_label_html
+      breadcrumb_parent_href_html="$(html_escape "$breadcrumb_parent_href")"
+      breadcrumb_parent_label_html="$(html_escape "$breadcrumb_parent_label")"
+      breadcrumb_current_label_html="$(html_escape "$breadcrumb_current_label")"
+      printf '      <p class="breadcrumbs"><a href="%s">%s</a> / %s</p>\n' \
+        "$breadcrumb_parent_href_html" \
+        "$breadcrumb_parent_label_html" \
+        "$breadcrumb_current_label_html"
     fi
 
     cat <<'HTML_BODY'
@@ -147,50 +184,60 @@ render_markdown_page \
   "${out_dir}/getting-started.html" \
   "Carapace | Getting Started" \
   "Install, first run, and practical operations for Carapace." \
-  "" \
   "docs" \
   "0" \
-  "."
+  "." \
+  "" \
+  "" \
+  ""
 
 render_markdown_page \
   "${site_docs_dir}/install.md" \
   "${out_dir}/install.html" \
   "Carapace | Install" \
   "Install Carapace binaries and verify signatures." \
-  "<a href=\"./getting-started.html\">Getting Started</a> / Install" \
   "docs" \
   "0" \
-  "."
+  "." \
+  "./getting-started.html" \
+  "Getting Started" \
+  "Install"
 
 render_markdown_page \
   "${site_docs_dir}/first-run.md" \
   "${out_dir}/first-run.html" \
   "Carapace | First Run" \
   "Run Carapace locally with secure defaults and verify health." \
-  "<a href=\"./getting-started.html\">Getting Started</a> / First Run" \
   "docs" \
   "0" \
-  "."
+  "." \
+  "./getting-started.html" \
+  "Getting Started" \
+  "First Run"
 
 render_markdown_page \
   "${site_docs_dir}/get-unstuck.md" \
   "${out_dir}/get-unstuck.html" \
   "Carapace | Get Unstuck" \
   "Troubleshooting checks, logs, and issue-reporting paths for Carapace." \
-  "<a href=\"./getting-started.html\">Getting Started</a> / Get Unstuck" \
   "docs" \
   "0" \
-  "."
+  "." \
+  "./getting-started.html" \
+  "Getting Started" \
+  "Get Unstuck"
 
 render_markdown_page \
   "${cookbook_dir}/README.md" \
   "${out_cookbook_dir}/index.html" \
   "Carapace | Cookbook" \
   "Task-focused Carapace walkthroughs for setup and integrations." \
-  "" \
   "cookbook" \
   "1" \
-  ".."
+  ".." \
+  "" \
+  "" \
+  ""
 
 while IFS= read -r src; do
   file_name="$(basename "$src")"
@@ -211,10 +258,12 @@ while IFS= read -r src; do
     "${out_cookbook_dir}/${stem}.html" \
     "Carapace Cookbook | ${heading}" \
     "Carapace recipe: ${heading}" \
-    "<a href=\"./\">Cookbook</a> / ${heading}" \
     "cookbook" \
     "1" \
-    ".."
+    ".." \
+    "./" \
+    "Cookbook" \
+    "${heading}"
 done < <(find "${cookbook_dir}" -maxdepth 1 -type f -name '*.md' | sort)
 
 echo "Generated Pages content in ${out_dir}"
