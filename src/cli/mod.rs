@@ -4518,10 +4518,10 @@ mod tests {
     }
 
     #[test]
-    fn test_sanitize_channel_delivery_error_allows_short_standard_message() {
+    fn test_sanitize_channel_delivery_error_redacts_short_standard_message() {
         assert_eq!(
             sanitize_channel_delivery_error("Unauthorized".to_string()),
-            "Unauthorized"
+            "send path rejected request (provider details hidden for safety)"
         );
     }
 
