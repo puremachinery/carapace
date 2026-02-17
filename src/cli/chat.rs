@@ -17,6 +17,7 @@ use super::{
 
 const CHAT_CLIENT_ID: &str = "cli";
 const CHAT_CLIENT_MODE: &str = "cli";
+const MAX_PENDING_VERIFY_EVENTS: usize = 64;
 
 /// REPL commands recognised in the input loop.
 #[derive(Debug, PartialEq)]
@@ -527,7 +528,9 @@ pub(crate) async fn verify_chat_roundtrip(
     let session_key = format!("cli-verify-{}", Uuid::new_v4());
     let mut active_run_id: Option<String> = None;
     let mut seen_response = false;
-    let mut pending_events: Vec<Value> = Vec::with_capacity(64);
+    // Bound pre-response buffering so a misbehaving server cannot grow memory
+    // without limit before the verify timeout fires.
+    let mut pending_events: Vec<Value> = Vec::with_capacity(MAX_PENDING_VERIFY_EVENTS);
 
     let chat_frame = serde_json::json!({
         "type": "req",
@@ -596,7 +599,7 @@ pub(crate) async fn verify_chat_roundtrip(
                 }
                 "event" => {
                     if !seen_response {
-                        if pending_events.len() >= 64 {
+                        if pending_events.len() >= MAX_PENDING_VERIFY_EVENTS {
                             return Err(
                                 "too many server events before response; aborting verification"
                                     .to_string(),

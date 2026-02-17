@@ -2140,6 +2140,8 @@ impl VerifyCheckResult {
     }
 }
 
+// Keep this list in sync when adding channels that support token placeholders.
+// We permit known token keys and scoped custom channel token aliases.
 const VERIFY_ALLOWED_ENV_PLACEHOLDER_KEYS: &[&str] = &[
     "DISCORD_BOT_TOKEN",
     "TELEGRAM_BOT_TOKEN",
@@ -2156,7 +2158,9 @@ fn is_allowed_verify_placeholder_key(key: &str) -> bool {
     {
         return false;
     }
-    key.ends_with("_BOT_TOKEN") || key.ends_with("_HOOKS_TOKEN")
+    key.ends_with("_DISCORD_BOT_TOKEN")
+        || key.ends_with("_TELEGRAM_BOT_TOKEN")
+        || key.ends_with("_CARAPACE_HOOKS_TOKEN")
 }
 
 fn normalize_optional_input(input: Option<String>) -> Option<String> {
@@ -2297,13 +2301,27 @@ async fn verify_channel_send_path(
         if delivery.ok {
             Ok(())
         } else {
-            Err(delivery
-                .error
-                .unwrap_or_else(|| "send path rejected request".to_string()))
+            Err(sanitize_channel_delivery_error(
+                delivery
+                    .error
+                    .unwrap_or_else(|| "send path rejected request".to_string()),
+            ))
         }
     })
     .await
     .map_err(|e| format!("send-path verification task failed: {e}"))?
+}
+
+fn sanitize_channel_delivery_error(raw_error: String) -> String {
+    let trimmed = raw_error.trim();
+    if trimmed.is_empty() {
+        return "send path rejected request".to_string();
+    }
+    if trimmed.chars().count() > 200 {
+        let excerpt: String = trimmed.chars().take(200).collect();
+        return format!("{excerpt}... (truncated)");
+    }
+    trimmed.to_string()
 }
 
 fn summarize_http_failure_body(status: reqwest::StatusCode, body: &str) -> String {
@@ -2363,11 +2381,14 @@ async fn verify_local_chat_outcome(
             "Local chat roundtrip",
             "non-interactive chat send reached final state",
         )),
-        Err(err) => checks.push(VerifyCheckResult::fail(
-            "Local chat roundtrip",
-            err,
-            "check provider API key/model and retry `cara verify --outcome local-chat`",
-        )),
+        Err(err) => {
+            checks.push(VerifyCheckResult::fail(
+                "Local chat roundtrip",
+                err,
+                "check provider API key/model and retry `cara verify --outcome local-chat`",
+            ));
+            return Err("outcome verification failed".to_string());
+        }
     }
     Ok(())
 }
@@ -2409,6 +2430,10 @@ async fn verify_hooks_outcome(
             "gateway.hooks.enabled is false",
             "enable `gateway.hooks.enabled` and configure `gateway.hooks.token`, then retry",
         ));
+        if let Some(handle) = setup_server_handle.take() {
+            handle.shutdown().await;
+        }
+        return Err("outcome verification failed".to_string());
     } else {
         checks.push(VerifyCheckResult::pass(
             "Hooks enabled",
