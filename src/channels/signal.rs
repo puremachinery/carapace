@@ -31,6 +31,12 @@ impl SignalChannel {
                     host = parsed.host_str().unwrap_or(""),
                     "signal channel base_url uses http on loopback; use https for non-local deployments"
                 );
+            } else if parsed.scheme() != "https" {
+                tracing::warn!(
+                    scheme = parsed.scheme(),
+                    host = parsed.host_str().unwrap_or(""),
+                    "signal channel base_url is not usable: non-loopback endpoints must use https"
+                );
             }
         }
 

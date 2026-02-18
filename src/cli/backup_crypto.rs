@@ -97,7 +97,8 @@ fn derive_key(passphrase: &[u8], salt: &[u8]) -> [u8; KEY_LEN] {
         mac.finalize().into_bytes()
     };
 
-    let mut key: Vec<u8> = u_prev.to_vec();
+    let mut key = [0u8; KEY_LEN];
+    key.copy_from_slice(&u_prev);
 
     for _ in 1..PBKDF2_ITERATIONS {
         let mut mac =
@@ -110,8 +111,7 @@ fn derive_key(passphrase: &[u8], salt: &[u8]) -> [u8; KEY_LEN] {
         }
     }
 
-    key.try_into()
-        .expect("PBKDF2 output block size must match backup key length")
+    key
 }
 
 /// Encrypt a backup file with AES-256-GCM.
