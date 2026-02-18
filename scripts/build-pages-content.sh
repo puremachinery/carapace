@@ -181,6 +181,24 @@ HTML_FOOT
   } >"$dst"
 }
 
+render_site_doc_page() {
+  local slug="$1"
+  local title="$2"
+  local description="$3"
+
+  render_markdown_page \
+    "${site_docs_dir}/${slug}.md" \
+    "${out_dir}/${slug}.html" \
+    "Carapace | ${title}" \
+    "${description}" \
+    "docs" \
+    "0" \
+    "." \
+    "./getting-started.html" \
+    "Getting Started" \
+    "${title}"
+}
+
 render_markdown_page \
   "${repo_root}/docs/getting-started.md" \
   "${out_dir}/getting-started.html" \
@@ -193,65 +211,16 @@ render_markdown_page \
   "" \
   ""
 
-render_markdown_page \
-  "${site_docs_dir}/install.md" \
-  "${out_dir}/install.html" \
-  "Carapace | Install" \
-  "Install Carapace binaries and verify signatures." \
-  "docs" \
-  "0" \
-  "." \
-  "./getting-started.html" \
-  "Getting Started" \
-  "Install"
-
-render_markdown_page \
-  "${site_docs_dir}/first-run.md" \
-  "${out_dir}/first-run.html" \
-  "Carapace | First Run" \
-  "Run Carapace locally with secure defaults and verify health." \
-  "docs" \
-  "0" \
-  "." \
-  "./getting-started.html" \
-  "Getting Started" \
-  "First Run"
-
-render_markdown_page \
-  "${site_docs_dir}/security.md" \
-  "${out_dir}/security.html" \
-  "Carapace | Security" \
-  "Security defaults, trust boundaries, and practical verification checks." \
-  "docs" \
-  "0" \
-  "." \
-  "./getting-started.html" \
-  "Getting Started" \
-  "Security"
-
-render_markdown_page \
-  "${site_docs_dir}/ops.md" \
-  "${out_dir}/ops.html" \
-  "Carapace | Ops" \
-  "Day-2 operations: status, logs, backup, update, and recovery." \
-  "docs" \
-  "0" \
-  "." \
-  "./getting-started.html" \
-  "Getting Started" \
-  "Ops"
-
-render_markdown_page \
-  "${site_docs_dir}/get-unstuck.md" \
-  "${out_dir}/get-unstuck.html" \
-  "Carapace | Get Unstuck" \
-  "Troubleshooting checks, logs, and issue-reporting paths for Carapace." \
-  "docs" \
-  "0" \
-  "." \
-  "./getting-started.html" \
-  "Getting Started" \
-  "Get Unstuck"
+render_site_doc_page "install" "Install" \
+  "Install Carapace binaries and verify signatures."
+render_site_doc_page "first-run" "First Run" \
+  "Run Carapace locally with secure defaults and verify health."
+render_site_doc_page "security" "Security" \
+  "Security defaults, trust boundaries, and practical verification checks."
+render_site_doc_page "ops" "Ops" \
+  "Day-2 operations: status, logs, backup, update, and recovery."
+render_site_doc_page "get-unstuck" "Get Unstuck" \
+  "Troubleshooting checks, logs, and issue-reporting paths for Carapace."
 
 render_markdown_page \
   "${cookbook_dir}/README.md" \
