@@ -101,3 +101,17 @@ pub fn create_store() -> SessionStore {
 pub fn create_store_with_path(base_path: std::path::PathBuf) -> SessionStore {
     SessionStore::with_base_path(base_path)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::canonicalize_session_hint;
+
+    #[test]
+    fn test_canonicalize_session_hint_pinned_hash_output() {
+        let canonical = canonicalize_session_hint("my-session");
+        assert_eq!(
+            canonical,
+            "sid_31c3253ae028e0adb3745c77672b8ea3adfc6a971c4aae07b0e26500d5886ed4"
+        );
+    }
+}

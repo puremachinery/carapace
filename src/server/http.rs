@@ -1973,6 +1973,20 @@ mod tests {
         create_router(config)
     }
 
+    #[test]
+    fn test_stable_sender_id_from_ip_v4_format() {
+        let sender = stable_sender_id_from_ip(IpAddr::V4(std::net::Ipv4Addr::new(1, 0, 0, 0)));
+        assert_eq!(sender, "ip4:01000000");
+        assert_eq!(sender.len(), 12);
+    }
+
+    #[test]
+    fn test_stable_sender_id_from_ip_v6_format() {
+        let sender = stable_sender_id_from_ip(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST));
+        assert_eq!(sender, "ip6:00000000000000000000000000000001");
+        assert_eq!(sender.len(), 36);
+    }
+
     #[tokio::test]
     async fn test_hooks_wake_success() {
         let router = test_router(test_config());
