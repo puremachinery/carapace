@@ -183,7 +183,7 @@ Example uses the Linux config directory (`~/.config/carapace`).
 
 ```
 ~/.config/carapace/
-├── carapace.json           # Config (may contain tokens)
+├── carapace.json5          # Config (may contain tokens; legacy .json fallback)
 ├── credentials/            # Channel credentials, allowlists
 │   ├── whatsapp/          # WhatsApp session data
 │   └── *-allowFrom.json   # Pairing allowlists

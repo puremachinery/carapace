@@ -10,8 +10,8 @@ A hardened alternative to openclaw / clawdbot — for when your assistant needs 
 
 - **Multi-provider LLM engine** — Anthropic, OpenAI, Ollama, Google Gemini, AWS Bedrock, Venice AI with streaming, tool dispatch, and cancellation
 - **Multi-channel messaging** — Signal, Telegram, Discord, Slack, console, and webhooks. 10 built-in tools + 15 channel-specific tool schemas
-- **WASM plugin runtime** — wasmtime 41 with Ed25519 signature verification, capability sandboxing, resource limits (64MB memory, fuel CPU budget, epoch wall-clock timeout), and permission enforcement
-- **Security by default** — localhost-only binding, SSRF/DNS-rebinding defense, prompt guard, inbound message classifier, exec approval flow, output content security. Auth denies by default when no credentials configured; CSRF-protected control endpoints. AES-256-GCM secret encryption at rest with PBKDF2 key derivation. OS-level subprocess sandboxing is implemented for macOS/Linux and partial on Windows (network-deny mode fails closed there)
+- **Signed plugin runtime** — plugins are signature-verified and run with strict permissions and resource limits
+- **Secure defaults** — local-first binding, locked-down auth behavior, encrypted secret storage, guarded tool execution, and OS-level subprocess sandboxing for protected paths
 - **Infrastructure** — TLS, mTLS, mDNS discovery, config hot-reload, Tailscale integration, Prometheus metrics, audit logging. Multi-node clustering is partially implemented
 
 ## Expectations vs OpenClaw
@@ -36,237 +36,67 @@ Carapace is designed to address the major vulnerability classes reported in the 
 | Plaintext secret storage | OS credential store (Keychain / Keyutils / Credential Manager) with AES-256-GCM fallback |
 | Skills supply chain | Ed25519 signatures + WASM capability sandbox + resource limits |
 | Prompt injection | Prompt guard + inbound classifier + exec approval flow + tool policies |
-| No process sandboxing | Seatbelt / Landlock / rlimits implemented for sandbox-required subprocess paths; Windows network-deny mode currently fails closed |
+| No process sandboxing | OS-level subprocess sandboxing on macOS/Linux/Windows for sandbox-required paths; unsupported paths fail closed |
 | SSRF / DNS rebinding | Private IP blocking + post-resolution validation |
 
 See [docs/security.md](docs/security.md) for the full security model.
 See [docs/security-comparison.md](docs/security-comparison.md) for a threat-by-threat comparison with OpenClaw.
 See [docs/feature-status.yaml](docs/feature-status.yaml) and [docs/feature-evidence.yaml](docs/feature-evidence.yaml) for verified-vs-partial implementation status.
 
-## Docs
+## Quick Start
 
-- [Website](https://getcara.io) — install, first run, cookbook, and troubleshooting
-- [Getting started](docs/getting-started.md) — install, first run, and ops
-- [Install](docs/site/install.md) — release binaries, signatures, and install commands
-- [First run](docs/site/first-run.md) — secure local startup + smoke checks
-- [Get unstuck](docs/site/get-unstuck.md) — quick troubleshooting and report paths
-- [Cookbook](docs/cookbook/README.md) — practical "do X" walkthroughs
-- [Channel setup](docs/channels.md) — Signal, Telegram, Discord, Slack, webhooks
-- [Channel smoke validation](docs/channel-smoke.md) — reproducible live checks and evidence capture
-- [CLI guide](docs/cli.md) — subcommands, flags, and device identity
-- [Documentation index](docs/README.md) — architecture, protocol, security
-- [Report feedback or bugs](https://github.com/puremachinery/carapace/issues/new/choose) — setup smoke reports, bug reports, and feature requests
-
-## Status (Preview)
-
-This project is in preview. Core paths are tested and verified. Expect gaps and sharp edges.
-
-Known working:
-
-- Setup wizard from clean state
-- Anthropic LLM provider (via OpenAI-compatible API)
-- Token auth enforcement
-- Discord channel (end-to-end: inbound message, agent run, outbound reply)
-- Health endpoint (`/health`)
-- Restart persistence (sessions, cron, config)
-- WebSocket protocol handlers (golden trace tests)
-- OpenAI-compatible HTTP endpoints (`/v1/chat/completions`, `/v1/responses`)
-- Config loading, defaults, and validation
-- Interactive CLI chat REPL (`cara chat`)
-
-Known gaps:
-
-- Control UI frontend (backend wired, no frontend built/bundled yet)
-- Signal, Slack channels (not yet smoke-tested in real environments)
-- Public internet deployments (TLS/mTLS, reverse proxy, auth hardening)
-
-## Install
-
-### Prebuilt binaries
-
-Download from the [latest release](https://github.com/puremachinery/carapace/releases):
-
-- `cara-x86_64-linux`
-- `cara-aarch64-linux`
-- `cara-x86_64-darwin`
-- `cara-aarch64-darwin`
-- `cara-x86_64-windows.exe`
-
-Release binaries include Sigstore signatures and certificates (`.sig` + `.pem`).
-You can verify with cosign:
-
-```bash
-cosign verify-blob \
-  --certificate cara-x86_64-linux.pem \
-  --signature cara-x86_64-linux.sig \
-  --certificate-identity-regexp "https://github.com/puremachinery/carapace/.github/workflows/release.yml@refs/tags/v.*" \
-  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-  cara-x86_64-linux
-```
-
-### Build from source (current)
-
-```bash
-cargo build --release
-./target/release/cara --help
-```
-
-### Install (macOS/Linux, manual)
-
-Make it executable and move it into your PATH:
-
-```bash
-chmod +x cara-x86_64-linux
-sudo mv cara-x86_64-linux /usr/local/bin/cara
-```
-
-### Install (Windows, manual)
-
-Copy the binary into a folder on your PATH:
-
-```powershell
-$installDir = "$env:LOCALAPPDATA\\cara\\bin"
-New-Item -ItemType Directory -Force -Path $installDir | Out-Null
-Copy-Item .\\cara-x86_64-windows.exe (Join-Path $installDir "cara.exe")
-```
-
-### Install helper (macOS/Linux)
-
-If you cloned the repo, the install script copies the binary into place:
-
-```bash
-sudo ./scripts/install.sh --binary ./cara-x86_64-linux
-```
-
-If you downloaded a release binary, use the manual steps above.
-
-### Install helper (Windows PowerShell)
-
-If you cloned the repo, the install script copies the binary into place:
-
-```powershell
-.\scripts\install.ps1 -BinaryPath .\cara-x86_64-windows.exe
-```
-
-If you downloaded a release binary, use the manual steps above.
-
-## Getting Started
-
-### First run (setup wizard)
-
-1. Create a minimal config interactively:
+1. Install `cara` from the latest release (Linux/macOS/Windows):
+   - <https://getcara.io/install>
+   - [docs/site/install.md](docs/site/install.md)
+2. Run guided setup:
    ```bash
    cara setup
    ```
-
-2. Start Carapace:
+3. Start the assistant:
    ```bash
    cara
    ```
-
-3. Check status:
+4. Verify first-run outcome:
    ```bash
-   cara status --host 127.0.0.1 --port 18789
+   cara verify --outcome auto --port 18789
    ```
-
-4. Verify your first-run outcome:
-   ```bash
-   cara verify --outcome local-chat --port 18789
-   ```
-
-5. Open a local interactive chat session:
+5. Start local interactive chat:
    ```bash
    cara chat
    ```
-   Use `/help` for a list of REPL commands:
-   - `/new` — start a fresh session
-   - `/exit` or `/quit` — exit chat
 
-### With Ollama (free, local)
+Use `/help` in chat for REPL commands (`/new`, `/exit`, `/quit`).
 
-1. [Install Ollama](https://ollama.com) and pull a model:
-   ```bash
-   ollama pull llama3.2
-   ```
+If you use cloud models, set one provider key before launching (for example
+`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_API_KEY`, or `VENICE_API_KEY`).
 
-2. Run cara:
-   ```bash
-   OLLAMA_BASE_URL=http://localhost:11434 cara
-   ```
+## Status (Preview)
 
-3. Connect a channel (Signal/Telegram/Discord/Slack/webhooks) or enable the
-   Control UI — see `docs/channels.md` and `docs/getting-started.md`.
+This project is in preview. Core paths are tested and verified, but expect gaps.
 
-### With a cloud provider
+- Working now: setup wizard, local chat (`cara chat`), token auth enforcement,
+  health/control endpoints, and OpenAI-compatible HTTP endpoints.
+- In progress: Control UI frontend (backend is wired), broader channel smoke
+  evidence, and hardened internet-facing deployment guidance.
 
-Set one API key and run:
+See [docs/feature-status.yaml](docs/feature-status.yaml) and
+[docs/feature-evidence.yaml](docs/feature-evidence.yaml) for the current source
+of truth.
 
-```bash
-export ANTHROPIC_API_KEY="sk-ant-..."   # or OPENAI_API_KEY, GOOGLE_API_KEY, VENICE_API_KEY
-cara
-```
+## Docs
 
-Then connect a channel or enable the Control UI — see `docs/channels.md` and
-`docs/getting-started.md`.
-
-### Other local servers (vLLM, llama.cpp, LM Studio, MLX)
-
-Any OpenAI-compatible server works — point the OpenAI provider at it.
-HTTP is allowed for loopback addresses (`localhost` / `127.0.0.1` / `::1`).
-
-```bash
-# vLLM
-OPENAI_BASE_URL=http://localhost:8000/v1 OPENAI_API_KEY=unused cara
-
-# llama.cpp server (llama-server --port 8080)
-OPENAI_BASE_URL=http://localhost:8080/v1 OPENAI_API_KEY=unused cara
-
-# LM Studio (default port 1234)
-OPENAI_BASE_URL=http://localhost:1234/v1 OPENAI_API_KEY=unused cara
-
-# MLX (default port 8080)
-OPENAI_BASE_URL=http://localhost:8080/v1 OPENAI_API_KEY=unused cara
-```
-
-You can also use the Ollama provider with non-Ollama servers that expose an
-OpenAI-compatible `/v1/chat/completions` endpoint:
-
-```bash
-OLLAMA_BASE_URL=http://localhost:8000 cara
-```
-
-Or configure via `config.json5` — see [`config.example.json5`](config.example.json5)
-for the `openai` and `ollama` provider sections.
-
-### Channels
-
-Setup guides for Signal, Telegram, Discord, and Slack (including inbound
-webhooks and service configuration) live in:
-
-- `docs/channels.md`
-
-### Full Setup Guide
-
-End‑to‑end setup, auth, TLS, and ops guidance:
-
-- `docs/getting-started.md`
-
-### Signal
-
-Requires [signal-cli-rest-api](https://github.com/bbernhard/signal-cli-rest-api):
-
-```bash
-docker run -d -p 8080:8080 -v $HOME/.local/share/signal-api:/home/.local/share/signal-cli \
-  -e MODE=native bbernhard/signal-cli-rest-api
-```
-
-Then configure carapace:
-
-```bash
-SIGNAL_CLI_URL=http://localhost:8080 SIGNAL_PHONE_NUMBER=+15551234567 cara
-```
-
-Or via `config.json5` — see `config.example.json5` for the `signal` section.
+- [Website](https://getcara.io) — install, first run, security, ops, cookbook, troubleshooting
+- [Getting started](docs/getting-started.md) — full setup and operations
+- [Install](docs/site/install.md) — release binaries, signatures, and install commands
+- [First run](docs/site/first-run.md) — secure local startup and smoke checks
+- [Security model](docs/security.md) — architecture and trust boundaries
+- [Security comparison](docs/security-comparison.md) — threat-by-threat view
+- [Channel setup](docs/channels.md) — Signal, Telegram, Discord, Slack, webhooks
+- [Channel smoke validation](docs/channel-smoke.md) — live checks and evidence capture
+- [Cookbook](docs/cookbook/README.md) — outcome-first walkthroughs
+- [CLI guide](docs/cli.md) — subcommands, flags, and device identity
+- [Documentation index](docs/README.md) — architecture/protocol/security references
+- [Report feedback or bugs](https://github.com/puremachinery/carapace/issues/new/choose)
 
 ## Contributing
 

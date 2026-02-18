@@ -20,8 +20,9 @@ Current platform status for sandbox-required subprocess paths:
 
 - macOS: Seatbelt + resource limits
 - Linux: Landlock + resource limits
-- Windows: process limits and path allowlisting; network-deny mode currently
-  fails closed
+- Windows: sandboxed subprocesses use Job Objects + AppContainer. If a
+  deny-network spawn flow is unsupported, Carapace blocks it instead of
+  running unsandboxed.
 - other targets: fail closed for sandbox-required subprocess paths
 
 ## 3) Verify key controls
@@ -49,13 +50,13 @@ Quick checks:
 
 Carapace is preview software. Verified and partial feature status is tracked in:
 
-- [`docs/feature-status.yaml`](https://github.com/puremachinery/carapace/blob/HEAD/docs/feature-status.yaml)
-- [`docs/feature-evidence.yaml`](https://github.com/puremachinery/carapace/blob/HEAD/docs/feature-evidence.yaml)
+- [`docs/feature-status.yaml`](https://github.com/puremachinery/carapace/blob/main/docs/feature-status.yaml)
+- [`docs/feature-evidence.yaml`](https://github.com/puremachinery/carapace/blob/main/docs/feature-evidence.yaml)
 
 Read the full threat model and control details:
 
-- [Security model](https://github.com/puremachinery/carapace/blob/HEAD/docs/security.md)
-- [Security comparison](https://github.com/puremachinery/carapace/blob/HEAD/docs/security-comparison.md)
+- [Security model](https://github.com/puremachinery/carapace/blob/main/docs/security.md)
+- [Security comparison](https://github.com/puremachinery/carapace/blob/main/docs/security-comparison.md)
 
 ## 5) Report vulnerabilities privately
 

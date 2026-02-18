@@ -8,9 +8,9 @@ If you are new to Carapace, start with:
 ## Ready now
 
 - [Add Carapace to Discord](discord-assistant.md)
-- [Use Carapace as a local OpenAI-compatible endpoint](openai-compatible-endpoint.md)
+- [Connect apps to your local Carapace assistant (OpenAI-compatible API)](openai-compatible-endpoint.md)
 - [Expose hooks safely for automation](hooks-safe-automation.md)
-- [Add Carapace to Telegram (webhook mode)](telegram-webhook-assistant.md)
+- [Add Carapace to Telegram (public webhook mode)](telegram-webhook-assistant.md)
 
 ## Recipe format
 
@@ -21,11 +21,6 @@ Every recipe follows the same structure:
 4. Exact commands
 5. Verification checks
 6. Common failures and fixes
-
-## Planned recipes (feature priorities)
-
-- Telegram local-only mode (no public webhook), after long-polling support is implemented.
-- Calendar assistant workflow, after calendar integration is implemented and stable.
 
 ## Request a recipe
 

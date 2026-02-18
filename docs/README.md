@@ -4,7 +4,7 @@ A security-focused, open-source personal AI assistant.
 
 ## Start Here
 
-- [Website](https://getcara.io) — install, first run, cookbook, and troubleshooting
+- [Website](https://getcara.io) — install, first run, security, ops, cookbook, and troubleshooting
 - [Getting Started](getting-started.md) — install, first run, and ops
 - [Install](site/install.md) — binary downloads and verification
 - [First Run](site/first-run.md) — secure local startup and smoke checks
@@ -26,7 +26,6 @@ A security-focused, open-source personal AI assistant.
 - [Pairing](protocol/pairing.md) — Node and device pairing flows
 - [Configuration](protocol/config.md) — Config file format, environment variables
 - [Credentials](protocol/credentials.md) — Secret storage
-- [CLI Guide](cli.md) — Subcommands, flags, and device identity notes
 
 ## Quick Links
 

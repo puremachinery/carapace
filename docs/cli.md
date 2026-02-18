@@ -1,65 +1,33 @@
 # cara CLI Guide
 
-This guide covers the CLI subcommands, common flags, and behavior that is not obvious
-from `--help`, including recent changes around device identity and TLS requirements.
+This page is command-reference-first: subcommands, key flags, and CLI-specific
+behavior that is easy to miss from `--help`.
 
-## Commands
+For first-run walkthroughs and channel onboarding:
+- [First Run](site/first-run.md)
+- [Getting Started](getting-started.md)
+- [Channel Setup](channels.md)
 
-### start
+## Command Reference
+
+### `cara` (start)
 Starts the Carapace service (default when no subcommand is given).
 
-### config
+### `cara config`
 Manage configuration values.
 
-- `config show` — print resolved config as JSON (secrets redacted).
-- `config get {key}` — read value by dot path.
-- `config set {key} {value}` — set a value (JSON interpreted, string fallback).
-- `config path` — print the config file path.
+- `cara config show` — print resolved config as JSON (secrets redacted)
+- `cara config get <key>` — read value by dot path
+- `cara config set <key> <value>` — set value (JSON interpreted, string fallback)
+- `cara config path` — print the config file path
 
-### status
-Health/status check via HTTP.
+### `cara setup`
+Interactive first-run wizard for provider/auth/network/channel setup.
 
-```
-cara status --host 127.0.0.1 --port 18789
-```
+Wizard outcomes include `local-chat`, `discord`, `telegram`, and `hooks`.
+For the full setup flow and decision guidance, use [First Run](site/first-run.md).
 
-### logs
-Fetch recent log lines via WebSocket (`logs.tail`).
-
-```
-cara logs -n 50 --host 127.0.0.1 --port 18789
-```
-
-Remote hosts require TLS or explicit plaintext opt-in:
-
-- `--tls` — use `wss://` (recommended for remote).
-- `--trust` — accept invalid TLS certs (only with `--tls`).
-- `--allow-plaintext` — permit `ws://` on non-loopback hosts (unsafe; warns).
-
-### version
-Prints version/build info.
-
-### backup / restore
-Create or restore a backup archive of Carapace state.
-
-### reset
-Remove state data categories. Use `--all` or explicit flags plus `--force`.
-
-### setup
-Interactive first-run configuration wizard.
-
-It prompts for:
-- provider + API key (with optional credential validation),
-- gateway auth mode + generated/custom secret,
-- bind mode + port,
-- first-run outcome (`local-chat`, `discord`, `telegram`, `hooks`),
-- optional hooks API token and Control UI toggle.
-
-At the end, it offers immediate smoke checks (`cara status`) and a first action
-(`cara chat`), plus outcome verification (`cara verify`), then prints
-outcome-specific next steps.
-
-### verify
+### `cara verify`
 Run first-run outcome checks with pass/fail output and next-step guidance.
 
 ```bash
@@ -67,34 +35,41 @@ cara verify --outcome auto --port 18789
 ```
 
 Outcomes:
-- `auto` — infer from current config.
-- `local-chat` — verify local reachability + one non-interactive `chat.send` roundtrip.
-- `hooks` — verify signed `POST /hooks/wake` with configured token.
-- `discord` / `telegram` — verify bot credential validity and outbound send path.
+- `auto` — infer from current config
+- `local-chat` — local reachability + one non-interactive `chat.send` roundtrip
+- `hooks` — signed `POST /hooks/wake` with configured token
+- `discord` / `telegram` — credential validity + outbound send-path verification
 
 Options:
-- `--port` / `-p` — local service port (default: config or `18789`).
-- `--discord-to <channel_id>` — required for Discord send-path check to pass.
-- `--telegram-to <chat_id>` — required for Telegram send-path check to pass.
+- `--port` / `-p` — local service port (default: config or `18789`)
+- `--discord-to <channel_id>` — required for Discord send-path verification
+- `--telegram-to <chat_id>` — required for Telegram send-path verification
 
 Notes:
-- `cara verify` currently targets local loopback only (`127.0.0.1`).
-- Discord/Telegram send-path verification sends a real test message to the destination you provide.
-- Hooks verification sends a signed `POST /hooks/wake` and may trigger a real agent run.
+- `cara verify` currently targets local loopback only (`127.0.0.1`)
+- Discord/Telegram verification sends a real test message
+- Hooks verification may trigger a real agent run
 
-### pair
-Pair this CLI with a Carapace service.
+### `cara status`
+Health/status check via HTTP.
 
+```bash
+cara status --host 127.0.0.1 --port 18789
 ```
-cara pair https://gateway.local:3001 --name "My CLI" --trust
+
+### `cara logs`
+Fetch log lines via WebSocket (`logs.tail`).
+
+```bash
+cara logs -n 50 --host 127.0.0.1 --port 18789
 ```
 
-Notes:
-- Requires service auth (token or password).
-- Performs the device-identity challenge/response during WS connect.
-- If pairing is required, the CLI prints a `requestId` to approve in the control UI.
+Remote hosts require TLS or explicit plaintext opt-in:
+- `--tls` — use `wss://` (recommended for remote)
+- `--trust` — accept invalid TLS certs (only with `--tls`)
+- `--allow-plaintext` — permit `ws://` on non-loopback hosts (unsafe; warns)
 
-### chat
+### `cara chat`
 Start an interactive chat REPL (`chat.send` over WebSocket).
 
 ```bash
@@ -102,78 +77,100 @@ cara chat
 ```
 
 Options:
-- `--new` — start a new session key instead of resuming `cli-chat`.
-- `--port` / `-p` — connect to a specific local Carapace port.
+- `--new` — start a new session key instead of resuming `cli-chat`
+- `--port` / `-p` — connect to a specific local Carapace port
 
 REPL commands:
-- `/help` — show command help.
-- `/new` — start a fresh session.
-- `/exit` or `/quit` — exit chat.
+- `/help` — show command help
+- `/new` — start a fresh session
+- `/exit` or `/quit` — exit chat
 
-### update
+### `cara pair`
+Pair this CLI with a Carapace service.
+
+```bash
+cara pair https://gateway.local:3001 --name "My CLI" --trust
+```
+
+Notes:
+- Requires service auth (token/password)
+- Performs device-identity challenge/response during WS connect
+- If pairing approval is required, the CLI prints a `requestId` for control UI approval
+
+### `cara backup` / `cara restore`
+Create or restore a backup archive of Carapace state.
+
+### `cara reset`
+Remove state data categories. Use `--all` or explicit flags plus `--force`.
+
+### `cara update`
 Check for or install updates from GitHub releases.
 
-### tls
-Manage cluster CA and node certs:
+### `cara version`
+Print version/build info.
 
-- `tls init-ca`
-- `tls issue-cert`
-- `tls revoke-cert`
-- `tls show-ca`
+### `cara tls`
+Manage cluster CA and node certificates:
+- `cara tls init-ca`
+- `cara tls issue-cert`
+- `cara tls revoke-cert`
+- `cara tls show-ca`
 
 ## Authentication Inputs
 
-The CLI will try, in order:
+The CLI resolves auth inputs in this order:
 
-1. Environment variables: `CARAPACE_GATEWAY_TOKEN` / `CARAPACE_GATEWAY_PASSWORD`
+1. Environment: `CARAPACE_GATEWAY_TOKEN` / `CARAPACE_GATEWAY_PASSWORD`
 2. Config file: `gateway.auth.token` / `gateway.auth.password`
-3. Credential store (OS keychain/keyutils)
+3. OS credential store (Keychain / Keyutils / Credential Manager)
 
-If nothing is found, local-direct access may still work when configured.
+If none are found, local-direct access may still work when configured.
 
 ## Device Identity (CLI)
 
-The CLI generates and stores a device identity for WebSocket access:
+The CLI creates a device identity for WebSocket access:
 
-- Stored in the OS credential store when available.
-- Legacy on-disk fallback: `{config_dir}/device-identity.json` (e.g.
-  `~/.config/carapace/device-identity.json` on Linux; owner-only perms).
-- A service-issued `connect.challenge` nonce is signed and sent in `connect`.
+- Stored in OS credential store when available
+- Legacy fallback file: `{config_dir}/device-identity.json` (owner-only perms)
+- A service-issued `connect.challenge` nonce is signed and sent in `connect`
 
-Strict mode: set this env var to *disallow* fallback to the legacy file:
+Strict mode to disallow legacy fallback:
 
 - `CARAPACE_DEVICE_IDENTITY_STRICT=1`
 
-When strict mode is enabled:
-- credential store unavailable → hard error
-- legacy file present → hard error
+Strict mode behavior:
+- credential store unavailable -> hard error
+- legacy fallback file present -> hard error
 
-## State Directories
+## State Directory
 
-Default state directory: platform config directory (e.g. `~/.config/carapace/` on Linux).
+Default: platform config directory (for example `~/.config/carapace/` on Linux).
 
 Override with:
-
 - `CARAPACE_STATE_DIR=/path/to/state`
 
-## Examples
+## Common Snippets
 
-### Tail logs over TLS (self-signed service cert)
-```
+Tail logs over TLS (self-signed service cert):
+
+```bash
 cara logs --host gateway.local --port 3001 --tls --trust -n 200
 ```
 
-### Allow plaintext logs (unsafe)
-```
+Allow plaintext logs (unsafe):
+
+```bash
 cara logs --host 10.0.0.12 --port 18789 --allow-plaintext
 ```
 
-### Pair with a remote Carapace service
-```
+Pair with a remote Carapace service:
+
+```bash
 CARAPACE_GATEWAY_TOKEN=... cara pair https://gateway.local:3001 --name "Ops CLI" --trust
 ```
 
-### Start a fresh local chat session
+Start a fresh local chat session:
+
 ```bash
 cara chat --new
 ```

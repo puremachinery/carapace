@@ -23,7 +23,7 @@ cara logs --follow
 For deeper troubleshooting, use:
 
 - [Get Unstuck](get-unstuck.md)
-- [CLI guide](https://github.com/puremachinery/carapace/blob/HEAD/docs/cli.md)
+- [CLI guide](https://github.com/puremachinery/carapace/blob/main/docs/cli.md)
 
 ## 3) Backup and restore
 

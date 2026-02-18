@@ -1,4 +1,4 @@
-# Add Carapace to Telegram (webhook mode)
+# Add Carapace to Telegram (public webhook mode)
 
 ## Outcome
 
@@ -96,6 +96,7 @@ curl -sS "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getWebhookInfo"
 
 ## Note
 
-Current Telegram inbound support is webhook-based. Local-only inbound without a
-public webhook requires long-polling support, which is planned.
+This recipe is webhook-based. For local-only inbound without a public webhook,
+Carapace also supports Telegram long-polling mode when `telegram.webhookSecret`
+is unset.
 When `gateway.bind` is `all`, keep `gateway.auth` enabled and use a strong token.

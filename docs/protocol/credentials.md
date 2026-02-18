@@ -17,7 +17,7 @@ Secrets covered:
 - WhatsApp Web session material (treated as secret data)
 
 Non-secrets (allowed to remain on disk as plaintext metadata):
-- Config files (`carapace.json`) and include files
+- Config files (`carapace.json5`, with legacy `.json` fallback) and include files
 - Profile ordering/usage stats metadata (no secret fields)
 
 ## Storage API (Rust)
