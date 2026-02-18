@@ -601,7 +601,8 @@ fn windows_quote_command_arg(arg: &str) -> String {
     if arg.is_empty() {
         return "\"\"".to_string();
     }
-    if !arg.chars().any(|ch| ch.is_whitespace() || ch == '"') {
+    // CommandLineToArgvW only treats ASCII space/tab as token delimiters.
+    if !arg.chars().any(|ch| matches!(ch, ' ' | '\t' | '"')) {
         return arg.to_string();
     }
 
@@ -743,13 +744,10 @@ fn assign_windows_job_to_pid(pid: u32, config: &ProcessSandboxConfig) -> std::io
         "Windows job assignment",
     )?;
 
-    let job = create_windows_job(config).map_err(|e| std::io::Error::other(e.to_string()))?;
+    let job = create_windows_job(config)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))?;
     job.assign_process(process_handle.raw() as isize)
-        .map_err(|e| {
-            std::io::Error::other(format!(
-                "failed to assign process {pid} to Windows job object: {e}"
-            ))
-        })?;
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))?;
 
     Ok(job)
 }
@@ -807,9 +805,9 @@ fn run_windows_appcontainer_command_output(
         "Carapace Sandboxed Process",
         Some("carapace subprocess sandbox"),
     )
-    .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()))?;
+    .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))?;
     let caps = windows_no_network_capabilities(&profile)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()))?;
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))?;
 
     let launch_opts = LaunchOptions {
         exe: resolved_program.to_path_buf(),
@@ -824,7 +822,7 @@ fn run_windows_appcontainer_command_output(
     };
 
     let mut child = launch_in_container_with_io(&caps, &launch_opts)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()))?;
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))?;
 
     // Apply full Carapace job limits immediately after spawn. With current
     // rappct launch behavior, job assignment (including LaunchOptions.join_job)
@@ -1581,13 +1579,10 @@ fn assign_windows_job_to_std_child(
     child: &std::process::Child,
     config: &ProcessSandboxConfig,
 ) -> std::io::Result<Job> {
-    let job = create_windows_job(config).map_err(|e| std::io::Error::other(e.to_string()))?;
+    let job = create_windows_job(config)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))?;
     job.assign_process(child.as_raw_handle() as isize)
-        .map_err(|e| {
-            std::io::Error::other(format!(
-                "failed to assign process to Windows job object: {e}"
-            ))
-        })?;
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))?;
     Ok(job)
 }
 
@@ -1599,12 +1594,10 @@ fn assign_windows_job_to_tokio_child(
     let Some(raw_handle) = child.raw_handle() else {
         return Err(std::io::Error::other("missing child process handle"));
     };
-    let job = create_windows_job(config).map_err(|e| std::io::Error::other(e.to_string()))?;
-    job.assign_process(raw_handle as isize).map_err(|e| {
-        std::io::Error::other(format!(
-            "failed to assign process to Windows job object: {e}"
-        ))
-    })?;
+    let job = create_windows_job(config)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))?;
+    job.assign_process(raw_handle as isize)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))?;
     Ok(job)
 }
 
