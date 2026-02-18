@@ -1,15 +1,15 @@
-# Use Carapace as a local OpenAI-compatible endpoint
+# Connect apps to your local Carapace assistant (OpenAI-compatible API)
 
 ## Outcome
 
-Expose `/v1/chat/completions` and `/v1/responses` on your local Carapace service
-and call them with standard OpenAI-style HTTP requests.
+Expose `/v1/chat/completions` and `/v1/responses` on your local Carapace
+service so apps/tools that support OpenAI-compatible APIs can talk to it.
 
 ## Prerequisites
 
 - `cara` installed.
 - `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`.
-- `curl` or an OpenAI-compatible client.
+- An app/tool that supports OpenAI-compatible APIs (or `curl`).
 
 ## 1) Create config
 
