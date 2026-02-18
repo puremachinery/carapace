@@ -77,7 +77,7 @@ impl ChannelPluginInstance for WebhookChannel {
 
 impl WebhookChannel {
     fn validate_https_webhook_url(raw: &str) -> Result<url::Url, String> {
-        let parsed = url::Url::parse(raw).map_err(|e| format!("invalid webhook URL: {}", e))?;
+        let parsed = url::Url::parse(raw).map_err(|_| "invalid webhook URL".to_string())?;
         if parsed.scheme() != "https" {
             return Err(format!(
                 "webhook URL must use https (got scheme '{}')",
@@ -313,6 +313,13 @@ mod tests {
             "unexpected webhook URL validation error: {}",
             err
         );
+    }
+
+    #[test]
+    fn test_webhook_url_parse_error_does_not_echo_raw_url() {
+        let err = WebhookChannel::validate_https_webhook_url("https://user:pass@/broken")
+            .expect_err("invalid URL should fail");
+        assert!(!err.contains("user:pass"));
     }
 
     #[test]

@@ -999,19 +999,7 @@ fn dispatch_agent_run(
 }
 
 fn format_sender_ip(ip: IpAddr) -> String {
-    match ip {
-        IpAddr::V4(v4) => {
-            let octets = v4.octets();
-            format!("{}.{}.{}.{}", octets[0], octets[1], octets[2], octets[3])
-        }
-        IpAddr::V6(v6) => {
-            let seg = v6.segments();
-            format!(
-                "{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}",
-                seg[0], seg[1], seg[2], seg[3], seg[4], seg[5], seg[6], seg[7]
-            )
-        }
-    }
+    ip.to_string()
 }
 
 /// POST /hooks/agent - Dispatch message to agent

@@ -183,12 +183,12 @@ impl MediaFetcher {
         SsrfProtection::validate_url_with_config(url, &config.ssrf_config)?;
 
         // Parse URL to extract host for DNS validation
-        let parsed_url =
-            url::Url::parse(url).map_err(|e| FetchError::InvalidUrl(format!("{}: {}", url, e)))?;
+        let parsed_url = url::Url::parse(url)
+            .map_err(|_| FetchError::InvalidUrl("invalid media URL".to_string()))?;
         if parsed_url.scheme() != "https" {
             return Err(FetchError::InvalidUrl(format!(
-                "only https URLs are allowed for media fetch: {}",
-                url
+                "only https URLs are allowed for media fetch, but got scheme '{}'",
+                parsed_url.scheme()
             )));
         }
 

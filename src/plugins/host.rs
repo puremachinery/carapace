@@ -441,8 +441,8 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
             });
         }
 
-        let parsed_url = url::Url::parse(&req.url)
-            .map_err(|e| HostError::Http(format!("Invalid URL: {}", e)))?;
+        let parsed_url =
+            url::Url::parse(&req.url).map_err(|_| HostError::Http("Invalid URL".to_string()))?;
         if parsed_url.scheme() != "https" {
             return Err(HostError::Http(format!(
                 "Only HTTPS URLs are allowed, got '{}'",
@@ -583,8 +583,8 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
         // Validate URL for SSRF
         SsrfProtection::validate_url_with_config(url, &self.ssrf_config)?;
 
-        let parsed_url = url::Url::parse(url)
-            .map_err(|e| HostError::MediaFetch(format!("Invalid URL: {}", e)))?;
+        let parsed_url =
+            url::Url::parse(url).map_err(|_| HostError::MediaFetch("Invalid URL".to_string()))?;
         if parsed_url.scheme() != "https" {
             return Err(HostError::MediaFetch(format!(
                 "Only HTTPS URLs are allowed, got '{}'",
