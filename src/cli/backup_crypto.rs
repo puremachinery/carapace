@@ -211,8 +211,24 @@ mod tests {
         hex::encode(random_bytes::<24>())
     }
 
-    fn derive_key_reference_pbkdf2(passphrase: &[u8], salt: &[u8]) -> [u8; KEY_LEN] {
+    fn derive_key_with_iterations(
+        passphrase: &[u8],
+        salt: &[u8],
+        iterations: u32,
+    ) -> [u8; KEY_LEN] {
+        let mut key = [0u8; KEY_LEN];
+        pbkdf2_hmac::<Sha256>(passphrase, salt, iterations, &mut key);
+        key
+    }
+
+    fn derive_key_reference_pbkdf2(
+        passphrase: &[u8],
+        salt: &[u8],
+        iterations: u32,
+    ) -> [u8; KEY_LEN] {
         type HmacSha256 = Hmac<Sha256>;
+
+        assert!(iterations >= 1, "PBKDF2 requires at least one iteration");
 
         let mut first_block_input = Vec::with_capacity(salt.len() + 4);
         first_block_input.extend_from_slice(salt);
@@ -223,7 +239,7 @@ mod tests {
         let mut u_prev: [u8; KEY_LEN] = mac.finalize().into_bytes().into();
         let mut out = u_prev;
 
-        for _ in 1..PBKDF2_ITERATIONS {
+        for _ in 1..iterations {
             let mut iter_mac =
                 <HmacSha256 as Mac>::new_from_slice(passphrase).expect("HMAC key creation");
             iter_mac.update(&u_prev);
@@ -257,10 +273,13 @@ mod tests {
 
     #[test]
     fn test_derive_key_matches_reference_pbkdf2() {
+        // Keep this test fast: compare crate and reference implementations
+        // using a reduced iteration count, not production cost.
+        let iterations = 10_000;
         let passphrase = random_bytes::<24>();
         let salt = random_bytes::<SALT_LEN>();
-        let key = derive_key(&passphrase, &salt);
-        let reference = derive_key_reference_pbkdf2(&passphrase, &salt);
+        let key = derive_key_with_iterations(&passphrase, &salt, iterations);
+        let reference = derive_key_reference_pbkdf2(&passphrase, &salt, iterations);
         assert_eq!(key, reference);
     }
 

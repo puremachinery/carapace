@@ -15,7 +15,7 @@ pub use store::{
     Session, SessionFilter, SessionMetadata, SessionStatus, SessionStore, SessionStoreError,
 };
 
-/// Resolve a session key using scoping config and optional explicit key.
+/// Resolve a session key using scoping config and optional explicit session ID.
 pub fn resolve_scoped_session_key(
     config: &serde_json::Value,
     channel: &str,
@@ -60,14 +60,14 @@ pub fn get_or_create_scoped_session(
     explicit_session_id: Option<&str>,
     mut metadata: SessionMetadata,
 ) -> Result<Session, SessionStoreError> {
-    let (session_key, channel_config, channel_name) =
+    let (resolved_session_id, channel_config, channel_name) =
         resolve_scoped_session_key(config, channel, sender_id, peer_id, explicit_session_id);
 
     if metadata.channel.is_none() {
         metadata.channel = Some(channel_name);
     }
 
-    match store.get_session_by_key(&session_key) {
+    match store.get_session_by_key(&resolved_session_id) {
         Ok(existing) => {
             if scoping::should_reset_session(existing.updated_at, &channel_config.reset) {
                 store.reset_session(&existing.id)
@@ -75,7 +75,9 @@ pub fn get_or_create_scoped_session(
                 Ok(existing)
             }
         }
-        Err(SessionStoreError::NotFound(_)) => store.get_or_create_session(&session_key, metadata),
+        Err(SessionStoreError::NotFound(_)) => {
+            store.get_or_create_session(&resolved_session_id, metadata)
+        }
         Err(e) => Err(e),
     }
 }

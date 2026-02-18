@@ -232,7 +232,7 @@ impl MediaFetcher {
 
         // Make the request
         let response = client
-            .get(parsed_url.clone())
+            .get(parsed_url)
             .send()
             .await
             .map_err(|e| FetchError::HttpRequest(format!("Request failed: {}", e)))?;
