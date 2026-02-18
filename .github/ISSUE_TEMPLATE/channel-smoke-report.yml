@@ -1,6 +1,6 @@
 name: Channel smoke report
 description: Report a real-world channel smoke run (Signal, Slack, Telegram, Discord).
-title: "channel smoke: <channel> <pass|fail>"
+title: "channel smoke: <Signal|Slack|Telegram|Discord> <pass|fail>"
 labels:
   - smoke
   - channel

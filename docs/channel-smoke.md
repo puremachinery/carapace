@@ -38,7 +38,8 @@ If any step fails, capture the first failing step and logs.
 
 ## Signal Smoke
 
-Assumes `signal-cli-rest-api` is running and configured in `carapace.json5`.
+Assumes `signal-cli-rest-api` is running and configured in `carapace.json5`
+(see [Signal Channel Setup](channels.md#signal-signal-cli-rest-api)).
 
 1. Start services and verify health:
    - `cara status --host 127.0.0.1 --port 18789`
@@ -57,7 +58,8 @@ Common failure indicators:
 ## Slack Smoke
 
 Assumes Slack bot token and signing secret are configured and Events API request
-URL points to `/channels/slack/events`.
+URL points to `/channels/slack/events` (see
+[Slack Channel Setup](channels.md#slack-web-api--events-api)).
 
 1. Verify Slack Events URL challenge succeeds.
 2. Send one message in a subscribed Slack channel.
