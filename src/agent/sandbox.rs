@@ -632,19 +632,25 @@ fn windows_quote_command_arg(arg: &str) -> String {
 }
 
 #[cfg(target_os = "windows")]
-fn windows_build_cmdline(args: &[&str]) -> Option<String> {
+fn windows_build_cmdline(args: &[&str]) -> std::io::Result<Option<String>> {
     if args.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     let mut cmdline = String::new();
     for (index, arg) in args.iter().enumerate() {
+        if arg.contains('\0') {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Windows sandboxed command arguments cannot contain NUL bytes",
+            ));
+        }
         if index > 0 {
             cmdline.push(' ');
         }
         cmdline.push_str(&windows_quote_command_arg(arg));
     }
-    Some(cmdline)
+    Ok(Some(cmdline))
 }
 
 #[cfg(target_os = "windows")]
@@ -788,7 +794,7 @@ fn run_windows_appcontainer_command_output(
 
     let launch_opts = LaunchOptions {
         exe: resolved_program.to_path_buf(),
-        cmdline: windows_build_cmdline(args),
+        cmdline: windows_build_cmdline(args)?,
         cwd: resolved_program.parent().map(Path::to_path_buf),
         env: windows_filtered_env(config),
         stdio: StdioConfig::Pipe,
@@ -800,10 +806,11 @@ fn run_windows_appcontainer_command_output(
     let mut child = launch_in_container_with_io(&caps, &launch_opts)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()))?;
 
-    // Apply full Carapace job limits immediately after spawn. With the current
-    // AppContainer launch APIs this is not atomic, so there is a brief
-    // pre-assignment window before our stricter CPU-time/process-count limits
-    // attach; if assignment fails we terminate the child (fail-closed).
+    // Apply full Carapace job limits immediately after spawn. With current
+    // rappct launch behavior, job assignment (including LaunchOptions.join_job)
+    // occurs after CreateProcess, so there is a brief pre-assignment window
+    // before our stricter CPU-time/process-count limits attach; if assignment
+    // fails we terminate the child (fail-closed).
     let _job = match assign_windows_job_to_pid(child.pid, config) {
         Ok(job) => job,
         Err(err) => {
@@ -2096,8 +2103,19 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn test_windows_build_cmdline() {
-        let cmdline = windows_build_cmdline(&["arg1", "arg two", "with\"quote"]).expect("cmdline");
+        let cmdline = windows_build_cmdline(&["arg1", "arg two", "with\"quote"])
+            .expect("cmdline build should succeed")
+            .expect("cmdline");
         assert_eq!(cmdline, "arg1 \"arg two\" \"with\\\"quote\"");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_windows_build_cmdline_rejects_nul_bytes() {
+        let err = windows_build_cmdline(&["good", "bad\0arg"])
+            .expect_err("NUL bytes must be rejected in Windows command-line arguments");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("NUL"));
     }
 
     #[cfg(target_os = "windows")]
