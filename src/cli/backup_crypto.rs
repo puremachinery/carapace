@@ -198,6 +198,7 @@ pub fn decrypt_backup(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::Digest;
     use tempfile::TempDir;
 
     fn random_bytes<const N: usize>() -> [u8; N] {
@@ -227,6 +228,18 @@ mod tests {
         let key1 = derive_key(passphrase.as_bytes(), &salt);
         let key2 = derive_key(passphrase.as_bytes(), &salt);
         assert_eq!(key1, key2);
+    }
+
+    #[test]
+    fn test_derive_key_known_answer_vector() {
+        let passphrase = b"carapace-backup-test-vector";
+        let salt = Sha256::digest(b"carapace-backup-salt-vector");
+        let key = derive_key(passphrase, &salt);
+        // Cross-implementation test vector generated via Python hashlib.pbkdf2_hmac.
+        assert_eq!(
+            hex::encode(key),
+            "f4bcd91fca362696051cf83584d1fba537b688436139015b092b2f8dc89dea96"
+        );
     }
 
     #[test]
