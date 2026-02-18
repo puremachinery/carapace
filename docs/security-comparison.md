@@ -112,11 +112,11 @@ Rust does not help with logic bugs, auth bypass, or prompt injection. Those requ
 
 ## Honest Caveats
 
-Carapace is in preview. The security architecture is real and tested (~5,000 automated tests, multi-platform CI), but some items are incomplete:
+Carapace is in preview. The security architecture is real and tested (~5,000 automated tests, multi-platform CI), but some items are incomplete. Verified-vs-partial feature state is tracked in `docs/feature-status.yaml` and `docs/feature-evidence.yaml`:
 
 - **Platform backend coverage.** Seatbelt/Landlock/rlimit subprocess wiring is implemented across probe/tailscale/whois/SSH tunnel callsites, but OS-level sandbox backends are currently macOS/Linux only. Unsupported targets fail closed for sandbox-required subprocess paths.
 - **Control UI.** The backend (routes, auth, CSRF) is complete. The frontend is not built yet.
-- **Channels.** Discord is verified end-to-end. Telegram requires a webhook (no long-polling), so it needs a tunnel or public endpoint. Signal and Slack are implemented but not yet smoke-tested in real environments.
+- **Channels.** Discord is verified end-to-end. Telegram supports webhook and localhost long-polling fallback. Signal and Slack are implemented but not yet smoke-tested in real environments.
 - **Audit log emission.** The audit log module is implemented (append-only JSONL, 19 event types, 50 MB rotation) but event emission is not yet wired into all runtime paths.
 
 We'd rather ship an honest "here's what works and what doesn't" than pretend everything is finished.
