@@ -83,4 +83,4 @@ Open a smoke report with:
 
 Template:
 
-<https://github.com/puremachinery/carapace/issues/new?template=channel-smoke-report.yml&title=channel+smoke%3A+%3Csignal%7Cslack%3E+%3Cpass%7Cfail%3E>
+[Open a smoke report](https://github.com/puremachinery/carapace/issues/new?template=channel-smoke-report.yml&title=channel+smoke%3A+%3CCHANNEL%3E+%3CPASS%7CFAIL%3E)
