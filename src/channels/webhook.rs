@@ -283,6 +283,39 @@ mod tests {
     }
 
     #[test]
+    fn test_webhook_rejects_non_https_url() {
+        let wh = WebhookChannel::new("http://example.com/hook".to_string());
+        let ctx = OutboundContext {
+            to: "user123".to_string(),
+            text: "Hello".to_string(),
+            media_url: None,
+            gif_playback: false,
+            reply_to_id: None,
+            thread_id: None,
+            account_id: None,
+        };
+        let result = wh.send_text(ctx).unwrap();
+        assert!(!result.ok);
+        assert!(!result.retryable);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("webhook URL must use https"));
+    }
+
+    #[test]
+    fn test_webhook_rejects_missing_host_url() {
+        let err = WebhookChannel::validate_https_webhook_url("https://")
+            .expect_err("missing host URL should fail validation");
+        assert!(
+            err.contains("invalid webhook URL") || err.contains("missing a host"),
+            "unexpected webhook URL validation error: {}",
+            err
+        );
+    }
+
+    #[test]
     fn test_webhook_ssrf_allows_public_url() {
         // Public URL should pass SSRF validation (will fail at HTTP level since
         // the server doesn't exist, but the SSRF check itself should pass)

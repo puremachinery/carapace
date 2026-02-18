@@ -699,7 +699,7 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
             .ok_or_else(|| HostError::MediaFetch("URL has no host".to_string()))?
             .to_string();
 
-        let port = parsed_url.port_or_known_default().unwrap_or(80);
+        let port = parsed_url.port_or_known_default().unwrap_or(443);
 
         let timeout = Duration::from_millis(
             timeout_ms
@@ -937,6 +937,27 @@ mod tests {
 
         let result = ctx.http_fetch(req).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_http_fetch_rejects_non_https_url() {
+        let ctx = create_test_context("test-plugin").await;
+        let req = HttpRequest {
+            method: "GET".to_string(),
+            url: "http://example.com/data".to_string(),
+            headers: vec![],
+            body: None,
+        };
+        let result = ctx.http_fetch(req).await;
+        match result {
+            Err(HostError::Http(msg)) => {
+                assert!(
+                    msg.contains("Only HTTPS URLs are allowed"),
+                    "unexpected error: {msg}"
+                );
+            }
+            other => panic!("expected HostError::Http for non-https URL, got {other:?}"),
+        }
     }
 
     #[tokio::test]

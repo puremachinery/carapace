@@ -3516,10 +3516,12 @@ pub fn handle_tls_init_ca(output: Option<&str>) -> Result<(), Box<dyn std::error
         None => crate::tls::ca::default_ca_dir(),
     };
 
-    let _cluster = crate::tls::ca::ClusterCA::generate(&ca_dir)?;
+    let cluster = crate::tls::ca::ClusterCA::generate(&ca_dir)?;
 
     println!("Cluster CA generated successfully");
     println!("  Directory:   {}", ca_dir.display());
+    println!("  Certificate: {}", cluster.ca_cert_path().display());
+    println!("  Fingerprint: {}", cluster.ca_fingerprint());
     println!("  Files:       ca.crt, ca.key, crl.json");
     println!();
     println!("Distribute the CA certificate to all gateway nodes.");
@@ -3545,10 +3547,12 @@ pub fn handle_tls_issue_cert(
     };
 
     let cluster = crate::tls::ca::ClusterCA::load(&ca_dir)?;
-    let _issued = cluster.issue_node_cert(node_id, &output_dir)?;
+    let issued = cluster.issue_node_cert(node_id, &output_dir)?;
 
     println!("Node certificate issued successfully");
-    println!("  Node ID:     {}", node_id);
+    println!("  Node ID:     {}", issued.node_id);
+    println!("  Certificate: {}", issued.cert_path.display());
+    println!("  Fingerprint: {}", issued.fingerprint);
     println!("  Output Dir:  {}", output_dir.display());
     println!();
     println!("Deploy these files to the node and configure gateway.mtls:");
@@ -3599,6 +3603,8 @@ pub fn handle_tls_show_ca(ca_dir_opt: Option<&str>) -> Result<(), Box<dyn std::e
     println!("Cluster CA Information");
     println!("=====================");
     println!("  Directory:   {}", ca_dir.display());
+    println!("  Certificate: {}", cluster.ca_cert_path().display());
+    println!("  Fingerprint: {}", cluster.ca_fingerprint());
     println!("  Files:       ca.crt, ca.key, crl.json");
 
     let entries = cluster.crl_entries();
