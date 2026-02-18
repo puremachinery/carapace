@@ -75,9 +75,25 @@ For pinned releases, compare against release-provided checksums:
 ```bash
 VERSION="vX.Y.Z"
 BASE_URL="https://github.com/puremachinery/carapace/releases/download/${VERSION}"
+curl -LO "${BASE_URL}/cara-x86_64-linux"
 curl -LO "${BASE_URL}/SHA256SUMS.txt"
-grep "  cara-x86_64-linux$" SHA256SUMS.txt
-sha256sum cara-x86_64-linux
+curl -LO "${BASE_URL}/SHA256SUMS.txt.sig"
+curl -LO "${BASE_URL}/SHA256SUMS.txt.pem"
+
+cosign verify-blob \
+  --certificate SHA256SUMS.txt.pem \
+  --signature SHA256SUMS.txt.sig \
+  --certificate-identity-regexp "https://github.com/puremachinery/carapace/.github/workflows/release.yml@refs/tags/v.*" \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+  SHA256SUMS.txt
+
+grep "  cara-x86_64-linux$" SHA256SUMS.txt | sha256sum --check -
+```
+
+If you downloaded every artifact listed in `SHA256SUMS.txt`, you can also run:
+
+```bash
+sha256sum --check SHA256SUMS.txt
 ```
 
 ## 4) Install on your PATH
