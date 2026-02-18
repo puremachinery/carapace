@@ -186,8 +186,8 @@ impl LlmProvider for GeminiProvider {
         // Strip any prefix (gemini/, models/) to get the bare model name for the URL
         let model_name = strip_gemini_prefix(&request.model);
         let url = format!(
-            "{}/v1beta/models/{}:streamGenerateContent?alt=sse&key={}",
-            self.base_url, model_name, self.api_key
+            "{}/v1beta/models/{}:streamGenerateContent?alt=sse",
+            self.base_url, model_name
         );
 
         let response = tokio::select! {
@@ -197,6 +197,7 @@ impl LlmProvider for GeminiProvider {
             response = self
                 .client
                 .post(&url)
+                .header("x-goog-api-key", &self.api_key)
                 .header("content-type", "application/json")
                 .header("accept", "text/event-stream")
                 .json(&body)
