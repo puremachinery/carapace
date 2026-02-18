@@ -551,21 +551,21 @@ mod tests {
     #[test]
     fn test_new_rejects_empty_api_key() {
         let result = AnthropicProvider::new("".to_string());
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected empty API key to fail");
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("empty"));
+        assert!(err.contains("empty"), "got: {err}");
     }
 
     #[test]
     fn test_new_rejects_whitespace_api_key() {
         let result = AnthropicProvider::new("   ".to_string());
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected whitespace API key to fail");
     }
 
     #[test]
     fn test_new_accepts_valid_api_key() {
         let result = AnthropicProvider::new("sk-ant-valid-key".to_string());
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "expected valid API key to pass");
     }
 
     #[test]
@@ -610,9 +610,9 @@ mod tests {
         let result = AnthropicProvider::new("test-key".to_string())
             .unwrap()
             .with_base_url("http://insecure.example.com".to_string());
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected http base URL to fail");
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("https"));
+        assert!(err.contains("https"), "got: {err}");
     }
 
     #[test]
@@ -620,7 +620,7 @@ mod tests {
         let result = AnthropicProvider::new("test-key".to_string())
             .unwrap()
             .with_base_url("not-a-url".to_string());
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected malformed base URL to fail");
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("invalid URL"),

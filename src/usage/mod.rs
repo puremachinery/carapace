@@ -1067,9 +1067,9 @@ impl UsageTracker {
     /// Reset usage for a specific session
     pub fn reset_session(&mut self, session_key: &str) -> bool {
         let session_id = usage_session_id(session_key);
-        if self.data.sessions.remove(&session_id).is_some()
-            || self.data.sessions.remove(session_key).is_some()
-        {
+        let removed_by_id = self.data.sessions.remove(&session_id).is_some();
+        let removed_by_key = self.data.sessions.remove(session_key).is_some();
+        if removed_by_id || removed_by_key {
             self.dirty = true;
             true
         } else {
@@ -1501,6 +1501,37 @@ mod tests {
 
         assert!(tracker.get_session_usage("session-1").is_none());
         assert!(tracker.get_session_usage("session-2").is_some());
+    }
+
+    #[test]
+    fn test_tracker_reset_session_removes_hashed_and_legacy_entries() {
+        let mut tracker = create_test_tracker();
+
+        let session_key = "legacy-session";
+        let session_id = usage_session_id(session_key);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_else(|_| std::time::Duration::from_secs(0))
+            .as_millis() as u64;
+        let usage = SessionUsage {
+            session_id: session_id.clone(),
+            input_tokens: 10,
+            output_tokens: 20,
+            requests: 1,
+            cost_usd: 0.001,
+            first_used_at: now,
+            last_used_at: now,
+        };
+
+        tracker.data.sessions.insert(session_id, usage.clone());
+        tracker.data.sessions.insert(session_key.to_string(), usage);
+
+        assert!(tracker.reset_session(session_key));
+        assert!(!tracker.data.sessions.contains_key(session_key));
+        assert!(!tracker
+            .data
+            .sessions
+            .contains_key(&usage_session_id(session_key)));
     }
 
     #[test]

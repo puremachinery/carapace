@@ -66,7 +66,7 @@ impl SignalChannel {
         context: &str,
         allow_loopback_http: bool,
     ) -> Result<url::Url, String> {
-        let parsed = url::Url::parse(raw).map_err(|e| format!("invalid {} URL: {}", context, e))?;
+        let parsed = url::Url::parse(raw).map_err(|_| format!("invalid {} URL", context))?;
         match parsed.scheme() {
             "https" => {}
             "http" if allow_loopback_http && Self::is_loopback_host(&parsed) => {}

@@ -806,12 +806,6 @@ impl<B: CredentialBackend + 'static> PluginHostContextBuilder<B> {
 
 /// Parse host and port from a URL string.
 fn parse_host_and_port(parsed_url: &url::Url) -> Result<(String, u16), HostError> {
-    if parsed_url.scheme() != "https" {
-        return Err(HostError::Http(format!(
-            "Only HTTPS URLs are allowed, got '{}'",
-            parsed_url.scheme()
-        )));
-    }
     let host = parsed_url
         .host_str()
         .ok_or_else(|| HostError::Http("URL has no host".to_string()))?
