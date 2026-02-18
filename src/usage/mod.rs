@@ -361,9 +361,37 @@ fn current_month() -> String {
     date[..7].to_string()
 }
 
-fn usage_session_id(session_key: &str) -> String {
+#[derive(Debug, Clone)]
+struct SessionIdentity {
+    raw_key: String,
+    session_id: String,
+    legacy_session_id: String,
+}
+
+fn session_identity(session_key: &str) -> SessionIdentity {
     let digest = Sha256::digest(session_key.as_bytes());
-    format!("sid_{}", hex::encode(&digest[..12]))
+    let digest_hex = hex::encode(digest);
+    let legacy_digest_hex = &digest_hex[..24];
+    SessionIdentity {
+        raw_key: session_key.to_string(),
+        session_id: format!("sid_{digest_hex}"),
+        legacy_session_id: format!("sid_{legacy_digest_hex}"),
+    }
+}
+
+fn merge_session_usage(existing: &mut SessionUsage, incoming: SessionUsage) {
+    existing.input_tokens += incoming.input_tokens;
+    existing.output_tokens += incoming.output_tokens;
+    existing.requests += incoming.requests;
+    existing.cost_usd += incoming.cost_usd;
+    if existing.first_used_at == 0
+        || (incoming.first_used_at != 0 && incoming.first_used_at < existing.first_used_at)
+    {
+        existing.first_used_at = incoming.first_used_at;
+    }
+    if incoming.last_used_at > existing.last_used_at {
+        existing.last_used_at = incoming.last_used_at;
+    }
 }
 
 fn is_leap_year(year: u64) -> bool {
@@ -765,7 +793,7 @@ impl UsageTracker {
         let now = now_ms();
         let date = today_date();
         let month = current_month();
-        let session_id = session_key.map(usage_session_id);
+        let session_identity = session_key.map(session_identity);
 
         // Calculate cost
         let pricing = get_model_pricing(model).unwrap_or_else(default_pricing);
@@ -775,7 +803,9 @@ impl UsageTracker {
             timestamp: now,
             provider: provider.to_string(),
             model: model.to_string(),
-            session_id: session_id.clone(),
+            session_id: session_identity
+                .as_ref()
+                .map(|identity| identity.session_id.clone()),
             input_tokens,
             output_tokens,
             cost_usd: cost,
@@ -798,16 +828,21 @@ impl UsageTracker {
         monthly.add_record(&record);
 
         // Update session usage if session key provided
-        if let Some(session_id) = session_id {
+        if let Some(identity) = session_identity {
+            // Backward compatibility: consolidate pre-migration keys into the
+            // canonical full-hash session id when a matching session appears.
+            self.promote_session_aliases(&identity);
             let session = self
                 .data
                 .sessions
-                .entry(session_id.clone())
+                .entry(identity.session_id.clone())
                 .or_insert_with(|| SessionUsage {
-                    session_id: session_id.clone(),
-                    first_used_at: now,
+                    session_id: identity.session_id.clone(),
                     ..Default::default()
                 });
+            if session.first_used_at == 0 {
+                session.first_used_at = now;
+            }
             session.input_tokens += input_tokens;
             session.output_tokens += output_tokens;
             session.requests += 1;
@@ -1003,10 +1038,11 @@ impl UsageTracker {
 
     /// Get session usage
     pub fn get_session_usage(&self, session_key: &str) -> Option<&SessionUsage> {
-        let session_id = usage_session_id(session_key);
+        let identity = session_identity(session_key);
         self.data
             .sessions
-            .get(&session_id)
+            .get(&identity.session_id)
+            .or_else(|| self.data.sessions.get(&identity.legacy_session_id))
             // Backward compatibility for pre-hash usage.json data.
             .or_else(|| self.data.sessions.get(session_key))
     }
@@ -1066,15 +1102,62 @@ impl UsageTracker {
 
     /// Reset usage for a specific session
     pub fn reset_session(&mut self, session_key: &str) -> bool {
-        let session_id = usage_session_id(session_key);
-        let removed_by_id = self.data.sessions.remove(&session_id).is_some();
-        let removed_by_key = self.data.sessions.remove(session_key).is_some();
-        if removed_by_id || removed_by_key {
+        let identity = session_identity(session_key);
+        let removed_by_id = self.data.sessions.remove(&identity.session_id).is_some();
+        let removed_by_legacy = self
+            .data
+            .sessions
+            .remove(&identity.legacy_session_id)
+            .is_some();
+        let removed_by_key = if session_key.starts_with("sid_") {
+            false
+        } else {
+            self.data.sessions.remove(session_key).is_some()
+        };
+        if removed_by_id || removed_by_legacy || removed_by_key {
             self.dirty = true;
             true
         } else {
             false
         }
+    }
+
+    fn promote_session_aliases(&mut self, identity: &SessionIdentity) {
+        let mut migrated: Vec<SessionUsage> = Vec::with_capacity(2);
+        if let Some(legacy_usage) = self.data.sessions.remove(&identity.legacy_session_id) {
+            migrated.push(legacy_usage);
+        }
+
+        // Only remove raw plaintext alias keys when they are clearly distinct
+        // from canonical sid_* identifiers to avoid accidental collisions.
+        if !identity.raw_key.starts_with("sid_") {
+            if let Some(legacy_plaintext_usage) = self.data.sessions.remove(&identity.raw_key) {
+                migrated.push(legacy_plaintext_usage);
+            }
+        }
+
+        if migrated.is_empty() {
+            return;
+        }
+
+        let session = self
+            .data
+            .sessions
+            .entry(identity.session_id.clone())
+            .or_insert_with(|| SessionUsage {
+                session_id: identity.session_id.clone(),
+                ..Default::default()
+            });
+        for migrated_usage in migrated {
+            merge_session_usage(session, migrated_usage);
+        }
+        self.dirty = true;
+    }
+
+    fn has_session_aliases(&self, identity: &SessionIdentity) -> bool {
+        self.data.sessions.contains_key(&identity.legacy_session_id)
+            || (!identity.raw_key.starts_with("sid_")
+                && self.data.sessions.contains_key(&identity.raw_key))
     }
 }
 
@@ -1238,7 +1321,21 @@ pub fn is_tracking_enabled() -> bool {
 
 /// Get session usage (global tracker)
 pub fn get_session_usage(session_key: &str) -> Option<SessionUsage> {
-    let tracker = USAGE_TRACKER.read();
+    let identity = session_identity(session_key);
+    {
+        let tracker = USAGE_TRACKER.read();
+        if !tracker.has_session_aliases(&identity) {
+            return tracker.get_session_usage(session_key).cloned();
+        }
+    }
+
+    let mut tracker = USAGE_TRACKER.write();
+    if tracker.has_session_aliases(&identity) {
+        tracker.promote_session_aliases(&identity);
+        if tracker.dirty {
+            tracker.maybe_save();
+        }
+    }
     tracker.get_session_usage(session_key).cloned()
 }
 
@@ -1508,7 +1605,9 @@ mod tests {
         let mut tracker = create_test_tracker();
 
         let session_key = "legacy-session";
-        let session_id = usage_session_id(session_key);
+        let identity = session_identity(session_key);
+        let session_id = identity.session_id.clone();
+        let legacy_session_id = identity.legacy_session_id.clone();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_else(|_| std::time::Duration::from_secs(0))
@@ -1523,15 +1622,136 @@ mod tests {
             last_used_at: now,
         };
 
-        tracker.data.sessions.insert(session_id, usage.clone());
+        tracker
+            .data
+            .sessions
+            .insert(session_id.clone(), usage.clone());
+        tracker
+            .data
+            .sessions
+            .insert(legacy_session_id.clone(), usage.clone());
         tracker.data.sessions.insert(session_key.to_string(), usage);
 
         assert!(tracker.reset_session(session_key));
         assert!(!tracker.data.sessions.contains_key(session_key));
-        assert!(!tracker
+        assert!(!tracker.data.sessions.contains_key(&session_id));
+        assert!(!tracker.data.sessions.contains_key(&legacy_session_id));
+    }
+
+    #[test]
+    fn test_get_session_usage_supports_legacy_hashed_id() {
+        let mut tracker = create_test_tracker();
+        let session_key = "legacy-hash-session";
+        let legacy_session_id = session_identity(session_key).legacy_session_id;
+
+        tracker.data.sessions.insert(
+            legacy_session_id.clone(),
+            SessionUsage {
+                session_id: legacy_session_id,
+                input_tokens: 7,
+                output_tokens: 9,
+                requests: 2,
+                cost_usd: 0.123,
+                first_used_at: 100,
+                last_used_at: 200,
+            },
+        );
+
+        let usage = tracker
+            .get_session_usage(session_key)
+            .expect("legacy hashed session should be resolved");
+        assert_eq!(usage.requests, 2);
+    }
+
+    #[test]
+    fn test_record_migrates_legacy_keys_to_full_hash() {
+        let mut tracker = create_test_tracker();
+        let session_key = "migrate-me";
+        let identity = session_identity(session_key);
+        let full_session_id = identity.session_id.clone();
+        let legacy_session_id = identity.legacy_session_id.clone();
+
+        tracker.data.sessions.insert(
+            legacy_session_id.clone(),
+            SessionUsage {
+                session_id: legacy_session_id.clone(),
+                input_tokens: 100,
+                output_tokens: 200,
+                requests: 3,
+                cost_usd: 1.5,
+                first_used_at: 10,
+                last_used_at: 20,
+            },
+        );
+        tracker.data.sessions.insert(
+            session_key.to_string(),
+            SessionUsage {
+                session_id: session_key.to_string(),
+                input_tokens: 5,
+                output_tokens: 6,
+                requests: 1,
+                cost_usd: 0.2,
+                first_used_at: 5,
+                last_used_at: 8,
+            },
+        );
+
+        tracker.record(
+            "anthropic",
+            "claude-3-5-sonnet-20241022",
+            Some(session_key),
+            10,
+            20,
+        );
+
+        assert!(!tracker.data.sessions.contains_key(&legacy_session_id));
+        assert!(!tracker.data.sessions.contains_key(session_key));
+
+        let usage = tracker
             .data
             .sessions
-            .contains_key(&usage_session_id(session_key)));
+            .get(&full_session_id)
+            .expect("expected canonical full-hash session entry");
+        assert_eq!(usage.session_id, full_session_id);
+        assert_eq!(usage.input_tokens, 115);
+        assert_eq!(usage.output_tokens, 226);
+        assert_eq!(usage.requests, 5);
+        assert!(usage.cost_usd > 1.7);
+    }
+
+    #[test]
+    fn test_record_does_not_remove_sid_prefixed_raw_key_alias() {
+        let mut tracker = create_test_tracker();
+        let victim_key = "victim-session";
+        let victim_id = session_identity(victim_key).session_id;
+        let now = now_ms();
+
+        tracker.data.sessions.insert(
+            victim_id.clone(),
+            SessionUsage {
+                session_id: victim_id.clone(),
+                input_tokens: 1,
+                output_tokens: 1,
+                requests: 1,
+                cost_usd: 0.01,
+                first_used_at: now,
+                last_used_at: now,
+            },
+        );
+
+        // Contrived input where caller-provided raw key equals another canonical sid_* key.
+        tracker.record(
+            "anthropic",
+            "claude-3-5-sonnet-20241022",
+            Some(&victim_id),
+            10,
+            20,
+        );
+
+        assert!(
+            tracker.data.sessions.contains_key(&victim_id),
+            "sid_-prefixed raw key should not remove existing canonical sid entries"
+        );
     }
 
     #[test]

@@ -24,6 +24,11 @@ pub struct SignalChannel {
 
 impl SignalChannel {
     /// Create a new Signal channel targeting the given signal-cli-rest-api instance.
+    ///
+    /// This constructor intentionally does not fail closed for URL policy checks
+    /// to preserve compatibility with existing configs (including localhost
+    /// signal-cli-rest-api over HTTP). Enforcement happens at send time in
+    /// `post_send` and `send_media`.
     pub fn new(base_url: String, phone_number: String) -> Self {
         if let Ok(parsed) = url::Url::parse(&base_url) {
             if parsed.scheme() == "http" && Self::is_loopback_host(&parsed) {
@@ -38,6 +43,8 @@ impl SignalChannel {
                     "signal channel base_url is not usable: non-loopback endpoints must use https"
                 );
             }
+        } else {
+            tracing::warn!("signal channel base_url is invalid and will fail send-time validation");
         }
 
         Self {
