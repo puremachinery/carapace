@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
-use hmac::Hmac;
+use pbkdf2::pbkdf2_hmac;
 use sha2::Sha256;
 use zeroize::Zeroize;
 
@@ -84,33 +84,8 @@ impl From<std::io::Error> for BackupCryptoError {
 
 /// Derive a 256-bit key from a passphrase and salt using PBKDF2-HMAC-SHA256.
 fn derive_key(passphrase: &[u8], salt: &[u8]) -> [u8; KEY_LEN] {
-    use hmac::Mac;
-
-    type HmacSha256 = Hmac<Sha256>;
-
-    // PBKDF2: block_num = 1 since we only need 32 bytes (one HMAC-SHA256 block)
-    let mut u_prev = {
-        let mut mac =
-            <HmacSha256 as Mac>::new_from_slice(passphrase).expect("HMAC accepts any key length");
-        mac.update(salt);
-        mac.update(&1u32.to_be_bytes());
-        mac.finalize().into_bytes()
-    };
-
     let mut key = [0u8; KEY_LEN];
-    key.copy_from_slice(&u_prev);
-
-    for _ in 1..PBKDF2_ITERATIONS {
-        let mut mac =
-            <HmacSha256 as Mac>::new_from_slice(passphrase).expect("HMAC accepts any key length");
-        mac.update(&u_prev);
-        u_prev = mac.finalize().into_bytes();
-
-        for (k, u) in key.iter_mut().zip(u_prev.iter()) {
-            *k ^= u;
-        }
-    }
-
+    pbkdf2_hmac::<Sha256>(passphrase, salt, PBKDF2_ITERATIONS, &mut key);
     key
 }
 
