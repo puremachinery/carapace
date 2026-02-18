@@ -185,6 +185,8 @@ render_site_doc_page() {
   local slug="$1"
   local title="$2"
   local description="$3"
+  local parent_href="$4"
+  local parent_label="$5"
 
   render_markdown_page \
     "${site_docs_dir}/${slug}.md" \
@@ -194,8 +196,8 @@ render_site_doc_page() {
     "docs" \
     "0" \
     "." \
-    "./getting-started.html" \
-    "Getting Started" \
+    "${parent_href}" \
+    "${parent_label}" \
     "${title}"
 }
 
@@ -212,15 +214,25 @@ render_markdown_page \
   ""
 
 render_site_doc_page "install" "Install" \
-  "Install Carapace binaries and verify signatures."
+  "Install Carapace binaries and verify signatures." \
+  "./getting-started.html" \
+  "Getting Started"
 render_site_doc_page "first-run" "First Run" \
-  "Run Carapace locally with secure defaults and verify health."
+  "Run Carapace locally with secure defaults and verify health." \
+  "./install.html" \
+  "Install"
 render_site_doc_page "security" "Security" \
-  "Security defaults, trust boundaries, and practical verification checks."
+  "Security defaults, trust boundaries, and practical verification checks." \
+  "./first-run.html" \
+  "First Run"
 render_site_doc_page "ops" "Ops" \
-  "Day-2 operations: status, logs, backup, update, and recovery."
+  "Day-2 operations: status, logs, backup, update, and recovery." \
+  "./security.html" \
+  "Security"
 render_site_doc_page "get-unstuck" "Get Unstuck" \
-  "Troubleshooting checks, logs, and issue-reporting paths for Carapace."
+  "Troubleshooting checks, logs, and issue-reporting paths for Carapace." \
+  "./getting-started.html" \
+  "Getting Started"
 
 render_markdown_page \
   "${cookbook_dir}/README.md" \

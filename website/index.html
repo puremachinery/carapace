@@ -46,9 +46,18 @@
       <section class="hero">
         <p class="eyebrow">Preview release</p>
         <h1>Security-first personal AI assistant</h1>
+        <ul class="defaults-bar" aria-label="Default safety controls">
+          <li>127.0.0.1 default bind</li>
+          <li>Fail-closed auth defaults</li>
+          <li>Keychain/Keyutils/CredMan + AES-256-GCM fallback</li>
+          <li>Signed WASM plugins + capability sandbox</li>
+          <li>Seatbelt/Landlock subprocess sandbox</li>
+          <li>SSRF + DNS rebinding defense</li>
+        </ul>
         <p class="lede">
           Carapace runs local-first, keeps security controls explicit, and gives you
-          auditable behavior across chat channels and tooling integrations.
+          auditable behavior across chat channels and tooling integrations. Works
+          through Signal, Telegram, Discord, Slack, webhooks, and console.
         </p>
         <div class="cta-row">
           <a class="button button-primary" href="./install.html">Install in minutes</a>
@@ -61,6 +70,12 @@
         <p>Run setup, choose your first outcome, then start Carapace:</p>
         <pre><code>cara setup
 cara</code></pre>
+        <p class="quickstart-callout">
+          Need security deltas fast?
+          <a href="https://github.com/puremachinery/carapace/blob/HEAD/docs/security-comparison.md#summary-table">
+            Carapace vs OpenClaw threat-by-threat table
+          </a>.
+        </p>
         <p>
           New here? Follow the full path:
           <a href="./install.html">Install</a> ->
