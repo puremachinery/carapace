@@ -242,17 +242,16 @@ pub fn derive_key(password: &[u8], salt: &[u8]) -> [u8; 32] {
     out
 }
 
-/// Build a sentinel salt for password-only decryption stores used in fallback/error paths.
-///
-/// Prefers randomness to avoid static cryptographic literals in the code path.
-/// If randomness is unavailable, falls back to a deterministic value derived
-/// from the password bytes.
+/// Derive a deterministic, non-random sentinel salt for password-only
+/// decryption stores used in fallback/error paths.
 fn derive_decrypt_sentinel_salt(password: &[u8]) -> [u8; SALT_LEN] {
+    // Hash incrementally to avoid allocating an intermediate buffer that
+    // copies password bytes.
+    let mut hasher = Sha256::new();
+    hasher.update(b"carapace:decrypt-sentinel:");
+    hasher.update(password);
+    let digest = hasher.finalize();
     let mut derived = [0u8; SALT_LEN];
-    if getrandom::fill(&mut derived).is_ok() {
-        return derived;
-    }
-    let digest = Sha256::digest(password);
     derived.copy_from_slice(&digest[..SALT_LEN]);
     derived
 }

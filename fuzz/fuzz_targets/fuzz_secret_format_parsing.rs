@@ -1,10 +1,8 @@
 #![no_main]
 
 use std::sync::LazyLock;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use libfuzzer_sys::fuzz_target;
-use sha2::{Digest, Sha256};
 
 use carapace::config::secrets::{is_encrypted, SecretStore};
 
@@ -30,19 +28,10 @@ fn build_fuzz_store() -> SecretStore {
         .and_then(|hex| hex::decode(hex).ok())
         .and_then(|bytes| bytes.try_into().ok())
         .unwrap_or_else(|| {
-            let mut random_seed = [0u8; 32];
-            if getrandom::fill(&mut random_seed).is_ok() {
-                return random_seed;
-            }
-            // Fallback when OS randomness is unavailable.
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
-            let mut hasher = Sha256::new();
-            hasher.update(std::process::id().to_le_bytes());
-            hasher.update(now.to_le_bytes());
-            derive_seed_bytes(&hasher.finalize())
+            // Deterministic seed keeps fuzz crash reproduction stable across restarts.
+            // Note: if this seed constant changes, any corpus input that relied on a
+            // successful decrypt under the previous seed may no longer reproduce.
+            derive_seed_bytes(b"carapace:fuzz_secret_format_parsing:seed:v1")
         });
 
     let store_salt: [u8; 16] = seed[..16]
