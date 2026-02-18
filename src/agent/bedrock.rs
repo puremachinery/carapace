@@ -856,22 +856,18 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn random_ascii_alnum(len: usize) -> String {
-        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-        let mut bytes = vec![0u8; len];
+    fn random_hex(bytes_len: usize) -> String {
+        let mut bytes = vec![0u8; bytes_len];
         getrandom::fill(&mut bytes).expect("random test bytes");
-        bytes
-            .into_iter()
-            .map(|b| ALPHABET[(b as usize) % ALPHABET.len()] as char)
-            .collect()
+        hex::encode(bytes)
     }
 
     fn test_access_key() -> String {
-        format!("TESTACCESS{}", random_ascii_alnum(12))
+        format!("TESTACCESS{}", random_hex(8).to_uppercase())
     }
 
     fn test_secret_key() -> String {
-        format!("test-secret-{}", random_ascii_alnum(24))
+        format!("test-secret-{}", random_hex(16))
     }
 
     fn test_provider(region: &str) -> BedrockProvider {
