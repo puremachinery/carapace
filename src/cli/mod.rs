@@ -3547,10 +3547,9 @@ pub fn handle_tls_issue_cert(
     };
 
     let cluster = crate::tls::ca::ClusterCA::load(&ca_dir)?;
-    let issued = cluster.issue_node_cert(node_id, &output_dir)?;
+    let _issued = cluster.issue_node_cert(node_id, &output_dir)?;
 
     println!("Node certificate issued successfully");
-    println!("  Certificate: {}", issued.cert_path.display());
     println!("  Output Dir:  {}", output_dir.display());
     println!();
     println!("Deploy these files to the node and configure gateway.mtls:");
