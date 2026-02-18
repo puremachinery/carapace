@@ -1602,7 +1602,9 @@ mod tests {
             "plaintext store should write tokens in clear"
         );
 
-        // Now load with an encrypted store -- plaintext values should be read fine
+        // Now load with an encrypted store -- plaintext values should be read fine.
+        // Password value is irrelevant here because no ciphertext is being decrypted;
+        // this verifies backward-compatible opening of plaintext profile files.
         let password = random_password();
         let store2 = ProfileStore::with_encryption(dir.path().to_path_buf(), &password).unwrap();
         store2.load().unwrap();
