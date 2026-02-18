@@ -87,13 +87,34 @@ cosign verify-blob \
   --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
   SHA256SUMS.txt
 
-grep "  cara-x86_64-linux$" SHA256SUMS.txt | sha256sum --check -
+grep "  cara-x86_64-linux$" SHA256SUMS.txt | sha256sum --check --strict
 ```
 
 If you downloaded every artifact listed in `SHA256SUMS.txt`, you can also run:
 
 ```bash
 sha256sum --check SHA256SUMS.txt
+```
+
+PowerShell example:
+
+```powershell
+$Version = "vX.Y.Z"
+$FileName = "cara-x86_64-windows.exe"
+$BaseUrl = "https://github.com/puremachinery/carapace/releases/download/$Version"
+Invoke-WebRequest "$BaseUrl/$FileName" -OutFile ".\$FileName"
+Invoke-WebRequest "$BaseUrl/SHA256SUMS.txt" -OutFile ".\SHA256SUMS.txt"
+
+$expectedLine = (Select-String -Path .\SHA256SUMS.txt -SimpleMatch "  $FileName").Line
+if (-not $expectedLine) {
+  throw "No checksum entry found for $FileName in SHA256SUMS.txt"
+}
+$expected = ($expectedLine -split '\s+')[0].ToLower()
+$actual = (Get-FileHash ".\$FileName" -Algorithm SHA256).Hash.ToLower()
+if ($expected -ne $actual) {
+  throw "Checksum mismatch for $FileName"
+}
+Write-Host "Checksum verified for $FileName"
 ```
 
 ## 4) Install on your PATH
