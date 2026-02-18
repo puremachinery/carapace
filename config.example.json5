@@ -209,6 +209,55 @@
   //   // baseUrl: "https://api.venice.ai/api",  // override with VENICE_BASE_URL env var
   // },
 
+  // --- Azure OpenAI provider -----------------------------------------------
+  // azure: {
+  //   apiKey: "${AZURE_OPENAI_API_KEY}",
+  //   resource: "my-resource",       // Azure resource name (e.g., "my-resource" from "my-resource.openai.azure.com")
+  //   deployment: "gpt-4",           // Deployment name
+  //   // apiVersion: "2024-02-15-preview",  // API version (default)
+  // },
+
+  // --- Google Cloud Vertex AI provider ------------------------------------
+  // vertex: {
+  //   projectId: "my-gcp-project",   // GCP project ID
+  //   region: "us-central1",        // GCP region
+  //   // accessToken: "...",          // OAuth2 access token (or use GCP_ACCESS_TOKEN env var)
+  // },
+  // // Alternatively, use environment variables:
+  // // export GCP_PROJECT_ID="my-gcp-project"
+  // // export GCP_REGION="us-central1"
+  // // export GCP_ACCESS_TOKEN="ya29.***
+
+  // --- OpenAI-Compatible Providers ---------------------------------------
+  // DeepSeek, Qwen, Moonshot (Kimi), Minimax, GLM (Z.ai), xAI (Grok)
+  // Use either config or environment variables:
+  //
+  // Via config:
+  // openaiCompatible: {
+  //   deepseek: { apiKey: "...", baseUrl: "https://api.deepseek.com/v1" },
+  //   qwen: { apiKey: "...", baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1" },
+  //   moonshot: { apiKey: "...", baseUrl: "https://api.moonshot.cn/v1" },
+  //   minimax: { apiKey: "...", baseUrl: "https://api.minimax.chat/v1" },
+  //   glm: { apiKey: "...", baseUrl: "https://open.bigmodel.cn/api/paas/v4" },
+  //   xai: { apiKey: "...", baseUrl: "https://api.x.ai/v1" },
+  // },
+  //
+  // Via environment variables (first configured provider wins):
+  // DEEPSEEK_API_KEY + DEEPSEEK_BASE_URL
+  // QWEN_API_KEY + QWEN_BASE_URL
+  // MOONSHOT_API_KEY + MOONSHOT_BASE_URL
+  // MINIMAX_API_KEY + MINIMAX_BASE_URL
+  // GLM_API_KEY + GLM_BASE_URL
+  // XAI_API_KEY + XAI_BASE_URL
+  //
+  // Model prefixes:
+  //   deepseek:deepseek-chat -> DeepSeek
+  //   qwen:qwen-turbo -> Qwen
+  //   moonshot:kimi-k2.5 or kimi:kimi-k2.5 -> Moonshot
+  //   minimax:minimax-m2 -> Minimax
+  //   glm:glm-5 or z.ai:glm-5 -> GLM (Z.ai)
+  //   xai:grok-2 or grok:grok-2 -> xAI
+
   // --- Inbound message classifier ----------------------------------------
   // classifier: {
   //   enabled: true,

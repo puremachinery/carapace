@@ -113,8 +113,8 @@ pub trait LlmProvider: Send + Sync {
     ) -> Result<mpsc::Receiver<StreamEvent>, AgentError>;
 }
 
-/// A provider that dispatches to Anthropic, OpenAI, Ollama, Gemini, or Bedrock
-/// based on the model identifier in the request.
+/// A provider that dispatches to Anthropic, OpenAI, Ollama, Gemini, Bedrock, Azure OpenAI, Vertex AI,
+/// or OpenAI-compatible providers (DeepSeek, Qwen, Moonshot, Minimax, GLM, xAI) based on the model identifier in the request.
 ///
 /// This allows the system to hold a single `Arc<dyn LlmProvider>` while
 /// supporting multiple backend providers transparently.
@@ -125,6 +125,10 @@ pub struct MultiProvider {
     gemini: Option<std::sync::Arc<dyn LlmProvider>>,
     bedrock: Option<std::sync::Arc<dyn LlmProvider>>,
     venice: Option<std::sync::Arc<dyn LlmProvider>>,
+    azure: Option<std::sync::Arc<dyn LlmProvider>>,
+    vertex: Option<std::sync::Arc<dyn LlmProvider>>,
+    // OpenAI-compatible providers: deepseek, qwen, moonshot, minimax, glm, xai
+    openai_compatible: Option<std::sync::Arc<dyn LlmProvider>>,
 }
 
 impl std::fmt::Debug for MultiProvider {
@@ -136,6 +140,9 @@ impl std::fmt::Debug for MultiProvider {
             .field("gemini", &self.gemini.is_some())
             .field("bedrock", &self.bedrock.is_some())
             .field("venice", &self.venice.is_some())
+            .field("azure", &self.azure.is_some())
+            .field("vertex", &self.vertex.is_some())
+            .field("openai_compatible", &self.openai_compatible.is_some())
             .finish()
     }
 }
@@ -156,6 +163,9 @@ impl MultiProvider {
             gemini: None,
             bedrock: None,
             venice: None,
+            azure: None,
+            vertex: None,
+            openai_compatible: None,
         }
     }
 
@@ -183,6 +193,24 @@ impl MultiProvider {
         self
     }
 
+    /// Set the Azure OpenAI provider for Azure-deployed models.
+    pub fn with_azure(mut self, azure: Option<std::sync::Arc<dyn LlmProvider>>) -> Self {
+        self.azure = azure;
+        self
+    }
+
+    /// Set the Vertex AI provider for Google Cloud Vertex AI models.
+    pub fn with_vertex(mut self, vertex: Option<std::sync::Arc<dyn LlmProvider>>) -> Self {
+        self.vertex = vertex;
+        self
+    }
+
+    /// Set the OpenAI-compatible provider for DeepSeek, Qwen, Moonshot, Minimax, GLM, xAI models.
+    pub fn with_openai_compatible(mut self, openai_compatible: Option<std::sync::Arc<dyn LlmProvider>>) -> Self {
+        self.openai_compatible = openai_compatible;
+        self
+    }
+
     /// Returns `true` if at least one provider is configured.
     pub fn has_any_provider(&self) -> bool {
         self.anthropic.is_some()
@@ -191,6 +219,9 @@ impl MultiProvider {
             || self.gemini.is_some()
             || self.bedrock.is_some()
             || self.venice.is_some()
+            || self.azure.is_some()
+            || self.vertex.is_some()
+            || self.openai_compatible.is_some()
     }
 
     /// Select the appropriate backend provider for the given model.
@@ -201,7 +232,10 @@ impl MultiProvider {
     /// 3. Models matching Gemini patterns (gemini-*, gemini/*, models/gemini-*) -> Gemini
     /// 4. Models matching OpenAI patterns (gpt-*, o1-*, etc.) -> OpenAI
     /// 5. Models matching Bedrock patterns (bedrock:*, anthropic.claude-*, etc.) -> Bedrock
-    /// 6. Everything else -> Anthropic (default)
+    /// 6. Models prefixed with `azure:` -> Azure OpenAI
+    /// 7. Models prefixed with `vertex:` -> Vertex AI
+    /// 8. OpenAI-compatible providers (deepseek:, qwen:, moonshot:, kimi:, minimax:, glm:, z.ai:, xai:, grok:) -> OpenAI-Compatible
+    /// 9. Everything else -> Anthropic (default)
     fn select_provider(&self, model: &str) -> Result<&dyn LlmProvider, AgentError> {
         if crate::agent::ollama::is_ollama_model(model) {
             self.ollama.as_deref().ok_or_else(|| {
@@ -231,6 +265,24 @@ impl MultiProvider {
             self.bedrock.as_deref().ok_or_else(|| {
                 AgentError::Provider(format!(
                     "model \"{model}\" requires Bedrock provider, but no AWS credentials are configured"
+                ))
+            })
+        } else if crate::agent::azure_openai::is_azure_openai_model(model) {
+            self.azure.as_deref().ok_or_else(|| {
+                AgentError::Provider(format!(
+                    "model \"{model}\" requires Azure OpenAI provider, but no AZURE_OPENAI_API_KEY is configured"
+                ))
+            })
+        } else if crate::agent::vertex::is_vertex_model(model) {
+            self.vertex.as_deref().ok_or_else(|| {
+                AgentError::Provider(format!(
+                    "model \"{model}\" requires Vertex AI provider, but no GCP credentials are configured"
+                ))
+            })
+        } else if is_openai_compatible_model(model) {
+            self.openai_compatible.as_deref().ok_or_else(|| {
+                AgentError::Provider(format!(
+                    "model \"{model}\" requires an OpenAI-compatible provider (DeepSeek, Qwen, Moonshot, Minimax, GLM, xAI), but none is configured"
                 ))
             })
         } else {
@@ -277,7 +329,57 @@ impl LlmProvider for MultiProvider {
             request.model = crate::agent::bedrock::strip_bedrock_prefix(&request.model).to_string();
         }
 
+        // Strip the azure: prefix before forwarding to the provider,
+        // so the Azure API receives the bare deployment name (e.g. "gpt-4").
+        if crate::agent::azure_openai::is_azure_openai_model(&request.model) {
+            request.model = crate::agent::azure_openai::strip_azure_prefix(&request.model).to_string();
+        }
+
+        // Strip the vertex: prefix before forwarding to the provider,
+        // so the Vertex API receives the bare model name (e.g. "gemini-2.0-flash").
+        if crate::agent::vertex::is_vertex_model(&request.model) {
+            request.model = crate::agent::vertex::strip_vertex_prefix(&request.model).to_string();
+        }
+
+        // Strip OpenAI-compatible prefixes (deepseek:, qwen:, moonshot:, minimax:, glm:, xai:, grok:)
+        if is_openai_compatible_model(&request.model) {
+            request.model = strip_openai_compatible_prefix(&request.model).to_string();
+        }
+
         provider.complete(request, cancel_token).await
+    }
+}
+
+/// Check if a model should be routed to an OpenAI-compatible provider.
+/// Matches: deepseek:, qwen:, moonshot:, kimi:, minimax:, glm:, z.ai:, zai:, xai:, grok:, openrouter:
+fn is_openai_compatible_model(model: &str) -> bool {
+    crate::agent::openai_compatible::is_deepseek_model(model)
+        || crate::agent::openai_compatible::is_qwen_model(model)
+        || crate::agent::openai_compatible::is_moonshot_model(model)
+        || crate::agent::openai_compatible::is_minimax_model(model)
+        || crate::agent::openai_compatible::is_glm_model(model)
+        || crate::agent::openai_compatible::is_xai_model(model)
+        || crate::agent::openai_compatible::is_openrouter_model(model)
+}
+
+/// Strip the provider-specific prefix from an OpenAI-compatible model.
+fn strip_openai_compatible_prefix(model: &str) -> &str {
+    if crate::agent::openai_compatible::is_deepseek_model(model) {
+        crate::agent::openai_compatible::strip_deepseek_prefix(model)
+    } else if crate::agent::openai_compatible::is_qwen_model(model) {
+        crate::agent::openai_compatible::strip_qwen_prefix(model)
+    } else if crate::agent::openai_compatible::is_moonshot_model(model) {
+        crate::agent::openai_compatible::strip_moonshot_prefix(model)
+    } else if crate::agent::openai_compatible::is_minimax_model(model) {
+        crate::agent::openai_compatible::strip_minimax_prefix(model)
+    } else if crate::agent::openai_compatible::is_glm_model(model) {
+        crate::agent::openai_compatible::strip_glm_prefix(model)
+    } else if crate::agent::openai_compatible::is_xai_model(model) {
+        crate::agent::openai_compatible::strip_xai_prefix(model)
+    } else if crate::agent::openai_compatible::is_openrouter_model(model) {
+        crate::agent::openai_compatible::strip_openrouter_prefix(model)
+    } else {
+        model
     }
 }
 

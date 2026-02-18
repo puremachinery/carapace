@@ -275,12 +275,205 @@ pub fn build_providers(cfg: &Value) -> Result<Option<MultiProvider>, Box<dyn std
         }
     };
 
+    // Azure OpenAI
+    let azure_api_key = std::env::var("AZURE_OPENAI_API_KEY").ok().or_else(|| {
+        cfg.get("azure")
+            .and_then(|v| v.get("apiKey"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    });
+    let azure_resource = std::env::var("AZURE_OPENAI_RESOURCE").ok().or_else(|| {
+        cfg.get("azure")
+            .and_then(|v| v.get("resource"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    });
+    let azure_deployment = std::env::var("AZURE_OPENAI_DEPLOYMENT").ok().or_else(|| {
+        cfg.get("azure")
+            .and_then(|v| v.get("deployment"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    });
+    let azure_api_version = std::env::var("AZURE_OPENAI_API_VERSION").ok().or_else(|| {
+        cfg.get("azure")
+            .and_then(|v| v.get("apiVersion"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    });
+
+    let azure_provider = match (azure_api_key, azure_resource, azure_deployment) {
+        (Some(key), Some(resource), Some(deployment)) => {
+            match agent::azure_openai::AzureOpenAiProvider::new(key, resource, deployment) {
+                Ok(mut p) => {
+                    if let Some(version) = azure_api_version {
+                        p = p.with_api_version(version);
+                    }
+                    info!("Azure OpenAI provider configured");
+                    Some(Arc::new(p) as Arc<dyn agent::LlmProvider>)
+                }
+                Err(e) => {
+                    warn!("Azure OpenAI provider init failed: {}", e);
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+
+    // Vertex AI
+    let vertex_project_id = std::env::var("GCP_PROJECT_ID").ok().or_else(|| {
+        cfg.get("vertex")
+            .and_then(|v| v.get("projectId"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    });
+    let vertex_region = std::env::var("GCP_REGION").ok().or_else(|| {
+        cfg.get("vertex")
+            .and_then(|v| v.get("region"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    });
+    let vertex_access_token = std::env::var("GCP_ACCESS_TOKEN").ok().or_else(|| {
+        cfg.get("vertex")
+            .and_then(|v| v.get("accessToken"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    });
+
+    let vertex_provider = match (vertex_project_id, vertex_region, vertex_access_token) {
+        (Some(project_id), Some(region), Some(access_token)) => {
+            match agent::vertex::VertexProvider::new(project_id, region, access_token) {
+                Ok(p) => {
+                    info!("Vertex AI provider configured");
+                    Some(Arc::new(p) as Arc<dyn agent::LlmProvider>)
+                }
+                Err(e) => {
+                    warn!("Vertex AI provider init failed: {}", e);
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+
+    // OpenAI-compatible providers (DeepSeek, Qwen, Moonshot, Minimax, GLM/Z.ai, xAI/Grok)
+    // Check for any configured OpenAI-compatible provider
+    let openai_compatible_cfg = cfg.get("openaiCompatible").or_else(|| cfg.get("openai_compatible"));
+    let deepseek_key = std::env::var("DEEPSEEK_API_KEY").ok()
+        .or_else(|| openai_compatible_cfg.and_then(|v| v.get("deepseek")).and_then(|v| v.get("apiKey")).and_then(|v| v.as_str()).map(|s| s.to_string()));
+    let deepseek_url = std::env::var("DEEPSEEK_BASE_URL").ok()
+        .or_else(|| openai_compatible_cfg.and_then(|v| v.get("deepseek")).and_then(|v| v.get("baseUrl")).and_then(|v| v.as_str()).map(|s| s.to_string()));
+
+    let qwen_key = std::env::var("QWEN_API_KEY").ok()
+        .or_else(|| openai_compatible_cfg.and_then(|v| v.get("qwen")).and_then(|v| v.get("apiKey")).and_then(|v| v.as_str()).map(|s| s.to_string()));
+    let qwen_url = std::env::var("QWEN_BASE_URL").ok()
+        .or_else(|| openai_compatible_cfg.and_then(|v| v.get("qwen")).and_then(|v| v.get("baseUrl")).and_then(|v| v.as_str()).map(|s| s.to_string()));
+
+    let moonshot_key = std::env::var("MOONSHOT_API_KEY").ok()
+        .or_else(|| openai_compatible_cfg.and_then(|v| v.get("moonshot")).and_then(|v| v.get("apiKey")).and_then(|v| v.as_str()).map(|s| s.to_string()));
+    let moonshot_url = std::env::var("MOONSHOT_BASE_URL").ok()
+        .or_else(|| openai_compatible_cfg.and_then(|v| v.get("moonshot")).and_then(|v| v.get("baseUrl")).and_then(|v| v.as_str()).map(|s| s.to_string()));
+
+    let minimax_key = std::env::var("MINIMAX_API_KEY").ok()
+        .or_else(|| openai_compatible_cfg.and_then(|v| v.get("minimax")).and_then(|v| v.get("apiKey")).and_then(|v| v.as_str()).map(|s| s.to_string()));
+    let minimax_url = std::env::var("MINIMAX_BASE_URL").ok()
+        .or_else(|| openai_compatible_cfg.and_then(|v| v.get("minimax")).and_then(|v| v.get("baseUrl")).and_then(|v| v.as_str()).map(|s| s.to_string()));
+
+    let glm_key = std::env::var("GLM_API_KEY").ok()
+        .or_else(|| openai_compatible_cfg.and_then(|v| v.get("glm")).and_then(|v| v.get("apiKey")).and_then(|v| v.as_str()).map(|s| s.to_string()));
+    let glm_url = std::env::var("GLM_BASE_URL").ok()
+        .or_else(|| openai_compatible_cfg.and_then(|v| v.get("glm")).and_then(|v| v.get("baseUrl")).and_then(|v| v.as_str()).map(|s| s.to_string()));
+
+    let xai_key = std::env::var("XAI_API_KEY").ok()
+        .or_else(|| openai_compatible_cfg.and_then(|v| v.get("xai")).and_then(|v| v.get("apiKey")).and_then(|v| v.as_str()).map(|s| s.to_string()));
+    let xai_url = std::env::var("XAI_BASE_URL").ok()
+        .or_else(|| openai_compatible_cfg.and_then(|v| v.get("xai")).and_then(|v| v.get("baseUrl")).and_then(|v| v.as_str()).map(|s| s.to_string()));
+
+    let openrouter_key = std::env::var("OPENROUTER_API_KEY").ok()
+        .or_else(|| openai_compatible_cfg.and_then(|v| v.get("openrouter")).and_then(|v| v.get("apiKey")).and_then(|v| v.as_str()).map(|s| s.to_string()));
+    let openrouter_url = std::env::var("OPENROUTER_BASE_URL").ok()
+        .or_else(|| openai_compatible_cfg.and_then(|v| v.get("openrouter")).and_then(|v| v.get("baseUrl")).and_then(|v| v.as_str()).map(|s| s.to_string()));
+
+    // Build the first configured OpenAI-compatible provider
+    let openai_compatible_provider = if let Some((key, base_url, name)) = deepseek_key.zip(deepseek_url).map(|(k, u)| (k, u, "DeepSeek".to_string())) {
+        match agent::openai_compatible::OpenAiCompatibleProvider::new(key, base_url, name) {
+            Ok(p) => {
+                info!("OpenAI-compatible provider configured: DeepSeek");
+                Some(Arc::new(p) as Arc<dyn agent::LlmProvider>)
+            }
+            Err(e) => {
+                warn!("DeepSeek provider init failed: {}", e);
+                None
+            }
+        }
+    } else if let Some((key, base_url, name)) = qwen_key.zip(qwen_url).map(|(k, u)| (k, u, "Qwen".to_string())) {
+        match agent::openai_compatible::OpenAiCompatibleProvider::new(key, base_url, name) {
+            Ok(p) => {
+                info!("OpenAI-compatible provider configured: Qwen");
+                Some(Arc::new(p) as Arc<dyn agent::LlmProvider>)
+            }
+            Err(e) => {
+                warn!("Qwen provider init failed: {}", e);
+                None
+            }
+        }
+    } else if let Some((key, base_url, name)) = moonshot_key.zip(moonshot_url).map(|(k, u)| (k, u, "Moonshot".to_string())) {
+        match agent::openai_compatible::OpenAiCompatibleProvider::new(key, base_url, name) {
+            Ok(p) => {
+                info!("OpenAI-compatible provider configured: Moonshot");
+                Some(Arc::new(p) as Arc<dyn agent::LlmProvider>)
+            }
+            Err(e) => {
+                warn!("Moonshot provider init failed: {}", e);
+                None
+            }
+        }
+    } else if let Some((key, base_url, name)) = minimax_key.zip(minimax_url).map(|(k, u)| (k, u, "Minimax".to_string())) {
+        match agent::openai_compatible::OpenAiCompatibleProvider::new(key, base_url, name) {
+            Ok(p) => {
+                info!("OpenAI-compatible provider configured: Minimax");
+                Some(Arc::new(p) as Arc<dyn agent::LlmProvider>)
+            }
+            Err(e) => {
+                warn!("Minimax provider init failed: {}", e);
+                None
+            }
+        }
+    } else if let Some((key, base_url, name)) = glm_key.zip(glm_url).map(|(k, u)| (k, u, "GLM".to_string())) {
+        match agent::openai_compatible::OpenAiCompatibleProvider::new(key, base_url, name) {
+            Ok(p) => {
+                info!("OpenAI-compatible provider configured: GLM");
+                Some(Arc::new(p) as Arc<dyn agent::LlmProvider>)
+            }
+            Err(e) => {
+                warn!("GLM provider init failed: {}", e);
+                None
+            }
+        }
+    } else if let Some((key, base_url, name)) = xai_key.zip(xai_url).map(|(k, u)| (k, u, "xAI".to_string())) {
+        match agent::openai_compatible::OpenAiCompatibleProvider::new(key, base_url, name) {
+            Ok(p) => {
+                info!("OpenAI-compatible provider configured: xAI");
+                Some(Arc::new(p) as Arc<dyn agent::LlmProvider>)
+            }
+            Err(e) => {
+                warn!("xAI provider init failed: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Build multi-provider dispatcher
     let multi_provider = MultiProvider::new(anthropic_provider, openai_provider)
         .with_ollama(ollama_provider)
         .with_gemini(gemini_provider)
         .with_venice(venice_provider)
-        .with_bedrock(bedrock);
+        .with_bedrock(bedrock)
+        .with_azure(azure_provider)
+        .with_vertex(vertex_provider)
+        .with_openai_compatible(openai_compatible_provider);
 
     if multi_provider.has_any_provider() {
         Ok(Some(multi_provider))
@@ -300,6 +493,8 @@ pub struct ProviderFingerprint {
     pub gemini: Option<(String, Option<String>)>,
     pub venice: Option<(String, Option<String>)>,
     pub bedrock: Option<String>,
+    pub azure: Option<(String, Option<String>)>,
+    pub vertex: Option<(String, String)>,
 }
 
 /// Compute a fingerprint of the provider configuration from config + env vars.
@@ -386,6 +581,34 @@ pub fn fingerprint_providers(cfg: &Value) -> ProviderFingerprint {
             .map(String::from)
     });
 
+    // Azure OpenAI fingerprint
+    let azure_key = std::env::var("AZURE_OPENAI_API_KEY").ok().or_else(|| {
+        cfg.get("azure")
+            .and_then(|v| v.get("apiKey"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    });
+    let azure_resource = std::env::var("AZURE_OPENAI_RESOURCE").ok().or_else(|| {
+        cfg.get("azure")
+            .and_then(|v| v.get("resource"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    });
+
+    // Vertex AI fingerprint
+    let vertex_project = std::env::var("GCP_PROJECT_ID").ok().or_else(|| {
+        cfg.get("vertex")
+            .and_then(|v| v.get("projectId"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    });
+    let vertex_region = std::env::var("GCP_REGION").ok().or_else(|| {
+        cfg.get("vertex")
+            .and_then(|v| v.get("region"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    });
+
     ProviderFingerprint {
         anthropic: anthropic_key.map(|k| (hash_key_prefix(&k), anthropic_url)),
         openai: openai_key.map(|k| (hash_key_prefix(&k), openai_url)),
@@ -407,6 +630,8 @@ pub fn fingerprint_providers(cfg: &Value) -> ProviderFingerprint {
         } else {
             None
         },
+        azure: azure_key.map(|k| (hash_key_prefix(&k), azure_resource)),
+        vertex: vertex_project.map(|p| (hash_key_prefix(&p), vertex_region.unwrap_or_default())),
     }
 }
 

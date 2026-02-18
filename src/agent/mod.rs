@@ -4,6 +4,7 @@
 //! and the core agent run loop that ties everything together.
 
 pub mod anthropic;
+pub mod azure_openai;
 pub mod bedrock;
 pub mod builtin_tools;
 pub mod channel_tools;
@@ -15,6 +16,7 @@ pub mod factory;
 pub mod gemini;
 pub mod ollama;
 pub mod openai;
+pub mod openai_compatible;
 pub mod output_sanitizer;
 pub mod prompt_guard;
 pub mod provider;
@@ -22,6 +24,7 @@ pub mod sandbox;
 pub mod tool_policy;
 pub mod tools;
 pub mod venice;
+pub mod vertex;
 
 use std::sync::Arc;
 
