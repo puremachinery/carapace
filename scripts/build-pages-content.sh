@@ -122,6 +122,8 @@ render_markdown_page() {
         <a href="${rel_prefix_html}/getting-started.html">Getting Started</a>
         <a href="${rel_prefix_html}/install.html">Install</a>
         <a href="${rel_prefix_html}/first-run.html">First Run</a>
+        <a href="${rel_prefix_html}/security.html">Security</a>
+        <a href="${rel_prefix_html}/ops.html">Ops</a>
         <a href="${rel_prefix_html}/cookbook/">Cookbook</a>
         <a href="${rel_prefix_html}/get-unstuck.html">Get Unstuck</a>
         <a href="https://github.com/puremachinery/carapace">GitHub</a>
@@ -214,6 +216,30 @@ render_markdown_page \
   "./getting-started.html" \
   "Getting Started" \
   "First Run"
+
+render_markdown_page \
+  "${site_docs_dir}/security.md" \
+  "${out_dir}/security.html" \
+  "Carapace | Security" \
+  "Security defaults, trust boundaries, and practical verification checks." \
+  "docs" \
+  "0" \
+  "." \
+  "./getting-started.html" \
+  "Getting Started" \
+  "Security"
+
+render_markdown_page \
+  "${site_docs_dir}/ops.md" \
+  "${out_dir}/ops.html" \
+  "Carapace | Ops" \
+  "Day-2 operations: status, logs, backup, update, and recovery." \
+  "docs" \
+  "0" \
+  "." \
+  "./getting-started.html" \
+  "Getting Started" \
+  "Ops"
 
 render_markdown_page \
   "${site_docs_dir}/get-unstuck.md" \
