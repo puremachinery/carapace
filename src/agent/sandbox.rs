@@ -703,6 +703,25 @@ fn windows_appcontainer_available() -> Result<(), SandboxError> {
 }
 
 #[cfg(target_os = "windows")]
+fn io_error_from_rappct(err: rappct::AcError) -> std::io::Error {
+    let kind = match &err {
+        rappct::AcError::AccessDenied { .. } => std::io::ErrorKind::PermissionDenied,
+        rappct::AcError::LaunchFailed { source, .. } => source
+            .downcast_ref::<std::io::Error>()
+            .map(std::io::Error::kind)
+            .unwrap_or(std::io::ErrorKind::Other),
+        rappct::AcError::UnsupportedPlatform | rappct::AcError::UnsupportedLpac => {
+            std::io::ErrorKind::Unsupported
+        }
+        rappct::AcError::UnknownCapability { .. } | rappct::AcError::Unimplemented(_) => {
+            std::io::ErrorKind::InvalidInput
+        }
+        rappct::AcError::Win32(_) => std::io::ErrorKind::Other,
+    };
+    std::io::Error::new(kind, err)
+}
+
+#[cfg(target_os = "windows")]
 struct WindowsProcessHandle(HANDLE);
 
 #[cfg(target_os = "windows")]
@@ -805,7 +824,7 @@ fn run_windows_appcontainer_command_output(
         "Carapace Sandboxed Process",
         Some("carapace subprocess sandbox"),
     )
-    .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))?;
+    .map_err(io_error_from_rappct)?;
     let caps = windows_no_network_capabilities(&profile)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))?;
 
@@ -821,8 +840,8 @@ fn run_windows_appcontainer_command_output(
         ..Default::default()
     };
 
-    let mut child = launch_in_container_with_io(&caps, &launch_opts)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))?;
+    let mut child =
+        launch_in_container_with_io(&caps, &launch_opts).map_err(io_error_from_rappct)?;
 
     // Apply full Carapace job limits immediately after spawn. With current
     // rappct launch behavior, job assignment (including LaunchOptions.join_job)
@@ -853,9 +872,7 @@ fn run_windows_appcontainer_command_output(
     let stdout_reader = child.stdout.take().map(windows_pipe_reader);
     let stderr_reader = child.stderr.take().map(windows_pipe_reader);
 
-    let exit_code = child
-        .wait(None)
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let exit_code = child.wait(None).map_err(io_error_from_rappct)?;
 
     let stdout = windows_join_pipe_reader(stdout_reader, "stdout")?;
     let stderr = windows_join_pipe_reader(stderr_reader, "stderr")?;
