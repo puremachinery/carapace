@@ -586,9 +586,12 @@ fn windows_job_objects_available(config: &ProcessSandboxConfig) -> Result<(), Sa
 #[cfg(target_os = "windows")]
 fn windows_sandbox_profile_name(program: &Path) -> String {
     use sha2::{Digest, Sha256};
+    use std::os::windows::ffi::OsStrExt;
 
     let mut hasher = Sha256::new();
-    hasher.update(program.to_string_lossy().as_bytes());
+    for unit in program.as_os_str().encode_wide() {
+        hasher.update(unit.to_le_bytes());
+    }
     let digest = hex::encode(hasher.finalize());
     format!("carapace.sandbox.{}", &digest[..16])
 }
@@ -706,10 +709,11 @@ impl WindowsProcessHandle {
     fn open(access: u32, pid: u32, purpose: &str) -> std::io::Result<Self> {
         let handle = unsafe { OpenProcess(access, 0, pid) };
         if handle == 0 {
-            return Err(std::io::Error::other(format!(
-                "failed to open process {pid} for {purpose}: {}",
-                std::io::Error::last_os_error()
-            )));
+            let os_err = std::io::Error::last_os_error();
+            return Err(std::io::Error::new(
+                os_err.kind(),
+                format!("failed to open process {pid} for {purpose}: {os_err}"),
+            ));
         }
         Ok(Self(handle))
     }
@@ -756,10 +760,11 @@ fn terminate_windows_process(pid: u32) -> std::io::Result<()> {
 
     let terminate_ret = unsafe { TerminateProcess(process_handle.raw(), 1) };
     if terminate_ret == 0 {
-        return Err(std::io::Error::other(format!(
-            "failed to terminate process {pid}: {}",
-            std::io::Error::last_os_error()
-        )));
+        let os_err = std::io::Error::last_os_error();
+        return Err(std::io::Error::new(
+            os_err.kind(),
+            format!("failed to terminate process {pid}: {os_err}"),
+        ));
     }
     Ok(())
 }
@@ -809,6 +814,7 @@ fn run_windows_appcontainer_command_output(
     let launch_opts = LaunchOptions {
         exe: resolved_program.to_path_buf(),
         cmdline: windows_build_cmdline(args)?,
+        // Use executable parent so relative lookups mirror direct CLI invocation.
         cwd: resolved_program.parent().map(Path::to_path_buf),
         env: windows_filtered_env(config),
         stdio: StdioConfig::Pipe,
