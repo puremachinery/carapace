@@ -832,8 +832,20 @@ fn run_windows_appcontainer_command_output(
     let _job = match assign_windows_job_to_pid(child.pid, config) {
         Ok(job) => job,
         Err(err) => {
-            let _ = terminate_windows_process(child.pid);
-            let _ = child.wait(Some(std::time::Duration::from_secs(2)));
+            if let Err(terminate_err) = terminate_windows_process(child.pid) {
+                tracing::warn!(
+                    pid = child.pid,
+                    error = %terminate_err,
+                    "failed to terminate sandboxed child after Windows job assignment failure"
+                );
+            }
+            if let Err(wait_err) = child.wait(Some(std::time::Duration::from_secs(2))) {
+                tracing::warn!(
+                    pid = child.pid,
+                    error = %wait_err,
+                    "failed waiting for sandboxed child after Windows job assignment failure"
+                );
+            }
             return Err(err);
         }
     };
@@ -1656,10 +1668,12 @@ pub async fn run_sandboxed_tokio_command_output(
     {
         if let Some(cfg) = config.filter(|cfg| cfg.enabled) {
             if !cfg.network_access {
-                let resolved_program = resolve_and_validate_windows_allowed_program(program, cfg)?;
                 let owned_args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+                let program = program.to_string();
                 let cfg = cfg.clone();
                 return tokio::task::spawn_blocking(move || {
+                    let resolved_program =
+                        resolve_and_validate_windows_allowed_program(&program, &cfg)?;
                     let arg_refs: Vec<&str> = owned_args.iter().map(String::as_str).collect();
                     run_windows_appcontainer_command_output(&resolved_program, &arg_refs, &cfg)
                 })
