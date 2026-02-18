@@ -228,6 +228,9 @@ mod tests {
     ) -> [u8; KEY_LEN] {
         type HmacSha256 = Hmac<Sha256>;
 
+        // This reference path derives exactly one PBKDF2 block. It is valid
+        // because KEY_LEN is fixed to the SHA-256 output size (32 bytes).
+        assert_eq!(KEY_LEN, 32, "reference PBKDF2 assumes one output block");
         assert!(iterations >= 1, "PBKDF2 requires at least one iteration");
 
         let mut first_block_input = Vec::with_capacity(salt.len() + 4);
@@ -281,6 +284,21 @@ mod tests {
         let key = derive_key_with_iterations(&passphrase, &salt, iterations);
         let reference = derive_key_reference_pbkdf2(&passphrase, &salt, iterations);
         assert_eq!(key, reference);
+    }
+
+    #[test]
+    fn test_derive_key_known_answer_vector() {
+        use sha2::Digest;
+
+        // Deterministic KAT inputs from hashed labels.
+        let passphrase = sha2::Sha256::digest(b"carapace-backup-kat-passphrase");
+        let salt = sha2::Sha256::digest(b"carapace-backup-kat-salt");
+        // Expected output generated independently via Python hashlib.pbkdf2_hmac:
+        // python3 -c 'import hashlib; p=hashlib.sha256(b"carapace-backup-kat-passphrase").digest(); s=hashlib.sha256(b"carapace-backup-kat-salt").digest(); print(hashlib.pbkdf2_hmac("sha256", p, s, 600000, 32).hex())'
+        let expected_hex = "696c6039c67c9ce83717fe1f72e32d9c8e0b46ceaef2fa6d59268ddc49653329";
+
+        let key = derive_key(passphrase.as_slice(), salt.as_slice());
+        assert_eq!(hex::encode(key), expected_hex);
     }
 
     #[test]
