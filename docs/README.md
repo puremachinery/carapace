@@ -26,7 +26,6 @@ A security-focused, open-source personal AI assistant.
 - [Pairing](protocol/pairing.md) — Node and device pairing flows
 - [Configuration](protocol/config.md) — Config file format, environment variables
 - [Credentials](protocol/credentials.md) — Secret storage
-- [CLI Guide](cli.md) — Subcommands, flags, and device identity notes
 
 ## Quick Links
 
