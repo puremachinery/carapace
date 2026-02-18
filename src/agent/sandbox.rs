@@ -881,7 +881,38 @@ fn resume_windows_process_threads(pid: u32) -> std::io::Result<()> {
                     ));
                 }
 
-                let resume_ret = unsafe { ResumeThread(thread) };
+                let mut saw_suspended = false;
+                loop {
+                    let resume_ret = unsafe { ResumeThread(thread) };
+                    if resume_ret == u32::MAX {
+                        let os_err = std::io::Error::last_os_error();
+                        if unsafe { CloseHandle(thread) } == 0 {
+                            tracing::warn!(
+                                pid,
+                                tid = entry.th32ThreadID,
+                                error = %std::io::Error::last_os_error(),
+                                "failed to close Windows thread handle after resume failure"
+                            );
+                        }
+                        return Err(std::io::Error::new(
+                            os_err.kind(),
+                            format!(
+                                "failed to resume thread {} for process {pid}: {os_err}",
+                                entry.th32ThreadID
+                            ),
+                        ));
+                    }
+
+                    // ResumeThread returns the previous suspend count.
+                    // If >1, the thread remains suspended and must be resumed again.
+                    if resume_ret > 0 {
+                        saw_suspended = true;
+                    }
+                    if resume_ret <= 1 {
+                        break;
+                    }
+                }
+
                 if unsafe { CloseHandle(thread) } == 0 {
                     tracing::warn!(
                         pid,
@@ -891,17 +922,9 @@ fn resume_windows_process_threads(pid: u32) -> std::io::Result<()> {
                     );
                 }
 
-                if resume_ret == u32::MAX {
-                    let os_err = std::io::Error::last_os_error();
-                    return Err(std::io::Error::new(
-                        os_err.kind(),
-                        format!(
-                            "failed to resume thread {} for process {pid}: {os_err}",
-                            entry.th32ThreadID
-                        ),
-                    ));
+                if saw_suspended {
+                    resumed_any = true;
                 }
-                resumed_any = true;
             }
 
             if unsafe { Thread32Next(snapshot, &mut entry) } == 0 {
@@ -1014,14 +1037,27 @@ fn run_windows_appcontainer_command_output(
             return Err(err);
         }
     };
+    let mut stdout_reader = child.stdout.take().map(windows_pipe_reader);
+    let mut stderr_reader = child.stderr.take().map(windows_pipe_reader);
     if let Err(err) = resume_windows_process_threads(child.pid) {
         terminate_and_reap_windows_appcontainer_child(&mut child, "resume_threads");
+        if let Err(join_err) = windows_join_pipe_reader(stdout_reader.take(), "stdout") {
+            tracing::warn!(
+                pid = child.pid,
+                error = %join_err,
+                "failed joining stdout reader after Windows resume failure"
+            );
+        }
+        if let Err(join_err) = windows_join_pipe_reader(stderr_reader.take(), "stderr") {
+            tracing::warn!(
+                pid = child.pid,
+                error = %join_err,
+                "failed joining stderr reader after Windows resume failure"
+            );
+        }
         return Err(err);
     }
     let _job = job;
-
-    let mut stdout_reader = child.stdout.take().map(windows_pipe_reader);
-    let mut stderr_reader = child.stderr.take().map(windows_pipe_reader);
 
     let exit_code = match child.wait(None) {
         Ok(code) => code,
