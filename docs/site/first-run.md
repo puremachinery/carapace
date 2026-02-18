@@ -7,9 +7,9 @@ Run `cara setup`, start Carapace, and complete your first useful assistant workf
 ## Prerequisites
 
 - `cara` installed: [Install guide](install.md)
-- One provider key available in your shell:
-  - `ANTHROPIC_API_KEY`, or
-  - `OPENAI_API_KEY`
+- One supported provider configured:
+  - `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_API_KEY`, or `VENICE_API_KEY`, or
+  - local Ollama (`OLLAMA_BASE_URL`)
 
 ## 1) Run the setup wizard
 
@@ -40,7 +40,7 @@ In a second terminal:
 
 ```bash
 cara status --host 127.0.0.1 --port 18789
-cara verify --outcome local-chat --port 18789
+cara verify --outcome auto --port 18789
 cara chat --port 18789
 ```
 
@@ -51,6 +51,8 @@ Expected:
 - `cara chat` opens the REPL and returns a model response.
 
 If you set a custom port during setup, use that instead of `18789`.
+If your selected outcome is `discord` or `telegram`, `cara verify` may also
+require destination flags (`--discord-to` / `--telegram-to`) for send-path checks.
 
 ## 4) Complete your chosen first outcome
 
