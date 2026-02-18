@@ -21,7 +21,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs;
@@ -998,10 +998,11 @@ fn dispatch_agent_run(
     Ok(())
 }
 
-fn sender_scope_from_ip(ip: IpAddr) -> &'static str {
-    match ip {
-        IpAddr::V4(_) => "ip4",
-        IpAddr::V6(_) => "ip6",
+fn sender_scope_for_hook_request(has_remote_addr: bool) -> &'static str {
+    if has_remote_addr {
+        "remote"
+    } else {
+        "unknown"
     }
 }
 
@@ -1046,10 +1047,7 @@ async fn hooks_agent_handler(
         }
     };
 
-    let sender_id = connect_info
-        .0
-        .map(|addr| sender_scope_from_ip(addr.ip()))
-        .unwrap_or("unknown");
+    let sender_id = sender_scope_for_hook_request(connect_info.0.is_some());
 
     if let Err(resp) = dispatch_agent_run(&ws, &validated, &run_id, sender_id) {
         return resp;
@@ -1974,15 +1972,15 @@ mod tests {
     }
 
     #[test]
-    fn test_sender_scope_from_ip_v4_format() {
-        let sender = sender_scope_from_ip(IpAddr::V4(std::net::Ipv4Addr::new(1, 0, 0, 0)));
-        assert_eq!(sender, "ip4");
+    fn test_sender_scope_for_hook_request_with_remote_addr() {
+        let sender = sender_scope_for_hook_request(true);
+        assert_eq!(sender, "remote");
     }
 
     #[test]
-    fn test_sender_scope_from_ip_v6_format() {
-        let sender = sender_scope_from_ip(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST));
-        assert_eq!(sender, "ip6");
+    fn test_sender_scope_for_hook_request_without_remote_addr() {
+        let sender = sender_scope_for_hook_request(false);
+        assert_eq!(sender, "unknown");
     }
 
     #[tokio::test]
