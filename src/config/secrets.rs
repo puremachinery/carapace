@@ -237,7 +237,7 @@ fn decrypt_with_key(
 ///
 /// Uses 600,000 iterations per OWASP recommendations.
 pub fn derive_key(password: &[u8], salt: &[u8]) -> [u8; 32] {
-    let mut out = [0u8; 32];
+    let mut out: [u8; 32] = Default::default();
     pbkdf2_hmac::<Sha256>(password, salt, PBKDF2_ITERATIONS, &mut out);
     out
 }
@@ -251,7 +251,7 @@ fn derive_decrypt_sentinel_salt(password: &[u8]) -> [u8; SALT_LEN] {
     hasher.update(b"carapace:decrypt-sentinel:");
     hasher.update(password);
     let digest = hasher.finalize();
-    let mut derived = [0u8; SALT_LEN];
+    let mut derived: [u8; SALT_LEN] = Default::default();
     derived.copy_from_slice(&digest[..SALT_LEN]);
     derived
 }

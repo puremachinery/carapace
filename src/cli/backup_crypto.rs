@@ -84,7 +84,7 @@ impl From<std::io::Error> for BackupCryptoError {
 
 /// Derive a 256-bit key from a passphrase and salt using PBKDF2-HMAC-SHA256.
 fn derive_key(passphrase: &[u8], salt: &[u8]) -> [u8; KEY_LEN] {
-    let mut key = [0u8; KEY_LEN];
+    let mut key: [u8; KEY_LEN] = Default::default();
     pbkdf2_hmac::<Sha256>(passphrase, salt, PBKDF2_ITERATIONS, &mut key);
     key
 }

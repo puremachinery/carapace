@@ -4,6 +4,8 @@
 //! Sessions are stored in `~/.config/carapace/sessions/` using JSONL format for
 //! append-friendly history operations.
 
+use sha2::{Digest, Sha256};
+
 pub mod file_lock;
 pub mod integrity;
 pub mod retention;
@@ -16,12 +18,20 @@ pub use store::{
 };
 
 /// Resolve a session key using scoping config and optional explicit session ID.
+pub fn canonicalize_session_hint(session_hint: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"carapace:session-hint:v1:");
+    hasher.update(session_hint.as_bytes());
+    format!("sid_{}", hex::encode(hasher.finalize()))
+}
+
+/// Resolve a session key using scoping config and optional explicit session hint.
 pub fn resolve_scoped_session_key(
     config: &serde_json::Value,
     channel: &str,
     sender_id: &str,
     peer_id: &str,
-    explicit_session_id: Option<&str>,
+    explicit_session_hint: Option<&str>,
 ) -> (String, scoping::ChannelSessionConfig, String) {
     let channel_name = channel.trim();
     let channel_name = if channel_name.is_empty() {
@@ -35,11 +45,11 @@ pub fn resolve_scoped_session_key(
     let peer = if peer.is_empty() { sender } else { peer };
 
     let channel_config = scoping::ChannelSessionConfig::from_config(config, channel_name);
-    let resolved_session_id = match explicit_session_id
+    let resolved_session_id = match explicit_session_hint
         .map(|id| id.trim())
         .filter(|id| !id.is_empty())
     {
-        Some(id) => id.to_string(),
+        Some(id) => canonicalize_session_hint(id),
         None => scoping::resolve_session_key(channel_name, sender, peer, channel_config.scope),
     };
 
@@ -57,11 +67,11 @@ pub fn get_or_create_scoped_session(
     channel: &str,
     sender_id: &str,
     peer_id: &str,
-    explicit_session_id: Option<&str>,
+    explicit_session_hint: Option<&str>,
     mut metadata: SessionMetadata,
 ) -> Result<Session, SessionStoreError> {
     let (resolved_session_id, channel_config, channel_name) =
-        resolve_scoped_session_key(config, channel, sender_id, peer_id, explicit_session_id);
+        resolve_scoped_session_key(config, channel, sender_id, peer_id, explicit_session_hint);
 
     if metadata.channel.is_none() {
         metadata.channel = Some(channel_name);

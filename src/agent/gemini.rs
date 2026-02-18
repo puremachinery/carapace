@@ -506,7 +506,7 @@ mod tests {
         let result = GeminiProvider::new("".to_string());
         assert!(result.is_err(), "expected empty API key to fail");
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("empty"), "got: {err}");
+        assert!(err.contains("empty"));
     }
 
     #[test]

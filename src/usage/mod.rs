@@ -363,7 +363,6 @@ fn current_month() -> String {
 
 #[derive(Debug, Clone)]
 struct SessionIdentity {
-    raw_key: String,
     session_id: String,
     legacy_session_id: String,
 }
@@ -373,7 +372,6 @@ fn session_identity(session_key: &str) -> SessionIdentity {
     let digest_hex = hex::encode(digest);
     let legacy_digest_hex = &digest_hex[..24];
     SessionIdentity {
-        raw_key: session_key.to_string(),
         session_id: format!("sid_{digest_hex}"),
         legacy_session_id: format!("sid_{legacy_digest_hex}"),
     }
@@ -782,7 +780,7 @@ impl UsageTracker {
         &mut self,
         provider: &str,
         model: &str,
-        session_id_hint: Option<&str>,
+        session_hint: Option<&str>,
         input_tokens: u64,
         output_tokens: u64,
     ) {
@@ -793,7 +791,7 @@ impl UsageTracker {
         let now = now_ms();
         let date = today_date();
         let month = current_month();
-        let session_identity = session_id_hint.map(session_identity);
+        let resolved_session_identity = session_hint.map(session_identity);
 
         // Calculate cost
         let pricing = get_model_pricing(model).unwrap_or_else(default_pricing);
@@ -803,7 +801,7 @@ impl UsageTracker {
             timestamp: now,
             provider: provider.to_string(),
             model: model.to_string(),
-            session_id: session_identity
+            session_id: resolved_session_identity
                 .as_ref()
                 .map(|identity| identity.session_id.clone()),
             input_tokens,
@@ -828,10 +826,11 @@ impl UsageTracker {
         monthly.add_record(&record);
 
         // Update session usage if session key provided
-        if let Some(identity) = session_identity {
+        if let (Some(identity), Some(raw_session_hint)) = (resolved_session_identity, session_hint)
+        {
             // Backward compatibility: consolidate pre-migration keys into the
             // canonical full-hash session id when a matching session appears.
-            self.promote_session_aliases(&identity);
+            self.promote_session_aliases(&identity, raw_session_hint);
             let session = self
                 .data
                 .sessions
@@ -1122,7 +1121,7 @@ impl UsageTracker {
         }
     }
 
-    fn promote_session_aliases(&mut self, identity: &SessionIdentity) {
+    fn promote_session_aliases(&mut self, identity: &SessionIdentity, raw_session_hint: &str) {
         let mut migrated: Vec<SessionUsage> = Vec::with_capacity(2);
         if let Some(legacy_usage) = self.data.sessions.remove(&identity.legacy_session_id) {
             migrated.push(legacy_usage);
@@ -1130,8 +1129,8 @@ impl UsageTracker {
 
         // Only remove raw plaintext alias keys when they are clearly distinct
         // from canonical sid_* identifiers to avoid accidental collisions.
-        if !identity.raw_key.starts_with("sid_") {
-            if let Some(legacy_plaintext_usage) = self.data.sessions.remove(&identity.raw_key) {
+        if !raw_session_hint.starts_with("sid_") {
+            if let Some(legacy_plaintext_usage) = self.data.sessions.remove(raw_session_hint) {
                 migrated.push(legacy_plaintext_usage);
             }
         }
@@ -1154,10 +1153,10 @@ impl UsageTracker {
         self.dirty = true;
     }
 
-    fn has_session_aliases(&self, identity: &SessionIdentity) -> bool {
+    fn has_session_aliases(&self, identity: &SessionIdentity, raw_session_hint: &str) -> bool {
         self.data.sessions.contains_key(&identity.legacy_session_id)
-            || (!identity.raw_key.starts_with("sid_")
-                && self.data.sessions.contains_key(&identity.raw_key))
+            || (!raw_session_hint.starts_with("sid_")
+                && self.data.sessions.contains_key(raw_session_hint))
     }
 }
 
@@ -1324,14 +1323,14 @@ pub fn get_session_usage(session_key: &str) -> Option<SessionUsage> {
     let identity = session_identity(session_key);
     {
         let tracker = USAGE_TRACKER.read();
-        if !tracker.has_session_aliases(&identity) {
+        if !tracker.has_session_aliases(&identity, session_key) {
             return tracker.get_session_usage(session_key).cloned();
         }
     }
 
     let mut tracker = USAGE_TRACKER.write();
-    if tracker.has_session_aliases(&identity) {
-        tracker.promote_session_aliases(&identity);
+    if tracker.has_session_aliases(&identity, session_key) {
+        tracker.promote_session_aliases(&identity, session_key);
         if tracker.dirty {
             tracker.maybe_save();
         }

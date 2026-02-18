@@ -10,7 +10,7 @@ fn build_fuzz_store() -> SecretStore {
     // Intentional simple deterministic (non-cryptographic) mixer for stable
     // fuzz seed expansion.
     fn derive_seed_bytes(seed: &[u8]) -> [u8; 32] {
-        let mut out = [0u8; 32];
+        let mut out: [u8; 32] = Default::default();
         for (idx, byte) in seed.iter().copied().enumerate() {
             let slot = idx % out.len();
             out[slot] = out[slot]
