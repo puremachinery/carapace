@@ -612,21 +612,22 @@ fn windows_quote_command_arg(arg: &str) -> String {
     for ch in arg.chars() {
         if ch == '\\' {
             trailing_backslashes += 1;
-            continue;
-        }
-        if ch == '"' {
-            for _ in 0..(trailing_backslashes * 2 + 1) {
-                quoted.push('\\');
+        } else {
+            if ch == '"' {
+                // n backslashes before a quote => 2n+1 backslashes + quote.
+                for _ in 0..(trailing_backslashes * 2 + 1) {
+                    quoted.push('\\');
+                }
+                quoted.push('"');
+            } else {
+                // n backslashes before a normal char stay as n backslashes.
+                for _ in 0..trailing_backslashes {
+                    quoted.push('\\');
+                }
+                quoted.push(ch);
             }
-            quoted.push('"');
             trailing_backslashes = 0;
-            continue;
         }
-        for _ in 0..trailing_backslashes {
-            quoted.push('\\');
-        }
-        trailing_backslashes = 0;
-        quoted.push(ch);
     }
     for _ in 0..(trailing_backslashes * 2) {
         quoted.push('\\');
@@ -655,6 +656,18 @@ fn windows_build_cmdline(args: &[&str]) -> std::io::Result<Option<String>> {
         cmdline.push_str(&windows_quote_command_arg(arg));
     }
     Ok(Some(cmdline))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_build_appcontainer_cmdline(
+    resolved_program: &Path,
+    args: &[&str],
+) -> std::io::Result<Option<String>> {
+    let program = resolved_program.to_string_lossy().into_owned();
+    let mut full_args = Vec::with_capacity(args.len() + 1);
+    full_args.push(program.as_str());
+    full_args.extend(args.iter().copied());
+    windows_build_cmdline(&full_args)
 }
 
 #[cfg(target_os = "windows")]
@@ -830,7 +843,7 @@ fn run_windows_appcontainer_command_output(
 
     let launch_opts = LaunchOptions {
         exe: resolved_program.to_path_buf(),
-        cmdline: windows_build_cmdline(args)?,
+        cmdline: windows_build_appcontainer_cmdline(resolved_program, args)?,
         // Use executable parent so relative lookups mirror direct CLI invocation.
         cwd: resolved_program.parent().map(Path::to_path_buf),
         env: windows_filtered_env(config),
@@ -2160,6 +2173,19 @@ mod tests {
             .expect_err("NUL bytes must be rejected in Windows command-line arguments");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         assert!(err.to_string().contains("NUL"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_windows_build_appcontainer_cmdline_includes_executable_token() {
+        let program = Path::new(r"C:\Program Files\Carapace\cara.exe");
+        let cmdline = windows_build_appcontainer_cmdline(program, &["--mode", "arg two"])
+            .expect("cmdline build should succeed")
+            .expect("cmdline");
+        assert_eq!(
+            cmdline,
+            "\"C:\\Program Files\\Carapace\\cara.exe\" --mode \"arg two\""
+        );
     }
 
     #[cfg(target_os = "windows")]
