@@ -810,10 +810,19 @@ fn assign_windows_job_to_pid(pid: u32, config: &ProcessSandboxConfig) -> std::io
         "Windows job assignment",
     )?;
 
-    let job = create_windows_job(config)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))?;
+    let job = create_windows_job(config).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("failed to create Windows Job for pid {pid}: {e}"),
+        )
+    })?;
     job.assign_process(process_handle.raw() as isize)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))?;
+        .map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("failed to assign pid {pid} to Windows Job: {e}"),
+            )
+        })?;
 
     Ok(job)
 }
