@@ -20,9 +20,9 @@ Current platform status for sandbox-required subprocess paths:
 
 - macOS: Seatbelt + resource limits
 - Linux: Landlock + resource limits
-- Windows: Job Objects + AppContainer on sandbox-required paths. Deny-network
-  execution is supported via command-output helpers; generic spawned
-  deny-network subprocesses fail closed.
+- Windows: sandboxed subprocesses use Job Objects + AppContainer. If a
+  deny-network spawn flow is unsupported, Carapace blocks it instead of
+  running unsandboxed.
 - other targets: fail closed for sandbox-required subprocess paths
 
 ## 3) Verify key controls

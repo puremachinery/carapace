@@ -47,12 +47,12 @@
         <p class="eyebrow">Preview release</p>
         <h1>Security-first personal AI assistant</h1>
         <ul class="defaults-bar" aria-label="Default safety controls">
-          <li>127.0.0.1 default bind</li>
-          <li>Fail-closed auth defaults</li>
-          <li>Keychain/Keyutils/CredMan + AES-256-GCM fallback</li>
-          <li>Signed WASM plugins + capability sandbox</li>
-          <li>OS-native subprocess controls (Seatbelt, Landlock, Windows limits)</li>
-          <li>SSRF + DNS rebinding defense</li>
+          <li>Local-only by default (127.0.0.1)</li>
+          <li>Locked down until you configure access</li>
+          <li>Secrets kept in OS credential stores</li>
+          <li>Plugins must be signed and permission-scoped</li>
+          <li>Subprocesses run with OS sandbox limits</li>
+          <li>Built-in outbound request protections</li>
         </ul>
         <p class="lede">
           Carapace runs local-first, keeps security controls explicit, and gives you
@@ -71,8 +71,8 @@
         <pre><code>cara setup
 cara</code></pre>
         <p class="quickstart-callout">
-          Need security deltas fast?
-          <a href="https://github.com/puremachinery/carapace/blob/HEAD/docs/security-comparison.md#summary-table">
+          Want a quick security comparison?
+          <a href="https://github.com/puremachinery/carapace/blob/main/docs/security-comparison.md#summary-table">
             Carapace vs OpenClaw threat-by-threat table
           </a>.
         </p>
@@ -145,7 +145,7 @@ cara</code></pre>
 
     <footer class="site-footer">
       <p>Carapace by PureMachinery.</p>
-      <a href="https://github.com/puremachinery/carapace/blob/HEAD/SECURITY.md">Security policy</a>
+      <a href="https://github.com/puremachinery/carapace/blob/main/SECURITY.md">Security policy</a>
     </footer>
   </body>
 </html>

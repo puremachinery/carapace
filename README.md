@@ -10,8 +10,8 @@ A hardened alternative to openclaw / clawdbot — for when your assistant needs 
 
 - **Multi-provider LLM engine** — Anthropic, OpenAI, Ollama, Google Gemini, AWS Bedrock, Venice AI with streaming, tool dispatch, and cancellation
 - **Multi-channel messaging** — Signal, Telegram, Discord, Slack, console, and webhooks. 10 built-in tools + 15 channel-specific tool schemas
-- **WASM plugin runtime** — wasmtime 41 with Ed25519 signature verification, capability sandboxing, resource limits (64MB memory, fuel CPU budget, epoch wall-clock timeout), and permission enforcement
-- **Security by default** — localhost-only binding, SSRF/DNS-rebinding defense, prompt guard, inbound message classifier, exec approval flow, output content security. Auth denies by default when no credentials configured; CSRF-protected control endpoints. AES-256-GCM secret encryption at rest with PBKDF2 key derivation. OS-level subprocess sandboxing uses Seatbelt (macOS), Landlock (Linux), and Windows Job Objects + AppContainer for sandbox-required paths; unsupported targets fail closed. On Windows, deny-network execution is supported via command-output helpers, while generic spawned deny-network subprocesses fail closed.
+- **Signed plugin runtime** — plugins are signature-verified and run with strict permissions and resource limits
+- **Secure defaults** — local-first binding, locked-down auth behavior, encrypted secret storage, guarded tool execution, and OS-level subprocess sandboxing for protected paths
 - **Infrastructure** — TLS, mTLS, mDNS discovery, config hot-reload, Tailscale integration, Prometheus metrics, audit logging. Multi-node clustering is partially implemented
 
 ## Expectations vs OpenClaw
@@ -36,7 +36,7 @@ Carapace is designed to address the major vulnerability classes reported in the 
 | Plaintext secret storage | OS credential store (Keychain / Keyutils / Credential Manager) with AES-256-GCM fallback |
 | Skills supply chain | Ed25519 signatures + WASM capability sandbox + resource limits |
 | Prompt injection | Prompt guard + inbound classifier + exec approval flow + tool policies |
-| No process sandboxing | Seatbelt / Landlock / rlimits + Windows Job Objects/AppContainer on sandbox-required subprocess paths; unsupported targets fail closed. On Windows, deny-network execution is supported via command-output helpers; generic spawned deny-network subprocesses fail closed. |
+| No process sandboxing | OS-level subprocess sandboxing on macOS/Linux/Windows for sandbox-required paths; unsupported paths fail closed |
 | SSRF / DNS rebinding | Private IP blocking + post-resolution validation |
 
 See [docs/security.md](docs/security.md) for the full security model.
@@ -58,7 +58,7 @@ See [docs/feature-status.yaml](docs/feature-status.yaml) and [docs/feature-evide
    ```
 4. Verify first-run outcome:
    ```bash
-   cara verify --outcome local-chat --port 18789
+   cara verify --outcome auto --port 18789
    ```
 5. Start local interactive chat:
    ```bash

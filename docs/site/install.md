@@ -21,7 +21,16 @@ rollouts, and preview-specific installs, use a pinned tag URL.
 
 Note: `releases/latest` may not point at the newest pre-release preview.
 
-## 1b) Pinned version links (automation/ops)
+Quick path for first-time setup:
+
+1. Download your platform binary (above).
+2. Install it on PATH (Step 4).
+3. Run `cara --help` and `cara version` (Step 5).
+
+Steps 2-3 below (signature/checksum verification) are recommended, especially
+for production or automation.
+
+## 1b) Advanced: pinned version links (automation/ops)
 
 ```bash
 VERSION="vX.Y.Z"

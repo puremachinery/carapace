@@ -42,15 +42,19 @@ In another terminal:
 
 ```bash
 cara status --host 127.0.0.1 --port 18789
-cara verify --outcome local-chat --port 18789
+cara verify --outcome auto --port 18789
 cara chat --port 18789
 ```
 
-The setup wizard asks for provider/auth/bind settings, first-run outcome
-(`local-chat`, `discord`, `telegram`, `hooks`), and optional hooks/control-ui
-configuration.
+The setup wizard asks for:
+- which model provider you want to use,
+- how locked down you want access to be,
+- whether to keep the service local-only or reachable on your network,
+- your first desired outcome (`local-chat`, `discord`, `telegram`, or `hooks`).
 
-If you set `gateway.port`, use that port instead of `18789`.
+If you picked a custom port in setup, use that instead of `18789`.
+If your selected outcome is `discord` or `telegram`, `cara verify` may also
+need destination flags (`--discord-to` / `--telegram-to`).
 
 Helpful REPL commands:
 - `/help` — show available commands
@@ -61,6 +65,8 @@ For full first-run flow, use [site/first-run.md](site/first-run.md).
 Manual configuration is documented in `config.example.json5`.
 
 ## Configuration Basics
+
+If you just want a working first run, you can skip this section and come back later.
 
 Config is JSON5 and can live in:
 - `${CARAPACE_CONFIG_PATH}` (highest priority)
