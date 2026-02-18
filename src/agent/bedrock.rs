@@ -856,11 +856,29 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn random_hex(bytes_len: usize) -> String {
+        let mut bytes = vec![0u8; bytes_len];
+        getrandom::fill(&mut bytes).expect("random test bytes");
+        hex::encode(bytes)
+    }
+
+    fn test_access_key() -> String {
+        format!("TESTACCESS{}", random_hex(8).to_uppercase())
+    }
+
+    fn test_secret_key() -> String {
+        format!("test-secret-{}", random_hex(16))
+    }
+
+    fn test_provider(region: &str) -> BedrockProvider {
+        BedrockProvider::new(region.to_string(), test_access_key(), test_secret_key()).unwrap()
+    }
+
     // ==================== Provider construction tests ====================
 
     #[test]
     fn test_new_rejects_empty_region() {
-        let result = BedrockProvider::new("".to_string(), "AKID".to_string(), "secret".to_string());
+        let result = BedrockProvider::new("".to_string(), test_access_key(), test_secret_key());
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("region"), "error should mention region: {err}");
@@ -868,11 +886,8 @@ mod tests {
 
     #[test]
     fn test_new_rejects_empty_access_key() {
-        let result = BedrockProvider::new(
-            "us-east-1".to_string(),
-            "".to_string(),
-            "secret".to_string(),
-        );
+        let result =
+            BedrockProvider::new("us-east-1".to_string(), "".to_string(), test_secret_key());
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -884,7 +899,7 @@ mod tests {
     #[test]
     fn test_new_rejects_empty_secret_key() {
         let result =
-            BedrockProvider::new("us-east-1".to_string(), "AKID".to_string(), "".to_string());
+            BedrockProvider::new("us-east-1".to_string(), test_access_key(), "".to_string());
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -895,11 +910,9 @@ mod tests {
 
     #[test]
     fn test_new_accepts_valid_credentials() {
-        let result = BedrockProvider::new(
-            "us-east-1".to_string(),
-            "AKIAIOSFODNN7EXAMPLE".to_string(),
-            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
-        );
+        let access_key = test_access_key();
+        let secret_key = test_secret_key();
+        let result = BedrockProvider::new("us-east-1".to_string(), access_key, secret_key);
         assert!(result.is_ok());
         let provider = result.unwrap();
         assert_eq!(provider.region, "us-east-1");
@@ -911,37 +924,20 @@ mod tests {
 
     #[test]
     fn test_with_session_token() {
-        let provider = BedrockProvider::new(
-            "us-west-2".to_string(),
-            "AKID".to_string(),
-            "secret".to_string(),
-        )
-        .unwrap()
-        .with_session_token("FwoGZX...".to_string());
+        let provider = test_provider("us-west-2").with_session_token("FwoGZX...".to_string());
         assert!(provider.session_token.is_some());
         assert_eq!(provider.session_token.as_deref(), Some("FwoGZX..."));
     }
 
     #[test]
     fn test_with_empty_session_token_clears() {
-        let provider = BedrockProvider::new(
-            "us-west-2".to_string(),
-            "AKID".to_string(),
-            "secret".to_string(),
-        )
-        .unwrap()
-        .with_session_token("".to_string());
+        let provider = test_provider("us-west-2").with_session_token("".to_string());
         assert!(provider.session_token.is_none());
     }
 
     #[test]
     fn test_base_url_derived_from_region() {
-        let provider = BedrockProvider::new(
-            "eu-west-1".to_string(),
-            "AKID".to_string(),
-            "secret".to_string(),
-        )
-        .unwrap();
+        let provider = test_provider("eu-west-1");
         assert_eq!(
             provider.base_url,
             "https://bedrock-runtime.eu-west-1.amazonaws.com"
@@ -952,12 +948,7 @@ mod tests {
 
     #[test]
     fn test_build_body_basic() {
-        let provider = BedrockProvider::new(
-            "us-east-1".to_string(),
-            "AKID".to_string(),
-            "secret".to_string(),
-        )
-        .unwrap();
+        let provider = test_provider("us-east-1");
         let request = CompletionRequest {
             model: "anthropic.claude-3-sonnet-20240229-v1:0".to_string(),
             messages: vec![LlmMessage {
@@ -991,12 +982,7 @@ mod tests {
 
     #[test]
     fn test_build_body_with_system() {
-        let provider = BedrockProvider::new(
-            "us-east-1".to_string(),
-            "AKID".to_string(),
-            "secret".to_string(),
-        )
-        .unwrap();
+        let provider = test_provider("us-east-1");
         let request = CompletionRequest {
             model: "anthropic.claude-3-sonnet-20240229-v1:0".to_string(),
             messages: vec![],
@@ -1018,12 +1004,7 @@ mod tests {
 
     #[test]
     fn test_build_body_with_tools() {
-        let provider = BedrockProvider::new(
-            "us-east-1".to_string(),
-            "AKID".to_string(),
-            "secret".to_string(),
-        )
-        .unwrap();
+        let provider = test_provider("us-east-1");
         let request = CompletionRequest {
             model: "anthropic.claude-3-sonnet-20240229-v1:0".to_string(),
             messages: vec![],
@@ -1056,12 +1037,7 @@ mod tests {
 
     #[test]
     fn test_build_body_with_tool_results() {
-        let provider = BedrockProvider::new(
-            "us-east-1".to_string(),
-            "AKID".to_string(),
-            "secret".to_string(),
-        )
-        .unwrap();
+        let provider = test_provider("us-east-1");
         let request = CompletionRequest {
             model: "anthropic.claude-3-sonnet-20240229-v1:0".to_string(),
             messages: vec![LlmMessage {
@@ -1090,12 +1066,7 @@ mod tests {
 
     #[test]
     fn test_build_body_with_error_tool_result() {
-        let provider = BedrockProvider::new(
-            "us-east-1".to_string(),
-            "AKID".to_string(),
-            "secret".to_string(),
-        )
-        .unwrap();
+        let provider = test_provider("us-east-1");
         let request = CompletionRequest {
             model: "anthropic.claude-3-sonnet-20240229-v1:0".to_string(),
             messages: vec![LlmMessage {
@@ -1120,12 +1091,7 @@ mod tests {
 
     #[test]
     fn test_build_body_multi_turn() {
-        let provider = BedrockProvider::new(
-            "us-east-1".to_string(),
-            "AKID".to_string(),
-            "secret".to_string(),
-        )
-        .unwrap();
+        let provider = test_provider("us-east-1");
         let request = CompletionRequest {
             model: "anthropic.claude-3-sonnet-20240229-v1:0".to_string(),
             messages: vec![
@@ -1188,23 +1154,33 @@ mod tests {
 
     #[test]
     fn test_signing_key_derivation() {
-        let key = derive_signing_key(
-            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
-            "20240101",
-            "us-east-1",
-        );
-        // Should produce a 32-byte key (SHA-256 output)
-        assert_eq!(key.len(), 32);
+        fn hmac_once(key: &[u8], data: &[u8]) -> Vec<u8> {
+            let mut hmac = HmacSha256::new_from_slice(key).unwrap();
+            hmac.update(data);
+            hmac.finalize().into_bytes().to_vec()
+        }
+
+        let secret = test_secret_key();
+        let date = "20240101";
+        let region = "us-east-1";
+
+        // Compute expected key via explicit SigV4 key-schedule chaining.
+        let k_secret = format!("AWS4{secret}");
+        let k_date = hmac_once(k_secret.as_bytes(), date.as_bytes());
+        let k_region = hmac_once(&k_date, region.as_bytes());
+        let k_service = hmac_once(&k_region, b"bedrock");
+        let expected = hmac_once(&k_service, b"aws4_request");
+
+        let derived = derive_signing_key(&secret, date, region);
+        assert_eq!(derived, expected);
     }
 
     #[test]
     fn test_sign_request_produces_required_headers() {
-        let provider = BedrockProvider::new(
-            "us-east-1".to_string(),
-            "AKIAIOSFODNN7EXAMPLE".to_string(),
-            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
-        )
-        .unwrap();
+        let access_key = test_access_key();
+        let secret_key = test_secret_key();
+        let provider =
+            BedrockProvider::new("us-east-1".to_string(), access_key, secret_key).unwrap();
 
         let body = b"{}";
         let datetime = "20240101T120000Z";
@@ -1228,12 +1204,10 @@ mod tests {
 
     #[test]
     fn test_sign_request_authorization_format() {
-        let provider = BedrockProvider::new(
-            "us-east-1".to_string(),
-            "AKIAIOSFODNN7EXAMPLE".to_string(),
-            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
-        )
-        .unwrap();
+        let access_key = test_access_key();
+        let secret_key = test_secret_key();
+        let provider =
+            BedrockProvider::new("us-east-1".to_string(), access_key.clone(), secret_key).unwrap();
 
         let body = b"{\"test\": true}";
         let datetime = "20240315T093000Z";
@@ -1250,9 +1224,9 @@ mod tests {
             "auth should start with algorithm: {auth}"
         );
         assert!(
-            auth.contains(
-                "Credential=AKIAIOSFODNN7EXAMPLE/20240315/us-east-1/bedrock/aws4_request"
-            ),
+            auth.contains(&format!(
+                "Credential={access_key}/20240315/us-east-1/bedrock/aws4_request"
+            )),
             "auth should contain credential scope: {auth}"
         );
         assert!(
@@ -1267,13 +1241,8 @@ mod tests {
 
     #[test]
     fn test_sign_request_with_session_token() {
-        let provider = BedrockProvider::new(
-            "us-east-1".to_string(),
-            "AKID".to_string(),
-            "secret".to_string(),
-        )
-        .unwrap()
-        .with_session_token("my-session-token".to_string());
+        let provider =
+            test_provider("us-east-1").with_session_token("my-session-token".to_string());
 
         let body = b"{}";
         let datetime = "20240101T120000Z";

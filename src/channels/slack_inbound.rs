@@ -74,18 +74,20 @@ mod tests {
 
     #[test]
     fn test_verify_slack_signature() {
-        let secret = "secret";
         let body = br#"{"type":"url_verification","challenge":"abc"}"#;
         let timestamp = 1_700_000_000i64;
+        let mut secret_bytes = [0u8; 16];
+        getrandom::fill(&mut secret_bytes).expect("random slack test secret");
+        let secret = format!("test-signing-secret-{}", hex::encode(secret_bytes));
         let base = format!("v0:{timestamp}:{}", String::from_utf8_lossy(body));
         let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
         mac.update(base.as_bytes());
         let digest = mac.finalize().into_bytes();
         let signature = format!("v0={}", hex::encode(digest));
 
-        assert!(verify_slack_signature(secret, timestamp, &signature, body));
+        assert!(verify_slack_signature(&secret, timestamp, &signature, body));
         assert!(!verify_slack_signature(
-            secret,
+            &secret,
             timestamp,
             "v0=deadbeef",
             body

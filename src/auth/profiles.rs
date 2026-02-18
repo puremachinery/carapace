@@ -947,6 +947,12 @@ mod tests {
         OAuthProvider::Discord.default_config("cid", "csecret", "https://example.com/cb")
     }
 
+    fn random_password() -> Vec<u8> {
+        let mut bytes = [0u8; 32];
+        getrandom::fill(&mut bytes).expect("random test password bytes");
+        bytes.to_vec()
+    }
+
     // -----------------------------------------------------------------------
     // Provider config tests
     // -----------------------------------------------------------------------
@@ -1539,11 +1545,11 @@ mod tests {
     #[test]
     fn test_encrypted_profile_store_roundtrip() {
         let dir = tempdir().unwrap();
-        let password = b"test-encryption-pw";
+        let password = random_password();
 
         // Create an encrypted store, add a profile, and save
         {
-            let store = ProfileStore::with_encryption(dir.path().to_path_buf(), password).unwrap();
+            let store = ProfileStore::with_encryption(dir.path().to_path_buf(), &password).unwrap();
 
             store.add(sample_profile("enc-1")).unwrap();
         }
@@ -1564,7 +1570,7 @@ mod tests {
         );
 
         // Load the profiles back with a new store derived from the same password
-        let store2 = ProfileStore::with_encryption(dir.path().to_path_buf(), password).unwrap();
+        let store2 = ProfileStore::with_encryption(dir.path().to_path_buf(), &password).unwrap();
         store2.load().unwrap();
 
         let profile = store2.get("enc-1").unwrap();
@@ -1596,9 +1602,11 @@ mod tests {
             "plaintext store should write tokens in clear"
         );
 
-        // Now load with an encrypted store -- plaintext values should be read fine
-        let store2 =
-            ProfileStore::with_encryption(dir.path().to_path_buf(), b"encryption-pw").unwrap();
+        // Now load with an encrypted store -- plaintext values should be read fine.
+        // Password value is irrelevant here because no ciphertext is being decrypted;
+        // this verifies backward-compatible opening of plaintext profile files.
+        let password = random_password();
+        let store2 = ProfileStore::with_encryption(dir.path().to_path_buf(), &password).unwrap();
         store2.load().unwrap();
 
         let profile = store2.get("plain-1").unwrap();
@@ -1651,16 +1659,16 @@ mod tests {
     #[test]
     fn test_encrypted_store_no_double_encryption() {
         let dir = tempdir().unwrap();
-        let password = b"double-enc-test";
+        let password = random_password();
 
         // Save a profile (tokens get encrypted on disk)
         {
-            let store = ProfileStore::with_encryption(dir.path().to_path_buf(), password).unwrap();
+            let store = ProfileStore::with_encryption(dir.path().to_path_buf(), &password).unwrap();
             store.add(sample_profile("de-1")).unwrap();
         }
 
         // Load and save again -- should not double-encrypt
-        let store2 = ProfileStore::with_encryption(dir.path().to_path_buf(), password).unwrap();
+        let store2 = ProfileStore::with_encryption(dir.path().to_path_buf(), &password).unwrap();
         store2.load().unwrap();
 
         // In-memory tokens should be plaintext
@@ -1671,7 +1679,7 @@ mod tests {
         store2.update_last_used("de-1");
 
         // Load yet again to verify
-        let store3 = ProfileStore::with_encryption(dir.path().to_path_buf(), password).unwrap();
+        let store3 = ProfileStore::with_encryption(dir.path().to_path_buf(), &password).unwrap();
         store3.load().unwrap();
 
         let profile2 = store3.get("de-1").unwrap();
@@ -1688,17 +1696,17 @@ mod tests {
     #[test]
     fn test_encrypted_store_no_refresh_token() {
         let dir = tempdir().unwrap();
-        let password = b"no-refresh-test";
+        let password = random_password();
 
         // Create a profile without a refresh token
         let mut profile = sample_profile("nrt-1");
         profile.tokens.refresh_token = None;
 
-        let store = ProfileStore::with_encryption(dir.path().to_path_buf(), password).unwrap();
+        let store = ProfileStore::with_encryption(dir.path().to_path_buf(), &password).unwrap();
         store.add(profile).unwrap();
 
         // Reload and verify
-        let store2 = ProfileStore::with_encryption(dir.path().to_path_buf(), password).unwrap();
+        let store2 = ProfileStore::with_encryption(dir.path().to_path_buf(), &password).unwrap();
         store2.load().unwrap();
 
         let loaded = store2.get("nrt-1").unwrap();
