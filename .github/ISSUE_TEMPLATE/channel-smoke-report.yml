@@ -1,0 +1,80 @@
+name: Channel smoke report
+description: Report a real-world channel smoke run (Signal, Slack, Telegram, Discord).
+title: "channel smoke: <channel> <pass|fail>"
+labels:
+  - smoke
+  - channel
+  - feedback
+  - triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form for real-world channel smoke runs.
+        If this report includes a security vulnerability, do not post it publicly.
+        Use private security reporting instead:
+        https://github.com/puremachinery/carapace/security/advisories/new
+
+  - type: input
+    id: version
+    attributes:
+      label: Carapace version
+      description: Output of `cara version`
+      placeholder: v0.1.0-preview5
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - macOS (Apple Silicon)
+        - macOS (Intel)
+        - Linux (x86_64)
+        - Linux (ARM64)
+        - Windows (x86_64)
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: channel
+    attributes:
+      label: Channel
+      options:
+        - Signal
+        - Slack
+        - Telegram
+        - Discord
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Smoke checks completed
+      description: Mark each completed check.
+      options:
+        - label: `cara status` reported healthy
+        - label: Channel registration was successful (no repeated auth/signature errors)
+        - label: One inbound message triggered an agent run
+        - label: One outbound reply was delivered
+    validations:
+      required: true
+
+  - type: textarea
+    id: result
+    attributes:
+      label: Result summary
+      description: Pass/fail plus first failing step (if any).
+      placeholder: PASS. Inbound + outbound validated in one channel thread.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs/errors
+      description: Paste relevant output and redact secrets/tokens.
+      render: text

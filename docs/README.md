@@ -11,6 +11,7 @@ A security-focused, open-source personal AI assistant.
 - [Get Unstuck](site/get-unstuck.md) — troubleshooting and report paths
 - [Cookbook](cookbook/README.md) — task-focused walkthroughs
 - [Channel Setup](channels.md) — Signal, Telegram, Discord, Slack, webhooks
+- [Channel Smoke Validation](channel-smoke.md) — reproducible live channel checks + evidence capture
 - [CLI Guide](cli.md) — subcommands, flags, and device identity
 
 ## Architecture & Security

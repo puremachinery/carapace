@@ -52,6 +52,7 @@ See [docs/feature-status.yaml](docs/feature-status.yaml) and [docs/feature-evide
 - [Get unstuck](docs/site/get-unstuck.md) — quick troubleshooting and report paths
 - [Cookbook](docs/cookbook/README.md) — practical "do X" walkthroughs
 - [Channel setup](docs/channels.md) — Signal, Telegram, Discord, Slack, webhooks
+- [Channel smoke validation](docs/channel-smoke.md) — reproducible live checks and evidence capture
 - [CLI guide](docs/cli.md) — subcommands, flags, and device identity
 - [Documentation index](docs/README.md) — architecture, protocol, security
 - [Report feedback or bugs](https://github.com/puremachinery/carapace/issues/new/choose) — setup smoke reports, bug reports, and feature requests
