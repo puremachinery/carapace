@@ -98,8 +98,8 @@ sha256sum --check SHA256SUMS.txt
 
 PowerShell example:
 
-If `cosign` is not installed on Windows, install it first (for example:
-`winget install Sigstore.Cosign`).
+> **Prerequisite (Windows):** Install `cosign` if needed (for example:
+> `winget install Sigstore.Cosign`).
 
 ```powershell
 $Version = "vX.Y.Z"
