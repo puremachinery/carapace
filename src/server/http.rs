@@ -999,10 +999,29 @@ fn dispatch_agent_run(
 }
 
 fn stable_sender_id_from_ip(ip: IpAddr) -> String {
-    match ip {
-        IpAddr::V4(v4) => format!("ip4:{:08x}", u32::from(v4)),
-        IpAddr::V6(v6) => format!("ip6:{}", hex::encode(v6.octets())),
+    fn push_hex_byte(out: &mut String, byte: u8) {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
     }
+
+    // Bounded output: max length is 36 ("ip6:" + 32 hex chars).
+    let mut sender = String::with_capacity(36);
+    match ip {
+        IpAddr::V4(v4) => {
+            sender.push_str("ip4:");
+            for byte in v4.octets() {
+                push_hex_byte(&mut sender, byte);
+            }
+        }
+        IpAddr::V6(v6) => {
+            sender.push_str("ip6:");
+            for byte in v6.octets() {
+                push_hex_byte(&mut sender, byte);
+            }
+        }
+    }
+    sender
 }
 
 /// POST /hooks/agent - Dispatch message to agent
