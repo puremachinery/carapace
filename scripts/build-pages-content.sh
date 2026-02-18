@@ -45,7 +45,7 @@ rewrite_links() {
   local kind="$2"
 
   body="$(printf '%s' "$body" | sed -E \
-    -e 's|href="\.\./CONTRIBUTING\.md"|href="https://github.com/puremachinery/carapace/blob/HEAD/CONTRIBUTING.md"|g' \
+    -e 's|href="\.\./CONTRIBUTING\.md"|href="https://github.com/puremachinery/carapace/blob/main/CONTRIBUTING.md"|g' \
     -e 's|href="cookbook/README\.md"|href="cookbook/"|g' \
     -e 's|href="cookbook/([^":#]+)\.md"|href="cookbook/\1.html"|g' \
     -e 's|href="\.\./cookbook/README\.md"|href="cookbook/"|g' \
