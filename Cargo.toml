@@ -74,6 +74,7 @@ gateway = []
 auth-profiles = []
 keychain-tests = []
 secret-service-tests = []
+credential-manager-tests = []
 
 [lib]
 name = "carapace"

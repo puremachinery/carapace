@@ -12,7 +12,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use pbkdf2::pbkdf2_hmac;
 use serde_json::Value;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
@@ -84,10 +84,11 @@ impl SecretStore {
     /// Create a store for rekey-based decryption without random salt generation.
     ///
     /// Note: `decrypt()` will always fail for real ciphertexts because the
-    /// stored salt is zeroed; use `decrypt_rekey()` for actual decryption.
+    /// stored salt is a deterministic sentinel; use `decrypt_rekey()` for
+    /// actual decryption.
     pub fn for_decrypt(password: &[u8]) -> Self {
-        let salt = [0u8; SALT_LEN];
-        Self::from_password_and_salt(password, &salt)
+        let sentinel_salt = derive_decrypt_sentinel_salt(password);
+        Self::from_password_and_salt(password, &sentinel_salt)
     }
 
     /// Encrypt a plaintext string, returning the `enc:v1:...` formatted string.
@@ -191,11 +192,23 @@ pub(crate) fn parse_encrypted(encrypted: &str) -> Result<EncryptedParts, SecretE
         });
     }
 
-    let mut nonce = [0u8; NONCE_LEN];
-    nonce.copy_from_slice(&nonce_bytes);
+    let nonce: [u8; NONCE_LEN] =
+        nonce_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| SecretError::InvalidNonceLength {
+                expected: NONCE_LEN,
+                got: nonce_bytes.len(),
+            })?;
 
-    let mut salt = [0u8; SALT_LEN];
-    salt.copy_from_slice(&salt_bytes);
+    let salt: [u8; SALT_LEN] =
+        salt_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| SecretError::InvalidSaltLength {
+                expected: SALT_LEN,
+                got: salt_bytes.len(),
+            })?;
 
     Ok(EncryptedParts {
         nonce,
@@ -227,6 +240,15 @@ pub fn derive_key(password: &[u8], salt: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
     pbkdf2_hmac::<Sha256>(password, salt, PBKDF2_ITERATIONS, &mut out);
     out
+}
+
+/// Derive a deterministic, non-random sentinel salt for password-only
+/// decryption stores used in fallback/error paths.
+fn derive_decrypt_sentinel_salt(password: &[u8]) -> [u8; SALT_LEN] {
+    let digest = Sha256::digest([b"carapace:decrypt-sentinel:", password].concat());
+    let mut derived = [0u8; SALT_LEN];
+    derived.copy_from_slice(&digest[..SALT_LEN]);
+    derived
 }
 
 /// Check whether a string value is in encrypted format.
@@ -389,6 +411,24 @@ mod tests {
         bytes
     }
 
+    fn random_password_different_from(reference: &[u8]) -> Vec<u8> {
+        loop {
+            let candidate = random_password();
+            if candidate != reference {
+                return candidate;
+            }
+        }
+    }
+
+    fn random_salt_different_from(reference: &[u8; SALT_LEN]) -> [u8; SALT_LEN] {
+        loop {
+            let candidate = random_salt();
+            if &candidate != reference {
+                return candidate;
+            }
+        }
+    }
+
     fn new_test_store() -> SecretStore {
         let password = random_password();
         SecretStore::new(&password).expect("create test secret store")
@@ -407,10 +447,7 @@ mod tests {
     fn test_derive_key_different_passwords() {
         let salt = random_salt();
         let p1 = random_password();
-        let mut p2 = random_password();
-        if p1 == p2 {
-            p2[0] ^= 0xFF;
-        }
+        let p2 = random_password_different_from(&p1);
         let k1 = derive_key(&p1, &salt);
         let k2 = derive_key(&p2, &salt);
         assert_ne!(k1, k2, "different passwords must produce different keys");
@@ -420,10 +457,7 @@ mod tests {
     fn test_derive_key_different_salts() {
         let password = random_password();
         let s1 = random_salt();
-        let mut s2 = random_salt();
-        if s1 == s2 {
-            s2[0] ^= 0xFF;
-        }
+        let s2 = random_salt_different_from(&s1);
         let k1 = derive_key(&password, &s1);
         let k2 = derive_key(&password, &s2);
         assert_ne!(k1, k2, "different salts must produce different keys");
@@ -513,10 +547,7 @@ mod tests {
         let encrypted = store1.encrypt("secret-data").unwrap();
 
         let parts = parse_encrypted(&encrypted).unwrap();
-        let mut wrong_password = random_password();
-        if wrong_password == correct_password {
-            wrong_password[0] ^= 0xFF;
-        }
+        let wrong_password = random_password_different_from(&correct_password);
         let wrong_key = Zeroizing::new(derive_key(&wrong_password, &parts.salt));
         let result = decrypt_with_key(&wrong_key, &parts.nonce, &parts.ciphertext);
         assert_eq!(result, Err(SecretError::DecryptionFailed));
@@ -527,10 +558,7 @@ mod tests {
         let correct_password = random_password();
         let store = SecretStore::new(&correct_password).unwrap();
         let encrypted = store.encrypt("secret-data").unwrap();
-        let mut wrong_password = random_password();
-        if wrong_password == correct_password {
-            wrong_password[0] ^= 0xFF;
-        }
+        let wrong_password = random_password_different_from(&correct_password);
         let result = store.decrypt_rekey(&encrypted, &wrong_password);
         assert_eq!(result, Err(SecretError::DecryptionFailed));
     }
@@ -768,10 +796,7 @@ mod tests {
         let encrypted = store.encrypt("super-secret").unwrap();
 
         let mut config = json!({ "apiKey": encrypted });
-        let mut wrong_password = random_password();
-        if wrong_password == correct_password {
-            wrong_password[0] ^= 0xFF;
-        }
+        let wrong_password = random_password_different_from(&correct_password);
         let wrong_store = SecretStore::for_decrypt(&wrong_password);
 
         resolve_secrets(&mut config, &wrong_store, &wrong_password);

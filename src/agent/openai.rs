@@ -1035,7 +1035,7 @@ mod tests {
         let result = OpenAiProvider::new("".to_string());
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("empty"), "error should mention empty: {err}");
+        assert!(err.contains("empty"));
     }
 
     #[test]
@@ -1081,11 +1081,8 @@ mod tests {
             .with_base_url("http://insecure.example.com".to_string());
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("https"), "error should mention https: {err}");
-        assert!(
-            err.contains("or http for localhost"),
-            "error should mention localhost exception: {err}"
-        );
+        assert!(err.contains("https"));
+        assert!(err.contains("or http for localhost"));
     }
 
     #[test]
@@ -1113,7 +1110,7 @@ mod tests {
             .with_base_url("http://192.168.1.100:8000".to_string());
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("https"), "error should mention https: {err}");
+        assert!(err.contains("https"));
     }
 
     #[test]

@@ -21,7 +21,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs;
@@ -998,6 +998,22 @@ fn dispatch_agent_run(
     Ok(())
 }
 
+fn format_sender_ip(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            format!("{}.{}.{}.{}", octets[0], octets[1], octets[2], octets[3])
+        }
+        IpAddr::V6(v6) => {
+            let seg = v6.segments();
+            format!(
+                "{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}",
+                seg[0], seg[1], seg[2], seg[3], seg[4], seg[5], seg[6], seg[7]
+            )
+        }
+    }
+}
+
 /// POST /hooks/agent - Dispatch message to agent
 async fn hooks_agent_handler(
     State(state): State<AppState>,
@@ -1041,7 +1057,7 @@ async fn hooks_agent_handler(
 
     let sender_id = connect_info
         .0
-        .map(|addr| addr.ip().to_string())
+        .map(|addr| format_sender_ip(addr.ip()))
         .unwrap_or_else(|| "unknown".to_string());
 
     if let Err(resp) = dispatch_agent_run(&ws, &validated, &run_id, &sender_id) {

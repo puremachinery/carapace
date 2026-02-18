@@ -5,6 +5,7 @@
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter};
@@ -360,6 +361,11 @@ fn current_month() -> String {
     date[..7].to_string()
 }
 
+fn usage_session_id(session_key: &str) -> String {
+    let digest = Sha256::digest(session_key.as_bytes());
+    format!("sid_{}", hex::encode(&digest[..12]))
+}
+
 fn is_leap_year(year: u64) -> bool {
     (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
 }
@@ -397,9 +403,14 @@ pub struct UsageRecord {
     pub provider: String,
     /// Model name
     pub model: String,
-    /// Session key (optional)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub session_key: Option<String>,
+    /// Opaque session identifier (optional)
+    #[serde(
+        default,
+        alias = "session_key",
+        rename = "session_id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub session_id: Option<String>,
     /// Input tokens consumed
     pub input_tokens: u64,
     /// Output tokens generated
@@ -607,8 +618,9 @@ fn default_enabled() -> bool {
 /// Session-level usage tracking
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionUsage {
-    /// Session key
-    pub session_key: String,
+    /// Opaque session identifier
+    #[serde(alias = "session_key", rename = "session_id")]
+    pub session_id: String,
     /// Total input tokens
     pub input_tokens: u64,
     /// Total output tokens
@@ -753,6 +765,7 @@ impl UsageTracker {
         let now = now_ms();
         let date = today_date();
         let month = current_month();
+        let session_id = session_key.map(usage_session_id);
 
         // Calculate cost
         let pricing = get_model_pricing(model).unwrap_or_else(default_pricing);
@@ -762,7 +775,7 @@ impl UsageTracker {
             timestamp: now,
             provider: provider.to_string(),
             model: model.to_string(),
-            session_key: session_key.map(|s| s.to_string()),
+            session_id: session_id.clone(),
             input_tokens,
             output_tokens,
             cost_usd: cost,
@@ -785,13 +798,13 @@ impl UsageTracker {
         monthly.add_record(&record);
 
         // Update session usage if session key provided
-        if let Some(key) = session_key {
+        if let Some(session_id) = session_id {
             let session = self
                 .data
                 .sessions
-                .entry(key.to_string())
+                .entry(session_id.clone())
                 .or_insert_with(|| SessionUsage {
-                    session_key: key.to_string(),
+                    session_id: session_id.clone(),
                     first_used_at: now,
                     ..Default::default()
                 });
@@ -990,7 +1003,12 @@ impl UsageTracker {
 
     /// Get session usage
     pub fn get_session_usage(&self, session_key: &str) -> Option<&SessionUsage> {
-        self.data.sessions.get(session_key)
+        let session_id = usage_session_id(session_key);
+        self.data
+            .sessions
+            .get(&session_id)
+            // Backward compatibility for pre-hash usage.json data.
+            .or_else(|| self.data.sessions.get(session_key))
     }
 
     /// Get all session usage entries
@@ -1048,7 +1066,10 @@ impl UsageTracker {
 
     /// Reset usage for a specific session
     pub fn reset_session(&mut self, session_key: &str) -> bool {
-        if self.data.sessions.remove(session_key).is_some() {
+        let session_id = usage_session_id(session_key);
+        if self.data.sessions.remove(&session_id).is_some()
+            || self.data.sessions.remove(session_key).is_some()
+        {
             self.dirty = true;
             true
         } else {
@@ -1533,14 +1554,14 @@ mod tests {
         tracker.data.sessions.insert(
             "old".to_string(),
             SessionUsage {
-                session_key: "old".to_string(),
+                session_id: "old".to_string(),
                 ..Default::default()
             },
         );
         tracker.data.sessions.insert(
             "recent".to_string(),
             SessionUsage {
-                session_key: "recent".to_string(),
+                session_id: "recent".to_string(),
                 first_used_at: now,
                 last_used_at: now,
                 ..Default::default()
@@ -1592,7 +1613,7 @@ mod tests {
         tracker.data.sessions.insert(
             "older".to_string(),
             SessionUsage {
-                session_key: "older".to_string(),
+                session_id: "older".to_string(),
                 first_used_at: now.saturating_sub(1_000),
                 last_used_at: now.saturating_sub(1_000),
                 ..Default::default()
@@ -1601,7 +1622,7 @@ mod tests {
         tracker.data.sessions.insert(
             "newer".to_string(),
             SessionUsage {
-                session_key: "newer".to_string(),
+                session_id: "newer".to_string(),
                 first_used_at: now,
                 last_used_at: now,
                 ..Default::default()
@@ -1693,7 +1714,7 @@ mod tests {
             timestamp: now_ms(),
             provider: "anthropic".to_string(),
             model: "claude-3-5-sonnet".to_string(),
-            session_key: None,
+            session_id: None,
             input_tokens: 1000,
             output_tokens: 500,
             cost_usd: 0.01,

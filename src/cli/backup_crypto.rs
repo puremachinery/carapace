@@ -88,7 +88,6 @@ fn derive_key(passphrase: &[u8], salt: &[u8]) -> [u8; KEY_LEN] {
 
     type HmacSha256 = Hmac<Sha256>;
 
-    let mut key = [0u8; KEY_LEN];
     // PBKDF2: block_num = 1 since we only need 32 bytes (one HMAC-SHA256 block)
     let mut u_prev = {
         let mut mac =
@@ -98,7 +97,7 @@ fn derive_key(passphrase: &[u8], salt: &[u8]) -> [u8; KEY_LEN] {
         mac.finalize().into_bytes()
     };
 
-    key.copy_from_slice(&u_prev);
+    let mut key: Vec<u8> = u_prev.to_vec();
 
     for _ in 1..PBKDF2_ITERATIONS {
         let mut mac =
@@ -111,7 +110,8 @@ fn derive_key(passphrase: &[u8], salt: &[u8]) -> [u8; KEY_LEN] {
         }
     }
 
-    key
+    key.try_into()
+        .expect("PBKDF2 output block size must match backup key length")
 }
 
 /// Encrypt a backup file with AES-256-GCM.
@@ -271,10 +271,12 @@ mod tests {
     fn test_derive_key_different_salts() {
         let passphrase = random_passphrase();
         let salt1 = random_bytes::<SALT_LEN>();
-        let mut salt2 = random_bytes::<SALT_LEN>();
-        if salt1 == salt2 {
-            salt2[0] ^= 0xFF;
-        }
+        let salt2 = loop {
+            let candidate = random_bytes::<SALT_LEN>();
+            if candidate != salt1 {
+                break candidate;
+            }
+        };
         let key1 = derive_key(passphrase.as_bytes(), &salt1);
         let key2 = derive_key(passphrase.as_bytes(), &salt2);
         assert_ne!(key1, key2);

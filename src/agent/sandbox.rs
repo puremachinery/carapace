@@ -962,7 +962,7 @@ fn resume_windows_process_threads(pid: u32) -> std::io::Result<()> {
 }
 
 #[cfg(target_os = "windows")]
-fn terminate_and_reap_windows_appcontainer_child(mut child: LaunchedIo, failure_context: &str) {
+fn terminate_and_reap_windows_appcontainer_child(child: LaunchedIo, failure_context: &str) {
     let pid = child.pid;
     if let Err(terminate_err) = terminate_windows_process(pid) {
         tracing::warn!(
@@ -974,7 +974,7 @@ fn terminate_and_reap_windows_appcontainer_child(mut child: LaunchedIo, failure_
     }
     if let Err(wait_err) = child.wait(Some(std::time::Duration::from_secs(2))) {
         tracing::warn!(
-            pid = child.pid,
+            pid,
             context = failure_context,
             error = %wait_err,
             "failed waiting for sandboxed child after Windows sandbox setup failure"

@@ -185,13 +185,19 @@ impl MediaFetcher {
         // Parse URL to extract host for DNS validation
         let parsed_url =
             url::Url::parse(url).map_err(|e| FetchError::InvalidUrl(format!("{}: {}", url, e)))?;
+        if parsed_url.scheme() != "https" {
+            return Err(FetchError::InvalidUrl(format!(
+                "only https URLs are allowed for media fetch: {}",
+                url
+            )));
+        }
 
         let host = parsed_url
             .host_str()
             .ok_or_else(|| FetchError::InvalidUrl("URL has no host".to_string()))?
             .to_string();
 
-        let port = parsed_url.port_or_known_default().unwrap_or(80);
+        let port = parsed_url.port_or_known_default().unwrap_or(443);
 
         // Calculate timeout (capped at max)
         let timeout = Duration::from_millis(config.timeout_ms.min(MAX_FETCH_TIMEOUT_MS));
@@ -354,13 +360,13 @@ mod tests {
     #[tokio::test]
     async fn test_fetch_blocks_localhost() {
         let fetcher = MediaFetcher::new();
-        let result = fetcher.fetch("http://localhost/image.png").await;
+        let result = fetcher.fetch("https://localhost/image.png").await;
         assert!(matches!(result, Err(FetchError::Ssrf(_))));
 
-        let result = fetcher.fetch("http://127.0.0.1/image.png").await;
+        let result = fetcher.fetch("https://127.0.0.1/image.png").await;
         assert!(matches!(result, Err(FetchError::Ssrf(_))));
 
-        let result = fetcher.fetch("http://[::1]/image.png").await;
+        let result = fetcher.fetch("https://[::1]/image.png").await;
         assert!(matches!(result, Err(FetchError::Ssrf(_))));
     }
 
@@ -369,22 +375,22 @@ mod tests {
         let fetcher = MediaFetcher::new();
 
         // 10.0.0.0/8
-        let result = fetcher.fetch("http://10.0.0.1/image.png").await;
+        let result = fetcher.fetch("https://10.0.0.1/image.png").await;
         assert!(matches!(result, Err(FetchError::Ssrf(_))));
 
         // 172.16.0.0/12
-        let result = fetcher.fetch("http://172.16.0.1/image.png").await;
+        let result = fetcher.fetch("https://172.16.0.1/image.png").await;
         assert!(matches!(result, Err(FetchError::Ssrf(_))));
 
         // 192.168.0.0/16
-        let result = fetcher.fetch("http://192.168.1.1/image.png").await;
+        let result = fetcher.fetch("https://192.168.1.1/image.png").await;
         assert!(matches!(result, Err(FetchError::Ssrf(_))));
     }
 
     #[tokio::test]
     async fn test_fetch_blocks_link_local() {
         let fetcher = MediaFetcher::new();
-        let result = fetcher.fetch("http://169.254.1.1/image.png").await;
+        let result = fetcher.fetch("https://169.254.1.1/image.png").await;
         assert!(matches!(result, Err(FetchError::Ssrf(_))));
     }
 
@@ -394,7 +400,7 @@ mod tests {
 
         // AWS/GCP/Azure metadata endpoint
         let result = fetcher
-            .fetch("http://169.254.169.254/latest/meta-data/")
+            .fetch("https://169.254.169.254/latest/meta-data/")
             .await;
         assert!(matches!(result, Err(FetchError::Ssrf(_))));
     }
@@ -404,11 +410,11 @@ mod tests {
         let fetcher = MediaFetcher::new();
 
         // fc00::/7 (ULA)
-        let result = fetcher.fetch("http://[fc00::1]/image.png").await;
+        let result = fetcher.fetch("https://[fc00::1]/image.png").await;
         assert!(matches!(result, Err(FetchError::Ssrf(_))));
 
         // fe80::/10 (link-local)
-        let result = fetcher.fetch("http://[fe80::1]/image.png").await;
+        let result = fetcher.fetch("https://[fe80::1]/image.png").await;
         assert!(matches!(result, Err(FetchError::Ssrf(_))));
     }
 
@@ -438,7 +444,7 @@ mod tests {
     async fn test_fetch_blocks_tailscale_by_default() {
         let fetcher = MediaFetcher::new();
         // 100.64.0.0/10 is CGNAT / Tailscale range
-        let result = fetcher.fetch("http://100.100.50.25/image.png").await;
+        let result = fetcher.fetch("https://100.100.50.25/image.png").await;
         assert!(matches!(result, Err(FetchError::Ssrf(_))));
     }
 
@@ -448,10 +454,17 @@ mod tests {
         let fetcher = MediaFetcher::with_config(config);
 
         // Should pass SSRF validation but fail on connection (IP doesn't exist)
-        let result = fetcher.fetch("http://100.100.50.25/image.png").await;
+        let result = fetcher.fetch("https://100.100.50.25/image.png").await;
         // Should NOT be an SSRF error
         assert!(!matches!(result, Err(FetchError::Ssrf(_))));
         // Should be a connection/HTTP error instead
         assert!(matches!(result, Err(FetchError::HttpRequest(_))));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_rejects_http_scheme() {
+        let fetcher = MediaFetcher::new();
+        let result = fetcher.fetch("http://example.com/image.png").await;
+        assert!(matches!(result, Err(FetchError::InvalidUrl(_))));
     }
 }

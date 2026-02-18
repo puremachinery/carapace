@@ -36,6 +36,22 @@ impl SignalChannel {
     fn send_url(&self) -> String {
         format!("{}/v2/send", self.base_url)
     }
+
+    fn validate_https_url(raw: &str, context: &str) -> Result<url::Url, String> {
+        let parsed = url::Url::parse(raw)
+            .map_err(|e| format!("invalid {} URL '{}': {}", context, raw, e))?;
+        if parsed.scheme() != "https" {
+            return Err(format!(
+                "{} URL must use https (got scheme '{}')",
+                context,
+                parsed.scheme()
+            ));
+        }
+        if parsed.host_str().is_none() {
+            return Err(format!("{} URL is missing a host", context));
+        }
+        Ok(parsed)
+    }
 }
 
 impl ChannelPluginInstance for SignalChannel {
@@ -79,7 +95,22 @@ impl ChannelPluginInstance for SignalChannel {
         };
 
         // Fetch media bytes (URL has already been SSRF-validated by the host)
-        let media_bytes = match self.client.get(media_url).send() {
+        let media_request_url = match Self::validate_https_url(media_url, "signal media") {
+            Ok(url) => url,
+            Err(e) => {
+                return Ok(DeliveryResult {
+                    ok: false,
+                    message_id: None,
+                    error: Some(e),
+                    retryable: false,
+                    conversation_id: None,
+                    to_jid: None,
+                    poll_id: None,
+                });
+            }
+        };
+
+        let media_bytes = match self.client.get(media_request_url).send() {
             Ok(resp) if resp.status().is_success() => {
                 if let Some(len) = resp.content_length() {
                     if len > MAX_MEDIA_BYTES {
@@ -151,7 +182,22 @@ impl ChannelPluginInstance for SignalChannel {
 
 impl SignalChannel {
     fn post_send(&self, body: &serde_json::Value) -> Result<DeliveryResult, BindingError> {
-        match self.client.post(self.send_url()).json(body).send() {
+        let send_url = match Self::validate_https_url(&self.send_url(), "signal send") {
+            Ok(url) => url,
+            Err(e) => {
+                return Ok(DeliveryResult {
+                    ok: false,
+                    message_id: None,
+                    error: Some(e),
+                    retryable: false,
+                    conversation_id: None,
+                    to_jid: None,
+                    poll_id: None,
+                });
+            }
+        };
+
+        match self.client.post(send_url).json(body).send() {
             Ok(resp) => {
                 let status = resp.status();
                 if status.is_success() {
@@ -197,7 +243,7 @@ mod tests {
 
     fn test_channel() -> SignalChannel {
         SignalChannel::new(
-            "http://localhost:8080".to_string(),
+            "https://localhost:8080".to_string(),
             "+15551234567".to_string(),
         )
     }
@@ -227,19 +273,22 @@ mod tests {
     #[test]
     fn test_signal_send_url() {
         let ch = test_channel();
-        assert_eq!(ch.send_url(), "http://localhost:8080/v2/send");
+        assert_eq!(ch.send_url(), "https://localhost:8080/v2/send");
 
         let ch2 = SignalChannel::new(
-            "http://example.com:9090".to_string(),
+            "https://example.com:9090".to_string(),
             "+15559999999".to_string(),
         );
-        assert_eq!(ch2.send_url(), "http://example.com:9090/v2/send");
+        assert_eq!(ch2.send_url(), "https://example.com:9090/v2/send");
     }
 
     #[test]
     fn test_signal_send_text_connection_failure() {
         // Use an unreachable endpoint to verify the error handling path
-        let ch = SignalChannel::new("http://192.0.2.1:1".to_string(), "+15551234567".to_string());
+        let ch = SignalChannel::new(
+            "https://192.0.2.1:1".to_string(),
+            "+15551234567".to_string(),
+        );
         let ctx = OutboundContext {
             to: "+15559876543".to_string(),
             text: "Hello from Signal!".to_string(),
@@ -259,7 +308,10 @@ mod tests {
     fn test_signal_send_media_no_url_falls_back_to_text() {
         // When media_url is None, send_media should fall back to send_text.
         // Use unreachable endpoint — we're testing the fallback logic, not delivery.
-        let ch = SignalChannel::new("http://192.0.2.1:1".to_string(), "+15551234567".to_string());
+        let ch = SignalChannel::new(
+            "https://192.0.2.1:1".to_string(),
+            "+15551234567".to_string(),
+        );
         let ctx = OutboundContext {
             to: "+15559876543".to_string(),
             text: "caption only".to_string(),
@@ -277,11 +329,14 @@ mod tests {
 
     #[test]
     fn test_signal_send_media_connection_failure() {
-        let ch = SignalChannel::new("http://192.0.2.1:1".to_string(), "+15551234567".to_string());
+        let ch = SignalChannel::new(
+            "https://192.0.2.1:1".to_string(),
+            "+15551234567".to_string(),
+        );
         let ctx = OutboundContext {
             to: "+15559876543".to_string(),
             text: "Check this out".to_string(),
-            media_url: Some("http://192.0.2.1:1/image.jpg".to_string()),
+            media_url: Some("https://192.0.2.1:1/image.jpg".to_string()),
             gif_playback: false,
             reply_to_id: None,
             thread_id: None,
@@ -296,10 +351,10 @@ mod tests {
     #[test]
     fn test_signal_default_construction() {
         let ch = SignalChannel::new(
-            "http://localhost:8080".to_string(),
+            "https://localhost:8080".to_string(),
             "+15551234567".to_string(),
         );
-        assert_eq!(ch.base_url, "http://localhost:8080");
+        assert_eq!(ch.base_url, "https://localhost:8080");
         assert_eq!(ch.phone_number, "+15551234567");
     }
 }

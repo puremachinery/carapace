@@ -35,12 +35,12 @@ pub fn resolve_scoped_session_key(
     let peer = if peer.is_empty() { sender } else { peer };
 
     let channel_config = scoping::ChannelSessionConfig::from_config(config, channel_name);
-    let session_key = match explicit_key.map(|k| k.trim()).filter(|k| !k.is_empty()) {
+    let resolved_key = match explicit_key.map(|k| k.trim()).filter(|k| !k.is_empty()) {
         Some(key) => key.to_string(),
         None => scoping::resolve_session_key(channel_name, sender, peer, channel_config.scope),
     };
 
-    (session_key, channel_config, channel_name.to_string())
+    (resolved_key, channel_config, channel_name.to_string())
 }
 
 /// Get or create a session using scoping and reset policy enforcement.
