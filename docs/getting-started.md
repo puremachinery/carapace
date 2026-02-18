@@ -8,6 +8,8 @@ the [Cookbook](cookbook/README.md).
 If you want the website flow instead of Markdown docs, use:
 - <https://getcara.io/install.html>
 - <https://getcara.io/first-run.html>
+- <https://getcara.io/security.html>
+- <https://getcara.io/ops.html>
 - <https://getcara.io/get-unstuck.html>
 
 ## Prerequisites

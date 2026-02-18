@@ -1627,7 +1627,7 @@ features:
       - "tests/ (integration-style unit tests)"
       - "src/** (#[cfg(test)] unit tests)"
     tests:
-      - "cargo nextest run --all-targets (4,886 tests as of 2026-02-02)"
+      - "cargo nextest list --all-targets (5,093 tests as of 2026-02-18)"
 
   - feature: "provider auto-discovery"
     status: "verified_done"

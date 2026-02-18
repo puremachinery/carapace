@@ -20,8 +20,8 @@ Current platform status for sandbox-required subprocess paths:
 
 - macOS: Seatbelt + resource limits
 - Linux: Landlock + resource limits
-- Windows: process limits and path allowlisting; network-deny mode currently
-  fails closed
+- Windows: Job Objects + AppContainer on sandbox-required paths; unsupported
+  deny-network spawn paths currently fail closed
 - other targets: fail closed for sandbox-required subprocess paths
 
 ## 3) Verify key controls
