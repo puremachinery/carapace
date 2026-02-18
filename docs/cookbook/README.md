@@ -24,7 +24,7 @@ Every recipe follows the same structure:
 
 ## Planned recipes (feature priorities)
 
-- Telegram local-only mode (no public webhook), after long-polling support is implemented.
+- Telegram local-only mode (polling fallback, no public webhook).
 - Calendar assistant workflow, after calendar integration is implemented and stable.
 
 ## Request a recipe
