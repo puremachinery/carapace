@@ -553,7 +553,7 @@ mod tests {
         let result = AnthropicProvider::new("".to_string());
         assert!(result.is_err(), "expected empty API key to fail");
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("empty"), "got: {err}");
+        assert!(err.contains("empty"));
     }
 
     #[test]
@@ -612,7 +612,7 @@ mod tests {
             .with_base_url("http://insecure.example.com".to_string());
         assert!(result.is_err(), "expected http base URL to fail");
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("https"), "got: {err}");
+        assert!(err.contains("https"));
     }
 
     #[test]

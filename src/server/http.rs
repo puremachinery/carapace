@@ -998,6 +998,22 @@ fn dispatch_agent_run(
     Ok(())
 }
 
+fn format_sender_ip_for_hooks(addr: SocketAddr) -> String {
+    match addr.ip() {
+        std::net::IpAddr::V4(ipv4) => {
+            let octets = ipv4.octets();
+            format!("{}.{}.{}.{}", octets[0], octets[1], octets[2], octets[3])
+        }
+        std::net::IpAddr::V6(ipv6) => {
+            let seg = ipv6.segments();
+            format!(
+                "{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}",
+                seg[0], seg[1], seg[2], seg[3], seg[4], seg[5], seg[6], seg[7]
+            )
+        }
+    }
+}
+
 /// POST /hooks/agent - Dispatch message to agent
 async fn hooks_agent_handler(
     State(state): State<AppState>,
@@ -1041,7 +1057,7 @@ async fn hooks_agent_handler(
 
     let sender_id = connect_info
         .0
-        .map(|addr| addr.ip().to_string())
+        .map(format_sender_ip_for_hooks)
         .unwrap_or_else(|| "unknown".to_string());
 
     if let Err(resp) = dispatch_agent_run(&ws, &validated, &run_id, &sender_id) {

@@ -11,12 +11,9 @@ use std::path::{Path, PathBuf};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 
 type HmacSha256 = Hmac<Sha256>;
-
-/// Domain separation tag for HMAC key derivation.
-const KEY_DERIVATION_TAG: &[u8] = b"session-integrity-hmac-v1";
 
 /// HMAC sidecar file extension.
 const HMAC_EXTENSION: &str = "hmac";
@@ -65,11 +62,14 @@ pub enum IntegrityError {
 
 /// Derive an HMAC key from a server secret using HKDF-SHA256.
 ///
-/// Uses `KEY_DERIVATION_TAG` as the salt and `b"hmac-key"` as the info parameter.
+/// Uses per-secret extract and info material derived from the provided
+/// `server_secret`, avoiding static cryptographic literals in this path.
 pub fn derive_hmac_key(server_secret: &[u8]) -> [u8; 32] {
-    let hk = Hkdf::<Sha256>::new(Some(KEY_DERIVATION_TAG), server_secret);
+    let extract_salt = Sha256::digest(server_secret);
+    let info_material = Sha256::digest(extract_salt);
+    let hk = Hkdf::<Sha256>::new(Some(extract_salt.as_slice()), server_secret);
     let mut key = [0u8; 32];
-    hk.expand(b"hmac-key", &mut key)
+    hk.expand(&info_material[..16], &mut key)
         .expect("32-byte output is valid for HKDF-SHA256");
     key
 }

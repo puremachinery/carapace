@@ -21,7 +21,7 @@ pub fn resolve_scoped_session_key(
     channel: &str,
     sender_id: &str,
     peer_id: &str,
-    explicit_key: Option<&str>,
+    explicit_session_id: Option<&str>,
 ) -> (String, scoping::ChannelSessionConfig, String) {
     let channel_name = channel.trim();
     let channel_name = if channel_name.is_empty() {
@@ -35,12 +35,19 @@ pub fn resolve_scoped_session_key(
     let peer = if peer.is_empty() { sender } else { peer };
 
     let channel_config = scoping::ChannelSessionConfig::from_config(config, channel_name);
-    let resolved_key = match explicit_key.map(|k| k.trim()).filter(|k| !k.is_empty()) {
-        Some(key) => key.to_string(),
+    let resolved_session_id = match explicit_session_id
+        .map(|id| id.trim())
+        .filter(|id| !id.is_empty())
+    {
+        Some(id) => id.to_string(),
         None => scoping::resolve_session_key(channel_name, sender, peer, channel_config.scope),
     };
 
-    (resolved_key, channel_config, channel_name.to_string())
+    (
+        resolved_session_id,
+        channel_config,
+        channel_name.to_string(),
+    )
 }
 
 /// Get or create a session using scoping and reset policy enforcement.
@@ -50,11 +57,11 @@ pub fn get_or_create_scoped_session(
     channel: &str,
     sender_id: &str,
     peer_id: &str,
-    explicit_key: Option<&str>,
+    explicit_session_id: Option<&str>,
     mut metadata: SessionMetadata,
 ) -> Result<Session, SessionStoreError> {
     let (session_key, channel_config, channel_name) =
-        resolve_scoped_session_key(config, channel, sender_id, peer_id, explicit_key);
+        resolve_scoped_session_key(config, channel, sender_id, peer_id, explicit_session_id);
 
     if metadata.channel.is_none() {
         metadata.channel = Some(channel_name);

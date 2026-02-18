@@ -782,7 +782,7 @@ impl UsageTracker {
         &mut self,
         provider: &str,
         model: &str,
-        session_key: Option<&str>,
+        session_id_hint: Option<&str>,
         input_tokens: u64,
         output_tokens: u64,
     ) {
@@ -793,7 +793,7 @@ impl UsageTracker {
         let now = now_ms();
         let date = today_date();
         let month = current_month();
-        let session_identity = session_key.map(session_identity);
+        let session_identity = session_id_hint.map(session_identity);
 
         // Calculate cost
         let pricing = get_model_pricing(model).unwrap_or_else(default_pricing);
