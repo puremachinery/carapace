@@ -76,7 +76,7 @@ Prompt injection remains an industry-wide unsolved problem. No AI system fully p
 - **Resource limits.** RLIMIT_CPU, RLIMIT_AS, RLIMIT_NOFILE per tool execution.
 - **Output content security.** HTML/Markdown sanitizer strips XSS vectors, dangerous tags, and non-image data URIs from agent output.
 
-*Caveat: Unsupported targets still fail closed for sandbox-required subprocess paths instead of running unsandboxed. On Windows, deny-network spawned subprocesses currently fail closed.*
+*Caveat: Unsupported targets still fail closed for sandbox-required subprocess paths instead of running unsandboxed. On Windows, deny-network spawned subprocesses currently fail closed, and AppContainer process-limit job attachment is post-spawn (not atomic with process creation).*
 
 ### 7. SSRF / DNS Rebinding
 
@@ -115,7 +115,7 @@ Rust does not help with logic bugs, auth bypass, or prompt injection. Those requ
 
 Carapace is in preview. The security architecture is real and tested (~5,000 automated tests, multi-platform CI), but some items are incomplete. Verified-vs-partial feature state is tracked in `docs/feature-status.yaml` and `docs/feature-evidence.yaml`:
 
-- **Platform backend coverage.** Seatbelt/Landlock/Windows AppContainer+Job subprocess wiring is implemented across probe/tailscale/whois/SSH tunnel callsites. Unsupported targets still fail closed; Windows deny-network spawned subprocesses currently fail closed.
+- **Platform backend coverage.** Seatbelt/Landlock/Windows AppContainer+Job subprocess wiring is implemented across probe/tailscale/whois/SSH tunnel callsites. Unsupported targets still fail closed; Windows deny-network spawned subprocesses currently fail closed; AppContainer process-limit job attachment is currently post-spawn.
 - **Control UI.** The backend (routes, auth, CSRF) is complete. The frontend is not built yet.
 - **Channels.** Discord is verified end-to-end. Telegram supports webhook and localhost long-polling fallback. Signal and Slack are implemented but not yet smoke-tested in real environments.
 - **Smoke evidence process.** Live channel validation criteria and report template are tracked in `docs/channel-smoke.md`.
