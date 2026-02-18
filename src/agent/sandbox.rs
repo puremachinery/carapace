@@ -775,7 +775,7 @@ struct WindowsProcessHandle(HANDLE);
 impl WindowsProcessHandle {
     fn open(access: u32, pid: u32, purpose: &str) -> std::io::Result<Self> {
         let handle = unsafe { OpenProcess(access, 0, pid) };
-        if handle == 0 {
+        if handle.is_null() {
             let os_err = std::io::Error::last_os_error();
             return Err(std::io::Error::new(
                 os_err.kind(),
@@ -793,11 +793,11 @@ impl WindowsProcessHandle {
 #[cfg(target_os = "windows")]
 impl Drop for WindowsProcessHandle {
     fn drop(&mut self) {
-        if self.0 != 0 {
+        if !self.0.is_null() {
             unsafe {
                 CloseHandle(self.0);
             }
-            self.0 = 0;
+            self.0 = std::ptr::null_mut();
         }
     }
 }
@@ -870,7 +870,7 @@ fn resume_windows_process_threads(pid: u32) -> std::io::Result<()> {
         loop {
             if entry.th32OwnerProcessID == pid {
                 let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
-                if thread == 0 {
+                if thread.is_null() {
                     let os_err = std::io::Error::last_os_error();
                     return Err(std::io::Error::new(
                         os_err.kind(),
@@ -962,10 +962,11 @@ fn resume_windows_process_threads(pid: u32) -> std::io::Result<()> {
 }
 
 #[cfg(target_os = "windows")]
-fn terminate_and_reap_windows_appcontainer_child(child: &mut LaunchedIo, failure_context: &str) {
-    if let Err(terminate_err) = terminate_windows_process(child.pid) {
+fn terminate_and_reap_windows_appcontainer_child(mut child: LaunchedIo, failure_context: &str) {
+    let pid = child.pid;
+    if let Err(terminate_err) = terminate_windows_process(pid) {
         tracing::warn!(
-            pid = child.pid,
+            pid,
             context = failure_context,
             error = %terminate_err,
             "failed to terminate sandboxed child after Windows sandbox setup failure"
@@ -1033,24 +1034,25 @@ fn run_windows_appcontainer_command_output(
     let job = match assign_windows_job_to_pid(child.pid, config) {
         Ok(job) => job,
         Err(err) => {
-            terminate_and_reap_windows_appcontainer_child(&mut child, "job_assignment");
+            terminate_and_reap_windows_appcontainer_child(child, "job_assignment");
             return Err(err);
         }
     };
     let mut stdout_reader = child.stdout.take().map(windows_pipe_reader);
     let mut stderr_reader = child.stderr.take().map(windows_pipe_reader);
     if let Err(err) = resume_windows_process_threads(child.pid) {
-        terminate_and_reap_windows_appcontainer_child(&mut child, "resume_threads");
+        let pid = child.pid;
+        terminate_and_reap_windows_appcontainer_child(child, "resume_threads");
         if let Err(join_err) = windows_join_pipe_reader(stdout_reader.take(), "stdout") {
             tracing::warn!(
-                pid = child.pid,
+                pid,
                 error = %join_err,
                 "failed joining stdout reader after Windows resume failure"
             );
         }
         if let Err(join_err) = windows_join_pipe_reader(stderr_reader.take(), "stderr") {
             tracing::warn!(
-                pid = child.pid,
+                pid,
                 error = %join_err,
                 "failed joining stderr reader after Windows resume failure"
             );
@@ -1059,20 +1061,28 @@ fn run_windows_appcontainer_command_output(
     }
     let _job = job;
 
+    let pid = child.pid;
     let exit_code = match child.wait(None) {
         Ok(code) => code,
         Err(err) => {
-            terminate_and_reap_windows_appcontainer_child(&mut child, "wait_exit_code");
+            if let Err(terminate_err) = terminate_windows_process(pid) {
+                tracing::warn!(
+                    pid,
+                    context = "wait_exit_code",
+                    error = %terminate_err,
+                    "failed to terminate sandboxed child after Windows wait failure"
+                );
+            }
             if let Err(join_err) = windows_join_pipe_reader(stdout_reader.take(), "stdout") {
                 tracing::warn!(
-                    pid = child.pid,
+                    pid,
                     error = %join_err,
                     "failed joining stdout reader after Windows wait failure"
                 );
             }
             if let Err(join_err) = windows_join_pipe_reader(stderr_reader.take(), "stderr") {
                 tracing::warn!(
-                    pid = child.pid,
+                    pid,
                     error = %join_err,
                     "failed joining stderr reader after Windows wait failure"
                 );
@@ -2753,9 +2763,10 @@ mod tests {
             network_access: false,
             ..Default::default()
         };
-        let err = spawn_sandboxed_tokio_command("hostname", &[], Some(&config), true)
-            .await
-            .expect_err("network deny spawn path should fail closed on Windows");
+        let err = match spawn_sandboxed_tokio_command("hostname", &[], Some(&config), true).await {
+            Ok(_) => panic!("network deny spawn path should fail closed on Windows"),
+            Err(err) => err,
+        };
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
         assert!(err.to_string().contains("network_access=true"));
     }
