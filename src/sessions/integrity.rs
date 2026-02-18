@@ -68,11 +68,10 @@ pub enum IntegrityError {
 /// Uses `KEY_DERIVATION_TAG` as the salt and `b"hmac-key"` as the info parameter.
 pub fn derive_hmac_key(server_secret: &[u8]) -> [u8; 32] {
     let hk = Hkdf::<Sha256>::new(Some(KEY_DERIVATION_TAG), server_secret);
-    let mut key = vec![0u8; 32];
+    let mut key = [0u8; 32];
     hk.expand(b"hmac-key", &mut key)
         .expect("32-byte output is valid for HKDF-SHA256");
-    key.try_into()
-        .expect("HKDF key output length must match HMAC key size")
+    key
 }
 
 /// Compute HMAC-SHA256 over the given data.
