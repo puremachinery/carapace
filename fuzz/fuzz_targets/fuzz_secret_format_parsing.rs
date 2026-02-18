@@ -21,10 +21,19 @@ fn build_fuzz_store() -> SecretStore {
         out
     }
 
-    // Deterministic seed keeps fuzz crash reproduction stable across restarts.
-    // Note: if this seed constant changes, any corpus input that relied on a
-    // successful decrypt under the previous seed may no longer reproduce.
-    let seed = derive_seed_bytes(b"carapace:fuzz_secret_format_parsing:seed:v1");
+    // Optional deterministic override for reproduction:
+    // CARAPACE_FUZZ_STORE_SEED_HEX=<64 hex chars>
+    let seed = std::env::var("CARAPACE_FUZZ_STORE_SEED_HEX")
+        .ok()
+        .and_then(|hex| hex::decode(hex).ok())
+        .and_then(|bytes| bytes.try_into().ok())
+        .unwrap_or_else(|| {
+            // Deterministic seed keeps fuzz crash reproduction stable across restarts.
+            // Note: if this seed constant changes, any corpus input that relied on a
+            // successful decrypt under the previous seed may no longer reproduce.
+            derive_seed_bytes(b"carapace:fuzz_secret_format_parsing:seed:v1")
+        });
+
     let store_salt: [u8; 16] = seed[..16]
         .try_into()
         .expect("seed slice for fuzz salt has fixed size");
