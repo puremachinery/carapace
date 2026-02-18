@@ -76,7 +76,7 @@ Prompt injection remains an industry-wide unsolved problem. No AI system fully p
 - **Resource limits.** RLIMIT_CPU, RLIMIT_AS, RLIMIT_NOFILE per tool execution.
 - **Output content security.** HTML/Markdown sanitizer strips XSS vectors, dangerous tags, and non-image data URIs from agent output.
 
-*Caveat: Unsupported targets still fail closed for sandbox-required subprocess paths instead of running unsandboxed. On Windows, deny-network spawned subprocesses currently fail closed.*
+*Caveat: Unsupported targets still fail closed for sandbox-required subprocess paths instead of running unsandboxed. On Windows, `spawn_sandboxed_tokio_command` with `network_access=false` currently fails closed; use the `*_command_output` helpers for deny-network subprocesses.*
 
 ### 7. SSRF / DNS Rebinding
 

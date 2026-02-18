@@ -919,16 +919,10 @@ fn resume_windows_process_threads(pid: u32) -> std::io::Result<()> {
 
     if unsafe { CloseHandle(snapshot) } == 0 {
         let close_err = std::io::Error::last_os_error();
-        if result.is_ok() {
-            return Err(std::io::Error::new(
-                close_err.kind(),
-                format!("failed to close thread snapshot handle for process {pid}: {close_err}"),
-            ));
-        }
         tracing::warn!(
             pid,
             error = %close_err,
-            "failed to close thread snapshot handle after resume failure"
+            "failed to close thread snapshot handle after resume processing"
         );
     }
 
