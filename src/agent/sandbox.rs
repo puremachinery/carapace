@@ -35,8 +35,8 @@
 
 #[cfg(target_os = "windows")]
 use rappct::{
-    launch::launch_in_container_with_io, AppContainerProfile, LaunchOptions,
-    SecurityCapabilitiesBuilder, StdioConfig,
+    launch::{launch_in_container_with_io, LaunchedIo},
+    AppContainerProfile, LaunchOptions, SecurityCapabilitiesBuilder, StdioConfig,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -60,6 +60,10 @@ use win32job::Job;
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 #[cfg(target_os = "windows")]
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+};
+#[cfg(target_os = "windows")]
 use windows_sys::Win32::System::JobObjects::{
     JobObjectExtendedLimitInformation, SetInformationJobObject,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
@@ -68,8 +72,8 @@ use windows_sys::Win32::System::JobObjects::{
 };
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::System::Threading::{
-    OpenProcess, TerminateProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA,
-    PROCESS_TERMINATE,
+    OpenProcess, OpenThread, ResumeThread, TerminateProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SET_QUOTA, PROCESS_TERMINATE, THREAD_SUSPEND_RESUME,
 };
 
 // ---------------------------------------------------------------------------
@@ -679,6 +683,28 @@ fn windows_build_appcontainer_cmdline(
 }
 
 #[cfg(target_os = "windows")]
+fn build_windows_appcontainer_launch_options(
+    resolved_program: &Path,
+    args: &[&str],
+    config: &ProcessSandboxConfig,
+) -> std::io::Result<LaunchOptions> {
+    Ok(LaunchOptions {
+        exe: resolved_program.to_path_buf(),
+        cmdline: windows_build_appcontainer_cmdline(resolved_program, args)?,
+        // Use executable parent so relative lookups mirror direct CLI invocation.
+        cwd: resolved_program.parent().map(Path::to_path_buf),
+        env: windows_filtered_env(config),
+        stdio: StdioConfig::Pipe,
+        // Start suspended so full Carapace Job limits are attached before
+        // any child code executes.
+        suspended: true,
+        join_job: None,
+        startup_timeout: None,
+        ..Default::default()
+    })
+}
+
+#[cfg(target_os = "windows")]
 fn windows_filtered_env(config: &ProcessSandboxConfig) -> Option<Vec<(OsString, OsString)>> {
     if config.env_filter.is_empty() {
         // Empty filter means inherit full parent environment unchanged.
@@ -808,6 +834,128 @@ fn terminate_windows_process(pid: u32) -> std::io::Result<()> {
 }
 
 #[cfg(target_os = "windows")]
+fn resume_windows_process_threads(pid: u32) -> std::io::Result<()> {
+    const ERROR_NO_MORE_FILES: i32 = 18;
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snapshot == -1isize as HANDLE {
+        let os_err = std::io::Error::last_os_error();
+        return Err(std::io::Error::new(
+            os_err.kind(),
+            format!("failed to create thread snapshot for process {pid}: {os_err}"),
+        ));
+    }
+
+    let result = (|| -> std::io::Result<()> {
+        let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
+        entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+        if unsafe { Thread32First(snapshot, &mut entry) } == 0 {
+            let os_err = std::io::Error::last_os_error();
+            return Err(std::io::Error::new(
+                os_err.kind(),
+                format!("failed to enumerate threads for process {pid}: {os_err}"),
+            ));
+        }
+
+        let mut resumed_any = false;
+        loop {
+            if entry.th32OwnerProcessID == pid {
+                let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
+                if thread == 0 {
+                    let os_err = std::io::Error::last_os_error();
+                    return Err(std::io::Error::new(
+                        os_err.kind(),
+                        format!(
+                            "failed to open thread {} for process {pid}: {os_err}",
+                            entry.th32ThreadID
+                        ),
+                    ));
+                }
+
+                let resume_ret = unsafe { ResumeThread(thread) };
+                if unsafe { CloseHandle(thread) } == 0 {
+                    tracing::warn!(
+                        pid,
+                        tid = entry.th32ThreadID,
+                        error = %std::io::Error::last_os_error(),
+                        "failed to close Windows thread handle after resume"
+                    );
+                }
+
+                if resume_ret == u32::MAX {
+                    let os_err = std::io::Error::last_os_error();
+                    return Err(std::io::Error::new(
+                        os_err.kind(),
+                        format!(
+                            "failed to resume thread {} for process {pid}: {os_err}",
+                            entry.th32ThreadID
+                        ),
+                    ));
+                }
+                resumed_any = true;
+            }
+
+            if unsafe { Thread32Next(snapshot, &mut entry) } == 0 {
+                let walk_err = std::io::Error::last_os_error();
+                if walk_err.raw_os_error() != Some(ERROR_NO_MORE_FILES) {
+                    return Err(std::io::Error::new(
+                        walk_err.kind(),
+                        format!("thread enumeration failed for process {pid}: {walk_err}"),
+                    ));
+                }
+                break;
+            }
+        }
+
+        if !resumed_any {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("no suspended threads found to resume for process {pid}"),
+            ));
+        }
+
+        Ok(())
+    })();
+
+    if unsafe { CloseHandle(snapshot) } == 0 {
+        let close_err = std::io::Error::last_os_error();
+        if result.is_ok() {
+            return Err(std::io::Error::new(
+                close_err.kind(),
+                format!("failed to close thread snapshot handle for process {pid}: {close_err}"),
+            ));
+        }
+        tracing::warn!(
+            pid,
+            error = %close_err,
+            "failed to close thread snapshot handle after resume failure"
+        );
+    }
+
+    result
+}
+
+#[cfg(target_os = "windows")]
+fn terminate_and_reap_windows_appcontainer_child(child: &mut LaunchedIo, failure_context: &str) {
+    if let Err(terminate_err) = terminate_windows_process(child.pid) {
+        tracing::warn!(
+            pid = child.pid,
+            context = failure_context,
+            error = %terminate_err,
+            "failed to terminate sandboxed child after Windows sandbox setup failure"
+        );
+    }
+    if let Err(wait_err) = child.wait(Some(std::time::Duration::from_secs(2))) {
+        tracing::warn!(
+            pid = child.pid,
+            context = failure_context,
+            error = %wait_err,
+            "failed waiting for sandboxed child after Windows sandbox setup failure"
+        );
+    }
+}
+
+#[cfg(target_os = "windows")]
 fn windows_pipe_reader(
     mut file: std::fs::File,
 ) -> std::thread::JoinHandle<std::io::Result<Vec<u8>>> {
@@ -849,46 +997,25 @@ fn run_windows_appcontainer_command_output(
     let caps = windows_no_network_capabilities(&profile)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))?;
 
-    let launch_opts = LaunchOptions {
-        exe: resolved_program.to_path_buf(),
-        cmdline: windows_build_appcontainer_cmdline(resolved_program, args)?,
-        // Use executable parent so relative lookups mirror direct CLI invocation.
-        cwd: resolved_program.parent().map(Path::to_path_buf),
-        env: windows_filtered_env(config),
-        stdio: StdioConfig::Pipe,
-        join_job: None,
-        startup_timeout: None,
-        ..Default::default()
-    };
+    let launch_opts = build_windows_appcontainer_launch_options(resolved_program, args, config)?;
 
     let mut child =
         launch_in_container_with_io(&caps, &launch_opts).map_err(io_error_from_rappct)?;
 
-    // Apply full Carapace job limits immediately after spawn. With current
-    // rappct launch behavior, job assignment (including LaunchOptions.join_job)
-    // occurs after CreateProcess, so there is a brief pre-assignment window
-    // before our stricter CPU-time/process-count limits attach; if assignment
-    // fails we terminate the child (fail-closed).
-    let _job = match assign_windows_job_to_pid(child.pid, config) {
+    // Child starts suspended. Attach full Carapace Job limits first, then
+    // resume execution to eliminate the pre-assignment execution window.
+    let job = match assign_windows_job_to_pid(child.pid, config) {
         Ok(job) => job,
         Err(err) => {
-            if let Err(terminate_err) = terminate_windows_process(child.pid) {
-                tracing::warn!(
-                    pid = child.pid,
-                    error = %terminate_err,
-                    "failed to terminate sandboxed child after Windows job assignment failure"
-                );
-            }
-            if let Err(wait_err) = child.wait(Some(std::time::Duration::from_secs(2))) {
-                tracing::warn!(
-                    pid = child.pid,
-                    error = %wait_err,
-                    "failed waiting for sandboxed child after Windows job assignment failure"
-                );
-            }
+            terminate_and_reap_windows_appcontainer_child(&mut child, "job_assignment");
             return Err(err);
         }
     };
+    if let Err(err) = resume_windows_process_threads(child.pid) {
+        terminate_and_reap_windows_appcontainer_child(&mut child, "resume_threads");
+        return Err(err);
+    }
+    let _job = job;
 
     let stdout_reader = child.stdout.take().map(windows_pipe_reader);
     let stderr_reader = child.stderr.take().map(windows_pipe_reader);
@@ -2209,6 +2336,18 @@ mod tests {
         let err = windows_build_appcontainer_cmdline(&path, &[])
             .expect_err("non-UTF8 executable path must be rejected");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_windows_appcontainer_launch_options_start_suspended() {
+        let config = ProcessSandboxConfig::default();
+        let program = Path::new(r"C:\Windows\System32\cmd.exe");
+        let opts = build_windows_appcontainer_launch_options(program, &["/C", "echo hi"], &config)
+            .expect("launch options should build");
+        assert!(opts.suspended);
+        assert!(opts.join_job.is_none());
+        assert!(matches!(opts.stdio, StdioConfig::Pipe));
     }
 
     #[cfg(target_os = "windows")]

@@ -1264,8 +1264,8 @@ features:
       - "2026-02-16 local precheck: `cargo nextest run` passed (2568/2568)."
       - "wrapped subprocesses now apply in-child constraints via `src/agent/sandbox.rs::configure_sandboxed_command` (`pre_exec` + `apply_sandbox` on Unix)."
       - "runtime subprocess wrappers are now wired for probe, tailscale/whois, and SSH tunnel callsites."
-      - "Windows backend now enforces `network_access=false` via AppContainer launch with no network capabilities; `network_access=true` paths use Job Object limits + allowlisted executable resolution."
-      - "Windows AppContainer process-limit Job assignment is currently post-spawn (not atomic with process creation); assignment failures terminate the child (fail closed)."
+      - "Windows backend now enforces `network_access=false` via suspended AppContainer launch with no network capabilities; full Job Object limits are attached before resuming child execution."
+      - "Windows `network_access=true` paths use Job Object limits + allowlisted executable resolution."
       - "Windows spawned deny-network subprocesses currently fail closed (`spawn_sandboxed_tokio_command` requires `network_access=true` on Windows)."
       - "unsupported targets still fail closed via `src/agent/sandbox.rs::ensure_sandbox_supported`."
 
