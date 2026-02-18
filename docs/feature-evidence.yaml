@@ -1246,7 +1246,7 @@ features:
   - feature: "OS-level process sandbox"
     status: "partial"
     runtime_wiring:
-      - "src/agent/sandbox.rs (process sandbox config, rlimits, seatbelt/landlock helpers)"
+      - "src/agent/sandbox.rs (process sandbox config, rlimits, seatbelt/landlock helpers, Windows Job Object + AppContainer backend)"
       - "src/agent/executor.rs (passes process_sandbox into tool dispatch)"
       - "src/agent/tools.rs (sets sandboxed flag on ToolInvokeContext)"
       - "src/discovery/mod.rs::run_hostname_command (probe subprocess wrapper)"
@@ -1264,7 +1264,10 @@ features:
       - "2026-02-16 local precheck: `cargo nextest run` passed (2568/2568)."
       - "wrapped subprocesses now apply in-child constraints via `src/agent/sandbox.rs::configure_sandboxed_command` (`pre_exec` + `apply_sandbox` on Unix)."
       - "runtime subprocess wrappers are now wired for probe, tailscale/whois, and SSH tunnel callsites."
-      - "status remains partial because OS-level sandbox backends are implemented for macOS/Linux only; other targets fail closed via `src/agent/sandbox.rs::ensure_sandbox_supported`."
+      - "Windows backend now enforces `network_access=false` via suspended AppContainer launch with no network capabilities; full Job Object limits are attached before resuming child execution."
+      - "Windows `network_access=true` paths use Job Object limits + allowlisted executable resolution."
+      - "Windows spawned deny-network subprocesses currently fail closed (`spawn_sandboxed_tokio_command` requires `network_access=true` on Windows)."
+      - "unsupported targets still fail closed via `src/agent/sandbox.rs::ensure_sandbox_supported`."
 
   - feature: "channel-specific tools"
     status: "partial"
