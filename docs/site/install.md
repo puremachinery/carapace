@@ -27,8 +27,8 @@ Quick path for first-time setup:
 2. Install it on PATH (Step 4).
 3. Run `cara --help` and `cara version` (Step 5).
 
-Steps 2-3 below (signature/checksum verification) are recommended, especially
-for production or automation.
+Signature and checksum verification (Steps 2 and 3 below) are recommended,
+especially for production or automation.
 
 ## 1b) Advanced: pinned version links (automation/ops)
 

@@ -279,7 +279,7 @@ feature_inventory_markdown: |
 
   ### Tests & CI
 
-  - [x] **Unit tests** — 5,093 tests across all modules (`cargo nextest list --all-targets`, 2026-02-18)
+  - [x] **Unit tests (enumerated)** — 5,093 tests across all modules (`cargo nextest list --all-targets`, 2026-02-18)
   - [x] **Integration tests** — tests/*.rs
   - [x] **Golden snapshot tests** — insta-based snapshot testing
   - [x] **Cross-platform CI** — Linux, macOS, Windows matrix
