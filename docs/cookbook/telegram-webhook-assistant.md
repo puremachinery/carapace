@@ -1,4 +1,4 @@
-# Add Carapace to Telegram (webhook mode)
+# Add Carapace to Telegram (public webhook mode)
 
 ## Outcome
 
