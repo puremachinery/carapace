@@ -691,8 +691,8 @@ fn build_windows_appcontainer_launch_options(
     Ok(LaunchOptions {
         exe: resolved_program.to_path_buf(),
         cmdline: windows_build_appcontainer_cmdline(resolved_program, args)?,
-        // Use executable parent so relative lookups mirror direct CLI invocation.
-        cwd: resolved_program.parent().map(Path::to_path_buf),
+        // Inherit caller cwd to match standard Command/Tokio behavior.
+        cwd: None,
         env: windows_filtered_env(config),
         stdio: StdioConfig::Pipe,
         // Start suspended so full Carapace Job limits are attached before
@@ -1024,6 +1024,10 @@ fn run_windows_appcontainer_command_output(
             stdout,
             stderr,
         }),
+        (Err(stdout_err), Err(stderr_err)) => Err(std::io::Error::new(
+            stdout_err.kind(),
+            format!("stdout reader failed: {stdout_err}; stderr reader also failed: {stderr_err}"),
+        )),
         (Err(err), _) => Err(err),
         (_, Err(err)) => Err(err),
     }
@@ -1753,10 +1757,22 @@ fn assign_windows_job_to_std_child(
     child: &std::process::Child,
     config: &ProcessSandboxConfig,
 ) -> std::io::Result<Job> {
-    let job = create_windows_job(config)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))?;
+    let job = create_windows_job(config).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("failed to create Windows Job for std child: {e}"),
+        )
+    })?;
     job.assign_process(child.as_raw_handle() as isize)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))?;
+        .map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "failed to assign std child pid {} to Windows Job: {e}",
+                    child.id()
+                ),
+            )
+        })?;
     Ok(job)
 }
 
@@ -1768,10 +1784,22 @@ fn assign_windows_job_to_tokio_child(
     let Some(raw_handle) = child.raw_handle() else {
         return Err(std::io::Error::other("missing child process handle"));
     };
-    let job = create_windows_job(config)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))?;
-    job.assign_process(raw_handle as isize)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))?;
+    let job = create_windows_job(config).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("failed to create Windows Job for tokio child: {e}"),
+        )
+    })?;
+    job.assign_process(raw_handle as isize).map_err(|e| {
+        let child_id = child
+            .id()
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("failed to assign tokio child pid {child_id} to Windows Job: {e}"),
+        )
+    })?;
     Ok(job)
 }
 
@@ -1872,6 +1900,10 @@ pub async fn spawn_sandboxed_tokio_command(
     {
         if let Some(cfg) = config.filter(|cfg| cfg.enabled) {
             if !cfg.network_access {
+                tracing::warn!(
+                    program,
+                    "Windows sandboxed spawn denied: network_access=false is unsupported for spawn helper; use output helpers"
+                );
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     "Windows sandboxed spawn requires network_access=true; use output helpers for network-deny subprocesses",
