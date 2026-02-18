@@ -51,7 +51,10 @@ feature_inventory_markdown: |
 
   - [x] **Channel registry** — thread-safe channel tracking, status enum
   - [x] **Console channel** — built-in testing channel
-  - [x] **Telegram/Discord/Slack** — outbound + inbound (Telegram webhook, Slack Events API, Discord Gateway).
+  - [x] **Telegram/Discord/Slack runtime wiring** — outbound + inbound (Telegram webhook/long-polling, Slack Events API, Discord Gateway).
+  - [x] **Signal runtime wiring** — outbound via signal-cli REST + inbound polling receive loop.
+  - [~] **Signal real-world smoke** — pending reproducible pass/fail evidence from a live Signal deployment.
+  - [~] **Slack real-world smoke** — pending reproducible pass/fail evidence from a live Slack Events API deployment.
 
   ### CLI (`src/cli/`)
 

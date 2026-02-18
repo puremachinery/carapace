@@ -2,7 +2,7 @@
 # Keep this focused on audited entries in docs/feature-status.yaml.
 
 version: "1.0"
-updated_at: "2026-02-16"
+updated_at: "2026-02-18"
 
 features:
   - feature: "logs.tail"
@@ -23,7 +23,7 @@ features:
       - "src/server/ws/golden_tests.rs::golden_skills_status"
       - "src/server/ws/snapshots/carapace__server__ws__golden_tests__golden_trace__golden_skills_status.snap"
 
-  - feature: "channels.telegram/discord/slack"
+  - feature: "channels.telegram/discord/slack runtime wiring"
     status: "verified_done"
     runtime_wiring:
       - "src/channels/telegram.rs (TelegramChannel send_text/send_media)"
@@ -41,6 +41,31 @@ features:
       - "src/channels/discord.rs::test_discord_get_info"
       - "src/channels/slack.rs::test_slack_get_info"
       - "src/channels/slack_inbound.rs::test_verify_slack_signature"
+
+  - feature: "channels.signal runtime wiring"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/channels/signal.rs (SignalChannel send_text/send_media)"
+      - "src/channels/signal_receive.rs (signal-cli receive polling + inbound dispatch)"
+      - "src/main.rs (register_signal_channel_if_configured)"
+      - "src/main.rs (spawn_signal_receive_loop_if_configured)"
+    tests:
+      - "src/channels/signal.rs::test_signal_get_info"
+      - "src/channels/signal.rs::test_signal_send_text_connection_failure"
+      - "src/channels/signal_receive.rs::test_parse_inbound_message"
+      - "src/channels/signal_receive.rs::test_parse_group_message"
+
+  - feature: "channels.signal live smoke"
+    status: "partial"
+    notes:
+      - "Evidence artifacts: docs/channel-smoke.md; .github/ISSUE_TEMPLATE/channel-smoke-report.yml"
+      - "Pending published pass/fail evidence from a live signal-cli-rest-api deployment."
+
+  - feature: "channels.slack live smoke"
+    status: "partial"
+    notes:
+      - "Evidence artifacts: docs/channel-smoke.md; .github/ISSUE_TEMPLATE/channel-smoke-report.yml"
+      - "Pending published pass/fail evidence from a live Slack Events API deployment."
 
   - feature: "cron.*"
     status: "verified_done"
@@ -1269,7 +1294,7 @@ features:
     tests:
       - "src/channels/console.rs (unit tests)"
 
-  - feature: "telegram/discord/slack channels"
+  - feature: "telegram/discord/slack runtime wiring"
     status: "verified_done"
     runtime_wiring:
       - "src/channels/telegram.rs (TelegramChannel send_text/send_media)"

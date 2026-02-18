@@ -6,6 +6,8 @@ the minimum external setup needed to make each channel usable.
 
 For step-by-step channel onboarding recipes, see the
 [Cookbook](cookbook/README.md).
+For real-world validation criteria and evidence capture, see
+[Channel Smoke Validation](channel-smoke.md).
 
 All examples assume `carapace.json5` (see `config.example.json5`) and the default
 service HTTP port 18789. Adjust paths/ports for your deployment.

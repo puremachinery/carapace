@@ -117,6 +117,7 @@ Carapace is in preview. The security architecture is real and tested (~5,000 aut
 - **Platform backend coverage.** Seatbelt/Landlock/rlimit subprocess wiring is implemented across probe/tailscale/whois/SSH tunnel callsites, but OS-level sandbox backends are currently macOS/Linux only. Unsupported targets fail closed for sandbox-required subprocess paths.
 - **Control UI.** The backend (routes, auth, CSRF) is complete. The frontend is not built yet.
 - **Channels.** Discord is verified end-to-end. Telegram supports webhook and localhost long-polling fallback. Signal and Slack are implemented but not yet smoke-tested in real environments.
+- **Smoke evidence process.** Live channel validation criteria and report template are tracked in `docs/channel-smoke.md`.
 - **Audit log emission.** The audit log module is implemented (append-only JSONL, 19 event types, 50 MB rotation) but event emission is not yet wired into all runtime paths.
 
 We'd rather ship an honest "here's what works and what doesn't" than pretend everything is finished.
