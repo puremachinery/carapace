@@ -838,8 +838,6 @@ impl UsageTracker {
                 .entry(identity.session_id.clone())
                 .or_insert_with(|| SessionUsage {
                     session_id: identity.session_id.clone(),
-                    first_used_at: now,
-                    last_used_at: now,
                     ..Default::default()
                 });
             if session.first_used_at == 0 {
