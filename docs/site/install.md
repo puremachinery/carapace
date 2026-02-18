@@ -104,6 +104,16 @@ $FileName = "cara-x86_64-windows.exe"
 $BaseUrl = "https://github.com/puremachinery/carapace/releases/download/$Version"
 Invoke-WebRequest "$BaseUrl/$FileName" -OutFile ".\$FileName"
 Invoke-WebRequest "$BaseUrl/SHA256SUMS.txt" -OutFile ".\SHA256SUMS.txt"
+Invoke-WebRequest "$BaseUrl/SHA256SUMS.txt.sig" -OutFile ".\SHA256SUMS.txt.sig"
+Invoke-WebRequest "$BaseUrl/SHA256SUMS.txt.pem" -OutFile ".\SHA256SUMS.txt.pem"
+
+# Optional: install cosign if needed (for example: winget install Sigstore.Cosign)
+cosign verify-blob `
+  --certificate .\SHA256SUMS.txt.pem `
+  --signature .\SHA256SUMS.txt.sig `
+  --certificate-identity-regexp "https://github.com/puremachinery/carapace/.github/workflows/release.yml@refs/tags/v.*" `
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" `
+  .\SHA256SUMS.txt
 
 $expectedLine = (Select-String -Path .\SHA256SUMS.txt -SimpleMatch "  $FileName").Line
 if (-not $expectedLine) {
