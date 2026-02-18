@@ -22,10 +22,6 @@ Every recipe follows the same structure:
 5. Verification checks
 6. Common failures and fixes
 
-## Planned recipes (feature priorities)
-
-- Calendar assistant workflow, after calendar integration is implemented and stable.
-
 ## Request a recipe
 
 Missing your use case? Open a request:
