@@ -86,9 +86,9 @@ jobs:
       - name: Generate checksums
         run: |
           set -euo pipefail
-          find artifacts -maxdepth 1 -type f -print0 \
+          find artifacts -maxdepth 1 -type f ! -name 'SHA256SUMS.txt' -print0 \
             | sort -z \
-            | xargs -0 sha256sum \
+            | xargs -0 -I{} sh -c 'sha256sum "$1" | sed "s|artifacts/||"' _ {} \
             > artifacts/SHA256SUMS.txt
 
       - name: Install cosign

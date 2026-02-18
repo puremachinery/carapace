@@ -24,13 +24,13 @@ Note: `releases/latest` may not point at the newest pre-release preview.
 ## 1b) Pinned version links (automation/ops)
 
 ```bash
-VERSION="v0.1.0-preview6"
+VERSION="vX.Y.Z"
 BASE_URL="https://github.com/puremachinery/carapace/releases/download/${VERSION}"
 curl -LO "${BASE_URL}/cara-x86_64-linux"
 ```
 
 ```powershell
-$Version = "v0.1.0-preview6"
+$Version = "vX.Y.Z"
 $BaseUrl = "https://github.com/puremachinery/carapace/releases/download/$Version"
 Invoke-WebRequest "$BaseUrl/cara-x86_64-windows.exe" -OutFile ".\cara-x86_64-windows.exe"
 ```
@@ -73,7 +73,7 @@ Get-FileHash .\cara-x86_64-windows.exe -Algorithm SHA256
 For pinned releases, compare against release-provided checksums:
 
 ```bash
-VERSION="v0.1.0-preview6"
+VERSION="vX.Y.Z"
 BASE_URL="https://github.com/puremachinery/carapace/releases/download/${VERSION}"
 curl -LO "${BASE_URL}/SHA256SUMS.txt"
 grep "  cara-x86_64-linux$" SHA256SUMS.txt
