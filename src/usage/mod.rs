@@ -1155,6 +1155,12 @@ impl UsageTracker {
         }
         self.dirty = true;
     }
+
+    fn has_session_aliases(&self, identity: &SessionIdentity) -> bool {
+        self.data.sessions.contains_key(&identity.legacy_session_id)
+            || (!identity.raw_key.starts_with("sid_")
+                && self.data.sessions.contains_key(&identity.raw_key))
+    }
 }
 
 fn parse_date(date_str: &str) -> Option<(u64, u64, u64)> {
@@ -1317,11 +1323,20 @@ pub fn is_tracking_enabled() -> bool {
 
 /// Get session usage (global tracker)
 pub fn get_session_usage(session_key: &str) -> Option<SessionUsage> {
-    let mut tracker = USAGE_TRACKER.write();
     let identity = session_identity(session_key);
-    tracker.promote_session_aliases(&identity);
-    if tracker.dirty {
-        tracker.maybe_save();
+    {
+        let tracker = USAGE_TRACKER.read();
+        if !tracker.has_session_aliases(&identity) {
+            return tracker.get_session_usage(session_key).cloned();
+        }
+    }
+
+    let mut tracker = USAGE_TRACKER.write();
+    if tracker.has_session_aliases(&identity) {
+        tracker.promote_session_aliases(&identity);
+        if tracker.dirty {
+            tracker.maybe_save();
+        }
     }
     tracker.get_session_usage(session_key).cloned()
 }
