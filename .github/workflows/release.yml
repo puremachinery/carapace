@@ -83,6 +83,14 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          find artifacts -maxdepth 1 -type f ! -name 'SHA256SUMS.txt' -print0 \
+            | sort -z \
+            | xargs -0 -I{} sh -c 'sha256sum "$1" | sed "s|artifacts/||"' _ {} \
+            > artifacts/SHA256SUMS.txt
+
       - name: Install cosign
         uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
 

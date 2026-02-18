@@ -16,6 +16,25 @@ Use a direct download link for your platform:
 
 Release page: <https://github.com/puremachinery/carapace/releases/latest>
 
+Use `releases/latest` for quick interactive installs. For automation, reproducible
+rollouts, and preview-specific installs, use a pinned tag URL.
+
+Note: `releases/latest` may not point at the newest pre-release preview.
+
+## 1b) Pinned version links (automation/ops)
+
+```bash
+VERSION="vX.Y.Z"
+BASE_URL="https://github.com/puremachinery/carapace/releases/download/${VERSION}"
+curl -LO "${BASE_URL}/cara-x86_64-linux"
+```
+
+```powershell
+$Version = "vX.Y.Z"
+$BaseUrl = "https://github.com/puremachinery/carapace/releases/download/$Version"
+Invoke-WebRequest "$BaseUrl/cara-x86_64-windows.exe" -OutFile ".\cara-x86_64-windows.exe"
+```
+
 ## 2) Verify signature (recommended)
 
 Each release artifact has a matching `.sig` and `.pem` file.
@@ -49,6 +68,53 @@ sha256sum cara-x86_64-linux
 ```powershell
 # Windows PowerShell
 Get-FileHash .\cara-x86_64-windows.exe -Algorithm SHA256
+```
+
+For pinned releases, compare against release-provided checksums:
+
+```bash
+VERSION="vX.Y.Z"
+BASE_URL="https://github.com/puremachinery/carapace/releases/download/${VERSION}"
+curl -LO "${BASE_URL}/cara-x86_64-linux"
+curl -LO "${BASE_URL}/SHA256SUMS.txt"
+curl -LO "${BASE_URL}/SHA256SUMS.txt.sig"
+curl -LO "${BASE_URL}/SHA256SUMS.txt.pem"
+
+cosign verify-blob \
+  --certificate SHA256SUMS.txt.pem \
+  --signature SHA256SUMS.txt.sig \
+  --certificate-identity-regexp "https://github.com/puremachinery/carapace/.github/workflows/release.yml@refs/tags/v.*" \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+  SHA256SUMS.txt
+
+grep "  cara-x86_64-linux$" SHA256SUMS.txt | sha256sum --check --strict
+```
+
+If you downloaded every artifact listed in `SHA256SUMS.txt`, you can also run:
+
+```bash
+sha256sum --check SHA256SUMS.txt
+```
+
+PowerShell example:
+
+```powershell
+$Version = "vX.Y.Z"
+$FileName = "cara-x86_64-windows.exe"
+$BaseUrl = "https://github.com/puremachinery/carapace/releases/download/$Version"
+Invoke-WebRequest "$BaseUrl/$FileName" -OutFile ".\$FileName"
+Invoke-WebRequest "$BaseUrl/SHA256SUMS.txt" -OutFile ".\SHA256SUMS.txt"
+
+$expectedLine = (Select-String -Path .\SHA256SUMS.txt -SimpleMatch "  $FileName").Line
+if (-not $expectedLine) {
+  throw "No checksum entry found for $FileName in SHA256SUMS.txt"
+}
+$expected = ($expectedLine -split '\s+')[0].ToLower()
+$actual = (Get-FileHash ".\$FileName" -Algorithm SHA256).Hash.ToLower()
+if ($expected -ne $actual) {
+  throw "Checksum mismatch for $FileName"
+}
+Write-Host "Checksum verified for $FileName"
 ```
 
 ## 4) Install on your PATH
