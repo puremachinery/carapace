@@ -72,10 +72,11 @@ Prompt injection remains an industry-wide unsolved problem. No AI system fully p
 **Carapace:**
 - **macOS Seatbelt.** sandbox-exec SBPL profiles restrict filesystem, network, and IPC access.
 - **Linux Landlock.** Filesystem access rules via raw syscalls. Read/write restricted to declared paths only.
+- **Windows AppContainer + Job Objects.** `network_access=false` subprocesses launch with no network capabilities; allowlisted executable paths and process limits are enforced.
 - **Resource limits.** RLIMIT_CPU, RLIMIT_AS, RLIMIT_NOFILE per tool execution.
 - **Output content security.** HTML/Markdown sanitizer strips XSS vectors, dangerous tags, and non-image data URIs from agent output.
 
-*Caveat: OS-level sandbox backends are currently implemented for macOS and Linux. On other targets, sandbox-required subprocess paths fail closed instead of running unsandboxed.*
+*Caveat: Unsupported targets still fail closed for sandbox-required subprocess paths instead of running unsandboxed. On Windows, deny-network spawned subprocesses currently fail closed.*
 
 ### 7. SSRF / DNS Rebinding
 
@@ -97,7 +98,7 @@ Prompt injection remains an industry-wide unsolved problem. No AI system fully p
 | Skills supply chain | No verification, no moderation | Ed25519 signatures + WASM sandbox |
 | Control UI token exfil | 1-click RCE via query param | No query param override; CSRF enforced |
 | Prompt injection | No defenses | Prompt guard + classifier + approval flow |
-| Process sandboxing | Full host privileges | Seatbelt / Landlock / rlimits |
+| Process sandboxing | Full host privileges | Seatbelt / Landlock / Windows AppContainer+Job / rlimits |
 | SSRF / DNS rebinding | No protections | Comprehensive IP + DNS defense |
 
 ## Why Rust
@@ -114,7 +115,7 @@ Rust does not help with logic bugs, auth bypass, or prompt injection. Those requ
 
 Carapace is in preview. The security architecture is real and tested (~5,000 automated tests, multi-platform CI), but some items are incomplete. Verified-vs-partial feature state is tracked in `docs/feature-status.yaml` and `docs/feature-evidence.yaml`:
 
-- **Platform backend coverage.** Seatbelt/Landlock/rlimit subprocess wiring is implemented across probe/tailscale/whois/SSH tunnel callsites, but OS-level sandbox backends are currently macOS/Linux only. Unsupported targets fail closed for sandbox-required subprocess paths.
+- **Platform backend coverage.** Seatbelt/Landlock/Windows AppContainer+Job subprocess wiring is implemented across probe/tailscale/whois/SSH tunnel callsites. Unsupported targets still fail closed; Windows deny-network spawned subprocesses currently fail closed.
 - **Control UI.** The backend (routes, auth, CSRF) is complete. The frontend is not built yet.
 - **Channels.** Discord is verified end-to-end. Telegram supports webhook and localhost long-polling fallback. Signal and Slack are implemented but not yet smoke-tested in real environments.
 - **Smoke evidence process.** Live channel validation criteria and report template are tracked in `docs/channel-smoke.md`.

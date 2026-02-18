@@ -60,7 +60,7 @@ rpassword = "7"
 
 [target.'cfg(windows)'.dependencies]
 win32job = "2.0.3"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_JobObjects"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [dev-dependencies]
 insta = { version = "1", features = ["json"] }

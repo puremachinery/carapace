@@ -10,9 +10,8 @@
 //! - **Linux**: Uses landlock (Linux 5.13+) for filesystem access control and
 //!   `setrlimit` / `prctl` for resource limits.
 //! - **Windows**: Uses Job Objects for process-level limits (CPU, memory,
-//!   process-count) and command allowlisting against configured path roots.
-//!   Network deny mode (`network_access=false`) is not yet enforceable and
-//!   fails closed in support checks.
+//!   process-count), command allowlisting against configured path roots, and
+//!   AppContainer launch for `network_access=false`.
 //! - **Other**: Unsupported for sandbox-required subprocess paths (fail-closed).
 //!
 //! ## Configuration
@@ -34,12 +33,21 @@
 //! }
 //! ```
 
+#[cfg(target_os = "windows")]
+use rappct::{
+    launch::launch_in_container_with_io, AppContainerProfile, LaunchOptions,
+    SecurityCapabilitiesBuilder, StdioConfig,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+#[cfg(target_os = "windows")]
+use std::ffi::OsString;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
+#[cfg(target_os = "windows")]
+use std::os::windows::process::ExitStatusExt;
 #[cfg(not(target_os = "windows"))]
 use std::path::PathBuf;
 #[cfg(target_os = "windows")]
@@ -50,13 +58,18 @@ use std::process::{Command, Output};
 #[cfg(windows)]
 use win32job::Job;
 #[cfg(target_os = "windows")]
-use windows_sys::Win32::Foundation::HANDLE;
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::System::JobObjects::{
     JobObjectExtendedLimitInformation, SetInformationJobObject,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
     JOB_OBJECT_LIMIT_PROCESS_TIME, JOB_OBJECT_LIMIT_WORKINGSET,
+};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::System::Threading::{
+    OpenProcess, TerminateProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA,
+    PROCESS_TERMINATE,
 };
 
 // ---------------------------------------------------------------------------
@@ -568,6 +581,248 @@ fn create_windows_job(config: &ProcessSandboxConfig) -> Result<Job, SandboxError
 fn windows_job_objects_available(config: &ProcessSandboxConfig) -> Result<(), SandboxError> {
     let _ = create_windows_job(config)?;
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_sandbox_profile_name(program: &Path) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(program.to_string_lossy().as_bytes());
+    let digest = hex::encode(hasher.finalize());
+    format!("carapace.sandbox.{}", &digest[..16])
+}
+
+#[cfg(target_os = "windows")]
+fn windows_quote_command_arg(arg: &str) -> String {
+    if arg.is_empty() {
+        return "\"\"".to_string();
+    }
+    if !arg.chars().any(|ch| ch.is_whitespace() || ch == '"') {
+        return arg.to_string();
+    }
+
+    let mut quoted = String::with_capacity(arg.len() + 2);
+    quoted.push('"');
+    let mut trailing_backslashes = 0usize;
+    for ch in arg.chars() {
+        if ch == '\\' {
+            trailing_backslashes += 1;
+            continue;
+        }
+        if ch == '"' {
+            for _ in 0..(trailing_backslashes * 2 + 1) {
+                quoted.push('\\');
+            }
+            quoted.push('"');
+            trailing_backslashes = 0;
+            continue;
+        }
+        for _ in 0..trailing_backslashes {
+            quoted.push('\\');
+        }
+        trailing_backslashes = 0;
+        quoted.push(ch);
+    }
+    for _ in 0..(trailing_backslashes * 2) {
+        quoted.push('\\');
+    }
+    quoted.push('"');
+    quoted
+}
+
+#[cfg(target_os = "windows")]
+fn windows_build_cmdline(args: &[&str]) -> Option<String> {
+    if args.is_empty() {
+        return None;
+    }
+
+    let mut cmdline = String::new();
+    for arg in args {
+        cmdline.push(' ');
+        cmdline.push_str(&windows_quote_command_arg(arg));
+    }
+    Some(cmdline)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_filtered_env(config: &ProcessSandboxConfig) -> Option<Vec<(OsString, OsString)>> {
+    if config.env_filter.is_empty() {
+        return None;
+    }
+
+    let mut filtered = Vec::new();
+    for key in &config.env_filter {
+        if let Some(value) = std::env::var_os(key) {
+            filtered.push((OsString::from(key), value));
+        }
+    }
+    Some(rappct::launch::merge_parent_env(filtered))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_no_network_capabilities(
+    profile: &AppContainerProfile,
+) -> Result<rappct::SecurityCapabilities, SandboxError> {
+    SecurityCapabilitiesBuilder::new(&profile.sid)
+        .build()
+        .map_err(|e| {
+            SandboxError::Platform(format!(
+                "failed to build Windows AppContainer capabilities: {e}"
+            ))
+        })
+}
+
+#[cfg(target_os = "windows")]
+fn windows_appcontainer_available() -> Result<(), SandboxError> {
+    let profile = AppContainerProfile::ensure(
+        "carapace.sandbox.probe",
+        "Carapace Sandbox Probe",
+        Some("Carapace Windows sandbox capability probe"),
+    )
+    .map_err(|e| {
+        SandboxError::Platform(format!(
+            "failed to ensure Windows AppContainer profile: {e}"
+        ))
+    })?;
+    let _ = windows_no_network_capabilities(&profile)?;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn assign_windows_job_to_pid(pid: u32, config: &ProcessSandboxConfig) -> std::io::Result<Job> {
+    let process_handle = unsafe {
+        OpenProcess(
+            PROCESS_SET_QUOTA | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+            0,
+            pid,
+        )
+    };
+    if process_handle == 0 {
+        return Err(std::io::Error::other(format!(
+            "failed to open process {pid} for Windows job assignment: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    let job = create_windows_job(config).map_err(|e| std::io::Error::other(e.to_string()))?;
+    let assign_result = job.assign_process(process_handle as isize).map_err(|e| {
+        std::io::Error::other(format!(
+            "failed to assign process {pid} to Windows job object: {e}"
+        ))
+    });
+    unsafe {
+        CloseHandle(process_handle);
+    }
+    assign_result?;
+
+    Ok(job)
+}
+
+#[cfg(target_os = "windows")]
+fn terminate_windows_process(pid: u32) -> std::io::Result<()> {
+    let process_handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+    if process_handle == 0 {
+        return Err(std::io::Error::other(format!(
+            "failed to open process {pid} for termination: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    let terminate_ret = unsafe { TerminateProcess(process_handle, 1) };
+    unsafe {
+        CloseHandle(process_handle);
+    }
+    if terminate_ret == 0 {
+        return Err(std::io::Error::other(format!(
+            "failed to terminate process {pid}: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_pipe_reader(
+    mut file: std::fs::File,
+) -> std::thread::JoinHandle<std::io::Result<Vec<u8>>> {
+    std::thread::spawn(move || {
+        use std::io::Read;
+
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf)?;
+        Ok(buf)
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn windows_join_pipe_reader(
+    handle: Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>,
+    label: &str,
+) -> std::io::Result<Vec<u8>> {
+    match handle {
+        Some(reader) => reader
+            .join()
+            .map_err(|_| std::io::Error::other(format!("{label} reader thread panicked")))?,
+        None => Ok(Vec::new()),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn run_windows_appcontainer_command_output(
+    resolved_program: &Path,
+    args: &[&str],
+    config: &ProcessSandboxConfig,
+) -> std::io::Result<Output> {
+    let profile_name = windows_sandbox_profile_name(resolved_program);
+    let profile = AppContainerProfile::ensure(
+        &profile_name,
+        "Carapace Sandboxed Process",
+        Some("carapace subprocess sandbox"),
+    )
+    .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()))?;
+    let caps = SecurityCapabilitiesBuilder::new(&profile.sid)
+        .build()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()))?;
+
+    let launch_opts = LaunchOptions {
+        exe: resolved_program.to_path_buf(),
+        cmdline: windows_build_cmdline(args),
+        cwd: resolved_program.parent().map(Path::to_path_buf),
+        env: windows_filtered_env(config),
+        stdio: StdioConfig::Pipe,
+        join_job: None,
+        startup_timeout: None,
+        ..Default::default()
+    };
+
+    let mut child = launch_in_container_with_io(&caps, &launch_opts)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()))?;
+
+    let _job = match assign_windows_job_to_pid(child.pid, config) {
+        Ok(job) => job,
+        Err(err) => {
+            let _ = terminate_windows_process(child.pid);
+            let _ = child.wait(Some(std::time::Duration::from_secs(2)));
+            return Err(err);
+        }
+    };
+
+    let stdout_reader = child.stdout.take().map(windows_pipe_reader);
+    let stderr_reader = child.stderr.take().map(windows_pipe_reader);
+
+    let exit_code = child
+        .wait(None)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+    let stdout = windows_join_pipe_reader(stdout_reader, "stdout")?;
+    let stderr = windows_join_pipe_reader(stderr_reader, "stderr")?;
+
+    Ok(Output {
+        status: std::process::ExitStatus::from_raw(exit_code),
+        stdout,
+        stderr,
+    })
 }
 
 #[cfg(target_os = "windows")]
@@ -1107,12 +1362,11 @@ pub fn ensure_sandbox_supported(config: Option<&ProcessSandboxConfig>) -> Result
 
     #[cfg(target_os = "windows")]
     {
+        windows_job_objects_available(config)?;
         if !config.network_access {
-            return Err(SandboxError::Platform(
-                "Windows sandbox backend does not yet enforce network_access=false".to_string(),
-            ));
+            windows_appcontainer_available()?;
         }
-        windows_job_objects_available(config)
+        Ok(())
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -1324,8 +1578,10 @@ fn assign_windows_job_to_tokio_child(
 
 /// Execute a sandboxed std command and capture output.
 ///
-/// On Windows this assigns the spawned child process to a Job Object before
-/// waiting for completion.
+/// On Windows:
+/// - `network_access=true` uses Job Objects + allowlisted executable launch
+/// - `network_access=false` uses an AppContainer launch with no network
+///   capabilities, plus Job Object limits
 pub fn run_sandboxed_std_command_output(
     program: &str,
     args: &[&str],
@@ -1334,6 +1590,11 @@ pub fn run_sandboxed_std_command_output(
     #[cfg(target_os = "windows")]
     {
         if let Some(cfg) = config.filter(|cfg| cfg.enabled) {
+            if !cfg.network_access {
+                let resolved_program = resolve_and_validate_windows_allowed_program(program, cfg)?;
+                return run_windows_appcontainer_command_output(&resolved_program, args, cfg);
+            }
+
             let mut cmd = build_windows_sandboxed_std_command(program, args, cfg)?;
             cmd.stdin(Stdio::null());
             cmd.stdout(Stdio::piped());
@@ -1357,8 +1618,10 @@ pub fn run_sandboxed_std_command_output(
 
 /// Execute a sandboxed tokio command and capture output.
 ///
-/// On Windows this assigns the spawned child process to a Job Object before
-/// waiting for completion.
+/// On Windows:
+/// - `network_access=true` uses Job Objects + allowlisted executable launch
+/// - `network_access=false` uses an AppContainer launch with no network
+///   capabilities, plus Job Object limits
 pub async fn run_sandboxed_tokio_command_output(
     program: &str,
     args: &[&str],
@@ -1367,6 +1630,18 @@ pub async fn run_sandboxed_tokio_command_output(
     #[cfg(target_os = "windows")]
     {
         if let Some(cfg) = config.filter(|cfg| cfg.enabled) {
+            if !cfg.network_access {
+                let resolved_program = resolve_and_validate_windows_allowed_program(program, cfg)?;
+                let owned_args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+                let cfg = cfg.clone();
+                return tokio::task::spawn_blocking(move || {
+                    let arg_refs: Vec<&str> = owned_args.iter().map(String::as_str).collect();
+                    run_windows_appcontainer_command_output(&resolved_program, &arg_refs, &cfg)
+                })
+                .await
+                .map_err(|e| std::io::Error::other(format!("sandbox task join error: {e}")))?;
+            }
+
             let mut cmd = build_windows_sandboxed_tokio_command(program, args, cfg)?;
             cmd.stdin(Stdio::null());
             cmd.stdout(Stdio::piped());
@@ -1383,7 +1658,9 @@ pub async fn run_sandboxed_tokio_command_output(
 /// Spawn a sandboxed tokio child process.
 ///
 /// On Windows this assigns the spawned child process to a Job Object before
-/// returning it to the caller.
+/// returning it to the caller. This helper currently requires
+/// `network_access=true` on Windows; deny-network paths should use the
+/// `*_command_output` helpers which execute in AppContainer.
 pub async fn spawn_sandboxed_tokio_command(
     program: &str,
     args: &[&str],
@@ -1393,6 +1670,12 @@ pub async fn spawn_sandboxed_tokio_command(
     #[cfg(target_os = "windows")]
     {
         if let Some(cfg) = config.filter(|cfg| cfg.enabled) {
+            if !cfg.network_access {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "Windows sandboxed spawn requires network_access=true; use output helpers for network-deny subprocesses",
+                ));
+            }
             let mut cmd = build_windows_sandboxed_tokio_command(program, args, cfg)?;
             cmd.kill_on_drop(kill_on_drop);
             return spawn_windows_tokio_child_with_job(&mut cmd, cfg).await;
@@ -1796,6 +2079,35 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
+    fn test_windows_quote_command_arg() {
+        assert_eq!(windows_quote_command_arg("plain"), "plain");
+        assert_eq!(windows_quote_command_arg("hello world"), "\"hello world\"");
+        assert_eq!(
+            windows_quote_command_arg("with\"quote"),
+            "\"with\\\"quote\""
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_windows_build_cmdline() {
+        let cmdline = windows_build_cmdline(&["arg1", "arg two", "with\"quote"]).expect("cmdline");
+        assert_eq!(cmdline, " arg1 \"arg two\" \"with\\\"quote\"");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_windows_sandbox_profile_name_is_stable() {
+        let program = Path::new(r"C:\Windows\System32\cmd.exe");
+        let first = windows_sandbox_profile_name(program);
+        let second = windows_sandbox_profile_name(program);
+        assert_eq!(first, second);
+        assert!(first.starts_with("carapace.sandbox."));
+        assert_eq!(first.len(), "carapace.sandbox.".len() + 16);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
     fn test_resolve_windows_executable_with_and_without_extension() {
         let temp_dir = windows_test_temp_dir("resolve");
         let exe_path = temp_dir.join("carapace-sandbox-test.exe");
@@ -2079,14 +2391,27 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn test_ensure_sandbox_supported_windows_rejects_network_deny() {
+    fn test_ensure_sandbox_supported_windows_allows_network_deny() {
         let config = ProcessSandboxConfig {
             network_access: false,
             ..Default::default()
         };
-        let err = ensure_sandbox_supported(Some(&config)).unwrap_err();
-        assert!(matches!(err, SandboxError::Platform(_)));
-        assert!(err.to_string().contains("network_access=false"));
+        assert!(ensure_sandbox_supported(Some(&config)).is_ok());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn test_spawn_sandboxed_tokio_command_windows_rejects_network_deny() {
+        let config = ProcessSandboxConfig {
+            enabled: true,
+            network_access: false,
+            ..Default::default()
+        };
+        let err = spawn_sandboxed_tokio_command("hostname", &[], Some(&config), true)
+            .await
+            .expect_err("network deny spawn path should fail closed on Windows");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("network_access=true"));
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
