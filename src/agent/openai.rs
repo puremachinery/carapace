@@ -1033,21 +1033,21 @@ mod tests {
     #[test]
     fn test_new_rejects_empty_api_key() {
         let result = OpenAiProvider::new("".to_string());
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected empty API key to fail");
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("empty"), "error should mention empty: {err}");
+        assert!(err.contains("empty"), "got: {err}");
     }
 
     #[test]
     fn test_new_rejects_whitespace_api_key() {
         let result = OpenAiProvider::new("   ".to_string());
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected whitespace API key to fail");
     }
 
     #[test]
     fn test_new_accepts_valid_api_key() {
         let result = OpenAiProvider::new("sk-valid-key-1234567890".to_string());
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "expected valid API key to pass");
     }
 
     #[test]
@@ -1079,13 +1079,10 @@ mod tests {
         let result = OpenAiProvider::new("test-key".to_string())
             .unwrap()
             .with_base_url("http://insecure.example.com".to_string());
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected http base URL to fail");
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("https"), "error should mention https: {err}");
-        assert!(
-            err.contains("or http for localhost"),
-            "error should mention localhost exception: {err}"
-        );
+        assert!(err.contains("https"), "got: {err}");
+        assert!(err.contains("or http for localhost"), "got: {err}");
     }
 
     #[test]
@@ -1111,9 +1108,9 @@ mod tests {
         let result = OpenAiProvider::new("test-key".to_string())
             .unwrap()
             .with_base_url("http://192.168.1.100:8000".to_string());
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected remote http base URL to fail");
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("https"), "error should mention https: {err}");
+        assert!(err.contains("https"), "got: {err}");
     }
 
     #[test]
@@ -1121,7 +1118,7 @@ mod tests {
         let result = OpenAiProvider::new("test-key".to_string())
             .unwrap()
             .with_base_url("not-a-url".to_string());
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected malformed base URL to fail");
     }
 
     // ==================== is_openai_model tests ====================

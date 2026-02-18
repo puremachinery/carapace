@@ -3516,13 +3516,13 @@ pub fn handle_tls_init_ca(output: Option<&str>) -> Result<(), Box<dyn std::error
         None => crate::tls::ca::default_ca_dir(),
     };
 
-    let ca = crate::tls::ca::ClusterCA::generate(&ca_dir)?;
+    let cluster = crate::tls::ca::ClusterCA::generate(&ca_dir)?;
 
     println!("Cluster CA generated successfully");
     println!("  Directory:   {}", ca_dir.display());
-    println!("  Certificate: {}", ca.ca_cert_path().display());
-    println!("  Key:         {}", ca.ca_key_path().display());
-    println!("  Fingerprint: {}", ca.ca_fingerprint());
+    println!("  Certificate: {}", cluster.ca_cert_path().display());
+    println!("  Fingerprint: {}", cluster.ca_fingerprint());
+    println!("  Files:       ca.crt, ca.key, crl.json");
     println!();
     println!("Distribute the CA certificate to all gateway nodes.");
     println!("Keep the CA private key secure.");
@@ -3546,18 +3546,18 @@ pub fn handle_tls_issue_cert(
         None => ca_dir.join("nodes"),
     };
 
-    let ca = crate::tls::ca::ClusterCA::load(&ca_dir)?;
-    let cert = ca.issue_node_cert(node_id, &output_dir)?;
+    let cluster = crate::tls::ca::ClusterCA::load(&ca_dir)?;
+    let issued = cluster.issue_node_cert(node_id, &output_dir)?;
 
     println!("Node certificate issued successfully");
-    println!("  Node ID:     {}", cert.node_id);
-    println!("  Certificate: {}", cert.cert_path.display());
-    println!("  Key:         {}", cert.key_path.display());
-    println!("  Fingerprint: {}", cert.fingerprint);
+    println!("  Node ID:     {}", issued.node_id);
+    println!("  Certificate: {}", issued.cert_path.display());
+    println!("  Fingerprint: {}", issued.fingerprint);
+    println!("  Output Dir:  {}", output_dir.display());
     println!();
     println!("Deploy these files to the node and configure gateway.mtls:");
-    println!("  nodeCert: \"{}\"", cert.cert_path.display());
-    println!("  nodeKey:  \"{}\"", cert.key_path.display());
+    println!("  nodeCert: \"<path-to-output-dir>/node.crt\"");
+    println!("  nodeKey:  \"<path-to-output-dir>/node.key\"");
 
     Ok(())
 }
@@ -3598,16 +3598,16 @@ pub fn handle_tls_show_ca(ca_dir_opt: Option<&str>) -> Result<(), Box<dyn std::e
         None => crate::tls::ca::default_ca_dir(),
     };
 
-    let ca = crate::tls::ca::ClusterCA::load(&ca_dir)?;
+    let cluster = crate::tls::ca::ClusterCA::load(&ca_dir)?;
 
     println!("Cluster CA Information");
     println!("=====================");
-    println!("  Directory:   {}", ca.ca_dir().display());
-    println!("  Certificate: {}", ca.ca_cert_path().display());
-    println!("  Key:         {}", ca.ca_key_path().display());
-    println!("  Fingerprint: {}", ca.ca_fingerprint());
+    println!("  Directory:   {}", ca_dir.display());
+    println!("  Certificate: {}", cluster.ca_cert_path().display());
+    println!("  Fingerprint: {}", cluster.ca_fingerprint());
+    println!("  Files:       ca.crt, ca.key, crl.json");
 
-    let entries = ca.crl_entries();
+    let entries = cluster.crl_entries();
     if entries.is_empty() {
         println!();
         println!("Certificate Revocation List: (empty)");

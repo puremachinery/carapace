@@ -1824,7 +1824,7 @@ struct AgentRequestParams<'a> {
 /// Extract and validate agent request parameters (message, idempotencyKey, sessionKey, stream).
 fn parse_agent_request_params<'a>(
     params: Option<&'a Value>,
-    default_session_key: Option<&'a str>,
+    fallback_session_key: Option<&'a str>,
 ) -> Result<AgentRequestParams<'a>, ErrorShape> {
     let message = params
         .and_then(|v| v.get("message"))
@@ -1847,7 +1847,7 @@ fn parse_agent_request_params<'a>(
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
-        .or_else(|| default_session_key.map(|s| s.to_string()));
+        .or_else(|| fallback_session_key.map(|s| s.to_string()));
     let stream = params
         .and_then(|v| v.get("stream"))
         .and_then(|v| v.as_bool())

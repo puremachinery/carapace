@@ -25,11 +25,11 @@ fn build_fuzz_store() -> SecretStore {
     // Note: if this seed constant changes, any corpus input that relied on a
     // successful decrypt under the previous seed may no longer reproduce.
     let seed = derive_seed_bytes(b"carapace:fuzz_secret_format_parsing:seed:v1");
-    let mut salt = [0u8; 16];
-    salt.copy_from_slice(&seed[..16]);
-    let mut password = [0u8; 16];
-    password.copy_from_slice(&seed[16..]);
-    SecretStore::from_password_and_salt(&password, &salt)
+    let store_salt: [u8; 16] = seed[..16]
+        .try_into()
+        .expect("seed slice for fuzz salt has fixed size");
+    let store_password = &seed[16..];
+    SecretStore::from_password_and_salt(store_password, &store_salt)
 }
 
 static FUZZ_STORE: LazyLock<SecretStore> = LazyLock::new(build_fuzz_store);

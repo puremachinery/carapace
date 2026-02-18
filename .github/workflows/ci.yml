@@ -25,6 +25,7 @@ jobs:
       docs: ${{ steps.filter.outputs.docs }}
       workflow: ${{ steps.filter.outputs.workflow }}
       rust_runtime: ${{ steps.filter.outputs.rust_runtime }}
+      windows_sensitive: ${{ steps.filter.outputs.windows_sensitive }}
       docker: ${{ steps.filter.outputs.docker }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -53,6 +54,15 @@ jobs:
               - "deny.toml"
               - "config.example.json5"
               - ".cargo/**"
+            windows_sensitive:
+              - "src/agent/sandbox.rs"
+              - "src/credentials/windows.rs"
+              - "src/discovery/mod.rs"
+              - "src/server/bind.rs"
+              - "src/tailscale/mod.rs"
+              - "Cargo.toml"
+              - "Cargo.lock"
+              - ".github/workflows/**"
             docker:
               - "Dockerfile"
               - ".dockerignore"
@@ -115,6 +125,18 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - uses: taiki-e/install-action@602dc500e2b7e0e2486b4ce53909ba048de44e08 # nextest
+      - run: cargo nextest run --all-targets
+
+  test-pr-windows:
+    name: Test (windows PR)
+    runs-on: windows-latest
+    needs: changes
+    if: needs.changes.outputs.rust_runtime == 'true' && github.event_name == 'pull_request' && needs.changes.outputs.windows_sensitive == 'true'
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
@@ -253,6 +275,7 @@ jobs:
       - clippy
       - build
       - test-pr
+      - test-pr-windows
       - test-push
       - msrv
       - audit
@@ -271,6 +294,7 @@ jobs:
           CLIPPY_RESULT: ${{ needs.clippy.result }}
           BUILD_RESULT: ${{ needs.build.result }}
           TEST_PR_RESULT: ${{ needs['test-pr'].result }}
+          TEST_PR_WINDOWS_RESULT: ${{ needs['test-pr-windows'].result }}
           TEST_PUSH_RESULT: ${{ needs['test-push'].result }}
           MSRV_RESULT: ${{ needs.msrv.result }}
           AUDIT_RESULT: ${{ needs.audit.result }}
@@ -290,6 +314,7 @@ jobs:
             "clippy"
             "build"
             "test-pr"
+            "test-pr-windows"
             "test-push"
             "msrv"
             "audit"
@@ -308,6 +333,7 @@ jobs:
             "$CLIPPY_RESULT"
             "$BUILD_RESULT"
             "$TEST_PR_RESULT"
+            "$TEST_PR_WINDOWS_RESULT"
             "$TEST_PUSH_RESULT"
             "$MSRV_RESULT"
             "$AUDIT_RESULT"
