@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
+const HMAC_DIGEST_SIZE: usize = 32;
 
 /// Domain separation tag for HMAC key derivation.
 const KEY_DERIVATION_TAG: &[u8] = b"session-integrity-hmac-v1";
@@ -119,7 +120,7 @@ enum HmacSidecarFormat {
     V1Hex,
 }
 
-fn encode_sidecar_hmac_v1(hmac: &[u8; 32]) -> String {
+fn encode_sidecar_hmac_v1(hmac: &[u8; HMAC_DIGEST_SIZE]) -> String {
     format!("{HMAC_SIDECAR_V1_PREFIX}{}", hex::encode(hmac))
 }
 
@@ -134,6 +135,16 @@ fn parse_sidecar_hmac(
             file: file_name.to_string(),
             reason: format!("invalid hex in versioned HMAC sidecar: {e}"),
         })?;
+        if decoded.len() != HMAC_DIGEST_SIZE {
+            return Err(IntegrityError::VerificationFailed {
+                file: file_name.to_string(),
+                reason: format!(
+                    "invalid HMAC length in versioned sidecar: got {}, expected {}",
+                    decoded.len(),
+                    HMAC_DIGEST_SIZE
+                ),
+            });
+        }
         return Ok((decoded, HmacSidecarFormat::V1Hex));
     }
 
@@ -148,6 +159,16 @@ fn parse_sidecar_hmac(
         file: file_name.to_string(),
         reason: format!("invalid hex in HMAC sidecar: {e}"),
     })?;
+    if decoded.len() != HMAC_DIGEST_SIZE {
+        return Err(IntegrityError::VerificationFailed {
+            file: file_name.to_string(),
+            reason: format!(
+                "invalid HMAC length in legacy sidecar: got {}, expected {}",
+                decoded.len(),
+                HMAC_DIGEST_SIZE
+            ),
+        });
+    }
     Ok((decoded, HmacSidecarFormat::LegacyHex))
 }
 
