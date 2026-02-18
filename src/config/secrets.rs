@@ -377,40 +377,69 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn random_password() -> Vec<u8> {
+        let mut bytes = [0u8; 24];
+        getrandom::fill(&mut bytes).expect("random password bytes");
+        bytes.to_vec()
+    }
+
+    fn random_salt() -> [u8; SALT_LEN] {
+        let mut bytes = [0u8; SALT_LEN];
+        getrandom::fill(&mut bytes).expect("random salt bytes");
+        bytes
+    }
+
+    fn new_test_store() -> SecretStore {
+        let password = random_password();
+        SecretStore::new(&password).expect("create test secret store")
+    }
+
     #[test]
     fn test_derive_key_deterministic() {
-        let password = b"hunter2";
-        let salt = b"1234567890abcdef";
-        let k1 = derive_key(password, salt);
-        let k2 = derive_key(password, salt);
+        let password = random_password();
+        let salt = random_salt();
+        let k1 = derive_key(&password, &salt);
+        let k2 = derive_key(&password, &salt);
         assert_eq!(k1, k2, "same password+salt must produce same key");
     }
 
     #[test]
     fn test_derive_key_different_passwords() {
-        let salt = b"1234567890abcdef";
-        let k1 = derive_key(b"password1", salt);
-        let k2 = derive_key(b"password2", salt);
+        let salt = random_salt();
+        let p1 = random_password();
+        let mut p2 = random_password();
+        if p1 == p2 {
+            p2[0] ^= 0xFF;
+        }
+        let k1 = derive_key(&p1, &salt);
+        let k2 = derive_key(&p2, &salt);
         assert_ne!(k1, k2, "different passwords must produce different keys");
     }
 
     #[test]
     fn test_derive_key_different_salts() {
-        let password = b"password";
-        let k1 = derive_key(password, b"salt_aaaaaaaaaaaa");
-        let k2 = derive_key(password, b"salt_bbbbbbbbbbbb");
+        let password = random_password();
+        let s1 = random_salt();
+        let mut s2 = random_salt();
+        if s1 == s2 {
+            s2[0] ^= 0xFF;
+        }
+        let k1 = derive_key(&password, &s1);
+        let k2 = derive_key(&password, &s2);
         assert_ne!(k1, k2, "different salts must produce different keys");
     }
 
     #[test]
     fn test_derive_key_length() {
-        let key = derive_key(b"pass", b"saltsaltsaltsalt");
+        let password = random_password();
+        let salt = random_salt();
+        let key = derive_key(&password, &salt);
         assert_eq!(key.len(), 32, "key must be 256 bits (32 bytes)");
     }
 
     #[test]
     fn test_encrypt_decrypt_round_trip() {
-        let store = SecretStore::new(b"my-secret-password").unwrap();
+        let store = new_test_store();
         let plaintext = "sk-live-abc123xyz";
         let encrypted = store.encrypt(plaintext).unwrap();
         let decrypted = store.decrypt(&encrypted).unwrap();
@@ -419,7 +448,7 @@ mod tests {
 
     #[test]
     fn test_encrypt_decrypt_empty_string() {
-        let store = SecretStore::new(b"password").unwrap();
+        let store = new_test_store();
         let encrypted = store.encrypt("").unwrap();
         let decrypted = store.decrypt(&encrypted).unwrap();
         assert_eq!(decrypted, "");
@@ -427,7 +456,7 @@ mod tests {
 
     #[test]
     fn test_encrypt_decrypt_unicode() {
-        let store = SecretStore::new(b"password").unwrap();
+        let store = new_test_store();
         let plaintext = "hello world with accents";
         let encrypted = store.encrypt(plaintext).unwrap();
         let decrypted = store.decrypt(&encrypted).unwrap();
@@ -436,7 +465,7 @@ mod tests {
 
     #[test]
     fn test_encrypt_decrypt_long_value() {
-        let store = SecretStore::new(b"password").unwrap();
+        let store = new_test_store();
         let plaintext: String = "A".repeat(10_000);
         let encrypted = store.encrypt(&plaintext).unwrap();
         let decrypted = store.decrypt(&encrypted).unwrap();
@@ -445,7 +474,7 @@ mod tests {
 
     #[test]
     fn test_encrypt_produces_different_ciphertext() {
-        let store = SecretStore::new(b"password").unwrap();
+        let store = new_test_store();
         let plaintext = "same-value";
         let e1 = store.encrypt(plaintext).unwrap();
         let e2 = store.encrypt(plaintext).unwrap();
@@ -456,7 +485,7 @@ mod tests {
 
     #[test]
     fn test_encrypted_format() {
-        let store = SecretStore::new(b"password").unwrap();
+        let store = new_test_store();
         let encrypted = store.encrypt("test").unwrap();
         assert!(
             encrypted.starts_with("enc:v1:"),
@@ -479,34 +508,45 @@ mod tests {
 
     #[test]
     fn test_wrong_password_fails() {
-        let store1 = SecretStore::new(b"correct-password").unwrap();
+        let correct_password = random_password();
+        let store1 = SecretStore::new(&correct_password).unwrap();
         let encrypted = store1.encrypt("secret-data").unwrap();
 
         let parts = parse_encrypted(&encrypted).unwrap();
-        let wrong_key = Zeroizing::new(derive_key(b"wrong-password", &parts.salt));
+        let mut wrong_password = random_password();
+        if wrong_password == correct_password {
+            wrong_password[0] ^= 0xFF;
+        }
+        let wrong_key = Zeroizing::new(derive_key(&wrong_password, &parts.salt));
         let result = decrypt_with_key(&wrong_key, &parts.nonce, &parts.ciphertext);
         assert_eq!(result, Err(SecretError::DecryptionFailed));
     }
 
     #[test]
     fn test_decrypt_rekey_wrong_password() {
-        let store = SecretStore::new(b"correct-password").unwrap();
+        let correct_password = random_password();
+        let store = SecretStore::new(&correct_password).unwrap();
         let encrypted = store.encrypt("secret-data").unwrap();
-        let result = store.decrypt_rekey(&encrypted, b"wrong-password");
+        let mut wrong_password = random_password();
+        if wrong_password == correct_password {
+            wrong_password[0] ^= 0xFF;
+        }
+        let result = store.decrypt_rekey(&encrypted, &wrong_password);
         assert_eq!(result, Err(SecretError::DecryptionFailed));
     }
 
     #[test]
     fn test_decrypt_rekey_correct_password() {
-        let store = SecretStore::new(b"my-password").unwrap();
+        let password = random_password();
+        let store = SecretStore::new(&password).unwrap();
         let encrypted = store.encrypt("hello").unwrap();
-        let decrypted = store.decrypt_rekey(&encrypted, b"my-password").unwrap();
+        let decrypted = store.decrypt_rekey(&encrypted, &password).unwrap();
         assert_eq!(decrypted, "hello");
     }
 
     #[test]
     fn test_corrupted_ciphertext() {
-        let store = SecretStore::new(b"password").unwrap();
+        let store = new_test_store();
         let encrypted = store.encrypt("test").unwrap();
 
         let parts: Vec<&str> = encrypted.splitn(5, ':').collect();
@@ -527,7 +567,7 @@ mod tests {
 
     #[test]
     fn test_corrupted_nonce() {
-        let store = SecretStore::new(b"password").unwrap();
+        let store = new_test_store();
         let encrypted = store.encrypt("test").unwrap();
 
         let parts: Vec<&str> = encrypted.splitn(5, ':').collect();
@@ -546,30 +586,30 @@ mod tests {
 
     #[test]
     fn test_bad_format_no_prefix() {
-        let store = SecretStore::new(b"password").unwrap();
+        let store = new_test_store();
         let result = store.decrypt("not-encrypted-at-all");
         assert!(matches!(result, Err(SecretError::BadFormat(_))));
     }
 
     #[test]
     fn test_bad_format_wrong_prefix() {
-        let store = SecretStore::new(b"password").unwrap();
+        let store = new_test_store();
         let result = store.decrypt("enc:v2:aaa:bbb:ccc");
         assert!(matches!(result, Err(SecretError::BadFormat(_))));
     }
 
     #[test]
     fn test_bad_format_missing_segments() {
-        let store = SecretStore::new(b"password").unwrap();
+        let store = new_test_store();
         let result = store.decrypt("enc:v1:onlyone");
         assert!(matches!(result, Err(SecretError::BadFormat(_))));
     }
 
     #[test]
     fn test_bad_format_invalid_base64_nonce() {
-        let store = SecretStore::new(b"password").unwrap();
-        let salt_b64 = BASE64.encode([0u8; SALT_LEN]);
-        let ct_b64 = BASE64.encode(b"ciphertext");
+        let store = new_test_store();
+        let salt_b64 = BASE64.encode(random_salt());
+        let ct_b64 = BASE64.encode(random_password());
         let bad = format!("enc:v1:not+valid+b64!:{}:{}", ct_b64, salt_b64);
         let result = store.decrypt(&bad);
         assert!(matches!(result, Err(SecretError::Base64Decode { .. })));
@@ -577,9 +617,11 @@ mod tests {
 
     #[test]
     fn test_bad_format_invalid_base64_ciphertext() {
-        let store = SecretStore::new(b"password").unwrap();
-        let nonce_b64 = BASE64.encode([0u8; NONCE_LEN]);
-        let salt_b64 = BASE64.encode([0u8; SALT_LEN]);
+        let store = new_test_store();
+        let mut nonce = [0u8; NONCE_LEN];
+        getrandom::fill(&mut nonce).unwrap();
+        let nonce_b64 = BASE64.encode(nonce);
+        let salt_b64 = BASE64.encode(random_salt());
         let bad = format!("enc:v1:{}:not+valid+b64!:{}", nonce_b64, salt_b64);
         let result = store.decrypt(&bad);
         assert!(matches!(result, Err(SecretError::Base64Decode { .. })));
@@ -587,10 +629,12 @@ mod tests {
 
     #[test]
     fn test_bad_format_wrong_nonce_length() {
-        let store = SecretStore::new(b"password").unwrap();
-        let nonce_b64 = BASE64.encode([0u8; 8]);
-        let ct_b64 = BASE64.encode(b"ciphertext");
-        let salt_b64 = BASE64.encode([0u8; SALT_LEN]);
+        let store = new_test_store();
+        let mut nonce = [0u8; 8];
+        getrandom::fill(&mut nonce).unwrap();
+        let nonce_b64 = BASE64.encode(nonce);
+        let ct_b64 = BASE64.encode(random_password());
+        let salt_b64 = BASE64.encode(random_salt());
         let bad = format!("enc:v1:{}:{}:{}", nonce_b64, ct_b64, salt_b64);
         let result = store.decrypt(&bad);
         assert!(matches!(
@@ -604,10 +648,14 @@ mod tests {
 
     #[test]
     fn test_bad_format_wrong_salt_length() {
-        let store = SecretStore::new(b"password").unwrap();
-        let nonce_b64 = BASE64.encode([0u8; NONCE_LEN]);
-        let ct_b64 = BASE64.encode(b"ciphertext");
-        let salt_b64 = BASE64.encode([0u8; 8]);
+        let store = new_test_store();
+        let mut nonce = [0u8; NONCE_LEN];
+        getrandom::fill(&mut nonce).unwrap();
+        let nonce_b64 = BASE64.encode(nonce);
+        let ct_b64 = BASE64.encode(random_password());
+        let mut short_salt = [0u8; 8];
+        getrandom::fill(&mut short_salt).unwrap();
+        let salt_b64 = BASE64.encode(short_salt);
         let bad = format!("enc:v1:{}:{}:{}", nonce_b64, ct_b64, salt_b64);
         let result = store.decrypt(&bad);
         assert!(matches!(
@@ -634,8 +682,8 @@ mod tests {
 
     #[test]
     fn test_resolve_secrets_flat_config() {
-        let password = b"test-password";
-        let store = SecretStore::new(password).unwrap();
+        let password = random_password();
+        let store = SecretStore::new(&password).unwrap();
         let encrypted = store.encrypt("my-api-key").unwrap();
 
         let mut config = json!({
@@ -644,7 +692,7 @@ mod tests {
             "port": 8080
         });
 
-        resolve_secrets(&mut config, &store, password);
+        resolve_secrets(&mut config, &store, &password);
 
         assert_eq!(config["apiKey"], "my-api-key");
         assert_eq!(config["name"], "bot");
@@ -653,8 +701,8 @@ mod tests {
 
     #[test]
     fn test_resolve_secrets_nested_config() {
-        let password = b"test-password";
-        let store = SecretStore::new(password).unwrap();
+        let password = random_password();
+        let store = SecretStore::new(&password).unwrap();
         let enc_key = store.encrypt("sk-secret").unwrap();
         let enc_token = store.encrypt("tok-12345").unwrap();
 
@@ -669,7 +717,7 @@ mod tests {
             "name": "bot"
         });
 
-        resolve_secrets(&mut config, &store, password);
+        resolve_secrets(&mut config, &store, &password);
 
         assert_eq!(config["auth"]["apiKey"], "sk-secret");
         assert_eq!(config["auth"]["nested"]["token"], "tok-12345");
@@ -679,8 +727,8 @@ mod tests {
 
     #[test]
     fn test_resolve_secrets_in_arrays() {
-        let password = b"password";
-        let store = SecretStore::new(password).unwrap();
+        let password = random_password();
+        let store = SecretStore::new(&password).unwrap();
         let enc1 = store.encrypt("secret1").unwrap();
         let enc2 = store.encrypt("secret2").unwrap();
 
@@ -688,7 +736,7 @@ mod tests {
             "keys": [enc1, "plain", enc2]
         });
 
-        resolve_secrets(&mut config, &store, password);
+        resolve_secrets(&mut config, &store, &password);
 
         assert_eq!(config["keys"][0], "secret1");
         assert_eq!(config["keys"][1], "plain");
@@ -697,8 +745,8 @@ mod tests {
 
     #[test]
     fn test_resolve_secrets_skips_non_encrypted() {
-        let password = b"password";
-        let store = SecretStore::new(password).unwrap();
+        let password = random_password();
+        let store = SecretStore::new(&password).unwrap();
 
         let mut config = json!({
             "name": "bot",
@@ -708,20 +756,25 @@ mod tests {
         });
 
         let original = config.clone();
-        resolve_secrets(&mut config, &store, password);
+        resolve_secrets(&mut config, &store, &password);
 
         assert_eq!(config, original, "non-encrypted values should be untouched");
     }
 
     #[test]
     fn test_resolve_secrets_bad_password_scrubs_value() {
-        let store = SecretStore::new(b"correct-password").unwrap();
+        let correct_password = random_password();
+        let store = SecretStore::new(&correct_password).unwrap();
         let encrypted = store.encrypt("super-secret").unwrap();
 
         let mut config = json!({ "apiKey": encrypted });
-        let wrong_store = SecretStore::for_decrypt(b"wrong-password");
+        let mut wrong_password = random_password();
+        if wrong_password == correct_password {
+            wrong_password[0] ^= 0xFF;
+        }
+        let wrong_store = SecretStore::for_decrypt(&wrong_password);
 
-        resolve_secrets(&mut config, &wrong_store, b"wrong-password");
+        resolve_secrets(&mut config, &wrong_store, &wrong_password);
 
         assert!(
             config["apiKey"].is_null(),
@@ -731,7 +784,7 @@ mod tests {
 
     #[test]
     fn test_scrub_encrypted_values_replaces_with_null() {
-        let store = SecretStore::new(b"password").unwrap();
+        let store = new_test_store();
         let encrypted = store.encrypt("secret").unwrap();
 
         let mut config = json!({ "apiKey": encrypted, "name": "bot" });
@@ -743,7 +796,7 @@ mod tests {
 
     #[test]
     fn test_seal_secrets_single_path() {
-        let store = SecretStore::new(b"password").unwrap();
+        let store = new_test_store();
         let mut config = json!({
             "auth": {
                 "apiKey": "sk-live-abc123"
@@ -759,7 +812,7 @@ mod tests {
 
     #[test]
     fn test_seal_secrets_multiple_paths() {
-        let store = SecretStore::new(b"password").unwrap();
+        let store = new_test_store();
         let mut config = json!({
             "auth": { "apiKey": "key1" },
             "db": { "password": "dbpass" }
@@ -773,7 +826,7 @@ mod tests {
 
     #[test]
     fn test_seal_secrets_skips_already_encrypted() {
-        let store = SecretStore::new(b"password").unwrap();
+        let store = new_test_store();
         let already_encrypted = store.encrypt("secret").unwrap();
 
         let mut config = json!({
@@ -791,7 +844,7 @@ mod tests {
 
     #[test]
     fn test_seal_secrets_missing_path_is_noop() {
-        let store = SecretStore::new(b"password").unwrap();
+        let store = new_test_store();
         let mut config = json!({ "a": 1 });
         let original = config.clone();
 
@@ -802,7 +855,7 @@ mod tests {
 
     #[test]
     fn test_seal_secrets_non_string_is_noop() {
-        let store = SecretStore::new(b"password").unwrap();
+        let store = new_test_store();
         let mut config = json!({ "port": 8080 });
         let original = config.clone();
 
@@ -813,8 +866,8 @@ mod tests {
 
     #[test]
     fn test_seal_then_resolve_round_trip() {
-        let password = b"integration-test-pw";
-        let store = SecretStore::new(password).unwrap();
+        let password = random_password();
+        let store = SecretStore::new(&password).unwrap();
 
         let mut config = json!({
             "auth": {
@@ -848,7 +901,7 @@ mod tests {
         assert_eq!(config["auth"]["provider"], "anthropic");
         assert_eq!(config["name"], "mybot");
 
-        resolve_secrets(&mut config, &store, password);
+        resolve_secrets(&mut config, &store, &password);
 
         assert_eq!(config["auth"]["apiKey"], "sk-ant-test123");
         assert_eq!(config["auth"]["webhook"]["secret"], "whsec_abc");
@@ -862,9 +915,9 @@ mod tests {
 
     #[test]
     fn test_from_password_and_salt() {
-        let password = b"my-password";
-        let salt = [0xABu8; SALT_LEN];
-        let store = SecretStore::from_password_and_salt(password, &salt);
+        let password = random_password();
+        let salt = random_salt();
+        let store = SecretStore::from_password_and_salt(&password, &salt);
         let encrypted = store.encrypt("hello").unwrap();
         let decrypted = store.decrypt(&encrypted).unwrap();
         assert_eq!(decrypted, "hello");
@@ -872,14 +925,14 @@ mod tests {
 
     #[test]
     fn test_store_new_generates_random_salt() {
-        let s1 = SecretStore::new(b"password").unwrap();
-        let s2 = SecretStore::new(b"password").unwrap();
+        let s1 = new_test_store();
+        let s2 = new_test_store();
         assert_ne!(s1.salt, s2.salt, "each store should have a unique salt");
     }
 
     #[test]
     fn test_encrypt_decrypt_special_characters() {
-        let store = SecretStore::new(b"password").unwrap();
+        let store = new_test_store();
         let plaintext = "p@w0rd!#%^&*()_+-=[]{}|;':,./<>?~";
         let encrypted = store.encrypt(plaintext).unwrap();
         let decrypted = store.decrypt(&encrypted).unwrap();
@@ -888,7 +941,7 @@ mod tests {
 
     #[test]
     fn test_encrypt_decrypt_newlines() {
-        let store = SecretStore::new(b"password").unwrap();
+        let store = new_test_store();
         let plaintext = "line1\nline2\nline3\ttab";
         let encrypted = store.encrypt(plaintext).unwrap();
         let decrypted = store.decrypt(&encrypted).unwrap();
@@ -897,7 +950,7 @@ mod tests {
 
     #[test]
     fn test_encrypt_decrypt_json_string() {
-        let store = SecretStore::new(b"password").unwrap();
+        let store = new_test_store();
         let plaintext = r#"{"key": "value", "nested": {"a": 1}}"#;
         let encrypted = store.encrypt(plaintext).unwrap();
         let decrypted = store.decrypt(&encrypted).unwrap();
@@ -919,8 +972,10 @@ mod tests {
     fn test_pbkdf2_more_iterations_changes_output() {
         let mut k1 = [0u8; 32];
         let mut k2 = [0u8; 32];
-        pbkdf2_hmac::<Sha256>(b"password", b"salt", 1, &mut k1);
-        pbkdf2_hmac::<Sha256>(b"password", b"salt", 2, &mut k2);
+        let password = random_password();
+        let salt = random_salt();
+        pbkdf2_hmac::<Sha256>(&password, &salt, 1, &mut k1);
+        pbkdf2_hmac::<Sha256>(&password, &salt, 2, &mut k2);
         assert_ne!(
             k1, k2,
             "different iteration counts must produce different keys"
@@ -929,7 +984,7 @@ mod tests {
 
     #[test]
     fn test_contains_encrypted_values_detects_ciphertext() {
-        let store = SecretStore::new(b"password").unwrap();
+        let store = new_test_store();
         let encrypted = store.encrypt("secret").unwrap();
 
         let config = json!({ "apiKey": encrypted, "name": "bot" });
