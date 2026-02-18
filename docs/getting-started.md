@@ -5,7 +5,8 @@ It’s intentionally practical: copy/paste steps, then customize.
 
 If you prefer outcome-first walkthroughs (for example "add Discord"), see
 the [Cookbook](cookbook/README.md).
-If you want the website flow instead of Markdown docs, use:
+If you want the website flow instead of Markdown docs, start at
+<https://getcara.io>:
 - <https://getcara.io/install.html>
 - <https://getcara.io/first-run.html>
 - <https://getcara.io/security.html>
@@ -14,41 +15,14 @@ If you want the website flow instead of Markdown docs, use:
 
 ## Prerequisites
 
-- A `cara` binary on your PATH (download pre-built binaries from
-  <https://github.com/puremachinery/carapace/releases>)
+- A `cara` binary on your PATH
 - A supported LLM provider API key (OpenAI/Anthropic/etc), or Ollama
 - Optional: TLS certs if exposing Carapace publicly
 
-If you want to build from source, see [CONTRIBUTING.md](../CONTRIBUTING.md).
-
-## Install `cara` (Pre-Built Binary)
-
-Download from the latest release:
-<https://github.com/puremachinery/carapace/releases>
-
-Common artifacts:
-- Linux x64: `cara-x86_64-linux`
-- Linux ARM64: `cara-aarch64-linux`
-- macOS Intel: `cara-x86_64-darwin`
-- macOS Apple Silicon: `cara-aarch64-darwin`
-- Windows x64: `cara-x86_64-windows.exe`
-
-macOS/Linux install:
-
-```bash
-chmod +x ./cara-<your-platform>
-sudo mv ./cara-<your-platform> /usr/local/bin/cara
-cara --help
-```
-
-Windows install (PowerShell):
-
-```powershell
-$installDir = "$env:LOCALAPPDATA\cara\bin"
-New-Item -ItemType Directory -Force -Path $installDir | Out-Null
-Copy-Item .\cara-x86_64-windows.exe (Join-Path $installDir "cara.exe")
-cara --help
-```
+Install options:
+- Prebuilt binaries + signature/checksum verification:
+  [docs/site/install.md](site/install.md)
+- Source build: [CONTRIBUTING.md](../CONTRIBUTING.md)
 
 ## Quick Start (Recommended: setup wizard)
 
@@ -83,8 +57,8 @@ Helpful REPL commands:
 - `/new` — start a fresh chat session
 - `/exit` or `/quit` — leave chat
 
-Manual config path is still available in [First Run](site/first-run.md) and
-`config.example.json5`.
+For full first-run flow, use [site/first-run.md](site/first-run.md).
+Manual configuration is documented in `config.example.json5`.
 
 ## Configuration Basics
 
@@ -168,30 +142,16 @@ Then visit `/ui` on the Carapace host.
 You can override the base path via `gateway.controlUi.basePath`.
 
 ## Operations
+Use the dedicated ops guide for day-2 workflows:
+- [site/ops.md](site/ops.md)
+- [site/get-unstuck.md](site/get-unstuck.md)
 
-### Health Checks
-
-- `GET /health` – liveness
-- `GET /health/ready` – readiness (storage + provider reachability)
-
-### Logs
-
-Use the CLI:
+Most common commands:
 
 ```bash
+cara status --host 127.0.0.1 --port 18789
 cara logs --follow
-```
-
-### Backups
-
-```bash
 cara backup --out ./carapace-backup.tar.gz
-cara restore --path ./carapace-backup.tar.gz
-```
-
-### Update
-
-```bash
 cara update
 ```
 
@@ -203,3 +163,4 @@ cara update
 - **No replies**: ensure an LLM provider is configured; check `/health/ready`.
 
 If unsure, start with `RUST_LOG=debug` and inspect logs.
+For a structured checklist, use [site/get-unstuck.md](site/get-unstuck.md).
