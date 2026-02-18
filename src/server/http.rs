@@ -998,30 +998,11 @@ fn dispatch_agent_run(
     Ok(())
 }
 
-fn stable_sender_id_from_ip(ip: IpAddr) -> String {
-    fn push_hex_byte(out: &mut String, byte: u8) {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-
-    // Bounded output: max length is 36 ("ip6:" + 32 hex chars).
-    let mut sender = String::with_capacity(36);
+fn sender_scope_from_ip(ip: IpAddr) -> &'static str {
     match ip {
-        IpAddr::V4(v4) => {
-            sender.push_str("ip4:");
-            for byte in v4.octets() {
-                push_hex_byte(&mut sender, byte);
-            }
-        }
-        IpAddr::V6(v6) => {
-            sender.push_str("ip6:");
-            for byte in v6.octets() {
-                push_hex_byte(&mut sender, byte);
-            }
-        }
+        IpAddr::V4(_) => "ip4",
+        IpAddr::V6(_) => "ip6",
     }
-    sender
 }
 
 /// POST /hooks/agent - Dispatch message to agent
@@ -1067,10 +1048,10 @@ async fn hooks_agent_handler(
 
     let sender_id = connect_info
         .0
-        .map(|addr| stable_sender_id_from_ip(addr.ip()))
-        .unwrap_or_else(|| "unknown".to_string());
+        .map(|addr| sender_scope_from_ip(addr.ip()))
+        .unwrap_or("unknown");
 
-    if let Err(resp) = dispatch_agent_run(&ws, &validated, &run_id, &sender_id) {
+    if let Err(resp) = dispatch_agent_run(&ws, &validated, &run_id, sender_id) {
         return resp;
     }
 
@@ -1993,17 +1974,15 @@ mod tests {
     }
 
     #[test]
-    fn test_stable_sender_id_from_ip_v4_format() {
-        let sender = stable_sender_id_from_ip(IpAddr::V4(std::net::Ipv4Addr::new(1, 0, 0, 0)));
-        assert_eq!(sender, "ip4:01000000");
-        assert_eq!(sender.len(), 12);
+    fn test_sender_scope_from_ip_v4_format() {
+        let sender = sender_scope_from_ip(IpAddr::V4(std::net::Ipv4Addr::new(1, 0, 0, 0)));
+        assert_eq!(sender, "ip4");
     }
 
     #[test]
-    fn test_stable_sender_id_from_ip_v6_format() {
-        let sender = stable_sender_id_from_ip(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST));
-        assert_eq!(sender, "ip6:00000000000000000000000000000001");
-        assert_eq!(sender.len(), 36);
+    fn test_sender_scope_from_ip_v6_format() {
+        let sender = sender_scope_from_ip(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST));
+        assert_eq!(sender, "ip6");
     }
 
     #[tokio::test]
