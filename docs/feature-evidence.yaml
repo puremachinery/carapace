@@ -57,18 +57,14 @@ features:
 
   - feature: "channels.signal live smoke"
     status: "partial"
-    runtime_wiring:
-      - "docs/channel-smoke.md (Signal smoke pass criteria)"
-      - ".github/ISSUE_TEMPLATE/channel-smoke-report.yml"
     notes:
+      - "Evidence artifacts: docs/channel-smoke.md; .github/ISSUE_TEMPLATE/channel-smoke-report.yml"
       - "Pending published pass/fail evidence from a live signal-cli-rest-api deployment."
 
   - feature: "channels.slack live smoke"
     status: "partial"
-    runtime_wiring:
-      - "docs/channel-smoke.md (Slack smoke pass criteria)"
-      - ".github/ISSUE_TEMPLATE/channel-smoke-report.yml"
     notes:
+      - "Evidence artifacts: docs/channel-smoke.md; .github/ISSUE_TEMPLATE/channel-smoke-report.yml"
       - "Pending published pass/fail evidence from a live Slack Events API deployment."
 
   - feature: "cron.*"

@@ -54,7 +54,7 @@ body:
     id: checks
     attributes:
       label: Smoke checks completed
-      description: Mark each completed check.
+      description: Mark each completed check. For a PASS report, all four checks must be completed.
       options:
         - label: `cara status` reported healthy
         - label: Channel registration was successful (no repeated auth/signature errors)
