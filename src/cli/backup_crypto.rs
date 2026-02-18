@@ -293,7 +293,8 @@ mod tests {
         // Deterministic KAT inputs from hashed labels.
         let passphrase = sha2::Sha256::digest(b"carapace-backup-kat-passphrase");
         let salt = sha2::Sha256::digest(b"carapace-backup-kat-salt");
-        // Expected output generated independently via Python hashlib.pbkdf2_hmac.
+        // Expected output generated independently via Python hashlib.pbkdf2_hmac:
+        // python3 -c 'import hashlib; p=hashlib.sha256(b"carapace-backup-kat-passphrase").digest(); s=hashlib.sha256(b"carapace-backup-kat-salt").digest(); print(hashlib.pbkdf2_hmac("sha256", p, s, 600000, 32).hex())'
         let expected_hex = "696c6039c67c9ce83717fe1f72e32d9c8e0b46ceaef2fa6d59268ddc49653329";
 
         let key = derive_key(passphrase.as_slice(), salt.as_slice());

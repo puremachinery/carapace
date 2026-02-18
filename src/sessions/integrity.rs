@@ -214,6 +214,8 @@ pub fn delete_hmac_sidecar(file_path: &Path) -> Result<(), io::Error> {
 /// - Missing `.hmac` file with `action: Reject` → returns error.
 /// - HMAC mismatch with `action: Warn` → logs warning.
 /// - HMAC mismatch with `action: Reject` → returns error.
+/// - Sidecar parse/format errors with `action: Warn` → logs warning.
+/// - Sidecar parse/format errors with `action: Reject` → returns error.
 /// - Legacy (non-versioned) sidecar payloads are accepted and rewritten to
 ///   the current versioned format after successful verification.
 pub fn verify_hmac_file(
@@ -256,7 +258,16 @@ fn verify_hmac_digest(
 
     match fs::read_to_string(&sidecar) {
         Ok(stored_hex) => {
-            let (stored_hmac, format) = parse_sidecar_hmac(&stored_hex, file_name)?;
+            let (stored_hmac, format) = match parse_sidecar_hmac(&stored_hex, file_name) {
+                Ok(parsed) => parsed,
+                Err(e) => match config.action {
+                    IntegrityAction::Warn => {
+                        tracing::warn!("{}", e);
+                        return Ok(());
+                    }
+                    IntegrityAction::Reject => return Err(e),
+                },
+            };
 
             if stored_hmac.as_slice() != computed {
                 let msg = format!("HMAC verification failed for {file_name} — possible tampering");
@@ -632,6 +643,31 @@ mod tests {
             }
             other => panic!("expected VerificationFailed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_verify_warns_on_unknown_sidecar_version() {
+        let dir = TempDir::new().unwrap();
+        let file_path = dir.path().join("meta.json");
+        let data = r#"{"id":"version"}"#;
+        fs::write(&file_path, data).unwrap();
+        let sidecar = dir.path().join("meta.json.hmac");
+        fs::write(&sidecar, "v2:deadbeef").unwrap();
+
+        let key = derive_hmac_key(b"version-secret");
+        let config = IntegrityConfig {
+            enabled: true,
+            action: IntegrityAction::Warn,
+        };
+
+        let result = verify_hmac_file(&key, data.as_bytes(), &file_path, &config);
+        assert!(
+            result.is_ok(),
+            "unknown sidecar version should warn-and-continue in Warn mode"
+        );
+
+        let unchanged = fs::read_to_string(&sidecar).unwrap();
+        assert_eq!(unchanged, "v2:deadbeef");
     }
 
     #[test]
