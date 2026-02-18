@@ -150,6 +150,26 @@ h1 {
   font-size: 1.05rem;
 }
 
+.defaults-bar {
+  list-style: none;
+  margin: 0.95rem 0 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.42rem;
+}
+
+.defaults-bar li {
+  border: 1px solid rgba(45, 212, 191, 0.32);
+  border-radius: 0.55rem;
+  background: rgba(8, 24, 34, 0.62);
+  padding: 0.28rem 0.5rem;
+  color: #c7ffef;
+  font-family: "IBM Plex Mono", "SFMono-Regular", Menlo, monospace;
+  font-size: 0.73rem;
+  line-height: 1.25;
+}
+
 .cta-row {
   margin-top: 1.2rem;
   display: flex;
@@ -208,6 +228,14 @@ h1 {
 .quickstart h2 {
   margin-top: 0;
   margin-bottom: 0.35rem;
+}
+
+.quickstart-callout {
+  margin: 0.72rem 0 0.42rem;
+}
+
+.quickstart-callout a {
+  color: var(--accent-lighter);
 }
 
 .doc-main {
