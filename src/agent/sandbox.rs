@@ -656,6 +656,7 @@ fn windows_build_cmdline(args: &[&str]) -> std::io::Result<Option<String>> {
 #[cfg(target_os = "windows")]
 fn windows_filtered_env(config: &ProcessSandboxConfig) -> Option<Vec<(OsString, OsString)>> {
     if config.env_filter.is_empty() {
+        // Empty filter means inherit full parent environment unchanged.
         return None;
     }
 
@@ -665,7 +666,7 @@ fn windows_filtered_env(config: &ProcessSandboxConfig) -> Option<Vec<(OsString, 
             filtered.push((OsString::from(key), value));
         }
     }
-    Some(rappct::launch::merge_parent_env(filtered))
+    Some(filtered)
 }
 
 #[cfg(target_os = "windows")]
@@ -698,49 +699,62 @@ fn windows_appcontainer_available() -> Result<(), SandboxError> {
 }
 
 #[cfg(target_os = "windows")]
-fn assign_windows_job_to_pid(pid: u32, config: &ProcessSandboxConfig) -> std::io::Result<Job> {
-    let process_handle = unsafe {
-        OpenProcess(
-            PROCESS_SET_QUOTA | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
-            0,
-            pid,
-        )
-    };
-    if process_handle == 0 {
-        return Err(std::io::Error::other(format!(
-            "failed to open process {pid} for Windows job assignment: {}",
-            std::io::Error::last_os_error()
-        )));
+struct WindowsProcessHandle(HANDLE);
+
+#[cfg(target_os = "windows")]
+impl WindowsProcessHandle {
+    fn open(access: u32, pid: u32, purpose: &str) -> std::io::Result<Self> {
+        let handle = unsafe { OpenProcess(access, 0, pid) };
+        if handle == 0 {
+            return Err(std::io::Error::other(format!(
+                "failed to open process {pid} for {purpose}: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(Self(handle))
     }
 
-    let job = create_windows_job(config).map_err(|e| std::io::Error::other(e.to_string()))?;
-    let assign_result = job.assign_process(process_handle as isize).map_err(|e| {
-        std::io::Error::other(format!(
-            "failed to assign process {pid} to Windows job object: {e}"
-        ))
-    });
-    unsafe {
-        CloseHandle(process_handle);
+    fn raw(&self) -> HANDLE {
+        self.0
     }
-    assign_result?;
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for WindowsProcessHandle {
+    fn drop(&mut self) {
+        if self.0 != 0 {
+            unsafe {
+                CloseHandle(self.0);
+            }
+            self.0 = 0;
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn assign_windows_job_to_pid(pid: u32, config: &ProcessSandboxConfig) -> std::io::Result<Job> {
+    let process_handle = WindowsProcessHandle::open(
+        PROCESS_SET_QUOTA | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+        pid,
+        "Windows job assignment",
+    )?;
+
+    let job = create_windows_job(config).map_err(|e| std::io::Error::other(e.to_string()))?;
+    job.assign_process(process_handle.raw() as isize)
+        .map_err(|e| {
+            std::io::Error::other(format!(
+                "failed to assign process {pid} to Windows job object: {e}"
+            ))
+        })?;
 
     Ok(job)
 }
 
 #[cfg(target_os = "windows")]
 fn terminate_windows_process(pid: u32) -> std::io::Result<()> {
-    let process_handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
-    if process_handle == 0 {
-        return Err(std::io::Error::other(format!(
-            "failed to open process {pid} for termination: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
+    let process_handle = WindowsProcessHandle::open(PROCESS_TERMINATE, pid, "termination")?;
 
-    let terminate_ret = unsafe { TerminateProcess(process_handle, 1) };
-    unsafe {
-        CloseHandle(process_handle);
-    }
+    let terminate_ret = unsafe { TerminateProcess(process_handle.raw(), 1) };
     if terminate_ret == 0 {
         return Err(std::io::Error::other(format!(
             "failed to terminate process {pid}: {}",
