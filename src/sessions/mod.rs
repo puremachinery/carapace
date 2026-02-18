@@ -17,7 +17,7 @@ pub use store::{
     Session, SessionFilter, SessionMetadata, SessionStatus, SessionStore, SessionStoreError,
 };
 
-/// Resolve a session key using scoping config and optional explicit session ID.
+/// Canonicalize an explicit session hint to a deterministic opaque session ID.
 pub fn canonicalize_session_hint(session_hint: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"carapace:session-hint:v1:");

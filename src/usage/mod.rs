@@ -367,7 +367,22 @@ struct SessionIdentity {
     legacy_session_id: String,
 }
 
+fn canonical_session_digest(session_key: &str) -> Option<&str> {
+    let digest = session_key.strip_prefix("sid_")?;
+    if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(digest)
+}
+
 fn session_identity(session_key: &str) -> SessionIdentity {
+    if let Some(canonical_digest_hex) = canonical_session_digest(session_key) {
+        return SessionIdentity {
+            session_id: session_key.to_string(),
+            legacy_session_id: format!("sid_{}", &canonical_digest_hex[..24]),
+        };
+    }
+
     let digest = Sha256::digest(session_key.as_bytes());
     let digest_hex = hex::encode(digest);
     let legacy_digest_hex = &digest_hex[..24];
@@ -1663,6 +1678,21 @@ mod tests {
     }
 
     #[test]
+    fn test_session_identity_preserves_canonical_sid_input() {
+        let raw_session_hint = "canonical-session";
+        let canonical_id = session_identity(raw_session_hint).session_id;
+        let legacy_id = session_identity(raw_session_hint).legacy_session_id;
+
+        let identity = session_identity(&canonical_id);
+
+        assert_eq!(identity.session_id, canonical_id);
+        assert_eq!(
+            identity.legacy_session_id, legacy_id,
+            "canonical sid should keep the same legacy alias for migration"
+        );
+    }
+
+    #[test]
     fn test_record_migrates_legacy_keys_to_full_hash() {
         let mut tracker = create_test_tracker();
         let session_key = "migrate-me";
@@ -1747,10 +1777,23 @@ mod tests {
             20,
         );
 
+        assert_eq!(
+            tracker.data.sessions.len(),
+            1,
+            "canonical sid input should update in place, not create a second hashed entry"
+        );
         assert!(
             tracker.data.sessions.contains_key(&victim_id),
             "sid_-prefixed raw key should not remove existing canonical sid entries"
         );
+        let usage = tracker
+            .data
+            .sessions
+            .get(&victim_id)
+            .expect("expected existing canonical sid entry");
+        assert_eq!(usage.input_tokens, 11);
+        assert_eq!(usage.output_tokens, 21);
+        assert_eq!(usage.requests, 2);
     }
 
     #[test]
