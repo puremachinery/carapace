@@ -1011,10 +1011,30 @@ fn run_windows_appcontainer_command_output(
     }
     let _job = job;
 
-    let stdout_reader = child.stdout.take().map(windows_pipe_reader);
-    let stderr_reader = child.stderr.take().map(windows_pipe_reader);
+    let mut stdout_reader = child.stdout.take().map(windows_pipe_reader);
+    let mut stderr_reader = child.stderr.take().map(windows_pipe_reader);
 
-    let exit_code = child.wait(None).map_err(io_error_from_rappct)?;
+    let exit_code = match child.wait(None) {
+        Ok(code) => code,
+        Err(err) => {
+            terminate_and_reap_windows_appcontainer_child(&mut child, "wait_exit_code");
+            if let Err(join_err) = windows_join_pipe_reader(stdout_reader.take(), "stdout") {
+                tracing::warn!(
+                    pid = child.pid,
+                    error = %join_err,
+                    "failed joining stdout reader after Windows wait failure"
+                );
+            }
+            if let Err(join_err) = windows_join_pipe_reader(stderr_reader.take(), "stderr") {
+                tracing::warn!(
+                    pid = child.pid,
+                    error = %join_err,
+                    "failed joining stderr reader after Windows wait failure"
+                );
+            }
+            return Err(io_error_from_rappct(err));
+        }
+    };
 
     let stdout_res = windows_join_pipe_reader(stdout_reader, "stdout");
     let stderr_res = windows_join_pipe_reader(stderr_reader, "stderr");
