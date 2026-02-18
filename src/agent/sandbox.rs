@@ -663,9 +663,17 @@ fn windows_build_appcontainer_cmdline(
     resolved_program: &Path,
     args: &[&str],
 ) -> std::io::Result<Option<String>> {
-    let program = resolved_program.to_string_lossy().into_owned();
+    let program = resolved_program.to_str().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "Windows AppContainer executable path is not valid UTF-8: {}",
+                resolved_program.display()
+            ),
+        )
+    })?;
     let mut full_args = Vec::with_capacity(args.len() + 1);
-    full_args.push(program.as_str());
+    full_args.push(program);
     full_args.extend(args.iter().copied());
     windows_build_cmdline(&full_args)
 }
@@ -887,14 +895,17 @@ fn run_windows_appcontainer_command_output(
 
     let exit_code = child.wait(None).map_err(io_error_from_rappct)?;
 
-    let stdout = windows_join_pipe_reader(stdout_reader, "stdout")?;
-    let stderr = windows_join_pipe_reader(stderr_reader, "stderr")?;
-
-    Ok(Output {
-        status: std::process::ExitStatus::from_raw(exit_code),
-        stdout,
-        stderr,
-    })
+    let stdout_res = windows_join_pipe_reader(stdout_reader, "stdout");
+    let stderr_res = windows_join_pipe_reader(stderr_reader, "stderr");
+    match (stdout_res, stderr_res) {
+        (Ok(stdout), Ok(stderr)) => Ok(Output {
+            status: std::process::ExitStatus::from_raw(exit_code),
+            stdout,
+            stderr,
+        }),
+        (Err(err), _) => Err(err),
+        (_, Err(err)) => Err(err),
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -2186,6 +2197,18 @@ mod tests {
             cmdline,
             "\"C:\\Program Files\\Carapace\\cara.exe\" --mode \"arg two\""
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_windows_build_appcontainer_cmdline_rejects_non_utf8_program_path() {
+        use std::os::windows::ffi::OsStringExt;
+
+        let non_utf8 = std::ffi::OsString::from_wide(&[0xD800]);
+        let path = PathBuf::from(non_utf8);
+        let err = windows_build_appcontainer_cmdline(&path, &[])
+            .expect_err("non-UTF8 executable path must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     #[cfg(target_os = "windows")]
