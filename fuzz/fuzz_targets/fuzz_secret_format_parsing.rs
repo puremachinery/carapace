@@ -1,23 +1,32 @@
 #![no_main]
 
 use std::sync::LazyLock;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use libfuzzer_sys::fuzz_target;
 
 use carapace::config::secrets::{is_encrypted, SecretStore};
 
 fn build_fuzz_store() -> SecretStore {
-    // Build once at process start to keep PBKDF2 out of the per-input hot path.
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(1);
-    let salt = now.to_le_bytes();
-    let mut password = now.rotate_left(29).to_be_bytes();
-    if password.iter().all(|b| *b == 0) {
-        password[0] = 1;
+    fn derive_seed_bytes(seed: &[u8]) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        for (idx, byte) in seed.iter().copied().enumerate() {
+            let slot = idx % out.len();
+            out[slot] = out[slot]
+                .wrapping_mul(131)
+                .wrapping_add(byte)
+                .wrapping_add((idx as u8).rotate_left((idx % 8) as u32));
+        }
+        out
     }
+
+    // Deterministic seed keeps fuzz crash reproduction stable across restarts.
+    // Note: if this seed constant changes, any corpus input that relied on a
+    // successful decrypt under the previous seed may no longer reproduce.
+    let seed = derive_seed_bytes(b"carapace:fuzz_secret_format_parsing:seed:v1");
+    let mut salt = [0u8; 16];
+    salt.copy_from_slice(&seed[..16]);
+    let mut password = [0u8; 16];
+    password.copy_from_slice(&seed[16..]);
     SecretStore::from_password_and_salt(&password, &salt)
 }
 

@@ -1154,9 +1154,25 @@ mod tests {
 
     #[test]
     fn test_signing_key_derivation() {
-        let key = derive_signing_key(&test_secret_key(), "20240101", "us-east-1");
-        // Should produce a 32-byte key (SHA-256 output)
-        assert_eq!(key.len(), 32);
+        fn hmac_once(key: &[u8], data: &[u8]) -> Vec<u8> {
+            let mut hmac = HmacSha256::new_from_slice(key).unwrap();
+            hmac.update(data);
+            hmac.finalize().into_bytes().to_vec()
+        }
+
+        let secret = test_secret_key();
+        let date = "20240101";
+        let region = "us-east-1";
+
+        // Compute expected key via explicit SigV4 key-schedule chaining.
+        let k_secret = format!("AWS4{secret}");
+        let k_date = hmac_once(k_secret.as_bytes(), date.as_bytes());
+        let k_region = hmac_once(&k_date, region.as_bytes());
+        let k_service = hmac_once(&k_region, b"bedrock");
+        let expected = hmac_once(&k_service, b"aws4_request");
+
+        let derived = derive_signing_key(&secret, date, region);
+        assert_eq!(derived, expected);
     }
 
     #[test]
