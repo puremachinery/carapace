@@ -58,7 +58,7 @@ use std::process::{Command, Output};
 #[cfg(windows)]
 use win32job::Job;
 #[cfg(target_os = "windows")]
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
@@ -847,7 +847,7 @@ fn resume_windows_process_threads(pid: u32) -> std::io::Result<()> {
     const ERROR_NO_MORE_FILES: i32 = 18;
 
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
-    if snapshot == -1isize as HANDLE {
+    if snapshot == INVALID_HANDLE_VALUE {
         let os_err = std::io::Error::last_os_error();
         return Err(std::io::Error::new(
             os_err.kind(),
