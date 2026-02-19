@@ -912,13 +912,15 @@ fn dispatch_agent_run(
         user_id: Some(sender_id.to_string()),
         ..Default::default()
     };
+    let explicit_session_hint =
+        crate::sessions::canonicalize_optional_session_hint(validated.session_key.as_deref());
     let session = crate::sessions::get_or_create_scoped_session(
         ws.session_store(),
         &cfg,
         channel,
         sender_id,
         peer_id,
-        validated.session_key.as_deref(),
+        explicit_session_hint.as_deref(),
         metadata,
     )
     .map_err(|e| {
@@ -1239,15 +1241,12 @@ fn hook_result_to_response(
             (StatusCode::OK, Json(json!({ "ok": true, "mode": mode }))).into_response()
         }
         Ok(HookMappingResult::Agent {
-            message,
-            session_key,
+            message: _,
+            session_key: _,
             ..
         }) => {
             let run_id = Uuid::new_v4().to_string();
-            debug!(
-                "Hook triggered agent: message='{}', session_key='{}', runId='{}'",
-                message, session_key, run_id
-            );
+            debug!("Hook triggered agent: runId='{}'", run_id);
             (
                 StatusCode::ACCEPTED,
                 Json(json!({ "ok": true, "runId": run_id })),

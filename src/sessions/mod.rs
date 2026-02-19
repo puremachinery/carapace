@@ -25,6 +25,28 @@ pub fn canonicalize_session_hint(session_hint: &str) -> String {
     format!("sid_{}", hex::encode(hasher.finalize()))
 }
 
+fn is_canonical_session_id(session_hint: &str) -> bool {
+    let Some(hex_part) = session_hint.strip_prefix("sid_") else {
+        return false;
+    };
+    hex_part.len() == 64 && hex_part.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Canonicalize an optional explicit session hint.
+///
+/// Empty hints are discarded. Existing canonical IDs are preserved as-is to
+/// avoid double hashing when call sites pre-canonicalize.
+pub fn canonicalize_optional_session_hint(session_hint: Option<&str>) -> Option<String> {
+    let trimmed = session_hint
+        .map(str::trim)
+        .filter(|hint| !hint.is_empty())?;
+    if is_canonical_session_id(trimmed) {
+        Some(trimmed.to_string())
+    } else {
+        Some(canonicalize_session_hint(trimmed))
+    }
+}
+
 /// Resolve a session key using scoping config and optional explicit session hint.
 pub fn resolve_scoped_session_key(
     config: &serde_json::Value,
@@ -45,13 +67,10 @@ pub fn resolve_scoped_session_key(
     let peer = if peer.is_empty() { sender } else { peer };
 
     let channel_config = scoping::ChannelSessionConfig::from_config(config, channel_name);
-    let resolved_session_id = match explicit_session_hint
-        .map(|id| id.trim())
-        .filter(|id| !id.is_empty())
-    {
-        Some(id) => canonicalize_session_hint(id),
-        None => scoping::resolve_session_key(channel_name, sender, peer, channel_config.scope),
-    };
+    let explicit_session_id = canonicalize_optional_session_hint(explicit_session_hint);
+    let resolved_session_id = explicit_session_id.unwrap_or_else(|| {
+        scoping::resolve_session_key(channel_name, sender, peer, channel_config.scope)
+    });
 
     (
         resolved_session_id,
@@ -104,7 +123,7 @@ pub fn create_store_with_path(base_path: std::path::PathBuf) -> SessionStore {
 
 #[cfg(test)]
 mod tests {
-    use super::canonicalize_session_hint;
+    use super::{canonicalize_optional_session_hint, canonicalize_session_hint};
 
     #[test]
     fn test_canonicalize_session_hint_pinned_hash_output() {
@@ -113,5 +132,20 @@ mod tests {
             canonical,
             "sid_31c3253ae028e0adb3745c77672b8ea3adfc6a971c4aae07b0e26500d5886ed4"
         );
+    }
+
+    #[test]
+    fn test_canonicalize_optional_session_hint_preserves_canonical_id() {
+        let canonical = "sid_31c3253ae028e0adb3745c77672b8ea3adfc6a971c4aae07b0e26500d5886ed4";
+        assert_eq!(
+            canonicalize_optional_session_hint(Some(canonical)),
+            Some(canonical.to_string())
+        );
+    }
+
+    #[test]
+    fn test_canonicalize_optional_session_hint_discards_empty_input() {
+        assert_eq!(canonicalize_optional_session_hint(Some("   ")), None);
+        assert_eq!(canonicalize_optional_session_hint(None), None);
     }
 }
