@@ -1239,15 +1239,12 @@ fn hook_result_to_response(
             (StatusCode::OK, Json(json!({ "ok": true, "mode": mode }))).into_response()
         }
         Ok(HookMappingResult::Agent {
-            message,
-            session_key,
+            message: _,
+            session_key: _,
             ..
         }) => {
             let run_id = Uuid::new_v4().to_string();
-            debug!(
-                "Hook triggered agent: message='{}', session_key='{}', runId='{}'",
-                message, session_key, run_id
-            );
+            debug!("Hook triggered agent: runId='{}'", run_id);
             (
                 StatusCode::ACCEPTED,
                 Json(json!({ "ok": true, "runId": run_id })),
