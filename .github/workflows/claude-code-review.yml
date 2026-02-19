@@ -83,16 +83,20 @@ jobs:
                - Only in-scope high/medium findings are blocking for this PR.
                - Out-of-scope findings are advisory only.
             7) Review format:
-               - If there are one or more in-scope high/medium findings, submit exactly ONE GitHub pull-request review.
+               - Submit exactly ONE GitHub pull-request review on every run.
+               - If there are one or more in-scope high/medium findings, mark the review body as:
+                 "Blocking findings present."
                - Put all line-level findings as inline comments within that single review.
                - Include a short review body summary at submit time.
-               - If there are zero in-scope high/medium findings, do not submit a review.
+               - If there are zero in-scope high/medium findings, submit a short summary-only review body:
+                 "LGTM for blocking issues."
                - Never create standalone PR conversation comments.
                - Never create issue comments.
                - Never create review comments outside that single pending review.
 
             Output requirements:
             - Use GitHub Review API flow (pending review -> review comments -> submit review).
+            - When there are no in-scope high/medium findings, submit a summary-only review with no inline comments.
             - Keep each inline comment concise and non-repetitive.
             - Do not use gh pr comment.
             - Do not use issue comment endpoints.
