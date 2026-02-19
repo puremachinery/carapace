@@ -912,15 +912,13 @@ fn dispatch_agent_run(
         user_id: Some(sender_id.to_string()),
         ..Default::default()
     };
-    let explicit_session_hint =
-        crate::sessions::canonicalize_optional_session_hint(validated.session_key.as_deref());
     let session = crate::sessions::get_or_create_scoped_session(
         ws.session_store(),
         &cfg,
         channel,
         sender_id,
         peer_id,
-        explicit_session_hint.as_deref(),
+        validated.session_key.as_deref(),
         metadata,
     )
     .map_err(|e| {

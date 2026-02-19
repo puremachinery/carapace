@@ -34,14 +34,14 @@ fn is_canonical_session_id(session_hint: &str) -> bool {
 
 /// Canonicalize an optional explicit session hint.
 ///
-/// Empty hints are discarded. Existing canonical IDs are preserved as-is to
-/// avoid double hashing when call sites pre-canonicalize.
+/// Empty hints are discarded. Existing canonical IDs are preserved and
+/// normalized to lowercase to avoid double hashing and key mismatches.
 pub fn canonicalize_optional_session_hint(session_hint: Option<&str>) -> Option<String> {
     let trimmed = session_hint
         .map(str::trim)
         .filter(|hint| !hint.is_empty())?;
     if is_canonical_session_id(trimmed) {
-        Some(trimmed.to_string())
+        Some(trimmed.to_ascii_lowercase())
     } else {
         Some(canonicalize_session_hint(trimmed))
     }
@@ -147,5 +147,53 @@ mod tests {
     fn test_canonicalize_optional_session_hint_discards_empty_input() {
         assert_eq!(canonicalize_optional_session_hint(Some("   ")), None);
         assert_eq!(canonicalize_optional_session_hint(None), None);
+    }
+
+    #[test]
+    fn test_canonicalize_optional_session_hint_hashes_non_canonical_hint() {
+        let expected = canonicalize_session_hint("my-session");
+        assert_eq!(
+            canonicalize_optional_session_hint(Some("my-session")),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn test_canonicalize_optional_session_hint_trims_and_preserves_canonical_id() {
+        let canonical = "sid_31c3253ae028e0adb3745c77672b8ea3adfc6a971c4aae07b0e26500d5886ed4";
+        let padded = format!("  {}  ", canonical);
+        assert_eq!(
+            canonicalize_optional_session_hint(Some(&padded)),
+            Some(canonical.to_string())
+        );
+    }
+
+    #[test]
+    fn test_canonicalize_optional_session_hint_normalizes_canonical_hex_case() {
+        let upper = "sid_31C3253AE028E0ADB3745C77672B8EA3ADFC6A971C4AAE07B0E26500D5886ED4";
+        let lower = "sid_31c3253ae028e0adb3745c77672b8ea3adfc6a971c4aae07b0e26500d5886ed4";
+        assert_eq!(
+            canonicalize_optional_session_hint(Some(upper)),
+            Some(lower.to_string())
+        );
+    }
+
+    #[test]
+    fn test_canonicalize_optional_session_hint_rehashes_invalid_sid_forms() {
+        let invalid_prefix = "SID_31c3253ae028e0adb3745c77672b8ea3adfc6a971c4aae07b0e26500d5886ed4";
+        let invalid_len = "sid_31c3253ae028e0adb3745c77672b8ea3adfc6a971c4aae07b0e26500d5886ed";
+        let invalid_hex = "sid_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz";
+        assert_eq!(
+            canonicalize_optional_session_hint(Some(invalid_prefix)),
+            Some(canonicalize_session_hint(invalid_prefix))
+        );
+        assert_eq!(
+            canonicalize_optional_session_hint(Some(invalid_len)),
+            Some(canonicalize_session_hint(invalid_len))
+        );
+        assert_eq!(
+            canonicalize_optional_session_hint(Some(invalid_hex)),
+            Some(canonicalize_session_hint(invalid_hex))
+        );
     }
 }

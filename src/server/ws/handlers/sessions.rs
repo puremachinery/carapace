@@ -1955,15 +1955,13 @@ pub(super) fn handle_agent(
         .filter(|s| !s.is_empty())
         .unwrap_or(sender_id.as_str())
         .to_string();
-    let explicit_session_hint =
-        sessions::canonicalize_optional_session_hint(agent_params.session_hint.as_deref());
     let session = sessions::get_or_create_scoped_session(
         state.session_store(),
         &cfg,
         channel.as_str(),
         sender_id.as_str(),
         peer_id.as_str(),
-        explicit_session_hint.as_deref(),
+        agent_params.session_hint.as_deref(),
         metadata,
     )
     .map_err(|err| {
