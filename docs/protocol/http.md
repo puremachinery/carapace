@@ -146,8 +146,9 @@ Plugins can register webhook paths. Carapace routes any request under
 Common behavior:
 - Method: **any**
 - Max body size: 256 KB (override via `gateway.hooks.maxBodyBytes`)
-- Auth: **none at the service layer** — plugins must validate their own secrets
-  (e.g., shared tokens or signatures).
+- Auth: hooks token required (same auth check as `/hooks/*`).
+  Plugins may still perform additional validation (for example shared secrets or
+  signatures in request payloads/headers).
 - Response: status, headers, and body are forwarded from the plugin.
 
 ### `ANY /plugins/{plugin_id}/*`
@@ -300,18 +301,6 @@ The following handlers are available but require additional documentation:
 - Event subscription webhook receiver
 - Slash command handlers
 - Interactive component handlers
-
-### Plugin HTTP Handlers
-- `POST /plugins/{pluginId}/{path}` - Plugin webhook routes
-- Registered via `registerHttpRoute()` in plugin API
-- Each plugin's routes are namespaced under `/plugins/{pluginId}/`
-- Authentication: uses the hooks token (same as `/hooks/*`)
-
-**BREAKING CHANGE from Node implementation:**
-The Node implementation allowed plugins to register arbitrary paths (e.g., `/my-webhook`).
-The Rust implementation enforces namespacing for security isolation. All plugin routes
-are prefixed with `/plugins/{pluginId}/`. Existing webhook integrations must
-update their URLs accordingly.
 
 ### Canvas Host / A2UI Endpoints
 - `/a2ui/*` - Artifact-to-UI canvas host

@@ -39,7 +39,7 @@ Pending requests expire after **5 minutes** (configurable via `PAIRING_EXPIRY_MS
 
 1. Entity connects to the Carapace WS endpoint and sends `node.pair.request` (or `device.pair.request`)
 2. Carapace creates a **pending request** and emits `node.pair.requested` event
-3. Operator approves or rejects via CLI or UI
+3. Operator approves or rejects via CLI or control API
 4. On approval, Carapace issues a **new token** (tokens rotate on re-pair)
 5. Entity stores token and uses it for future authentication
 
@@ -172,4 +172,4 @@ Both modules include comprehensive test coverage. See also [Security](../securit
 | Purpose | Application-level pairing | WS connection identity |
 | Capabilities | Audio, camera, location, etc. | Roles and scopes |
 | Token expiry | 30 days | 90 days |
-| Use case | iOS/Android apps, headless nodes | CLI, macOS app, web UI |
+| Use case | iOS/Android apps, headless nodes | CLI and other paired operator clients |

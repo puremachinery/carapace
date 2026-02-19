@@ -14,8 +14,12 @@ service HTTP port 18789. Adjust paths/ports for your deployment.
 
 ## Common Notes
 
-- Inbound webhooks require a public HTTPS URL. If you are behind a reverse
-  proxy, ensure it forwards to Carapace and preserves the request body.
+- Webhook-based inbound modes require a public HTTPS URL (for example, Telegram
+  webhook mode and Slack Events API). Polling/Gateway modes (Signal polling,
+  Telegram polling fallback, Discord Gateway) do not require a public webhook
+  endpoint.
+- If you are behind a reverse proxy, ensure it forwards to Carapace and
+  preserves the request body.
 - Secrets are encrypted at rest when config encryption is enabled.
 - Channel tools (agent actions) are available when `session.metadata.channel`
   is set for the conversation.
@@ -43,6 +47,9 @@ docker run -d -p 8080:8080 -v $HOME/.local/share/signal-api:/home/.local/share/s
   }
 }
 ```
+
+For non-loopback Signal deployments, set `signal.baseUrl` to `https://...`.
+Carapace rejects non-HTTPS non-loopback Signal URLs.
 
 ## Telegram (Bot API + Webhook or Polling)
 
@@ -136,7 +143,6 @@ running:
 ```bash
 cara verify --outcome discord --port 18789 --discord-to "<channel_id>"
 cara verify --outcome telegram --port 18789 --telegram-to "<chat_id>"
-cara verify --outcome hooks --port 18789
 ```
 
 Notes:

@@ -65,7 +65,7 @@ graph TB
     end
 
     subgraph "Storage"
-        FS[(Config Dir<br/>~/.config/carapace (Linux))]
+        FS[(Platform Config/State Dir<br/>OS-specific paths)]
     end
 
     %% Client connections
@@ -203,7 +203,7 @@ sequenceDiagram
         TD->>EA: Requires approval?
         EA-->>TD: allow-once / allow-always / deny
         TD->>SB: Execute in sandbox
-        SB->>SB: Seatbelt (macOS) / Landlock (Linux)
+        SB->>SB: Seatbelt (macOS) / Landlock (Linux) / Job Objects + AppContainer (Windows)
         SB->>SB: rlimits (CPU, memory, fds)
         SB-->>TD: Tool result
         TD-->>LLM: Tool result
@@ -222,6 +222,8 @@ sequenceDiagram
 |-----------|------|-------------|
 | WS Server | `src/server/ws/` | WebSocket JSON-RPC, method dispatch |
 | HTTP Service | `src/server/http.rs` | HTTP endpoints, static files |
+| CLI | `src/cli/mod.rs` | CLI command parsing and command handlers (`start`, `setup`, `update`, `verify`, etc.) |
+| CLI Chat | `src/cli/chat.rs` | Interactive REPL chat flow (`cara chat`) |
 | OpenAI Compat | `src/server/openai.rs` | /v1/chat/completions, /v1/responses |
 | Control API | `src/server/control.rs` | /control/status, /control/channels |
 | Auth | `src/auth/mod.rs` | Token/password verification, loopback detection |

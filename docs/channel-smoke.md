@@ -11,7 +11,8 @@ Priority for current validation wave:
 - Signal
 - Slack
 
-Other channels can follow the same evidence format.
+The smoke report template also supports Telegram and Discord; use the same
+evidence format.
 
 ## Preflight
 
@@ -22,8 +23,11 @@ Other channels can follow the same evidence format.
 3. Keep logs open:
 
 ```bash
-cara logs --follow
+cara logs -n 200
 ```
+
+`cara logs` prints a recent tail (not a live follow stream). Re-run it at key
+steps and after failures to capture relevant evidence.
 
 ## Pass Criteria
 

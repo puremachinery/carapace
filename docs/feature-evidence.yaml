@@ -1,8 +1,8 @@
-# Evidence for verified feature statuses (done/partial/missing).
+# Working evidence log for tracked feature statuses (done/partial/missing).
 # Keep this focused on audited entries in docs/feature-status.yaml.
 
 version: "1.0"
-updated_at: "2026-02-18"
+updated_at: "2026-02-19"
 
 features:
   - feature: "logs.tail"
@@ -103,6 +103,36 @@ features:
     tests:
       - "src/cron/mod.rs (CronExpr parse tests)"
       - "src/cron/mod.rs::test_compute_next_run_cron_schedule"
+
+  - feature: "cron.timezone support"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/cron/mod.rs::compute_next_run (CronSchedule::Cron with optional tz)"
+      - "src/cron/mod.rs::compute_next_run_with_tz_fallback (IANA tz + DST handling)"
+      - "src/server/ws/handlers/cron.rs::parse_schedule (cron.tz parse)"
+    tests:
+      - "src/cron/mod.rs::test_compute_next_run_cron_tz_none_unchanged"
+      - "src/cron/mod.rs::test_compute_next_run_cron_tz_utc_unchanged"
+      - "src/cron/mod.rs::test_compute_next_run_cron_eastern_winter"
+      - "src/cron/mod.rs::test_compute_next_run_cron_eastern_summer"
+      - "src/cron/mod.rs::test_compute_next_run_cron_spring_forward_skip"
+      - "src/cron/mod.rs::test_compute_next_run_cron_fall_back_first_only"
+      - "src/cron/mod.rs::test_compute_next_run_cron_fall_back_no_double"
+      - "src/server/ws/handlers/cron.rs::test_parse_schedule_cron"
+
+  - feature: "cron.job persistence"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/cron/mod.rs::CronScheduler::new (persist path wiring)"
+      - "src/cron/mod.rs::CronScheduler::load (restore persisted jobs + clear stale running state)"
+      - "src/cron/mod.rs::CronScheduler::flush (persist mutations to jobs.json)"
+      - "src/server/ws/mod.rs (startup CronScheduler::new(state_dir/cron/jobs.json) + load)"
+    tests:
+      - "src/cron/mod.rs::test_flush_and_load_round_trip"
+      - "src/cron/mod.rs::test_load_nonexistent_file"
+      - "src/cron/mod.rs::test_load_corrupt_file"
+      - "src/cron/mod.rs::test_remove_flushes"
+      - "src/cron/mod.rs::test_update_flushes"
 
   - feature: "cron.job quotas"
     status: "verified_done"
@@ -1110,6 +1140,7 @@ features:
     runtime_wiring:
       - "src/sessions/file_lock.rs (FileLock RAII + flock)"
       - "src/sessions/store.rs (FileLock on meta/history writes)"
+      - "src/sessions/store.rs::acquire_session_key_lock (per-session-key advisory lock for create/get_or_create)"
     tests:
       - "src/sessions/file_lock.rs (locking tests)"
 
@@ -1117,7 +1148,7 @@ features:
     status: "verified_done"
     runtime_wiring:
       - "src/sessions/store.rs (cleanup_expired)"
-      - "src/sessions/retention.rs (retention loop + config)"
+      - "src/sessions/retention.rs (retention loop + config + spawn_blocking cleanup)"
       - "src/server/startup.rs (spawn retention cleanup)"
     tests:
       - "src/sessions/retention.rs (config + loop tests)"
@@ -1139,6 +1170,26 @@ features:
       - "src/agent/executor.rs::record_turn_usage (usage recording)"
     tests:
       - "src/usage/mod.rs (calculate_cost tests)"
+
+  - feature: "usage.pricing overrides"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/usage/mod.rs::parse_pricing_config (usage.pricing.default + overrides)"
+      - "src/usage/mod.rs::update_pricing_from_config (global pricing refresh)"
+      - "src/config/schema.rs (usage.pricing validation)"
+      - "src/config/mod.rs (pricing refresh on load/reload)"
+    tests:
+      - "src/usage/mod.rs::test_pricing_override_precedence"
+      - "src/usage/mod.rs::test_pricing_default_fallback"
+
+  - feature: "usage.retention and size caps"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/usage/mod.rs::prune_data_with_limits (retention windows + max entries)"
+      - "src/usage/mod.rs::record (prune + bounded persistence on write path)"
+    tests:
+      - "src/usage/mod.rs::test_usage_prune_by_retention"
+      - "src/usage/mod.rs::test_usage_prune_by_max_entries"
 
   - feature: "tests.integration"
     status: "verified_done"
@@ -1350,6 +1401,38 @@ features:
     tests:
       - "src/cli/mod.rs::test_cli_version_subcommand"
 
+  - feature: "chat"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/main.rs (Command::Chat dispatch)"
+      - "src/cli/chat.rs::handle_chat (gateway startup + session run)"
+      - "src/cli/chat.rs::run_chat_session (interactive REPL flow)"
+    tests:
+      - "src/cli/mod.rs::test_cli_chat_defaults"
+      - "src/cli/mod.rs::test_cli_chat_with_new_and_port"
+      - "src/cli/chat.rs::test_parse_repl_command"
+
+  - feature: "verify"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/main.rs (Command::Verify dispatch)"
+      - "src/cli/mod.rs::handle_verify"
+      - "src/cli/mod.rs::run_outcome_verifier"
+    tests:
+      - "src/cli/mod.rs::test_cli_verify_defaults"
+      - "src/cli/mod.rs::test_cli_verify_with_options"
+
+  - feature: "cli.binary naming"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/cli/mod.rs (clap parsing uses `cara` command name)"
+      - "src/cli/mod.rs::download_and_install_binary (platform asset lookup uses cara-<os>-<arch>)"
+      - ".github/workflows/release.yml (release artifacts named cara-<arch>-<os>)"
+    tests:
+      - "src/cli/mod.rs::test_cli_no_args_defaults_to_none"
+      - "src/server/ws/handlers/update.rs::test_expected_asset_name_no_exe_on_unix"
+      - "src/server/ws/handlers/update.rs::test_staged_path_construction"
+
   - feature: "backup"
     status: "verified_done"
     runtime_wiring:
@@ -1407,6 +1490,10 @@ features:
     runtime_wiring:
       - "src/cli/mod.rs::handle_update (GitHub releases + staged update)"
       - "src/server/ws/handlers/update.rs::apply_staged_update"
+      - "src/server/ws/handlers/update.rs::handle_update_install (test-build guard avoids replacing current test binary)"
+    tests:
+      - "src/server/ws/handlers/update.rs::test_update_install_download_failure_clears_flag"
+      - "src/server/ws/handlers/update.rs::test_install_sets_installing_flag"
 
   - feature: "tls init-ca / issue-cert / revoke-cert / show-ca"
     status: "verified_done"
@@ -1436,15 +1523,33 @@ features:
     tests:
       - "src/config/mod.rs::test_env_var_substitution"
 
+  - feature: "Config path/env naming"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/config/mod.rs::get_config_path (CARAPACE_CONFIG_PATH -> CARAPACE_STATE_DIR -> platform config dir)"
+    tests:
+      - "src/config/mod.rs::test_get_config_path_default"
+      - "src/config/mod.rs::test_get_config_path_override"
+      - "src/config/mod.rs::test_get_config_path_state_dir"
+
   - feature: "Config cache"
     status: "verified_done"
     runtime_wiring:
       - "src/config/mod.rs (CONFIG_CACHE + load_config TTL)"
 
+  - feature: "Config shared snapshots"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/config/mod.rs::load_config_shared (Arc-backed cached config snapshot)"
+      - "src/channels/inbound.rs::dispatch_inbound_text (shared config read)"
+      - "src/channels/signal_receive.rs::dispatch_signal_inbound (shared config read)"
+      - "src/agent/builtin_tools.rs::handle_media_analyze (shared config read)"
+
   - feature: "Hot reload"
     status: "verified_done"
     runtime_wiring:
       - "src/config/watcher.rs (ConfigWatcher)"
+      - "src/config/watcher.rs::perform_reload_async (spawn_blocking reload path)"
       - "src/server/startup.rs (spawn config watcher)"
     tests:
       - "src/config/watcher.rs (ConfigWatcher tests)"
@@ -1478,13 +1583,15 @@ features:
     status: "verified_done"
     runtime_wiring:
       - "src/credentials/macos.rs (MacOsCredentialBackend via keyring)"
+      - "src/credentials/macos.rs (get/set/delete/list operations via tokio::task::spawn_blocking)"
     tests:
       - "src/credentials/macos.rs::test_error_mapping"
 
-  - feature: "Linux Keyutils"
+  - feature: "Linux Secret Service"
     status: "verified_done"
     runtime_wiring:
-      - "src/credentials/linux.rs (LinuxCredentialBackend via keyring/keyutils)"
+      - "src/credentials/linux.rs (LinuxCredentialBackend via keyring/Secret Service)"
+      - "src/credentials/linux.rs (get/set/delete/list operations via tokio::task::spawn_blocking)"
     tests:
       - "src/credentials/linux.rs::test_error_mapping"
 
@@ -1492,6 +1599,7 @@ features:
     status: "verified_done"
     runtime_wiring:
       - "src/credentials/windows.rs (WindowsCredentialBackend via keyring)"
+      - "src/credentials/windows.rs (get/set/delete/list operations via tokio::task::spawn_blocking)"
     tests:
       - "src/credentials/windows.rs::test_error_mapping"
 

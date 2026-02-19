@@ -16,7 +16,8 @@ If you want the website flow instead of Markdown docs, start at
 ## Prerequisites
 
 - A `cara` binary on your PATH
-- A supported LLM provider API key (OpenAI/Anthropic/etc), or Ollama
+- A supported LLM provider API key (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
+  `GOOGLE_API_KEY`, or `VENICE_API_KEY`), or local Ollama
 - Optional: TLS certs if exposing Carapace publicly
 
 Install options:
@@ -156,10 +157,12 @@ Most common commands:
 
 ```bash
 cara status --host 127.0.0.1 --port 18789
-cara logs --follow
-cara backup --out ./carapace-backup.tar.gz
+cara logs -n 200
+cara backup --output ./carapace-backup.tar.gz
 cara update
 ```
+
+`cara logs` is a snapshot tail, not a continuous follow stream.
 
 ## Troubleshooting
 

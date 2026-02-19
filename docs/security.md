@@ -1,6 +1,6 @@
 # Security
 
-Security architecture and threat model for carapace.
+Security architecture and threat model for Carapace.
 
 ## Threat Model
 
@@ -71,7 +71,7 @@ graph TB
         Secrets["AES-256-GCM Encrypted Secrets<br/>(PBKDF2, 600K iterations)"]
         Sessions["HMAC-SHA256 Session Integrity"]
         Audit["Append-Only Audit Log<br/>(JSONL, 19 event types)"]
-        Keychain["Platform Credential Store<br/>(Keychain / Keyutils / Windows)"]
+        Keychain["Platform Credential Store<br/>(Keychain / Secret Service / Windows)"]
     end
 
     subgraph "Plugin Boundary"

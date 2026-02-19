@@ -5,12 +5,20 @@ This section is task-first: "I want to do X, what exact steps do I run?"
 If you are new to Carapace, start with:
 - [5-minute secure local setup + first reply](secure-local-first-reply.md)
 
-## Ready now
+## Recipes
 
 - [Add Carapace to Discord](discord-assistant.md)
-- [Connect apps to your local Carapace assistant (OpenAI-compatible API)](openai-compatible-endpoint.md)
-- [Expose hooks safely for automation](hooks-safe-automation.md)
-- [Add Carapace to Telegram (public webhook mode)](telegram-webhook-assistant.md)
+- [Use Cara with VS Code, JetBrains, chat UIs, and scripts](openai-compatible-endpoint.md)
+- [Trigger Cara from other apps](hooks-safe-automation.md)
+- [Add Carapace to Telegram](telegram-webhook-assistant.md)
+- Add Carapace to Slack
+- Add Carapace to Signal
+- Run Cara fully local with Ollama
+- Set up daily/weekly digests
+- Use Cara to control your home with Home Assistant
+- Secure remote access with Tailscale
+- Move Cara to a new machine (backup + restore)
+- Use one Cara across multiple channels
 
 ## Recipe format
 

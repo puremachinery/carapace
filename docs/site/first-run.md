@@ -61,9 +61,9 @@ require destination flags (`--discord-to` / `--telegram-to`) for send-path check
 - `discord`:
   - Continue with [Add Carapace to Discord](../cookbook/discord-assistant.md)
 - `telegram`:
-  - Continue with [Set up Telegram inbound + reply flow](../cookbook/telegram-webhook-assistant.md)
+  - Continue with [Add Carapace to Telegram](../cookbook/telegram-webhook-assistant.md)
 - `hooks`:
-  - Continue with [Expose hooks safely with token auth](../cookbook/hooks-safe-automation.md)
+  - Continue with [Trigger Cara from other apps](../cookbook/hooks-safe-automation.md)
 
 ## Continue
 

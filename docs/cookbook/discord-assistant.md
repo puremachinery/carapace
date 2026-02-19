@@ -11,6 +11,7 @@ Connect Carapace to Discord so inbound messages can trigger agent responses.
 - Discord bot token (`DISCORD_BOT_TOKEN`).
 - Discord bot added to your server.
 - Message Content Intent enabled in the Discord developer portal.
+- A Discord channel ID for a test channel (recommended for send-path verification).
 
 ## 1) Create config
 
@@ -70,10 +71,19 @@ cara status --host 127.0.0.1 --port 18789
 curl -H "Authorization: Bearer ${CARAPACE_GATEWAY_TOKEN}" http://127.0.0.1:18789/health
 ```
 
+Optional built-in verifier (sends a real test message):
+
+```bash
+cara verify --outcome discord --port 18789 --discord-to YOUR_CHANNEL_ID
+```
+
+Replace `YOUR_CHANNEL_ID` with the numeric Discord channel ID.
+
 ## 3) Verify
 
 1. Send a message in a Discord channel where the bot is present.
 2. Confirm Carapace receives it and sends a reply.
+3. If you ran `cara verify`, confirm Discord checks report PASS.
 
 ## Common failures and fixes
 
