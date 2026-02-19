@@ -72,31 +72,22 @@ jobs:
                - scope tag: in-scope or out-of-scope for this PR
                - concrete impact and concise fix
             3) Dedupe aggressively across pushes:
-               - Before posting, fetch existing PR comments/review threads with gh api.
-               - Do NOT post a new comment for the same root cause if one already exists.
-               - If still unresolved, skip reposting and only mention in top-level summary.
+               - Before posting, inspect existing review threads with gh pr view.
+               - Do NOT post a new inline comment for the same root cause if one already exists.
             4) low findings:
                - Do NOT post inline.
-               - Include them only in one top-level "Optional follow-ups (non-blocking)" section.
+               - Suppress entirely.
             5) info findings:
                - Suppress entirely (do not post inline or top-level).
             6) Blocking policy:
                - Only in-scope high/medium findings are blocking for this PR.
                - Out-of-scope findings are advisory only.
-            7) Consistency requirement:
-               - If you report any in-scope high/medium finding, do NOT say "LGTM for blocking issues."
-               - If you say "LGTM for blocking issues.", there must be zero in-scope high/medium findings in the entire review comment.
-               - Never place high/medium findings inside "Optional follow-ups (non-blocking)".
 
             Output requirements:
-            - Post at most one top-level PR comment via gh pr comment.
-            - Start with exactly one of:
-              - "LGTM for blocking issues." (only when there are zero in-scope high/medium findings)
-              - "Blocking findings present." (required when any in-scope high/medium finding exists)
-            - If "Blocking findings present.": include a "### Blocking findings (required before merge)" section with each in-scope high/medium finding.
-            - Keep advisory out-of-scope high/medium findings in a separate "### Advisory findings (out-of-scope)" section.
-            - Keep "### Optional follow-ups (non-blocking)" limited to low findings only.
-            - Keep comments concise and avoid repetitive wording.
-            - Only post GitHub comments; do not leave final feedback only in tool output.
+            - Post inline comments only for in-scope high/medium findings.
+            - Do NOT post standalone PR comments with gh pr comment.
+            - Do NOT post standalone PR comments with gh api.
+            - If there are zero in-scope high/medium findings, do not post inline comments.
+            - Keep each inline comment concise and non-repetitive.
           claude_args: |
-            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh api:*),Bash(git:*),WebSearch"
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr diff:*),Bash(gh pr view:*),Bash(git:*),WebSearch"
