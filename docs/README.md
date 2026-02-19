@@ -1,4 +1,4 @@
-# carapace Documentation
+# Carapace Documentation
 
 A security-focused, open-source personal AI assistant.
 

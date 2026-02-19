@@ -13,7 +13,7 @@ status_legend:
 feature_inventory_markdown: |
   ## Feature Inventory
 
-  Comprehensive list of every feature in the system, grouped by module.
+  Working inventory of tracked features in the system, grouped by module.
   Markers follow the status_legend.
 
   ### Agent (`src/agent/`)
@@ -63,12 +63,15 @@ feature_inventory_markdown: |
   - [x] **status** — gateway health check via HTTP
   - [x] **logs** — tail logs via WebSocket
   - [x] **version** — show version + build info
+  - [x] **CLI binary naming** — executable is `cara`; release assets follow `cara-<arch>-<os>`
   - [x] **backup** — tar.gz archive of state directory
   - [x] **restore** — extract backup with path traversal protection
   - [x] **reset** — clear sessions/cron/usage/memory
   - [x] **setup** — interactive configuration wizard
   - [x] **pair** — device identity handshake + node pairing initiation (remote gateways supported)
   - [x] **update** — version check and self-update
+  - [x] **chat** — interactive local REPL session over WebSocket
+  - [x] **verify** — first-run outcome verification (local chat/channels/hooks)
   - [x] **tls init-ca / issue-cert / revoke-cert / show-ca** — cluster CA management
 
   ### Config (`src/config/`)
@@ -76,8 +79,11 @@ feature_inventory_markdown: |
   - [x] **JSON5 parsing** — comments, trailing commas
   - [x] **$include directive** — max depth 10, circular reference detection
   - [x] **Env var substitution** — `${VAR}` pattern replacement
+  - [x] **Config path/env naming** — `CARAPACE_CONFIG_PATH` and `CARAPACE_STATE_DIR` precedence with platform config-dir defaults
   - [x] **Config cache** — 200ms TTL in-memory cache
   - [x] **Hot reload** — file watcher infrastructure (`watcher.rs`)
+  - [x] **Reload on blocking thread** — reload file I/O runs via `spawn_blocking` to avoid async runtime stalls
+  - [x] **Shared config snapshots** — `load_config_shared` cache reused by inbound dispatch and media analysis paths
   - [x] **Schema validation** — error/warning severity
   - [x] **Config defaults** — fallback values
   - [x] **Secret encryption** — AES-256-GCM at rest with PBKDF2 key derivation
@@ -85,9 +91,10 @@ feature_inventory_markdown: |
   ### Credentials (`src/credentials/`)
 
   - [x] **macOS Keychain** — keyring crate integration
-  - [x] **Linux Keyutils** — kernel keyring
+  - [x] **Linux Secret Service** — keyring-backed credential storage via D-Bus
   - [x] **Windows Credential Manager** — native API
   - [x] **Env-only fallback** — when keychain unavailable
+  - [x] **Non-blocking credential ops** — keyring/keychain operations run on blocking threads
   - [x] **Quotas and rate limiting** — 100 per plugin, 10 writes/min
   - [x] **Key/value size limits** — 64B key, 64KB value
 
@@ -96,6 +103,8 @@ feature_inventory_markdown: |
   - [x] **At schedule** — one-time execution at unix timestamp
   - [x] **Every schedule** — interval-based recurring
   - [x] **Cron expression** — 5-field format (min hr day mon dow)
+  - [x] **Cron timezone support** — optional IANA timezone (`tz`) with DST-aware next-run behavior
+  - [x] **Cron job persistence** — jobs stored at `state_dir/cron/jobs.json`, restored on startup, stale runtime state cleared on load
   - [x] **Job quotas** — max 500 enforced with LRU eviction when at limit
   - [x] **Payload types** — SystemEvent broadcast, AgentTurn spawn
   - [x] **Background tick loop** — async task runner
@@ -243,7 +252,7 @@ feature_inventory_markdown: |
   - [x] **HMAC integrity** — SHA-256 HMAC (metadata + history)
   - [x] **Session archiving + restoration**
   - [x] **Session filters** — list/search by criteria
-  - [x] **File locking** — concurrent-safe operations (flock RAII)
+  - [x] **File locking** — concurrent-safe operations (flock RAII), including per-session-key creation locks
   - [x] **Retention policies** — age-based cleanup
   - [x] **Scoping** — channel/session scope + reset policy across ingress
 
@@ -274,6 +283,8 @@ feature_inventory_markdown: |
   - [x] **Session usage tracking** — per-session totals
   - [x] **Provider/model breakdown** — per-provider and per-model aggregation
   - [x] **Cost calculation** — per-million-token pricing
+  - [x] **Pricing overrides** — configurable per-model pricing via `usage.pricing`
+  - [x] **Retention + size caps** — daily/monthly/session pruning keeps `usage.json` bounded
   - [x] **Persistent JSON storage** — pretty JSON format
   - [x] **Enable/disable tracking** — privacy control
 

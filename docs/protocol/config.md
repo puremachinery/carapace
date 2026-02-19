@@ -1,6 +1,6 @@
 # Config File Format
 
-This document describes the config file format used by the Carapace service.
+This document describes the config file format used by Carapace.
 
 ## File Location
 

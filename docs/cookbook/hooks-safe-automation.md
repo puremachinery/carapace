@@ -1,4 +1,4 @@
-# Expose hooks safely for automation
+# Trigger Cara from other apps
 
 ## Outcome
 
@@ -61,6 +61,12 @@ Create `carapace.json5`:
 CARAPACE_CONFIG_PATH=./carapace.json5 cara
 ```
 
+Optional built-in verifier:
+
+```bash
+cara verify --outcome hooks --port 18789
+```
+
 Trigger wake:
 
 ```bash
@@ -86,6 +92,7 @@ curl -sS \
 - `/hooks/wake` returns `{"ok":true,...}`.
 - `/hooks/agent` returns `{"ok":true,"runId":"..."}`.
 - Using service token for hooks fails, proving token separation works.
+- `cara verify --outcome hooks` reports PASS.
 
 ## Common failures and fixes
 

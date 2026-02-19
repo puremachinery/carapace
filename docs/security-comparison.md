@@ -27,7 +27,7 @@ Carapace is a Rust rewrite of OpenClaw built from the ground up to address these
 **How it was exploited:** Credentials stored in plaintext JSON and Markdown files. Commodity infostealers (RedLine, Lumma, Vidar) trivially harvest API keys, OAuth tokens, and credentials from the standard OpenClaw directory structure.
 
 **Carapace:**
-- **OS credential stores.** Secrets are stored in macOS Keychain, Linux Keyutils, or Windows Credential Manager — not in filesystem-accessible files.
+- **OS credential stores.** Secrets are stored in macOS Keychain, Linux Secret Service, or Windows Credential Manager — not in filesystem-accessible files.
 - **AES-256-GCM fallback.** When OS keychains are unavailable (containers, CI), secrets are encrypted with AES-256-GCM using PBKDF2-HMAC-SHA256 key derivation (600,000 iterations per OWASP 2024 recommendation). Each value has its own random salt and nonce.
 - **Zeroization.** Encryption keys and auth secrets are zeroized in memory after use via the `zeroize` crate.
 - An infostealer reading Carapace's state directory gets ciphertext and keychain references, not credentials.
@@ -103,7 +103,7 @@ Prompt injection remains an industry-wide unsolved problem. No AI system fully p
 
 ## Why Rust
 
-Rust is not a silver bullet, but it eliminates vulnerability classes that are irrelevant to mention because they cannot happen:
+Rust is not a silver bullet, but it significantly reduces broad memory-safety vulnerability classes:
 
 - **Memory safety without GC.** No buffer overflows, use-after-free, or double-free — the categories that account for ~70% of CVEs in C/C++ codebases (per Microsoft and Google's published data). This matters for a long-running daemon that processes untrusted input.
 - **Thread safety at compile time.** The borrow checker prevents data races. No "works on my machine" concurrency bugs that surface under load.

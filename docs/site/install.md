@@ -2,11 +2,11 @@
 
 ## Outcome
 
-Install `cara` from release binaries, verify artifact integrity, and confirm the CLI works.
+Install `cara`, optionally verify signatures/checksums, and confirm it runs.
 
 ## 1) Download a release binary
 
-Use a direct download link for your platform:
+Use a direct download link for your platform (fastest path for most users):
 
 - Linux x86_64: [cara-x86_64-linux](https://github.com/puremachinery/carapace/releases/latest/download/cara-x86_64-linux)
 - Linux ARM64: [cara-aarch64-linux](https://github.com/puremachinery/carapace/releases/latest/download/cara-aarch64-linux)
@@ -30,7 +30,7 @@ Quick path for first-time setup:
 Signature and checksum verification (Steps 2 and 3 below) are recommended,
 especially for production or automation.
 
-## 1b) Advanced: pinned version links (automation/ops)
+## Optional (advanced): pinned version links (automation/ops)
 
 ```bash
 VERSION="vX.Y.Z"
@@ -147,8 +147,9 @@ Write-Host "Checksum verified for $FileName"
 macOS/Linux:
 
 ```bash
-chmod +x ./cara-<your-platform>
-sudo mv ./cara-<your-platform> /usr/local/bin/cara
+FILE="cara-<your-platform>"   # example: cara-aarch64-darwin
+chmod +x "./${FILE}"
+sudo mv "./${FILE}" /usr/local/bin/cara
 ```
 
 Windows (PowerShell):

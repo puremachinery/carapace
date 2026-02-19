@@ -5,7 +5,8 @@
 ```bash
 cara version
 cara status --host 127.0.0.1 --port 18789
-curl -H "Authorization: Bearer ${CARAPACE_GATEWAY_TOKEN}" http://127.0.0.1:18789/health
+curl -sS http://127.0.0.1:18789/health
+cara logs -n 80
 ```
 
 ## Typical failures
@@ -30,8 +31,10 @@ RUST_LOG=debug CARAPACE_CONFIG_PATH=./carapace.json5 cara
 If service is running already:
 
 ```bash
-cara logs --follow
+cara logs -n 200
 ```
+
+`cara logs` is a snapshot tail, so re-run it as needed while debugging.
 
 ## Validate config quickly
 

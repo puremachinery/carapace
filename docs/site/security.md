@@ -2,17 +2,17 @@
 
 ## Outcome
 
-Understand what Carapace enforces today, what is partial, and how to verify
+Understand current security controls, known partial areas, and how to verify
 your local deployment quickly.
 
 ## 1) Security defaults
 
 By default, Carapace starts in a local-first, fail-closed posture:
 
-- binds to loopback (`127.0.0.1`) unless you explicitly choose otherwise
-- denies authenticated control requests when auth config is missing
-- stores credentials in OS keychains when available, with encrypted fallback
-- applies SSRF and DNS-rebinding protections for outbound fetch paths
+- Binds to loopback (`127.0.0.1`) unless you explicitly choose otherwise.
+- Denies authenticated control requests when auth config is missing.
+- Stores credentials in OS keychains when available, with encrypted fallback.
+- Applies SSRF and DNS-rebinding protections for outbound fetch paths.
 
 ## 2) Subprocess sandboxing status
 
@@ -20,10 +20,10 @@ Current platform status for sandbox-required subprocess paths:
 
 - macOS: Seatbelt + resource limits
 - Linux: Landlock + resource limits
-- Windows: sandboxed subprocesses use Job Objects + AppContainer. If a
+- Windows: sandboxes subprocesses with Job Objects + AppContainer. If a
   deny-network spawn flow is unsupported, Carapace blocks it instead of
   running unsandboxed.
-- other targets: fail closed for sandbox-required subprocess paths
+- Other targets: fail closed for sandbox-required subprocess paths.
 
 ## 3) Verify key controls
 
@@ -34,7 +34,7 @@ cara status --host 127.0.0.1 --port 18789
 curl -sS http://127.0.0.1:18789/health
 curl -sS -o /dev/null -w "%{http_code}\n" http://127.0.0.1:18789/control/status
 curl -sS -o /dev/null -w "%{http_code}\n" -H "Authorization: Bearer ${CARAPACE_GATEWAY_TOKEN}" http://127.0.0.1:18789/control/status
-cara logs --follow
+cara logs -n 200
 ```
 
 Quick checks:
@@ -43,8 +43,7 @@ Quick checks:
 - `/health` should return `status: "ok"` (public liveness probe).
 - `/control/status` should return `401` without auth and `200` with a valid
   service auth token/password.
-- logs should show expected startup/auth/channel events and no repeated
-  sandbox/auth errors.
+- `cara logs -n 200` should show expected startup/auth/channel events.
 
 ## 4) Trust model and caveats
 

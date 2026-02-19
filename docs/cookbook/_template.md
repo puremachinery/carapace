@@ -1,8 +1,8 @@
-# Recipe Title
+# Recipe Title (plain-language, outcome-first)
 
 ## Outcome
 
-What this walkthrough gives you when done.
+What this walkthrough gives you when done, in user-facing terms.
 
 ## Prerequisites
 

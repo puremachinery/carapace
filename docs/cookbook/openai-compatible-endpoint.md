@@ -1,15 +1,19 @@
-# Connect apps to your local Carapace assistant (OpenAI-compatible API)
+# Use Cara with VS Code, JetBrains, chat UIs, and scripts
 
 ## Outcome
 
-Expose `/v1/chat/completions` and `/v1/responses` on your local Carapace
-service so apps/tools that support OpenAI-compatible APIs can talk to it.
+Run Cara locally with OpenAI-style endpoints enabled, then connect:
+
+- VS Code / JetBrains (via Continue)
+- Open WebUI
+- LibreChat
+- Scripts and automations (`curl`)
 
 ## Prerequisites
 
 - `cara` installed.
 - `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`.
-- An app/tool that supports OpenAI-compatible APIs (or `curl`).
+- Optional client app: Continue, Open WebUI, or LibreChat.
 
 ## 1) Create config
 
@@ -47,13 +51,34 @@ $env:CARAPACE_GATEWAY_TOKEN = [System.BitConverter]::ToString($bytes).Replace('-
 }
 ```
 
-## 2) Run commands
+## 2) Start Cara
 
 ```bash
 CARAPACE_CONFIG_PATH=./carapace.json5 cara
 ```
 
-Call chat completions:
+## 3) Connect your app
+
+Use these values in your app's model/provider settings:
+
+- Provider type: `OpenAI` / `OpenAI-compatible`
+- Base URL: `http://127.0.0.1:18789/v1`
+- API key/token: same value as `CARAPACE_GATEWAY_TOKEN`
+- Model: `carapace`
+
+### VS Code / JetBrains (Continue)
+
+In Continue model/provider settings, point the model to the values above.
+
+### Open WebUI / LibreChat
+
+Add a custom OpenAI-compatible connection and use the same values above.
+Field names vary by UI, but the required pieces are always: base URL, API key,
+and model.
+
+## 4) Script smoke test (`curl`)
+
+Chat Completions:
 
 ```bash
 curl -sS \
@@ -68,7 +93,7 @@ curl -sS \
   }'
 ```
 
-Call responses:
+Responses:
 
 ```bash
 curl -sS \
@@ -81,16 +106,22 @@ curl -sS \
   }'
 ```
 
-## 3) Verify
+## 5) Verify
 
-- Both endpoints return `200` JSON responses with assistant output.
-- Unauthorized calls return `401`, confirming auth is enforced.
+- Your client app returns assistant output through Cara.
+- `curl` calls return `200` JSON responses with assistant output.
+- Unauthorized calls return `401` (auth enforcement working).
 
 ## Common failures and fixes
 
 - Symptom: `404` on `/v1/chat/completions` or `/v1/responses`.
   - Fix: Ensure `gateway.openai.chatCompletions` / `gateway.openai.responses` are enabled.
+- Symptom: app says endpoint not found.
+  - Fix: Confirm base URL is `http://127.0.0.1:18789/v1` (include `/v1`).
 - Symptom: `401 Unauthorized`.
   - Fix: Confirm bearer token matches `gateway.auth.token`.
 - Symptom: `500` provider error.
-  - Fix: Verify provider key/model config and check server logs for upstream API errors.
+  - Fix: Verify provider key/model config and check logs with `cara logs -n 200`.
+- Symptom: app on another device cannot connect.
+  - Fix: This recipe is local-only (`127.0.0.1`). If you need remote access, use
+    a LAN/Tailnet setup with TLS and auth hardening.

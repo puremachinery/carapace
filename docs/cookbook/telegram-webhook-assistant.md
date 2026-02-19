@@ -1,4 +1,4 @@
-# Add Carapace to Telegram (public webhook mode)
+# Add Carapace to Telegram
 
 ## Outcome
 
@@ -78,10 +78,20 @@ Check webhook status:
 curl -sS "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getWebhookInfo"
 ```
 
+Optional built-in verifier (credential checks; send-path is optional):
+
+```bash
+cara verify --outcome telegram --port 18789
+```
+
+For full send-path verification, rerun with `--telegram-to YOUR_CHAT_ID`.
+
 ## 3) Verify
 
 1. Send a message to your bot in Telegram.
 2. Confirm Carapace receives it and returns a reply.
+3. `getWebhookInfo` shows no delivery errors.
+4. If you ran `cara verify`, confirm Telegram checks report PASS/SKIP (SKIP is expected when no `--telegram-to` is provided).
 
 ## Common failures and fixes
 

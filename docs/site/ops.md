@@ -17,7 +17,7 @@ If you changed bind/port in setup, use those values instead of `127.0.0.1:18789`
 ## 2) Logs and diagnosis
 
 ```bash
-cara logs --follow
+cara logs -n 200
 ```
 
 For deeper troubleshooting, use:
@@ -30,7 +30,7 @@ For deeper troubleshooting, use:
 Create a backup before major config/channel changes:
 
 ```bash
-cara backup --out ./carapace-backup.tar.gz
+cara backup --output ./carapace-backup.tar.gz
 ```
 
 Restore from backup:
@@ -54,7 +54,7 @@ For pinned or reproducible installs, use the install guide:
 ## 5) First-response recovery checklist
 
 1. Confirm service health and port/bind settings.
-2. Tail logs and isolate first failing component (provider/channel/auth).
+2. Capture recent logs and isolate the first failing component (provider/channel/auth).
 3. Re-run setup for misconfigured auth/network/channel values.
 4. Restore from latest known-good backup if needed.
 5. Open an issue with logs + exact steps if still blocked.

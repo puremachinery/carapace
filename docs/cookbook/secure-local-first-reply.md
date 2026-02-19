@@ -70,11 +70,18 @@ curl -H "Authorization: Bearer ${CARAPACE_GATEWAY_TOKEN}" http://127.0.0.1:18789
 cara chat
 ```
 
+Optional built-in verifier:
+
+```bash
+cara verify --outcome local-chat --port 18789
+```
+
 ## 3) Verify
 
 - `cara status` reports healthy.
 - `/health` returns JSON with `status: "ok"`.
 - `cara chat` opens an interactive REPL and returns a model response.
+- `cara verify --outcome local-chat` reports PASS.
 
 ## Common failures and fixes
 

@@ -10,7 +10,7 @@ For first-run walkthroughs and channel onboarding:
 
 ## Command Reference
 
-### `cara` (start)
+### `cara` / `cara start`
 Starts the Carapace service (default when no subcommand is given).
 
 ### `cara config`
@@ -25,6 +25,7 @@ Manage configuration values.
 Interactive first-run wizard for provider/auth/network/channel setup.
 
 Wizard outcomes include `local-chat`, `discord`, `telegram`, and `hooks`.
+Use `--force` to overwrite an existing config file.
 For the full setup flow and decision guidance, use [First Run](site/first-run.md).
 
 ### `cara verify`
@@ -63,6 +64,8 @@ Fetch log lines via WebSocket (`logs.tail`).
 ```bash
 cara logs -n 50 --host 127.0.0.1 --port 18789
 ```
+
+`cara logs` is a snapshot tail request (not a persistent follow stream).
 
 Remote hosts require TLS or explicit plaintext opt-in:
 - `--tls` — use `wss://` (recommended for remote)
@@ -106,6 +109,9 @@ Remove state data categories. Use `--all` or explicit flags plus `--force`.
 ### `cara update`
 Check for or install updates from GitHub releases.
 
+- `cara update --check` — check only (no install)
+- `cara update --version <x.y.z>` — install a specific version
+
 ### `cara version`
 Print version/build info.
 
@@ -122,7 +128,7 @@ The CLI resolves auth inputs in this order:
 
 1. Environment: `CARAPACE_GATEWAY_TOKEN` / `CARAPACE_GATEWAY_PASSWORD`
 2. Config file: `gateway.auth.token` / `gateway.auth.password`
-3. OS credential store (Keychain / Keyutils / Credential Manager)
+3. OS credential store (Keychain / Secret Service / Credential Manager)
 
 If none are found, local-direct access may still work when configured.
 
