@@ -631,7 +631,7 @@ impl SessionStore {
     fn verify_history_hmac(
         &self,
         history_path: &Path,
-        session_id: &str,
+        _session_id: &str,
     ) -> Result<(), SessionStoreError> {
         if let Some(ref key) = self.hmac_key {
             let integrity_config = super::integrity::IntegrityConfig {
@@ -648,7 +648,6 @@ impl SessionStore {
                 }
                 Err(e) => {
                     tracing::warn!(
-                        session_id = %session_id,
                         error = %e,
                         "session history integrity verification issue"
                     );
@@ -967,7 +966,6 @@ impl SessionStore {
                 }
                 Err(e) => {
                     warn!(
-                        session_id = %session.id,
                         user_id = %user_id,
                         error = %e,
                         "failed to export session history during user data export"
@@ -1005,7 +1003,6 @@ impl SessionStore {
         for session in &sessions {
             if let Err(e) = self.delete_session(&session.id) {
                 warn!(
-                    session_id = %session.id,
                     user_id = %user_id,
                     error = %e,
                     "failed to delete session during user purge"
@@ -1033,7 +1030,6 @@ impl SessionStore {
         for session in &expired {
             if let Err(e) = self.delete_session(&session.id) {
                 warn!(
-                    session_id = %session.id,
                     error = %e,
                     "failed to delete expired session"
                 );
@@ -1171,7 +1167,6 @@ impl SessionStore {
                 Ok(m) => m,
                 Err(e) => {
                     tracing::warn!(
-                        session_id = %session_id,
                         error = %e,
                         "skipping corrupt JSONL line in session history"
                     );
@@ -1677,7 +1672,6 @@ impl SessionStore {
                 }
                 Err(e) => {
                     tracing::warn!(
-                        session_id = %session_id,
                         error = %e,
                         "session integrity verification issue"
                     );

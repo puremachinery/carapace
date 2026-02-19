@@ -48,7 +48,9 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 1
-          ref: ${{ github.event.review.commit_id || github.event.pull_request.head.sha }}
+          # Keep privileged @claude runs on trusted repository content.
+          # PR changes are inspected via GitHub APIs, not by executing PR-head code.
+          ref: ${{ github.event.repository.default_branch }}
 
       - name: Checkout repository (issue context)
         if: ${{ github.event_name == 'issues' || github.event_name == 'issue_comment' }}
