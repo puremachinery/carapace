@@ -66,28 +66,35 @@ jobs:
             - maintainability concerns
 
             STRICT REVIEW POLICY
-            1) Inline comments are allowed ONLY for high/medium findings with concrete impact.
+            1) Review comments are allowed ONLY for in-scope high/medium findings with concrete impact.
             2) Every finding must include:
                - severity (high/medium/low/info)
                - scope tag: in-scope or out-of-scope for this PR
                - concrete impact and concise fix
             3) Dedupe aggressively across pushes:
                - Before posting, inspect existing review threads with gh pr view.
-               - Do NOT post a new inline comment for the same root cause if one already exists.
+               - Do NOT post a new comment for the same root cause if one already exists.
             4) low findings:
-               - Do NOT post inline.
+               - Do NOT post review comments.
                - Suppress entirely.
             5) info findings:
                - Suppress entirely (do not post inline or top-level).
             6) Blocking policy:
                - Only in-scope high/medium findings are blocking for this PR.
                - Out-of-scope findings are advisory only.
+            7) Review format:
+               - If there are one or more in-scope high/medium findings, submit exactly ONE GitHub pull-request review.
+               - Put all line-level findings as inline comments within that single review.
+               - Include a short review body summary at submit time.
+               - If there are zero in-scope high/medium findings, do not submit a review.
+               - Never create standalone PR conversation comments.
+               - Never create issue comments.
+               - Never create review comments outside that single pending review.
 
             Output requirements:
-            - Post inline comments only for in-scope high/medium findings.
-            - Do NOT post standalone PR comments with gh pr comment.
-            - Do NOT post standalone PR comments with gh api.
-            - If there are zero in-scope high/medium findings, do not post inline comments.
+            - Use GitHub Review API flow (pending review -> review comments -> submit review).
             - Keep each inline comment concise and non-repetitive.
+            - Do not use gh pr comment.
+            - Do not use issue comment endpoints.
           claude_args: |
-            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr diff:*),Bash(gh pr view:*),Bash(git:*),WebSearch"
+            --allowedTools "Bash(gh api:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(git:*),WebSearch"
