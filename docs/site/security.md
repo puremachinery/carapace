@@ -10,7 +10,9 @@ your local deployment quickly.
 By default, Carapace starts in a local-first, fail-closed posture:
 
 - Binds to loopback (`127.0.0.1`) unless you explicitly choose otherwise.
-- Denies control API requests (fail-closed) when auth config is missing.
+- Denies control API requests (fail-closed) until `gateway.auth.token` /
+  `gateway.auth.password` is configured or auth mode is explicitly set for
+  local-direct access.
 - Stores credentials in OS keychains when available, with encrypted fallback.
 - Applies SSRF and DNS-rebinding protections for outbound fetch paths.
 
