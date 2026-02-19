@@ -40,7 +40,6 @@ jobs:
               - "**/*.md"
               - "website/**"
               - "LICENSE"
-              - "CHANGELOG.md"
             workflow:
               - ".github/workflows/**"
             rust_runtime:
