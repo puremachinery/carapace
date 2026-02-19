@@ -998,6 +998,14 @@ fn dispatch_agent_run(
     Ok(())
 }
 
+fn sender_scope_for_hook_request(has_remote_addr: bool) -> &'static str {
+    if has_remote_addr {
+        "remote"
+    } else {
+        "unknown"
+    }
+}
+
 /// POST /hooks/agent - Dispatch message to agent
 async fn hooks_agent_handler(
     State(state): State<AppState>,
@@ -1039,12 +1047,9 @@ async fn hooks_agent_handler(
         }
     };
 
-    let sender_id = connect_info
-        .0
-        .map(|addr| addr.ip().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
+    let sender_id = sender_scope_for_hook_request(connect_info.0.is_some());
 
-    if let Err(resp) = dispatch_agent_run(&ws, &validated, &run_id, &sender_id) {
+    if let Err(resp) = dispatch_agent_run(&ws, &validated, &run_id, sender_id) {
         return resp;
     }
 
@@ -1964,6 +1969,18 @@ mod tests {
     /// Create a test router that can be used with oneshot()
     fn test_router(config: HttpConfig) -> Router {
         create_router(config)
+    }
+
+    #[test]
+    fn test_sender_scope_for_hook_request_with_remote_addr() {
+        let sender = sender_scope_for_hook_request(true);
+        assert_eq!(sender, "remote");
+    }
+
+    #[test]
+    fn test_sender_scope_for_hook_request_without_remote_addr() {
+        let sender = sender_scope_for_hook_request(false);
+        assert_eq!(sender, "unknown");
     }
 
     #[tokio::test]

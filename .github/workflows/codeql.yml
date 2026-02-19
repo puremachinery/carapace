@@ -3,6 +3,15 @@ name: CodeQL
 on:
   push:
     branches: [main, master]
+  pull_request:
+    branches: [main, master]
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "build.rs"
+      - ".github/workflows/**"
   schedule:
     - cron: '0 6 * * 1' # Weekly Monday 6am UTC
 
