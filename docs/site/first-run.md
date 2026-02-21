@@ -39,15 +39,15 @@ cara
 In a second terminal:
 
 ```bash
-cara status --host 127.0.0.1 --port 18789
 cara verify --outcome auto --port 18789
+cara status --port 18789
 cara chat --port 18789
 ```
 
 Expected:
 
-- `cara status` shows the service healthy.
 - `cara verify` prints a pass/fail summary for your selected outcome.
+- `cara status` shows the service healthy.
 - `cara chat` opens the REPL and returns a model response.
 
 If you set a custom port during setup, use that instead of `18789`.
@@ -57,7 +57,7 @@ require destination flags (`--discord-to` / `--telegram-to`) for send-path check
 ## 4) Complete your chosen first outcome
 
 - `local-chat`:
-  - You can continue in `cara chat`.
+  - Continue in `cara chat`, or try the [local first-reply recipe](../cookbook/secure-local-first-reply.md).
 - `discord`:
   - Continue with [Add Carapace to Discord](../cookbook/discord-assistant.md)
 - `telegram`:

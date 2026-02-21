@@ -1,5 +1,8 @@
 # Getting Started
 
+Carapace is a security-focused personal AI assistant that runs locally and
+connects through Signal, Telegram, Discord, Slack, webhooks, or console.
+
 This guide covers first‑run setup, security basics, and day‑to‑day operations.
 It’s intentionally practical: copy/paste steps, then customize.
 
@@ -42,8 +45,8 @@ cara
 In another terminal:
 
 ```bash
-cara status --host 127.0.0.1 --port 18789
 cara verify --outcome auto --port 18789
+cara status --port 18789
 cara chat --port 18789
 ```
 
@@ -81,16 +84,17 @@ See `config.example.json5` and `docs/protocol/config.md` for all keys.
 ### Secrets at Rest
 
 If `CARAPACE_CONFIG_PASSWORD` is set, secrets at known paths are encrypted
-at rest (AES‑256‑GCM). If the password is missing or wrong, encrypted values
-are scrubbed on load.
+at rest (AES‑256‑GCM). If the password is missing or wrong at startup,
+encrypted values are replaced with empty strings in the loaded config (the
+on-disk file is not modified).
 
 ## Security Baseline
 
 Minimum recommendations:
 
+- Do **not** expose hooks (`/hooks/*`) without a hooks token.
 - Use service auth (`gateway.auth.mode = token` or `password`).
 - Use TLS if Carapace is reachable outside localhost.
-- Do **not** expose hooks (`/hooks/*`) without a hooks token.
 - Rotate tokens if the state directory is exposed.
 
 ### Auth Modes
@@ -104,34 +108,7 @@ Minimum recommendations:
 }
 ```
 
-`mode = none` is **local‑direct only** (loopback); remote requests are denied.
-
-## Running Behind a Reverse Proxy
-
-If you terminate TLS in a reverse proxy:
-
-1) Keep Carapace on localhost or a private network.
-2) Forward `/` to Carapace.
-3) Preserve request headers.
-4) Set `gateway.trustedProxies` to your proxy IPs so local‑direct detection
-   works correctly.
-
-## Hooks (Web API)
-
-Hooks are separate from service auth and require a hooks token.
-
-```json5
-{
-  "gateway": {
-    "hooks": {
-      "enabled": true,
-      "token": "${CARAPACE_HOOKS_TOKEN}"
-    }
-  }
-}
-```
-
-See `docs/protocol/http.md` for request/response shapes.
+`mode = none` is **localhost only**; remote requests are denied.
 
 ## Control UI
 
@@ -148,6 +125,35 @@ Enable the Control UI:
 Then visit `/ui` on the Carapace host.
 You can override the base path via `gateway.controlUi.basePath`.
 
+## Hooks (Web API)
+
+Hooks let external systems send messages through Carapace — useful for CI/CD
+notifications, monitoring alerts, or custom integrations. They are separate
+from service auth and require their own token.
+
+```json5
+{
+  "gateway": {
+    "hooks": {
+      "enabled": true,
+      "token": "${CARAPACE_HOOKS_TOKEN}"
+    }
+  }
+}
+```
+
+See `docs/protocol/http.md` for request/response shapes.
+
+## Running Behind a Reverse Proxy
+
+If you terminate TLS in a reverse proxy:
+
+1) Keep Carapace on localhost or a private network.
+2) Forward `/` to Carapace.
+3) Preserve request headers.
+4) Set `gateway.trustedProxies` to your proxy IPs so local‑direct detection
+   works correctly.
+
 ## Operations
 Use the dedicated ops guide for day-2 workflows:
 - [site/ops.md](site/ops.md)
@@ -156,13 +162,13 @@ Use the dedicated ops guide for day-2 workflows:
 Most common commands:
 
 ```bash
-cara status --host 127.0.0.1 --port 18789
+cara status --port 18789
 cara logs -n 200
 cara backup --output ./carapace-backup.tar.gz
 cara update
 ```
 
-`cara logs` is a snapshot tail, not a continuous follow stream.
+`cara logs` prints the last N log lines; it does not stream continuously.
 
 ## Troubleshooting
 

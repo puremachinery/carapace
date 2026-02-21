@@ -94,6 +94,10 @@ curl -sS \
 - Using service token for hooks fails, proving token separation works.
 - `cara verify --outcome hooks` reports PASS.
 
+## Next step
+
+- [Day-2 ops](../site/ops.md)
+
 ## Common failures and fixes
 
 - Symptom: `401 Unauthorized`.

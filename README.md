@@ -83,6 +83,13 @@ See [docs/feature-status.yaml](docs/feature-status.yaml) and
 [docs/feature-evidence.yaml](docs/feature-evidence.yaml) for the current source
 of truth.
 
+## Roadmap
+
+- [Roadmap](docs/roadmap.md) — what we're building now, next, and later
+- Up next: long-running assistant MVP, Control UI frontend, and stable release gate
+- Recently shipped: cross-platform subprocess sandboxing, guided setup
+  (`cara setup`), and first-run verifier (`cara verify`)
+
 ## Docs
 
 - [Website](https://getcara.io) — install, first run, security, ops, cookbook, troubleshooting
@@ -94,6 +101,7 @@ of truth.
 - [Channel setup](docs/channels.md) — Signal, Telegram, Discord, Slack, webhooks
 - [Channel smoke validation](docs/channel-smoke.md) — live checks and evidence capture
 - [Cookbook](docs/cookbook/README.md) — outcome-first walkthroughs
+- [Roadmap](docs/roadmap.md) — near-term and longer-term priorities
 - [CLI guide](docs/cli.md) — subcommands, flags, and device identity
 - [Documentation index](docs/README.md) — architecture/protocol/security references
 - [Report feedback or bugs](https://github.com/puremachinery/carapace/issues/new/choose)

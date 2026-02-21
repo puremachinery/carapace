@@ -46,7 +46,7 @@ Assumes `signal-cli-rest-api` is running and configured in `carapace.json5`
 (see [Signal Channel Setup](channels.md#signal-signal-cli-rest-api)).
 
 1. Start services and verify health:
-   - `cara status --host 127.0.0.1 --port 18789`
+   - `cara status --port 18789`
 2. Send one test message from another Signal device/account to the configured
    Signal number.
 3. Confirm logs show inbound parsing + agent run dispatch from

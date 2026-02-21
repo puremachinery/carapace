@@ -24,10 +24,10 @@ Note: `releases/latest` may not point at the newest pre-release preview.
 Quick path for first-time setup:
 
 1. Download your platform binary (above).
-2. Install it on PATH (Step 4).
-3. Run `cara --help` and `cara version` (Step 5).
+2. Make it executable and move it onto your PATH (see "Install on your PATH" below).
+3. Run `cara version` to confirm.
 
-Signature and checksum verification (Steps 2 and 3 below) are recommended,
+Signature and checksum verification (next two sections) are recommended,
 especially for production or automation.
 
 ## Optional (advanced): pinned version links (automation/ops)
@@ -158,7 +158,18 @@ Windows (PowerShell):
 $installDir = "$env:LOCALAPPDATA\cara\bin"
 New-Item -ItemType Directory -Force -Path $installDir | Out-Null
 Copy-Item .\cara-x86_64-windows.exe (Join-Path $installDir "cara.exe")
+
+# Add to PATH for the current user (persistent across sessions)
+$currentPath = [Environment]::GetEnvironmentVariable("Path", "User")
+$pathParts = if ($currentPath) { $currentPath -split ';' } else { @() }
+if ($pathParts -notcontains $installDir) {
+    $newPath = ($pathParts + $installDir) -join ';'
+    [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
+    $env:Path = if ($env:Path) { "$env:Path;$installDir" } else { $installDir }
+}
 ```
+
+If `cara` is not found in your current shell, restart your terminal.
 
 ## 5) Verify install
 

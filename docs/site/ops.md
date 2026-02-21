@@ -8,7 +8,7 @@ practical recovery steps.
 ## 1) Health and status
 
 ```bash
-cara status --host 127.0.0.1 --port 18789
+cara status --port 18789
 curl -sS http://127.0.0.1:18789/health
 ```
 
@@ -23,7 +23,7 @@ cara logs -n 200
 For deeper troubleshooting, use:
 
 - [Get Unstuck](get-unstuck.md)
-- [CLI guide](https://github.com/puremachinery/carapace/blob/main/docs/cli.md)
+- [CLI guide](../cli.md)
 
 ## 3) Backup and restore
 

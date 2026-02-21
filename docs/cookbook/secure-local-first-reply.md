@@ -65,7 +65,7 @@ CARAPACE_CONFIG_PATH=./carapace.json5 cara
 In another terminal:
 
 ```bash
-cara status --host 127.0.0.1 --port 18789
+cara status --port 18789
 curl -H "Authorization: Bearer ${CARAPACE_GATEWAY_TOKEN}" http://127.0.0.1:18789/health
 cara chat
 ```
@@ -82,6 +82,11 @@ cara verify --outcome local-chat --port 18789
 - `/health` returns JSON with `status: "ok"`.
 - `cara chat` opens an interactive REPL and returns a model response.
 - `cara verify --outcome local-chat` reports PASS.
+
+## Next step
+
+- [Connect VS Code, chat UIs, or scripts](openai-compatible-endpoint.md)
+- [Add Discord](discord-assistant.md) or [Telegram](telegram-webhook-assistant.md)
 
 ## Common failures and fixes
 

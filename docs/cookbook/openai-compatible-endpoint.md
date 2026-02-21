@@ -64,7 +64,7 @@ Use these values in your app's model/provider settings:
 - Provider type: `OpenAI` / `OpenAI-compatible`
 - Base URL: `http://127.0.0.1:18789/v1`
 - API key/token: same value as `CARAPACE_GATEWAY_TOKEN`
-- Model: `carapace`
+- Model: `carapace` (this is the fixed model name Cara exposes; the actual backend model is determined by your provider config)
 
 ### VS Code / JetBrains (Continue)
 
@@ -111,6 +111,11 @@ curl -sS \
 - Your client app returns assistant output through Cara.
 - `curl` calls return `200` JSON responses with assistant output.
 - Unauthorized calls return `401` (auth enforcement working).
+
+## Next step
+
+- [Trigger Cara from other apps](hooks-safe-automation.md)
+- [Add Discord](discord-assistant.md) or [Telegram](telegram-webhook-assistant.md)
 
 ## Common failures and fixes
 

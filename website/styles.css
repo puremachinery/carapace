@@ -366,6 +366,13 @@ code {
   font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
 }
 
+:not(pre) > code {
+  background: rgba(2, 6, 23, 0.7);
+  padding: 0.15em 0.35em;
+  border-radius: 0.3rem;
+  font-size: 0.9em;
+}
+
 .muted {
   color: var(--muted);
   margin-bottom: 0;
@@ -400,6 +407,15 @@ code {
 }
 
 .site-footer a {
+  color: var(--text);
+}
+
+.footer-links {
+  display: flex;
+  gap: 1rem;
+}
+
+.footer-links a {
   color: var(--text);
 }
 

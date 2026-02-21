@@ -103,6 +103,7 @@ render_markdown_page() {
     <meta property="og:description" content="${description_html}" />
     <meta property="og:type" content="website" />
     <meta name="theme-color" content="#0f172a" />
+    <link rel="icon" href="${rel_prefix_html}/favicon.svg" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
@@ -173,7 +174,10 @@ HTML_CTA
 
     <footer class="site-footer">
       <p>Carapace by PureMachinery.</p>
-      <a href="https://github.com/puremachinery/carapace/issues/new/choose">Report an issue</a>
+      <nav class="footer-links">
+        <a href="https://github.com/puremachinery/carapace/blob/main/SECURITY.md">Security policy</a>
+        <a href="https://github.com/puremachinery/carapace/issues/new/choose">Report an issue</a>
+      </nav>
     </footer>
   </body>
 </html>
