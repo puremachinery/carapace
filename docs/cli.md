@@ -55,14 +55,14 @@ Notes:
 Health/status check via HTTP.
 
 ```bash
-cara status --host 127.0.0.1 --port 18789
+cara status --port 18789
 ```
 
 ### `cara logs`
 Fetch log lines via WebSocket (`logs.tail`).
 
 ```bash
-cara logs -n 50 --host 127.0.0.1 --port 18789
+cara logs -n 50 --port 18789
 ```
 
 `cara logs` is a snapshot tail request (not a persistent follow stream).

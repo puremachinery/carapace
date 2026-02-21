@@ -10,6 +10,7 @@ A security-focused, open-source personal AI assistant.
 - [First Run](site/first-run.md) — secure local startup and smoke checks
 - [Get Unstuck](site/get-unstuck.md) — troubleshooting and report paths
 - [Cookbook](cookbook/README.md) — task-focused walkthroughs
+- [Roadmap](roadmap.md) — now/next/later priorities
 - [Channel Setup](channels.md) — Signal, Telegram, Discord, Slack, webhooks
 - [Channel Smoke Validation](channel-smoke.md) — reproducible live channel checks + evidence capture
 - [CLI Guide](cli.md) — subcommands, flags, and device identity

@@ -4,7 +4,7 @@
 
 ```bash
 cara version
-cara status --host 127.0.0.1 --port 18789
+cara status --port 18789
 curl -sS http://127.0.0.1:18789/health
 cara logs -n 80
 ```
@@ -34,7 +34,8 @@ If service is running already:
 cara logs -n 200
 ```
 
-`cara logs` is a snapshot tail, so re-run it as needed while debugging.
+`cara logs` prints the last N log lines (it does not stream continuously),
+so re-run it as needed while debugging.
 
 ## Validate config quickly
 

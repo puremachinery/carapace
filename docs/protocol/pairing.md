@@ -111,21 +111,16 @@ Tokens are sensitive credentials:
 - **Expiry**: Device tokens expire after 90 days by default
 
 ```rust
-// From src/nodes/mod.rs
+// From src/nodes/mod.rs — tokens are SHA-256 hashed before storage
 fn hash_token(token: &str) -> String {
     let digest = Sha256::digest(token.as_bytes());
     hex::encode(digest)
 }
-
-fn constant_time_eq(a: &str, b: &str) -> bool {
-    if a.len() != b.len() { return false; }
-    let mut result = 0u8;
-    for (x, y) in a.bytes().zip(b.bytes()) {
-        result |= x ^ y;
-    }
-    result == 0
-}
 ```
+
+Verification uses the canonical `timing_safe_eq` from `src/auth/mod.rs`, which
+hashes both inputs to fixed-length SHA-256 digests before XOR comparison —
+eliminating length side-channels. See [Security](../security.md) for details.
 
 ## Storage
 

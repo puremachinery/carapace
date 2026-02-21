@@ -45,7 +45,7 @@ $env:CARAPACE_GATEWAY_TOKEN = [System.BitConverter]::ToString($bytes).Replace('-
   "discord": {
     "botToken": "${DISCORD_BOT_TOKEN}",
     "gatewayEnabled": true,
-    "gatewayIntents": 37377
+    "gatewayIntents": 37377  // GUILDS | GUILD_MESSAGES | MESSAGE_CONTENT | DIRECT_MESSAGES
   }
 }
 ```
@@ -67,7 +67,7 @@ CARAPACE_CONFIG_PATH=./carapace.json5 cara
 Optional status check:
 
 ```bash
-cara status --host 127.0.0.1 --port 18789
+cara status --port 18789
 curl -H "Authorization: Bearer ${CARAPACE_GATEWAY_TOKEN}" http://127.0.0.1:18789/health
 ```
 
@@ -84,6 +84,11 @@ Replace `YOUR_CHANNEL_ID` with the numeric Discord channel ID.
 1. Send a message in a Discord channel where the bot is present.
 2. Confirm Carapace receives it and sends a reply.
 3. If you ran `cara verify`, confirm Discord checks report PASS.
+
+## Next step
+
+- [Trigger Cara from other apps](hooks-safe-automation.md)
+- [Day-2 ops](../site/ops.md)
 
 ## Common failures and fixes
 

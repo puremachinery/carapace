@@ -32,7 +32,7 @@ $env:CARAPACE_GATEWAY_TOKEN = [System.BitConverter]::ToString($bytes).Replace('-
 ```json5
 {
   "gateway": {
-    "bind": "all",
+    "bind": "all",          // exposes port to the network — keep auth enabled
     "port": 18789,
     "auth": {
       "mode": "token",
@@ -92,6 +92,11 @@ For full send-path verification, rerun with `--telegram-to YOUR_CHAT_ID`.
 2. Confirm Carapace receives it and returns a reply.
 3. `getWebhookInfo` shows no delivery errors.
 4. If you ran `cara verify`, confirm Telegram checks report PASS/SKIP (SKIP is expected when no `--telegram-to` is provided).
+
+## Next step
+
+- [Trigger Cara from other apps](hooks-safe-automation.md)
+- [Day-2 ops](../site/ops.md)
 
 ## Common failures and fixes
 
