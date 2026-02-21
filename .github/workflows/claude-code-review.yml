@@ -6,6 +6,9 @@ on:
 
 jobs:
   claude-review:
+    outputs:
+      workflow_changed: ${{ steps.workflow-change.outputs.changed }}
+      cleanup_started_at: ${{ steps.cleanup-window.outputs.started_at }}
     concurrency:
       group: claude-review-${{ github.event.pull_request.number }}
       cancel-in-progress: true
@@ -16,7 +19,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
-      issues: write
+      issues: read
       id-token: write
 
     steps:
@@ -49,11 +52,11 @@ jobs:
         run: |
           echo "Skipping Claude code review because this PR modifies Claude workflow files."
 
-      - name: Record review run start time
-        id: run-start
-        if: steps.workflow-change.outputs.changed != 'true'
+      - name: Record cleanup window start time
+        id: cleanup-window
         run: |
-          echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          # Safety buffer handles small clock skew between runner and GitHub comment timestamps.
+          echo "started_at=$(date -u -d '2 minutes ago' +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
       - name: Run Claude Code Review
         id: claude-review
@@ -120,11 +123,18 @@ jobs:
           claude_args: |
             --allowedTools "Bash(gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/reviews:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(git:*),WebSearch"
 
-      - name: Delete stray Claude issue comments from this run
-        if: steps.workflow-change.outputs.changed != 'true'
+  cleanup-claude-stray-comments:
+    name: Delete stray Claude issue comments from this run
+    needs: [claude-review]
+    if: always() && needs.claude-review.outputs.workflow_changed != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Delete comments
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
-          RUN_STARTED_AT: ${{ steps.run-start.outputs.started_at }}
+          RUN_STARTED_AT: ${{ needs.claude-review.outputs.cleanup_started_at }}
         with:
           script: |
             const startedAt = Date.parse(process.env.RUN_STARTED_AT || "");
