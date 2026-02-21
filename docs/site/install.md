@@ -161,12 +161,15 @@ Copy-Item .\cara-x86_64-windows.exe (Join-Path $installDir "cara.exe")
 
 # Add to PATH for the current user (persistent across sessions)
 $currentPath = [Environment]::GetEnvironmentVariable("Path", "User")
-if ($currentPath -notlike "*$installDir*") {
-    [Environment]::SetEnvironmentVariable("Path", "$currentPath;$installDir", "User")
+$pathParts = if ($currentPath) { $currentPath -split ';' } else { @() }
+if ($pathParts -notcontains $installDir) {
+    $newPath = ($pathParts + $installDir) -join ';'
+    [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
+    $env:Path = if ($env:Path) { "$env:Path;$installDir" } else { $installDir }
 }
 ```
 
-Restart your terminal after updating PATH.
+If `cara` is not found in your current shell, restart your terminal.
 
 ## 5) Verify install
 
