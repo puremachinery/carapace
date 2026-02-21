@@ -2,7 +2,7 @@ name: Claude Code Review
 
 on:
   pull_request:
-    types: [opened, synchronize, ready_for_review, reopened]
+    types: [opened, synchronize]
 
 jobs:
   claude-review:
@@ -16,7 +16,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
-      issues: read
+      issues: write
       id-token: write
 
     steps:
@@ -49,6 +49,12 @@ jobs:
         run: |
           echo "Skipping Claude code review because this PR modifies Claude workflow files."
 
+      - name: Record review run start time
+        id: run-start
+        if: steps.workflow-change.outputs.changed != 'true'
+        run: |
+          echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
       - name: Run Claude Code Review
         id: claude-review
         if: steps.workflow-change.outputs.changed != 'true'
@@ -66,39 +72,83 @@ jobs:
             - maintainability concerns
 
             STRICT REVIEW POLICY
-            1) Review comments are allowed ONLY for in-scope high/medium findings with concrete impact.
-            2) Every finding must include:
-               - severity (high/medium/low/info)
+            1) Use severities: critical, high, medium, low, info.
+            2) Inline review comments are allowed ONLY for in-scope critical/high/medium findings with concrete impact.
+               - Put each in-scope critical/high/medium finding on its relevant line as one inline comment.
+               - Never inline-comment low/info findings.
+            3) Every finding must include:
+               - severity
                - scope tag: in-scope or out-of-scope for this PR
                - concrete impact and concise fix
-            3) Dedupe aggressively across pushes:
+            4) Dedupe aggressively across pushes:
                - Before posting, inspect existing review threads with gh pr view.
-               - Do NOT post a new comment for the same root cause if one already exists.
-            4) low findings:
-               - Do NOT post review comments.
-               - Suppress entirely.
-            5) info findings:
-               - Suppress entirely (do not post inline or top-level).
-            6) Blocking policy:
-               - Only in-scope high/medium findings are blocking for this PR.
+               - Do NOT post a new comment for the same root cause if one already exists unresolved.
+            5) low findings:
+               - Do NOT post inline.
+               - Include low findings only as one aggregate section in the single review body:
+                 "Optional follow-ups (non-blocking)".
+            6) info findings:
+               - Suppress entirely (do not post inline or in review body).
+            7) Blocking policy:
+               - Only in-scope critical/high/medium findings are blocking for this PR.
                - Out-of-scope findings are advisory only.
-            7) Review format:
+            8) Review format:
                - Submit exactly ONE GitHub pull-request review on every run.
-               - If there are one or more in-scope high/medium findings, mark the review body as:
+               - If there are one or more in-scope critical/high/medium findings, review body must start with:
                  "Blocking findings present."
-               - Put all line-level findings as inline comments within that single review.
-               - Include a short review body summary at submit time.
-               - If there are zero in-scope high/medium findings, submit a short summary-only review body:
+               - If there are zero in-scope critical/high/medium findings, review body must start with:
                  "LGTM for blocking issues."
                - Never create standalone PR conversation comments.
                - Never create issue comments.
-               - Never create review comments outside that single pending review.
+               - Never create additional reviews, retries, test, or placeholder comments.
+
+            Required review body structure:
+            - Header line: one of the two exact lines above.
+            - One short summary paragraph.
+            - If blocking findings exist: "### Blocking findings (required before merge)" section.
+            - If advisory out-of-scope critical/high/medium findings exist:
+              "### Advisory findings (out-of-scope)" section.
+            - If low findings exist:
+              exactly one "### Optional follow-ups (non-blocking)" section with compact bullets.
 
             Output requirements:
-            - Use GitHub Review API flow (pending review -> review comments -> submit review).
-            - When there are no in-scope high/medium findings, submit a summary-only review with no inline comments.
-            - Keep each inline comment concise and non-repetitive.
+            - Use GitHub Review API flow (pending review -> inline review comments -> submit review).
             - Do not use gh pr comment.
             - Do not use issue comment endpoints.
+            - Do not post duplicate content across pushes.
+            - Keep inline comments concise and non-repetitive.
           claude_args: |
-            --allowedTools "Bash(gh api:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(git:*),WebSearch"
+            --allowedTools "Bash(gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/reviews:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(git:*),WebSearch"
+
+      - name: Delete stray Claude issue comments from this run
+        if: steps.workflow-change.outputs.changed != 'true'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          RUN_STARTED_AT: ${{ steps.run-start.outputs.started_at }}
+        with:
+          script: |
+            const startedAt = Date.parse(process.env.RUN_STARTED_AT || "");
+            if (Number.isNaN(startedAt)) {
+              core.warning(`Invalid RUN_STARTED_AT: ${process.env.RUN_STARTED_AT}`);
+              return;
+            }
+            const issueNumber = context.payload.pull_request.number;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              per_page: 100,
+            });
+            const stray = comments.filter((comment) => {
+              const login = comment.user?.login || "";
+              const createdAt = Date.parse(comment.created_at || "");
+              return login === "claude[bot]" && !Number.isNaN(createdAt) && createdAt >= startedAt;
+            });
+            for (const comment of stray) {
+              await github.rest.issues.deleteComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: comment.id,
+              });
+            }
+            core.info(`Deleted ${stray.length} stray issue comment(s) from claude[bot].`);
