@@ -1966,6 +1966,13 @@ async fn validate_provider_credentials(provider: &str, api_key: &str) -> Result<
     Err(message)
 }
 
+async fn validate_provider_credentials_owned(
+    provider: String,
+    api_key: String,
+) -> Result<(), String> {
+    validate_provider_credentials(&provider, &api_key).await
+}
+
 fn map_channel_validation_error(
     channel_name: &str,
     err: crate::channels::ChannelAuthError,
@@ -2029,6 +2036,10 @@ async fn validate_channel_credentials(channel: &str, token: &str) -> Result<(), 
     }
 }
 
+async fn validate_channel_credentials_owned(channel: String, token: String) -> Result<(), String> {
+    validate_channel_credentials(&channel, &token).await
+}
+
 fn validate_provider_credentials_interactive(
     provider: &str,
     api_key: &str,
@@ -2038,8 +2049,10 @@ fn validate_provider_credentials_interactive(
         return Ok(());
     }
 
+    let provider = provider.to_string();
+    let api_key = api_key.to_string();
     println!("Checking {} credentials...", provider);
-    match run_sync_blocking(validate_provider_credentials(provider, api_key))
+    match run_sync_blocking_send(validate_provider_credentials_owned(provider, api_key))
         .map_err(|err| format!("credential validation runtime failed: {err}"))
     {
         Ok(()) => {
@@ -2069,8 +2082,10 @@ fn validate_channel_credentials_interactive(
         return Ok(());
     }
 
+    let channel = channel.to_string();
+    let token = token.to_string();
     println!("Checking {} credentials...", channel);
-    match run_sync_blocking(validate_channel_credentials(channel, token))
+    match run_sync_blocking_send(validate_channel_credentials_owned(channel, token))
         .map_err(|err| format!("credential validation runtime failed: {err}"))
     {
         Ok(()) => {
@@ -2613,18 +2628,18 @@ async fn run_outcome_verifier(
     port: u16,
     discord_to: Option<String>,
     telegram_to: Option<String>,
-    cfg: &Value,
+    cfg: Value,
 ) -> Result<(), String> {
     let mut checks: Vec<VerifyCheckResult> = Vec::new();
-    let outcome = selection.resolved(cfg);
+    let outcome = selection.resolved(&cfg);
     let discord_to = normalize_optional_input(discord_to);
     let telegram_to = normalize_optional_input(telegram_to);
 
     let result = match outcome {
         SetupOutcome::LocalChat => verify_local_chat_outcome(port, &mut checks).await,
-        SetupOutcome::Hooks => verify_hooks_outcome(port, cfg, &mut checks).await,
+        SetupOutcome::Hooks => verify_hooks_outcome(port, &cfg, &mut checks).await,
         SetupOutcome::Discord | SetupOutcome::Telegram => {
-            verify_channel_outcome(outcome, cfg, discord_to, telegram_to, &mut checks).await
+            verify_channel_outcome(outcome, &cfg, discord_to, telegram_to, &mut checks).await
         }
     };
     if let Err(err) = result {
@@ -2666,7 +2681,7 @@ pub async fn handle_verify(
     let cfg = config::load_config()
         .map_err(|e| format!("failed to load config: {e}. Run `cara setup` first."))?;
     let port = resolve_port(port);
-    run_outcome_verifier(outcome, port, discord_to, telegram_to, &cfg)
+    run_outcome_verifier(outcome, port, discord_to, telegram_to, cfg)
         .await
         .map_err(|err| err.into())
 }
@@ -2675,15 +2690,19 @@ async fn run_setup_post_checks(
     port: u16,
     run_status: bool,
     launch_chat: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), String> {
     let mut setup_server_handle = if run_status || launch_chat {
-        chat::ensure_local_gateway_running(port).await?
+        chat::ensure_local_gateway_running(port)
+            .await
+            .map_err(|e| format!("failed to start local gateway: {e}"))?
     } else {
         None
     };
 
     if run_status {
-        let status_result = handle_status("127.0.0.1", Some(port)).await;
+        let status_result = handle_status("127.0.0.1", Some(port))
+            .await
+            .map_err(|e| format!("status check failed: {e}"));
         if status_result.is_err() {
             if let Some(handle) = setup_server_handle.take() {
                 handle.shutdown().await;
@@ -2693,7 +2712,9 @@ async fn run_setup_post_checks(
     }
 
     let chat_result = if launch_chat {
-        chat::run_chat_session(false, port).await
+        chat::run_chat_session(false, port)
+            .await
+            .map_err(|e| format!("chat session failed: {e}"))
     } else {
         Ok(())
     };
@@ -2974,6 +2995,8 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
 
         if run_status || launch_chat || run_verify {
             if run_status || launch_chat {
+                // Assumes this executes from the main thread (#[tokio::main] multi-threaded runtime),
+                // where this helper works without spawning a new thread.
                 if let Err(err) =
                     run_sync_blocking(run_setup_post_checks(port, run_status, launch_chat))
                         .map_err(|err| format!("runtime execution failed: {err}"))
@@ -2993,12 +3016,12 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
                     SetupOutcome::Telegram => VerifyOutcomeSelection::Telegram,
                     SetupOutcome::Hooks => VerifyOutcomeSelection::Hooks,
                 };
-                if let Err(err) = run_sync_blocking(run_outcome_verifier(
+                if let Err(err) = run_sync_blocking_send(run_outcome_verifier(
                     verify_outcome,
                     port,
                     verify_discord_to,
                     verify_telegram_to,
-                    &config,
+                    config.clone(),
                 ))
                 .map_err(|err| format!("runtime execution failed: {err}"))
                 {
@@ -3022,8 +3045,8 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
 /// - If already inside a multi-threaded runtime, use `block_in_place` and execute
 ///   the future on the current runtime handle.
 /// - Otherwise, create a temporary current-thread runtime and `block_on` there.
-/// - If inside a current-thread runtime, return an explicit error instead of
-///   triggering a panic.
+/// - If inside a current-thread runtime, return an explicit error and let callers
+///   switch to `run_sync_blocking_send` if safe-threaded fallback is needed.
 fn run_sync_blocking<T, E>(future: impl Future<Output = Result<T, E>>) -> Result<T, String>
 where
     E: Display,
@@ -3033,6 +3056,45 @@ where
             tokio::task::block_in_place(|| handle.block_on(future).map_err(|e| e.to_string()))
         } else {
             Err("cannot run blocking sync-async bridge from current-thread runtime".to_string())
+        }
+    } else {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("failed to create runtime: {e}"))?
+            .block_on(future)
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Run an async computation from synchronous code with the same semantics as
+/// `run_sync_blocking`, but using a dedicated thread when inside a
+/// current-thread runtime to avoid "Cannot start a runtime from within a runtime"
+/// panics.
+fn run_sync_blocking_send<T, E>(
+    future: impl Future<Output = Result<T, E>> + Send + 'static,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+    E: Display + Send + 'static,
+{
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+            tokio::task::block_in_place(|| handle.block_on(future).map_err(|e| e.to_string()))
+        } else {
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            std::thread::spawn(move || {
+                let result = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| e.to_string())
+                    .and_then(|runtime| runtime.block_on(future).map_err(|e| e.to_string()));
+                let _ = tx.send(result);
+            })
+            .join()
+            .map_err(|_| "runtime bridge thread panicked".to_string())?;
+            rx.recv()
+                .map_err(|_| "runtime bridge thread dropped without response".to_string())?
         }
     } else {
         tokio::runtime::Builder::new_current_thread()
@@ -3922,11 +3984,23 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let err = rt.block_on(async {
+        let value = rt.block_on(async {
             run_sync_blocking(async { Ok::<u16, std::io::Error>(11) })
                 .expect_err("current-thread runtime should return an explicit error")
         });
-        assert!(err.contains("cannot run blocking sync-async bridge from current-thread runtime"));
+        assert!(value.contains("cannot run blocking sync-async bridge from current-thread runtime"));
+    }
+
+    #[test]
+    fn test_run_sync_blocking_send_inside_current_thread_runtime_works() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let value = rt.block_on(async {
+            run_sync_blocking_send(async { Ok::<u16, std::io::Error>(11) }).unwrap()
+        });
+        assert_eq!(value, 11);
     }
 
     #[test]
