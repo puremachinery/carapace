@@ -327,7 +327,7 @@ fn handle_media_analyze(args: Value) -> ToolInvokeResult {
 
     match result {
         Ok(value) => ToolInvokeResult::success(value),
-        Err(e) => ToolInvokeResult::tool_error(e),
+        Err(e) => ToolInvokeResult::tool_error(e.to_string()),
     }
 }
 

@@ -9,7 +9,29 @@ use hickory_resolver::TokioAsyncResolver;
 use crate::media::fetch::{DEFAULT_FETCH_TIMEOUT_MS, MAX_FETCH_TIMEOUT_MS, MAX_URL_LENGTH};
 use crate::plugins::capabilities::{SsrfConfig, SsrfProtection};
 use crate::plugins::DeliveryResult;
-use crate::runtime_bridge::run_sync_blocking;
+use crate::runtime_bridge::{run_sync_blocking, BridgeError};
+
+enum ResolveDnsError {
+    Retryable(String),
+    NonRetryable(String),
+}
+
+impl std::fmt::Display for ResolveDnsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Retryable(msg) | Self::NonRetryable(msg) => write!(f, "{}", msg),
+        }
+    }
+}
+
+impl ResolveDnsError {
+    fn into_delivery_result(self) -> DeliveryResult {
+        match self {
+            Self::Retryable(msg) => error_result(msg, true),
+            Self::NonRetryable(msg) => error_result(msg, false),
+        }
+    }
+}
 
 /// Fetch media bytes with SSRF protection and size limits.
 #[allow(clippy::result_large_err)]
@@ -100,27 +122,31 @@ fn resolve_and_validate_dns(
     let fut = async {
         let resolver =
             TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default());
-        let lookup = resolver
-            .lookup_ip(host)
-            .await
-            .map_err(|e| format!("DNS resolution failed: {host}: {e}"))?;
+        let lookup = resolver.lookup_ip(host).await.map_err(|e| {
+            ResolveDnsError::Retryable(format!("DNS resolution failed: {host}: {e}"))
+        })?;
 
         let mut validated_ip: Option<IpAddr> = None;
         for ip in lookup.iter() {
             if let Err(e) = SsrfProtection::validate_resolved_ip_with_config(&ip, host, ssrf_config)
             {
-                return Err(format!("SSRF protection: {e}"));
+                return Err(ResolveDnsError::NonRetryable(format!(
+                    "SSRF protection: {e}"
+                )));
             }
             if validated_ip.is_none() {
                 validated_ip = Some(ip);
             }
         }
 
-        validated_ip.ok_or_else(|| format!("DNS resolution failed: {host}"))
+        validated_ip
+            .ok_or_else(|| ResolveDnsError::Retryable(format!("DNS resolution failed: {host}")))
     };
 
-    run_sync_blocking(fut)
-        .map_err(|e| error_result(format!("media fetch runtime error: {e}"), false))
+    run_sync_blocking(fut).map_err(|err| match err {
+        BridgeError::Inner(inner) => inner.into_delivery_result(),
+        other => error_result(format!("media fetch runtime error: {other}"), false),
+    })
 }
 
 fn error_result(error: impl Into<String>, retryable: bool) -> DeliveryResult {

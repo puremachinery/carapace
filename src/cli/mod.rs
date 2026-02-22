@@ -3914,7 +3914,7 @@ mod tests {
             call_result.is_ok(),
             "current-thread runtime should not panic when running setup post checks through sync bridge"
         );
-        let err = call_result.unwrap();
+        let err = call_result.unwrap().to_string();
         assert!(
             err.contains("cannot run blocking sync-async bridge from current-thread runtime"),
             "expected explicit current-thread bridge guard error, got: {err}"
@@ -3942,7 +3942,7 @@ mod tests {
             call_result.is_ok(),
             "current-thread runtime should not panic when validating channel creds through send bridge"
         );
-        let err = call_result.unwrap();
+        let err = call_result.unwrap().to_string();
         assert!(
             err.contains("unsupported channel for validation: unsupported"),
             "expected unsupported-channel rejection path, got: {err}"

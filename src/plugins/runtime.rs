@@ -44,7 +44,7 @@ use super::permissions::{
     compute_effective_permissions, validate_declared_permissions, PermissionConfig,
     PermissionEnforcer,
 };
-use crate::runtime_bridge::run_sync_blocking;
+use crate::runtime_bridge::{run_sync_blocking, BridgeError, CURRENT_THREAD_RUNTIME_MESSAGE};
 
 /// Maximum memory per plugin instance (64MB)
 pub const MAX_PLUGIN_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
@@ -707,6 +707,62 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginInstanceHandle<B> {
             })
     }
 
+    fn map_component_call_bridge_error<E: std::fmt::Display>(
+        err: BridgeError<E>,
+        iface_name: &str,
+        func_name: &str,
+    ) -> BindingError {
+        match err {
+            BridgeError::CurrentThreadRuntime => BindingError::CallError(format!(
+                "plugin call '{}.{}' requires a multi-thread Tokio runtime: {}",
+                iface_name, func_name, CURRENT_THREAD_RUNTIME_MESSAGE
+            )),
+            BridgeError::Inner(inner) => {
+                let msg = inner.to_string();
+                let msg_lower = msg.to_lowercase();
+                if msg_lower.contains("fuel") {
+                    BindingError::CallError(format!(
+                        "WASM fuel exhausted during '{}.{}' (budget: {} instructions)",
+                        iface_name, func_name, DEFAULT_FUEL_BUDGET
+                    ))
+                } else if msg_lower.contains("epoch") || msg_lower.contains("interrupt") {
+                    BindingError::CallError(format!(
+                        "WASM execution timed out during '{}.{}' (timeout: {}s)",
+                        iface_name,
+                        func_name,
+                        DEFAULT_EXECUTION_TIMEOUT.as_secs()
+                    ))
+                } else {
+                    BindingError::CallError(format!(
+                        "call to '{}.{}' failed: {}",
+                        iface_name, func_name, msg
+                    ))
+                }
+            }
+            other => BindingError::CallError(format!(
+                "call to '{}.{}' failed: {}",
+                iface_name, func_name, other
+            )),
+        }
+    }
+
+    fn map_component_post_return_bridge_error<E: std::fmt::Display>(
+        err: BridgeError<E>,
+        iface_name: &str,
+        func_name: &str,
+    ) -> BindingError {
+        match err {
+            BridgeError::CurrentThreadRuntime => BindingError::CallError(format!(
+                "plugin post_return '{}.{}' requires a multi-thread Tokio runtime: {}",
+                iface_name, func_name, CURRENT_THREAD_RUNTIME_MESSAGE
+            )),
+            other => BindingError::CallError(format!(
+                "post_return for '{}.{}' failed: {}",
+                iface_name, func_name, other
+            )),
+        }
+    }
+
     /// Call an exported function from a named interface with no parameters.
     ///
     /// Looks up the function `func_name` within the exported interface `iface_name`,
@@ -732,49 +788,12 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginInstanceHandle<B> {
         let func = self.get_iface_typed_func::<(), R>(&mut store, iface_name, func_name)?;
 
         // Call the function asynchronously via the centralized sync/async bridge helper.
-        let result =
-            run_sync_blocking(async { func.call_async(&mut *store, ()).await }).map_err(|e| {
-                let msg = e;
-                let msg_lower = msg.to_lowercase();
-                if msg.contains("cannot run blocking sync-async bridge from current-thread runtime")
-                {
-                    BindingError::CallError(format!(
-                        "plugin call '{}.{}' requires a multi-thread Tokio runtime: {}",
-                        iface_name, func_name, msg
-                    ))
-                } else if msg_lower.contains("fuel") {
-                    BindingError::CallError(format!(
-                        "WASM fuel exhausted during '{}.{}' (budget: {} instructions)",
-                        iface_name, func_name, DEFAULT_FUEL_BUDGET
-                    ))
-                } else if msg_lower.contains("epoch") || msg_lower.contains("interrupt") {
-                    BindingError::CallError(format!(
-                        "WASM execution timed out during '{}.{}' (timeout: {}s)",
-                        iface_name,
-                        func_name,
-                        DEFAULT_EXECUTION_TIMEOUT.as_secs()
-                    ))
-                } else {
-                    BindingError::CallError(format!(
-                        "call to '{}.{}' failed: {}",
-                        iface_name, func_name, msg
-                    ))
-                }
-            })?;
+        let result = run_sync_blocking(async { func.call_async(&mut *store, ()).await })
+            .map_err(|err| Self::map_component_call_bridge_error(err, iface_name, func_name))?;
 
         // Post-return cleanup
-        run_sync_blocking(async { func.post_return_async(&mut *store).await }).map_err(|e| {
-            if e.contains("cannot run blocking sync-async bridge from current-thread runtime") {
-                BindingError::CallError(format!(
-                    "plugin post_return '{}.{}' requires a multi-thread Tokio runtime: {}",
-                    iface_name, func_name, e
-                ))
-            } else {
-                BindingError::CallError(format!(
-                    "post_return for '{}.{}' failed: {}",
-                    iface_name, func_name, e
-                ))
-            }
+        run_sync_blocking(async { func.post_return_async(&mut *store).await }).map_err(|err| {
+            Self::map_component_post_return_bridge_error(err, iface_name, func_name)
         })?;
 
         Ok(result)
@@ -808,47 +827,10 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginInstanceHandle<B> {
         let func = self.get_iface_typed_func::<P, R>(&mut store, iface_name, func_name)?;
 
         let result = run_sync_blocking(async { func.call_async(&mut *store, param).await })
-            .map_err(|e| {
-                let msg = e;
-                let msg_lower = msg.to_lowercase();
-                if msg.contains("cannot run blocking sync-async bridge from current-thread runtime")
-                {
-                    BindingError::CallError(format!(
-                        "plugin call '{}.{}' requires a multi-thread Tokio runtime: {}",
-                        iface_name, func_name, msg
-                    ))
-                } else if msg_lower.contains("fuel") {
-                    BindingError::CallError(format!(
-                        "WASM fuel exhausted during '{}.{}' (budget: {} instructions)",
-                        iface_name, func_name, DEFAULT_FUEL_BUDGET
-                    ))
-                } else if msg_lower.contains("epoch") || msg_lower.contains("interrupt") {
-                    BindingError::CallError(format!(
-                        "WASM execution timed out during '{}.{}' (timeout: {}s)",
-                        iface_name,
-                        func_name,
-                        DEFAULT_EXECUTION_TIMEOUT.as_secs()
-                    ))
-                } else {
-                    BindingError::CallError(format!(
-                        "call to '{}.{}' failed: {}",
-                        iface_name, func_name, msg
-                    ))
-                }
-            })?;
+            .map_err(|err| Self::map_component_call_bridge_error(err, iface_name, func_name))?;
 
-        run_sync_blocking(async { func.post_return_async(&mut *store).await }).map_err(|e| {
-            if e.contains("cannot run blocking sync-async bridge from current-thread runtime") {
-                BindingError::CallError(format!(
-                    "plugin post_return '{}.{}' requires a multi-thread Tokio runtime: {}",
-                    iface_name, func_name, e
-                ))
-            } else {
-                BindingError::CallError(format!(
-                    "post_return for '{}.{}' failed: {}",
-                    iface_name, func_name, e
-                ))
-            }
+        run_sync_blocking(async { func.post_return_async(&mut *store).await }).map_err(|err| {
+            Self::map_component_post_return_bridge_error(err, iface_name, func_name)
         })?;
 
         Ok(result)

@@ -12,7 +12,7 @@ use hickory_resolver::TokioAsyncResolver;
 use super::super::*;
 use super::config::{map_validation_issues, read_config_snapshot, write_config_file};
 use crate::plugins::capabilities::SsrfProtection;
-use crate::runtime_bridge::run_sync_blocking;
+use crate::runtime_bridge::{run_sync_blocking, BridgeError};
 
 /// WASM binary magic bytes: `\0asm`
 const WASM_MAGIC: [u8; 4] = [0x00, 0x61, 0x73, 0x6D];
@@ -25,6 +25,28 @@ const SKILL_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Name of the skills manifest file stored alongside WASM binaries.
 const SKILLS_MANIFEST_FILE: &str = "skills-manifest.json";
+
+enum SkillDnsError {
+    InvalidRequest(String),
+    Unavailable(String),
+}
+
+impl std::fmt::Display for SkillDnsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidRequest(msg) | Self::Unavailable(msg) => write!(f, "{}", msg),
+        }
+    }
+}
+
+impl SkillDnsError {
+    fn into_error_shape(self) -> ErrorShape {
+        match self {
+            Self::InvalidRequest(msg) => error_shape(ERROR_INVALID_REQUEST, &msg, None),
+            Self::Unavailable(msg) => error_shape(ERROR_UNAVAILABLE, &msg, None),
+        }
+    }
+}
 
 fn ensure_object(value: &mut Value) -> Result<&mut serde_json::Map<String, Value>, ErrorShape> {
     if !value.is_object() {
@@ -260,24 +282,34 @@ fn validate_and_resolve_dns(url: &url::Url) -> Result<(String, u16, Option<IpAdd
             let resolver =
                 TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default());
 
-            let lookup = resolver
-                .lookup_ip(&host)
-                .await
-                .map_err(|e| format!("DNS resolution failed for {}: {}", host, e))?;
+            let lookup = resolver.lookup_ip(&host).await.map_err(|e| {
+                SkillDnsError::Unavailable(format!("DNS resolution failed for {}: {}", host, e))
+            })?;
 
             let mut first_valid: Option<IpAddr> = None;
             for ip in lookup.iter() {
                 SsrfProtection::validate_resolved_ip(&ip, &host).map_err(|e| {
-                    format!("skill download blocked by DNS rebinding protection: {}", e)
+                    SkillDnsError::InvalidRequest(format!(
+                        "skill download blocked by DNS rebinding protection: {}",
+                        e
+                    ))
                 })?;
                 if first_valid.is_none() {
                     first_valid = Some(ip);
                 }
             }
 
-            first_valid.ok_or_else(|| format!("DNS resolution returned no addresses for {}", host))
+            first_valid.ok_or_else(|| {
+                SkillDnsError::Unavailable(format!(
+                    "DNS resolution returned no addresses for {}",
+                    host
+                ))
+            })
         })
-        .map_err(|err| error_shape(ERROR_UNAVAILABLE, &err, None))?;
+        .map_err(|err| match err {
+            BridgeError::Inner(inner) => inner.into_error_shape(),
+            other => error_shape(ERROR_UNAVAILABLE, &other.to_string(), None),
+        })?;
 
         tracing::debug!(
             url = %url,
