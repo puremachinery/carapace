@@ -23,6 +23,35 @@ use crate::logging::audit::{audit, AuditEvent};
 use crate::server::connect_info::MaybeConnectInfo;
 use crate::server::ws::{map_validation_issues, persist_config_file, read_config_snapshot};
 
+const PROTECTED_CONFIG_PREFIXES: &[&str] = &[
+    "gateway.auth",
+    "gateway.hooks.token",
+    "credentials",
+    "secrets",
+    "anthropic.apiKey",
+    "openai.apiKey",
+    "google.apiKey",
+    "venice.apiKey",
+    "ollama.apiKey",
+    "providers.ollama.apiKey",
+    "bedrock.accessKeyId",
+    "bedrock.secretAccessKey",
+    "bedrock.sessionToken",
+    "models.providers.openai.apiKey",
+    "telegram.botToken",
+    "telegram.webhookSecret",
+    "discord.botToken",
+    "slack.botToken",
+    "slack.signingSecret",
+    "anthropic.baseUrl",
+    "openai.baseUrl",
+    "google.baseUrl",
+    "venice.baseUrl",
+    "ollama.baseUrl",
+    "providers.ollama.baseUrl",
+    "models.providers.openai.baseUrl",
+];
+
 /// Control endpoint state
 #[derive(Clone)]
 pub struct ControlState {
@@ -302,14 +331,7 @@ pub async fn config_handler(
     }
 
     // Block sensitive paths
-    let blocked_prefixes = [
-        "gateway.auth",
-        "gateway.hooks.token",
-        "credentials",
-        "secrets",
-    ];
-
-    for prefix in blocked_prefixes {
+    for prefix in PROTECTED_CONFIG_PREFIXES {
         if req.path.starts_with(prefix) {
             return (
                 StatusCode::FORBIDDEN,

@@ -722,7 +722,9 @@ impl UsageTracker {
                                 save_interval: Duration::from_secs(5),
                             };
                             if tracker.prune_data() {
-                                let _ = tracker.save();
+                                if let Err(error) = tracker.save() {
+                                    tracing::warn!(error = %error, "failed to persist pruned usage data");
+                                }
                             }
                             return tracker;
                         }
@@ -769,7 +771,9 @@ impl UsageTracker {
             None => true,
         };
         if should_flush {
-            let _ = self.save();
+            if let Err(error) = self.save() {
+                tracing::warn!(error = %error, "failed to persist usage data");
+            }
         }
     }
 
@@ -1317,14 +1321,18 @@ pub fn get_cost_breakdown(days: u64) -> CostBreakdown {
 pub fn enable_tracking() {
     let mut tracker = USAGE_TRACKER.write();
     tracker.enable();
-    let _ = tracker.save();
+    if let Err(error) = tracker.save() {
+        tracing::warn!(error = %error, "failed to persist usage tracking enable state");
+    }
 }
 
 /// Disable usage tracking (global tracker)
 pub fn disable_tracking() {
     let mut tracker = USAGE_TRACKER.write();
     tracker.disable();
-    let _ = tracker.save();
+    if let Err(error) = tracker.save() {
+        tracing::warn!(error = %error, "failed to persist usage tracking disable state");
+    }
 }
 
 /// Check if tracking is enabled (global tracker)
@@ -1381,14 +1389,18 @@ pub fn get_monthly_summaries(months: usize) -> Vec<MonthlySummary> {
 pub fn reset_all() {
     let mut tracker = USAGE_TRACKER.write();
     tracker.reset();
-    let _ = tracker.save();
+    if let Err(error) = tracker.save() {
+        tracing::warn!(error = %error, "failed to persist usage reset");
+    }
 }
 
 /// Reset session usage (global tracker)
 pub fn reset_session(session_key: &str) -> bool {
     let mut tracker = USAGE_TRACKER.write();
     let result = tracker.reset_session(session_key);
-    let _ = tracker.save();
+    if let Err(error) = tracker.save() {
+        tracing::warn!(error = %error, "failed to persist session usage reset");
+    }
     result
 }
 

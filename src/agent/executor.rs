@@ -708,9 +708,8 @@ async fn execute_single_turn(
         &pending_tool_calls,
         turn_usage.output_tokens,
     ) {
-        state
-            .session_store()
-            .append_message(msg.clone())
+        crate::sessions::append_message_blocking(state.session_store().clone(), msg.clone())
+            .await
             .map_err(|e| AgentError::SessionStore(e.to_string()))?;
         history.push(msg);
     }
@@ -730,9 +729,8 @@ async fn execute_single_turn(
             run_id,
             seq,
         );
-        state
-            .session_store()
-            .append_messages(&tool_msgs)
+        crate::sessions::append_messages_blocking(state.session_store().clone(), tool_msgs.clone())
+            .await
             .map_err(|e| AgentError::SessionStore(e.to_string()))?;
         history.extend(tool_msgs);
         return Ok(true);
@@ -772,10 +770,12 @@ pub async fn execute_run(
     );
 
     // 2. Load or create session
-    let session = state
-        .session_store()
-        .get_session_by_key(&session_key)
-        .map_err(|e| AgentError::SessionNotFound(format!("{session_key}: {e}")))?;
+    let session = crate::sessions::get_session_by_key_blocking(
+        state.session_store().clone(),
+        session_key.clone(),
+    )
+    .await
+    .map_err(|e| AgentError::SessionNotFound(format!("{session_key}: {e}")))?;
     let message_channel = session.metadata.channel.clone();
 
     if let Some(result) = dispatch_plugin_hook(
@@ -836,17 +836,21 @@ pub async fn execute_run(
     if let Some(ref clf_config) = config.classifier {
         if clf_config.enabled && clf_config.mode != crate::agent::classifier::ClassifierMode::Off {
             // Get the last user message from session history for classification
-            let last_user_msg = state
-                .session_store()
-                .get_history(&session.id, None, None)
-                .ok()
-                .and_then(|history| {
-                    history
-                        .iter()
-                        .rev()
-                        .find(|m| m.role == MessageRole::User)
-                        .map(|m| m.content.clone())
-                });
+            let last_user_msg = crate::sessions::get_history_blocking(
+                state.session_store().clone(),
+                session.id.clone(),
+                None,
+                None,
+            )
+            .await
+            .ok()
+            .and_then(|history| {
+                history
+                    .iter()
+                    .rev()
+                    .find(|m| m.role == MessageRole::User)
+                    .map(|m| m.content.clone())
+            });
 
             if let Some(user_message) = last_user_msg {
                 match crate::agent::classifier::classify_message(
@@ -907,10 +911,14 @@ pub async fn execute_run(
     let mut total_output_tokens: u64 = 0;
     let mut final_stop_reason = StopReason::EndTurn;
 
-    let mut history = state
-        .session_store()
-        .get_history(&session.id, None, None)
-        .map_err(|e| AgentError::SessionStore(e.to_string()))?;
+    let mut history = crate::sessions::get_history_blocking(
+        state.session_store().clone(),
+        session.id.clone(),
+        None,
+        None,
+    )
+    .await
+    .map_err(|e| AgentError::SessionStore(e.to_string()))?;
 
     for _turn in 0..config.max_turns {
         let should_continue = execute_single_turn(

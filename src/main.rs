@@ -215,15 +215,18 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Initialize logging based on the CARAPACE_DEV environment variable.
 fn init_logging_from_env() -> Result<(), Box<dyn std::error::Error>> {
-    let log_config = if std::env::var("CARAPACE_DEV")
+    let dev_mode = std::env::var("CARAPACE_DEV")
         .map(|v| !v.is_empty() && v != "0" && v.to_lowercase() != "false")
-        .unwrap_or(false)
-    {
+        .unwrap_or(false);
+    let log_config = if dev_mode {
         logging::LogConfig::development()
     } else {
         logging::LogConfig::production()
     };
     logging::init_logging(log_config)?;
+    if dev_mode {
+        warn!("CARAPACE_DEV is enabled; using development logging");
+    }
     Ok(())
 }
 

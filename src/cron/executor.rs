@@ -119,7 +119,7 @@ async fn execute_agent_turn(
     );
 
     let session = load_or_create_cron_session(state, &session_key, metadata, has_metadata_updates)?;
-    append_user_message(state, &session.id, params.message)?;
+    append_user_message(state, &session.id, params.message).await?;
 
     let config = build_agent_config(
         params.model,
@@ -221,15 +221,14 @@ fn load_or_create_cron_session(
     }
 }
 
-fn append_user_message(
+async fn append_user_message(
     state: &Arc<WsServerState>,
     session_id: &str,
     message: &str,
 ) -> Result<(), String> {
     let msg = crate::sessions::ChatMessage::user(session_id, message);
-    state
-        .session_store()
-        .append_message(msg)
+    crate::sessions::append_message_blocking(state.session_store().clone(), msg)
+        .await
         .map_err(|e| format!("failed to append message: {}", e))
 }
 

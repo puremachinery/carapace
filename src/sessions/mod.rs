@@ -5,6 +5,7 @@
 //! append-friendly history operations.
 
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 
 pub mod file_lock;
 pub mod integrity;
@@ -126,6 +127,50 @@ pub fn create_store() -> SessionStore {
 /// Create a session store with a custom base path
 pub fn create_store_with_path(base_path: std::path::PathBuf) -> SessionStore {
     SessionStore::with_base_path(base_path)
+}
+
+/// Append a message via a blocking worker thread.
+pub async fn append_message_blocking(
+    store: Arc<SessionStore>,
+    message: ChatMessage,
+) -> Result<(), SessionStoreError> {
+    tokio::task::spawn_blocking(move || store.append_message(message))
+        .await
+        .map_err(|e| SessionStoreError::Io(format!("session append task failed: {e}")))?
+}
+
+/// Append multiple messages via a blocking worker thread.
+pub async fn append_messages_blocking(
+    store: Arc<SessionStore>,
+    messages: Vec<ChatMessage>,
+) -> Result<(), SessionStoreError> {
+    tokio::task::spawn_blocking(move || store.append_messages(&messages))
+        .await
+        .map_err(|e| SessionStoreError::Io(format!("session append task failed: {e}")))?
+}
+
+/// Read session history via a blocking worker thread.
+pub async fn get_history_blocking(
+    store: Arc<SessionStore>,
+    session_id: String,
+    limit: Option<usize>,
+    before_message_id: Option<String>,
+) -> Result<Vec<ChatMessage>, SessionStoreError> {
+    tokio::task::spawn_blocking(move || {
+        store.get_history(&session_id, limit, before_message_id.as_deref())
+    })
+    .await
+    .map_err(|e| SessionStoreError::Io(format!("session read task failed: {e}")))?
+}
+
+/// Resolve a session by key via a blocking worker thread.
+pub async fn get_session_by_key_blocking(
+    store: Arc<SessionStore>,
+    session_key: String,
+) -> Result<Session, SessionStoreError> {
+    tokio::task::spawn_blocking(move || store.get_session_by_key(&session_key))
+        .await
+        .map_err(|e| SessionStoreError::Io(format!("session read task failed: {e}")))?
 }
 
 #[cfg(test)]

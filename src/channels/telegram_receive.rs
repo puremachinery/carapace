@@ -96,7 +96,9 @@ pub async fn telegram_receive_loop(
                                     &inbound_message.chat_id,
                                     &inbound_message.text,
                                     Some(inbound_message.chat_id.clone()),
-                                ) {
+                                )
+                                .await
+                                {
                                     warn!("Telegram inbound dispatch failed: {}", err);
                                 }
                             }

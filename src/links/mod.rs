@@ -29,7 +29,7 @@
 //! ```
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
@@ -59,6 +59,43 @@ pub const DEFAULT_TEXT_PREVIEW_LEN: usize = 2000;
 
 /// Maximum number of URLs to process from a single message
 pub const MAX_URLS_PER_MESSAGE: usize = 5;
+
+static URL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"https?://[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+").expect("URL regex is valid")
+});
+static FENCED_CODE_BLOCK_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?s)```.*?```").expect("fenced code block regex"));
+static INLINE_CODE_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"`[^`]+`").expect("inline code regex"));
+static TITLE_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?is)<title[^>]*>(.*?)</title>").expect("title regex"));
+static META_DESCRIPTION_NAME_FIRST_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?is)<meta\s+(?:[^>]*?\s)?name\s*=\s*["']description["'][^>]*?\scontent\s*=\s*["'](.*?)["'][^>]*/?\s*>"#,
+    )
+    .expect("meta description regex (name first)")
+});
+static META_DESCRIPTION_CONTENT_FIRST_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?is)<meta\s+(?:[^>]*?\s)?content\s*=\s*["'](.*?)["'][^>]*?\sname\s*=\s*["']description["'][^>]*/?\s*>"#,
+    )
+    .expect("meta description regex (content first)")
+});
+static SCRIPT_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?is)<script[^>]*>.*?</script>").expect("script regex"));
+static STYLE_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?is)<style[^>]*>.*?</style>").expect("style regex"));
+static COMMENT_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?s)<!--.*?-->").expect("comment regex"));
+static BLOCK_TAG_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)</?(?:div|p|br|h[1-6]|li|tr|blockquote|hr|section|article|header|footer|nav|main|aside)[^>]*>")
+        .expect("block tag regex")
+});
+static TAG_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<[^>]+>").expect("tag regex"));
+static MULTI_NEWLINE_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\n\s*\n").expect("multi newline regex"));
+static SPACES_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[^\S\n]+").expect("spaces regex"));
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -289,11 +326,8 @@ impl LinkUnderstanding {
         // First, blank out content inside code blocks so URLs within them are ignored.
         let cleaned = remove_code_blocks(text);
 
-        let url_re = Regex::new(r"https?://[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+")
-            .expect("URL regex is valid");
-
         let mut urls: Vec<String> = Vec::new();
-        for mat in url_re.find_iter(&cleaned) {
+        for mat in URL_REGEX.find_iter(&cleaned) {
             let url = mat.as_str().to_string();
             // Strip trailing punctuation that is likely sentence-ending, not part of the URL
             let url = strip_trailing_punctuation(&url);
@@ -400,14 +434,12 @@ fn remove_code_blocks(text: &str) -> String {
     let mut result = text.to_string();
 
     // Fenced code blocks: ```...```
-    let fenced_re = Regex::new(r"(?s)```.*?```").expect("fenced code block regex");
-    result = fenced_re
+    result = FENCED_CODE_BLOCK_REGEX
         .replace_all(&result, |m: &regex::Captures| " ".repeat(m[0].len()))
         .into_owned();
 
     // Inline code spans: `...`
-    let inline_re = Regex::new(r"`[^`]+`").expect("inline code regex");
-    result = inline_re
+    result = INLINE_CODE_REGEX
         .replace_all(&result, |m: &regex::Captures| " ".repeat(m[0].len()))
         .into_owned();
 
@@ -426,8 +458,8 @@ fn strip_trailing_punctuation(url: &str) -> String {
 
 /// Extract the page title from the `<title>` tag.
 pub fn extract_title(html: &str) -> Option<String> {
-    let re = Regex::new(r"(?is)<title[^>]*>(.*?)</title>").expect("title regex");
-    re.captures(html)
+    TITLE_REGEX
+        .captures(html)
         .and_then(|c| c.get(1))
         .map(|m| collapse_whitespace(&decode_html_entities(m.as_str())))
         .filter(|s| !s.is_empty())
@@ -436,12 +468,7 @@ pub fn extract_title(html: &str) -> Option<String> {
 /// Extract the meta description from `<meta name="description" content="...">`.
 pub fn extract_meta_description(html: &str) -> Option<String> {
     // Handles both name="description" content="..." and content="..." name="description"
-    let re = Regex::new(
-        r#"(?is)<meta\s+(?:[^>]*?\s)?name\s*=\s*["']description["'][^>]*?\scontent\s*=\s*["'](.*?)["'][^>]*/?\s*>"#,
-    )
-    .expect("meta description regex (name first)");
-
-    if let Some(caps) = re.captures(html) {
+    if let Some(caps) = META_DESCRIPTION_NAME_FIRST_REGEX.captures(html) {
         let desc = collapse_whitespace(&decode_html_entities(caps.get(1).unwrap().as_str()));
         if !desc.is_empty() {
             return Some(desc);
@@ -449,12 +476,8 @@ pub fn extract_meta_description(html: &str) -> Option<String> {
     }
 
     // Try reversed attribute order: content first, name second
-    let re2 = Regex::new(
-        r#"(?is)<meta\s+(?:[^>]*?\s)?content\s*=\s*["'](.*?)["'][^>]*?\sname\s*=\s*["']description["'][^>]*/?\s*>"#,
-    )
-    .expect("meta description regex (content first)");
-
-    re2.captures(html)
+    META_DESCRIPTION_CONTENT_FIRST_REGEX
+        .captures(html)
         .and_then(|c| c.get(1))
         .map(|m| collapse_whitespace(&decode_html_entities(m.as_str())))
         .filter(|s| !s.is_empty())
@@ -465,25 +488,18 @@ pub fn html_to_text(html: &str) -> String {
     let mut text = html.to_string();
 
     // Remove <script> and <style> blocks entirely
-    let script_re = Regex::new(r"(?is)<script[^>]*>.*?</script>").expect("script regex");
-    text = script_re.replace_all(&text, " ").into_owned();
+    text = SCRIPT_REGEX.replace_all(&text, " ").into_owned();
 
-    let style_re = Regex::new(r"(?is)<style[^>]*>.*?</style>").expect("style regex");
-    text = style_re.replace_all(&text, " ").into_owned();
+    text = STYLE_REGEX.replace_all(&text, " ").into_owned();
 
     // Remove HTML comments
-    let comment_re = Regex::new(r"(?s)<!--.*?-->").expect("comment regex");
-    text = comment_re.replace_all(&text, " ").into_owned();
+    text = COMMENT_REGEX.replace_all(&text, " ").into_owned();
 
     // Replace block-level tags with newlines for readability
-    let block_re =
-        Regex::new(r"(?i)</?(?:div|p|br|h[1-6]|li|tr|blockquote|hr|section|article|header|footer|nav|main|aside)[^>]*>")
-            .expect("block tag regex");
-    text = block_re.replace_all(&text, "\n").into_owned();
+    text = BLOCK_TAG_REGEX.replace_all(&text, "\n").into_owned();
 
     // Strip all remaining HTML tags
-    let tag_re = Regex::new(r"<[^>]+>").expect("tag regex");
-    text = tag_re.replace_all(&text, "").into_owned();
+    text = TAG_REGEX.replace_all(&text, "").into_owned();
 
     // Decode HTML entities
     text = decode_html_entities(&text);
@@ -506,12 +522,10 @@ fn decode_html_entities(text: &str) -> String {
 /// Collapse runs of whitespace into single spaces / double newlines.
 fn collapse_whitespace(text: &str) -> String {
     // Replace multiple blank lines with a single blank line
-    let multi_newline = Regex::new(r"\n\s*\n").expect("multi newline regex");
-    let collapsed = multi_newline.replace_all(text, "\n\n").into_owned();
+    let collapsed = MULTI_NEWLINE_REGEX.replace_all(text, "\n\n").into_owned();
 
     // Replace runs of spaces/tabs (not newlines) with a single space
-    let spaces = Regex::new(r"[^\S\n]+").expect("spaces regex");
-    let collapsed = spaces.replace_all(&collapsed, " ").into_owned();
+    let collapsed = SPACES_REGEX.replace_all(&collapsed, " ").into_owned();
 
     collapsed.trim().to_string()
 }
