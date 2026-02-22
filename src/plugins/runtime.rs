@@ -731,13 +731,18 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginInstanceHandle<B> {
         // Get the exported interface, then get the typed function
         let func = self.get_iface_typed_func::<(), R>(&mut store, iface_name, func_name)?;
 
-        // Call the function asynchronously (required by async-enabled engine)
-        // We bridge sync -> async using tokio's block_in_place + block_on
+        // Call the function asynchronously via the centralized sync/async bridge helper.
         let result =
             run_sync_blocking(async { func.call_async(&mut *store, ()).await }).map_err(|e| {
                 let msg = e;
                 let msg_lower = msg.to_lowercase();
-                if msg_lower.contains("fuel") {
+                if msg.contains("cannot run blocking sync-async bridge from current-thread runtime")
+                {
+                    BindingError::CallError(format!(
+                        "plugin call '{}.{}' requires a multi-thread Tokio runtime: {}",
+                        iface_name, func_name, msg
+                    ))
+                } else if msg_lower.contains("fuel") {
                     BindingError::CallError(format!(
                         "WASM fuel exhausted during '{}.{}' (budget: {} instructions)",
                         iface_name, func_name, DEFAULT_FUEL_BUDGET
@@ -759,10 +764,17 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginInstanceHandle<B> {
 
         // Post-return cleanup
         run_sync_blocking(async { func.post_return_async(&mut *store).await }).map_err(|e| {
-            BindingError::CallError(format!(
-                "post_return for '{}.{}' failed: {}",
-                iface_name, func_name, e
-            ))
+            if e.contains("cannot run blocking sync-async bridge from current-thread runtime") {
+                BindingError::CallError(format!(
+                    "plugin post_return '{}.{}' requires a multi-thread Tokio runtime: {}",
+                    iface_name, func_name, e
+                ))
+            } else {
+                BindingError::CallError(format!(
+                    "post_return for '{}.{}' failed: {}",
+                    iface_name, func_name, e
+                ))
+            }
         })?;
 
         Ok(result)
@@ -799,7 +811,13 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginInstanceHandle<B> {
             .map_err(|e| {
                 let msg = e;
                 let msg_lower = msg.to_lowercase();
-                if msg_lower.contains("fuel") {
+                if msg.contains("cannot run blocking sync-async bridge from current-thread runtime")
+                {
+                    BindingError::CallError(format!(
+                        "plugin call '{}.{}' requires a multi-thread Tokio runtime: {}",
+                        iface_name, func_name, msg
+                    ))
+                } else if msg_lower.contains("fuel") {
                     BindingError::CallError(format!(
                         "WASM fuel exhausted during '{}.{}' (budget: {} instructions)",
                         iface_name, func_name, DEFAULT_FUEL_BUDGET
@@ -820,10 +838,17 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginInstanceHandle<B> {
             })?;
 
         run_sync_blocking(async { func.post_return_async(&mut *store).await }).map_err(|e| {
-            BindingError::CallError(format!(
-                "post_return for '{}.{}' failed: {}",
-                iface_name, func_name, e
-            ))
+            if e.contains("cannot run blocking sync-async bridge from current-thread runtime") {
+                BindingError::CallError(format!(
+                    "plugin post_return '{}.{}' requires a multi-thread Tokio runtime: {}",
+                    iface_name, func_name, e
+                ))
+            } else {
+                BindingError::CallError(format!(
+                    "post_return for '{}.{}' failed: {}",
+                    iface_name, func_name, e
+                ))
+            }
         })?;
 
         Ok(result)

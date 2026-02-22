@@ -1,4 +1,4 @@
-use std::{any::Any, fmt::Debug, future::Future, sync::mpsc, thread};
+use std::{any::Any, fmt::Display, future::Future, sync::mpsc, thread};
 
 use tokio::{
     runtime::{Builder, Handle, RuntimeFlavor},
@@ -12,11 +12,11 @@ use tokio::{
 /// - If running inside a current-thread runtime, returns an explicit error.
 pub fn run_sync_blocking<T, E>(future: impl Future<Output = Result<T, E>>) -> Result<T, String>
 where
-    E: Debug,
+    E: Display,
 {
     if let Ok(handle) = Handle::try_current() {
         if handle.runtime_flavor() == RuntimeFlavor::MultiThread {
-            return block_in_place(|| handle.block_on(future).map_err(|e| format!("{e:?}")));
+            return block_in_place(|| handle.block_on(future).map_err(|e| e.to_string()));
         }
         return Err(
             "cannot run blocking sync-async bridge from current-thread runtime".to_string(),
@@ -35,11 +35,11 @@ pub fn run_sync_blocking_send<T, E>(
 ) -> Result<T, String>
 where
     T: Send + 'static,
-    E: Debug + Send + 'static,
+    E: Display + Send + 'static,
 {
     if let Ok(handle) = Handle::try_current() {
         if handle.runtime_flavor() == RuntimeFlavor::MultiThread {
-            return block_in_place(|| handle.block_on(future).map_err(|e| format!("{e:?}")));
+            return block_in_place(|| handle.block_on(future).map_err(|e| e.to_string()));
         }
         return run_in_spawned_runtime(future);
     }
@@ -52,7 +52,7 @@ fn run_in_spawned_runtime<T, E>(
 ) -> Result<T, String>
 where
     T: Send + 'static,
-    E: Debug + Send + 'static,
+    E: Display + Send + 'static,
 {
     let (tx, rx) = mpsc::channel::<Result<T, String>>();
     let handle = thread::spawn(move || {
@@ -75,14 +75,14 @@ fn run_in_current_thread_runtime<T, E>(
     future: impl Future<Output = Result<T, E>>,
 ) -> Result<T, String>
 where
-    E: Debug,
+    E: Display,
 {
     Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| format!("failed to create runtime: {e}"))?
         .block_on(future)
-        .map_err(|e| format!("{e:?}"))
+        .map_err(|e| e.to_string())
 }
 
 fn panic_to_string(payload: Box<dyn Any + Send>) -> String {

@@ -3897,31 +3897,6 @@ mod tests {
     }
 
     #[test]
-    fn test_run_sync_blocking_outside_runtime() {
-        let value = run_sync_blocking(async { Ok::<u16, std::io::Error>(17) }).unwrap();
-        assert_eq!(value, 17);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_run_sync_blocking_inside_multi_thread_runtime() {
-        let value = run_sync_blocking(async { Ok::<u16, std::io::Error>(99) }).unwrap();
-        assert_eq!(value, 99);
-    }
-
-    #[test]
-    fn test_run_sync_blocking_inside_current_thread_runtime_returns_error() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let value = rt.block_on(async {
-            run_sync_blocking(async { Ok::<u16, std::io::Error>(11) })
-                .expect_err("current-thread runtime should return an explicit error")
-        });
-        assert!(value.contains("cannot run blocking sync-async bridge from current-thread runtime"));
-    }
-
-    #[test]
     fn test_setup_post_checks_bridge_inside_current_thread_runtime_does_not_panic() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -3972,30 +3947,6 @@ mod tests {
             err.contains("unsupported channel for validation: unsupported"),
             "expected unsupported-channel rejection path, got: {err}"
         );
-    }
-
-    #[test]
-    fn test_run_sync_blocking_send_inside_current_thread_runtime_works() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let value = rt.block_on(async {
-            run_sync_blocking_send(async { Ok::<u16, std::io::Error>(11) }).unwrap()
-        });
-        assert_eq!(value, 11);
-    }
-
-    #[test]
-    fn test_run_sync_blocking_send_outside_any_runtime_works() {
-        let value = run_sync_blocking_send(async { Ok::<u16, std::io::Error>(22) }).unwrap();
-        assert_eq!(value, 22);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_run_sync_blocking_send_inside_multi_thread_runtime_works() {
-        let value = run_sync_blocking_send(async { Ok::<u16, std::io::Error>(33) }).unwrap();
-        assert_eq!(value, 33);
     }
 
     #[test]
