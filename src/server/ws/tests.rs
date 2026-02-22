@@ -61,6 +61,119 @@ fn test_get_value_at_path() {
     assert_eq!(get_value_at_path(&root, "unknown"), None);
 }
 
+#[test]
+fn test_resolve_session_integrity_config_defaults_to_enabled_warn() {
+    let cfg = json!({});
+    let integrity = resolve_session_integrity_config(&cfg);
+    assert!(integrity.enabled);
+    assert_eq!(
+        integrity.action,
+        crate::sessions::integrity::IntegrityAction::Warn
+    );
+}
+
+#[test]
+fn test_resolve_session_integrity_config_respects_overrides() {
+    let cfg = json!({
+        "sessions": {
+            "integrity": {
+                "enabled": false,
+                "action": "reject"
+            }
+        }
+    });
+    let integrity = resolve_session_integrity_config(&cfg);
+    assert!(!integrity.enabled);
+    assert_eq!(
+        integrity.action,
+        crate::sessions::integrity::IntegrityAction::Reject
+    );
+}
+
+#[test]
+fn test_resolve_session_integrity_config_invalid_value_uses_defaults() {
+    let cfg = json!({
+        "sessions": {
+            "integrity": {
+                "enabled": false,
+                "action": "invalid"
+            }
+        }
+    });
+    let integrity = resolve_session_integrity_config(&cfg);
+    assert!(integrity.enabled);
+    assert_eq!(
+        integrity.action,
+        crate::sessions::integrity::IntegrityAction::Warn
+    );
+}
+
+#[test]
+fn test_resolve_session_integrity_secret_prefers_explicit_server_secret() {
+    let resolved_auth = auth::ResolvedGatewayAuth {
+        mode: auth::AuthMode::Token,
+        token: Some("gateway-token".to_string()),
+        password: Some("gateway-password".to_string()),
+        allow_tailscale: false,
+    };
+    let (secret, source) = resolve_session_integrity_secret(
+        &resolved_auth,
+        Some("explicit-server-secret".to_string()),
+    )
+    .expect("secret should resolve from explicit server secret");
+    assert_eq!(secret, "explicit-server-secret");
+    assert_eq!(source, "CARAPACE_SERVER_SECRET");
+}
+
+#[test]
+fn test_resolve_session_integrity_secret_falls_back_to_gateway_credentials() {
+    let from_token = auth::ResolvedGatewayAuth {
+        mode: auth::AuthMode::Token,
+        token: Some("gateway-token".to_string()),
+        password: None,
+        allow_tailscale: false,
+    };
+    let (secret, source) = resolve_session_integrity_secret(&from_token, None)
+        .expect("secret should resolve from gateway token");
+    assert_eq!(secret, "gateway-token");
+    assert_eq!(source, "gateway token");
+
+    let from_password = auth::ResolvedGatewayAuth {
+        mode: auth::AuthMode::Password,
+        token: None,
+        password: Some("gateway-password".to_string()),
+        allow_tailscale: false,
+    };
+    let (secret, source) = resolve_session_integrity_secret(&from_password, None)
+        .expect("secret should resolve from gateway password");
+    assert_eq!(secret, "gateway-password");
+    assert_eq!(source, "gateway password");
+}
+
+#[test]
+fn test_resolve_session_integrity_secret_ignores_empty_values() {
+    let resolved_auth = auth::ResolvedGatewayAuth {
+        mode: auth::AuthMode::Token,
+        token: Some(String::new()),
+        password: Some(String::new()),
+        allow_tailscale: false,
+    };
+    let secret = resolve_session_integrity_secret(&resolved_auth, Some(String::new()));
+    assert!(secret.is_none());
+}
+
+#[test]
+fn test_resolve_session_integrity_secret_returns_none_when_all_missing() {
+    let resolved_auth = auth::ResolvedGatewayAuth {
+        mode: auth::AuthMode::Token,
+        token: None,
+        password: None,
+        allow_tailscale: false,
+    };
+    let secret = resolve_session_integrity_secret(&resolved_auth, None);
+    assert!(secret.is_none());
+}
+
 #[tokio::test]
 async fn test_handle_node_invoke_enforces_allowlist() {
     let state = Arc::new(WsServerState::new(WsServerConfig::default()));

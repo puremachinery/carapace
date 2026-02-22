@@ -249,7 +249,7 @@ feature_inventory_markdown: |
 
   - [x] **JSONL format** — append-friendly history
   - [x] **Compaction** — truncate old messages
-  - [x] **HMAC integrity** — SHA-256 HMAC (metadata + history)
+  - [x] **HMAC integrity** — SHA-256 HMAC (metadata + history), enabled by default (`warn` mode migration)
   - [x] **Session archiving + restoration**
   - [x] **Session filters** — list/search by criteria
   - [x] **File locking** — concurrent-safe operations (flock RAII), including per-session-key creation locks

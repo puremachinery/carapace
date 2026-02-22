@@ -1111,9 +1111,9 @@ features:
   - feature: "sessions.HMAC integrity"
     status: "verified_done"
     runtime_wiring:
-      - "src/server/ws/mod.rs (sessions.integrity config + HMAC key)"
+      - "src/server/ws/mod.rs (sessions.integrity defaults + HMAC key wiring from server secret or resolved gateway auth)"
       - "src/sessions/store.rs (HMAC sidecar write + verify on load/history)"
-      - "src/sessions/integrity.rs (HMAC helpers)"
+      - "src/sessions/integrity.rs (HMAC helpers + IntegrityConfig default enabled=true/action=warn)"
     tests:
       - "src/sessions/integrity.rs (HMAC unit tests)"
       - "src/sessions/store.rs (history HMAC enforcement test)"
