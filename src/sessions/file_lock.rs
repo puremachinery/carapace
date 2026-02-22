@@ -102,20 +102,39 @@ fn flock_unlock(file: &File) {
 // ---------------------------------------------------------------------------
 
 #[cfg(windows)]
+const WHOLE_FILE_LOCK_LEN_LOW: u32 = u32::MAX;
+#[cfg(windows)]
+const WHOLE_FILE_LOCK_LEN_HIGH: u32 = u32::MAX;
+
+#[cfg(windows)]
+fn whole_file_overlapped() -> windows_sys::Win32::System::IO::OVERLAPPED {
+    use windows_sys::Win32::System::IO::{OVERLAPPED, OVERLAPPED_0, OVERLAPPED_0_0};
+    // Lock range starts at offset 0 and spans u64::MAX bytes via LOW/HIGH length args.
+    OVERLAPPED {
+        Anonymous: OVERLAPPED_0 {
+            Anonymous: OVERLAPPED_0_0 {
+                Offset: 0,
+                OffsetHigh: 0,
+            },
+        },
+        ..Default::default()
+    }
+}
+
+#[cfg(windows)]
 fn flock_exclusive(file: &File) -> Result<(), io::Error> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{LockFileEx, LOCKFILE_EXCLUSIVE_LOCK};
-    use windows_sys::Win32::System::IO::OVERLAPPED;
 
     let handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
-    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+    let mut overlapped = whole_file_overlapped();
     let rc = unsafe {
         LockFileEx(
             handle,
             LOCKFILE_EXCLUSIVE_LOCK,
             0,
-            u32::MAX,
-            u32::MAX,
+            WHOLE_FILE_LOCK_LEN_LOW,
+            WHOLE_FILE_LOCK_LEN_HIGH,
             &mut overlapped,
         )
     };
@@ -133,17 +152,16 @@ fn flock_try_exclusive(file: &File) -> Result<bool, io::Error> {
     use windows_sys::Win32::Storage::FileSystem::{
         LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
     };
-    use windows_sys::Win32::System::IO::OVERLAPPED;
 
     let handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
-    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+    let mut overlapped = whole_file_overlapped();
     let rc = unsafe {
         LockFileEx(
             handle,
             LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
             0,
-            u32::MAX,
-            u32::MAX,
+            WHOLE_FILE_LOCK_LEN_LOW,
+            WHOLE_FILE_LOCK_LEN_HIGH,
             &mut overlapped,
         )
     };
@@ -166,12 +184,18 @@ fn flock_try_exclusive(file: &File) -> Result<bool, io::Error> {
 fn flock_unlock(file: &File) {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
-    use windows_sys::Win32::System::IO::OVERLAPPED;
 
     let handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
-    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+    // Unlock must match the same region/offset used by LockFileEx.
+    let mut overlapped = whole_file_overlapped();
     unsafe {
-        let _ = UnlockFileEx(handle, 0, u32::MAX, u32::MAX, &mut overlapped);
+        let _ = UnlockFileEx(
+            handle,
+            0,
+            WHOLE_FILE_LOCK_LEN_LOW,
+            WHOLE_FILE_LOCK_LEN_HIGH,
+            &mut overlapped,
+        );
     }
 }
 

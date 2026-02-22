@@ -692,7 +692,14 @@ async fn dispatch_sessions(
             "sessions.archive.delete" => handle_sessions_archive_delete(&state, params),
             "sessions.export_user" => handle_sessions_export_user(&state, params),
             "sessions.purge_user" => handle_sessions_purge_user(&state, params),
-            _ => unreachable!("checked by is_session_method"),
+            _ => {
+                tracing::error!("unhandled session method dispatched to blocking worker");
+                Err(error_shape(
+                    ERROR_UNAVAILABLE,
+                    "internal server error: unhandled session method",
+                    Some(json!({ "method": method_owned })),
+                ))
+            }
         }
     })
     .await;
