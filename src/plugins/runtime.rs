@@ -674,6 +674,12 @@ pub struct PluginInstanceHandle<B: CredentialBackend + Send + Sync + 'static> {
     component: Component,
 }
 
+// SAFETY: PluginInstanceHandle coordinates all mutable Wasmtime Store access through
+// `store: RwLock<Store<HostState<B>>>`. The remaining fields are immutable after
+// instantiation and only used alongside locked store access when invoking exports.
+unsafe impl<B: CredentialBackend + Send + Sync + 'static> Send for PluginInstanceHandle<B> {}
+unsafe impl<B: CredentialBackend + Send + Sync + 'static> Sync for PluginInstanceHandle<B> {}
+
 impl<B: CredentialBackend + Send + Sync + 'static> PluginInstanceHandle<B> {
     /// Look up a typed function from a named exported interface.
     ///
@@ -1442,12 +1448,6 @@ impl<B: CredentialBackend + Send + Sync + 'static> ChannelAdapter<B> {
     }
 }
 
-// SAFETY: ChannelAdapter only holds an Arc<PluginInstanceHandle<B>> whose interior
-// wasmtime Store is guarded by an RwLock.  All access goes through the lock,
-// so sharing across threads is safe.
-unsafe impl<B: CredentialBackend + Send + Sync + 'static> Send for ChannelAdapter<B> {}
-unsafe impl<B: CredentialBackend + Send + Sync + 'static> Sync for ChannelAdapter<B> {}
-
 impl<B: CredentialBackend + Send + Sync + 'static> ChannelPluginInstance for ChannelAdapter<B> {
     fn get_info(&self) -> Result<ChannelInfo, BindingError> {
         tracing::debug!(plugin_id = %self.plugin_id, "Calling WASM export channel-meta.get-info");
@@ -1509,12 +1509,6 @@ impl<B: CredentialBackend + Send + Sync + 'static> ToolAdapter<B> {
     }
 }
 
-// SAFETY: ToolAdapter only holds an Arc<PluginInstanceHandle<B>> whose interior
-// wasmtime Store is guarded by an RwLock.  All access goes through the lock,
-// so sharing across threads is safe.
-unsafe impl<B: CredentialBackend + Send + Sync + 'static> Send for ToolAdapter<B> {}
-unsafe impl<B: CredentialBackend + Send + Sync + 'static> Sync for ToolAdapter<B> {}
-
 impl<B: CredentialBackend + Send + Sync + 'static> ToolPluginInstance for ToolAdapter<B> {
     fn get_definitions(&self) -> Result<Vec<ToolDefinition>, BindingError> {
         tracing::debug!(plugin_id = %self.plugin_id, "Calling WASM export tool.get-definitions");
@@ -1559,12 +1553,6 @@ impl<B: CredentialBackend + Send + Sync + 'static> WebhookAdapter<B> {
     }
 }
 
-// SAFETY: WebhookAdapter only holds an Arc<PluginInstanceHandle<B>> whose interior
-// wasmtime Store is guarded by an RwLock.  All access goes through the lock,
-// so sharing across threads is safe.
-unsafe impl<B: CredentialBackend + Send + Sync + 'static> Send for WebhookAdapter<B> {}
-unsafe impl<B: CredentialBackend + Send + Sync + 'static> Sync for WebhookAdapter<B> {}
-
 impl<B: CredentialBackend + Send + Sync + 'static> WebhookPluginInstance for WebhookAdapter<B> {
     fn get_paths(&self) -> Result<Vec<String>, BindingError> {
         tracing::debug!(plugin_id = %self.plugin_id, "Calling WASM export webhook.get-paths");
@@ -1606,12 +1594,6 @@ impl<B: CredentialBackend + Send + Sync + 'static> ServiceAdapter<B> {
     }
 }
 
-// SAFETY: ServiceAdapter only holds an Arc<PluginInstanceHandle<B>> whose interior
-// wasmtime Store is guarded by an RwLock.  All access goes through the lock,
-// so sharing across threads is safe.
-unsafe impl<B: CredentialBackend + Send + Sync + 'static> Send for ServiceAdapter<B> {}
-unsafe impl<B: CredentialBackend + Send + Sync + 'static> Sync for ServiceAdapter<B> {}
-
 impl<B: CredentialBackend + Send + Sync + 'static> ServicePluginInstance for ServiceAdapter<B> {
     fn start(&self) -> Result<(), BindingError> {
         tracing::debug!(plugin_id = %self.plugin_id, "Calling WASM export service.start");
@@ -1650,12 +1632,6 @@ impl<B: CredentialBackend + Send + Sync + 'static> HookAdapter<B> {
         Self { plugin_id, handle }
     }
 }
-
-// SAFETY: HookAdapter only holds an Arc<PluginInstanceHandle<B>> whose interior
-// wasmtime Store is guarded by an RwLock.  All access goes through the lock,
-// so sharing across threads is safe.
-unsafe impl<B: CredentialBackend + Send + Sync + 'static> Send for HookAdapter<B> {}
-unsafe impl<B: CredentialBackend + Send + Sync + 'static> Sync for HookAdapter<B> {}
 
 impl<B: CredentialBackend + Send + Sync + 'static> HookPluginInstance for HookAdapter<B> {
     fn get_hooks(&self) -> Result<Vec<String>, BindingError> {

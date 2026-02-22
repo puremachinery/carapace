@@ -60,7 +60,7 @@ rpassword = "7"
 
 [target.'cfg(windows)'.dependencies]
 win32job = "2.0.3"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Threading"] }
 rappct = "0.13.3"
 
 [dev-dependencies]

@@ -1439,7 +1439,7 @@ fn check_hooks_auth(config: &HttpConfig, headers: &HeaderMap, uri: &Uri) -> Opti
     };
 
     match extract_hooks_token(headers, uri) {
-        Some((token, _deprecated)) => {
+        Some(token) => {
             if !validate_hooks_token(&token, configured_token) {
                 Some(unauthorized_response())
             } else {
