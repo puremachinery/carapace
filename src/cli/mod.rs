@@ -294,6 +294,8 @@ use rustls::{DigitallySignedStruct, Error as RustlsError, SignatureScheme};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+use std::fmt::Display;
+use std::future::Future;
 use std::io::IsTerminal;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -2037,11 +2039,9 @@ fn validate_provider_credentials_interactive(
     }
 
     println!("Checking {} credentials...", provider);
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-
-    match runtime.block_on(validate_provider_credentials(provider, api_key)) {
+    match run_sync_blocking(validate_provider_credentials(provider, api_key))
+        .map_err(|err| format!("credential validation runtime failed: {err}"))
+    {
         Ok(()) => {
             println!("Credential check succeeded.");
             Ok(())
@@ -2070,11 +2070,9 @@ fn validate_channel_credentials_interactive(
     }
 
     println!("Checking {} credentials...", channel);
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-
-    match runtime.block_on(validate_channel_credentials(channel, token)) {
+    match run_sync_blocking(validate_channel_credentials(channel, token))
+        .map_err(|err| format!("credential validation runtime failed: {err}"))
+    {
         Ok(()) => {
             println!("Credential check succeeded.");
             Ok(())
@@ -2975,12 +2973,10 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
         let run_verify = prompt_yes_no(&verify_prompt, verify_default)?;
 
         if run_status || launch_chat || run_verify {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
             if run_status || launch_chat {
                 if let Err(err) =
-                    runtime.block_on(run_setup_post_checks(port, run_status, launch_chat))
+                    run_sync_blocking(run_setup_post_checks(port, run_status, launch_chat))
+                        .map_err(|err| format!("runtime execution failed: {err}"))
                 {
                     eprintln!("Post-setup checks failed: {}", err);
                     eprintln!(
@@ -2997,13 +2993,15 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
                     SetupOutcome::Telegram => VerifyOutcomeSelection::Telegram,
                     SetupOutcome::Hooks => VerifyOutcomeSelection::Hooks,
                 };
-                if let Err(err) = runtime.block_on(run_outcome_verifier(
+                if let Err(err) = run_sync_blocking(run_outcome_verifier(
                     verify_outcome,
                     port,
                     verify_discord_to,
                     verify_telegram_to,
                     &config,
-                )) {
+                ))
+                .map_err(|err| format!("runtime execution failed: {err}"))
+                {
                     eprintln!("Outcome verification failed: {}", err);
                     eprintln!("Fix the failing checks above, then rerun `cara verify`.");
                 }
@@ -3014,6 +3012,36 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+/// Run an async computation from synchronous code.
+///
+/// This helper is used by sync entry points (like setup flows) that need to
+/// invoke async code that may be called with or without an active Tokio runtime.
+///
+/// - If already inside a multi-threaded runtime, use `block_in_place` and execute
+///   the future on the current runtime handle.
+/// - Otherwise, create a temporary current-thread runtime and `block_on` there.
+/// - If inside a current-thread runtime, return an explicit error instead of
+///   triggering a panic.
+fn run_sync_blocking<T, E>(future: impl Future<Output = Result<T, E>>) -> Result<T, String>
+where
+    E: Display,
+{
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+            tokio::task::block_in_place(|| handle.block_on(future).map_err(|e| e.to_string()))
+        } else {
+            Err("cannot run blocking sync-async bridge from current-thread runtime".to_string())
+        }
+    } else {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("failed to create runtime: {e}"))?
+            .block_on(future)
+            .map_err(|e| e.to_string())
+    }
 }
 
 /// Run the `pair` subcommand -- pair with a remote gateway node.
@@ -3874,6 +3902,31 @@ mod tests {
             }
             other => panic!("Expected Verify, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_run_sync_blocking_outside_runtime() {
+        let value = run_sync_blocking(async { Ok::<u16, std::io::Error>(17) }).unwrap();
+        assert_eq!(value, 17);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_run_sync_blocking_inside_multi_thread_runtime() {
+        let value = run_sync_blocking(async { Ok::<u16, std::io::Error>(99) }).unwrap();
+        assert_eq!(value, 99);
+    }
+
+    #[test]
+    fn test_run_sync_blocking_inside_current_thread_runtime_returns_error() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = rt.block_on(async {
+            run_sync_blocking(async { Ok::<u16, std::io::Error>(11) })
+                .expect_err("current-thread runtime should return an explicit error")
+        });
+        assert!(err.contains("cannot run blocking sync-async bridge from current-thread runtime"));
     }
 
     #[test]
