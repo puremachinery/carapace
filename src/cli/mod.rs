@@ -3021,7 +3021,7 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
                     port,
                     verify_discord_to,
                     verify_telegram_to,
-                    config.clone(),
+                    config,
                 ))
                 .map_err(|err| format!("runtime execution failed: {err}"))
                 {
@@ -3082,19 +3082,17 @@ where
         if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
             tokio::task::block_in_place(|| handle.block_on(future).map_err(|e| e.to_string()))
         } else {
-            let (tx, rx) = std::sync::mpsc::sync_channel(1);
-            std::thread::spawn(move || {
-                let result = tokio::runtime::Builder::new_current_thread()
+            let thread = std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .map_err(|e| e.to_string())
-                    .and_then(|runtime| runtime.block_on(future).map_err(|e| e.to_string()));
-                let _ = tx.send(result);
-            })
-            .join()
-            .map_err(|_| "runtime bridge thread panicked".to_string())?;
-            rx.recv()
-                .map_err(|_| "runtime bridge thread dropped without response".to_string())?
+                    .and_then(|runtime| runtime.block_on(future).map_err(|e| e.to_string()))
+            });
+
+            thread
+                .join()
+                .map_err(|_| "runtime bridge thread panicked".to_string())?
         }
     } else {
         tokio::runtime::Builder::new_current_thread()
@@ -4001,6 +3999,18 @@ mod tests {
             run_sync_blocking_send(async { Ok::<u16, std::io::Error>(11) }).unwrap()
         });
         assert_eq!(value, 11);
+    }
+
+    #[test]
+    fn test_run_sync_blocking_send_outside_any_runtime_works() {
+        let value = run_sync_blocking_send(async { Ok::<u16, std::io::Error>(22) }).unwrap();
+        assert_eq!(value, 22);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_run_sync_blocking_send_inside_multi_thread_runtime_works() {
+        let value = run_sync_blocking_send(async { Ok::<u16, std::io::Error>(33) }).unwrap();
+        assert_eq!(value, 33);
     }
 
     #[test]
