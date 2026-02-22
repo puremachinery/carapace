@@ -998,11 +998,11 @@ async fn dispatch_agent_run(
     Ok(())
 }
 
-fn sender_scope_for_hook_request(has_remote_addr: bool) -> &'static str {
-    if has_remote_addr {
-        "remote"
-    } else {
-        "unknown"
+fn sender_scope_for_hook_request(remote_addr: Option<SocketAddr>) -> String {
+    match remote_addr.map(|addr| addr.ip()) {
+        Some(std::net::IpAddr::V4(v4)) => format!("ip4_{:08x}", u32::from(v4)),
+        Some(std::net::IpAddr::V6(v6)) => format!("ip6_{:032x}", u128::from(v6)),
+        None => "unknown".to_string(),
     }
 }
 
@@ -1047,9 +1047,9 @@ async fn hooks_agent_handler(
         }
     };
 
-    let sender_id = sender_scope_for_hook_request(connect_info.0.is_some());
+    let sender_id = sender_scope_for_hook_request(connect_info.0);
 
-    if let Err(resp) = dispatch_agent_run(&ws, &validated, &run_id, sender_id).await {
+    if let Err(resp) = dispatch_agent_run(&ws, &validated, &run_id, &sender_id).await {
         return resp;
     }
 
@@ -1973,15 +1973,24 @@ mod tests {
     }
 
     #[test]
-    fn test_sender_scope_for_hook_request_with_remote_addr() {
-        let sender = sender_scope_for_hook_request(true);
-        assert_eq!(sender, "remote");
+    fn test_sender_scope_for_hook_request_with_ipv4_remote_addr() {
+        let sender = sender_scope_for_hook_request(Some(SocketAddr::from(([127, 0, 0, 1], 43123))));
+        assert_eq!(sender, "ip4_7f000001");
     }
 
     #[test]
     fn test_sender_scope_for_hook_request_without_remote_addr() {
-        let sender = sender_scope_for_hook_request(false);
+        let sender = sender_scope_for_hook_request(None);
         assert_eq!(sender, "unknown");
+    }
+
+    #[test]
+    fn test_sender_scope_for_hook_request_with_ipv6_remote_addr() {
+        let sender = sender_scope_for_hook_request(Some(SocketAddr::from((
+            [0, 0, 0, 0, 0, 0, 0, 1],
+            43123,
+        ))));
+        assert_eq!(sender, "ip6_00000000000000000000000000000001");
     }
 
     #[tokio::test]
