@@ -34,8 +34,27 @@ jobs:
           # Safety buffer handles small clock skew between runner and GitHub comment timestamps.
           echo "started_at=$(date -u -d '2 minutes ago' +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
+      - name: Detect workflow self-change
+        id: workflow-change
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.payload.pull_request.number,
+              per_page: 100,
+            });
+            const blocked = new Set([
+              ".github/workflows/claude-code-review.yml",
+              ".github/workflows/claude.yml",
+            ]);
+            const changed = files.some((file) => blocked.has(file.filename));
+            core.setOutput("changed", changed ? "true" : "false");
+
       - name: Run Claude Code Review
         id: claude-review
+        continue-on-error: true
         uses: anthropics/claude-code-action@2f8ba26a219c06cfb0f468eef8d97055fa814f97 # v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -97,6 +116,18 @@ jobs:
             - Keep inline comments concise and non-repetitive.
           claude_args: |
             --allowedTools "Bash(gh api:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr review:*),Bash(git:*),Bash(jq:*),Bash(cat:*),Bash(head:*),Bash(echo:*),WebSearch"
+
+      - name: Allow expected Claude failure on workflow-change PRs
+        if: steps.claude-review.outcome == 'failure' && steps.workflow-change.outputs.changed == 'true'
+        run: |
+          echo "Claude review failed as expected: claude-code-action requires workflow files to match default branch for app-token exchange."
+          echo "Continuing because this PR intentionally changes Claude workflow files."
+
+      - name: Fail on unexpected Claude review failure
+        if: steps.claude-review.outcome == 'failure' && steps.workflow-change.outputs.changed != 'true'
+        run: |
+          echo "Claude review failed for a non-workflow-change reason."
+          exit 1
 
   cleanup-claude-stray-comments:
     name: Delete stray Claude issue comments from this run
