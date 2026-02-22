@@ -44,6 +44,7 @@ use super::permissions::{
     compute_effective_permissions, validate_declared_permissions, PermissionConfig,
     PermissionEnforcer,
 };
+use crate::runtime_bridge::run_sync_blocking;
 
 /// Maximum memory per plugin instance (64MB)
 pub const MAX_PLUGIN_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
@@ -732,39 +733,32 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginInstanceHandle<B> {
 
         // Call the function asynchronously (required by async-enabled engine)
         // We bridge sync -> async using tokio's block_in_place + block_on
-        let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async { func.call_async(&mut *store, ()).await })
-        })
-        .map_err(|e: wasmtime::Error| {
-            let msg = e.to_string();
-            let msg_lower = msg.to_lowercase();
-            if msg_lower.contains("fuel") {
-                BindingError::CallError(format!(
-                    "WASM fuel exhausted during '{}.{}' (budget: {} instructions)",
-                    iface_name, func_name, DEFAULT_FUEL_BUDGET
-                ))
-            } else if msg_lower.contains("epoch") || msg_lower.contains("interrupt") {
-                BindingError::CallError(format!(
-                    "WASM execution timed out during '{}.{}' (timeout: {}s)",
-                    iface_name,
-                    func_name,
-                    DEFAULT_EXECUTION_TIMEOUT.as_secs()
-                ))
-            } else {
-                BindingError::CallError(format!(
-                    "call to '{}.{}' failed: {}",
-                    iface_name, func_name, msg
-                ))
-            }
-        })?;
+        let result =
+            run_sync_blocking(async { func.call_async(&mut *store, ()).await }).map_err(|e| {
+                let msg = e;
+                let msg_lower = msg.to_lowercase();
+                if msg_lower.contains("fuel") {
+                    BindingError::CallError(format!(
+                        "WASM fuel exhausted during '{}.{}' (budget: {} instructions)",
+                        iface_name, func_name, DEFAULT_FUEL_BUDGET
+                    ))
+                } else if msg_lower.contains("epoch") || msg_lower.contains("interrupt") {
+                    BindingError::CallError(format!(
+                        "WASM execution timed out during '{}.{}' (timeout: {}s)",
+                        iface_name,
+                        func_name,
+                        DEFAULT_EXECUTION_TIMEOUT.as_secs()
+                    ))
+                } else {
+                    BindingError::CallError(format!(
+                        "call to '{}.{}' failed: {}",
+                        iface_name, func_name, msg
+                    ))
+                }
+            })?;
 
         // Post-return cleanup
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async { func.post_return_async(&mut *store).await })
-        })
-        .map_err(|e| {
+        run_sync_blocking(async { func.post_return_async(&mut *store).await }).map_err(|e| {
             BindingError::CallError(format!(
                 "post_return for '{}.{}' failed: {}",
                 iface_name, func_name, e
@@ -801,38 +795,31 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginInstanceHandle<B> {
 
         let func = self.get_iface_typed_func::<P, R>(&mut store, iface_name, func_name)?;
 
-        let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async { func.call_async(&mut *store, param).await })
-        })
-        .map_err(|e: wasmtime::Error| {
-            let msg = e.to_string();
-            let msg_lower = msg.to_lowercase();
-            if msg_lower.contains("fuel") {
-                BindingError::CallError(format!(
-                    "WASM fuel exhausted during '{}.{}' (budget: {} instructions)",
-                    iface_name, func_name, DEFAULT_FUEL_BUDGET
-                ))
-            } else if msg_lower.contains("epoch") || msg_lower.contains("interrupt") {
-                BindingError::CallError(format!(
-                    "WASM execution timed out during '{}.{}' (timeout: {}s)",
-                    iface_name,
-                    func_name,
-                    DEFAULT_EXECUTION_TIMEOUT.as_secs()
-                ))
-            } else {
-                BindingError::CallError(format!(
-                    "call to '{}.{}' failed: {}",
-                    iface_name, func_name, msg
-                ))
-            }
-        })?;
+        let result = run_sync_blocking(async { func.call_async(&mut *store, param).await })
+            .map_err(|e| {
+                let msg = e;
+                let msg_lower = msg.to_lowercase();
+                if msg_lower.contains("fuel") {
+                    BindingError::CallError(format!(
+                        "WASM fuel exhausted during '{}.{}' (budget: {} instructions)",
+                        iface_name, func_name, DEFAULT_FUEL_BUDGET
+                    ))
+                } else if msg_lower.contains("epoch") || msg_lower.contains("interrupt") {
+                    BindingError::CallError(format!(
+                        "WASM execution timed out during '{}.{}' (timeout: {}s)",
+                        iface_name,
+                        func_name,
+                        DEFAULT_EXECUTION_TIMEOUT.as_secs()
+                    ))
+                } else {
+                    BindingError::CallError(format!(
+                        "call to '{}.{}' failed: {}",
+                        iface_name, func_name, msg
+                    ))
+                }
+            })?;
 
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async { func.post_return_async(&mut *store).await })
-        })
-        .map_err(|e| {
+        run_sync_blocking(async { func.post_return_async(&mut *store).await }).map_err(|e| {
             BindingError::CallError(format!(
                 "post_return for '{}.{}' failed: {}",
                 iface_name, func_name, e
