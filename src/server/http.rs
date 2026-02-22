@@ -889,7 +889,7 @@ fn parse_agent_request(
 /// Dispatch a validated agent request through the WebSocket runtime, creating
 /// a session, registering the run, and optionally spawning the LLM executor.
 #[allow(clippy::result_large_err)]
-fn dispatch_agent_run(
+async fn dispatch_agent_run(
     ws: &Arc<WsServerState>,
     validated: &crate::hooks::handler::ValidatedAgentRequest,
     run_id: &str,
@@ -929,18 +929,18 @@ fn dispatch_agent_run(
             .into_response()
     })?;
 
-    ws.session_store()
-        .append_message(crate::sessions::ChatMessage::user(
-            session.id.clone(),
-            &validated.message,
-        ))
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(AgentResponse::error(&format!("session write error: {}", e))),
-            )
-                .into_response()
-        })?;
+    crate::sessions::append_message_blocking(
+        ws.session_store().clone(),
+        crate::sessions::ChatMessage::user(session.id.clone(), &validated.message),
+    )
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(AgentResponse::error(&format!("session write error: {}", e))),
+        )
+            .into_response()
+    })?;
 
     // Register the agent run
     let now = std::time::SystemTime::now()
@@ -1049,7 +1049,7 @@ async fn hooks_agent_handler(
 
     let sender_id = sender_scope_for_hook_request(connect_info.0.is_some());
 
-    if let Err(resp) = dispatch_agent_run(&ws, &validated, &run_id, sender_id) {
+    if let Err(resp) = dispatch_agent_run(&ws, &validated, &run_id, sender_id).await {
         return resp;
     }
 
@@ -1113,7 +1113,9 @@ async fn telegram_webhook_handler(
         &inbound.chat_id,
         &inbound.text,
         Some(inbound.chat_id.clone()),
-    ) {
+    )
+    .await
+    {
         warn!("Telegram inbound dispatch failed: {}", err);
     }
 
@@ -1192,7 +1194,9 @@ async fn slack_events_handler(
                     &inbound.channel_id,
                     &inbound.text,
                     Some(inbound.channel_id.clone()),
-                ) {
+                )
+                .await
+                {
                     warn!("Slack inbound dispatch failed: {}", err);
                 }
             }

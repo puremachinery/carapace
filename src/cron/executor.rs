@@ -118,8 +118,9 @@ async fn execute_agent_turn(
         params.model,
     );
 
-    let session = load_or_create_cron_session(state, &session_key, metadata, has_metadata_updates)?;
-    append_user_message(state, &session.id, params.message)?;
+    let session =
+        load_or_create_cron_session(state, &session_key, metadata, has_metadata_updates).await?;
+    append_user_message(state, &session.id, params.message).await?;
 
     let config = build_agent_config(
         params.model,
@@ -196,40 +197,46 @@ fn has_metadata_updates(
     normalized_channel.is_some() || normalized_to.is_some() || thinking.is_some() || model.is_some()
 }
 
-fn load_or_create_cron_session(
+async fn load_or_create_cron_session(
     state: &Arc<WsServerState>,
     session_key: &str,
     metadata: crate::sessions::SessionMetadata,
     has_metadata_updates: bool,
 ) -> Result<crate::sessions::Session, String> {
-    match state.session_store().get_session_by_key(session_key) {
+    let store = state.session_store().clone();
+    match crate::sessions::get_session_by_key_blocking(store, session_key.to_string()).await {
         Ok(existing) => {
             if has_metadata_updates {
-                state
-                    .session_store()
-                    .patch_session(&existing.id, metadata)
-                    .map_err(|e| format!("failed to update session: {}", e))
+                let store = state.session_store().clone();
+                let session_id = existing.id.clone();
+                tokio::task::spawn_blocking(move || store.patch_session(&session_id, metadata))
+                    .await
+                    .map_err(|e| format!("session patch task failed: {e}"))?
+                    .map_err(|e| format!("failed to update session: {e}"))
             } else {
                 Ok(existing)
             }
         }
-        Err(crate::sessions::SessionStoreError::NotFound(_)) => state
-            .session_store()
-            .get_or_create_session(session_key, metadata)
-            .map_err(|e| format!("failed to create session: {}", e)),
+        Err(crate::sessions::SessionStoreError::NotFound(_)) => {
+            let store = state.session_store().clone();
+            let session_key = session_key.to_string();
+            tokio::task::spawn_blocking(move || store.get_or_create_session(&session_key, metadata))
+                .await
+                .map_err(|e| format!("session create task failed: {e}"))?
+                .map_err(|e| format!("failed to create session: {e}"))
+        }
         Err(err) => Err(format!("failed to load session: {}", err)),
     }
 }
 
-fn append_user_message(
+async fn append_user_message(
     state: &Arc<WsServerState>,
     session_id: &str,
     message: &str,
 ) -> Result<(), String> {
     let msg = crate::sessions::ChatMessage::user(session_id, message);
-    state
-        .session_store()
-        .append_message(msg)
+    crate::sessions::append_message_blocking(state.session_store().clone(), msg)
+        .await
         .map_err(|e| format!("failed to append message: {}", e))
 }
 

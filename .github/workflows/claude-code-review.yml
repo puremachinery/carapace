@@ -7,7 +7,6 @@ on:
 jobs:
   claude-review:
     outputs:
-      workflow_changed: ${{ steps.workflow-change.outputs.changed }}
       cleanup_started_at: ${{ steps.cleanup-window.outputs.started_at }}
     concurrency:
       group: claude-review-${{ github.event.pull_request.number }}
@@ -29,6 +28,12 @@ jobs:
           fetch-depth: 1
           ref: refs/pull/${{ github.event.pull_request.number }}/head
 
+      - name: Record cleanup window start time
+        id: cleanup-window
+        run: |
+          # Safety buffer handles small clock skew between runner and GitHub comment timestamps.
+          echo "started_at=$(date -u -d '2 minutes ago' +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
       - name: Detect workflow self-change
         id: workflow-change
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
@@ -47,20 +52,9 @@ jobs:
             const changed = files.some((file) => blocked.has(file.filename));
             core.setOutput("changed", changed ? "true" : "false");
 
-      - name: Skip Claude review when workflow changed in PR
-        if: steps.workflow-change.outputs.changed == 'true'
-        run: |
-          echo "Skipping Claude code review because this PR modifies Claude workflow files."
-
-      - name: Record cleanup window start time
-        id: cleanup-window
-        run: |
-          # Safety buffer handles small clock skew between runner and GitHub comment timestamps.
-          echo "started_at=$(date -u -d '2 minutes ago' +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
-
       - name: Run Claude Code Review
         id: claude-review
-        if: steps.workflow-change.outputs.changed != 'true'
+        continue-on-error: true
         uses: anthropics/claude-code-action@2f8ba26a219c06cfb0f468eef8d97055fa814f97 # v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -121,12 +115,24 @@ jobs:
             - Do not post duplicate content across pushes.
             - Keep inline comments concise and non-repetitive.
           claude_args: |
-            --allowedTools "Bash(gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/reviews:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(git:*),WebSearch"
+            --allowedTools "Bash(gh api:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr review:*),Bash(git:*),Bash(jq:*),Bash(cat:*),Bash(head:*),Bash(echo:*),WebSearch"
+
+      - name: Allow expected Claude failure on workflow-change PRs
+        if: steps.claude-review.outcome == 'failure' && steps.workflow-change.outputs.changed == 'true'
+        run: |
+          echo "Claude review failed as expected: claude-code-action requires workflow files to match default branch for app-token exchange."
+          echo "Continuing because this PR intentionally changes Claude workflow files."
+
+      - name: Fail on unexpected Claude review failure
+        if: steps.claude-review.outcome == 'failure' && steps.workflow-change.outputs.changed != 'true'
+        run: |
+          echo "Claude review failed for a non-workflow-change reason."
+          exit 1
 
   cleanup-claude-stray-comments:
     name: Delete stray Claude issue comments from this run
     needs: [claude-review]
-    if: always() && needs.claude-review.outputs.workflow_changed != 'true'
+    if: always()
     runs-on: ubuntu-latest
     permissions:
       issues: write

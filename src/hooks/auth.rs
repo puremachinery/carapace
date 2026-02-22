@@ -8,6 +8,8 @@
 use axum::http::{HeaderMap, Uri};
 use tracing::warn;
 
+use crate::auth::timing_safe_eq;
+
 /// Extract the hooks token from the request.
 /// Returns the token and whether it was from the deprecated query param.
 pub fn extract_hooks_token(headers: &HeaderMap, uri: &Uri) -> Option<(String, bool)> {
@@ -41,17 +43,10 @@ pub fn extract_hooks_token(headers: &HeaderMap, uri: &Uri) -> Option<(String, bo
 }
 
 /// Timing-safe comparison of two strings.
-/// Uses constant-time comparison to prevent timing attacks.
+///
+/// Uses the shared gateway/auth timing-safe compare implementation.
 pub fn timing_safe_equal(a: &str, b: &str) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-
-    let mut result: u8 = 0;
-    for (x, y) in a.bytes().zip(b.bytes()) {
-        result |= x ^ y;
-    }
-    result == 0
+    timing_safe_eq(a, b)
 }
 
 /// Validate the hooks token against the configured token.
@@ -127,14 +122,14 @@ mod tests {
     }
 
     #[test]
-    fn test_timing_safe_equal() {
-        assert!(timing_safe_equal("secret", "secret"));
-        assert!(!timing_safe_equal("secret", "secret1"));
-        assert!(!timing_safe_equal("secret1", "secret"));
-        assert!(!timing_safe_equal("secret", "SECRET"));
-        assert!(!timing_safe_equal("", "secret"));
-        assert!(!timing_safe_equal("secret", ""));
-        assert!(timing_safe_equal("", ""));
+    fn test_validate_hooks_token_timing_safe_behavior() {
+        assert!(validate_hooks_token("secret", "secret"));
+        assert!(!validate_hooks_token("secret", "secret1"));
+        assert!(!validate_hooks_token("secret1", "secret"));
+        assert!(!validate_hooks_token("secret", "SECRET"));
+        assert!(!validate_hooks_token("", "secret"));
+        assert!(!validate_hooks_token("secret", ""));
+        assert!(!validate_hooks_token("", ""));
     }
 
     #[test]
