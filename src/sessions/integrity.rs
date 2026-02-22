@@ -211,6 +211,8 @@ pub fn delete_hmac_sidecar(file_path: &Path) -> Result<(), io::Error> {
 /// # Behavior
 ///
 /// - Missing `.hmac` file with `action: Warn` → logs warning, writes HMAC (auto-migration).
+///   This establishes a new baseline from current bytes and cannot prove
+///   historical integrity before migration.
 /// - Missing `.hmac` file with `action: Reject` → returns error.
 /// - HMAC mismatch with `action: Warn` → logs warning.
 /// - HMAC mismatch with `action: Reject` → returns error.
@@ -306,6 +308,10 @@ fn verify_hmac_digest(
                     tracing::warn!(
                         file = %file_name,
                         "no HMAC sidecar found — auto-migrating (writing HMAC)"
+                    );
+                    tracing::warn!(
+                        file = %file_name,
+                        "warn-mode integrity migration trusts current bytes; prior tampering cannot be detected"
                     );
                     // Auto-migrate: write the HMAC sidecar
                     if let Err(e) = fs::write(&sidecar, encode_sidecar_hmac_v1(computed)) {

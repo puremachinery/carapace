@@ -136,34 +136,6 @@ impl ResourceLimiter for PluginResourceLimiter {
 // These types mirror the WIT record definitions in wit/plugin.wit and are used
 // by the component model linker to marshal data between host and guest.
 
-/// Assert that a future is Send.
-///
-/// # Safety
-///
-/// The caller must guarantee that the future is actually Send-safe.
-/// This is needed because `CredentialBackend` uses `async fn` in trait
-/// which doesn't imply `Send` at the trait level, even though all concrete
-/// implementations are Send (the backend type `B` is bound as `Send + Sync`).
-unsafe fn assert_send<T>(
-    fut: impl std::future::Future<Output = T>,
-) -> impl std::future::Future<Output = T> + Send {
-    /// Wrapper that unsafely implements Send for a future.
-    struct AssertSend<F>(F);
-    // SAFETY: Caller guarantees the inner future is Send-safe.
-    unsafe impl<F> Send for AssertSend<F> {}
-    impl<F: std::future::Future> std::future::Future for AssertSend<F> {
-        type Output = F::Output;
-        fn poll(
-            self: std::pin::Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<Self::Output> {
-            // SAFETY: We are not moving the inner future, just projecting through the wrapper.
-            unsafe { self.map_unchecked_mut(|s| &mut s.0).poll(cx) }
-        }
-    }
-    AssertSend(fut)
-}
-
 /// WIT `http-request` record for the component model linker.
 #[derive(Clone, Debug, ComponentType, Lift, Lower)]
 #[component(record)]
@@ -673,6 +645,21 @@ pub struct PluginInstanceHandle<B: CredentialBackend + Send + Sync + 'static> {
     /// Component (needed for export index lookups in wasmtime 29+)
     component: Component,
 }
+
+// SAFETY:
+// - `PluginInstanceHandle` may be shared across threads (e.g. inside `Arc`), but all
+//   access to the underlying `Store<HostState<B>>` is serialized through
+//   `store: RwLock<Store<HostState<B>>>` write-lock usage in this module.
+// - We do not use `RwLock::read` for store access here, so `Store`/`Instance` calls are
+//   not executed concurrently across threads.
+// - `HostState<B>` is bounded by `B: CredentialBackend + Send + Sync`, so moving the
+//   handle across threads does not create host-state data races.
+// - Remaining fields (`manifest`, `epoch_deadline_ticks`, `instance`, `component`) are
+//   immutable after instantiation and used only alongside locked store access.
+// - Any future `read`-lock or unlocked store access would require revisiting this
+//   unsafe contract.
+unsafe impl<B: CredentialBackend + Send + Sync + 'static> Send for PluginInstanceHandle<B> {}
+unsafe impl<B: CredentialBackend + Send + Sync + 'static> Sync for PluginInstanceHandle<B> {}
 
 impl<B: CredentialBackend + Send + Sync + 'static> PluginInstanceHandle<B> {
     /// Look up a typed function from a named exported interface.
@@ -1210,13 +1197,9 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
                         + '_,
                 > {
                     let host_ctx = ctx.data().host_ctx.clone();
-                    // SAFETY: PluginHostContext<B> is Send+Sync (B: Send+Sync),
-                    // and all concrete CredentialBackend impls produce Send futures.
-                    Box::new(unsafe {
-                        assert_send(async move {
-                            let wit = WitHost::new(host_ctx);
-                            Ok((wit.credential_get(&key).await,))
-                        })
+                    Box::new(async move {
+                        let wit = WitHost::new(host_ctx);
+                        Ok((wit.credential_get(&key).await,))
                     })
                 },
             )
@@ -1233,12 +1216,9 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
                     dyn std::future::Future<Output = wasmtime::Result<(bool,)>> + Send + '_,
                 > {
                     let host_ctx = ctx.data().host_ctx.clone();
-                    // SAFETY: Same reasoning as credential-get above.
-                    Box::new(unsafe {
-                        assert_send(async move {
-                            let wit = WitHost::new(host_ctx);
-                            Ok((wit.credential_set(&key, &value).await,))
-                        })
+                    Box::new(async move {
+                        let wit = WitHost::new(host_ctx);
+                        Ok((wit.credential_set(&key, &value).await,))
                     })
                 },
             )
@@ -1442,12 +1422,6 @@ impl<B: CredentialBackend + Send + Sync + 'static> ChannelAdapter<B> {
     }
 }
 
-// SAFETY: ChannelAdapter only holds an Arc<PluginInstanceHandle<B>> whose interior
-// wasmtime Store is guarded by an RwLock.  All access goes through the lock,
-// so sharing across threads is safe.
-unsafe impl<B: CredentialBackend + Send + Sync + 'static> Send for ChannelAdapter<B> {}
-unsafe impl<B: CredentialBackend + Send + Sync + 'static> Sync for ChannelAdapter<B> {}
-
 impl<B: CredentialBackend + Send + Sync + 'static> ChannelPluginInstance for ChannelAdapter<B> {
     fn get_info(&self) -> Result<ChannelInfo, BindingError> {
         tracing::debug!(plugin_id = %self.plugin_id, "Calling WASM export channel-meta.get-info");
@@ -1509,12 +1483,6 @@ impl<B: CredentialBackend + Send + Sync + 'static> ToolAdapter<B> {
     }
 }
 
-// SAFETY: ToolAdapter only holds an Arc<PluginInstanceHandle<B>> whose interior
-// wasmtime Store is guarded by an RwLock.  All access goes through the lock,
-// so sharing across threads is safe.
-unsafe impl<B: CredentialBackend + Send + Sync + 'static> Send for ToolAdapter<B> {}
-unsafe impl<B: CredentialBackend + Send + Sync + 'static> Sync for ToolAdapter<B> {}
-
 impl<B: CredentialBackend + Send + Sync + 'static> ToolPluginInstance for ToolAdapter<B> {
     fn get_definitions(&self) -> Result<Vec<ToolDefinition>, BindingError> {
         tracing::debug!(plugin_id = %self.plugin_id, "Calling WASM export tool.get-definitions");
@@ -1559,12 +1527,6 @@ impl<B: CredentialBackend + Send + Sync + 'static> WebhookAdapter<B> {
     }
 }
 
-// SAFETY: WebhookAdapter only holds an Arc<PluginInstanceHandle<B>> whose interior
-// wasmtime Store is guarded by an RwLock.  All access goes through the lock,
-// so sharing across threads is safe.
-unsafe impl<B: CredentialBackend + Send + Sync + 'static> Send for WebhookAdapter<B> {}
-unsafe impl<B: CredentialBackend + Send + Sync + 'static> Sync for WebhookAdapter<B> {}
-
 impl<B: CredentialBackend + Send + Sync + 'static> WebhookPluginInstance for WebhookAdapter<B> {
     fn get_paths(&self) -> Result<Vec<String>, BindingError> {
         tracing::debug!(plugin_id = %self.plugin_id, "Calling WASM export webhook.get-paths");
@@ -1606,12 +1568,6 @@ impl<B: CredentialBackend + Send + Sync + 'static> ServiceAdapter<B> {
     }
 }
 
-// SAFETY: ServiceAdapter only holds an Arc<PluginInstanceHandle<B>> whose interior
-// wasmtime Store is guarded by an RwLock.  All access goes through the lock,
-// so sharing across threads is safe.
-unsafe impl<B: CredentialBackend + Send + Sync + 'static> Send for ServiceAdapter<B> {}
-unsafe impl<B: CredentialBackend + Send + Sync + 'static> Sync for ServiceAdapter<B> {}
-
 impl<B: CredentialBackend + Send + Sync + 'static> ServicePluginInstance for ServiceAdapter<B> {
     fn start(&self) -> Result<(), BindingError> {
         tracing::debug!(plugin_id = %self.plugin_id, "Calling WASM export service.start");
@@ -1650,12 +1606,6 @@ impl<B: CredentialBackend + Send + Sync + 'static> HookAdapter<B> {
         Self { plugin_id, handle }
     }
 }
-
-// SAFETY: HookAdapter only holds an Arc<PluginInstanceHandle<B>> whose interior
-// wasmtime Store is guarded by an RwLock.  All access goes through the lock,
-// so sharing across threads is safe.
-unsafe impl<B: CredentialBackend + Send + Sync + 'static> Send for HookAdapter<B> {}
-unsafe impl<B: CredentialBackend + Send + Sync + 'static> Sync for HookAdapter<B> {}
 
 impl<B: CredentialBackend + Send + Sync + 'static> HookPluginInstance for HookAdapter<B> {
     fn get_hooks(&self) -> Result<Vec<String>, BindingError> {

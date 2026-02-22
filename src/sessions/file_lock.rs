@@ -1,12 +1,8 @@
-//! Advisory file locking using `flock(2)` on Unix.
+//! Advisory file locking using `flock(2)` on Unix and `LockFileEx` on Windows.
 //!
 //! Provides an RAII [`FileLock`] that holds an exclusive advisory lock on a
 //! `.lock` sentinel file beside the target path. The lock is released
 //! automatically when the `FileLock` is dropped.
-//!
-//! On non-Unix platforms the lock is a no-op (always succeeds). This is
-//! acceptable because the primary goal is preventing concurrent writes from
-//! multiple carapace processes, which is a Unix-specific deployment scenario.
 
 use std::fs::File;
 use std::io;
@@ -102,20 +98,122 @@ fn flock_unlock(file: &File) {
 }
 
 // ---------------------------------------------------------------------------
-// Non-Unix: no-op implementation
+// Windows implementation using LockFileEx
 // ---------------------------------------------------------------------------
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+const WHOLE_FILE_LOCK_LEN_LOW: u32 = u32::MAX;
+#[cfg(windows)]
+const WHOLE_FILE_LOCK_LEN_HIGH: u32 = u32::MAX;
+
+#[cfg(windows)]
+fn whole_file_overlapped() -> windows_sys::Win32::System::IO::OVERLAPPED {
+    use windows_sys::Win32::System::IO::{OVERLAPPED, OVERLAPPED_0, OVERLAPPED_0_0};
+    // Lock range starts at offset 0 and spans u64::MAX bytes via LOW/HIGH length args.
+    OVERLAPPED {
+        Anonymous: OVERLAPPED_0 {
+            Anonymous: OVERLAPPED_0_0 {
+                Offset: 0,
+                OffsetHigh: 0,
+            },
+        },
+        ..Default::default()
+    }
+}
+
+#[cfg(windows)]
+fn flock_exclusive(file: &File) -> Result<(), io::Error> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{LockFileEx, LOCKFILE_EXCLUSIVE_LOCK};
+
+    let handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+    let mut overlapped = whole_file_overlapped();
+    let rc = unsafe {
+        LockFileEx(
+            handle,
+            LOCKFILE_EXCLUSIVE_LOCK,
+            0,
+            WHOLE_FILE_LOCK_LEN_LOW,
+            WHOLE_FILE_LOCK_LEN_HIGH,
+            &mut overlapped,
+        )
+    };
+    if rc == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn flock_try_exclusive(file: &File) -> Result<bool, io::Error> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION};
+    use windows_sys::Win32::Storage::FileSystem::{
+        LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+    };
+
+    let handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+    let mut overlapped = whole_file_overlapped();
+    let rc = unsafe {
+        LockFileEx(
+            handle,
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            WHOLE_FILE_LOCK_LEN_LOW,
+            WHOLE_FILE_LOCK_LEN_HIGH,
+            &mut overlapped,
+        )
+    };
+    if rc != 0 {
+        return Ok(true);
+    }
+
+    let err = io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(code)
+            if code == ERROR_LOCK_VIOLATION as i32 || code == ERROR_SHARING_VIOLATION as i32 =>
+        {
+            Ok(false)
+        }
+        _ => Err(err),
+    }
+}
+
+#[cfg(windows)]
+fn flock_unlock(file: &File) {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
+
+    let handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+    // Unlock must match the same region/offset used by LockFileEx.
+    let mut overlapped = whole_file_overlapped();
+    unsafe {
+        let _ = UnlockFileEx(
+            handle,
+            0,
+            WHOLE_FILE_LOCK_LEN_LOW,
+            WHOLE_FILE_LOCK_LEN_HIGH,
+            &mut overlapped,
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Non-Unix and non-Windows: no-op implementation
+// ---------------------------------------------------------------------------
+
+#[cfg(all(not(unix), not(windows)))]
 fn flock_exclusive(_file: &File) -> Result<(), io::Error> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(windows)))]
 fn flock_try_exclusive(_file: &File) -> Result<bool, io::Error> {
     Ok(true)
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(windows)))]
 fn flock_unlock(_file: &File) {}
 
 // ---------------------------------------------------------------------------
@@ -153,7 +251,7 @@ mod tests {
         assert!(maybe.is_some());
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn test_try_acquire_returns_none_when_held() {
         let dir = TempDir::new().unwrap();
@@ -165,7 +263,7 @@ mod tests {
         assert!(second.is_none(), "should return None when lock is held");
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn test_lock_released_on_drop() {
         let dir = TempDir::new().unwrap();
@@ -183,7 +281,7 @@ mod tests {
         assert!(reclaimed.is_some());
     }
 
-    #[cfg(not(unix))]
+    #[cfg(all(not(unix), not(windows)))]
     #[test]
     fn test_noop_lock_always_succeeds() {
         let dir = TempDir::new().unwrap();
