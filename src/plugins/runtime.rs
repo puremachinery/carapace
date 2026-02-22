@@ -64,6 +64,9 @@ pub const DEFAULT_EPOCH_TICK_INTERVAL: Duration = Duration::from_millis(100);
 /// epoch deadline fires, giving a clearer error message.
 pub const DEFAULT_FUEL_BUDGET: u64 = 1_000_000_000;
 
+/// Bounded queue depth for per-plugin worker requests.
+const PLUGIN_WORKER_QUEUE_CAPACITY: usize = 64;
+
 fn compute_epoch_deadline_ticks(timeout: Duration) -> u64 {
     let interval_ms = DEFAULT_EPOCH_TICK_INTERVAL.as_millis().max(1);
     let timeout_ms = timeout.as_millis().max(1);
@@ -634,7 +637,7 @@ pub struct PluginInstanceHandle<B: CredentialBackend + Send + Sync + 'static> {
     pub manifest: PluginManifest,
 
     /// Work queue for executing plugin calls on the dedicated runtime thread.
-    worker_tx: mpsc::Sender<PluginWorkerMessage<B>>,
+    worker_tx: mpsc::SyncSender<PluginWorkerMessage<B>>,
 
     /// Worker thread handle joined on drop.
     worker_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -807,14 +810,21 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginWorkerState<B> {
 
 impl<B: CredentialBackend + Send + Sync + 'static> Drop for PluginInstanceHandle<B> {
     fn drop(&mut self) {
-        let _ = self.worker_tx.send(PluginWorkerMessage::Shutdown);
-        if let Some(handle) = self
-            .worker_thread
-            .lock()
-            .expect("worker mutex poisoned")
-            .take()
-        {
-            let _ = handle.join();
+        // Best-effort shutdown signal; dropping the sender also closes the channel.
+        let _ = self.worker_tx.try_send(PluginWorkerMessage::Shutdown);
+
+        let handle = match self.worker_thread.lock() {
+            Ok(mut guard) => guard.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+
+        if let Some(handle) = handle {
+            // Never block Drop on worker shutdown; join in a detached helper thread.
+            let _ = std::thread::Builder::new()
+                .name("plugin-worker-join".to_string())
+                .spawn(move || {
+                    let _ = handle.join();
+                });
         }
     }
 }
@@ -887,7 +897,8 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginInstanceHandle<B> {
         host_ctx: Arc<PluginHostContext<B>>,
     ) -> Result<Self, RuntimeError> {
         let plugin_id = manifest.id.clone();
-        let (worker_tx, worker_rx) = mpsc::channel::<PluginWorkerMessage<B>>();
+        let (worker_tx, worker_rx) =
+            mpsc::sync_channel::<PluginWorkerMessage<B>>(PLUGIN_WORKER_QUEUE_CAPACITY);
         let (init_tx, init_rx) = mpsc::channel::<Result<(), RuntimeError>>();
 
         let thread = std::thread::Builder::new()
@@ -950,13 +961,20 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginInstanceHandle<B> {
     {
         let (result_tx, result_rx) = mpsc::channel();
         self.worker_tx
-            .send(PluginWorkerMessage::Run(Box::new(move |state| {
+            .try_send(PluginWorkerMessage::Run(Box::new(move |state| {
                 let _ = result_tx.send(operation(state));
             })))
-            .map_err(|_| BindingError::CallError("plugin worker unavailable".to_string()))?;
+            .map_err(|err| match err {
+                mpsc::TrySendError::Full(_) => {
+                    BindingError::CallError("plugin worker queue is full".to_string())
+                }
+                mpsc::TrySendError::Disconnected(_) => {
+                    BindingError::CallError("plugin worker is disconnected".to_string())
+                }
+            })?;
 
-        result_rx.recv().map_err(|_| {
-            BindingError::CallError("plugin worker did not return a result".to_string())
+        result_rx.recv().map_err(|err| {
+            BindingError::CallError(format!("plugin worker did not return a result: {err}"))
         })?
     }
 
