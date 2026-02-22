@@ -978,24 +978,22 @@ pub enum WsConfigError {
 }
 
 fn resolve_session_integrity_config(cfg: &Value) -> crate::sessions::integrity::IntegrityConfig {
-    let default_cfg = crate::sessions::integrity::IntegrityConfig::default();
-    let integrity_cfg = cfg.get("sessions").and_then(|s| s.get("integrity"));
+    let Some(integrity_cfg) = cfg.get("sessions").and_then(|s| s.get("integrity")) else {
+        return crate::sessions::integrity::IntegrityConfig::default();
+    };
 
-    let enabled = integrity_cfg
-        .and_then(|i| i.get("enabled"))
-        .and_then(Value::as_bool)
-        .unwrap_or(default_cfg.enabled);
-
-    let action = integrity_cfg
-        .and_then(|i| i.get("action"))
-        .and_then(Value::as_str)
-        .map(|value| match value {
-            "reject" => crate::sessions::integrity::IntegrityAction::Reject,
-            _ => crate::sessions::integrity::IntegrityAction::Warn,
-        })
-        .unwrap_or(default_cfg.action);
-
-    crate::sessions::integrity::IntegrityConfig { enabled, action }
+    match serde_json::from_value::<crate::sessions::integrity::IntegrityConfig>(
+        integrity_cfg.clone(),
+    ) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "invalid sessions.integrity config; using secure defaults"
+            );
+            crate::sessions::integrity::IntegrityConfig::default()
+        }
+    }
 }
 
 fn non_empty_integrity_secret(secret: Option<String>) -> Option<String> {

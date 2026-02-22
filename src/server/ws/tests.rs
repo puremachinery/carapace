@@ -91,6 +91,24 @@ fn test_resolve_session_integrity_config_respects_overrides() {
 }
 
 #[test]
+fn test_resolve_session_integrity_config_invalid_value_uses_defaults() {
+    let cfg = json!({
+        "sessions": {
+            "integrity": {
+                "enabled": false,
+                "action": "invalid"
+            }
+        }
+    });
+    let integrity = resolve_session_integrity_config(&cfg);
+    assert!(integrity.enabled);
+    assert_eq!(
+        integrity.action,
+        crate::sessions::integrity::IntegrityAction::Warn
+    );
+}
+
+#[test]
 fn test_resolve_session_integrity_secret_prefers_explicit_server_secret() {
     let resolved_auth = auth::ResolvedGatewayAuth {
         mode: auth::AuthMode::Token,
@@ -135,6 +153,18 @@ fn test_resolve_session_integrity_secret_ignores_empty_values() {
         allow_tailscale: false,
     };
     let secret = resolve_session_integrity_secret(&resolved_auth, Some(String::new()));
+    assert!(secret.is_none());
+}
+
+#[test]
+fn test_resolve_session_integrity_secret_returns_none_when_all_missing() {
+    let resolved_auth = auth::ResolvedGatewayAuth {
+        mode: auth::AuthMode::Token,
+        token: None,
+        password: None,
+        allow_tailscale: false,
+    };
+    let secret = resolve_session_integrity_secret(&resolved_auth, None);
     assert!(secret.is_none());
 }
 
