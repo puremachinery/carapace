@@ -3656,6 +3656,7 @@ pub fn handle_tls_show_ca(ca_dir_opt: Option<&str>) -> Result<(), Box<dyn std::e
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime_bridge::CURRENT_THREAD_RUNTIME_MESSAGE;
     use clap::Parser;
     use ed25519_dalek::{Signature, VerifyingKey};
     use std::ffi::OsString;
@@ -3916,7 +3917,7 @@ mod tests {
         );
         let err = call_result.unwrap().to_string();
         assert!(
-            err.contains("cannot run blocking sync-async bridge from current-thread runtime"),
+            err.contains(CURRENT_THREAD_RUNTIME_MESSAGE),
             "expected explicit current-thread bridge guard error, got: {err}"
         );
     }
