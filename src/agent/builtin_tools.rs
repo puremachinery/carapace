@@ -13,7 +13,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use crate::plugins::tools::{BuiltinTool, ToolInvokeResult};
-use crate::runtime_bridge::run_sync_blocking;
+use crate::runtime_bridge::run_sync_blocking_send;
 
 /// Return all built-in tool definitions.
 ///
@@ -199,7 +199,7 @@ fn handle_media_analyze(args: Value) -> ToolInvokeResult {
         }
     }
 
-    let result = run_sync_blocking(async {
+    let result = run_sync_blocking_send(async move {
         use crate::media::analysis::{
             analyze, AnthropicMediaAnalyzer, MediaType, OpenAiMediaAnalyzer,
         };
@@ -441,7 +441,7 @@ fn handle_web_fetch(args: Value) -> ToolInvokeResult {
         .unwrap_or(WEB_FETCH_DEFAULT_MAX_BYTES)
         .min(WEB_FETCH_MAX_ALLOWED_BYTES);
 
-    let result = run_sync_blocking(async {
+    let result = run_sync_blocking_send(async move {
         use crate::media::fetch::{FetchConfig, MediaFetcher};
 
         let config = FetchConfig::default().with_max_size(max_bytes);

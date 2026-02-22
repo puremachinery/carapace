@@ -282,7 +282,7 @@ use crate::channels::telegram::{TelegramChannel, TELEGRAM_DEFAULT_API_BASE_URL};
 use crate::config;
 use crate::credentials;
 use crate::logging::buffer::LogLevel;
-use crate::runtime_bridge::{run_sync_blocking, run_sync_blocking_send};
+use crate::runtime_bridge::run_sync_blocking_send;
 use crate::server::bind::DEFAULT_PORT;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
@@ -2994,10 +2994,8 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
 
         if run_status || launch_chat || run_verify {
             if run_status || launch_chat {
-                // Assumes this executes from the main thread (#[tokio::main] multi-threaded runtime),
-                // where this helper works without spawning a new thread.
                 if let Err(err) =
-                    run_sync_blocking(run_setup_post_checks(port, run_status, launch_chat))
+                    run_sync_blocking_send(run_setup_post_checks(port, run_status, launch_chat))
                         .map_err(|err| format!("runtime execution failed: {err}"))
                 {
                     eprintln!("Post-setup checks failed: {}", err);
@@ -3656,7 +3654,7 @@ pub fn handle_tls_show_ca(ca_dir_opt: Option<&str>) -> Result<(), Box<dyn std::e
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime_bridge::CURRENT_THREAD_RUNTIME_MESSAGE;
+    use crate::runtime_bridge::{run_sync_blocking, CURRENT_THREAD_RUNTIME_MESSAGE};
     use clap::Parser;
     use ed25519_dalek::{Signature, VerifyingKey};
     use std::ffi::OsString;

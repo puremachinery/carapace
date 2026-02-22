@@ -436,12 +436,12 @@ async fn stream_chat_response(
     let mut got_output = false;
     loop {
         let frame = tokio::select! {
-            frame = read_ws_json(ws_read, ws_write) => {
+            frame = async { read_ws_json(ws_read, ws_write).await.map_err(|e| e.to_string()) } => {
                 match frame {
                     Ok(f) => f,
                     Err(e) => {
                         eprintln!("\nConnection lost: {}", e);
-                        return Err(e);
+                        return Err(std::io::Error::other(e).into());
                     }
                 }
             }
