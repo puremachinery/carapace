@@ -18,6 +18,7 @@ use axum::{
     routing::{any, get, post},
     Json, Router,
 };
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -55,6 +56,9 @@ pub const DEFAULT_MAX_BODY_BYTES: usize = 262144;
 
 /// Default hooks base path
 pub const DEFAULT_HOOKS_PATH: &str = "/hooks";
+const HOOK_SENDER_SCOPE_KDF_TAG: &[u8] = b"hooks-sender-scope-v1";
+const HOOK_SENDER_SCOPE_KDF_FALLBACK_KEY: &str = "carapace-hooks-sender-scope-fallback";
+type HmacSha256 = Hmac<sha2::Sha256>;
 
 /// HTTP server configuration
 #[non_exhaustive]
@@ -74,6 +78,8 @@ pub struct HttpConfig {
     pub gateway_password: Option<String>,
     /// Gateway auth mode
     pub gateway_auth_mode: auth::AuthMode,
+    /// Secret used for keyed hook sender derivation.
+    pub sender_scope_secret: Option<String>,
     /// Whether Tailscale auth is allowed for gateway endpoints
     pub gateway_allow_tailscale: bool,
     /// Trusted proxy IPs for local-direct detection
@@ -108,6 +114,7 @@ impl Default for HttpConfig {
             gateway_auth_mode: auth::AuthMode::Token,
             gateway_allow_tailscale: false,
             trusted_proxies: Vec::new(),
+            sender_scope_secret: None,
             control_ui_base_path: String::new(),
             control_ui_enabled: false,
             control_ui_dist_path: PathBuf::from("dist/control-ui"),
@@ -225,6 +232,13 @@ pub fn build_http_config(cfg: &Value) -> Result<HttpConfig, String> {
         }
     };
 
+    let sender_scope_secret = std::env::var("CARAPACE_SERVER_SECRET")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| gateway_token.clone().filter(|value| !value.is_empty()))
+        .or_else(|| gateway_password.clone().filter(|value| !value.is_empty()))
+        .or_else(|| hooks_token.clone().filter(|value| !value.is_empty()));
+
     let control_ui_enabled = control_ui_obj
         .and_then(|c| c.get("enabled"))
         .and_then(|v| v.as_bool())
@@ -269,6 +283,7 @@ pub fn build_http_config(cfg: &Value) -> Result<HttpConfig, String> {
         control_ui_base_path,
         control_ui_enabled,
         control_ui_dist_path,
+        sender_scope_secret,
         openai_chat_completions_enabled,
         openai_responses_enabled,
         control_endpoints_enabled,
@@ -998,12 +1013,26 @@ async fn dispatch_agent_run(
     Ok(())
 }
 
-fn sender_scope_for_hook_request(has_remote_addr: bool) -> &'static str {
-    if has_remote_addr {
-        "remote"
-    } else {
-        "unknown"
-    }
+fn sender_scope_for_hook_request(
+    remote_addr: Option<SocketAddr>,
+    headers: &HeaderMap,
+    trusted_proxies: &[String],
+    sender_scope_secret: Option<&str>,
+) -> String {
+    let Some(remote_ip) = auth::resolve_request_client_ip(remote_addr, headers, trusted_proxies)
+    else {
+        return "unknown".to_string();
+    };
+
+    let secret = sender_scope_secret
+        .filter(|value| !value.is_empty())
+        .unwrap_or(HOOK_SENDER_SCOPE_KDF_FALLBACK_KEY);
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
+    mac.update(HOOK_SENDER_SCOPE_KDF_TAG);
+    mac.update(remote_ip.to_string().as_bytes());
+    let digest = mac.finalize().into_bytes();
+    format!("sender_{}", hex::encode(digest))
 }
 
 /// POST /hooks/agent - Dispatch message to agent
@@ -1047,9 +1076,14 @@ async fn hooks_agent_handler(
         }
     };
 
-    let sender_id = sender_scope_for_hook_request(connect_info.0.is_some());
+    let sender_id = sender_scope_for_hook_request(
+        connect_info.0,
+        &headers,
+        &state.config.trusted_proxies,
+        state.config.sender_scope_secret.as_deref(),
+    );
 
-    if let Err(resp) = dispatch_agent_run(&ws, &validated, &run_id, sender_id).await {
+    if let Err(resp) = dispatch_agent_run(&ws, &validated, &run_id, &sender_id).await {
         return resp;
     }
 
@@ -1957,11 +1991,23 @@ mod tests {
     use axum::http::Request;
     use tower::ServiceExt;
 
+    fn make_headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            headers.insert(
+                axum::http::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                axum::http::HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        headers
+    }
+
     fn test_config() -> HttpConfig {
         HttpConfig {
             hooks_token: Some("test-hooks-token".to_string()),
             hooks_enabled: true,
             gateway_token: Some("test-gateway-token".to_string()),
+            sender_scope_secret: None,
             control_ui_enabled: true,
             ..Default::default()
         }
@@ -1973,15 +2019,84 @@ mod tests {
     }
 
     #[test]
-    fn test_sender_scope_for_hook_request_with_remote_addr() {
-        let sender = sender_scope_for_hook_request(true);
-        assert_eq!(sender, "remote");
+    fn test_sender_scope_for_hook_request_with_ipv4_remote_addr() {
+        let headers = HeaderMap::new();
+        let sender = sender_scope_for_hook_request(
+            Some(SocketAddr::from(([127, 0, 0, 1], 43123))),
+            &headers,
+            &[],
+            None,
+        );
+        assert!(sender.starts_with("sender_"));
+        assert_eq!(sender.len(), 71);
     }
 
     #[test]
     fn test_sender_scope_for_hook_request_without_remote_addr() {
-        let sender = sender_scope_for_hook_request(false);
+        let headers = HeaderMap::new();
+        let sender = sender_scope_for_hook_request(None, &headers, &[], None);
         assert_eq!(sender, "unknown");
+    }
+
+    #[test]
+    fn test_sender_scope_for_hook_request_with_ipv6_remote_addr() {
+        let headers = HeaderMap::new();
+        let sender = sender_scope_for_hook_request(
+            Some(SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 43123))),
+            &headers,
+            &[],
+            None,
+        );
+        assert!(sender.starts_with("sender_"));
+        assert_eq!(sender.len(), 71);
+    }
+
+    #[test]
+    fn test_sender_scope_for_hook_request_uses_forwarded_for_for_trusted_proxy() {
+        let trusted = vec!["203.0.113.5".to_string()];
+        let headers = make_headers(&[
+            ("x-forwarded-for", "198.51.100.9"),
+            ("x-real-ip", "198.51.100.10"),
+        ]);
+        let trusted_sender = sender_scope_for_hook_request(
+            Some("203.0.113.5:1234".parse().unwrap()),
+            &headers,
+            &trusted,
+            None,
+        );
+        let direct_sender = sender_scope_for_hook_request(
+            Some("203.0.113.5:1234".parse().unwrap()),
+            &headers,
+            &[],
+            None,
+        );
+        let fallback_sender = sender_scope_for_hook_request(
+            Some("198.51.100.9:1234".parse().unwrap()),
+            &HeaderMap::new(),
+            &[],
+            None,
+        );
+
+        assert_eq!(trusted_sender, fallback_sender);
+        assert_ne!(trusted_sender, direct_sender);
+    }
+
+    #[test]
+    fn test_sender_scope_for_hook_request_normalizes_ipv4_mapped_v6() {
+        let headers = HeaderMap::new();
+        let mapped = sender_scope_for_hook_request(
+            Some("[::ffff:127.0.0.1]:8080".parse().unwrap()),
+            &headers,
+            &[],
+            None,
+        );
+        let ipv4 = sender_scope_for_hook_request(
+            Some("127.0.0.1:8080".parse().unwrap()),
+            &headers,
+            &[],
+            None,
+        );
+        assert_eq!(mapped, ipv4);
     }
 
     #[tokio::test]

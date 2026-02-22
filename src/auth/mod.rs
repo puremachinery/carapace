@@ -483,6 +483,23 @@ fn resolve_client_ip(
     parse_forwarded_for(forwarded_for).or_else(|| normalize_ip(&real_ip.unwrap_or_default()))
 }
 
+/// Resolve the effective client IP for a request.
+///
+/// Uses direct socket IP by default. If the direct remote IP is listed in
+/// `trusted`, proxy headers (`X-Forwarded-For`, then `X-Real-IP`) are allowed
+/// to override it. IPv4-mapped IPv6 addresses are normalized to IPv4.
+pub fn resolve_request_client_ip(
+    remote_addr: Option<SocketAddr>,
+    headers: &HeaderMap,
+    trusted: &[String],
+) -> Option<IpAddr> {
+    let remote_addr = remote_addr?;
+    let remote_ip = normalize_ip_addr(remote_addr.ip());
+    let forwarded_for = header_value(headers, "x-forwarded-for");
+    let real_ip = header_value(headers, "x-real-ip");
+    resolve_client_ip(remote_ip, forwarded_for, real_ip, trusted).or(Some(remote_ip))
+}
+
 /// Determine if the request is a local direct request.
 pub fn is_local_direct_request(
     remote_addr: SocketAddr,
@@ -647,6 +664,31 @@ mod tests {
 
     fn no_trusted_proxies() -> Vec<String> {
         vec![]
+    }
+
+    #[test]
+    fn test_resolve_request_client_ip_untrusted_proxy_ignores_forwarded_headers() {
+        let headers = make_headers(&[("x-forwarded-for", "1.2.3.4"), ("x-real-ip", "2.2.2.2")]);
+        let remote: SocketAddr = "203.0.113.10:8080".parse().unwrap();
+        let resolved = resolve_request_client_ip(Some(remote), &headers, &[]);
+        assert_eq!(resolved, Some("203.0.113.10".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_resolve_request_client_ip_trusted_proxy_uses_forwarded_for() {
+        let headers = make_headers(&[("x-forwarded-for", "1.2.3.4"), ("x-real-ip", "2.2.2.2")]);
+        let remote: SocketAddr = "10.0.0.2:8080".parse().unwrap();
+        let trusted = vec!["10.0.0.2".to_string()];
+        let resolved = resolve_request_client_ip(Some(remote), &headers, &trusted);
+        assert_eq!(resolved, Some("1.2.3.4".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_resolve_request_client_ip_normalizes_ipv4_mapped_ipv6() {
+        let headers = HeaderMap::new();
+        let remote: SocketAddr = "[::ffff:127.0.0.1]:8080".parse().unwrap();
+        let resolved = resolve_request_client_ip(Some(remote), &headers, &[]);
+        assert_eq!(resolved, Some("127.0.0.1".parse().unwrap()));
     }
 
     // --- Token mode: valid token ---
