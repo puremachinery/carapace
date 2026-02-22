@@ -3058,12 +3058,7 @@ where
             Err("cannot run blocking sync-async bridge from current-thread runtime".to_string())
         }
     } else {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| format!("failed to create runtime: {e}"))?
-            .block_on(future)
-            .map_err(|e| e.to_string())
+        run_sync_blocking_current_thread(future)
     }
 }
 
@@ -3082,26 +3077,29 @@ where
         if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
             tokio::task::block_in_place(|| handle.block_on(future).map_err(|e| e.to_string()))
         } else {
-            let thread = std::thread::spawn(move || {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|e| e.to_string())
-                    .and_then(|runtime| runtime.block_on(future).map_err(|e| e.to_string()))
-            });
+            let thread = std::thread::spawn(move || run_sync_blocking_current_thread(future));
 
             thread
                 .join()
                 .map_err(|_| "runtime bridge thread panicked".to_string())?
         }
     } else {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| format!("failed to create runtime: {e}"))?
-            .block_on(future)
-            .map_err(|e| e.to_string())
+        run_sync_blocking_current_thread(future)
     }
+}
+
+fn run_sync_blocking_current_thread<T, E>(
+    future: impl Future<Output = Result<T, E>>,
+) -> Result<T, String>
+where
+    E: Display,
+{
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("failed to create runtime: {e}"))?
+        .block_on(future)
+        .map_err(|e| e.to_string())
 }
 
 /// Run the `pair` subcommand -- pair with a remote gateway node.
