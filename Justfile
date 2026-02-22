@@ -57,6 +57,10 @@ fmt-check:
 # Run all checks (lint + fmt + test)
 check: lint fmt-check test
 
+# Enforce sync/async runtime bridge boundaries.
+runtime-bridge-guard:
+    ./scripts/check-runtime-bridge-usage.sh
+
 # Build documentation
 doc:
     cargo doc --no-deps

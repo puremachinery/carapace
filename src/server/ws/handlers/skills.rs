@@ -12,7 +12,7 @@ use hickory_resolver::TokioAsyncResolver;
 use super::super::*;
 use super::config::{map_validation_issues, read_config_snapshot, write_config_file};
 use crate::plugins::capabilities::SsrfProtection;
-use crate::runtime_bridge::{run_sync_blocking, BridgeError};
+use crate::runtime_bridge::{run_sync_blocking_send, BridgeError};
 
 /// WASM binary magic bytes: `\0asm`
 const WASM_MAGIC: [u8; 4] = [0x00, 0x61, 0x73, 0x6D];
@@ -278,17 +278,21 @@ fn validate_and_resolve_dns(url: &url::Url) -> Result<(String, u16, Option<IpAdd
         None
     } else {
         // Host is a hostname -- resolve DNS and validate every returned IP.
-        let ip = run_sync_blocking(async {
+        let host_for_lookup = host.clone();
+        let ip = run_sync_blocking_send(async move {
             let resolver =
                 TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default());
 
-            let lookup = resolver.lookup_ip(&host).await.map_err(|e| {
-                SkillDnsError::Unavailable(format!("DNS resolution failed for {}: {}", host, e))
+            let lookup = resolver.lookup_ip(&host_for_lookup).await.map_err(|e| {
+                SkillDnsError::Unavailable(format!(
+                    "DNS resolution failed for {}: {}",
+                    host_for_lookup, e
+                ))
             })?;
 
             let mut first_valid: Option<IpAddr> = None;
             for ip in lookup.iter() {
-                SsrfProtection::validate_resolved_ip(&ip, &host).map_err(|e| {
+                SsrfProtection::validate_resolved_ip(&ip, &host_for_lookup).map_err(|e| {
                     SkillDnsError::InvalidRequest(format!(
                         "skill download blocked by DNS rebinding protection: {}",
                         e
@@ -302,7 +306,7 @@ fn validate_and_resolve_dns(url: &url::Url) -> Result<(String, u16, Option<IpAdd
             first_valid.ok_or_else(|| {
                 SkillDnsError::Unavailable(format!(
                     "DNS resolution returned no addresses for {}",
-                    host
+                    host_for_lookup
                 ))
             })
         })

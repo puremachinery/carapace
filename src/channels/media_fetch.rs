@@ -9,7 +9,7 @@ use hickory_resolver::TokioAsyncResolver;
 use crate::media::fetch::{DEFAULT_FETCH_TIMEOUT_MS, MAX_FETCH_TIMEOUT_MS, MAX_URL_LENGTH};
 use crate::plugins::capabilities::{SsrfConfig, SsrfProtection};
 use crate::plugins::DeliveryResult;
-use crate::runtime_bridge::{run_sync_blocking, BridgeError};
+use crate::runtime_bridge::{run_sync_blocking_send, BridgeError};
 
 enum ResolveDnsError {
     Retryable(String),
@@ -119,16 +119,19 @@ fn resolve_and_validate_dns(
     host: &str,
     ssrf_config: &SsrfConfig,
 ) -> Result<IpAddr, DeliveryResult> {
-    let fut = async {
+    let host = host.to_string();
+    let ssrf_config = ssrf_config.clone();
+    let fut = async move {
         let resolver =
             TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default());
-        let lookup = resolver.lookup_ip(host).await.map_err(|e| {
+        let lookup = resolver.lookup_ip(&host).await.map_err(|e| {
             ResolveDnsError::Retryable(format!("DNS resolution failed: {host}: {e}"))
         })?;
 
         let mut validated_ip: Option<IpAddr> = None;
         for ip in lookup.iter() {
-            if let Err(e) = SsrfProtection::validate_resolved_ip_with_config(&ip, host, ssrf_config)
+            if let Err(e) =
+                SsrfProtection::validate_resolved_ip_with_config(&ip, &host, &ssrf_config)
             {
                 return Err(ResolveDnsError::NonRetryable(format!(
                     "SSRF protection: {e}"
@@ -143,7 +146,7 @@ fn resolve_and_validate_dns(
             .ok_or_else(|| ResolveDnsError::Retryable(format!("DNS resolution failed: {host}")))
     };
 
-    run_sync_blocking(fut).map_err(|err| match err {
+    run_sync_blocking_send(fut).map_err(|err| match err {
         BridgeError::Inner(inner) => inner.into_delivery_result(),
         other => error_result(format!("media fetch runtime error: {other}"), false),
     })

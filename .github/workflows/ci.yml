@@ -92,6 +92,16 @@ jobs:
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
+  runtime-bridge-guard:
+    name: Runtime Bridge Guard
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.rust_runtime == 'true'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Enforce runtime bridge boundaries
+        run: ./scripts/check-runtime-bridge-usage.sh
+
   build:
     name: Build
     runs-on: ubuntu-latest
@@ -272,6 +282,7 @@ jobs:
       - changes
       - fmt
       - clippy
+      - runtime-bridge-guard
       - build
       - test-pr
       - test-pr-windows
@@ -291,6 +302,7 @@ jobs:
           CHANGES_RESULT: ${{ needs.changes.result }}
           FMT_RESULT: ${{ needs.fmt.result }}
           CLIPPY_RESULT: ${{ needs.clippy.result }}
+          RUNTIME_BRIDGE_GUARD_RESULT: ${{ needs['runtime-bridge-guard'].result }}
           BUILD_RESULT: ${{ needs.build.result }}
           TEST_PR_RESULT: ${{ needs['test-pr'].result }}
           TEST_PR_WINDOWS_RESULT: ${{ needs['test-pr-windows'].result }}
@@ -311,6 +323,7 @@ jobs:
             "changes"
             "fmt"
             "clippy"
+            "runtime-bridge-guard"
             "build"
             "test-pr"
             "test-pr-windows"
@@ -330,6 +343,7 @@ jobs:
             "$CHANGES_RESULT"
             "$FMT_RESULT"
             "$CLIPPY_RESULT"
+            "$RUNTIME_BRIDGE_GUARD_RESULT"
             "$BUILD_RESULT"
             "$TEST_PR_RESULT"
             "$TEST_PR_WINDOWS_RESULT"
