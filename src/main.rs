@@ -19,6 +19,7 @@ mod media;
 mod messages;
 mod nodes;
 mod plugins;
+mod runtime_bridge;
 mod server;
 mod sessions;
 mod tailscale;

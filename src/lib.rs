@@ -23,6 +23,7 @@ pub mod media;
 pub mod messages;
 pub mod nodes;
 pub mod plugins;
+pub mod runtime_bridge;
 pub mod server;
 pub mod sessions;
 pub mod tailscale;

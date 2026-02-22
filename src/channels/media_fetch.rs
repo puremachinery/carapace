@@ -9,6 +9,29 @@ use hickory_resolver::TokioAsyncResolver;
 use crate::media::fetch::{DEFAULT_FETCH_TIMEOUT_MS, MAX_FETCH_TIMEOUT_MS, MAX_URL_LENGTH};
 use crate::plugins::capabilities::{SsrfConfig, SsrfProtection};
 use crate::plugins::DeliveryResult;
+use crate::runtime_bridge::{run_sync_blocking, BridgeError};
+
+enum ResolveDnsError {
+    Retryable(String),
+    NonRetryable(String),
+}
+
+impl std::fmt::Display for ResolveDnsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Retryable(msg) | Self::NonRetryable(msg) => write!(f, "{}", msg),
+        }
+    }
+}
+
+impl ResolveDnsError {
+    fn into_delivery_result(self) -> DeliveryResult {
+        match self {
+            Self::Retryable(msg) => error_result(msg, true),
+            Self::NonRetryable(msg) => error_result(msg, false),
+        }
+    }
+}
 
 /// Fetch media bytes with SSRF protection and size limits.
 #[allow(clippy::result_large_err)]
@@ -99,34 +122,31 @@ fn resolve_and_validate_dns(
     let fut = async {
         let resolver =
             TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default());
-        let lookup = resolver
-            .lookup_ip(host)
-            .await
-            .map_err(|e| error_result(format!("DNS resolution failed: {host}: {e}"), true))?;
+        let lookup = resolver.lookup_ip(host).await.map_err(|e| {
+            ResolveDnsError::Retryable(format!("DNS resolution failed: {host}: {e}"))
+        })?;
 
         let mut validated_ip: Option<IpAddr> = None;
         for ip in lookup.iter() {
             if let Err(e) = SsrfProtection::validate_resolved_ip_with_config(&ip, host, ssrf_config)
             {
-                return Err(error_result(format!("SSRF protection: {e}"), false));
+                return Err(ResolveDnsError::NonRetryable(format!(
+                    "SSRF protection: {e}"
+                )));
             }
             if validated_ip.is_none() {
                 validated_ip = Some(ip);
             }
         }
 
-        validated_ip.ok_or_else(|| error_result(format!("DNS resolution failed: {host}"), true))
+        validated_ip
+            .ok_or_else(|| ResolveDnsError::Retryable(format!("DNS resolution failed: {host}")))
     };
 
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        handle.block_on(fut)
-    } else {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| error_result(format!("media fetch runtime unavailable: {e}"), false))?;
-        runtime.block_on(fut)
-    }
+    run_sync_blocking(fut).map_err(|err| match err {
+        BridgeError::Inner(inner) => inner.into_delivery_result(),
+        other => error_result(format!("media fetch runtime error: {other}"), false),
+    })
 }
 
 fn error_result(error: impl Into<String>, retryable: bool) -> DeliveryResult {
@@ -138,5 +158,32 @@ fn error_result(error: impl Into<String>, retryable: bool) -> DeliveryResult {
         conversation_id: None,
         to_jid: None,
         poll_id: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_and_validate_dns_inside_current_thread_runtime_is_panic_free() {
+        let ssrf_config = SsrfConfig::default();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rt.block_on(async { resolve_and_validate_dns("localhost", &ssrf_config) })
+        }));
+
+        assert!(
+            result.is_ok(),
+            "DNS resolution helper should not panic in current-thread runtime"
+        );
+        assert!(
+            result.unwrap().is_err(),
+            "localhost resolution should return a transport/SSRF error in this test setup"
+        );
     }
 }

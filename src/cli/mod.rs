@@ -282,6 +282,7 @@ use crate::channels::telegram::{TelegramChannel, TELEGRAM_DEFAULT_API_BASE_URL};
 use crate::config;
 use crate::credentials;
 use crate::logging::buffer::LogLevel;
+use crate::runtime_bridge::{run_sync_blocking, run_sync_blocking_send};
 use crate::server::bind::DEFAULT_PORT;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
@@ -294,8 +295,6 @@ use rustls::{DigitallySignedStruct, Error as RustlsError, SignatureScheme};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
-use std::fmt::Display;
-use std::future::Future;
 use std::io::IsTerminal;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -3037,71 +3036,6 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Run an async computation from synchronous code.
-///
-/// This helper is used by sync entry points (like setup flows) that need to
-/// invoke async code that may be called with or without an active Tokio runtime.
-///
-/// - If already inside a multi-threaded runtime, use `block_in_place` and execute
-///   the future on the current runtime handle.
-/// - Otherwise, create a temporary current-thread runtime and `block_on` there.
-/// - If inside a current-thread runtime, return an explicit error and let callers
-///   switch to `run_sync_blocking_send` if safe-threaded fallback is needed.
-fn run_sync_blocking<T, E>(future: impl Future<Output = Result<T, E>>) -> Result<T, String>
-where
-    E: Display,
-{
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
-            tokio::task::block_in_place(|| handle.block_on(future).map_err(|e| e.to_string()))
-        } else {
-            Err("cannot run blocking sync-async bridge from current-thread runtime".to_string())
-        }
-    } else {
-        run_sync_blocking_current_thread(future)
-    }
-}
-
-/// Run an async computation from synchronous code with the same semantics as
-/// `run_sync_blocking`, but using a dedicated thread when inside a
-/// current-thread runtime to avoid "Cannot start a runtime from within a runtime"
-/// panics.
-fn run_sync_blocking_send<T, E>(
-    future: impl Future<Output = Result<T, E>> + Send + 'static,
-) -> Result<T, String>
-where
-    T: Send + 'static,
-    E: Display + Send + 'static,
-{
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
-            tokio::task::block_in_place(|| handle.block_on(future).map_err(|e| e.to_string()))
-        } else {
-            let thread = std::thread::spawn(move || run_sync_blocking_current_thread(future));
-
-            thread
-                .join()
-                .map_err(|_| "runtime bridge thread panicked".to_string())?
-        }
-    } else {
-        run_sync_blocking_current_thread(future)
-    }
-}
-
-fn run_sync_blocking_current_thread<T, E>(
-    future: impl Future<Output = Result<T, E>>,
-) -> Result<T, String>
-where
-    E: Display,
-{
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| format!("failed to create runtime: {e}"))?
-        .block_on(future)
-        .map_err(|e| e.to_string())
-}
-
 /// Run the `pair` subcommand -- pair with a remote gateway node.
 pub async fn handle_pair(
     url: &str,
@@ -3722,6 +3656,7 @@ pub fn handle_tls_show_ca(ca_dir_opt: Option<&str>) -> Result<(), Box<dyn std::e
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime_bridge::CURRENT_THREAD_RUNTIME_MESSAGE;
     use clap::Parser;
     use ed25519_dalek::{Signature, VerifyingKey};
     use std::ffi::OsString;
@@ -3963,52 +3898,56 @@ mod tests {
     }
 
     #[test]
-    fn test_run_sync_blocking_outside_runtime() {
-        let value = run_sync_blocking(async { Ok::<u16, std::io::Error>(17) }).unwrap();
-        assert_eq!(value, 17);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_run_sync_blocking_inside_multi_thread_runtime() {
-        let value = run_sync_blocking(async { Ok::<u16, std::io::Error>(99) }).unwrap();
-        assert_eq!(value, 99);
-    }
-
-    #[test]
-    fn test_run_sync_blocking_inside_current_thread_runtime_returns_error() {
+    fn test_setup_post_checks_bridge_inside_current_thread_runtime_does_not_panic() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
-        let value = rt.block_on(async {
-            run_sync_blocking(async { Ok::<u16, std::io::Error>(11) })
-                .expect_err("current-thread runtime should return an explicit error")
-        });
-        assert!(value.contains("cannot run blocking sync-async bridge from current-thread runtime"));
+
+        let call_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rt.block_on(async {
+                run_sync_blocking(run_setup_post_checks(DEFAULT_PORT, false, false))
+                    .expect_err("expected bridge error from current-thread runtime")
+            })
+        }));
+
+        assert!(
+            call_result.is_ok(),
+            "current-thread runtime should not panic when running setup post checks through sync bridge"
+        );
+        let err = call_result.unwrap().to_string();
+        assert!(
+            err.contains(CURRENT_THREAD_RUNTIME_MESSAGE),
+            "expected explicit current-thread bridge guard error, got: {err}"
+        );
     }
 
     #[test]
-    fn test_run_sync_blocking_send_inside_current_thread_runtime_works() {
+    fn test_validate_channel_credentials_bridge_inside_current_thread_runtime_is_panic_free() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
-        let value = rt.block_on(async {
-            run_sync_blocking_send(async { Ok::<u16, std::io::Error>(11) }).unwrap()
-        });
-        assert_eq!(value, 11);
-    }
 
-    #[test]
-    fn test_run_sync_blocking_send_outside_any_runtime_works() {
-        let value = run_sync_blocking_send(async { Ok::<u16, std::io::Error>(22) }).unwrap();
-        assert_eq!(value, 22);
-    }
+        let call_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rt.block_on(async {
+                run_sync_blocking_send(validate_channel_credentials_owned(
+                    "unsupported".to_string(),
+                    "ignored-token".to_string(),
+                ))
+                .expect_err("unsupported channels should be rejected, not panic")
+            })
+        }));
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_run_sync_blocking_send_inside_multi_thread_runtime_works() {
-        let value = run_sync_blocking_send(async { Ok::<u16, std::io::Error>(33) }).unwrap();
-        assert_eq!(value, 33);
+        assert!(
+            call_result.is_ok(),
+            "current-thread runtime should not panic when validating channel creds through send bridge"
+        );
+        let err = call_result.unwrap().to_string();
+        assert!(
+            err.contains("unsupported channel for validation: unsupported"),
+            "expected unsupported-channel rejection path, got: {err}"
+        );
     }
 
     #[test]
