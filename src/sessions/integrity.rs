@@ -40,17 +40,21 @@ pub enum IntegrityAction {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IntegrityConfig {
     /// Master switch — when `false`, HMAC operations are skipped.
-    #[serde(default)]
+    #[serde(default = "default_integrity_enabled")]
     pub enabled: bool,
     /// Action on integrity failure.
     #[serde(default)]
     pub action: IntegrityAction,
 }
 
+fn default_integrity_enabled() -> bool {
+    true
+}
+
 impl Default for IntegrityConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: default_integrity_enabled(),
             action: IntegrityAction::Warn,
         }
     }
@@ -719,8 +723,15 @@ mod tests {
     #[test]
     fn test_integrity_config_default() {
         let config = IntegrityConfig::default();
-        assert!(!config.enabled);
+        assert!(config.enabled);
         assert_eq!(config.action, IntegrityAction::Warn);
+    }
+
+    #[test]
+    fn test_integrity_config_missing_enabled_defaults_to_true() {
+        let parsed: IntegrityConfig = serde_json::from_str(r#"{"action":"reject"}"#).unwrap();
+        assert!(parsed.enabled);
+        assert_eq!(parsed.action, IntegrityAction::Reject);
     }
 
     #[test]

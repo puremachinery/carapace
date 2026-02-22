@@ -977,6 +977,40 @@ pub enum WsConfigError {
     Devices(#[from] devices::DevicePairingError),
 }
 
+fn resolve_session_integrity_config(cfg: &Value) -> crate::sessions::integrity::IntegrityConfig {
+    let default_cfg = crate::sessions::integrity::IntegrityConfig::default();
+    let integrity_cfg = cfg.get("sessions").and_then(|s| s.get("integrity"));
+
+    let enabled = integrity_cfg
+        .and_then(|i| i.get("enabled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(default_cfg.enabled);
+
+    let action = integrity_cfg
+        .and_then(|i| i.get("action"))
+        .and_then(Value::as_str)
+        .map(|value| match value {
+            "reject" => crate::sessions::integrity::IntegrityAction::Reject,
+            _ => crate::sessions::integrity::IntegrityAction::Warn,
+        })
+        .unwrap_or(default_cfg.action);
+
+    crate::sessions::integrity::IntegrityConfig { enabled, action }
+}
+
+fn non_empty_integrity_secret(secret: Option<String>) -> Option<String> {
+    secret.filter(|value| !value.is_empty())
+}
+
+fn resolve_session_integrity_secret(
+    auth: &auth::ResolvedGatewayAuth,
+    env_server_secret: Option<String>,
+) -> Option<String> {
+    non_empty_integrity_secret(env_server_secret)
+        .or_else(|| non_empty_integrity_secret(auth.token.clone()))
+        .or_else(|| non_empty_integrity_secret(auth.password.clone()))
+}
+
 pub async fn build_ws_state_owned_from_value(cfg: &Value) -> Result<WsServerState, WsConfigError> {
     let state_dir = resolve_state_dir();
     if let Err(err) = credentials::migrate_plaintext_credentials(state_dir.clone()).await {
@@ -985,46 +1019,32 @@ pub async fn build_ws_state_owned_from_value(cfg: &Value) -> Result<WsServerStat
     let config = build_ws_config_from_value(cfg).await?;
     let mut state = WsServerState::new_persistent(config, state_dir)?;
 
-    // Wire session integrity HMAC key from config
-    let sessions_cfg = cfg.get("sessions").and_then(|s| s.get("integrity"));
-    let integrity_enabled = sessions_cfg
-        .and_then(|i| i.get("enabled"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    // Wire session integrity HMAC key from resolved auth/server secret.
+    let integrity_config = resolve_session_integrity_config(cfg);
+    if integrity_config.enabled {
+        let server_secret = resolve_session_integrity_secret(
+            &state.config.auth.resolved,
+            std::env::var("CARAPACE_SERVER_SECRET").ok(),
+        );
 
-    if integrity_enabled {
-        // Derive HMAC key from the gateway auth token (server secret)
-        let server_secret = std::env::var("CARAPACE_GATEWAY_TOKEN")
-            .or_else(|_| std::env::var("CARAPACE_SERVER_SECRET"))
-            .unwrap_or_default();
-
-        if !server_secret.is_empty() {
+        if let Some(server_secret) = server_secret {
             let hmac_key = crate::sessions::integrity::derive_hmac_key(server_secret.as_bytes());
-
-            let integrity_action = sessions_cfg
-                .and_then(|i| i.get("action"))
-                .and_then(|v| v.as_str())
-                .map(|s| match s {
-                    "reject" => crate::sessions::integrity::IntegrityAction::Reject,
-                    _ => crate::sessions::integrity::IntegrityAction::Warn,
-                })
-                .unwrap_or(crate::sessions::integrity::IntegrityAction::Warn);
 
             let session_store = sessions::SessionStore::with_base_path(
                 state.session_store.base_path().to_path_buf(),
             )
             .with_hmac_key(hmac_key)
-            .with_integrity_action(integrity_action);
+            .with_integrity_action(integrity_config.action);
             state.session_store = Arc::new(session_store);
 
             tracing::info!(
-                action = ?integrity_action,
+                action = ?integrity_config.action,
                 "session integrity verification enabled"
             );
         } else {
             tracing::warn!(
                 "sessions.integrity.enabled is true but no server secret found \
-                 (set CARAPACE_GATEWAY_TOKEN or CARAPACE_SERVER_SECRET)"
+                 (set gateway.auth.token/password or CARAPACE_SERVER_SECRET)"
             );
         }
     }

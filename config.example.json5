@@ -183,6 +183,10 @@
   //     days: 30,              // delete sessions older than N days (default: 30)
   //     intervalHours: 6,      // cleanup cadence in hours (default: 6)
   //   },
+  //   integrity: {
+  //     enabled: true,         // verify session metadata/history HMAC sidecars (default: true)
+  //     action: "warn",        // "warn" auto-migrates missing sidecars; "reject" fail-closed
+  //   },
   // },
 
   // --- Usage tracking ---------------------------------------------------

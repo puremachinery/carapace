@@ -154,6 +154,7 @@ This is a condensed map; refer to the JSON schema for full detail.
   - `enabled`, `mode` (`off` | `warn` | `block`), `model`, `blockThreshold`
 - `sessions`
   - `retention.enabled`, `retention.days`, `retention.intervalHours`
+  - `integrity.enabled` (default `true`), `integrity.action` (`warn` | `reject`, default `warn`)
   - Legacy: `sessions.retentionDays`, `session.retention.*`
 - `usage`
   - `pricing.default` – fallback pricing (`inputCostPerMTok`, `outputCostPerMTok`)
@@ -186,6 +187,8 @@ Defaults are applied after validation. Key defaults include:
   - `contextWindow`: `DEFAULT_CONTEXT_TOKENS`
   - `maxTokens`: `min(8192, contextWindow)`
 - `talk.apiKey` may be injected from the environment if missing.
+- `sessions.integrity.enabled`: `true`
+- `sessions.integrity.action`: `"warn"` (missing sidecars auto-migrate; use `"reject"` to fail closed)
 
 ## Validation Rules (Highlights)
 
