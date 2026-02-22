@@ -187,7 +187,7 @@ Defaults are applied after validation. Key defaults include:
   - `contextWindow`: `DEFAULT_CONTEXT_TOKENS`
   - `maxTokens`: `min(8192, contextWindow)`
 - `talk.apiKey` may be injected from the environment if missing.
-- `sessions.integrity.enabled`: `true`
+- `sessions.integrity.enabled`: `true` (HMAC key source order: `CARAPACE_SERVER_SECRET` → `gateway.auth.token` → `gateway.auth.password`)
 - `sessions.integrity.action`: `"warn"` (missing sidecars auto-migrate; use `"reject"` to fail closed)
 
 ## Validation Rules (Highlights)

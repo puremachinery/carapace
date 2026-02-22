@@ -116,11 +116,13 @@ fn test_resolve_session_integrity_secret_prefers_explicit_server_secret() {
         password: Some("gateway-password".to_string()),
         allow_tailscale: false,
     };
-    let secret = resolve_session_integrity_secret(
+    let (secret, source) = resolve_session_integrity_secret(
         &resolved_auth,
         Some("explicit-server-secret".to_string()),
-    );
-    assert_eq!(secret.as_deref(), Some("explicit-server-secret"));
+    )
+    .expect("secret should resolve from explicit server secret");
+    assert_eq!(secret, "explicit-server-secret");
+    assert_eq!(source, "CARAPACE_SERVER_SECRET");
 }
 
 #[test]
@@ -131,8 +133,10 @@ fn test_resolve_session_integrity_secret_falls_back_to_gateway_credentials() {
         password: None,
         allow_tailscale: false,
     };
-    let secret = resolve_session_integrity_secret(&from_token, None);
-    assert_eq!(secret.as_deref(), Some("gateway-token"));
+    let (secret, source) = resolve_session_integrity_secret(&from_token, None)
+        .expect("secret should resolve from gateway token");
+    assert_eq!(secret, "gateway-token");
+    assert_eq!(source, "gateway token");
 
     let from_password = auth::ResolvedGatewayAuth {
         mode: auth::AuthMode::Password,
@@ -140,8 +144,10 @@ fn test_resolve_session_integrity_secret_falls_back_to_gateway_credentials() {
         password: Some("gateway-password".to_string()),
         allow_tailscale: false,
     };
-    let secret = resolve_session_integrity_secret(&from_password, None);
-    assert_eq!(secret.as_deref(), Some("gateway-password"));
+    let (secret, source) = resolve_session_integrity_secret(&from_password, None)
+        .expect("secret should resolve from gateway password");
+    assert_eq!(secret, "gateway-password");
+    assert_eq!(source, "gateway password");
 }
 
 #[test]

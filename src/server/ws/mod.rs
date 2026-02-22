@@ -996,17 +996,20 @@ fn resolve_session_integrity_config(cfg: &Value) -> crate::sessions::integrity::
     }
 }
 
-fn non_empty_integrity_secret(secret: Option<String>) -> Option<String> {
-    secret.filter(|value| !value.is_empty())
-}
-
 fn resolve_session_integrity_secret(
     auth: &auth::ResolvedGatewayAuth,
     env_server_secret: Option<String>,
-) -> Option<String> {
-    non_empty_integrity_secret(env_server_secret)
-        .or_else(|| non_empty_integrity_secret(auth.token.clone()))
-        .or_else(|| non_empty_integrity_secret(auth.password.clone()))
+) -> Option<(String, &'static str)> {
+    if let Some(secret) = env_server_secret.filter(|value| !value.is_empty()) {
+        return Some((secret, "CARAPACE_SERVER_SECRET"));
+    }
+    if let Some(secret) = auth.token.clone().filter(|value| !value.is_empty()) {
+        return Some((secret, "gateway token"));
+    }
+    if let Some(secret) = auth.password.clone().filter(|value| !value.is_empty()) {
+        return Some((secret, "gateway password"));
+    }
+    None
 }
 
 pub async fn build_ws_state_owned_from_value(cfg: &Value) -> Result<WsServerState, WsConfigError> {
@@ -1020,12 +1023,12 @@ pub async fn build_ws_state_owned_from_value(cfg: &Value) -> Result<WsServerStat
     // Wire session integrity HMAC key from resolved auth/server secret.
     let integrity_config = resolve_session_integrity_config(cfg);
     if integrity_config.enabled {
-        let server_secret = resolve_session_integrity_secret(
+        let integrity_secret = resolve_session_integrity_secret(
             &state.config.auth.resolved,
             std::env::var("CARAPACE_SERVER_SECRET").ok(),
         );
 
-        if let Some(server_secret) = server_secret {
+        if let Some((server_secret, source)) = integrity_secret {
             let hmac_key = crate::sessions::integrity::derive_hmac_key(server_secret.as_bytes());
 
             let session_store = sessions::SessionStore::with_base_path(
@@ -1037,12 +1040,14 @@ pub async fn build_ws_state_owned_from_value(cfg: &Value) -> Result<WsServerStat
 
             tracing::info!(
                 action = ?integrity_config.action,
+                source = source,
                 "session integrity verification enabled"
             );
         } else {
             tracing::warn!(
                 "sessions.integrity.enabled is true but no server secret found \
-                 (set gateway.auth.token/password or CARAPACE_SERVER_SECRET)"
+                 (set gateway.auth.token/password or CARAPACE_SERVER_SECRET); \
+                 sessions will run without integrity verification"
             );
         }
     }
