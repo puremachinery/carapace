@@ -646,9 +646,18 @@ pub struct PluginInstanceHandle<B: CredentialBackend + Send + Sync + 'static> {
     component: Component,
 }
 
-// SAFETY: PluginInstanceHandle coordinates all mutable Wasmtime Store access through
-// `store: RwLock<Store<HostState<B>>>`. The remaining fields are immutable after
-// instantiation and only used alongside locked store access when invoking exports.
+// SAFETY:
+// - `PluginInstanceHandle` may be shared across threads (e.g. inside `Arc`), but all
+//   access to the underlying `Store<HostState<B>>` is serialized through
+//   `store: RwLock<Store<HostState<B>>>` write-lock usage in this module.
+// - We do not use `RwLock::read` for store access here, so `Store`/`Instance` calls are
+//   not executed concurrently across threads.
+// - `HostState<B>` is bounded by `B: CredentialBackend + Send + Sync`, so moving the
+//   handle across threads does not create host-state data races.
+// - Remaining fields (`manifest`, `epoch_deadline_ticks`, `instance`, `component`) are
+//   immutable after instantiation and used only alongside locked store access.
+// - Any future `read`-lock or unlocked store access would require revisiting this
+//   unsafe contract.
 unsafe impl<B: CredentialBackend + Send + Sync + 'static> Send for PluginInstanceHandle<B> {}
 unsafe impl<B: CredentialBackend + Send + Sync + 'static> Sync for PluginInstanceHandle<B> {}
 
