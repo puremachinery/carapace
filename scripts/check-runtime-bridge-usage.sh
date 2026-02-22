@@ -11,11 +11,57 @@ violations="$(
     fi
 
     awk -v file="$file" '
-      BEGIN { in_tests = 0 }
-      /^[[:space:]]*#\[cfg\(test\)\]/ { in_tests = 1 }
+      function brace_delta(s,    tmp, opens, closes) {
+        tmp = s
+        gsub(/"([^"\\]|\\.)*"/, "\"\"", tmp)
+        gsub(/'\''([^'\''\\]|\\.)*'\''/, "''", tmp)
+        opens = gsub(/{/, "{", tmp)
+        closes = gsub(/}/, "}", tmp)
+        return opens - closes
+      }
+
+      BEGIN {
+        in_tests = 0
+        pending_cfg_test = 0
+        test_brace_depth = 0
+        saw_test_open_brace = 0
+      }
+
+      /^[[:space:]]*#\[cfg\(test\)\]/ {
+        pending_cfg_test = 1
+        next
+      }
+
       {
-        if (in_tests) next
         line = $0
+
+        if (in_tests) {
+          delta = brace_delta(line)
+          test_brace_depth += delta
+          if (delta > 0) {
+            saw_test_open_brace = 1
+          }
+          if (saw_test_open_brace && test_brace_depth <= 0) {
+            in_tests = 0
+            test_brace_depth = 0
+            saw_test_open_brace = 0
+          }
+          next
+        }
+
+        if (pending_cfg_test) {
+          if (line ~ /^[[:space:]]*mod[[:space:]]+tests([[:space:]]*\{|[[:space:]]*$)/) {
+            in_tests = 1
+            pending_cfg_test = 0
+            test_brace_depth = brace_delta(line)
+            if (test_brace_depth > 0) {
+              saw_test_open_brace = 1
+            }
+            next
+          }
+          pending_cfg_test = 0
+        }
+
         if (line ~ /^[[:space:]]*\/\//) next
         if (line ~ /tokio::task::block_in_place[[:space:]]*\(/ || line ~ /\.block_on[[:space:]]*\(/) {
           printf "%s:%d:%s\n", file, NR, line

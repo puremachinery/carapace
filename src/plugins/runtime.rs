@@ -1166,14 +1166,26 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
             permission_enforcer,
         ));
 
-        // Create the instance handle with a dedicated plugin runtime worker.
-        let handle = Arc::new(PluginInstanceHandle::spawn(
-            loaded.manifest.clone(),
-            loaded.wasm_bytes.clone(),
-            self.engine.clone(),
-            self.epoch_deadline_ticks,
-            host_ctx,
-        )?);
+        // Initialize the dedicated plugin worker off the async runtime thread.
+        let manifest = loaded.manifest.clone();
+        let wasm_bytes = loaded.wasm_bytes.clone();
+        let engine = self.engine.clone();
+        let epoch_deadline_ticks = self.epoch_deadline_ticks;
+        let handle = Arc::new(
+            tokio::task::spawn_blocking(move || {
+                PluginInstanceHandle::spawn(
+                    manifest,
+                    wasm_bytes,
+                    engine,
+                    epoch_deadline_ticks,
+                    host_ctx,
+                )
+            })
+            .await
+            .map_err(|e| {
+                RuntimeError::InstantiationError(format!("plugin worker join failed: {e}"))
+            })??,
+        );
 
         // Store the instance
         {
