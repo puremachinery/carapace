@@ -468,11 +468,13 @@ pub fn extract_title(html: &str) -> Option<String> {
 /// Extract the meta description from `<meta name="description" content="...">`.
 pub fn extract_meta_description(html: &str) -> Option<String> {
     // Handles both name="description" content="..." and content="..." name="description"
-    if let Some(caps) = META_DESCRIPTION_NAME_FIRST_REGEX.captures(html) {
-        let desc = collapse_whitespace(&decode_html_entities(caps.get(1).unwrap().as_str()));
-        if !desc.is_empty() {
-            return Some(desc);
-        }
+    if let Some(desc) = META_DESCRIPTION_NAME_FIRST_REGEX
+        .captures(html)
+        .and_then(|c| c.get(1))
+        .map(|m| collapse_whitespace(&decode_html_entities(m.as_str())))
+        .filter(|s| !s.is_empty())
+    {
+        return Some(desc);
     }
 
     // Try reversed attribute order: content first, name second
