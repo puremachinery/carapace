@@ -136,34 +136,6 @@ impl ResourceLimiter for PluginResourceLimiter {
 // These types mirror the WIT record definitions in wit/plugin.wit and are used
 // by the component model linker to marshal data between host and guest.
 
-/// Assert that a future is Send.
-///
-/// # Safety
-///
-/// The caller must guarantee that the future is actually Send-safe.
-/// This is needed because `CredentialBackend` uses `async fn` in trait
-/// which doesn't imply `Send` at the trait level, even though all concrete
-/// implementations are Send (the backend type `B` is bound as `Send + Sync`).
-unsafe fn assert_send<T>(
-    fut: impl std::future::Future<Output = T>,
-) -> impl std::future::Future<Output = T> + Send {
-    /// Wrapper that unsafely implements Send for a future.
-    struct AssertSend<F>(F);
-    // SAFETY: Caller guarantees the inner future is Send-safe.
-    unsafe impl<F> Send for AssertSend<F> {}
-    impl<F: std::future::Future> std::future::Future for AssertSend<F> {
-        type Output = F::Output;
-        fn poll(
-            self: std::pin::Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<Self::Output> {
-            // SAFETY: We are not moving the inner future, just projecting through the wrapper.
-            unsafe { self.map_unchecked_mut(|s| &mut s.0).poll(cx) }
-        }
-    }
-    AssertSend(fut)
-}
-
 /// WIT `http-request` record for the component model linker.
 #[derive(Clone, Debug, ComponentType, Lift, Lower)]
 #[component(record)]
@@ -1216,13 +1188,9 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
                         + '_,
                 > {
                     let host_ctx = ctx.data().host_ctx.clone();
-                    // SAFETY: PluginHostContext<B> is Send+Sync (B: Send+Sync),
-                    // and all concrete CredentialBackend impls produce Send futures.
-                    Box::new(unsafe {
-                        assert_send(async move {
-                            let wit = WitHost::new(host_ctx);
-                            Ok((wit.credential_get(&key).await,))
-                        })
+                    Box::new(async move {
+                        let wit = WitHost::new(host_ctx);
+                        Ok((wit.credential_get(&key).await,))
                     })
                 },
             )
@@ -1239,12 +1207,9 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
                     dyn std::future::Future<Output = wasmtime::Result<(bool,)>> + Send + '_,
                 > {
                     let host_ctx = ctx.data().host_ctx.clone();
-                    // SAFETY: Same reasoning as credential-get above.
-                    Box::new(unsafe {
-                        assert_send(async move {
-                            let wit = WitHost::new(host_ctx);
-                            Ok((wit.credential_set(&key, &value).await,))
-                        })
+                    Box::new(async move {
+                        let wit = WitHost::new(host_ctx);
+                        Ok((wit.credential_set(&key, &value).await,))
                     })
                 },
             )
