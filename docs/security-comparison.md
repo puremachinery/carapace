@@ -50,7 +50,9 @@ Carapace is a Rust rewrite of OpenClaw built from the ground up to address these
 **Carapace:**
 - The service URL is set server-side only. No query parameter override exists.
 - Control endpoints enforce CSRF protection and require service authentication.
-- Sensitive config paths (`gateway.auth`, `gateway.hooks.token`, `credentials`, `secrets`) are blocked from modification via the control API.
+- Sensitive config paths are blocked from modification via the control API, including
+  auth tokens/secrets, credentials, API keys, base URLs for provider configs, and webhook
+  signing material.
 
 ### 5. Prompt Injection
 

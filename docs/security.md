@@ -285,14 +285,40 @@ The control UI (`/control/*` endpoints) requires:
 - Service authentication (token or password)
 - CSRF protection (double-submit cookie with `__Host-` prefix, `SameSite=Strict`, origin/host validation)
 - Protected config paths blocked from modification:
-  - `gateway.auth.*`
-  - `gateway.hooks.token`
-  - `credentials.*`
-  - `secrets.*`
+  - authentication and channel secret roots (`gateway.auth.*`, `gateway.hooks.token`, `credentials.*`, `secrets.*`)
+  - provider credentials and endpoint settings (`anthropic/openai/google/venice/ollama/bedrock` API keys and provider `baseUrl`s, plus `models.providers.openai.*` API key/base URL)
+  - channel signing and webhook material (`telegram.webhookSecret`, `telegram.botToken`, `discord.botToken`, `slack.botToken`, `slack.signingSecret`)
 
 ```rust
 // From src/server/control.rs
-let blocked_prefixes = ["gateway.auth", "gateway.hooks.token", "credentials", "secrets"];
+let blocked_prefixes = [
+    "gateway.auth",
+    "gateway.hooks.token",
+    "credentials",
+    "secrets",
+    "anthropic.apiKey",
+    "openai.apiKey",
+    "google.apiKey",
+    "venice.apiKey",
+    "ollama.apiKey",
+    "providers.ollama.apiKey",
+    "bedrock.accessKeyId",
+    "bedrock.secretAccessKey",
+    "bedrock.sessionToken",
+    "models.providers.openai.apiKey",
+    "telegram.botToken",
+    "telegram.webhookSecret",
+    "discord.botToken",
+    "slack.botToken",
+    "slack.signingSecret",
+    "anthropic.baseUrl",
+    "openai.baseUrl",
+    "google.baseUrl",
+    "venice.baseUrl",
+    "ollama.baseUrl",
+    "providers.ollama.baseUrl",
+    "models.providers.openai.baseUrl",
+];
 for prefix in blocked_prefixes {
     if req.path.starts_with(prefix) {
         return Err(forbidden("Cannot modify protected configuration"));
