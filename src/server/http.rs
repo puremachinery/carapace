@@ -2007,7 +2007,7 @@ mod tests {
             hooks_token: Some("test-hooks-token".to_string()),
             hooks_enabled: true,
             gateway_token: Some("test-gateway-token".to_string()),
-            sender_scope_secret: Some("test-sender-scope-secret".to_string()),
+            sender_scope_secret: None,
             control_ui_enabled: true,
             ..Default::default()
         }
@@ -2025,7 +2025,7 @@ mod tests {
             Some(SocketAddr::from(([127, 0, 0, 1], 43123))),
             &headers,
             &[],
-            Some("test-secret"),
+            None,
         );
         assert!(sender.starts_with("sender_"));
         assert_eq!(sender.len(), 71);
@@ -2034,7 +2034,7 @@ mod tests {
     #[test]
     fn test_sender_scope_for_hook_request_without_remote_addr() {
         let headers = HeaderMap::new();
-        let sender = sender_scope_for_hook_request(None, &headers, &[], Some("test-secret"));
+        let sender = sender_scope_for_hook_request(None, &headers, &[], None);
         assert_eq!(sender, "unknown");
     }
 
@@ -2045,7 +2045,7 @@ mod tests {
             Some(SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 43123))),
             &headers,
             &[],
-            Some("test-secret"),
+            None,
         );
         assert!(sender.starts_with("sender_"));
         assert_eq!(sender.len(), 71);
@@ -2062,19 +2062,19 @@ mod tests {
             Some("203.0.113.5:1234".parse().unwrap()),
             &headers,
             &trusted,
-            Some("test-secret"),
+            None,
         );
         let direct_sender = sender_scope_for_hook_request(
             Some("203.0.113.5:1234".parse().unwrap()),
             &headers,
             &[],
-            Some("test-secret"),
+            None,
         );
         let fallback_sender = sender_scope_for_hook_request(
             Some("198.51.100.9:1234".parse().unwrap()),
             &HeaderMap::new(),
             &[],
-            Some("test-secret"),
+            None,
         );
 
         assert_eq!(trusted_sender, fallback_sender);
@@ -2088,13 +2088,13 @@ mod tests {
             Some("[::ffff:127.0.0.1]:8080".parse().unwrap()),
             &headers,
             &[],
-            Some("test-secret"),
+            None,
         );
         let ipv4 = sender_scope_for_hook_request(
             Some("127.0.0.1:8080".parse().unwrap()),
             &headers,
             &[],
-            Some("test-secret"),
+            None,
         );
         assert_eq!(mapped, ipv4);
     }

@@ -493,7 +493,8 @@ pub fn resolve_request_client_ip(
     headers: &HeaderMap,
     trusted: &[String],
 ) -> Option<IpAddr> {
-    let remote_ip = remote_addr.map(|addr| normalize_ip_addr(addr.ip()))?;
+    let remote_addr = remote_addr?;
+    let remote_ip = normalize_ip_addr(remote_addr.ip());
     let forwarded_for = header_value(headers, "x-forwarded-for");
     let real_ip = header_value(headers, "x-real-ip");
     resolve_client_ip(remote_ip, forwarded_for, real_ip, trusted).or(Some(remote_ip))
