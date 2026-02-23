@@ -816,6 +816,8 @@ fn enqueue_hook_wake_event(ws: &Arc<WsServerState>, text: &str, mode: WakeMode) 
         WakeMode::Now => "hook-wake-now",
         WakeMode::NextHeartbeat => "hook-wake-next-heartbeat",
     };
+    // Hook wake events track intent + mode and intentionally omit source-network
+    // attribution fields. Sender scoping is applied on run dispatch paths.
     ws.enqueue_system_event(SystemEvent {
         ts: unix_now_ms(),
         text: text.to_string(),
@@ -1376,11 +1378,7 @@ async fn hook_result_to_response(
             }
 
             debug!("Hook triggered agent dispatch: runId='{}'", run_id);
-            (
-                StatusCode::ACCEPTED,
-                Json(json!({ "ok": true, "runId": run_id })),
-            )
-                .into_response()
+            (StatusCode::ACCEPTED, Json(AgentResponse::success(run_id))).into_response()
         }
         Err(e) => {
             let status = match &e {
@@ -2469,6 +2467,76 @@ mod tests {
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["ok"], true);
         assert!(json["runId"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_hooks_mapping_wake_dispatches_system_event_with_runtime() {
+        let (ws_state, _tmp) = make_test_ws_state();
+        let hook_registry = Arc::new(HookRegistry::new());
+        let mut mapping = HookMapping::new("wake-map")
+            .with_path("wake-map")
+            .with_action(HookAction::Wake)
+            .with_text_template("Wake {{reason}}");
+        mapping.wake_mode = Some("next-heartbeat".to_string());
+        hook_registry.register(mapping);
+
+        let router = test_router_with_hook_registry(test_config(), hook_registry, ws_state.clone());
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/hooks/wake-map")
+            .header("authorization", "Bearer test-hooks-token")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"reason":"mapped"}"#))
+            .unwrap();
+
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["mode"], "next-heartbeat");
+
+        let history = ws_state.get_system_event_history();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].text, "Wake mapped");
+        assert_eq!(
+            history[0].reason.as_deref(),
+            Some("hook-wake-next-heartbeat")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hooks_mapping_wake_accepts_when_runtime_missing() {
+        let hook_registry = Arc::new(HookRegistry::new());
+        let mapping = HookMapping::new("wake-map-no-runtime")
+            .with_path("wake-map-no-runtime")
+            .with_action(HookAction::Wake)
+            .with_text_template("Wake {{reason}}");
+        hook_registry.register(mapping);
+
+        let router = test_router_with_hook_registry_no_runtime(test_config(), hook_registry);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/hooks/wake-map-no-runtime")
+            .header("authorization", "Bearer test-hooks-token")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"reason":"fallback"}"#))
+            .unwrap();
+
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["mode"], "now");
     }
 
     #[tokio::test]
