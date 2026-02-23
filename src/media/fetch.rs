@@ -11,8 +11,9 @@
 use std::net::IpAddr;
 use std::time::Duration;
 
-use hickory_resolver::config::{ResolverConfig, ResolverOpts};
-use hickory_resolver::TokioAsyncResolver;
+use hickory_resolver::config::ResolverConfig;
+use hickory_resolver::name_server::TokioConnectionProvider;
+use hickory_resolver::TokioResolver;
 use reqwest::Client;
 use thiserror::Error;
 
@@ -275,8 +276,11 @@ impl MediaFetcher {
         host: &str,
         ssrf_config: &SsrfConfig,
     ) -> Result<IpAddr, FetchError> {
-        let resolver =
-            TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default());
+        let resolver = TokioResolver::builder_with_config(
+            ResolverConfig::default(),
+            TokioConnectionProvider::default(),
+        )
+        .build();
 
         let lookup = resolver
             .lookup_ip(host)

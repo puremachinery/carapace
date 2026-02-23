@@ -6,8 +6,9 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use hickory_resolver::config::{ResolverConfig, ResolverOpts};
-use hickory_resolver::TokioAsyncResolver;
+use hickory_resolver::config::ResolverConfig;
+use hickory_resolver::name_server::TokioConnectionProvider;
+use hickory_resolver::TokioResolver;
 
 use super::super::*;
 use super::config::{map_validation_issues, read_config_snapshot, write_config_file};
@@ -280,8 +281,11 @@ fn validate_and_resolve_dns(url: &url::Url) -> Result<(String, u16, Option<IpAdd
         // Host is a hostname -- resolve DNS and validate every returned IP.
         let host_for_lookup = host.clone();
         let ip = run_sync_blocking_send(async move {
-            let resolver =
-                TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default());
+            let resolver = TokioResolver::builder_with_config(
+                ResolverConfig::default(),
+                TokioConnectionProvider::default(),
+            )
+            .build();
 
             let lookup = resolver.lookup_ip(&host_for_lookup).await.map_err(|e| {
                 SkillDnsError::Unavailable(format!(
