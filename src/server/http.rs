@@ -1031,12 +1031,7 @@ async fn dispatch_agent_run(
             provider,
             cancel_token,
         );
-        debug!(
-            "Agent job dispatched: channel='{}', runId='{}', message_len={}",
-            validated.channel,
-            run_id,
-            validated.message.len()
-        );
+        debug!("Agent job dispatched: runId='{}'", run_id);
     } else {
         debug!("Agent job queued (no LLM provider): runId='{}'", run_id);
     }
@@ -1099,12 +1094,7 @@ async fn hooks_agent_handler(
     let ws = match &state.ws_state {
         Some(ws) => ws.clone(),
         None => {
-            debug!(
-                "Agent job accepted (no runtime): channel='{}', runId='{}', message_len={}",
-                validated.channel,
-                run_id,
-                validated.message.len()
-            );
+            debug!("Agent job accepted (no runtime): runId='{}'", run_id);
             return (StatusCode::ACCEPTED, Json(AgentResponse::success(run_id))).into_response();
         }
     };
