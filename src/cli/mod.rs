@@ -2078,7 +2078,7 @@ fn validate_provider_credentials_interactive(
     provider: &str,
     api_key: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let validate_now = prompt_yes_no("Validate provider credentials now? Recommended.", true)?;
+    let validate_now = prompt_yes_no("Validate provider credentials now?", true)?;
     if !validate_now {
         return Ok(());
     }
@@ -2108,10 +2108,7 @@ fn validate_channel_credentials_interactive(
     channel: &str,
     token: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let validate_now = prompt_yes_no(
-        &format!("Validate {channel} credentials now? Recommended."),
-        true,
-    )?;
+    let validate_now = prompt_yes_no(&format!("Validate {channel} credentials now?"), true)?;
     if !validate_now {
         return Ok(());
     }
@@ -2807,8 +2804,7 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
     if interactive {
         println!("Carapace setup wizard");
         println!("---------------------");
-        let hide_sensitive_input =
-            prompt_yes_no("Hide sensitive input while typing? Recommended.", true)?;
+        let hide_sensitive_input = prompt_yes_no("Hide sensitive input while typing?", true)?;
 
         let default_provider = if std::env::var("ANTHROPIC_API_KEY").is_ok() {
             "anthropic"
