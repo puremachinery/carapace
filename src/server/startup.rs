@@ -8,6 +8,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use axum::routing::get;
 use axum::Router;
 use serde_json::Value;
@@ -24,6 +25,34 @@ use crate::plugins::PluginRegistry;
 use crate::server::http::{HttpConfig, MiddlewareConfig};
 use crate::server::ws::WsServerState;
 use crate::sessions;
+use crate::tasks::{DurableTask, TaskExecutionOutcome, TaskExecutor};
+
+struct RuntimeTaskExecutor {
+    state: Arc<WsServerState>,
+}
+
+#[async_trait]
+impl TaskExecutor for RuntimeTaskExecutor {
+    async fn execute(&self, task: DurableTask) -> TaskExecutionOutcome {
+        let payload = match serde_json::from_value::<crate::cron::CronPayload>(task.payload.clone())
+        {
+            Ok(payload) => payload,
+            Err(err) => {
+                return TaskExecutionOutcome::Failed {
+                    error: format!("invalid task payload: {err}"),
+                };
+            }
+        };
+
+        match crate::cron::executor::execute_payload(&task.id, &payload, &self.state).await {
+            Ok(_) => TaskExecutionOutcome::Done,
+            Err(err) if err.contains("no LLM provider configured") => {
+                TaskExecutionOutcome::Blocked { reason: err }
+            }
+            Err(err) => TaskExecutionOutcome::Failed { error: err },
+        }
+    }
+}
 
 /// Everything needed to start a non-TLS Carapace server.
 pub struct ServerConfig {
@@ -268,6 +297,17 @@ pub fn spawn_background_tasks(
     raw_config: &Value,
     shutdown_rx: &watch::Receiver<bool>,
 ) {
+    // Durable task worker loop
+    let task_executor = Arc::new(RuntimeTaskExecutor {
+        state: ws_state.clone(),
+    });
+    tokio::spawn(crate::tasks::task_worker_loop(
+        ws_state.task_queue().clone(),
+        task_executor,
+        Duration::from_secs(1),
+        shutdown_rx.clone(),
+    ));
+
     // Delivery loop
     if let Some(plugin_reg) = ws_state.plugin_registry().cloned() {
         let pipeline = ws_state.message_pipeline().clone();
