@@ -23,6 +23,7 @@ mod runtime_bridge;
 mod server;
 mod sessions;
 mod tailscale;
+mod tasks;
 mod tls;
 mod usage;
 

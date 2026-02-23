@@ -25,7 +25,7 @@ use uuid::Uuid;
 
 use crate::{
     agent, auth, channels, config, credentials, cron, devices, exec, messages, nodes, plugins,
-    sessions,
+    sessions, tasks,
 };
 
 #[cfg(test)]
@@ -458,6 +458,8 @@ pub struct WsServerState {
     exec_manager: exec::ExecApprovalManager,
     /// Cron job scheduler
     pub cron_scheduler: cron::CronScheduler,
+    /// Durable task queue for long-running autonomy workflows.
+    pub task_queue: Arc<tasks::TaskQueue>,
     /// Agent run registry for tracking active/completed agent invocations
     pub agent_run_registry: Mutex<handlers::AgentRunRegistry>,
     /// System event history (enqueued via system-event method)
@@ -530,6 +532,7 @@ impl WsServerState {
             }),
             exec_manager: exec::ExecApprovalManager::new(),
             cron_scheduler: cron::CronScheduler::in_memory(),
+            task_queue: Arc::new(tasks::TaskQueue::in_memory()),
             agent_run_registry: Mutex::new(handlers::AgentRunRegistry::new()),
             system_event_history: Mutex::new(Vec::new()),
             llm_provider: parking_lot::RwLock::new(None),
@@ -584,6 +587,13 @@ impl WsServerState {
                     cron::CronScheduler::new(true, Some(state_dir.join("cron").join("jobs.json")));
                 scheduler.load();
                 scheduler
+            },
+            task_queue: {
+                let queue = Arc::new(tasks::TaskQueue::new(Some(
+                    state_dir.join("tasks").join("queue.json"),
+                )));
+                queue.load();
+                queue
             },
             agent_run_registry: Mutex::new(handlers::AgentRunRegistry::new()),
             system_event_history: Mutex::new(Vec::new()),
@@ -689,6 +699,11 @@ impl WsServerState {
     /// Get the outbound message pipeline.
     pub fn message_pipeline(&self) -> &Arc<messages::outbound::MessagePipeline> {
         &self.message_pipeline
+    }
+
+    /// Get the durable task queue.
+    pub fn task_queue(&self) -> &Arc<tasks::TaskQueue> {
+        &self.task_queue
     }
 
     /// Get the channel registry.

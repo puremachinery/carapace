@@ -98,6 +98,7 @@ pub async fn prepare_runtime_environment() -> Result<std::path::PathBuf, Box<dyn
     tokio::fs::create_dir_all(&state_dir).await?;
     tokio::fs::create_dir_all(state_dir.join("sessions")).await?;
     tokio::fs::create_dir_all(state_dir.join("cron")).await?;
+    tokio::fs::create_dir_all(state_dir.join("tasks")).await?;
     crate::logging::audit::AuditLog::init(state_dir.clone()).await;
     init_media_store_cleanup().await;
     Ok(state_dir)
