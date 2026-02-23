@@ -136,7 +136,6 @@ pub fn validate_wake_request(req: &WakeRequest) -> Result<ValidatedWakeRequest, 
 }
 
 /// Validated agent request
-#[derive(Debug)]
 pub struct ValidatedAgentRequest {
     pub message: String,
     pub name: String,
@@ -315,7 +314,7 @@ mod tests {
             mode: None,
         };
         let result = validate_wake_request(&req);
-        assert_eq!(result.unwrap_err(), "text required");
+        assert_eq!(result.err().as_deref(), Some("text required"));
     }
 
     #[test]
@@ -325,7 +324,7 @@ mod tests {
             mode: None,
         };
         let result = validate_wake_request(&req);
-        assert_eq!(result.unwrap_err(), "text required");
+        assert_eq!(result.err().as_deref(), Some("text required"));
     }
 
     #[test]
@@ -380,7 +379,7 @@ mod tests {
             venice_parameters: None,
         };
         let result = validate_agent_request(&req, &[]);
-        assert_eq!(result.unwrap_err(), "message required");
+        assert_eq!(result.err().as_deref(), Some("message required"));
     }
 
     #[test]
@@ -400,7 +399,7 @@ mod tests {
             venice_parameters: None,
         };
         let result = validate_agent_request(&req, &[]);
-        assert_eq!(result.unwrap_err(), "message required");
+        assert_eq!(result.err().as_deref(), Some("message required"));
     }
 
     #[test]
@@ -420,7 +419,7 @@ mod tests {
             venice_parameters: None,
         };
         let result = validate_agent_request(&req, &[]);
-        assert_eq!(result.unwrap_err(), "model required");
+        assert_eq!(result.err().as_deref(), Some("model required"));
     }
 
     #[test]
@@ -460,7 +459,10 @@ mod tests {
             venice_parameters: None,
         };
         let result = validate_agent_request(&req, &["telegram".to_string(), "discord".to_string()]);
-        assert!(result.unwrap_err().contains("channel must be"));
+        assert!(result
+            .err()
+            .map(|err| err.contains("channel must be"))
+            .unwrap_or(false));
     }
 
     #[test]
@@ -560,7 +562,10 @@ mod tests {
             venice_parameters: Some(serde_json::json!("not an object")),
         };
         let result = validate_agent_request(&req, &[]);
-        assert_eq!(result.unwrap_err(), "venice_parameters must be an object");
+        assert_eq!(
+            result.err().as_deref(),
+            Some("venice_parameters must be an object")
+        );
     }
 
     #[test]
