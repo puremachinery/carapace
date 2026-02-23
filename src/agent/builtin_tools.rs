@@ -1122,6 +1122,31 @@ mod tests {
     use super::*;
     use crate::plugins::tools::ToolInvokeContext;
     use serde_json::json;
+    use std::ffi::OsString;
+    use std::sync::{LazyLock, Mutex};
+
+    // Serializes env-var touching tests in this module.
+    static ENV_VAR_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    fn set_env_var_scoped(key: &'static str, value: &str) -> EnvVarGuard {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        EnvVarGuard { key, previous }
+    }
 
     // -- current_time tests --
 
@@ -1272,6 +1297,15 @@ mod tests {
 
     #[test]
     fn test_config_read_missing_key() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp_dir = tempfile::tempdir().expect("temp config dir");
+        let config_path = temp_dir.path().join("carapace-test-config.json5");
+        std::fs::write(&config_path, "{}").expect("write isolated config");
+        let _config_path_guard =
+            set_env_var_scoped("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
+        let _disable_cache_guard = set_env_var_scoped("CARAPACE_DISABLE_CONFIG_CACHE", "1");
+        crate::config::clear_cache();
+
         let tool = config_read_tool();
         let ctx = ToolInvokeContext::default();
         let result = (tool.handler)(json!({"key": "nonexistent.deeply.nested"}), &ctx);
@@ -1281,6 +1315,8 @@ mod tests {
             }
             _ => panic!("expected success with null value"),
         }
+
+        crate::config::clear_cache();
     }
 
     #[test]
