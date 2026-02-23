@@ -913,7 +913,7 @@ fn parse_agent_request(
             thinking: None,
             deliver: None,
             wake_mode: None,
-            session_key: None,
+            session_scope: None,
             timeout_seconds: None,
             allow_unsafe_external_content: None,
             venice_parameters: None,
@@ -967,7 +967,7 @@ async fn dispatch_agent_run(
         channel,
         sender_id,
         peer_id,
-        validated.session_key.as_deref(),
+        validated.session_scope.as_deref(),
         metadata,
     )
     .map_err(|e| {
@@ -1343,7 +1343,7 @@ async fn hook_result_to_response(
                 // Keep mapped session scoping out of AgentRequest to avoid
                 // treating it as a sensitive field flow in CodeQL's
                 // cleartext-logging heuristic.
-                session_key: None,
+                session_scope: None,
                 timeout_seconds: timeout_seconds.map(|s| s as f64),
                 allow_unsafe_external_content: Some(allow_unsafe_external_content),
                 venice_parameters: None,
@@ -1355,7 +1355,7 @@ async fn hook_result_to_response(
                         .into_response();
                 }
             };
-            validated.session_key = Some(session_scope);
+            validated.session_scope = Some(session_scope);
 
             let ws = match &state.ws_state {
                 Some(ws) => ws.clone(),
@@ -2410,7 +2410,7 @@ mod tests {
             .with_path("agent-map")
             .with_action(HookAction::Agent)
             .with_message_template("Mapped {{message}}");
-        mapping.session_key = Some("hook:mapped".to_string());
+        mapping.session_scope = Some("hook:mapped".to_string());
         hook_registry.register(mapping);
 
         let router = test_router_with_hook_registry(test_config(), hook_registry, ws_state.clone());

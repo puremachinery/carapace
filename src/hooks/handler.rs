@@ -74,7 +74,13 @@ pub struct AgentRequest {
     pub thinking: Option<String>,
     pub deliver: Option<bool>,
     pub wake_mode: Option<String>,
-    pub session_key: Option<String>,
+    #[serde(
+        rename = "sessionKey",
+        alias = "session_scope",
+        alias = "sessionScope",
+        alias = "session_key"
+    )]
+    pub session_scope: Option<String>,
     pub timeout_seconds: Option<f64>,
     pub allow_unsafe_external_content: Option<bool>,
     pub venice_parameters: Option<serde_json::Value>,
@@ -145,7 +151,7 @@ pub struct ValidatedAgentRequest {
     pub thinking: Option<String>,
     pub deliver: bool,
     pub wake_mode: WakeMode,
-    pub session_key: Option<String>,
+    pub session_scope: Option<String>,
     pub timeout_seconds: Option<u32>,
     pub allow_unsafe_external_content: bool,
     pub venice_parameters: Option<serde_json::Value>,
@@ -208,7 +214,7 @@ pub fn validate_agent_request(
         ));
     }
 
-    let session_key = req.session_key.clone();
+    let session_scope = req.session_scope.clone();
 
     // Parse timeout_seconds (floor to integer, ignore invalid values)
     let timeout_seconds = req.timeout_seconds.and_then(|t| {
@@ -233,7 +239,7 @@ pub fn validate_agent_request(
             .as_ref()
             .map(|s| WakeMode::from_str_lenient(s))
             .unwrap_or(WakeMode::Now),
-        session_key,
+        session_scope,
         timeout_seconds,
         allow_unsafe_external_content: req.allow_unsafe_external_content.unwrap_or(false),
         venice_parameters: match &req.venice_parameters {
@@ -348,7 +354,7 @@ mod tests {
             thinking: None,
             deliver: None,
             wake_mode: None,
-            session_key: None,
+            session_scope: None,
             timeout_seconds: None,
             allow_unsafe_external_content: None,
             venice_parameters: None,
@@ -359,7 +365,7 @@ mod tests {
         assert_eq!(result.channel, "last");
         assert!(result.deliver);
         assert_eq!(result.wake_mode, WakeMode::Now);
-        assert!(result.session_key.is_none());
+        assert!(result.session_scope.is_none());
     }
 
     #[test]
@@ -373,7 +379,7 @@ mod tests {
             thinking: None,
             deliver: None,
             wake_mode: None,
-            session_key: None,
+            session_scope: None,
             timeout_seconds: None,
             allow_unsafe_external_content: None,
             venice_parameters: None,
@@ -393,7 +399,7 @@ mod tests {
             thinking: None,
             deliver: None,
             wake_mode: None,
-            session_key: None,
+            session_scope: None,
             timeout_seconds: None,
             allow_unsafe_external_content: None,
             venice_parameters: None,
@@ -413,7 +419,7 @@ mod tests {
             thinking: None,
             deliver: None,
             wake_mode: None,
-            session_key: None,
+            session_scope: None,
             timeout_seconds: None,
             allow_unsafe_external_content: None,
             venice_parameters: None,
@@ -433,7 +439,7 @@ mod tests {
             thinking: None,
             deliver: None,
             wake_mode: None,
-            session_key: None,
+            session_scope: None,
             timeout_seconds: None,
             allow_unsafe_external_content: None,
             venice_parameters: None,
@@ -453,7 +459,7 @@ mod tests {
             thinking: None,
             deliver: None,
             wake_mode: None,
-            session_key: None,
+            session_scope: None,
             timeout_seconds: None,
             allow_unsafe_external_content: None,
             venice_parameters: None,
@@ -476,7 +482,7 @@ mod tests {
             thinking: None,
             deliver: None,
             wake_mode: None,
-            session_key: None,
+            session_scope: None,
             timeout_seconds: Some(60.7),
             allow_unsafe_external_content: None,
             venice_parameters: None,
@@ -496,7 +502,7 @@ mod tests {
             thinking: None,
             deliver: None,
             wake_mode: None,
-            session_key: None,
+            session_scope: None,
             timeout_seconds: Some(-1.0),
             allow_unsafe_external_content: None,
             venice_parameters: None,
@@ -506,7 +512,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_agent_request_custom_session_key() {
+    fn test_validate_agent_request_custom_session_scope() {
         let req = AgentRequest {
             message: Some("test".to_string()),
             name: None,
@@ -516,13 +522,13 @@ mod tests {
             thinking: None,
             deliver: None,
             wake_mode: None,
-            session_key: Some("my-custom-session".to_string()),
+            session_scope: Some("my-custom-session".to_string()),
             timeout_seconds: None,
             allow_unsafe_external_content: None,
             venice_parameters: None,
         };
         let result = validate_agent_request(&req, &[]).unwrap();
-        assert_eq!(result.session_key.as_deref(), Some("my-custom-session"));
+        assert_eq!(result.session_scope.as_deref(), Some("my-custom-session"));
     }
 
     #[test]
@@ -536,7 +542,7 @@ mod tests {
             thinking: None,
             deliver: Some(false),
             wake_mode: None,
-            session_key: None,
+            session_scope: None,
             timeout_seconds: None,
             allow_unsafe_external_content: None,
             venice_parameters: None,
@@ -556,7 +562,7 @@ mod tests {
             thinking: None,
             deliver: None,
             wake_mode: None,
-            session_key: None,
+            session_scope: None,
             timeout_seconds: None,
             allow_unsafe_external_content: None,
             venice_parameters: Some(serde_json::json!("not an object")),
@@ -579,7 +585,7 @@ mod tests {
             thinking: None,
             deliver: None,
             wake_mode: None,
-            session_key: None,
+            session_scope: None,
             timeout_seconds: None,
             allow_unsafe_external_content: None,
             venice_parameters: Some(serde_json::json!({"enable_web_search": "on"})),
@@ -589,6 +595,26 @@ mod tests {
             result.venice_parameters,
             Some(serde_json::json!({"enable_web_search": "on"}))
         );
+    }
+
+    #[test]
+    fn test_agent_request_deserializes_session_key_compat() {
+        let req: AgentRequest = serde_json::from_value(serde_json::json!({
+            "message": "hello",
+            "sessionKey": "hook:legacy"
+        }))
+        .unwrap();
+        assert_eq!(req.session_scope.as_deref(), Some("hook:legacy"));
+    }
+
+    #[test]
+    fn test_agent_request_deserializes_session_scope_alias() {
+        let req: AgentRequest = serde_json::from_value(serde_json::json!({
+            "message": "hello",
+            "sessionScope": "hook:new"
+        }))
+        .unwrap();
+        assert_eq!(req.session_scope.as_deref(), Some("hook:new"));
     }
 
     #[test]
