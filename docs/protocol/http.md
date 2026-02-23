@@ -34,7 +34,6 @@ Hooks require a **hooks token** (not service auth). Accepted forms:
 
 - `Authorization: Bearer ${CARAPACE_HOOKS_TOKEN}`
 - `X-Carapace-Token: ${CARAPACE_HOOKS_TOKEN}`
-- `?token=${CARAPACE_HOOKS_TOKEN}` (deprecated; logs a warning)
 
 ### Common behavior
 - Method: **POST** only
@@ -52,6 +51,12 @@ Error body format for JSON parse/validation errors:
 ```json
 { "ok": false, "error": "{message}" }
 ```
+
+### Production secret hygiene
+
+For production deployments, set `CARAPACE_SERVER_SECRET`.
+When this is unset, hooks sender-scoping key derivation falls back to a built-in
+constant intended for local/dev use, not long-lived production environments.
 
 #### POST `{basePath}/wake`
 Trigger a wake event.

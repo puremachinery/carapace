@@ -25,7 +25,18 @@ For deeper troubleshooting, use:
 - [Get Unstuck](get-unstuck.md)
 - [CLI guide](../cli.md)
 
-## 3) Backup and restore
+## 3) Production secret baseline
+
+Set a deployment-specific server secret in production:
+
+```bash
+export CARAPACE_SERVER_SECRET='<long-random-secret>'
+```
+
+This avoids hooks sender-scoping fallback behavior that is acceptable for local
+development but not ideal for long-lived production deployments.
+
+## 4) Backup and restore
 
 Create a backup before major config/channel changes:
 
@@ -39,7 +50,7 @@ Restore from backup:
 cara restore --path ./carapace-backup.tar.gz
 ```
 
-## 4) Update flow
+## 5) Update flow
 
 Check/update the local binary:
 
@@ -51,7 +62,7 @@ For pinned or reproducible installs, use the install guide:
 
 - [Install](install.md)
 
-## 5) First-response recovery checklist
+## 6) First-response recovery checklist
 
 1. Confirm service health and port/bind settings.
 2. Capture recent logs and isolate the first failing component (provider/channel/auth).
@@ -59,7 +70,7 @@ For pinned or reproducible installs, use the install guide:
 4. Restore from latest known-good backup if needed.
 5. Open an issue with logs + exact steps if still blocked.
 
-## 6) Next paths
+## 7) Next paths
 
 - [First Run](first-run.md)
 - [Cookbook](../cookbook/README.md)
