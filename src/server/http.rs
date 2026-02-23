@@ -2764,6 +2764,186 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_control_tasks_cancel_done_conflict() {
+        let (ws_state, _tmp) = make_test_ws_state();
+        let router = test_router_with_hook_registry(
+            test_config(),
+            Arc::new(HookRegistry::new()),
+            ws_state.clone(),
+        );
+
+        let create_req = Request::builder()
+            .method("POST")
+            .uri("/control/tasks")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"payload":{"kind":"systemEvent","text":"task done conflict"}}"#,
+            ))
+            .unwrap();
+        let create_response = router.clone().oneshot(create_req).await.unwrap();
+        assert_eq!(create_response.status(), StatusCode::CREATED);
+        let create_body = axum::body::to_bytes(create_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let create_json: Value = serde_json::from_slice(&create_body).unwrap();
+        let task_id = create_json["task"]["id"]
+            .as_str()
+            .expect("task id should be present")
+            .to_string();
+
+        let queue = ws_state.task_queue();
+        let _ = queue.claim_due(u64::MAX, 32);
+        assert!(queue.mark_done(&task_id, Some("run-test")));
+
+        let cancel_req = Request::builder()
+            .method("POST")
+            .uri(format!("/control/tasks/{task_id}/cancel"))
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::empty())
+            .unwrap();
+        let cancel_response = router.oneshot(cancel_req).await.unwrap();
+        assert_eq!(cancel_response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn test_control_tasks_retry_done_conflict() {
+        let (ws_state, _tmp) = make_test_ws_state();
+        let router = test_router_with_hook_registry(
+            test_config(),
+            Arc::new(HookRegistry::new()),
+            ws_state.clone(),
+        );
+
+        let create_req = Request::builder()
+            .method("POST")
+            .uri("/control/tasks")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"payload":{"kind":"systemEvent","text":"task retry conflict"}}"#,
+            ))
+            .unwrap();
+        let create_response = router.clone().oneshot(create_req).await.unwrap();
+        assert_eq!(create_response.status(), StatusCode::CREATED);
+        let create_body = axum::body::to_bytes(create_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let create_json: Value = serde_json::from_slice(&create_body).unwrap();
+        let task_id = create_json["task"]["id"]
+            .as_str()
+            .expect("task id should be present")
+            .to_string();
+
+        let queue = ws_state.task_queue();
+        let _ = queue.claim_due(u64::MAX, 32);
+        assert!(queue.mark_done(&task_id, Some("run-test")));
+
+        let retry_req = Request::builder()
+            .method("POST")
+            .uri(format!("/control/tasks/{task_id}/retry"))
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::empty())
+            .unwrap();
+        let retry_response = router.oneshot(retry_req).await.unwrap();
+        assert_eq!(retry_response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn test_control_tasks_rejects_overlong_reason() {
+        let (ws_state, _tmp) = make_test_ws_state();
+        let router = test_router_with_hook_registry(
+            test_config(),
+            Arc::new(HookRegistry::new()),
+            ws_state.clone(),
+        );
+
+        let create_req = Request::builder()
+            .method("POST")
+            .uri("/control/tasks")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"payload":{"kind":"systemEvent","text":"task long reason"}}"#,
+            ))
+            .unwrap();
+        let create_response = router.clone().oneshot(create_req).await.unwrap();
+        assert_eq!(create_response.status(), StatusCode::CREATED);
+        let create_body = axum::body::to_bytes(create_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let create_json: Value = serde_json::from_slice(&create_body).unwrap();
+        let task_id = create_json["task"]["id"]
+            .as_str()
+            .expect("task id should be present")
+            .to_string();
+
+        let long_reason = "a".repeat(1025);
+
+        let cancel_req = Request::builder()
+            .method("POST")
+            .uri(format!("/control/tasks/{task_id}/cancel"))
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({ "reason": long_reason })
+                    .to_string()
+                    .into_bytes(),
+            ))
+            .unwrap();
+        let cancel_response = router.clone().oneshot(cancel_req).await.unwrap();
+        assert_eq!(cancel_response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_control_tasks_retry_accepts_whitespace_body() {
+        let (ws_state, _tmp) = make_test_ws_state();
+        let router = test_router_with_hook_registry(
+            test_config(),
+            Arc::new(HookRegistry::new()),
+            ws_state.clone(),
+        );
+
+        let create_req = Request::builder()
+            .method("POST")
+            .uri("/control/tasks")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"payload":{"kind":"systemEvent","text":"task retry whitespace"}}"#,
+            ))
+            .unwrap();
+        let create_response = router.clone().oneshot(create_req).await.unwrap();
+        assert_eq!(create_response.status(), StatusCode::CREATED);
+        let create_body = axum::body::to_bytes(create_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let create_json: Value = serde_json::from_slice(&create_body).unwrap();
+        let task_id = create_json["task"]["id"]
+            .as_str()
+            .expect("task id should be present")
+            .to_string();
+
+        let retry_req = Request::builder()
+            .method("POST")
+            .uri(format!("/control/tasks/{task_id}/retry"))
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(" \n\t "))
+            .unwrap();
+        let retry_response = router.oneshot(retry_req).await.unwrap();
+        assert_eq!(retry_response.status(), StatusCode::OK);
+        let retry_body = axum::body::to_bytes(retry_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let retry_json: Value = serde_json::from_slice(&retry_body).unwrap();
+        assert_eq!(retry_json["task"]["state"], "retry_wait");
+        assert_eq!(retry_json["task"]["lastError"], "retried by operator");
+    }
+
+    #[tokio::test]
     async fn test_control_tasks_queue_unavailable_without_runtime() {
         let router = test_router(test_config());
 

@@ -38,6 +38,15 @@ pub enum TaskState {
     Cancelled,
 }
 
+impl TaskState {
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            TaskState::Done | TaskState::Failed | TaskState::Cancelled
+        )
+    }
+}
+
 /// A single persisted task record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -186,6 +195,26 @@ impl TaskQueue {
         tasks
     }
 
+    /// List tasks with optional state filtering and limit, newest-first.
+    pub fn list_filtered(
+        &self,
+        state_filter: Option<TaskState>,
+        limit: Option<usize>,
+    ) -> (usize, Vec<DurableTask>) {
+        let tasks = self.tasks.read();
+        let mut matched: Vec<&DurableTask> = tasks
+            .iter()
+            .filter(|task| state_filter.is_none_or(|state| task.state == state))
+            .collect();
+        matched.sort_by_key(|task| std::cmp::Reverse(task.updated_at_ms));
+        let total = matched.len();
+        if let Some(limit) = limit {
+            matched.truncate(limit);
+        }
+        let listed = matched.into_iter().cloned().collect();
+        (total, listed)
+    }
+
     /// Claim due tasks and move them to `running`.
     ///
     /// Claimed tasks increment `attempts`.
@@ -221,48 +250,65 @@ impl TaskQueue {
 
     /// Mark a task as done.
     pub fn mark_done(&self, id: &str, run_id: Option<&str>) -> bool {
-        self.update_task(id, |task, now| {
-            task.state = TaskState::Done;
-            task.last_error = None;
-            task.next_run_at_ms = None;
-            task.updated_at_ms = now;
-            if let Some(run_id) = run_id {
-                let run_id = run_id.trim();
-                if !run_id.is_empty() && !task.run_ids.iter().any(|existing| existing == run_id) {
-                    task.run_ids.push(run_id.to_string());
+        self.update_task_if(
+            id,
+            |task| task.state == TaskState::Running,
+            |task, now| {
+                task.state = TaskState::Done;
+                task.last_error = None;
+                task.next_run_at_ms = None;
+                task.updated_at_ms = now;
+                if let Some(run_id) = run_id {
+                    let run_id = run_id.trim();
+                    if !run_id.is_empty() && !task.run_ids.iter().any(|existing| existing == run_id)
+                    {
+                        task.run_ids.push(run_id.to_string());
+                    }
                 }
-            }
-        })
+            },
+        )
     }
 
     /// Mark a task as failed.
     pub fn mark_failed(&self, id: &str, error: &str) -> bool {
-        self.update_task(id, |task, now| {
-            task.state = TaskState::Failed;
-            task.last_error = Some(error.to_string());
-            task.next_run_at_ms = None;
-            task.updated_at_ms = now;
-        })
+        self.update_task_if(
+            id,
+            |task| task.state == TaskState::Running,
+            |task, now| {
+                task.state = TaskState::Failed;
+                task.last_error = Some(error.to_string());
+                task.next_run_at_ms = None;
+                task.updated_at_ms = now;
+            },
+        )
     }
 
     /// Mark a task as blocked.
     pub fn mark_blocked(&self, id: &str, reason: &str) -> bool {
-        self.update_task(id, |task, now| {
-            task.state = TaskState::Blocked;
-            task.last_error = Some(reason.to_string());
-            task.next_run_at_ms = None;
-            task.updated_at_ms = now;
-        })
+        self.update_task_if(
+            id,
+            |task| task.state == TaskState::Running,
+            |task, now| {
+                task.state = TaskState::Blocked;
+                task.last_error = Some(reason.to_string());
+                task.next_run_at_ms = None;
+                task.updated_at_ms = now;
+            },
+        )
     }
 
     /// Mark a task as cancelled.
     pub fn mark_cancelled(&self, id: &str, reason: Option<&str>) -> bool {
-        self.update_task(id, |task, now| {
-            task.state = TaskState::Cancelled;
-            task.last_error = reason.map(ToString::to_string);
-            task.next_run_at_ms = None;
-            task.updated_at_ms = now;
-        })
+        self.update_task_if(
+            id,
+            |task| !task.state.is_terminal(),
+            |task, now| {
+                task.state = TaskState::Cancelled;
+                task.last_error = reason.map(ToString::to_string);
+                task.next_run_at_ms = None;
+                task.updated_at_ms = now;
+            },
+        )
     }
 
     /// Mark a task for retry at `now + delay_ms`.
@@ -296,13 +342,26 @@ impl TaskQueue {
         stats
     }
 
-    fn update_task(&self, id: &str, mut apply: impl FnMut(&mut DurableTask, u64)) -> bool {
+    fn update_task(&self, id: &str, apply: impl FnMut(&mut DurableTask, u64)) -> bool {
+        self.update_task_if(id, |_| true, apply)
+    }
+
+    fn update_task_if(
+        &self,
+        id: &str,
+        mut predicate: impl FnMut(&DurableTask) -> bool,
+        mut apply: impl FnMut(&mut DurableTask, u64),
+    ) -> bool {
         let now = now_ms();
         let updated = {
             let mut tasks = self.tasks.write();
             if let Some(task) = tasks.iter_mut().find(|t| t.id == id) {
-                apply(task, now);
-                true
+                if predicate(task) {
+                    apply(task, now);
+                    true
+                } else {
+                    false
+                }
             } else {
                 false
             }
@@ -460,20 +519,46 @@ mod tests {
     }
 
     #[test]
-    fn test_mark_done_records_run_id_and_dedupes() {
+    fn test_mark_done_requires_running_and_records_run_id() {
         let queue = TaskQueue::in_memory();
         let task = queue.enqueue(serde_json::json!({"kind":"demo"}), None);
+        let _ = queue.claim_due(now_ms(), 1);
 
         assert!(queue.mark_done(&task.id, Some("run-1")));
-        assert!(queue.mark_done(&task.id, Some("run-1")));
-        assert!(queue.mark_done(&task.id, Some("run-2")));
+        assert!(!queue.mark_done(&task.id, Some("run-1")));
+        assert!(!queue.mark_done(&task.id, Some("run-2")));
 
         let updated = queue.get(&task.id).expect("task should exist");
         assert_eq!(updated.state, TaskState::Done);
-        assert_eq!(
-            updated.run_ids,
-            vec!["run-1".to_string(), "run-2".to_string()]
-        );
+        assert_eq!(updated.run_ids, vec!["run-1".to_string()]);
+    }
+
+    #[test]
+    fn test_mark_cancelled_rejects_terminal_state() {
+        let queue = TaskQueue::in_memory();
+        let task = queue.enqueue(serde_json::json!({"kind":"demo"}), None);
+        let _ = queue.claim_due(now_ms(), 1);
+        assert!(queue.mark_done(&task.id, Some("run-1")));
+        assert!(!queue.mark_cancelled(&task.id, Some("too late")));
+    }
+
+    #[test]
+    fn test_list_filtered_applies_state_and_limit() {
+        let queue = TaskQueue::in_memory();
+        let done = queue.enqueue(serde_json::json!({"kind":"done"}), None);
+        let queued = queue.enqueue(serde_json::json!({"kind":"queued"}), None);
+        let _ = queue.claim_due(now_ms(), 1);
+        assert!(queue.mark_done(&done.id, Some("run-1")));
+
+        let (total_done, done_only) = queue.list_filtered(Some(TaskState::Done), Some(10));
+        assert_eq!(total_done, 1);
+        assert_eq!(done_only.len(), 1);
+        assert_eq!(done_only[0].id, done.id);
+
+        let (total_all, limited) = queue.list_filtered(None, Some(1));
+        assert_eq!(total_all, 2);
+        assert_eq!(limited.len(), 1);
+        assert!(limited[0].id == done.id || limited[0].id == queued.id);
     }
 
     #[test]

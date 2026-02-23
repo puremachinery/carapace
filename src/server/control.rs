@@ -232,6 +232,8 @@ pub struct TaskRetryRequest {
     pub reason: Option<String>,
 }
 
+const MAX_TASK_REASON_LEN: usize = 1024;
+
 /// Single-task response.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -580,14 +582,7 @@ pub async fn tasks_list_handler(
         None
     };
 
-    let mut tasks = queue.list();
-    if let Some(state_filter) = filter_state {
-        tasks.retain(|task| task.state == state_filter);
-    }
-    let total = tasks.len();
-    if let Some(limit) = query.limit {
-        tasks.truncate(limit);
-    }
+    let (total, tasks) = queue.list_filtered(filter_state, query.limit);
 
     (
         StatusCode::OK,
@@ -646,20 +641,37 @@ pub async fn tasks_cancel_handler(
             return (StatusCode::BAD_REQUEST, Json(ControlError::new(msg))).into_response();
         }
     };
-    let reason = req
-        .reason
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
+    let task_id = task_id.trim();
+    let reason = match parse_optional_reason(req.reason) {
+        Ok(reason) => reason,
+        Err(msg) => {
+            return (StatusCode::BAD_REQUEST, Json(ControlError::new(msg))).into_response();
+        }
+    };
 
-    if !queue.mark_cancelled(task_id.trim(), reason) {
+    let Some(task) = queue.get(task_id) else {
         return (
             StatusCode::NOT_FOUND,
             Json(ControlError::new("Task not found")),
         )
             .into_response();
+    };
+    if task.state.is_terminal() {
+        return (
+            StatusCode::CONFLICT,
+            Json(ControlError::new("Task is already in a terminal state")),
+        )
+            .into_response();
     }
-    match queue.get(task_id.trim()) {
+
+    if !queue.mark_cancelled(task_id, reason.as_deref()) {
+        return (
+            StatusCode::CONFLICT,
+            Json(ControlError::new("Task state changed; cancel rejected")),
+        )
+            .into_response();
+    }
+    match queue.get(task_id) {
         Some(task) => (StatusCode::OK, Json(TaskResponse::success(task))).into_response(),
         None => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -690,22 +702,40 @@ pub async fn tasks_retry_handler(
             return (StatusCode::BAD_REQUEST, Json(ControlError::new(msg))).into_response();
         }
     };
-    let reason = req
-        .reason
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("retried by operator");
+    let task_id = task_id.trim();
+    let reason = match parse_optional_reason(req.reason) {
+        Ok(reason) => reason.unwrap_or_else(|| "retried by operator".to_string()),
+        Err(msg) => {
+            return (StatusCode::BAD_REQUEST, Json(ControlError::new(msg))).into_response();
+        }
+    };
     let delay_ms = req.delay_ms.unwrap_or(0);
 
-    if !queue.mark_retry_wait(task_id.trim(), delay_ms, reason) {
+    let Some(task) = queue.get(task_id) else {
         return (
             StatusCode::NOT_FOUND,
             Json(ControlError::new("Task not found")),
         )
             .into_response();
+    };
+    if matches!(task.state, TaskState::Running | TaskState::Done) {
+        return (
+            StatusCode::CONFLICT,
+            Json(ControlError::new(
+                "Task is not retryable in its current state",
+            )),
+        )
+            .into_response();
     }
-    match queue.get(task_id.trim()) {
+
+    if !queue.mark_retry_wait(task_id, delay_ms, &reason) {
+        return (
+            StatusCode::CONFLICT,
+            Json(ControlError::new("Task state changed; retry rejected")),
+        )
+            .into_response();
+    }
+    match queue.get(task_id) {
         Some(task) => (StatusCode::OK, Json(TaskResponse::success(task))).into_response(),
         None => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -768,10 +798,24 @@ fn parse_optional_json<T>(body: &axum::body::Bytes) -> Result<T, String>
 where
     T: DeserializeOwned + Default,
 {
-    if body.is_empty() {
+    if body.is_empty() || body.iter().all(|byte| byte.is_ascii_whitespace()) {
         return Ok(T::default());
     }
     serde_json::from_slice(body).map_err(|e| format!("Invalid JSON: {}", e))
+}
+
+fn parse_optional_reason(reason: Option<String>) -> Result<Option<String>, String> {
+    let reason = reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    if let Some(value) = &reason {
+        if value.chars().count() > MAX_TASK_REASON_LEN {
+            return Err(format!("reason exceeds {} characters", MAX_TASK_REASON_LEN));
+        }
+    }
+    Ok(reason)
 }
 
 /// Check control endpoint authentication
@@ -957,5 +1001,20 @@ mod tests {
         );
         assert_eq!(root["channels"]["telegram"]["enabled"], true);
         assert_eq!(root["channels"]["telegram"]["token"], "abc");
+    }
+
+    #[test]
+    fn test_parse_optional_json_whitespace_body_defaults() {
+        let body = axum::body::Bytes::from_static(b" \n\t ");
+        let parsed: TaskCancelRequest =
+            parse_optional_json(&body).expect("should parse as default");
+        assert!(parsed.reason.is_none());
+    }
+
+    #[test]
+    fn test_parse_optional_reason_enforces_max_length() {
+        let long_reason = "a".repeat(MAX_TASK_REASON_LEN + 1);
+        let err = parse_optional_reason(Some(long_reason)).expect_err("expected bound error");
+        assert!(err.contains("reason exceeds"));
     }
 }
