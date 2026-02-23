@@ -497,7 +497,7 @@ mod tests {
 
     #[test]
     fn test_perform_reload_with_no_config_file() {
-        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let _lock = ENV_VAR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp_dir = tempfile::TempDir::new().unwrap();
         let missing_config_path = temp_dir.path().join("missing-carapace.json5");
         let _config_path_guard = EnvVarGuard::set(
@@ -601,7 +601,7 @@ mod tests {
     #[tokio::test]
     async fn test_reload_validation_with_temp_config() {
         use std::io::Write;
-        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let _lock = ENV_VAR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::TempDir::new().unwrap();
         let config_path = dir.path().join("carapace.json5");
 
@@ -621,7 +621,7 @@ mod tests {
     #[tokio::test]
     async fn test_reload_invalid_config_fails() {
         use std::io::Write;
-        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let _lock = ENV_VAR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::TempDir::new().unwrap();
         let config_path = dir.path().join("carapace.json5");
 
