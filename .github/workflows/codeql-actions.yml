@@ -7,8 +7,6 @@ on:
       - ".github/workflows/**"
   pull_request:
     branches: [main, master]
-    paths:
-      - ".github/workflows/**"
   schedule:
     - cron: "10 6 * * 1"
 
