@@ -3,8 +3,9 @@
 use std::net::IpAddr;
 use std::time::Duration;
 
-use hickory_resolver::config::{ResolverConfig, ResolverOpts};
-use hickory_resolver::TokioAsyncResolver;
+use hickory_resolver::config::ResolverConfig;
+use hickory_resolver::name_server::TokioConnectionProvider;
+use hickory_resolver::TokioResolver;
 
 use crate::media::fetch::{DEFAULT_FETCH_TIMEOUT_MS, MAX_FETCH_TIMEOUT_MS, MAX_URL_LENGTH};
 use crate::plugins::capabilities::{SsrfConfig, SsrfProtection};
@@ -122,8 +123,11 @@ fn resolve_and_validate_dns(
     let host = host.to_string();
     let ssrf_config = ssrf_config.clone();
     let fut = async move {
-        let resolver =
-            TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default());
+        let resolver = TokioResolver::builder_with_config(
+            ResolverConfig::default(),
+            TokioConnectionProvider::default(),
+        )
+        .build();
         let lookup = resolver.lookup_ip(&host).await.map_err(|e| {
             ResolveDnsError::Retryable(format!("DNS resolution failed: {host}: {e}"))
         })?;
