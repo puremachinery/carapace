@@ -12,6 +12,7 @@
 //! - `setup` -- interactive first-run configuration wizard
 //! - `pair` -- pair with a remote gateway node
 //! - `update` -- check for updates or self-update
+//! - `task` -- manage long-running objective tasks
 
 pub mod backup_crypto;
 pub mod chat;
@@ -165,6 +166,10 @@ pub enum Command {
         version: Option<String>,
     },
 
+    /// Manage long-running objective tasks.
+    #[command(subcommand)]
+    Task(TaskCommand),
+
     /// Start an interactive chat session.
     Chat {
         /// Start a new session instead of resuming.
@@ -246,6 +251,97 @@ pub enum TlsCommand {
         /// Directory containing the cluster CA files.
         #[arg(long)]
         ca_dir: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum TaskCommand {
+    /// Create a durable objective task.
+    Create {
+        /// Task payload as JSON (CronPayload shape).
+        #[arg(long)]
+        payload: String,
+
+        /// Optional Unix-ms time when the task becomes runnable.
+        #[arg(long = "next-run-at-ms")]
+        next_run_at_ms: Option<u64>,
+
+        /// Port of the running instance (default: from config or 18789).
+        #[arg(short, long)]
+        port: Option<u16>,
+
+        /// Host of the running instance.
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+    },
+    /// List durable objective tasks.
+    List {
+        /// Optional task state filter.
+        #[arg(long)]
+        state: Option<String>,
+
+        /// Optional max number of tasks to return.
+        #[arg(long)]
+        limit: Option<usize>,
+
+        /// Port of the running instance (default: from config or 18789).
+        #[arg(short, long)]
+        port: Option<u16>,
+
+        /// Host of the running instance.
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+    },
+    /// Get a single durable objective task by ID.
+    Get {
+        /// Task ID.
+        id: String,
+
+        /// Port of the running instance (default: from config or 18789).
+        #[arg(short, long)]
+        port: Option<u16>,
+
+        /// Host of the running instance.
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+    },
+    /// Cancel a durable objective task.
+    Cancel {
+        /// Task ID.
+        id: String,
+
+        /// Optional cancellation reason.
+        #[arg(long)]
+        reason: Option<String>,
+
+        /// Port of the running instance (default: from config or 18789).
+        #[arg(short, long)]
+        port: Option<u16>,
+
+        /// Host of the running instance.
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+    },
+    /// Retry a durable objective task.
+    Retry {
+        /// Task ID.
+        id: String,
+
+        /// Retry delay in milliseconds (default: immediate).
+        #[arg(long = "delay-ms")]
+        delay_ms: Option<u64>,
+
+        /// Optional retry reason.
+        #[arg(long)]
+        reason: Option<String>,
+
+        /// Port of the running instance (default: from config or 18789).
+        #[arg(short, long)]
+        port: Option<u16>,
+
+        /// Host of the running instance.
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
     },
 }
 
@@ -442,6 +538,262 @@ pub async fn handle_status(
         }
     }
 
+    Ok(())
+}
+
+/// Run the `task` subcommand family -- manage durable objective tasks.
+pub async fn handle_task(command: TaskCommand) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        TaskCommand::Create {
+            payload,
+            next_run_at_ms,
+            port,
+            host,
+        } => handle_task_create(&host, port, payload, next_run_at_ms).await,
+        TaskCommand::List {
+            state,
+            limit,
+            port,
+            host,
+        } => handle_task_list(&host, port, state, limit).await,
+        TaskCommand::Get { id, port, host } => handle_task_get(&host, port, &id).await,
+        TaskCommand::Cancel {
+            id,
+            reason,
+            port,
+            host,
+        } => handle_task_cancel(&host, port, &id, reason).await,
+        TaskCommand::Retry {
+            id,
+            delay_ms,
+            reason,
+            port,
+            host,
+        } => handle_task_retry(&host, port, &id, delay_ms, reason).await,
+    }
+}
+
+async fn handle_task_create(
+    host: &str,
+    port: Option<u16>,
+    payload: String,
+    next_run_at_ms: Option<u64>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let parsed_payload: Value = serde_json::from_str(&payload)
+        .map_err(|e| format!("invalid --payload JSON (expected CronPayload object): {e}"))?;
+    let body = serde_json::json!({
+        "payload": parsed_payload,
+        "nextRunAtMs": next_run_at_ms,
+    });
+
+    let response = send_control_request(
+        host,
+        resolve_port(port),
+        reqwest::Method::POST,
+        "/control/tasks",
+        &[],
+        Some(body),
+    )
+    .await?;
+    print_pretty_json(&response)
+}
+
+async fn handle_task_list(
+    host: &str,
+    port: Option<u16>,
+    state: Option<String>,
+    limit: Option<usize>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut query: Vec<(&str, String)> = Vec::new();
+    if let Some(state) = state {
+        let normalized = state.trim();
+        if !normalized.is_empty() {
+            query.push(("state", normalized.to_string()));
+        }
+    }
+    if let Some(limit) = limit {
+        query.push(("limit", limit.to_string()));
+    }
+
+    let response = send_control_request(
+        host,
+        resolve_port(port),
+        reqwest::Method::GET,
+        "/control/tasks",
+        &query,
+        None,
+    )
+    .await?;
+    print_pretty_json(&response)
+}
+
+async fn handle_task_get(
+    host: &str,
+    port: Option<u16>,
+    id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let task_id = normalize_task_id(id)?;
+    let path = format!("/control/tasks/{task_id}");
+    let response = send_control_request(
+        host,
+        resolve_port(port),
+        reqwest::Method::GET,
+        &path,
+        &[],
+        None,
+    )
+    .await?;
+    print_pretty_json(&response)
+}
+
+async fn handle_task_cancel(
+    host: &str,
+    port: Option<u16>,
+    id: &str,
+    reason: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let task_id = normalize_task_id(id)?;
+    let path = format!("/control/tasks/{task_id}/cancel");
+    let body = match reason {
+        Some(reason) => {
+            let trimmed = reason.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(serde_json::json!({ "reason": trimmed }))
+            }
+        }
+        None => None,
+    };
+    let response = send_control_request(
+        host,
+        resolve_port(port),
+        reqwest::Method::POST,
+        &path,
+        &[],
+        body,
+    )
+    .await?;
+    print_pretty_json(&response)
+}
+
+async fn handle_task_retry(
+    host: &str,
+    port: Option<u16>,
+    id: &str,
+    delay_ms: Option<u64>,
+    reason: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let task_id = normalize_task_id(id)?;
+    let path = format!("/control/tasks/{task_id}/retry");
+    let mut body = serde_json::Map::new();
+    if let Some(delay_ms) = delay_ms {
+        body.insert("delayMs".to_string(), Value::from(delay_ms));
+    }
+    if let Some(reason) = reason {
+        let trimmed = reason.trim();
+        if !trimmed.is_empty() {
+            body.insert("reason".to_string(), Value::from(trimmed));
+        }
+    }
+    let payload = if body.is_empty() {
+        None
+    } else {
+        Some(Value::Object(body))
+    };
+    let response = send_control_request(
+        host,
+        resolve_port(port),
+        reqwest::Method::POST,
+        &path,
+        &[],
+        payload,
+    )
+    .await?;
+    print_pretty_json(&response)
+}
+
+fn normalize_task_id(id: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let trimmed = id.trim();
+    if trimmed.is_empty() {
+        return Err("task id cannot be empty".into());
+    }
+    Ok(trimmed.to_string())
+}
+
+async fn send_control_request(
+    host: &str,
+    port: u16,
+    method: reqwest::Method,
+    path: &str,
+    query: &[(&str, String)],
+    body: Option<Value>,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let mut url = Url::parse(&format!("http://{}:{}{}", host, port, path))
+        .map_err(|e| format!("failed to build control URL: {e}"))?;
+    if !query.is_empty() {
+        let mut pairs = url.query_pairs_mut();
+        for (key, value) in query {
+            pairs.append_pair(key, value);
+        }
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()?;
+    let GatewayAuth { token, password } = resolve_gateway_auth().await;
+
+    let mut request = client.request(method, url);
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    } else if let Some(password) = password {
+        request = request.bearer_auth(password);
+    }
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+
+    let response = request.send().await.map_err(|e| {
+        format!("failed to send control request (host={host}, port={port}, path={path}): {e}")
+    })?;
+    let status = response.status();
+    let bytes = response.bytes().await?;
+    if !status.is_success() {
+        let error = extract_control_error_message(&bytes);
+        return Err(format!("control request failed (HTTP {status}): {error}").into());
+    }
+
+    if bytes.is_empty() {
+        return Ok(serde_json::json!({ "ok": true }));
+    }
+
+    serde_json::from_slice(&bytes)
+        .map_err(|e| format!("failed to parse control response as JSON: {e}").into())
+}
+
+fn extract_control_error_message(body: &[u8]) -> String {
+    if body.is_empty() {
+        return "empty response body".to_string();
+    }
+    if let Ok(value) = serde_json::from_slice::<Value>(body) {
+        if let Some(error) = value.get("error").and_then(|v| v.as_str()) {
+            return error.to_string();
+        }
+        if let Some(message) = value.get("message").and_then(|v| v.as_str()) {
+            return message.to_string();
+        }
+        return value.to_string();
+    }
+    let text = String::from_utf8_lossy(body).trim().to_string();
+    if text.is_empty() {
+        "response body unavailable".to_string()
+    } else {
+        text
+    }
+}
+
+fn print_pretty_json(value: &Value) -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
 }
 
@@ -3946,6 +4298,118 @@ mod tests {
                 assert!(telegram_to.is_none());
             }
             other => panic!("Expected Verify, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_task_create() {
+        let cli = Cli::try_parse_from([
+            "cara",
+            "task",
+            "create",
+            "--payload",
+            r#"{"kind":"systemEvent","text":"hello"}"#,
+            "--next-run-at-ms",
+            "1234",
+            "--port",
+            "19123",
+            "--host",
+            "localhost",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Task(TaskCommand::Create {
+                payload,
+                next_run_at_ms,
+                port,
+                host,
+            })) => {
+                assert_eq!(payload, r#"{"kind":"systemEvent","text":"hello"}"#);
+                assert_eq!(next_run_at_ms, Some(1234));
+                assert_eq!(port, Some(19123));
+                assert_eq!(host, "localhost");
+            }
+            other => panic!("Expected Task(Create), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_task_list_with_filters() {
+        let cli = Cli::try_parse_from([
+            "cara",
+            "task",
+            "list",
+            "--state",
+            "retry_wait",
+            "--limit",
+            "25",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Task(TaskCommand::List { state, limit, .. })) => {
+                assert_eq!(state.as_deref(), Some("retry_wait"));
+                assert_eq!(limit, Some(25));
+            }
+            other => panic!("Expected Task(List), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_task_get() {
+        let cli = Cli::try_parse_from(["cara", "task", "get", "task-123"]).unwrap();
+        match cli.command {
+            Some(Command::Task(TaskCommand::Get { id, .. })) => {
+                assert_eq!(id, "task-123");
+            }
+            other => panic!("Expected Task(Get), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_task_cancel() {
+        let cli = Cli::try_parse_from([
+            "cara",
+            "task",
+            "cancel",
+            "task-123",
+            "--reason",
+            "operator requested",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Task(TaskCommand::Cancel { id, reason, .. })) => {
+                assert_eq!(id, "task-123");
+                assert_eq!(reason.as_deref(), Some("operator requested"));
+            }
+            other => panic!("Expected Task(Cancel), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_task_retry() {
+        let cli = Cli::try_parse_from([
+            "cara",
+            "task",
+            "retry",
+            "task-123",
+            "--delay-ms",
+            "500",
+            "--reason",
+            "retry now",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Task(TaskCommand::Retry {
+                id,
+                delay_ms,
+                reason,
+                ..
+            })) => {
+                assert_eq!(id, "task-123");
+                assert_eq!(delay_ms, Some(500));
+                assert_eq!(reason.as_deref(), Some("retry now"));
+            }
+            other => panic!("Expected Task(Retry), got {:?}", other),
         }
     }
 

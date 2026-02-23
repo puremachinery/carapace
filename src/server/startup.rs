@@ -45,7 +45,14 @@ impl TaskExecutor for RuntimeTaskExecutor {
         };
 
         match crate::cron::executor::execute_payload(&task.id, &payload, &self.state).await {
-            Ok(_) => TaskExecutionOutcome::Done,
+            Ok(crate::cron::executor::CronRunOutcome::Broadcast) => {
+                TaskExecutionOutcome::Done { run_id: None }
+            }
+            Ok(crate::cron::executor::CronRunOutcome::Spawned { run_id }) => {
+                TaskExecutionOutcome::Done {
+                    run_id: Some(run_id),
+                }
+            }
             Err(err) if err == crate::cron::executor::NO_LLM_PROVIDER_CONFIGURED_ERROR => {
                 TaskExecutionOutcome::Blocked { reason: err }
             }

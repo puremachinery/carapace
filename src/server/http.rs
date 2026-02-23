@@ -4,7 +4,7 @@
 //! - Hooks API (POST /hooks/wake, /hooks/agent, /hooks/<mapping>)
 //! - Tools API (POST /tools/invoke)
 //! - OpenAI compatibility (POST /v1/chat/completions, /v1/responses)
-//! - Control endpoints (GET /control/status, /control/channels, POST /control/config)
+//! - Control endpoints (status/channels/config/tasks)
 //! - Control UI (static files + SPA fallback + avatar endpoint)
 //! - Auth middleware (hooks token, gateway auth, loopback bypass)
 //! - Security middleware (headers, CSRF, rate limiting)
@@ -413,6 +413,7 @@ pub fn create_router_with_state(
     } else {
         None
     };
+    let control_ws_state = ws_state.clone();
     let state = build_app_state(
         &config,
         start_time,
@@ -435,7 +436,13 @@ pub fn create_router_with_state(
 
     // Control endpoints
     if config.control_endpoints_enabled {
-        router = register_session_routes(router, &config, &channel_registry, start_time);
+        router = register_session_routes(
+            router,
+            &config,
+            &channel_registry,
+            control_ws_state,
+            start_time,
+        );
     }
 
     // Control UI routes (when enabled)
@@ -647,6 +654,7 @@ fn register_session_routes(
     router: Router<AppState>,
     config: &HttpConfig,
     channel_registry: &Arc<ChannelRegistry>,
+    ws_state: Option<Arc<WsServerState>>,
     start_time: i64,
 ) -> Router<AppState> {
     let control_state = ControlState {
@@ -658,11 +666,17 @@ fn register_session_routes(
         channel_registry: channel_registry.clone(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         start_time,
+        task_queue: ws_state.as_ref().map(|state| state.task_queue().clone()),
     };
 
     let control_state_status = control_state.clone();
     let control_state_channels = control_state.clone();
     let control_state_config = control_state.clone();
+    let control_state_tasks_create = control_state.clone();
+    let control_state_tasks_list = control_state.clone();
+    let control_state_tasks_get = control_state.clone();
+    let control_state_tasks_cancel = control_state.clone();
+    let control_state_tasks_retry = control_state.clone();
 
     router
         .route(
@@ -686,6 +700,88 @@ fn register_session_routes(
                     let state = control_state_config.clone();
                     async move {
                         control::config_handler(State(state), connect_info, headers, body).await
+                    }
+                },
+            ),
+        )
+        .route(
+            "/control/tasks",
+            post(
+                move |connect_info: MaybeConnectInfo, headers: HeaderMap, body: Bytes| {
+                    let state = control_state_tasks_create.clone();
+                    async move {
+                        control::tasks_create_handler(State(state), connect_info, headers, body)
+                            .await
+                    }
+                },
+            ),
+        )
+        .route(
+            "/control/tasks",
+            get(
+                move |connect_info: MaybeConnectInfo,
+                      headers: HeaderMap,
+                      query: Query<control::TaskListQuery>| {
+                    let state = control_state_tasks_list.clone();
+                    async move {
+                        control::tasks_list_handler(State(state), connect_info, headers, query)
+                            .await
+                    }
+                },
+            ),
+        )
+        .route(
+            "/control/tasks/{id}",
+            get(
+                move |Path(id): Path<String>,
+                      connect_info: MaybeConnectInfo,
+                      headers: HeaderMap| {
+                    let state = control_state_tasks_get.clone();
+                    async move {
+                        control::tasks_get_handler(Path(id), State(state), connect_info, headers)
+                            .await
+                    }
+                },
+            ),
+        )
+        .route(
+            "/control/tasks/{id}/cancel",
+            post(
+                move |Path(id): Path<String>,
+                      connect_info: MaybeConnectInfo,
+                      headers: HeaderMap,
+                      body: Bytes| {
+                    let state = control_state_tasks_cancel.clone();
+                    async move {
+                        control::tasks_cancel_handler(
+                            Path(id),
+                            State(state),
+                            connect_info,
+                            headers,
+                            body,
+                        )
+                        .await
+                    }
+                },
+            ),
+        )
+        .route(
+            "/control/tasks/{id}/retry",
+            post(
+                move |Path(id): Path<String>,
+                      connect_info: MaybeConnectInfo,
+                      headers: HeaderMap,
+                      body: Bytes| {
+                    let state = control_state_tasks_retry.clone();
+                    async move {
+                        control::tasks_retry_handler(
+                            Path(id),
+                            State(state),
+                            connect_info,
+                            headers,
+                            body,
+                        )
+                        .await
                     }
                 },
             ),
@@ -2108,6 +2204,7 @@ mod tests {
             hooks_enabled: true,
             gateway_token: Some("test-gateway-token".to_string()),
             sender_scope_secret: None,
+            control_endpoints_enabled: true,
             control_ui_enabled: true,
             ..Default::default()
         }
@@ -2535,6 +2632,153 @@ mod tests {
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["ok"], true);
         assert_eq!(json["mode"], "now");
+    }
+
+    #[tokio::test]
+    async fn test_control_tasks_create_list_and_get() {
+        let (ws_state, _tmp) = make_test_ws_state();
+        let router = test_router_with_hook_registry(
+            test_config(),
+            Arc::new(HookRegistry::new()),
+            ws_state.clone(),
+        );
+
+        let create_req = Request::builder()
+            .method("POST")
+            .uri("/control/tasks")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"payload":{"kind":"systemEvent","text":"task wake"}}"#,
+            ))
+            .unwrap();
+        let create_response = router.clone().oneshot(create_req).await.unwrap();
+        assert_eq!(create_response.status(), StatusCode::CREATED);
+        let create_body = axum::body::to_bytes(create_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let create_json: Value = serde_json::from_slice(&create_body).unwrap();
+        assert_eq!(create_json["ok"], true);
+        let task_id = create_json["task"]["id"]
+            .as_str()
+            .expect("task id should be present")
+            .to_string();
+
+        let list_req = Request::builder()
+            .method("GET")
+            .uri("/control/tasks")
+            .header("authorization", "Bearer test-gateway-token")
+            .body(Body::empty())
+            .unwrap();
+        let list_response = router.clone().oneshot(list_req).await.unwrap();
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let list_body = axum::body::to_bytes(list_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let list_json: Value = serde_json::from_slice(&list_body).unwrap();
+        assert_eq!(list_json["ok"], true);
+        let listed_tasks = list_json["tasks"]
+            .as_array()
+            .expect("tasks should be an array");
+        assert!(listed_tasks
+            .iter()
+            .any(|task| task.get("id").and_then(|id| id.as_str()) == Some(task_id.as_str())));
+
+        let get_req = Request::builder()
+            .method("GET")
+            .uri(format!("/control/tasks/{task_id}"))
+            .header("authorization", "Bearer test-gateway-token")
+            .body(Body::empty())
+            .unwrap();
+        let get_response = router.oneshot(get_req).await.unwrap();
+        assert_eq!(get_response.status(), StatusCode::OK);
+        let get_body = axum::body::to_bytes(get_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let get_json: Value = serde_json::from_slice(&get_body).unwrap();
+        assert_eq!(get_json["ok"], true);
+        assert_eq!(get_json["task"]["id"], task_id);
+    }
+
+    #[tokio::test]
+    async fn test_control_tasks_cancel_and_retry() {
+        let (ws_state, _tmp) = make_test_ws_state();
+        let router = test_router_with_hook_registry(
+            test_config(),
+            Arc::new(HookRegistry::new()),
+            ws_state.clone(),
+        );
+
+        let create_req = Request::builder()
+            .method("POST")
+            .uri("/control/tasks")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"payload":{"kind":"systemEvent","text":"task cancel retry"}}"#,
+            ))
+            .unwrap();
+        let create_response = router.clone().oneshot(create_req).await.unwrap();
+        assert_eq!(create_response.status(), StatusCode::CREATED);
+        let create_body = axum::body::to_bytes(create_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let create_json: Value = serde_json::from_slice(&create_body).unwrap();
+        let task_id = create_json["task"]["id"]
+            .as_str()
+            .expect("task id should be present")
+            .to_string();
+
+        let cancel_req = Request::builder()
+            .method("POST")
+            .uri(format!("/control/tasks/{task_id}/cancel"))
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"reason":"operator stop"}"#))
+            .unwrap();
+        let cancel_response = router.clone().oneshot(cancel_req).await.unwrap();
+        assert_eq!(cancel_response.status(), StatusCode::OK);
+        let cancel_body = axum::body::to_bytes(cancel_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let cancel_json: Value = serde_json::from_slice(&cancel_body).unwrap();
+        assert_eq!(cancel_json["ok"], true);
+        assert_eq!(cancel_json["task"]["state"], "cancelled");
+
+        let retry_req = Request::builder()
+            .method("POST")
+            .uri(format!("/control/tasks/{task_id}/retry"))
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"delayMs":500,"reason":"operator retry"}"#))
+            .unwrap();
+        let retry_response = router.oneshot(retry_req).await.unwrap();
+        assert_eq!(retry_response.status(), StatusCode::OK);
+        let retry_body = axum::body::to_bytes(retry_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let retry_json: Value = serde_json::from_slice(&retry_body).unwrap();
+        assert_eq!(retry_json["ok"], true);
+        assert_eq!(retry_json["task"]["state"], "retry_wait");
+        assert_eq!(retry_json["task"]["lastError"], "operator retry");
+    }
+
+    #[tokio::test]
+    async fn test_control_tasks_queue_unavailable_without_runtime() {
+        let router = test_router(test_config());
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/control/tasks")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"payload":{"kind":"systemEvent","text":"task unavailable"}}"#,
+            ))
+            .unwrap();
+
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]

@@ -50,6 +50,8 @@ pub struct DurableTask {
     pub payload: Value,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub run_ids: Vec<String>,
 }
 
 /// Queue stats by state.
@@ -145,6 +147,7 @@ impl TaskQueue {
             payload,
             created_at_ms: now,
             updated_at_ms: now,
+            run_ids: Vec::new(),
         };
 
         {
@@ -217,12 +220,18 @@ impl TaskQueue {
     }
 
     /// Mark a task as done.
-    pub fn mark_done(&self, id: &str) -> bool {
+    pub fn mark_done(&self, id: &str, run_id: Option<&str>) -> bool {
         self.update_task(id, |task, now| {
             task.state = TaskState::Done;
             task.last_error = None;
             task.next_run_at_ms = None;
             task.updated_at_ms = now;
+            if let Some(run_id) = run_id {
+                let run_id = run_id.trim();
+                if !run_id.is_empty() && !task.run_ids.iter().any(|existing| existing == run_id) {
+                    task.run_ids.push(run_id.to_string());
+                }
+            }
         })
     }
 
@@ -362,7 +371,7 @@ fn is_due(task: &DurableTask, now: u64) -> bool {
 /// Result of executing a claimed task.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskExecutionOutcome {
-    Done,
+    Done { run_id: Option<String> },
     RetryWait { delay_ms: u64, error: String },
     Blocked { reason: String },
     Failed { error: String },
@@ -400,8 +409,8 @@ pub async fn task_worker_loop(
         for task in due {
             let outcome = executor.execute(task.clone()).await;
             match outcome {
-                TaskExecutionOutcome::Done => {
-                    let _ = queue.mark_done(&task.id);
+                TaskExecutionOutcome::Done { run_id } => {
+                    let _ = queue.mark_done(&task.id, run_id.as_deref());
                 }
                 TaskExecutionOutcome::RetryWait { delay_ms, error } => {
                     let _ = queue.mark_retry_wait(&task.id, delay_ms, &error);
@@ -448,6 +457,23 @@ mod tests {
         assert_eq!(updated.state, TaskState::RetryWait);
         assert_eq!(updated.last_error.as_deref(), Some("temporary failure"));
         assert!(updated.next_run_at_ms.is_some());
+    }
+
+    #[test]
+    fn test_mark_done_records_run_id_and_dedupes() {
+        let queue = TaskQueue::in_memory();
+        let task = queue.enqueue(serde_json::json!({"kind":"demo"}), None);
+
+        assert!(queue.mark_done(&task.id, Some("run-1")));
+        assert!(queue.mark_done(&task.id, Some("run-1")));
+        assert!(queue.mark_done(&task.id, Some("run-2")));
+
+        let updated = queue.get(&task.id).expect("task should exist");
+        assert_eq!(updated.state, TaskState::Done);
+        assert_eq!(
+            updated.run_ids,
+            vec!["run-1".to_string(), "run-2".to_string()]
+        );
     }
 
     #[test]
@@ -517,6 +543,7 @@ mod tests {
                     payload: serde_json::json!({"kind":"demo"}),
                     created_at_ms: idx as u64 + 1,
                     updated_at_ms: idx as u64 + 1,
+                    run_ids: Vec::new(),
                 });
             }
             tasks[0].id = "done-oldest".to_string();
@@ -539,7 +566,7 @@ mod tests {
     impl TaskExecutor for DoneExecutor {
         async fn execute(&self, _task: DurableTask) -> TaskExecutionOutcome {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            TaskExecutionOutcome::Done
+            TaskExecutionOutcome::Done { run_id: None }
         }
     }
 
