@@ -52,8 +52,13 @@ jobs:
             const changed = files.some((file) => blocked.has(file.filename));
             core.setOutput("changed", changed ? "true" : "false");
 
+      - name: Skip Claude review for Dependabot
+        if: github.actor == 'dependabot[bot]'
+        run: echo "Skipping Claude review for Dependabot PR."
+
       - name: Run Claude Code Review
         id: claude-review
+        if: github.actor != 'dependabot[bot]'
         continue-on-error: true
         uses: anthropics/claude-code-action@2f8ba26a219c06cfb0f468eef8d97055fa814f97 # v1
         with:
@@ -118,13 +123,13 @@ jobs:
             --allowedTools "Bash(gh api:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr review:*),Bash(git:*),Bash(jq:*),Bash(cat:*),Bash(head:*),Bash(echo:*),WebSearch"
 
       - name: Allow expected Claude failure on workflow-change PRs
-        if: steps.claude-review.outcome == 'failure' && steps.workflow-change.outputs.changed == 'true'
+        if: github.actor != 'dependabot[bot]' && steps.claude-review.outcome == 'failure' && steps.workflow-change.outputs.changed == 'true'
         run: |
           echo "Claude review failed as expected: claude-code-action requires workflow files to match default branch for app-token exchange."
           echo "Continuing because this PR intentionally changes Claude workflow files."
 
       - name: Fail on unexpected Claude review failure
-        if: steps.claude-review.outcome == 'failure' && steps.workflow-change.outputs.changed != 'true'
+        if: github.actor != 'dependabot[bot]' && steps.claude-review.outcome == 'failure' && steps.workflow-change.outputs.changed != 'true'
         run: |
           echo "Claude review failed for a non-workflow-change reason."
           exit 1
