@@ -27,5 +27,6 @@ pub mod runtime_bridge;
 pub mod server;
 pub mod sessions;
 pub mod tailscale;
+pub mod tasks;
 pub mod tls;
 pub mod usage;
