@@ -148,7 +148,7 @@ pub enum HookMappingResult {
         thinking: Option<String>,
         deliver: bool,
         wake_mode: String,
-        session_key: String,
+        session_scope: String,
         timeout_seconds: Option<u32>,
         allow_unsafe_external_content: bool,
     },
@@ -311,7 +311,7 @@ impl HookRegistry {
                     return Err(HookMappingError::EmptyMessage);
                 }
 
-                let session_key = if let Some(template) = &mapping.session_key {
+                let session_scope = if let Some(template) = &mapping.session_key {
                     evaluate_template(template, ctx)?
                 } else {
                     format!("hook:{}:{}", ctx.path, uuid::Uuid::new_v4())
@@ -332,7 +332,7 @@ impl HookRegistry {
                         .wake_mode
                         .clone()
                         .unwrap_or_else(|| "now".to_string()),
-                    session_key,
+                    session_scope,
                     timeout_seconds: mapping.timeout_seconds,
                     allow_unsafe_external_content: mapping
                         .allow_unsafe_external_content

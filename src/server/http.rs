@@ -1325,7 +1325,7 @@ async fn hook_result_to_response(
             thinking,
             deliver,
             wake_mode,
-            session_key: session_scope,
+            session_scope,
             timeout_seconds,
             allow_unsafe_external_content,
         }) => {
