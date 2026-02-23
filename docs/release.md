@@ -38,7 +38,7 @@ General migration rules:
 
 Operator expectation:
 
-- Run `cara backup` before upgrading.
+- Run `cara backup --output ./carapace-backup.tar.gz` before upgrading.
 - Upgrade using a pinned release tag in production environments.
 - Run `cara verify --outcome auto` after upgrade.
 
