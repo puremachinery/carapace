@@ -123,11 +123,11 @@ jobs:
             Required command patterns (via gh/api):
             - Read existing threads/reviews before posting (for dedupe):
               - gh pr view "$PR_NUMBER" --json reviews
-              - gh api graphql ... pullRequest(reviewThreads)
+              - gh api graphql (or see https://docs.github.com/en/graphql for pullRequest(reviewThreads) query structure)
             - Create exactly one pending review:
               - gh api repos/$REPO/pulls/$PR_NUMBER/reviews -f body='...'
             - Add inline comments to that review only:
-              - gh api repos/$REPO/pulls/$PR_NUMBER/reviews/$REVIEW_ID/comments -f path='...' -F line=... -f body='...'
+              - gh api repos/$REPO/pulls/$PR_NUMBER/reviews/$REVIEW_ID/comments -f path='...' -F line=42 -f body='...'
             - Submit the same review once after comments are attached:
               - gh api repos/$REPO/pulls/$PR_NUMBER/reviews/$REVIEW_ID/events -f event='COMMENT' -f body='...'
             - Never use:
