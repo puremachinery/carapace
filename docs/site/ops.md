@@ -52,15 +52,22 @@ cara restore --path ./carapace-backup.tar.gz
 
 ## 5) Update flow
 
-Check/update the local binary:
+Quick path:
 
 ```bash
 cara update
 ```
 
-For pinned or reproducible installs, use the install guide:
+Production/reproducible path:
+
+- Use pinned release tags instead of `releases/latest`.
+- Validate signatures/checksums before rollout.
+- Keep a recent backup to support fast rollback.
+
+Reference docs:
 
 - [Install](install.md)
+- [Release & upgrade policy](../release.md)
 
 ## 6) First-response recovery checklist
 
@@ -74,3 +81,11 @@ For pinned or reproducible installs, use the install guide:
 
 - [First Run](first-run.md)
 - [Cookbook](../cookbook/README.md)
+- [Get Unstuck](get-unstuck.md)
+
+## 8) Security reporting
+
+For suspected vulnerabilities, use private reporting:
+
+- <https://github.com/puremachinery/carapace/security/advisories/new>
+- [Security policy](../../SECURITY.md)

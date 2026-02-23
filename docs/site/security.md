@@ -64,3 +64,7 @@ Read the full threat model and control details:
 Do not post security vulnerabilities publicly. Use:
 
 <https://github.com/puremachinery/carapace/security/advisories/new>
+
+For reporting expectations (ack window, response targets), see:
+
+- [Security policy](../../SECURITY.md)

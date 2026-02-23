@@ -16,10 +16,10 @@ Use a direct download link for your platform (fastest path for most users):
 
 Release page: <https://github.com/puremachinery/carapace/releases/latest>
 
-Use `releases/latest` for quick interactive installs. For automation, reproducible
-rollouts, and preview-specific installs, use a pinned tag URL.
+Use `releases/latest` for quick interactive installs. For automation,
+reproducible rollouts, and explicit rollback control, use pinned tag URLs.
 
-Note: `releases/latest` may not point at the newest pre-release preview.
+If you specifically need a preview build, pin the exact preview tag.
 
 Quick path for first-time setup:
 
@@ -30,7 +30,7 @@ Quick path for first-time setup:
 Signature and checksum verification (next two sections) are recommended,
 especially for production or automation.
 
-## Optional (advanced): pinned version links (automation/ops)
+## Optional (advanced): pinned version links (automation/ops/rollback)
 
 ```bash
 VERSION="vX.Y.Z"
@@ -182,3 +182,4 @@ cara version
 
 - Continue with [First run](first-run.md)
 - Or jump to [Cookbook recipes](../cookbook/README.md)
+- For maintainer/operator release policy, see [Release & upgrade policy](../release.md)

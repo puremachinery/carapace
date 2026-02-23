@@ -102,8 +102,10 @@ of truth.
 - [Channel smoke validation](docs/channel-smoke.md) — live checks and evidence capture
 - [Cookbook](docs/cookbook/README.md) — outcome-first walkthroughs
 - [Roadmap](docs/roadmap.md) — near-term and longer-term priorities
+- [Release & upgrade policy](docs/release.md) — compatibility, migration, rollback, release checklist
 - [CLI guide](docs/cli.md) — subcommands, flags, and device identity
 - [Documentation index](docs/README.md) — architecture/protocol/security references
+- [Security reporting policy](SECURITY.md) — private vulnerability reporting and response expectations
 - [Report feedback or bugs](https://github.com/puremachinery/carapace/issues/new/choose)
 
 ## Contributing
