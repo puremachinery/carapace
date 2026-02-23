@@ -1003,10 +1003,20 @@ fn resolve_session_integrity_secret(
     if let Some(secret) = env_server_secret.filter(|value| !value.is_empty()) {
         return Some((secret, "CARAPACE_SERVER_SECRET"));
     }
-    if let Some(secret) = auth.token.clone().filter(|value| !value.is_empty()) {
+    if let Some(secret) = auth
+        .token
+        .as_ref()
+        .filter(|value| !value.is_empty())
+        .cloned()
+    {
         return Some((secret, "gateway token"));
     }
-    if let Some(secret) = auth.password.clone().filter(|value| !value.is_empty()) {
+    if let Some(secret) = auth
+        .password
+        .as_ref()
+        .filter(|value| !value.is_empty())
+        .cloned()
+    {
         return Some((secret, "gateway password"));
     }
     None
