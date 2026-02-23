@@ -879,13 +879,15 @@ async fn hooks_wake_handler(
             if let Some(ws) = &state.ws_state {
                 enqueue_hook_wake_event(ws, &validated.text, validated.mode);
                 debug!(
-                    "Wake event dispatched: text='{}', mode={:?}",
-                    validated.text, validated.mode
+                    "Wake event dispatched: mode={:?}, text_len={}",
+                    validated.mode,
+                    validated.text.len()
                 );
             } else {
                 debug!(
-                    "Wake event accepted (no runtime): text='{}', mode={:?}",
-                    validated.text, validated.mode
+                    "Wake event accepted (no runtime): mode={:?}, text_len={}",
+                    validated.mode,
+                    validated.text.len()
                 );
             }
             (StatusCode::OK, Json(WakeResponse::success(validated.mode))).into_response()
@@ -1030,8 +1032,10 @@ async fn dispatch_agent_run(
             cancel_token,
         );
         debug!(
-            "Agent job dispatched: message='{}', channel='{}', runId='{}'",
-            validated.message, validated.channel, run_id
+            "Agent job dispatched: channel='{}', runId='{}', message_len={}",
+            validated.channel,
+            run_id,
+            validated.message.len()
         );
     } else {
         debug!("Agent job queued (no LLM provider): runId='{}'", run_id);
@@ -1096,8 +1100,10 @@ async fn hooks_agent_handler(
         Some(ws) => ws.clone(),
         None => {
             debug!(
-                "Agent job accepted (no runtime): message='{}', channel='{}', runId='{}'",
-                validated.message, validated.channel, run_id
+                "Agent job accepted (no runtime): channel='{}', runId='{}', message_len={}",
+                validated.channel,
+                run_id,
+                validated.message.len()
             );
             return (StatusCode::ACCEPTED, Json(AgentResponse::success(run_id))).into_response();
         }
@@ -1307,13 +1313,15 @@ async fn hook_result_to_response(
             if let Some(ws) = &state.ws_state {
                 enqueue_hook_wake_event(ws, &text, wake_mode);
                 debug!(
-                    "Hook triggered wake dispatch: text='{}', mode='{}'",
-                    text, mode
+                    "Hook triggered wake dispatch: mode='{}', text_len={}",
+                    mode,
+                    text.len()
                 );
             } else {
                 debug!(
-                    "Hook triggered wake accepted (no runtime): text='{}', mode='{}'",
-                    text, mode
+                    "Hook triggered wake accepted (no runtime): mode='{}', text_len={}",
+                    mode,
+                    text.len()
                 );
             }
             (StatusCode::OK, Json(WakeResponse::success(wake_mode))).into_response()
