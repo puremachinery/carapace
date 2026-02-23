@@ -1297,7 +1297,7 @@ mod tests {
 
     #[test]
     fn test_config_read_missing_key() {
-        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let _lock = ENV_VAR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp_dir = tempfile::tempdir().expect("temp config dir");
         let config_path = temp_dir.path().join("carapace-test-config.json5");
         std::fs::write(&config_path, "{}").expect("write isolated config");
