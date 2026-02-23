@@ -1780,7 +1780,8 @@ fn prompt_setup_outcome() -> Result<SetupOutcome, Box<dyn std::error::Error>> {
 fn prompt_optional_value_from_env(
     env_var: &str,
     label: &str,
-    prompt: &str,
+    value_label: &str,
+    hide_sensitive_input: bool,
 ) -> Result<Option<String>, Box<dyn std::error::Error>> {
     let env_value = std::env::var(env_var).ok().filter(|v| !v.trim().is_empty());
     if let Some(value) = env_value {
@@ -1790,7 +1791,7 @@ fn prompt_optional_value_from_env(
         }
     }
 
-    let entered = prompt_hidden_line(prompt)?;
+    let entered = prompt_sensitive_line(value_label, hide_sensitive_input, true)?;
     if entered.is_empty() {
         Ok(None)
     } else {
@@ -1850,6 +1851,30 @@ fn prompt_hidden_line(prompt: &str) -> Result<String, Box<dyn std::error::Error>
     Ok(input.trim().to_string())
 }
 
+fn prompt_sensitive_line(
+    label: &str,
+    hide_sensitive_input: bool,
+    allow_blank: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let visibility_hint = if hide_sensitive_input {
+        "input hidden; pasted text will not be shown"
+    } else {
+        "input visible"
+    };
+    let blank_hint = if allow_blank {
+        ", leave blank to skip for now"
+    } else {
+        ""
+    };
+    let prompt = format!("Enter {label} ({visibility_hint}{blank_hint}): ");
+
+    if hide_sensitive_input {
+        prompt_hidden_line(&prompt)
+    } else {
+        prompt_line(&prompt)
+    }
+}
+
 fn prompt_with_default(prompt: &str, default: &str) -> Result<String, Box<dyn std::error::Error>> {
     let line = prompt_line(&format!("{prompt} [{default}]: "))?;
     if line.is_empty() {
@@ -1905,11 +1930,14 @@ fn generate_hex_secret(byte_len: usize) -> Result<String, Box<dyn std::error::Er
     Ok(crate::crypto::generate_hex_secret(byte_len)?)
 }
 
-fn prompt_custom_secret(kind: &str) -> Result<String, Box<dyn std::error::Error>> {
+fn prompt_custom_secret(
+    kind: &str,
+    hide_sensitive_input: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
     const MIN_SECRET_LENGTH: usize = 10;
 
     loop {
-        let entered = prompt_hidden_line(&format!("Enter {kind} (input hidden): "))?;
+        let entered = prompt_sensitive_line(kind, hide_sensitive_input, false)?;
         if entered.is_empty() {
             eprintln!("{} cannot be empty.", kind);
             continue;
@@ -1991,17 +2019,24 @@ fn prompt_and_configure_bot_channel(
     channel_key: &str,
     channel_label: &str,
     env_var: &str,
-    prompt: &str,
+    hide_sensitive_input: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let token_label = format!("{channel_label} bot token");
-    let channel_token = prompt_optional_value_from_env(env_var, &token_label, prompt)?;
+    let channel_token = prompt_optional_value_from_env(
+        env_var,
+        &token_label,
+        &format!("{channel_label} bot token"),
+        hide_sensitive_input,
+    )?;
     if let Some(token) = channel_token {
+        println!("{channel_label} token captured.");
         validate_channel_credentials_interactive(channel_key, &token)?;
         config[channel_key] = serde_json::json!({
             "enabled": true,
             "botToken": token
         });
     } else {
+        println!("No {channel_label} token entered; skipping credential validation.");
         println!(
             "Skipped {channel_label} token. You can configure it later in `{channel_key}.botToken`."
         );
@@ -2772,6 +2807,8 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
     if interactive {
         println!("Carapace setup wizard");
         println!("---------------------");
+        let hide_sensitive_input =
+            prompt_yes_no("Hide sensitive input while typing? Recommended.", true)?;
 
         let default_provider = if std::env::var("ANTHROPIC_API_KEY").is_ok() {
             "anthropic"
@@ -2805,7 +2842,7 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
                 effective_api_key = env_key.clone();
                 Some(format!("${{{env_var}}}"))
             } else {
-                let entered = prompt_hidden_line("Enter API key (input hidden): ")?;
+                let entered = prompt_sensitive_line("API key", hide_sensitive_input, true)?;
                 if entered.is_empty() {
                     None
                 } else {
@@ -2814,8 +2851,7 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         } else {
-            let entered =
-                prompt_hidden_line("Enter API key (input hidden, leave blank to skip): ")?;
+            let entered = prompt_sensitive_line("API key", hide_sensitive_input, true)?;
             if entered.is_empty() {
                 None
             } else {
@@ -2841,12 +2877,12 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
             if prompt_yes_no("Generate a strong gateway token automatically?", true)? {
                 generate_hex_secret(32)?
             } else {
-                prompt_custom_secret("gateway token")?
+                prompt_custom_secret("gateway token", hide_sensitive_input)?
             }
         } else if prompt_yes_no("Generate a strong gateway password automatically?", true)? {
             generate_hex_secret(24)?
         } else {
-            prompt_custom_secret("gateway password")?
+            prompt_custom_secret("gateway password", hide_sensitive_input)?
         };
 
         let bind_mode = loop {
@@ -2889,7 +2925,7 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
                     "discord",
                     "Discord",
                     "DISCORD_BOT_TOKEN",
-                    "Enter Discord bot token (leave blank to skip for now): ",
+                    hide_sensitive_input,
                 )?;
                 let discord_configured =
                     resolve_channel_bot_token_from_config(&config, "discord").is_some();
@@ -2906,7 +2942,7 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
                     "telegram",
                     "Telegram",
                     "TELEGRAM_BOT_TOKEN",
-                    "Enter Telegram bot token (leave blank to skip for now): ",
+                    hide_sensitive_input,
                 )?;
                 let telegram_configured =
                     resolve_channel_bot_token_from_config(&config, "telegram").is_some();
@@ -2929,7 +2965,7 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
                 if prompt_yes_no("Generate a strong hooks token automatically?", true)? {
                     generate_hex_secret(32)?
                 } else {
-                    prompt_custom_secret("hooks token")?
+                    prompt_custom_secret("hooks token", hide_sensitive_input)?
                 };
             config["gateway"]["hooks"] = serde_json::json!({
                 "enabled": true,
