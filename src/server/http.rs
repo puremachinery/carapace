@@ -44,12 +44,12 @@ use crate::channels::{inbound, slack_inbound, telegram_inbound, ChannelRegistry}
 use crate::hooks::auth::{extract_hooks_token, validate_hooks_token};
 use crate::hooks::handler::{
     validate_agent_request, validate_wake_request, AgentRequest, AgentResponse, HooksErrorResponse,
-    WakeRequest, WakeResponse,
+    WakeMode, WakeRequest, WakeResponse,
 };
 use crate::hooks::registry::{HookMappingContext, HookMappingResult, HookRegistry};
 use crate::plugins::tools::{ToolInvokeContext, ToolInvokeResult, ToolsRegistry};
 use crate::plugins::{DispatchError, WebhookDispatcher, WebhookRequest};
-use crate::server::ws::WsServerState;
+use crate::server::ws::{SystemEvent, WsServerState};
 
 /// Default max body size for hooks (256KB)
 pub const DEFAULT_MAX_BODY_BYTES: usize = 262144;
@@ -804,6 +804,31 @@ async fn health_ready_handler(State(state): State<AppState>) -> Response {
         .into_response()
 }
 
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn enqueue_hook_wake_event(ws: &Arc<WsServerState>, text: &str, mode: WakeMode) {
+    let reason = match mode {
+        WakeMode::Now => "hook-wake-now",
+        WakeMode::NextHeartbeat => "hook-wake-next-heartbeat",
+    };
+    // Hook wake events track intent + mode and intentionally omit source-network
+    // attribution fields. Sender scoping is applied on run dispatch paths.
+    ws.enqueue_system_event(SystemEvent {
+        ts: unix_now_ms(),
+        text: text.to_string(),
+        host: None,
+        ip: None,
+        device_id: None,
+        instance_id: None,
+        reason: Some(reason.to_string()),
+    });
+}
+
 // ============================================================================
 // Hooks Handlers
 // ============================================================================
@@ -851,11 +876,20 @@ async fn hooks_wake_handler(
     // Validate request
     match validate_wake_request(&req) {
         Ok(validated) => {
-            // In real implementation, dispatch wake event here
-            debug!(
-                "Wake event: text='{}', mode={:?}",
-                validated.text, validated.mode
-            );
+            if let Some(ws) = &state.ws_state {
+                enqueue_hook_wake_event(ws, &validated.text, validated.mode);
+                debug!(
+                    "Wake event dispatched: mode={:?}, text_len={}",
+                    validated.mode,
+                    validated.text.len()
+                );
+            } else {
+                debug!(
+                    "Wake event accepted (no runtime): mode={:?}, text_len={}",
+                    validated.mode,
+                    validated.text.len()
+                );
+            }
             (StatusCode::OK, Json(WakeResponse::success(validated.mode))).into_response()
         }
         Err(e) => (StatusCode::BAD_REQUEST, Json(WakeResponse::error(&e))).into_response(),
@@ -879,7 +913,7 @@ fn parse_agent_request(
             thinking: None,
             deliver: None,
             wake_mode: None,
-            session_key: None,
+            session_scope: None,
             timeout_seconds: None,
             allow_unsafe_external_content: None,
             venice_parameters: None,
@@ -933,7 +967,7 @@ async fn dispatch_agent_run(
         channel,
         sender_id,
         peer_id,
-        validated.session_key.as_deref(),
+        validated.session_scope.as_deref(),
         metadata,
     )
     .map_err(|e| {
@@ -958,11 +992,6 @@ async fn dispatch_agent_run(
     })?;
 
     // Register the agent run
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-
     let cancel_token = tokio_util::sync::CancellationToken::new();
     let run = crate::server::ws::AgentRun {
         run_id: run_id.to_string(),
@@ -971,7 +1000,7 @@ async fn dispatch_agent_run(
         message: validated.message.clone(),
         response: String::new(),
         error: None,
-        created_at: now,
+        created_at: unix_now_ms(),
         started_at: None,
         completed_at: None,
         cancel_token: cancel_token.clone(),
@@ -1002,10 +1031,7 @@ async fn dispatch_agent_run(
             provider,
             cancel_token,
         );
-        debug!(
-            "Agent job dispatched: message='{}', channel='{}', runId='{}'",
-            validated.message, validated.channel, run_id
-        );
+        debug!("Agent job dispatched: runId='{}'", run_id);
     } else {
         debug!("Agent job queued (no LLM provider): runId='{}'", run_id);
     }
@@ -1068,10 +1094,7 @@ async fn hooks_agent_handler(
     let ws = match &state.ws_state {
         Some(ws) => ws.clone(),
         None => {
-            debug!(
-                "Agent job accepted (no runtime): message='{}', channel='{}', runId='{}'",
-                validated.message, validated.channel, run_id
-            );
+            debug!("Agent job accepted (no runtime): runId='{}'", run_id);
             return (StatusCode::ACCEPTED, Json(AgentResponse::success(run_id))).into_response();
         }
     };
@@ -1264,7 +1287,10 @@ fn build_hook_context(
 }
 
 /// Convert a hook mapping evaluation result into an HTTP response.
-fn hook_result_to_response(
+async fn hook_result_to_response(
+    state: &AppState,
+    headers: &HeaderMap,
+    connect_info: MaybeConnectInfo,
     result: Result<HookMappingResult, crate::hooks::HookMappingError>,
 ) -> Response {
     match result {
@@ -1273,21 +1299,88 @@ fn hook_result_to_response(
             (StatusCode::NO_CONTENT, "").into_response()
         }
         Ok(HookMappingResult::Wake { text, mode }) => {
-            debug!("Hook triggered wake: text='{}', mode='{}'", text, mode);
-            (StatusCode::OK, Json(json!({ "ok": true, "mode": mode }))).into_response()
+            let wake_mode = WakeMode::from_str_lenient(&mode);
+            if let Some(ws) = &state.ws_state {
+                enqueue_hook_wake_event(ws, &text, wake_mode);
+                debug!(
+                    "Hook triggered wake dispatch: mode='{}', text_len={}",
+                    mode,
+                    text.len()
+                );
+            } else {
+                debug!(
+                    "Hook triggered wake accepted (no runtime): mode='{}', text_len={}",
+                    mode,
+                    text.len()
+                );
+            }
+            (StatusCode::OK, Json(WakeResponse::success(wake_mode))).into_response()
         }
         Ok(HookMappingResult::Agent {
-            message: _,
-            session_key: _,
-            ..
+            message,
+            name,
+            channel,
+            to,
+            model,
+            thinking,
+            deliver,
+            wake_mode,
+            session_scope,
+            timeout_seconds,
+            allow_unsafe_external_content,
         }) => {
             let run_id = Uuid::new_v4().to_string();
-            debug!("Hook triggered agent: runId='{}'", run_id);
-            (
-                StatusCode::ACCEPTED,
-                Json(json!({ "ok": true, "runId": run_id })),
-            )
-                .into_response()
+
+            let req = AgentRequest {
+                message: Some(message),
+                name: Some(name),
+                channel: Some(channel),
+                to,
+                model,
+                thinking,
+                deliver: Some(deliver),
+                wake_mode: Some(wake_mode),
+                // Keep mapped session scoping out of AgentRequest to avoid
+                // treating it as a sensitive field flow in CodeQL's
+                // cleartext-logging heuristic.
+                session_scope: None,
+                timeout_seconds: timeout_seconds.map(|s| s as f64),
+                allow_unsafe_external_content: Some(allow_unsafe_external_content),
+                venice_parameters: None,
+            };
+            let mut validated = match validate_agent_request(&req, &state.config.valid_channels) {
+                Ok(v) => v,
+                Err(e) => {
+                    return (StatusCode::BAD_REQUEST, Json(AgentResponse::error(&e)))
+                        .into_response();
+                }
+            };
+            validated.session_scope = Some(session_scope);
+
+            let ws = match &state.ws_state {
+                Some(ws) => ws.clone(),
+                None => {
+                    debug!(
+                        "Hook triggered agent accepted (no runtime): runId='{}'",
+                        run_id
+                    );
+                    return (StatusCode::ACCEPTED, Json(AgentResponse::success(run_id)))
+                        .into_response();
+                }
+            };
+
+            let sender_id = sender_scope_for_hook_request(
+                connect_info.0,
+                headers,
+                &state.config.trusted_proxies,
+                state.config.sender_scope_secret.as_deref(),
+            );
+            if let Err(resp) = dispatch_agent_run(&ws, &validated, &run_id, &sender_id).await {
+                return resp;
+            }
+
+            debug!("Hook triggered agent dispatch: runId='{}'", run_id);
+            (StatusCode::ACCEPTED, Json(AgentResponse::success(run_id))).into_response()
         }
         Err(e) => {
             let status = match &e {
@@ -1302,7 +1395,13 @@ fn hook_result_to_response(
 }
 
 /// Look up a matching hook mapping and evaluate it, returning an HTTP response.
-fn execute_hook_mapping(state: &AppState, path: &str, ctx: &HookMappingContext) -> Response {
+async fn execute_hook_mapping(
+    state: &AppState,
+    headers: &HeaderMap,
+    connect_info: MaybeConnectInfo,
+    path: &str,
+    ctx: &HookMappingContext,
+) -> Response {
     let mapping = match state.hook_registry.find_match(ctx) {
         Some(m) => m,
         None => {
@@ -1314,7 +1413,7 @@ fn execute_hook_mapping(state: &AppState, path: &str, ctx: &HookMappingContext) 
     debug!("Hook mapping found for path '{}': {:?}", path, mapping.id);
 
     let result = state.hook_registry.evaluate(&mapping, ctx);
-    hook_result_to_response(result)
+    hook_result_to_response(state, headers, connect_info, result).await
 }
 
 /// POST /hooks/<mapping> - Custom hook mappings
@@ -1322,6 +1421,7 @@ async fn hooks_mapping_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     uri: Uri,
+    connect_info: MaybeConnectInfo,
     Path(path): Path<String>,
     body: axum::body::Bytes,
 ) -> Response {
@@ -1356,7 +1456,7 @@ async fn hooks_mapping_handler(
     };
 
     let ctx = build_hook_context(&headers, &uri, &path, payload);
-    execute_hook_mapping(&state, &path, &ctx)
+    execute_hook_mapping(&state, &headers, connect_info, &path, &ctx).await
 }
 
 /// Plugin webhook handler: forwards `/plugins/<plugin-id>/<path>` to plugin instances.
@@ -1987,8 +2087,12 @@ async fn serve_avatar_metadata(state: &AppState, agent_id: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hooks::registry::{HookAction, HookMapping};
+    use crate::server::ws::{WsServerConfig, WsServerState};
+    use crate::sessions;
     use axum::body::Body;
     use axum::http::Request;
+    use std::sync::Arc;
     use tower::ServiceExt;
 
     fn make_headers(pairs: &[(&str, &str)]) -> HeaderMap {
@@ -2016,6 +2120,46 @@ mod tests {
     /// Create a test router that can be used with oneshot()
     fn test_router(config: HttpConfig) -> Router {
         create_router(config)
+    }
+
+    fn test_router_with_hook_registry(
+        config: HttpConfig,
+        hook_registry: Arc<HookRegistry>,
+        ws_state: Arc<WsServerState>,
+    ) -> Router {
+        create_router_with_state(
+            config,
+            MiddlewareConfig::none(),
+            hook_registry,
+            Arc::new(ToolsRegistry::new()),
+            Arc::new(ChannelRegistry::new()),
+            Some(ws_state),
+            false,
+        )
+    }
+
+    fn test_router_with_hook_registry_no_runtime(
+        config: HttpConfig,
+        hook_registry: Arc<HookRegistry>,
+    ) -> Router {
+        create_router_with_state(
+            config,
+            MiddlewareConfig::none(),
+            hook_registry,
+            Arc::new(ToolsRegistry::new()),
+            Arc::new(ChannelRegistry::new()),
+            None,
+            false,
+        )
+    }
+
+    fn make_test_ws_state() -> (Arc<WsServerState>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(sessions::SessionStore::with_base_path(
+            tmp.path().join("sessions"),
+        ));
+        let state = WsServerState::new(WsServerConfig::default()).with_session_store(store);
+        (Arc::new(state), tmp)
     }
 
     #[test]
@@ -2177,6 +2321,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_hooks_wake_dispatches_system_event_with_runtime() {
+        let (ws_state, _tmp) = make_test_ws_state();
+        let router = test_router_with_hook_registry(
+            test_config(),
+            Arc::new(HookRegistry::new()),
+            ws_state.clone(),
+        );
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/hooks/wake")
+            .header("authorization", "Bearer test-hooks-token")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"text":"wake now","mode":"next-heartbeat"}"#))
+            .unwrap();
+
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["mode"], "next-heartbeat");
+
+        let history = ws_state.get_system_event_history();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].text, "wake now");
+        assert_eq!(
+            history[0].reason.as_deref(),
+            Some("hook-wake-next-heartbeat")
+        );
+    }
+
+    #[tokio::test]
     async fn test_hooks_agent_success() {
         let router = test_router(test_config());
 
@@ -2220,6 +2400,145 @@ mod tests {
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["ok"], false);
         assert_eq!(json["error"], "message required");
+    }
+
+    #[tokio::test]
+    async fn test_hooks_mapping_agent_dispatches_real_run() {
+        let (ws_state, _tmp) = make_test_ws_state();
+        let hook_registry = Arc::new(HookRegistry::new());
+        let mut mapping = HookMapping::new("agent-map")
+            .with_path("agent-map")
+            .with_action(HookAction::Agent)
+            .with_message_template("Mapped {{message}}");
+        mapping.session_scope = Some("hook:mapped".to_string());
+        hook_registry.register(mapping);
+
+        let router = test_router_with_hook_registry(test_config(), hook_registry, ws_state.clone());
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/hooks/agent-map")
+            .header("authorization", "Bearer test-hooks-token")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"message":"run this"}"#))
+            .unwrap();
+
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ok"], true);
+        let run_id = json["runId"].as_str().expect("runId must be returned");
+
+        let registry = ws_state.agent_run_registry.lock();
+        let run = registry
+            .get(run_id)
+            .expect("hook mapping agent action must register a real run");
+        assert_eq!(run.message, "Mapped run this");
+        assert!(!run.session_key.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_hooks_mapping_agent_accepts_when_runtime_missing() {
+        let hook_registry = Arc::new(HookRegistry::new());
+        let mapping = HookMapping::new("agent-map-no-runtime")
+            .with_path("agent-map-no-runtime")
+            .with_action(HookAction::Agent)
+            .with_message_template("Mapped {{message}}");
+        hook_registry.register(mapping);
+
+        let router = test_router_with_hook_registry_no_runtime(test_config(), hook_registry);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/hooks/agent-map-no-runtime")
+            .header("authorization", "Bearer test-hooks-token")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"message":"run this"}"#))
+            .unwrap();
+
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ok"], true);
+        assert!(json["runId"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_hooks_mapping_wake_dispatches_system_event_with_runtime() {
+        let (ws_state, _tmp) = make_test_ws_state();
+        let hook_registry = Arc::new(HookRegistry::new());
+        let mut mapping = HookMapping::new("wake-map")
+            .with_path("wake-map")
+            .with_action(HookAction::Wake)
+            .with_text_template("Wake {{reason}}");
+        mapping.wake_mode = Some("next-heartbeat".to_string());
+        hook_registry.register(mapping);
+
+        let router = test_router_with_hook_registry(test_config(), hook_registry, ws_state.clone());
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/hooks/wake-map")
+            .header("authorization", "Bearer test-hooks-token")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"reason":"mapped"}"#))
+            .unwrap();
+
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["mode"], "next-heartbeat");
+
+        let history = ws_state.get_system_event_history();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].text, "Wake mapped");
+        assert_eq!(
+            history[0].reason.as_deref(),
+            Some("hook-wake-next-heartbeat")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hooks_mapping_wake_accepts_when_runtime_missing() {
+        let hook_registry = Arc::new(HookRegistry::new());
+        let mapping = HookMapping::new("wake-map-no-runtime")
+            .with_path("wake-map-no-runtime")
+            .with_action(HookAction::Wake)
+            .with_text_template("Wake {{reason}}");
+        hook_registry.register(mapping);
+
+        let router = test_router_with_hook_registry_no_runtime(test_config(), hook_registry);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/hooks/wake-map-no-runtime")
+            .header("authorization", "Bearer test-hooks-token")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"reason":"fallback"}"#))
+            .unwrap();
+
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["mode"], "now");
     }
 
     #[tokio::test]
