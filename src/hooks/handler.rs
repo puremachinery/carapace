@@ -63,7 +63,7 @@ impl WakeResponse {
 }
 
 /// Request body for POST /hooks/agent
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentRequest {
     pub message: Option<String>,
