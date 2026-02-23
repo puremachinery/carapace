@@ -46,7 +46,7 @@ impl TaskExecutor for RuntimeTaskExecutor {
 
         match crate::cron::executor::execute_payload(&task.id, &payload, &self.state).await {
             Ok(_) => TaskExecutionOutcome::Done,
-            Err(err) if err.contains("no LLM provider configured") => {
+            Err(err) if err == crate::cron::executor::NO_LLM_PROVIDER_CONFIGURED_ERROR => {
                 TaskExecutionOutcome::Blocked { reason: err }
             }
             Err(err) => TaskExecutionOutcome::Failed { error: err },

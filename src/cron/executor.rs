@@ -14,6 +14,8 @@ use serde_json::Value;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
+pub const NO_LLM_PROVIDER_CONFIGURED_ERROR: &str = "no LLM provider configured";
+
 /// Outcome of executing a cron payload.
 #[derive(Debug)]
 pub enum CronRunOutcome {
@@ -134,7 +136,7 @@ async fn execute_agent_turn(
 
     let provider = state
         .llm_provider()
-        .ok_or_else(|| "no LLM provider configured".to_string())?;
+        .ok_or_else(|| NO_LLM_PROVIDER_CONFIGURED_ERROR.to_string())?;
 
     spawn_delivery_waiter_if_enabled(
         state,

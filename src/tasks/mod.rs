@@ -114,11 +114,13 @@ impl TaskQueue {
         };
 
         let now = now_ms();
+        let mut recovered_running = false;
         for task in &mut loaded {
             if task.state == TaskState::Running {
                 task.state = TaskState::RetryWait;
                 task.next_run_at_ms = Some(now);
                 task.updated_at_ms = now;
+                recovered_running = true;
                 if task.last_error.is_none() {
                     task.last_error = Some("recovered after restart".to_string());
                 }
@@ -126,6 +128,9 @@ impl TaskQueue {
         }
 
         *self.tasks.write() = loaded;
+        if recovered_running {
+            self.flush_to_disk();
+        }
     }
 
     /// Add a new task in `queued` state.
@@ -152,10 +157,7 @@ impl TaskQueue {
                     .filter(|(_, t)| {
                         matches!(
                             t.state,
-                            TaskState::Done
-                                | TaskState::Failed
-                                | TaskState::Cancelled
-                                | TaskState::Blocked
+                            TaskState::Done | TaskState::Failed | TaskState::Cancelled
                         )
                     })
                     .min_by_key(|(_, t)| t.updated_at_ms)
@@ -324,14 +326,12 @@ impl TaskQueue {
             PathBuf::from(s)
         };
 
-        let mut data = {
-            let tasks = self.tasks.read();
-            match serde_json::to_vec_pretty(&*tasks) {
-                Ok(v) => v,
-                Err(err) => {
-                    warn!(error = %err, "failed to serialize tasks");
-                    return;
-                }
+        let snapshot = self.tasks.read().clone();
+        let mut data = match serde_json::to_vec_pretty(&snapshot) {
+            Ok(v) => v,
+            Err(err) => {
+                warn!(error = %err, "failed to serialize tasks");
+                return;
             }
         };
         data.push(b'\n');
@@ -371,6 +371,7 @@ pub enum TaskExecutionOutcome {
 
 #[async_trait]
 pub trait TaskExecutor: Send + Sync {
+    /// Retry-cap policy is intentionally executor-owned; queue records attempts only.
     async fn execute(&self, task: DurableTask) -> TaskExecutionOutcome;
 }
 
@@ -394,6 +395,8 @@ pub async fn task_worker_loop(
 
         let now = now_ms();
         let due = queue.claim_due(now, 32);
+        // TODO: move to bounded concurrent execution once dispatch paths are fully
+        // validated under parallel task processing.
         for task in due {
             let outcome = executor.execute(task.clone()).await;
             match outcome {
@@ -478,6 +481,54 @@ mod tests {
         let loaded = recovered.get(&task.id).expect("task should load");
         assert_eq!(loaded.state, TaskState::RetryWait);
         assert!(loaded.next_run_at_ms.is_some());
+    }
+
+    #[test]
+    fn test_load_recovery_persists_to_disk() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tasks").join("queue.json");
+
+        let queue = TaskQueue::new(Some(path.clone()));
+        queue.enqueue(serde_json::json!({"kind":"demo"}), None);
+        let _ = queue.claim_due(now_ms(), 1);
+
+        let recovered = TaskQueue::new(Some(path.clone()));
+        recovered.load();
+
+        let persisted: Vec<DurableTask> =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].state, TaskState::RetryWait);
+        assert!(persisted[0].next_run_at_ms.is_some());
+    }
+
+    #[test]
+    fn test_enqueue_evicts_terminal_before_blocked() {
+        let queue = TaskQueue::in_memory();
+        {
+            let mut tasks = queue.tasks.write();
+            for idx in 0..MAX_TASKS {
+                tasks.push(DurableTask {
+                    id: format!("blocked-{idx}"),
+                    state: TaskState::Blocked,
+                    attempts: 1,
+                    next_run_at_ms: None,
+                    last_error: Some("blocked".to_string()),
+                    payload: serde_json::json!({"kind":"demo"}),
+                    created_at_ms: idx as u64 + 1,
+                    updated_at_ms: idx as u64 + 1,
+                });
+            }
+            tasks[0].id = "done-oldest".to_string();
+            tasks[0].state = TaskState::Done;
+            tasks[0].last_error = None;
+            tasks[0].updated_at_ms = 0;
+        }
+
+        let _ = queue.enqueue(serde_json::json!({"kind":"new"}), None);
+        assert!(queue.get("done-oldest").is_none());
+        assert_eq!(queue.stats().blocked, MAX_TASKS - 1);
+        assert_eq!(queue.stats().total, MAX_TASKS);
     }
 
     struct DoneExecutor {
