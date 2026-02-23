@@ -988,11 +988,6 @@ async fn dispatch_agent_run(
     })?;
 
     // Register the agent run
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-
     let cancel_token = tokio_util::sync::CancellationToken::new();
     let run = crate::server::ws::AgentRun {
         run_id: run_id.to_string(),
@@ -1001,7 +996,7 @@ async fn dispatch_agent_run(
         message: validated.message.clone(),
         response: String::new(),
         error: None,
-        created_at: now,
+        created_at: unix_now_ms(),
         started_at: None,
         completed_at: None,
         cancel_token: cancel_token.clone(),
@@ -2143,6 +2138,21 @@ mod tests {
         )
     }
 
+    fn test_router_with_hook_registry_no_runtime(
+        config: HttpConfig,
+        hook_registry: Arc<HookRegistry>,
+    ) -> Router {
+        create_router_with_state(
+            config,
+            MiddlewareConfig::none(),
+            hook_registry,
+            Arc::new(ToolsRegistry::new()),
+            Arc::new(ChannelRegistry::new()),
+            None,
+            false,
+        )
+    }
+
     fn make_test_ws_state() -> (Arc<WsServerState>, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(sessions::SessionStore::with_base_path(
@@ -2429,6 +2439,36 @@ mod tests {
             .expect("hook mapping agent action must register a real run");
         assert_eq!(run.message, "Mapped run this");
         assert!(!run.session_key.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_hooks_mapping_agent_accepts_when_runtime_missing() {
+        let hook_registry = Arc::new(HookRegistry::new());
+        let mapping = HookMapping::new("agent-map-no-runtime")
+            .with_path("agent-map-no-runtime")
+            .with_action(HookAction::Agent)
+            .with_message_template("Mapped {{message}}");
+        hook_registry.register(mapping);
+
+        let router = test_router_with_hook_registry_no_runtime(test_config(), hook_registry);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/hooks/agent-map-no-runtime")
+            .header("authorization", "Bearer test-hooks-token")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"message":"run this"}"#))
+            .unwrap();
+
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ok"], true);
+        assert!(json["runId"].as_str().is_some());
     }
 
     #[tokio::test]
