@@ -46,12 +46,18 @@ rewrite_links() {
 
   body="$(printf '%s' "$body" | sed -E \
     -e 's|href="\.\./CONTRIBUTING\.md"|href="https://github.com/puremachinery/carapace/blob/main/CONTRIBUTING.md"|g' \
+    -e 's|href="\.\./architecture\.md(#[-A-Za-z0-9._/]*)?"|href="https://github.com/puremachinery/carapace/blob/main/docs/architecture.md\1"|g' \
+    -e 's|href="\.\./protocol/([^":#]+)\.md(#[-A-Za-z0-9._/]*)?"|href="https://github.com/puremachinery/carapace/blob/main/docs/protocol/\1.md\2"|g' \
     -e 's|href="\.\./release\.md"|href="release.html"|g' \
     -e 's|href="\.\./cli\.md"|href="cli.html"|g' \
     -e 's|href="\.\./feature-status\.yaml"|href="feature-status.yaml"|g' \
     -e 's|href="\.\./feature-evidence\.yaml"|href="feature-evidence.yaml"|g' \
+    -e 's|href="\.\./channel-smoke\.md"|href="channel-smoke.html"|g' \
+    -e 's|href="\.\./channels\.md"|href="channels.html"|g' \
+    -e 's|href="\.\./getting-started\.md"|href="getting-started.html"|g' \
     -e 's|href="\.\./security\.md"|href="security-model.html"|g' \
     -e 's|href="\.\./security-comparison\.md"|href="security-comparison.html"|g' \
+    -e 's|href="\.\./([A-Za-z0-9._-]+)\.md(#[-A-Za-z0-9._/]*)?"|href="\1.html\2"|g' \
     -e 's|href="\.\./\.\./SECURITY\.md"|href="security-policy.html"|g' \
     -e 's|href="\.\./SECURITY\.md"|href="security-policy.html"|g' \
     -e 's|href="docs/security\.md"|href="security-model.html"|g' \
@@ -132,12 +138,13 @@ render_markdown_page() {
       <nav class="nav-links" aria-label="Primary">
         <a href="${rel_prefix_html}/">Home</a>
         <a href="${rel_prefix_html}/getting-started.html">Getting Started</a>
-        <a href="${rel_prefix_html}/install.html">Install</a>
-        <a href="${rel_prefix_html}/first-run.html">First Run</a>
-        <a href="${rel_prefix_html}/security.html">Security</a>
-        <a href="${rel_prefix_html}/ops.html">Ops</a>
+        <a href="${rel_prefix_html}/channels.html">Channels</a>
+        <a href="${rel_prefix_html}/providers.html">Providers</a>
+        <a href="${rel_prefix_html}/cli-tasks.html">CLI</a>
+        <a href="${rel_prefix_html}/security-ops.html">Security/Ops</a>
+        <a href="${rel_prefix_html}/reference.html">Reference</a>
         <a href="${rel_prefix_html}/cookbook/">Cookbook</a>
-        <a href="${rel_prefix_html}/get-unstuck.html">Get Unstuck</a>
+        <a href="${rel_prefix_html}/docs.html">Docs</a>
         <a href="https://github.com/puremachinery/carapace">GitHub</a>
       </nav>
     </header>
@@ -248,6 +255,30 @@ render_site_doc_page "get-unstuck" "Get Unstuck" \
   "Troubleshooting checks, logs, and issue-reporting paths for Carapace." \
   "./getting-started.html" \
   "Getting Started"
+render_site_doc_page "docs" "Docs Hubs" \
+  "Top-level documentation hubs by outcome and operating area." \
+  "./getting-started.html" \
+  "Getting Started"
+render_site_doc_page "providers" "Providers Hub" \
+  "Provider setup guidance and capability references." \
+  "./docs.html" \
+  "Docs Hubs"
+render_site_doc_page "capability-matrix" "Capability Matrix" \
+  "Support matrix for channels, providers, and platform/runtime behavior." \
+  "./providers.html" \
+  "Providers Hub"
+render_site_doc_page "cli-tasks" "CLI Tasks Index" \
+  "Task-oriented command index for setup, operations, and recovery." \
+  "./docs.html" \
+  "Docs Hubs"
+render_site_doc_page "security-ops" "Security & Ops Hub" \
+  "Security and operations pathways for day-2 running and hardening." \
+  "./docs.html" \
+  "Docs Hubs"
+render_site_doc_page "reference" "Reference Hub" \
+  "Architecture, protocol, and inventory references." \
+  "./docs.html" \
+  "Docs Hubs"
 
 render_markdown_page \
   "${repo_root}/docs/cli.md" \
