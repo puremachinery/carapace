@@ -20,7 +20,7 @@ trap 'rm -f "${diff_file}"' EXIT
 
 if ! diff -ru --exclude '.DS_Store' "${src_dir}" "${dist_dir}" >"${diff_file}"; then
   echo "Control UI source and dist assets are out of sync." >&2
-  echo "Run: npm run ui:build" >&2
+  echo "Run: ./scripts/build-control-ui.sh" >&2
   echo >&2
   sed -n '1,200p' "${diff_file}" >&2
   exit 1

@@ -2855,6 +2855,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_control_config_patch_rejects_non_allowlisted_path() {
+        let (_temp, _guard) = set_temp_config_path();
         let router = test_router(test_config());
         let snapshot = read_control_config_snapshot(router.clone()).await;
         let mut req_body = json!({
