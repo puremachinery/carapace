@@ -857,13 +857,16 @@ pub async fn tasks_patch_handler(
         }
     };
 
-    let Some(_task) = queue.get(task_id) else {
+    if queue.get(task_id).is_none() {
         return (
             StatusCode::NOT_FOUND,
             Json(ControlError::new("Task not found")),
         )
             .into_response();
-    };
+    }
+    // Cancellation is intentionally non-terminal for operator remediation:
+    // cancelled tasks may be patched and then retried/resumed as needed.
+    // Done remains terminal and is rejected by `patch_task`.
 
     let payload = match req.payload {
         Some(payload) => {

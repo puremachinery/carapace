@@ -37,7 +37,16 @@ This check submits a real durable task and verifies both:
 - start proof (`attempts > 0`)
 - terminal proof (`done` or `blocked`)
 
-## 4) Production secret baseline
+## 4) Task payload storage note
+
+Durable task payloads are persisted in plaintext at:
+
+- `~/.config/carapace/tasks/queue.json`
+
+Treat task payload text as operational state, not secret storage. Do not place
+raw secrets/tokens in task messages.
+
+## 5) Production secret baseline
 
 Set a deployment-specific server secret in production:
 
@@ -48,7 +57,7 @@ export CARAPACE_SERVER_SECRET='<long-random-secret>'
 This avoids hooks sender-scoping fallback behavior that is acceptable for local
 development but not ideal for long-lived production deployments.
 
-## 5) Backup and restore
+## 6) Backup and restore
 
 Create a backup before major config/channel changes:
 
@@ -62,7 +71,7 @@ Restore from backup:
 cara restore --path ./carapace-backup.tar.gz
 ```
 
-## 6) Update flow
+## 7) Update flow
 
 Quick path:
 
@@ -81,7 +90,7 @@ Reference docs:
 - [Install](install.md)
 - [Release & upgrade policy](../release.md)
 
-## 7) First-response recovery checklist
+## 8) First-response recovery checklist
 
 1. Confirm service health and port/bind settings.
 2. Capture recent logs and isolate the first failing component (provider/channel/auth).
@@ -89,13 +98,13 @@ Reference docs:
 4. Restore from latest known-good backup if needed.
 5. Open an issue with logs + exact steps if still blocked.
 
-## 8) Next paths
+## 9) Next paths
 
 - [First Run](first-run.md)
 - [Cookbook](../cookbook/README.md)
 - [Get Unstuck](get-unstuck.md)
 
-## 9) Security reporting
+## 10) Security reporting
 
 For suspected vulnerabilities, use private reporting:
 

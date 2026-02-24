@@ -118,6 +118,10 @@ pub struct DurableTask {
     pub attempts: u32,
     pub next_run_at_ms: Option<u64>,
     pub last_error: Option<String>,
+    /// Task payload persisted to disk as operational state.
+    ///
+    /// Payload content is currently stored in plaintext queue JSON for
+    /// durability and operator inspection. Avoid embedding raw secrets.
     pub payload: Value,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
@@ -365,9 +369,7 @@ impl TaskQueue {
 
     /// List tasks newest-first.
     pub fn list(&self) -> Vec<DurableTask> {
-        let mut tasks = self.tasks.read().clone();
-        tasks.sort_by_key(|t| std::cmp::Reverse(t.updated_at_ms));
-        tasks
+        self.list_filtered(None, None).1
     }
 
     /// List tasks with optional state filtering and limit, newest-first.
@@ -1207,16 +1209,14 @@ mod tests {
     where
         F: Fn() -> bool,
     {
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if condition() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(1)).await;
+        const MAX_POLLS: usize = 10_000;
+        for _ in 0..MAX_POLLS {
+            if condition() {
+                return;
             }
-        })
-        .await
-        .expect(failure_message);
+            tokio::task::yield_now().await;
+        }
+        panic!("{failure_message}");
     }
 
     async fn run_worker_once_with_outcome(
@@ -1240,6 +1240,8 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 let notified = executor.notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
                 if executor.calls.load(Ordering::Relaxed) >= 1 {
                     break;
                 }
@@ -1284,6 +1286,8 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 let notified = executor.notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
                 if executor.calls.load(Ordering::Relaxed) >= 2 {
                     break;
                 }
