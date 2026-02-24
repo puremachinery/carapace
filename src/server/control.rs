@@ -30,7 +30,7 @@ use crate::cron::CronPayload;
 use crate::logging::audit::{audit, AuditEvent};
 use crate::server::connect_info::MaybeConnectInfo;
 use crate::server::ws::{map_validation_issues, persist_config_file, read_config_snapshot};
-use crate::tasks::{DurableTask, TaskPolicy, TaskQueue, TaskState};
+use crate::tasks::{DurableTask, TaskPolicy, TaskPolicyPatch, TaskQueue, TaskState};
 
 const PROTECTED_CONFIG_PREFIXES: &[&str] = &[
     "gateway.auth",
@@ -250,6 +250,16 @@ pub struct TaskRetryRequest {
     pub reason: Option<String>,
 }
 
+/// Task resume request.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskResumeRequest {
+    #[serde(default)]
+    pub delay_ms: Option<u64>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
 /// Task update request.
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -315,30 +325,37 @@ fn resolve_task_policy(input: Option<TaskPolicyRequest>) -> Result<TaskPolicy, S
     Ok(policy)
 }
 
-fn merge_task_policy(base: &TaskPolicy, patch: TaskPolicyRequest) -> Result<TaskPolicy, String> {
-    let mut policy = base.clone();
-    if let Some(max_attempts) = patch.max_attempts {
-        policy.max_attempts =
-            resolve_policy_bound(max_attempts, MAX_TASK_ATTEMPTS_LIMIT, "maxAttempts")?;
+fn resolve_task_policy_patch(input: TaskPolicyRequest) -> Result<TaskPolicyPatch, String> {
+    let mut patch = TaskPolicyPatch::default();
+    if let Some(max_attempts) = input.max_attempts {
+        patch.max_attempts = Some(resolve_policy_bound(
+            max_attempts,
+            MAX_TASK_ATTEMPTS_LIMIT,
+            "maxAttempts",
+        )?);
     }
-    if let Some(max_total_runtime_ms) = patch.max_total_runtime_ms {
-        policy.max_total_runtime_ms = resolve_policy_bound(
+    if let Some(max_total_runtime_ms) = input.max_total_runtime_ms {
+        patch.max_total_runtime_ms = Some(resolve_policy_bound(
             max_total_runtime_ms,
             MAX_TASK_TOTAL_RUNTIME_MS_LIMIT,
             "maxTotalRuntimeMs",
-        )?;
+        )?);
     }
-    if let Some(max_turns) = patch.max_turns {
-        policy.max_turns = resolve_policy_bound(max_turns, MAX_TASK_TURNS_LIMIT, "maxTurns")?;
+    if let Some(max_turns) = input.max_turns {
+        patch.max_turns = Some(resolve_policy_bound(
+            max_turns,
+            MAX_TASK_TURNS_LIMIT,
+            "maxTurns",
+        )?);
     }
-    if let Some(max_run_timeout_seconds) = patch.max_run_timeout_seconds {
-        policy.max_run_timeout_seconds = resolve_policy_bound(
+    if let Some(max_run_timeout_seconds) = input.max_run_timeout_seconds {
+        patch.max_run_timeout_seconds = Some(resolve_policy_bound(
             max_run_timeout_seconds,
             MAX_TASK_RUN_TIMEOUT_SECONDS_LIMIT,
             "maxRunTimeoutSeconds",
-        )?;
+        )?);
     }
-    Ok(policy)
+    Ok(patch)
 }
 
 /// Single-task response.
@@ -840,7 +857,7 @@ pub async fn tasks_patch_handler(
         }
     };
 
-    let Some(task) = queue.get(task_id) else {
+    let Some(_task) = queue.get(task_id) else {
         return (
             StatusCode::NOT_FOUND,
             Json(ControlError::new("Task not found")),
@@ -864,9 +881,9 @@ pub async fn tasks_patch_handler(
         None => None,
     };
 
-    let policy = match req.policy {
-        Some(patch) => match merge_task_policy(&task.policy, patch) {
-            Ok(policy) => Some(policy),
+    let policy_patch = match req.policy {
+        Some(patch) => match resolve_task_policy_patch(patch) {
+            Ok(patch) => Some(patch),
             Err(msg) => {
                 return (StatusCode::BAD_REQUEST, Json(ControlError::new(msg))).into_response();
             }
@@ -874,7 +891,12 @@ pub async fn tasks_patch_handler(
         None => None,
     };
 
-    if payload.is_none() && policy.is_none() && reason.is_none() {
+    if payload.is_none()
+        && reason.is_none()
+        && policy_patch
+            .as_ref()
+            .is_none_or(|patch| !patch.has_updates())
+    {
         return (
             StatusCode::BAD_REQUEST,
             Json(ControlError::new(
@@ -884,7 +906,7 @@ pub async fn tasks_patch_handler(
             .into_response();
     }
 
-    if !queue.patch_task(task_id, payload, policy, reason.as_deref()) {
+    if !queue.patch_task(task_id, payload, policy_patch, reason.as_deref()) {
         return (
             StatusCode::CONFLICT,
             Json(ControlError::new("Task state changed; patch rejected")),
@@ -917,7 +939,7 @@ pub async fn tasks_retry_handler(
     let Some(queue) = task_queue_or_unavailable(&state) else {
         return task_queue_unavailable_response();
     };
-    let req: TaskRetryRequest = match parse_optional_json(&body) {
+    let req: TaskResumeRequest = match parse_optional_json(&body) {
         Ok(req) => req,
         Err(msg) => {
             return (StatusCode::BAD_REQUEST, Json(ControlError::new(msg))).into_response();

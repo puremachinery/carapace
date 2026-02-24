@@ -91,6 +91,24 @@ impl Default for TaskPolicy {
     }
 }
 
+/// Partial operator patch for a task continuation policy.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TaskPolicyPatch {
+    pub max_attempts: Option<u32>,
+    pub max_total_runtime_ms: Option<u64>,
+    pub max_turns: Option<u32>,
+    pub max_run_timeout_seconds: Option<u32>,
+}
+
+impl TaskPolicyPatch {
+    pub fn has_updates(&self) -> bool {
+        self.max_attempts.is_some()
+            || self.max_total_runtime_ms.is_some()
+            || self.max_turns.is_some()
+            || self.max_run_timeout_seconds.is_some()
+    }
+}
+
 /// A single persisted task record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -486,10 +504,15 @@ impl TaskQueue {
         &self,
         id: &str,
         payload: Option<Value>,
-        policy: Option<TaskPolicy>,
+        policy_patch: Option<TaskPolicyPatch>,
         reason: Option<&str>,
     ) -> bool {
-        if payload.is_none() && policy.is_none() && reason.is_none() {
+        if payload.is_none()
+            && reason.is_none()
+            && policy_patch
+                .as_ref()
+                .is_none_or(|patch| !patch.has_updates())
+        {
             return false;
         }
 
@@ -500,9 +523,22 @@ impl TaskQueue {
                 if let Some(payload) = &payload {
                     task.payload = payload.clone();
                 }
-                if let Some(policy) = &policy {
-                    task.policy = policy.clone();
-                    task.policy_explicit = true;
+                if let Some(policy_patch) = &policy_patch {
+                    if let Some(max_attempts) = policy_patch.max_attempts {
+                        task.policy.max_attempts = max_attempts;
+                    }
+                    if let Some(max_total_runtime_ms) = policy_patch.max_total_runtime_ms {
+                        task.policy.max_total_runtime_ms = max_total_runtime_ms;
+                    }
+                    if let Some(max_turns) = policy_patch.max_turns {
+                        task.policy.max_turns = max_turns;
+                    }
+                    if let Some(max_run_timeout_seconds) = policy_patch.max_run_timeout_seconds {
+                        task.policy.max_run_timeout_seconds = max_run_timeout_seconds;
+                    }
+                    if policy_patch.has_updates() {
+                        task.policy_explicit = true;
+                    }
                 }
                 if let Some(reason) = reason {
                     task.last_error = Some(reason.to_string());
