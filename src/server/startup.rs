@@ -31,6 +31,8 @@ struct RuntimeTaskExecutor {
     state: Arc<WsServerState>,
 }
 
+const NO_PROVIDER_RETRY_DELAY_MS: u64 = 60_000;
+
 #[async_trait]
 impl TaskExecutor for RuntimeTaskExecutor {
     async fn execute(&self, task: DurableTask) -> TaskExecutionOutcome {
@@ -46,8 +48,9 @@ impl TaskExecutor for RuntimeTaskExecutor {
         match crate::cron::executor::execute_payload(&task.id, &payload, &self.state).await {
             Ok(_) => TaskExecutionOutcome::Done,
             Err(crate::cron::executor::CronExecuteError::LlmNotConfigured) => {
-                TaskExecutionOutcome::Blocked {
-                    reason: crate::cron::executor::NO_LLM_PROVIDER_CONFIGURED_ERROR.to_string(),
+                TaskExecutionOutcome::RetryWait {
+                    delay_ms: NO_PROVIDER_RETRY_DELAY_MS,
+                    error: crate::cron::executor::NO_LLM_PROVIDER_CONFIGURED_ERROR.to_string(),
                 }
             }
             Err(crate::cron::executor::CronExecuteError::Other(error)) => {
@@ -482,4 +485,51 @@ pub async fn run_server_with_config(
         ws_state: config.ws_state,
         server_task,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cron::CronPayload;
+    use crate::server::ws::WsServerConfig;
+
+    fn durable_task_with_payload(payload: serde_json::Value) -> DurableTask {
+        DurableTask {
+            id: "task-1".to_string(),
+            state: crate::tasks::TaskState::Queued,
+            attempts: 1,
+            next_run_at_ms: None,
+            last_error: None,
+            payload,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_task_executor_retries_when_provider_missing() {
+        let state = Arc::new(WsServerState::new(WsServerConfig::default()));
+        let executor = RuntimeTaskExecutor { state };
+        let payload = serde_json::to_value(CronPayload::AgentTurn {
+            message: "hello".to_string(),
+            model: None,
+            thinking: None,
+            timeout_seconds: None,
+            allow_unsafe_external_content: None,
+            deliver: None,
+            channel: None,
+            to: None,
+            best_effort_deliver: None,
+        })
+        .expect("payload serializes");
+
+        let outcome = executor.execute(durable_task_with_payload(payload)).await;
+        assert_eq!(
+            outcome,
+            TaskExecutionOutcome::RetryWait {
+                delay_ms: NO_PROVIDER_RETRY_DELAY_MS,
+                error: crate::cron::executor::NO_LLM_PROVIDER_CONFIGURED_ERROR.to_string(),
+            }
+        );
+    }
 }
