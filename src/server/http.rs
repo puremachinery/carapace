@@ -2663,6 +2663,22 @@ mod tests {
             .unwrap();
         let create_json: Value = serde_json::from_slice(&create_body).unwrap();
         assert_eq!(create_json["ok"], true);
+        assert_eq!(
+            create_json["task"]["policy"]["maxAttempts"],
+            crate::tasks::DEFAULT_TASK_MAX_ATTEMPTS
+        );
+        assert_eq!(
+            create_json["task"]["policy"]["maxTotalRuntimeMs"],
+            crate::tasks::DEFAULT_TASK_MAX_TOTAL_RUNTIME_MS
+        );
+        assert_eq!(
+            create_json["task"]["policy"]["maxTurns"],
+            crate::tasks::DEFAULT_TASK_MAX_TURNS
+        );
+        assert_eq!(
+            create_json["task"]["policy"]["maxRunTimeoutSeconds"],
+            crate::tasks::DEFAULT_TASK_MAX_RUN_TIMEOUT_SECONDS
+        );
         let task_id = create_json["task"]["id"]
             .as_str()
             .expect("task id should be present")
@@ -2702,6 +2718,37 @@ mod tests {
         let get_json: Value = serde_json::from_slice(&get_body).unwrap();
         assert_eq!(get_json["ok"], true);
         assert_eq!(get_json["task"]["id"], task_id);
+    }
+
+    #[tokio::test]
+    async fn test_control_tasks_create_rejects_invalid_policy_budget() {
+        let (ws_state, _tmp) = make_test_ws_state();
+        let router = test_router_with_hook_registry(
+            test_config(),
+            Arc::new(HookRegistry::new()),
+            ws_state.clone(),
+        );
+
+        let create_req = Request::builder()
+            .method("POST")
+            .uri("/control/tasks")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"payload":{"kind":"systemEvent","text":"task wake"},"policy":{"maxAttempts":0}}"#,
+            ))
+            .unwrap();
+        let create_response = router.clone().oneshot(create_req).await.unwrap();
+        assert_eq!(create_response.status(), StatusCode::BAD_REQUEST);
+        let create_body = axum::body::to_bytes(create_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let create_json: Value = serde_json::from_slice(&create_body).unwrap();
+        assert_eq!(create_json["ok"], false);
+        assert!(create_json["error"]
+            .as_str()
+            .expect("error should be present")
+            .contains("policy.maxAttempts"));
     }
 
     #[tokio::test]

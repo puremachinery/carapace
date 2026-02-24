@@ -32,11 +32,56 @@ struct RuntimeTaskExecutor {
 }
 
 const NO_PROVIDER_RETRY_DELAY_MS: u64 = 60_000;
-const NO_PROVIDER_MAX_RETRY_ATTEMPTS: u32 = 3_600;
 
 #[async_trait]
 impl TaskExecutor for RuntimeTaskExecutor {
     async fn execute(&self, task: DurableTask) -> TaskExecutionOutcome {
+        if task.policy.max_attempts == 0 {
+            return TaskExecutionOutcome::Failed {
+                error: "objective policy violation: maxAttempts must be greater than 0".to_string(),
+            };
+        }
+        if task.policy.max_total_runtime_ms == 0 {
+            return TaskExecutionOutcome::Failed {
+                error: "objective policy violation: maxTotalRuntimeMs must be greater than 0"
+                    .to_string(),
+            };
+        }
+        if task.policy.max_turns == 0 {
+            return TaskExecutionOutcome::Failed {
+                error: "objective policy violation: maxTurns must be greater than 0".to_string(),
+            };
+        }
+        if task.policy.max_run_timeout_seconds == 0 {
+            return TaskExecutionOutcome::Failed {
+                error: "objective policy violation: maxRunTimeoutSeconds must be greater than 0"
+                    .to_string(),
+            };
+        }
+
+        if task.attempts > task.policy.max_attempts {
+            return TaskExecutionOutcome::Failed {
+                error: format!(
+                    "objective policy violation: attempts {} exceeded maxAttempts {}",
+                    task.attempts, task.policy.max_attempts
+                ),
+            };
+        }
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let task_age_ms = now_ms.saturating_sub(task.created_at_ms);
+        if task_age_ms > task.policy.max_total_runtime_ms {
+            return TaskExecutionOutcome::Failed {
+                error: format!(
+                    "objective policy violation: task age {}ms exceeded maxTotalRuntimeMs {}",
+                    task_age_ms, task.policy.max_total_runtime_ms
+                ),
+            };
+        }
+
         let payload = match serde_json::from_value::<crate::cron::CronPayload>(task.payload) {
             Ok(payload) => payload,
             Err(err) => {
@@ -46,7 +91,19 @@ impl TaskExecutor for RuntimeTaskExecutor {
             }
         };
 
-        match crate::cron::executor::execute_payload(&task.id, &payload, &self.state).await {
+        let execution_limits = crate::cron::executor::ExecutionLimits {
+            max_turns: Some(task.policy.max_turns),
+            max_timeout_seconds: Some(task.policy.max_run_timeout_seconds),
+        };
+
+        match crate::cron::executor::execute_payload(
+            &task.id,
+            &payload,
+            &self.state,
+            execution_limits,
+        )
+        .await
+        {
             Ok(crate::cron::executor::CronRunOutcome::Broadcast) => {
                 TaskExecutionOutcome::Done { run_id: None }
             }
@@ -56,12 +113,12 @@ impl TaskExecutor for RuntimeTaskExecutor {
                 }
             }
             Err(crate::cron::executor::CronExecuteError::LlmNotConfigured) => {
-                if task.attempts >= NO_PROVIDER_MAX_RETRY_ATTEMPTS {
+                if task.attempts >= task.policy.max_attempts {
                     TaskExecutionOutcome::Failed {
                         error: format!(
                             "{} (retry limit reached: {})",
                             crate::cron::executor::NO_LLM_PROVIDER_CONFIGURED_ERROR,
-                            NO_PROVIDER_MAX_RETRY_ATTEMPTS
+                            task.policy.max_attempts
                         ),
                     }
                 } else {
@@ -512,6 +569,10 @@ mod tests {
     use crate::server::ws::WsServerConfig;
 
     fn durable_task_with_payload(payload: serde_json::Value, attempts: u32) -> DurableTask {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
         DurableTask {
             id: "task-1".to_string(),
             state: crate::tasks::TaskState::Queued,
@@ -519,10 +580,21 @@ mod tests {
             next_run_at_ms: None,
             last_error: None,
             payload,
-            created_at_ms: 1,
-            updated_at_ms: 1,
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
             run_ids: Vec::new(),
+            policy: crate::tasks::TaskPolicy::default(),
         }
+    }
+
+    fn durable_task_with_policy(
+        payload: serde_json::Value,
+        attempts: u32,
+        policy: crate::tasks::TaskPolicy,
+    ) -> DurableTask {
+        let mut task = durable_task_with_payload(payload, attempts);
+        task.policy = policy;
+        task
     }
 
     #[tokio::test]
@@ -574,7 +646,7 @@ mod tests {
         let outcome = executor
             .execute(durable_task_with_payload(
                 payload,
-                NO_PROVIDER_MAX_RETRY_ATTEMPTS,
+                crate::tasks::TaskPolicy::default().max_attempts,
             ))
             .await;
         assert_eq!(
@@ -583,8 +655,90 @@ mod tests {
                 error: format!(
                     "{} (retry limit reached: {})",
                     crate::cron::executor::NO_LLM_PROVIDER_CONFIGURED_ERROR,
-                    NO_PROVIDER_MAX_RETRY_ATTEMPTS
+                    crate::tasks::TaskPolicy::default().max_attempts
                 ),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_task_executor_rejects_attempts_over_policy_budget() {
+        let state = Arc::new(WsServerState::new(WsServerConfig::default()));
+        let executor = RuntimeTaskExecutor { state };
+        let policy = crate::tasks::TaskPolicy {
+            max_attempts: 1,
+            ..Default::default()
+        };
+        let payload = serde_json::to_value(CronPayload::SystemEvent {
+            text: "hello".to_string(),
+        })
+        .expect("payload serializes");
+
+        let outcome = executor
+            .execute(durable_task_with_policy(payload, 2, policy))
+            .await;
+        assert_eq!(
+            outcome,
+            TaskExecutionOutcome::Failed {
+                error: "objective policy violation: attempts 2 exceeded maxAttempts 1".to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_task_executor_rejects_task_age_over_policy_budget() {
+        let state = Arc::new(WsServerState::new(WsServerConfig::default()));
+        let executor = RuntimeTaskExecutor { state };
+        let policy = crate::tasks::TaskPolicy {
+            max_total_runtime_ms: 1,
+            ..Default::default()
+        };
+        let payload = serde_json::to_value(CronPayload::SystemEvent {
+            text: "hello".to_string(),
+        })
+        .expect("payload serializes");
+        let mut task = durable_task_with_policy(payload, 1, policy);
+        task.created_at_ms = 0;
+
+        let outcome = executor.execute(task).await;
+        assert!(matches!(
+            outcome,
+            TaskExecutionOutcome::Failed { error }
+            if error.contains("objective policy violation: task age")
+                && error.contains("exceeded maxTotalRuntimeMs 1")
+        ));
+    }
+
+    #[tokio::test]
+    async fn runtime_task_executor_rejects_run_timeout_over_policy_budget() {
+        let state = Arc::new(WsServerState::new(WsServerConfig::default()));
+        let executor = RuntimeTaskExecutor { state };
+        let policy = crate::tasks::TaskPolicy {
+            max_run_timeout_seconds: 10,
+            ..Default::default()
+        };
+        let payload = serde_json::to_value(CronPayload::AgentTurn {
+            message: "hello".to_string(),
+            model: None,
+            thinking: None,
+            timeout_seconds: Some(30),
+            allow_unsafe_external_content: None,
+            deliver: None,
+            channel: None,
+            to: None,
+            best_effort_deliver: None,
+        })
+        .expect("payload serializes");
+
+        let outcome = executor
+            .execute(durable_task_with_policy(payload, 1, policy))
+            .await;
+        assert_eq!(
+            outcome,
+            TaskExecutionOutcome::Failed {
+                error:
+                    "objective policy violation: timeoutSeconds 30 exceeds maxRunTimeoutSeconds 10"
+                        .to_string(),
             }
         );
     }
