@@ -542,6 +542,11 @@ impl WsServerState {
         }
     }
 
+    /// Construct persistent WS server state.
+    ///
+    /// For async startup paths, callers must follow construction with
+    /// `task_queue.load_async().await` so queue file I/O and recovery do not
+    /// run on Tokio worker threads.
     pub fn new_persistent(
         config: WsServerConfig,
         state_dir: PathBuf,

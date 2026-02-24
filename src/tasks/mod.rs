@@ -1200,7 +1200,7 @@ mod tests {
                 if condition() {
                     break;
                 }
-                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
         .await
