@@ -144,6 +144,10 @@ impl TaskQueue {
     ///
     /// For Tokio async call sites, prefer [`Self::enqueue_async`] to avoid
     /// blocking runtime worker threads on fsync.
+    ///
+    /// If the queue is full and has no terminal task to evict, this returns a
+    /// synthetic `Failed` task and does not insert it into the queue. Callers
+    /// must not assume the returned task ID is persisted in that case.
     pub fn enqueue(&self, payload: Value, next_run_at_ms: Option<u64>) -> DurableTask {
         let now = now_ms();
         let mut task = DurableTask {
@@ -194,6 +198,10 @@ impl TaskQueue {
     ///
     /// This offloads sync queue mutation and fsync persistence to a blocking
     /// thread, so async handlers do not block runtime worker threads.
+    ///
+    /// The same capacity-full contract as [`Self::enqueue`] applies: on full
+    /// queue with no evictable terminal task, the returned `Failed` task ID is
+    /// synthetic and not present in the queue.
     pub async fn enqueue_async(
         self: &Arc<Self>,
         payload: Value,
@@ -718,6 +726,32 @@ mod tests {
         }
     }
 
+    struct FixedOutcomeExecutor {
+        outcome: TaskExecutionOutcome,
+    }
+
+    #[async_trait]
+    impl TaskExecutor for FixedOutcomeExecutor {
+        async fn execute(&self, _task: DurableTask) -> TaskExecutionOutcome {
+            self.outcome.clone()
+        }
+    }
+
+    async fn run_worker_once_with_outcome(queue: Arc<TaskQueue>, outcome: TaskExecutionOutcome) {
+        let executor = Arc::new(FixedOutcomeExecutor { outcome });
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let worker = tokio::spawn(task_worker_loop(
+            queue,
+            executor,
+            Duration::from_millis(10),
+            shutdown_rx,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let _ = shutdown_tx.send(true);
+        let _ = worker.await;
+    }
+
     #[tokio::test]
     async fn test_task_worker_loop_processes_due_tasks() {
         let queue = Arc::new(TaskQueue::in_memory());
@@ -743,5 +777,82 @@ mod tests {
         let stats = queue.stats();
         assert_eq!(stats.done, 2);
         assert_eq!(stats.running, 0);
+    }
+
+    #[tokio::test]
+    async fn test_task_worker_loop_retry_wait_outcome_branch() {
+        let queue = Arc::new(TaskQueue::in_memory());
+        let task = queue.enqueue(serde_json::json!({"kind":"demo"}), None);
+
+        run_worker_once_with_outcome(
+            queue.clone(),
+            TaskExecutionOutcome::RetryWait {
+                delay_ms: 5_000,
+                error: "temporary failure".to_string(),
+            },
+        )
+        .await;
+
+        let updated = queue.get(&task.id).expect("task should exist");
+        assert_eq!(updated.state, TaskState::RetryWait);
+        assert_eq!(updated.last_error.as_deref(), Some("temporary failure"));
+        assert!(updated.next_run_at_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_task_worker_loop_failed_outcome_branch() {
+        let queue = Arc::new(TaskQueue::in_memory());
+        let task = queue.enqueue(serde_json::json!({"kind":"demo"}), None);
+
+        run_worker_once_with_outcome(
+            queue.clone(),
+            TaskExecutionOutcome::Failed {
+                error: "fatal".to_string(),
+            },
+        )
+        .await;
+
+        let updated = queue.get(&task.id).expect("task should exist");
+        assert_eq!(updated.state, TaskState::Failed);
+        assert_eq!(updated.last_error.as_deref(), Some("fatal"));
+        assert_eq!(updated.next_run_at_ms, None);
+    }
+
+    #[tokio::test]
+    async fn test_task_worker_loop_blocked_outcome_branch() {
+        let queue = Arc::new(TaskQueue::in_memory());
+        let task = queue.enqueue(serde_json::json!({"kind":"demo"}), None);
+
+        run_worker_once_with_outcome(
+            queue.clone(),
+            TaskExecutionOutcome::Blocked {
+                reason: "needs operator action".to_string(),
+            },
+        )
+        .await;
+
+        let updated = queue.get(&task.id).expect("task should exist");
+        assert_eq!(updated.state, TaskState::Blocked);
+        assert_eq!(updated.last_error.as_deref(), Some("needs operator action"));
+        assert_eq!(updated.next_run_at_ms, None);
+    }
+
+    #[tokio::test]
+    async fn test_task_worker_loop_cancelled_outcome_branch() {
+        let queue = Arc::new(TaskQueue::in_memory());
+        let task = queue.enqueue(serde_json::json!({"kind":"demo"}), None);
+
+        run_worker_once_with_outcome(
+            queue.clone(),
+            TaskExecutionOutcome::Cancelled {
+                reason: Some("operator cancelled".to_string()),
+            },
+        )
+        .await;
+
+        let updated = queue.get(&task.id).expect("task should exist");
+        assert_eq!(updated.state, TaskState::Cancelled);
+        assert_eq!(updated.last_error.as_deref(), Some("operator cancelled"));
+        assert_eq!(updated.next_run_at_ms, None);
     }
 }
