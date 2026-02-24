@@ -672,7 +672,8 @@ fn register_session_routes(
     let control_state_status = control_state.clone();
     let control_state_channels = control_state.clone();
     let control_state_config_read = control_state.clone();
-    let control_state_config = control_state.clone();
+    let control_state_config_post = control_state.clone();
+    let control_state_config_patch = control_state.clone();
     let control_state_tasks_create = control_state.clone();
     let control_state_tasks_list = control_state.clone();
     let control_state_tasks_get = control_state.clone();
@@ -704,9 +705,18 @@ fn register_session_routes(
             })
             .post(
                 move |connect_info: MaybeConnectInfo, headers: HeaderMap, body: Bytes| {
-                    let state = control_state_config.clone();
+                    let state = control_state_config_post.clone();
                     async move {
                         control::config_handler(State(state), connect_info, headers, body).await
+                    }
+                },
+            )
+            .patch(
+                move |connect_info: MaybeConnectInfo, headers: HeaderMap, body: Bytes| {
+                    let state = control_state_config_patch.clone();
+                    async move {
+                        control::config_patch_handler(State(state), connect_info, headers, body)
+                            .await
                     }
                 },
             ),
@@ -2299,6 +2309,21 @@ mod tests {
         )
     }
 
+    async fn read_control_config_snapshot(router: Router) -> Value {
+        let req = Request::builder()
+            .method("GET")
+            .uri("/control/config")
+            .header("authorization", "Bearer test-gateway-token")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
     fn make_test_ws_state() -> (Arc<WsServerState>, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(sessions::SessionStore::with_base_path(
@@ -2716,6 +2741,82 @@ mod tests {
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["ok"], true);
         assert!(json["config"].is_object());
+    }
+
+    #[tokio::test]
+    async fn test_control_config_patch_updates_allowed_path() {
+        let router = test_router(test_config());
+        let snapshot = read_control_config_snapshot(router.clone()).await;
+        let mut req_body = json!({
+            "path": "gateway.controlUi.enabled",
+            "value": true,
+        });
+        if let Some(hash) = snapshot["hash"].as_str() {
+            req_body["baseHash"] = json!(hash);
+        }
+
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/control/config")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(req_body.to_string()))
+            .unwrap();
+        let response = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["applied"]["path"], "gateway.controlUi.enabled");
+        assert_eq!(json["applied"]["value"], true);
+    }
+
+    #[tokio::test]
+    async fn test_control_config_patch_rejects_non_allowlisted_path() {
+        let router = test_router(test_config());
+        let snapshot = read_control_config_snapshot(router.clone()).await;
+        let mut req_body = json!({
+            "path": "gateway.mode",
+            "value": "lan",
+        });
+        if let Some(hash) = snapshot["hash"].as_str() {
+            req_body["baseHash"] = json!(hash);
+        }
+
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/control/config")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(req_body.to_string()))
+            .unwrap();
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_control_config_post_alias_updates_allowed_path() {
+        let router = test_router(test_config());
+        let snapshot = read_control_config_snapshot(router.clone()).await;
+        let mut req_body = json!({
+            "path": "gateway.controlUi.basePath",
+            "value": "/ui-admin",
+        });
+        if let Some(hash) = snapshot["hash"].as_str() {
+            req_body["baseHash"] = json!(hash);
+        }
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/control/config")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(req_body.to_string()))
+            .unwrap();
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

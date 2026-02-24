@@ -76,8 +76,34 @@
       </section>
 
       <section class="panel">
-        <h2>Config Update</h2>
-        <p>Apply one path update through <code>POST /control/config</code>.</p>
+        <h2>Control UI Settings</h2>
+        <p class="meta">Safe write path via <code>PATCH /control/config</code> (only <code>gateway.controlUi.*</code>).</p>
+
+        <div class="settings-grid">
+          <label class="inline-field checkbox" for="controlUiEnabled">
+            <span>Control UI enabled</span>
+            <input id="controlUiEnabled" type="checkbox" />
+          </label>
+          <label class="inline-field checkbox" for="controlUiAllowInsecureAuth">
+            <span>Allow insecure auth paths</span>
+            <input id="controlUiAllowInsecureAuth" type="checkbox" />
+          </label>
+          <label class="inline-field checkbox" for="controlUiDisableDeviceAuth">
+            <span>Disable device auth for Control UI client</span>
+            <input id="controlUiDisableDeviceAuth" type="checkbox" />
+          </label>
+        </div>
+
+        <label for="controlUiBasePath">Control UI base path (empty = <code>/ui</code>)</label>
+        <input id="controlUiBasePath" type="text" placeholder="/ui" />
+
+        <button id="saveControlUiSettings" type="button">Save control UI settings</button>
+        <p id="controlUiSettingsStatus" class="meta"></p>
+      </section>
+
+      <section class="panel">
+        <h2>Advanced Config Patch</h2>
+        <p>Apply one explicit path update through <code>PATCH /control/config</code>.</p>
         <label for="configPath">Path</label>
         <input id="configPath" type="text" placeholder="gateway.controlUi.enabled" />
 
@@ -86,6 +112,72 @@
 
         <button id="applyConfig" type="button">Apply config update</button>
         <p id="configUpdateStatus" class="meta"></p>
+      </section>
+
+      <section class="panel">
+        <h2>Task Queue Operator</h2>
+        <p class="meta">Inspect and mutate durable tasks via control endpoints.</p>
+
+        <div class="task-toolbar">
+          <label class="inline-field" for="taskFilterState">
+            <span>State filter</span>
+            <select id="taskFilterState">
+              <option value="">all</option>
+              <option value="queued">queued</option>
+              <option value="running">running</option>
+              <option value="retry_wait">retry_wait</option>
+              <option value="blocked">blocked</option>
+              <option value="failed">failed</option>
+              <option value="done">done</option>
+              <option value="cancelled">cancelled</option>
+            </select>
+          </label>
+          <button id="refreshTasks" type="button" class="secondary">Refresh tasks</button>
+        </div>
+
+        <div id="tasksCards" class="cards"></div>
+
+        <h3>Selected Task</h3>
+        <pre id="taskDetailJson" class="json">{}</pre>
+
+        <div class="task-actions">
+          <label for="taskActionReason">Reason</label>
+          <input id="taskActionReason" type="text" placeholder="operator action" />
+
+          <label for="taskActionDelayMs">Delay (ms) for retry/resume</label>
+          <input id="taskActionDelayMs" type="number" min="0" step="1" placeholder="0" />
+
+          <div class="task-action-buttons">
+            <button id="taskCancel" type="button" class="danger">Cancel task</button>
+            <button id="taskRetry" type="button">Retry task</button>
+            <button id="taskResume" type="button">Resume blocked task</button>
+          </div>
+
+          <label for="taskPatchPayload">Patch payload (CronPayload JSON, optional)</label>
+          <textarea id="taskPatchPayload" rows="6" placeholder='{"kind":"systemEvent","text":"updated text"}'></textarea>
+
+          <div class="task-policy-grid">
+            <label class="inline-field" for="taskPatchMaxAttempts">
+              <span>policy.maxAttempts</span>
+              <input id="taskPatchMaxAttempts" type="number" min="1" step="1" placeholder="unchanged" />
+            </label>
+            <label class="inline-field" for="taskPatchMaxTotalRuntimeMs">
+              <span>policy.maxTotalRuntimeMs</span>
+              <input id="taskPatchMaxTotalRuntimeMs" type="number" min="1" step="1" placeholder="unchanged" />
+            </label>
+            <label class="inline-field" for="taskPatchMaxTurns">
+              <span>policy.maxTurns</span>
+              <input id="taskPatchMaxTurns" type="number" min="1" step="1" placeholder="unchanged" />
+            </label>
+            <label class="inline-field" for="taskPatchMaxRunTimeoutSeconds">
+              <span>policy.maxRunTimeoutSeconds</span>
+              <input id="taskPatchMaxRunTimeoutSeconds" type="number" min="1" step="1" placeholder="unchanged" />
+            </label>
+          </div>
+
+          <button id="taskApplyPatch" type="button" class="secondary">Apply task patch</button>
+        </div>
+        <p id="taskStatus" class="meta"></p>
       </section>
 
       <section class="panel">

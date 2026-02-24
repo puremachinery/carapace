@@ -11,9 +11,15 @@
     toggleAuthVisibilityButton: document.getElementById("toggleAuthVisibility"),
     refreshAllButton: document.getElementById("refreshAll"),
     applyConfigButton: document.getElementById("applyConfig"),
+    saveControlUiSettingsButton: document.getElementById("saveControlUiSettings"),
     wsConnectButton: document.getElementById("wsConnect"),
     wsDisconnectButton: document.getElementById("wsDisconnect"),
     wsRefreshPairingsButton: document.getElementById("wsRefreshPairings"),
+    refreshTasksButton: document.getElementById("refreshTasks"),
+    taskCancelButton: document.getElementById("taskCancel"),
+    taskRetryButton: document.getElementById("taskRetry"),
+    taskResumeButton: document.getElementById("taskResume"),
+    taskApplyPatchButton: document.getElementById("taskApplyPatch"),
 
     statusJson: document.getElementById("statusJson"),
     channelsJson: document.getElementById("channelsJson"),
@@ -21,8 +27,13 @@
     configJson: document.getElementById("configJson"),
     authStatus: document.getElementById("authStatus"),
     configUpdateStatus: document.getElementById("configUpdateStatus"),
+    controlUiSettingsStatus: document.getElementById("controlUiSettingsStatus"),
     configPathInput: document.getElementById("configPath"),
     configValueInput: document.getElementById("configValue"),
+    controlUiEnabledInput: document.getElementById("controlUiEnabled"),
+    controlUiBasePathInput: document.getElementById("controlUiBasePath"),
+    controlUiAllowInsecureAuthInput: document.getElementById("controlUiAllowInsecureAuth"),
+    controlUiDisableDeviceAuthInput: document.getElementById("controlUiDisableDeviceAuth"),
     runtimeBasePath: document.getElementById("runtimeBasePath"),
     transportWarning: document.getElementById("transportWarning"),
     secureContextStatus: document.getElementById("secureContextStatus"),
@@ -30,6 +41,17 @@
     pendingPairings: document.getElementById("pendingPairings"),
     pairedDevices: document.getElementById("pairedDevices"),
     pairingEvents: document.getElementById("pairingEvents"),
+    taskFilterState: document.getElementById("taskFilterState"),
+    tasksCards: document.getElementById("tasksCards"),
+    taskDetailJson: document.getElementById("taskDetailJson"),
+    taskActionReasonInput: document.getElementById("taskActionReason"),
+    taskActionDelayMsInput: document.getElementById("taskActionDelayMs"),
+    taskPatchPayloadInput: document.getElementById("taskPatchPayload"),
+    taskPatchMaxAttemptsInput: document.getElementById("taskPatchMaxAttempts"),
+    taskPatchMaxTotalRuntimeMsInput: document.getElementById("taskPatchMaxTotalRuntimeMs"),
+    taskPatchMaxTurnsInput: document.getElementById("taskPatchMaxTurns"),
+    taskPatchMaxRunTimeoutSecondsInput: document.getElementById("taskPatchMaxRunTimeoutSeconds"),
+    taskStatus: document.getElementById("taskStatus"),
 
     assistantNameEl: document.getElementById("assistantName"),
     assistantAvatarEl: document.getElementById("assistantAvatar"),
@@ -41,6 +63,14 @@
     configHash: null,
     allowInsecureAuth: false,
     isSecureContext: isSecureTransportContext(),
+    controlUiConfig: {
+      enabled: false,
+      basePath: "",
+      allowInsecureAuth: false,
+      disableDeviceAuth: false,
+    },
+    currentConfigRoot: {},
+    isBusy: false,
 
     ws: null,
     wsAuthed: false,
@@ -50,6 +80,9 @@
     wsNonce: null,
 
     pairingEvents: [],
+    tasks: [],
+    selectedTaskId: null,
+    selectedTask: null,
   };
 
   ui.assistantNameEl.textContent = assistantName;
@@ -70,17 +103,26 @@
     ui.transportWarning.hidden = false;
   }
 
+  renderJson(ui.taskDetailJson, {});
   updateSecurityContextStatus();
   updateWsButtons();
+  updateTaskActionButtons();
 
   ui.saveAuthButton.addEventListener("click", onSaveCredential);
   ui.clearAuthButton.addEventListener("click", onClearCredential);
   ui.toggleAuthVisibilityButton.addEventListener("click", onToggleAuthVisibility);
   ui.refreshAllButton.addEventListener("click", () => refreshAll().catch(noop));
   ui.applyConfigButton.addEventListener("click", () => applyConfigUpdate().catch(noop));
+  ui.saveControlUiSettingsButton.addEventListener("click", () => saveControlUiSettings().catch(noop));
   ui.wsConnectButton.addEventListener("click", () => connectPairingSocket().catch(noop));
   ui.wsDisconnectButton.addEventListener("click", disconnectPairingSocket);
   ui.wsRefreshPairingsButton.addEventListener("click", () => refreshPairings().catch(noop));
+  ui.refreshTasksButton.addEventListener("click", () => refreshTasks(false).catch(noop));
+  ui.taskFilterState.addEventListener("change", () => refreshTasks(false).catch(noop));
+  ui.taskCancelButton.addEventListener("click", () => cancelSelectedTask().catch(noop));
+  ui.taskRetryButton.addEventListener("click", () => retrySelectedTask().catch(noop));
+  ui.taskResumeButton.addEventListener("click", () => resumeSelectedTask().catch(noop));
+  ui.taskApplyPatchButton.addEventListener("click", () => patchSelectedTask().catch(noop));
 
   ui.pendingPairings.addEventListener("click", (event) => {
     const button = event.target.closest("button[data-action][data-request-id]");
@@ -99,6 +141,18 @@
     }
   });
 
+  ui.tasksCards.addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-task-id]");
+    if (!button) {
+      return;
+    }
+    const taskId = button.dataset.taskId;
+    if (!taskId) {
+      return;
+    }
+    selectTask(taskId).catch(noop);
+  });
+
   if (state.authCredential) {
     refreshAll().catch((err) => {
       setAuthStatus(String(err), true);
@@ -115,6 +169,7 @@
 
     setBusy(true);
     ui.configUpdateStatus.textContent = "";
+    ui.controlUiSettingsStatus.textContent = "";
     try {
       const [status, channels, configResponse] = await Promise.all([
         controlGet("/control/status"),
@@ -128,15 +183,17 @@
       renderJson(ui.configJson, configResponse);
 
       state.configHash = typeof configResponse.hash === "string" ? configResponse.hash : null;
+      state.currentConfigRoot =
+        configResponse && typeof configResponse.config === "object" ? configResponse.config : {};
 
-      const configRoot = configResponse && typeof configResponse.config === "object" ? configResponse.config : {};
-      state.allowInsecureAuth = Boolean(
-        dig(configRoot, ["gateway", "controlUi", "allowInsecureAuth"]) ||
-          dig(configRoot, ["gateway", "controlUi", "allow_insecure_auth"])
-      );
+      applyControlUiFormFromConfig(state.currentConfigRoot);
       updateSecurityContextStatus();
-
-      await ensureAssistantAvatar(configRoot);
+      await ensureAssistantAvatar(state.currentConfigRoot);
+      try {
+        await refreshTasks(true);
+      } catch (err) {
+        setTaskStatus(String(err), true);
+      }
       setAuthStatus("Control API read successful.", false);
     } finally {
       setBusy(false);
@@ -183,6 +240,81 @@
     }
   }
 
+  function applyControlUiFormFromConfig(configRoot) {
+    const controlUi = dig(configRoot, ["gateway", "controlUi"]);
+    const next = {
+      enabled: Boolean(controlUi && controlUi.enabled),
+      basePath: typeof (controlUi && controlUi.basePath) === "string" ? controlUi.basePath : "",
+      allowInsecureAuth: Boolean(
+        controlUi && (controlUi.allowInsecureAuth === true || controlUi.allow_insecure_auth === true)
+      ),
+      disableDeviceAuth: Boolean(
+        controlUi && (controlUi.disableDeviceAuth === true || controlUi.disable_device_auth === true)
+      ),
+    };
+    state.controlUiConfig = next;
+    state.allowInsecureAuth = next.allowInsecureAuth;
+
+    ui.controlUiEnabledInput.checked = next.enabled;
+    ui.controlUiBasePathInput.value = next.basePath;
+    ui.controlUiAllowInsecureAuthInput.checked = next.allowInsecureAuth;
+    ui.controlUiDisableDeviceAuthInput.checked = next.disableDeviceAuth;
+  }
+
+  async function saveControlUiSettings() {
+    const updates = [];
+    const desired = {
+      enabled: Boolean(ui.controlUiEnabledInput.checked),
+      basePath: ui.controlUiBasePathInput.value.trim(),
+      allowInsecureAuth: Boolean(ui.controlUiAllowInsecureAuthInput.checked),
+      disableDeviceAuth: Boolean(ui.controlUiDisableDeviceAuthInput.checked),
+    };
+
+    if (desired.enabled !== state.controlUiConfig.enabled) {
+      updates.push({ path: "gateway.controlUi.enabled", value: desired.enabled });
+    }
+    if (desired.basePath !== state.controlUiConfig.basePath) {
+      updates.push({ path: "gateway.controlUi.basePath", value: desired.basePath });
+    }
+    if (desired.allowInsecureAuth !== state.controlUiConfig.allowInsecureAuth) {
+      updates.push({
+        path: "gateway.controlUi.allowInsecureAuth",
+        value: desired.allowInsecureAuth,
+      });
+    }
+    if (desired.disableDeviceAuth !== state.controlUiConfig.disableDeviceAuth) {
+      updates.push({
+        path: "gateway.controlUi.disableDeviceAuth",
+        value: desired.disableDeviceAuth,
+      });
+    }
+
+    if (!updates.length) {
+      setControlUiSettingsStatus("No control UI setting changes to save.", false);
+      return;
+    }
+
+    setBusy(true);
+    try {
+      for (const update of updates) {
+        const body = { path: update.path, value: update.value };
+        if (state.configHash) {
+          body.baseHash = state.configHash;
+        }
+        const response = await controlPatch("/control/config", body);
+        if (typeof response.hash === "string") {
+          state.configHash = response.hash;
+        }
+      }
+      await refreshAll();
+      setControlUiSettingsStatus(`Saved ${updates.length} control UI setting(s).`, false);
+    } catch (err) {
+      setControlUiSettingsStatus(String(err), true);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function applyConfigUpdate() {
     ui.configUpdateStatus.textContent = "";
 
@@ -210,19 +342,260 @@
         body.baseHash = state.configHash;
       }
 
-      const response = await controlPost("/control/config", body);
+      const response = await controlPatch("/control/config", body);
       renderJson(ui.configJson, response);
       if (typeof response.hash === "string") {
         state.configHash = response.hash;
       }
 
       await refreshAll();
-      setConfigStatus("Config update applied.", false);
+      setConfigStatus("Config patch applied.", false);
     } catch (err) {
       setConfigStatus(String(err), true);
     } finally {
       setBusy(false);
     }
+  }
+
+  async function refreshTasks(quiet) {
+    const stateFilter = ui.taskFilterState.value.trim();
+    const path = stateFilter ? `/control/tasks?state=${encodeURIComponent(stateFilter)}` : "/control/tasks";
+    const payload = await controlGet(path);
+    state.tasks = Array.isArray(payload.tasks) ? payload.tasks : [];
+    if (!state.selectedTaskId || !state.tasks.some((task) => task && task.id === state.selectedTaskId)) {
+      state.selectedTaskId = state.tasks.length ? String(state.tasks[0].id || "") : null;
+    }
+    renderTaskCards();
+    await loadSelectedTask();
+    if (!quiet) {
+      setTaskStatus(`Loaded ${state.tasks.length} task(s).`, false);
+    }
+  }
+
+  function renderTaskCards() {
+    if (!state.tasks.length) {
+      ui.tasksCards.innerHTML = "<div class=\"card\"><div class=\"detail\">No tasks found.</div></div>";
+      return;
+    }
+
+    ui.tasksCards.innerHTML = state.tasks
+      .map((task) => {
+        const id = escapeHtml(String(task.id || "unknown"));
+        const selected = state.selectedTaskId && String(task.id) === state.selectedTaskId ? " selected" : "";
+        const taskState = escapeHtml(String(task.state || "unknown"));
+        const attempts = Number(task.attempts || 0);
+        const maxAttempts = Number(dig(task, ["policy", "maxAttempts"]) || 0);
+        const nextRun = formatEpochMillis(task.nextRunAtMs);
+        const updatedAt = formatEpochMillis(task.updatedAtMs);
+        return `
+          <article class="card${selected}">
+            <div class="title">${id}</div>
+            <div class="detail">state: ${taskState}</div>
+            <div class="detail">attempts: ${attempts}${maxAttempts ? ` / ${maxAttempts}` : ""}</div>
+            <div class="detail">next run: ${nextRun}</div>
+            <div class="detail">updated: ${updatedAt}</div>
+            <div class="row">
+              <button class="secondary" data-task-id="${id}">Select</button>
+            </div>
+          </article>
+        `;
+      })
+      .join("");
+  }
+
+  async function selectTask(taskId) {
+    state.selectedTaskId = taskId;
+    renderTaskCards();
+    await loadSelectedTask();
+  }
+
+  async function loadSelectedTask() {
+    if (!state.selectedTaskId) {
+      state.selectedTask = null;
+      renderJson(ui.taskDetailJson, {});
+      updateTaskActionButtons();
+      return;
+    }
+
+    try {
+      const payload = await controlGet(`/control/tasks/${encodeURIComponent(state.selectedTaskId)}`);
+      state.selectedTask = payload && payload.task ? payload.task : null;
+      renderJson(ui.taskDetailJson, state.selectedTask || {});
+      updateTaskActionButtons();
+    } catch (err) {
+      state.selectedTask = null;
+      renderJson(ui.taskDetailJson, {});
+      updateTaskActionButtons();
+      setTaskStatus(String(err), true);
+    }
+  }
+
+  async function cancelSelectedTask() {
+    const taskId = selectedTaskIdOrReport();
+    if (!taskId) {
+      return;
+    }
+    const body = {};
+    const reason = ui.taskActionReasonInput.value.trim();
+    if (reason) {
+      body.reason = reason;
+    }
+
+    await runTaskMutation("Cancelled task.", async () => controlPost(`/control/tasks/${taskId}/cancel`, body));
+  }
+
+  async function retrySelectedTask() {
+    const taskId = selectedTaskIdOrReport();
+    if (!taskId) {
+      return;
+    }
+    const body = {};
+    const reason = ui.taskActionReasonInput.value.trim();
+    if (reason) {
+      body.reason = reason;
+    }
+    let delayMs;
+    try {
+      delayMs = parseOptionalNonNegativeInt(ui.taskActionDelayMsInput.value, "delayMs");
+    } catch (err) {
+      setTaskStatus(String(err), true);
+      return;
+    }
+    if (delayMs !== null) {
+      body.delayMs = delayMs;
+    }
+
+    await runTaskMutation("Retried task.", async () => controlPost(`/control/tasks/${taskId}/retry`, body));
+  }
+
+  async function resumeSelectedTask() {
+    const taskId = selectedTaskIdOrReport();
+    if (!taskId) {
+      return;
+    }
+    const body = {};
+    const reason = ui.taskActionReasonInput.value.trim();
+    if (reason) {
+      body.reason = reason;
+    }
+    let delayMs;
+    try {
+      delayMs = parseOptionalNonNegativeInt(ui.taskActionDelayMsInput.value, "delayMs");
+    } catch (err) {
+      setTaskStatus(String(err), true);
+      return;
+    }
+    if (delayMs !== null) {
+      body.delayMs = delayMs;
+    }
+
+    await runTaskMutation("Resumed blocked task.", async () => controlPost(`/control/tasks/${taskId}/resume`, body));
+  }
+
+  async function patchSelectedTask() {
+    const taskId = selectedTaskIdOrReport();
+    if (!taskId) {
+      return;
+    }
+
+    const body = {};
+    const reason = ui.taskActionReasonInput.value.trim();
+    if (reason) {
+      body.reason = reason;
+    }
+
+    const payloadText = ui.taskPatchPayloadInput.value.trim();
+    if (payloadText) {
+      try {
+        body.payload = JSON.parse(payloadText);
+      } catch (err) {
+        setTaskStatus(`Patch payload must be valid JSON: ${err}`, true);
+        return;
+      }
+    }
+
+    const policy = {};
+    let maxAttempts;
+    let maxTotalRuntimeMs;
+    let maxTurns;
+    let maxRunTimeoutSeconds;
+    try {
+      maxAttempts = parseOptionalPositiveInt(ui.taskPatchMaxAttemptsInput.value, "policy.maxAttempts");
+      maxTotalRuntimeMs = parseOptionalPositiveInt(
+        ui.taskPatchMaxTotalRuntimeMsInput.value,
+        "policy.maxTotalRuntimeMs"
+      );
+      maxTurns = parseOptionalPositiveInt(ui.taskPatchMaxTurnsInput.value, "policy.maxTurns");
+      maxRunTimeoutSeconds = parseOptionalPositiveInt(
+        ui.taskPatchMaxRunTimeoutSecondsInput.value,
+        "policy.maxRunTimeoutSeconds"
+      );
+    } catch (err) {
+      setTaskStatus(String(err), true);
+      return;
+    }
+    if (maxAttempts !== null) {
+      policy.maxAttempts = maxAttempts;
+    }
+    if (maxTotalRuntimeMs !== null) {
+      policy.maxTotalRuntimeMs = maxTotalRuntimeMs;
+    }
+    if (maxTurns !== null) {
+      policy.maxTurns = maxTurns;
+    }
+    if (maxRunTimeoutSeconds !== null) {
+      policy.maxRunTimeoutSeconds = maxRunTimeoutSeconds;
+    }
+    if (Object.keys(policy).length > 0) {
+      body.policy = policy;
+    }
+
+    if (!("payload" in body) && !("policy" in body) && !("reason" in body)) {
+      setTaskStatus("Patch requires payload JSON, policy field(s), or reason.", true);
+      return;
+    }
+
+    await runTaskMutation("Patched task.", async () => controlPatch(`/control/tasks/${taskId}`, body));
+  }
+
+  async function runTaskMutation(successMessage, operation) {
+    setBusy(true);
+    try {
+      const response = await operation();
+      if (response && response.task && response.task.id) {
+        state.selectedTaskId = String(response.task.id);
+      }
+      await refreshTasks(true);
+      setTaskStatus(successMessage, false);
+    } catch (err) {
+      setTaskStatus(String(err), true);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function selectedTaskIdOrReport() {
+    const taskId = state.selectedTaskId;
+    if (!taskId) {
+      setTaskStatus("Select a task first.", true);
+      return null;
+    }
+    return encodeURIComponent(taskId);
+  }
+
+  function updateTaskActionButtons() {
+    const task = state.selectedTask;
+    const selected = Boolean(task && task.id);
+    const taskState = selected ? String(task.state || "") : "";
+    const retryable = selected && !["queued", "running", "done"].includes(taskState);
+    const resumable = selected && taskState === "blocked";
+    const cancellable = selected && !["failed", "done", "cancelled"].includes(taskState);
+    const patchable = selected && !["running", "done"].includes(taskState);
+
+    ui.taskCancelButton.disabled = state.isBusy || !cancellable;
+    ui.taskRetryButton.disabled = state.isBusy || !retryable;
+    ui.taskResumeButton.disabled = state.isBusy || !resumable;
+    ui.taskApplyPatchButton.disabled = state.isBusy || !patchable;
   }
 
   async function connectPairingSocket() {
@@ -501,6 +874,19 @@
     return parseResponse(response);
   }
 
+  async function controlPatch(path, body) {
+    const response = await fetch(path, {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+        ...authHeaders(),
+      },
+      credentials: "same-origin",
+      body: JSON.stringify(body),
+    });
+    return parseResponse(response);
+  }
+
   function authHeaders() {
     const credential = currentCredential();
     if (!credential) {
@@ -651,8 +1037,16 @@
     state.authCredential = "";
     ui.authInput.value = "";
     sessionStorage.removeItem("carapace.control.auth");
+    sessionStorage.removeItem("carapace.control.authType");
     setAuthStatus("Credential cleared.", false);
     disconnectPairingSocket();
+
+    state.tasks = [];
+    state.selectedTaskId = null;
+    state.selectedTask = null;
+    ui.tasksCards.innerHTML = "<div class=\"card\"><div class=\"detail\">No tasks loaded.</div></div>";
+    renderJson(ui.taskDetailJson, {});
+    updateTaskActionButtons();
   }
 
   function onToggleAuthVisibility() {
@@ -662,10 +1056,21 @@
   }
 
   function setBusy(busy) {
-    ui.refreshAllButton.disabled = busy;
-    ui.applyConfigButton.disabled = busy;
-    ui.saveAuthButton.disabled = busy;
-    ui.clearAuthButton.disabled = busy;
+    state.isBusy = Boolean(busy);
+
+    ui.refreshAllButton.disabled = state.isBusy;
+    ui.applyConfigButton.disabled = state.isBusy;
+    ui.saveAuthButton.disabled = state.isBusy;
+    ui.clearAuthButton.disabled = state.isBusy;
+    ui.saveControlUiSettingsButton.disabled = state.isBusy;
+    ui.refreshTasksButton.disabled = state.isBusy;
+
+    ui.wsConnectButton.disabled = state.isBusy || (state.ws && state.ws.readyState === WebSocket.OPEN);
+    ui.wsDisconnectButton.disabled = state.isBusy || !(state.ws && state.ws.readyState === WebSocket.OPEN);
+    ui.wsRefreshPairingsButton.disabled =
+      state.isBusy || !(state.ws && state.ws.readyState === WebSocket.OPEN && state.wsAuthed);
+
+    updateTaskActionButtons();
   }
 
   function setAuthStatus(message, isError) {
@@ -680,10 +1085,22 @@
     ui.configUpdateStatus.classList.toggle("success", !isError);
   }
 
+  function setControlUiSettingsStatus(message, isError) {
+    ui.controlUiSettingsStatus.textContent = message;
+    ui.controlUiSettingsStatus.classList.toggle("error", Boolean(isError));
+    ui.controlUiSettingsStatus.classList.toggle("success", !isError);
+  }
+
   function setPairingStatus(message, isError) {
     ui.pairingStatus.textContent = message;
     ui.pairingStatus.classList.toggle("error", Boolean(isError));
     ui.pairingStatus.classList.toggle("success", !isError);
+  }
+
+  function setTaskStatus(message, isError) {
+    ui.taskStatus.textContent = message;
+    ui.taskStatus.classList.toggle("error", Boolean(isError));
+    ui.taskStatus.classList.toggle("success", !isError);
   }
 
   function updateSecurityContextStatus() {
@@ -698,9 +1115,9 @@
     const open = state.ws && state.ws.readyState === WebSocket.OPEN;
     const ready = open && state.wsAuthed;
 
-    ui.wsConnectButton.disabled = open;
-    ui.wsDisconnectButton.disabled = !open;
-    ui.wsRefreshPairingsButton.disabled = !ready;
+    ui.wsConnectButton.disabled = state.isBusy || open;
+    ui.wsDisconnectButton.disabled = state.isBusy || !open;
+    ui.wsRefreshPairingsButton.disabled = state.isBusy || !ready;
   }
 
   function clearWsPending(error) {
@@ -747,6 +1164,45 @@
       current = current[key];
     }
     return current;
+  }
+
+  function parseOptionalNonNegativeInt(raw, fieldName) {
+    const trimmed = String(raw || "").trim();
+    if (!trimmed) {
+      return null;
+    }
+    const parsed = Number(trimmed);
+    if (!Number.isInteger(parsed) || parsed < 0) {
+      throw new Error(`${fieldName} must be a non-negative integer`);
+    }
+    return parsed;
+  }
+
+  function parseOptionalPositiveInt(raw, fieldName) {
+    const trimmed = String(raw || "").trim();
+    if (!trimmed) {
+      return null;
+    }
+    const parsed = Number(trimmed);
+    if (!Number.isInteger(parsed) || parsed < 1) {
+      throw new Error(`${fieldName} must be an integer >= 1`);
+    }
+    return parsed;
+  }
+
+  function formatEpochMillis(value) {
+    if (value === null || value === undefined) {
+      return "-";
+    }
+    const millis = Number(value);
+    if (!Number.isFinite(millis) || millis <= 0) {
+      return "-";
+    }
+    try {
+      return new Date(millis).toISOString();
+    } catch (_err) {
+      return "-";
+    }
   }
 
   function dedupeStrings(values) {

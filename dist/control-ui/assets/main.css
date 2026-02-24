@@ -78,6 +78,14 @@ h3 {
   flex-wrap: wrap;
 }
 
+.task-toolbar {
+  display: flex;
+  gap: 0.6rem;
+  align-items: end;
+  flex-wrap: wrap;
+  margin-bottom: 0.7rem;
+}
+
 .auth-grid {
   display: grid;
   grid-template-columns: 180px minmax(220px, 1fr) auto auto auto;
@@ -85,10 +93,26 @@ h3 {
   align-items: end;
 }
 
+.settings-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(180px, 1fr));
+  gap: 0.5rem;
+  margin-bottom: 0.7rem;
+}
+
 .inline-field {
   display: grid;
   gap: 0.25rem;
   margin: 0;
+}
+
+.inline-field.checkbox {
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #0b1220;
+  padding: 0.55rem 0.7rem;
 }
 
 .inline-field span {
@@ -98,6 +122,11 @@ h3 {
 
 .inline-field.credential {
   min-width: 0;
+}
+
+.inline-field.checkbox input[type="checkbox"] {
+  width: auto;
+  margin: 0;
 }
 
 input,
@@ -166,6 +195,10 @@ button:disabled {
   font-weight: 700;
 }
 
+.card.selected {
+  border-color: var(--accent);
+}
+
 .card .detail {
   color: var(--muted);
   font-size: 0.9rem;
@@ -212,6 +245,23 @@ code {
   border-color: var(--warn);
 }
 
+.task-actions {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.task-action-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+}
+
+.task-policy-grid {
+  display: grid;
+  gap: 0.5rem;
+  grid-template-columns: repeat(2, minmax(180px, 1fr));
+}
+
 .error {
   color: var(--danger);
 }
@@ -223,5 +273,10 @@ code {
 @media (max-width: 860px) {
   .auth-grid {
     grid-template-columns: 1fr 1fr;
+  }
+
+  .settings-grid,
+  .task-policy-grid {
+    grid-template-columns: 1fr;
   }
 }

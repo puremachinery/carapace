@@ -4,7 +4,8 @@
 //! - GET /control/status - Gateway status
 //! - GET /control/channels - Channel status
 //! - GET /control/config - Redacted config snapshot + optimistic concurrency hash
-//! - POST /control/config - Config updates
+//! - PATCH /control/config - Safe config updates (controlUi subtree)
+//! - POST /control/config - Legacy alias for PATCH /control/config
 //! - POST /control/tasks - Create objective task
 //! - GET /control/tasks - List objective tasks
 //! - GET /control/tasks/{id} - Get task by ID
@@ -61,6 +62,7 @@ const PROTECTED_CONFIG_PREFIXES: &[&str] = &[
     "providers.ollama.baseUrl",
     "models.providers.openai.baseUrl",
 ];
+const CONTROL_UI_MUTABLE_PREFIX: &str = "gateway.controlUi";
 
 /// Control endpoint state
 #[derive(Clone)]
@@ -513,8 +515,8 @@ pub async fn channels_handler(
     (StatusCode::OK, Json(response)).into_response()
 }
 
-/// POST /control/config - Update configuration
-pub async fn config_handler(
+/// PATCH /control/config - Update configuration for safe allowlisted paths.
+pub async fn config_patch_handler(
     State(state): State<ControlState>,
     connect_info: MaybeConnectInfo,
     headers: HeaderMap,
@@ -538,8 +540,8 @@ pub async fn config_handler(
         }
     };
 
-    // Validate path
-    if req.path.is_empty() {
+    let path = req.path.trim();
+    if path.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
             Json(ControlError::new("Configuration path is required")),
@@ -547,9 +549,13 @@ pub async fn config_handler(
             .into_response();
     }
 
-    // Block sensitive paths
+    // Block sensitive paths first.
     for prefix in PROTECTED_CONFIG_PREFIXES {
-        if req.path.starts_with(prefix) {
+        if path == *prefix
+            || path
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with('.'))
+        {
             return (
                 StatusCode::FORBIDDEN,
                 Json(ControlError::new(format!(
@@ -559,6 +565,17 @@ pub async fn config_handler(
             )
                 .into_response();
         }
+    }
+
+    // Restrict control UI writes to the explicit controlUi subtree.
+    if !is_allowed_control_ui_config_path(path) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ControlError::new(
+                "Control API config writes are limited to gateway.controlUi.*",
+            )),
+        )
+            .into_response();
     }
 
     // Read current config snapshot (with hash for optimistic concurrency)
@@ -594,7 +611,7 @@ pub async fn config_handler(
 
     // Apply the path-based update to the current config
     let mut updated_config = snapshot.config.clone();
-    set_value_at_path(&mut updated_config, &req.path, req.value.clone());
+    set_value_at_path(&mut updated_config, path, req.value.clone());
 
     // Validate the updated config
     let issues = map_validation_issues(config::validate_config(&updated_config));
@@ -625,7 +642,7 @@ pub async fn config_handler(
     }
 
     audit(AuditEvent::ConfigChanged {
-        key_path: req.path.clone(),
+        key_path: path.to_string(),
         actor: control_actor(remote_addr),
         method: "control_api".to_string(),
     });
@@ -637,7 +654,7 @@ pub async fn config_handler(
         ok: true,
         error: None,
         applied: Some(json!({
-            "path": req.path,
+            "path": path,
             "value": req.value,
             "config": new_snapshot.config,
         })),
@@ -645,6 +662,16 @@ pub async fn config_handler(
     };
 
     (StatusCode::OK, Json(response)).into_response()
+}
+
+/// POST /control/config - Legacy alias for PATCH /control/config.
+pub async fn config_handler(
+    state: State<ControlState>,
+    connect_info: MaybeConnectInfo,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    config_patch_handler(state, connect_info, headers, body).await
 }
 
 /// GET /control/config - Read redacted config + hash for optimistic concurrency.
@@ -1121,6 +1148,10 @@ fn set_value_at_path(root: &mut Value, path: &str, value: Value) {
         }
         current = current.get_mut(*part).expect("just inserted");
     }
+}
+
+fn is_allowed_control_ui_config_path(path: &str) -> bool {
+    path == CONTROL_UI_MUTABLE_PREFIX || path.starts_with("gateway.controlUi.")
 }
 
 fn task_queue_or_unavailable(state: &ControlState) -> Option<Arc<TaskQueue>> {
