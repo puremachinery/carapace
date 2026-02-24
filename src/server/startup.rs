@@ -34,8 +34,7 @@ struct RuntimeTaskExecutor {
 #[async_trait]
 impl TaskExecutor for RuntimeTaskExecutor {
     async fn execute(&self, task: DurableTask) -> TaskExecutionOutcome {
-        let payload = match serde_json::from_value::<crate::cron::CronPayload>(task.payload.clone())
-        {
+        let payload = match serde_json::from_value::<crate::cron::CronPayload>(task.payload) {
             Ok(payload) => payload,
             Err(err) => {
                 return TaskExecutionOutcome::Failed {

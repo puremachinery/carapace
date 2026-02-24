@@ -136,7 +136,7 @@ impl TaskQueue {
     /// Add a new task in `queued` state.
     pub fn enqueue(&self, payload: Value, next_run_at_ms: Option<u64>) -> DurableTask {
         let now = now_ms();
-        let task = DurableTask {
+        let mut task = DurableTask {
             id: Uuid::new_v4().to_string(),
             state: TaskState::Queued,
             attempts: 0,
@@ -163,6 +163,17 @@ impl TaskQueue {
                     .min_by_key(|(_, t)| t.updated_at_ms)
                 {
                     tasks.remove(idx);
+                } else {
+                    task.state = TaskState::Failed;
+                    task.last_error = Some(
+                        "task queue full: no terminal tasks available for eviction".to_string(),
+                    );
+                    task.updated_at_ms = now;
+                    warn!(
+                        max_tasks = MAX_TASKS,
+                        "task queue full with no terminal tasks; dropping enqueue request"
+                    );
+                    return task;
                 }
             }
             tasks.push(task.clone());
@@ -401,19 +412,29 @@ pub async fn task_worker_loop(
             let outcome = executor.execute(task.clone()).await;
             match outcome {
                 TaskExecutionOutcome::Done => {
-                    let _ = queue.mark_done(&task.id);
+                    if !queue.mark_done(&task.id) {
+                        warn!(task_id = %task.id, "failed to mark task done");
+                    }
                 }
                 TaskExecutionOutcome::RetryWait { delay_ms, error } => {
-                    let _ = queue.mark_retry_wait(&task.id, delay_ms, &error);
+                    if !queue.mark_retry_wait(&task.id, delay_ms, &error) {
+                        warn!(task_id = %task.id, "failed to mark task retry_wait");
+                    }
                 }
                 TaskExecutionOutcome::Blocked { reason } => {
-                    let _ = queue.mark_blocked(&task.id, &reason);
+                    if !queue.mark_blocked(&task.id, &reason) {
+                        warn!(task_id = %task.id, "failed to mark task blocked");
+                    }
                 }
                 TaskExecutionOutcome::Failed { error } => {
-                    let _ = queue.mark_failed(&task.id, &error);
+                    if !queue.mark_failed(&task.id, &error) {
+                        warn!(task_id = %task.id, "failed to mark task failed");
+                    }
                 }
                 TaskExecutionOutcome::Cancelled { reason } => {
-                    let _ = queue.mark_cancelled(&task.id, reason.as_deref());
+                    if !queue.mark_cancelled(&task.id, reason.as_deref()) {
+                        warn!(task_id = %task.id, "failed to mark task cancelled");
+                    }
                 }
             }
         }
@@ -448,6 +469,30 @@ mod tests {
         assert_eq!(updated.state, TaskState::RetryWait);
         assert_eq!(updated.last_error.as_deref(), Some("temporary failure"));
         assert!(updated.next_run_at_ms.is_some());
+    }
+
+    #[test]
+    fn test_mark_blocked_tracks_reason() {
+        let queue = TaskQueue::in_memory();
+        let task = queue.enqueue(serde_json::json!({"kind":"demo"}), None);
+        let _ = queue.claim_due(now_ms(), 1);
+        assert!(queue.mark_blocked(&task.id, "waiting approval"));
+        let updated = queue.get(&task.id).expect("task should exist");
+        assert_eq!(updated.state, TaskState::Blocked);
+        assert_eq!(updated.last_error.as_deref(), Some("waiting approval"));
+        assert_eq!(updated.next_run_at_ms, None);
+    }
+
+    #[test]
+    fn test_mark_cancelled_tracks_reason() {
+        let queue = TaskQueue::in_memory();
+        let task = queue.enqueue(serde_json::json!({"kind":"demo"}), None);
+        let _ = queue.claim_due(now_ms(), 1);
+        assert!(queue.mark_cancelled(&task.id, Some("operator cancel")));
+        let updated = queue.get(&task.id).expect("task should exist");
+        assert_eq!(updated.state, TaskState::Cancelled);
+        assert_eq!(updated.last_error.as_deref(), Some("operator cancel"));
+        assert_eq!(updated.next_run_at_ms, None);
     }
 
     #[test]
@@ -529,6 +574,35 @@ mod tests {
         assert!(queue.get("done-oldest").is_none());
         assert_eq!(queue.stats().blocked, MAX_TASKS - 1);
         assert_eq!(queue.stats().total, MAX_TASKS);
+    }
+
+    #[test]
+    fn test_enqueue_drops_when_full_without_terminal_capacity() {
+        let queue = TaskQueue::in_memory();
+        {
+            let mut tasks = queue.tasks.write();
+            for idx in 0..MAX_TASKS {
+                tasks.push(DurableTask {
+                    id: format!("running-{idx}"),
+                    state: TaskState::Running,
+                    attempts: 1,
+                    next_run_at_ms: None,
+                    last_error: None,
+                    payload: serde_json::json!({"kind":"demo"}),
+                    created_at_ms: idx as u64 + 1,
+                    updated_at_ms: idx as u64 + 1,
+                });
+            }
+        }
+
+        let dropped = queue.enqueue(serde_json::json!({"kind":"new"}), None);
+        assert_eq!(queue.stats().total, MAX_TASKS);
+        assert_eq!(dropped.state, TaskState::Failed);
+        assert!(dropped
+            .last_error
+            .as_deref()
+            .is_some_and(|msg| msg.contains("task queue full")));
+        assert!(queue.get(&dropped.id).is_none());
     }
 
     struct DoneExecutor {
