@@ -888,13 +888,32 @@
   }
 
   function authHeaders() {
+    const headers = {};
+
     const credential = currentCredential();
-    if (!credential) {
-      return {};
+    if (credential) {
+      headers.Authorization = `Bearer ${credential}`;
     }
-    return {
-      Authorization: `Bearer ${credential}`,
-    };
+
+    const csrfHeader = window.__CARAPACE_CSRF_HEADER__;
+    if (typeof csrfHeader === "string" && csrfHeader.trim()) {
+      let csrfToken = typeof window.__CARAPACE_CSRF_TOKEN__ === "string" ? window.__CARAPACE_CSRF_TOKEN__ : "";
+      if (!csrfToken) {
+        const csrfCookieName =
+          typeof window.__CARAPACE_CSRF_COOKIE__ === "string" ? window.__CARAPACE_CSRF_COOKIE__ : "";
+        if (csrfCookieName) {
+          csrfToken = readCookie(csrfCookieName);
+          if (csrfToken) {
+            window.__CARAPACE_CSRF_TOKEN__ = csrfToken;
+          }
+        }
+      }
+      if (csrfToken) {
+        headers[csrfHeader] = csrfToken;
+      }
+    }
+
+    return headers;
   }
 
   function currentCredential() {
@@ -1147,6 +1166,18 @@
       return "/ui";
     }
     return trimmed.endsWith("/") ? trimmed.slice(0, -1) : trimmed;
+  }
+
+  function readCookie(name) {
+    const raw = document.cookie || "";
+    const parts = raw.split(";");
+    for (const part of parts) {
+      const trimmed = part.trim();
+      if (trimmed.startsWith(`${name}=`)) {
+        return trimmed.slice(name.length + 1);
+      }
+    }
+    return "";
   }
 
   function isSecureTransportContext() {

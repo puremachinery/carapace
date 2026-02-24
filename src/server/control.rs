@@ -5,7 +5,7 @@
 //! - GET /control/channels - Channel status
 //! - GET /control/config - Redacted config snapshot + optimistic concurrency hash
 //! - PATCH /control/config - Safe config updates (controlUi subtree)
-//! - POST /control/config - Legacy alias for PATCH /control/config
+//! - POST /control/config - Legacy broader config updates
 //! - POST /control/tasks - Create objective task
 //! - GET /control/tasks - List objective tasks
 //! - GET /control/tasks/{id} - Get task by ID
@@ -517,10 +517,30 @@ pub async fn channels_handler(
 
 /// PATCH /control/config - Update configuration for safe allowlisted paths.
 pub async fn config_patch_handler(
+    state: State<ControlState>,
+    connect_info: MaybeConnectInfo,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    config_update_handler(state, connect_info, headers, body, true).await
+}
+
+/// POST /control/config - Legacy broader config updates (compatibility path).
+pub async fn config_handler(
+    state: State<ControlState>,
+    connect_info: MaybeConnectInfo,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    config_update_handler(state, connect_info, headers, body, false).await
+}
+
+async fn config_update_handler(
     State(state): State<ControlState>,
     connect_info: MaybeConnectInfo,
     headers: HeaderMap,
     body: axum::body::Bytes,
+    restrict_to_control_ui_paths: bool,
 ) -> Response {
     // Check auth
     let remote_addr = connect_info.0;
@@ -551,11 +571,7 @@ pub async fn config_patch_handler(
 
     // Block sensitive paths first.
     for prefix in PROTECTED_CONFIG_PREFIXES {
-        if path == *prefix
-            || path
-                .strip_prefix(prefix)
-                .is_some_and(|rest| rest.starts_with('.'))
-        {
+        if path.starts_with(prefix) {
             return (
                 StatusCode::FORBIDDEN,
                 Json(ControlError::new(format!(
@@ -567,8 +583,8 @@ pub async fn config_patch_handler(
         }
     }
 
-    // Restrict control UI writes to the explicit controlUi subtree.
-    if !is_allowed_control_ui_config_path(path) {
+    // Restrict PATCH writes to the explicit controlUi subtree.
+    if restrict_to_control_ui_paths && !is_allowed_control_ui_config_path(path) {
         return (
             StatusCode::FORBIDDEN,
             Json(ControlError::new(
@@ -662,16 +678,6 @@ pub async fn config_patch_handler(
     };
 
     (StatusCode::OK, Json(response)).into_response()
-}
-
-/// POST /control/config - Legacy alias for PATCH /control/config.
-pub async fn config_handler(
-    state: State<ControlState>,
-    connect_info: MaybeConnectInfo,
-    headers: HeaderMap,
-    body: axum::body::Bytes,
-) -> Response {
-    config_patch_handler(state, connect_info, headers, body).await
 }
 
 /// GET /control/config - Read redacted config + hash for optimistic concurrency.

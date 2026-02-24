@@ -57,9 +57,9 @@ rewrite_links() {
     -e 's|href="\.\./getting-started\.md"|href="getting-started.html"|g' \
     -e 's|href="\.\./security\.md"|href="security-model.html"|g' \
     -e 's|href="\.\./security-comparison\.md"|href="security-comparison.html"|g' \
-    -e 's|href="\.\./([A-Za-z0-9._-]+)\.md(#[-A-Za-z0-9._/]*)?"|href="\1.html\2"|g' \
     -e 's|href="\.\./\.\./SECURITY\.md"|href="security-policy.html"|g' \
     -e 's|href="\.\./SECURITY\.md"|href="security-policy.html"|g' \
+    -e 's|href="\.\./([A-Za-z0-9._-]+)\.md(#[-A-Za-z0-9._/]*)?"|href="\1.html\2"|g' \
     -e 's|href="docs/security\.md"|href="security-model.html"|g' \
     -e 's|href="protocol/([^":#]+)\.md"|href="https://github.com/puremachinery/carapace/blob/main/docs/protocol/\1.md"|g' \
     -e 's|href="cookbook/README\.md"|href="cookbook/"|g' \

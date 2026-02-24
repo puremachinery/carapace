@@ -9,7 +9,9 @@ Find the right `cara` command by outcome instead of scanning the full CLI refere
 - [Setup and first value](#setup-and-first-value)
 - [Operate and diagnose](#operate-and-diagnose)
 - [Secure access and pairing](#secure-access-and-pairing)
-- [Backup/restore/update lifecycle](#backup-restore-reset)
+- [Backup, restore, reset](#backup-restore-reset)
+- [Update lifecycle](#update-lifecycle)
+- [Advanced verification](#advanced-verification)
 - [Deeper references](#deeper-reference)
 
 ## Setup and first value

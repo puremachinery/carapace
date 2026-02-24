@@ -2022,13 +2022,24 @@ async fn serve_index_html(state: &AppState, headers: &HeaderMap) -> Response {
             };
 
             let mut injected = content
-                .replace("__CARAPACE_CONTROL_UI_BASE_PATH__", &base_path)
-                .replace("__CARAPACE_ASSISTANT_NAME__", "Carapace")
-                .replace("__CARAPACE_ASSISTANT_AVATAR__", "");
+                .replace(
+                    "\"__CARAPACE_CONTROL_UI_BASE_PATH__\"",
+                    &json_string_literal(&base_path),
+                )
+                .replace(
+                    "\"__CARAPACE_ASSISTANT_NAME__\"",
+                    &json_string_literal("Carapace"),
+                )
+                .replace(
+                    "\"__CARAPACE_ASSISTANT_AVATAR__\"",
+                    &json_string_literal(""),
+                );
 
             if let Some(store) = &state.csrf_store {
                 let config = store.config();
                 if config.enabled {
+                    let config_script = csrf_ui_config_script(config);
+                    injected = inject_html_script(&injected, &config_script);
                     let script = csrf_bootstrap_script(config);
                     injected = inject_html_script(&injected, &script);
                 }
@@ -2070,6 +2081,13 @@ async fn serve_index_html(state: &AppState, headers: &HeaderMap) -> Response {
     }
 }
 
+fn json_string_literal(value: &str) -> String {
+    // Keep literals safe when injected into inline <script> blocks.
+    serde_json::to_string(value)
+        .unwrap_or_else(|_| "\"\"".to_string())
+        .replace("</", "<\\/")
+}
+
 fn control_ui_tls_guard(state: &AppState) -> Option<Response> {
     let store = state.csrf_store.as_ref()?;
     let config = store.config();
@@ -2085,10 +2103,19 @@ fn control_ui_tls_guard(state: &AppState) -> Option<Response> {
     None
 }
 
+fn csrf_ui_config_script(config: &CsrfConfig) -> String {
+    let cookie_name = csrf_cookie_name(config);
+    format!(
+        r#"<script>window.__CARAPACE_CSRF_COOKIE__={cookie};window.__CARAPACE_CSRF_HEADER__={header};window.__CARAPACE_CSRF_TOKEN__='';</script>"#,
+        cookie = json_string_literal(cookie_name),
+        header = json_string_literal(&config.header_name),
+    )
+}
+
 fn csrf_bootstrap_script(config: &CsrfConfig) -> String {
     let cookie_name = csrf_cookie_name(config);
     format!(
-        r#"<script>(function(){{var cookieName='{cookie}';var headerName='{header}';function readCookie(name){{var parts=document.cookie?document.cookie.split(';'):[];for(var i=0;i<parts.length;i++){{var part=parts[i].trim();if(part.indexOf(name+'=')===0){{return part.substring(name.length+1);}}}}return '';}}function getToken(){{return readCookie(cookieName);}}function addHeader(headers,token){{if(!token){{return headers;}}var lower=headerName.toLowerCase();if(headers instanceof Headers){{if(!headers.has(headerName)){{headers.set(headerName,token);}}return headers;}}if(Array.isArray(headers)){{for(var i=0;i<headers.length;i++){{if(String(headers[i][0]).toLowerCase()===lower){{return headers;}}}}headers.push([headerName,token]);return headers;}}headers=headers||{{}};for(var key in headers){{if(Object.prototype.hasOwnProperty.call(headers,key)&&String(key).toLowerCase()===lower){{return headers;}}}}headers[headerName]=token;return headers;}}if(window.fetch){{var origFetch=window.fetch.bind(window);window.fetch=function(input,init){{var token=getToken();if(token){{init=init||{{}};if(input instanceof Request){{var baseHeaders=new Headers(input.headers);init.headers=addHeader(baseHeaders,token);var req=new Request(input,init);return origFetch(req);}}init.headers=addHeader(init.headers,token);}}return origFetch(input,init);}};}}if(window.XMLHttpRequest){{var origOpen=XMLHttpRequest.prototype.open;var origSend=XMLHttpRequest.prototype.send;XMLHttpRequest.prototype.open=function(){{this.__csrfToken=getToken();return origOpen.apply(this,arguments);}};XMLHttpRequest.prototype.send=function(){{if(this.__csrfToken){{try{{this.setRequestHeader(headerName,this.__csrfToken);}}catch(e){{}}}}return origSend.apply(this,arguments);}};}}}})();</script>"#,
+        r#"<script>(function(){{var cookieName='{cookie}';var headerName='{header}';function readCookie(name){{var parts=document.cookie?document.cookie.split(';'):[];for(var i=0;i<parts.length;i++){{var part=parts[i].trim();if(part.indexOf(name+'=')===0){{return part.substring(name.length+1);}}}}return '';}}function getToken(){{var token=readCookie(cookieName);window.__CARAPACE_CSRF_TOKEN__=token;return token;}}window.__CARAPACE_CSRF_COOKIE__=cookieName;window.__CARAPACE_CSRF_HEADER__=headerName;window.__CARAPACE_CSRF_TOKEN__=getToken();function addHeader(headers,token){{if(!token){{return headers;}}var lower=headerName.toLowerCase();if(headers instanceof Headers){{if(!headers.has(headerName)){{headers.set(headerName,token);}}return headers;}}if(Array.isArray(headers)){{for(var i=0;i<headers.length;i++){{if(String(headers[i][0]).toLowerCase()===lower){{return headers;}}}}headers.push([headerName,token]);return headers;}}headers=headers||{{}};for(var key in headers){{if(Object.prototype.hasOwnProperty.call(headers,key)&&String(key).toLowerCase()===lower){{return headers;}}}}headers[headerName]=token;return headers;}}if(window.fetch){{var origFetch=window.fetch.bind(window);window.fetch=function(input,init){{var token=getToken();if(token){{init=init||{{}};if(input instanceof Request){{var baseHeaders=new Headers(input.headers);init.headers=addHeader(baseHeaders,token);var req=new Request(input,init);return origFetch(req);}}init.headers=addHeader(init.headers,token);}}return origFetch(input,init);}};}}if(window.XMLHttpRequest){{var origOpen=XMLHttpRequest.prototype.open;var origSend=XMLHttpRequest.prototype.send;XMLHttpRequest.prototype.open=function(){{this.__csrfToken=getToken();return origOpen.apply(this,arguments);}};XMLHttpRequest.prototype.send=function(){{if(this.__csrfToken){{try{{this.setRequestHeader(headerName,this.__csrfToken);}}catch(e){{}}}}return origSend.apply(this,arguments);}};}}}})();</script>"#,
         cookie = cookie_name,
         header = config.header_name
     )
@@ -2249,6 +2276,38 @@ mod tests {
     use axum::http::Request;
     use std::sync::Arc;
     use tower::ServiceExt;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            // SAFETY: tests in this module scope env var writes to a short-lived guard.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                // SAFETY: restoring test-scoped env var state.
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                // SAFETY: restoring test-scoped env var state.
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    fn set_temp_config_path() -> (tempfile::TempDir, EnvVarGuard) {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("carapace-test-config.json5");
+        let guard = EnvVarGuard::set("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
+        (temp, guard)
+    }
 
     fn make_headers(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut headers = HeaderMap::new();
@@ -2745,6 +2804,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_control_config_patch_updates_allowed_path() {
+        let (_temp, _guard) = set_temp_config_path();
         let router = test_router(test_config());
         let snapshot = read_control_config_snapshot(router.clone()).await;
         let mut req_body = json!({
@@ -2798,11 +2858,36 @@ mod tests {
 
     #[tokio::test]
     async fn test_control_config_post_alias_updates_allowed_path() {
+        let (_temp, _guard) = set_temp_config_path();
         let router = test_router(test_config());
         let snapshot = read_control_config_snapshot(router.clone()).await;
         let mut req_body = json!({
             "path": "gateway.controlUi.basePath",
             "value": "/ui-admin",
+        });
+        if let Some(hash) = snapshot["hash"].as_str() {
+            req_body["baseHash"] = json!(hash);
+        }
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/control/config")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(req_body.to_string()))
+            .unwrap();
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_control_config_post_allows_legacy_non_control_ui_paths() {
+        let (_temp, _guard) = set_temp_config_path();
+        let router = test_router(test_config());
+        let snapshot = read_control_config_snapshot(router.clone()).await;
+        let mut req_body = json!({
+            "path": "gateway.port",
+            "value": 18789,
         });
         if let Some(hash) = snapshot["hash"].as_str() {
             req_body["baseHash"] = json!(hash);
@@ -3612,6 +3697,12 @@ mod tests {
         assert_eq!(normalize_control_ui_base_path("/ui/"), "/ui");
         assert_eq!(normalize_control_ui_base_path("/admin/ui"), "/admin/ui");
         assert_eq!(normalize_control_ui_base_path("  /admin  "), "/admin");
+    }
+
+    #[test]
+    fn test_json_string_literal_escapes_script_end_sequence() {
+        let value = json_string_literal("</script><b>");
+        assert_eq!(value, "\"<\\/script><b>\"");
     }
 
     #[test]

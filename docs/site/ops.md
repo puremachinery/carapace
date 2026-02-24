@@ -10,9 +10,13 @@ practical recovery steps.
 - [Health command ladder](#1-health-command-ladder)
 - [Logs and diagnosis ladder](#2-logs-and-diagnosis-ladder)
 - [Autonomy smoke check](#3-autonomy-smoke-check)
+- [Task payload storage note](#4-task-payload-storage-note)
+- [Production secret baseline](#5-production-secret-baseline)
 - [Backup and restore](#6-backup-and-restore)
 - [Update flow](#7-update-flow)
 - [First-response recovery checklist](#8-first-response-recovery-checklist)
+- [Next paths](#9-next-paths)
+- [Security reporting](#10-security-reporting)
 
 ## 1) Health command ladder
 
