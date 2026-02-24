@@ -16,6 +16,29 @@ use tokio_util::sync::CancellationToken;
 
 pub const NO_LLM_PROVIDER_CONFIGURED_ERROR: &str = "no LLM provider configured";
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CronExecuteError {
+    LlmNotConfigured,
+    Other(String),
+}
+
+impl std::fmt::Display for CronExecuteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CronExecuteError::LlmNotConfigured => f.write_str(NO_LLM_PROVIDER_CONFIGURED_ERROR),
+            CronExecuteError::Other(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for CronExecuteError {}
+
+impl From<String> for CronExecuteError {
+    fn from(value: String) -> Self {
+        CronExecuteError::Other(value)
+    }
+}
+
 /// Outcome of executing a cron payload.
 #[derive(Debug)]
 pub enum CronRunOutcome {
@@ -33,7 +56,7 @@ pub async fn execute_payload(
     job_id: &str,
     payload: &CronPayload,
     state: &Arc<WsServerState>,
-) -> Result<CronRunOutcome, String> {
+) -> Result<CronRunOutcome, CronExecuteError> {
     match payload {
         CronPayload::SystemEvent { text } => execute_system_event(job_id, text, state),
         CronPayload::AgentTurn {
@@ -83,7 +106,7 @@ fn execute_system_event(
     job_id: &str,
     text: &str,
     state: &Arc<WsServerState>,
-) -> Result<CronRunOutcome, String> {
+) -> Result<CronRunOutcome, CronExecuteError> {
     let now = crate::cron::now_ms();
     state.enqueue_system_event(SystemEvent {
         ts: now,
@@ -101,7 +124,7 @@ async fn execute_agent_turn(
     job_id: &str,
     state: &Arc<WsServerState>,
     params: AgentTurnParams<'_>,
-) -> Result<CronRunOutcome, String> {
+) -> Result<CronRunOutcome, CronExecuteError> {
     let session_key = format!("cron:{}", job_id);
     let run_id = uuid::Uuid::new_v4().to_string();
     let normalized_channel = normalize_channel(params.channel);
@@ -136,7 +159,7 @@ async fn execute_agent_turn(
 
     let provider = state
         .llm_provider()
-        .ok_or_else(|| NO_LLM_PROVIDER_CONFIGURED_ERROR.to_string())?;
+        .ok_or(CronExecuteError::LlmNotConfigured)?;
 
     spawn_delivery_waiter_if_enabled(
         state,
@@ -452,7 +475,7 @@ mod tests {
 
         let result = execute_payload("job-2", &payload, &state).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("no LLM provider"));
+        assert_eq!(result.unwrap_err(), CronExecuteError::LlmNotConfigured);
     }
 
     #[tokio::test]

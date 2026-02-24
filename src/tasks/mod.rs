@@ -108,7 +108,11 @@ impl TaskQueue {
         let mut loaded: Vec<DurableTask> = match serde_json::from_slice(&data) {
             Ok(tasks) => tasks,
             Err(err) => {
-                warn!(path = %path.display(), error = %err, "failed to parse tasks file");
+                tracing::error!(
+                    path = %path.display(),
+                    error = %err,
+                    "failed to parse tasks file; starting with empty task queue"
+                );
                 return;
             }
         };
@@ -321,14 +325,14 @@ impl TaskQueue {
             None => return,
         };
 
-        if !self.dir_ensured.load(Ordering::Relaxed) {
+        if !self.dir_ensured.load(Ordering::Acquire) {
             if let Some(parent) = path.parent() {
                 if let Err(err) = fs::create_dir_all(parent) {
                     warn!(path = %parent.display(), error = %err, "failed to create tasks dir");
                     return;
                 }
             }
-            self.dir_ensured.store(true, Ordering::Relaxed);
+            self.dir_ensured.store(true, Ordering::Release);
         }
 
         let tmp_path = {
@@ -397,45 +401,96 @@ pub async fn task_worker_loop(
     loop {
         tokio::select! {
             _ = ticker.tick() => {}
-            _ = shutdown.changed() => break,
+            _ = shutdown.changed() => {
+                tracing::info!("durable task worker received shutdown signal");
+                break;
+            }
         }
 
         if *shutdown.borrow() {
+            tracing::info!("durable task worker observed shutdown state");
             break;
         }
 
         let now = now_ms();
-        let due = queue.claim_due(now, 32);
+        let due = match tokio::task::spawn_blocking({
+            let queue = queue.clone();
+            move || queue.claim_due(now, 32)
+        })
+        .await
+        {
+            Ok(due) => due,
+            Err(err) => {
+                warn!(error = %err, "failed to claim due tasks in worker");
+                continue;
+            }
+        };
         // TODO: move to bounded concurrent execution once dispatch paths are fully
         // validated under parallel task processing.
         for task in due {
             let outcome = executor.execute(task.clone()).await;
-            match outcome {
-                TaskExecutionOutcome::Done => {
-                    if !queue.mark_done(&task.id) {
-                        warn!(task_id = %task.id, "failed to mark task done");
-                    }
+            let task_id = task.id.clone();
+            let (state_name, update_result) = match outcome {
+                TaskExecutionOutcome::Done => (
+                    "done",
+                    tokio::task::spawn_blocking({
+                        let queue = queue.clone();
+                        let task_id = task_id.clone();
+                        move || queue.mark_done(&task_id)
+                    })
+                    .await,
+                ),
+                TaskExecutionOutcome::RetryWait { delay_ms, error } => (
+                    "retry_wait",
+                    tokio::task::spawn_blocking({
+                        let queue = queue.clone();
+                        let task_id = task_id.clone();
+                        let error = error.clone();
+                        move || queue.mark_retry_wait(&task_id, delay_ms, &error)
+                    })
+                    .await,
+                ),
+                TaskExecutionOutcome::Blocked { reason } => (
+                    "blocked",
+                    tokio::task::spawn_blocking({
+                        let queue = queue.clone();
+                        let task_id = task_id.clone();
+                        let reason = reason.clone();
+                        move || queue.mark_blocked(&task_id, &reason)
+                    })
+                    .await,
+                ),
+                TaskExecutionOutcome::Failed { error } => (
+                    "failed",
+                    tokio::task::spawn_blocking({
+                        let queue = queue.clone();
+                        let task_id = task_id.clone();
+                        let error = error.clone();
+                        move || queue.mark_failed(&task_id, &error)
+                    })
+                    .await,
+                ),
+                TaskExecutionOutcome::Cancelled { reason } => (
+                    "cancelled",
+                    tokio::task::spawn_blocking({
+                        let queue = queue.clone();
+                        let task_id = task_id.clone();
+                        move || queue.mark_cancelled(&task_id, reason.as_deref())
+                    })
+                    .await,
+                ),
+            };
+            match update_result {
+                Ok(true) => {}
+                Ok(false) => {
+                    warn!(task_id = %task_id, state = state_name, "failed to update task state")
                 }
-                TaskExecutionOutcome::RetryWait { delay_ms, error } => {
-                    if !queue.mark_retry_wait(&task.id, delay_ms, &error) {
-                        warn!(task_id = %task.id, "failed to mark task retry_wait");
-                    }
-                }
-                TaskExecutionOutcome::Blocked { reason } => {
-                    if !queue.mark_blocked(&task.id, &reason) {
-                        warn!(task_id = %task.id, "failed to mark task blocked");
-                    }
-                }
-                TaskExecutionOutcome::Failed { error } => {
-                    if !queue.mark_failed(&task.id, &error) {
-                        warn!(task_id = %task.id, "failed to mark task failed");
-                    }
-                }
-                TaskExecutionOutcome::Cancelled { reason } => {
-                    if !queue.mark_cancelled(&task.id, reason.as_deref()) {
-                        warn!(task_id = %task.id, "failed to mark task cancelled");
-                    }
-                }
+                Err(err) => warn!(
+                    task_id = %task_id,
+                    state = state_name,
+                    error = %err,
+                    "task state update worker failed"
+                ),
             }
         }
     }

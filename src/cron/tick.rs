@@ -90,7 +90,7 @@ pub async fn cron_tick_loop(
                             }
                         }
                         Ok(CronRunOutcome::Broadcast) => (CronJobStatus::Ok, None),
-                        Err(e) => (CronJobStatus::Error, Some(e)),
+                        Err(e) => (CronJobStatus::Error, Some(e.to_string())),
                     };
 
                     let duration_ms = start.elapsed().as_millis() as u64;
