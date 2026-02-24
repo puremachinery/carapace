@@ -31,8 +31,6 @@ For what is already shipped and verified, see:
   - migration/compatibility statement,
   - backup/restore and update-path validation,
   - cross-platform smoke evidence current.
-- Security follow-up: restore per-client hooks sender identity without
-  reintroducing uncontrolled-allocation risk.
 
 ## Next
 
