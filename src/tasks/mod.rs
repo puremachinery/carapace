@@ -440,6 +440,7 @@ pub async fn task_worker_loop(
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             _ = ticker.tick() => {}
