@@ -4414,6 +4414,23 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_control_error_message_prefers_error_field() {
+        let body = br#"{"ok":false,"error":"Task not found"}"#;
+        assert_eq!(extract_control_error_message(body), "Task not found");
+    }
+
+    #[test]
+    fn test_extract_control_error_message_falls_back_to_text_body() {
+        let body = b"plain error text";
+        assert_eq!(extract_control_error_message(body), "plain error text");
+    }
+
+    #[test]
+    fn test_extract_control_error_message_handles_empty_body() {
+        assert_eq!(extract_control_error_message(b""), "empty response body");
+    }
+
+    #[test]
     fn test_setup_post_checks_bridge_inside_current_thread_runtime_does_not_panic() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
