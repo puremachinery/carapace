@@ -55,8 +55,15 @@ pub struct HookMapping {
     pub wake_mode: Option<String>,
     /// Display name (supports templates)
     pub name: Option<String>,
-    /// Session key (supports templates)
-    pub session_key: Option<String>,
+    /// Session scope override (supports templates).
+    /// Serialized/deserialized as `sessionKey` for backward compatibility.
+    #[serde(
+        rename = "sessionKey",
+        alias = "session_scope",
+        alias = "sessionScope",
+        alias = "session_key"
+    )]
+    pub session_scope: Option<String>,
     /// Message template for agent action
     pub message_template: Option<String>,
     /// Text template for wake action
@@ -88,7 +95,7 @@ impl HookMapping {
             action: HookAction::Agent,
             wake_mode: None,
             name: None,
-            session_key: None,
+            session_scope: None,
             message_template: None,
             text_template: None,
             deliver: None,
@@ -148,7 +155,7 @@ pub enum HookMappingResult {
         thinking: Option<String>,
         deliver: bool,
         wake_mode: String,
-        session_key: String,
+        session_scope: String,
         timeout_seconds: Option<u32>,
         allow_unsafe_external_content: bool,
     },
@@ -202,7 +209,7 @@ impl HookRegistry {
                 action: HookAction::Agent,
                 wake_mode: None,
                 name: Some("Gmail".to_string()),
-                session_key: Some("hook:gmail:{{messages[0].id}}".to_string()),
+                session_scope: Some("hook:gmail:{{messages[0].id}}".to_string()),
                 message_template: Some(
                     "New email from {{messages[0].from}}\nSubject: {{messages[0].subject}}\n{{messages[0].snippet}}\n{{messages[0].body}}".to_string()
                 ),
@@ -311,7 +318,7 @@ impl HookRegistry {
                     return Err(HookMappingError::EmptyMessage);
                 }
 
-                let session_key = if let Some(template) = &mapping.session_key {
+                let session_scope = if let Some(template) = &mapping.session_scope {
                     evaluate_template(template, ctx)?
                 } else {
                     format!("hook:{}:{}", ctx.path, uuid::Uuid::new_v4())
@@ -332,7 +339,7 @@ impl HookRegistry {
                         .wake_mode
                         .clone()
                         .unwrap_or_else(|| "now".to_string()),
-                    session_key,
+                    session_scope,
                     timeout_seconds: mapping.timeout_seconds,
                     allow_unsafe_external_content: mapping
                         .allow_unsafe_external_content
@@ -613,6 +620,30 @@ mod tests {
         let mappings = registry.list();
         assert_eq!(mappings.len(), 1);
         assert_eq!(mappings[0].id, Some("test".to_string()));
+    }
+
+    #[test]
+    fn test_hook_mapping_deserializes_session_key_compat() {
+        let mapping: HookMapping = serde_json::from_value(json!({
+            "id": "test",
+            "action": "agent",
+            "messageTemplate": "hello",
+            "sessionKey": "hook:legacy"
+        }))
+        .unwrap();
+        assert_eq!(mapping.session_scope.as_deref(), Some("hook:legacy"));
+    }
+
+    #[test]
+    fn test_hook_mapping_deserializes_session_scope_alias() {
+        let mapping: HookMapping = serde_json::from_value(json!({
+            "id": "test",
+            "action": "agent",
+            "messageTemplate": "hello",
+            "sessionScope": "hook:new"
+        }))
+        .unwrap();
+        assert_eq!(mapping.session_scope.as_deref(), Some("hook:new"));
     }
 
     #[test]

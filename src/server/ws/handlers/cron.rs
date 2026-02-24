@@ -340,7 +340,7 @@ pub(super) fn handle_cron_run(
 
                 let (status, error) = match outcome {
                     Ok(_) => (CronJobStatus::Ok, None),
-                    Err(e) => (CronJobStatus::Error, Some(e)),
+                    Err(e) => (CronJobStatus::Error, Some(e.to_string())),
                 };
 
                 if let Err(e) = state_clone.cron_scheduler.mark_run_finished(

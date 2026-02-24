@@ -17,6 +17,9 @@ use tracing::warn;
 use uuid::Uuid;
 
 const MAX_TASKS: usize = 10_000;
+const TASK_QUEUE_FULL_NO_EVICTION_ERROR: &str =
+    "task queue full: no terminal tasks available for eviction";
+const ENQUEUE_WORKER_FAILED_ERROR: &str = "task queue enqueue worker failed";
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -119,7 +122,11 @@ impl TaskQueue {
         let mut loaded: Vec<DurableTask> = match serde_json::from_slice(&data) {
             Ok(tasks) => tasks,
             Err(err) => {
-                warn!(path = %path.display(), error = %err, "failed to parse tasks file");
+                tracing::error!(
+                    path = %path.display(),
+                    error = %err,
+                    "failed to parse tasks file; starting with empty task queue"
+                );
                 return;
             }
         };
@@ -145,9 +152,16 @@ impl TaskQueue {
     }
 
     /// Add a new task in `queued` state.
+    ///
+    /// For Tokio async call sites, prefer [`Self::enqueue_async`] to avoid
+    /// blocking runtime worker threads on fsync.
+    ///
+    /// If the queue is full and has no terminal task to evict, this returns a
+    /// synthetic `Failed` task and does not insert it into the queue. Callers
+    /// must not assume the returned task ID is persisted in that case.
     pub fn enqueue(&self, payload: Value, next_run_at_ms: Option<u64>) -> DurableTask {
         let now = now_ms();
-        let task = DurableTask {
+        let mut task = DurableTask {
             id: Uuid::new_v4().to_string(),
             state: TaskState::Queued,
             attempts: 0,
@@ -175,12 +189,56 @@ impl TaskQueue {
                     .min_by_key(|(_, t)| t.updated_at_ms)
                 {
                     tasks.remove(idx);
+                } else {
+                    task.state = TaskState::Failed;
+                    task.last_error = Some(TASK_QUEUE_FULL_NO_EVICTION_ERROR.to_string());
+                    task.updated_at_ms = now;
+                    warn!(
+                        max_tasks = MAX_TASKS,
+                        "task queue full with no terminal tasks; dropping enqueue request"
+                    );
+                    return task;
                 }
             }
             tasks.push(task.clone());
         }
         self.flush_to_disk();
         task
+    }
+
+    /// Async-safe enqueue wrapper for Tokio call sites.
+    ///
+    /// This offloads sync queue mutation and fsync persistence to a blocking
+    /// thread, so async handlers do not block runtime worker threads.
+    ///
+    /// The same capacity-full contract as [`Self::enqueue`] applies: on full
+    /// queue with no evictable terminal task, the returned `Failed` task ID is
+    /// synthetic and not present in the queue.
+    pub async fn enqueue_async(
+        self: &Arc<Self>,
+        payload: Value,
+        next_run_at_ms: Option<u64>,
+    ) -> DurableTask {
+        let queue = Arc::clone(self);
+        let payload_fallback = payload.clone();
+        match tokio::task::spawn_blocking(move || queue.enqueue(payload, next_run_at_ms)).await {
+            Ok(task) => task,
+            Err(err) => {
+                let now = now_ms();
+                warn!(error = %err, "enqueue worker failed");
+                DurableTask {
+                    id: Uuid::new_v4().to_string(),
+                    state: TaskState::Failed,
+                    attempts: 0,
+                    next_run_at_ms,
+                    last_error: Some(ENQUEUE_WORKER_FAILED_ERROR.to_string()),
+                    payload: payload_fallback,
+                    created_at_ms: now,
+                    updated_at_ms: now,
+                    run_ids: Vec::new(),
+                }
+            }
+        }
     }
 
     /// Get a task by ID.
@@ -378,14 +436,14 @@ impl TaskQueue {
             None => return,
         };
 
-        if !self.dir_ensured.load(Ordering::Relaxed) {
+        if !self.dir_ensured.load(Ordering::Acquire) {
             if let Some(parent) = path.parent() {
                 if let Err(err) = fs::create_dir_all(parent) {
                     warn!(path = %parent.display(), error = %err, "failed to create tasks dir");
                     return;
                 }
             }
-            self.dir_ensured.store(true, Ordering::Relaxed);
+            self.dir_ensured.store(true, Ordering::Release);
         }
 
         let tmp_path = {
@@ -451,38 +509,101 @@ pub async fn task_worker_loop(
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             _ = ticker.tick() => {}
-            _ = shutdown.changed() => break,
+            _ = shutdown.changed() => {
+                tracing::info!("durable task worker received shutdown signal");
+                break;
+            }
         }
 
         if *shutdown.borrow() {
+            tracing::info!("durable task worker observed shutdown state");
             break;
         }
 
         let now = now_ms();
-        let due = queue.claim_due(now, 32);
-        // TODO: move to bounded concurrent execution once dispatch paths are fully
-        // validated under parallel task processing.
+        let due = match tokio::task::spawn_blocking({
+            let queue = queue.clone();
+            move || queue.claim_due(now, 32)
+        })
+        .await
+        {
+            Ok(due) => due,
+            Err(err) => {
+                warn!(error = %err, "failed to claim due tasks in worker");
+                continue;
+            }
+        };
+        // Intentionally sequential for now: each tick claims at most 32 tasks.
+        // Future work may add bounded parallelism once dispatch paths are
+        // validated under concurrent execution.
         for task in due {
             let outcome = executor.execute(task.clone()).await;
-            match outcome {
-                TaskExecutionOutcome::Done { run_id } => {
-                    let _ = queue.mark_done(&task.id, run_id.as_deref());
+            let task_id = task.id.clone();
+            let (state_name, update_result) = match outcome {
+                TaskExecutionOutcome::Done { run_id } => (
+                    "done",
+                    tokio::task::spawn_blocking({
+                        let queue = queue.clone();
+                        let task_id = task_id.clone();
+                        move || queue.mark_done(&task_id, run_id.as_deref())
+                    })
+                    .await,
+                ),
+                TaskExecutionOutcome::RetryWait { delay_ms, error } => (
+                    "retry_wait",
+                    tokio::task::spawn_blocking({
+                        let queue = queue.clone();
+                        let task_id = task_id.clone();
+                        let error = error.clone();
+                        move || queue.mark_retry_wait(&task_id, delay_ms, &error)
+                    })
+                    .await,
+                ),
+                TaskExecutionOutcome::Blocked { reason } => (
+                    "blocked",
+                    tokio::task::spawn_blocking({
+                        let queue = queue.clone();
+                        let task_id = task_id.clone();
+                        let reason = reason.clone();
+                        move || queue.mark_blocked(&task_id, &reason)
+                    })
+                    .await,
+                ),
+                TaskExecutionOutcome::Failed { error } => (
+                    "failed",
+                    tokio::task::spawn_blocking({
+                        let queue = queue.clone();
+                        let task_id = task_id.clone();
+                        let error = error.clone();
+                        move || queue.mark_failed(&task_id, &error)
+                    })
+                    .await,
+                ),
+                TaskExecutionOutcome::Cancelled { reason } => (
+                    "cancelled",
+                    tokio::task::spawn_blocking({
+                        let queue = queue.clone();
+                        let task_id = task_id.clone();
+                        move || queue.mark_cancelled(&task_id, reason.as_deref())
+                    })
+                    .await,
+                ),
+            };
+            match update_result {
+                Ok(true) => {}
+                Ok(false) => {
+                    warn!(task_id = %task_id, state = state_name, "failed to update task state")
                 }
-                TaskExecutionOutcome::RetryWait { delay_ms, error } => {
-                    let _ = queue.mark_retry_wait(&task.id, delay_ms, &error);
-                }
-                TaskExecutionOutcome::Blocked { reason } => {
-                    let _ = queue.mark_blocked(&task.id, &reason);
-                }
-                TaskExecutionOutcome::Failed { error } => {
-                    let _ = queue.mark_failed(&task.id, &error);
-                }
-                TaskExecutionOutcome::Cancelled { reason } => {
-                    let _ = queue.mark_cancelled(&task.id, reason.as_deref());
-                }
+                Err(err) => warn!(
+                    task_id = %task_id,
+                    state = state_name,
+                    error = %err,
+                    "task state update worker failed"
+                ),
             }
         }
     }
@@ -534,12 +655,36 @@ mod tests {
     }
 
     #[test]
+    fn test_mark_blocked_tracks_reason() {
+        let queue = TaskQueue::in_memory();
+        let task = queue.enqueue(serde_json::json!({"kind":"demo"}), None);
+        let _ = queue.claim_due(now_ms(), 1);
+        assert!(queue.mark_blocked(&task.id, "waiting approval"));
+        let updated = queue.get(&task.id).expect("task should exist");
+        assert_eq!(updated.state, TaskState::Blocked);
+        assert_eq!(updated.last_error.as_deref(), Some("waiting approval"));
+        assert_eq!(updated.next_run_at_ms, None);
+    }
+
+    #[test]
     fn test_mark_cancelled_rejects_terminal_state() {
         let queue = TaskQueue::in_memory();
         let task = queue.enqueue(serde_json::json!({"kind":"demo"}), None);
         let _ = queue.claim_due(now_ms(), 1);
         assert!(queue.mark_done(&task.id, Some("run-1")));
         assert!(!queue.mark_cancelled(&task.id, Some("too late")));
+    }
+
+    #[test]
+    fn test_mark_cancelled_tracks_reason() {
+        let queue = TaskQueue::in_memory();
+        let task = queue.enqueue(serde_json::json!({"kind":"demo"}), None);
+        let _ = queue.claim_due(now_ms(), 1);
+        assert!(queue.mark_cancelled(&task.id, Some("operator cancel")));
+        let updated = queue.get(&task.id).expect("task should exist");
+        assert_eq!(updated.state, TaskState::Cancelled);
+        assert_eq!(updated.last_error.as_deref(), Some("operator cancel"));
+        assert_eq!(updated.next_run_at_ms, None);
     }
 
     #[test]
@@ -643,6 +788,79 @@ mod tests {
         assert_eq!(queue.stats().total, MAX_TASKS);
     }
 
+    #[test]
+    fn test_enqueue_drops_when_full_without_terminal_capacity() {
+        let queue = TaskQueue::in_memory();
+        {
+            let mut tasks = queue.tasks.write();
+            for idx in 0..MAX_TASKS {
+                tasks.push(DurableTask {
+                    id: format!("running-{idx}"),
+                    state: TaskState::Running,
+                    attempts: 1,
+                    next_run_at_ms: None,
+                    last_error: None,
+                    payload: serde_json::json!({"kind":"demo"}),
+                    created_at_ms: idx as u64 + 1,
+                    updated_at_ms: idx as u64 + 1,
+                    run_ids: Vec::new(),
+                });
+            }
+        }
+
+        let dropped = queue.enqueue(serde_json::json!({"kind":"new"}), None);
+        assert_eq!(queue.stats().total, MAX_TASKS);
+        assert_eq!(dropped.state, TaskState::Failed);
+        assert_eq!(
+            dropped.last_error.as_deref(),
+            Some(TASK_QUEUE_FULL_NO_EVICTION_ERROR)
+        );
+        assert!(queue.get(&dropped.id).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_async_queues_without_blocking_callsite() {
+        let queue = Arc::new(TaskQueue::in_memory());
+        let task = queue
+            .enqueue_async(serde_json::json!({"kind":"demo-async"}), None)
+            .await;
+        assert_eq!(task.state, TaskState::Queued);
+        let persisted = queue.get(&task.id).expect("task should be queued");
+        assert_eq!(persisted.payload, serde_json::json!({"kind":"demo-async"}));
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_async_drops_when_full_without_terminal_capacity() {
+        let queue = Arc::new(TaskQueue::in_memory());
+        {
+            let mut tasks = queue.tasks.write();
+            for idx in 0..MAX_TASKS {
+                tasks.push(DurableTask {
+                    id: format!("running-{idx}"),
+                    state: TaskState::Running,
+                    attempts: 1,
+                    next_run_at_ms: None,
+                    last_error: None,
+                    payload: serde_json::json!({"kind":"demo"}),
+                    created_at_ms: idx as u64 + 1,
+                    updated_at_ms: idx as u64 + 1,
+                    run_ids: Vec::new(),
+                });
+            }
+        }
+
+        let dropped = queue
+            .enqueue_async(serde_json::json!({"kind":"new-async"}), None)
+            .await;
+        assert_eq!(queue.stats().total, MAX_TASKS);
+        assert_eq!(dropped.state, TaskState::Failed);
+        assert_eq!(
+            dropped.last_error.as_deref(),
+            Some(TASK_QUEUE_FULL_NO_EVICTION_ERROR)
+        );
+        assert!(queue.get(&dropped.id).is_none());
+    }
+
     struct DoneExecutor {
         calls: AtomicUsize,
     }
@@ -653,6 +871,32 @@ mod tests {
             self.calls.fetch_add(1, Ordering::Relaxed);
             TaskExecutionOutcome::Done { run_id: None }
         }
+    }
+
+    struct FixedOutcomeExecutor {
+        outcome: TaskExecutionOutcome,
+    }
+
+    #[async_trait]
+    impl TaskExecutor for FixedOutcomeExecutor {
+        async fn execute(&self, _task: DurableTask) -> TaskExecutionOutcome {
+            self.outcome.clone()
+        }
+    }
+
+    async fn run_worker_once_with_outcome(queue: Arc<TaskQueue>, outcome: TaskExecutionOutcome) {
+        let executor = Arc::new(FixedOutcomeExecutor { outcome });
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let worker = tokio::spawn(task_worker_loop(
+            queue,
+            executor,
+            Duration::from_millis(10),
+            shutdown_rx,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let _ = shutdown_tx.send(true);
+        let _ = worker.await;
     }
 
     #[tokio::test]
@@ -680,5 +924,82 @@ mod tests {
         let stats = queue.stats();
         assert_eq!(stats.done, 2);
         assert_eq!(stats.running, 0);
+    }
+
+    #[tokio::test]
+    async fn test_task_worker_loop_retry_wait_outcome_branch() {
+        let queue = Arc::new(TaskQueue::in_memory());
+        let task = queue.enqueue(serde_json::json!({"kind":"demo"}), None);
+
+        run_worker_once_with_outcome(
+            queue.clone(),
+            TaskExecutionOutcome::RetryWait {
+                delay_ms: 5_000,
+                error: "temporary failure".to_string(),
+            },
+        )
+        .await;
+
+        let updated = queue.get(&task.id).expect("task should exist");
+        assert_eq!(updated.state, TaskState::RetryWait);
+        assert_eq!(updated.last_error.as_deref(), Some("temporary failure"));
+        assert!(updated.next_run_at_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_task_worker_loop_failed_outcome_branch() {
+        let queue = Arc::new(TaskQueue::in_memory());
+        let task = queue.enqueue(serde_json::json!({"kind":"demo"}), None);
+
+        run_worker_once_with_outcome(
+            queue.clone(),
+            TaskExecutionOutcome::Failed {
+                error: "fatal".to_string(),
+            },
+        )
+        .await;
+
+        let updated = queue.get(&task.id).expect("task should exist");
+        assert_eq!(updated.state, TaskState::Failed);
+        assert_eq!(updated.last_error.as_deref(), Some("fatal"));
+        assert_eq!(updated.next_run_at_ms, None);
+    }
+
+    #[tokio::test]
+    async fn test_task_worker_loop_blocked_outcome_branch() {
+        let queue = Arc::new(TaskQueue::in_memory());
+        let task = queue.enqueue(serde_json::json!({"kind":"demo"}), None);
+
+        run_worker_once_with_outcome(
+            queue.clone(),
+            TaskExecutionOutcome::Blocked {
+                reason: "needs operator action".to_string(),
+            },
+        )
+        .await;
+
+        let updated = queue.get(&task.id).expect("task should exist");
+        assert_eq!(updated.state, TaskState::Blocked);
+        assert_eq!(updated.last_error.as_deref(), Some("needs operator action"));
+        assert_eq!(updated.next_run_at_ms, None);
+    }
+
+    #[tokio::test]
+    async fn test_task_worker_loop_cancelled_outcome_branch() {
+        let queue = Arc::new(TaskQueue::in_memory());
+        let task = queue.enqueue(serde_json::json!({"kind":"demo"}), None);
+
+        run_worker_once_with_outcome(
+            queue.clone(),
+            TaskExecutionOutcome::Cancelled {
+                reason: Some("operator cancelled".to_string()),
+            },
+        )
+        .await;
+
+        let updated = queue.get(&task.id).expect("task should exist");
+        assert_eq!(updated.state, TaskState::Cancelled);
+        assert_eq!(updated.last_error.as_deref(), Some("operator cancelled"));
+        assert_eq!(updated.next_run_at_ms, None);
     }
 }

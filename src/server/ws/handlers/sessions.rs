@@ -58,7 +58,6 @@ impl std::fmt::Display for AgentRunStatus {
 }
 
 /// Represents an active agent run
-#[derive(Debug)]
 pub struct AgentRun {
     /// Unique run identifier
     pub run_id: String,
@@ -96,7 +95,7 @@ pub struct AgentRunResult {
 }
 
 /// Registry for tracking active agent runs
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct AgentRunRegistry {
     /// Active runs by run_id
     runs: HashMap<String, AgentRun>,
