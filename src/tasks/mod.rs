@@ -715,6 +715,37 @@ mod tests {
         assert_eq!(persisted.payload, serde_json::json!({"kind":"demo-async"}));
     }
 
+    #[tokio::test]
+    async fn test_enqueue_async_drops_when_full_without_terminal_capacity() {
+        let queue = Arc::new(TaskQueue::in_memory());
+        {
+            let mut tasks = queue.tasks.write();
+            for idx in 0..MAX_TASKS {
+                tasks.push(DurableTask {
+                    id: format!("running-{idx}"),
+                    state: TaskState::Running,
+                    attempts: 1,
+                    next_run_at_ms: None,
+                    last_error: None,
+                    payload: serde_json::json!({"kind":"demo"}),
+                    created_at_ms: idx as u64 + 1,
+                    updated_at_ms: idx as u64 + 1,
+                });
+            }
+        }
+
+        let dropped = queue
+            .enqueue_async(serde_json::json!({"kind":"new-async"}), None)
+            .await;
+        assert_eq!(queue.stats().total, MAX_TASKS);
+        assert_eq!(dropped.state, TaskState::Failed);
+        assert_eq!(
+            dropped.last_error.as_deref(),
+            Some(TASK_QUEUE_FULL_NO_EVICTION_ERROR)
+        );
+        assert!(queue.get(&dropped.id).is_none());
+    }
+
     struct DoneExecutor {
         calls: AtomicUsize,
     }
