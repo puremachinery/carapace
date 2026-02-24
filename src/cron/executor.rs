@@ -223,6 +223,8 @@ fn apply_timeout_limit(
         Some(requested) if requested > limit => Err(CronExecuteError::Other(format!(
             "objective policy violation: timeoutSeconds {requested} exceeds maxRunTimeoutSeconds {limit}"
         ))),
+        // In bounded objective mode, an explicit zero timeout is treated as
+        // "use the policy cap", not "unbounded execution".
         Some(0) => Ok(Some(limit)),
         Some(requested) => Ok(Some(requested)),
         None => Ok(Some(limit)),
@@ -322,6 +324,8 @@ fn build_agent_config(
         // Delivery for cron runs is handled via a completion waiter below.
         config.deliver = deliver;
     }
+    // Task policy is a per-objective ceiling. It can only reduce turns versus
+    // global/runtime config, never raise them.
     if let Some(max_turns_limit) = max_turns_limit.filter(|max_turns| *max_turns > 0) {
         config.max_turns = config.max_turns.min(max_turns_limit);
     }

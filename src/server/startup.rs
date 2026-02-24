@@ -33,53 +33,58 @@ struct RuntimeTaskExecutor {
 
 const NO_PROVIDER_RETRY_DELAY_MS: u64 = 60_000;
 
+fn invalid_policy_budget_error(policy: &crate::tasks::TaskPolicy) -> Option<&'static str> {
+    if policy.max_attempts == 0 {
+        Some("maxAttempts must be greater than 0")
+    } else if policy.max_total_runtime_ms == 0 {
+        Some("maxTotalRuntimeMs must be greater than 0")
+    } else if policy.max_turns == 0 {
+        Some("maxTurns must be greater than 0")
+    } else if policy.max_run_timeout_seconds == 0 {
+        Some("maxRunTimeoutSeconds must be greater than 0")
+    } else {
+        None
+    }
+}
+
 #[async_trait]
 impl TaskExecutor for RuntimeTaskExecutor {
     async fn execute(&self, task: DurableTask) -> TaskExecutionOutcome {
-        if task.policy.max_attempts == 0 {
-            return TaskExecutionOutcome::Failed {
-                error: "objective policy violation: maxAttempts must be greater than 0".to_string(),
-            };
-        }
-        if task.policy.max_total_runtime_ms == 0 {
-            return TaskExecutionOutcome::Failed {
-                error: "objective policy violation: maxTotalRuntimeMs must be greater than 0"
-                    .to_string(),
-            };
-        }
-        if task.policy.max_turns == 0 {
-            return TaskExecutionOutcome::Failed {
-                error: "objective policy violation: maxTurns must be greater than 0".to_string(),
-            };
-        }
-        if task.policy.max_run_timeout_seconds == 0 {
-            return TaskExecutionOutcome::Failed {
-                error: "objective policy violation: maxRunTimeoutSeconds must be greater than 0"
-                    .to_string(),
-            };
-        }
+        // Policy budgets are enforced only for tasks created with explicit
+        // policy metadata. Legacy tasks loaded from pre-policy queue files
+        // deserialize with policy_explicit=false and retain prior behavior.
+        if task.policy_explicit {
+            // Belt-and-suspenders fail-closed guard: control API validation
+            // rejects zero budgets, but persisted/manual task mutations should
+            // still fail safely at execution time.
+            if let Some(error) = invalid_policy_budget_error(&task.policy) {
+                return TaskExecutionOutcome::Failed {
+                    error: format!("objective policy violation: {error}"),
+                };
+            }
 
-        if task.attempts > task.policy.max_attempts {
-            return TaskExecutionOutcome::Failed {
-                error: format!(
-                    "objective policy violation: attempts {} exceeded maxAttempts {}",
-                    task.attempts, task.policy.max_attempts
-                ),
-            };
-        }
+            if task.attempts > task.policy.max_attempts {
+                return TaskExecutionOutcome::Failed {
+                    error: format!(
+                        "objective policy violation: attempts {} exceeded maxAttempts {}",
+                        task.attempts, task.policy.max_attempts
+                    ),
+                };
+            }
 
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        let task_age_ms = now_ms.saturating_sub(task.created_at_ms);
-        if task_age_ms > task.policy.max_total_runtime_ms {
-            return TaskExecutionOutcome::Failed {
-                error: format!(
-                    "objective policy violation: task age {}ms exceeded maxTotalRuntimeMs {}",
-                    task_age_ms, task.policy.max_total_runtime_ms
-                ),
-            };
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let task_age_ms = now_ms.saturating_sub(task.created_at_ms);
+            if task_age_ms > task.policy.max_total_runtime_ms {
+                return TaskExecutionOutcome::Failed {
+                    error: format!(
+                        "objective policy violation: task age {}ms exceeded maxTotalRuntimeMs {}",
+                        task_age_ms, task.policy.max_total_runtime_ms
+                    ),
+                };
+            }
         }
 
         let payload = match serde_json::from_value::<crate::cron::CronPayload>(task.payload) {
@@ -91,9 +96,13 @@ impl TaskExecutor for RuntimeTaskExecutor {
             }
         };
 
-        let execution_limits = crate::cron::executor::ExecutionLimits {
-            max_turns: Some(task.policy.max_turns),
-            max_timeout_seconds: Some(task.policy.max_run_timeout_seconds),
+        let execution_limits = if task.policy_explicit {
+            crate::cron::executor::ExecutionLimits {
+                max_turns: Some(task.policy.max_turns),
+                max_timeout_seconds: Some(task.policy.max_run_timeout_seconds),
+            }
+        } else {
+            crate::cron::executor::ExecutionLimits::default()
         };
 
         match crate::cron::executor::execute_payload(
@@ -113,7 +122,9 @@ impl TaskExecutor for RuntimeTaskExecutor {
                 }
             }
             Err(crate::cron::executor::CronExecuteError::LlmNotConfigured) => {
-                if task.attempts >= task.policy.max_attempts {
+                // At budget boundary, fail immediately instead of enqueuing a
+                // retry that cannot run due to maxAttempts preflight checks.
+                if task.policy_explicit && task.attempts >= task.policy.max_attempts {
                     TaskExecutionOutcome::Failed {
                         error: format!(
                             "{} (retry limit reached: {})",
@@ -584,6 +595,7 @@ mod tests {
             updated_at_ms: now_ms,
             run_ids: Vec::new(),
             policy: crate::tasks::TaskPolicy::default(),
+            policy_explicit: true,
         }
     }
 
@@ -741,5 +753,37 @@ mod tests {
                         .to_string(),
             }
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_task_executor_preserves_legacy_task_behavior_for_old_age() {
+        let state = Arc::new(WsServerState::new(WsServerConfig::default()));
+        let executor = RuntimeTaskExecutor { state };
+        let payload = serde_json::to_value(CronPayload::SystemEvent {
+            text: "hello".to_string(),
+        })
+        .expect("payload serializes");
+        let mut task = durable_task_with_payload(payload, 1);
+        task.policy_explicit = false;
+        task.created_at_ms = 0;
+
+        let outcome = executor.execute(task).await;
+        assert_eq!(outcome, TaskExecutionOutcome::Done { run_id: None });
+    }
+
+    #[tokio::test]
+    async fn runtime_task_executor_preserves_legacy_task_behavior_for_attempt_budget() {
+        let state = Arc::new(WsServerState::new(WsServerConfig::default()));
+        let executor = RuntimeTaskExecutor { state };
+        let payload = serde_json::to_value(CronPayload::SystemEvent {
+            text: "hello".to_string(),
+        })
+        .expect("payload serializes");
+        let mut task =
+            durable_task_with_payload(payload, crate::tasks::DEFAULT_TASK_MAX_ATTEMPTS + 1);
+        task.policy_explicit = false;
+
+        let outcome = executor.execute(task).await;
+        assert_eq!(outcome, TaskExecutionOutcome::Done { run_id: None });
     }
 }

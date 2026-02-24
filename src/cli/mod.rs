@@ -607,17 +607,36 @@ async fn handle_task_create(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let parsed_payload: Value = serde_json::from_str(&options.payload)
         .map_err(|e| format!("invalid --payload JSON (expected CronPayload object): {e}"))?;
-    let policy = serde_json::json!({
-        "maxAttempts": options.max_attempts,
-        "maxTotalRuntimeMs": options.max_total_runtime_ms,
-        "maxTurns": options.max_turns,
-        "maxRunTimeoutSeconds": options.max_run_timeout_seconds,
-    });
-    let body = serde_json::json!({
-        "payload": parsed_payload,
-        "nextRunAtMs": options.next_run_at_ms,
-        "policy": policy,
-    });
+    let mut body = serde_json::Map::new();
+    body.insert("payload".to_string(), parsed_payload);
+    body.insert(
+        "nextRunAtMs".to_string(),
+        options.next_run_at_ms.map_or(Value::Null, Value::from),
+    );
+
+    let mut policy = serde_json::Map::new();
+    if let Some(max_attempts) = options.max_attempts {
+        policy.insert("maxAttempts".to_string(), Value::from(max_attempts));
+    }
+    if let Some(max_total_runtime_ms) = options.max_total_runtime_ms {
+        policy.insert(
+            "maxTotalRuntimeMs".to_string(),
+            Value::from(max_total_runtime_ms),
+        );
+    }
+    if let Some(max_turns) = options.max_turns {
+        policy.insert("maxTurns".to_string(), Value::from(max_turns));
+    }
+    if let Some(max_run_timeout_seconds) = options.max_run_timeout_seconds {
+        policy.insert(
+            "maxRunTimeoutSeconds".to_string(),
+            Value::from(max_run_timeout_seconds),
+        );
+    }
+    if !policy.is_empty() {
+        body.insert("policy".to_string(), Value::Object(policy));
+    }
+    let body = Value::Object(body);
 
     let response = send_control_request(
         host,

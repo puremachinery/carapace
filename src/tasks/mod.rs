@@ -32,6 +32,10 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// Durable lifecycle states for long-running task processing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -91,6 +95,10 @@ pub struct DurableTask {
     pub run_ids: Vec<String>,
     #[serde(default)]
     pub policy: TaskPolicy,
+    /// True when the task was created with an explicit continuation policy.
+    /// Legacy tasks loaded from pre-policy queue files default to false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub policy_explicit: bool,
 }
 
 /// Queue stats by state.
@@ -209,6 +217,7 @@ impl TaskQueue {
             updated_at_ms: now,
             run_ids: Vec::new(),
             policy,
+            policy_explicit: true,
         };
 
         {
@@ -291,6 +300,7 @@ impl TaskQueue {
                     updated_at_ms: now,
                     run_ids: Vec::new(),
                     policy: policy_fallback,
+                    policy_explicit: true,
                 }
             }
         }
@@ -842,6 +852,35 @@ mod tests {
     }
 
     #[test]
+    fn test_load_legacy_task_defaults_policy_explicit_false() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tasks").join("queue.json");
+        std::fs::create_dir_all(path.parent().expect("tasks directory")).unwrap();
+        let legacy = serde_json::json!([{
+            "id": "legacy-task",
+            "state": "queued",
+            "attempts": 250,
+            "nextRunAtMs": null,
+            "lastError": null,
+            "payload": { "kind": "demo" },
+            "createdAtMs": 1,
+            "updatedAtMs": 1,
+            "runIds": []
+        }]);
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&legacy).expect("legacy queue json"),
+        )
+        .unwrap();
+
+        let queue = TaskQueue::new(Some(path));
+        queue.load();
+        let loaded = queue.get("legacy-task").expect("legacy task should load");
+        assert!(!loaded.policy_explicit);
+        assert_eq!(loaded.policy, TaskPolicy::default());
+    }
+
+    #[test]
     fn test_enqueue_evicts_terminal_before_blocked() {
         let queue = TaskQueue::in_memory();
         {
@@ -858,6 +897,7 @@ mod tests {
                     updated_at_ms: idx as u64 + 1,
                     run_ids: Vec::new(),
                     policy: TaskPolicy::default(),
+                    policy_explicit: true,
                 });
             }
             tasks[0].id = "done-oldest".to_string();
@@ -889,6 +929,7 @@ mod tests {
                     updated_at_ms: idx as u64 + 1,
                     run_ids: Vec::new(),
                     policy: TaskPolicy::default(),
+                    policy_explicit: true,
                 });
             }
         }
@@ -931,6 +972,7 @@ mod tests {
                     updated_at_ms: idx as u64 + 1,
                     run_ids: Vec::new(),
                     policy: TaskPolicy::default(),
+                    policy_explicit: true,
                 });
             }
         }
