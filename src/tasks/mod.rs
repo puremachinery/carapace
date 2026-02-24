@@ -496,6 +496,21 @@ impl TaskQueue {
         )
     }
 
+    /// Resume a blocked task by moving it back to `retry_wait`.
+    pub fn resume_blocked_task(&self, id: &str, delay_ms: u64, reason: &str) -> bool {
+        self.update_task_if(
+            id,
+            |task| task.state == TaskState::Blocked,
+            |task, now| {
+                task.state = TaskState::RetryWait;
+                task.last_error = Some(reason.to_string());
+                task.next_run_at_ms = Some(now.saturating_add(delay_ms));
+                task.updated_at_ms = now;
+                task.blocked_reason = None;
+            },
+        )
+    }
+
     /// Patch mutable task fields for operator remediation.
     ///
     /// Intended for blocked/failed/cancelled/retry_wait/queued tasks where an
@@ -832,6 +847,33 @@ mod tests {
         let _ = queue.claim_due(now_ms(), 10);
         assert!(queue.mark_done(&done.id, Some("run-1")));
         assert!(!queue.mark_retry_wait(&done.id, 1_000, "reject done"));
+    }
+
+    #[test]
+    fn test_resume_blocked_task_allows_only_blocked_state() {
+        let queue = TaskQueue::in_memory();
+        let blocked = queue.enqueue(
+            serde_json::json!({"kind":"systemEvent","text":"blocked"}),
+            None,
+        );
+        let queued = queue.enqueue(
+            serde_json::json!({"kind":"systemEvent","text":"queued"}),
+            None,
+        );
+
+        let _ = queue.claim_due(u64::MAX, 32);
+        assert!(queue.mark_blocked(
+            &blocked.id,
+            "awaiting operator",
+            TaskBlockedReason::OperatorActionRequired
+        ));
+        assert!(!queue.resume_blocked_task(&queued.id, 1000, "resume queued"));
+        assert!(queue.resume_blocked_task(&blocked.id, 1000, "resume blocked"));
+
+        let updated = queue.get(&blocked.id).expect("blocked task should exist");
+        assert_eq!(updated.state, TaskState::RetryWait);
+        assert_eq!(updated.last_error.as_deref(), Some("resume blocked"));
+        assert!(updated.blocked_reason.is_none());
     }
 
     #[test]

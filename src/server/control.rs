@@ -939,7 +939,7 @@ pub async fn tasks_retry_handler(
     let Some(queue) = task_queue_or_unavailable(&state) else {
         return task_queue_unavailable_response();
     };
-    let req: TaskResumeRequest = match parse_optional_json(&body) {
+    let req: TaskRetryRequest = match parse_optional_json(&body) {
         Ok(req) => req,
         Err(msg) => {
             return (StatusCode::BAD_REQUEST, Json(ControlError::new(msg))).into_response();
@@ -1007,7 +1007,7 @@ pub async fn tasks_resume_handler(
     let Some(queue) = task_queue_or_unavailable(&state) else {
         return task_queue_unavailable_response();
     };
-    let req: TaskRetryRequest = match parse_optional_json(&body) {
+    let req: TaskResumeRequest = match parse_optional_json(&body) {
         Ok(req) => req,
         Err(msg) => {
             return (StatusCode::BAD_REQUEST, Json(ControlError::new(msg))).into_response();
@@ -1022,25 +1022,17 @@ pub async fn tasks_resume_handler(
     };
     let delay_ms = req.delay_ms.unwrap_or(0);
 
-    let Some(task) = queue.get(task_id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(ControlError::new("Task not found")),
-        )
-            .into_response();
-    };
-    if task.state != TaskState::Blocked {
+    if !queue.resume_blocked_task(task_id, delay_ms, &reason) {
+        if queue.get(task_id).is_none() {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ControlError::new("Task not found")),
+            )
+                .into_response();
+        }
         return (
             StatusCode::CONFLICT,
             Json(ControlError::new("Task is not blocked")),
-        )
-            .into_response();
-    }
-
-    if !queue.mark_retry_wait(task_id, delay_ms, &reason) {
-        return (
-            StatusCode::CONFLICT,
-            Json(ControlError::new("Task state changed; resume rejected")),
         )
             .into_response();
     }
