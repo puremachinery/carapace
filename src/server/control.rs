@@ -4,14 +4,19 @@
 //! - GET /control/status - Gateway status
 //! - GET /control/channels - Channel status
 //! - POST /control/config - Config updates
+//! - POST /control/tasks - Create objective task
+//! - GET /control/tasks - List objective tasks
+//! - GET /control/tasks/{id} - Get task by ID
+//! - POST /control/tasks/{id}/cancel - Cancel task
+//! - POST /control/tasks/{id}/retry - Retry task
 
 use axum::{
-    extract::State,
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -19,9 +24,11 @@ use std::sync::Arc;
 use crate::auth;
 use crate::channels::{ChannelRegistry, ChannelStatus};
 use crate::config;
+use crate::cron::CronPayload;
 use crate::logging::audit::{audit, AuditEvent};
 use crate::server::connect_info::MaybeConnectInfo;
 use crate::server::ws::{map_validation_issues, persist_config_file, read_config_snapshot};
+use crate::tasks::{DurableTask, TaskQueue, TaskState};
 
 const PROTECTED_CONFIG_PREFIXES: &[&str] = &[
     "gateway.auth",
@@ -71,6 +78,8 @@ pub struct ControlState {
     pub version: String,
     /// Gateway start time (Unix timestamp)
     pub start_time: i64,
+    /// Durable task queue (available only when runtime state is attached).
+    pub task_queue: Option<Arc<TaskQueue>>,
 }
 
 impl Default for ControlState {
@@ -84,6 +93,7 @@ impl Default for ControlState {
             channel_registry: Arc::new(ChannelRegistry::new()),
             version: env!("CARGO_PKG_VERSION").to_string(),
             start_time: chrono::Utc::now().timestamp(),
+            task_queue: None,
         }
     }
 }
@@ -183,6 +193,75 @@ pub struct ConfigUpdateResponse {
     /// SHA256 hash of the persisted config (for subsequent optimistic concurrency)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
+}
+
+/// Task create request.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskCreateRequest {
+    pub payload: CronPayload,
+    #[serde(default)]
+    pub next_run_at_ms: Option<u64>,
+}
+
+/// Task list query parameters.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskListQuery {
+    #[serde(default)]
+    pub state: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// Task cancel request.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskCancelRequest {
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// Task retry request.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskRetryRequest {
+    #[serde(default)]
+    pub delay_ms: Option<u64>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+const MAX_TASK_REASON_LEN: usize = 1024;
+
+/// Single-task response.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskResponse {
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<DurableTask>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl TaskResponse {
+    fn success(task: DurableTask) -> Self {
+        TaskResponse {
+            ok: true,
+            task: Some(task),
+            error: None,
+        }
+    }
+}
+
+/// Task list response.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskListResponse {
+    pub ok: bool,
+    pub total: usize,
+    pub tasks: Vec<DurableTask>,
 }
 
 /// Control API error
@@ -433,6 +512,251 @@ pub async fn config_handler(
     (StatusCode::OK, Json(response)).into_response()
 }
 
+/// POST /control/tasks - Create a durable task.
+pub async fn tasks_create_handler(
+    State(state): State<ControlState>,
+    connect_info: MaybeConnectInfo,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let remote_addr = connect_info.0;
+    if let Some(err) = check_control_auth(&state, &headers, remote_addr) {
+        return err;
+    }
+    let Some(queue) = task_queue_or_unavailable(&state) else {
+        return task_queue_unavailable_response();
+    };
+
+    let req: TaskCreateRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ControlError::new(format!("Invalid JSON: {}", e))),
+            )
+                .into_response();
+        }
+    };
+    let payload = match serde_json::to_value(req.payload) {
+        Ok(value) => value,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ControlError::new(format!("Invalid task payload: {}", e))),
+            )
+                .into_response();
+        }
+    };
+
+    let task = queue.enqueue_async(payload, req.next_run_at_ms).await;
+    if task.state == TaskState::Failed {
+        let message = task.last_error.as_deref().unwrap_or("task queue full");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ControlError::new(message)),
+        )
+            .into_response();
+    }
+    (StatusCode::CREATED, Json(TaskResponse::success(task))).into_response()
+}
+
+/// GET /control/tasks - List durable tasks.
+pub async fn tasks_list_handler(
+    State(state): State<ControlState>,
+    connect_info: MaybeConnectInfo,
+    headers: HeaderMap,
+    Query(query): Query<TaskListQuery>,
+) -> Response {
+    let remote_addr = connect_info.0;
+    if let Some(err) = check_control_auth(&state, &headers, remote_addr) {
+        return err;
+    }
+    let Some(queue) = task_queue_or_unavailable(&state) else {
+        return task_queue_unavailable_response();
+    };
+
+    let filter_state = if let Some(raw_state) = query.state.as_deref() {
+        match parse_task_state(raw_state) {
+            Some(state) => Some(state),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ControlError::new("invalid task state filter")),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        None
+    };
+
+    let (total, tasks) = queue.list_filtered(filter_state, query.limit);
+
+    (
+        StatusCode::OK,
+        Json(TaskListResponse {
+            ok: true,
+            total,
+            tasks,
+        }),
+    )
+        .into_response()
+}
+
+/// GET /control/tasks/{id} - Get a single durable task.
+pub async fn tasks_get_handler(
+    Path(task_id): Path<String>,
+    State(state): State<ControlState>,
+    connect_info: MaybeConnectInfo,
+    headers: HeaderMap,
+) -> Response {
+    let remote_addr = connect_info.0;
+    if let Some(err) = check_control_auth(&state, &headers, remote_addr) {
+        return err;
+    }
+    let Some(queue) = task_queue_or_unavailable(&state) else {
+        return task_queue_unavailable_response();
+    };
+
+    match queue.get(task_id.trim()) {
+        Some(task) => (StatusCode::OK, Json(TaskResponse::success(task))).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(ControlError::new("Task not found")),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /control/tasks/{id}/cancel - Cancel a durable task.
+pub async fn tasks_cancel_handler(
+    Path(task_id): Path<String>,
+    State(state): State<ControlState>,
+    connect_info: MaybeConnectInfo,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let remote_addr = connect_info.0;
+    if let Some(err) = check_control_auth(&state, &headers, remote_addr) {
+        return err;
+    }
+    let Some(queue) = task_queue_or_unavailable(&state) else {
+        return task_queue_unavailable_response();
+    };
+    let req: TaskCancelRequest = match parse_optional_json(&body) {
+        Ok(req) => req,
+        Err(msg) => {
+            return (StatusCode::BAD_REQUEST, Json(ControlError::new(msg))).into_response();
+        }
+    };
+    let task_id = task_id.trim();
+    let reason = match parse_optional_reason(req.reason) {
+        Ok(reason) => reason,
+        Err(msg) => {
+            return (StatusCode::BAD_REQUEST, Json(ControlError::new(msg))).into_response();
+        }
+    };
+
+    let Some(task) = queue.get(task_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ControlError::new("Task not found")),
+        )
+            .into_response();
+    };
+    if task.state.is_terminal() {
+        return (
+            StatusCode::CONFLICT,
+            Json(ControlError::new("Task is already in a terminal state")),
+        )
+            .into_response();
+    }
+
+    if !queue.mark_cancelled(task_id, reason.as_deref()) {
+        return (
+            StatusCode::CONFLICT,
+            Json(ControlError::new("Task state changed; cancel rejected")),
+        )
+            .into_response();
+    }
+    match queue.get(task_id) {
+        Some(task) => (StatusCode::OK, Json(TaskResponse::success(task))).into_response(),
+        None => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ControlError::new("Task updated but unavailable")),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /control/tasks/{id}/retry - Retry a durable task.
+pub async fn tasks_retry_handler(
+    Path(task_id): Path<String>,
+    State(state): State<ControlState>,
+    connect_info: MaybeConnectInfo,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let remote_addr = connect_info.0;
+    if let Some(err) = check_control_auth(&state, &headers, remote_addr) {
+        return err;
+    }
+    let Some(queue) = task_queue_or_unavailable(&state) else {
+        return task_queue_unavailable_response();
+    };
+    let req: TaskRetryRequest = match parse_optional_json(&body) {
+        Ok(req) => req,
+        Err(msg) => {
+            return (StatusCode::BAD_REQUEST, Json(ControlError::new(msg))).into_response();
+        }
+    };
+    let task_id = task_id.trim();
+    let reason = match parse_optional_reason(req.reason) {
+        Ok(reason) => reason.unwrap_or_else(|| "retried by operator".to_string()),
+        Err(msg) => {
+            return (StatusCode::BAD_REQUEST, Json(ControlError::new(msg))).into_response();
+        }
+    };
+    let delay_ms = req.delay_ms.unwrap_or(0);
+
+    let Some(task) = queue.get(task_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ControlError::new("Task not found")),
+        )
+            .into_response();
+    };
+    // Operator retry is intentionally allowed for failed/blocked/cancelled tasks.
+    if matches!(
+        task.state,
+        TaskState::Queued | TaskState::Running | TaskState::Done
+    ) {
+        return (
+            StatusCode::CONFLICT,
+            Json(ControlError::new(
+                "Task is not retryable in its current state",
+            )),
+        )
+            .into_response();
+    }
+
+    if !queue.mark_retry_wait(task_id, delay_ms, &reason) {
+        return (
+            StatusCode::CONFLICT,
+            Json(ControlError::new("Task state changed; retry rejected")),
+        )
+            .into_response();
+    }
+    match queue.get(task_id) {
+        Some(task) => (StatusCode::OK, Json(TaskResponse::success(task))).into_response(),
+        None => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ControlError::new("Task updated but unavailable")),
+        )
+            .into_response(),
+    }
+}
+
 /// Set a value at a dot-notation path in a JSON object.
 /// Creates intermediate objects as needed.
 fn set_value_at_path(root: &mut Value, path: &str, value: Value) {
@@ -455,6 +779,55 @@ fn set_value_at_path(root: &mut Value, path: &str, value: Value) {
         }
         current = current.get_mut(*part).expect("just inserted");
     }
+}
+
+fn task_queue_or_unavailable(state: &ControlState) -> Option<Arc<TaskQueue>> {
+    state.task_queue.clone()
+}
+
+fn task_queue_unavailable_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ControlError::new("Task queue unavailable")),
+    )
+        .into_response()
+}
+
+fn parse_task_state(value: &str) -> Option<TaskState> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "queued" => Some(TaskState::Queued),
+        "running" => Some(TaskState::Running),
+        "blocked" => Some(TaskState::Blocked),
+        "retry_wait" | "retry-wait" | "retrywait" => Some(TaskState::RetryWait),
+        "done" => Some(TaskState::Done),
+        "failed" => Some(TaskState::Failed),
+        "cancelled" | "canceled" => Some(TaskState::Cancelled),
+        _ => None,
+    }
+}
+
+fn parse_optional_json<T>(body: &axum::body::Bytes) -> Result<T, String>
+where
+    T: DeserializeOwned + Default,
+{
+    if body.is_empty() || body.iter().all(|byte| byte.is_ascii_whitespace()) {
+        return Ok(T::default());
+    }
+    serde_json::from_slice(body).map_err(|e| format!("Invalid JSON: {}", e))
+}
+
+fn parse_optional_reason(reason: Option<String>) -> Result<Option<String>, String> {
+    let reason = reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    if let Some(value) = &reason {
+        if value.chars().count() > MAX_TASK_REASON_LEN {
+            return Err(format!("reason exceeds {} characters", MAX_TASK_REASON_LEN));
+        }
+    }
+    Ok(reason)
 }
 
 /// Check control endpoint authentication
@@ -640,5 +1013,20 @@ mod tests {
         );
         assert_eq!(root["channels"]["telegram"]["enabled"], true);
         assert_eq!(root["channels"]["telegram"]["token"], "abc");
+    }
+
+    #[test]
+    fn test_parse_optional_json_whitespace_body_defaults() {
+        let body = axum::body::Bytes::from_static(b" \n\t ");
+        let parsed: TaskCancelRequest =
+            parse_optional_json(&body).expect("should parse as default");
+        assert!(parsed.reason.is_none());
+    }
+
+    #[test]
+    fn test_parse_optional_reason_enforces_max_length() {
+        let long_reason = "a".repeat(MAX_TASK_REASON_LEN + 1);
+        let err = parse_optional_reason(Some(long_reason)).expect_err("expected bound error");
+        assert!(err.contains("reason exceeds"));
     }
 }

@@ -47,7 +47,14 @@ impl TaskExecutor for RuntimeTaskExecutor {
         };
 
         match crate::cron::executor::execute_payload(&task.id, &payload, &self.state).await {
-            Ok(_) => TaskExecutionOutcome::Done,
+            Ok(crate::cron::executor::CronRunOutcome::Broadcast) => {
+                TaskExecutionOutcome::Done { run_id: None }
+            }
+            Ok(crate::cron::executor::CronRunOutcome::Spawned { run_id }) => {
+                TaskExecutionOutcome::Done {
+                    run_id: Some(run_id),
+                }
+            }
             Err(crate::cron::executor::CronExecuteError::LlmNotConfigured) => {
                 if task.attempts >= NO_PROVIDER_MAX_RETRY_ATTEMPTS {
                     TaskExecutionOutcome::Failed {
@@ -514,6 +521,7 @@ mod tests {
             payload,
             created_at_ms: 1,
             updated_at_ms: 1,
+            run_ids: Vec::new(),
         }
     }
 

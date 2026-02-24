@@ -38,7 +38,6 @@ impl From<String> for CronExecuteError {
         CronExecuteError::Other(value)
     }
 }
-
 /// Outcome of executing a cron payload.
 #[derive(Debug)]
 pub enum CronRunOutcome {
