@@ -171,6 +171,10 @@ impl TaskQueue {
     }
 
     /// Load tasks from disk and recover stale `running` entries.
+    ///
+    /// This synchronous path is intended for non-async contexts and tests.
+    /// Runtime startup should prefer [`Self::load_async`] so file I/O does not
+    /// run on Tokio worker threads.
     pub fn load(&self) {
         let path = match &self.persist_path {
             Some(p) => p,
@@ -215,6 +219,14 @@ impl TaskQueue {
         *self.tasks.write() = loaded;
         if recovered_running {
             self.flush_to_disk();
+        }
+    }
+
+    /// Async-safe wrapper around [`Self::load`] for runtime startup paths.
+    pub async fn load_async(self: &Arc<Self>) {
+        let queue = Arc::clone(self);
+        if let Err(err) = tokio::task::spawn_blocking(move || queue.load()).await {
+            warn!(error = %err, "task queue load worker failed");
         }
     }
 
@@ -1004,6 +1016,25 @@ mod tests {
         assert!(persisted[0].next_run_at_ms.is_some());
     }
 
+    #[tokio::test]
+    async fn test_load_async_recovery_persists_to_disk() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tasks").join("queue.json");
+
+        let queue = TaskQueue::new(Some(path.clone()));
+        queue.enqueue(serde_json::json!({"kind":"demo"}), None);
+        let _ = queue.claim_due(now_ms(), 1);
+
+        let recovered = Arc::new(TaskQueue::new(Some(path.clone())));
+        recovered.load_async().await;
+
+        let persisted: Vec<DurableTask> =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].state, TaskState::RetryWait);
+        assert!(persisted[0].next_run_at_ms.is_some());
+    }
+
     #[test]
     fn test_load_legacy_task_defaults_policy_explicit_false() {
         let dir = tempdir().unwrap();
@@ -1145,40 +1176,75 @@ mod tests {
         assert!(queue.get(&dropped.id).is_none());
     }
 
-    struct DoneExecutor {
+    struct NotifyingOutcomeExecutor {
+        outcome: TaskExecutionOutcome,
         calls: AtomicUsize,
+        notify: tokio::sync::Notify,
     }
 
     #[async_trait]
-    impl TaskExecutor for DoneExecutor {
+    impl TaskExecutor for NotifyingOutcomeExecutor {
         async fn execute(&self, _task: DurableTask) -> TaskExecutionOutcome {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            TaskExecutionOutcome::Done { run_id: None }
-        }
-    }
-
-    struct FixedOutcomeExecutor {
-        outcome: TaskExecutionOutcome,
-    }
-
-    #[async_trait]
-    impl TaskExecutor for FixedOutcomeExecutor {
-        async fn execute(&self, _task: DurableTask) -> TaskExecutionOutcome {
+            self.notify.notify_waiters();
             self.outcome.clone()
         }
     }
 
-    async fn run_worker_once_with_outcome(queue: Arc<TaskQueue>, outcome: TaskExecutionOutcome) {
-        let executor = Arc::new(FixedOutcomeExecutor { outcome });
+    async fn wait_for_task_condition<F>(condition: F, failure_message: &str)
+    where
+        F: Fn() -> bool,
+    {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if condition() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect(failure_message);
+    }
+
+    async fn run_worker_once_with_outcome(
+        queue: Arc<TaskQueue>,
+        task_id: &str,
+        outcome: TaskExecutionOutcome,
+    ) {
+        let executor = Arc::new(NotifyingOutcomeExecutor {
+            outcome,
+            calls: AtomicUsize::new(0),
+            notify: tokio::sync::Notify::new(),
+        });
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let worker = tokio::spawn(task_worker_loop(
-            queue,
-            executor,
+            queue.clone(),
+            executor.clone(),
             Duration::from_millis(10),
             shutdown_rx,
         ));
 
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if executor.calls.load(Ordering::Relaxed) >= 1 {
+                    break;
+                }
+                executor.notify.notified().await;
+            }
+        })
+        .await
+        .expect("worker never executed task");
+        wait_for_task_condition(
+            || {
+                queue
+                    .get(task_id)
+                    .map(|task| !matches!(task.state, TaskState::Queued | TaskState::Running))
+                    .unwrap_or(false)
+            },
+            "task never reached a post-running state",
+        )
+        .await;
         let _ = shutdown_tx.send(true);
         let _ = worker.await;
     }
@@ -1189,8 +1255,10 @@ mod tests {
         queue.enqueue(serde_json::json!({"kind":"demo-1"}), None);
         queue.enqueue(serde_json::json!({"kind":"demo-2"}), None);
 
-        let executor = Arc::new(DoneExecutor {
+        let executor = Arc::new(NotifyingOutcomeExecutor {
+            outcome: TaskExecutionOutcome::Done { run_id: None },
             calls: AtomicUsize::new(0),
+            notify: tokio::sync::Notify::new(),
         });
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let worker = tokio::spawn(task_worker_loop(
@@ -1200,7 +1268,21 @@ mod tests {
             shutdown_rx,
         ));
 
-        tokio::time::sleep(Duration::from_millis(75)).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if executor.calls.load(Ordering::Relaxed) >= 2 {
+                    break;
+                }
+                executor.notify.notified().await;
+            }
+        })
+        .await
+        .expect("worker did not execute both queued tasks");
+        wait_for_task_condition(
+            || queue.stats().done == 2,
+            "queued tasks did not transition to done state",
+        )
+        .await;
         let _ = shutdown_tx.send(true);
         let _ = worker.await;
 
@@ -1217,6 +1299,7 @@ mod tests {
 
         run_worker_once_with_outcome(
             queue.clone(),
+            &task.id,
             TaskExecutionOutcome::RetryWait {
                 delay_ms: 5_000,
                 error: "temporary failure".to_string(),
@@ -1237,6 +1320,7 @@ mod tests {
 
         run_worker_once_with_outcome(
             queue.clone(),
+            &task.id,
             TaskExecutionOutcome::Failed {
                 error: "fatal".to_string(),
             },
@@ -1256,6 +1340,7 @@ mod tests {
 
         run_worker_once_with_outcome(
             queue.clone(),
+            &task.id,
             TaskExecutionOutcome::Blocked {
                 reason: "needs operator action".to_string(),
                 category: TaskBlockedReason::OperatorActionRequired,
@@ -1280,6 +1365,7 @@ mod tests {
 
         run_worker_once_with_outcome(
             queue.clone(),
+            &task.id,
             TaskExecutionOutcome::Cancelled {
                 reason: Some("operator cancelled".to_string()),
             },

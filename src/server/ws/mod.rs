@@ -589,11 +589,9 @@ impl WsServerState {
                 scheduler
             },
             task_queue: {
-                let queue = Arc::new(tasks::TaskQueue::new(Some(
+                Arc::new(tasks::TaskQueue::new(Some(
                     state_dir.join("tasks").join("queue.json"),
-                )));
-                queue.load();
-                queue
+                )))
             },
             agent_run_registry: Mutex::new(handlers::AgentRunRegistry::new()),
             system_event_history: Mutex::new(Vec::new()),
@@ -1044,6 +1042,7 @@ pub async fn build_ws_state_owned_from_value(cfg: &Value) -> Result<WsServerStat
     }
     let config = build_ws_config_from_value(cfg).await?;
     let mut state = WsServerState::new_persistent(config, state_dir)?;
+    state.task_queue.load_async().await;
 
     // Wire session integrity HMAC key from resolved auth/server secret.
     let integrity_config = resolve_session_integrity_config(cfg);
