@@ -32,6 +32,7 @@ struct RuntimeTaskExecutor {
 }
 
 const NO_PROVIDER_RETRY_DELAY_MS: u64 = 60_000;
+const NO_PROVIDER_LEGACY_MAX_RETRY_ATTEMPTS: u32 = 3_600;
 
 fn invalid_policy_budget_error(policy: &crate::tasks::TaskPolicy) -> Option<&'static str> {
     if policy.max_attempts == 0 {
@@ -130,6 +131,16 @@ impl TaskExecutor for RuntimeTaskExecutor {
                             "{} (retry limit reached: {})",
                             crate::cron::executor::NO_LLM_PROVIDER_CONFIGURED_ERROR,
                             task.policy.max_attempts
+                        ),
+                    }
+                } else if !task.policy_explicit
+                    && task.attempts >= NO_PROVIDER_LEGACY_MAX_RETRY_ATTEMPTS
+                {
+                    TaskExecutionOutcome::Failed {
+                        error: format!(
+                            "{} (retry limit reached: {})",
+                            crate::cron::executor::NO_LLM_PROVIDER_CONFIGURED_ERROR,
+                            NO_PROVIDER_LEGACY_MAX_RETRY_ATTEMPTS
                         ),
                     }
                 } else {
@@ -785,5 +796,67 @@ mod tests {
 
         let outcome = executor.execute(task).await;
         assert_eq!(outcome, TaskExecutionOutcome::Done { run_id: None });
+    }
+
+    #[tokio::test]
+    async fn runtime_task_executor_legacy_provider_missing_retries_below_legacy_limit() {
+        let state = Arc::new(WsServerState::new(WsServerConfig::default()));
+        let executor = RuntimeTaskExecutor { state };
+        let payload = serde_json::to_value(CronPayload::AgentTurn {
+            message: "hello".to_string(),
+            model: None,
+            thinking: None,
+            timeout_seconds: None,
+            allow_unsafe_external_content: None,
+            deliver: None,
+            channel: None,
+            to: None,
+            best_effort_deliver: None,
+        })
+        .expect("payload serializes");
+        let mut task =
+            durable_task_with_payload(payload, NO_PROVIDER_LEGACY_MAX_RETRY_ATTEMPTS - 1);
+        task.policy_explicit = false;
+
+        let outcome = executor.execute(task).await;
+        assert_eq!(
+            outcome,
+            TaskExecutionOutcome::RetryWait {
+                delay_ms: NO_PROVIDER_RETRY_DELAY_MS,
+                error: crate::cron::executor::NO_LLM_PROVIDER_CONFIGURED_ERROR.to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_task_executor_legacy_provider_missing_fails_at_legacy_limit() {
+        let state = Arc::new(WsServerState::new(WsServerConfig::default()));
+        let executor = RuntimeTaskExecutor { state };
+        let payload = serde_json::to_value(CronPayload::AgentTurn {
+            message: "hello".to_string(),
+            model: None,
+            thinking: None,
+            timeout_seconds: None,
+            allow_unsafe_external_content: None,
+            deliver: None,
+            channel: None,
+            to: None,
+            best_effort_deliver: None,
+        })
+        .expect("payload serializes");
+        let mut task = durable_task_with_payload(payload, NO_PROVIDER_LEGACY_MAX_RETRY_ATTEMPTS);
+        task.policy_explicit = false;
+
+        let outcome = executor.execute(task).await;
+        assert_eq!(
+            outcome,
+            TaskExecutionOutcome::Failed {
+                error: format!(
+                    "{} (retry limit reached: {})",
+                    crate::cron::executor::NO_LLM_PROVIDER_CONFIGURED_ERROR,
+                    NO_PROVIDER_LEGACY_MAX_RETRY_ATTEMPTS
+                ),
+            }
+        );
     }
 }
