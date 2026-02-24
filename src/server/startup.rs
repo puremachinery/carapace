@@ -32,6 +32,7 @@ struct RuntimeTaskExecutor {
 }
 
 const NO_PROVIDER_RETRY_DELAY_MS: u64 = 60_000;
+const NO_PROVIDER_MAX_RETRY_ATTEMPTS: u32 = 3_600;
 
 #[async_trait]
 impl TaskExecutor for RuntimeTaskExecutor {
@@ -48,9 +49,19 @@ impl TaskExecutor for RuntimeTaskExecutor {
         match crate::cron::executor::execute_payload(&task.id, &payload, &self.state).await {
             Ok(_) => TaskExecutionOutcome::Done,
             Err(crate::cron::executor::CronExecuteError::LlmNotConfigured) => {
-                TaskExecutionOutcome::RetryWait {
-                    delay_ms: NO_PROVIDER_RETRY_DELAY_MS,
-                    error: crate::cron::executor::NO_LLM_PROVIDER_CONFIGURED_ERROR.to_string(),
+                if task.attempts >= NO_PROVIDER_MAX_RETRY_ATTEMPTS {
+                    TaskExecutionOutcome::Failed {
+                        error: format!(
+                            "{} (retry limit reached: {})",
+                            crate::cron::executor::NO_LLM_PROVIDER_CONFIGURED_ERROR,
+                            NO_PROVIDER_MAX_RETRY_ATTEMPTS
+                        ),
+                    }
+                } else {
+                    TaskExecutionOutcome::RetryWait {
+                        delay_ms: NO_PROVIDER_RETRY_DELAY_MS,
+                        error: crate::cron::executor::NO_LLM_PROVIDER_CONFIGURED_ERROR.to_string(),
+                    }
                 }
             }
             Err(crate::cron::executor::CronExecuteError::Other(error)) => {
@@ -493,11 +504,11 @@ mod tests {
     use crate::cron::CronPayload;
     use crate::server::ws::WsServerConfig;
 
-    fn durable_task_with_payload(payload: serde_json::Value) -> DurableTask {
+    fn durable_task_with_payload(payload: serde_json::Value, attempts: u32) -> DurableTask {
         DurableTask {
             id: "task-1".to_string(),
             state: crate::tasks::TaskState::Queued,
-            attempts: 1,
+            attempts,
             next_run_at_ms: None,
             last_error: None,
             payload,
@@ -523,12 +534,49 @@ mod tests {
         })
         .expect("payload serializes");
 
-        let outcome = executor.execute(durable_task_with_payload(payload)).await;
+        let outcome = executor
+            .execute(durable_task_with_payload(payload, 1))
+            .await;
         assert_eq!(
             outcome,
             TaskExecutionOutcome::RetryWait {
                 delay_ms: NO_PROVIDER_RETRY_DELAY_MS,
                 error: crate::cron::executor::NO_LLM_PROVIDER_CONFIGURED_ERROR.to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_task_executor_fails_after_provider_retry_limit() {
+        let state = Arc::new(WsServerState::new(WsServerConfig::default()));
+        let executor = RuntimeTaskExecutor { state };
+        let payload = serde_json::to_value(CronPayload::AgentTurn {
+            message: "hello".to_string(),
+            model: None,
+            thinking: None,
+            timeout_seconds: None,
+            allow_unsafe_external_content: None,
+            deliver: None,
+            channel: None,
+            to: None,
+            best_effort_deliver: None,
+        })
+        .expect("payload serializes");
+
+        let outcome = executor
+            .execute(durable_task_with_payload(
+                payload,
+                NO_PROVIDER_MAX_RETRY_ATTEMPTS,
+            ))
+            .await;
+        assert_eq!(
+            outcome,
+            TaskExecutionOutcome::Failed {
+                error: format!(
+                    "{} (retry limit reached: {})",
+                    crate::cron::executor::NO_LLM_PROVIDER_CONFIGURED_ERROR,
+                    NO_PROVIDER_MAX_RETRY_ATTEMPTS
+                ),
             }
         );
     }
