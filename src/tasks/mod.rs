@@ -20,12 +20,20 @@ const MAX_TASKS: usize = 10_000;
 const TASK_QUEUE_FULL_NO_EVICTION_ERROR: &str =
     "task queue full: no terminal tasks available for eviction";
 const ENQUEUE_WORKER_FAILED_ERROR: &str = "task queue enqueue worker failed";
+pub const DEFAULT_TASK_MAX_ATTEMPTS: u32 = 100;
+pub const DEFAULT_TASK_MAX_TOTAL_RUNTIME_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+pub const DEFAULT_TASK_MAX_TURNS: u32 = 25;
+pub const DEFAULT_TASK_MAX_RUN_TIMEOUT_SECONDS: u32 = 600;
 
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Durable lifecycle states for long-running task processing.
@@ -50,6 +58,27 @@ impl TaskState {
     }
 }
 
+/// Per-task continuation policy budgets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskPolicy {
+    pub max_attempts: u32,
+    pub max_total_runtime_ms: u64,
+    pub max_turns: u32,
+    pub max_run_timeout_seconds: u32,
+}
+
+impl Default for TaskPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: DEFAULT_TASK_MAX_ATTEMPTS,
+            max_total_runtime_ms: DEFAULT_TASK_MAX_TOTAL_RUNTIME_MS,
+            max_turns: DEFAULT_TASK_MAX_TURNS,
+            max_run_timeout_seconds: DEFAULT_TASK_MAX_RUN_TIMEOUT_SECONDS,
+        }
+    }
+}
+
 /// A single persisted task record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -64,6 +93,12 @@ pub struct DurableTask {
     pub updated_at_ms: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub run_ids: Vec<String>,
+    #[serde(default)]
+    pub policy: TaskPolicy,
+    /// True when the task was created with an explicit continuation policy.
+    /// Legacy tasks loaded from pre-policy queue files default to false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub policy_explicit: bool,
 }
 
 /// Queue stats by state.
@@ -160,6 +195,16 @@ impl TaskQueue {
     /// synthetic `Failed` task and does not insert it into the queue. Callers
     /// must not assume the returned task ID is persisted in that case.
     pub fn enqueue(&self, payload: Value, next_run_at_ms: Option<u64>) -> DurableTask {
+        self.enqueue_with_policy(payload, next_run_at_ms, TaskPolicy::default())
+    }
+
+    /// Add a new task with an explicit continuation policy.
+    pub fn enqueue_with_policy(
+        &self,
+        payload: Value,
+        next_run_at_ms: Option<u64>,
+        policy: TaskPolicy,
+    ) -> DurableTask {
         let now = now_ms();
         let mut task = DurableTask {
             id: Uuid::new_v4().to_string(),
@@ -171,6 +216,8 @@ impl TaskQueue {
             created_at_ms: now,
             updated_at_ms: now,
             run_ids: Vec::new(),
+            policy,
+            policy_explicit: true,
         };
 
         {
@@ -219,9 +266,25 @@ impl TaskQueue {
         payload: Value,
         next_run_at_ms: Option<u64>,
     ) -> DurableTask {
+        self.enqueue_async_with_policy(payload, next_run_at_ms, TaskPolicy::default())
+            .await
+    }
+
+    /// Async-safe enqueue wrapper with explicit continuation policy.
+    pub async fn enqueue_async_with_policy(
+        self: &Arc<Self>,
+        payload: Value,
+        next_run_at_ms: Option<u64>,
+        policy: TaskPolicy,
+    ) -> DurableTask {
         let queue = Arc::clone(self);
         let payload_fallback = payload.clone();
-        match tokio::task::spawn_blocking(move || queue.enqueue(payload, next_run_at_ms)).await {
+        let policy_fallback = policy.clone();
+        match tokio::task::spawn_blocking(move || {
+            queue.enqueue_with_policy(payload, next_run_at_ms, policy)
+        })
+        .await
+        {
             Ok(task) => task,
             Err(err) => {
                 let now = now_ms();
@@ -236,6 +299,8 @@ impl TaskQueue {
                     created_at_ms: now,
                     updated_at_ms: now,
                     run_ids: Vec::new(),
+                    policy: policy_fallback,
+                    policy_explicit: true,
                 }
             }
         }
@@ -787,6 +852,35 @@ mod tests {
     }
 
     #[test]
+    fn test_load_legacy_task_defaults_policy_explicit_false() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tasks").join("queue.json");
+        std::fs::create_dir_all(path.parent().expect("tasks directory")).unwrap();
+        let legacy = serde_json::json!([{
+            "id": "legacy-task",
+            "state": "queued",
+            "attempts": 250,
+            "nextRunAtMs": null,
+            "lastError": null,
+            "payload": { "kind": "demo" },
+            "createdAtMs": 1,
+            "updatedAtMs": 1,
+            "runIds": []
+        }]);
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&legacy).expect("legacy queue json"),
+        )
+        .unwrap();
+
+        let queue = TaskQueue::new(Some(path));
+        queue.load();
+        let loaded = queue.get("legacy-task").expect("legacy task should load");
+        assert!(!loaded.policy_explicit);
+        assert_eq!(loaded.policy, TaskPolicy::default());
+    }
+
+    #[test]
     fn test_enqueue_evicts_terminal_before_blocked() {
         let queue = TaskQueue::in_memory();
         {
@@ -802,6 +896,8 @@ mod tests {
                     created_at_ms: idx as u64 + 1,
                     updated_at_ms: idx as u64 + 1,
                     run_ids: Vec::new(),
+                    policy: TaskPolicy::default(),
+                    policy_explicit: true,
                 });
             }
             tasks[0].id = "done-oldest".to_string();
@@ -832,6 +928,8 @@ mod tests {
                     created_at_ms: idx as u64 + 1,
                     updated_at_ms: idx as u64 + 1,
                     run_ids: Vec::new(),
+                    policy: TaskPolicy::default(),
+                    policy_explicit: true,
                 });
             }
         }
@@ -873,6 +971,8 @@ mod tests {
                     created_at_ms: idx as u64 + 1,
                     updated_at_ms: idx as u64 + 1,
                     run_ids: Vec::new(),
+                    policy: TaskPolicy::default(),
+                    policy_explicit: true,
                 });
             }
         }

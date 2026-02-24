@@ -277,6 +277,22 @@ pub enum TaskCommand {
         #[arg(long = "next-run-at-ms")]
         next_run_at_ms: Option<u64>,
 
+        /// Optional max retry attempts for this task.
+        #[arg(long = "max-attempts")]
+        max_attempts: Option<u32>,
+
+        /// Optional max wall-clock budget in milliseconds from creation.
+        #[arg(long = "max-total-runtime-ms")]
+        max_total_runtime_ms: Option<u64>,
+
+        /// Optional max tool-turn budget for this task.
+        #[arg(long = "max-turns")]
+        max_turns: Option<u32>,
+
+        /// Optional max timeout (seconds) for each spawned agent run.
+        #[arg(long = "max-run-timeout-seconds")]
+        max_run_timeout_seconds: Option<u32>,
+
         #[command(flatten)]
         connection: TaskConnectionArgs,
     },
@@ -533,8 +549,26 @@ pub async fn handle_task(command: TaskCommand) -> Result<(), Box<dyn std::error:
         TaskCommand::Create {
             payload,
             next_run_at_ms,
+            max_attempts,
+            max_total_runtime_ms,
+            max_turns,
+            max_run_timeout_seconds,
             connection,
-        } => handle_task_create(&connection.host, connection.port, payload, next_run_at_ms).await,
+        } => {
+            handle_task_create(
+                &connection.host,
+                connection.port,
+                TaskCreateOptions {
+                    payload,
+                    next_run_at_ms,
+                    max_attempts,
+                    max_total_runtime_ms,
+                    max_turns,
+                    max_run_timeout_seconds,
+                },
+            )
+            .await
+        }
         TaskCommand::List {
             state,
             limit,
@@ -557,18 +591,52 @@ pub async fn handle_task(command: TaskCommand) -> Result<(), Box<dyn std::error:
     }
 }
 
+struct TaskCreateOptions {
+    payload: String,
+    next_run_at_ms: Option<u64>,
+    max_attempts: Option<u32>,
+    max_total_runtime_ms: Option<u64>,
+    max_turns: Option<u32>,
+    max_run_timeout_seconds: Option<u32>,
+}
+
 async fn handle_task_create(
     host: &str,
     port: Option<u16>,
-    payload: String,
-    next_run_at_ms: Option<u64>,
+    options: TaskCreateOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let parsed_payload: Value = serde_json::from_str(&payload)
+    let parsed_payload: Value = serde_json::from_str(&options.payload)
         .map_err(|e| format!("invalid --payload JSON (expected CronPayload object): {e}"))?;
-    let body = serde_json::json!({
-        "payload": parsed_payload,
-        "nextRunAtMs": next_run_at_ms,
-    });
+    let mut body = serde_json::Map::new();
+    body.insert("payload".to_string(), parsed_payload);
+    body.insert(
+        "nextRunAtMs".to_string(),
+        options.next_run_at_ms.map_or(Value::Null, Value::from),
+    );
+
+    let mut policy = serde_json::Map::new();
+    if let Some(max_attempts) = options.max_attempts {
+        policy.insert("maxAttempts".to_string(), Value::from(max_attempts));
+    }
+    if let Some(max_total_runtime_ms) = options.max_total_runtime_ms {
+        policy.insert(
+            "maxTotalRuntimeMs".to_string(),
+            Value::from(max_total_runtime_ms),
+        );
+    }
+    if let Some(max_turns) = options.max_turns {
+        policy.insert("maxTurns".to_string(), Value::from(max_turns));
+    }
+    if let Some(max_run_timeout_seconds) = options.max_run_timeout_seconds {
+        policy.insert(
+            "maxRunTimeoutSeconds".to_string(),
+            Value::from(max_run_timeout_seconds),
+        );
+    }
+    if !policy.is_empty() {
+        body.insert("policy".to_string(), Value::Object(policy));
+    }
+    let body = Value::Object(body);
 
     let response = send_control_request(
         host,
@@ -4289,6 +4357,14 @@ mod tests {
             r#"{"kind":"systemEvent","text":"hello"}"#,
             "--next-run-at-ms",
             "1234",
+            "--max-attempts",
+            "5",
+            "--max-total-runtime-ms",
+            "60000",
+            "--max-turns",
+            "12",
+            "--max-run-timeout-seconds",
+            "45",
             "--port",
             "19123",
             "--host",
@@ -4299,10 +4375,18 @@ mod tests {
             Some(Command::Task(TaskCommand::Create {
                 payload,
                 next_run_at_ms,
+                max_attempts,
+                max_total_runtime_ms,
+                max_turns,
+                max_run_timeout_seconds,
                 connection,
             })) => {
                 assert_eq!(payload, r#"{"kind":"systemEvent","text":"hello"}"#);
                 assert_eq!(next_run_at_ms, Some(1234));
+                assert_eq!(max_attempts, Some(5));
+                assert_eq!(max_total_runtime_ms, Some(60_000));
+                assert_eq!(max_turns, Some(12));
+                assert_eq!(max_run_timeout_seconds, Some(45));
                 assert_eq!(connection.port, Some(19123));
                 assert_eq!(connection.host, "localhost");
             }

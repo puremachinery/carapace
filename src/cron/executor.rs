@@ -47,6 +47,13 @@ pub enum CronRunOutcome {
     Spawned { run_id: String },
 }
 
+/// Optional execution limits enforced before payload dispatch.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExecutionLimits {
+    pub max_turns: Option<u32>,
+    pub max_timeout_seconds: Option<u32>,
+}
+
 /// Execute a cron job payload.
 ///
 /// For `SystemEvent`: enqueues the event into system event history.
@@ -55,6 +62,7 @@ pub async fn execute_payload(
     job_id: &str,
     payload: &CronPayload,
     state: &Arc<WsServerState>,
+    limits: ExecutionLimits,
 ) -> Result<CronRunOutcome, CronExecuteError> {
     match payload {
         CronPayload::SystemEvent { text } => execute_system_event(job_id, text, state),
@@ -82,6 +90,7 @@ pub async fn execute_payload(
                     channel,
                     to,
                     best_effort_deliver: *best_effort_deliver,
+                    execution_limits: limits,
                 },
             )
             .await
@@ -99,6 +108,7 @@ struct AgentTurnParams<'a> {
     channel: &'a Option<String>,
     to: &'a Option<String>,
     best_effort_deliver: Option<bool>,
+    execution_limits: ExecutionLimits,
 }
 
 fn execute_system_event(
@@ -129,6 +139,11 @@ async fn execute_agent_turn(
     let normalized_channel = normalize_channel(params.channel);
     let normalized_to = normalize_recipient(params.to);
 
+    let timeout_seconds = apply_timeout_limit(
+        params.timeout_seconds,
+        params.execution_limits.max_timeout_seconds,
+    )?;
+
     let metadata = build_session_metadata(
         &normalized_channel,
         &normalized_to,
@@ -150,11 +165,12 @@ async fn execute_agent_turn(
         params.model,
         params.allow_unsafe_external_content,
         params.deliver,
+        params.execution_limits.max_turns,
     );
 
     let cancel_token = CancellationToken::new();
     register_agent_run(state, &run_id, &session_key, params.message, &cancel_token);
-    spawn_timeout_cancellation(state, &run_id, params.timeout_seconds, cancel_token.clone());
+    spawn_timeout_cancellation(state, &run_id, timeout_seconds, cancel_token.clone());
 
     let provider = state
         .llm_provider()
@@ -188,6 +204,31 @@ fn normalize_channel(channel: &Option<String>) -> Option<String> {
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_ascii_lowercase())
+}
+
+fn apply_timeout_limit(
+    requested_timeout_seconds: Option<u32>,
+    max_timeout_seconds: Option<u32>,
+) -> Result<Option<u32>, CronExecuteError> {
+    let Some(limit) = max_timeout_seconds else {
+        return Ok(requested_timeout_seconds);
+    };
+    if limit == 0 {
+        return Err(CronExecuteError::Other(
+            "objective policy violation: maxRunTimeoutSeconds must be greater than 0".to_string(),
+        ));
+    }
+
+    match requested_timeout_seconds {
+        Some(requested) if requested > limit => Err(CronExecuteError::Other(format!(
+            "objective policy violation: timeoutSeconds {requested} exceeds maxRunTimeoutSeconds {limit}"
+        ))),
+        // In bounded objective mode, an explicit zero timeout is treated as
+        // "use the policy cap", not "unbounded execution".
+        Some(0) => Ok(Some(limit)),
+        Some(requested) => Ok(Some(requested)),
+        None => Ok(Some(limit)),
+    }
 }
 
 fn normalize_recipient(to: &Option<String>) -> Option<String> {
@@ -268,6 +309,7 @@ fn build_agent_config(
     model: &Option<String>,
     allow_unsafe_external_content: Option<bool>,
     deliver: Option<bool>,
+    max_turns_limit: Option<u32>,
 ) -> crate::agent::AgentConfig {
     let cfg = crate::config::load_config().unwrap_or(Value::Object(serde_json::Map::new()));
     let mut config = crate::agent::AgentConfig::default();
@@ -281,6 +323,11 @@ fn build_agent_config(
     if let Some(deliver) = deliver {
         // Delivery for cron runs is handled via a completion waiter below.
         config.deliver = deliver;
+    }
+    // Task policy is a per-objective ceiling. It can only reduce turns versus
+    // global/runtime config, never raise them.
+    if let Some(max_turns_limit) = max_turns_limit.filter(|max_turns| *max_turns > 0) {
+        config.max_turns = config.max_turns.min(max_turns_limit);
     }
     config
 }
@@ -450,7 +497,7 @@ mod tests {
             text: "test cron event".to_string(),
         };
 
-        let result = execute_payload("job-1", &payload, &state).await;
+        let result = execute_payload("job-1", &payload, &state, ExecutionLimits::default()).await;
         assert!(result.is_ok());
         assert!(matches!(result.unwrap(), CronRunOutcome::Broadcast));
     }
@@ -472,7 +519,7 @@ mod tests {
             best_effort_deliver: None,
         };
 
-        let result = execute_payload("job-2", &payload, &state).await;
+        let result = execute_payload("job-2", &payload, &state, ExecutionLimits::default()).await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), CronExecuteError::LlmNotConfigured);
     }
@@ -493,7 +540,8 @@ mod tests {
             best_effort_deliver: Some(true),
         };
 
-        let result = execute_payload("job-meta", &payload, &state).await;
+        let result =
+            execute_payload("job-meta", &payload, &state, ExecutionLimits::default()).await;
         assert!(result.is_err());
 
         let session = state
@@ -534,7 +582,8 @@ mod tests {
             best_effort_deliver: Some(true),
         };
 
-        let result = execute_payload("job-update", &payload, &state).await;
+        let result =
+            execute_payload("job-update", &payload, &state, ExecutionLimits::default()).await;
         assert!(result.is_err());
 
         let session = state
@@ -545,5 +594,55 @@ mod tests {
         assert_eq!(session.metadata.chat_id, Some("999".to_string()));
         assert_eq!(session.metadata.thinking_level, Some("deep".to_string()));
         assert_eq!(session.metadata.model, Some("new-model".to_string()));
+    }
+
+    #[test]
+    fn test_apply_timeout_limit_enforces_policy_budget() {
+        let result = apply_timeout_limit(Some(30), Some(10));
+        assert_eq!(
+            result,
+            Err(CronExecuteError::Other(
+                "objective policy violation: timeoutSeconds 30 exceeds maxRunTimeoutSeconds 10"
+                    .to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_apply_timeout_limit_uses_budget_when_timeout_missing_or_zero() {
+        assert_eq!(apply_timeout_limit(None, Some(12)).unwrap(), Some(12));
+        assert_eq!(apply_timeout_limit(Some(0), Some(12)).unwrap(), Some(12));
+    }
+
+    #[tokio::test]
+    async fn test_execute_agent_turn_rejects_timeout_over_execution_limits() {
+        let (state, _tmp) = make_test_state();
+        let payload = CronPayload::AgentTurn {
+            message: "hello".to_string(),
+            model: None,
+            thinking: None,
+            timeout_seconds: Some(45),
+            allow_unsafe_external_content: None,
+            deliver: None,
+            channel: None,
+            to: None,
+            best_effort_deliver: None,
+        };
+        let result = execute_payload(
+            "job-timeout-limit",
+            &payload,
+            &state,
+            ExecutionLimits {
+                max_turns: Some(10),
+                max_timeout_seconds: Some(10),
+            },
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(CronExecuteError::Other(message))
+            if message
+                == "objective policy violation: timeoutSeconds 45 exceeds maxRunTimeoutSeconds 10"
+        ));
     }
 }
