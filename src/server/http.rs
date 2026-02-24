@@ -671,7 +671,9 @@ fn register_session_routes(
 
     let control_state_status = control_state.clone();
     let control_state_channels = control_state.clone();
-    let control_state_config = control_state.clone();
+    let control_state_config_read = control_state.clone();
+    let control_state_config_post = control_state.clone();
+    let control_state_config_patch = control_state.clone();
     let control_state_tasks_create = control_state.clone();
     let control_state_tasks_list = control_state.clone();
     let control_state_tasks_get = control_state.clone();
@@ -697,11 +699,24 @@ fn register_session_routes(
         )
         .route(
             "/control/config",
-            post(
+            get(move |connect_info: MaybeConnectInfo, headers: HeaderMap| {
+                let state = control_state_config_read.clone();
+                async move { control::config_read_handler(State(state), connect_info, headers).await }
+            })
+            .post(
                 move |connect_info: MaybeConnectInfo, headers: HeaderMap, body: Bytes| {
-                    let state = control_state_config.clone();
+                    let state = control_state_config_post.clone();
                     async move {
                         control::config_handler(State(state), connect_info, headers, body).await
+                    }
+                },
+            )
+            .patch(
+                move |connect_info: MaybeConnectInfo, headers: HeaderMap, body: Bytes| {
+                    let state = control_state_config_patch.clone();
+                    async move {
+                        control::config_patch_handler(State(state), connect_info, headers, body)
+                            .await
                     }
                 },
             ),
@@ -2006,18 +2021,35 @@ async fn serve_index_html(state: &AppState, headers: &HeaderMap) -> Response {
                 state.config.control_ui_base_path.clone()
             };
 
-            let mut injected = content
-                .replace("__CARAPACE_CONTROL_UI_BASE_PATH__", &base_path)
-                .replace("__CARAPACE_ASSISTANT_NAME__", "Carapace")
-                .replace("__CARAPACE_ASSISTANT_AVATAR__", "");
-
-            if let Some(store) = &state.csrf_store {
+            let (csrf_cookie_name, csrf_header_name) = if let Some(store) = &state.csrf_store {
                 let config = store.config();
                 if config.enabled {
-                    let script = csrf_bootstrap_script(config);
-                    injected = inject_html_script(&injected, &script);
+                    (
+                        csrf_cookie_name(config).to_string(),
+                        config.header_name.clone(),
+                    )
+                } else {
+                    (String::new(), String::new())
                 }
-            }
+            } else {
+                (String::new(), String::new())
+            };
+
+            let injected = content
+                .replace(
+                    "__CARAPACE_CONTROL_UI_BASE_PATH__",
+                    &html_attr_escape(&base_path),
+                )
+                .replace("__CARAPACE_ASSISTANT_NAME__", &html_attr_escape("Carapace"))
+                .replace("__CARAPACE_ASSISTANT_AVATAR__", &html_attr_escape(""))
+                .replace(
+                    "__CARAPACE_CSRF_COOKIE__",
+                    &html_attr_escape(&csrf_cookie_name),
+                )
+                .replace(
+                    "__CARAPACE_CSRF_HEADER__",
+                    &html_attr_escape(&csrf_header_name),
+                );
 
             let mut response = (
                 StatusCode::OK,
@@ -2055,6 +2087,15 @@ async fn serve_index_html(state: &AppState, headers: &HeaderMap) -> Response {
     }
 }
 
+fn html_attr_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 fn control_ui_tls_guard(state: &AppState) -> Option<Response> {
     let store = state.csrf_store.as_ref()?;
     let config = store.config();
@@ -2068,25 +2109,6 @@ fn control_ui_tls_guard(state: &AppState) -> Option<Response> {
         );
     }
     None
-}
-
-fn csrf_bootstrap_script(config: &CsrfConfig) -> String {
-    let cookie_name = csrf_cookie_name(config);
-    format!(
-        r#"<script>(function(){{var cookieName='{cookie}';var headerName='{header}';function readCookie(name){{var parts=document.cookie?document.cookie.split(';'):[];for(var i=0;i<parts.length;i++){{var part=parts[i].trim();if(part.indexOf(name+'=')===0){{return part.substring(name.length+1);}}}}return '';}}function getToken(){{return readCookie(cookieName);}}function addHeader(headers,token){{if(!token){{return headers;}}var lower=headerName.toLowerCase();if(headers instanceof Headers){{if(!headers.has(headerName)){{headers.set(headerName,token);}}return headers;}}if(Array.isArray(headers)){{for(var i=0;i<headers.length;i++){{if(String(headers[i][0]).toLowerCase()===lower){{return headers;}}}}headers.push([headerName,token]);return headers;}}headers=headers||{{}};for(var key in headers){{if(Object.prototype.hasOwnProperty.call(headers,key)&&String(key).toLowerCase()===lower){{return headers;}}}}headers[headerName]=token;return headers;}}if(window.fetch){{var origFetch=window.fetch.bind(window);window.fetch=function(input,init){{var token=getToken();if(token){{init=init||{{}};if(input instanceof Request){{var baseHeaders=new Headers(input.headers);init.headers=addHeader(baseHeaders,token);var req=new Request(input,init);return origFetch(req);}}init.headers=addHeader(init.headers,token);}}return origFetch(input,init);}};}}if(window.XMLHttpRequest){{var origOpen=XMLHttpRequest.prototype.open;var origSend=XMLHttpRequest.prototype.send;XMLHttpRequest.prototype.open=function(){{this.__csrfToken=getToken();return origOpen.apply(this,arguments);}};XMLHttpRequest.prototype.send=function(){{if(this.__csrfToken){{try{{this.setRequestHeader(headerName,this.__csrfToken);}}catch(e){{}}}}return origSend.apply(this,arguments);}};}}}})();</script>"#,
-        cookie = cookie_name,
-        header = config.header_name
-    )
-}
-
-fn inject_html_script(html: &str, script: &str) -> String {
-    if html.contains("</head>") {
-        return html.replace("</head>", &format!("{}</head>", script));
-    }
-    if html.contains("</body>") {
-        return html.replace("</body>", &format!("{}</body>", script));
-    }
-    format!("{}{}", html, script)
 }
 
 /// Serve a static file
@@ -2235,6 +2257,38 @@ mod tests {
     use std::sync::Arc;
     use tower::ServiceExt;
 
+    struct EnvVarGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            // SAFETY: tests in this module scope env var writes to a short-lived guard.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                // SAFETY: restoring test-scoped env var state.
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                // SAFETY: restoring test-scoped env var state.
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    fn set_temp_config_path() -> (tempfile::TempDir, EnvVarGuard) {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("carapace-test-config.json5");
+        let guard = EnvVarGuard::set("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
+        (temp, guard)
+    }
+
     fn make_headers(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut headers = HeaderMap::new();
         for (name, value) in pairs {
@@ -2292,6 +2346,21 @@ mod tests {
             None,
             false,
         )
+    }
+
+    async fn read_control_config_snapshot(router: Router) -> Value {
+        let req = Request::builder()
+            .method("GET")
+            .uri("/control/config")
+            .header("authorization", "Bearer test-gateway-token")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
     }
 
     fn make_test_ws_state() -> (Arc<WsServerState>, tempfile::TempDir) {
@@ -2680,6 +2749,159 @@ mod tests {
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["ok"], true);
         assert_eq!(json["mode"], "now");
+    }
+
+    #[tokio::test]
+    async fn test_control_config_read_requires_auth() {
+        let router = test_router(test_config());
+        let req = Request::builder()
+            .method("GET")
+            .uri("/control/config")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_control_config_read_returns_snapshot() {
+        let (temp, _guard) = set_temp_config_path();
+        std::fs::write(
+            temp.path().join("carapace-test-config.json5"),
+            r#"{
+  "gateway": {
+    "controlUi": { "enabled": true }
+  },
+  "anthropic": {
+    "apiKey": "test-secret-anthropic-key"
+  },
+  "bedrock": {
+    "accessKeyId": "AKIA_TEST_ACCESS_KEY"
+  }
+}"#,
+        )
+        .unwrap();
+
+        let router = test_router(test_config());
+        let req = Request::builder()
+            .method("GET")
+            .uri("/control/config")
+            .header("authorization", "Bearer test-gateway-token")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ok"], true);
+        assert!(json["config"].is_object());
+        assert_eq!(json["config"]["anthropic"]["apiKey"], "[REDACTED]");
+        assert_eq!(json["config"]["bedrock"]["accessKeyId"], "[REDACTED]");
+    }
+
+    #[tokio::test]
+    async fn test_control_config_patch_updates_allowed_path() {
+        let (_temp, _guard) = set_temp_config_path();
+        let router = test_router(test_config());
+        let snapshot = read_control_config_snapshot(router.clone()).await;
+        let mut req_body = json!({
+            "path": "gateway.controlUi.enabled",
+            "value": true,
+        });
+        if let Some(hash) = snapshot["hash"].as_str() {
+            req_body["baseHash"] = json!(hash);
+        }
+
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/control/config")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(req_body.to_string()))
+            .unwrap();
+        let response = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["applied"]["path"], "gateway.controlUi.enabled");
+        assert_eq!(json["applied"]["value"], true);
+    }
+
+    #[tokio::test]
+    async fn test_control_config_patch_rejects_non_allowlisted_path() {
+        let (_temp, _guard) = set_temp_config_path();
+        let router = test_router(test_config());
+        let snapshot = read_control_config_snapshot(router.clone()).await;
+        let mut req_body = json!({
+            "path": "gateway.mode",
+            "value": "lan",
+        });
+        if let Some(hash) = snapshot["hash"].as_str() {
+            req_body["baseHash"] = json!(hash);
+        }
+
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/control/config")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(req_body.to_string()))
+            .unwrap();
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_control_config_post_alias_updates_allowed_path() {
+        let (_temp, _guard) = set_temp_config_path();
+        let router = test_router(test_config());
+        let snapshot = read_control_config_snapshot(router.clone()).await;
+        let mut req_body = json!({
+            "path": "gateway.controlUi.basePath",
+            "value": "/ui-admin",
+        });
+        if let Some(hash) = snapshot["hash"].as_str() {
+            req_body["baseHash"] = json!(hash);
+        }
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/control/config")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(req_body.to_string()))
+            .unwrap();
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_control_config_post_allows_legacy_non_control_ui_paths() {
+        let (_temp, _guard) = set_temp_config_path();
+        let router = test_router(test_config());
+        let snapshot = read_control_config_snapshot(router.clone()).await;
+        let mut req_body = json!({
+            "path": "gateway.port",
+            "value": 18789,
+        });
+        if let Some(hash) = snapshot["hash"].as_str() {
+            req_body["baseHash"] = json!(hash);
+        }
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/control/config")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(req_body.to_string()))
+            .unwrap();
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -3475,6 +3697,15 @@ mod tests {
         assert_eq!(normalize_control_ui_base_path("/ui/"), "/ui");
         assert_eq!(normalize_control_ui_base_path("/admin/ui"), "/admin/ui");
         assert_eq!(normalize_control_ui_base_path("  /admin  "), "/admin");
+    }
+
+    #[test]
+    fn test_html_attr_escape() {
+        let value = html_attr_escape(r#"</script><b test='x' "y">&"#);
+        assert_eq!(
+            value,
+            "&lt;/script&gt;&lt;b test=&#39;x&#39; &quot;y&quot;&gt;&amp;"
+        );
     }
 
     #[test]

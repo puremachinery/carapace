@@ -27,6 +27,7 @@ jobs:
       rust_runtime: ${{ steps.filter.outputs.rust_runtime }}
       windows_sensitive: ${{ steps.filter.outputs.windows_sensitive }}
       docker: ${{ steps.filter.outputs.docker }}
+      control_ui: ${{ steps.filter.outputs.control_ui }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -66,6 +67,11 @@ jobs:
               - "Dockerfile"
               - ".dockerignore"
               - ".hadolint.yaml"
+            control_ui:
+              - "ui/control-ui/**"
+              - "dist/control-ui/**"
+              - "scripts/build-control-ui.sh"
+              - "package.json"
 
   fmt:
     name: Format
@@ -211,6 +217,11 @@ jobs:
     runs-on: ubuntu-latest
     needs: changes
     if: needs.changes.outputs.rust_runtime == 'true' || needs.changes.outputs.docker == 'true'
+    env:
+      # Avoid transient mirror.gcr.io 404s when pulling Trivy databases.
+      TRIVY_DB_REPOSITORY: ghcr.io/aquasecurity/trivy-db:2
+      TRIVY_JAVA_DB_REPOSITORY: ghcr.io/aquasecurity/trivy-java-db:1
+      TRIVY_CHECKS_BUNDLE_REPOSITORY: ghcr.io/aquasecurity/trivy-checks:1
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Run Trivy filesystem scan
@@ -274,6 +285,16 @@ jobs:
             exit 1
           fi
 
+  control-ui-sync:
+    name: Control UI Dist Sync
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.control_ui == 'true'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Verify source/dist parity
+        run: ./scripts/check-control-ui-dist.sh
+
   ci-required:
     name: CI Required
     runs-on: ubuntu-latest
@@ -296,6 +317,7 @@ jobs:
       - geiger
       - workflow-lint
       - docs-check
+      - control-ui-sync
     steps:
       - name: Ensure dependent jobs are success or skipped
         env:
@@ -316,6 +338,7 @@ jobs:
           GEIGER_RESULT: ${{ needs.geiger.result }}
           WORKFLOW_LINT_RESULT: ${{ needs['workflow-lint'].result }}
           DOCS_CHECK_RESULT: ${{ needs['docs-check'].result }}
+          CONTROL_UI_SYNC_RESULT: ${{ needs['control-ui-sync'].result }}
         run: |
           set -euo pipefail
 
@@ -337,6 +360,7 @@ jobs:
             "geiger"
             "workflow-lint"
             "docs-check"
+            "control-ui-sync"
           )
 
           results=(
@@ -357,6 +381,7 @@ jobs:
             "$GEIGER_RESULT"
             "$WORKFLOW_LINT_RESULT"
             "$DOCS_CHECK_RESULT"
+            "$CONTROL_UI_SYNC_RESULT"
           )
 
           for i in "${!names[@]}"; do

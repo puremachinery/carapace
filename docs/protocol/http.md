@@ -285,6 +285,106 @@ Errors:
 - 404 Not Found (invalid agent ID or no local avatar)
 - 405 Method Not Allowed (non-GET/HEAD)
 
+## Control API
+
+Control endpoints use service auth (Bearer token/password or Tailscale Serve
+identity), not hooks token.
+
+### GET `/control/status`
+
+Returns gateway/runtime status + diagnostics snapshot.
+
+Response:
+
+```json
+{
+  "ok": true,
+  "version": "0.1.0-previewX",
+  "startedAt": "2026-02-24T00:00:00Z",
+  "uptimeSeconds": 123,
+  "connectedChannels": 1,
+  "totalChannels": 2,
+  "runtime": {
+    "name": "carapace",
+    "version": "0.1.0-previewX",
+    "platform": "linux",
+    "arch": "x86_64"
+  },
+  "diagnostics": { "...": "..." }
+}
+```
+
+### GET `/control/channels`
+
+Returns channel connectivity state:
+
+```json
+{
+  "total": 2,
+  "connected": 1,
+  "channels": [
+    {
+      "id": "telegram",
+      "name": "telegram",
+      "status": "connected",
+      "lastConnectedAt": "2026-02-24T00:00:00Z",
+      "lastError": null
+    }
+  ]
+}
+```
+
+### GET `/control/config`
+
+Returns a **redacted** config snapshot plus optimistic-concurrency hash:
+
+```json
+{
+  "ok": true,
+  "config": { "...": "..." },
+  "hash": "abc123..."
+}
+```
+
+Secret-like keys are redacted as `"[REDACTED]"`.
+
+### PATCH `/control/config`
+
+Applies a **safe allowlisted** single-path update with optimistic concurrency.
+Only `gateway.controlUi.*` paths are accepted on this endpoint.
+
+Request:
+
+```json
+{
+  "path": "gateway.controlUi.enabled",
+  "value": true,
+  "baseHash": "abc123..."
+}
+```
+
+Responses:
+- `200 OK` with `{ "ok": true, "applied": {...}, "hash": "..." }`
+- `400 Bad Request` for invalid JSON/path/baseHash usage
+- `403 Forbidden` for non-allowlisted paths or protected paths
+- `409 Conflict` when config changed since provided hash
+- `422 Unprocessable Entity` for schema-invalid updates
+
+### POST `/control/config`
+
+Legacy broader config-mutation endpoint.
+
+Request shape is the same as `PATCH /control/config` (`path`, `value`,
+optional `baseHash`), but unlike PATCH it is not limited to
+`gateway.controlUi.*` (protected prefixes still remain blocked).
+
+Responses:
+- `200 OK` with `{ "ok": true, "applied": {...}, "hash": "..." }`
+- `400 Bad Request` for invalid JSON/path/baseHash usage
+- `403 Forbidden` for protected paths
+- `409 Conflict` when config changed since provided hash
+- `422 Unprocessable Entity` for schema-invalid updates
+
 ## Control Task API
 
 Control task endpoints are part of the service control plane and use **service

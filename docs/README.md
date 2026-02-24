@@ -9,6 +9,13 @@ A security-focused, open-source personal AI assistant.
 - [Install](site/install.md) — binary downloads and verification
 - [First Run](site/first-run.md) — secure local startup and smoke checks
 - [Get Unstuck](site/get-unstuck.md) — troubleshooting and report paths
+- [Docs Hubs](site/docs.md) — getting started/channels/providers/cli/security-ops/reference hubs
+- [Providers Hub](site/providers.md) — provider setup and decision guidance
+- [Capability Matrix](site/capability-matrix.md) — channels/providers/platform support + caveats
+- [CLI Tasks Index](site/cli-tasks.md) — task-oriented command index
+- [CLI Reference Hub](site/cli-reference.md) — task index + full reference + troubleshooting routes
+- [Security & Ops Hub](site/security-ops.md) — day-2 security/ops paths
+- [Reference Hub](site/reference.md) — protocol/architecture reference routing
 - [Cookbook](cookbook/README.md) — task-focused walkthroughs
 - [Roadmap](roadmap.md) — now/next/later priorities
 - [Release & Upgrade Policy](release.md) — compatibility, migration, rollback, release checklist

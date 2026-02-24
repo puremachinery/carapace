@@ -1,6 +1,14 @@
 # Get Unstuck
 
-## Quick triage (copy/paste)
+## On this page
+
+- [Quick triage command ladder](#quick-triage-command-ladder-copy-paste)
+- [Typical failures](#typical-failures)
+- [Task stuck or blocked](#task-stuck-or-blocked)
+- [Capture useful logs](#capture-useful-logs)
+- [Validate config quickly](#validate-config-quickly)
+
+## Quick triage command ladder (copy/paste)
 
 ```bash
 cara version
@@ -8,6 +16,8 @@ cara status --port 18789
 curl -sS http://127.0.0.1:18789/health
 cara logs -n 80
 ```
+
+Run top-to-bottom, then branch into the sections below based on first failure.
 
 ## Typical failures
 

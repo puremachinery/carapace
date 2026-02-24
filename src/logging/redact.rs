@@ -12,6 +12,8 @@ use tracing_subscriber::fmt::MakeWriter;
 const SECRET_KEY_NAMES: &[&str] = &[
     "apikey",
     "api_key",
+    "accesskeyid",
+    "access_key_id",
     "token",
     "secret",
     "password",
@@ -281,6 +283,7 @@ mod tests {
     fn test_json_known_keys_redacted() {
         let mut val = json!({
             "apiKey": "my-secret-api-key",
+            "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
             "token": "tok_123",
             "secret": "s3cr3t",
             "password": "hunter2",
@@ -288,6 +291,7 @@ mod tests {
         });
         redact_json_value(&mut val);
         assert_eq!(val["apiKey"], "[REDACTED]");
+        assert_eq!(val["accessKeyId"], "[REDACTED]");
         assert_eq!(val["token"], "[REDACTED]");
         assert_eq!(val["secret"], "[REDACTED]");
         assert_eq!(val["password"], "[REDACTED]");
