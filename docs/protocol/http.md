@@ -285,6 +285,179 @@ Errors:
 - 404 Not Found (invalid agent ID or no local avatar)
 - 405 Method Not Allowed (non-GET/HEAD)
 
+## Control Task API
+
+Control task endpoints are part of the service control plane and use **service
+auth** (Bearer token/password or Tailscale Serve identity), not hooks token.
+
+If runtime state is unavailable (for example startup race/misconfiguration),
+task endpoints return:
+
+```json
+{ "ok": false, "error": "Task queue unavailable" }
+```
+
+with `503 Service Unavailable`.
+
+### Durable task model
+
+Task lifecycle states:
+- `queued`
+- `running`
+- `blocked`
+- `retry_wait`
+- `done`
+- `failed`
+- `cancelled`
+
+Continuation policy fields (camelCase):
+- `maxAttempts` (default `100`)
+- `maxTotalRuntimeMs` (default `604800000`)
+- `maxTurns` (default `25`)
+- `maxRunTimeoutSeconds` (default `600`)
+
+Blocked tasks may include `blockedReason` values such as:
+- `approval_required`
+- `config_missing`
+- `delivery_failure`
+- `external_dependency`
+- `operator_action_required`
+- `unknown`
+
+### POST `/control/tasks`
+
+Create a durable objective task.
+
+Request:
+
+```json
+{
+  "payload": { "kind": "systemEvent", "text": "run nightly summary" },
+  "nextRunAtMs": 1735689600000,
+  "policy": {
+    "maxAttempts": 10,
+    "maxTotalRuntimeMs": 3600000,
+    "maxTurns": 10,
+    "maxRunTimeoutSeconds": 120
+  }
+}
+```
+
+`payload.kind` supports:
+- `systemEvent`
+- `agentTurn`
+
+Responses:
+- `201 Created` with `{ "ok": true, "task": { ... } }`
+- `400 Bad Request` for invalid JSON/payload/policy
+- `503 Service Unavailable` when queue is full or unavailable
+
+### GET `/control/tasks`
+
+List tasks (newest-first).
+
+Query params:
+- `state` optional (`queued`, `running`, `blocked`, `retry_wait`, `done`, `failed`, `cancelled`)
+- `limit` optional (max rows returned)
+
+Response:
+
+```json
+{
+  "ok": true,
+  "total": 42,
+  "tasks": [ ... ]
+}
+```
+
+Errors:
+- `400 Bad Request` (invalid state filter)
+
+### GET `/control/tasks/{id}`
+
+Fetch one task by ID.
+
+Responses:
+- `200 OK` with `{ "ok": true, "task": { ... } }`
+- `404 Not Found` when missing
+
+### PATCH `/control/tasks/{id}`
+
+Patch mutable task fields:
+- `payload` (full replacement; validated as `CronPayload`)
+- `policy` (partial policy patch)
+- `reason` (stored into `lastError`, max 1024 chars)
+
+Request:
+
+```json
+{
+  "payload": { "kind": "systemEvent", "text": "updated task payload" },
+  "policy": { "maxRunTimeoutSeconds": 45 },
+  "reason": "operator patch"
+}
+```
+
+Responses:
+- `200 OK` on success
+- `400 Bad Request` for invalid JSON/payload/policy/reason length or empty patch body
+- `404 Not Found` when missing
+- `409 Conflict` when state is not patchable (`running`/`done`) or changed concurrently
+
+### POST `/control/tasks/{id}/cancel`
+
+Cancel a task (optional body `{ "reason": "..." }`).
+
+Responses:
+- `200 OK` on success
+- `400 Bad Request` for invalid reason length/JSON
+- `404 Not Found` when missing
+- `409 Conflict` when already terminal (`done`/`failed`/`cancelled`) or changed concurrently
+
+### POST `/control/tasks/{id}/retry`
+
+Move a retryable task to `retry_wait`.
+
+Request:
+
+```json
+{ "delayMs": 500, "reason": "operator retry" }
+```
+
+If `reason` is omitted/blank, default is `"retried by operator"`.
+
+Responses:
+- `200 OK` on success
+- `400 Bad Request` for invalid reason length/JSON
+- `404 Not Found` when missing
+- `409 Conflict` when not retryable in current state (`queued`/`running`/`done`) or changed concurrently
+
+### POST `/control/tasks/{id}/resume`
+
+Resume a blocked task (moves `blocked -> retry_wait`).
+
+Request:
+
+```json
+{ "delayMs": 1000, "reason": "operator resume" }
+```
+
+If `reason` is omitted/blank, default is `"resumed by operator"`.
+
+Responses:
+- `200 OK` on success
+- `400 Bad Request` for invalid reason length/JSON
+- `404 Not Found` when missing
+- `409 Conflict` when task is not blocked
+
+### Audit coverage
+
+Successful task mutations emit audit event type `task_mutated` with:
+- `task_id`
+- `action` (`cancel` / `patch` / `retry` / `resume`)
+- `actor` (remote IP or `unknown`)
+- `resulting_state`
+
 ## Health / Status
 
 ### GET `/health`

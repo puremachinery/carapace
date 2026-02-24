@@ -72,6 +72,12 @@ pub enum AuditEvent {
         actor: String,
         method: String,
     },
+    TaskMutated {
+        task_id: String,
+        action: String,
+        actor: String,
+        resulting_state: String,
+    },
     DevicePaired {
         device_id: String,
         device_family: String,
@@ -180,6 +186,7 @@ impl AuditEvent {
             AuditEvent::AuthSuccess { .. } => "auth_success",
             AuditEvent::AuthFailure { .. } => "auth_failure",
             AuditEvent::ConfigChanged { .. } => "config_changed",
+            AuditEvent::TaskMutated { .. } => "task_mutated",
             AuditEvent::DevicePaired { .. } => "device_paired",
             AuditEvent::NodePaired { .. } => "node_paired",
             AuditEvent::ToolExecuted { .. } => "tool_executed",
@@ -448,6 +455,12 @@ mod tests {
                 key_path: "k".into(),
                 actor: "a".into(),
                 method: "m".into(),
+            },
+            AuditEvent::TaskMutated {
+                task_id: "t".into(),
+                action: "retry".into(),
+                actor: "a".into(),
+                resulting_state: "retry_wait".into(),
             },
             AuditEvent::DevicePaired {
                 device_id: "d".into(),
@@ -877,6 +890,20 @@ mod tests {
             }
             .event_name(),
             "tool_denied"
+        );
+    }
+
+    #[test]
+    fn test_event_name_task_mutated() {
+        assert_eq!(
+            AuditEvent::TaskMutated {
+                task_id: "task-1".into(),
+                action: "cancel".into(),
+                actor: "127.0.0.1".into(),
+                resulting_state: "cancelled".into(),
+            }
+            .event_name(),
+            "task_mutated"
         );
     }
 

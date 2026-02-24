@@ -194,10 +194,14 @@ Example uses the Linux config directory (`~/.config/carapace`).
 ├── agents/<id>/
 │   ├── sessions/*.jsonl   # Session transcripts
 │   └── auth-profiles.json # API keys, OAuth tokens
+├── tasks/
+│   └── queue.json         # Durable task payload/state (plaintext operational data)
 └── extensions/            # Installed plugins
 ```
 
 **File permissions**: Directories should be `700`, files `600`.
+**Task payload note**: `tasks/queue.json` is plaintext durable state for operator
+workflows. Do not store raw secrets in task payload text.
 
 ## Security Anti-Patterns
 

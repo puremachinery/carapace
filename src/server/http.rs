@@ -3052,6 +3052,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_control_tasks_patch_not_found_returns_404() {
+        let (ws_state, _tmp) = make_test_ws_state();
+        let router = test_router_with_hook_registry(
+            test_config(),
+            Arc::new(HookRegistry::new()),
+            ws_state.clone(),
+        );
+
+        let patch_req = Request::builder()
+            .method("PATCH")
+            .uri("/control/tasks/task-does-not-exist")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"reason":"operator patch"}"#))
+            .unwrap();
+        let patch_response = router.oneshot(patch_req).await.unwrap();
+        assert_eq!(patch_response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn test_control_tasks_resume_non_blocked_conflict() {
         let (ws_state, _tmp) = make_test_ws_state();
         let router = test_router_with_hook_registry(
@@ -3089,6 +3109,26 @@ mod tests {
             .unwrap();
         let resume_response = router.oneshot(resume_req).await.unwrap();
         assert_eq!(resume_response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn test_control_tasks_resume_not_found_returns_404() {
+        let (ws_state, _tmp) = make_test_ws_state();
+        let router = test_router_with_hook_registry(
+            test_config(),
+            Arc::new(HookRegistry::new()),
+            ws_state.clone(),
+        );
+
+        let resume_req = Request::builder()
+            .method("POST")
+            .uri("/control/tasks/task-does-not-exist/resume")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{}"#))
+            .unwrap();
+        let resume_response = router.oneshot(resume_req).await.unwrap();
+        assert_eq!(resume_response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

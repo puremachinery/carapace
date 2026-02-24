@@ -225,13 +225,14 @@ sequenceDiagram
 | CLI | `src/cli/mod.rs` | CLI command parsing and command handlers (`start`, `setup`, `update`, `verify`, etc.) |
 | CLI Chat | `src/cli/chat.rs` | Interactive REPL chat flow (`cara chat`) |
 | OpenAI Compat | `src/server/openai.rs` | /v1/chat/completions, /v1/responses |
-| Control API | `src/server/control.rs` | /control/status, /control/channels |
+| Control API | `src/server/control.rs` | /control/status, /control/channels, /control/config, /control/tasks* |
 | Auth | `src/auth/mod.rs` | Token/password verification, loopback detection |
 | Channels | `src/channels/mod.rs` | Channel registry, status tracking |
 | Sessions | `src/sessions/store.rs` | Session CRUD, JSONL history, compaction, archiving |
 | Nodes | `src/nodes/mod.rs` | Node pairing state machine |
 | Devices | `src/devices/mod.rs` | Device pairing state machine |
 | Cron | `src/cron/mod.rs` | Scheduled job management, run history |
+| Task Queue | `src/tasks/mod.rs` | Durable objective/task queue, recovery, retry/blocked policies |
 | Exec Approvals | `src/exec/mod.rs` | Tool execution approval workflow |
 | TTS | `src/server/ws/handlers/tts.rs` | Text-to-speech provider abstraction |
 | Voice Wake | WS handler | Wake word trigger management |

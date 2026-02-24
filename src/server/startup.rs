@@ -653,7 +653,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_task_executor_blocks_after_provider_retry_limit() {
+    async fn runtime_task_executor_blocks_when_policy_max_attempts_reached() {
         let state = Arc::new(WsServerState::new(WsServerConfig::default()));
         let executor = RuntimeTaskExecutor { state };
         let payload = serde_json::to_value(CronPayload::AgentTurn {

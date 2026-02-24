@@ -71,7 +71,7 @@ feature_inventory_markdown: |
   - [x] **pair** — device identity handshake + node pairing initiation (remote gateways supported)
   - [x] **update** — version check and self-update
   - [x] **chat** — interactive local REPL session over WebSocket
-  - [x] **verify** — first-run outcome verification (local chat/channels/hooks)
+  - [x] **verify** — first-run outcome verification (local chat/channels/hooks/autonomy)
   - [x] **tls init-ca / issue-cert / revoke-cert / show-ca** — cluster CA management
 
   ### Config (`src/config/`)
@@ -163,7 +163,7 @@ feature_inventory_markdown: |
   - [x] **Output destinations** — stdout, stderr, file
   - [x] **Log buffer layer** — ring buffer for /logs endpoint
   - [x] **Secret masking** — redacts API keys in log output and buffer
-  - [x] **Audit logging** — initialized at startup; events emitted for security-relevant actions
+  - [x] **Audit logging** — initialized at startup; events emitted for security-relevant actions, including `task_mutated` on control task actions
 
   ### Media (`src/media/`)
 
@@ -222,7 +222,7 @@ feature_inventory_markdown: |
   - [x] **Rate limiting** — per-IP quotas
   - [x] **Resource monitoring** — CPU/memory tracking
   - [x] **Content Security Policy** — CSP headers
-  - [x] **Control API** — status, channels, config handlers
+  - [x] **Control API** — status/channels/config plus task endpoints (`/control/tasks` create/list/get/patch/cancel/retry/resume)
   - [x] **Graceful shutdown** — 30s drain period
 
   #### WebSocket Handlers
@@ -255,6 +255,14 @@ feature_inventory_markdown: |
   - [x] **File locking** — concurrent-safe operations (flock RAII), including per-session-key creation locks
   - [x] **Retention policies** — age-based cleanup
   - [x] **Scoping** — channel/session scope + reset policy across ingress
+
+  ### Tasks (`src/tasks/`)
+
+  - [x] **Durable queue persistence** — persisted task lifecycle (`queued/running/blocked/retry_wait/done/failed/cancelled`)
+  - [x] **Startup recovery** — stale `running` tasks recover to `retry_wait`
+  - [x] **Background worker loop** — due-task claiming + execution outcome transitions
+  - [x] **Continuation policy budgets** — per-task `maxAttempts/maxTotalRuntimeMs/maxTurns/maxRunTimeoutSeconds`
+  - [x] **Operator mutation primitives** — patch/cancel/retry/resume state transitions with validation guards
 
   ### Tailscale (`src/tailscale/`)
 

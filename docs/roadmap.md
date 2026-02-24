@@ -13,17 +13,16 @@ For what is already shipped and verified, see:
 - Cross-platform subprocess sandbox hardening — macOS, Linux, and Windows
   enforce OS-level isolation for sandbox-required paths; unsupported platforms
   fail closed.
+- Long-running assistant MVP — durable task queue with restart recovery,
+  operator task controls (`create/list/get/patch/cancel/retry/resume`),
+  continuation policy budgets, blocked-state handling, and autonomy verification
+  (`cara verify --outcome autonomy`).
 - Outcome-driven setup flow (`cara setup`) with provider credential validation.
 - First-run verifier (`cara verify`) with pass/fail outcome checks.
 - Multi-page docs site with install, first-run, security, and ops guides.
 
 ## Now
 
-- Long-running assistant MVP:
-  - durable task queue with retry/recovery state,
-  - operator surface for objective/task create/list/get/cancel/retry,
-  - continuation budgets and blocked-state handling,
-  - close remaining trigger wiring gaps.
 - Stable (non-preview) release gate:
   - migration/compatibility statement,
   - backup/restore and update-path validation,

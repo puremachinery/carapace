@@ -583,10 +583,7 @@ impl WsServerState {
             }),
             exec_manager: exec::ExecApprovalManager::new(),
             cron_scheduler: {
-                let scheduler =
-                    cron::CronScheduler::new(true, Some(state_dir.join("cron").join("jobs.json")));
-                scheduler.load();
-                scheduler
+                cron::CronScheduler::new(true, Some(state_dir.join("cron").join("jobs.json")))
             },
             task_queue: {
                 Arc::new(tasks::TaskQueue::new(Some(
@@ -603,12 +600,29 @@ impl WsServerState {
     }
 
     /// Construct persistent WS server state, including async-safe task queue
-    /// load and recovery.
+    /// load/recovery and async-safe cron scheduler load.
     pub async fn new_persistent(
         config: WsServerConfig,
         state_dir: PathBuf,
     ) -> Result<Self, WsConfigError> {
         let state = Self::new_persistent_unloaded(config, state_dir)?;
+        let state = tokio::task::spawn_blocking(move || {
+            state.cron_scheduler.load();
+            state
+        })
+        .await
+        .map_err(|err| {
+            let reason = if err.is_panic() {
+                "panicked"
+            } else if err.is_cancelled() {
+                "was cancelled"
+            } else {
+                "failed"
+            };
+            WsConfigError::Runtime(format!(
+                "cron scheduler load worker {reason} during startup: {err}"
+            ))
+        })?;
         state
             .task_queue
             .load_async()
