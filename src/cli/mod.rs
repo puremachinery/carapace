@@ -962,6 +962,21 @@ async fn send_control_request(
     query: &[(&str, String)],
     body: Option<Value>,
 ) -> Result<Value, Box<dyn std::error::Error>> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()?;
+    let GatewayAuth { token, password } = resolve_gateway_auth().await;
+    let auth = GatewayAuth { token, password };
+    let url = build_control_url(host, port, path, query)?;
+    send_control_request_with_client_and_auth(&client, &auth, method, url, body).await
+}
+
+fn build_control_url(
+    host: &str,
+    port: u16,
+    path: &str,
+    query: &[(&str, String)],
+) -> Result<Url, Box<dyn std::error::Error>> {
     let mut url = Url::parse(&format!("http://{}:{}{}", host, port, path))
         .map_err(|e| format!("failed to build control URL: {e}"))?;
     if !query.is_empty() {
@@ -970,25 +985,31 @@ async fn send_control_request(
             pairs.append_pair(key, value);
         }
     }
+    Ok(url)
+}
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()?;
-    let GatewayAuth { token, password } = resolve_gateway_auth().await;
-
+async fn send_control_request_with_client_and_auth(
+    client: &reqwest::Client,
+    auth: &GatewayAuth,
+    method: reqwest::Method,
+    url: Url,
+    body: Option<Value>,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let request_url = url.clone();
     let mut request = client.request(method, url);
-    if let Some(token) = token {
+    if let Some(token) = auth.token.as_deref() {
         request = request.bearer_auth(token);
-    } else if let Some(password) = password {
+    } else if let Some(password) = auth.password.as_deref() {
         request = request.bearer_auth(password);
     }
     if let Some(body) = body {
         request = request.json(&body);
     }
 
-    let response = request.send().await.map_err(|e| {
-        format!("failed to send control request (host={host}, port={port}, path={path}): {e}")
-    })?;
+    let response = request
+        .send()
+        .await
+        .map_err(|e| format!("failed to send control request ({request_url}): {e}"))?;
     let status = response.status();
     let bytes = response.bytes().await?;
     if !status.is_success() {
@@ -3296,8 +3317,17 @@ async fn verify_channel_outcome(
 
 async fn verify_autonomy_outcome(
     port: u16,
+    cfg: &Value,
     checks: &mut Vec<VerifyCheckResult>,
 ) -> Result<(), String> {
+    async fn shutdown_embedded_gateway(
+        setup_server_handle: &mut Option<crate::server::startup::ServerHandle>,
+    ) {
+        if let Some(handle) = setup_server_handle.take() {
+            handle.shutdown().await;
+        }
+    }
+
     let mut setup_server_handle = match chat::ensure_local_gateway_running(port).await {
         Ok(handle) => {
             checks.push(VerifyCheckResult::pass(
@@ -3318,25 +3348,82 @@ async fn verify_autonomy_outcome(
         }
     };
 
+    let control_client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+    {
+        Ok(client) => client,
+        Err(err) => {
+            checks.push(VerifyCheckResult::fail(
+                "Control client setup",
+                err.to_string(),
+                "fix local networking/runtime dependencies, then retry",
+            ));
+            shutdown_embedded_gateway(&mut setup_server_handle).await;
+            return Err("outcome verification failed".to_string());
+        }
+    };
+    // Resolve control-plane auth once and reuse for task create + polling.
+    // This includes env/config/keychain fallback behavior.
+    let mut control_auth = resolve_gateway_auth().await;
+    if control_auth.token.is_none() && control_auth.password.is_none() {
+        if let Some(token) = cfg
+            .get("gateway")
+            .and_then(|v| v.get("auth"))
+            .and_then(|v| v.get("token"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            control_auth.token = Some(token.to_string());
+        } else if let Some(password) = cfg
+            .get("gateway")
+            .and_then(|v| v.get("auth"))
+            .and_then(|v| v.get("password"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            control_auth.password = Some(password.to_string());
+        }
+    }
+
+    let policy_max_attempts: u32 = 1;
+    let policy_max_total_runtime_ms: u64 = 60_000;
+    let policy_max_turns: u32 = 1;
+    let policy_max_run_timeout_seconds: u32 = 30;
     let create_body = serde_json::json!({
         "payload": {
             "kind": "agentTurn",
             "message": "verify-autonomy",
         },
         "policy": {
-            "maxAttempts": 1,
-            "maxTotalRuntimeMs": 60000,
-            "maxTurns": 1,
-            "maxRunTimeoutSeconds": 30
+            "maxAttempts": policy_max_attempts,
+            "maxTotalRuntimeMs": policy_max_total_runtime_ms,
+            "maxTurns": policy_max_turns,
+            "maxRunTimeoutSeconds": policy_max_run_timeout_seconds
         }
     });
 
-    let create_response = match send_control_request(
-        "127.0.0.1",
-        port,
+    let create_url = match build_control_url("127.0.0.1", port, "/control/tasks", &[])
+        .map_err(|error| error.to_string())
+    {
+        Ok(url) => url,
+        Err(error) => {
+            checks.push(VerifyCheckResult::fail(
+                "Task create",
+                format!("failed to build control URL: {error}"),
+                "confirm host/port configuration and retry verification",
+            ));
+            shutdown_embedded_gateway(&mut setup_server_handle).await;
+            return Err("outcome verification failed".to_string());
+        }
+    };
+    let create_response = match send_control_request_with_client_and_auth(
+        &control_client,
+        &control_auth,
         reqwest::Method::POST,
-        "/control/tasks",
-        &[],
+        create_url,
         Some(create_body),
     )
     .await
@@ -3347,11 +3434,9 @@ async fn verify_autonomy_outcome(
             checks.push(VerifyCheckResult::fail(
                 "Task create",
                 error_message,
-                format!("ensure control auth is configured, then retry `cara verify --outcome autonomy --port {port}`"),
+                format!("verify control auth and task queue availability, then retry `cara verify --outcome autonomy --port {port}`"),
             ));
-            if let Some(handle) = setup_server_handle.take() {
-                handle.shutdown().await;
-            }
+            shutdown_embedded_gateway(&mut setup_server_handle).await;
             return Err("outcome verification failed".to_string());
         }
     };
@@ -3366,9 +3451,7 @@ async fn verify_autonomy_outcome(
             "task response missing task object",
             "retry verification; if this persists, inspect server logs",
         ));
-        if let Some(handle) = setup_server_handle.take() {
-            handle.shutdown().await;
-        }
+        shutdown_embedded_gateway(&mut setup_server_handle).await;
         return Err("outcome verification failed".to_string());
     };
 
@@ -3382,9 +3465,7 @@ async fn verify_autonomy_outcome(
             "task response missing task id",
             "retry verification; if this persists, inspect server logs",
         ));
-        if let Some(handle) = setup_server_handle.take() {
-            handle.shutdown().await;
-        }
+        shutdown_embedded_gateway(&mut setup_server_handle).await;
         return Err("outcome verification failed".to_string());
     };
 
@@ -3397,29 +3478,52 @@ async fn verify_autonomy_outcome(
         .get("attempts")
         .and_then(|value| value.as_u64())
         .unwrap_or(0);
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    // Polling window must be at least as long as task runtime policy budgets
+    // (plus headroom) to avoid false negatives on healthy slow paths.
+    let polling_timeout_secs = policy_max_total_runtime_ms
+        .div_ceil(1000)
+        .max(u64::from(policy_max_run_timeout_seconds))
+        .saturating_add(10);
+    let deadline = std::time::Instant::now() + Duration::from_secs(polling_timeout_secs);
     let mut terminal_task: Option<Value> = None;
 
     while std::time::Instant::now() < deadline {
         let path = format!("/control/tasks/{task_id}");
-        let task_response =
-            match send_control_request("127.0.0.1", port, reqwest::Method::GET, &path, &[], None)
-                .await
-                .map_err(|err| err.to_string())
-            {
-                Ok(response) => response,
-                Err(error_message) => {
-                    checks.push(VerifyCheckResult::fail(
-                        "Task polling",
-                        error_message,
-                        "confirm service health and control auth, then retry",
-                    ));
-                    if let Some(handle) = setup_server_handle.take() {
-                        handle.shutdown().await;
-                    }
-                    return Err("outcome verification failed".to_string());
-                }
-            };
+        let task_url = match build_control_url("127.0.0.1", port, &path, &[])
+            .map_err(|error| error.to_string())
+        {
+            Ok(url) => url,
+            Err(error) => {
+                checks.push(VerifyCheckResult::fail(
+                    "Task polling",
+                    format!("failed to build control URL: {error}"),
+                    "confirm host/port configuration and retry verification",
+                ));
+                shutdown_embedded_gateway(&mut setup_server_handle).await;
+                return Err("outcome verification failed".to_string());
+            }
+        };
+        let task_response = match send_control_request_with_client_and_auth(
+            &control_client,
+            &control_auth,
+            reqwest::Method::GET,
+            task_url,
+            None,
+        )
+        .await
+        .map_err(|err| err.to_string())
+        {
+            Ok(response) => response,
+            Err(error_message) => {
+                checks.push(VerifyCheckResult::fail(
+                    "Task polling",
+                    error_message,
+                    "confirm service health and control auth, then retry",
+                ));
+                shutdown_embedded_gateway(&mut setup_server_handle).await;
+                return Err("outcome verification failed".to_string());
+            }
+        };
 
         let task = task_response.get("task").cloned();
         if let Some(task) = task {
@@ -3440,9 +3544,7 @@ async fn verify_autonomy_outcome(
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
 
-    if let Some(handle) = setup_server_handle.take() {
-        handle.shutdown().await;
-    }
+    shutdown_embedded_gateway(&mut setup_server_handle).await;
 
     if max_attempts_seen == 0 {
         checks.push(VerifyCheckResult::fail(
@@ -3542,7 +3644,7 @@ async fn run_outcome_verifier(
         VerifyOutcome::Discord | VerifyOutcome::Telegram => {
             verify_channel_outcome(outcome, &cfg, discord_to, telegram_to, &mut checks).await
         }
-        VerifyOutcome::Autonomy => verify_autonomy_outcome(port, &mut checks).await,
+        VerifyOutcome::Autonomy => verify_autonomy_outcome(port, &cfg, &mut checks).await,
     };
     if let Err(err) = result {
         print_verify_summary(outcome, port, &checks);
