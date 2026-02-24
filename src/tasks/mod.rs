@@ -1209,14 +1209,16 @@ mod tests {
     where
         F: Fn() -> bool,
     {
-        const MAX_POLLS: usize = 10_000;
-        for _ in 0..MAX_POLLS {
-            if condition() {
-                return;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if condition() {
+                    break;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
-        panic!("{failure_message}");
+        })
+        .await
+        .expect(failure_message);
     }
 
     async fn run_worker_once_with_outcome(

@@ -612,8 +612,15 @@ impl WsServerState {
         })
         .await
         .map_err(|err| {
+            let reason = if err.is_panic() {
+                "panicked"
+            } else if err.is_cancelled() {
+                "was cancelled"
+            } else {
+                "failed"
+            };
             WsConfigError::Runtime(format!(
-                "cron scheduler load worker panicked during startup: {err}"
+                "cron scheduler load worker {reason} during startup: {err}"
             ))
         })?;
         state
