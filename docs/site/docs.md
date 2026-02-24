@@ -4,7 +4,28 @@
 
 Navigate docs by outcome area instead of file-by-file browsing.
 
-## Hubs
+## On this page
+
+- [Day 1: install and first value](#day-1-install-and-first-value)
+- [Day 2: operate and recover](#day-2-operate-and-recover)
+- [Topic hubs](#topic-hubs)
+
+## Day 1: install and first value
+
+- [Getting Started](../getting-started.md)
+- [Install](install.md)
+- [First Run](first-run.md)
+- [Cookbook recipes](../cookbook/README.md)
+
+## Day 2: operate and recover
+
+- [Security & Ops hub](security-ops.md)
+- [Ops runbook](ops.md)
+- [Get Unstuck](get-unstuck.md)
+- [CLI tasks index](cli-tasks.md)
+- [CLI reference hub](cli-reference.md)
+
+## Topic hubs
 
 - **Getting Started**
   - [Getting Started](../getting-started.md)
@@ -22,7 +43,8 @@ Navigate docs by outcome area instead of file-by-file browsing.
 
 - **CLI**
   - [CLI tasks index](cli-tasks.md)
-  - [CLI reference guide](../cli.md)
+  - [CLI reference hub](cli-reference.md)
+  - [CLI guide](../cli.md)
 
 - **Security/Ops**
   - [Security & Ops hub](security-ops.md)

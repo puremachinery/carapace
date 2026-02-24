@@ -13,6 +13,7 @@ A security-focused, open-source personal AI assistant.
 - [Providers Hub](site/providers.md) — provider setup and decision guidance
 - [Capability Matrix](site/capability-matrix.md) — channels/providers/platform support + caveats
 - [CLI Tasks Index](site/cli-tasks.md) — task-oriented command index
+- [CLI Reference Hub](site/cli-reference.md) — task index + full reference + troubleshooting routes
 - [Security & Ops Hub](site/security-ops.md) — day-2 security/ops paths
 - [Reference Hub](site/reference.md) — protocol/architecture reference routing
 - [Cookbook](cookbook/README.md) — task-focused walkthroughs

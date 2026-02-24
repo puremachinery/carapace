@@ -271,6 +271,10 @@ render_site_doc_page "cli-tasks" "CLI Tasks Index" \
   "Task-oriented command index for setup, operations, and recovery." \
   "./docs.html" \
   "Docs Hubs"
+render_site_doc_page "cli-reference" "CLI Reference Hub" \
+  "Task-first CLI routing to full command reference and troubleshooting paths." \
+  "./cli-tasks.html" \
+  "CLI Tasks Index"
 render_site_doc_page "security-ops" "Security & Ops Hub" \
   "Security and operations pathways for day-2 running and hardening." \
   "./docs.html" \

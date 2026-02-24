@@ -4,11 +4,24 @@
 
 Find the right `cara` command by outcome instead of scanning the full CLI reference.
 
+## On this page
+
+- [Setup and first value](#setup-and-first-value)
+- [Operate and diagnose](#operate-and-diagnose)
+- [Secure access and pairing](#secure-access-and-pairing)
+- [Backup/restore/update lifecycle](#backup-restore-reset)
+- [Deeper references](#deeper-reference)
+
 ## Setup and first value
 
 - Initial setup wizard: `cara setup`
 - Verify current setup outcome: `cara verify --outcome auto`
 - Start local chat: `cara chat`
+
+Command ladder:
+- Start with `cara setup`
+- Validate with `cara verify --outcome auto`
+- Move to `cara verify --outcome autonomy` for task-runtime proof
 
 ## Operate and diagnose
 
@@ -41,6 +54,7 @@ Find the right `cara` command by outcome instead of scanning the full CLI refere
 
 ## Deeper reference
 
+- [CLI reference hub](cli-reference.md)
 - [CLI guide](../cli.md)
 - [Ops guide](ops.md)
 - [Get Unstuck](get-unstuck.md)
