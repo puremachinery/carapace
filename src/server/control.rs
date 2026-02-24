@@ -548,7 +548,15 @@ pub async fn tasks_create_handler(
         }
     };
 
-    let task = queue.enqueue(payload, req.next_run_at_ms);
+    let task = queue.enqueue_async(payload, req.next_run_at_ms).await;
+    if task.state == TaskState::Failed {
+        let message = task.last_error.as_deref().unwrap_or("task queue full");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ControlError::new(message)),
+        )
+            .into_response();
+    }
     (StatusCode::CREATED, Json(TaskResponse::success(task))).into_response()
 }
 

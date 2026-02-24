@@ -735,6 +735,7 @@ mod tests {
 
         let queue = TaskQueue::new(Some(path.clone()));
         let task = queue.enqueue(serde_json::json!({"kind":"demo"}), Some(123));
+        let _ = queue.claim_due(now_ms(), 1);
         assert!(queue.mark_failed(&task.id, "boom"));
 
         let loaded = TaskQueue::new(Some(path));

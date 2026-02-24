@@ -254,6 +254,17 @@ pub enum TlsCommand {
     },
 }
 
+#[derive(clap::Args, Debug)]
+pub struct TaskConnectionArgs {
+    /// Port of the running instance (default: from config or 18789).
+    #[arg(short, long)]
+    port: Option<u16>,
+
+    /// Host of the running instance.
+    #[arg(long, default_value = "127.0.0.1")]
+    host: String,
+}
+
 #[derive(Subcommand, Debug)]
 pub enum TaskCommand {
     /// Create a durable objective task.
@@ -266,13 +277,8 @@ pub enum TaskCommand {
         #[arg(long = "next-run-at-ms")]
         next_run_at_ms: Option<u64>,
 
-        /// Port of the running instance (default: from config or 18789).
-        #[arg(short, long)]
-        port: Option<u16>,
-
-        /// Host of the running instance.
-        #[arg(long, default_value = "127.0.0.1")]
-        host: String,
+        #[command(flatten)]
+        connection: TaskConnectionArgs,
     },
     /// List durable objective tasks.
     List {
@@ -284,26 +290,16 @@ pub enum TaskCommand {
         #[arg(long)]
         limit: Option<usize>,
 
-        /// Port of the running instance (default: from config or 18789).
-        #[arg(short, long)]
-        port: Option<u16>,
-
-        /// Host of the running instance.
-        #[arg(long, default_value = "127.0.0.1")]
-        host: String,
+        #[command(flatten)]
+        connection: TaskConnectionArgs,
     },
     /// Get a single durable objective task by ID.
     Get {
         /// Task ID.
         id: String,
 
-        /// Port of the running instance (default: from config or 18789).
-        #[arg(short, long)]
-        port: Option<u16>,
-
-        /// Host of the running instance.
-        #[arg(long, default_value = "127.0.0.1")]
-        host: String,
+        #[command(flatten)]
+        connection: TaskConnectionArgs,
     },
     /// Cancel a durable objective task.
     Cancel {
@@ -314,13 +310,8 @@ pub enum TaskCommand {
         #[arg(long)]
         reason: Option<String>,
 
-        /// Port of the running instance (default: from config or 18789).
-        #[arg(short, long)]
-        port: Option<u16>,
-
-        /// Host of the running instance.
-        #[arg(long, default_value = "127.0.0.1")]
-        host: String,
+        #[command(flatten)]
+        connection: TaskConnectionArgs,
     },
     /// Retry a durable objective task.
     Retry {
@@ -335,13 +326,8 @@ pub enum TaskCommand {
         #[arg(long)]
         reason: Option<String>,
 
-        /// Port of the running instance (default: from config or 18789).
-        #[arg(short, long)]
-        port: Option<u16>,
-
-        /// Host of the running instance.
-        #[arg(long, default_value = "127.0.0.1")]
-        host: String,
+        #[command(flatten)]
+        connection: TaskConnectionArgs,
     },
 }
 
@@ -547,29 +533,27 @@ pub async fn handle_task(command: TaskCommand) -> Result<(), Box<dyn std::error:
         TaskCommand::Create {
             payload,
             next_run_at_ms,
-            port,
-            host,
-        } => handle_task_create(&host, port, payload, next_run_at_ms).await,
+            connection,
+        } => handle_task_create(&connection.host, connection.port, payload, next_run_at_ms).await,
         TaskCommand::List {
             state,
             limit,
-            port,
-            host,
-        } => handle_task_list(&host, port, state, limit).await,
-        TaskCommand::Get { id, port, host } => handle_task_get(&host, port, &id).await,
+            connection,
+        } => handle_task_list(&connection.host, connection.port, state, limit).await,
+        TaskCommand::Get { id, connection } => {
+            handle_task_get(&connection.host, connection.port, &id).await
+        }
         TaskCommand::Cancel {
             id,
             reason,
-            port,
-            host,
-        } => handle_task_cancel(&host, port, &id, reason).await,
+            connection,
+        } => handle_task_cancel(&connection.host, connection.port, &id, reason).await,
         TaskCommand::Retry {
             id,
             delay_ms,
             reason,
-            port,
-            host,
-        } => handle_task_retry(&host, port, &id, delay_ms, reason).await,
+            connection,
+        } => handle_task_retry(&connection.host, connection.port, &id, delay_ms, reason).await,
     }
 }
 
@@ -4315,13 +4299,12 @@ mod tests {
             Some(Command::Task(TaskCommand::Create {
                 payload,
                 next_run_at_ms,
-                port,
-                host,
+                connection,
             })) => {
                 assert_eq!(payload, r#"{"kind":"systemEvent","text":"hello"}"#);
                 assert_eq!(next_run_at_ms, Some(1234));
-                assert_eq!(port, Some(19123));
-                assert_eq!(host, "localhost");
+                assert_eq!(connection.port, Some(19123));
+                assert_eq!(connection.host, "localhost");
             }
             other => panic!("Expected Task(Create), got {:?}", other),
         }
@@ -4352,8 +4335,10 @@ mod tests {
     fn test_cli_task_get() {
         let cli = Cli::try_parse_from(["cara", "task", "get", "task-123"]).unwrap();
         match cli.command {
-            Some(Command::Task(TaskCommand::Get { id, .. })) => {
+            Some(Command::Task(TaskCommand::Get { id, connection })) => {
                 assert_eq!(id, "task-123");
+                assert_eq!(connection.port, None);
+                assert_eq!(connection.host, "127.0.0.1");
             }
             other => panic!("Expected Task(Get), got {:?}", other),
         }
@@ -4371,9 +4356,15 @@ mod tests {
         ])
         .unwrap();
         match cli.command {
-            Some(Command::Task(TaskCommand::Cancel { id, reason, .. })) => {
+            Some(Command::Task(TaskCommand::Cancel {
+                id,
+                reason,
+                connection,
+            })) => {
                 assert_eq!(id, "task-123");
                 assert_eq!(reason.as_deref(), Some("operator requested"));
+                assert_eq!(connection.port, None);
+                assert_eq!(connection.host, "127.0.0.1");
             }
             other => panic!("Expected Task(Cancel), got {:?}", other),
         }
@@ -4397,11 +4388,13 @@ mod tests {
                 id,
                 delay_ms,
                 reason,
-                ..
+                connection,
             })) => {
                 assert_eq!(id, "task-123");
                 assert_eq!(delay_ms, Some(500));
                 assert_eq!(reason.as_deref(), Some("retry now"));
+                assert_eq!(connection.port, None);
+                assert_eq!(connection.host, "127.0.0.1");
             }
             other => panic!("Expected Task(Retry), got {:?}", other),
         }
