@@ -2,7 +2,7 @@
 # Keep this focused on audited entries in docs/feature-status.yaml.
 
 version: "1.0"
-updated_at: "2026-02-19"
+updated_at: "2026-02-24"
 
 features:
   - feature: "logs.tail"
@@ -468,9 +468,10 @@ features:
       - "src/agent/executor.rs (audit events for prompt guard/classifier)"
       - "src/plugins/runtime.rs (audit events for capability denial)"
       - "src/main.rs (AuditLog::init)"
-      - "src/server/control.rs (ConfigChanged audit event)"
+      - "src/server/control.rs (ConfigChanged + TaskMutated audit events)"
     tests:
       - "src/logging/audit.rs (audit event serialization tests)"
+      - "src/logging/audit.rs::test_event_name_task_mutated"
     notes:
       - "AuditLog is initialized on gateway startup; audit() emits to audit.jsonl"
 
@@ -855,10 +856,42 @@ features:
   - feature: "server.control api"
     status: "verified_done"
     runtime_wiring:
-      - "src/server/control.rs (status/channels/config handlers)"
-      - "src/server/http.rs (control routes)"
+      - "src/server/control.rs (status/channels/config + task create/list/get/patch/cancel/retry/resume handlers)"
+      - "src/server/http.rs (control routes including /control/tasks*)"
+      - "src/tasks/mod.rs (durable queue primitives used by control handlers)"
     tests:
       - "src/server/control.rs::test_gateway_status_response_serialization"
+      - "src/server/http.rs::test_control_tasks_create_list_and_get"
+      - "src/server/http.rs::test_control_tasks_patch_not_found_returns_404"
+      - "src/server/http.rs::test_control_tasks_resume_not_found_returns_404"
+      - "src/server/http.rs::test_control_tasks_patch_updates_payload_and_policy"
+      - "src/server/http.rs::test_control_tasks_cancel_and_retry"
+
+  - feature: "tasks.durable queue + recovery"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/tasks/mod.rs (persisted task lifecycle: queued/running/blocked/retry_wait/done/failed/cancelled)"
+      - "src/tasks/mod.rs::load/load_async (startup load + running->retry_wait recovery)"
+      - "src/tasks/mod.rs::task_worker_loop (claim + execute + transition)"
+      - "src/server/ws/mod.rs::new_persistent (async-safe cron + task startup loading)"
+    tests:
+      - "src/tasks/mod.rs::test_load_recovers_running_to_retry_wait"
+      - "src/tasks/mod.rs::test_task_worker_loop_processes_due_tasks"
+      - "src/tasks/mod.rs::test_task_worker_loop_retry_wait_outcome_branch"
+      - "src/tasks/mod.rs::test_task_worker_loop_blocked_outcome_branch"
+      - "src/tasks/mod.rs::test_task_worker_loop_cancelled_outcome_branch"
+
+  - feature: "tasks.continuation policy budgets"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/tasks/mod.rs::TaskPolicy (maxAttempts/maxTotalRuntimeMs/maxTurns/maxRunTimeoutSeconds)"
+      - "src/server/control.rs::resolve_task_policy(_patch) (API-level policy validation)"
+      - "src/server/startup.rs::RuntimeTaskExecutor (attempt/age/timeout budget enforcement)"
+    tests:
+      - "src/server/http.rs::test_control_tasks_create_rejects_invalid_policy_budget"
+      - "src/server/startup.rs::runtime_task_executor_rejects_attempts_over_policy_budget"
+      - "src/server/startup.rs::runtime_task_executor_rejects_task_age_over_policy_budget"
+      - "src/server/startup.rs::runtime_task_executor_rejects_run_timeout_over_policy_budget"
 
   - feature: "server.graceful shutdown"
     status: "verified_done"
@@ -1418,9 +1451,12 @@ features:
       - "src/main.rs (Command::Verify dispatch)"
       - "src/cli/mod.rs::handle_verify"
       - "src/cli/mod.rs::run_outcome_verifier"
+      - "src/cli/mod.rs::verify_autonomy_outcome"
     tests:
       - "src/cli/mod.rs::test_cli_verify_defaults"
       - "src/cli/mod.rs::test_cli_verify_with_options"
+      - "src/cli/mod.rs::test_cli_verify_autonomy_outcome"
+      - "src/cli/mod.rs::test_verify_outcome_selection_autonomy_resolved"
 
   - feature: "cli.binary naming"
     status: "verified_done"

@@ -20,6 +20,45 @@ cara logs -n 80
 - Channel inbound not working
   - Missing channel token/secret or external platform webhook/intents not configured.
 
+## Task stuck or blocked
+
+If long-running autonomy tasks are not progressing:
+
+```bash
+curl -sS -H "Authorization: Bearer ${CARAPACE_GATEWAY_TOKEN}" \
+  "http://127.0.0.1:18789/control/tasks?state=blocked&limit=20"
+```
+
+Inspect a specific task:
+
+```bash
+curl -sS -H "Authorization: Bearer ${CARAPACE_GATEWAY_TOKEN}" \
+  "http://127.0.0.1:18789/control/tasks/<task_id>"
+```
+
+Common operator actions:
+- Resume blocked task:
+  ```bash
+  curl -sS -X POST -H "Authorization: Bearer ${CARAPACE_GATEWAY_TOKEN}" \
+    -H "content-type: application/json" \
+    -d '{"delayMs":1000,"reason":"operator resume"}' \
+    "http://127.0.0.1:18789/control/tasks/<task_id>/resume"
+  ```
+- Retry failed/cancelled task:
+  ```bash
+  curl -sS -X POST -H "Authorization: Bearer ${CARAPACE_GATEWAY_TOKEN}" \
+    -H "content-type: application/json" \
+    -d '{"delayMs":500,"reason":"operator retry"}' \
+    "http://127.0.0.1:18789/control/tasks/<task_id>/retry"
+  ```
+- Patch payload/policy before retry:
+  ```bash
+  curl -sS -X PATCH -H "Authorization: Bearer ${CARAPACE_GATEWAY_TOKEN}" \
+    -H "content-type: application/json" \
+    -d '{"policy":{"maxRunTimeoutSeconds":45},"reason":"operator patch"}' \
+    "http://127.0.0.1:18789/control/tasks/<task_id>"
+  ```
+
 ## Capture useful logs
 
 Run with debug logging:
