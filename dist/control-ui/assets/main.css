@@ -7,6 +7,7 @@
   --muted: #94a3b8;
   --accent: #22c55e;
   --danger: #ef4444;
+  --warn: #f59e0b;
 }
 
 * {
@@ -59,7 +60,8 @@ body {
 }
 
 h1,
-h2 {
+h2,
+h3 {
   margin: 0 0 0.5rem;
 }
 
@@ -69,26 +71,46 @@ h2 {
   color: var(--muted);
 }
 
-.actions {
+.actions,
+.pairing-actions {
   display: flex;
   gap: 0.5rem;
+  flex-wrap: wrap;
 }
 
 .auth-grid {
   display: grid;
-  grid-template-columns: 1fr auto auto auto;
+  grid-template-columns: 180px minmax(220px, 1fr) auto auto auto;
   gap: 0.5rem;
+  align-items: end;
+}
+
+.inline-field {
+  display: grid;
+  gap: 0.25rem;
+  margin: 0;
+}
+
+.inline-field span {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.inline-field.credential {
+  min-width: 0;
 }
 
 input,
 textarea,
+select,
 button {
   font: inherit;
   color: inherit;
 }
 
 input,
-textarea {
+textarea,
+select {
   width: 100%;
   border: 1px solid var(--border);
   border-radius: 10px;
@@ -118,9 +140,46 @@ button.secondary {
   color: var(--text);
 }
 
+button.danger {
+  background: var(--danger);
+  color: #fff;
+}
+
 button:disabled {
   opacity: 0.55;
   cursor: not-allowed;
+}
+
+.cards {
+  display: grid;
+  gap: 0.6rem;
+}
+
+.card {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0.65rem;
+  background: #0b1220;
+}
+
+.card .title {
+  font-weight: 700;
+}
+
+.card .detail {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.card .detail.error {
+  color: var(--danger);
+}
+
+.card .row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  margin-top: 0.5rem;
 }
 
 .json {
@@ -133,7 +192,16 @@ button:disabled {
   white-space: pre-wrap;
   word-break: break-word;
   font-family: "IBM Plex Mono", monospace;
-  font-size: 0.9rem;
+  font-size: 0.88rem;
+}
+
+details {
+  margin-top: 0.6rem;
+}
+
+summary {
+  cursor: pointer;
+  color: var(--muted);
 }
 
 code {
@@ -141,7 +209,7 @@ code {
 }
 
 .warnings {
-  border-color: #f59e0b;
+  border-color: var(--warn);
 }
 
 .error {
@@ -152,7 +220,7 @@ code {
   color: #4ade80;
 }
 
-@media (max-width: 700px) {
+@media (max-width: 860px) {
   .auth-grid {
     grid-template-columns: 1fr 1fr;
   }

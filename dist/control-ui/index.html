@@ -22,14 +22,33 @@
 
       <section class="panel">
         <h2>Auth</h2>
-        <p>Use your gateway token or password. It is sent as a bearer credential.</p>
+        <p>Use gateway token/password to call Control API and open pairing WebSocket.</p>
+
         <div class="auth-grid">
-          <input id="authInput" type="password" placeholder="Enter token or password" autocomplete="off" />
-          <button id="toggleAuthVisibility" type="button">Show</button>
+          <label class="inline-field" for="authType">
+            <span>Auth type</span>
+            <select id="authType">
+              <option value="token">Token</option>
+              <option value="password">Password</option>
+            </select>
+          </label>
+
+          <label class="inline-field credential" for="authInput">
+            <span>Credential</span>
+            <input id="authInput" type="password" placeholder="Enter credential" autocomplete="off" />
+          </label>
+
+          <button id="toggleAuthVisibility" type="button" class="secondary">Show</button>
           <button id="saveAuth" type="button">Use credential</button>
           <button id="clearAuth" type="button" class="secondary">Clear</button>
         </div>
+
         <p id="authStatus" class="meta">No credential loaded.</p>
+      </section>
+
+      <section class="panel" id="securityContextPanel">
+        <h2>Security Context</h2>
+        <p id="secureContextStatus" class="meta"></p>
       </section>
 
       <section class="panel actions">
@@ -43,18 +62,22 @@
 
       <section class="panel">
         <h2>Channels</h2>
-        <pre id="channelsJson" class="json">{}</pre>
+        <div id="channelsCards" class="cards"></div>
+        <details>
+          <summary>Raw JSON</summary>
+          <pre id="channelsJson" class="json">{}</pre>
+        </details>
       </section>
 
       <section class="panel">
         <h2>Config Snapshot (Redacted)</h2>
-        <p class="meta">Read-only redacted config view with hash for optimistic concurrency.</p>
+        <p class="meta">Read-only redacted config + hash for optimistic concurrency.</p>
         <pre id="configJson" class="json">{}</pre>
       </section>
 
       <section class="panel">
         <h2>Config Update</h2>
-        <p>Apply a single path update through <code>POST /control/config</code>.</p>
+        <p>Apply one path update through <code>POST /control/config</code>.</p>
         <label for="configPath">Path</label>
         <input id="configPath" type="text" placeholder="gateway.controlUi.enabled" />
 
@@ -65,11 +88,35 @@
         <p id="configUpdateStatus" class="meta"></p>
       </section>
 
+      <section class="panel">
+        <h2>Device Pairing (WebSocket)</h2>
+        <p class="meta">Uses client ID <code>carapace-control-ui</code> over <code>/ws</code>.</p>
+
+        <div class="pairing-actions">
+          <button id="wsConnect" type="button">Connect pairing socket</button>
+          <button id="wsDisconnect" type="button" class="secondary" disabled>Disconnect</button>
+          <button id="wsRefreshPairings" type="button" class="secondary" disabled>Refresh pairing lists</button>
+        </div>
+
+        <p id="pairingStatus" class="meta">Pairing socket disconnected.</p>
+
+        <h3>Pending Pairing Requests</h3>
+        <div id="pendingPairings" class="cards"></div>
+
+        <h3>Paired Devices</h3>
+        <div id="pairedDevices" class="cards"></div>
+
+        <details>
+          <summary>Pairing event log</summary>
+          <pre id="pairingEvents" class="json">[]</pre>
+        </details>
+      </section>
+
       <section class="panel warnings" id="transportWarning" hidden>
         <h2>Security Notice</h2>
         <p>
-          This page is not on HTTPS and not localhost. Browser protections and secure-cookie behavior may block
-          some control operations. Use HTTPS or localhost.
+          This page is not on HTTPS and not localhost. Some auth/pairing paths may be blocked unless
+          <code>gateway.controlUi.allowInsecureAuth=true</code>.
         </p>
       </section>
     </main>
