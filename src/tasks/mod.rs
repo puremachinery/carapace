@@ -369,7 +369,8 @@ impl TaskQueue {
 
     /// List tasks newest-first.
     pub fn list(&self) -> Vec<DurableTask> {
-        self.list_filtered(None, None).1
+        let (_, tasks) = self.list_filtered(None, None);
+        tasks
     }
 
     /// List tasks with optional state filtering and limit, newest-first.

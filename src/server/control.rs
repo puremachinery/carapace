@@ -1095,6 +1095,9 @@ fn task_queue_unavailable_response() -> Response {
         .into_response()
 }
 
+// Actor attribution is based on the direct TCP peer. If control is behind a
+// reverse proxy, this will record the proxy IP unless trusted-forwarded-header
+// handling is introduced.
 fn control_actor(remote_addr: Option<SocketAddr>) -> String {
     remote_addr
         .map(|addr| addr.ip().to_string())
