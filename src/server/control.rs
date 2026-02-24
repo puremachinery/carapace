@@ -849,8 +849,8 @@ pub async fn tasks_patch_handler(
     };
 
     let payload = match req.payload {
-        Some(payload) => match serde_json::from_value::<CronPayload>(payload.clone()) {
-            Ok(validated) => match serde_json::to_value(validated) {
+        Some(payload) => {
+            match serde_json::from_value::<CronPayload>(payload).and_then(serde_json::to_value) {
                 Ok(normalized) => Some(normalized),
                 Err(err) => {
                     return (
@@ -859,15 +859,8 @@ pub async fn tasks_patch_handler(
                     )
                         .into_response();
                 }
-            },
-            Err(err) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(ControlError::new(format!("Invalid payload JSON: {err}"))),
-                )
-                    .into_response();
             }
-        },
+        }
         None => None,
     };
 
