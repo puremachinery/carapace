@@ -654,17 +654,11 @@ async fn handle_task_cancel(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let task_id = normalize_task_id(id)?;
     let path = format!("/control/tasks/{task_id}/cancel");
-    let body = match reason {
-        Some(reason) => {
-            let trimmed = reason.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(serde_json::json!({ "reason": trimmed }))
-            }
-        }
-        None => None,
-    };
+    let body = reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|trimmed| serde_json::json!({ "reason": trimmed }));
     let response = send_control_request(
         host,
         resolve_port(port),

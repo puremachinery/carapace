@@ -718,7 +718,11 @@ pub async fn tasks_retry_handler(
         )
             .into_response();
     };
-    if matches!(task.state, TaskState::Running | TaskState::Done) {
+    // Operator retry is intentionally allowed for failed/blocked/cancelled tasks.
+    if matches!(
+        task.state,
+        TaskState::Queued | TaskState::Running | TaskState::Done
+    ) {
         return (
             StatusCode::CONFLICT,
             Json(ControlError::new(
