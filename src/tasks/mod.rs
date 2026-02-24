@@ -1028,7 +1028,7 @@ mod tests {
         let path = dir.path().join("tasks").join("queue.json");
 
         let queue = TaskQueue::new(Some(path.clone()));
-        queue.enqueue(serde_json::json!({"kind":"demo"}), None);
+        let task = queue.enqueue(serde_json::json!({"kind":"demo"}), None);
         let _ = queue.claim_due(now_ms(), 1);
 
         let recovered = Arc::new(TaskQueue::new(Some(path.clone())));
@@ -1036,6 +1036,9 @@ mod tests {
             .load_async()
             .await
             .expect("async load should not panic worker");
+        let loaded = recovered.get(&task.id).expect("task should load");
+        assert_eq!(loaded.state, TaskState::RetryWait);
+        assert!(loaded.next_run_at_ms.is_some());
 
         let persisted: Vec<DurableTask> =
             serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
@@ -1236,10 +1239,11 @@ mod tests {
 
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
+                let notified = executor.notify.notified();
                 if executor.calls.load(Ordering::Relaxed) >= 1 {
                     break;
                 }
-                executor.notify.notified().await;
+                notified.await;
             }
         })
         .await
@@ -1279,10 +1283,11 @@ mod tests {
 
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
+                let notified = executor.notify.notified();
                 if executor.calls.load(Ordering::Relaxed) >= 2 {
                     break;
                 }
-                executor.notify.notified().await;
+                notified.await;
             }
         })
         .await
