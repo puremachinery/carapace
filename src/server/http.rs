@@ -2970,6 +2970,16 @@ mod tests {
             .expect("task id should be present")
             .to_string();
 
+        let cancel_req = Request::builder()
+            .method("POST")
+            .uri(format!("/control/tasks/{task_id}/cancel"))
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::empty())
+            .unwrap();
+        let cancel_response = router.clone().oneshot(cancel_req).await.unwrap();
+        assert_eq!(cancel_response.status(), StatusCode::OK);
+
         let retry_req = Request::builder()
             .method("POST")
             .uri(format!("/control/tasks/{task_id}/retry"))
