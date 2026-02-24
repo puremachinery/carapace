@@ -17,6 +17,9 @@ use tracing::warn;
 use uuid::Uuid;
 
 const MAX_TASKS: usize = 10_000;
+const TASK_QUEUE_FULL_NO_EVICTION_ERROR: &str =
+    "task queue full: no terminal tasks available for eviction";
+const ENQUEUE_WORKER_FAILED_ERROR: &str = "task queue enqueue worker failed";
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -138,6 +141,9 @@ impl TaskQueue {
     }
 
     /// Add a new task in `queued` state.
+    ///
+    /// For Tokio async call sites, prefer [`Self::enqueue_async`] to avoid
+    /// blocking runtime worker threads on fsync.
     pub fn enqueue(&self, payload: Value, next_run_at_ms: Option<u64>) -> DurableTask {
         let now = now_ms();
         let mut task = DurableTask {
@@ -169,9 +175,7 @@ impl TaskQueue {
                     tasks.remove(idx);
                 } else {
                     task.state = TaskState::Failed;
-                    task.last_error = Some(
-                        "task queue full: no terminal tasks available for eviction".to_string(),
-                    );
+                    task.last_error = Some(TASK_QUEUE_FULL_NO_EVICTION_ERROR.to_string());
                     task.updated_at_ms = now;
                     warn!(
                         max_tasks = MAX_TASKS,
@@ -184,6 +188,36 @@ impl TaskQueue {
         }
         self.flush_to_disk();
         task
+    }
+
+    /// Async-safe enqueue wrapper for Tokio call sites.
+    ///
+    /// This offloads sync queue mutation and fsync persistence to a blocking
+    /// thread, so async handlers do not block runtime worker threads.
+    pub async fn enqueue_async(
+        self: &Arc<Self>,
+        payload: Value,
+        next_run_at_ms: Option<u64>,
+    ) -> DurableTask {
+        let queue = Arc::clone(self);
+        let payload_fallback = payload.clone();
+        match tokio::task::spawn_blocking(move || queue.enqueue(payload, next_run_at_ms)).await {
+            Ok(task) => task,
+            Err(err) => {
+                let now = now_ms();
+                warn!(error = %err, "enqueue worker failed");
+                DurableTask {
+                    id: Uuid::new_v4().to_string(),
+                    state: TaskState::Failed,
+                    attempts: 0,
+                    next_run_at_ms,
+                    last_error: Some(ENQUEUE_WORKER_FAILED_ERROR.to_string()),
+                    payload: payload_fallback,
+                    created_at_ms: now,
+                    updated_at_ms: now,
+                }
+            }
+        }
     }
 
     /// Get a task by ID.
@@ -425,8 +459,9 @@ pub async fn task_worker_loop(
                 continue;
             }
         };
-        // TODO: move to bounded concurrent execution once dispatch paths are fully
-        // validated under parallel task processing.
+        // Intentionally sequential for now: each tick claims at most 32 tasks.
+        // Future work may add bounded parallelism once dispatch paths are
+        // validated under concurrent execution.
         for task in due {
             let outcome = executor.execute(task.clone()).await;
             let task_id = task.id.clone();
@@ -653,11 +688,22 @@ mod tests {
         let dropped = queue.enqueue(serde_json::json!({"kind":"new"}), None);
         assert_eq!(queue.stats().total, MAX_TASKS);
         assert_eq!(dropped.state, TaskState::Failed);
-        assert!(dropped
-            .last_error
-            .as_deref()
-            .is_some_and(|msg| msg.contains("task queue full")));
+        assert_eq!(
+            dropped.last_error.as_deref(),
+            Some(TASK_QUEUE_FULL_NO_EVICTION_ERROR)
+        );
         assert!(queue.get(&dropped.id).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_async_queues_without_blocking_callsite() {
+        let queue = Arc::new(TaskQueue::in_memory());
+        let task = queue
+            .enqueue_async(serde_json::json!({"kind":"demo-async"}), None)
+            .await;
+        assert_eq!(task.state, TaskState::Queued);
+        let persisted = queue.get(&task.id).expect("task should be queued");
+        assert_eq!(persisted.payload, serde_json::json!({"kind":"demo-async"}));
     }
 
     struct DoneExecutor {
