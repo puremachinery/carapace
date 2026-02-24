@@ -376,7 +376,8 @@ impl TaskQueue {
             |task| {
                 matches!(
                     task.state,
-                    TaskState::Failed
+                    TaskState::Running
+                        | TaskState::Failed
                         | TaskState::Blocked
                         | TaskState::RetryWait
                         | TaskState::Cancelled
