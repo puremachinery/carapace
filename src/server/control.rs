@@ -254,6 +254,19 @@ const MAX_TASK_TOTAL_RUNTIME_MS_LIMIT: u64 = 30 * 24 * 60 * 60 * 1000;
 const MAX_TASK_TURNS_LIMIT: u32 = 1_000;
 const MAX_TASK_RUN_TIMEOUT_SECONDS_LIMIT: u32 = 24 * 60 * 60;
 
+fn resolve_policy_bound<T>(value: T, max: T, field: &str) -> Result<T, String>
+where
+    T: Copy + PartialOrd + From<u8> + std::fmt::Display,
+{
+    if value < T::from(1) || value > max {
+        Err(format!(
+            "invalid policy.{field}: must be between 1 and {max}"
+        ))
+    } else {
+        Ok(value)
+    }
+}
+
 fn resolve_task_policy(input: Option<TaskPolicyRequest>) -> Result<TaskPolicy, String> {
     let mut policy = TaskPolicy::default();
     let Some(input) = input else {
@@ -261,41 +274,28 @@ fn resolve_task_policy(input: Option<TaskPolicyRequest>) -> Result<TaskPolicy, S
     };
 
     if let Some(max_attempts) = input.max_attempts {
-        if max_attempts == 0 || max_attempts > MAX_TASK_ATTEMPTS_LIMIT {
-            return Err(format!(
-                "invalid policy.maxAttempts: must be between 1 and {MAX_TASK_ATTEMPTS_LIMIT}"
-            ));
-        }
-        policy.max_attempts = max_attempts;
+        policy.max_attempts =
+            resolve_policy_bound(max_attempts, MAX_TASK_ATTEMPTS_LIMIT, "maxAttempts")?;
     }
 
     if let Some(max_total_runtime_ms) = input.max_total_runtime_ms {
-        if max_total_runtime_ms == 0 || max_total_runtime_ms > MAX_TASK_TOTAL_RUNTIME_MS_LIMIT {
-            return Err(format!(
-                "invalid policy.maxTotalRuntimeMs: must be between 1 and {MAX_TASK_TOTAL_RUNTIME_MS_LIMIT}"
-            ));
-        }
-        policy.max_total_runtime_ms = max_total_runtime_ms;
+        policy.max_total_runtime_ms = resolve_policy_bound(
+            max_total_runtime_ms,
+            MAX_TASK_TOTAL_RUNTIME_MS_LIMIT,
+            "maxTotalRuntimeMs",
+        )?;
     }
 
     if let Some(max_turns) = input.max_turns {
-        if max_turns == 0 || max_turns > MAX_TASK_TURNS_LIMIT {
-            return Err(format!(
-                "invalid policy.maxTurns: must be between 1 and {MAX_TASK_TURNS_LIMIT}"
-            ));
-        }
-        policy.max_turns = max_turns;
+        policy.max_turns = resolve_policy_bound(max_turns, MAX_TASK_TURNS_LIMIT, "maxTurns")?;
     }
 
     if let Some(max_run_timeout_seconds) = input.max_run_timeout_seconds {
-        if max_run_timeout_seconds == 0
-            || max_run_timeout_seconds > MAX_TASK_RUN_TIMEOUT_SECONDS_LIMIT
-        {
-            return Err(format!(
-                "invalid policy.maxRunTimeoutSeconds: must be between 1 and {MAX_TASK_RUN_TIMEOUT_SECONDS_LIMIT}"
-            ));
-        }
-        policy.max_run_timeout_seconds = max_run_timeout_seconds;
+        policy.max_run_timeout_seconds = resolve_policy_bound(
+            max_run_timeout_seconds,
+            MAX_TASK_RUN_TIMEOUT_SECONDS_LIMIT,
+            "maxRunTimeoutSeconds",
+        )?;
     }
 
     Ok(policy)
