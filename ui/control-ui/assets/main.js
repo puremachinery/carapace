@@ -1,7 +1,10 @@
 (() => {
-  const basePath = normalizeBasePath(window.__CARAPACE_CONTROL_UI_BASE_PATH__ || "/ui");
-  const assistantName = (window.__CARAPACE_ASSISTANT_NAME__ || "Carapace").trim() || "Carapace";
-  const assistantAvatar = (window.__CARAPACE_ASSISTANT_AVATAR__ || "").trim();
+  const runtimeConfig = loadRuntimeConfig();
+  const basePath = normalizeBasePath(runtimeConfig.basePath || "/ui");
+  const assistantName = (runtimeConfig.assistantName || "Carapace").trim() || "Carapace";
+  const assistantAvatar = (runtimeConfig.assistantAvatar || "").trim();
+  const csrfCookieName = runtimeConfig.csrfCookieName;
+  const csrfHeaderName = runtimeConfig.csrfHeaderName;
 
   const ui = {
     authType: document.getElementById("authType"),
@@ -928,19 +931,9 @@
       headers.Authorization = `Bearer ${credential}`;
     }
 
-    const csrfHeader = window.__CARAPACE_CSRF_HEADER__;
-    if (typeof csrfHeader === "string" && csrfHeader.trim()) {
-      let csrfToken = typeof window.__CARAPACE_CSRF_TOKEN__ === "string" ? window.__CARAPACE_CSRF_TOKEN__ : "";
-      if (!csrfToken) {
-        const csrfCookieName =
-          typeof window.__CARAPACE_CSRF_COOKIE__ === "string" ? window.__CARAPACE_CSRF_COOKIE__ : "";
-        if (csrfCookieName) {
-          csrfToken = readCookie(csrfCookieName);
-          if (csrfToken) {
-            window.__CARAPACE_CSRF_TOKEN__ = csrfToken;
-          }
-        }
-      }
+    const csrfHeader = csrfHeaderName;
+    if (csrfHeader) {
+      const csrfToken = csrfCookieName ? readCookie(csrfCookieName) : "";
       if (csrfToken) {
         headers[csrfHeader] = csrfToken;
       }
@@ -1225,6 +1218,31 @@
       return "/ui";
     }
     return trimmed.endsWith("/") ? trimmed.slice(0, -1) : trimmed;
+  }
+
+  function loadRuntimeConfig() {
+    const basePath = readBootstrapMeta("carapace-control-ui-base-path", "__CARAPACE_CONTROL_UI_BASE_PATH__");
+    const assistantName = readBootstrapMeta("carapace-assistant-name", "__CARAPACE_ASSISTANT_NAME__");
+    const assistantAvatar = readBootstrapMeta("carapace-assistant-avatar", "__CARAPACE_ASSISTANT_AVATAR__");
+    const csrfCookieName = readBootstrapMeta("carapace-csrf-cookie", "__CARAPACE_CSRF_COOKIE__");
+    const csrfHeaderName = readBootstrapMeta("carapace-csrf-header", "__CARAPACE_CSRF_HEADER__");
+
+    return {
+      basePath,
+      assistantName,
+      assistantAvatar,
+      csrfCookieName,
+      csrfHeaderName,
+    };
+  }
+
+  function readBootstrapMeta(name, placeholder) {
+    const content = document.querySelector(`meta[name="${name}"]`)?.getAttribute("content") || "";
+    const trimmed = content.trim();
+    if (!trimmed || trimmed === placeholder) {
+      return "";
+    }
+    return trimmed;
   }
 
   function readCookie(name) {
