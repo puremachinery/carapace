@@ -2113,11 +2113,12 @@ fn csrf_ui_config_script(config: &CsrfConfig) -> String {
 }
 
 fn csrf_bootstrap_script(config: &CsrfConfig) -> String {
-    let cookie_name = csrf_cookie_name(config);
+    let cookie_name = json_string_literal(csrf_cookie_name(config));
+    let header_name = json_string_literal(&config.header_name);
     format!(
-        r#"<script>(function(){{var cookieName='{cookie}';var headerName='{header}';function readCookie(name){{var parts=document.cookie?document.cookie.split(';'):[];for(var i=0;i<parts.length;i++){{var part=parts[i].trim();if(part.indexOf(name+'=')===0){{return part.substring(name.length+1);}}}}return '';}}function getToken(){{var token=readCookie(cookieName);window.__CARAPACE_CSRF_TOKEN__=token;return token;}}window.__CARAPACE_CSRF_COOKIE__=cookieName;window.__CARAPACE_CSRF_HEADER__=headerName;window.__CARAPACE_CSRF_TOKEN__=getToken();function addHeader(headers,token){{if(!token){{return headers;}}var lower=headerName.toLowerCase();if(headers instanceof Headers){{if(!headers.has(headerName)){{headers.set(headerName,token);}}return headers;}}if(Array.isArray(headers)){{for(var i=0;i<headers.length;i++){{if(String(headers[i][0]).toLowerCase()===lower){{return headers;}}}}headers.push([headerName,token]);return headers;}}headers=headers||{{}};for(var key in headers){{if(Object.prototype.hasOwnProperty.call(headers,key)&&String(key).toLowerCase()===lower){{return headers;}}}}headers[headerName]=token;return headers;}}if(window.fetch){{var origFetch=window.fetch.bind(window);window.fetch=function(input,init){{var token=getToken();if(token){{init=init||{{}};if(input instanceof Request){{var baseHeaders=new Headers(input.headers);init.headers=addHeader(baseHeaders,token);var req=new Request(input,init);return origFetch(req);}}init.headers=addHeader(init.headers,token);}}return origFetch(input,init);}};}}if(window.XMLHttpRequest){{var origOpen=XMLHttpRequest.prototype.open;var origSend=XMLHttpRequest.prototype.send;XMLHttpRequest.prototype.open=function(){{this.__csrfToken=getToken();return origOpen.apply(this,arguments);}};XMLHttpRequest.prototype.send=function(){{if(this.__csrfToken){{try{{this.setRequestHeader(headerName,this.__csrfToken);}}catch(e){{}}}}return origSend.apply(this,arguments);}};}}}})();</script>"#,
+        r#"<script>(function(){{var cookieName={cookie};var headerName={header};function readCookie(name){{var parts=document.cookie?document.cookie.split(';'):[];for(var i=0;i<parts.length;i++){{var part=parts[i].trim();if(part.indexOf(name+'=')===0){{return part.substring(name.length+1);}}}}return '';}}function getToken(){{var token=readCookie(cookieName);window.__CARAPACE_CSRF_TOKEN__=token;return token;}}window.__CARAPACE_CSRF_TOKEN__=getToken();function addHeader(headers,token){{if(!token){{return headers;}}var lower=headerName.toLowerCase();if(headers instanceof Headers){{if(!headers.has(headerName)){{headers.set(headerName,token);}}return headers;}}if(Array.isArray(headers)){{for(var i=0;i<headers.length;i++){{if(String(headers[i][0]).toLowerCase()===lower){{return headers;}}}}headers.push([headerName,token]);return headers;}}headers=headers||{{}};for(var key in headers){{if(Object.prototype.hasOwnProperty.call(headers,key)&&String(key).toLowerCase()===lower){{return headers;}}}}headers[headerName]=token;return headers;}}if(window.fetch){{var origFetch=window.fetch.bind(window);window.fetch=function(input,init){{var token=getToken();if(token){{init=init||{{}};if(input instanceof Request){{var baseHeaders=new Headers(input.headers);init.headers=addHeader(baseHeaders,token);var req=new Request(input,init);return origFetch(req);}}init.headers=addHeader(init.headers,token);}}return origFetch(input,init);}};}}if(window.XMLHttpRequest){{var origOpen=XMLHttpRequest.prototype.open;var origSend=XMLHttpRequest.prototype.send;XMLHttpRequest.prototype.open=function(){{this.__csrfToken=getToken();return origOpen.apply(this,arguments);}};XMLHttpRequest.prototype.send=function(){{if(this.__csrfToken){{try{{this.setRequestHeader(headerName,this.__csrfToken);}}catch(e){{}}}}return origSend.apply(this,arguments);}};}}}})();</script>"#,
         cookie = cookie_name,
-        header = config.header_name
+        header = header_name
     )
 }
 
@@ -2785,6 +2786,23 @@ mod tests {
 
     #[tokio::test]
     async fn test_control_config_read_returns_snapshot() {
+        let (temp, _guard) = set_temp_config_path();
+        std::fs::write(
+            temp.path().join("carapace-test-config.json5"),
+            r#"{
+  "gateway": {
+    "controlUi": { "enabled": true }
+  },
+  "anthropic": {
+    "apiKey": "test-secret-anthropic-key"
+  },
+  "bedrock": {
+    "accessKeyId": "AKIA_TEST_ACCESS_KEY"
+  }
+}"#,
+        )
+        .unwrap();
+
         let router = test_router(test_config());
         let req = Request::builder()
             .method("GET")
@@ -2800,6 +2818,8 @@ mod tests {
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["ok"], true);
         assert!(json["config"].is_object());
+        assert_eq!(json["config"]["anthropic"]["apiKey"], "[REDACTED]");
+        assert_eq!(json["config"]["bedrock"]["accessKeyId"], "[REDACTED]");
     }
 
     #[tokio::test]

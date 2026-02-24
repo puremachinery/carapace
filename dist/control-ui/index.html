@@ -103,7 +103,10 @@
 
       <section class="panel">
         <h2>Advanced Config Patch</h2>
-        <p>Apply one explicit path update through <code>PATCH /control/config</code>.</p>
+        <p>
+          Apply one explicit <code>gateway.controlUi.*</code> path update through
+          <code>PATCH /control/config</code> (other paths are rejected by the server).
+        </p>
         <label for="configPath">Path</label>
         <input id="configPath" type="text" placeholder="gateway.controlUi.enabled" />
 

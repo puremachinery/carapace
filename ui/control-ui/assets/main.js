@@ -372,35 +372,68 @@
     }
   }
 
+  function clearNode(target) {
+    while (target.firstChild) {
+      target.removeChild(target.firstChild);
+    }
+  }
+
+  function appendDetailLine(card, text, extraClass) {
+    const detail = document.createElement("div");
+    detail.className = extraClass ? `detail ${extraClass}` : "detail";
+    detail.textContent = text;
+    card.appendChild(detail);
+  }
+
+  function appendMessageCard(target, message) {
+    clearNode(target);
+    const card = document.createElement("div");
+    card.className = "card";
+    appendDetailLine(card, message);
+    target.appendChild(card);
+  }
+
   function renderTaskCards() {
     if (!state.tasks.length) {
-      ui.tasksCards.innerHTML = "<div class=\"card\"><div class=\"detail\">No tasks found.</div></div>";
+      appendMessageCard(ui.tasksCards, "No tasks found.");
       return;
     }
 
-    ui.tasksCards.innerHTML = state.tasks
-      .map((task) => {
-        const id = escapeHtml(String(task.id || "unknown"));
-        const selected = state.selectedTaskId && String(task.id) === state.selectedTaskId ? " selected" : "";
-        const taskState = escapeHtml(String(task.state || "unknown"));
-        const attempts = Number(task.attempts || 0);
-        const maxAttempts = Number(dig(task, ["policy", "maxAttempts"]) || 0);
-        const nextRun = formatEpochMillis(task.nextRunAtMs);
-        const updatedAt = formatEpochMillis(task.updatedAtMs);
-        return `
-          <article class="card${selected}">
-            <div class="title">${id}</div>
-            <div class="detail">state: ${taskState}</div>
-            <div class="detail">attempts: ${attempts}${maxAttempts ? ` / ${maxAttempts}` : ""}</div>
-            <div class="detail">next run: ${nextRun}</div>
-            <div class="detail">updated: ${updatedAt}</div>
-            <div class="row">
-              <button class="secondary" data-task-id="${id}">Select</button>
-            </div>
-          </article>
-        `;
-      })
-      .join("");
+    clearNode(ui.tasksCards);
+
+    for (const task of state.tasks) {
+      const id = String(task && task.id ? task.id : "unknown");
+      const selected = state.selectedTaskId && String(task.id) === state.selectedTaskId;
+      const taskState = String(task && task.state ? task.state : "unknown");
+      const attempts = Number(task && task.attempts ? task.attempts : 0);
+      const maxAttempts = Number(dig(task, ["policy", "maxAttempts"]) || 0);
+      const nextRun = formatEpochMillis(task && task.nextRunAtMs);
+      const updatedAt = formatEpochMillis(task && task.updatedAtMs);
+
+      const card = document.createElement("article");
+      card.className = selected ? "card selected" : "card";
+
+      const title = document.createElement("div");
+      title.className = "title";
+      title.textContent = id;
+      card.appendChild(title);
+
+      appendDetailLine(card, `state: ${taskState}`);
+      appendDetailLine(card, `attempts: ${attempts}${maxAttempts ? ` / ${maxAttempts}` : ""}`);
+      appendDetailLine(card, `next run: ${nextRun}`);
+      appendDetailLine(card, `updated: ${updatedAt}`);
+
+      const row = document.createElement("div");
+      row.className = "row";
+      const selectButton = document.createElement("button");
+      selectButton.className = "secondary";
+      selectButton.dataset.taskId = id;
+      selectButton.textContent = "Select";
+      row.appendChild(selectButton);
+      card.appendChild(row);
+
+      ui.tasksCards.appendChild(card);
+    }
   }
 
   async function selectTask(taskId) {
@@ -952,28 +985,33 @@
       : [];
 
     if (!channels.length) {
-      ui.channelsCards.innerHTML = "<div class=\"card\"><div class=\"detail\">No channels configured.</div></div>";
+      appendMessageCard(ui.channelsCards, "No channels configured.");
       return;
     }
 
-    const cards = channels
-      .map((channel) => {
-        const name = escapeHtml(String(channel.name || channel.id || "unknown"));
-        const status = escapeHtml(String(channel.status || "unknown"));
-        const connectedAt = channel.lastConnectedAt ? escapeHtml(String(channel.lastConnectedAt)) : "-";
-        const error = channel.lastError ? `<div class=\"detail error\">${escapeHtml(String(channel.lastError))}</div>` : "";
-        return `
-          <article class="card">
-            <div class="title">${name}</div>
-            <div class="detail">status: ${status}</div>
-            <div class="detail">last connected: ${connectedAt}</div>
-            ${error}
-          </article>
-        `;
-      })
-      .join("");
+    clearNode(ui.channelsCards);
+    for (const channel of channels) {
+      const name = String(channel && (channel.name || channel.id) ? channel.name || channel.id : "unknown");
+      const status = String(channel && channel.status ? channel.status : "unknown");
+      const connectedAt = channel && channel.lastConnectedAt ? String(channel.lastConnectedAt) : "-";
+      const error = channel && channel.lastError ? String(channel.lastError) : "";
 
-    ui.channelsCards.innerHTML = cards;
+      const card = document.createElement("article");
+      card.className = "card";
+
+      const title = document.createElement("div");
+      title.className = "title";
+      title.textContent = name;
+      card.appendChild(title);
+
+      appendDetailLine(card, `status: ${status}`);
+      appendDetailLine(card, `last connected: ${connectedAt}`);
+      if (error) {
+        appendDetailLine(card, error, "error");
+      }
+
+      ui.channelsCards.appendChild(card);
+    }
   }
 
   function renderPairingLists(payload) {
@@ -981,51 +1019,72 @@
     const paired = Array.isArray(payload && payload.paired) ? payload.paired : [];
 
     if (!pending.length) {
-      ui.pendingPairings.innerHTML = "<div class=\"card\"><div class=\"detail\">No pending pairing requests.</div></div>";
+      appendMessageCard(ui.pendingPairings, "No pending pairing requests.");
     } else {
-      ui.pendingPairings.innerHTML = pending
-        .map((item) => {
-          const requestId = escapeHtml(String(item.requestId || ""));
-          const deviceId = escapeHtml(String(item.deviceId || "unknown"));
-          const displayName = escapeHtml(String(item.displayName || "(no display name)"));
-          const remoteIp = escapeHtml(String(item.remoteIp || "local"));
-          return `
-            <article class="card">
-              <div class="title">${displayName}</div>
-              <div class="detail">requestId: ${requestId}</div>
-              <div class="detail">deviceId: ${deviceId}</div>
-              <div class="detail">remoteIp: ${remoteIp}</div>
-              <div class="row">
-                <button data-action="approve" data-request-id="${requestId}">Approve</button>
-                <button class="danger" data-action="reject" data-request-id="${requestId}">Reject</button>
-              </div>
-            </article>
-          `;
-        })
-        .join("");
+      clearNode(ui.pendingPairings);
+      for (const item of pending) {
+        const requestId = String(item && item.requestId ? item.requestId : "");
+        const deviceId = String(item && item.deviceId ? item.deviceId : "unknown");
+        const displayName = String(item && item.displayName ? item.displayName : "(no display name)");
+        const remoteIp = String(item && item.remoteIp ? item.remoteIp : "local");
+
+        const card = document.createElement("article");
+        card.className = "card";
+
+        const title = document.createElement("div");
+        title.className = "title";
+        title.textContent = displayName;
+        card.appendChild(title);
+
+        appendDetailLine(card, `requestId: ${requestId}`);
+        appendDetailLine(card, `deviceId: ${deviceId}`);
+        appendDetailLine(card, `remoteIp: ${remoteIp}`);
+
+        const row = document.createElement("div");
+        row.className = "row";
+        const approve = document.createElement("button");
+        approve.dataset.action = "approve";
+        approve.dataset.requestId = requestId;
+        approve.textContent = "Approve";
+        const reject = document.createElement("button");
+        reject.className = "danger";
+        reject.dataset.action = "reject";
+        reject.dataset.requestId = requestId;
+        reject.textContent = "Reject";
+        row.appendChild(approve);
+        row.appendChild(reject);
+        card.appendChild(row);
+
+        ui.pendingPairings.appendChild(card);
+      }
     }
 
     if (!paired.length) {
-      ui.pairedDevices.innerHTML = "<div class=\"card\"><div class=\"detail\">No paired devices.</div></div>";
+      appendMessageCard(ui.pairedDevices, "No paired devices.");
       return;
     }
 
-    ui.pairedDevices.innerHTML = paired
-      .map((item) => {
-        const deviceId = escapeHtml(String(item.deviceId || "unknown"));
-        const displayName = escapeHtml(String(item.displayName || "(no display name)"));
-        const platform = escapeHtml(String(item.platform || "unknown"));
-        const lastSeen = item.lastSeenAtMs ? escapeHtml(new Date(Number(item.lastSeenAtMs)).toISOString()) : "-";
-        return `
-          <article class="card">
-            <div class="title">${displayName}</div>
-            <div class="detail">deviceId: ${deviceId}</div>
-            <div class="detail">platform: ${platform}</div>
-            <div class="detail">lastSeen: ${lastSeen}</div>
-          </article>
-        `;
-      })
-      .join("");
+    clearNode(ui.pairedDevices);
+    for (const item of paired) {
+      const deviceId = String(item && item.deviceId ? item.deviceId : "unknown");
+      const displayName = String(item && item.displayName ? item.displayName : "(no display name)");
+      const platform = String(item && item.platform ? item.platform : "unknown");
+      const lastSeen = item && item.lastSeenAtMs ? new Date(Number(item.lastSeenAtMs)).toISOString() : "-";
+
+      const card = document.createElement("article");
+      card.className = "card";
+
+      const title = document.createElement("div");
+      title.className = "title";
+      title.textContent = displayName;
+      card.appendChild(title);
+
+      appendDetailLine(card, `deviceId: ${deviceId}`);
+      appendDetailLine(card, `platform: ${platform}`);
+      appendDetailLine(card, `lastSeen: ${lastSeen}`);
+
+      ui.pairedDevices.appendChild(card);
+    }
   }
 
   function appendPairingEvent(entry) {
@@ -1063,7 +1122,7 @@
     state.tasks = [];
     state.selectedTaskId = null;
     state.selectedTask = null;
-    ui.tasksCards.innerHTML = "<div class=\"card\"><div class=\"detail\">No tasks loaded.</div></div>";
+    appendMessageCard(ui.tasksCards, "No tasks loaded.");
     renderJson(ui.taskDetailJson, {});
     updateTaskActionButtons();
   }
@@ -1251,15 +1310,6 @@
       out.push(trimmed);
     }
     return out;
-  }
-
-  function escapeHtml(value) {
-    return value
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/\"/g, "&quot;")
-      .replace(/'/g, "&#39;");
   }
 
   function noop() {

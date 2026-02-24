@@ -666,13 +666,16 @@ async fn config_update_handler(
     // Re-read to get the new hash
     let new_snapshot = read_config_snapshot();
 
+    let mut redacted_config = new_snapshot.config;
+    crate::logging::redact::redact_json_value(&mut redacted_config);
+
     let response = ConfigUpdateResponse {
         ok: true,
         error: None,
         applied: Some(json!({
             "path": path,
             "value": req.value,
-            "config": new_snapshot.config,
+            "config": redacted_config,
         })),
         hash: new_snapshot.hash,
     };
