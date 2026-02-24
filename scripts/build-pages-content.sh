@@ -46,19 +46,30 @@ rewrite_links() {
 
   body="$(printf '%s' "$body" | sed -E \
     -e 's|href="\.\./CONTRIBUTING\.md"|href="https://github.com/puremachinery/carapace/blob/main/CONTRIBUTING.md"|g' \
+    -e 's|href="\.\./release\.md"|href="release.html"|g' \
+    -e 's|href="\.\./cli\.md"|href="cli.html"|g' \
+    -e 's|href="\.\./feature-status\.yaml"|href="feature-status.yaml"|g' \
+    -e 's|href="\.\./feature-evidence\.yaml"|href="feature-evidence.yaml"|g' \
+    -e 's|href="\.\./security\.md"|href="security-model.html"|g' \
+    -e 's|href="\.\./security-comparison\.md"|href="security-comparison.html"|g' \
+    -e 's|href="\.\./\.\./SECURITY\.md"|href="security-policy.html"|g' \
+    -e 's|href="\.\./SECURITY\.md"|href="security-policy.html"|g' \
+    -e 's|href="docs/security\.md"|href="security-model.html"|g' \
+    -e 's|href="protocol/([^":#]+)\.md"|href="https://github.com/puremachinery/carapace/blob/main/docs/protocol/\1.md"|g' \
     -e 's|href="cookbook/README\.md"|href="cookbook/"|g' \
-    -e 's|href="cookbook/([^":#]+)\.md"|href="cookbook/\1.html"|g' \
+    -e 's|href="cookbook/([^":#]+)\.md(#[-A-Za-z0-9._/]*)?"|href="cookbook/\1.html\2"|g' \
     -e 's|href="\.\./cookbook/README\.md"|href="cookbook/"|g' \
-    -e 's|href="\.\./cookbook/([^":#]+)\.md"|href="cookbook/\1.html"|g' \
-    -e 's|href="site/([^":#]+)\.md"|href="\1.html"|g')"
+    -e 's|href="\.\./cookbook/([^":#]+)\.md(#[-A-Za-z0-9._/]*)?"|href="cookbook/\1.html\2"|g' \
+    -e 's|href="site/([^":#]+)\.md(#[-A-Za-z0-9._/]*)?"|href="\1.html\2"|g' \
+    -e 's|href="\.\./site/([^":#]+)\.md(#[-A-Za-z0-9._/]*)?"|href="../\1.html\2"|g')"
 
   if [[ "$kind" == "cookbook" ]]; then
     body="$(printf '%s' "$body" | sed -E \
       -e 's|href="README\.md"|href="./"|g' \
-      -e 's|href="([A-Za-z0-9._/-]+)\.md"|href="\1.html"|g')"
+      -e 's|href="([A-Za-z0-9._/-]+)\.md(#[-A-Za-z0-9._/]*)?"|href="\1.html\2"|g')"
   elif [[ "$kind" == "docs" ]]; then
     body="$(printf '%s' "$body" | sed -E \
-      -e 's|href="([A-Za-z0-9._/-]+)\.md"|href="\1.html"|g')"
+      -e 's|href="([A-Za-z0-9._/-]+)\.md(#[-A-Za-z0-9._/]*)?"|href="\1.html\2"|g')"
   fi
 
   printf '%s' "$body"
@@ -237,6 +248,93 @@ render_site_doc_page "get-unstuck" "Get Unstuck" \
   "Troubleshooting checks, logs, and issue-reporting paths for Carapace." \
   "./getting-started.html" \
   "Getting Started"
+
+render_markdown_page \
+  "${repo_root}/docs/cli.md" \
+  "${out_dir}/cli.html" \
+  "Carapace | CLI Guide" \
+  "Command reference and operational CLI behavior for Carapace." \
+  "docs" \
+  "0" \
+  "." \
+  "./ops.html" \
+  "Ops" \
+  "CLI Guide"
+
+render_markdown_page \
+  "${repo_root}/docs/release.md" \
+  "${out_dir}/release.html" \
+  "Carapace | Release & Upgrade Policy" \
+  "Release, migration, rollback, and operator upgrade policy for Carapace." \
+  "docs" \
+  "0" \
+  "." \
+  "./ops.html" \
+  "Ops" \
+  "Release & Upgrade Policy"
+
+render_markdown_page \
+  "${repo_root}/docs/channels.md" \
+  "${out_dir}/channels.html" \
+  "Carapace | Channel Setup" \
+  "Channel setup and operational caveats by provider." \
+  "docs" \
+  "0" \
+  "." \
+  "./getting-started.html" \
+  "Getting Started" \
+  "Channel Setup"
+
+render_markdown_page \
+  "${repo_root}/docs/channel-smoke.md" \
+  "${out_dir}/channel-smoke.html" \
+  "Carapace | Channel Smoke Testing" \
+  "Channel smoke-test criteria, process, and reporting template." \
+  "docs" \
+  "0" \
+  "." \
+  "./channels.html" \
+  "Channel Setup" \
+  "Channel Smoke Testing"
+
+render_markdown_page \
+  "${repo_root}/docs/security.md" \
+  "${out_dir}/security-model.html" \
+  "Carapace | Security Model" \
+  "Threat model, trust boundaries, and security architecture details." \
+  "docs" \
+  "0" \
+  "." \
+  "./security.html" \
+  "Security" \
+  "Security Model"
+
+render_markdown_page \
+  "${repo_root}/docs/security-comparison.md" \
+  "${out_dir}/security-comparison.html" \
+  "Carapace | Security Comparison" \
+  "Threat-by-threat security comparison and implementation notes." \
+  "docs" \
+  "0" \
+  "." \
+  "./security.html" \
+  "Security" \
+  "Security Comparison"
+
+render_markdown_page \
+  "${repo_root}/SECURITY.md" \
+  "${out_dir}/security-policy.html" \
+  "Carapace | Security Policy" \
+  "Private vulnerability reporting process and security response policy." \
+  "docs" \
+  "0" \
+  "." \
+  "./security.html" \
+  "Security" \
+  "Security Policy"
+
+cp "${repo_root}/docs/feature-status.yaml" "${out_dir}/feature-status.yaml"
+cp "${repo_root}/docs/feature-evidence.yaml" "${out_dir}/feature-evidence.yaml"
 
 render_markdown_page \
   "${cookbook_dir}/README.md" \

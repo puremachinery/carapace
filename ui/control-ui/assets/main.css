@@ -1,0 +1,159 @@
+:root {
+  color-scheme: dark;
+  --bg: #0f172a;
+  --panel: #111827;
+  --border: #334155;
+  --text: #e2e8f0;
+  --muted: #94a3b8;
+  --accent: #22c55e;
+  --danger: #ef4444;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: "Space Grotesk", "IBM Plex Sans", sans-serif;
+  background: radial-gradient(circle at 10% -10%, #1e293b 0%, var(--bg) 45%);
+  color: var(--text);
+}
+
+.layout {
+  max-width: 980px;
+  margin: 0 auto;
+  padding: 1rem;
+  display: grid;
+  gap: 1rem;
+}
+
+.panel {
+  border: 1px solid var(--border);
+  background: rgba(17, 24, 39, 0.9);
+  border-radius: 14px;
+  padding: 1rem;
+}
+
+.header {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.brand-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.avatar {
+  width: 44px;
+  height: 44px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  object-fit: cover;
+}
+
+.hidden {
+  display: none;
+}
+
+h1,
+h2 {
+  margin: 0 0 0.5rem;
+}
+
+.subtitle,
+.meta {
+  margin: 0;
+  color: var(--muted);
+}
+
+.actions {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.auth-grid {
+  display: grid;
+  grid-template-columns: 1fr auto auto auto;
+  gap: 0.5rem;
+}
+
+input,
+textarea,
+button {
+  font: inherit;
+  color: inherit;
+}
+
+input,
+textarea {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #0b1220;
+  padding: 0.55rem 0.7rem;
+}
+
+label {
+  display: block;
+  margin: 0.6rem 0 0.3rem;
+  color: var(--muted);
+}
+
+button {
+  border: 1px solid transparent;
+  border-radius: 10px;
+  background: var(--accent);
+  color: #052e16;
+  font-weight: 700;
+  padding: 0.55rem 0.75rem;
+  cursor: pointer;
+}
+
+button.secondary {
+  background: transparent;
+  border-color: var(--border);
+  color: var(--text);
+}
+
+button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.json {
+  margin: 0;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #020617;
+  padding: 0.75rem;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.9rem;
+}
+
+code {
+  font-family: "IBM Plex Mono", monospace;
+}
+
+.warnings {
+  border-color: #f59e0b;
+}
+
+.error {
+  color: var(--danger);
+}
+
+.success {
+  color: #4ade80;
+}
+
+@media (max-width: 700px) {
+  .auth-grid {
+    grid-template-columns: 1fr 1fr;
+  }
+}

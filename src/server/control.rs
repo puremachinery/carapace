@@ -3,6 +3,7 @@
 //! Implements:
 //! - GET /control/status - Gateway status
 //! - GET /control/channels - Channel status
+//! - GET /control/config - Redacted config snapshot + optimistic concurrency hash
 //! - POST /control/config - Config updates
 //! - POST /control/tasks - Create objective task
 //! - GET /control/tasks - List objective tasks
@@ -193,6 +194,19 @@ pub struct ConfigUpdateResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub applied: Option<Value>,
     /// SHA256 hash of the persisted config (for subsequent optimistic concurrency)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
+}
+
+/// Config read response.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigReadResponse {
+    /// Success flag
+    pub ok: bool,
+    /// Redacted config snapshot
+    pub config: Value,
+    /// SHA256 hash of current config file (if present)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
 }
@@ -631,6 +645,32 @@ pub async fn config_handler(
     };
 
     (StatusCode::OK, Json(response)).into_response()
+}
+
+/// GET /control/config - Read redacted config + hash for optimistic concurrency.
+pub async fn config_read_handler(
+    State(state): State<ControlState>,
+    connect_info: MaybeConnectInfo,
+    headers: HeaderMap,
+) -> Response {
+    let remote_addr = connect_info.0;
+    if let Some(err) = check_control_auth(&state, &headers, remote_addr) {
+        return err;
+    }
+
+    let snapshot = read_config_snapshot();
+    let mut redacted = snapshot.config;
+    crate::logging::redact::redact_json_value(&mut redacted);
+
+    (
+        StatusCode::OK,
+        Json(ConfigReadResponse {
+            ok: true,
+            config: redacted,
+            hash: snapshot.hash,
+        }),
+    )
+        .into_response()
 }
 
 /// POST /control/tasks - Create a durable task.

@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Carapace Control UI</title>
+    <meta name="description" content="Local control plane for Carapace" />
+    <link rel="stylesheet" href="./assets/main.css" />
+  </head>
+  <body>
+    <main class="layout">
+      <header class="panel header">
+        <div class="brand-row">
+          <img id="assistantAvatar" class="avatar hidden" alt="Assistant avatar" />
+          <div>
+            <h1 id="assistantName">Carapace</h1>
+            <p class="subtitle">Local control plane</p>
+          </div>
+        </div>
+        <p id="runtimeBasePath" class="meta"></p>
+      </header>
+
+      <section class="panel">
+        <h2>Auth</h2>
+        <p>Use your gateway token or password. It is sent as a bearer credential.</p>
+        <div class="auth-grid">
+          <input id="authInput" type="password" placeholder="Enter token or password" autocomplete="off" />
+          <button id="toggleAuthVisibility" type="button">Show</button>
+          <button id="saveAuth" type="button">Use credential</button>
+          <button id="clearAuth" type="button" class="secondary">Clear</button>
+        </div>
+        <p id="authStatus" class="meta">No credential loaded.</p>
+      </section>
+
+      <section class="panel actions">
+        <button id="refreshAll" type="button">Refresh status + channels + config</button>
+      </section>
+
+      <section class="panel">
+        <h2>Gateway Status</h2>
+        <pre id="statusJson" class="json">{}</pre>
+      </section>
+
+      <section class="panel">
+        <h2>Channels</h2>
+        <pre id="channelsJson" class="json">{}</pre>
+      </section>
+
+      <section class="panel">
+        <h2>Config Snapshot (Redacted)</h2>
+        <p class="meta">Read-only redacted config view with hash for optimistic concurrency.</p>
+        <pre id="configJson" class="json">{}</pre>
+      </section>
+
+      <section class="panel">
+        <h2>Config Update</h2>
+        <p>Apply a single path update through <code>POST /control/config</code>.</p>
+        <label for="configPath">Path</label>
+        <input id="configPath" type="text" placeholder="gateway.controlUi.enabled" />
+
+        <label for="configValue">Value (JSON)</label>
+        <textarea id="configValue" rows="8" placeholder="true"></textarea>
+
+        <button id="applyConfig" type="button">Apply config update</button>
+        <p id="configUpdateStatus" class="meta"></p>
+      </section>
+
+      <section class="panel warnings" id="transportWarning" hidden>
+        <h2>Security Notice</h2>
+        <p>
+          This page is not on HTTPS and not localhost. Browser protections and secure-cookie behavior may block
+          some control operations. Use HTTPS or localhost.
+        </p>
+      </section>
+    </main>
+
+    <script>
+      window.__CARAPACE_CONTROL_UI_BASE_PATH__ = "__CARAPACE_CONTROL_UI_BASE_PATH__";
+      window.__CARAPACE_ASSISTANT_NAME__ = "__CARAPACE_ASSISTANT_NAME__";
+      window.__CARAPACE_ASSISTANT_AVATAR__ = "__CARAPACE_ASSISTANT_AVATAR__";
+    </script>
+    <script src="./assets/main.js" defer></script>
+  </body>
+</html>

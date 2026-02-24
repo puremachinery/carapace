@@ -75,10 +75,11 @@ If you use cloud models, set one provider key before launching (for example
 This project is in preview. Core paths are tested and verified, but expect gaps.
 
 - Working now: setup wizard, local chat (`cara chat`), token auth enforcement,
-  health/control endpoints (including durable task controls), and
+  health/control endpoints (including durable task controls), control UI
+  frontend foundation (status/channels/redacted config editor), and
   OpenAI-compatible HTTP endpoints.
-- In progress: Control UI frontend (backend is wired), broader channel smoke
-  evidence, and hardened internet-facing deployment guidance.
+- In progress: advanced Control UI flows (pairing/workflow UX), broader
+  channel smoke evidence, and hardened internet-facing deployment guidance.
 
 See [docs/feature-status.yaml](docs/feature-status.yaml) and
 [docs/feature-evidence.yaml](docs/feature-evidence.yaml) for the current source
@@ -87,7 +88,7 @@ of truth.
 ## Roadmap
 
 - [Roadmap](docs/roadmap.md) — what we're building now, next, and later
-- Up next: Control UI frontend and stable release gate
+- Up next: advanced Control UI flows and stable release gate
 - Recently shipped: long-running assistant MVP (durable queue + autonomy verify),
   cross-platform subprocess sandboxing, guided setup (`cara setup`), and
   first-run verifier (`cara verify`)

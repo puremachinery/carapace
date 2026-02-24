@@ -127,6 +127,7 @@ Enable the Control UI:
 
 Then visit `/ui` on the Carapace host.
 You can override the base path via `gateway.controlUi.basePath`.
+If you are modifying the frontend assets, rebuild with `pnpm ui:build`.
 
 ## Hooks (Web API)
 

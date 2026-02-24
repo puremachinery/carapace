@@ -671,6 +671,7 @@ fn register_session_routes(
 
     let control_state_status = control_state.clone();
     let control_state_channels = control_state.clone();
+    let control_state_config_read = control_state.clone();
     let control_state_config = control_state.clone();
     let control_state_tasks_create = control_state.clone();
     let control_state_tasks_list = control_state.clone();
@@ -697,7 +698,11 @@ fn register_session_routes(
         )
         .route(
             "/control/config",
-            post(
+            get(move |connect_info: MaybeConnectInfo, headers: HeaderMap| {
+                let state = control_state_config_read.clone();
+                async move { control::config_read_handler(State(state), connect_info, headers).await }
+            })
+            .post(
                 move |connect_info: MaybeConnectInfo, headers: HeaderMap, body: Bytes| {
                     let state = control_state_config.clone();
                     async move {
@@ -2680,6 +2685,37 @@ mod tests {
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["ok"], true);
         assert_eq!(json["mode"], "now");
+    }
+
+    #[tokio::test]
+    async fn test_control_config_read_requires_auth() {
+        let router = test_router(test_config());
+        let req = Request::builder()
+            .method("GET")
+            .uri("/control/config")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_control_config_read_returns_snapshot() {
+        let router = test_router(test_config());
+        let req = Request::builder()
+            .method("GET")
+            .uri("/control/config")
+            .header("authorization", "Bearer test-gateway-token")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ok"], true);
+        assert!(json["config"].is_object());
     }
 
     #[tokio::test]
