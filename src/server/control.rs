@@ -610,12 +610,9 @@ pub async fn config_handler(
             .into_response();
     }
 
-    let actor = remote_addr
-        .map(|addr| addr.ip().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
     audit(AuditEvent::ConfigChanged {
         key_path: req.path.clone(),
-        actor,
+        actor: control_actor(remote_addr),
         method: "control_api".to_string(),
     });
 
@@ -819,7 +816,10 @@ pub async fn tasks_cancel_handler(
             .into_response();
     }
     match queue.get(task_id) {
-        Some(task) => (StatusCode::OK, Json(TaskResponse::success(task))).into_response(),
+        Some(task) => {
+            audit_task_mutation("cancel", &task, remote_addr);
+            (StatusCode::OK, Json(TaskResponse::success(task))).into_response()
+        }
         None => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ControlError::new("Task updated but unavailable")),
@@ -918,7 +918,10 @@ pub async fn tasks_patch_handler(
     }
 
     match queue.get(task_id) {
-        Some(task) => (StatusCode::OK, Json(TaskResponse::success(task))).into_response(),
+        Some(task) => {
+            audit_task_mutation("patch", &task, remote_addr);
+            (StatusCode::OK, Json(TaskResponse::success(task))).into_response()
+        }
         None => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ControlError::new("Task updated but unavailable")),
@@ -986,7 +989,10 @@ pub async fn tasks_retry_handler(
             .into_response();
     }
     match queue.get(task_id) {
-        Some(task) => (StatusCode::OK, Json(TaskResponse::success(task))).into_response(),
+        Some(task) => {
+            audit_task_mutation("retry", &task, remote_addr);
+            (StatusCode::OK, Json(TaskResponse::success(task))).into_response()
+        }
         None => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ControlError::new("Task updated but unavailable")),
@@ -1041,7 +1047,10 @@ pub async fn tasks_resume_handler(
     }
 
     match queue.get(task_id) {
-        Some(task) => (StatusCode::OK, Json(TaskResponse::success(task))).into_response(),
+        Some(task) => {
+            audit_task_mutation("resume", &task, remote_addr);
+            (StatusCode::OK, Json(TaskResponse::success(task))).into_response()
+        }
         None => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ControlError::new("Task updated but unavailable")),
@@ -1084,6 +1093,21 @@ fn task_queue_unavailable_response() -> Response {
         Json(ControlError::new("Task queue unavailable")),
     )
         .into_response()
+}
+
+fn control_actor(remote_addr: Option<SocketAddr>) -> String {
+    remote_addr
+        .map(|addr| addr.ip().to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn audit_task_mutation(action: &str, task: &DurableTask, remote_addr: Option<SocketAddr>) {
+    audit(AuditEvent::TaskMutated {
+        task_id: task.id.clone(),
+        action: action.to_string(),
+        actor: control_actor(remote_addr),
+        resulting_state: format!("{:?}", task.state).to_ascii_lowercase(),
+    });
 }
 
 fn parse_task_state(value: &str) -> Option<TaskState> {
