@@ -15,7 +15,7 @@ use axum::{
     http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri},
     middleware,
     response::{IntoResponse, Response},
-    routing::{any, get, post},
+    routing::{any, get, patch, post},
     Json, Router,
 };
 use hmac::{Hmac, Mac};
@@ -675,8 +675,10 @@ fn register_session_routes(
     let control_state_tasks_create = control_state.clone();
     let control_state_tasks_list = control_state.clone();
     let control_state_tasks_get = control_state.clone();
+    let control_state_tasks_patch = control_state.clone();
     let control_state_tasks_cancel = control_state.clone();
     let control_state_tasks_retry = control_state.clone();
+    let control_state_tasks_resume = control_state.clone();
 
     router
         .route(
@@ -745,6 +747,27 @@ fn register_session_routes(
             ),
         )
         .route(
+            "/control/tasks/{id}",
+            patch(
+                move |Path(id): Path<String>,
+                      connect_info: MaybeConnectInfo,
+                      headers: HeaderMap,
+                      body: Bytes| {
+                    let state = control_state_tasks_patch.clone();
+                    async move {
+                        control::tasks_patch_handler(
+                            Path(id),
+                            State(state),
+                            connect_info,
+                            headers,
+                            body,
+                        )
+                        .await
+                    }
+                },
+            ),
+        )
+        .route(
             "/control/tasks/{id}/cancel",
             post(
                 move |Path(id): Path<String>,
@@ -775,6 +798,27 @@ fn register_session_routes(
                     let state = control_state_tasks_retry.clone();
                     async move {
                         control::tasks_retry_handler(
+                            Path(id),
+                            State(state),
+                            connect_info,
+                            headers,
+                            body,
+                        )
+                        .await
+                    }
+                },
+            ),
+        )
+        .route(
+            "/control/tasks/{id}/resume",
+            post(
+                move |Path(id): Path<String>,
+                      connect_info: MaybeConnectInfo,
+                      headers: HeaderMap,
+                      body: Bytes| {
+                    let state = control_state_tasks_resume.clone();
+                    async move {
+                        control::tasks_resume_handler(
                             Path(id),
                             State(state),
                             connect_info,
@@ -2812,6 +2856,116 @@ mod tests {
         assert_eq!(retry_json["ok"], true);
         assert_eq!(retry_json["task"]["state"], "retry_wait");
         assert_eq!(retry_json["task"]["lastError"], "operator retry");
+    }
+
+    #[tokio::test]
+    async fn test_control_tasks_resume_blocked_task() {
+        let (ws_state, _tmp) = make_test_ws_state();
+        let router = test_router_with_hook_registry(
+            test_config(),
+            Arc::new(HookRegistry::new()),
+            ws_state.clone(),
+        );
+
+        let create_req = Request::builder()
+            .method("POST")
+            .uri("/control/tasks")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"payload":{"kind":"systemEvent","text":"task resume blocked"}}"#,
+            ))
+            .unwrap();
+        let create_response = router.clone().oneshot(create_req).await.unwrap();
+        assert_eq!(create_response.status(), StatusCode::CREATED);
+        let create_body = axum::body::to_bytes(create_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let create_json: Value = serde_json::from_slice(&create_body).unwrap();
+        let task_id = create_json["task"]["id"]
+            .as_str()
+            .expect("task id should be present")
+            .to_string();
+
+        let queue = ws_state.task_queue();
+        let _ = queue.claim_due(u64::MAX, 32);
+        assert!(queue.mark_blocked(
+            &task_id,
+            "missing provider config",
+            crate::tasks::TaskBlockedReason::ConfigMissing
+        ));
+
+        let resume_req = Request::builder()
+            .method("POST")
+            .uri(format!("/control/tasks/{task_id}/resume"))
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"delayMs":1000,"reason":"operator resume"}"#))
+            .unwrap();
+        let resume_response = router.oneshot(resume_req).await.unwrap();
+        assert_eq!(resume_response.status(), StatusCode::OK);
+        let resume_body = axum::body::to_bytes(resume_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let resume_json: Value = serde_json::from_slice(&resume_body).unwrap();
+        assert_eq!(resume_json["ok"], true);
+        assert_eq!(resume_json["task"]["state"], "retry_wait");
+        assert_eq!(resume_json["task"]["lastError"], "operator resume");
+        assert!(resume_json["task"]["blockedReason"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_control_tasks_patch_updates_payload_and_policy() {
+        let (ws_state, _tmp) = make_test_ws_state();
+        let router = test_router_with_hook_registry(
+            test_config(),
+            Arc::new(HookRegistry::new()),
+            ws_state.clone(),
+        );
+
+        let create_req = Request::builder()
+            .method("POST")
+            .uri("/control/tasks")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"payload":{"kind":"systemEvent","text":"task patch old"}}"#,
+            ))
+            .unwrap();
+        let create_response = router.clone().oneshot(create_req).await.unwrap();
+        assert_eq!(create_response.status(), StatusCode::CREATED);
+        let create_body = axum::body::to_bytes(create_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let create_json: Value = serde_json::from_slice(&create_body).unwrap();
+        let task_id = create_json["task"]["id"]
+            .as_str()
+            .expect("task id should be present")
+            .to_string();
+
+        let patch_req = Request::builder()
+            .method("PATCH")
+            .uri(format!("/control/tasks/{task_id}"))
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"payload":{"kind":"systemEvent","text":"task patch new"},"policy":{"maxRunTimeoutSeconds":42},"reason":"operator patch"}"#,
+            ))
+            .unwrap();
+        let patch_response = router.oneshot(patch_req).await.unwrap();
+        assert_eq!(patch_response.status(), StatusCode::OK);
+        let patch_body = axum::body::to_bytes(patch_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let patch_json: Value = serde_json::from_slice(&patch_body).unwrap();
+        assert_eq!(patch_json["ok"], true);
+        assert_eq!(patch_json["task"]["payload"]["text"], "task patch new");
+        assert_eq!(patch_json["task"]["policy"]["maxRunTimeoutSeconds"], 42);
+        assert_eq!(
+            patch_json["task"]["policy"]["maxAttempts"],
+            crate::tasks::DEFAULT_TASK_MAX_ATTEMPTS
+        );
+        assert_eq!(patch_json["task"]["lastError"], "operator patch");
     }
 
     #[tokio::test]

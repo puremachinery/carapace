@@ -25,7 +25,7 @@ use crate::plugins::PluginRegistry;
 use crate::server::http::{HttpConfig, MiddlewareConfig};
 use crate::server::ws::WsServerState;
 use crate::sessions;
-use crate::tasks::{DurableTask, TaskExecutionOutcome, TaskExecutor};
+use crate::tasks::{DurableTask, TaskBlockedReason, TaskExecutionOutcome, TaskExecutor};
 
 struct RuntimeTaskExecutor {
     state: Arc<WsServerState>,
@@ -126,8 +126,9 @@ impl TaskExecutor for RuntimeTaskExecutor {
                 // At budget boundary, fail immediately instead of enqueuing a
                 // retry that cannot run due to maxAttempts preflight checks.
                 if task.policy_explicit && task.attempts >= task.policy.max_attempts {
-                    TaskExecutionOutcome::Failed {
-                        error: format!(
+                    TaskExecutionOutcome::Blocked {
+                        category: TaskBlockedReason::ConfigMissing,
+                        reason: format!(
                             "{} (retry limit reached: {})",
                             crate::cron::executor::NO_LLM_PROVIDER_CONFIGURED_ERROR,
                             task.policy.max_attempts
@@ -136,8 +137,9 @@ impl TaskExecutor for RuntimeTaskExecutor {
                 } else if !task.policy_explicit
                     && task.attempts >= NO_PROVIDER_LEGACY_MAX_RETRY_ATTEMPTS
                 {
-                    TaskExecutionOutcome::Failed {
-                        error: format!(
+                    TaskExecutionOutcome::Blocked {
+                        category: TaskBlockedReason::ConfigMissing,
+                        reason: format!(
                             "{} (retry limit reached: {})",
                             crate::cron::executor::NO_LLM_PROVIDER_CONFIGURED_ERROR,
                             NO_PROVIDER_LEGACY_MAX_RETRY_ATTEMPTS
@@ -606,6 +608,7 @@ mod tests {
             updated_at_ms: now_ms,
             run_ids: Vec::new(),
             policy: crate::tasks::TaskPolicy::default(),
+            blocked_reason: None,
             policy_explicit: true,
         }
     }
@@ -650,7 +653,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_task_executor_fails_after_provider_retry_limit() {
+    async fn runtime_task_executor_blocks_after_provider_retry_limit() {
         let state = Arc::new(WsServerState::new(WsServerConfig::default()));
         let executor = RuntimeTaskExecutor { state };
         let payload = serde_json::to_value(CronPayload::AgentTurn {
@@ -674,8 +677,9 @@ mod tests {
             .await;
         assert_eq!(
             outcome,
-            TaskExecutionOutcome::Failed {
-                error: format!(
+            TaskExecutionOutcome::Blocked {
+                category: TaskBlockedReason::ConfigMissing,
+                reason: format!(
                     "{} (retry limit reached: {})",
                     crate::cron::executor::NO_LLM_PROVIDER_CONFIGURED_ERROR,
                     crate::tasks::TaskPolicy::default().max_attempts
@@ -829,7 +833,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_task_executor_legacy_provider_missing_fails_at_legacy_limit() {
+    async fn runtime_task_executor_legacy_provider_missing_blocks_at_legacy_limit() {
         let state = Arc::new(WsServerState::new(WsServerConfig::default()));
         let executor = RuntimeTaskExecutor { state };
         let payload = serde_json::to_value(CronPayload::AgentTurn {
@@ -850,8 +854,9 @@ mod tests {
         let outcome = executor.execute(task).await;
         assert_eq!(
             outcome,
-            TaskExecutionOutcome::Failed {
-                error: format!(
+            TaskExecutionOutcome::Blocked {
+                category: TaskBlockedReason::ConfigMissing,
+                reason: format!(
                     "{} (retry limit reached: {})",
                     crate::cron::executor::NO_LLM_PROVIDER_CONFIGURED_ERROR,
                     NO_PROVIDER_LEGACY_MAX_RETRY_ATTEMPTS

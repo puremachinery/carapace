@@ -7,8 +7,10 @@
 //! - POST /control/tasks - Create objective task
 //! - GET /control/tasks - List objective tasks
 //! - GET /control/tasks/{id} - Get task by ID
+//! - PATCH /control/tasks/{id} - Update task payload/policy
 //! - POST /control/tasks/{id}/cancel - Cancel task
 //! - POST /control/tasks/{id}/retry - Retry task
+//! - POST /control/tasks/{id}/resume - Resume blocked task
 
 use axum::{
     extract::{Path, Query, State},
@@ -248,6 +250,18 @@ pub struct TaskRetryRequest {
     pub reason: Option<String>,
 }
 
+/// Task update request.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskUpdateRequest {
+    #[serde(default)]
+    pub payload: Option<Value>,
+    #[serde(default)]
+    pub policy: Option<TaskPolicyRequest>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
 const MAX_TASK_REASON_LEN: usize = 1024;
 const MAX_TASK_ATTEMPTS_LIMIT: u32 = 10_000;
 const MAX_TASK_TOTAL_RUNTIME_MS_LIMIT: u64 = 30 * 24 * 60 * 60 * 1000;
@@ -298,6 +312,32 @@ fn resolve_task_policy(input: Option<TaskPolicyRequest>) -> Result<TaskPolicy, S
         )?;
     }
 
+    Ok(policy)
+}
+
+fn merge_task_policy(base: &TaskPolicy, patch: TaskPolicyRequest) -> Result<TaskPolicy, String> {
+    let mut policy = base.clone();
+    if let Some(max_attempts) = patch.max_attempts {
+        policy.max_attempts =
+            resolve_policy_bound(max_attempts, MAX_TASK_ATTEMPTS_LIMIT, "maxAttempts")?;
+    }
+    if let Some(max_total_runtime_ms) = patch.max_total_runtime_ms {
+        policy.max_total_runtime_ms = resolve_policy_bound(
+            max_total_runtime_ms,
+            MAX_TASK_TOTAL_RUNTIME_MS_LIMIT,
+            "maxTotalRuntimeMs",
+        )?;
+    }
+    if let Some(max_turns) = patch.max_turns {
+        policy.max_turns = resolve_policy_bound(max_turns, MAX_TASK_TURNS_LIMIT, "maxTurns")?;
+    }
+    if let Some(max_run_timeout_seconds) = patch.max_run_timeout_seconds {
+        policy.max_run_timeout_seconds = resolve_policy_bound(
+            max_run_timeout_seconds,
+            MAX_TASK_RUN_TIMEOUT_SECONDS_LIMIT,
+            "maxRunTimeoutSeconds",
+        )?;
+    }
     Ok(policy)
 }
 
@@ -771,6 +811,104 @@ pub async fn tasks_cancel_handler(
     }
 }
 
+/// PATCH /control/tasks/{id} - Update mutable task fields.
+pub async fn tasks_patch_handler(
+    Path(task_id): Path<String>,
+    State(state): State<ControlState>,
+    connect_info: MaybeConnectInfo,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let remote_addr = connect_info.0;
+    if let Some(err) = check_control_auth(&state, &headers, remote_addr) {
+        return err;
+    }
+    let Some(queue) = task_queue_or_unavailable(&state) else {
+        return task_queue_unavailable_response();
+    };
+    let req: TaskUpdateRequest = match parse_optional_json(&body) {
+        Ok(req) => req,
+        Err(msg) => {
+            return (StatusCode::BAD_REQUEST, Json(ControlError::new(msg))).into_response();
+        }
+    };
+    let task_id = task_id.trim();
+    let reason = match parse_optional_reason(req.reason) {
+        Ok(reason) => reason,
+        Err(msg) => {
+            return (StatusCode::BAD_REQUEST, Json(ControlError::new(msg))).into_response();
+        }
+    };
+
+    let Some(task) = queue.get(task_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ControlError::new("Task not found")),
+        )
+            .into_response();
+    };
+
+    let payload = match req.payload {
+        Some(payload) => match serde_json::from_value::<CronPayload>(payload.clone()) {
+            Ok(validated) => match serde_json::to_value(validated) {
+                Ok(normalized) => Some(normalized),
+                Err(err) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ControlError::new(format!("Invalid payload JSON: {err}"))),
+                    )
+                        .into_response();
+                }
+            },
+            Err(err) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ControlError::new(format!("Invalid payload JSON: {err}"))),
+                )
+                    .into_response();
+            }
+        },
+        None => None,
+    };
+
+    let policy = match req.policy {
+        Some(patch) => match merge_task_policy(&task.policy, patch) {
+            Ok(policy) => Some(policy),
+            Err(msg) => {
+                return (StatusCode::BAD_REQUEST, Json(ControlError::new(msg))).into_response();
+            }
+        },
+        None => None,
+    };
+
+    if payload.is_none() && policy.is_none() && reason.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ControlError::new(
+                "Task patch requires payload, policy, or reason",
+            )),
+        )
+            .into_response();
+    }
+
+    if !queue.patch_task(task_id, payload, policy, reason.as_deref()) {
+        return (
+            StatusCode::CONFLICT,
+            Json(ControlError::new("Task state changed; patch rejected")),
+        )
+            .into_response();
+    }
+
+    match queue.get(task_id) {
+        Some(task) => (StatusCode::OK, Json(TaskResponse::success(task))).into_response(),
+        None => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ControlError::new("Task updated but unavailable")),
+        )
+            .into_response(),
+    }
+}
+
 /// POST /control/tasks/{id}/retry - Retry a durable task.
 pub async fn tasks_retry_handler(
     Path(task_id): Path<String>,
@@ -829,6 +967,69 @@ pub async fn tasks_retry_handler(
         )
             .into_response();
     }
+    match queue.get(task_id) {
+        Some(task) => (StatusCode::OK, Json(TaskResponse::success(task))).into_response(),
+        None => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ControlError::new("Task updated but unavailable")),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /control/tasks/{id}/resume - Resume a blocked task.
+pub async fn tasks_resume_handler(
+    Path(task_id): Path<String>,
+    State(state): State<ControlState>,
+    connect_info: MaybeConnectInfo,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let remote_addr = connect_info.0;
+    if let Some(err) = check_control_auth(&state, &headers, remote_addr) {
+        return err;
+    }
+    let Some(queue) = task_queue_or_unavailable(&state) else {
+        return task_queue_unavailable_response();
+    };
+    let req: TaskRetryRequest = match parse_optional_json(&body) {
+        Ok(req) => req,
+        Err(msg) => {
+            return (StatusCode::BAD_REQUEST, Json(ControlError::new(msg))).into_response();
+        }
+    };
+    let task_id = task_id.trim();
+    let reason = match parse_optional_reason(req.reason) {
+        Ok(reason) => reason.unwrap_or_else(|| "resumed by operator".to_string()),
+        Err(msg) => {
+            return (StatusCode::BAD_REQUEST, Json(ControlError::new(msg))).into_response();
+        }
+    };
+    let delay_ms = req.delay_ms.unwrap_or(0);
+
+    let Some(task) = queue.get(task_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ControlError::new("Task not found")),
+        )
+            .into_response();
+    };
+    if task.state != TaskState::Blocked {
+        return (
+            StatusCode::CONFLICT,
+            Json(ControlError::new("Task is not blocked")),
+        )
+            .into_response();
+    }
+
+    if !queue.mark_retry_wait(task_id, delay_ms, &reason) {
+        return (
+            StatusCode::CONFLICT,
+            Json(ControlError::new("Task state changed; resume rejected")),
+        )
+            .into_response();
+    }
+
     match queue.get(task_id) {
         Some(task) => (StatusCode::OK, Json(TaskResponse::success(task))).into_response(),
         None => (

@@ -345,6 +345,54 @@ pub enum TaskCommand {
         #[command(flatten)]
         connection: TaskConnectionArgs,
     },
+    /// Resume a blocked durable objective task.
+    Resume {
+        /// Task ID.
+        id: String,
+
+        /// Resume delay in milliseconds (default: immediate).
+        #[arg(long = "delay-ms")]
+        delay_ms: Option<u64>,
+
+        /// Optional resume reason.
+        #[arg(long)]
+        reason: Option<String>,
+
+        #[command(flatten)]
+        connection: TaskConnectionArgs,
+    },
+    /// Update payload/policy fields for a durable objective task.
+    Update {
+        /// Task ID.
+        id: String,
+
+        /// Replacement task payload as JSON (CronPayload shape).
+        #[arg(long)]
+        payload: Option<String>,
+
+        /// Optional max retry attempts for this task.
+        #[arg(long = "max-attempts")]
+        max_attempts: Option<u32>,
+
+        /// Optional max wall-clock budget in milliseconds from creation.
+        #[arg(long = "max-total-runtime-ms")]
+        max_total_runtime_ms: Option<u64>,
+
+        /// Optional max tool-turn budget for this task.
+        #[arg(long = "max-turns")]
+        max_turns: Option<u32>,
+
+        /// Optional max timeout (seconds) for each spawned agent run.
+        #[arg(long = "max-run-timeout-seconds")]
+        max_run_timeout_seconds: Option<u32>,
+
+        /// Optional operator note stored on the task.
+        #[arg(long)]
+        reason: Option<String>,
+
+        #[command(flatten)]
+        connection: TaskConnectionArgs,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -588,6 +636,37 @@ pub async fn handle_task(command: TaskCommand) -> Result<(), Box<dyn std::error:
             reason,
             connection,
         } => handle_task_retry(&connection.host, connection.port, &id, delay_ms, reason).await,
+        TaskCommand::Resume {
+            id,
+            delay_ms,
+            reason,
+            connection,
+        } => handle_task_resume(&connection.host, connection.port, &id, delay_ms, reason).await,
+        TaskCommand::Update {
+            id,
+            payload,
+            max_attempts,
+            max_total_runtime_ms,
+            max_turns,
+            max_run_timeout_seconds,
+            reason,
+            connection,
+        } => {
+            handle_task_update(
+                &connection.host,
+                connection.port,
+                &id,
+                TaskUpdateOptions {
+                    payload,
+                    max_attempts,
+                    max_total_runtime_ms,
+                    max_turns,
+                    max_run_timeout_seconds,
+                    reason,
+                },
+            )
+            .await
+        }
     }
 }
 
@@ -598,6 +677,15 @@ struct TaskCreateOptions {
     max_total_runtime_ms: Option<u64>,
     max_turns: Option<u32>,
     max_run_timeout_seconds: Option<u32>,
+}
+
+struct TaskUpdateOptions {
+    payload: Option<String>,
+    max_attempts: Option<u32>,
+    max_total_runtime_ms: Option<u64>,
+    max_turns: Option<u32>,
+    max_run_timeout_seconds: Option<u32>,
+    reason: Option<String>,
 }
 
 async fn handle_task_create(
@@ -754,6 +842,104 @@ async fn handle_task_retry(
         &path,
         &[],
         payload,
+    )
+    .await?;
+    print_pretty_json(&response)
+}
+
+async fn handle_task_resume(
+    host: &str,
+    port: Option<u16>,
+    id: &str,
+    delay_ms: Option<u64>,
+    reason: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let task_id = normalize_task_id(id)?;
+    let path = format!("/control/tasks/{task_id}/resume");
+    let mut body = serde_json::Map::new();
+    if let Some(delay_ms) = delay_ms {
+        body.insert("delayMs".to_string(), Value::from(delay_ms));
+    }
+    if let Some(reason) = reason {
+        let trimmed = reason.trim();
+        if !trimmed.is_empty() {
+            body.insert("reason".to_string(), Value::from(trimmed));
+        }
+    }
+    let payload = if body.is_empty() {
+        None
+    } else {
+        Some(Value::Object(body))
+    };
+    let response = send_control_request(
+        host,
+        resolve_port(port),
+        reqwest::Method::POST,
+        &path,
+        &[],
+        payload,
+    )
+    .await?;
+    print_pretty_json(&response)
+}
+
+async fn handle_task_update(
+    host: &str,
+    port: Option<u16>,
+    id: &str,
+    options: TaskUpdateOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let task_id = normalize_task_id(id)?;
+    let path = format!("/control/tasks/{task_id}");
+    let mut body = serde_json::Map::new();
+
+    if let Some(payload) = options.payload {
+        let parsed_payload: Value = serde_json::from_str(&payload)
+            .map_err(|e| format!("invalid --payload JSON (expected CronPayload object): {e}"))?;
+        body.insert("payload".to_string(), parsed_payload);
+    }
+
+    let mut policy = serde_json::Map::new();
+    if let Some(max_attempts) = options.max_attempts {
+        policy.insert("maxAttempts".to_string(), Value::from(max_attempts));
+    }
+    if let Some(max_total_runtime_ms) = options.max_total_runtime_ms {
+        policy.insert(
+            "maxTotalRuntimeMs".to_string(),
+            Value::from(max_total_runtime_ms),
+        );
+    }
+    if let Some(max_turns) = options.max_turns {
+        policy.insert("maxTurns".to_string(), Value::from(max_turns));
+    }
+    if let Some(max_run_timeout_seconds) = options.max_run_timeout_seconds {
+        policy.insert(
+            "maxRunTimeoutSeconds".to_string(),
+            Value::from(max_run_timeout_seconds),
+        );
+    }
+    if !policy.is_empty() {
+        body.insert("policy".to_string(), Value::Object(policy));
+    }
+
+    if let Some(reason) = options.reason {
+        let trimmed = reason.trim();
+        if !trimmed.is_empty() {
+            body.insert("reason".to_string(), Value::from(trimmed));
+        }
+    }
+
+    if body.is_empty() {
+        return Err("task update requires at least one of: --payload, --max-attempts, --max-total-runtime-ms, --max-turns, --max-run-timeout-seconds, --reason".into());
+    }
+
+    let response = send_control_request(
+        host,
+        resolve_port(port),
+        reqwest::Method::PATCH,
+        &path,
+        &[],
+        Some(Value::Object(body)),
     )
     .await?;
     print_pretty_json(&response)
@@ -4481,6 +4667,85 @@ mod tests {
                 assert_eq!(connection.host, "127.0.0.1");
             }
             other => panic!("Expected Task(Retry), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_task_resume() {
+        let cli = Cli::try_parse_from([
+            "cara",
+            "task",
+            "resume",
+            "task-123",
+            "--delay-ms",
+            "250",
+            "--reason",
+            "unblocked",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Task(TaskCommand::Resume {
+                id,
+                delay_ms,
+                reason,
+                connection,
+            })) => {
+                assert_eq!(id, "task-123");
+                assert_eq!(delay_ms, Some(250));
+                assert_eq!(reason.as_deref(), Some("unblocked"));
+                assert_eq!(connection.port, None);
+                assert_eq!(connection.host, "127.0.0.1");
+            }
+            other => panic!("Expected Task(Resume), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_task_update() {
+        let cli = Cli::try_parse_from([
+            "cara",
+            "task",
+            "update",
+            "task-123",
+            "--payload",
+            r#"{"kind":"systemEvent","text":"updated"}"#,
+            "--max-attempts",
+            "10",
+            "--max-total-runtime-ms",
+            "90000",
+            "--max-turns",
+            "15",
+            "--max-run-timeout-seconds",
+            "30",
+            "--reason",
+            "operator patch",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Task(TaskCommand::Update {
+                id,
+                payload,
+                max_attempts,
+                max_total_runtime_ms,
+                max_turns,
+                max_run_timeout_seconds,
+                reason,
+                connection,
+            })) => {
+                assert_eq!(id, "task-123");
+                assert_eq!(
+                    payload.as_deref(),
+                    Some(r#"{"kind":"systemEvent","text":"updated"}"#)
+                );
+                assert_eq!(max_attempts, Some(10));
+                assert_eq!(max_total_runtime_ms, Some(90_000));
+                assert_eq!(max_turns, Some(15));
+                assert_eq!(max_run_timeout_seconds, Some(30));
+                assert_eq!(reason.as_deref(), Some("operator patch"));
+                assert_eq!(connection.port, None);
+                assert_eq!(connection.host, "127.0.0.1");
+            }
+            other => panic!("Expected Task(Update), got {:?}", other),
         }
     }
 
