@@ -649,17 +649,21 @@ mod tests {
     }
 
     #[test]
-    fn test_mark_retry_wait_rejects_non_retryable_states() {
+    fn test_mark_retry_wait_allows_running_and_rejects_queued_done() {
         let queue = TaskQueue::in_memory();
         let queued = queue.enqueue(serde_json::json!({"kind":"queued"}), None);
         assert!(!queue.mark_retry_wait(&queued.id, 1_000, "reject queued"));
 
         let running = queue.enqueue(serde_json::json!({"kind":"running"}), None);
         let _ = queue.claim_due(now_ms(), 10);
-        assert!(!queue.mark_retry_wait(&running.id, 1_000, "reject running"));
+        assert!(queue.mark_retry_wait(&running.id, 1_000, "allow running"));
+        let running_updated = queue.get(&running.id).expect("running task should exist");
+        assert_eq!(running_updated.state, TaskState::RetryWait);
 
-        assert!(queue.mark_done(&running.id, Some("run-1")));
-        assert!(!queue.mark_retry_wait(&running.id, 1_000, "reject done"));
+        let done = queue.enqueue(serde_json::json!({"kind":"done"}), None);
+        let _ = queue.claim_due(now_ms(), 10);
+        assert!(queue.mark_done(&done.id, Some("run-1")));
+        assert!(!queue.mark_retry_wait(&done.id, 1_000, "reject done"));
     }
 
     #[test]
