@@ -46,6 +46,7 @@ In another terminal:
 
 ```bash
 cara verify --outcome auto --port 18789
+cara verify --outcome autonomy --port 18789
 cara status --port 18789
 cara chat --port 18789
 ```
@@ -59,6 +60,8 @@ The setup wizard asks for:
 If you picked a custom port in setup, use that instead of `18789`.
 If your selected outcome is `discord` or `telegram`, `cara verify` may also
 need destination flags (`--discord-to` / `--telegram-to`).
+`cara verify --outcome autonomy` submits a real durable task and verifies it
+starts and reaches `done`/`blocked`.
 
 Helpful REPL commands:
 - `/help` — show available commands

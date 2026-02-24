@@ -35,11 +35,19 @@ Run first-run outcome checks with pass/fail output and next-step guidance.
 cara verify --outcome auto --port 18789
 ```
 
+Autonomy scenario:
+
+```bash
+cara verify --outcome autonomy --port 18789
+```
+
 Outcomes:
 - `auto` — infer from current config
 - `local-chat` — local reachability + one non-interactive `chat.send` roundtrip
 - `hooks` — signed `POST /hooks/wake` with configured token
 - `discord` / `telegram` — credential validity + outbound send-path verification
+- `autonomy` — creates a durable objective task and verifies start proof
+  (`attempts > 0`) plus terminal proof (`done` or `blocked`)
 
 Options:
 - `--port` / `-p` — local service port (default: config or `18789`)
@@ -50,6 +58,7 @@ Notes:
 - `cara verify` currently targets local loopback only (`127.0.0.1`)
 - Discord/Telegram verification sends a real test message
 - Hooks verification may trigger a real agent run
+- Autonomy verification submits a real task to the task queue
 
 ### `cara status`
 Health/status check via HTTP.

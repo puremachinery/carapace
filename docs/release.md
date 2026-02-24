@@ -41,6 +41,8 @@ Operator expectation:
 - Run `cara backup --output ./carapace-backup.tar.gz` before upgrading.
 - Upgrade using a pinned release tag in production environments.
 - Run `cara verify --outcome auto` after upgrade.
+- Run `cara verify --outcome autonomy` after upgrade to confirm durable task
+  start + terminal behavior.
 
 ## Rollback Runbook
 
@@ -54,6 +56,7 @@ Use this when an upgrade causes a regression.
 5. Verify:
    - `cara status --port 18789`
    - `cara verify --outcome auto --port 18789`
+   - `cara verify --outcome autonomy --port 18789`
 
 Recovery-time target:
 

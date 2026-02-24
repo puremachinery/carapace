@@ -40,6 +40,7 @@ In a second terminal:
 
 ```bash
 cara verify --outcome auto --port 18789
+cara verify --outcome autonomy --port 18789
 cara status --port 18789
 cara chat --port 18789
 ```
@@ -47,6 +48,8 @@ cara chat --port 18789
 Expected:
 
 - `cara verify` prints a pass/fail summary for your selected outcome.
+- `cara verify --outcome autonomy` proves task start (`attempts > 0`) and
+  terminal state (`done` or `blocked`).
 - `cara status` shows the service healthy.
 - `cara chat` opens the REPL and returns a model response.
 

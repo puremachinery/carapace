@@ -25,7 +25,19 @@ For deeper troubleshooting, use:
 - [Get Unstuck](get-unstuck.md)
 - [CLI guide](../cli.md)
 
-## 3) Production secret baseline
+## 3) Autonomy smoke check
+
+Verify long-running task execution behavior:
+
+```bash
+cara verify --outcome autonomy --port 18789
+```
+
+This check submits a real durable task and verifies both:
+- start proof (`attempts > 0`)
+- terminal proof (`done` or `blocked`)
+
+## 4) Production secret baseline
 
 Set a deployment-specific server secret in production:
 
@@ -36,7 +48,7 @@ export CARAPACE_SERVER_SECRET='<long-random-secret>'
 This avoids hooks sender-scoping fallback behavior that is acceptable for local
 development but not ideal for long-lived production deployments.
 
-## 4) Backup and restore
+## 5) Backup and restore
 
 Create a backup before major config/channel changes:
 
@@ -50,7 +62,7 @@ Restore from backup:
 cara restore --path ./carapace-backup.tar.gz
 ```
 
-## 5) Update flow
+## 6) Update flow
 
 Quick path:
 
@@ -69,7 +81,7 @@ Reference docs:
 - [Install](install.md)
 - [Release & upgrade policy](../release.md)
 
-## 6) First-response recovery checklist
+## 7) First-response recovery checklist
 
 1. Confirm service health and port/bind settings.
 2. Capture recent logs and isolate the first failing component (provider/channel/auth).
@@ -77,13 +89,13 @@ Reference docs:
 4. Restore from latest known-good backup if needed.
 5. Open an issue with logs + exact steps if still blocked.
 
-## 7) Next paths
+## 8) Next paths
 
 - [First Run](first-run.md)
 - [Cookbook](../cookbook/README.md)
 - [Get Unstuck](get-unstuck.md)
 
-## 8) Security reporting
+## 9) Security reporting
 
 For suspected vulnerabilities, use private reporting:
 
