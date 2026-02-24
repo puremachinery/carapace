@@ -223,11 +223,17 @@ impl TaskQueue {
     }
 
     /// Async-safe wrapper around [`Self::load`] for runtime startup paths.
-    pub async fn load_async(self: &Arc<Self>) {
+    pub async fn load_async(self: &Arc<Self>) -> Result<(), String> {
         let queue = Arc::clone(self);
-        if let Err(err) = tokio::task::spawn_blocking(move || queue.load()).await {
-            warn!(error = %err, "task queue load worker failed");
-        }
+        tokio::task::spawn_blocking(move || queue.load())
+            .await
+            .map_err(|err| {
+                let message = format!(
+                    "task queue load worker panicked; queue may contain stale running tasks: {err}"
+                );
+                tracing::error!("{message}");
+                message
+            })
     }
 
     /// Add a new task in `queued` state.
@@ -1026,7 +1032,10 @@ mod tests {
         let _ = queue.claim_due(now_ms(), 1);
 
         let recovered = Arc::new(TaskQueue::new(Some(path.clone())));
-        recovered.load_async().await;
+        recovered
+            .load_async()
+            .await
+            .expect("async load should not panic worker");
 
         let persisted: Vec<DurableTask> =
             serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
