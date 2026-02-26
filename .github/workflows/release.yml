@@ -101,6 +101,7 @@ jobs:
           for artifact in artifacts/*; do
             if [ -f "$artifact" ]; then
               cosign sign-blob --yes \
+                --bundle "${artifact}.bundle" \
                 --output-signature "${artifact}.sig" \
                 --output-certificate "${artifact}.pem" \
                 "$artifact"
