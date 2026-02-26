@@ -29,6 +29,7 @@ See what works today across channels, providers, and platforms, including caveat
 
 | Area | Support level | Notes / caveats |
 |---|---|---|
+| Control UI (`/ui`) | Foundation shipped | Auth/session handling, status/channels, redacted config read + safe patch path, task operator actions, pairing flow. |
 | macOS sandboxing | Verified | Seatbelt + limits for sandbox-required subprocess paths. |
 | Linux sandboxing | Verified | Landlock + limits for sandbox-required subprocess paths. |
 | Windows sandboxing | Partial | Job Objects + AppContainer paths; unsupported deny-network spawn paths fail closed. |

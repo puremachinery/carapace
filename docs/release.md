@@ -105,6 +105,12 @@ Every release should include these sections:
 8. Smoke-check the published binary on at least one Linux and one macOS path.
 9. Confirm release notes contain all required sections above.
 
+## Release Notes Location
+
+- Keep release notes in-repo under `docs/releases/`.
+- Existing notes:
+  - [`v0.1.0-preview10`](releases/v0.1.0-preview10.md)
+
 ## Distribution Notes
 
 - Interactive installs may use `releases/latest`.

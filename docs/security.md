@@ -288,21 +288,26 @@ Even with access controls, prompt injection can occur via:
 The control UI (`/control/*` endpoints) requires:
 - Service authentication (token or password)
 - CSRF protection (double-submit cookie with `__Host-` prefix, `SameSite=Strict`, origin/host validation)
-- Protected config paths blocked from modification:
-  - `gateway.auth.*`
-  - `gateway.hooks.token`
-  - `credentials.*`
-  - `secrets.*`
+- Config mutation split:
+  - `PATCH /control/config` is restricted to `gateway.controlUi.*`
+  - `POST /control/config` is the legacy broader path (still blocked from protected prefixes)
+- Protected config prefixes blocked from control mutation include auth/hooks/credentials/secrets plus provider and channel secrets (for example `anthropic.apiKey`, `openai.apiKey`, `google.apiKey`, `venice.apiKey`, `bedrock.secretAccessKey`, `telegram.botToken`, `discord.botToken`, `slack.signingSecret`) and provider endpoint overrides (`*.baseUrl`).
 
 ```rust
 // From src/server/control.rs
-let blocked_prefixes = ["gateway.auth", "gateway.hooks.token", "credentials", "secrets"];
-for prefix in blocked_prefixes {
+for prefix in PROTECTED_CONFIG_PREFIXES {
     if req.path.starts_with(prefix) {
         return Err(forbidden("Cannot modify protected configuration"));
     }
 }
+
+if restrict_to_control_ui_paths && !path.starts_with("gateway.controlUi.") {
+    return Err(forbidden("Control API config writes are limited to gateway.controlUi.*"));
+}
 ```
+
+The actual allowlist helper also accepts the subtree root key itself:
+`gateway.controlUi`.
 
 ## Plugin Security
 

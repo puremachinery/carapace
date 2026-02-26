@@ -13,6 +13,9 @@ By default, Carapace starts in a local-first, fail-closed posture:
 - Denies control API requests (fail-closed) until `gateway.auth.token` /
   `gateway.auth.password` is configured or auth mode is explicitly set for
   local-direct access.
+- Limits browser-safe config mutation to `PATCH /control/config` on
+  `gateway.controlUi.*`; legacy broader `POST /control/config` still enforces
+  protected-prefix blocking for auth/hooks/credentials/provider/channel secrets.
 - Stores credentials in OS keychains when available, with encrypted fallback.
 - Applies SSRF and DNS-rebinding protections for outbound fetch paths.
 
