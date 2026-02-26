@@ -295,19 +295,20 @@ The control UI (`/control/*` endpoints) requires:
 
 ```rust
 // From src/server/control.rs
+let path = req.path.trim();
+
 for prefix in PROTECTED_CONFIG_PREFIXES {
-    if req.path.starts_with(prefix) {
+    if path.starts_with(prefix) {
         return Err(forbidden("Cannot modify protected configuration"));
     }
 }
 
-if restrict_to_control_ui_paths && !path.starts_with("gateway.controlUi.") {
+if restrict_to_control_ui_paths
+    && !(path == "gateway.controlUi" || path.starts_with("gateway.controlUi."))
+{
     return Err(forbidden("Control API config writes are limited to gateway.controlUi.*"));
 }
 ```
-
-The actual allowlist helper also accepts the subtree root key itself:
-`gateway.controlUi`.
 
 ## Plugin Security
 
