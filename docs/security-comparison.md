@@ -50,7 +50,7 @@ Carapace is a Rust rewrite of OpenClaw built from the ground up to address these
 **Carapace:**
 - The service URL is set server-side only. No query parameter override exists.
 - Control endpoints enforce CSRF protection and require service authentication.
-- Sensitive config paths (`gateway.auth`, `gateway.hooks.token`, `credentials`, `secrets`) are blocked from modification via the control API.
+- Control config writes are least-privilege by default (`PATCH /control/config` is limited to `gateway.controlUi.*`), and sensitive prefixes remain blocked on both PATCH and legacy POST paths (auth/hooks/credentials/secrets, provider API keys, provider base URLs, and channel tokens/secrets).
 
 ### 5. Prompt Injection
 
@@ -116,7 +116,7 @@ Rust does not help with logic bugs, auth bypass, or prompt injection. Those requ
 Carapace is in preview. The security architecture is real and tested (large automated test coverage with multi-platform CI), but some items are incomplete. Verified-vs-partial feature state is tracked in `docs/feature-status.yaml` and `docs/feature-evidence.yaml`:
 
 - **Platform backend coverage.** Seatbelt/Landlock/Windows AppContainer+Job subprocess wiring is implemented across probe/tailscale/whois/SSH tunnel callsites. Unsupported targets still fail closed. On Windows, deny-network execution is supported through command-output helpers, while spawned deny-network subprocess requests fail closed.
-- **Control UI.** The backend (routes, auth, CSRF) is complete. The frontend is not built yet.
+- **Control UI.** Foundation is shipped (`/ui` auth/session handling, status/channels, redacted config read + safe patch path, task operator actions, pairing flow). Richer operator workflows and UX refinements remain in-progress.
 - **Channels.** Discord is verified end-to-end. Telegram supports webhook and localhost long-polling fallback. Signal and Slack are implemented but not yet smoke-tested in real environments.
 - **Smoke evidence process.** Live channel validation criteria and report template are tracked in `docs/channel-smoke.md`.
 - **Audit log emission.** The audit log module is implemented (append-only JSONL, 19 event types, 50 MB rotation) but event emission is not yet wired into all runtime paths.
