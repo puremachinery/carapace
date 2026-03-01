@@ -13,11 +13,11 @@ fi
 
 echo "==> Requesting linking QR code for device '$DEVICE_NAME'..."
 
-# Fetch the QR code link URI from the Signal API
-RESPONSE=$(curl -s "$API_URL/v1/qrcodelink?device_name=$DEVICE_NAME")
-URI=$(echo "$RESPONSE" | grep -o '"uri":"[^"]*' | grep -o '[^"]*$')
+# Fetch the raw QR code link URI string from the Signal API safely using jq
+RESPONSE=$(curl -s "$API_URL/v1/qrcodelink/raw?device_name=$DEVICE_NAME")
+URI=$(echo "$RESPONSE" | jq -r '.device_link_uri' || true)
 
-if [ -z "$URI" ]; then
+if [ "$URI" = "null" ] || [ -z "$URI" ]; then
     echo "Failed to get linking URI. Response was:"
     echo "$RESPONSE"
     exit 1
@@ -30,8 +30,8 @@ echo "(Settings -> Linked Devices -> +)"
 echo "========================================================="
 echo ""
 
-# Use qrenco.de to generate an ASCII QR code in the terminal
-curl -s "https://qrenco.de/$URI"
+# Use local qrencode to generate a perfect ASCII QR code in the terminal
+nix run nixpkgs#qrencode -- -t UTF8 "$URI"
 
 echo ""
 echo "========================================================="
@@ -39,6 +39,20 @@ echo "If scanning fails, you can try scanning this exact string:"
 echo "$URI"
 echo "========================================================="
 echo ""
-echo "After scanning and approving on your phone, wait a few seconds."
-echo "Then check carapace's output. The '400 Bad Request' errors should stop,"
-echo "and your new device will be ready to process messages!"
+echo "Waiting for you to scan and approve the link on your phone..."
+while true; do
+    ACCOUNTS=$(curl -s "$API_URL/v1/accounts")
+    NUM_ACCOUNTS=$(echo "$ACCOUNTS" | jq '. | length' 2>/dev/null || echo "0")
+    if [ "$NUM_ACCOUNTS" -gt 0 ]; then
+        echo ""
+        echo "========================================================="
+        echo "✅ Link successful! The device has been securely added."
+        echo "Linked accounts:"
+        echo "$ACCOUNTS"
+        echo "========================================================="
+        echo "The '400 Bad Request' errors in carapace should now stop,"
+        echo "and it is ready to process messages!"
+        break
+    fi
+    sleep 2
+done
