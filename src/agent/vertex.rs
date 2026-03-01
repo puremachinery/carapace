@@ -1022,8 +1022,7 @@ pub async fn list_models(
             .map_err(|e| AgentError::Provider(format!("failed to list models for {publisher}: {e}")))?;
 
         if !response.status().is_success() {
-             // Log warning but continue?
-             // eprintln!("Failed to list models for {publisher}: {}", response.status());
+             tracing::warn!("Failed to list models for {}: {}", publisher, response.status());
              continue;
         }
 
