@@ -4,16 +4,25 @@
 
 set -euo pipefail
 
-echo "Running cargo fmt --check..."
-if ! cargo fmt --all --check; then
-    echo "Formatting check failed. Run 'cargo fmt' to fix."
-    exit 1
-fi
+staged_files="$(git diff --cached --name-only --diff-filter=ACMR)"
+if echo "${staged_files}" | grep -Eq '(^|/)(Cargo\.toml|Cargo\.lock|rust-toolchain(\.toml)?|clippy\.toml)$|(^|/)\.cargo/|\.rs$'; then
+    # Force visible progress output so long builds don't look stalled.
+    export CARGO_TERM_PROGRESS_WHEN=always
 
-echo "Running cargo clippy --all-features --all-targets -- -D warnings..."
-if ! cargo clippy --all-features --all-targets -- -D warnings; then
-    echo "Clippy check failed. Fix the warnings above."
-    exit 1
+    echo "Rust/Cargo changes detected in staged files; running Rust checks..."
+    echo "Running cargo fmt --check..."
+    if ! cargo fmt --all --check; then
+        echo "Formatting check failed. Run 'cargo fmt' to fix."
+        exit 1
+    fi
+
+    echo "Running cargo clippy --all-features --all-targets -- -D warnings..."
+    if ! cargo clippy --all-features --all-targets -- -D warnings; then
+        echo "Clippy check failed. Fix the warnings above."
+        exit 1
+    fi
+else
+    echo "No staged Rust/Cargo changes; skipping cargo fmt/clippy."
 fi
 
 # Scan staged changes for leaked secrets (if gitleaks is installed).
