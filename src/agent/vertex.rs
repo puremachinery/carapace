@@ -559,7 +559,7 @@ impl ResponseAdapter for OpenAiAdapter {
 
         let parsed: Value = match serde_json::from_str(data) {
             Ok(v) => v,
-            Err(_e) => return Ok(events), // Skip unparseable (maybe keepalive?)
+            Err(e) => return Err(format!("failed to parse JSON chunk: {}", e)),
         };
 
         if let Some(choices) = parsed.get("choices").and_then(|v| v.as_array()) {
