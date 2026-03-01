@@ -27,3 +27,4 @@ test_vertex_config.json5
 .direnv
 carapace.json5
 carapace.json
+src/server/ws/snapshots/
