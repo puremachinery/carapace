@@ -226,7 +226,7 @@ impl MultiProvider {
                     "model \"{model}\" requires Venice provider, but no VENICE_API_KEY is configured"
                 ))
             })
-        } else if model.starts_with("vertex/") || model.starts_with("vertex:") {
+        } else if crate::agent::vertex::is_vertex_model(model) {
             self.vertex.as_deref().ok_or_else(|| {
                 AgentError::Provider(format!(
                     "model \"{model}\" requires Vertex provider, but it is not configured"
