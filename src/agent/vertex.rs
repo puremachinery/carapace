@@ -719,7 +719,7 @@ impl VertexProvider {
 
         // ... rest of logic uses effective_model
 
-        let (_publisher, model_id, adapter): (&str, &str, Box<dyn ResponseAdapter>) =
+        let (publisher, model_id, adapter): (&str, &str, Box<dyn ResponseAdapter>) =
             if effective_model.starts_with("anthropic/") {
                 (
                     "anthropic",
@@ -747,25 +747,24 @@ impl VertexProvider {
                  ("google", effective_model, Box::new(GeminiAdapter))
             };
 
-        let _method = adapter.api_method();
+        let method = adapter.api_method();
 
         // Global endpoints for Gemini 3 and Experimental
         // These models are automatically routed to the global endpoint `aiplatform.googleapis.com`
         // unless overridden.
         if model_id.contains("gemini-3") {
              let url = format!(
-                "https://aiplatform.googleapis.com/v1beta1/projects/{}/locations/{}/publishers/google/models/{}:streamGenerateContent?alt=sse",
-                self.project_id, "global", model_id
+                "https://aiplatform.googleapis.com/v1beta1/projects/{}/locations/{}/publishers/{}/models/{}:{}?alt=sse",
+                self.project_id, "global", publisher, model_id, method
             );
-            return (Box::new(GeminiAdapter), url);
+            return (adapter, url);
         }
 
-        // Default to Google/Gemini for "vertex/gemini-..."
         let url = format!(
-            "https://{}-aiplatform.googleapis.com/v1beta1/projects/{}/locations/{}/publishers/google/models/{}:streamGenerateContent?alt=sse",
-            self.location, self.project_id, self.location, model_id
+            "https://{}-aiplatform.googleapis.com/v1beta1/projects/{}/locations/{}/publishers/{}/models/{}:{}?alt=sse",
+            self.location, self.project_id, self.location, publisher, model_id, method
         );
-        (Box::new(GeminiAdapter), url)
+        (adapter, url)
     }
 }
 
