@@ -24,7 +24,11 @@ const RECEIVE_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Debug, Deserialize)]
 pub struct SignalEnvelope {
     /// Source phone number (e.g. "+15559876543").
-    #[serde(default, rename = "sourceNumber", alias = "source")]
+    #[serde(default)]
+    pub source: Option<String>,
+
+    /// Source phone number (newer key).
+    #[serde(default, rename = "sourceNumber")]
     pub source_number: Option<String>,
 
     /// Timestamp of the message.
@@ -108,14 +112,23 @@ pub async fn signal_receive_loop(
                 }
                 channel_registry.update_status("signal", ChannelStatus::Connected);
 
-                match resp.json::<Vec<SignalEnvelope>>().await {
-                    Ok(envelopes) => {
-                        for envelope in envelopes {
-                            process_envelope(&envelope, &state).await;
+                match resp.json::<Vec<serde_json::Value>>().await {
+                    Ok(items) => {
+                        for item in items {
+                            info!("Raw JSON item received: {}", item);
+                            let env_val = item.get("envelope").unwrap_or(&item);
+                            match serde_json::from_value::<SignalEnvelope>(env_val.clone()) {
+                                Ok(envelope) => {
+                                    process_envelope(&envelope, &state);
+                                }
+                                Err(err) => {
+                                    warn!("Failed to cleanly deserialize envelope: {} - JSON: {}", err, env_val);
+                                }
+                            }
                         }
                     }
                     Err(e) => {
-                        debug!("Failed to parse Signal receive response: {}", e);
+                        error!("Failed to read Signal receive response: {}", e);
                     }
                 }
             }
@@ -157,7 +170,10 @@ pub async fn signal_receive_loop(
 async fn process_envelope(envelope: &SignalEnvelope, state: &Arc<WsServerState>) {
     let data_message = match &envelope.data_message {
         Some(dm) => dm,
-        None => return, // Not a data message (e.g., receipt, typing indicator)
+        None => {
+            info!("Dropped envelope without dataMessage (could be syncMessage/receipt): {:?}", envelope);
+            return;
+        }
     };
 
     let text = match &data_message.message {
@@ -165,12 +181,12 @@ async fn process_envelope(envelope: &SignalEnvelope, state: &Arc<WsServerState>)
         _ => return, // No text content
     };
 
-    let sender = match &envelope.source_number {
+    let sender = match envelope.source_number.as_ref().or(envelope.source.as_ref()) {
         Some(s) => s,
         None => return, // No sender info
     };
 
-    debug!(
+    info!(
         sender = %sender,
         text_len = text.len(),
         "Signal inbound message"
@@ -187,7 +203,7 @@ async fn process_envelope(envelope: &SignalEnvelope, state: &Arc<WsServerState>)
     let metadata = SessionMetadata {
         channel: Some("signal".to_string()),
         user_id: Some(sender.to_string()),
-        chat_id: group_id,
+        chat_id: Some(peer_id.clone()),
         ..Default::default()
     };
 
@@ -258,7 +274,7 @@ async fn process_envelope(envelope: &SignalEnvelope, state: &Arc<WsServerState>)
             provider,
             cancel_token,
         );
-        debug!(
+        info!(
             run_id = %run_id,
             sender = %sender,
             "Signal agent run dispatched"

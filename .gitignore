@@ -21,9 +21,14 @@ fuzz/corpus
 fuzz/artifacts
 
 # Environment
+.env
 .envrc
 test_config.json5
 test_vertex_config.json5
 .direnv
 carapace.json5
-carapace.json
+run_local_with_signal.sh
+
+# Snapshots
+**/*.snap.new
+
