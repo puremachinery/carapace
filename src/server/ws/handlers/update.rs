@@ -468,6 +468,22 @@ mod tests {
         let params = json!({ "channel": "beta" });
         let result = handle_update_set_channel(Some(&params)).unwrap();
         assert_eq!(result["channel"], "beta");
+        assert_eq!(result["previousChannel"], "stable");
+    }
+
+    #[test]
+    fn test_update_configure() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        reset_state();
+
+        let params = json!({
+            "autoUpdate": false,
+            "channel": "beta"
+        });
+        let result = handle_update_configure(Some(&params)).unwrap();
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["autoUpdate"], false);
+        assert_eq!(result["channel"], "beta");
     }
 
     #[test]
@@ -476,8 +492,9 @@ mod tests {
         reset_state();
 
         let params = json!({ "channel": "invalid" });
-        let result = handle_update_set_channel(Some(&params));
-        assert!(result.is_err());
+        let err = handle_update_set_channel(Some(&params)).expect_err("invalid channel must fail");
+        assert_eq!(err.code, ERROR_INVALID_REQUEST);
+        assert!(err.message.contains("unknown update channel"));
     }
 
     #[tokio::test]
@@ -485,8 +502,11 @@ mod tests {
     async fn test_update_install_no_update() {
         let _lock = TEST_LOCK.lock().unwrap();
         reset_state();
-        let result = handle_update_install().await;
-        assert!(result.is_err());
+        let err = handle_update_install()
+            .await
+            .expect_err("install with no available update must fail");
+        assert_eq!(err.code, ERROR_INVALID_REQUEST);
+        assert!(err.message.contains("no update available"));
     }
 
     #[tokio::test]
