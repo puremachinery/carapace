@@ -136,7 +136,7 @@ pub(super) async fn handle_update_run(params: Option<&Value>) -> Result<Value, E
     };
 
     if should_install {
-        return handle_update_install().await;
+        return handle_update_install_with_force(force).await;
     }
 
     let state = UPDATE_STATE.read();
@@ -154,26 +154,29 @@ pub(super) async fn handle_update_run(params: Option<&Value>) -> Result<Value, E
 /// Get update status.
 pub(super) async fn handle_update_status() -> Result<Value, ErrorShape> {
     let state_dir = resolve_state_dir();
-    let tx =
-        tokio::task::spawn_blocking(move || crate::update::load_update_transaction(&state_dir))
-            .await
-            .map_err(|err| {
-                error_shape(
-                    ERROR_UNAVAILABLE,
-                    &format!("failed to join update transaction load task: {err}"),
-                    None,
-                )
-            })?
-            .map_err(|err| {
-                error_shape(
-                    ERROR_UNAVAILABLE,
-                    &format!("failed to load update transaction: {}", err.message),
-                    Some(json!({
-                        "retryable": err.retryable,
-                        "phase": err.phase
-                    })),
-                )
-            })?;
+    let tx = match tokio::task::spawn_blocking(move || {
+        crate::update::load_update_transaction(&state_dir)
+    })
+    .await
+    {
+        Ok(Ok(tx)) => tx,
+        Ok(Err(err)) => {
+            tracing::warn!(
+                error = %err.message,
+                retryable = err.retryable,
+                phase = ?err.phase,
+                "failed to load update transaction for status; returning status without transaction details"
+            );
+            None
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "failed to join update transaction load task for status; returning status without transaction details"
+            );
+            None
+        }
+    };
     let state = UPDATE_STATE.read();
 
     Ok(json!({
@@ -288,11 +291,15 @@ pub(super) fn handle_update_configure(params: Option<&Value>) -> Result<Value, E
 
 /// Install an available update.
 pub(super) async fn handle_update_install() -> Result<Value, ErrorShape> {
+    handle_update_install_with_force(false).await
+}
+
+async fn handle_update_install_with_force(force: bool) -> Result<Value, ErrorShape> {
     let state_dir = resolve_state_dir();
     let (version, current_version) = {
         let mut state = UPDATE_STATE.write();
 
-        if !state.update_available {
+        if !state.update_available && !force {
             return Err(error_shape(
                 ERROR_INVALID_REQUEST,
                 "no update available",
@@ -480,6 +487,36 @@ mod tests {
         reset_state();
         let result = handle_update_install().await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_update_install_already_installing() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        reset_state();
+        {
+            let mut state = UPDATE_STATE.write();
+            state.update_available = true;
+            state.latest_version = Some("9.9.9".to_string());
+            state.installing = true;
+        }
+        let err = handle_update_install()
+            .await
+            .expect_err("install guard should reject");
+        assert_eq!(err.code, ERROR_UNAVAILABLE);
+        assert!(err.message.contains("already in progress"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_update_install_force_bypasses_no_update_guard() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        reset_state();
+        let err = handle_update_install_with_force(true)
+            .await
+            .expect_err("force should bypass no-update check");
+        assert_eq!(err.code, ERROR_INVALID_REQUEST);
+        assert!(err.message.contains("latest version not known"));
     }
 
     #[test]

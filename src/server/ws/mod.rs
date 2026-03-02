@@ -626,7 +626,22 @@ impl WsServerState {
             .load_async()
             .await
             .map_err(WsConfigError::Runtime)?;
-        crate::update::cleanup_old_binaries(&cleanup_state_dir);
+        tokio::task::spawn_blocking(move || {
+            crate::update::cleanup_old_binaries(&cleanup_state_dir)
+        })
+        .await
+        .map_err(|err| {
+            let reason = if err.is_panic() {
+                "panicked"
+            } else if err.is_cancelled() {
+                "was cancelled"
+            } else {
+                "failed"
+            };
+            WsConfigError::Runtime(format!(
+                "update cleanup worker {reason} during startup: {err}"
+            ))
+        })?;
         Ok(state)
     }
 

@@ -214,13 +214,17 @@ pub fn update_transaction_path(state_dir: &Path) -> PathBuf {
 }
 
 fn update_staging_path(state_dir: &Path, version: &str) -> PathBuf {
-    state_dir.join("updates").join(format!("cara-{version}"))
+    let safe_version = sanitize_version_for_path(version);
+    state_dir
+        .join("updates")
+        .join(format!("cara-{safe_version}"))
 }
 
 fn update_bundle_path(state_dir: &Path, version: &str) -> PathBuf {
+    let safe_version = sanitize_version_for_path(version);
     state_dir
         .join("updates")
-        .join(format!("cara-{version}.bundle"))
+        .join(format!("cara-{safe_version}.bundle"))
 }
 
 pub fn load_update_transaction(state_dir: &Path) -> Result<Option<UpdateTransaction>, UpdateError> {
@@ -430,12 +434,19 @@ fn apply_staged_update_at_paths(
         return apply_staged_update_windows(staged, sha256, binary_path);
     }
 
-    let backup_path = format!("{}.bak", current_path.display());
+    let backup_path = {
+        let mut os = current_path.as_os_str().to_os_string();
+        os.push(".bak");
+        PathBuf::from(os)
+    };
 
     fs::rename(current_path, &backup_path).map_err(|e| {
         UpdateError::non_retryable(
             Some(UpdatePhase::Applying),
-            format!("failed to rename current binary to .bak: {e}"),
+            format!(
+                "failed to rename current binary to '{}': {e}",
+                backup_path.display()
+            ),
         )
     })?;
 
@@ -459,7 +470,8 @@ fn apply_staged_update_at_paths(
             return Err(UpdateError::non_retryable(
                 Some(UpdatePhase::Applying),
                 format!(
-                    "CRITICAL: copy failed ({copy_err}) AND restore failed ({restore_err}). Backup at: {backup_path}"
+                    "CRITICAL: copy failed ({copy_err}) AND restore failed ({restore_err}). Backup at: {}",
+                    backup_path.display()
                 ),
             ));
         }
@@ -484,7 +496,7 @@ fn apply_staged_update_at_paths(
 
     if let Err(err) = fs::remove_file(&backup_path) {
         tracing::warn!(
-            path = %backup_path,
+            path = %backup_path.display(),
             error = %err,
             "failed to remove backup file"
         );
@@ -587,6 +599,24 @@ fn cleanup_stale_staged_updates(state_dir: &Path) {
 fn is_rate_limit_forbidden_body(body: &str) -> bool {
     let body_lower = body.to_ascii_lowercase();
     body_lower.contains("rate limit") || body_lower.contains("secondary rate")
+}
+
+fn sanitize_version_for_path(version: &str) -> String {
+    let sanitized: String = version
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "unknown".to_string()
+    } else {
+        sanitized
+    }
 }
 
 fn is_retryable_release_response(status: reqwest::StatusCode, body: &str) -> bool {
@@ -1191,14 +1221,14 @@ async fn install_with_transaction(request: &InstallRequest) -> Result<InstallOut
                 let (tx, release) = prepare_transaction(request).await?;
                 (tx, Some(release))
             } else if tx.state == UpdateTransactionState::Failed && !tx.retryable {
-                let message = tx
-                    .last_error
-                    .clone()
-                    .unwrap_or_else(|| "non-retryable update failure".to_string());
-                return Err(UpdateError::non_retryable(
-                    Some(UpdatePhase::Failed),
-                    message,
-                ));
+                tracing::info!(
+                    transaction_id = %tx.id,
+                    transaction_version = %tx.version,
+                    "clearing non-retryable transaction and starting a fresh update attempt"
+                );
+                clear_update_transaction(&request.state_dir)?;
+                let (tx, release) = prepare_transaction(request).await?;
+                (tx, Some(release))
             } else if should_restart_transaction_for_requested_version(
                 request.requested_version.as_deref(),
                 &tx.version,
@@ -1309,6 +1339,18 @@ mod tests {
             Some("v0.1.0-preview11"),
             "0.1.0-preview12"
         ));
+    }
+
+    #[test]
+    fn test_sanitize_version_for_path_replaces_unsafe_chars() {
+        assert_eq!(
+            sanitize_version_for_path("../../v0.1.0-preview12"),
+            "______v0.1.0-preview12"
+        );
+        assert_eq!(
+            sanitize_version_for_path("v0.1.0+build/metadata"),
+            "v0.1.0_build_metadata"
+        );
     }
 
     #[test]
