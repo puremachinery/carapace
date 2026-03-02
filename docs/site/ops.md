@@ -108,10 +108,12 @@ Production/reproducible path:
 
 Interrupted/failed update handling:
 
-- Update transactions are persisted at `~/.config/carapace/updates/transaction.json`.
+- Update transactions are persisted at `{state_dir}/updates/transaction.json`
+  (override with `CARAPACE_STATE_DIR` if needed).
 - Resume is automatic on startup and when you rerun `cara update`.
-- Transaction states: `in_progress`, `applied`, `failed`; phases include
-  `downloading`, `downloaded`, `verified`, `applying`.
+- Transaction states: `in_progress`, `applied`, `failed`.
+- Transaction phases: `created`, `downloading`, `downloaded`, `verified`,
+  `applying`, `failed`, `applied`.
 - Retryable failures are retried with bounded backoff; non-retryable failures
   require operator action (artifact/policy mismatch, malformed bundle, etc.).
 
@@ -119,7 +121,7 @@ Quick checks:
 
 ```bash
 cara update --check
-cat ~/.config/carapace/updates/transaction.json
+cat "${CARAPACE_STATE_DIR:-$HOME/.config/carapace}/updates/transaction.json"
 ```
 
 Reference docs:

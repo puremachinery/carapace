@@ -19,20 +19,38 @@ error_msg=""
 ran_any="false"
 
 write_report() {
-  cat >"${report_path}" <<EOF
-{
-  "suite": "live-channel-smoke",
-  "timestampUtc": "${timestamp}",
-  "binaryPath": "${binary_path}",
-  "port": ${port},
-  "telegramToSet": $([[ -n "${telegram_to}" ]] && echo "true" || echo "false"),
-  "discordToSet": $([[ -n "${discord_to}" ]] && echo "true" || echo "false"),
-  "ranAny": ${ran_any},
-  "logPath": "${log_path}",
-  "status": "${status}",
-  "error": "${error_msg}"
+  python3 - "${report_path}" "${timestamp}" "${binary_path}" "${port}" "${telegram_to}" "${discord_to}" "${ran_any}" "${log_path}" "${status}" "${error_msg}" <<'PY'
+import json
+import sys
+
+(
+    report_path,
+    timestamp,
+    binary_path,
+    port,
+    telegram_to,
+    discord_to,
+    ran_any,
+    log_path,
+    status,
+    error_msg,
+) = sys.argv[1:11]
+payload = {
+    "suite": "live-channel-smoke",
+    "timestampUtc": timestamp,
+    "binaryPath": binary_path,
+    "port": port,
+    "telegramToSet": bool(telegram_to),
+    "discordToSet": bool(discord_to),
+    "ranAny": ran_any == "true",
+    "logPath": log_path,
+    "status": status,
+    "error": error_msg,
 }
-EOF
+with open(report_path, "w", encoding="utf-8") as f:
+    json.dump(payload, f, indent=2)
+    f.write("\n")
+PY
   echo "Report: ${report_path}"
 }
 
@@ -52,7 +70,7 @@ if [[ -n "${telegram_to}" ]]; then
   ran_any="true"
   {
     echo "== telegram verify =="
-    echo "$ ${binary_path} verify --outcome telegram --telegram-to ${telegram_to} --port ${port}"
+    echo "$ ${binary_path} verify --outcome telegram --telegram-to <redacted> --port ${port}"
   } >>"${log_path}"
   if ! "${binary_path}" verify --outcome telegram --telegram-to "${telegram_to}" --port "${port}" >>"${log_path}" 2>&1; then
     status="fail"
@@ -64,15 +82,14 @@ if [[ -n "${discord_to}" ]]; then
   ran_any="true"
   {
     echo "== discord verify =="
-    echo "$ ${binary_path} verify --outcome discord --discord-to ${discord_to} --port ${port}"
+    echo "$ ${binary_path} verify --outcome discord --discord-to <redacted> --port ${port}"
   } >>"${log_path}"
   if ! "${binary_path}" verify --outcome discord --discord-to "${discord_to}" --port "${port}" >>"${log_path}" 2>&1; then
     status="fail"
     if [[ -n "${error_msg}" ]]; then
-      error_msg="${error_msg}; discord verify failed"
-    else
-      error_msg="discord verify failed"
+      error_msg+="; "
     fi
+    error_msg+="discord verify failed"
   fi
 fi
 

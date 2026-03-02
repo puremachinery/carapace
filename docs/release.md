@@ -98,8 +98,8 @@ Updater behavior is fail-closed by policy:
 Resume behavior:
 
 1. Update transactions persist at `{state_dir}/updates/transaction.json`.
-2. Transaction phases are persisted across restarts (`downloading`,
-   `downloaded`, `verified`, `applying`, `failed`, `applied`).
+2. Transaction phases are persisted across restarts (`created`,
+   `downloading`, `downloaded`, `verified`, `applying`, `failed`, `applied`).
 3. Startup performs bounded auto-resume for retryable interrupted updates.
 4. Non-retryable failures stay terminal and require operator intervention.
 

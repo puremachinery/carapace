@@ -13,22 +13,38 @@ report_path="${report_dir}/update-smoke-linux-orbstack-${timestamp}.json"
 status="pass"
 error_msg=""
 machine="${ORB_MACHINE:-}"
+remote_dir=""
+remote_bin=""
 
 write_report() {
-  cat >"${report_path}" <<EOF
-{
-  "suite": "update-linux-orbstack",
-  "timestampUtc": "${timestamp}",
-  "platform": "linux-orbstack",
-  "machine": "${machine}",
-  "binaryPath": "${binary_path}",
-  "logPath": "${log_path}",
-  "status": "${status}",
-  "error": "${error_msg}"
+  python3 - "${report_path}" "${timestamp}" "${machine}" "${binary_path}" "${log_path}" "${status}" "${error_msg}" <<'PY'
+import json
+import sys
+
+report_path, timestamp, machine, binary_path, log_path, status, error_msg = sys.argv[1:8]
+payload = {
+    "suite": "update-linux-orbstack",
+    "timestampUtc": timestamp,
+    "platform": "linux-orbstack",
+    "machine": machine,
+    "binaryPath": binary_path,
+    "logPath": log_path,
+    "status": status,
+    "error": error_msg,
 }
-EOF
+with open(report_path, "w", encoding="utf-8") as f:
+    json.dump(payload, f, indent=2)
+    f.write("\n")
+PY
   echo "Report: ${report_path}"
 }
+
+cleanup_remote() {
+  if [[ -n "${machine}" && -n "${remote_dir}" ]]; then
+    orbctl run -m "${machine}" -- sh -lc "rm -rf '${remote_dir}'" >>"${log_path}" 2>&1 || true
+  fi
+}
+trap cleanup_remote EXIT
 
 if ! command -v orbctl >/dev/null 2>&1; then
   status="skipped"
@@ -45,10 +61,7 @@ if [[ ! -x "${binary_path}" ]]; then
 fi
 
 if [[ -z "${machine}" ]]; then
-  machine="$(orbctl default 2>/dev/null || true)"
-fi
-if [[ -z "${machine}" ]]; then
-  machine="$(orbctl list -q --running | head -n 1 || true)"
+  machine="$(orbctl default 2>/dev/null || orbctl list -q --running | head -n 1 || true)"
 fi
 if [[ -z "${machine}" ]]; then
   status="skipped"
@@ -70,10 +83,17 @@ if ! orbctl start "${machine}" >>"${log_path}" 2>&1; then
 fi
 
 run_id="cara-update-smoke-${timestamp}"
-remote_dir="${run_id}"
+remote_home="$(orbctl run -m "${machine}" -- sh -lc 'printf %s "$HOME"' 2>>"${log_path}" || true)"
+if [[ -z "${remote_home}" ]]; then
+  status="fail"
+  error_msg="failed to determine remote home directory"
+  write_report
+  exit 1
+fi
+remote_dir="${remote_home}/${run_id}"
 remote_bin="${remote_dir}/cara"
 
-if ! orbctl run -m "${machine}" -- sh -lc "mkdir -p \"\$HOME/${remote_dir}\"" >>"${log_path}" 2>&1; then
+if ! orbctl run -m "${machine}" -- sh -lc "mkdir -p '${remote_dir}'" >>"${log_path}" 2>&1; then
   status="fail"
   error_msg="failed to create remote directory"
   write_report
@@ -87,8 +107,8 @@ if ! orbctl push -m "${machine}" "${binary_path}" "${remote_bin}" >>"${log_path}
   exit 1
 fi
 
-if ! orbctl run -m "${machine}" -- sh -lc "cd \"\$HOME/${remote_dir}\" && chmod +x ./cara && ./cara version && ./cara update --check" >>"${log_path}" 2>&1; then
-  if [[ "${STRICT_NETWORK:-0}" != "1" ]] && rg -q "failed to fetch release info|api.github.com" "${log_path}"; then
+if ! orbctl run -m "${machine}" -- sh -lc "cd '${remote_dir}' && chmod +x ./cara && ./cara version && ./cara update --check" >>"${log_path}" 2>&1; then
+  if [[ "${STRICT_NETWORK:-0}" != "1" ]] && grep -Eq "failed to fetch release info|api.github.com" "${log_path}"; then
     status="skipped"
     error_msg="network unavailable for release API check"
     write_report

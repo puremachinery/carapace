@@ -13,6 +13,28 @@ report_path="${report_dir}/update-smoke-macos-local-${timestamp}.json"
 status="pass"
 error_msg=""
 
+write_report() {
+  python3 - "${report_path}" "${timestamp}" "${binary_path}" "${log_path}" "${status}" "${error_msg}" <<'PY'
+import json
+import sys
+
+report_path, timestamp, binary_path, log_path, status, error_msg = sys.argv[1:7]
+payload = {
+    "suite": "update-macos-local",
+    "timestampUtc": timestamp,
+    "platform": "macos",
+    "binaryPath": binary_path,
+    "logPath": log_path,
+    "status": status,
+    "error": error_msg,
+}
+with open(report_path, "w", encoding="utf-8") as f:
+    json.dump(payload, f, indent=2)
+    f.write("\n")
+PY
+  echo "Report: ${report_path}"
+}
+
 run_step() {
   local label="$1"
   shift
@@ -34,26 +56,14 @@ if [[ ! -x "${binary_path}" ]]; then
 else
   run_step "cara version" "${binary_path}" version || true
   if ! run_step "cara update --check" "${binary_path}" update --check; then
-    if [[ "${STRICT_NETWORK:-0}" != "1" ]] && rg -q "failed to fetch release info|api.github.com" "${log_path}"; then
+    if [[ "${STRICT_NETWORK:-0}" != "1" ]] && grep -Eq "failed to fetch release info|api.github.com" "${log_path}"; then
       status="skipped"
       error_msg="network unavailable for release API check"
     fi
   fi
 fi
 
-cat >"${report_path}" <<EOF
-{
-  "suite": "update-macos-local",
-  "timestampUtc": "${timestamp}",
-  "platform": "macos",
-  "binaryPath": "${binary_path}",
-  "logPath": "${log_path}",
-  "status": "${status}",
-  "error": "${error_msg}"
-}
-EOF
-
-echo "Report: ${report_path}"
+write_report
 if [[ "${status}" != "pass" ]]; then
   if [[ "${status}" == "skipped" ]]; then
     exit 0
