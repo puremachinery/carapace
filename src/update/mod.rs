@@ -21,6 +21,9 @@ pub const EXPECTED_IDENTITY_PREFIX: &str =
 pub const DEFAULT_RESUME_MAX_ATTEMPTS: u32 = 3;
 const DOWNLOAD_TIMEOUT_SECS: u64 = 300;
 const UPDATE_TRANSACTION_FILENAME: &str = "transaction.json";
+const RESUME_BACKOFF_SHORT_SECS: u64 = 5;
+const RESUME_BACKOFF_MEDIUM_SECS: u64 = 15;
+const RESUME_BACKOFF_LONG_SECS: u64 = 45;
 
 static UPDATE_OPERATION_LOCK: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
@@ -638,6 +641,14 @@ fn release_http_error_message(status: reqwest::StatusCode, body: &str) -> String
     format!("GitHub API returned HTTP {status} ({reason})")
 }
 
+fn resume_backoff_for_attempt(attempt: u32) -> Duration {
+    match attempt {
+        0 | 1 => Duration::from_secs(RESUME_BACKOFF_SHORT_SECS),
+        2 => Duration::from_secs(RESUME_BACKOFF_MEDIUM_SECS),
+        _ => Duration::from_secs(RESUME_BACKOFF_LONG_SECS),
+    }
+}
+
 pub async fn fetch_release_info(
     current_version: &str,
     requested_version: Option<&str>,
@@ -1216,7 +1227,7 @@ async fn apply_staged_update_blocking(staged_path: String) -> Result<ApplyResult
 
 async fn install_with_transaction(request: &InstallRequest) -> Result<InstallOutcome, UpdateError> {
     let existing = load_update_transaction(&request.state_dir)?;
-    let resumed = existing.is_some();
+    let resumed = existing.as_ref().is_some_and(transaction_resume_pending);
     if let Some(tx) = existing.as_ref() {
         tracing::info!(
             transaction_id = %tx.id,
@@ -1305,15 +1316,14 @@ pub async fn auto_resume_with_backoff(
         match install_or_resume(request).await {
             Ok(outcome) => return Ok(Some(outcome)),
             Err(err) if err.retryable => {
-                tx = load_update_transaction(&state_dir)?.unwrap_or(tx);
+                tx = match load_update_transaction(&state_dir)? {
+                    Some(next_tx) => next_tx,
+                    None => return Err(err),
+                };
                 if tx.attempt >= tx.max_attempts || !tx.retryable {
                     return Err(err);
                 }
-                let backoff = match tx.attempt {
-                    0 | 1 => Duration::from_secs(5),
-                    2 => Duration::from_secs(15),
-                    _ => Duration::from_secs(45),
-                };
+                let backoff = resume_backoff_for_attempt(tx.attempt);
                 tokio::time::sleep(backoff).await;
             }
             Err(err) => return Err(err),
@@ -1409,6 +1419,15 @@ mod tests {
             sanitize_version_for_path("v0.1.0+build/metadata"),
             "v0.1.0_build_metadata"
         );
+    }
+
+    #[test]
+    fn test_resume_backoff_for_attempt() {
+        assert_eq!(resume_backoff_for_attempt(0), Duration::from_secs(5));
+        assert_eq!(resume_backoff_for_attempt(1), Duration::from_secs(5));
+        assert_eq!(resume_backoff_for_attempt(2), Duration::from_secs(15));
+        assert_eq!(resume_backoff_for_attempt(3), Duration::from_secs(45));
+        assert_eq!(resume_backoff_for_attempt(10), Duration::from_secs(45));
     }
 
     #[test]
