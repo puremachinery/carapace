@@ -408,6 +408,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_update_status() {
         let _lock = TEST_LOCK.lock().unwrap();
         reset_state();
