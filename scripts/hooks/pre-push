@@ -231,7 +231,7 @@ if [ "$needs_script_checks" -eq 1 ]; then
     fi
 fi
 
-if [ "$needs_ws_golden" -eq 1 ]; then
+if [ "$needs_ws_golden" -eq 1 ] && [ "$needs_full_nextest" -eq 0 ]; then
     echo "WebSocket changes detected. Running websocket golden snapshot checks..."
     ensure_nextest_installed
     if ! cargo nextest run --all-targets server::ws::golden_tests::golden_trace; then
