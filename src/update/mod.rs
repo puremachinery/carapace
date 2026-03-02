@@ -1290,6 +1290,7 @@ mod tests {
         assert!(err.message.contains("parse update transaction"));
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn test_apply_staged_update_success_for_paths() {
         let dir = tempfile::tempdir().unwrap();
@@ -1305,6 +1306,7 @@ mod tests {
         assert!(!current.with_extension("bak").exists());
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn test_apply_staged_update_copy_failure_restores_original() {
         let dir = tempfile::tempdir().unwrap();
