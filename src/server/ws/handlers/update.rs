@@ -310,29 +310,28 @@ pub(super) async fn handle_update_install() -> Result<Value, ErrorShape> {
 
 async fn handle_update_install_with_force(force: bool) -> Result<Value, ErrorShape> {
     let state_dir = resolve_state_dir();
-    let pending_transaction =
-        tokio::task::spawn_blocking({
-            let state_dir = state_dir.clone();
-            move || crate::update::load_update_transaction(&state_dir)
-        })
-        .await
-        .map_err(|err| {
-            error_shape(
-                ERROR_UNAVAILABLE,
-                &format!("failed to join update transaction load task: {err}"),
-                None,
-            )
-        })?
-        .map_err(|err| {
-            error_shape(
-                ERROR_UNAVAILABLE,
-                &format!("failed to load update transaction: {}", err.message),
-                Some(json!({
-                    "retryable": err.retryable,
-                    "phase": err.phase
-                })),
-            )
-        })?;
+    let pending_transaction = tokio::task::spawn_blocking({
+        let state_dir = state_dir.clone();
+        move || crate::update::load_update_transaction(&state_dir)
+    })
+    .await
+    .map_err(|err| {
+        error_shape(
+            ERROR_UNAVAILABLE,
+            &format!("failed to join update transaction load task: {err}"),
+            None,
+        )
+    })?
+    .map_err(|err| {
+        error_shape(
+            ERROR_UNAVAILABLE,
+            &format!("failed to load update transaction: {}", err.message),
+            Some(json!({
+                "retryable": err.retryable,
+                "phase": err.phase
+            })),
+        )
+    })?;
     let resume_pending = pending_transaction
         .as_ref()
         .is_some_and(crate::update::transaction_resume_pending);

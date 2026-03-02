@@ -1605,14 +1605,10 @@ mod tests {
     #[tokio::test]
     async fn test_auto_resume_with_backoff_no_transaction() {
         let dir = tempfile::tempdir().unwrap();
-        let result = auto_resume_with_backoff(
-            dir.path().to_path_buf(),
-            "0.1.0".to_string(),
-            true,
-            None,
-        )
-        .await
-        .expect("no transaction should not fail");
+        let result =
+            auto_resume_with_backoff(dir.path().to_path_buf(), "0.1.0".to_string(), true, None)
+                .await
+                .expect("no transaction should not fail");
         assert!(result.is_none());
     }
 
@@ -1625,14 +1621,10 @@ mod tests {
         tx.retryable = false;
         persist_update_transaction(dir.path(), &tx).unwrap();
 
-        let result = auto_resume_with_backoff(
-            dir.path().to_path_buf(),
-            "0.1.0".to_string(),
-            true,
-            None,
-        )
-        .await
-        .expect("applied transaction should not fail");
+        let result =
+            auto_resume_with_backoff(dir.path().to_path_buf(), "0.1.0".to_string(), true, None)
+                .await
+                .expect("applied transaction should not fail");
         assert!(result.is_none());
     }
 
