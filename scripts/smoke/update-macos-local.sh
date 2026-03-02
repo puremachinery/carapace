@@ -69,6 +69,10 @@ run_step() {
 if [[ ! -x "${binary_path}" ]]; then
   status="fail"
   error_msg="binary not executable: ${binary_path}"
+  {
+    echo "== preflight =="
+    echo "binary not executable: ${binary_path}"
+  } >>"${log_path}"
 else
   if run_step "cara version" "${binary_path}" version; then
     if ! run_step "cara update --check" "${binary_path}" update --check; then

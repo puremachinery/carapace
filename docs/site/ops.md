@@ -102,7 +102,7 @@ Production/reproducible path:
 - Validate signatures/checksums before rollout.
 - Keep a recent backup to support fast rollback.
 - `cara update` is fail-closed on authenticity verification:
-  - requires `<binary>.bundle` verification
+  - requires `<asset>.bundle` verification
   - rejects issuer/identity mismatch
   - does not apply unverified binaries
 
@@ -121,7 +121,8 @@ Quick checks:
 
 ```bash
 cara update --check
-cat "${CARAPACE_STATE_DIR:-$HOME/.config/carapace}/updates/transaction.json"
+# Optional: inspect {state_dir}/updates/transaction.json
+# (set CARAPACE_STATE_DIR to your state path if you use a non-default location)
 ```
 
 Reference docs:
