@@ -1262,14 +1262,25 @@ async fn install_with_transaction(request: &InstallRequest) -> Result<InstallOut
                 let (tx, release) = prepare_transaction(request).await?;
                 (tx, Some(release))
             } else {
-                tracing::info!(
-                    transaction_id = %tx.id,
-                    phase = ?tx.phase,
-                    state = ?tx.state,
-                    attempt = tx.attempt,
-                    max_attempts = tx.max_attempts,
-                    "resuming existing update transaction"
-                );
+                if transaction_resume_pending(&tx) {
+                    tracing::info!(
+                        transaction_id = %tx.id,
+                        phase = ?tx.phase,
+                        state = ?tx.state,
+                        attempt = tx.attempt,
+                        max_attempts = tx.max_attempts,
+                        "resuming existing update transaction"
+                    );
+                } else {
+                    tracing::info!(
+                        transaction_id = %tx.id,
+                        phase = ?tx.phase,
+                        state = ?tx.state,
+                        attempt = tx.attempt,
+                        max_attempts = tx.max_attempts,
+                        "found non-resumable existing update transaction; re-running once to surface terminal state"
+                    );
+                }
                 tx.updated_at_ms = now_ms();
                 persist_update_transaction(&request.state_dir, &tx)?;
                 (tx, None)
@@ -1321,6 +1332,14 @@ pub async fn auto_resume_with_backoff(
     }
 
     loop {
+        tx = match load_update_transaction(&state_dir)? {
+            Some(next_tx) => next_tx,
+            None => return Ok(None),
+        };
+        if !transaction_resume_pending(&tx) {
+            return Ok(None);
+        }
+
         let request = InstallRequest {
             current_version: current_version.clone(),
             state_dir: state_dir.clone(),
@@ -1330,15 +1349,11 @@ pub async fn auto_resume_with_backoff(
         match install_or_resume(request).await {
             Ok(outcome) => return Ok(Some(outcome)),
             Err(err) if err.retryable => {
-                tx =
-                    match load_update_transaction(&state_dir)? {
-                        Some(next_tx) => next_tx,
-                        None => return Err(UpdateError::non_retryable(
-                            err.phase,
-                            "update transaction file disappeared during auto-resume retry attempt",
-                        )),
-                    };
-                if tx.attempt >= tx.max_attempts {
+                tx = match load_update_transaction(&state_dir)? {
+                    Some(next_tx) => next_tx,
+                    None => return Ok(None),
+                };
+                if !transaction_resume_pending(&tx) {
                     return Err(UpdateError::non_retryable(
                         err.phase,
                         format!(
@@ -1346,9 +1361,6 @@ pub async fn auto_resume_with_backoff(
                             err.message, tx.attempt, tx.max_attempts
                         ),
                     ));
-                }
-                if !tx.retryable {
-                    return Err(UpdateError::non_retryable(err.phase, err.message));
                 }
                 let backoff = resume_backoff_for_attempt(tx.attempt);
                 if let Some(shutdown) = shutdown_rx.as_mut() {
