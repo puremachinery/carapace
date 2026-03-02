@@ -1994,6 +1994,13 @@ pub fn handle_backup(output: Option<&str>) -> Result<(), Box<dyn std::error::Err
         included_sections.push("cron");
     }
 
+    // Durable task queue directory.
+    let tasks_dir = state_dir.join("tasks");
+    if tasks_dir.is_dir() {
+        archive.append_dir_all("tasks", &tasks_dir)?;
+        included_sections.push("tasks");
+    }
+
     // Usage data file.
     let usage_path = state_dir.join("usage.json");
     if usage_path.exists() {
@@ -2103,6 +2110,8 @@ fn validate_backup_file(archive_path: &PathBuf) -> Result<Vec<String>, Box<dyn s
                 Some("memory")
             } else if path_str.starts_with("cron/") {
                 Some("cron")
+            } else if path_str.starts_with("tasks/") {
+                Some("tasks")
             } else if path_str.starts_with("usage/") {
                 Some("usage")
             } else {
@@ -2187,6 +2196,13 @@ fn restore_files_from_tar(
             extract_entry(&mut entry, &target)?;
             if !restored.contains(&"cron".to_string()) {
                 restored.push("cron".to_string());
+            }
+        } else if path_str.starts_with("tasks/") {
+            let rel = path.strip_prefix("tasks").unwrap_or(&path);
+            let target = state_dir.join("tasks").join(rel);
+            extract_entry(&mut entry, &target)?;
+            if !restored.contains(&"tasks".to_string()) {
+                restored.push("tasks".to_string());
             }
         } else if path_str.starts_with("usage/") {
             let rel = path.strip_prefix("usage").unwrap_or(&path);
@@ -4217,28 +4233,17 @@ pub async fn handle_update(
     version: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let current_version = env!("CARGO_PKG_VERSION");
-
-    let (release, client) = fetch_release_info(current_version, version).await?;
-
-    let tag_name = release
-        .get("tag_name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-    let _release_name = release
-        .get("name")
-        .and_then(|v| v.as_str())
-        .unwrap_or(tag_name);
-    let html_url = release
-        .get("html_url")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let latest_version = tag_name.strip_prefix('v').unwrap_or(tag_name);
+    let release = crate::update::fetch_release_info(current_version, version)
+        .await
+        .map_err(|err| err.message)?;
+    let latest_version = crate::update::tag_to_version(&release.tag_name);
+    let html_url = release.html_url.as_str();
 
     if check {
         println!("Current version: v{}", current_version);
         println!("Latest version:  v{}", latest_version);
 
-        if current_version == latest_version {
+        if current_version == latest_version.as_str() {
             println!("Already up to date (v{})", current_version);
         } else {
             println!(
@@ -4251,7 +4256,7 @@ pub async fn handle_update(
     }
 
     // Install mode.
-    let target_version = version.unwrap_or(latest_version);
+    let target_version = version.unwrap_or(latest_version.as_str());
     if target_version == current_version {
         println!("Already up to date (v{})", current_version);
         return Ok(());
@@ -4262,137 +4267,54 @@ pub async fn handle_update(
         current_version, target_version
     );
 
-    download_and_install_binary(&release, &client, current_version, target_version, html_url).await
-}
-
-/// Fetch release information from the GitHub API.
-async fn fetch_release_info(
-    current_version: &str,
-    version: Option<&str>,
-) -> Result<(Value, reqwest::Client), Box<dyn std::error::Error>> {
-    let api_url = match version {
-        Some(v) => format!(
-            "https://api.github.com/repos/puremachinery/carapace/releases/tags/v{}",
-            v
-        ),
-        None => "https://api.github.com/repos/puremachinery/carapace/releases/latest".to_string(),
+    let request = crate::update::InstallRequest {
+        current_version: current_version.to_string(),
+        state_dir: crate::server::ws::resolve_state_dir(),
+        requested_version: Some(target_version.to_string()),
+        apply_update: true,
     };
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()?;
-
-    let response = match client
-        .get(&api_url)
-        .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", format!("cara/{}", current_version))
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("Failed to check for updates: {}", e);
-            return Err(e.into());
-        }
-    };
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body_text = response.text().await.unwrap_or_default();
-        eprintln!("GitHub API error (HTTP {}): {}", status, body_text);
-        return Err(format!("HTTP {}", status).into());
-    }
-
-    let release: Value = response.json().await?;
-    Ok((release, client))
-}
-
-/// Download and install a binary from a GitHub release.
-async fn download_and_install_binary(
-    release: &Value,
-    client: &reqwest::Client,
-    current_version: &str,
-    target_version: &str,
-    html_url: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let asset_name = format!("cara-{}-{}", std::env::consts::OS, std::env::consts::ARCH);
-
-    let assets = release
-        .get("assets")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let matching_asset = assets.iter().find(|a| {
-        a.get("name")
-            .and_then(|n| n.as_str())
-            .is_some_and(|n| n.contains(&asset_name))
-    });
-
-    let asset = match matching_asset {
-        Some(a) => a,
-        None => {
-            eprintln!(
-                "No matching binary asset found for platform '{}'. Download manually from: {}",
-                asset_name, html_url
-            );
-            return Ok(());
-        }
-    };
-
-    let download_url = asset
-        .get("browser_download_url")
-        .and_then(|u| u.as_str())
-        .ok_or("asset has no download URL")?;
-    let name = asset
-        .get("name")
-        .and_then(|n| n.as_str())
-        .unwrap_or(&asset_name);
-
-    println!("Downloading {}...", name);
-
-    let dl_response = client
-        .get(download_url)
-        .header("User-Agent", format!("cara/{}", current_version))
-        .send()
-        .await?;
-
-    if !dl_response.status().is_success() {
-        eprintln!("Download failed with HTTP {}", dl_response.status());
-        return Err(format!("download failed: HTTP {}", dl_response.status()).into());
-    }
-
-    let bytes = dl_response.bytes().await?;
-    if bytes.is_empty() {
-        return Err("downloaded asset is empty".into());
-    }
-
-    // Stage the binary
-    let state_dir = crate::server::ws::resolve_state_dir();
-    let updates_dir = state_dir.join("updates");
-    std::fs::create_dir_all(&updates_dir)?;
-    let staged_path = updates_dir.join(format!("cara-{}", target_version));
-    std::fs::write(&staged_path, &bytes)?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&staged_path, std::fs::Permissions::from_mode(0o755))?;
-    }
-
-    println!("Applying update...");
-
-    let staged_str = staged_path.to_string_lossy();
-    match crate::server::ws::apply_staged_update(&staged_str) {
-        Ok(result) => {
+    match crate::update::install_or_resume(request).await {
+        Ok(outcome) => {
             println!("Update applied successfully.");
-            println!("  Binary: {}", result.binary_path);
-            println!("  SHA-256: {}", result.sha256);
-            crate::server::ws::cleanup_old_binaries();
+            println!("  Staged path: {}", outcome.staged_path);
+            if let Some(apply) = outcome.apply_result {
+                println!("  Binary: {}", apply.binary_path);
+                println!("  SHA-256: {}", apply.sha256);
+            }
+            println!(
+                "  Sigstore bundle verification: {}",
+                if outcome.verification.bundle_verified {
+                    "passed"
+                } else {
+                    "failed"
+                }
+            );
+            println!(
+                "  Checksum verification: {}",
+                if outcome.verification.checksum_verified {
+                    "passed"
+                } else {
+                    "not available"
+                }
+            );
+            println!(
+                "  Signing identity: {}",
+                outcome.verification.expected_identity
+            );
             println!("Restart cara to use v{}.", target_version);
         }
-        Err(e) => {
-            eprintln!("Failed to apply update: {}", e);
-            return Err(e.into());
+        Err(err) => {
+            eprintln!("Update failed (phase: {:?}): {}", err.phase, err.message);
+            if err.retryable {
+                eprintln!("This failure is retryable; rerun `cara update` to resume.");
+            } else {
+                eprintln!(
+                    "This failure is non-retryable; resolve release artifact/policy mismatch before retrying."
+                );
+            }
+            eprintln!("Release page: {}", html_url);
+            return Err(err.message.into());
         }
     }
 
@@ -5511,8 +5433,10 @@ mod tests {
         let state_dir = temp.path().join("state");
         let sessions_dir = state_dir.join("sessions");
         let cron_dir = state_dir.join("cron");
+        let tasks_dir = state_dir.join("tasks");
         std::fs::create_dir_all(&sessions_dir).unwrap();
         std::fs::create_dir_all(&cron_dir).unwrap();
+        std::fs::create_dir_all(&tasks_dir).unwrap();
 
         // Create some fake session data.
         std::fs::write(
@@ -5528,6 +5452,8 @@ mod tests {
 
         // Create fake cron data.
         std::fs::write(cron_dir.join("jobs.json"), r#"{"version":1,"jobs":[]}"#).unwrap();
+        // Create fake tasks data.
+        std::fs::write(tasks_dir.join("queue.json"), r#"[]"#).unwrap();
 
         // Create fake usage data.
         std::fs::write(state_dir.join("usage.json"), r#"{"totalTokens":42}"#).unwrap();
@@ -5552,6 +5478,8 @@ mod tests {
         builder.append_dir_all("sessions", &sessions_dir).unwrap();
         // Add cron.
         builder.append_dir_all("cron", &cron_dir).unwrap();
+        // Add tasks.
+        builder.append_dir_all("tasks", &tasks_dir).unwrap();
         // Add usage.
         builder
             .append_path_with_name(state_dir.join("usage.json"), "usage/usage.json")
@@ -5568,6 +5496,7 @@ mod tests {
         let mut found_marker = false;
         let mut found_session = false;
         let mut found_cron = false;
+        let mut found_tasks = false;
         let mut found_usage = false;
 
         for entry in archive.entries().unwrap() {
@@ -5579,6 +5508,8 @@ mod tests {
                 found_session = true;
             } else if path.contains("jobs.json") {
                 found_cron = true;
+            } else if path.contains("queue.json") {
+                found_tasks = true;
             } else if path.contains("usage.json") {
                 found_usage = true;
             }
@@ -5587,6 +5518,7 @@ mod tests {
         assert!(found_marker, "Archive should contain backup marker");
         assert!(found_session, "Archive should contain session data");
         assert!(found_cron, "Archive should contain cron data");
+        assert!(found_tasks, "Archive should contain tasks data");
         assert!(found_usage, "Archive should contain usage data");
     }
 
@@ -5598,11 +5530,14 @@ mod tests {
         let source_state = temp.path().join("source");
         let source_sessions = source_state.join("sessions");
         let source_cron = source_state.join("cron");
+        let source_tasks = source_state.join("tasks");
         std::fs::create_dir_all(&source_sessions).unwrap();
         std::fs::create_dir_all(&source_cron).unwrap();
+        std::fs::create_dir_all(&source_tasks).unwrap();
 
         std::fs::write(source_sessions.join("sess1.json"), r#"{"id":"sess1"}"#).unwrap();
         std::fs::write(source_cron.join("store.json"), r#"{"version":1}"#).unwrap();
+        std::fs::write(source_tasks.join("queue.json"), r#"[]"#).unwrap();
         std::fs::write(source_state.join("usage.json"), r#"{"totalTokens":100}"#).unwrap();
 
         // Create an archive.
@@ -5623,6 +5558,7 @@ mod tests {
             .append_dir_all("sessions", &source_sessions)
             .unwrap();
         builder.append_dir_all("cron", &source_cron).unwrap();
+        builder.append_dir_all("tasks", &source_tasks).unwrap();
         builder
             .append_path_with_name(source_state.join("usage.json"), "usage/usage.json")
             .unwrap();
@@ -5676,6 +5612,20 @@ mod tests {
                     entry.read_to_end(&mut buf).unwrap();
                     std::fs::write(&target, &buf).unwrap();
                 }
+            } else if path_str.starts_with("tasks/") {
+                let rel = path.strip_prefix("tasks").unwrap_or(&path);
+                let target = target_state.join("tasks").join(rel);
+                let entry_type = entry.header().entry_type();
+                if entry_type.is_dir() {
+                    std::fs::create_dir_all(&target).unwrap();
+                } else if entry_type.is_file() {
+                    if let Some(parent) = target.parent() {
+                        std::fs::create_dir_all(parent).unwrap();
+                    }
+                    let mut buf = Vec::new();
+                    entry.read_to_end(&mut buf).unwrap();
+                    std::fs::write(&target, &buf).unwrap();
+                }
             } else if path_str.starts_with("usage/") {
                 let rel = path.strip_prefix("usage").unwrap_or(&path);
                 let target = target_state.join(rel);
@@ -5699,6 +5649,10 @@ mod tests {
         let restored_cron =
             std::fs::read_to_string(target_state.join("cron").join("store.json")).unwrap();
         assert_eq!(restored_cron, r#"{"version":1}"#);
+
+        let restored_tasks =
+            std::fs::read_to_string(target_state.join("tasks").join("queue.json")).unwrap();
+        assert_eq!(restored_tasks, r#"[]"#);
 
         let restored_usage = std::fs::read_to_string(target_state.join("usage.json")).unwrap();
         assert_eq!(restored_usage, r#"{"totalTokens":100}"#);

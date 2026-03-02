@@ -25,6 +25,7 @@ mod sessions;
 mod tailscale;
 mod tasks;
 mod tls;
+mod update;
 mod usage;
 
 use std::net::SocketAddr;
