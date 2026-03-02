@@ -152,18 +152,29 @@ pub(super) async fn handle_update_run(params: Option<&Value>) -> Result<Value, E
 }
 
 /// Get update status.
-pub(super) fn handle_update_status() -> Result<Value, ErrorShape> {
+pub(super) async fn handle_update_status() -> Result<Value, ErrorShape> {
+    let state_dir = resolve_state_dir();
+    let tx =
+        tokio::task::spawn_blocking(move || crate::update::load_update_transaction(&state_dir))
+            .await
+            .map_err(|err| {
+                error_shape(
+                    ERROR_UNAVAILABLE,
+                    &format!("failed to join update transaction load task: {err}"),
+                    None,
+                )
+            })?
+            .map_err(|err| {
+                error_shape(
+                    ERROR_UNAVAILABLE,
+                    &format!("failed to load update transaction: {}", err.message),
+                    Some(json!({
+                        "retryable": err.retryable,
+                        "phase": err.phase
+                    })),
+                )
+            })?;
     let state = UPDATE_STATE.read();
-    let tx = crate::update::load_update_transaction(&resolve_state_dir()).map_err(|err| {
-        error_shape(
-            ERROR_UNAVAILABLE,
-            &format!("failed to load update transaction: {}", err.message),
-            Some(json!({
-                "retryable": err.retryable,
-                "phase": err.phase
-            })),
-        )
-    })?;
 
     Ok(json!({
         "currentVersion": state.current_version,
@@ -396,11 +407,11 @@ mod tests {
         *state = UpdateState::default();
     }
 
-    #[test]
-    fn test_update_status() {
+    #[tokio::test]
+    async fn test_update_status() {
         let _lock = TEST_LOCK.lock().unwrap();
         reset_state();
-        let result = handle_update_status().unwrap();
+        let result = handle_update_status().await.unwrap();
         assert!(!result["currentVersion"].as_str().unwrap().is_empty());
         assert_eq!(result["channel"], "stable");
         assert_eq!(result["autoUpdate"], true);

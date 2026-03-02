@@ -20,6 +20,7 @@ pub const EXPECTED_IDENTITY_PREFIX: &str =
 
 pub const DEFAULT_RESUME_MAX_ATTEMPTS: u32 = 3;
 const DOWNLOAD_TIMEOUT_SECS: u64 = 300;
+const UPDATE_TRANSACTION_FILENAME: &str = "transaction.json";
 
 static UPDATE_OPERATION_LOCK: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
@@ -209,7 +210,7 @@ pub fn release_api_url(version: Option<&str>) -> String {
 }
 
 pub fn update_transaction_path(state_dir: &Path) -> PathBuf {
-    state_dir.join("updates").join("transaction.json")
+    state_dir.join("updates").join(UPDATE_TRANSACTION_FILENAME)
 }
 
 fn update_staging_path(state_dir: &Path, version: &str) -> PathBuf {
@@ -354,8 +355,9 @@ pub fn sha256_bytes(data: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-pub fn verify_checksum(actual_hash: &str, checksum_text: &str) -> Result<(), UpdateError> {
-    let expected = checksum_text
+/// Verify a staged artifact hash against one checksum entry line from SHA256SUMS.
+pub fn verify_checksum(actual_hash: &str, checksum_line: &str) -> Result<(), UpdateError> {
+    let expected = checksum_line
         .split_whitespace()
         .next()
         .unwrap_or("")
@@ -557,6 +559,13 @@ fn cleanup_stale_staged_updates(state_dir: &Path) {
     let seven_days = Duration::from_secs(7 * 24 * 60 * 60);
     for entry in entries.flatten() {
         let path = entry.path();
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == UPDATE_TRANSACTION_FILENAME)
+        {
+            continue;
+        }
         let stale = path
             .metadata()
             .ok()
@@ -586,6 +595,17 @@ fn is_retryable_release_response(status: reqwest::StatusCode, body: &str) -> boo
         || (status == reqwest::StatusCode::FORBIDDEN && is_rate_limit_forbidden_body(body))
 }
 
+fn release_http_error_message(status: reqwest::StatusCode, body: &str) -> String {
+    let reason = match status {
+        reqwest::StatusCode::TOO_MANY_REQUESTS => "rate limited",
+        reqwest::StatusCode::FORBIDDEN if is_rate_limit_forbidden_body(body) => "rate limited",
+        reqwest::StatusCode::NOT_FOUND => "release not found",
+        reqwest::StatusCode::UNAUTHORIZED => "authentication rejected",
+        _ => "unexpected response",
+    };
+    format!("GitHub API returned HTTP {status} ({reason})")
+}
+
 pub async fn fetch_release_info(
     current_version: &str,
     requested_version: Option<&str>,
@@ -613,7 +633,7 @@ pub async fn fetch_release_info(
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        let message = format!("GitHub API returned HTTP {status}: {body}");
+        let message = release_http_error_message(status, &body);
         return if is_retryable_release_response(status, &body) {
             Err(UpdateError::retryable(None, message))
         } else {
@@ -1000,6 +1020,13 @@ async fn run_transaction_once(
         if let Some(line) = entry {
             verify_checksum(&staged_hash, line)?;
             checksum_verified = true;
+        } else {
+            tracing::warn!(
+                transaction_id = %tx.id,
+                checksum_file = %expected_checksum_name(),
+                asset_name = %asset_name,
+                "checksum file present but no matching entry for update asset"
+            );
         }
     }
     tracing::info!(
@@ -1111,6 +1138,15 @@ fn requested_version_matches_transaction(
     tag_to_version(requested_version) == transaction_version
 }
 
+fn should_restart_transaction_for_requested_version(
+    requested_version: Option<&str>,
+    transaction_version: &str,
+) -> bool {
+    requested_version.is_some_and(|requested| {
+        !requested_version_matches_transaction(requested, transaction_version)
+    })
+}
+
 async fn compute_sha256_blocking(staged_path: String) -> Result<String, UpdateError> {
     tokio::task::spawn_blocking(move || compute_sha256(Path::new(&staged_path)))
         .await
@@ -1163,13 +1199,10 @@ async fn install_with_transaction(request: &InstallRequest) -> Result<InstallOut
                     Some(UpdatePhase::Failed),
                     message,
                 ));
-            } else if request
-                .requested_version
-                .as_deref()
-                .is_some_and(|requested| {
-                    !requested_version_matches_transaction(requested, &tx.version)
-                })
-            {
+            } else if should_restart_transaction_for_requested_version(
+                request.requested_version.as_deref(),
+                &tx.version,
+            ) {
                 clear_update_transaction(&request.state_dir)?;
                 let (tx, release) = prepare_transaction(request).await?;
                 (tx, Some(release))
@@ -1258,6 +1291,22 @@ mod tests {
         ));
         assert!(!requested_version_matches_transaction(
             "v0.1.0-preview11",
+            "0.1.0-preview12"
+        ));
+    }
+
+    #[test]
+    fn test_should_restart_transaction_for_requested_version() {
+        assert!(!should_restart_transaction_for_requested_version(
+            None,
+            "0.1.0-preview12"
+        ));
+        assert!(!should_restart_transaction_for_requested_version(
+            Some("v0.1.0-preview12"),
+            "0.1.0-preview12"
+        ));
+        assert!(should_restart_transaction_for_requested_version(
+            Some("v0.1.0-preview11"),
             "0.1.0-preview12"
         ));
     }
