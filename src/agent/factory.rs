@@ -51,6 +51,37 @@ fn try_build_provider<P: agent::LlmProvider + 'static>(
     }
 }
 
+struct VertexConfig {
+    project_id: Option<String>,
+    location: Option<String>,
+    model: Option<String>,
+}
+
+fn get_vertex_config(cfg: &Value) -> VertexConfig {
+    let vertex_cfg = cfg.get("vertex");
+    let project_id = vertex_cfg
+        .and_then(|v| v.get("projectId"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("VERTEX_PROJECT_ID").ok());
+    let location = vertex_cfg
+        .and_then(|v| v.get("location"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("VERTEX_LOCATION").ok());
+    let model = vertex_cfg
+        .and_then(|v| v.get("model"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("VERTEX_MODEL").ok());
+
+    VertexConfig {
+        project_id,
+        location,
+        model,
+    }
+}
+
 /// Try to build the Ollama provider with optional base URL, API key, and
 /// a non-blocking connectivity check.
 fn try_build_ollama_provider(
@@ -275,36 +306,19 @@ pub fn build_providers(cfg: &Value) -> Result<Option<MultiProvider>, Box<dyn std
     };
 
     // Vertex
-    let vertex_cfg = cfg.get("vertex");
-    let vertex_project_id = vertex_cfg
-        .and_then(|v| v.get("projectId"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .or_else(|| std::env::var("VERTEX_PROJECT_ID").ok());
+    let vertex_config = get_vertex_config(cfg);
 
-    let vertex_location = vertex_cfg
-        .and_then(|v| v.get("location"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .or_else(|| std::env::var("VERTEX_LOCATION").ok())
-        .unwrap_or_else(|| "us-central1".to_string());
-
-    let vertex_model = vertex_cfg
-        .and_then(|v| v.get("model"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .or_else(|| std::env::var("VERTEX_MODEL").ok());
-
-    let vertex_provider = if let Some(project_id) = vertex_project_id {
+    let vertex_provider = if let Some(project_id) = vertex_config.project_id {
+        let location = vertex_config.location.unwrap_or_else(|| "us-central1".to_string());
         info!(
             "LLM provider configured: Vertex (project: {}, location: {})",
-            project_id, vertex_location
+            project_id, location
         );
         Some(
             Arc::new(agent::vertex::VertexProvider::new(
                 project_id,
-                vertex_location,
-                vertex_model,
+                location,
+                vertex_config.model,
             )) as Arc<dyn agent::LlmProvider>,
         )
     } else {
@@ -404,22 +418,7 @@ pub fn fingerprint_providers(cfg: &Value) -> ProviderFingerprint {
     });
 
     let bedrock_cfg = cfg.get("bedrock");
-    let vertex_cfg = cfg.get("vertex");
-    let vertex_project_id = vertex_cfg
-        .and_then(|v| v.get("projectId"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .or_else(|| std::env::var("VERTEX_PROJECT_ID").ok());
-    let vertex_location = vertex_cfg
-        .and_then(|v| v.get("location"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .or_else(|| std::env::var("VERTEX_LOCATION").ok());
-    let vertex_model = vertex_cfg
-        .and_then(|v| v.get("model"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .or_else(|| std::env::var("VERTEX_MODEL").ok());
+    let vertex_config = get_vertex_config(cfg);
 
     let bedrock_enabled = bedrock_cfg
         .and_then(|b| b.get("enabled"))
@@ -459,7 +458,7 @@ pub fn fingerprint_providers(cfg: &Value) -> ProviderFingerprint {
         } else {
             None
         },
-        vertex: vertex_project_id.map(|p| (p, vertex_location.unwrap_or_default(), vertex_model)),
+        vertex: vertex_config.project_id.map(|p| (p, vertex_config.location.unwrap_or_default(), vertex_config.model)),
     }
 }
 
@@ -602,6 +601,9 @@ mod tests {
             assert!(fp.bedrock.is_some());
             assert_eq!(fp.bedrock.as_ref().unwrap().len(), 16); // 8 bytes = 16 hex chars
         });
+        let fp = fingerprint_providers(&cfg);
+        assert!(fp.bedrock.is_some());
+        assert_eq!(fp.bedrock.as_deref(), Some("us-east-1:AKIA...MPLE"));
     }
 
     #[test]

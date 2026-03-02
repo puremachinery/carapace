@@ -559,7 +559,7 @@ impl ResponseAdapter for OpenAiAdapter {
 
         let parsed: Value = match serde_json::from_str(data) {
             Ok(v) => v,
-            Err(_e) => return Ok(events), // Skip unparseable (maybe keepalive?)
+            Err(e) => return Err(format!("failed to parse JSON chunk: {}", e)),
         };
 
         if let Some(choices) = parsed.get("choices").and_then(|v| v.as_array()) {
@@ -638,13 +638,7 @@ impl VertexProvider {
         // Let's just default to GCloudCli for now as most users are local, AND verify if we are in cloud?
         // The plan said: "If gcloud is not found (NotFound), it falls back".
         // Let's make a `CompositeTokenProvider`.
-        let token_manager: Arc<dyn TokenProvider> = if std::env::var("UseGCloudCli").is_ok() {
-            Arc::new(GCloudCliProvider)
-        } else {
-            // Default to MetadataProvider, fallback to GCloudCliProvider if it fails?
-            // For now, let's implement a FallbackTokenProvider that tries both.
-            Arc::new(FallbackTokenProvider::new())
-        };
+        let token_manager: Arc<dyn TokenProvider> = Arc::new(FallbackTokenProvider::new());
 
         Self {
             client: reqwest::Client::builder()
@@ -660,7 +654,7 @@ impl VertexProvider {
         }
     }
 
-    async fn get_token(&self) -> Result<String, AgentError> {
+    pub async fn get_token(&self) -> Result<String, AgentError> {
         // Read path
         {
             let cache = self.token_cache.read().await;
@@ -719,7 +713,7 @@ impl VertexProvider {
 
         // ... rest of logic uses effective_model
 
-        let (_publisher, model_id, adapter): (&str, &str, Box<dyn ResponseAdapter>) =
+        let (publisher, model_id, adapter): (&str, &str, Box<dyn ResponseAdapter>) =
             if effective_model.starts_with("anthropic/") {
                 (
                     "anthropic",
@@ -747,25 +741,24 @@ impl VertexProvider {
                  ("google", effective_model, Box::new(GeminiAdapter))
             };
 
-        let _method = adapter.api_method();
+        let method = adapter.api_method();
 
         // Global endpoints for Gemini 3 and Experimental
         // These models are automatically routed to the global endpoint `aiplatform.googleapis.com`
         // unless overridden.
         if model_id.contains("gemini-3") {
              let url = format!(
-                "https://aiplatform.googleapis.com/v1beta1/projects/{}/locations/{}/publishers/google/models/{}:streamGenerateContent?alt=sse",
-                self.project_id, "global", model_id
+                "https://aiplatform.googleapis.com/v1beta1/projects/{}/locations/{}/publishers/{}/models/{}:{}?alt=sse",
+                self.project_id, "global", publisher, model_id, method
             );
-            return (Box::new(GeminiAdapter), url);
+            return (adapter, url);
         }
 
-        // Default to Google/Gemini for "vertex/gemini-..."
         let url = format!(
-            "https://{}-aiplatform.googleapis.com/v1beta1/projects/{}/locations/{}/publishers/google/models/{}:streamGenerateContent?alt=sse",
-            self.location, self.project_id, self.location, model_id
+            "https://{}-aiplatform.googleapis.com/v1beta1/projects/{}/locations/{}/publishers/{}/models/{}:{}?alt=sse",
+            self.location, self.project_id, self.location, publisher, model_id, method
         );
-        (Box::new(GeminiAdapter), url)
+        (adapter, url)
     }
 }
 
@@ -826,6 +819,10 @@ pub fn strip_vertex_prefix(model: &str) -> &str {
     } else {
         model
     }
+}
+
+pub fn is_vertex_model(model: &str) -> bool {
+    model.starts_with("vertex/") || model.starts_with("vertex:")
 }
 
 #[async_trait]
@@ -1029,8 +1026,7 @@ pub async fn list_models(
             .map_err(|e| AgentError::Provider(format!("failed to list models for {publisher}: {e}")))?;
 
         if !response.status().is_success() {
-             // Log warning but continue?
-             // eprintln!("Failed to list models for {publisher}: {}", response.status());
+             tracing::warn!("Failed to list models for {}: {}", publisher, response.status());
              continue;
         }
 

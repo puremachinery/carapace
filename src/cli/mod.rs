@@ -1602,19 +1602,15 @@ pub async fn handle_list_models(
         "Listing models for project: {}, location: {}...",
         project, effective_location
     );
-    println!("Fetching access token via gcloud...");
+    println!("Fetching access token...");
 
-    let output = tokio::process::Command::new("gcloud")
-        .args(&["auth", "print-access-token"])
-        .output()
-        .await?;
+    let provider = crate::agent::vertex::VertexProvider::new(
+        project.clone(),
+        effective_location.clone(),
+        None,
+    );
+    let token = provider.get_token().await.map_err(|e| format!("Failed to get token: {}", e))?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Failed to get gcloud token: {stderr}").into());
-    }
-
-    let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
     let models = crate::agent::vertex::list_models(&project, &effective_location, &token).await?;
 

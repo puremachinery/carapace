@@ -32,3 +32,5 @@ run_local_with_signal.sh
 # Snapshots
 **/*.snap.new
 
+carapace.json
+src/server/ws/snapshots/
