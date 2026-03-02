@@ -429,7 +429,7 @@ fn apply_staged_update_at_paths(
 
     let backup_path = format!("{}.bak", current_path.display());
 
-    fs::rename(&current_path, &backup_path).map_err(|e| {
+    fs::rename(current_path, &backup_path).map_err(|e| {
         UpdateError::non_retryable(
             Some(UpdatePhase::Applying),
             format!("failed to rename current binary to .bak: {e}"),
@@ -452,7 +452,7 @@ fn apply_staged_update_at_paths(
     };
 
     if let Err(copy_err) = copy_result {
-        if let Err(restore_err) = fs::rename(&backup_path, &current_path) {
+        if let Err(restore_err) = fs::rename(&backup_path, current_path) {
             return Err(UpdateError::non_retryable(
                 Some(UpdatePhase::Applying),
                 format!(
@@ -470,7 +470,7 @@ fn apply_staged_update_at_paths(
     {
         use std::os::unix::fs::PermissionsExt;
         let perms = fs::Permissions::from_mode(0o755);
-        if let Err(err) = fs::set_permissions(&current_path, perms) {
+        if let Err(err) = fs::set_permissions(current_path, perms) {
             tracing::warn!(
                 path = %current_path.display(),
                 error = %err,

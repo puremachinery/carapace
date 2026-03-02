@@ -9,4 +9,5 @@ ignore = [
     "RUSTSEC-2025-0118",  # wasmtime: unsound shared linear memory (severity 1.8)
     "RUSTSEC-2025-0046",  # wasmtime: fd_renumber host panic (severity 3.3)
     "RUSTSEC-2024-0438",  # wasmtime: Windows device filename sandboxing
+    "RUSTSEC-2023-0071",  # rsa via sigstore/openidconnect; verifier uses only public cert/provenance checks (no private-key RSA ops)
 ]

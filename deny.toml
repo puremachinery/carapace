@@ -27,7 +27,9 @@ unmaintained = "none"
 yanked = "deny"
 
 # Advisories to ignore (add RUSTSEC IDs with justification if needed).
-ignore = []
+ignore = [
+    "RUSTSEC-2023-0071", # rsa via sigstore/openidconnect; updater verification path uses public cert/provenance checks only
+]
 
 # ──────────────────────────────────────────────────────────────────────────────
 # License checks — allowlist of acceptable licenses
