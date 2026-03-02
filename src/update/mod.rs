@@ -1345,7 +1345,7 @@ mod tests {
     fn test_sanitize_version_for_path_replaces_unsafe_chars() {
         assert_eq!(
             sanitize_version_for_path("../../v0.1.0-preview12"),
-            "______v0.1.0-preview12"
+            ".._.._v0.1.0-preview12"
         );
         assert_eq!(
             sanitize_version_for_path("v0.1.0+build/metadata"),

@@ -338,6 +338,7 @@ jobs:
           FMT_RESULT: ${{ needs.fmt.result }}
           CLIPPY_RESULT: ${{ needs.clippy.result }}
           RUNTIME_BRIDGE_GUARD_RESULT: ${{ needs['runtime-bridge-guard'].result }}
+          WS_GOLDEN_RESULT: ${{ needs['ws-golden'].result }}
           BUILD_RESULT: ${{ needs.build.result }}
           TEST_PR_RESULT: ${{ needs['test-pr'].result }}
           TEST_PR_WINDOWS_RESULT: ${{ needs['test-pr-windows'].result }}
@@ -360,6 +361,7 @@ jobs:
             "fmt"
             "clippy"
             "runtime-bridge-guard"
+            "ws-golden"
             "build"
             "test-pr"
             "test-pr-windows"
@@ -381,6 +383,7 @@ jobs:
             "$FMT_RESULT"
             "$CLIPPY_RESULT"
             "$RUNTIME_BRIDGE_GUARD_RESULT"
+            "$WS_GOLDEN_RESULT"
             "$BUILD_RESULT"
             "$TEST_PR_RESULT"
             "$TEST_PR_WINDOWS_RESULT"

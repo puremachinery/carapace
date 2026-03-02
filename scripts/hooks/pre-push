@@ -75,6 +75,12 @@ is_ws_golden_relevant_path() {
         src/server/ws/*)
             return 0
             ;;
+        src/server/ws/*/*)
+            return 0
+            ;;
+        src/server/ws/*/*/*)
+            return 0
+            ;;
         *)
             return 1
             ;;
