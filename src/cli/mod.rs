@@ -4268,10 +4268,14 @@ pub async fn handle_update(
     match crate::update::install_or_resume(request).await {
         Ok(outcome) => {
             if outcome.resumed {
+                let max_attempts = outcome
+                    .transaction
+                    .as_ref()
+                    .map(|tx| tx.max_attempts)
+                    .unwrap_or(crate::update::DEFAULT_RESUME_MAX_ATTEMPTS);
                 println!(
                     "Resumed pending update transaction (attempt {}/{}).",
-                    outcome.attempt,
-                    crate::update::DEFAULT_RESUME_MAX_ATTEMPTS
+                    outcome.attempt, max_attempts
                 );
             }
             println!("Update applied successfully.");

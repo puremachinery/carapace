@@ -521,6 +521,28 @@ mod tests {
         assert_eq!(selected.as_deref(), Some("0.2.0"));
     }
 
+    #[test]
+    fn test_resolve_install_version_prefers_pending_when_resuming() {
+        let pending = crate::update::UpdateTransaction {
+            id: "tx-1".to_string(),
+            version: "0.0.1".to_string(),
+            asset_name: "cara-test".to_string(),
+            state: crate::update::UpdateTransactionState::InProgress,
+            attempt: 1,
+            max_attempts: 3,
+            started_at_ms: 0,
+            updated_at_ms: 0,
+            staged_path: None,
+            bundle_path: None,
+            sha256: None,
+            last_error: None,
+            phase: crate::update::UpdatePhase::Downloaded,
+            retryable: true,
+        };
+        let selected = resolve_install_version(Some("0.2.0"), Some(&pending), true);
+        assert_eq!(selected.as_deref(), Some("0.0.1"));
+    }
+
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn test_update_check() {

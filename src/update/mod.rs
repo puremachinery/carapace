@@ -1227,31 +1227,15 @@ async fn apply_staged_update_blocking(staged_path: String) -> Result<ApplyResult
 
 async fn install_with_transaction(request: &InstallRequest) -> Result<InstallOutcome, UpdateError> {
     let existing = load_update_transaction(&request.state_dir)?;
-    if let Some(tx) = existing.as_ref() {
-        if transaction_resume_pending(tx) {
-            tracing::info!(
-                transaction_id = %tx.id,
-                phase = ?tx.phase,
-                state = ?tx.state,
-                attempt = tx.attempt,
-                max_attempts = tx.max_attempts,
-                "resuming existing update transaction"
-            );
-        } else {
-            tracing::info!(
-                transaction_id = %tx.id,
-                phase = ?tx.phase,
-                state = ?tx.state,
-                attempt = tx.attempt,
-                max_attempts = tx.max_attempts,
-                "found non-resumable existing update transaction; starting a fresh update attempt"
-            );
-        }
-    }
-
     let (mut tx, release_for_first_run) = match existing {
         Some(mut tx) => {
             if tx.state == UpdateTransactionState::Applied {
+                tracing::info!(
+                    transaction_id = %tx.id,
+                    phase = ?tx.phase,
+                    state = ?tx.state,
+                    "clearing applied transaction and starting a fresh update attempt"
+                );
                 clear_update_transaction(&request.state_dir)?;
                 let (tx, release) = prepare_transaction(request).await?;
                 (tx, Some(release))
@@ -1268,10 +1252,24 @@ async fn install_with_transaction(request: &InstallRequest) -> Result<InstallOut
                 request.requested_version.as_deref(),
                 &tx.version,
             ) {
+                tracing::info!(
+                    transaction_id = %tx.id,
+                    transaction_version = %tx.version,
+                    requested_version = ?request.requested_version,
+                    "clearing transaction due to requested-version mismatch and starting a fresh update attempt"
+                );
                 clear_update_transaction(&request.state_dir)?;
                 let (tx, release) = prepare_transaction(request).await?;
                 (tx, Some(release))
             } else {
+                tracing::info!(
+                    transaction_id = %tx.id,
+                    phase = ?tx.phase,
+                    state = ?tx.state,
+                    attempt = tx.attempt,
+                    max_attempts = tx.max_attempts,
+                    "resuming existing update transaction"
+                );
                 tx.updated_at_ms = now_ms();
                 persist_update_transaction(&request.state_dir, &tx)?;
                 (tx, None)
@@ -1340,8 +1338,17 @@ pub async fn auto_resume_with_backoff(
                             "update transaction file disappeared during auto-resume retry attempt",
                         )),
                     };
-                if tx.attempt >= tx.max_attempts || !tx.retryable {
-                    return Err(err);
+                if tx.attempt >= tx.max_attempts {
+                    return Err(UpdateError::non_retryable(
+                        err.phase,
+                        format!(
+                            "{} (retry budget exhausted at attempt {}/{})",
+                            err.message, tx.attempt, tx.max_attempts
+                        ),
+                    ));
+                }
+                if !tx.retryable {
+                    return Err(UpdateError::non_retryable(err.phase, err.message));
                 }
                 let backoff = resume_backoff_for_attempt(tx.attempt);
                 if let Some(shutdown) = shutdown_rx.as_mut() {
