@@ -29,4 +29,5 @@ pub mod sessions;
 pub mod tailscale;
 pub mod tasks;
 pub mod tls;
+pub mod update;
 pub mod usage;

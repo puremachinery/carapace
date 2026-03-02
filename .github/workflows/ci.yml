@@ -108,6 +108,18 @@ jobs:
       - name: Enforce runtime bridge boundaries
         run: ./scripts/check-runtime-bridge-usage.sh
 
+  ws-golden:
+    name: WS Golden
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.rust_runtime == 'true'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - uses: taiki-e/install-action@602dc500e2b7e0e2486b4ce53909ba048de44e08 # nextest
+      - run: cargo nextest run --all-targets server::ws::golden_tests::golden_trace
+
   build:
     name: Build
     runs-on: ubuntu-latest
@@ -122,8 +134,8 @@ jobs:
   test-pr:
     name: Test (ubuntu PR)
     runs-on: ubuntu-latest
-    needs: changes
-    if: needs.changes.outputs.rust_runtime == 'true' && github.event_name == 'pull_request'
+    needs: [changes, ws-golden]
+    if: needs.changes.outputs.rust_runtime == 'true' && needs.ws-golden.result == 'success' && github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
@@ -134,8 +146,8 @@ jobs:
   test-push:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    needs: changes
-    if: needs.changes.outputs.rust_runtime == 'true' && github.event_name == 'push'
+    needs: [changes, ws-golden]
+    if: needs.changes.outputs.rust_runtime == 'true' && needs.ws-golden.result == 'success' && github.event_name == 'push'
     strategy:
       fail-fast: false
       matrix:
@@ -150,8 +162,8 @@ jobs:
   test-pr-windows:
     name: Test (windows PR)
     runs-on: windows-latest
-    needs: changes
-    if: needs.changes.outputs.rust_runtime == 'true' && github.event_name == 'pull_request' && needs.changes.outputs.windows_sensitive == 'true'
+    needs: [changes, ws-golden]
+    if: needs.changes.outputs.rust_runtime == 'true' && needs.ws-golden.result == 'success' && github.event_name == 'pull_request' && needs.changes.outputs.windows_sensitive == 'true'
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
@@ -304,6 +316,7 @@ jobs:
       - fmt
       - clippy
       - runtime-bridge-guard
+      - ws-golden
       - build
       - test-pr
       - test-pr-windows
@@ -325,6 +338,7 @@ jobs:
           FMT_RESULT: ${{ needs.fmt.result }}
           CLIPPY_RESULT: ${{ needs.clippy.result }}
           RUNTIME_BRIDGE_GUARD_RESULT: ${{ needs['runtime-bridge-guard'].result }}
+          WS_GOLDEN_RESULT: ${{ needs['ws-golden'].result }}
           BUILD_RESULT: ${{ needs.build.result }}
           TEST_PR_RESULT: ${{ needs['test-pr'].result }}
           TEST_PR_WINDOWS_RESULT: ${{ needs['test-pr-windows'].result }}
@@ -347,6 +361,7 @@ jobs:
             "fmt"
             "clippy"
             "runtime-bridge-guard"
+            "ws-golden"
             "build"
             "test-pr"
             "test-pr-windows"
@@ -368,6 +383,7 @@ jobs:
             "$FMT_RESULT"
             "$CLIPPY_RESULT"
             "$RUNTIME_BRIDGE_GUARD_RESULT"
+            "$WS_GOLDEN_RESULT"
             "$BUILD_RESULT"
             "$TEST_PR_RESULT"
             "$TEST_PR_WINDOWS_RESULT"

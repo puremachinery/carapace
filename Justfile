@@ -34,6 +34,14 @@ test-verbose:
 test-one NAME:
     cargo nextest run {{NAME}}
 
+# Run websocket golden snapshot tests.
+test-ws-golden:
+    cargo nextest run --all-targets server::ws::golden_tests::golden_trace
+
+# Run the fastest websocket golden guard for update/status contract drift.
+test-ws-golden-quick:
+    cargo nextest run --all-targets --test cara server::ws::golden_tests::golden_trace::golden_update_status
+
 # Run tests and show coverage summary
 test-coverage:
     cargo tarpaulin --out Html --output-dir target/coverage

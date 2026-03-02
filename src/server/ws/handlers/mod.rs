@@ -36,7 +36,6 @@ use system::*;
 pub(super) use talk::*;
 pub(super) use tts::*;
 pub(super) use update::*;
-pub(crate) use update::{apply_staged_update, cleanup_old_binaries};
 pub(super) use usage::*;
 pub(super) use voicewake::*;
 
@@ -793,7 +792,6 @@ fn dispatch_cron_usage_update(
         "usage.daily" => Some(handle_usage_daily(params)),
         "usage.monthly" => Some(handle_usage_monthly(params)),
         "usage.reset" => Some(handle_usage_reset(params)),
-        "update.status" => Some(handle_update_status()),
         "update.setChannel" => Some(handle_update_set_channel(params)),
         "update.configure" => Some(handle_update_configure(params)),
         "update.dismiss" => Some(handle_update_dismiss()),
@@ -889,6 +887,7 @@ pub(super) async fn dispatch_method(
 
         // Update (async)
         "update.run" => handle_update_run(params).await,
+        "update.status" => handle_update_status().await,
         "update.check" => handle_update_check().await,
         "update.install" => handle_update_install().await,
 

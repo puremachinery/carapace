@@ -45,9 +45,6 @@ pub use handlers::AgentRunStatus;
 // Re-export AgentRun for use by cron executor and tests
 pub use handlers::sessions::AgentRun;
 
-// Re-export update functions for use by CLI
-pub(crate) use handlers::{apply_staged_update, cleanup_old_binaries};
-
 // Re-export config persistence types for use by control endpoint
 pub(crate) use handlers::{
     broadcast_config_changed, map_validation_issues, persist_config_file, read_config_snapshot,
@@ -605,6 +602,7 @@ impl WsServerState {
         config: WsServerConfig,
         state_dir: PathBuf,
     ) -> Result<Self, WsConfigError> {
+        let cleanup_state_dir = state_dir.clone();
         let state = Self::new_persistent_unloaded(config, state_dir)?;
         let state = tokio::task::spawn_blocking(move || {
             state.cron_scheduler.load();
@@ -628,6 +626,22 @@ impl WsServerState {
             .load_async()
             .await
             .map_err(WsConfigError::Runtime)?;
+        tokio::task::spawn_blocking(move || {
+            crate::update::cleanup_old_binaries(&cleanup_state_dir)
+        })
+        .await
+        .map_err(|err| {
+            let reason = if err.is_panic() {
+                "panicked"
+            } else if err.is_cancelled() {
+                "was cancelled"
+            } else {
+                "failed"
+            };
+            WsConfigError::Runtime(format!(
+                "update cleanup worker {reason} during startup: {err}"
+            ))
+        })?;
         Ok(state)
     }
 
