@@ -732,17 +732,6 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginWorkerState<B> {
         }
     }
 
-    fn map_component_post_return_error(
-        err: wasmtime::Error,
-        iface_name: &str,
-        func_name: &str,
-    ) -> BindingError {
-        BindingError::CallError(format!(
-            "post_return for '{}.{}' failed: {}",
-            iface_name, func_name, err
-        ))
-    }
-
     fn call_export_no_args<R>(
         &mut self,
         iface_name: &str,
@@ -766,10 +755,6 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginWorkerState<B> {
             .runtime
             .block_on(async { func.call_async(&mut self.store, ()).await })
             .map_err(|err| Self::map_component_call_error(err, iface_name, func_name))?;
-
-        self.runtime
-            .block_on(async { func.post_return_async(&mut self.store).await })
-            .map_err(|err| Self::map_component_post_return_error(err, iface_name, func_name))?;
 
         Ok(result)
     }
@@ -799,10 +784,6 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginWorkerState<B> {
             .runtime
             .block_on(async { func.call_async(&mut self.store, param).await })
             .map_err(|err| Self::map_component_call_error(err, iface_name, func_name))?;
-
-        self.runtime
-            .block_on(async { func.post_return_async(&mut self.store).await })
-            .map_err(|err| Self::map_component_post_return_error(err, iface_name, func_name))?;
 
         Ok(result)
     }
@@ -1064,7 +1045,6 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
         // Configure wasmtime engine
         let mut config = Config::new();
         config.wasm_component_model(true);
-        config.async_support(true);
         config.consume_fuel(true);
         config.epoch_interruption(true);
         // Memory limits are enforced per-instance via resource limiter

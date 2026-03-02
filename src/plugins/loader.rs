@@ -622,7 +622,6 @@ impl PluginLoader {
         // Configure wasmtime engine
         let mut config = Config::new();
         config.wasm_component_model(true);
-        config.async_support(true);
 
         let engine = Engine::new(&config).map_err(|e| LoaderError::EngineError(e.to_string()))?;
 
