@@ -3,6 +3,7 @@
 # - docs/site/meta-only pushes: skip checks
 # - shell-script-only pushes: run shell syntax/lint checks
 # - non-shell script-only pushes: skip checks
+# - websocket changes: run websocket golden snapshot checks
 # - Rust-impacting pushes: run cargo nextest
 # Install via: just setup-hooks
 
@@ -67,6 +68,24 @@ is_script_path() {
             return 1
             ;;
     esac
+}
+
+is_ws_golden_relevant_path() {
+    case "$1" in
+        src/server/ws/*)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+ensure_nextest_installed() {
+    if ! command -v cargo-nextest >/dev/null 2>&1; then
+        echo "cargo-nextest is required. Install with: cargo install cargo-nextest"
+        exit 1
+    fi
 }
 
 run_shell_checks() {
@@ -157,10 +176,15 @@ fi
 needs_nextest=0
 needs_script_checks=0
 needs_non_shell_script_only=0
+needs_ws_golden=0
 declare -a shell_targets_to_check=()
 for path in "${changed_files[@]}"; do
     if is_docs_or_site_only_path "$path"; then
         continue
+    fi
+
+    if is_ws_golden_relevant_path "$path"; then
+        needs_ws_golden=1
     fi
 
     if is_rust_impacting_path "$path"; then
@@ -202,6 +226,16 @@ if [ "$needs_script_checks" -eq 1 ]; then
     fi
 fi
 
+if [ "$needs_ws_golden" -eq 1 ]; then
+    echo "WebSocket changes detected. Running websocket golden snapshot checks..."
+    ensure_nextest_installed
+    if ! cargo nextest run --all-targets server::ws::golden_tests::golden_trace; then
+        echo "Websocket golden snapshot checks failed."
+        echo "If output changes are intentional, update snapshots and commit them before pushing."
+        exit 1
+    fi
+fi
+
 if [ "$needs_nextest" -eq 0 ]; then
     echo "No Rust-impacting changes detected; skipping cargo nextest."
     echo "All applicable checks passed, pushing..."
@@ -210,10 +244,7 @@ fi
 
 echo "Rust-impacting changes detected. Running tests before push..."
 
-if ! command -v cargo-nextest >/dev/null 2>&1; then
-    echo "cargo-nextest is required. Install with: cargo install cargo-nextest"
-    exit 1
-fi
+ensure_nextest_installed
 
 if ! cargo nextest run --all-targets; then
     echo "Tests failed. Fix failing tests before pushing."

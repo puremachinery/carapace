@@ -34,6 +34,10 @@ test-verbose:
 test-one NAME:
     cargo nextest run {{NAME}}
 
+# Run websocket golden snapshot tests.
+test-ws-golden:
+    cargo nextest run --all-targets server::ws::golden_tests::golden_trace
+
 # Run tests and show coverage summary
 test-coverage:
     cargo tarpaulin --out Html --output-dir target/coverage
