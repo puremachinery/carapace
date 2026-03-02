@@ -688,7 +688,7 @@ async fn download_asset(
 }
 
 async fn verify_bundle_signature(
-    binary_bytes: &[u8],
+    binary_bytes: Vec<u8>,
     bundle_bytes: &[u8],
     expected_identity: &str,
 ) -> Result<(), UpdateError> {
@@ -700,7 +700,6 @@ async fn verify_bundle_signature(
             )
         })?;
     let expected_identity = expected_identity.to_string();
-    let input = binary_bytes.to_vec();
     tokio::task::spawn_blocking(move || {
         let verifier =
             sigstore::bundle::verify::blocking::Verifier::production().map_err(|err| {
@@ -711,7 +710,7 @@ async fn verify_bundle_signature(
             })?;
 
         let mut hasher = Sha256::new();
-        hasher.update(&input);
+        hasher.update(&binary_bytes);
 
         let issuer_policy = sigstore::bundle::verify::policy::OIDCIssuer::new(EXPECTED_OIDC_ISSUER);
         let identity_policy = sigstore::bundle::verify::policy::Identity::new(
@@ -743,6 +742,18 @@ async fn verify_bundle_signature(
             format!("bundle verification worker task failed: {err}"),
         )
     })?
+}
+
+fn checksum_entry_matches_asset(line: &str, asset_name: &str) -> bool {
+    let Some(raw_name) = line.split_whitespace().nth(1) else {
+        return false;
+    };
+    let normalized = raw_name.strip_prefix('*').unwrap_or(raw_name);
+    let file_name = Path::new(normalized)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(normalized);
+    file_name == asset_name
 }
 
 fn make_new_transaction(version: &str, asset_name: &str) -> UpdateTransaction {
@@ -955,7 +966,7 @@ async fn run_transaction_once(
     persist_update_transaction(&request.state_dir, tx)?;
 
     let expected_identity = expected_identity_for_tag(&version_to_tag(&tx.version));
-    verify_bundle_signature(&binary_bytes, &bundle_bytes, &expected_identity).await?;
+    verify_bundle_signature(binary_bytes, &bundle_bytes, &expected_identity).await?;
 
     let checksum_asset = release
         .assets
@@ -976,11 +987,9 @@ async fn run_transaction_once(
             )
         })?;
 
-        let entry = checksum_text.lines().find(|line| {
-            line.split_whitespace()
-                .nth(1)
-                .is_some_and(|name| name == asset_name)
-        });
+        let entry = checksum_text
+            .lines()
+            .find(|line| checksum_entry_matches_asset(line, &asset_name));
         if let Some(line) = entry {
             verify_checksum(&staged_hash, line)?;
             checksum_verified = true;
@@ -1117,6 +1126,14 @@ async fn install_with_transaction(request: &InstallRequest) -> Result<InstallOut
                     Some(UpdatePhase::Failed),
                     message,
                 ));
+            } else if request
+                .requested_version
+                .as_deref()
+                .is_some_and(|requested| requested != tx.version)
+            {
+                clear_update_transaction(&request.state_dir)?;
+                let (tx, release) = prepare_transaction(request).await?;
+                (tx, Some(release))
             } else {
                 tx.updated_at_ms = now_ms();
                 persist_update_transaction(&request.state_dir, &tx)?;
@@ -1200,6 +1217,22 @@ mod tests {
         )
         .expect_err("invalid checksum should fail");
         assert!(err.message.contains("valid SHA-256"));
+    }
+
+    #[test]
+    fn test_checksum_entry_matches_asset_supports_binary_mode_prefix() {
+        assert!(checksum_entry_matches_asset(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  *cara-x86_64-linux",
+            "cara-x86_64-linux"
+        ));
+    }
+
+    #[test]
+    fn test_checksum_entry_matches_asset_supports_path_prefixes() {
+        assert!(checksum_entry_matches_asset(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  ./dist/cara-x86_64-linux",
+            "cara-x86_64-linux"
+        ));
     }
 
     #[test]
@@ -1290,7 +1323,7 @@ mod tests {
     #[tokio::test]
     async fn test_verify_bundle_signature_missing_bundle_is_rejected() {
         let err = verify_bundle_signature(
-            b"artifact-bytes",
+            b"artifact-bytes".to_vec(),
             b"",
             "https://github.com/puremachinery/carapace/.github/workflows/release.yml@refs/tags/v0.1.0",
         )
@@ -1303,7 +1336,7 @@ mod tests {
     #[tokio::test]
     async fn test_verify_bundle_signature_malformed_bundle_is_rejected() {
         let err = verify_bundle_signature(
-            b"artifact-bytes",
+            b"artifact-bytes".to_vec(),
             br#"{"kindVersion":"oops"}"#,
             "https://github.com/puremachinery/carapace/.github/workflows/release.yml@refs/tags/v0.1.0",
         )
