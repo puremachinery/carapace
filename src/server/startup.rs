@@ -399,8 +399,8 @@ fn spawn_update_resume_task(shutdown_rx: &watch::Receiver<bool>) {
     tokio::spawn(async move {
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(1)) => {}
-            _ = update_shutdown_rx.changed() => {
-                if *update_shutdown_rx.borrow() {
+            result = update_shutdown_rx.changed() => {
+                if result.is_err() || *update_shutdown_rx.borrow() {
                     return;
                 }
             }
@@ -411,6 +411,7 @@ fn spawn_update_resume_task(shutdown_rx: &watch::Receiver<bool>) {
             state_dir,
             env!("CARGO_PKG_VERSION").to_string(),
             true,
+            Some(update_shutdown_rx),
         )
         .await
         {

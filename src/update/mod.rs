@@ -1296,11 +1296,16 @@ pub async fn auto_resume_with_backoff(
     state_dir: PathBuf,
     current_version: String,
     apply_update: bool,
+    mut shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<Option<InstallOutcome>, UpdateError> {
     let mut tx = match load_update_transaction(&state_dir)? {
         Some(tx) => tx,
         None => return Ok(None),
     };
+
+    if shutdown_rx.as_ref().is_some_and(|rx| *rx.borrow()) {
+        return Ok(None);
+    }
 
     if !transaction_resume_pending(&tx) {
         return Ok(None);
@@ -1324,7 +1329,18 @@ pub async fn auto_resume_with_backoff(
                     return Err(err);
                 }
                 let backoff = resume_backoff_for_attempt(tx.attempt);
-                tokio::time::sleep(backoff).await;
+                if let Some(shutdown) = shutdown_rx.as_mut() {
+                    tokio::select! {
+                        _ = tokio::time::sleep(backoff) => {}
+                        changed = shutdown.changed() => {
+                            if changed.is_err() || *shutdown.borrow() {
+                                return Ok(None);
+                            }
+                        }
+                    }
+                } else {
+                    tokio::time::sleep(backoff).await;
+                }
             }
             Err(err) => return Err(err),
         }
@@ -1589,9 +1605,14 @@ mod tests {
     #[tokio::test]
     async fn test_auto_resume_with_backoff_no_transaction() {
         let dir = tempfile::tempdir().unwrap();
-        let result = auto_resume_with_backoff(dir.path().to_path_buf(), "0.1.0".to_string(), true)
-            .await
-            .expect("no transaction should not fail");
+        let result = auto_resume_with_backoff(
+            dir.path().to_path_buf(),
+            "0.1.0".to_string(),
+            true,
+            None,
+        )
+        .await
+        .expect("no transaction should not fail");
         assert!(result.is_none());
     }
 
@@ -1604,9 +1625,38 @@ mod tests {
         tx.retryable = false;
         persist_update_transaction(dir.path(), &tx).unwrap();
 
-        let result = auto_resume_with_backoff(dir.path().to_path_buf(), "0.1.0".to_string(), true)
-            .await
-            .expect("applied transaction should not fail");
+        let result = auto_resume_with_backoff(
+            dir.path().to_path_buf(),
+            "0.1.0".to_string(),
+            true,
+            None,
+        )
+        .await
+        .expect("applied transaction should not fail");
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_auto_resume_with_backoff_shutdown_signal_skips_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tx = make_new_transaction("0.1.0", "cara-x86_64-linux");
+        tx.state = UpdateTransactionState::InProgress;
+        tx.phase = UpdatePhase::Downloading;
+        tx.retryable = true;
+        tx.attempt = 1;
+        tx.max_attempts = 3;
+        persist_update_transaction(dir.path(), &tx).unwrap();
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        shutdown_tx.send(true).unwrap();
+        let result = auto_resume_with_backoff(
+            dir.path().to_path_buf(),
+            "0.1.0".to_string(),
+            true,
+            Some(shutdown_rx),
+        )
+        .await
+        .expect("shutdown short-circuit should not fail");
         assert!(result.is_none());
     }
 }
