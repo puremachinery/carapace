@@ -154,9 +154,16 @@ pub(super) async fn handle_update_run(params: Option<&Value>) -> Result<Value, E
 /// Get update status.
 pub(super) fn handle_update_status() -> Result<Value, ErrorShape> {
     let state = UPDATE_STATE.read();
-    let tx = crate::update::load_update_transaction(&resolve_state_dir())
-        .ok()
-        .flatten();
+    let tx = crate::update::load_update_transaction(&resolve_state_dir()).map_err(|err| {
+        error_shape(
+            ERROR_UNAVAILABLE,
+            &format!("failed to load update transaction: {}", err.message),
+            Some(json!({
+                "retryable": err.retryable,
+                "phase": err.phase
+            })),
+        )
+    })?;
 
     Ok(json!({
         "currentVersion": state.current_version,

@@ -174,6 +174,7 @@ if [ "${#changed_files[@]}" -eq 0 ]; then
 fi
 
 needs_nextest=0
+needs_full_nextest=0
 needs_script_checks=0
 needs_non_shell_script_only=0
 needs_ws_golden=0
@@ -189,6 +190,9 @@ for path in "${changed_files[@]}"; do
 
     if is_rust_impacting_path "$path"; then
         needs_nextest=1
+        if ! is_ws_golden_relevant_path "$path"; then
+            needs_full_nextest=1
+        fi
         continue
     fi
 
@@ -207,6 +211,7 @@ for path in "${changed_files[@]}"; do
 
     # Unknown paths are treated as code-impacting to stay conservative.
     needs_nextest=1
+    needs_full_nextest=1
 done
 
 if [ "$needs_nextest" -eq 0 ] && [ "$needs_script_checks" -eq 0 ]; then
@@ -234,6 +239,12 @@ if [ "$needs_ws_golden" -eq 1 ]; then
         echo "If output changes are intentional, update snapshots and commit them before pushing."
         exit 1
     fi
+fi
+
+if [ "$needs_nextest" -eq 1 ] && [ "$needs_full_nextest" -eq 0 ] && [ "$needs_ws_golden" -eq 1 ]; then
+    echo "Only websocket golden-relevant Rust changes detected; skipping full cargo nextest run."
+    echo "All applicable checks passed, pushing..."
+    exit 0
 fi
 
 if [ "$needs_nextest" -eq 0 ]; then

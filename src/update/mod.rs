@@ -575,8 +575,15 @@ fn cleanup_stale_staged_updates(state_dir: &Path) {
     }
 }
 
-fn is_retryable_release_http_status(status: reqwest::StatusCode) -> bool {
-    status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+fn is_rate_limit_forbidden_body(body: &str) -> bool {
+    let body_lower = body.to_ascii_lowercase();
+    body_lower.contains("rate limit") || body_lower.contains("secondary rate")
+}
+
+fn is_retryable_release_response(status: reqwest::StatusCode, body: &str) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+        || (status == reqwest::StatusCode::FORBIDDEN && is_rate_limit_forbidden_body(body))
 }
 
 pub async fn fetch_release_info(
@@ -607,7 +614,7 @@ pub async fn fetch_release_info(
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         let message = format!("GitHub API returned HTTP {status}: {body}");
-        return if is_retryable_release_http_status(status) {
+        return if is_retryable_release_response(status, &body) {
             Err(UpdateError::retryable(None, message))
         } else {
             Err(UpdateError::non_retryable(None, message))
@@ -1036,22 +1043,14 @@ async fn run_transaction_once(
     );
     persist_update_transaction(&request.state_dir, tx)?;
 
-    let staged_path = tx.staged_path.as_deref().unwrap_or_default();
+    let staged_path = tx.staged_path.clone().unwrap_or_default();
     let expected_hash = tx.sha256.clone().ok_or_else(|| {
         UpdateError::non_retryable(
             Some(UpdatePhase::Applying),
             "missing staged artifact hash before apply",
         )
     })?;
-    let on_disk_hash = compute_sha256(Path::new(staged_path)).map_err(|err| {
-        UpdateError::retryable(
-            Some(UpdatePhase::Applying),
-            format!(
-                "failed to verify staged artifact before apply: {}",
-                err.message
-            ),
-        )
-    })?;
+    let on_disk_hash = compute_sha256_blocking(staged_path.clone()).await?;
     if on_disk_hash != expected_hash {
         return Err(UpdateError::non_retryable(
             Some(UpdatePhase::Applying),
@@ -1059,7 +1058,7 @@ async fn run_transaction_once(
         ));
     }
 
-    let apply_result = apply_staged_update(staged_path)?;
+    let apply_result = apply_staged_update_blocking(staged_path).await?;
 
     transition(
         tx,
@@ -1105,6 +1104,44 @@ async fn prepare_transaction(
     Ok((tx, release))
 }
 
+fn requested_version_matches_transaction(
+    requested_version: &str,
+    transaction_version: &str,
+) -> bool {
+    tag_to_version(requested_version) == transaction_version
+}
+
+async fn compute_sha256_blocking(staged_path: String) -> Result<String, UpdateError> {
+    tokio::task::spawn_blocking(move || compute_sha256(Path::new(&staged_path)))
+        .await
+        .map_err(|err| {
+            UpdateError::retryable(
+                Some(UpdatePhase::Applying),
+                format!("failed to join staged artifact hash task: {err}"),
+            )
+        })?
+        .map_err(|err| {
+            UpdateError::retryable(
+                Some(UpdatePhase::Applying),
+                format!(
+                    "failed to verify staged artifact before apply: {}",
+                    err.message
+                ),
+            )
+        })
+}
+
+async fn apply_staged_update_blocking(staged_path: String) -> Result<ApplyResult, UpdateError> {
+    tokio::task::spawn_blocking(move || apply_staged_update(&staged_path))
+        .await
+        .map_err(|err| {
+            UpdateError::retryable(
+                Some(UpdatePhase::Applying),
+                format!("failed to join staged apply task: {err}"),
+            )
+        })?
+}
+
 async fn install_with_transaction(request: &InstallRequest) -> Result<InstallOutcome, UpdateError> {
     let existing = load_update_transaction(&request.state_dir)?;
     if let Some(tx) = existing.as_ref() {
@@ -1129,7 +1166,9 @@ async fn install_with_transaction(request: &InstallRequest) -> Result<InstallOut
             } else if request
                 .requested_version
                 .as_deref()
-                .is_some_and(|requested| requested != tx.version)
+                .is_some_and(|requested| {
+                    !requested_version_matches_transaction(requested, &tx.version)
+                })
             {
                 clear_update_transaction(&request.state_dir)?;
                 let (tx, release) = prepare_transaction(request).await?;
@@ -1181,14 +1220,45 @@ mod tests {
 
     #[test]
     fn test_release_http_status_retryable_classification() {
-        assert!(is_retryable_release_http_status(
-            reqwest::StatusCode::TOO_MANY_REQUESTS
+        assert!(is_retryable_release_response(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            ""
         ));
-        assert!(is_retryable_release_http_status(
-            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        assert!(is_retryable_release_response(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            ""
         ));
-        assert!(!is_retryable_release_http_status(
-            reqwest::StatusCode::NOT_FOUND
+        assert!(!is_retryable_release_response(
+            reqwest::StatusCode::NOT_FOUND,
+            ""
+        ));
+    }
+
+    #[test]
+    fn test_release_http_status_forbidden_retryable_only_for_rate_limit() {
+        assert!(is_retryable_release_response(
+            reqwest::StatusCode::FORBIDDEN,
+            "API rate limit exceeded for user"
+        ));
+        assert!(!is_retryable_release_response(
+            reqwest::StatusCode::FORBIDDEN,
+            "forbidden"
+        ));
+    }
+
+    #[test]
+    fn test_requested_version_matches_transaction_with_or_without_v_prefix() {
+        assert!(requested_version_matches_transaction(
+            "v0.1.0-preview12",
+            "0.1.0-preview12"
+        ));
+        assert!(requested_version_matches_transaction(
+            "0.1.0-preview12",
+            "0.1.0-preview12"
+        ));
+        assert!(!requested_version_matches_transaction(
+            "v0.1.0-preview11",
+            "0.1.0-preview12"
         ));
     }
 
