@@ -350,6 +350,19 @@ mod golden_trace {
             *val = json!("<VERSION>");
         }
 
+        // Update transaction fields can vary based on persisted local state.
+        // Golden traces validate protocol shape, so normalize these dynamic values.
+        if key == "transactionState"
+            || key == "transactionVersion"
+            || key == "transactionAttempt"
+            || key == "transactionLastError"
+        {
+            *val = Value::Null;
+        }
+        if key == "resumePending" && val.is_boolean() {
+            *val = json!(false);
+        }
+
         // Replace architecture field for cross-platform stability.
         if key == "arch" && val.is_string() {
             *val = json!("<ARCH>");
