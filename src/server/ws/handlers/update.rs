@@ -296,10 +296,17 @@ pub(super) async fn handle_update_install() -> Result<Value, ErrorShape> {
 
 async fn handle_update_install_with_force(force: bool) -> Result<Value, ErrorShape> {
     let state_dir = resolve_state_dir();
+    let pending_transaction = crate::update::load_update_transaction(&state_dir)
+        .ok()
+        .flatten();
+    let resume_pending = pending_transaction
+        .as_ref()
+        .is_some_and(crate::update::transaction_resume_pending);
+
     let (version, current_version) = {
         let mut state = UPDATE_STATE.write();
 
-        if !state.update_available && !force {
+        if !state.update_available && !force && !resume_pending {
             return Err(error_shape(
                 ERROR_INVALID_REQUEST,
                 "no update available",
@@ -315,13 +322,17 @@ async fn handle_update_install_with_force(force: bool) -> Result<Value, ErrorSha
             ));
         }
 
-        let version = state.latest_version.clone().ok_or_else(|| {
-            error_shape(
-                ERROR_INVALID_REQUEST,
-                "latest version not known; run update.check first",
-                None,
-            )
-        })?;
+        let version = pending_transaction
+            .as_ref()
+            .map(|tx| tx.version.clone())
+            .or_else(|| state.latest_version.clone())
+            .ok_or_else(|| {
+                error_shape(
+                    ERROR_INVALID_REQUEST,
+                    "latest version not known; run update.check first",
+                    None,
+                )
+            })?;
 
         state.installing = true;
         state.last_error = None;
@@ -349,6 +360,8 @@ async fn handle_update_install_with_force(force: bool) -> Result<Value, ErrorSha
                 "version": outcome.version,
                 "stagedPath": outcome.staged_path,
                 "applied": outcome.applied,
+                "resumed": outcome.resumed,
+                "attempt": outcome.attempt,
                 "sha256": outcome.apply_result.as_ref().map(|r| r.sha256.clone()),
                 "binaryPath": outcome.apply_result.as_ref().map(|r| r.binary_path.clone()),
                 "restartRequired": outcome.applied,
@@ -357,6 +370,7 @@ async fn handle_update_install_with_force(force: bool) -> Result<Value, ErrorSha
                     "checksumVerified": outcome.verification.checksum_verified,
                     "expectedIdentity": outcome.verification.expected_identity,
                 },
+                "transaction": outcome.transaction,
                 "message": if outcome.applied {
                     "Update applied successfully. Restart to use new version."
                 } else {

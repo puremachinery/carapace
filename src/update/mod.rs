@@ -108,6 +108,8 @@ pub struct InstallOutcome {
     pub apply_result: Option<ApplyResult>,
     pub verification: VerificationSummary,
     pub transaction: Option<UpdateTransaction>,
+    pub resumed: bool,
+    pub attempt: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -1088,6 +1090,8 @@ async fn run_transaction_once(
                 expected_identity,
             },
             transaction: Some(tx.clone()),
+            resumed: false,
+            attempt: tx.attempt,
         });
     }
 
@@ -1139,6 +1143,8 @@ async fn run_transaction_once(
             expected_identity,
         },
         transaction: None,
+        resumed: false,
+        attempt: tx.attempt,
     })
 }
 
@@ -1210,8 +1216,16 @@ async fn apply_staged_update_blocking(staged_path: String) -> Result<ApplyResult
 
 async fn install_with_transaction(request: &InstallRequest) -> Result<InstallOutcome, UpdateError> {
     let existing = load_update_transaction(&request.state_dir)?;
+    let resumed = existing.is_some();
     if let Some(tx) = existing.as_ref() {
-        tracing::info!(transaction_id = %tx.id, phase = ?tx.phase, state = ?tx.state, "resuming existing update transaction");
+        tracing::info!(
+            transaction_id = %tx.id,
+            phase = ?tx.phase,
+            state = ?tx.state,
+            attempt = tx.attempt,
+            max_attempts = tx.max_attempts,
+            "resuming existing update transaction"
+        );
     }
 
     let (mut tx, release_for_first_run) = match existing {
@@ -1250,7 +1264,11 @@ async fn install_with_transaction(request: &InstallRequest) -> Result<InstallOut
 
     let outcome = run_transaction_once(request, &mut tx, release_for_first_run).await;
     match outcome {
-        Ok(value) => Ok(value),
+        Ok(mut value) => {
+            value.resumed = resumed;
+            value.attempt = tx.attempt;
+            Ok(value)
+        }
         Err(err) => {
             record_failure(&request.state_dir, &mut tx, &err)?;
             Err(err)
@@ -1261,6 +1279,46 @@ async fn install_with_transaction(request: &InstallRequest) -> Result<InstallOut
 pub async fn install_or_resume(request: InstallRequest) -> Result<InstallOutcome, UpdateError> {
     let _guard = UPDATE_OPERATION_LOCK.lock().await;
     install_with_transaction(&request).await
+}
+
+pub async fn auto_resume_with_backoff(
+    state_dir: PathBuf,
+    current_version: String,
+    apply_update: bool,
+) -> Result<Option<InstallOutcome>, UpdateError> {
+    let mut tx = match load_update_transaction(&state_dir)? {
+        Some(tx) => tx,
+        None => return Ok(None),
+    };
+
+    if !transaction_resume_pending(&tx) {
+        return Ok(None);
+    }
+
+    loop {
+        let request = InstallRequest {
+            current_version: current_version.clone(),
+            state_dir: state_dir.clone(),
+            requested_version: Some(tx.version.clone()),
+            apply_update,
+        };
+        match install_or_resume(request).await {
+            Ok(outcome) => return Ok(Some(outcome)),
+            Err(err) if err.retryable => {
+                tx = load_update_transaction(&state_dir)?.unwrap_or(tx);
+                if tx.attempt >= tx.max_attempts || !tx.retryable {
+                    return Err(err);
+                }
+                let backoff = match tx.attempt {
+                    0 | 1 => Duration::from_secs(5),
+                    2 => Duration::from_secs(15),
+                    _ => Duration::from_secs(45),
+                };
+                tokio::time::sleep(backoff).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1507,5 +1565,29 @@ mod tests {
         .expect_err("malformed bundle must fail");
         assert!(err.message.contains("bundle parse failed"));
         assert!(!err.retryable);
+    }
+
+    #[tokio::test]
+    async fn test_auto_resume_with_backoff_no_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = auto_resume_with_backoff(dir.path().to_path_buf(), "0.1.0".to_string(), true)
+            .await
+            .expect("no transaction should not fail");
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_auto_resume_with_backoff_applied_transaction_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tx = make_new_transaction("0.1.0", "cara-x86_64-linux");
+        tx.state = UpdateTransactionState::Applied;
+        tx.phase = UpdatePhase::Applied;
+        tx.retryable = false;
+        persist_update_transaction(dir.path(), &tx).unwrap();
+
+        let result = auto_resume_with_backoff(dir.path().to_path_buf(), "0.1.0".to_string(), true)
+            .await
+            .expect("applied transaction should not fail");
+        assert!(result.is_none());
     }
 }
