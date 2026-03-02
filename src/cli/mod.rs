@@ -4233,9 +4233,16 @@ pub async fn handle_update(
     version: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let current_version = env!("CARGO_PKG_VERSION");
-    let release = crate::update::fetch_release_info(current_version, version)
-        .await
-        .map_err(|err| err.message)?;
+    let release = match crate::update::fetch_release_info(current_version, version).await {
+        Ok(release) => release,
+        Err(err) => {
+            eprintln!("Failed to check for updates: {}", err.message);
+            if err.retryable {
+                eprintln!("This may be a temporary issue; retry in a moment.");
+            }
+            return Err(err.message.into());
+        }
+    };
     let latest_version = crate::update::tag_to_version(&release.tag_name);
     let html_url = release.html_url.as_str();
 

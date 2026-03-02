@@ -182,10 +182,6 @@ pub fn expected_checksum_name() -> &'static str {
     "SHA256SUMS.txt"
 }
 
-pub fn expected_checksum_bundle_name() -> &'static str {
-    "SHA256SUMS.txt.bundle"
-}
-
 pub fn tag_to_version(tag: &str) -> String {
     tag.strip_prefix('v').unwrap_or(tag).to_string()
 }
@@ -554,6 +550,10 @@ fn cleanup_stale_staged_updates(state_dir: &Path) {
     }
 }
 
+fn is_retryable_release_http_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
 pub async fn fetch_release_info(
     current_version: &str,
     requested_version: Option<&str>,
@@ -581,10 +581,12 @@ pub async fn fetch_release_info(
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        return Err(UpdateError::non_retryable(
-            None,
-            format!("GitHub API returned HTTP {status}: {body}"),
-        ));
+        let message = format!("GitHub API returned HTTP {status}: {body}");
+        return if is_retryable_release_http_status(status) {
+            Err(UpdateError::retryable(None, message))
+        } else {
+            Err(UpdateError::non_retryable(None, message))
+        };
     }
 
     response.json::<GitHubRelease>().await.map_err(|err| {
@@ -878,6 +880,15 @@ async fn run_transaction_once(
             ),
         )
     })?;
+    staged_file.sync_all().await.map_err(|err| {
+        UpdateError::retryable(
+            Some(UpdatePhase::Downloading),
+            format!(
+                "failed to sync staged file '{}': {err}",
+                staged_path.display()
+            ),
+        )
+    })?;
 
     tokio::fs::write(&bundle_path, &bundle_bytes)
         .await
@@ -991,7 +1002,30 @@ async fn run_transaction_once(
     );
     persist_update_transaction(&request.state_dir, tx)?;
 
-    let apply_result = apply_staged_update(tx.staged_path.as_deref().unwrap_or_default())?;
+    let staged_path = tx.staged_path.as_deref().unwrap_or_default();
+    let expected_hash = tx.sha256.clone().ok_or_else(|| {
+        UpdateError::non_retryable(
+            Some(UpdatePhase::Applying),
+            "missing staged artifact hash before apply",
+        )
+    })?;
+    let on_disk_hash = compute_sha256(Path::new(staged_path)).map_err(|err| {
+        UpdateError::retryable(
+            Some(UpdatePhase::Applying),
+            format!(
+                "failed to verify staged artifact before apply: {}",
+                err.message
+            ),
+        )
+    })?;
+    if on_disk_hash != expected_hash {
+        return Err(UpdateError::non_retryable(
+            Some(UpdatePhase::Applying),
+            "staged artifact changed after verification",
+        ));
+    }
+
+    let apply_result = apply_staged_update(staged_path)?;
 
     transition(
         tx,
@@ -1101,6 +1135,19 @@ mod tests {
         let identity = expected_identity_for_tag("v0.1.0-preview12");
         assert!(identity.starts_with(EXPECTED_IDENTITY_PREFIX));
         assert!(identity.ends_with("v0.1.0-preview12"));
+    }
+
+    #[test]
+    fn test_release_http_status_retryable_classification() {
+        assert!(is_retryable_release_http_status(
+            reqwest::StatusCode::TOO_MANY_REQUESTS
+        ));
+        assert!(is_retryable_release_http_status(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        ));
+        assert!(!is_retryable_release_http_status(
+            reqwest::StatusCode::NOT_FOUND
+        ));
     }
 
     #[test]
