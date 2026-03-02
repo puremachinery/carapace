@@ -14,6 +14,15 @@ status="pass"
 error_msg=""
 
 write_report() {
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "Warning: python3 not found; skipping JSON report generation for update-macos-local." >&2
+    echo "Status: ${status}" >&2
+    if [[ -n "${error_msg}" ]]; then
+      echo "Error: ${error_msg}" >&2
+    fi
+    echo "Log: ${log_path}" >&2
+    return 0
+  fi
   python3 - "${report_path}" "${timestamp}" "${binary_path}" "${log_path}" "${status}" "${error_msg}" <<'PY'
 import json
 import sys
@@ -50,15 +59,23 @@ run_step() {
   return 0
 }
 
+{
+  echo "update-macos-local smoke test log"
+  echo "timestamp=${timestamp}"
+  echo "binary_path=${binary_path}"
+  echo
+} >"${log_path}"
+
 if [[ ! -x "${binary_path}" ]]; then
   status="fail"
   error_msg="binary not executable: ${binary_path}"
 else
-  run_step "cara version" "${binary_path}" version || true
-  if ! run_step "cara update --check" "${binary_path}" update --check; then
-    if [[ "${STRICT_NETWORK:-0}" != "1" ]] && grep -Eq "failed to fetch release info|api.github.com" "${log_path}"; then
-      status="skipped"
-      error_msg="network unavailable for release API check"
+  if run_step "cara version" "${binary_path}" version; then
+    if ! run_step "cara update --check" "${binary_path}" update --check; then
+      if [[ "${STRICT_NETWORK:-0}" != "1" ]] && grep -Eq "failed to fetch release info|api.github.com" "${log_path}"; then
+        status="skipped"
+        error_msg="network unavailable for release API check"
+      fi
     fi
   fi
 fi

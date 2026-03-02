@@ -17,6 +17,15 @@ remote_dir=""
 remote_bin=""
 
 write_report() {
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "Warning: python3 not found; skipping JSON report generation for update-linux-orbstack." >&2
+    echo "Status: ${status}" >&2
+    if [[ -n "${error_msg}" ]]; then
+      echo "Error: ${error_msg}" >&2
+    fi
+    echo "Log: ${log_path}" >&2
+    return 0
+  fi
   python3 - "${report_path}" "${timestamp}" "${machine}" "${binary_path}" "${log_path}" "${status}" "${error_msg}" <<'PY'
 import json
 import sys
@@ -46,9 +55,18 @@ cleanup_remote() {
 }
 trap cleanup_remote EXIT
 
+{
+  echo "update-linux-orbstack smoke test log"
+  echo "timestamp=${timestamp}"
+  echo "binary_path=${binary_path}"
+  echo "machine=${machine:-<auto>}"
+  echo
+} >"${log_path}"
+
 if ! command -v orbctl >/dev/null 2>&1; then
   status="skipped"
   error_msg="orbctl not installed"
+  echo "${error_msg}" >>"${log_path}"
   write_report
   exit 0
 fi
@@ -56,6 +74,7 @@ fi
 if [[ ! -x "${binary_path}" ]]; then
   status="fail"
   error_msg="binary not executable: ${binary_path}"
+  echo "${error_msg}" >>"${log_path}"
   write_report
   exit 1
 fi
@@ -66,14 +85,11 @@ fi
 if [[ -z "${machine}" ]]; then
   status="skipped"
   error_msg="no OrbStack machine configured/running"
+  echo "${error_msg}" >>"${log_path}"
   write_report
   exit 0
 fi
-
-{
-  echo "Machine: ${machine}"
-  echo "Binary: ${binary_path}"
-} >"${log_path}"
+echo "Machine: ${machine}" >>"${log_path}"
 
 if ! orbctl start "${machine}" >>"${log_path}" 2>&1; then
   status="fail"

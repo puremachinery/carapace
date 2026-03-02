@@ -19,6 +19,15 @@ error_msg=""
 ran_any="false"
 
 write_report() {
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "Warning: python3 not found; skipping JSON report generation for live-channel-smoke." >&2
+    echo "Status: ${status}" >&2
+    if [[ -n "${error_msg}" ]]; then
+      echo "Error: ${error_msg}" >&2
+    fi
+    echo "Log: ${log_path}" >&2
+    return 0
+  fi
   python3 - "${report_path}" "${timestamp}" "${binary_path}" "${port}" "${telegram_to}" "${discord_to}" "${ran_any}" "${log_path}" "${status}" "${error_msg}" <<'PY'
 import json
 import sys
@@ -54,17 +63,21 @@ PY
   echo "Report: ${report_path}"
 }
 
-if [[ ! -x "${binary_path}" ]]; then
-  status="fail"
-  error_msg="binary not executable: ${binary_path}"
-  write_report
-  exit 1
-fi
-
 {
   echo "Binary: ${binary_path}"
   echo "Port: ${port}"
 } >"${log_path}"
+
+if [[ ! -x "${binary_path}" ]]; then
+  status="fail"
+  error_msg="binary not executable: ${binary_path}"
+  {
+    echo "== pre-check failure =="
+    echo "${error_msg}"
+  } >>"${log_path}"
+  write_report
+  exit 1
+fi
 
 if [[ -n "${telegram_to}" ]]; then
   ran_any="true"
@@ -86,9 +99,7 @@ if [[ -n "${discord_to}" ]]; then
   } >>"${log_path}"
   if ! "${binary_path}" verify --outcome discord --discord-to "${discord_to}" --port "${port}" >>"${log_path}" 2>&1; then
     status="fail"
-    if [[ -n "${error_msg}" ]]; then
-      error_msg+="; "
-    fi
+    [[ -n "${error_msg}" ]] && error_msg+="; "
     error_msg+="discord verify failed"
   fi
 fi
