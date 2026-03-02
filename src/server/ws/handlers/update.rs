@@ -843,11 +843,15 @@ mod tests {
     async fn test_update_run() {
         let _lock = TEST_LOCK.lock().unwrap();
         reset_state();
-        // Runtime behavior may vary by network and latest release state:
-        // run may return a check-only style response or proceed into install.
-        // In both cases, the handler should return a successful top-level result.
-        let result = handle_update_run(None).await.unwrap();
-        assert_eq!(result["ok"], true);
+        // Runtime behavior may vary by network and latest release state.
+        // Accept either a successful run result or a retryable unavailable error.
+        match handle_update_run(None).await {
+            Ok(result) => assert_eq!(result["ok"], true),
+            Err(err) => {
+                assert_eq!(err.code, ERROR_UNAVAILABLE);
+                assert!(err.retryable);
+            }
+        }
     }
 
     #[tokio::test]
