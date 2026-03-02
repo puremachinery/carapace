@@ -602,6 +602,7 @@ impl WsServerState {
         config: WsServerConfig,
         state_dir: PathBuf,
     ) -> Result<Self, WsConfigError> {
+        let cleanup_state_dir = state_dir.clone();
         let state = Self::new_persistent_unloaded(config, state_dir)?;
         let state = tokio::task::spawn_blocking(move || {
             state.cron_scheduler.load();
@@ -625,6 +626,7 @@ impl WsServerState {
             .load_async()
             .await
             .map_err(WsConfigError::Runtime)?;
+        crate::update::cleanup_old_binaries(&cleanup_state_dir);
         Ok(state)
     }
 

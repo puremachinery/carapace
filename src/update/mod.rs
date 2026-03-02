@@ -423,6 +423,11 @@ fn apply_staged_update_at_paths(
     let sha256 = compute_sha256(staged)?;
     let binary_path = current_path.to_string_lossy().into_owned();
 
+    #[cfg(windows)]
+    {
+        return apply_staged_update_windows(staged, sha256, binary_path);
+    }
+
     let backup_path = format!("{}.bak", current_path.display());
 
     fs::rename(current_path, &backup_path).map_err(|e| {
@@ -482,6 +487,26 @@ fn apply_staged_update_at_paths(
             "failed to remove backup file"
         );
     }
+
+    Ok(ApplyResult {
+        applied: true,
+        sha256,
+        binary_path,
+    })
+}
+
+#[cfg(windows)]
+fn apply_staged_update_windows(
+    staged: &Path,
+    sha256: String,
+    binary_path: String,
+) -> Result<ApplyResult, UpdateError> {
+    self_replace::self_replace(staged).map_err(|err| {
+        UpdateError::non_retryable(
+            Some(UpdatePhase::Applying),
+            format!("failed to replace running binary on windows: {err}"),
+        )
+    })?;
 
     Ok(ApplyResult {
         applied: true,

@@ -16,6 +16,11 @@ expression: normalized
     "lastError": null,
     "latestVersion": null,
     "releaseNotes": null,
+    "resumePending": false,
+    "transactionAttempt": null,
+    "transactionLastError": null,
+    "transactionState": null,
+    "transactionVersion": null,
     "updateAvailable": false
   }
 }

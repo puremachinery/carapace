@@ -154,6 +154,9 @@ pub(super) async fn handle_update_run(params: Option<&Value>) -> Result<Value, E
 /// Get update status.
 pub(super) fn handle_update_status() -> Result<Value, ErrorShape> {
     let state = UPDATE_STATE.read();
+    let tx = crate::update::load_update_transaction(&resolve_state_dir())
+        .ok()
+        .flatten();
 
     Ok(json!({
         "currentVersion": state.current_version,
@@ -167,6 +170,11 @@ pub(super) fn handle_update_status() -> Result<Value, ErrorShape> {
         "lastError": state.last_error,
         "releaseNotes": state.release_notes,
         "downloadUrl": state.download_url,
+        "transactionState": tx.as_ref().map(|t| t.state),
+        "transactionVersion": tx.as_ref().map(|t| t.version.clone()),
+        "transactionAttempt": tx.as_ref().map(|t| t.attempt),
+        "transactionLastError": tx.as_ref().and_then(|t| t.last_error.clone()),
+        "resumePending": tx.as_ref().is_some_and(crate::update::transaction_resume_pending),
     }))
 }
 
