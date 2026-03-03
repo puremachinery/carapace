@@ -6,11 +6,13 @@ report_dir="${repo_root}/.local/reports"
 mkdir -p "${report_dir}"
 
 timestamp="$(date -u +"%Y%m%dT%H%M%SZ")"
+# Keep trust pin defaults fixed to upstream repo/workflow. For forks or alternate repos,
+# callers must set EXPECTED_IDENTITY_REGEXP explicitly (enforced below).
 default_repo="puremachinery/carapace"
 repo="${GITHUB_REPO:-${default_repo}}"
 requested_tag="${RELEASE_TAG:-latest}"
 asset_name="${CARA_ASSET:-}"
-default_identity_regexp="^https://github\\.com/puremachinery/carapace/\\.github/workflows/release\\.yml@refs/tags/v.*$"
+default_identity_regexp="^https://github\\.com/puremachinery/carapace/\\.github/workflows/release\\.yml@refs/tags/v[0-9].*$"
 default_oidc_issuer="https://token.actions.githubusercontent.com"
 expected_identity_regexp="${EXPECTED_IDENTITY_REGEXP:-${default_identity_regexp}}"
 expected_oidc_issuer="${EXPECTED_OIDC_ISSUER:-${default_oidc_issuer}}"
@@ -116,8 +118,8 @@ write_report() {
 
 fail() {
   status="fail"
-  error_msg="$1"
-  echo "ERROR: ${error_msg}" >>"${log_path}"
+  error_msg="${error_msg:+${error_msg}; }$1"
+  echo "ERROR: $1" >>"${log_path}"
 }
 
 compute_sha256() {
@@ -299,18 +301,22 @@ if ! gh "${download_args[@]}" >>"${log_path}" 2>&1; then
   exit 1
 fi
 
-cd "${work_dir}"
-chmod +x "./${asset_name}"
+asset_path="${work_dir}/${asset_name}"
+bundle_path="${work_dir}/${bundle_name}"
+checksums_path="${work_dir}/SHA256SUMS.txt"
+checksums_bundle_path="${work_dir}/SHA256SUMS.txt.bundle"
+
+chmod +x "${asset_path}"
 
 {
   echo "== verify binary bundle =="
-  echo "\$ cosign verify-blob --bundle ${bundle_name} --certificate-identity-regexp '${expected_identity_regexp}' --certificate-oidc-issuer '${expected_oidc_issuer}' ${asset_name}"
+  echo "\$ cosign verify-blob --bundle ${bundle_path} --certificate-identity-regexp '${expected_identity_regexp}' --certificate-oidc-issuer '${expected_oidc_issuer}' ${asset_path}"
 } >>"${log_path}"
 if ! cosign verify-blob \
-  --bundle "./${bundle_name}" \
+  --bundle "${bundle_path}" \
   --certificate-identity-regexp "${expected_identity_regexp}" \
   --certificate-oidc-issuer "${expected_oidc_issuer}" \
-  "./${asset_name}" >>"${log_path}" 2>&1; then
+  "${asset_path}" >>"${log_path}" 2>&1; then
   fail "binary bundle verification failed"
   write_report
   exit 1
@@ -320,13 +326,13 @@ binary_verified="true"
 if [[ "${has_checksums}" == "true" ]]; then
   {
     echo "== verify checksums bundle =="
-    echo "\$ cosign verify-blob --bundle SHA256SUMS.txt.bundle --certificate-identity-regexp '${expected_identity_regexp}' --certificate-oidc-issuer '${expected_oidc_issuer}' SHA256SUMS.txt"
+    echo "\$ cosign verify-blob --bundle ${checksums_bundle_path} --certificate-identity-regexp '${expected_identity_regexp}' --certificate-oidc-issuer '${expected_oidc_issuer}' ${checksums_path}"
   } >>"${log_path}"
   if ! cosign verify-blob \
-    --bundle "./SHA256SUMS.txt.bundle" \
+    --bundle "${checksums_bundle_path}" \
     --certificate-identity-regexp "${expected_identity_regexp}" \
     --certificate-oidc-issuer "${expected_oidc_issuer}" \
-    "./SHA256SUMS.txt" >>"${log_path}" 2>&1; then
+    "${checksums_path}" >>"${log_path}" 2>&1; then
     fail "SHA256SUMS bundle verification failed"
     write_report
     exit 1
@@ -335,6 +341,7 @@ if [[ "${has_checksums}" == "true" ]]; then
   checksum_status=0
   expected_sha256="$(
     awk -v asset="${asset_name}" '
+      BEGIN { count = 0 }
       {
         filename = $2
         sub(/^\*/, "", filename)
@@ -347,7 +354,7 @@ if [[ "${has_checksums}" == "true" ]]; then
         if (count == 0) exit 2
         if (count > 1) exit 3
       }
-    ' "./SHA256SUMS.txt"
+    ' "${checksums_path}"
   )" || checksum_status=$?
   if [[ "${checksum_status}" -eq 2 ]]; then
     fail "no checksum entry for ${asset_name} in SHA256SUMS.txt"
@@ -364,7 +371,7 @@ if [[ "${has_checksums}" == "true" ]]; then
     write_report
     exit 1
   fi
-  if ! actual_sha256="$(compute_sha256 "./${asset_name}")"; then
+  if ! actual_sha256="$(compute_sha256 "${asset_path}")"; then
     fail "no local sha256 tool found (sha256sum/shasum)"
     write_report
     exit 1
@@ -377,16 +384,16 @@ if [[ "${has_checksums}" == "true" ]]; then
   fi
   checksums_verified="true"
 else
-  if ! binary_sha256="$(compute_sha256 "./${asset_name}")"; then
+  if ! binary_sha256="$(compute_sha256 "${asset_path}")"; then
     binary_sha256=""
   fi
 fi
 
 {
   echo "== execute binary =="
-  echo "\$ ./${asset_name} version"
+  echo "\$ ${asset_path} version"
 } >>"${log_path}"
-if ! "./${asset_name}" version >>"${log_path}" 2>&1; then
+if ! "${asset_path}" version >>"${log_path}" 2>&1; then
   fail "downloaded binary execution failed"
   write_report
   exit 1
