@@ -118,7 +118,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
       - uses: taiki-e/install-action@602dc500e2b7e0e2486b4ce53909ba048de44e08 # nextest
-      - run: cargo nextest run --all-targets server::ws::golden_tests::golden_trace
+      - run: ./scripts/run-nextest-guarded.sh --all-targets server::ws::golden_tests::golden_trace
 
   build:
     name: Build
@@ -141,7 +141,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
       - uses: taiki-e/install-action@602dc500e2b7e0e2486b4ce53909ba048de44e08 # nextest
-      - run: cargo nextest run --all-targets
+      - run: ./scripts/run-nextest-guarded.sh --all-targets
 
   test-push:
     name: Test (${{ matrix.os }})
@@ -157,7 +157,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
       - uses: taiki-e/install-action@602dc500e2b7e0e2486b4ce53909ba048de44e08 # nextest
-      - run: cargo nextest run --all-targets
+      - name: Run nextest (guarded)
+        if: runner.os != 'Windows'
+        run: ./scripts/run-nextest-guarded.sh --all-targets
+      - name: Run nextest (Windows)
+        if: runner.os == 'Windows'
+        run: cargo nextest run --all-targets
 
   test-pr-windows:
     name: Test (windows PR)

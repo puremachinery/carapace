@@ -16,7 +16,7 @@ build-release:
 
 # Run all tests with nextest (faster, better output)
 test:
-    cargo nextest run --all-targets
+    ./scripts/run-nextest-guarded.sh --all-targets
 
 # Run all tests with standard cargo test
 test-cargo:
@@ -24,23 +24,23 @@ test-cargo:
 
 # Run library tests only
 test-lib:
-    cargo nextest run --lib
+    ./scripts/run-nextest-guarded.sh --lib
 
 # Run tests with verbose output
 test-verbose:
-    cargo nextest run --no-capture
+    ./scripts/run-nextest-guarded.sh --no-capture
 
 # Run a specific test by name
 test-one NAME:
-    cargo nextest run {{NAME}}
+    ./scripts/run-nextest-guarded.sh {{NAME}}
 
 # Run websocket golden snapshot tests.
 test-ws-golden:
-    cargo nextest run --all-targets server::ws::golden_tests::golden_trace
+    ./scripts/run-nextest-guarded.sh --all-targets server::ws::golden_tests::golden_trace
 
 # Run the fastest websocket golden guard for update/status contract drift.
 test-ws-golden-quick:
-    cargo nextest run --all-targets --test cara server::ws::golden_tests::golden_trace::golden_update_status
+    ./scripts/run-nextest-guarded.sh --all-targets --test cara server::ws::golden_tests::golden_trace::golden_update_status
 
 # Run tests and show coverage summary
 test-coverage:
