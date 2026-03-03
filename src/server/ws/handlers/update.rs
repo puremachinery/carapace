@@ -417,7 +417,6 @@ pub(super) fn handle_update_release_notes() -> Result<Value, ErrorShape> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
     use std::sync::Mutex;
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -428,6 +427,7 @@ mod tests {
     }
 
     impl EnvVarGuard {
+        #[allow(unused_unsafe)]
         fn set(key: &'static str, value: &str) -> Self {
             let prev = std::env::var(key).ok();
             // SAFETY: tests in this module scope env var writes with a guard and TEST_LOCK.
@@ -437,6 +437,7 @@ mod tests {
     }
 
     impl Drop for EnvVarGuard {
+        #[allow(unused_unsafe)]
         fn drop(&mut self) {
             match &self.prev {
                 // SAFETY: restoring test-scoped env var state.
@@ -616,7 +617,8 @@ mod tests {
             phase: crate::update::UpdatePhase::Created,
             retryable: true,
         };
-        crate::update::persist_update_transaction(Path::new(&resolve_state_dir()), &tx)
+        let state_dir = resolve_state_dir();
+        crate::update::persist_update_transaction(state_dir.as_path(), &tx)
             .expect("persist pending transaction fixture");
 
         match handle_update_install().await {

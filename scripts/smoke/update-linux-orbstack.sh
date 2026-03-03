@@ -50,9 +50,8 @@ PY
 
 cleanup_remote() {
   if [[ -n "${machine}" && -n "${remote_dir}" ]]; then
-    local remote_dir_q
-    remote_dir_q="$(printf '%q' "${remote_dir}")"
-    orbctl run -m "${machine}" -- sh -lc "rm -rf ${remote_dir_q}" >>"${log_path}" 2>&1 || true
+    # shellcheck disable=SC2016
+    orbctl run -m "${machine}" -- sh -lc 'rm -rf -- "$1"' _ "${remote_dir}" >>"${log_path}" 2>&1 || true
   fi
 }
 trap cleanup_remote EXIT
@@ -110,9 +109,9 @@ if [[ -z "${remote_home}" ]]; then
 fi
 remote_dir="${remote_home}/${run_id}"
 remote_bin="${remote_dir}/cara"
-remote_dir_q="$(printf '%q' "${remote_dir}")"
 
-if ! orbctl run -m "${machine}" -- sh -lc "mkdir -p ${remote_dir_q}" >>"${log_path}" 2>&1; then
+# shellcheck disable=SC2016
+if ! orbctl run -m "${machine}" -- sh -lc 'mkdir -p -- "$1"' _ "${remote_dir}" >>"${log_path}" 2>&1; then
   status="fail"
   error_msg="failed to create remote directory"
   write_report
@@ -126,7 +125,8 @@ if ! orbctl push -m "${machine}" "${binary_path}" "${remote_bin}" >>"${log_path}
   exit 1
 fi
 
-if ! orbctl run -m "${machine}" -- sh -lc "cd ${remote_dir_q} && chmod +x ./cara && ./cara version && ./cara update --check" >>"${log_path}" 2>&1; then
+# shellcheck disable=SC2016
+if ! orbctl run -m "${machine}" -- sh -lc 'cd "$1" && chmod +x ./cara && ./cara version && ./cara update --check' _ "${remote_dir}" >>"${log_path}" 2>&1; then
   if [[ "${STRICT_NETWORK:-0}" != "1" ]] && grep -Eq "failed to fetch release info|api.github.com" "${log_path}"; then
     status="skipped"
     error_msg="network unavailable for release API check"

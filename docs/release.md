@@ -31,7 +31,7 @@ Stable-release compatibility policy (effective at first non-preview release):
 ### Versioned N-1 Contract (stable channel)
 
 | Surface | N-1 -> N expectation | Breaking-change requirement |
-|---|---|---|
+| --- | --- | --- |
 | Config format (`config.json5`) | New stable versions load prior stable config and preserve behavior unless explicitly deprecated. | If a key/shape is removed or semantics change, provide migration steps and at least one stable deprecation window. |
 | State files (`state_dir`) | New stable versions read prior stable state and perform safe migrations where needed. | If migration is not automatic, ship operator migration steps and rollback steps. |
 | Session/task persistence (`sessions/`, `tasks/`) | New stable versions can read prior stable persisted session/task data or fail closed with actionable remediation. | If format changes are incompatible, provide conversion path and recovery procedure from backup. |
