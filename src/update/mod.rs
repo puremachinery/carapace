@@ -19,6 +19,8 @@ pub const EXPECTED_IDENTITY_PREFIX: &str =
     "https://github.com/puremachinery/carapace/.github/workflows/release.yml@refs/tags/";
 
 pub const DEFAULT_RESUME_MAX_ATTEMPTS: u32 = 3;
+pub const NO_UPDATE_AVAILABLE_MESSAGE: &str = "no update available";
+pub const LATEST_VERSION_UNKNOWN_MESSAGE: &str = "latest version not known; run update.check first";
 const DOWNLOAD_TIMEOUT_SECS: u64 = 300;
 const UPDATE_TRANSACTION_FILENAME: &str = "transaction.json";
 const RESUME_BACKOFF_SHORT_SECS: u64 = 5;
@@ -1225,8 +1227,10 @@ async fn apply_staged_update_blocking(staged_path: String) -> Result<ApplyResult
         })?
 }
 
-async fn install_with_transaction(request: &InstallRequest) -> Result<InstallOutcome, UpdateError> {
-    let existing = load_update_transaction(&request.state_dir)?;
+async fn install_with_existing_transaction(
+    request: &InstallRequest,
+    existing: Option<UpdateTransaction>,
+) -> Result<InstallOutcome, UpdateError> {
     let (mut tx, release_for_first_run) = match existing {
         Some(mut tx) => {
             if tx.state == UpdateTransactionState::Applied {
@@ -1307,9 +1311,46 @@ async fn install_with_transaction(request: &InstallRequest) -> Result<InstallOut
     }
 }
 
+async fn install_with_transaction(request: &InstallRequest) -> Result<InstallOutcome, UpdateError> {
+    let existing = load_update_transaction(&request.state_dir)?;
+    install_with_existing_transaction(request, existing).await
+}
+
 pub async fn install_or_resume(request: InstallRequest) -> Result<InstallOutcome, UpdateError> {
     let _guard = UPDATE_OPERATION_LOCK.lock().await;
     install_with_transaction(&request).await
+}
+
+pub async fn install_or_resume_with_snapshot(
+    mut request: InstallRequest,
+    latest_version: Option<String>,
+    update_available: bool,
+    force: bool,
+) -> Result<InstallOutcome, UpdateError> {
+    let _guard = UPDATE_OPERATION_LOCK.lock().await;
+    let existing = load_update_transaction(&request.state_dir)?;
+    let resume_pending = existing.as_ref().is_some_and(transaction_resume_pending);
+    if !update_available && !force && !resume_pending {
+        return Err(UpdateError::non_retryable(
+            None,
+            NO_UPDATE_AVAILABLE_MESSAGE.to_string(),
+        ));
+    }
+
+    request.requested_version = if resume_pending {
+        existing.as_ref().map(|tx| tx.version.clone())
+    } else {
+        latest_version
+    };
+
+    if request.requested_version.is_none() {
+        return Err(UpdateError::non_retryable(
+            None,
+            LATEST_VERSION_UNKNOWN_MESSAGE.to_string(),
+        ));
+    }
+
+    install_with_existing_transaction(&request, existing).await
 }
 
 pub async fn auto_resume_with_backoff(

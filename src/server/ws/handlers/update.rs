@@ -289,20 +289,6 @@ pub(super) fn handle_update_configure(params: Option<&Value>) -> Result<Value, E
     }))
 }
 
-fn resolve_install_version(
-    latest_version: Option<&str>,
-    pending_transaction: Option<&crate::update::UpdateTransaction>,
-    resume_pending: bool,
-) -> Option<String> {
-    if resume_pending {
-        // resume_pending is derived from pending_transaction, so prefer the
-        // transaction version directly when resuming.
-        pending_transaction.map(|tx| tx.version.clone())
-    } else {
-        latest_version.map(str::to_string)
-    }
-}
-
 /// Install an available update.
 pub(super) async fn handle_update_install() -> Result<Value, ErrorShape> {
     handle_update_install_with_force(false).await
@@ -310,42 +296,8 @@ pub(super) async fn handle_update_install() -> Result<Value, ErrorShape> {
 
 async fn handle_update_install_with_force(force: bool) -> Result<Value, ErrorShape> {
     let state_dir = resolve_state_dir();
-    let pending_transaction = tokio::task::spawn_blocking({
-        let state_dir = state_dir.clone();
-        move || crate::update::load_update_transaction(&state_dir)
-    })
-    .await
-    .map_err(|err| {
-        error_shape(
-            ERROR_UNAVAILABLE,
-            &format!("failed to join update transaction load task: {err}"),
-            None,
-        )
-    })?
-    .map_err(|err| {
-        error_shape(
-            ERROR_UNAVAILABLE,
-            &format!("failed to load update transaction: {}", err.message),
-            Some(json!({
-                "retryable": err.retryable,
-                "phase": err.phase
-            })),
-        )
-    })?;
-    let resume_pending = pending_transaction
-        .as_ref()
-        .is_some_and(crate::update::transaction_resume_pending);
-
-    let (version, current_version) = {
+    let (latest_version, current_version, update_available) = {
         let mut state = UPDATE_STATE.write();
-
-        if !state.update_available && !force && !resume_pending {
-            return Err(error_shape(
-                ERROR_INVALID_REQUEST,
-                "no update available",
-                None,
-            ));
-        }
 
         if state.installing {
             return Err(error_shape(
@@ -355,32 +307,29 @@ async fn handle_update_install_with_force(force: bool) -> Result<Value, ErrorSha
             ));
         }
 
-        let version = resolve_install_version(
-            state.latest_version.as_deref(),
-            pending_transaction.as_ref(),
-            resume_pending,
-        )
-        .ok_or_else(|| {
-            error_shape(
-                ERROR_INVALID_REQUEST,
-                "latest version not known; run update.check first",
-                None,
-            )
-        })?;
-
         state.installing = true;
         state.last_error = None;
-        (version, state.current_version.clone())
+        (
+            state.latest_version.clone(),
+            state.current_version.clone(),
+            state.update_available,
+        )
     };
 
     let request = crate::update::InstallRequest {
         current_version,
         state_dir,
-        requested_version: Some(version.clone()),
+        requested_version: latest_version.clone(),
         apply_update: !cfg!(test),
     };
 
-    let result = crate::update::install_or_resume(request).await;
+    let result = crate::update::install_or_resume_with_snapshot(
+        request,
+        latest_version,
+        update_available,
+        force,
+    )
+    .await;
 
     let mut state = UPDATE_STATE.write();
     state.installing = false;
@@ -413,13 +362,27 @@ async fn handle_update_install_with_force(force: bool) -> Result<Value, ErrorSha
             }))
         }
         Err(err) => {
+            if err.message == crate::update::NO_UPDATE_AVAILABLE_MESSAGE {
+                return Err(error_shape(
+                    ERROR_INVALID_REQUEST,
+                    crate::update::NO_UPDATE_AVAILABLE_MESSAGE,
+                    None,
+                ));
+            }
+            if err.message == crate::update::LATEST_VERSION_UNKNOWN_MESSAGE {
+                return Err(error_shape(
+                    ERROR_INVALID_REQUEST,
+                    crate::update::LATEST_VERSION_UNKNOWN_MESSAGE,
+                    None,
+                ));
+            }
             tracing::warn!("update install failed: {}", err.message);
             state.last_error = Some(err.message.clone());
             Err(error_shape(
                 ERROR_UNAVAILABLE,
                 &format!("update install failed: {}", err.message),
                 Some(json!({
-                    "version": version,
+                    "version": state.latest_version,
                     "retryable": err.retryable,
                     "phase": err.phase
                 })),
@@ -497,50 +460,6 @@ mod tests {
         let params = json!({ "checkOnly": true });
         let result = handle_update_run(Some(&params)).await.unwrap();
         assert_eq!(result["checkOnly"], true);
-    }
-
-    #[test]
-    fn test_resolve_install_version_prefers_latest_when_not_resuming() {
-        let pending = crate::update::UpdateTransaction {
-            id: "tx-1".to_string(),
-            version: "0.0.1".to_string(),
-            asset_name: "cara-test".to_string(),
-            state: crate::update::UpdateTransactionState::Applied,
-            attempt: 1,
-            max_attempts: 3,
-            started_at_ms: 0,
-            updated_at_ms: 0,
-            staged_path: None,
-            bundle_path: None,
-            sha256: None,
-            last_error: None,
-            phase: crate::update::UpdatePhase::Applied,
-            retryable: false,
-        };
-        let selected = resolve_install_version(Some("0.2.0"), Some(&pending), false);
-        assert_eq!(selected.as_deref(), Some("0.2.0"));
-    }
-
-    #[test]
-    fn test_resolve_install_version_prefers_pending_when_resuming() {
-        let pending = crate::update::UpdateTransaction {
-            id: "tx-1".to_string(),
-            version: "0.0.1".to_string(),
-            asset_name: "cara-test".to_string(),
-            state: crate::update::UpdateTransactionState::InProgress,
-            attempt: 1,
-            max_attempts: 3,
-            started_at_ms: 0,
-            updated_at_ms: 0,
-            staged_path: None,
-            bundle_path: None,
-            sha256: None,
-            last_error: None,
-            phase: crate::update::UpdatePhase::Downloaded,
-            retryable: true,
-        };
-        let selected = resolve_install_version(Some("0.2.0"), Some(&pending), true);
-        assert_eq!(selected.as_deref(), Some("0.0.1"));
     }
 
     #[tokio::test]
