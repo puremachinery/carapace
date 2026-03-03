@@ -6,10 +6,11 @@ report_dir="${repo_root}/.local/reports"
 mkdir -p "${report_dir}"
 
 timestamp="$(date -u +"%Y%m%dT%H%M%SZ")"
-repo="${GITHUB_REPO:-puremachinery/carapace}"
+default_repo="puremachinery/carapace"
+repo="${GITHUB_REPO:-${default_repo}}"
 requested_tag="${RELEASE_TAG:-latest}"
 asset_name="${CARA_ASSET:-}"
-default_identity_regexp="https://github.com/puremachinery/carapace/.github/workflows/release.yml@refs/tags/v.*"
+default_identity_regexp="^https://github\\.com/puremachinery/carapace/\\.github/workflows/release\\.yml@refs/tags/v.*$"
 default_oidc_issuer="https://token.actions.githubusercontent.com"
 expected_identity_regexp="${EXPECTED_IDENTITY_REGEXP:-${default_identity_regexp}}"
 expected_oidc_issuer="${EXPECTED_OIDC_ISSUER:-${default_oidc_issuer}}"
@@ -26,6 +27,8 @@ resolved_tag=""
 release_url=""
 bundle_name=""
 has_checksums="false"
+checksums_file_present="false"
+checksums_bundle_present="false"
 binary_verified="false"
 checksums_verified="false"
 binary_sha256=""
@@ -207,6 +210,12 @@ if [[ "${oidc_policy_overridden}" == "true" ]]; then
   echo "WARNING: EXPECTED_OIDC_ISSUER overridden to: ${expected_oidc_issuer}" >>"${log_path}"
 fi
 
+if [[ "${repo}" != "${default_repo}" && -z "${EXPECTED_IDENTITY_REGEXP:-}" ]]; then
+  fail "GITHUB_REPO override (${repo}) requires EXPECTED_IDENTITY_REGEXP to keep trust policy explicit"
+  write_report
+  exit 1
+fi
+
 if [[ "${requested_tag}" == "latest" ]]; then
   if ! release_json="$(gh release view --repo "${repo}" --json tagName,url,assets 2>>"${log_path}")"; then
     fail "failed to query latest release metadata"
@@ -246,11 +255,25 @@ if ! jq -e --arg n "${bundle_name}" '.assets[] | select(.name == $n)' >/dev/null
   exit 1
 fi
 
-if jq -e '.assets[] | select(.name == "SHA256SUMS.txt")' >/dev/null <<<"${release_json}" &&
-   jq -e '.assets[] | select(.name == "SHA256SUMS.txt.bundle")' >/dev/null <<<"${release_json}"; then
+if jq -e '.assets[] | select(.name == "SHA256SUMS.txt")' >/dev/null <<<"${release_json}"; then
+  checksums_file_present="true"
+fi
+if jq -e '.assets[] | select(.name == "SHA256SUMS.txt.bundle")' >/dev/null <<<"${release_json}"; then
+  checksums_bundle_present="true"
+fi
+if [[ "${checksums_file_present}" != "${checksums_bundle_present}" ]]; then
+  fail "inconsistent checksum assets: SHA256SUMS.txt present=${checksums_file_present}, SHA256SUMS.txt.bundle present=${checksums_bundle_present}"
+  write_report
+  exit 1
+fi
+if [[ "${checksums_file_present}" == "true" && "${checksums_bundle_present}" == "true" ]]; then
   has_checksums="true"
 fi
-echo "checksums_present=${has_checksums}" >>"${log_path}"
+{
+  echo "checksums_file_present=${checksums_file_present}"
+  echo "checksums_bundle_present=${checksums_bundle_present}"
+  echo "checksums_present=${has_checksums}"
+} >>"${log_path}"
 
 download_args=(
   release download "${resolved_tag}"
