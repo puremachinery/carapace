@@ -101,6 +101,29 @@ Production/reproducible path:
 - Use pinned release tags instead of `releases/latest`.
 - Validate signatures/checksums before rollout.
 - Keep a recent backup to support fast rollback.
+- `cara update` is fail-closed on authenticity verification:
+  - requires `<asset>.bundle` verification
+  - rejects issuer/identity mismatch
+  - does not apply unverified binaries
+
+Interrupted/failed update handling:
+
+- Update transactions are persisted at `{state_dir}/updates/transaction.json`
+  (override with `CARAPACE_STATE_DIR` if needed).
+- Resume is automatic on startup and when you rerun `cara update`.
+- Transaction states: `in_progress`, `applied`, `failed`.
+- Transaction phases: `created`, `downloading`, `downloaded`, `verified`,
+  `applying`, `failed`, `applied`.
+- Retryable failures are retried with bounded backoff; non-retryable failures
+  require operator action (artifact/policy mismatch, malformed bundle, etc.).
+
+Quick checks:
+
+```bash
+cara update --check
+# Optional: inspect {state_dir}/updates/transaction.json
+# (set CARAPACE_STATE_DIR to your state path if you use a non-default location)
+```
 
 Reference docs:
 

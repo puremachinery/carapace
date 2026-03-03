@@ -46,18 +46,21 @@ Invoke-WebRequest "$BaseUrl/cara-x86_64-windows.exe" -OutFile ".\cara-x86_64-win
 
 ## 2) Verify signature (recommended)
 
-Each release artifact has a matching `.sig` and `.pem` file.
+Each release artifact has a matching `.bundle` file (Sigstore bundle).
+Compatibility `.sig` + `.pem` files are also published, but bundle verification
+is the primary documented path.
+
+`cara update` uses the same bundle verification policy in-process and fails
+closed if authenticity checks fail.
 
 Example for Linux x86_64:
 
 ```bash
 curl -LO https://github.com/puremachinery/carapace/releases/latest/download/cara-x86_64-linux
-curl -LO https://github.com/puremachinery/carapace/releases/latest/download/cara-x86_64-linux.sig
-curl -LO https://github.com/puremachinery/carapace/releases/latest/download/cara-x86_64-linux.pem
+curl -LO https://github.com/puremachinery/carapace/releases/latest/download/cara-x86_64-linux.bundle
 
 cosign verify-blob \
-  --certificate cara-x86_64-linux.pem \
-  --signature cara-x86_64-linux.sig \
+  --bundle cara-x86_64-linux.bundle \
   --certificate-identity-regexp "https://github.com/puremachinery/carapace/.github/workflows/release.yml@refs/tags/v.*" \
   --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
   cara-x86_64-linux
@@ -86,12 +89,10 @@ VERSION="vX.Y.Z"
 BASE_URL="https://github.com/puremachinery/carapace/releases/download/${VERSION}"
 curl -LO "${BASE_URL}/cara-x86_64-linux"
 curl -LO "${BASE_URL}/SHA256SUMS.txt"
-curl -LO "${BASE_URL}/SHA256SUMS.txt.sig"
-curl -LO "${BASE_URL}/SHA256SUMS.txt.pem"
+curl -LO "${BASE_URL}/SHA256SUMS.txt.bundle"
 
 cosign verify-blob \
-  --certificate SHA256SUMS.txt.pem \
-  --signature SHA256SUMS.txt.sig \
+  --bundle SHA256SUMS.txt.bundle \
   --certificate-identity-regexp "https://github.com/puremachinery/carapace/.github/workflows/release.yml@refs/tags/v.*" \
   --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
   SHA256SUMS.txt
@@ -117,12 +118,10 @@ $BaseUrl = "https://github.com/puremachinery/carapace/releases/download/$Version
 $ErrorActionPreference = 'Stop'
 Invoke-WebRequest "$BaseUrl/$FileName" -OutFile ".\$FileName"
 Invoke-WebRequest "$BaseUrl/SHA256SUMS.txt" -OutFile ".\SHA256SUMS.txt"
-Invoke-WebRequest "$BaseUrl/SHA256SUMS.txt.sig" -OutFile ".\SHA256SUMS.txt.sig"
-Invoke-WebRequest "$BaseUrl/SHA256SUMS.txt.pem" -OutFile ".\SHA256SUMS.txt.pem"
+Invoke-WebRequest "$BaseUrl/SHA256SUMS.txt.bundle" -OutFile ".\SHA256SUMS.txt.bundle"
 
 cosign verify-blob `
-  --certificate .\SHA256SUMS.txt.pem `
-  --signature .\SHA256SUMS.txt.sig `
+  --bundle .\SHA256SUMS.txt.bundle `
   --certificate-identity-regexp "https://github.com/puremachinery/carapace/.github/workflows/release.yml@refs/tags/v.*" `
   --certificate-oidc-issuer "https://token.actions.githubusercontent.com" `
   .\SHA256SUMS.txt
