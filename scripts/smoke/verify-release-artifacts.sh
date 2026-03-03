@@ -34,13 +34,18 @@ checksums_bundle_present="false"
 binary_verified="false"
 checksums_verified="false"
 binary_sha256=""
+report_written="false"
 
 cleanup() {
   rm -rf "${work_dir}"
 }
-trap cleanup EXIT
 
 write_report() {
+  if [[ "${report_written}" == "true" ]]; then
+    return 0
+  fi
+  report_written="true"
+
   if ! command -v jq >/dev/null 2>&1; then
     echo "Warning: jq not found; skipping JSON report generation for verify-release-artifacts." >&2
     echo "Status: ${status}" >&2
@@ -115,6 +120,18 @@ write_report() {
     }' >"${report_path}"
   echo "Report: ${report_path}"
 }
+
+on_exit() {
+  local exit_code=$?
+  if [[ "${report_written}" != "true" ]]; then
+    if [[ "${exit_code}" -ne 0 && "${status}" == "pass" ]]; then
+      fail "unexpected script failure (exit ${exit_code})"
+    fi
+    write_report || true
+  fi
+  cleanup
+}
+trap on_exit EXIT
 
 fail() {
   status="fail"
