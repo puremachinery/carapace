@@ -205,7 +205,27 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: taiki-e/install-action@f63130e3904c76fd4045473e61389a5266ee4cc0 # cargo-deny
-      - run: cargo deny check
+      - name: Run cargo deny with transient-network retries
+        run: |
+          set -euo pipefail
+          max_attempts=3
+          delay_seconds=15
+
+          for attempt in $(seq 1 "$max_attempts"); do
+            echo "cargo deny check attempt ${attempt}/${max_attempts}"
+            if cargo deny check; then
+              exit 0
+            fi
+
+            if [ "$attempt" -lt "$max_attempts" ]; then
+              echo "cargo deny check failed (likely transient upstream/network issue); retrying in ${delay_seconds}s..."
+              sleep "$delay_seconds"
+              delay_seconds=$((delay_seconds * 2))
+            fi
+          done
+
+          echo "cargo deny check failed after ${max_attempts} attempts."
+          exit 1
 
   gitleaks:
     name: Secret Scan
