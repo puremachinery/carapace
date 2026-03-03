@@ -347,110 +347,121 @@ jobs:
           PUBLISH_JOB_RESULT: ${{ needs.publish-claude-review.result }}
           REVIEW_MARKER: "<!-- claude-review-run:${{ github.run_id }}:${{ github.run_attempt }} -->"
         with:
+          retries: 3
+          retry-exempt-status-codes: 400,401,403,404,422
           script: |
-            const startedAt = Date.parse(process.env.RUN_STARTED_AT || '');
-            if (Number.isNaN(startedAt)) {
-              core.warning(`Invalid RUN_STARTED_AT: ${process.env.RUN_STARTED_AT}`);
-              return;
-            }
-
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-            const issue_number = context.payload.pull_request.number;
-            const strayAuthors = new Set(['claude', 'claude[bot]']);
-            const isKnownClaudeBotAuthor = (user) => {
-              const login = user?.login || '';
-              const type = user?.type || '';
-              return strayAuthors.has(login) && type === 'Bot';
-            };
-
-            const issueComments = await github.paginate(github.rest.issues.listComments, {
-              owner,
-              repo,
-              issue_number,
-              per_page: 100,
-            });
-
-            const strayIssueComments = issueComments.filter((c) => {
-              const created = Date.parse(c.created_at || '');
-              return isKnownClaudeBotAuthor(c.user) && !Number.isNaN(created) && created >= startedAt;
-            });
-
-            for (const c of strayIssueComments) {
-              await github.rest.issues.deleteComment({ owner, repo, comment_id: c.id });
-            }
-            core.info(`Deleted ${strayIssueComments.length} stray issue comment(s).`);
-
-            const reviews = await github.paginate(github.rest.pulls.listReviews, {
-              owner,
-              repo,
-              pull_number: issue_number,
-              per_page: 100,
-            });
-
-            const strayReviews = reviews.filter((r) => {
-              const submitted = Date.parse(r.submitted_at || '');
-              return isKnownClaudeBotAuthor(r.user) && !Number.isNaN(submitted) && submitted >= startedAt;
-            });
-
-            for (const r of strayReviews) {
-              try {
-                await github.graphql(
-                  `mutation($subjectId:ID!) {
-                    minimizeComment(input:{subjectId:$subjectId, classifier:OUTDATED}) {
-                      minimizedComment { isMinimized }
-                    }
-                  }`,
-                  { subjectId: r.node_id },
-                );
-              } catch (err) {
-                core.warning(`Failed to minimize review ${r.id}: ${err.message}`);
+            try {
+              const startedAt = Date.parse(process.env.RUN_STARTED_AT || '');
+              if (Number.isNaN(startedAt)) {
+                core.warning(`Invalid RUN_STARTED_AT: ${process.env.RUN_STARTED_AT}`);
+                return;
               }
-            }
-            core.info(`Minimized ${strayReviews.length} stray claude-authored review(s).`);
 
-            const reviewComments = await github.paginate(github.rest.pulls.listReviewComments, {
-              owner,
-              repo,
-              pull_number: issue_number,
-              per_page: 100,
-            });
+              const owner = context.repo.owner;
+              const repo = context.repo.repo;
+              const issue_number = context.payload.pull_request.number;
+              const strayAuthors = new Set(['claude', 'claude[bot]']);
+              const isKnownClaudeBotAuthor = (user) => {
+                const login = user?.login || '';
+                const type = user?.type || '';
+                return strayAuthors.has(login) && type === 'Bot';
+              };
 
-            const strayReviewComments = reviewComments.filter((c) => {
-              const created = Date.parse(c.created_at || '');
-              return isKnownClaudeBotAuthor(c.user) && !Number.isNaN(created) && created >= startedAt;
-            });
+              const issueComments = await github.paginate(github.rest.issues.listComments, {
+                owner,
+                repo,
+                issue_number,
+                per_page: 100,
+              });
 
-            for (const c of strayReviewComments) {
-              try {
-                await github.graphql(
-                  `mutation($subjectId:ID!) {
-                    minimizeComment(input:{subjectId:$subjectId, classifier:OUTDATED}) {
-                      minimizedComment { isMinimized }
-                    }
-                  }`,
-                  { subjectId: c.node_id },
-                );
-              } catch (err) {
-                core.warning(`Failed to minimize review comment ${c.id}: ${err.message}`);
+              const strayIssueComments = issueComments.filter((c) => {
+                const created = Date.parse(c.created_at || '');
+                return isKnownClaudeBotAuthor(c.user) && !Number.isNaN(created) && created >= startedAt;
+              });
+
+              for (const c of strayIssueComments) {
+                await github.rest.issues.deleteComment({ owner, repo, comment_id: c.id });
               }
-            }
-            core.info(`Minimized ${strayReviewComments.length} stray claude-authored review comment(s).`);
+              core.info(`Deleted ${strayIssueComments.length} stray issue comment(s).`);
 
-            if (process.env.SHOULD_PUBLISH === 'true' && process.env.PUBLISH_JOB_RESULT === 'success') {
-              const refreshed = await github.paginate(github.rest.pulls.listReviews, {
+              const reviews = await github.paginate(github.rest.pulls.listReviews, {
                 owner,
                 repo,
                 pull_number: issue_number,
                 per_page: 100,
               });
-              const marker = process.env.REVIEW_MARKER || '';
-              const published = refreshed.filter((r) => {
-                const login = r.user?.login || '';
-                const body = r.body || '';
-                return login.includes('github-actions') && marker && body.includes(marker);
+
+              const strayReviews = reviews.filter((r) => {
+                const submitted = Date.parse(r.submitted_at || '');
+                return isKnownClaudeBotAuthor(r.user) && !Number.isNaN(submitted) && submitted >= startedAt;
               });
-              if (published.length !== 1) {
-                core.setFailed(`Expected exactly one published review from github-actions for marker ${marker}, found ${published.length}.`);
+
+              for (const r of strayReviews) {
+                try {
+                  await github.graphql(
+                    `mutation($subjectId:ID!) {
+                      minimizeComment(input:{subjectId:$subjectId, classifier:OUTDATED}) {
+                        minimizedComment { isMinimized }
+                      }
+                    }`,
+                    { subjectId: r.node_id },
+                  );
+                } catch (err) {
+                  core.warning(`Failed to minimize review ${r.id}: ${err.message}`);
+                }
               }
+              core.info(`Minimized ${strayReviews.length} stray claude-authored review(s).`);
+
+              const reviewComments = await github.paginate(github.rest.pulls.listReviewComments, {
+                owner,
+                repo,
+                pull_number: issue_number,
+                per_page: 100,
+              });
+
+              const strayReviewComments = reviewComments.filter((c) => {
+                const created = Date.parse(c.created_at || '');
+                return isKnownClaudeBotAuthor(c.user) && !Number.isNaN(created) && created >= startedAt;
+              });
+
+              for (const c of strayReviewComments) {
+                try {
+                  await github.graphql(
+                    `mutation($subjectId:ID!) {
+                      minimizeComment(input:{subjectId:$subjectId, classifier:OUTDATED}) {
+                        minimizedComment { isMinimized }
+                      }
+                    }`,
+                    { subjectId: c.node_id },
+                  );
+                } catch (err) {
+                  core.warning(`Failed to minimize review comment ${c.id}: ${err.message}`);
+                }
+              }
+              core.info(`Minimized ${strayReviewComments.length} stray claude-authored review comment(s).`);
+
+              if (process.env.SHOULD_PUBLISH === 'true' && process.env.PUBLISH_JOB_RESULT === 'success') {
+                const refreshed = await github.paginate(github.rest.pulls.listReviews, {
+                  owner,
+                  repo,
+                  pull_number: issue_number,
+                  per_page: 100,
+                });
+                const marker = process.env.REVIEW_MARKER || '';
+                const published = refreshed.filter((r) => {
+                  const login = r.user?.login || '';
+                  const body = r.body || '';
+                  return login.includes('github-actions') && marker && body.includes(marker);
+                });
+                if (published.length !== 1) {
+                  core.setFailed(`Expected exactly one published review from github-actions for marker ${marker}, found ${published.length}.`);
+                }
+              }
+            } catch (err) {
+              const status = err?.status || err?.response?.status;
+              if ([500, 502, 503, 504].includes(status)) {
+                core.warning(`Cleanup skipped due to transient GitHub API error (${status}): ${err.message}`);
+                return;
+              }
+              throw err;
             }
