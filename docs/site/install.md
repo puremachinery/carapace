@@ -141,10 +141,10 @@ if ($expected -ne $actual) {
 Write-Host "Checksum verified for $FileName"
 ```
 
-Maintainer/operator shortcut for this full flow:
+Maintainer/operator shortcut for this full flow (run from the repo root):
 
 ```bash
-scripts/smoke/verify-release-artifacts.sh
+./scripts/smoke/verify-release-artifacts.sh
 ```
 
 ## 4) Install on your PATH

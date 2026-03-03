@@ -32,8 +32,8 @@ cleanup() {
 trap cleanup EXIT
 
 write_report() {
-  if ! command -v python3 >/dev/null 2>&1; then
-    echo "Warning: python3 not found; skipping JSON report generation for verify-release-artifacts." >&2
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "Warning: jq not found; skipping JSON report generation for verify-release-artifacts." >&2
     echo "Status: ${status}" >&2
     if [[ -n "${error_msg}" ]]; then
       echo "Error: ${error_msg}" >&2
@@ -41,49 +41,53 @@ write_report() {
     echo "Log: ${log_path}" >&2
     return 0
   fi
-  python3 - "${report_path}" "${timestamp}" "${repo}" "${requested_tag}" "${resolved_tag}" "${release_url}" "${asset_name}" "${bundle_name}" "${has_checksums}" "${binary_verified}" "${checksums_verified}" "${binary_sha256}" "${log_path}" "${status}" "${error_msg}" <<'PY'
-import json
-import sys
+  local checksums_present_json=false
+  local binary_verified_json=false
+  local checksums_verified_json=false
 
-(
-    report_path,
-    timestamp,
-    repo,
-    requested_tag,
-    resolved_tag,
-    release_url,
-    asset_name,
-    bundle_name,
-    has_checksums,
-    binary_verified,
-    checksums_verified,
-    binary_sha256,
-    log_path,
-    status,
-    error_msg,
-) = sys.argv[1:16]
+  if [[ "${has_checksums}" == "true" ]]; then
+    checksums_present_json=true
+  fi
+  if [[ "${binary_verified}" == "true" ]]; then
+    binary_verified_json=true
+  fi
+  if [[ "${checksums_verified}" == "true" ]]; then
+    checksums_verified_json=true
+  fi
 
-payload = {
-    "suite": "release-artifact-verify",
-    "timestampUtc": timestamp,
-    "repo": repo,
-    "tagRequested": requested_tag,
-    "tagResolved": resolved_tag,
-    "releaseUrl": release_url,
-    "asset": asset_name,
-    "bundle": bundle_name,
-    "checksumsPresent": has_checksums == "true",
-    "binaryVerified": binary_verified == "true",
-    "checksumsVerified": checksums_verified == "true",
-    "binarySha256": binary_sha256,
-    "logPath": log_path,
-    "status": status,
-    "error": error_msg,
-}
-with open(report_path, "w", encoding="utf-8") as f:
-    json.dump(payload, f, indent=2)
-    f.write("\n")
-PY
+  jq -n \
+    --arg suite "release-artifact-verify" \
+    --arg timestampUtc "${timestamp}" \
+    --arg repo "${repo}" \
+    --arg tagRequested "${requested_tag}" \
+    --arg tagResolved "${resolved_tag}" \
+    --arg releaseUrl "${release_url}" \
+    --arg asset "${asset_name}" \
+    --arg bundle "${bundle_name}" \
+    --argjson checksumsPresent "${checksums_present_json}" \
+    --argjson binaryVerified "${binary_verified_json}" \
+    --argjson checksumsVerified "${checksums_verified_json}" \
+    --arg binarySha256 "${binary_sha256}" \
+    --arg logPath "${log_path}" \
+    --arg status "${status}" \
+    --arg error "${error_msg}" \
+    '{
+      "suite": $suite,
+      "timestampUtc": $timestampUtc,
+      "repo": $repo,
+      "tagRequested": $tagRequested,
+      "tagResolved": $tagResolved,
+      "releaseUrl": $releaseUrl,
+      "asset": $asset,
+      "bundle": $bundle,
+      "checksumsPresent": $checksumsPresent,
+      "binaryVerified": $binaryVerified,
+      "checksumsVerified": $checksumsVerified,
+      "binarySha256": $binarySha256,
+      "logPath": $logPath,
+      "status": $status,
+      "error": $error
+    }' >"${report_path}"
   echo "Report: ${report_path}"
 }
 
@@ -267,13 +271,38 @@ if [[ "${has_checksums}" == "true" ]]; then
     exit 1
   fi
 
-  checksum_line="$(grep -E "[[:space:]][*]?${asset_name}$" "./SHA256SUMS.txt" | tail -n 1 || true)"
-  if [[ -z "${checksum_line}" ]]; then
+  checksum_status=0
+  expected_sha256="$(
+    awk -v asset="${asset_name}" '
+      {
+        filename = $2
+        sub(/^\*/, "", filename)
+        if (filename == asset) {
+          print $1
+          count++
+        }
+      }
+      END {
+        if (count == 0) exit 2
+        if (count > 1) exit 3
+      }
+    ' "./SHA256SUMS.txt"
+  )" || checksum_status=$?
+  if [[ "${checksum_status}" -eq 2 ]]; then
     fail "no checksum entry for ${asset_name} in SHA256SUMS.txt"
     write_report
     exit 1
   fi
-  expected_sha256="$(awk '{print $1}' <<<"${checksum_line}")"
+  if [[ "${checksum_status}" -eq 3 ]]; then
+    fail "multiple checksum entries for ${asset_name} in SHA256SUMS.txt"
+    write_report
+    exit 1
+  fi
+  if [[ "${checksum_status}" -ne 0 || -z "${expected_sha256}" ]]; then
+    fail "failed to parse checksum entry for ${asset_name}"
+    write_report
+    exit 1
+  fi
   if ! actual_sha256="$(compute_sha256 "./${asset_name}")"; then
     fail "no local sha256 tool found (sha256sum/shasum)"
     write_report
