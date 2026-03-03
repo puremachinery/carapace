@@ -24,8 +24,9 @@ if ! git diff --cached --quiet --diff-filter=ACMRD -- \
         exit 1
     fi
 
-    echo "Running cargo clippy --locked --all-features --all-targets -- -D warnings..."
-    if ! cargo clippy --locked --all-features --all-targets -- -D warnings; then
+    declare -a clippy_cmd=(cargo clippy --locked --all-features --all-targets -- -D warnings)
+    echo "Running ${clippy_cmd[*]}..."
+    if ! "${clippy_cmd[@]}"; then
         echo "Clippy check failed. Fix the warnings above."
         exit 1
     fi
