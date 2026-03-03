@@ -5600,12 +5600,19 @@ mod tests {
             "CARAPACE_CONFIG_PATH",
             target_config.to_string_lossy().as_ref(),
         );
-        let (restored_sections, restored_sessions) = restore_files_from_tar(&archive_path).unwrap();
+        let (mut restored_sections, restored_sessions) =
+            restore_files_from_tar(&archive_path).unwrap();
         assert_eq!(restored_sessions, 1);
-        assert!(restored_sections.contains(&"sessions".to_string()));
-        assert!(restored_sections.contains(&"cron".to_string()));
-        assert!(restored_sections.contains(&"tasks".to_string()));
-        assert!(restored_sections.contains(&"usage".to_string()));
+        restored_sections.sort_unstable();
+        assert_eq!(
+            restored_sections,
+            vec![
+                "cron".to_string(),
+                "sessions".to_string(),
+                "tasks".to_string(),
+                "usage".to_string()
+            ]
+        );
 
         // Verify restored data matches original.
         let restored_session =
@@ -5656,6 +5663,11 @@ mod tests {
     fn test_handle_backup_restore_round_trip_preserves_tasks() {
         let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
         let temp = tempfile::TempDir::new().unwrap();
+        let home_dir = temp.path().join("home");
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let _home_guard = set_env_var_scoped("HOME", home_dir.to_string_lossy().as_ref());
+        let _userprofile_guard =
+            set_env_var_scoped("USERPROFILE", home_dir.to_string_lossy().as_ref());
 
         let source_state = temp.path().join("source-state");
         let source_tasks = source_state.join("tasks");
