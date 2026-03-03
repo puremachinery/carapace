@@ -141,6 +141,12 @@ if ($expected -ne $actual) {
 Write-Host "Checksum verified for $FileName"
 ```
 
+Maintainer/operator shortcut for this full flow (run from the repo root):
+
+```bash
+./scripts/smoke/verify-release-artifacts.sh
+```
+
 ## 4) Install on your PATH
 
 macOS/Linux:
@@ -181,4 +187,4 @@ cara version
 
 - Continue with [First run](first-run.md)
 - Or jump to [Cookbook recipes](../cookbook/README.md)
-- For maintainer/operator release policy, see [Release & upgrade policy](../release.md)
+- For maintainer/operator release policy (including `./scripts/smoke/verify-release-artifacts.sh` from repo root), see [Release & upgrade policy](../release.md)
