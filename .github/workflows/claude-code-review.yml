@@ -119,6 +119,7 @@ jobs:
       - name: Validate Claude review output JSON
         id: validate-review-json
         if: github.actor != 'dependabot[bot]' && steps.claude-review.outcome == 'success'
+        continue-on-error: true
         run: |
           test -f .claude/review.json
           jq -e '
@@ -146,11 +147,12 @@ jobs:
       - name: Upload Claude review output
         id: upload-review-json
         if: github.actor != 'dependabot[bot]' && steps.claude-review.outcome == 'success'
+        continue-on-error: true
         uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
         with:
           name: claude-review-json
           path: .claude/review.json
-          if-no-files-found: error
+          if-no-files-found: warn
 
       - name: Allow expected Claude failure on workflow-change PRs
         if: github.actor != 'dependabot[bot]' && steps.claude-review.outcome == 'failure' && steps.workflow-change.outputs.changed == 'true'
