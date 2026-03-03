@@ -394,6 +394,48 @@ fn spawn_monitoring_and_retention(
     }
 }
 
+fn spawn_update_resume_task(shutdown_rx: &watch::Receiver<bool>) {
+    let mut update_shutdown_rx = shutdown_rx.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            result = update_shutdown_rx.changed() => {
+                if result.is_err() || *update_shutdown_rx.borrow() {
+                    return;
+                }
+            }
+        }
+
+        let state_dir = crate::server::ws::resolve_state_dir();
+        match crate::update::auto_resume_with_backoff(
+            state_dir,
+            env!("CARGO_PKG_VERSION").to_string(),
+            true,
+            Some(update_shutdown_rx),
+        )
+        .await
+        {
+            Ok(Some(outcome)) => {
+                info!(
+                    version = %outcome.version,
+                    staged_path = %outcome.staged_path,
+                    applied = outcome.applied,
+                    "resumed pending update transaction"
+                );
+            }
+            Ok(None) => {}
+            Err(err) => {
+                warn!(
+                    phase = ?err.phase,
+                    retryable = err.retryable,
+                    error = %err.message,
+                    "failed to resume pending update transaction"
+                );
+            }
+        }
+    });
+}
+
 /// Spawn background tasks (delivery loop, cron, config watcher, SIGHUP,
 /// retention cleanup).  Shared between `run_server_with_config` and the
 /// production TLS path in `main.rs`.
@@ -412,6 +454,9 @@ pub fn spawn_background_tasks(
         Duration::from_secs(1),
         shutdown_rx.clone(),
     ));
+
+    // One-shot updater resume pass for interrupted updates.
+    spawn_update_resume_task(shutdown_rx);
 
     // Delivery loop
     if let Some(plugin_reg) = ws_state.plugin_registry().cloned() {

@@ -4267,6 +4267,19 @@ pub async fn handle_update(
 
     match crate::update::install_or_resume(request).await {
         Ok(outcome) => {
+            if outcome.resumed {
+                if let Some(max_attempts) = outcome.transaction.as_ref().map(|tx| tx.max_attempts) {
+                    println!(
+                        "Resumed pending update transaction (attempt {}/{}).",
+                        outcome.attempt, max_attempts
+                    );
+                } else {
+                    println!(
+                        "Resumed pending update transaction (attempt {}).",
+                        outcome.attempt
+                    );
+                }
+            }
             println!("Update applied successfully.");
             println!("  Staged path: {}", outcome.staged_path);
             if let Some(apply) = outcome.apply_result {

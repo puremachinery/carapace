@@ -823,7 +823,6 @@ pub(super) async fn dispatch_method(
     if method == "config.reload" {
         return handle_config_reload(state).await;
     }
-
     // Sync sub-dispatchers
     if let Some(result) = dispatch_config(method, params, state) {
         return result;

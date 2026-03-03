@@ -21,6 +21,9 @@ pub const EXPECTED_IDENTITY_PREFIX: &str =
 pub const DEFAULT_RESUME_MAX_ATTEMPTS: u32 = 3;
 const DOWNLOAD_TIMEOUT_SECS: u64 = 300;
 const UPDATE_TRANSACTION_FILENAME: &str = "transaction.json";
+const RESUME_BACKOFF_SHORT_SECS: u64 = 5;
+const RESUME_BACKOFF_MEDIUM_SECS: u64 = 15;
+const RESUME_BACKOFF_LONG_SECS: u64 = 45;
 
 static UPDATE_OPERATION_LOCK: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
@@ -108,6 +111,8 @@ pub struct InstallOutcome {
     pub apply_result: Option<ApplyResult>,
     pub verification: VerificationSummary,
     pub transaction: Option<UpdateTransaction>,
+    pub resumed: bool,
+    pub attempt: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -636,6 +641,14 @@ fn release_http_error_message(status: reqwest::StatusCode, body: &str) -> String
     format!("GitHub API returned HTTP {status} ({reason})")
 }
 
+fn resume_backoff_for_attempt(attempt: u32) -> Duration {
+    match attempt {
+        0 | 1 => Duration::from_secs(RESUME_BACKOFF_SHORT_SECS),
+        2 => Duration::from_secs(RESUME_BACKOFF_MEDIUM_SECS),
+        _ => Duration::from_secs(RESUME_BACKOFF_LONG_SECS),
+    }
+}
+
 pub async fn fetch_release_info(
     current_version: &str,
     requested_version: Option<&str>,
@@ -1088,6 +1101,8 @@ async fn run_transaction_once(
                 expected_identity,
             },
             transaction: Some(tx.clone()),
+            resumed: false,
+            attempt: tx.attempt,
         });
     }
 
@@ -1139,6 +1154,8 @@ async fn run_transaction_once(
             expected_identity,
         },
         transaction: None,
+        resumed: false,
+        attempt: tx.attempt,
     })
 }
 
@@ -1210,13 +1227,15 @@ async fn apply_staged_update_blocking(staged_path: String) -> Result<ApplyResult
 
 async fn install_with_transaction(request: &InstallRequest) -> Result<InstallOutcome, UpdateError> {
     let existing = load_update_transaction(&request.state_dir)?;
-    if let Some(tx) = existing.as_ref() {
-        tracing::info!(transaction_id = %tx.id, phase = ?tx.phase, state = ?tx.state, "resuming existing update transaction");
-    }
-
     let (mut tx, release_for_first_run) = match existing {
         Some(mut tx) => {
             if tx.state == UpdateTransactionState::Applied {
+                tracing::info!(
+                    transaction_id = %tx.id,
+                    phase = ?tx.phase,
+                    state = ?tx.state,
+                    "clearing applied transaction and starting a fresh update attempt"
+                );
                 clear_update_transaction(&request.state_dir)?;
                 let (tx, release) = prepare_transaction(request).await?;
                 (tx, Some(release))
@@ -1233,10 +1252,35 @@ async fn install_with_transaction(request: &InstallRequest) -> Result<InstallOut
                 request.requested_version.as_deref(),
                 &tx.version,
             ) {
+                tracing::info!(
+                    transaction_id = %tx.id,
+                    transaction_version = %tx.version,
+                    requested_version = ?request.requested_version,
+                    "clearing transaction due to requested-version mismatch and starting a fresh update attempt"
+                );
                 clear_update_transaction(&request.state_dir)?;
                 let (tx, release) = prepare_transaction(request).await?;
                 (tx, Some(release))
             } else {
+                if transaction_resume_pending(&tx) {
+                    tracing::info!(
+                        transaction_id = %tx.id,
+                        phase = ?tx.phase,
+                        state = ?tx.state,
+                        attempt = tx.attempt,
+                        max_attempts = tx.max_attempts,
+                        "resuming existing update transaction"
+                    );
+                } else {
+                    tracing::info!(
+                        transaction_id = %tx.id,
+                        phase = ?tx.phase,
+                        state = ?tx.state,
+                        attempt = tx.attempt,
+                        max_attempts = tx.max_attempts,
+                        "found non-resumable existing update transaction; re-running once to surface terminal state"
+                    );
+                }
                 tx.updated_at_ms = now_ms();
                 persist_update_transaction(&request.state_dir, &tx)?;
                 (tx, None)
@@ -1248,9 +1292,14 @@ async fn install_with_transaction(request: &InstallRequest) -> Result<InstallOut
         }
     };
 
+    let resumed = release_for_first_run.is_none();
     let outcome = run_transaction_once(request, &mut tx, release_for_first_run).await;
     match outcome {
-        Ok(value) => Ok(value),
+        Ok(mut value) => {
+            value.resumed = resumed;
+            value.attempt = tx.attempt;
+            Ok(value)
+        }
         Err(err) => {
             record_failure(&request.state_dir, &mut tx, &err)?;
             Err(err)
@@ -1261,6 +1310,71 @@ async fn install_with_transaction(request: &InstallRequest) -> Result<InstallOut
 pub async fn install_or_resume(request: InstallRequest) -> Result<InstallOutcome, UpdateError> {
     let _guard = UPDATE_OPERATION_LOCK.lock().await;
     install_with_transaction(&request).await
+}
+
+pub async fn auto_resume_with_backoff(
+    state_dir: PathBuf,
+    current_version: String,
+    apply_update: bool,
+    mut shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<Option<InstallOutcome>, UpdateError> {
+    let mut tx;
+
+    loop {
+        if shutdown_rx.as_ref().is_some_and(|rx| *rx.borrow()) {
+            return Ok(None);
+        }
+
+        tx = match load_update_transaction(&state_dir)? {
+            Some(next_tx) => next_tx,
+            None => return Ok(None),
+        };
+        if !transaction_resume_pending(&tx) {
+            return Ok(None);
+        }
+
+        let request = InstallRequest {
+            current_version: current_version.clone(),
+            state_dir: state_dir.clone(),
+            requested_version: Some(tx.version.clone()),
+            apply_update,
+        };
+        match install_or_resume(request).await {
+            Ok(outcome) => return Ok(Some(outcome)),
+            Err(err) if err.retryable => {
+                tx = match load_update_transaction(&state_dir)? {
+                    Some(next_tx) => next_tx,
+                    None => return Ok(None),
+                };
+                if tx.state == UpdateTransactionState::Failed && tx.attempt >= tx.max_attempts {
+                    return Err(UpdateError::non_retryable(
+                        err.phase,
+                        format!(
+                            "{} (retry budget exhausted at attempt {}/{})",
+                            err.message, tx.attempt, tx.max_attempts
+                        ),
+                    ));
+                }
+                if !transaction_resume_pending(&tx) {
+                    return Ok(None);
+                }
+                let backoff = resume_backoff_for_attempt(tx.attempt);
+                if let Some(shutdown) = shutdown_rx.as_mut() {
+                    tokio::select! {
+                        _ = tokio::time::sleep(backoff) => {}
+                        changed = shutdown.changed() => {
+                            if changed.is_err() || *shutdown.borrow() {
+                                return Ok(None);
+                            }
+                        }
+                    }
+                } else {
+                    tokio::time::sleep(backoff).await;
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1351,6 +1465,15 @@ mod tests {
             sanitize_version_for_path("v0.1.0+build/metadata"),
             "v0.1.0_build_metadata"
         );
+    }
+
+    #[test]
+    fn test_resume_backoff_for_attempt() {
+        assert_eq!(resume_backoff_for_attempt(0), Duration::from_secs(5));
+        assert_eq!(resume_backoff_for_attempt(1), Duration::from_secs(5));
+        assert_eq!(resume_backoff_for_attempt(2), Duration::from_secs(15));
+        assert_eq!(resume_backoff_for_attempt(3), Duration::from_secs(45));
+        assert_eq!(resume_backoff_for_attempt(10), Duration::from_secs(45));
     }
 
     #[test]
@@ -1507,5 +1630,55 @@ mod tests {
         .expect_err("malformed bundle must fail");
         assert!(err.message.contains("bundle parse failed"));
         assert!(!err.retryable);
+    }
+
+    #[tokio::test]
+    async fn test_auto_resume_with_backoff_no_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let result =
+            auto_resume_with_backoff(dir.path().to_path_buf(), "0.1.0".to_string(), true, None)
+                .await
+                .expect("no transaction should not fail");
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_auto_resume_with_backoff_applied_transaction_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tx = make_new_transaction("0.1.0", "cara-x86_64-linux");
+        tx.state = UpdateTransactionState::Applied;
+        tx.phase = UpdatePhase::Applied;
+        tx.retryable = false;
+        persist_update_transaction(dir.path(), &tx).unwrap();
+
+        let result =
+            auto_resume_with_backoff(dir.path().to_path_buf(), "0.1.0".to_string(), true, None)
+                .await
+                .expect("applied transaction should not fail");
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_auto_resume_with_backoff_shutdown_signal_skips_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tx = make_new_transaction("0.1.0", "cara-x86_64-linux");
+        tx.state = UpdateTransactionState::InProgress;
+        tx.phase = UpdatePhase::Downloading;
+        tx.retryable = true;
+        tx.attempt = 1;
+        tx.max_attempts = 3;
+        persist_update_transaction(dir.path(), &tx).unwrap();
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        shutdown_tx.send(true).unwrap();
+        let result = auto_resume_with_backoff(
+            dir.path().to_path_buf(),
+            "0.1.0".to_string(),
+            true,
+            Some(shutdown_rx),
+        )
+        .await
+        .expect("shutdown short-circuit should not fail");
+        assert!(result.is_none());
     }
 }
