@@ -114,6 +114,7 @@ jobs:
             --allowedTools "Bash(git:*),Bash(rg:*),Bash(ls:*),Bash(find:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(jq:*),Bash(sed:*),Bash(echo:*),Bash(awk:*),Bash(wc:*),WebSearch"
 
       - name: Validate Claude review output JSON
+        id: validate-review-json
         if: github.actor != 'dependabot[bot]' && steps.claude-review.outcome == 'success'
         run: |
           test -f .claude/review.json
@@ -140,6 +141,7 @@ jobs:
           ' .claude/review.json >/dev/null
 
       - name: Upload Claude review output
+        id: upload-review-json
         if: github.actor != 'dependabot[bot]' && steps.claude-review.outcome == 'success'
         uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
         with:
@@ -166,7 +168,9 @@ jobs:
           should_publish=false
           if [[ "${{ github.actor }}" != "dependabot[bot]" ]] && \
              [[ "${{ steps.workflow-change.outputs.changed }}" != "true" ]] && \
-             [[ "${{ steps.claude-review.outcome }}" == "success" ]]; then
+             [[ "${{ steps.claude-review.outcome }}" == "success" ]] && \
+             [[ "${{ steps.validate-review-json.outcome }}" == "success" ]] && \
+             [[ "${{ steps.upload-review-json.outcome }}" == "success" ]]; then
             should_publish=true
           fi
           echo "should_publish=${should_publish}" >> "$GITHUB_OUTPUT"
@@ -189,6 +193,8 @@ jobs:
 
       - name: Publish deterministic single review
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        env:
+          REVIEW_MARKER: "<!-- claude-review-run:${{ github.run_id }}:${{ github.run_attempt }} -->"
         with:
           script: |
             const fs = require('fs');
@@ -261,6 +267,7 @@ jobs:
             }
 
             let body = `${review.header}\n\n${String(review.summary || '').trim()}`;
+            const reviewMarker = process.env.REVIEW_MARKER || '';
 
             if (inline.length > 0) {
               body += '\n\n### Blocking findings (required before merge)\n';
@@ -286,6 +293,9 @@ jobs:
 
             if (unplaced.length > 0) {
               body += `\n\nNote: ${unplaced.length} blocking finding(s) could not be placed inline because the requested path/line was not in the current PR diff.`;
+            }
+            if (reviewMarker) {
+              body += `\n\n${reviewMarker}`;
             }
 
             const payload = {
@@ -318,6 +328,8 @@ jobs:
         env:
           RUN_STARTED_AT: ${{ needs.claude-review.outputs.cleanup_started_at }}
           SHOULD_PUBLISH: ${{ needs.claude-review.outputs.should_publish }}
+          PUBLISH_JOB_RESULT: ${{ needs.publish-claude-review.result }}
+          REVIEW_MARKER: "<!-- claude-review-run:${{ github.run_id }}:${{ github.run_attempt }} -->"
         with:
           script: |
             const startedAt = Date.parse(process.env.RUN_STARTED_AT || '');
@@ -378,19 +390,20 @@ jobs:
             }
             core.info(`Minimized ${strayReviews.length} stray claude-authored review(s).`);
 
-            if (process.env.SHOULD_PUBLISH === 'true') {
+            if (process.env.SHOULD_PUBLISH === 'true' && process.env.PUBLISH_JOB_RESULT === 'success') {
               const refreshed = await github.paginate(github.rest.pulls.listReviews, {
                 owner,
                 repo,
                 pull_number: issue_number,
                 per_page: 100,
               });
+              const marker = process.env.REVIEW_MARKER || '';
               const published = refreshed.filter((r) => {
                 const login = r.user?.login || '';
-                const submitted = Date.parse(r.submitted_at || '');
-                return login.includes('github-actions') && !Number.isNaN(submitted) && submitted >= startedAt;
+                const body = r.body || '';
+                return login.includes('github-actions') && marker && body.includes(marker);
               });
               if (published.length !== 1) {
-                core.setFailed(`Expected exactly one published review from github-actions in this run, found ${published.length}.`);
+                core.setFailed(`Expected exactly one published review from github-actions for marker ${marker}, found ${published.length}.`);
               }
             }
