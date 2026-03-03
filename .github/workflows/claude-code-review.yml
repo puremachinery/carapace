@@ -78,6 +78,7 @@ jobs:
             - Do NOT call gh APIs for comments/reviews.
             - Output only structured findings JSON to: .claude/review.json
             - Overwrite the file each run.
+            - Use the Write tool to create .claude/review.json; do not use Bash redirection to write files.
 
             Required JSON output (example; must be valid JSON):
             {
@@ -114,7 +115,7 @@ jobs:
             - If inline_findings is non-empty, header MUST be "Blocking findings present.".
             - No markdown/code fences in .claude/review.json; emit valid JSON only.
           claude_args: |
-            --allowedTools "Bash(git:*),Bash(rg:*),Bash(ls:*),Bash(find:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(jq:*),Bash(sed:*),Bash(echo:*),Bash(awk:*),Bash(wc:*),WebSearch"
+            --allowedTools "Bash(git:*),Bash(rg:*),Bash(ls:*),Bash(find:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(jq:*),Bash(sed:*),Bash(echo:*),Bash(awk:*),Bash(wc:*),WebSearch,Write"
 
       - name: Validate Claude review output JSON
         id: validate-review-json
