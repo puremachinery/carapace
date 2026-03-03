@@ -5544,6 +5544,7 @@ mod tests {
 
     #[test]
     fn test_backup_restore_round_trip() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
         let temp = tempfile::TempDir::new().unwrap();
 
         // Set up source state directory.
@@ -5586,50 +5587,25 @@ mod tests {
         let enc = builder.into_inner().unwrap();
         enc.finish().unwrap();
 
-        // Set up a fresh target state directory and restore into it.
+        // Set up a fresh target state directory and restore into it using the
+        // production restore path.
         let target_state = temp.path().join("target");
-        std::fs::create_dir_all(&target_state).unwrap();
-
-        // Manually extract (simulating what handle_restore does).
-        let file = std::fs::File::open(&archive_path).unwrap();
-        let dec = flate2::read::GzDecoder::new(file);
-        let mut archive = tar::Archive::new(dec);
-
-        for entry_result in archive.entries().unwrap() {
-            let mut entry = entry_result.unwrap();
-            let path = entry.path().unwrap().to_path_buf();
-            let path_str = path.to_string_lossy().to_string();
-
-            if path_str == BACKUP_MARKER {
-                continue;
-            }
-
-            if path_str.starts_with("sessions/") {
-                let rel = path.strip_prefix("sessions").unwrap_or(&path);
-                let target = target_state.join("sessions").join(rel);
-                extract_entry(&mut entry, &target).unwrap();
-            } else if path_str.starts_with("cron/") {
-                let rel = path.strip_prefix("cron").unwrap_or(&path);
-                let target = target_state.join("cron").join(rel);
-                extract_entry(&mut entry, &target).unwrap();
-            } else if path_str.starts_with("usage/") {
-                let rel = path.strip_prefix("usage").unwrap_or(&path);
-                let target = target_state.join(rel);
-                let entry_type = entry.header().entry_type();
-                if entry_type.is_file() {
-                    if let Some(parent) = target.parent() {
-                        std::fs::create_dir_all(parent).unwrap();
-                    }
-                    let mut buf = Vec::new();
-                    entry.read_to_end(&mut buf).unwrap();
-                    std::fs::write(&target, &buf).unwrap();
-                }
-            } else if path_str.starts_with("tasks/") {
-                let rel = path.strip_prefix("tasks").unwrap_or(&path);
-                let target = target_state.join("tasks").join(rel);
-                extract_entry(&mut entry, &target).unwrap();
-            }
-        }
+        let target_config = temp.path().join("target-config.json5");
+        std::fs::write(&target_config, "{}").unwrap();
+        let _state_guard = set_env_var_scoped(
+            "CARAPACE_STATE_DIR",
+            target_state.to_string_lossy().as_ref(),
+        );
+        let _config_guard = set_env_var_scoped(
+            "CARAPACE_CONFIG_PATH",
+            target_config.to_string_lossy().as_ref(),
+        );
+        let (restored_sections, restored_sessions) = restore_files_from_tar(&archive_path).unwrap();
+        assert_eq!(restored_sessions, 1);
+        assert!(restored_sections.contains(&"sessions".to_string()));
+        assert!(restored_sections.contains(&"cron".to_string()));
+        assert!(restored_sections.contains(&"tasks".to_string()));
+        assert!(restored_sections.contains(&"usage".to_string()));
 
         // Verify restored data matches original.
         let restored_session =
@@ -5674,6 +5650,64 @@ mod tests {
             sections.contains(&"tasks".to_string()),
             "backup should report tasks section when state/tasks exists"
         );
+    }
+
+    #[test]
+    fn test_handle_backup_restore_round_trip_preserves_tasks() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let temp = tempfile::TempDir::new().unwrap();
+
+        let source_state = temp.path().join("source-state");
+        let source_tasks = source_state.join("tasks");
+        let source_sessions = source_state.join("sessions");
+        let source_cron = source_state.join("cron");
+        std::fs::create_dir_all(&source_tasks).unwrap();
+        std::fs::create_dir_all(&source_sessions).unwrap();
+        std::fs::create_dir_all(&source_cron).unwrap();
+        std::fs::write(
+            source_tasks.join("queue.json"),
+            r#"[{"id":"task-1","state":"queued"}]"#,
+        )
+        .unwrap();
+        std::fs::write(source_sessions.join("sess-a.json"), r#"{"id":"sess-a"}"#).unwrap();
+        std::fs::write(source_cron.join("jobs.json"), r#"{"jobs":[]}"#).unwrap();
+        std::fs::write(source_state.join("usage.json"), r#"{"sessions":{}}"#).unwrap();
+
+        let source_config = temp.path().join("source-config.json5");
+        std::fs::write(&source_config, "{}").unwrap();
+        let archive_path = temp.path().join("backup-roundtrip.tar.gz");
+
+        {
+            let _state_guard = set_env_var_scoped(
+                "CARAPACE_STATE_DIR",
+                source_state.to_string_lossy().as_ref(),
+            );
+            let _config_guard = set_env_var_scoped(
+                "CARAPACE_CONFIG_PATH",
+                source_config.to_string_lossy().as_ref(),
+            );
+            handle_backup(Some(archive_path.to_string_lossy().as_ref())).unwrap();
+        }
+
+        let target_state = temp.path().join("target-state");
+        let target_config = temp.path().join("target-config.json5");
+        std::fs::write(&target_config, "{}").unwrap();
+
+        {
+            let _state_guard = set_env_var_scoped(
+                "CARAPACE_STATE_DIR",
+                target_state.to_string_lossy().as_ref(),
+            );
+            let _config_guard = set_env_var_scoped(
+                "CARAPACE_CONFIG_PATH",
+                target_config.to_string_lossy().as_ref(),
+            );
+            handle_restore(archive_path.to_string_lossy().as_ref(), true).unwrap();
+        }
+
+        let restored_tasks =
+            std::fs::read_to_string(target_state.join("tasks").join("queue.json")).unwrap();
+        assert_eq!(restored_tasks, r#"[{"id":"task-1","state":"queued"}]"#);
     }
 
     #[test]
