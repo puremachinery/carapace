@@ -187,4 +187,4 @@ cara version
 
 - Continue with [First run](first-run.md)
 - Or jump to [Cookbook recipes](../cookbook/README.md)
-- For maintainer/operator release policy, see [Release & upgrade policy](../release.md)
+- For maintainer/operator release policy (including `./scripts/smoke/verify-release-artifacts.sh` from repo root), see [Release & upgrade policy](../release.md)

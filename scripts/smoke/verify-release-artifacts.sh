@@ -9,8 +9,12 @@ timestamp="$(date -u +"%Y%m%dT%H%M%SZ")"
 repo="${GITHUB_REPO:-puremachinery/carapace}"
 requested_tag="${RELEASE_TAG:-latest}"
 asset_name="${CARA_ASSET:-}"
-expected_identity_regexp="${EXPECTED_IDENTITY_REGEXP:-https://github.com/puremachinery/carapace/.github/workflows/release.yml@refs/tags/v.*}"
-expected_oidc_issuer="${EXPECTED_OIDC_ISSUER:-https://token.actions.githubusercontent.com}"
+default_identity_regexp="https://github.com/puremachinery/carapace/.github/workflows/release.yml@refs/tags/v.*"
+default_oidc_issuer="https://token.actions.githubusercontent.com"
+expected_identity_regexp="${EXPECTED_IDENTITY_REGEXP:-${default_identity_regexp}}"
+expected_oidc_issuer="${EXPECTED_OIDC_ISSUER:-${default_oidc_issuer}}"
+identity_policy_overridden="false"
+oidc_policy_overridden="false"
 
 work_dir="$(mktemp -d "${TMPDIR:-/tmp}/cara-release-verify-${timestamp}-XXXXXX")"
 log_path="${report_dir}/release-artifact-verify-${timestamp}.log"
@@ -44,6 +48,8 @@ write_report() {
   local checksums_present_json=false
   local binary_verified_json=false
   local checksums_verified_json=false
+  local identity_policy_overridden_json=false
+  local oidc_policy_overridden_json=false
 
   if [[ "${has_checksums}" == "true" ]]; then
     checksums_present_json=true
@@ -53,6 +59,12 @@ write_report() {
   fi
   if [[ "${checksums_verified}" == "true" ]]; then
     checksums_verified_json=true
+  fi
+  if [[ "${identity_policy_overridden}" == "true" ]]; then
+    identity_policy_overridden_json=true
+  fi
+  if [[ "${oidc_policy_overridden}" == "true" ]]; then
+    oidc_policy_overridden_json=true
   fi
 
   jq -n \
@@ -67,6 +79,10 @@ write_report() {
     --argjson checksumsPresent "${checksums_present_json}" \
     --argjson binaryVerified "${binary_verified_json}" \
     --argjson checksumsVerified "${checksums_verified_json}" \
+    --arg expectedIdentityRegexp "${expected_identity_regexp}" \
+    --arg expectedOidcIssuer "${expected_oidc_issuer}" \
+    --argjson identityPolicyOverridden "${identity_policy_overridden_json}" \
+    --argjson oidcPolicyOverridden "${oidc_policy_overridden_json}" \
     --arg binarySha256 "${binary_sha256}" \
     --arg logPath "${log_path}" \
     --arg status "${status}" \
@@ -83,6 +99,10 @@ write_report() {
       "checksumsPresent": $checksumsPresent,
       "binaryVerified": $binaryVerified,
       "checksumsVerified": $checksumsVerified,
+      "expectedIdentityRegexp": $expectedIdentityRegexp,
+      "expectedOidcIssuer": $expectedOidcIssuer,
+      "identityPolicyOverridden": $identityPolicyOverridden,
+      "oidcPolicyOverridden": $oidcPolicyOverridden,
       "binarySha256": $binarySha256,
       "logPath": $logPath,
       "status": $status,
@@ -173,6 +193,20 @@ if [[ -z "${asset_name}" ]]; then
 fi
 bundle_name="${asset_name}.bundle"
 
+if [[ -n "${EXPECTED_IDENTITY_REGEXP:-}" && "${EXPECTED_IDENTITY_REGEXP}" != "${default_identity_regexp}" ]]; then
+  identity_policy_overridden="true"
+fi
+if [[ -n "${EXPECTED_OIDC_ISSUER:-}" && "${EXPECTED_OIDC_ISSUER}" != "${default_oidc_issuer}" ]]; then
+  oidc_policy_overridden="true"
+fi
+
+if [[ "${identity_policy_overridden}" == "true" ]]; then
+  echo "WARNING: EXPECTED_IDENTITY_REGEXP overridden to: ${expected_identity_regexp}" >>"${log_path}"
+fi
+if [[ "${oidc_policy_overridden}" == "true" ]]; then
+  echo "WARNING: EXPECTED_OIDC_ISSUER overridden to: ${expected_oidc_issuer}" >>"${log_path}"
+fi
+
 if [[ "${requested_tag}" == "latest" ]]; then
   if ! release_json="$(gh release view --repo "${repo}" --json tagName,url,assets 2>>"${log_path}")"; then
     fail "failed to query latest release metadata"
@@ -194,6 +228,10 @@ release_url="$(jq -r '.url' <<<"${release_json}")"
   echo "release_url=${release_url}"
   echo "asset_name=${asset_name}"
   echo "bundle_name=${bundle_name}"
+  echo "expected_identity_regexp=${expected_identity_regexp}"
+  echo "expected_oidc_issuer=${expected_oidc_issuer}"
+  echo "identity_policy_overridden=${identity_policy_overridden}"
+  echo "oidc_policy_overridden=${oidc_policy_overridden}"
 } >>"${log_path}"
 
 if ! jq -e --arg n "${asset_name}" '.assets[] | select(.name == $n)' >/dev/null <<<"${release_json}"; then
