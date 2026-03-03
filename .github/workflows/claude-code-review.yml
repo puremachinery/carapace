@@ -132,15 +132,15 @@ jobs:
              ((.header == "Blocking findings present.") and ((.inline_findings | length) > 0))) and
             (all(.inline_findings[]?; (["critical","high","medium"] | index(.severity)) != null and
               .scope == "in-scope" and
-              (.title | type == "string" and length > 0) and
-              (.body | type == "string" and length > 0) and
-              (.path | type == "string" and length > 0) and
+              (.title | type == "string" and (. | gsub("^\\s+|\\s+$"; "") | length > 0)) and
+              (.body | type == "string" and (. | gsub("^\\s+|\\s+$"; "") | length > 0)) and
+              (.path | type == "string" and (. | gsub("^\\s+|\\s+$"; "") | length > 0)) and
               (.line | type == "number" and floor == . and . >= 1))) and
             (all(.advisory_findings[]?; (["critical","high","medium"] | index(.severity)) != null and
               .scope == "out-of-scope" and
-              (.title | type == "string" and length > 0) and
-              (.body | type == "string" and length > 0))) and
-            (all(.optional_followups[]?; type == "string" and length > 0))
+              (.title | type == "string" and (. | gsub("^\\s+|\\s+$"; "") | length > 0)) and
+              (.body | type == "string" and (. | gsub("^\\s+|\\s+$"; "") | length > 0))) and
+            (all(.optional_followups[]?; type == "string" and (. | gsub("^\\s+|\\s+$"; "") | length > 0)))
           ' .claude/review.json >/dev/null
 
       - name: Upload Claude review output
@@ -255,15 +255,21 @@ jobs:
 
             for (const finding of inline) {
               const p = String(finding.path || '');
-              const l = Math.trunc(Number(finding.line || 0));
+              const rawLine = finding.line;
+              const parsedLine = Number(rawLine);
+              const lineNumber = Number.isInteger(rawLine) ? rawLine : parsedLine;
+              if (!Number.isInteger(lineNumber) || lineNumber <= 0) {
+                unplaced.push(finding);
+                continue;
+              }
               const lineSet = changedLinesByPath.get(p);
-              if (!lineSet || !lineSet.has(l)) {
+              if (!lineSet || !lineSet.has(lineNumber)) {
                 unplaced.push(finding);
                 continue;
               }
               comments.push({
                 path: p,
-                line: l,
+                line: lineNumber,
                 side: 'RIGHT',
                 body: `[${finding.severity}, in-scope] ${finding.title}\n\n${finding.body}`,
               });
@@ -345,6 +351,11 @@ jobs:
             const repo = context.repo.repo;
             const issue_number = context.payload.pull_request.number;
             const strayAuthors = new Set(['claude', 'claude[bot]']);
+            const isKnownClaudeBotAuthor = (user) => {
+              const login = user?.login || '';
+              const type = user?.type || '';
+              return strayAuthors.has(login) && type === 'Bot';
+            };
 
             const issueComments = await github.paginate(github.rest.issues.listComments, {
               owner,
@@ -354,9 +365,8 @@ jobs:
             });
 
             const strayIssueComments = issueComments.filter((c) => {
-              const login = c.user?.login || '';
               const created = Date.parse(c.created_at || '');
-              return strayAuthors.has(login) && !Number.isNaN(created) && created >= startedAt;
+              return isKnownClaudeBotAuthor(c.user) && !Number.isNaN(created) && created >= startedAt;
             });
 
             for (const c of strayIssueComments) {
@@ -372,9 +382,8 @@ jobs:
             });
 
             const strayReviews = reviews.filter((r) => {
-              const login = r.user?.login || '';
               const submitted = Date.parse(r.submitted_at || '');
-              return strayAuthors.has(login) && !Number.isNaN(submitted) && submitted >= startedAt;
+              return isKnownClaudeBotAuthor(r.user) && !Number.isNaN(submitted) && submitted >= startedAt;
             });
 
             for (const r of strayReviews) {
@@ -401,9 +410,8 @@ jobs:
             });
 
             const strayReviewComments = reviewComments.filter((c) => {
-              const login = c.user?.login || '';
               const created = Date.parse(c.created_at || '');
-              return strayAuthors.has(login) && !Number.isNaN(created) && created >= startedAt;
+              return isKnownClaudeBotAuthor(c.user) && !Number.isNaN(created) && created >= startedAt;
             });
 
             for (const c of strayReviewComments) {
