@@ -1318,20 +1318,13 @@ pub async fn auto_resume_with_backoff(
     apply_update: bool,
     mut shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<Option<InstallOutcome>, UpdateError> {
-    let mut tx = match load_update_transaction(&state_dir)? {
-        Some(tx) => tx,
-        None => return Ok(None),
-    };
-
-    if shutdown_rx.as_ref().is_some_and(|rx| *rx.borrow()) {
-        return Ok(None);
-    }
-
-    if !transaction_resume_pending(&tx) {
-        return Ok(None);
-    }
+    let mut tx;
 
     loop {
+        if shutdown_rx.as_ref().is_some_and(|rx| *rx.borrow()) {
+            return Ok(None);
+        }
+
         tx = match load_update_transaction(&state_dir)? {
             Some(next_tx) => next_tx,
             None => return Ok(None),
@@ -1353,7 +1346,7 @@ pub async fn auto_resume_with_backoff(
                     Some(next_tx) => next_tx,
                     None => return Ok(None),
                 };
-                if !transaction_resume_pending(&tx) {
+                if tx.state == UpdateTransactionState::Failed && tx.attempt >= tx.max_attempts {
                     return Err(UpdateError::non_retryable(
                         err.phase,
                         format!(
@@ -1361,6 +1354,9 @@ pub async fn auto_resume_with_backoff(
                             err.message, tx.attempt, tx.max_attempts
                         ),
                     ));
+                }
+                if !transaction_resume_pending(&tx) {
+                    return Ok(None);
                 }
                 let backoff = resume_backoff_for_attempt(tx.attempt);
                 if let Some(shutdown) = shutdown_rx.as_mut() {
