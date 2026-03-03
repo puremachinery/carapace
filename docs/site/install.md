@@ -141,6 +141,12 @@ if ($expected -ne $actual) {
 Write-Host "Checksum verified for $FileName"
 ```
 
+Maintainer/operator shortcut for this full flow:
+
+```bash
+scripts/smoke/verify-release-artifacts.sh
+```
+
 ## 4) Install on your PATH
 
 macOS/Linux:

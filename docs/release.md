@@ -142,13 +142,18 @@ Every release should include these sections:
 6. Wait for `.github/workflows/release.yml` to complete.
 7. Verify release artifacts are published (all target binaries + signatures +
    checksums).
-8. Smoke-check the published binary on at least one Linux and one macOS path.
+8. Verify published artifact authenticity/checksum workflow against the release.
+   - `scripts/smoke/verify-release-artifacts.sh`
+   - Optional overrides:
+     - `RELEASE_TAG=vX.Y.Z scripts/smoke/verify-release-artifacts.sh`
+     - `CARA_ASSET=cara-x86_64-linux scripts/smoke/verify-release-artifacts.sh`
+9. Smoke-check the published binary on at least one Linux and one macOS path.
    - Suggested scripts:
      - `scripts/smoke/update-macos-local.sh`
      - `scripts/smoke/update-linux-orbstack.sh`
    - Optional live channel smoke:
      - `scripts/smoke/live-channel-smoke.sh`
-9. Confirm release notes contain all required sections above.
+10. Confirm release notes contain all required sections above.
 
 ## Distribution Notes
 
