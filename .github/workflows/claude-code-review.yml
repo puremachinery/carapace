@@ -254,7 +254,12 @@ jobs:
             const unplaced = [];
 
             for (const finding of inline) {
-              const p = String(finding.path || '');
+              const pRaw = String(finding.path || '');
+              const p = pRaw.trim();
+              if (!p) {
+                unplaced.push(finding);
+                continue;
+              }
               const rawLine = finding.line;
               const parsedLine = Number(rawLine);
               const lineNumber = Number.isInteger(rawLine) ? rawLine : parsedLine;
