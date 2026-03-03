@@ -131,7 +131,7 @@ jobs:
               (.title | type == "string" and length > 0) and
               (.body | type == "string" and length > 0) and
               (.path | type == "string" and length > 0) and
-              (.line | type == "number" and . >= 1))) and
+              (.line | type == "number" and floor == . and . >= 1))) and
             (all(.advisory_findings[]?; (["critical","high","medium"] | index(.severity)) != null and
               .scope == "out-of-scope" and
               (.title | type == "string" and length > 0) and
@@ -223,6 +223,8 @@ jobs:
                   newLine += 1;
                 } else if (l.startsWith('-') && !l.startsWith('---')) {
                   // deleted line; do not advance RHS line
+                } else if (l.startsWith('\\')) {
+                  // metadata line (e.g. "\ No newline at end of file"); do not advance RHS line
                 } else {
                   newLine += 1;
                 }
