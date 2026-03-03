@@ -4,14 +4,15 @@ on:
   pull_request:
     types: [opened, synchronize, ready_for_review, reopened]
 
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   claude-review:
     outputs:
       cleanup_started_at: ${{ steps.cleanup-window.outputs.started_at }}
       should_publish: ${{ steps.publish-decision.outputs.should_publish }}
-    concurrency:
-      group: claude-review-${{ github.event.pull_request.number }}
-      cancel-in-progress: true
     if: github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.draft == false
 
     runs-on: ubuntu-latest
@@ -78,32 +79,34 @@ jobs:
             - Output only structured findings JSON to: .claude/review.json
             - Overwrite the file each run.
 
-            Required JSON schema:
+            Required JSON output (example; must be valid JSON):
             {
-              "header": "Blocking findings present." | "LGTM for blocking issues.",
-              "summary": "string",
+              "header": "LGTM for blocking issues.",
+              "summary": "one-paragraph summary",
               "inline_findings": [
                 {
-                  "severity": "critical" | "high" | "medium",
+                  "severity": "high",
                   "scope": "in-scope",
-                  "title": "string",
-                  "body": "string",
-                  "path": "repo/relative/path",
+                  "title": "short finding title",
+                  "body": "one-paragraph explanation",
+                  "path": "repo/relative/path.ext",
                   "line": 123
                 }
               ],
               "advisory_findings": [
                 {
-                  "severity": "critical" | "high" | "medium",
+                  "severity": "medium",
                   "scope": "out-of-scope",
-                  "title": "string",
-                  "body": "string"
+                  "title": "short advisory title",
+                  "body": "one-paragraph explanation"
                 }
               ],
-              "optional_followups": ["string"]
+              "optional_followups": ["non-blocking follow-up item"]
             }
 
             Rules:
+            - Allowed header values: "Blocking findings present." or "LGTM for blocking issues.".
+            - Allowed severity values: "critical", "high", "medium".
             - Only in-scope critical/high/medium findings belong in inline_findings.
             - Never include low/info in inline_findings.
             - Low-only items go to optional_followups.
@@ -389,6 +392,35 @@ jobs:
               }
             }
             core.info(`Minimized ${strayReviews.length} stray claude-authored review(s).`);
+
+            const reviewComments = await github.paginate(github.rest.pulls.listReviewComments, {
+              owner,
+              repo,
+              pull_number: issue_number,
+              per_page: 100,
+            });
+
+            const strayReviewComments = reviewComments.filter((c) => {
+              const login = c.user?.login || '';
+              const created = Date.parse(c.created_at || '');
+              return strayAuthors.has(login) && !Number.isNaN(created) && created >= startedAt;
+            });
+
+            for (const c of strayReviewComments) {
+              try {
+                await github.graphql(
+                  `mutation($subjectId:ID!) {
+                    minimizeComment(input:{subjectId:$subjectId, classifier:OUTDATED}) {
+                      minimizedComment { isMinimized }
+                    }
+                  }`,
+                  { subjectId: c.node_id },
+                );
+              } catch (err) {
+                core.warning(`Failed to minimize review comment ${c.id}: ${err.message}`);
+              }
+            }
+            core.info(`Minimized ${strayReviewComments.length} stray claude-authored review comment(s).`);
 
             if (process.env.SHOULD_PUBLISH === 'true' && process.env.PUBLISH_JOB_RESULT === 'success') {
               const refreshed = await github.paginate(github.rest.pulls.listReviews, {
