@@ -84,7 +84,7 @@ is_ws_golden_relevant_path() {
 
 ensure_nextest_installed() {
     if ! command -v cargo-nextest >/dev/null 2>&1; then
-        echo "cargo-nextest is required. Install with: cargo install cargo-nextest"
+        echo "cargo-nextest is required. Install with: cargo install --locked cargo-nextest"
         exit 1
     fi
 }
