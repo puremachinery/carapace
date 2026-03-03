@@ -1994,6 +1994,13 @@ pub fn handle_backup(output: Option<&str>) -> Result<(), Box<dyn std::error::Err
         included_sections.push("cron");
     }
 
+    // Durable task queue/state directory.
+    let tasks_dir = state_dir.join("tasks");
+    if tasks_dir.is_dir() {
+        archive.append_dir_all("tasks", &tasks_dir)?;
+        included_sections.push("tasks");
+    }
+
     // Usage data file.
     let usage_path = state_dir.join("usage.json");
     if usage_path.exists() {
@@ -2103,6 +2110,8 @@ fn validate_backup_file(archive_path: &PathBuf) -> Result<Vec<String>, Box<dyn s
                 Some("memory")
             } else if path_str.starts_with("cron/") {
                 Some("cron")
+            } else if path_str.starts_with("tasks/") {
+                Some("tasks")
             } else if path_str.starts_with("usage/") {
                 Some("usage")
             } else {
@@ -2187,6 +2196,13 @@ fn restore_files_from_tar(
             extract_entry(&mut entry, &target)?;
             if !restored.contains(&"cron".to_string()) {
                 restored.push("cron".to_string());
+            }
+        } else if path_str.starts_with("tasks/") {
+            let rel = path.strip_prefix("tasks").unwrap_or(&path);
+            let target = state_dir.join("tasks").join(rel);
+            extract_entry(&mut entry, &target)?;
+            if !restored.contains(&"tasks".to_string()) {
+                restored.push("tasks".to_string());
             }
         } else if path_str.starts_with("usage/") {
             let rel = path.strip_prefix("usage").unwrap_or(&path);
@@ -5437,8 +5453,10 @@ mod tests {
         let state_dir = temp.path().join("state");
         let sessions_dir = state_dir.join("sessions");
         let cron_dir = state_dir.join("cron");
+        let tasks_dir = state_dir.join("tasks");
         std::fs::create_dir_all(&sessions_dir).unwrap();
         std::fs::create_dir_all(&cron_dir).unwrap();
+        std::fs::create_dir_all(&tasks_dir).unwrap();
 
         // Create some fake session data.
         std::fs::write(
@@ -5457,6 +5475,8 @@ mod tests {
 
         // Create fake usage data.
         std::fs::write(state_dir.join("usage.json"), r#"{"totalTokens":42}"#).unwrap();
+        // Create fake task data.
+        std::fs::write(tasks_dir.join("queue.json"), r#"{"tasks":[]}"#).unwrap();
 
         // Build archive.
         let archive_path = temp.path().join("test-backup.tar.gz");
@@ -5478,6 +5498,8 @@ mod tests {
         builder.append_dir_all("sessions", &sessions_dir).unwrap();
         // Add cron.
         builder.append_dir_all("cron", &cron_dir).unwrap();
+        // Add tasks.
+        builder.append_dir_all("tasks", &tasks_dir).unwrap();
         // Add usage.
         builder
             .append_path_with_name(state_dir.join("usage.json"), "usage/usage.json")
@@ -5494,6 +5516,7 @@ mod tests {
         let mut found_marker = false;
         let mut found_session = false;
         let mut found_cron = false;
+        let mut found_tasks = false;
         let mut found_usage = false;
 
         for entry in archive.entries().unwrap() {
@@ -5505,6 +5528,8 @@ mod tests {
                 found_session = true;
             } else if path.contains("jobs.json") {
                 found_cron = true;
+            } else if path.contains("queue.json") {
+                found_tasks = true;
             } else if path.contains("usage.json") {
                 found_usage = true;
             }
@@ -5513,6 +5538,7 @@ mod tests {
         assert!(found_marker, "Archive should contain backup marker");
         assert!(found_session, "Archive should contain session data");
         assert!(found_cron, "Archive should contain cron data");
+        assert!(found_tasks, "Archive should contain task queue data");
         assert!(found_usage, "Archive should contain usage data");
     }
 
@@ -5618,6 +5644,20 @@ mod tests {
                     entry.read_to_end(&mut buf).unwrap();
                     std::fs::write(&target, &buf).unwrap();
                 }
+            } else if path_str.starts_with("tasks/") {
+                let rel = path.strip_prefix("tasks").unwrap_or(&path);
+                let target = target_state.join("tasks").join(rel);
+                let entry_type = entry.header().entry_type();
+                if entry_type.is_dir() {
+                    std::fs::create_dir_all(&target).unwrap();
+                } else if entry_type.is_file() {
+                    if let Some(parent) = target.parent() {
+                        std::fs::create_dir_all(parent).unwrap();
+                    }
+                    let mut buf = Vec::new();
+                    entry.read_to_end(&mut buf).unwrap();
+                    std::fs::write(&target, &buf).unwrap();
+                }
             }
         }
 
@@ -5632,6 +5672,10 @@ mod tests {
 
         let restored_usage = std::fs::read_to_string(target_state.join("usage.json")).unwrap();
         assert_eq!(restored_usage, r#"{"totalTokens":100}"#);
+
+        let restored_tasks =
+            std::fs::read_to_string(target_state.join("tasks").join("queue.json")).unwrap();
+        assert_eq!(restored_tasks, r#"[]"#);
     }
 
     #[test]
