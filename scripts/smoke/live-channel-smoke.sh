@@ -85,7 +85,7 @@ if [[ -n "${telegram_to}" ]]; then
     echo "== telegram verify =="
     echo "$ ${binary_path} verify --outcome telegram --telegram-to <redacted> --port ${port}"
   } >>"${log_path}"
-  if ! "${binary_path}" verify --outcome telegram --telegram-to "${telegram_to}" --port "${port}" >/dev/null 2>&1; then
+  if ! "${binary_path}" verify --outcome telegram --telegram-to "${telegram_to}" --port "${port}" >>"${log_path}" 2>&1; then
     status="fail"
     error_msg="telegram verify failed"
   fi
@@ -97,7 +97,7 @@ if [[ -n "${discord_to}" ]]; then
     echo "== discord verify =="
     echo "$ ${binary_path} verify --outcome discord --discord-to <redacted> --port ${port}"
   } >>"${log_path}"
-  if ! "${binary_path}" verify --outcome discord --discord-to "${discord_to}" --port "${port}" >/dev/null 2>&1; then
+  if ! "${binary_path}" verify --outcome discord --discord-to "${discord_to}" --port "${port}" >>"${log_path}" 2>&1; then
     status="fail"
     [[ -n "${error_msg}" ]] && error_msg+="; "
     error_msg+="discord verify failed"

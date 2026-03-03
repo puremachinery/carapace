@@ -315,11 +315,12 @@ async fn handle_update_install_with_force(force: bool) -> Result<Value, ErrorSha
             state.update_available,
         )
     };
+    let requested_version_for_error = latest_version.clone();
 
     let request = crate::update::InstallRequest {
         current_version,
         state_dir,
-        requested_version: latest_version.clone(),
+        requested_version: None,
         apply_update: !cfg!(test),
     };
 
@@ -362,19 +363,19 @@ async fn handle_update_install_with_force(force: bool) -> Result<Value, ErrorSha
             }))
         }
         Err(err) => {
-            if err.message == crate::update::NO_UPDATE_AVAILABLE_MESSAGE {
-                return Err(error_shape(
-                    ERROR_INVALID_REQUEST,
-                    crate::update::NO_UPDATE_AVAILABLE_MESSAGE,
-                    None,
-                ));
-            }
-            if err.message == crate::update::LATEST_VERSION_UNKNOWN_MESSAGE {
-                return Err(error_shape(
-                    ERROR_INVALID_REQUEST,
-                    crate::update::LATEST_VERSION_UNKNOWN_MESSAGE,
-                    None,
-                ));
+            if let Some(code) = err.code {
+                return match code {
+                    crate::update::UpdateErrorCode::NoUpdateAvailable => Err(error_shape(
+                        ERROR_INVALID_REQUEST,
+                        crate::update::NO_UPDATE_AVAILABLE_MESSAGE,
+                        None,
+                    )),
+                    crate::update::UpdateErrorCode::LatestVersionUnknown => Err(error_shape(
+                        ERROR_INVALID_REQUEST,
+                        crate::update::LATEST_VERSION_UNKNOWN_MESSAGE,
+                        None,
+                    )),
+                };
             }
             tracing::warn!("update install failed: {}", err.message);
             state.last_error = Some(err.message.clone());
@@ -382,7 +383,7 @@ async fn handle_update_install_with_force(force: bool) -> Result<Value, ErrorSha
                 ERROR_UNAVAILABLE,
                 &format!("update install failed: {}", err.message),
                 Some(json!({
-                    "version": state.latest_version,
+                    "version": requested_version_for_error,
                     "retryable": err.retryable,
                     "phase": err.phase
                 })),
@@ -416,9 +417,46 @@ pub(super) fn handle_update_release_notes() -> Result<Value, ErrorShape> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use std::sync::Mutex;
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvVarGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            // SAFETY: tests in this module scope env var writes with a guard and TEST_LOCK.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                // SAFETY: restoring test-scoped env var state.
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                // SAFETY: restoring test-scoped env var state.
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    fn set_temp_state_dir() -> (tempfile::TempDir, EnvVarGuard) {
+        let temp = tempfile::tempdir().expect("tempdir for update handler tests");
+        let guard = EnvVarGuard::set(
+            "CARAPACE_STATE_DIR",
+            temp.path()
+                .to_str()
+                .expect("temp state dir should be utf-8 for tests"),
+        );
+        (temp, guard)
+    }
 
     fn reset_state() {
         let mut state = UPDATE_STATE.write();
@@ -548,6 +586,46 @@ mod tests {
             .expect_err("force should bypass no-update check");
         assert_eq!(err.code, ERROR_INVALID_REQUEST);
         assert!(err.message.contains("latest version not known"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_update_install_resume_pending_bypasses_no_update_invalid_request() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let (_tmp, _guard) = set_temp_state_dir();
+        reset_state();
+        {
+            let mut state = UPDATE_STATE.write();
+            state.update_available = false;
+            state.latest_version = None;
+        }
+
+        let tx = crate::update::UpdateTransaction {
+            id: "tx-test-resume".to_string(),
+            version: "0.0.1".to_string(),
+            asset_name: crate::update::expected_asset_name(),
+            state: crate::update::UpdateTransactionState::InProgress,
+            attempt: 0,
+            max_attempts: crate::update::DEFAULT_RESUME_MAX_ATTEMPTS,
+            started_at_ms: crate::update::now_ms(),
+            updated_at_ms: crate::update::now_ms(),
+            staged_path: None,
+            bundle_path: None,
+            sha256: None,
+            last_error: None,
+            phase: crate::update::UpdatePhase::Created,
+            retryable: true,
+        };
+        crate::update::persist_update_transaction(Path::new(&resolve_state_dir()), &tx)
+            .expect("persist pending transaction fixture");
+
+        match handle_update_install().await {
+            Ok(_) => {}
+            Err(err) => assert_ne!(
+                err.code, ERROR_INVALID_REQUEST,
+                "resume-pending transaction should bypass no-update invalid-request guard"
+            ),
+        }
     }
 
     #[test]

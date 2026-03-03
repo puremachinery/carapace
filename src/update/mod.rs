@@ -129,7 +129,14 @@ pub struct InstallRequest {
 pub struct UpdateError {
     pub phase: Option<UpdatePhase>,
     pub retryable: bool,
+    pub code: Option<UpdateErrorCode>,
     pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateErrorCode {
+    NoUpdateAvailable,
+    LatestVersionUnknown,
 }
 
 impl UpdateError {
@@ -137,6 +144,7 @@ impl UpdateError {
         Self {
             phase,
             retryable: true,
+            code: None,
             message: message.into(),
         }
     }
@@ -145,6 +153,20 @@ impl UpdateError {
         Self {
             phase,
             retryable: false,
+            code: None,
+            message: message.into(),
+        }
+    }
+
+    fn non_retryable_with_code<M: Into<String>>(
+        phase: Option<UpdatePhase>,
+        code: UpdateErrorCode,
+        message: M,
+    ) -> Self {
+        Self {
+            phase,
+            retryable: false,
+            code: Some(code),
             message: message.into(),
         }
     }
@@ -1331,8 +1353,9 @@ pub async fn install_or_resume_with_snapshot(
     let existing = load_update_transaction(&request.state_dir)?;
     let resume_pending = existing.as_ref().is_some_and(transaction_resume_pending);
     if !update_available && !force && !resume_pending {
-        return Err(UpdateError::non_retryable(
+        return Err(UpdateError::non_retryable_with_code(
             None,
+            UpdateErrorCode::NoUpdateAvailable,
             NO_UPDATE_AVAILABLE_MESSAGE.to_string(),
         ));
     }
@@ -1344,8 +1367,9 @@ pub async fn install_or_resume_with_snapshot(
     };
 
     if request.requested_version.is_none() {
-        return Err(UpdateError::non_retryable(
+        return Err(UpdateError::non_retryable_with_code(
             None,
+            UpdateErrorCode::LatestVersionUnknown,
             LATEST_VERSION_UNKNOWN_MESSAGE.to_string(),
         ));
     }
