@@ -2110,7 +2110,7 @@ fn validate_backup_file(archive_path: &PathBuf) -> Result<Vec<String>, Box<dyn s
                 Some("memory")
             } else if path_str.starts_with("cron/") {
                 Some("cron")
-            } else if path_str.starts_with("tasks/") {
+            } else if path_str == "tasks" || path_str.starts_with("tasks/") {
                 Some("tasks")
             } else if path_str.starts_with("usage/") {
                 Some("usage")
@@ -2197,7 +2197,7 @@ fn restore_files_from_tar(
             if !restored.contains(&"cron".to_string()) {
                 restored.push("cron".to_string());
             }
-        } else if path_str.starts_with("tasks/") {
+        } else if path_str == "tasks" || path_str.starts_with("tasks/") {
             let rel = path.strip_prefix("tasks").unwrap_or(&path);
             let target = state_dir.join("tasks").join(rel);
             extract_entry(&mut entry, &target)?;
@@ -5475,8 +5475,8 @@ mod tests {
 
         // Create fake usage data.
         std::fs::write(state_dir.join("usage.json"), r#"{"totalTokens":42}"#).unwrap();
-        // Create fake task data.
-        std::fs::write(tasks_dir.join("queue.json"), r#"{"tasks":[]}"#).unwrap();
+        // Create fake task data (durable task queue is stored as a JSON array).
+        std::fs::write(tasks_dir.join("queue.json"), r#"[]"#).unwrap();
 
         // Build archive.
         let archive_path = temp.path().join("test-backup.tar.gz");
@@ -5607,31 +5607,11 @@ mod tests {
             if path_str.starts_with("sessions/") {
                 let rel = path.strip_prefix("sessions").unwrap_or(&path);
                 let target = target_state.join("sessions").join(rel);
-                let entry_type = entry.header().entry_type();
-                if entry_type.is_dir() {
-                    std::fs::create_dir_all(&target).unwrap();
-                } else if entry_type.is_file() {
-                    if let Some(parent) = target.parent() {
-                        std::fs::create_dir_all(parent).unwrap();
-                    }
-                    let mut buf = Vec::new();
-                    entry.read_to_end(&mut buf).unwrap();
-                    std::fs::write(&target, &buf).unwrap();
-                }
+                extract_entry(&mut entry, &target).unwrap();
             } else if path_str.starts_with("cron/") {
                 let rel = path.strip_prefix("cron").unwrap_or(&path);
                 let target = target_state.join("cron").join(rel);
-                let entry_type = entry.header().entry_type();
-                if entry_type.is_dir() {
-                    std::fs::create_dir_all(&target).unwrap();
-                } else if entry_type.is_file() {
-                    if let Some(parent) = target.parent() {
-                        std::fs::create_dir_all(parent).unwrap();
-                    }
-                    let mut buf = Vec::new();
-                    entry.read_to_end(&mut buf).unwrap();
-                    std::fs::write(&target, &buf).unwrap();
-                }
+                extract_entry(&mut entry, &target).unwrap();
             } else if path_str.starts_with("usage/") {
                 let rel = path.strip_prefix("usage").unwrap_or(&path);
                 let target = target_state.join(rel);
@@ -5647,17 +5627,7 @@ mod tests {
             } else if path_str.starts_with("tasks/") {
                 let rel = path.strip_prefix("tasks").unwrap_or(&path);
                 let target = target_state.join("tasks").join(rel);
-                let entry_type = entry.header().entry_type();
-                if entry_type.is_dir() {
-                    std::fs::create_dir_all(&target).unwrap();
-                } else if entry_type.is_file() {
-                    if let Some(parent) = target.parent() {
-                        std::fs::create_dir_all(parent).unwrap();
-                    }
-                    let mut buf = Vec::new();
-                    entry.read_to_end(&mut buf).unwrap();
-                    std::fs::write(&target, &buf).unwrap();
-                }
+                extract_entry(&mut entry, &target).unwrap();
             }
         }
 
@@ -5676,6 +5646,92 @@ mod tests {
         let restored_tasks =
             std::fs::read_to_string(target_state.join("tasks").join("queue.json")).unwrap();
         assert_eq!(restored_tasks, r#"[]"#);
+    }
+
+    #[test]
+    fn test_handle_backup_includes_tasks_section() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let temp = tempfile::TempDir::new().unwrap();
+        let state_dir = temp.path().join("state");
+        let tasks_dir = state_dir.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        std::fs::write(tasks_dir.join("queue.json"), r#"[]"#).unwrap();
+
+        let config_path = temp.path().join("carapace.json5");
+        std::fs::write(&config_path, "{}").unwrap();
+        let archive_path = temp.path().join("backup-with-tasks.tar.gz");
+
+        let _state_guard =
+            set_env_var_scoped("CARAPACE_STATE_DIR", state_dir.to_string_lossy().as_ref());
+        let _config_guard = set_env_var_scoped(
+            "CARAPACE_CONFIG_PATH",
+            config_path.to_string_lossy().as_ref(),
+        );
+
+        handle_backup(Some(archive_path.to_string_lossy().as_ref())).unwrap();
+        let sections = validate_backup_file(&archive_path).unwrap();
+        assert!(
+            sections.contains(&"tasks".to_string()),
+            "backup should report tasks section when state/tasks exists"
+        );
+    }
+
+    #[test]
+    fn test_tasks_section_detected_and_restored_for_directory_entry() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let temp = tempfile::TempDir::new().unwrap();
+        let archive_path = temp.path().join("tasks-dir-only.tar.gz");
+
+        let file = std::fs::File::create(&archive_path).unwrap();
+        let enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut builder = tar::Builder::new(enc);
+
+        let marker = b"carapace-backup v1\n";
+        let mut marker_header = tar::Header::new_gnu();
+        marker_header.set_size(marker.len() as u64);
+        marker_header.set_mode(0o644);
+        marker_header.set_cksum();
+        builder
+            .append_data(&mut marker_header, BACKUP_MARKER, &marker[..])
+            .unwrap();
+
+        let mut dir_header = tar::Header::new_gnu();
+        dir_header.set_entry_type(tar::EntryType::Directory);
+        dir_header.set_size(0);
+        dir_header.set_mode(0o755);
+        dir_header.set_cksum();
+        builder
+            .append_data(&mut dir_header, "tasks", std::io::empty())
+            .unwrap();
+
+        let enc = builder.into_inner().unwrap();
+        enc.finish().unwrap();
+
+        let sections = validate_backup_file(&archive_path).unwrap();
+        assert!(
+            sections.contains(&"tasks".to_string()),
+            "top-level tasks directory entry should be detected as tasks section"
+        );
+
+        let target_state = temp.path().join("target-state");
+        let target_config = temp.path().join("target-config.json5");
+        std::fs::write(&target_config, "{}").unwrap();
+
+        let _state_guard = set_env_var_scoped(
+            "CARAPACE_STATE_DIR",
+            target_state.to_string_lossy().as_ref(),
+        );
+        let _config_guard = set_env_var_scoped(
+            "CARAPACE_CONFIG_PATH",
+            target_config.to_string_lossy().as_ref(),
+        );
+
+        let (restored, _) = restore_files_from_tar(&archive_path).unwrap();
+        assert!(restored.contains(&"tasks".to_string()));
+        assert!(
+            target_state.join("tasks").is_dir(),
+            "restore should recreate empty tasks directory from top-level tasks entry"
+        );
     }
 
     #[test]
