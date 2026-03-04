@@ -141,7 +141,7 @@ jobs:
             (all(.advisory_findings[]?; (["critical","high","medium"] | index(.severity)) != null and
               .scope == "out-of-scope" and
               (.title | type == "string" and (. | gsub("^\\s+|\\s+$"; "") | length > 0)) and
-              (.body | type == "string" and (. | gsub("^\\s+|\\s+$"; "") | length > 0))) and
+              (.body | type == "string" and (. | gsub("^\\s+|\\s+$"; "") | length > 0)))) and
             (all(.optional_followups[]?; type == "string" and (. | gsub("^\\s+|\\s+$"; "") | length > 0)))
           ' .claude/review.json >/dev/null
 
