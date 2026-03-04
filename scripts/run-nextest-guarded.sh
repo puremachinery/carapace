@@ -78,7 +78,9 @@ process_is_running() {
     fi
 
     local stat
-    stat="$(ps -p "${pid}" -o stat= 2>/dev/null | tr -d '[:space:]')"
+    if ! stat="$(ps -p "${pid}" -o stat= 2>/dev/null | tr -d '[:space:]')"; then
+        return 1
+    fi
     case "${stat}" in
         ""|Z*|*Z*)
             return 1
@@ -188,6 +190,9 @@ capture_diagnostics() {
     local -a suspected_pre_args=()
     local -a repro_command=()
     local repro_cmd=""
+    local repro_pid=""
+    local remaining=""
+    local exit_code=""
 
     stripped_cmd="$(printf '%s\n' "${stalled_cmd}" \
         | sed -E 's/[[:space:]]+--list[[:space:]]+--format[[:space:]]+terse.*$//' \
@@ -265,6 +270,9 @@ capture_diagnostics() {
         if [ -x "${suspected_binary}" ]; then
             set +e
             "${repro_command[@]}" > "${repro_log}" 2>&1 &
+            local repro_pid
+            local remaining
+            local exit_code
             repro_pid=$!
             remaining="${REPRO_TIMEOUT_SECS}"
             while [ "${remaining}" -gt 0 ]; do
