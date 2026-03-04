@@ -150,12 +150,7 @@ pub(crate) async fn delete_keyring_entry(
     })
     .await;
 
-    match outcome {
-        Ok(result) => result,
-        Err(e) => Err(CredentialError::Internal(format!(
-            "{task_name} task failed: {e}"
-        ))),
-    }
+    outcome.map_err(|e| CredentialError::Internal(format!("{task_name} task failed: {e}")))?
 }
 
 /// Retry policy configuration
