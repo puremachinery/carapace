@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Carapace Control UI</title>
+    <meta name="description" content="Local control plane for Carapace" />
+    <meta name="carapace-control-ui-base-path" content="__CARAPACE_CONTROL_UI_BASE_PATH__" />
+    <meta name="carapace-assistant-name" content="__CARAPACE_ASSISTANT_NAME__" />
+    <meta name="carapace-assistant-avatar" content="__CARAPACE_ASSISTANT_AVATAR__" />
+    <meta name="carapace-csrf-cookie" content="__CARAPACE_CSRF_COOKIE__" />
+    <meta name="carapace-csrf-header" content="__CARAPACE_CSRF_HEADER__" />
+    <link rel="stylesheet" href="./assets/main.css" />
+  </head>
+  <body>
+    <main class="layout">
+      <header class="panel header">
+        <div class="brand-row">
+          <img id="assistantAvatar" class="avatar hidden" alt="Assistant avatar" />
+          <div>
+            <h1 id="assistantName">Carapace</h1>
+            <p class="subtitle">Local control plane</p>
+          </div>
+        </div>
+        <p id="runtimeBasePath" class="meta"></p>
+      </header>
+
+      <section class="panel">
+        <h2>Auth</h2>
+        <p>Use gateway token/password to call Control API and open pairing WebSocket.</p>
+
+        <div class="auth-grid">
+          <label class="inline-field" for="authType">
+            <span>Auth type</span>
+            <select id="authType">
+              <option value="token">Token</option>
+              <option value="password">Password</option>
+            </select>
+          </label>
+
+          <label class="inline-field credential" for="authInput">
+            <span>Credential</span>
+            <input id="authInput" type="password" placeholder="Enter credential" autocomplete="off" />
+          </label>
+
+          <button id="toggleAuthVisibility" type="button" class="secondary">Show</button>
+          <button id="saveAuth" type="button">Use credential</button>
+          <button id="clearAuth" type="button" class="secondary">Clear</button>
+        </div>
+
+        <p id="authStatus" class="meta">No credential loaded.</p>
+      </section>
+
+      <section class="panel" id="securityContextPanel">
+        <h2>Security Context</h2>
+        <p id="secureContextStatus" class="meta"></p>
+      </section>
+
+      <section class="panel actions">
+        <button id="refreshAll" type="button">Refresh status + channels + config</button>
+      </section>
+
+      <section class="panel">
+        <h2>Gateway Status</h2>
+        <pre id="statusJson" class="json">{}</pre>
+      </section>
+
+      <section class="panel">
+        <h2>Channels</h2>
+        <div id="channelsCards" class="cards"></div>
+        <details>
+          <summary>Raw JSON</summary>
+          <pre id="channelsJson" class="json">{}</pre>
+        </details>
+      </section>
+
+      <section class="panel">
+        <h2>Config Snapshot (Redacted)</h2>
+        <p class="meta">Read-only redacted config + hash for optimistic concurrency.</p>
+        <pre id="configJson" class="json">{}</pre>
+      </section>
+
+      <section class="panel">
+        <h2>Control UI Settings</h2>
+        <p class="meta">Safe write path via <code>PATCH /control/config</code> (only <code>gateway.controlUi.*</code>).</p>
+
+        <div class="settings-grid">
+          <label class="inline-field checkbox" for="controlUiEnabled">
+            <span>Control UI enabled</span>
+            <input id="controlUiEnabled" type="checkbox" />
+          </label>
+          <label class="inline-field checkbox" for="controlUiAllowInsecureAuth">
+            <span>Allow insecure auth paths</span>
+            <input id="controlUiAllowInsecureAuth" type="checkbox" />
+          </label>
+          <label class="inline-field checkbox" for="controlUiDisableDeviceAuth">
+            <span>Disable device auth for Control UI client</span>
+            <input id="controlUiDisableDeviceAuth" type="checkbox" />
+          </label>
+        </div>
+
+        <label for="controlUiBasePath">Control UI base path (empty = <code>/ui</code>)</label>
+        <input id="controlUiBasePath" type="text" placeholder="/ui" />
+
+        <button id="saveControlUiSettings" type="button">Save control UI settings</button>
+        <p id="controlUiSettingsStatus" class="meta"></p>
+      </section>
+
+      <section class="panel">
+        <h2>Advanced Config Patch</h2>
+        <p>
+          Apply one explicit <code>gateway.controlUi.*</code> path update through
+          <code>PATCH /control/config</code> (other paths are rejected by the server).
+        </p>
+        <label for="configPath">Path</label>
+        <input id="configPath" type="text" placeholder="gateway.controlUi.enabled" />
+
+        <label for="configValue">Value (JSON)</label>
+        <textarea id="configValue" rows="8" placeholder="true"></textarea>
+
+        <button id="applyConfig" type="button">Apply config update</button>
+        <p id="configUpdateStatus" class="meta"></p>
+      </section>
+
+      <section class="panel">
+        <h2>Task Queue Operator</h2>
+        <p class="meta">Inspect and mutate durable tasks via control endpoints.</p>
+
+        <div class="task-toolbar">
+          <label class="inline-field" for="taskFilterState">
+            <span>State filter</span>
+            <select id="taskFilterState">
+              <option value="">all</option>
+              <option value="queued">queued</option>
+              <option value="running">running</option>
+              <option value="retry_wait">retry_wait</option>
+              <option value="blocked">blocked</option>
+              <option value="failed">failed</option>
+              <option value="done">done</option>
+              <option value="cancelled">cancelled</option>
+            </select>
+          </label>
+          <button id="refreshTasks" type="button" class="secondary">Refresh tasks</button>
+        </div>
+
+        <div id="tasksCards" class="cards"></div>
+
+        <h3>Selected Task</h3>
+        <pre id="taskDetailJson" class="json">{}</pre>
+
+        <div class="task-actions">
+          <label for="taskActionReason">Reason</label>
+          <input id="taskActionReason" type="text" placeholder="operator action" />
+
+          <label for="taskActionDelayMs">Delay (ms) for retry/resume</label>
+          <input id="taskActionDelayMs" type="number" min="0" step="1" placeholder="0" />
+
+          <div class="task-action-buttons">
+            <button id="taskCancel" type="button" class="danger">Cancel task</button>
+            <button id="taskRetry" type="button">Retry task</button>
+            <button id="taskResume" type="button">Resume blocked task</button>
+          </div>
+
+          <label for="taskPatchPayload">Patch payload (CronPayload JSON, optional)</label>
+          <textarea id="taskPatchPayload" rows="6" placeholder='{"kind":"systemEvent","text":"updated text"}'></textarea>
+
+          <div class="task-policy-grid">
+            <label class="inline-field" for="taskPatchMaxAttempts">
+              <span>policy.maxAttempts</span>
+              <input id="taskPatchMaxAttempts" type="number" min="1" step="1" placeholder="unchanged" />
+            </label>
+            <label class="inline-field" for="taskPatchMaxTotalRuntimeMs">
+              <span>policy.maxTotalRuntimeMs</span>
+              <input id="taskPatchMaxTotalRuntimeMs" type="number" min="1" step="1" placeholder="unchanged" />
+            </label>
+            <label class="inline-field" for="taskPatchMaxTurns">
+              <span>policy.maxTurns</span>
+              <input id="taskPatchMaxTurns" type="number" min="1" step="1" placeholder="unchanged" />
+            </label>
+            <label class="inline-field" for="taskPatchMaxRunTimeoutSeconds">
+              <span>policy.maxRunTimeoutSeconds</span>
+              <input id="taskPatchMaxRunTimeoutSeconds" type="number" min="1" step="1" placeholder="unchanged" />
+            </label>
+          </div>
+
+          <button id="taskApplyPatch" type="button" class="secondary">Apply task patch</button>
+        </div>
+        <p id="taskStatus" class="meta"></p>
+      </section>
+
+      <section class="panel">
+        <h2>Device Pairing (WebSocket)</h2>
+        <p class="meta">Uses client ID <code>carapace-control-ui</code> over <code>/ws</code>.</p>
+
+        <div class="pairing-actions">
+          <button id="wsConnect" type="button">Connect pairing socket</button>
+          <button id="wsDisconnect" type="button" class="secondary" disabled>Disconnect</button>
+          <button id="wsRefreshPairings" type="button" class="secondary" disabled>Refresh pairing lists</button>
+        </div>
+
+        <p id="pairingStatus" class="meta">Pairing socket disconnected.</p>
+
+        <h3>Pending Pairing Requests</h3>
+        <div id="pendingPairings" class="cards"></div>
+
+        <h3>Paired Devices</h3>
+        <div id="pairedDevices" class="cards"></div>
+
+        <details>
+          <summary>Pairing event log</summary>
+          <pre id="pairingEvents" class="json">[]</pre>
+        </details>
+      </section>
+
+      <section class="panel warnings" id="transportWarning" hidden>
+        <h2>Security Notice</h2>
+        <p>
+          This page is not on HTTPS and not localhost. Some auth/pairing paths may be blocked unless
+          <code>gateway.controlUi.allowInsecureAuth=true</code>.
+        </p>
+      </section>
+    </main>
+
+    <script src="./assets/main.js" defer></script>
+  </body>
+</html>

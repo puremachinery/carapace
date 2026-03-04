@@ -324,7 +324,7 @@ review_types:
         - "healthcare"
 
     breaking_changes:
-      description: "Semver compliance, deprecation policy, changelog updates"
+      description: "Semver compliance, deprecation policy, release notes/feature-status updates"
       enabled: true
       frequency: "every_pr"
       severity: "medium"

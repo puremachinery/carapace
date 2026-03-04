@@ -12,8 +12,10 @@
 //! - `setup` -- interactive first-run configuration wizard
 //! - `pair` -- pair with a remote gateway node
 //! - `update` -- check for updates or self-update
+//! - `task` -- manage long-running objective tasks
 
 pub mod backup_crypto;
+pub mod chat;
 
 use clap::{Parser, Subcommand};
 
@@ -27,6 +29,16 @@ use clap::{Parser, Subcommand};
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
+}
+
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyOutcomeSelection {
+    Auto,
+    LocalChat,
+    Discord,
+    Telegram,
+    Hooks,
+    Autonomy,
 }
 
 #[derive(Subcommand, Debug)]
@@ -155,6 +167,40 @@ pub enum Command {
         version: Option<String>,
     },
 
+    /// Manage long-running objective tasks.
+    #[command(subcommand)]
+    Task(TaskCommand),
+
+    /// Start an interactive chat session.
+    Chat {
+        /// Start a new session instead of resuming.
+        #[arg(long)]
+        new: bool,
+
+        /// Port of a running instance to connect to.
+        #[arg(short, long)]
+        port: Option<u16>,
+    },
+
+    /// Verify outcome paths, including long-running autonomy execution.
+    Verify {
+        /// Which outcome to verify (default: infer from config).
+        #[arg(long, value_enum, default_value_t = VerifyOutcomeSelection::Auto)]
+        outcome: VerifyOutcomeSelection,
+
+        /// Port of a running instance to connect to.
+        #[arg(short, long)]
+        port: Option<u16>,
+
+        /// Discord channel ID for send-path verification.
+        #[arg(long)]
+        discord_to: Option<String>,
+
+        /// Telegram chat ID for send-path verification.
+        #[arg(long)]
+        telegram_to: Option<String>,
+    },
+
     /// Manage mTLS certificates for gateway-to-gateway communication.
     #[command(subcommand)]
     Tls(TlsCommand),
@@ -220,6 +266,147 @@ pub enum TlsCommand {
     },
 }
 
+#[derive(clap::Args, Debug)]
+pub struct TaskConnectionArgs {
+    /// Port of the running instance (default: from config or 18789).
+    #[arg(short, long)]
+    port: Option<u16>,
+
+    /// Host of the running instance.
+    #[arg(long, default_value = "127.0.0.1")]
+    host: String,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum TaskCommand {
+    /// Create a durable objective task.
+    Create {
+        /// Task payload as JSON (CronPayload shape).
+        #[arg(long)]
+        payload: String,
+
+        /// Optional Unix-ms time when the task becomes runnable.
+        #[arg(long = "next-run-at-ms")]
+        next_run_at_ms: Option<u64>,
+
+        /// Optional max retry attempts for this task.
+        #[arg(long = "max-attempts")]
+        max_attempts: Option<u32>,
+
+        /// Optional max wall-clock budget in milliseconds from creation.
+        #[arg(long = "max-total-runtime-ms")]
+        max_total_runtime_ms: Option<u64>,
+
+        /// Optional max tool-turn budget for this task.
+        #[arg(long = "max-turns")]
+        max_turns: Option<u32>,
+
+        /// Optional max timeout (seconds) for each spawned agent run.
+        #[arg(long = "max-run-timeout-seconds")]
+        max_run_timeout_seconds: Option<u32>,
+
+        #[command(flatten)]
+        connection: TaskConnectionArgs,
+    },
+    /// List durable objective tasks.
+    List {
+        /// Optional task state filter.
+        #[arg(long)]
+        state: Option<String>,
+
+        /// Optional max number of tasks to return.
+        #[arg(long)]
+        limit: Option<usize>,
+
+        #[command(flatten)]
+        connection: TaskConnectionArgs,
+    },
+    /// Get a single durable objective task by ID.
+    Get {
+        /// Task ID.
+        id: String,
+
+        #[command(flatten)]
+        connection: TaskConnectionArgs,
+    },
+    /// Cancel a durable objective task.
+    Cancel {
+        /// Task ID.
+        id: String,
+
+        /// Optional cancellation reason.
+        #[arg(long)]
+        reason: Option<String>,
+
+        #[command(flatten)]
+        connection: TaskConnectionArgs,
+    },
+    /// Retry a durable objective task.
+    Retry {
+        /// Task ID.
+        id: String,
+
+        /// Retry delay in milliseconds (default: immediate).
+        #[arg(long = "delay-ms")]
+        delay_ms: Option<u64>,
+
+        /// Optional retry reason.
+        #[arg(long)]
+        reason: Option<String>,
+
+        #[command(flatten)]
+        connection: TaskConnectionArgs,
+    },
+    /// Resume a blocked durable objective task.
+    Resume {
+        /// Task ID.
+        id: String,
+
+        /// Resume delay in milliseconds (default: immediate).
+        #[arg(long = "delay-ms")]
+        delay_ms: Option<u64>,
+
+        /// Optional resume reason.
+        #[arg(long)]
+        reason: Option<String>,
+
+        #[command(flatten)]
+        connection: TaskConnectionArgs,
+    },
+    /// Update payload/policy fields for a durable objective task.
+    Update {
+        /// Task ID.
+        id: String,
+
+        /// Replacement task payload as JSON (CronPayload shape).
+        #[arg(long)]
+        payload: Option<String>,
+
+        /// Optional max retry attempts for this task.
+        #[arg(long = "max-attempts")]
+        max_attempts: Option<u32>,
+
+        /// Optional max wall-clock budget in milliseconds from creation.
+        #[arg(long = "max-total-runtime-ms")]
+        max_total_runtime_ms: Option<u64>,
+
+        /// Optional max tool-turn budget for this task.
+        #[arg(long = "max-turns")]
+        max_turns: Option<u32>,
+
+        /// Optional max timeout (seconds) for each spawned agent run.
+        #[arg(long = "max-run-timeout-seconds")]
+        max_run_timeout_seconds: Option<u32>,
+
+        /// Optional operator note stored on the task.
+        #[arg(long)]
+        reason: Option<String>,
+
+        #[command(flatten)]
+        connection: TaskConnectionArgs,
+    },
+}
+
 #[derive(Subcommand, Debug)]
 pub enum ConfigCommand {
     /// Print the fully loaded configuration (secrets redacted) as JSON.
@@ -248,9 +435,12 @@ pub enum ConfigCommand {
 // Subcommand handlers
 // ---------------------------------------------------------------------------
 
+use crate::channels::discord::{DiscordChannel, DISCORD_DEFAULT_API_BASE_URL};
+use crate::channels::telegram::{TelegramChannel, TELEGRAM_DEFAULT_API_BASE_URL};
 use crate::config;
 use crate::credentials;
 use crate::logging::buffer::LogLevel;
+use crate::runtime_bridge::run_sync_blocking_send;
 use crate::server::bind::DEFAULT_PORT;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
@@ -262,7 +452,10 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, Error as RustlsError, SignatureScheme};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
+#[cfg(not(test))]
 use std::io::IsTerminal;
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio_tungstenite::{
     connect_async, connect_async_tls_with_config, tungstenite::Message, Connector,
@@ -411,6 +604,465 @@ pub async fn handle_status(
     Ok(())
 }
 
+/// Run the `task` subcommand family -- manage durable objective tasks.
+pub async fn handle_task(command: TaskCommand) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        TaskCommand::Create {
+            payload,
+            next_run_at_ms,
+            max_attempts,
+            max_total_runtime_ms,
+            max_turns,
+            max_run_timeout_seconds,
+            connection,
+        } => {
+            handle_task_create(
+                &connection.host,
+                connection.port,
+                TaskCreateOptions {
+                    payload,
+                    next_run_at_ms,
+                    max_attempts,
+                    max_total_runtime_ms,
+                    max_turns,
+                    max_run_timeout_seconds,
+                },
+            )
+            .await
+        }
+        TaskCommand::List {
+            state,
+            limit,
+            connection,
+        } => handle_task_list(&connection.host, connection.port, state, limit).await,
+        TaskCommand::Get { id, connection } => {
+            handle_task_get(&connection.host, connection.port, &id).await
+        }
+        TaskCommand::Cancel {
+            id,
+            reason,
+            connection,
+        } => handle_task_cancel(&connection.host, connection.port, &id, reason).await,
+        TaskCommand::Retry {
+            id,
+            delay_ms,
+            reason,
+            connection,
+        } => handle_task_retry(&connection.host, connection.port, &id, delay_ms, reason).await,
+        TaskCommand::Resume {
+            id,
+            delay_ms,
+            reason,
+            connection,
+        } => handle_task_resume(&connection.host, connection.port, &id, delay_ms, reason).await,
+        TaskCommand::Update {
+            id,
+            payload,
+            max_attempts,
+            max_total_runtime_ms,
+            max_turns,
+            max_run_timeout_seconds,
+            reason,
+            connection,
+        } => {
+            handle_task_update(
+                &connection.host,
+                connection.port,
+                &id,
+                TaskUpdateOptions {
+                    payload,
+                    max_attempts,
+                    max_total_runtime_ms,
+                    max_turns,
+                    max_run_timeout_seconds,
+                    reason,
+                },
+            )
+            .await
+        }
+    }
+}
+
+struct TaskCreateOptions {
+    payload: String,
+    next_run_at_ms: Option<u64>,
+    max_attempts: Option<u32>,
+    max_total_runtime_ms: Option<u64>,
+    max_turns: Option<u32>,
+    max_run_timeout_seconds: Option<u32>,
+}
+
+struct TaskUpdateOptions {
+    payload: Option<String>,
+    max_attempts: Option<u32>,
+    max_total_runtime_ms: Option<u64>,
+    max_turns: Option<u32>,
+    max_run_timeout_seconds: Option<u32>,
+    reason: Option<String>,
+}
+
+async fn handle_task_create(
+    host: &str,
+    port: Option<u16>,
+    options: TaskCreateOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let parsed_payload: Value = serde_json::from_str(&options.payload)
+        .map_err(|e| format!("invalid --payload JSON (expected CronPayload object): {e}"))?;
+    let mut body = serde_json::Map::new();
+    body.insert("payload".to_string(), parsed_payload);
+    body.insert(
+        "nextRunAtMs".to_string(),
+        options.next_run_at_ms.map_or(Value::Null, Value::from),
+    );
+
+    let mut policy = serde_json::Map::new();
+    if let Some(max_attempts) = options.max_attempts {
+        policy.insert("maxAttempts".to_string(), Value::from(max_attempts));
+    }
+    if let Some(max_total_runtime_ms) = options.max_total_runtime_ms {
+        policy.insert(
+            "maxTotalRuntimeMs".to_string(),
+            Value::from(max_total_runtime_ms),
+        );
+    }
+    if let Some(max_turns) = options.max_turns {
+        policy.insert("maxTurns".to_string(), Value::from(max_turns));
+    }
+    if let Some(max_run_timeout_seconds) = options.max_run_timeout_seconds {
+        policy.insert(
+            "maxRunTimeoutSeconds".to_string(),
+            Value::from(max_run_timeout_seconds),
+        );
+    }
+    if !policy.is_empty() {
+        body.insert("policy".to_string(), Value::Object(policy));
+    }
+    let body = Value::Object(body);
+
+    let response = send_control_request(
+        host,
+        resolve_port(port),
+        reqwest::Method::POST,
+        "/control/tasks",
+        &[],
+        Some(body),
+    )
+    .await?;
+    print_pretty_json(&response)
+}
+
+async fn handle_task_list(
+    host: &str,
+    port: Option<u16>,
+    state: Option<String>,
+    limit: Option<usize>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut query: Vec<(&str, String)> = Vec::new();
+    if let Some(state) = state {
+        let normalized = state.trim();
+        if !normalized.is_empty() {
+            query.push(("state", normalized.to_string()));
+        }
+    }
+    if let Some(limit) = limit {
+        query.push(("limit", limit.to_string()));
+    }
+
+    let response = send_control_request(
+        host,
+        resolve_port(port),
+        reqwest::Method::GET,
+        "/control/tasks",
+        &query,
+        None,
+    )
+    .await?;
+    print_pretty_json(&response)
+}
+
+async fn handle_task_get(
+    host: &str,
+    port: Option<u16>,
+    id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let task_id = normalize_task_id(id)?;
+    let path = format!("/control/tasks/{task_id}");
+    let response = send_control_request(
+        host,
+        resolve_port(port),
+        reqwest::Method::GET,
+        &path,
+        &[],
+        None,
+    )
+    .await?;
+    print_pretty_json(&response)
+}
+
+async fn handle_task_cancel(
+    host: &str,
+    port: Option<u16>,
+    id: &str,
+    reason: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let task_id = normalize_task_id(id)?;
+    let path = format!("/control/tasks/{task_id}/cancel");
+    let body = reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|trimmed| serde_json::json!({ "reason": trimmed }));
+    let response = send_control_request(
+        host,
+        resolve_port(port),
+        reqwest::Method::POST,
+        &path,
+        &[],
+        body,
+    )
+    .await?;
+    print_pretty_json(&response)
+}
+
+async fn handle_task_retry(
+    host: &str,
+    port: Option<u16>,
+    id: &str,
+    delay_ms: Option<u64>,
+    reason: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let task_id = normalize_task_id(id)?;
+    let path = format!("/control/tasks/{task_id}/retry");
+    let mut body = serde_json::Map::new();
+    if let Some(delay_ms) = delay_ms {
+        body.insert("delayMs".to_string(), Value::from(delay_ms));
+    }
+    if let Some(reason) = reason {
+        let trimmed = reason.trim();
+        if !trimmed.is_empty() {
+            body.insert("reason".to_string(), Value::from(trimmed));
+        }
+    }
+    let payload = if body.is_empty() {
+        None
+    } else {
+        Some(Value::Object(body))
+    };
+    let response = send_control_request(
+        host,
+        resolve_port(port),
+        reqwest::Method::POST,
+        &path,
+        &[],
+        payload,
+    )
+    .await?;
+    print_pretty_json(&response)
+}
+
+async fn handle_task_resume(
+    host: &str,
+    port: Option<u16>,
+    id: &str,
+    delay_ms: Option<u64>,
+    reason: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let task_id = normalize_task_id(id)?;
+    let path = format!("/control/tasks/{task_id}/resume");
+    let mut body = serde_json::Map::new();
+    if let Some(delay_ms) = delay_ms {
+        body.insert("delayMs".to_string(), Value::from(delay_ms));
+    }
+    if let Some(reason) = reason {
+        let trimmed = reason.trim();
+        if !trimmed.is_empty() {
+            body.insert("reason".to_string(), Value::from(trimmed));
+        }
+    }
+    let payload = if body.is_empty() {
+        None
+    } else {
+        Some(Value::Object(body))
+    };
+    let response = send_control_request(
+        host,
+        resolve_port(port),
+        reqwest::Method::POST,
+        &path,
+        &[],
+        payload,
+    )
+    .await?;
+    print_pretty_json(&response)
+}
+
+async fn handle_task_update(
+    host: &str,
+    port: Option<u16>,
+    id: &str,
+    options: TaskUpdateOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let task_id = normalize_task_id(id)?;
+    let path = format!("/control/tasks/{task_id}");
+    let mut body = serde_json::Map::new();
+
+    if let Some(payload) = options.payload {
+        let parsed_payload: Value = serde_json::from_str(&payload)
+            .map_err(|e| format!("invalid --payload JSON (expected CronPayload object): {e}"))?;
+        body.insert("payload".to_string(), parsed_payload);
+    }
+
+    let mut policy = serde_json::Map::new();
+    if let Some(max_attempts) = options.max_attempts {
+        policy.insert("maxAttempts".to_string(), Value::from(max_attempts));
+    }
+    if let Some(max_total_runtime_ms) = options.max_total_runtime_ms {
+        policy.insert(
+            "maxTotalRuntimeMs".to_string(),
+            Value::from(max_total_runtime_ms),
+        );
+    }
+    if let Some(max_turns) = options.max_turns {
+        policy.insert("maxTurns".to_string(), Value::from(max_turns));
+    }
+    if let Some(max_run_timeout_seconds) = options.max_run_timeout_seconds {
+        policy.insert(
+            "maxRunTimeoutSeconds".to_string(),
+            Value::from(max_run_timeout_seconds),
+        );
+    }
+    if !policy.is_empty() {
+        body.insert("policy".to_string(), Value::Object(policy));
+    }
+
+    if let Some(reason) = options.reason {
+        let trimmed = reason.trim();
+        if !trimmed.is_empty() {
+            body.insert("reason".to_string(), Value::from(trimmed));
+        }
+    }
+
+    if body.is_empty() {
+        return Err("task update requires at least one of: --payload, --max-attempts, --max-total-runtime-ms, --max-turns, --max-run-timeout-seconds, --reason".into());
+    }
+
+    let response = send_control_request(
+        host,
+        resolve_port(port),
+        reqwest::Method::PATCH,
+        &path,
+        &[],
+        Some(Value::Object(body)),
+    )
+    .await?;
+    print_pretty_json(&response)
+}
+
+fn normalize_task_id(id: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let trimmed = id.trim();
+    if trimmed.is_empty() {
+        return Err("task id cannot be empty".into());
+    }
+    Ok(trimmed.to_string())
+}
+
+async fn send_control_request(
+    host: &str,
+    port: u16,
+    method: reqwest::Method,
+    path: &str,
+    query: &[(&str, String)],
+    body: Option<Value>,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()?;
+    let GatewayAuth { token, password } = resolve_gateway_auth().await;
+    let auth = GatewayAuth { token, password };
+    let url = build_control_url(host, port, path, query)?;
+    send_control_request_with_client_and_auth(&client, &auth, method, url, body).await
+}
+
+fn build_control_url(
+    host: &str,
+    port: u16,
+    path: &str,
+    query: &[(&str, String)],
+) -> Result<Url, Box<dyn std::error::Error>> {
+    let mut url = Url::parse(&format!("http://{}:{}{}", host, port, path))
+        .map_err(|e| format!("failed to build control URL: {e}"))?;
+    if !query.is_empty() {
+        let mut pairs = url.query_pairs_mut();
+        for (key, value) in query {
+            pairs.append_pair(key, value);
+        }
+    }
+    Ok(url)
+}
+
+async fn send_control_request_with_client_and_auth(
+    client: &reqwest::Client,
+    auth: &GatewayAuth,
+    method: reqwest::Method,
+    url: Url,
+    body: Option<Value>,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let request_url = url.clone();
+    let mut request = client.request(method, url);
+    if let Some(token) = auth.token.as_deref() {
+        request = request.bearer_auth(token);
+    } else if let Some(password) = auth.password.as_deref() {
+        request = request.bearer_auth(password);
+    }
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+
+    let response = request
+        .send()
+        .await
+        .map_err(|e| format!("failed to send control request ({request_url}): {e}"))?;
+    let status = response.status();
+    let bytes = response.bytes().await?;
+    if !status.is_success() {
+        let error = extract_control_error_message(&bytes);
+        return Err(format!("control request failed (HTTP {status}): {error}").into());
+    }
+
+    if bytes.is_empty() {
+        return Ok(serde_json::json!({ "ok": true }));
+    }
+
+    serde_json::from_slice(&bytes)
+        .map_err(|e| format!("failed to parse control response as JSON: {e}").into())
+}
+
+fn extract_control_error_message(body: &[u8]) -> String {
+    if body.is_empty() {
+        return "empty response body".to_string();
+    }
+    if let Ok(value) = serde_json::from_slice::<Value>(body) {
+        if let Some(error) = value.get("error").and_then(|v| v.as_str()) {
+            return error.to_string();
+        }
+        if let Some(message) = value.get("message").and_then(|v| v.as_str()) {
+            return message.to_string();
+        }
+        return value.to_string();
+    }
+    let text = String::from_utf8_lossy(body).trim().to_string();
+    if text.is_empty() {
+        "response body unavailable".to_string()
+    } else {
+        text
+    }
+}
+
+fn print_pretty_json(value: &Value) -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", serde_json::to_string_pretty(value)?);
+    Ok(())
+}
+
 /// Run the `logs` subcommand -- fetch recent logs from a running instance.
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -430,10 +1082,10 @@ struct LogsTailResponse {
     truncated: bool,
 }
 
-type WsStream =
+pub(crate) type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
-type WsRead = futures_util::stream::SplitStream<WsStream>;
-type WsWrite = futures_util::stream::SplitSink<WsStream, Message>;
+pub(crate) type WsRead = futures_util::stream::SplitStream<WsStream>;
+pub(crate) type WsWrite = futures_util::stream::SplitSink<WsStream, Message>;
 
 #[derive(Debug)]
 struct InsecureCertVerifier;
@@ -485,7 +1137,7 @@ impl ServerCertVerifier for InsecureCertVerifier {
     }
 }
 
-async fn connect_ws(
+pub(crate) async fn connect_ws(
     ws_url: &str,
     trust_invalid: bool,
 ) -> Result<WsStream, Box<dyn std::error::Error>> {
@@ -504,12 +1156,12 @@ async fn connect_ws(
     }
 }
 
-struct GatewayAuth {
-    token: Option<String>,
-    password: Option<String>,
+pub(crate) struct GatewayAuth {
+    pub(crate) token: Option<String>,
+    pub(crate) password: Option<String>,
 }
 
-async fn resolve_gateway_auth() -> GatewayAuth {
+pub(crate) async fn resolve_gateway_auth() -> GatewayAuth {
     let token_env = std::env::var("CARAPACE_GATEWAY_TOKEN").ok().and_then(|v| {
         let token = v.trim().to_string();
         if token.is_empty() {
@@ -558,7 +1210,7 @@ async fn resolve_gateway_auth() -> GatewayAuth {
 
     let mut token_creds = None;
     let mut password_creds = None;
-    let state_dir = crate::server::ws::resolve_state_dir();
+    let state_dir = resolve_state_dir();
     if let Ok(mut creds) = credentials::read_gateway_auth(state_dir).await {
         token_creds = std::mem::take(&mut creds.token).and_then(|v| {
             let token = v.trim().to_string();
@@ -594,7 +1246,7 @@ fn is_loopback_host(host: &str) -> bool {
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, Zeroize, ZeroizeOnDrop)]
-struct StoredDeviceIdentity {
+pub(crate) struct StoredDeviceIdentity {
     device_id: String,
     public_key: String,
     secret_key: String,
@@ -623,7 +1275,7 @@ fn env_flag_enabled(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-async fn load_or_create_device_identity(
+pub(crate) async fn load_or_create_device_identity(
     state_dir: &Path,
 ) -> Result<StoredDeviceIdentity, Box<dyn std::error::Error>> {
     std::fs::create_dir_all(state_dir)?;
@@ -813,7 +1465,7 @@ fn signing_key_from_identity(
     Ok(signing_key)
 }
 
-fn build_device_identity_for_connect(
+pub(crate) fn build_device_identity_for_connect(
     identity: &StoredDeviceIdentity,
     client_id: &str,
     client_mode: &str,
@@ -992,7 +1644,7 @@ fn ws_url_from_http(url: &Url) -> Result<String, Box<dyn std::error::Error>> {
     Ok(format!("{scheme}://{host}:{port}/ws"))
 }
 
-async fn read_ws_json(
+pub(crate) async fn read_ws_json(
     reader: &mut WsRead,
     writer: &mut WsWrite,
 ) -> Result<Value, Box<dyn std::error::Error>> {
@@ -1027,7 +1679,7 @@ async fn read_ws_json(
     Err("WebSocket closed".into())
 }
 
-async fn await_connect_challenge(
+pub(crate) async fn await_connect_challenge(
     reader: &mut WsRead,
     writer: &mut WsWrite,
 ) -> Result<String, Box<dyn std::error::Error>> {
@@ -1062,7 +1714,7 @@ async fn await_connect_challenge(
     .map_err(|_| -> Box<dyn std::error::Error> { "connect.challenge timed out".into() })?
 }
 
-async fn await_ws_response(
+pub(crate) async fn await_ws_response(
     reader: &mut WsRead,
     writer: &mut WsWrite,
     request_id: &str,
@@ -1094,10 +1746,10 @@ async fn await_ws_response(
 }
 
 #[derive(Debug)]
-struct WsError {
-    code: Option<String>,
-    message: String,
-    details: Option<Value>,
+pub(crate) struct WsError {
+    pub(crate) code: Option<String>,
+    pub(crate) message: String,
+    pub(crate) details: Option<Value>,
 }
 
 impl std::fmt::Display for WsError {
@@ -1108,7 +1760,7 @@ impl std::fmt::Display for WsError {
 
 impl std::error::Error for WsError {}
 
-async fn await_ws_response_with_error(
+pub(crate) async fn await_ws_response_with_error(
     reader: &mut WsRead,
     writer: &mut WsWrite,
     request_id: &str,
@@ -1339,7 +1991,7 @@ use std::path::{Component, Path, PathBuf};
 /// Resolve the state directory (same logic as `server::ws::resolve_state_dir`
 /// but duplicated here to avoid pulling in the full server module for CLI-only
 /// commands).
-fn resolve_state_dir() -> PathBuf {
+pub(crate) fn resolve_state_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("CARAPACE_STATE_DIR") {
         return PathBuf::from(dir);
     }
@@ -1415,6 +2067,13 @@ pub fn handle_backup(output: Option<&str>) -> Result<(), Box<dyn std::error::Err
     if cron_dir.is_dir() {
         archive.append_dir_all("cron", &cron_dir)?;
         included_sections.push("cron");
+    }
+
+    // Durable task queue/state directory.
+    let tasks_dir = state_dir.join("tasks");
+    if tasks_dir.is_dir() {
+        archive.append_dir_all("tasks", &tasks_dir)?;
+        included_sections.push("tasks");
     }
 
     // Usage data file.
@@ -1526,6 +2185,8 @@ fn validate_backup_file(archive_path: &PathBuf) -> Result<Vec<String>, Box<dyn s
                 Some("memory")
             } else if path_str.starts_with("cron/") {
                 Some("cron")
+            } else if path_str == "tasks" || path_str.starts_with("tasks/") {
+                Some("tasks")
             } else if path_str.starts_with("usage/") {
                 Some("usage")
             } else {
@@ -1610,6 +2271,13 @@ fn restore_files_from_tar(
             extract_entry(&mut entry, &target)?;
             if !restored.contains(&"cron".to_string()) {
                 restored.push("cron".to_string());
+            }
+        } else if path_str == "tasks" || path_str.starts_with("tasks/") {
+            let rel = path.strip_prefix("tasks").unwrap_or(&path);
+            let target = state_dir.join("tasks").join(rel);
+            extract_entry(&mut entry, &target)?;
+            if !restored.contains(&"tasks".to_string()) {
+                restored.push("tasks".to_string());
             }
         } else if path_str.starts_with("usage/") {
             let rel = path.strip_prefix("usage").unwrap_or(&path);
@@ -1752,7 +2420,277 @@ pub fn handle_reset(
 // Setup / Pair / Update handlers
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetupOutcome {
+    LocalChat,
+    Discord,
+    Telegram,
+    Hooks,
+}
+
+impl SetupOutcome {
+    fn prompt_key(self) -> &'static str {
+        match self {
+            Self::LocalChat => "local-chat",
+            Self::Discord => "discord",
+            Self::Telegram => "telegram",
+            Self::Hooks => "hooks",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerifyOutcome {
+    LocalChat,
+    Discord,
+    Telegram,
+    Hooks,
+    Autonomy,
+}
+
+impl VerifyOutcome {
+    fn key(self) -> &'static str {
+        match self {
+            Self::LocalChat => "local-chat",
+            Self::Discord => "discord",
+            Self::Telegram => "telegram",
+            Self::Hooks => "hooks",
+            Self::Autonomy => "autonomy",
+        }
+    }
+}
+
+impl From<SetupOutcome> for VerifyOutcome {
+    fn from(value: SetupOutcome) -> Self {
+        match value {
+            SetupOutcome::LocalChat => Self::LocalChat,
+            SetupOutcome::Discord => Self::Discord,
+            SetupOutcome::Telegram => Self::Telegram,
+            SetupOutcome::Hooks => Self::Hooks,
+        }
+    }
+}
+
+impl VerifyOutcomeSelection {
+    fn resolved(self, cfg: &Value) -> VerifyOutcome {
+        match self {
+            Self::Auto => infer_setup_outcome_from_config(cfg).into(),
+            Self::LocalChat => VerifyOutcome::LocalChat,
+            Self::Discord => VerifyOutcome::Discord,
+            Self::Telegram => VerifyOutcome::Telegram,
+            Self::Hooks => VerifyOutcome::Hooks,
+            Self::Autonomy => VerifyOutcome::Autonomy,
+        }
+    }
+}
+
+fn parse_setup_outcome(raw: &str) -> Option<SetupOutcome> {
+    match raw.trim().to_lowercase().as_str() {
+        "local-chat" | "local" | "chat" | "assistant" => Some(SetupOutcome::LocalChat),
+        "discord" => Some(SetupOutcome::Discord),
+        "telegram" => Some(SetupOutcome::Telegram),
+        "hooks" | "webhook" | "webhooks" => Some(SetupOutcome::Hooks),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Default)]
+struct SetupInteractiveTestHarness {
+    force_interactive: Option<bool>,
+    visible_inputs: std::collections::VecDeque<String>,
+    hidden_inputs: std::collections::VecDeque<String>,
+    provider_validation_results: std::collections::VecDeque<Result<(), String>>,
+    channel_validation_results: std::collections::VecDeque<Result<(), String>>,
+    visible_prompt_count: usize,
+    hidden_prompt_count: usize,
+    provider_validation_calls: usize,
+    channel_validation_calls: usize,
+}
+
+#[cfg(test)]
+static SETUP_INTERACTIVE_TEST_HARNESS: std::sync::LazyLock<
+    std::sync::Mutex<Option<SetupInteractiveTestHarness>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+// Test harness state is process-global; harness-using tests must serialize via ENV_VAR_TEST_LOCK.
+
+#[cfg(test)]
+fn set_setup_interactive_test_harness(harness: SetupInteractiveTestHarness) {
+    let mut slot = SETUP_INTERACTIVE_TEST_HARNESS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert!(slot.is_none(), "setup test harness already installed");
+    *slot = Some(harness);
+}
+
+#[cfg(test)]
+fn clear_setup_interactive_test_harness() {
+    let mut slot = SETUP_INTERACTIVE_TEST_HARNESS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *slot = None;
+}
+
+#[cfg(test)]
+fn setup_interactive_test_harness_snapshot() -> Option<SetupInteractiveTestHarness> {
+    let slot = SETUP_INTERACTIVE_TEST_HARNESS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    slot.clone()
+}
+
+#[cfg(test)]
+fn setup_interactive_test_harness_override_interactive() -> Option<bool> {
+    let slot = SETUP_INTERACTIVE_TEST_HARNESS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    slot.as_ref().and_then(|state| state.force_interactive)
+}
+
+#[cfg(test)]
+fn setup_interactive_test_harness_take_prompt_input(prompt: &str, hidden: bool) -> Option<String> {
+    let mut slot = SETUP_INTERACTIVE_TEST_HARNESS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let state = slot.as_mut()?;
+    let value = if hidden {
+        state.hidden_prompt_count = state.hidden_prompt_count.saturating_add(1);
+        state.hidden_inputs.pop_front()
+    } else {
+        state.visible_prompt_count = state.visible_prompt_count.saturating_add(1);
+        state.visible_inputs.pop_front()
+    };
+    if value.is_some() {
+        return value;
+    }
+    drop(slot);
+    if hidden {
+        panic!("missing scripted hidden input for prompt: {prompt}");
+    }
+    panic!("missing scripted visible input for prompt: {prompt}");
+}
+
+#[cfg(test)]
+fn setup_interactive_test_harness_take_provider_validation_result() -> Option<Result<(), String>> {
+    let mut slot = SETUP_INTERACTIVE_TEST_HARNESS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let state = slot.as_mut()?;
+    state.provider_validation_calls = state.provider_validation_calls.saturating_add(1);
+    let result = state.provider_validation_results.pop_front();
+    if result.is_some() {
+        return result;
+    }
+    drop(slot);
+    panic!("missing scripted provider validation result");
+}
+
+#[cfg(test)]
+fn setup_interactive_test_harness_take_channel_validation_result() -> Option<Result<(), String>> {
+    let mut slot = SETUP_INTERACTIVE_TEST_HARNESS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let state = slot.as_mut()?;
+    state.channel_validation_calls = state.channel_validation_calls.saturating_add(1);
+    let result = state.channel_validation_results.pop_front();
+    if result.is_some() {
+        return result;
+    }
+    drop(slot);
+    panic!("missing scripted channel validation result");
+}
+
+fn stdin_is_interactive() -> bool {
+    #[cfg(test)]
+    {
+        // Keep tests deterministic: default to non-interactive unless explicitly forced.
+        setup_interactive_test_harness_override_interactive().unwrap_or(false)
+    }
+
+    #[cfg(not(test))]
+    {
+        std::io::stdin().is_terminal()
+    }
+}
+
+fn prompt_setup_outcome() -> Result<SetupOutcome, Box<dyn std::error::Error>> {
+    loop {
+        let selection = prompt_with_default(
+            "Pick your first-run outcome (local-chat/discord/telegram/hooks)",
+            SetupOutcome::LocalChat.prompt_key(),
+        )?;
+        if let Some(outcome) = parse_setup_outcome(&selection) {
+            return Ok(outcome);
+        }
+        eprintln!("Please choose one of: local-chat, discord, telegram, hooks.");
+    }
+}
+
+fn prompt_optional_value_from_env(
+    env_var: &str,
+    label: &str,
+    value_label: &str,
+    hide_sensitive_input: bool,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let env_value = std::env::var(env_var).ok().filter(|v| !v.trim().is_empty());
+    if let Some(value) = env_value {
+        let use_env = prompt_yes_no(&format!("Use {label} from ${env_var}?"), true)?;
+        if use_env {
+            return Ok(Some(value.trim().to_string()));
+        }
+    }
+
+    let entered = prompt_sensitive_line(value_label, hide_sensitive_input, true)?;
+    if entered.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(entered))
+    }
+}
+
+fn print_setup_outcome_next_steps(outcome: SetupOutcome, port: u16, hooks_enabled: bool) {
+    println!();
+    match outcome {
+        SetupOutcome::LocalChat => {
+            println!("First-run outcome: local assistant chat");
+            println!("Next step: run `cara chat --port {port}` when the service is up.");
+        }
+        SetupOutcome::Discord => {
+            println!("First-run outcome: Discord assistant");
+            println!("Next step: https://getcara.io/cookbook/discord-assistant.html");
+            println!("Repo docs path: docs/cookbook/discord-assistant.md");
+        }
+        SetupOutcome::Telegram => {
+            println!("First-run outcome: Telegram assistant");
+            println!("Next step: https://getcara.io/cookbook/telegram-webhook-assistant.html");
+            println!("Repo docs path: docs/cookbook/telegram-webhook-assistant.md");
+        }
+        SetupOutcome::Hooks => {
+            println!("First-run outcome: hooks automation");
+            if hooks_enabled {
+                println!("Next step: send a test hook to http://127.0.0.1:{port}/hooks/wake");
+                println!(
+                    "Example: curl -X POST -H 'Authorization: Bearer <CARAPACE_HOOKS_TOKEN>' \\"
+                );
+                println!(
+                    "  -H 'Content-Type: application/json' http://127.0.0.1:{port}/hooks/wake \\"
+                );
+                println!("  -d '{{\"text\":\"wake\"}}'");
+            } else {
+                println!(
+                    "Hooks outcome selected, but hooks are disabled. Enable `gateway.hooks.enabled` to use it."
+                );
+            }
+        }
+    }
+}
+
 fn prompt_line(prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
+    #[cfg(test)]
+    if let Some(scripted) = setup_interactive_test_harness_take_prompt_input(prompt, false) {
+        return Ok(scripted.trim().to_string());
+    }
+
     use std::io::{self, Write};
 
     print!("{}", prompt);
@@ -1760,6 +2698,62 @@ fn prompt_line(prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
     Ok(input.trim().to_string())
+}
+
+fn prompt_hidden_line(prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
+    #[cfg(test)]
+    if let Some(scripted) = setup_interactive_test_harness_take_prompt_input(prompt, true) {
+        return Ok(scripted.trim().to_string());
+    }
+
+    let input = rpassword::prompt_password(prompt)?;
+    Ok(input.trim().to_string())
+}
+
+fn sensitive_prompt_text(label: &str, hide_sensitive_input: bool, allow_blank: bool) -> String {
+    let visibility_hint = if hide_sensitive_input {
+        "input hidden; pasted text will not be shown"
+    } else {
+        "input visible (WARNING: secrets will be shown on screen)"
+    };
+    let blank_hint = if allow_blank {
+        ", leave blank to skip for now"
+    } else {
+        ""
+    };
+
+    format!("Enter {label} ({visibility_hint}{blank_hint}): ")
+}
+
+fn prompt_sensitive_line_with<FHidden, FVisible>(
+    prompt: &str,
+    hide_sensitive_input: bool,
+    prompt_hidden: FHidden,
+    prompt_visible: FVisible,
+) -> Result<String, Box<dyn std::error::Error>>
+where
+    FHidden: FnOnce(&str) -> Result<String, Box<dyn std::error::Error>>,
+    FVisible: FnOnce(&str) -> Result<String, Box<dyn std::error::Error>>,
+{
+    if hide_sensitive_input {
+        prompt_hidden(prompt)
+    } else {
+        prompt_visible(prompt)
+    }
+}
+
+fn prompt_sensitive_line(
+    label: &str,
+    hide_sensitive_input: bool,
+    allow_blank: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let prompt = sensitive_prompt_text(label, hide_sensitive_input, allow_blank);
+    prompt_sensitive_line_with(
+        &prompt,
+        hide_sensitive_input,
+        prompt_hidden_line,
+        prompt_line,
+    )
 }
 
 fn prompt_with_default(prompt: &str, default: &str) -> Result<String, Box<dyn std::error::Error>> {
@@ -1784,6 +2778,1185 @@ fn prompt_yes_no(prompt: &str, default_yes: bool) -> Result<bool, Box<dyn std::e
     }
 }
 
+fn prompt_choice(
+    prompt: &str,
+    default: &str,
+    accepted: &[&str],
+) -> Result<String, Box<dyn std::error::Error>> {
+    loop {
+        let selection = prompt_with_default(prompt, default)?;
+        let normalized = selection.trim().to_lowercase();
+        if accepted
+            .iter()
+            .any(|value| normalized.as_str() == value.to_lowercase())
+        {
+            return Ok(normalized);
+        }
+        eprintln!("Please enter one of: {}", accepted.join(", "));
+    }
+}
+
+fn prompt_port(default_port: u16) -> Result<u16, Box<dyn std::error::Error>> {
+    loop {
+        let raw = prompt_with_default("Gateway port", &default_port.to_string())?;
+        match raw.parse::<u16>() {
+            Ok(0) => eprintln!("Port must be between 1 and 65535."),
+            Ok(port) => return Ok(port),
+            Err(_) => eprintln!("Please enter a valid TCP port (1-65535)."),
+        }
+    }
+}
+
+fn generate_hex_secret(byte_len: usize) -> Result<String, Box<dyn std::error::Error>> {
+    Ok(crate::crypto::generate_hex_secret(byte_len)?)
+}
+
+fn prompt_custom_secret(
+    kind: &str,
+    hide_sensitive_input: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    const MIN_SECRET_LENGTH: usize = 10;
+
+    loop {
+        let entered = prompt_sensitive_line(kind, hide_sensitive_input, false)?;
+        if entered.is_empty() {
+            eprintln!("{} cannot be empty.", kind);
+            continue;
+        }
+
+        if entered.chars().count() < MIN_SECRET_LENGTH {
+            eprintln!(
+                "{} must be at least {} characters long.",
+                kind, MIN_SECRET_LENGTH
+            );
+            continue;
+        }
+
+        return Ok(entered);
+    }
+}
+
+async fn validate_provider_credentials(provider: &str, api_key: &str) -> Result<(), String> {
+    #[cfg(test)]
+    if let Some(result) = setup_interactive_test_harness_take_provider_validation_result() {
+        return result;
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+        .map_err(|e| format!("failed to build validation client: {e}"))?;
+
+    let response = match provider {
+        "openai" => client
+            .get("https://api.openai.com/v1/models")
+            .bearer_auth(api_key)
+            .send()
+            .await
+            .map_err(|e| format!("OpenAI credential check failed: {e}"))?,
+        "anthropic" => client
+            .get("https://api.anthropic.com/v1/models")
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+            .send()
+            .await
+            .map_err(|e| format!("Anthropic credential check failed: {e}"))?,
+        other => return Err(format!("unsupported provider for validation: {other}")),
+    };
+
+    if response.status().is_success() {
+        return Ok(());
+    }
+
+    let status = response.status();
+    let has_body = !response.text().await.unwrap_or_default().trim().is_empty();
+    let mut message = format!("{provider} credential check failed (HTTP {status}).");
+    if has_body {
+        message.push_str(
+            " The provider returned an error message that is hidden because it may contain sensitive information.",
+        );
+    }
+    Err(message)
+}
+
+async fn validate_provider_credentials_owned(
+    provider: String,
+    api_key: String,
+) -> Result<(), String> {
+    validate_provider_credentials(&provider, &api_key).await
+}
+
+fn map_channel_validation_error(
+    channel_name: &str,
+    err: crate::channels::ChannelAuthError,
+) -> String {
+    let detail = err.message();
+    let mut message = if err.is_auth() {
+        format!("{channel_name} credential check failed.")
+    } else {
+        format!("{channel_name} credential check hit a transient error.")
+    };
+
+    if !detail.trim().is_empty() {
+        message.push_str(" Details are hidden because they may contain sensitive information.");
+    }
+
+    message
+}
+
+fn prompt_and_configure_bot_channel(
+    config: &mut Value,
+    channel_key: &str,
+    channel_label: &str,
+    env_var: &str,
+    hide_sensitive_input: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let token_label = format!("{channel_label} bot token");
+    let channel_token =
+        prompt_optional_value_from_env(env_var, &token_label, &token_label, hide_sensitive_input)?;
+    if let Some(token) = channel_token {
+        println!("{channel_label} token captured.");
+        validate_channel_credentials_interactive(channel_key, &token)?;
+        config[channel_key] = serde_json::json!({
+            "enabled": true,
+            "botToken": token
+        });
+    } else {
+        println!("No {channel_label} token entered; skipping credential validation.");
+        println!(
+            "Skipped {channel_label} token. You can configure it later in `{channel_key}.botToken`."
+        );
+    }
+    Ok(())
+}
+
+async fn validate_channel_credentials(channel: &str, token: &str) -> Result<(), String> {
+    #[cfg(test)]
+    if let Some(result) = setup_interactive_test_harness_take_channel_validation_result() {
+        return result;
+    }
+
+    match channel {
+        "discord" => {
+            let token = token.to_string();
+            tokio::task::spawn_blocking(move || {
+                DiscordChannel::new(DISCORD_DEFAULT_API_BASE_URL.to_string(), token)
+                    .validate()
+                    .map_err(|err| map_channel_validation_error("Discord", err))
+            })
+            .await
+            .map_err(|e| format!("Discord credential check task failed: {e}"))?
+        }
+        "telegram" => {
+            let token = token.to_string();
+            tokio::task::spawn_blocking(move || {
+                TelegramChannel::new(TELEGRAM_DEFAULT_API_BASE_URL.to_string(), token)
+                    .validate()
+                    .map_err(|err| map_channel_validation_error("Telegram", err))
+            })
+            .await
+            .map_err(|e| format!("Telegram credential check task failed: {e}"))?
+        }
+        other => Err(format!("unsupported channel for validation: {other}")),
+    }
+}
+
+async fn validate_channel_credentials_owned(channel: String, token: String) -> Result<(), String> {
+    validate_channel_credentials(&channel, &token).await
+}
+
+fn validate_provider_credentials_interactive(
+    provider: &str,
+    api_key: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let validate_now = prompt_yes_no("Validate provider credentials now?", true)?;
+    if !validate_now {
+        return Ok(());
+    }
+
+    let provider = provider.to_string();
+    let api_key = api_key.to_string();
+    println!("Checking {} credentials...", provider);
+    match run_sync_blocking_send(validate_provider_credentials_owned(provider, api_key))
+        .map_err(|err| format!("credential validation runtime failed: {err}"))
+    {
+        Ok(()) => {
+            println!("Credential check succeeded.");
+            Ok(())
+        }
+        Err(err) => {
+            eprintln!("Credential check failed: {}", err);
+            if prompt_yes_no("Continue setup and write config anyway?", false)? {
+                Ok(())
+            } else {
+                Err("setup aborted after credential validation failure".into())
+            }
+        }
+    }
+}
+
+fn validate_channel_credentials_interactive(
+    channel: &str,
+    token: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let validate_now = prompt_yes_no(&format!("Validate {channel} credentials now?"), true)?;
+    if !validate_now {
+        return Ok(());
+    }
+
+    let channel = channel.to_string();
+    let token = token.to_string();
+    println!("Checking {} credentials...", channel);
+    match run_sync_blocking_send(validate_channel_credentials_owned(channel, token))
+        .map_err(|err| format!("credential validation runtime failed: {err}"))
+    {
+        Ok(()) => {
+            println!("Credential check succeeded.");
+            Ok(())
+        }
+        Err(err) => {
+            eprintln!("Credential check failed: {}", err);
+            if prompt_yes_no("Continue setup and write config anyway?", false)? {
+                Ok(())
+            } else {
+                Err("setup aborted after credential validation failure".into())
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct VerifyCheckResult {
+    name: String,
+    status: VerifyCheckStatus,
+    detail: String,
+    next_step: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerifyCheckStatus {
+    Pass,
+    Fail,
+    Skip,
+}
+
+impl VerifyCheckResult {
+    fn pass(name: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            status: VerifyCheckStatus::Pass,
+            detail: detail.into(),
+            next_step: None,
+        }
+    }
+
+    fn fail(
+        name: impl Into<String>,
+        detail: impl Into<String>,
+        next_step: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            status: VerifyCheckStatus::Fail,
+            detail: detail.into(),
+            next_step: Some(next_step.into()),
+        }
+    }
+
+    fn skip(
+        name: impl Into<String>,
+        detail: impl Into<String>,
+        next_step: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            status: VerifyCheckStatus::Skip,
+            detail: detail.into(),
+            next_step: Some(next_step.into()),
+        }
+    }
+}
+
+// Keep this list in sync when adding channels that support token placeholders.
+const VERIFY_ALLOWED_ENV_PLACEHOLDER_KEYS: &[&str] = &[
+    "DISCORD_BOT_TOKEN",
+    "TELEGRAM_BOT_TOKEN",
+    "CARAPACE_HOOKS_TOKEN",
+];
+static WARNED_VERIFY_PLACEHOLDER_KEYS: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn is_allowed_verify_placeholder_key(key: &str) -> bool {
+    VERIFY_ALLOWED_ENV_PLACEHOLDER_KEYS.contains(&key)
+}
+
+fn warn_unsupported_verify_placeholder_key(key: &str) {
+    if cfg!(test) {
+        return;
+    }
+    if key.len() > 64 {
+        return;
+    }
+    let mut warned = WARNED_VERIFY_PLACEHOLDER_KEYS
+        .lock()
+        .expect("verify placeholder warning lock poisoned");
+    if !warned.insert(key.to_string()) {
+        return;
+    }
+    eprintln!(
+        "Warning: unsupported token placeholder `${{{key}}}` ignored during verification. \
+Use one of: {}",
+        VERIFY_ALLOWED_ENV_PLACEHOLDER_KEYS.join(", ")
+    );
+}
+
+fn normalize_optional_input(input: Option<String>) -> Option<String> {
+    input
+        .map(|value| value.trim().to_string())
+        .filter(|trimmed| !trimmed.is_empty())
+}
+
+fn summarize_destination_for_display(raw: &str) -> String {
+    let sanitized: String = raw
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(120)
+        .collect();
+    if sanitized.is_empty() {
+        "<redacted>".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn resolve_env_placeholder(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let Some(key) = trimmed.strip_prefix("${").and_then(|s| s.strip_suffix('}')) else {
+        return Some(trimmed.to_string());
+    };
+    let key = key.trim();
+    if key.is_empty() {
+        return None;
+    }
+    if !is_allowed_verify_placeholder_key(key) {
+        warn_unsupported_verify_placeholder_key(key);
+        return None;
+    }
+    std::env::var(key)
+        .ok()
+        .map(|env_value| env_value.trim().to_string())
+        .filter(|normalized| !normalized.is_empty())
+}
+
+fn resolve_channel_bot_token(cfg: &Value, channel_key: &str, env_var: &str) -> Option<String> {
+    std::env::var(env_var)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|normalized| !normalized.is_empty())
+        .or_else(|| resolve_channel_bot_token_from_config(cfg, channel_key))
+}
+
+fn resolve_channel_bot_token_from_config(cfg: &Value, channel_key: &str) -> Option<String> {
+    cfg.get(channel_key)
+        .and_then(|v| v.get("botToken"))
+        .and_then(|v| v.as_str())
+        .and_then(resolve_env_placeholder)
+}
+
+fn channel_outcome_configured(cfg: &Value, channel_key: &str) -> bool {
+    resolve_channel_bot_token_from_config(cfg, channel_key).is_some()
+}
+
+fn resolve_hooks_token(cfg: &Value) -> Option<String> {
+    std::env::var("CARAPACE_HOOKS_TOKEN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|normalized| !normalized.is_empty())
+        .or_else(|| {
+            cfg.get("gateway")
+                .and_then(|v| v.get("hooks"))
+                .and_then(|v| v.get("token"))
+                .and_then(|v| v.as_str())
+                .and_then(resolve_env_placeholder)
+        })
+}
+
+fn infer_setup_outcome_from_config(cfg: &Value) -> SetupOutcome {
+    // Priority is intentional: configured channels first, then hooks, then local chat.
+    if channel_outcome_configured(cfg, "discord") {
+        return SetupOutcome::Discord;
+    }
+    if channel_outcome_configured(cfg, "telegram") {
+        return SetupOutcome::Telegram;
+    }
+    let hooks_enabled = cfg
+        .get("gateway")
+        .and_then(|v| v.get("hooks"))
+        .and_then(|v| v.get("enabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if hooks_enabled {
+        return SetupOutcome::Hooks;
+    }
+    SetupOutcome::LocalChat
+}
+
+fn print_verify_summary(outcome: VerifyOutcome, port: u16, checks: &[VerifyCheckResult]) {
+    println!();
+    println!("Outcome verification summary");
+    println!("----------------------------");
+    println!("Outcome: {}", outcome.key());
+    println!("Gateway port: {}", port);
+    println!();
+    for check in checks {
+        let status = match check.status {
+            VerifyCheckStatus::Pass => "PASS",
+            VerifyCheckStatus::Fail => "FAIL",
+            VerifyCheckStatus::Skip => "SKIP",
+        };
+        println!("[{}] {}: {}", status, check.name, check.detail);
+        if let Some(next_step) = check.next_step.as_deref() {
+            println!("      next step: {}", next_step);
+        }
+    }
+}
+
+async fn verify_channel_send_path(
+    channel: VerifyOutcome,
+    token: String,
+    destination: String,
+) -> Result<(), String> {
+    let message = format!(
+        "Carapace verify ping ({})",
+        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
+    );
+    tokio::task::spawn_blocking(move || {
+        use crate::plugins::{ChannelPluginInstance, OutboundContext};
+        let outbound = OutboundContext {
+            to: destination,
+            text: message,
+            media_url: None,
+            gif_playback: false,
+            reply_to_id: None,
+            thread_id: None,
+            account_id: None,
+        };
+
+        let delivery = match channel {
+            VerifyOutcome::Discord => {
+                let channel_impl =
+                    DiscordChannel::new(DISCORD_DEFAULT_API_BASE_URL.to_string(), token);
+                channel_impl.send_text(outbound)
+            }
+            VerifyOutcome::Telegram => {
+                let channel_impl =
+                    TelegramChannel::new(TELEGRAM_DEFAULT_API_BASE_URL.to_string(), token);
+                channel_impl.send_text(outbound)
+            }
+            _ => return Err("unsupported channel send-path verification target".to_string()),
+        }
+        .map_err(|e| format!("send invocation failed: {e}"))?;
+
+        if delivery.ok {
+            Ok(())
+        } else {
+            Err(sanitize_channel_delivery_error(
+                delivery
+                    .error
+                    .unwrap_or_else(|| "send path rejected request".to_string()),
+            ))
+        }
+    })
+    .await
+    .map_err(|e| format!("send-path verification task failed: {e}"))?
+}
+
+fn sanitize_channel_delivery_error(raw_error: String) -> String {
+    let trimmed = raw_error.trim();
+    if trimmed.is_empty() {
+        return "send path rejected request".to_string();
+    }
+    "send path rejected request (provider details hidden for safety)".to_string()
+}
+
+fn summarize_http_failure_body(status: reqwest::StatusCode, body: &str) -> String {
+    let _ = status;
+    let _ = body;
+    "(body hidden for safety)".to_string()
+}
+
+async fn verify_local_chat_outcome(
+    port: u16,
+    checks: &mut Vec<VerifyCheckResult>,
+) -> Result<(), String> {
+    let mut setup_server_handle = match chat::ensure_local_gateway_running(port).await {
+        Ok(handle) => {
+            checks.push(VerifyCheckResult::pass(
+                "Gateway reachability",
+                format!("service is reachable at 127.0.0.1:{port}"),
+            ));
+            handle
+        }
+        Err(err) => {
+            checks.push(VerifyCheckResult::fail(
+                "Gateway reachability",
+                err.to_string(),
+                format!(
+                    "start the service (`cara start --port {port}`) and retry `cara verify --outcome local-chat --port {port}`"
+                ),
+            ));
+            return Err("outcome verification failed".to_string());
+        }
+    };
+
+    let roundtrip_result = chat::verify_chat_roundtrip(
+        port,
+        "Reply with exactly: verification-ok",
+        Duration::from_secs(45),
+    )
+    .await;
+    if let Some(handle) = setup_server_handle.take() {
+        handle.shutdown().await;
+    }
+
+    match roundtrip_result {
+        Ok(()) => checks.push(VerifyCheckResult::pass(
+            "Local chat roundtrip",
+            "non-interactive chat send reached final state",
+        )),
+        Err(err) => {
+            checks.push(VerifyCheckResult::fail(
+                "Local chat roundtrip",
+                err,
+                "check provider API key/model and retry `cara verify --outcome local-chat`",
+            ));
+            return Err("outcome verification failed".to_string());
+        }
+    }
+    Ok(())
+}
+
+async fn verify_hooks_outcome(
+    port: u16,
+    cfg: &Value,
+    checks: &mut Vec<VerifyCheckResult>,
+) -> Result<(), String> {
+    let mut setup_server_handle = match chat::ensure_local_gateway_running(port).await {
+        Ok(handle) => {
+            checks.push(VerifyCheckResult::pass(
+                "Gateway reachability",
+                format!("service is reachable at 127.0.0.1:{port}"),
+            ));
+            handle
+        }
+        Err(err) => {
+            checks.push(VerifyCheckResult::fail(
+                "Gateway reachability",
+                err.to_string(),
+                format!(
+                    "start the service (`cara start --port {port}`) and retry `cara verify --outcome hooks --port {port}`"
+                ),
+            ));
+            return Err("outcome verification failed".to_string());
+        }
+    };
+
+    let hooks_enabled = cfg
+        .get("gateway")
+        .and_then(|v| v.get("hooks"))
+        .and_then(|v| v.get("enabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !hooks_enabled {
+        checks.push(VerifyCheckResult::fail(
+            "Hooks enabled",
+            "gateway.hooks.enabled is false",
+            "enable `gateway.hooks.enabled` and configure `gateway.hooks.token`, then retry",
+        ));
+        if let Some(handle) = setup_server_handle.take() {
+            handle.shutdown().await;
+        }
+        return Err("outcome verification failed".to_string());
+    } else {
+        checks.push(VerifyCheckResult::pass(
+            "Hooks enabled",
+            "gateway.hooks.enabled is true",
+        ));
+    }
+
+    let hooks_token = resolve_hooks_token(cfg);
+    let hooks_token = if let Some(token) = hooks_token {
+        checks.push(VerifyCheckResult::pass(
+            "Hooks token",
+            "hooks token resolved from config/environment",
+        ));
+        token
+    } else {
+        checks.push(VerifyCheckResult::fail(
+            "Hooks token",
+            "no hooks token configured",
+            "set `gateway.hooks.token` (or CARAPACE_HOOKS_TOKEN) and retry",
+        ));
+        if let Some(handle) = setup_server_handle.take() {
+            handle.shutdown().await;
+        }
+        return Err("outcome verification failed".to_string());
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("failed to create hooks verification client: {e}"))?;
+    let wake_url = format!("http://127.0.0.1:{port}/hooks/wake");
+    println!("Sending signed hooks wake request (this triggers real hooks processing)...");
+    let wake_result = client
+        .post(&wake_url)
+        .header("Authorization", format!("Bearer {hooks_token}"))
+        .json(&serde_json::json!({ "text": "verify-hook" }))
+        .send()
+        .await;
+    if let Some(handle) = setup_server_handle.take() {
+        handle.shutdown().await;
+    }
+
+    match wake_result {
+        Ok(resp) if resp.status().is_success() => checks.push(VerifyCheckResult::pass(
+            "Signed /hooks/wake",
+            "received success response from /hooks/wake",
+        )),
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            let safe_body = summarize_http_failure_body(status, &body);
+            checks.push(VerifyCheckResult::fail(
+                "Signed /hooks/wake",
+                format!("request failed with HTTP {status}: {safe_body}"),
+                format!(
+                    "verify hooks auth token and retry `cara verify --outcome hooks --port {port}`"
+                ),
+            ));
+        }
+        Err(_err) => checks.push(VerifyCheckResult::fail(
+            "Signed /hooks/wake",
+            "network error sending request",
+            format!("confirm gateway is reachable on port {port} and retry"),
+        )),
+    }
+
+    Ok(())
+}
+
+async fn verify_channel_outcome(
+    outcome: VerifyOutcome,
+    cfg: &Value,
+    discord_to: Option<String>,
+    telegram_to: Option<String>,
+    checks: &mut Vec<VerifyCheckResult>,
+) -> Result<(), String> {
+    let (channel_label, channel_key, env_var, destination, destination_flag) = match outcome {
+        VerifyOutcome::Discord => (
+            "Discord",
+            "discord",
+            "DISCORD_BOT_TOKEN",
+            discord_to,
+            "--discord-to <channel_id>",
+        ),
+        VerifyOutcome::Telegram => (
+            "Telegram",
+            "telegram",
+            "TELEGRAM_BOT_TOKEN",
+            telegram_to,
+            "--telegram-to <chat_id>",
+        ),
+        other => {
+            return Err(format!(
+                "unsupported channel outcome for verification: {other:?}"
+            ))
+        }
+    };
+
+    let token = resolve_channel_bot_token(cfg, channel_key, env_var);
+    let token = if let Some(token) = token {
+        checks.push(VerifyCheckResult::pass(
+            format!("{channel_label} credentials"),
+            format!("{channel_label} token is configured"),
+        ));
+        token
+    } else {
+        checks.push(VerifyCheckResult::fail(
+            format!("{channel_label} credentials"),
+            format!("{channel_label} token is not configured"),
+            format!("set `{channel_key}.botToken` or `{env_var}`, then retry `cara verify --outcome {channel_key}`"),
+        ));
+        return Err("outcome verification failed".to_string());
+    };
+
+    match validate_channel_credentials(channel_key, &token).await {
+        Ok(()) => {
+            checks.push(VerifyCheckResult::pass(
+                format!("{channel_label} token check"),
+                "credential validation succeeded",
+            ));
+
+            if let Some(destination) = destination {
+                let destination_display = summarize_destination_for_display(&destination);
+                println!(
+                    "Sending verification ping to {channel_label} destination {destination_display}..."
+                );
+                match verify_channel_send_path(outcome, token, destination).await {
+                    Ok(()) => checks.push(VerifyCheckResult::pass(
+                        format!("{channel_label} send path"),
+                        "test message delivery succeeded",
+                    )),
+                    Err(err) => checks.push(VerifyCheckResult::fail(
+                        format!("{channel_label} send path"),
+                        err,
+                        format!(
+                            "confirm destination and bot permissions, then retry with `{destination_flag}`"
+                        ),
+                    )),
+                }
+            } else {
+                checks.push(VerifyCheckResult::skip(
+                    format!("{channel_label} send path"),
+                    "destination id not provided; send-path test skipped",
+                    format!("rerun with `{destination_flag}` to verify end-to-end delivery"),
+                ));
+            }
+        }
+        Err(err) => {
+            checks.push(VerifyCheckResult::fail(
+                format!("{channel_label} token check"),
+                err,
+                format!("update `{channel_key}.botToken` and retry `cara verify --outcome {channel_key}`"),
+            ));
+            checks.push(VerifyCheckResult::skip(
+                format!("{channel_label} send path"),
+                "not attempted because credential validation failed",
+                format!(
+                    "fix `{channel_key}` credentials first, then rerun with `{destination_flag}`"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn verify_autonomy_outcome(
+    port: u16,
+    cfg: &Value,
+    checks: &mut Vec<VerifyCheckResult>,
+) -> Result<(), String> {
+    async fn shutdown_embedded_gateway(
+        setup_server_handle: &mut Option<crate::server::startup::ServerHandle>,
+    ) {
+        if let Some(handle) = setup_server_handle.take() {
+            handle.shutdown().await;
+        }
+    }
+
+    let mut setup_server_handle = match chat::ensure_local_gateway_running(port).await {
+        Ok(handle) => {
+            checks.push(VerifyCheckResult::pass(
+                "Gateway reachability",
+                format!("service is reachable at 127.0.0.1:{port}"),
+            ));
+            handle
+        }
+        Err(err) => {
+            checks.push(VerifyCheckResult::fail(
+                "Gateway reachability",
+                err.to_string(),
+                format!(
+                    "start the service (`cara start --port {port}`) and retry `cara verify --outcome autonomy --port {port}`"
+                ),
+            ));
+            return Err("outcome verification failed".to_string());
+        }
+    };
+
+    let verify_result = async {
+        let control_client = match reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+        {
+            Ok(client) => client,
+            Err(err) => {
+                checks.push(VerifyCheckResult::fail(
+                    "Control client setup",
+                    err.to_string(),
+                    "fix local networking/runtime dependencies, then retry",
+                ));
+                return Err("outcome verification failed".to_string());
+            }
+        };
+        // Resolve control-plane auth once and reuse for task create + polling.
+        // This includes env/config/keychain fallback behavior.
+        let mut control_auth = resolve_gateway_auth().await;
+        if control_auth.token.is_none() && control_auth.password.is_none() {
+            if let Some(token) = cfg
+                .get("gateway")
+                .and_then(|v| v.get("auth"))
+                .and_then(|v| v.get("token"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+            {
+                control_auth.token = Some(token.to_string());
+            } else if let Some(password) = cfg
+                .get("gateway")
+                .and_then(|v| v.get("auth"))
+                .and_then(|v| v.get("password"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+            {
+                control_auth.password = Some(password.to_string());
+            }
+        }
+
+        let policy_max_attempts: u32 = 1;
+        let policy_max_total_runtime_ms: u64 = 60_000;
+        let policy_max_turns: u32 = 1;
+        let policy_max_run_timeout_seconds: u32 = 30;
+        let create_body = serde_json::json!({
+            "payload": {
+                "kind": "agentTurn",
+                "message": "verify-autonomy",
+            },
+            "policy": {
+                "maxAttempts": policy_max_attempts,
+                "maxTotalRuntimeMs": policy_max_total_runtime_ms,
+                "maxTurns": policy_max_turns,
+                "maxRunTimeoutSeconds": policy_max_run_timeout_seconds
+            }
+        });
+
+        let create_url = match build_control_url("127.0.0.1", port, "/control/tasks", &[])
+            .map_err(|error| error.to_string())
+        {
+            Ok(url) => url,
+            Err(error) => {
+                checks.push(VerifyCheckResult::fail(
+                    "Task create",
+                    format!("failed to build control URL: {error}"),
+                    "confirm host/port configuration and retry verification",
+                ));
+                return Err("outcome verification failed".to_string());
+            }
+        };
+        let create_response = match send_control_request_with_client_and_auth(
+            &control_client,
+            &control_auth,
+            reqwest::Method::POST,
+            create_url,
+            Some(create_body),
+        )
+        .await
+        .map_err(|err| err.to_string())
+        {
+            Ok(response) => response,
+            Err(error_message) => {
+                checks.push(VerifyCheckResult::fail(
+                    "Task create",
+                    error_message,
+                    format!("verify control auth and task queue availability, then retry `cara verify --outcome autonomy --port {port}`"),
+                ));
+                return Err("outcome verification failed".to_string());
+            }
+        };
+
+        let created_task = create_response
+            .get("task")
+            .and_then(|task| task.as_object())
+            .cloned();
+        let Some(created_task) = created_task else {
+            checks.push(VerifyCheckResult::fail(
+                "Task create",
+                "task response missing task object",
+                "retry verification; if this persists, inspect server logs",
+            ));
+            return Err("outcome verification failed".to_string());
+        };
+
+        let Some(task_id) = created_task
+            .get("id")
+            .and_then(|value| value.as_str())
+            .map(ToString::to_string)
+        else {
+            checks.push(VerifyCheckResult::fail(
+                "Task create",
+                "task response missing task id",
+                "retry verification; if this persists, inspect server logs",
+            ));
+            return Err("outcome verification failed".to_string());
+        };
+
+        checks.push(VerifyCheckResult::pass(
+            "Task create",
+            format!("created task `{task_id}`"),
+        ));
+
+        let mut max_attempts_seen = created_task
+            .get("attempts")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0);
+        // Polling window must be at least as long as task runtime policy budgets
+        // (plus headroom) to avoid false negatives on healthy slow paths.
+        let polling_timeout_secs = policy_max_total_runtime_ms
+            .div_ceil(1000)
+            .max(u64::from(policy_max_run_timeout_seconds))
+            .saturating_add(10);
+        let deadline = std::time::Instant::now() + Duration::from_secs(polling_timeout_secs);
+        let mut terminal_task: Option<Value> = None;
+
+        while std::time::Instant::now() < deadline {
+            let path = format!("/control/tasks/{task_id}");
+            let task_url = match build_control_url("127.0.0.1", port, &path, &[])
+                .map_err(|error| error.to_string())
+            {
+                Ok(url) => url,
+                Err(error) => {
+                    checks.push(VerifyCheckResult::fail(
+                        "Task polling",
+                        format!("failed to build control URL: {error}"),
+                        "confirm host/port configuration and retry verification",
+                    ));
+                    return Err("outcome verification failed".to_string());
+                }
+            };
+            let task_response = match send_control_request_with_client_and_auth(
+                &control_client,
+                &control_auth,
+                reqwest::Method::GET,
+                task_url,
+                None,
+            )
+            .await
+            .map_err(|err| err.to_string())
+            {
+                Ok(response) => response,
+                Err(error_message) => {
+                    checks.push(VerifyCheckResult::fail(
+                        "Task polling",
+                        error_message,
+                        "confirm service health and control auth, then retry",
+                    ));
+                    return Err("outcome verification failed".to_string());
+                }
+            };
+
+            let task = task_response.get("task").cloned();
+            if let Some(task) = task {
+                let attempts = task
+                    .get("attempts")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0);
+                max_attempts_seen = max_attempts_seen.max(attempts);
+                if matches!(
+                    task.get("state").and_then(|value| value.as_str()),
+                    Some("done" | "blocked" | "failed" | "cancelled")
+                ) {
+                    terminal_task = Some(task);
+                    break;
+                }
+            }
+
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+
+        if max_attempts_seen == 0 {
+            checks.push(VerifyCheckResult::fail(
+                "Task start proof",
+                "task never reported attempts > 0",
+                "inspect worker loop logs and retry verification",
+            ));
+            return Err("outcome verification failed".to_string());
+        }
+        checks.push(VerifyCheckResult::pass(
+            "Task start proof",
+            format!("task attempts observed: {max_attempts_seen}"),
+        ));
+
+        let Some(terminal_task) = terminal_task else {
+            checks.push(VerifyCheckResult::fail(
+                "Task terminal proof",
+                "task did not reach terminal state before timeout",
+                "inspect queue/worker logs and retry verification",
+            ));
+            return Err("outcome verification failed".to_string());
+        };
+
+        let state = terminal_task
+            .get("state")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown");
+        match state {
+            "done" => {
+                let run_count = terminal_task
+                    .get("runIds")
+                    .and_then(|value| value.as_array())
+                    .map_or(0, |runs| runs.len());
+                checks.push(VerifyCheckResult::pass(
+                    "Task terminal proof",
+                    format!("task reached done state (run IDs: {run_count})"),
+                ));
+                Ok(())
+            }
+            "blocked" => {
+                let blocked_reason = terminal_task
+                    .get("blockedReason")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown");
+                checks.push(VerifyCheckResult::pass(
+                    "Task terminal proof",
+                    format!("task reached blocked state ({blocked_reason})"),
+                ));
+                Ok(())
+            }
+            "failed" => {
+                let error = terminal_task
+                    .get("lastError")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown error");
+                checks.push(VerifyCheckResult::fail(
+                    "Task terminal proof",
+                    format!("task failed: {error}"),
+                    "check provider configuration or task policy and retry",
+                ));
+                Err("outcome verification failed".to_string())
+            }
+            "cancelled" => {
+                checks.push(VerifyCheckResult::fail(
+                    "Task terminal proof",
+                    "task was cancelled unexpectedly during verification",
+                    "retry verify; if this repeats, inspect control-plane mutations",
+                ));
+                Err("outcome verification failed".to_string())
+            }
+            other => {
+                checks.push(VerifyCheckResult::fail(
+                    "Task terminal proof",
+                    format!("task reached unexpected state `{other}`"),
+                    "inspect task state transitions and retry verification",
+                ));
+                Err("outcome verification failed".to_string())
+            }
+        }
+    }
+    .await;
+
+    shutdown_embedded_gateway(&mut setup_server_handle).await;
+    verify_result
+}
+
+async fn run_outcome_verifier(
+    selection: VerifyOutcomeSelection,
+    port: u16,
+    discord_to: Option<String>,
+    telegram_to: Option<String>,
+    cfg: Value,
+) -> Result<(), String> {
+    let mut checks: Vec<VerifyCheckResult> = Vec::new();
+    let outcome = selection.resolved(&cfg);
+    let discord_to = normalize_optional_input(discord_to);
+    let telegram_to = normalize_optional_input(telegram_to);
+
+    let result = match outcome {
+        VerifyOutcome::LocalChat => verify_local_chat_outcome(port, &mut checks).await,
+        VerifyOutcome::Hooks => verify_hooks_outcome(port, &cfg, &mut checks).await,
+        VerifyOutcome::Discord | VerifyOutcome::Telegram => {
+            verify_channel_outcome(outcome, &cfg, discord_to, telegram_to, &mut checks).await
+        }
+        VerifyOutcome::Autonomy => verify_autonomy_outcome(port, &cfg, &mut checks).await,
+    };
+    if let Err(err) = result {
+        print_verify_summary(outcome, port, &checks);
+        return Err(err);
+    }
+
+    print_verify_summary(outcome, port, &checks);
+    let has_fail = checks
+        .iter()
+        .any(|check| check.status == VerifyCheckStatus::Fail);
+    let has_pass = checks
+        .iter()
+        .any(|check| check.status == VerifyCheckStatus::Pass);
+    let has_skip = checks
+        .iter()
+        .any(|check| check.status == VerifyCheckStatus::Skip);
+    if !has_fail && has_pass {
+        println!();
+        if has_skip {
+            println!("Outcome verification passed with skipped checks.");
+        } else {
+            println!("Outcome verification passed.");
+        }
+        Ok(())
+    } else if !has_fail {
+        Err("outcome verification incomplete (no checks passed)".to_string())
+    } else {
+        Err("outcome verification failed".to_string())
+    }
+}
+
+pub async fn handle_verify(
+    outcome: VerifyOutcomeSelection,
+    port: Option<u16>,
+    discord_to: Option<String>,
+    telegram_to: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = config::load_config()
+        .map_err(|e| format!("failed to load config: {e}. Run `cara setup` first."))?;
+    let port = resolve_port(port);
+    run_outcome_verifier(outcome, port, discord_to, telegram_to, cfg)
+        .await
+        .map_err(|err| err.into())
+}
+
+async fn run_setup_post_checks(
+    port: u16,
+    run_status: bool,
+    launch_chat: bool,
+) -> Result<(), String> {
+    let mut setup_server_handle = if run_status || launch_chat {
+        chat::ensure_local_gateway_running(port)
+            .await
+            .map_err(|e| format!("failed to start local gateway: {e}"))?
+    } else {
+        None
+    };
+
+    if run_status {
+        let status_result = handle_status("127.0.0.1", Some(port))
+            .await
+            .map_err(|e| format!("status check failed: {e}"));
+        if status_result.is_err() {
+            if let Some(handle) = setup_server_handle.take() {
+                handle.shutdown().await;
+            }
+        }
+        status_result?;
+    }
+
+    let chat_result = if launch_chat {
+        chat::run_chat_session(false, port)
+            .await
+            .map_err(|e| format!("chat session failed: {e}"))
+    } else {
+        Ok(())
+    };
+
+    if let Some(handle) = setup_server_handle {
+        handle.shutdown().await;
+    }
+
+    chat_result
+}
+
 /// Run the `setup` subcommand -- interactive first-run wizard.
 pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
     let config_path = config::get_config_path();
@@ -1802,13 +3975,19 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
         std::fs::create_dir_all(parent)?;
     }
 
-    let interactive = std::io::stdin().is_terminal();
+    let interactive = stdin_is_interactive();
+
+    let default_gateway_token = generate_hex_secret(32)?;
 
     // Build a minimal default config.
     let mut config = serde_json::json!({
         "gateway": {
-            "port": 3001,
-            "bind": "loopback"
+            "port": DEFAULT_PORT,
+            "bind": "loopback",
+            "auth": {
+                "mode": "token",
+                "token": default_gateway_token
+            }
         },
         "agents": {
             "defaults": {
@@ -1817,9 +3996,15 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    let mut setup_outcome = SetupOutcome::LocalChat;
+    let mut hooks_enabled = false;
+    let mut verify_discord_to: Option<String> = None;
+    let mut verify_telegram_to: Option<String> = None;
+
     if interactive {
         println!("Carapace setup wizard");
         println!("---------------------");
+        let hide_sensitive_input = prompt_yes_no("Hide sensitive input while typing?", true)?;
 
         let default_provider = if std::env::var("ANTHROPIC_API_KEY").is_ok() {
             "anthropic"
@@ -1836,9 +4021,7 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
             match normalized.as_str() {
                 "anthropic" | "claude" => break "anthropic",
                 "openai" | "gpt" => break "openai",
-                _ => {
-                    eprintln!("Please enter either \"anthropic\" or \"openai\".");
-                }
+                _ => eprintln!("Please enter either \"anthropic\" or \"openai\"."),
             }
         };
 
@@ -1848,29 +4031,150 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
         };
 
         let env_key = std::env::var(env_var).ok();
+        let mut effective_api_key = None;
         let api_key = if env_key.is_some() {
             let use_env = prompt_yes_no(&format!("Use API key from ${env_var}?"), true)?;
             if use_env {
+                effective_api_key = env_key.clone();
                 Some(format!("${{{env_var}}}"))
             } else {
-                let entered = prompt_line("Enter API key (input is visible): ")?;
+                let entered = prompt_sensitive_line("API key", hide_sensitive_input, true)?;
                 if entered.is_empty() {
                     None
                 } else {
+                    effective_api_key = Some(entered.clone());
                     Some(entered)
                 }
             }
         } else {
-            let entered = prompt_line("Enter API key (input is visible, leave blank to skip): ")?;
+            let entered = prompt_sensitive_line("API key", hide_sensitive_input, true)?;
             if entered.is_empty() {
                 None
             } else {
+                effective_api_key = Some(entered.clone());
                 Some(entered)
             }
         };
 
         if api_key.is_none() {
             println!("No API key provided. You can set it later via ${env_var}.");
+        }
+
+        if let Some(key) = effective_api_key.as_deref() {
+            validate_provider_credentials_interactive(provider, key)?;
+        }
+
+        let auth_mode = prompt_choice(
+            "Gateway auth mode (token/password)",
+            "token",
+            &["token", "password"],
+        )?;
+        let auth_secret = if auth_mode == "token" {
+            if prompt_yes_no("Generate a strong gateway token automatically?", true)? {
+                generate_hex_secret(32)?
+            } else {
+                prompt_custom_secret("gateway token", hide_sensitive_input)?
+            }
+        } else if prompt_yes_no("Generate a strong gateway password automatically?", true)? {
+            generate_hex_secret(24)?
+        } else {
+            prompt_custom_secret("gateway password", hide_sensitive_input)?
+        };
+
+        let bind_mode = loop {
+            let bind = prompt_choice(
+                "Gateway bind mode (loopback/lan)",
+                "loopback",
+                &["loopback", "lan"],
+            )?;
+            if bind == "lan" {
+                eprintln!("Warning: LAN bind exposes Carapace to your local network.");
+                eprintln!("Use strong auth and add TLS/reverse proxy before broader exposure.");
+                if !prompt_yes_no("Continue with LAN bind?", false)? {
+                    continue;
+                }
+            }
+            break bind;
+        };
+        let gateway_port = prompt_port(DEFAULT_PORT)?;
+
+        config["gateway"]["bind"] = serde_json::json!(bind_mode);
+        config["gateway"]["port"] = serde_json::json!(gateway_port);
+        if auth_mode == "token" {
+            config["gateway"]["auth"] = serde_json::json!({
+                "mode": "token",
+                "token": auth_secret
+            });
+        } else {
+            config["gateway"]["auth"] = serde_json::json!({
+                "mode": "password",
+                "password": auth_secret
+            });
+        }
+
+        setup_outcome = prompt_setup_outcome()?;
+
+        match setup_outcome {
+            SetupOutcome::Discord => {
+                prompt_and_configure_bot_channel(
+                    &mut config,
+                    "discord",
+                    "Discord",
+                    "DISCORD_BOT_TOKEN",
+                    hide_sensitive_input,
+                )?;
+                let discord_configured =
+                    resolve_channel_bot_token_from_config(&config, "discord").is_some();
+                if discord_configured {
+                    let destination = prompt_line(
+                        "Optional: Discord channel ID for send-path verify (leave blank to skip): ",
+                    )?;
+                    verify_discord_to = normalize_optional_input(Some(destination));
+                }
+            }
+            SetupOutcome::Telegram => {
+                prompt_and_configure_bot_channel(
+                    &mut config,
+                    "telegram",
+                    "Telegram",
+                    "TELEGRAM_BOT_TOKEN",
+                    hide_sensitive_input,
+                )?;
+                let telegram_configured =
+                    resolve_channel_bot_token_from_config(&config, "telegram").is_some();
+                if telegram_configured {
+                    let destination = prompt_line(
+                        "Optional: Telegram chat ID for send-path verify (leave blank to skip): ",
+                    )?;
+                    verify_telegram_to = normalize_optional_input(Some(destination));
+                }
+            }
+            SetupOutcome::LocalChat | SetupOutcome::Hooks => {}
+        }
+
+        hooks_enabled = prompt_yes_no(
+            "Enable hooks API (`/hooks`) for automations?",
+            matches!(setup_outcome, SetupOutcome::Hooks),
+        )?;
+        if hooks_enabled {
+            let hooks_token =
+                if prompt_yes_no("Generate a strong hooks token automatically?", true)? {
+                    generate_hex_secret(32)?
+                } else {
+                    prompt_custom_secret("hooks token", hide_sensitive_input)?
+                };
+            config["gateway"]["hooks"] = serde_json::json!({
+                "enabled": true,
+                "token": hooks_token
+            });
+        }
+
+        let enable_control_ui =
+            prompt_yes_no("Enable local Control UI dashboard (`/control`)?", false)?;
+        if enable_control_ui {
+            config["gateway"]["controlUi"] = serde_json::json!({
+                "enabled": true
+            });
         }
 
         config["agents"]["defaults"]["model"] = serde_json::json!(default_model);
@@ -1892,6 +4196,72 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Config written to {}", config_path.display());
     println!("Start the server with: cara start");
+
+    if interactive {
+        let port = config
+            .get("gateway")
+            .and_then(|v| v.get("port"))
+            .and_then(|v| v.as_u64())
+            .and_then(|v| u16::try_from(v).ok())
+            .unwrap_or(DEFAULT_PORT);
+
+        let run_status = prompt_yes_no("Run setup smoke check now (`cara status`)?", true)?;
+        let launch_chat_default = matches!(setup_outcome, SetupOutcome::LocalChat);
+        let launch_chat_prompt = if launch_chat_default {
+            "Run your first assistant action now (`cara chat`)?"
+        } else {
+            "Also launch local assistant chat now (`cara chat`)?"
+        };
+        let launch_chat = prompt_yes_no(launch_chat_prompt, launch_chat_default)?;
+        let verify_default = match setup_outcome {
+            SetupOutcome::LocalChat | SetupOutcome::Hooks => true,
+            SetupOutcome::Discord => verify_discord_to.is_some(),
+            SetupOutcome::Telegram => verify_telegram_to.is_some(),
+        };
+        let verify_prompt = format!(
+            "Run outcome verifier now (`cara verify --outcome {}`)?",
+            setup_outcome.prompt_key()
+        );
+        let run_verify = prompt_yes_no(&verify_prompt, verify_default)?;
+
+        if run_status || launch_chat || run_verify {
+            if run_status || launch_chat {
+                if let Err(err) =
+                    run_sync_blocking_send(run_setup_post_checks(port, run_status, launch_chat))
+                        .map_err(|err| format!("runtime execution failed: {err}"))
+                {
+                    eprintln!("Post-setup checks failed: {}", err);
+                    eprintln!(
+                        "You can retry manually with: cara status --port {}  and  cara chat --port {}",
+                        port, port
+                    );
+                }
+            }
+
+            if run_verify {
+                let verify_outcome = match setup_outcome {
+                    SetupOutcome::LocalChat => VerifyOutcomeSelection::LocalChat,
+                    SetupOutcome::Discord => VerifyOutcomeSelection::Discord,
+                    SetupOutcome::Telegram => VerifyOutcomeSelection::Telegram,
+                    SetupOutcome::Hooks => VerifyOutcomeSelection::Hooks,
+                };
+                if let Err(err) = run_sync_blocking_send(run_outcome_verifier(
+                    verify_outcome,
+                    port,
+                    verify_discord_to,
+                    verify_telegram_to,
+                    config,
+                ))
+                .map_err(|err| format!("runtime execution failed: {err}"))
+                {
+                    eprintln!("Outcome verification failed: {}", err);
+                    eprintln!("Fix the failing checks above, then rerun `cara verify`.");
+                }
+            }
+        }
+
+        print_setup_outcome_next_steps(setup_outcome, port, hooks_enabled);
+    }
 
     Ok(())
 }
@@ -2077,28 +4447,24 @@ pub async fn handle_update(
     version: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let current_version = env!("CARGO_PKG_VERSION");
-
-    let (release, client) = fetch_release_info(current_version, version).await?;
-
-    let tag_name = release
-        .get("tag_name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-    let _release_name = release
-        .get("name")
-        .and_then(|v| v.as_str())
-        .unwrap_or(tag_name);
-    let html_url = release
-        .get("html_url")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let latest_version = tag_name.strip_prefix('v').unwrap_or(tag_name);
+    let release = match crate::update::fetch_release_info(current_version, version).await {
+        Ok(release) => release,
+        Err(err) => {
+            eprintln!("Failed to check for updates: {}", err.message);
+            if err.retryable {
+                eprintln!("This may be a temporary issue; retry in a moment.");
+            }
+            return Err(err.message.into());
+        }
+    };
+    let latest_version = crate::update::tag_to_version(&release.tag_name);
+    let html_url = release.html_url.as_str();
 
     if check {
         println!("Current version: v{}", current_version);
         println!("Latest version:  v{}", latest_version);
 
-        if current_version == latest_version {
+        if current_version == latest_version.as_str() {
             println!("Already up to date (v{})", current_version);
         } else {
             println!(
@@ -2111,7 +4477,7 @@ pub async fn handle_update(
     }
 
     // Install mode.
-    let target_version = version.unwrap_or(latest_version);
+    let target_version = version.unwrap_or(latest_version.as_str());
     if target_version == current_version {
         println!("Already up to date (v{})", current_version);
         return Ok(());
@@ -2122,137 +4488,67 @@ pub async fn handle_update(
         current_version, target_version
     );
 
-    download_and_install_binary(&release, &client, current_version, target_version, html_url).await
-}
-
-/// Fetch release information from the GitHub API.
-async fn fetch_release_info(
-    current_version: &str,
-    version: Option<&str>,
-) -> Result<(Value, reqwest::Client), Box<dyn std::error::Error>> {
-    let api_url = match version {
-        Some(v) => format!(
-            "https://api.github.com/repos/puremachinery/carapace/releases/tags/v{}",
-            v
-        ),
-        None => "https://api.github.com/repos/puremachinery/carapace/releases/latest".to_string(),
+    let request = crate::update::InstallRequest {
+        current_version: current_version.to_string(),
+        state_dir: resolve_state_dir(),
+        requested_version: Some(target_version.to_string()),
+        apply_update: true,
     };
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()?;
-
-    let response = match client
-        .get(&api_url)
-        .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", format!("cara/{}", current_version))
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("Failed to check for updates: {}", e);
-            return Err(e.into());
-        }
-    };
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body_text = response.text().await.unwrap_or_default();
-        eprintln!("GitHub API error (HTTP {}): {}", status, body_text);
-        return Err(format!("HTTP {}", status).into());
-    }
-
-    let release: Value = response.json().await?;
-    Ok((release, client))
-}
-
-/// Download and install a binary from a GitHub release.
-async fn download_and_install_binary(
-    release: &Value,
-    client: &reqwest::Client,
-    current_version: &str,
-    target_version: &str,
-    html_url: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let asset_name = format!("cara-{}-{}", std::env::consts::OS, std::env::consts::ARCH);
-
-    let assets = release
-        .get("assets")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let matching_asset = assets.iter().find(|a| {
-        a.get("name")
-            .and_then(|n| n.as_str())
-            .is_some_and(|n| n.contains(&asset_name))
-    });
-
-    let asset = match matching_asset {
-        Some(a) => a,
-        None => {
-            eprintln!(
-                "No matching binary asset found for platform '{}'. Download manually from: {}",
-                asset_name, html_url
-            );
-            return Ok(());
-        }
-    };
-
-    let download_url = asset
-        .get("browser_download_url")
-        .and_then(|u| u.as_str())
-        .ok_or("asset has no download URL")?;
-    let name = asset
-        .get("name")
-        .and_then(|n| n.as_str())
-        .unwrap_or(&asset_name);
-
-    println!("Downloading {}...", name);
-
-    let dl_response = client
-        .get(download_url)
-        .header("User-Agent", format!("cara/{}", current_version))
-        .send()
-        .await?;
-
-    if !dl_response.status().is_success() {
-        eprintln!("Download failed with HTTP {}", dl_response.status());
-        return Err(format!("download failed: HTTP {}", dl_response.status()).into());
-    }
-
-    let bytes = dl_response.bytes().await?;
-    if bytes.is_empty() {
-        return Err("downloaded asset is empty".into());
-    }
-
-    // Stage the binary
-    let state_dir = crate::server::ws::resolve_state_dir();
-    let updates_dir = state_dir.join("updates");
-    std::fs::create_dir_all(&updates_dir)?;
-    let staged_path = updates_dir.join(format!("cara-{}", target_version));
-    std::fs::write(&staged_path, &bytes)?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&staged_path, std::fs::Permissions::from_mode(0o755))?;
-    }
-
-    println!("Applying update...");
-
-    let staged_str = staged_path.to_string_lossy();
-    match crate::server::ws::apply_staged_update(&staged_str) {
-        Ok(result) => {
+    match crate::update::install_or_resume(request).await {
+        Ok(outcome) => {
+            if outcome.resumed {
+                if let Some(max_attempts) = outcome.transaction.as_ref().map(|tx| tx.max_attempts) {
+                    println!(
+                        "Resumed pending update transaction (attempt {}/{}).",
+                        outcome.attempt, max_attempts
+                    );
+                } else {
+                    println!(
+                        "Resumed pending update transaction (attempt {}).",
+                        outcome.attempt
+                    );
+                }
+            }
             println!("Update applied successfully.");
-            println!("  Binary: {}", result.binary_path);
-            println!("  SHA-256: {}", result.sha256);
-            crate::server::ws::cleanup_old_binaries();
+            println!("  Staged path: {}", outcome.staged_path);
+            if let Some(apply) = outcome.apply_result {
+                println!("  Binary: {}", apply.binary_path);
+                println!("  SHA-256: {}", apply.sha256);
+            }
+            println!(
+                "  Sigstore bundle verification: {}",
+                if outcome.verification.bundle_verified {
+                    "passed"
+                } else {
+                    "failed"
+                }
+            );
+            println!(
+                "  Checksum verification: {}",
+                if outcome.verification.checksum_verified {
+                    "passed"
+                } else {
+                    "not available"
+                }
+            );
+            println!(
+                "  Signing identity: {}",
+                outcome.verification.expected_identity
+            );
             println!("Restart cara to use v{}.", target_version);
         }
-        Err(e) => {
-            eprintln!("Failed to apply update: {}", e);
-            return Err(e.into());
+        Err(err) => {
+            eprintln!("Update failed (phase: {:?}): {}", err.phase, err.message);
+            if err.retryable {
+                eprintln!("This failure is retryable; rerun `cara update` to resume.");
+            } else {
+                eprintln!(
+                    "This failure is non-retryable; resolve release artifact/policy mismatch before retrying."
+                );
+            }
+            eprintln!("Release page: {}", html_url);
+            return Err(err.message.into());
         }
     }
 
@@ -2344,7 +4640,7 @@ fn redact_secrets(mut value: Value) -> Value {
 
 /// Resolve the port to use for connecting to a running instance.
 /// Tries (in order): explicit flag, config file value, DEFAULT_PORT.
-fn resolve_port(explicit: Option<u16>) -> u16 {
+pub(crate) fn resolve_port(explicit: Option<u16>) -> u16 {
     if let Some(p) = explicit {
         return p;
     }
@@ -2396,13 +4692,13 @@ pub fn handle_tls_init_ca(output: Option<&str>) -> Result<(), Box<dyn std::error
         None => crate::tls::ca::default_ca_dir(),
     };
 
-    let ca = crate::tls::ca::ClusterCA::generate(&ca_dir)?;
+    let cluster = crate::tls::ca::ClusterCA::generate(&ca_dir)?;
 
     println!("Cluster CA generated successfully");
     println!("  Directory:   {}", ca_dir.display());
-    println!("  Certificate: {}", ca.ca_cert_path().display());
-    println!("  Key:         {}", ca.ca_key_path().display());
-    println!("  Fingerprint: {}", ca.ca_fingerprint());
+    println!("  Certificate: {}", cluster.ca_cert_path().display());
+    println!("  Fingerprint: {}", cluster.ca_fingerprint());
+    println!("  Files:       ca.crt, ca.key, crl.json");
     println!();
     println!("Distribute the CA certificate to all gateway nodes.");
     println!("Keep the CA private key secure.");
@@ -2426,18 +4722,15 @@ pub fn handle_tls_issue_cert(
         None => ca_dir.join("nodes"),
     };
 
-    let ca = crate::tls::ca::ClusterCA::load(&ca_dir)?;
-    let cert = ca.issue_node_cert(node_id, &output_dir)?;
+    let cluster = crate::tls::ca::ClusterCA::load(&ca_dir)?;
+    let _issued = cluster.issue_node_cert(node_id, &output_dir)?;
 
     println!("Node certificate issued successfully");
-    println!("  Node ID:     {}", cert.node_id);
-    println!("  Certificate: {}", cert.cert_path.display());
-    println!("  Key:         {}", cert.key_path.display());
-    println!("  Fingerprint: {}", cert.fingerprint);
+    println!("  Output Dir:  {}", output_dir.display());
     println!();
     println!("Deploy these files to the node and configure gateway.mtls:");
-    println!("  nodeCert: \"{}\"", cert.cert_path.display());
-    println!("  nodeKey:  \"{}\"", cert.key_path.display());
+    println!("  nodeCert: \"<path-to-output-dir>/node.crt\"");
+    println!("  nodeKey:  \"<path-to-output-dir>/node.key\"");
 
     Ok(())
 }
@@ -2478,16 +4771,16 @@ pub fn handle_tls_show_ca(ca_dir_opt: Option<&str>) -> Result<(), Box<dyn std::e
         None => crate::tls::ca::default_ca_dir(),
     };
 
-    let ca = crate::tls::ca::ClusterCA::load(&ca_dir)?;
+    let cluster = crate::tls::ca::ClusterCA::load(&ca_dir)?;
 
     println!("Cluster CA Information");
     println!("=====================");
-    println!("  Directory:   {}", ca.ca_dir().display());
-    println!("  Certificate: {}", ca.ca_cert_path().display());
-    println!("  Key:         {}", ca.ca_key_path().display());
-    println!("  Fingerprint: {}", ca.ca_fingerprint());
+    println!("  Directory:   {}", ca_dir.display());
+    println!("  Certificate: {}", cluster.ca_cert_path().display());
+    println!("  Fingerprint: {}", cluster.ca_fingerprint());
+    println!("  Files:       ca.crt, ca.key, crl.json");
 
-    let entries = ca.crl_entries();
+    let entries = cluster.crl_entries();
     if entries.is_empty() {
         println!();
         println!("Certificate Revocation List: (empty)");
@@ -2519,8 +4812,97 @@ pub fn handle_tls_show_ca(ca_dir_opt: Option<&str>) -> Result<(), Box<dyn std::e
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime_bridge::{run_sync_blocking, CURRENT_THREAD_RUNTIME_MESSAGE};
     use clap::Parser;
     use ed25519_dalek::{Signature, VerifyingKey};
+    use std::collections::VecDeque;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+    use std::sync::{LazyLock, Mutex};
+
+    // Serializes env-var touching tests in this module.
+    // Cross-module env-var tests should use a shared lock if they touch the same keys.
+    static ENV_VAR_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    struct EnvVarGuard {
+        key: String,
+        previous: Option<OsString>,
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var(&self.key, value),
+                None => std::env::remove_var(&self.key),
+            }
+        }
+    }
+
+    fn set_env_var_scoped(key: &str, value: &str) -> EnvVarGuard {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        EnvVarGuard {
+            key: key.to_string(),
+            previous,
+        }
+    }
+
+    fn unset_env_var_scoped(key: &str) -> EnvVarGuard {
+        let previous = std::env::var_os(key);
+        std::env::remove_var(key);
+        EnvVarGuard {
+            key: key.to_string(),
+            previous,
+        }
+    }
+
+    struct SetupInteractiveHarnessGuard;
+
+    impl Drop for SetupInteractiveHarnessGuard {
+        fn drop(&mut self) {
+            clear_setup_interactive_test_harness();
+        }
+    }
+
+    fn install_setup_interactive_harness(
+        harness: SetupInteractiveTestHarness,
+    ) -> SetupInteractiveHarnessGuard {
+        set_setup_interactive_test_harness(harness);
+        SetupInteractiveHarnessGuard
+    }
+
+    struct SetupInteractiveTestEnv {
+        _temp: tempfile::TempDir,
+        config_path: PathBuf,
+        _config_guard: EnvVarGuard,
+        _openai_guard: EnvVarGuard,
+        _anthropic_guard: EnvVarGuard,
+        _telegram_guard: EnvVarGuard,
+        _discord_guard: EnvVarGuard,
+        _harness_guard: SetupInteractiveHarnessGuard,
+    }
+
+    fn setup_interactive_test_env(harness: SetupInteractiveTestHarness) -> SetupInteractiveTestEnv {
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_path = temp.path().join("carapace.json");
+        let config_guard =
+            set_env_var_scoped("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
+        let openai_guard = unset_env_var_scoped("OPENAI_API_KEY");
+        let anthropic_guard = unset_env_var_scoped("ANTHROPIC_API_KEY");
+        let telegram_guard = unset_env_var_scoped("TELEGRAM_BOT_TOKEN");
+        let discord_guard = unset_env_var_scoped("DISCORD_BOT_TOKEN");
+        let harness_guard = install_setup_interactive_harness(harness);
+        SetupInteractiveTestEnv {
+            _temp: temp,
+            config_path,
+            _config_guard: config_guard,
+            _openai_guard: openai_guard,
+            _anthropic_guard: anthropic_guard,
+            _telegram_guard: telegram_guard,
+            _discord_guard: discord_guard,
+            _harness_guard: harness_guard,
+        }
+    }
 
     #[test]
     fn test_cli_no_args_defaults_to_none() {
@@ -2647,6 +5029,392 @@ mod tests {
             }
             other => panic!("Expected Logs, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_cli_chat_defaults() {
+        let cli = Cli::try_parse_from(["cara", "chat"]).unwrap();
+        match cli.command {
+            Some(Command::Chat { new, port }) => {
+                assert!(!new);
+                assert_eq!(port, None);
+            }
+            other => panic!("Expected Chat, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_chat_with_new_and_port() {
+        let cli = Cli::try_parse_from(["cara", "chat", "--new", "--port", "9000"]).unwrap();
+        match cli.command {
+            Some(Command::Chat { new, port }) => {
+                assert!(new);
+                assert_eq!(port, Some(9000));
+            }
+            other => panic!("Expected Chat, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_verify_defaults() {
+        let cli = Cli::try_parse_from(["cara", "verify"]).unwrap();
+        match cli.command {
+            Some(Command::Verify {
+                outcome,
+                port,
+                discord_to,
+                telegram_to,
+            }) => {
+                assert_eq!(outcome, VerifyOutcomeSelection::Auto);
+                assert_eq!(port, None);
+                assert!(discord_to.is_none());
+                assert!(telegram_to.is_none());
+            }
+            other => panic!("Expected Verify, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_verify_with_options() {
+        let cli = Cli::try_parse_from([
+            "cara",
+            "verify",
+            "--outcome",
+            "discord",
+            "--port",
+            "19000",
+            "--discord-to",
+            "1234567890",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Verify {
+                outcome,
+                port,
+                discord_to,
+                telegram_to,
+            }) => {
+                assert_eq!(outcome, VerifyOutcomeSelection::Discord);
+                assert_eq!(port, Some(19000));
+                assert_eq!(discord_to.as_deref(), Some("1234567890"));
+                assert!(telegram_to.is_none());
+            }
+            other => panic!("Expected Verify, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_verify_autonomy_outcome() {
+        let cli = Cli::try_parse_from(["cara", "verify", "--outcome", "autonomy"]).unwrap();
+        match cli.command {
+            Some(Command::Verify {
+                outcome,
+                port,
+                discord_to,
+                telegram_to,
+            }) => {
+                assert_eq!(outcome, VerifyOutcomeSelection::Autonomy);
+                assert_eq!(port, None);
+                assert!(discord_to.is_none());
+                assert!(telegram_to.is_none());
+            }
+            other => panic!("Expected Verify autonomy outcome, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_verify_outcome_selection_autonomy_resolved() {
+        let cfg = serde_json::json!({});
+        assert_eq!(
+            VerifyOutcomeSelection::Autonomy.resolved(&cfg),
+            VerifyOutcome::Autonomy
+        );
+    }
+
+    #[test]
+    fn test_cli_task_create() {
+        let cli = Cli::try_parse_from([
+            "cara",
+            "task",
+            "create",
+            "--payload",
+            r#"{"kind":"systemEvent","text":"hello"}"#,
+            "--next-run-at-ms",
+            "1234",
+            "--max-attempts",
+            "5",
+            "--max-total-runtime-ms",
+            "60000",
+            "--max-turns",
+            "12",
+            "--max-run-timeout-seconds",
+            "45",
+            "--port",
+            "19123",
+            "--host",
+            "localhost",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Task(TaskCommand::Create {
+                payload,
+                next_run_at_ms,
+                max_attempts,
+                max_total_runtime_ms,
+                max_turns,
+                max_run_timeout_seconds,
+                connection,
+            })) => {
+                assert_eq!(payload, r#"{"kind":"systemEvent","text":"hello"}"#);
+                assert_eq!(next_run_at_ms, Some(1234));
+                assert_eq!(max_attempts, Some(5));
+                assert_eq!(max_total_runtime_ms, Some(60_000));
+                assert_eq!(max_turns, Some(12));
+                assert_eq!(max_run_timeout_seconds, Some(45));
+                assert_eq!(connection.port, Some(19123));
+                assert_eq!(connection.host, "localhost");
+            }
+            other => panic!("Expected Task(Create), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_task_list_with_filters() {
+        let cli = Cli::try_parse_from([
+            "cara",
+            "task",
+            "list",
+            "--state",
+            "retry_wait",
+            "--limit",
+            "25",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Task(TaskCommand::List { state, limit, .. })) => {
+                assert_eq!(state.as_deref(), Some("retry_wait"));
+                assert_eq!(limit, Some(25));
+            }
+            other => panic!("Expected Task(List), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_task_get() {
+        let cli = Cli::try_parse_from(["cara", "task", "get", "task-123"]).unwrap();
+        match cli.command {
+            Some(Command::Task(TaskCommand::Get { id, connection })) => {
+                assert_eq!(id, "task-123");
+                assert_eq!(connection.port, None);
+                assert_eq!(connection.host, "127.0.0.1");
+            }
+            other => panic!("Expected Task(Get), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_task_cancel() {
+        let cli = Cli::try_parse_from([
+            "cara",
+            "task",
+            "cancel",
+            "task-123",
+            "--reason",
+            "operator requested",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Task(TaskCommand::Cancel {
+                id,
+                reason,
+                connection,
+            })) => {
+                assert_eq!(id, "task-123");
+                assert_eq!(reason.as_deref(), Some("operator requested"));
+                assert_eq!(connection.port, None);
+                assert_eq!(connection.host, "127.0.0.1");
+            }
+            other => panic!("Expected Task(Cancel), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_task_retry() {
+        let cli = Cli::try_parse_from([
+            "cara",
+            "task",
+            "retry",
+            "task-123",
+            "--delay-ms",
+            "500",
+            "--reason",
+            "retry now",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Task(TaskCommand::Retry {
+                id,
+                delay_ms,
+                reason,
+                connection,
+            })) => {
+                assert_eq!(id, "task-123");
+                assert_eq!(delay_ms, Some(500));
+                assert_eq!(reason.as_deref(), Some("retry now"));
+                assert_eq!(connection.port, None);
+                assert_eq!(connection.host, "127.0.0.1");
+            }
+            other => panic!("Expected Task(Retry), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_task_resume() {
+        let cli = Cli::try_parse_from([
+            "cara",
+            "task",
+            "resume",
+            "task-123",
+            "--delay-ms",
+            "250",
+            "--reason",
+            "unblocked",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Task(TaskCommand::Resume {
+                id,
+                delay_ms,
+                reason,
+                connection,
+            })) => {
+                assert_eq!(id, "task-123");
+                assert_eq!(delay_ms, Some(250));
+                assert_eq!(reason.as_deref(), Some("unblocked"));
+                assert_eq!(connection.port, None);
+                assert_eq!(connection.host, "127.0.0.1");
+            }
+            other => panic!("Expected Task(Resume), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_task_update() {
+        let cli = Cli::try_parse_from([
+            "cara",
+            "task",
+            "update",
+            "task-123",
+            "--payload",
+            r#"{"kind":"systemEvent","text":"updated"}"#,
+            "--max-attempts",
+            "10",
+            "--max-total-runtime-ms",
+            "90000",
+            "--max-turns",
+            "15",
+            "--max-run-timeout-seconds",
+            "30",
+            "--reason",
+            "operator patch",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Task(TaskCommand::Update {
+                id,
+                payload,
+                max_attempts,
+                max_total_runtime_ms,
+                max_turns,
+                max_run_timeout_seconds,
+                reason,
+                connection,
+            })) => {
+                assert_eq!(id, "task-123");
+                assert_eq!(
+                    payload.as_deref(),
+                    Some(r#"{"kind":"systemEvent","text":"updated"}"#)
+                );
+                assert_eq!(max_attempts, Some(10));
+                assert_eq!(max_total_runtime_ms, Some(90_000));
+                assert_eq!(max_turns, Some(15));
+                assert_eq!(max_run_timeout_seconds, Some(30));
+                assert_eq!(reason.as_deref(), Some("operator patch"));
+                assert_eq!(connection.port, None);
+                assert_eq!(connection.host, "127.0.0.1");
+            }
+            other => panic!("Expected Task(Update), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_extract_control_error_message_prefers_error_field() {
+        let body = br#"{"ok":false,"error":"Task not found"}"#;
+        assert_eq!(extract_control_error_message(body), "Task not found");
+    }
+
+    #[test]
+    fn test_extract_control_error_message_falls_back_to_text_body() {
+        let body = b"plain error text";
+        assert_eq!(extract_control_error_message(body), "plain error text");
+    }
+
+    #[test]
+    fn test_extract_control_error_message_handles_empty_body() {
+        assert_eq!(extract_control_error_message(b""), "empty response body");
+    }
+
+    #[test]
+    fn test_setup_post_checks_bridge_inside_current_thread_runtime_does_not_panic() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let call_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rt.block_on(async {
+                run_sync_blocking(run_setup_post_checks(DEFAULT_PORT, false, false))
+                    .expect_err("expected bridge error from current-thread runtime")
+            })
+        }));
+
+        assert!(
+            call_result.is_ok(),
+            "current-thread runtime should not panic when running setup post checks through sync bridge"
+        );
+        let err = call_result.unwrap().to_string();
+        assert!(
+            err.contains(CURRENT_THREAD_RUNTIME_MESSAGE),
+            "expected explicit current-thread bridge guard error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_channel_credentials_bridge_inside_current_thread_runtime_is_panic_free() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let call_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rt.block_on(async {
+                run_sync_blocking_send(validate_channel_credentials_owned(
+                    "unsupported".to_string(),
+                    "ignored-token".to_string(),
+                ))
+                .expect_err("unsupported channels should be rejected, not panic")
+            })
+        }));
+
+        assert!(
+            call_result.is_ok(),
+            "current-thread runtime should not panic when validating channel creds through send bridge"
+        );
+        let err = call_result.unwrap().to_string();
+        assert!(
+            err.contains("unsupported channel for validation: unsupported"),
+            "expected unsupported-channel rejection path, got: {err}"
+        );
     }
 
     #[test]
@@ -2949,8 +5717,10 @@ mod tests {
         let state_dir = temp.path().join("state");
         let sessions_dir = state_dir.join("sessions");
         let cron_dir = state_dir.join("cron");
+        let tasks_dir = state_dir.join("tasks");
         std::fs::create_dir_all(&sessions_dir).unwrap();
         std::fs::create_dir_all(&cron_dir).unwrap();
+        std::fs::create_dir_all(&tasks_dir).unwrap();
 
         // Create some fake session data.
         std::fs::write(
@@ -2969,6 +5739,8 @@ mod tests {
 
         // Create fake usage data.
         std::fs::write(state_dir.join("usage.json"), r#"{"totalTokens":42}"#).unwrap();
+        // Create fake task data (durable task queue is stored as a JSON array).
+        std::fs::write(tasks_dir.join("queue.json"), r#"[]"#).unwrap();
 
         // Build archive.
         let archive_path = temp.path().join("test-backup.tar.gz");
@@ -2990,6 +5762,8 @@ mod tests {
         builder.append_dir_all("sessions", &sessions_dir).unwrap();
         // Add cron.
         builder.append_dir_all("cron", &cron_dir).unwrap();
+        // Add tasks.
+        builder.append_dir_all("tasks", &tasks_dir).unwrap();
         // Add usage.
         builder
             .append_path_with_name(state_dir.join("usage.json"), "usage/usage.json")
@@ -3006,6 +5780,7 @@ mod tests {
         let mut found_marker = false;
         let mut found_session = false;
         let mut found_cron = false;
+        let mut found_tasks = false;
         let mut found_usage = false;
 
         for entry in archive.entries().unwrap() {
@@ -3017,6 +5792,8 @@ mod tests {
                 found_session = true;
             } else if path.contains("jobs.json") {
                 found_cron = true;
+            } else if path.contains("queue.json") {
+                found_tasks = true;
             } else if path.contains("usage.json") {
                 found_usage = true;
             }
@@ -3025,22 +5802,27 @@ mod tests {
         assert!(found_marker, "Archive should contain backup marker");
         assert!(found_session, "Archive should contain session data");
         assert!(found_cron, "Archive should contain cron data");
+        assert!(found_tasks, "Archive should contain task queue data");
         assert!(found_usage, "Archive should contain usage data");
     }
 
     #[test]
     fn test_backup_restore_round_trip() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
         let temp = tempfile::TempDir::new().unwrap();
 
         // Set up source state directory.
         let source_state = temp.path().join("source");
         let source_sessions = source_state.join("sessions");
         let source_cron = source_state.join("cron");
+        let source_tasks = source_state.join("tasks");
         std::fs::create_dir_all(&source_sessions).unwrap();
         std::fs::create_dir_all(&source_cron).unwrap();
+        std::fs::create_dir_all(&source_tasks).unwrap();
 
         std::fs::write(source_sessions.join("sess1.json"), r#"{"id":"sess1"}"#).unwrap();
         std::fs::write(source_cron.join("store.json"), r#"{"version":1}"#).unwrap();
+        std::fs::write(source_tasks.join("queue.json"), r#"[]"#).unwrap();
         std::fs::write(source_state.join("usage.json"), r#"{"totalTokens":100}"#).unwrap();
 
         // Create an archive.
@@ -3061,6 +5843,7 @@ mod tests {
             .append_dir_all("sessions", &source_sessions)
             .unwrap();
         builder.append_dir_all("cron", &source_cron).unwrap();
+        builder.append_dir_all("tasks", &source_tasks).unwrap();
         builder
             .append_path_with_name(source_state.join("usage.json"), "usage/usage.json")
             .unwrap();
@@ -3068,66 +5851,32 @@ mod tests {
         let enc = builder.into_inner().unwrap();
         enc.finish().unwrap();
 
-        // Set up a fresh target state directory and restore into it.
+        // Set up a fresh target state directory and restore into it using the
+        // production restore path.
         let target_state = temp.path().join("target");
-        std::fs::create_dir_all(&target_state).unwrap();
-
-        // Manually extract (simulating what handle_restore does).
-        let file = std::fs::File::open(&archive_path).unwrap();
-        let dec = flate2::read::GzDecoder::new(file);
-        let mut archive = tar::Archive::new(dec);
-
-        for entry_result in archive.entries().unwrap() {
-            let mut entry = entry_result.unwrap();
-            let path = entry.path().unwrap().to_path_buf();
-            let path_str = path.to_string_lossy().to_string();
-
-            if path_str == BACKUP_MARKER {
-                continue;
-            }
-
-            if path_str.starts_with("sessions/") {
-                let rel = path.strip_prefix("sessions").unwrap_or(&path);
-                let target = target_state.join("sessions").join(rel);
-                let entry_type = entry.header().entry_type();
-                if entry_type.is_dir() {
-                    std::fs::create_dir_all(&target).unwrap();
-                } else if entry_type.is_file() {
-                    if let Some(parent) = target.parent() {
-                        std::fs::create_dir_all(parent).unwrap();
-                    }
-                    let mut buf = Vec::new();
-                    entry.read_to_end(&mut buf).unwrap();
-                    std::fs::write(&target, &buf).unwrap();
-                }
-            } else if path_str.starts_with("cron/") {
-                let rel = path.strip_prefix("cron").unwrap_or(&path);
-                let target = target_state.join("cron").join(rel);
-                let entry_type = entry.header().entry_type();
-                if entry_type.is_dir() {
-                    std::fs::create_dir_all(&target).unwrap();
-                } else if entry_type.is_file() {
-                    if let Some(parent) = target.parent() {
-                        std::fs::create_dir_all(parent).unwrap();
-                    }
-                    let mut buf = Vec::new();
-                    entry.read_to_end(&mut buf).unwrap();
-                    std::fs::write(&target, &buf).unwrap();
-                }
-            } else if path_str.starts_with("usage/") {
-                let rel = path.strip_prefix("usage").unwrap_or(&path);
-                let target = target_state.join(rel);
-                let entry_type = entry.header().entry_type();
-                if entry_type.is_file() {
-                    if let Some(parent) = target.parent() {
-                        std::fs::create_dir_all(parent).unwrap();
-                    }
-                    let mut buf = Vec::new();
-                    entry.read_to_end(&mut buf).unwrap();
-                    std::fs::write(&target, &buf).unwrap();
-                }
-            }
-        }
+        let target_config = temp.path().join("target-config.json5");
+        std::fs::write(&target_config, "{}").unwrap();
+        let _state_guard = set_env_var_scoped(
+            "CARAPACE_STATE_DIR",
+            target_state.to_string_lossy().as_ref(),
+        );
+        let _config_guard = set_env_var_scoped(
+            "CARAPACE_CONFIG_PATH",
+            target_config.to_string_lossy().as_ref(),
+        );
+        let (mut restored_sections, restored_sessions) =
+            restore_files_from_tar(&archive_path).unwrap();
+        assert_eq!(restored_sessions, 1);
+        restored_sections.sort_unstable();
+        assert_eq!(
+            restored_sections,
+            vec![
+                "cron".to_string(),
+                "sessions".to_string(),
+                "tasks".to_string(),
+                "usage".to_string()
+            ]
+        );
 
         // Verify restored data matches original.
         let restored_session =
@@ -3140,6 +5889,159 @@ mod tests {
 
         let restored_usage = std::fs::read_to_string(target_state.join("usage.json")).unwrap();
         assert_eq!(restored_usage, r#"{"totalTokens":100}"#);
+
+        let restored_tasks =
+            std::fs::read_to_string(target_state.join("tasks").join("queue.json")).unwrap();
+        assert_eq!(restored_tasks, r#"[]"#);
+    }
+
+    #[test]
+    fn test_handle_backup_includes_tasks_section() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let temp = tempfile::TempDir::new().unwrap();
+        let state_dir = temp.path().join("state");
+        let tasks_dir = state_dir.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        std::fs::write(tasks_dir.join("queue.json"), r#"[]"#).unwrap();
+
+        let config_path = temp.path().join("carapace.json5");
+        std::fs::write(&config_path, "{}").unwrap();
+        let archive_path = temp.path().join("backup-with-tasks.tar.gz");
+
+        let _state_guard =
+            set_env_var_scoped("CARAPACE_STATE_DIR", state_dir.to_string_lossy().as_ref());
+        let _config_guard = set_env_var_scoped(
+            "CARAPACE_CONFIG_PATH",
+            config_path.to_string_lossy().as_ref(),
+        );
+
+        handle_backup(Some(archive_path.to_string_lossy().as_ref())).unwrap();
+        let sections = validate_backup_file(&archive_path).unwrap();
+        assert!(
+            sections.contains(&"tasks".to_string()),
+            "backup should report tasks section when state/tasks exists"
+        );
+    }
+
+    #[test]
+    fn test_handle_backup_restore_round_trip_preserves_tasks() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let temp = tempfile::TempDir::new().unwrap();
+        let home_dir = temp.path().join("home");
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let _home_guard = set_env_var_scoped("HOME", home_dir.to_string_lossy().as_ref());
+        let _userprofile_guard =
+            set_env_var_scoped("USERPROFILE", home_dir.to_string_lossy().as_ref());
+
+        let source_state = temp.path().join("source-state");
+        let source_tasks = source_state.join("tasks");
+        let source_sessions = source_state.join("sessions");
+        let source_cron = source_state.join("cron");
+        std::fs::create_dir_all(&source_tasks).unwrap();
+        std::fs::create_dir_all(&source_sessions).unwrap();
+        std::fs::create_dir_all(&source_cron).unwrap();
+        std::fs::write(
+            source_tasks.join("queue.json"),
+            r#"[{"id":"task-1","state":"queued"}]"#,
+        )
+        .unwrap();
+        std::fs::write(source_sessions.join("sess-a.json"), r#"{"id":"sess-a"}"#).unwrap();
+        std::fs::write(source_cron.join("jobs.json"), r#"{"jobs":[]}"#).unwrap();
+        std::fs::write(source_state.join("usage.json"), r#"{"sessions":{}}"#).unwrap();
+
+        let source_config = temp.path().join("source-config.json5");
+        std::fs::write(&source_config, "{}").unwrap();
+        let archive_path = temp.path().join("backup-roundtrip.tar.gz");
+
+        {
+            let _state_guard = set_env_var_scoped(
+                "CARAPACE_STATE_DIR",
+                source_state.to_string_lossy().as_ref(),
+            );
+            let _config_guard = set_env_var_scoped(
+                "CARAPACE_CONFIG_PATH",
+                source_config.to_string_lossy().as_ref(),
+            );
+            handle_backup(Some(archive_path.to_string_lossy().as_ref())).unwrap();
+        }
+
+        let target_state = temp.path().join("target-state");
+        let target_config = temp.path().join("target-config.json5");
+        std::fs::write(&target_config, "{}").unwrap();
+
+        {
+            let _state_guard = set_env_var_scoped(
+                "CARAPACE_STATE_DIR",
+                target_state.to_string_lossy().as_ref(),
+            );
+            let _config_guard = set_env_var_scoped(
+                "CARAPACE_CONFIG_PATH",
+                target_config.to_string_lossy().as_ref(),
+            );
+            handle_restore(archive_path.to_string_lossy().as_ref(), true).unwrap();
+        }
+
+        let restored_tasks =
+            std::fs::read_to_string(target_state.join("tasks").join("queue.json")).unwrap();
+        assert_eq!(restored_tasks, r#"[{"id":"task-1","state":"queued"}]"#);
+    }
+
+    #[test]
+    fn test_tasks_section_detected_and_restored_for_directory_entry() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let temp = tempfile::TempDir::new().unwrap();
+        let archive_path = temp.path().join("tasks-dir-only.tar.gz");
+
+        let file = std::fs::File::create(&archive_path).unwrap();
+        let enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut builder = tar::Builder::new(enc);
+
+        let marker = b"carapace-backup v1\n";
+        let mut marker_header = tar::Header::new_gnu();
+        marker_header.set_size(marker.len() as u64);
+        marker_header.set_mode(0o644);
+        marker_header.set_cksum();
+        builder
+            .append_data(&mut marker_header, BACKUP_MARKER, &marker[..])
+            .unwrap();
+
+        let mut dir_header = tar::Header::new_gnu();
+        dir_header.set_entry_type(tar::EntryType::Directory);
+        dir_header.set_size(0);
+        dir_header.set_mode(0o755);
+        dir_header.set_cksum();
+        builder
+            .append_data(&mut dir_header, "tasks", std::io::empty())
+            .unwrap();
+
+        let enc = builder.into_inner().unwrap();
+        enc.finish().unwrap();
+
+        let sections = validate_backup_file(&archive_path).unwrap();
+        assert!(
+            sections.contains(&"tasks".to_string()),
+            "top-level tasks directory entry should be detected as tasks section"
+        );
+
+        let target_state = temp.path().join("target-state");
+        let target_config = temp.path().join("target-config.json5");
+        std::fs::write(&target_config, "{}").unwrap();
+
+        let _state_guard = set_env_var_scoped(
+            "CARAPACE_STATE_DIR",
+            target_state.to_string_lossy().as_ref(),
+        );
+        let _config_guard = set_env_var_scoped(
+            "CARAPACE_CONFIG_PATH",
+            target_config.to_string_lossy().as_ref(),
+        );
+
+        let (restored, _) = restore_files_from_tar(&archive_path).unwrap();
+        assert!(restored.contains(&"tasks".to_string()));
+        assert!(
+            target_state.join("tasks").is_dir(),
+            "restore should recreate empty tasks directory from top-level tasks entry"
+        );
     }
 
     #[test]
@@ -3212,6 +6114,221 @@ mod tests {
         assert_eq!(format_file_size(1073741824), "1.00 GB");
     }
 
+    #[test]
+    fn test_parse_setup_outcome_aliases() {
+        assert_eq!(
+            parse_setup_outcome("local-chat"),
+            Some(SetupOutcome::LocalChat)
+        );
+        assert_eq!(parse_setup_outcome("local"), Some(SetupOutcome::LocalChat));
+        assert_eq!(parse_setup_outcome("discord"), Some(SetupOutcome::Discord));
+        assert_eq!(
+            parse_setup_outcome("telegram"),
+            Some(SetupOutcome::Telegram)
+        );
+        assert_eq!(parse_setup_outcome("webhooks"), Some(SetupOutcome::Hooks));
+    }
+
+    #[test]
+    fn test_parse_setup_outcome_invalid() {
+        assert_eq!(parse_setup_outcome(""), None);
+        assert_eq!(parse_setup_outcome("unknown"), None);
+    }
+
+    #[test]
+    fn test_sensitive_prompt_text_hidden_with_skip_hint() {
+        let prompt = sensitive_prompt_text("API key", true, true);
+        assert_eq!(
+            prompt,
+            "Enter API key (input hidden; pasted text will not be shown, leave blank to skip for now): "
+        );
+    }
+
+    #[test]
+    fn test_sensitive_prompt_text_visible_warns_without_skip_hint() {
+        let prompt = sensitive_prompt_text("Telegram bot token", false, false);
+        assert_eq!(
+            prompt,
+            "Enter Telegram bot token (input visible (WARNING: secrets will be shown on screen)): "
+        );
+    }
+
+    #[test]
+    fn test_prompt_sensitive_line_with_uses_hidden_reader() {
+        let expected_prompt = "Enter gateway token (input hidden; pasted text will not be shown): ";
+        let value = prompt_sensitive_line_with(
+            expected_prompt,
+            true,
+            |prompt| {
+                assert_eq!(prompt, expected_prompt);
+                Ok("hidden-value".to_string())
+            },
+            |_prompt| panic!("visible reader should not be called when hide_sensitive_input=true"),
+        )
+        .expect("hidden prompt should succeed");
+
+        assert_eq!(value, "hidden-value");
+    }
+
+    #[test]
+    fn test_prompt_sensitive_line_with_uses_visible_reader() {
+        let expected_prompt =
+            "Enter gateway token (input visible (WARNING: secrets will be shown on screen)): ";
+        let value = prompt_sensitive_line_with(
+            expected_prompt,
+            false,
+            |_prompt| panic!("hidden reader should not be called when hide_sensitive_input=false"),
+            |prompt| {
+                assert_eq!(prompt, expected_prompt);
+                Ok("visible-value".to_string())
+            },
+        )
+        .expect("visible prompt should succeed");
+
+        assert_eq!(value, "visible-value");
+    }
+
+    #[test]
+    fn test_map_channel_validation_error_redacts_auth_detail() {
+        let err = crate::channels::ChannelAuthError::auth("token abc123 rejected");
+        let message = map_channel_validation_error("Telegram", err);
+        assert_eq!(
+            message,
+            "Telegram credential check failed. Details are hidden because they may contain sensitive information."
+        );
+    }
+
+    #[test]
+    fn test_map_channel_validation_error_redacts_transient_detail() {
+        let err = crate::channels::ChannelAuthError::transient("upstream returned HTML body");
+        let message = map_channel_validation_error("Discord", err);
+        assert_eq!(
+            message,
+            "Discord credential check hit a transient error. Details are hidden because they may contain sensitive information."
+        );
+    }
+
+    #[test]
+    fn test_resolve_env_placeholder_handles_literal_and_placeholder_values() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let key = "DISCORD_BOT_TOKEN";
+        let _env_guard = set_env_var_scoped(key, "  resolved-value  ");
+
+        assert_eq!(
+            resolve_env_placeholder("${DISCORD_BOT_TOKEN}"),
+            Some("resolved-value".to_string())
+        );
+        assert_eq!(
+            resolve_env_placeholder("{DISCORD_BOT_TOKEN}"),
+            Some("{DISCORD_BOT_TOKEN}".to_string())
+        );
+        assert_eq!(
+            resolve_env_placeholder("$$${{DISCORD_BOT_TOKEN}"),
+            Some("$$${{DISCORD_BOT_TOKEN}".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_env_placeholder_missing_var_returns_none() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let _env_guard = unset_env_var_scoped("DISCORD_BOT_TOKEN");
+        assert_eq!(resolve_env_placeholder("${DISCORD_BOT_TOKEN}"), None);
+    }
+
+    #[test]
+    fn test_resolve_env_placeholder_rejects_non_allowlisted_keys() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let _env_guard = set_env_var_scoped("CARAPACE_TEST_NON_ALLOWLISTED_SECRET", "secret");
+        assert_eq!(
+            resolve_env_placeholder("${CARAPACE_TEST_NON_ALLOWLISTED_SECRET}"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_resolve_env_placeholder_rejects_custom_bot_token_names() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let _env_guard = set_env_var_scoped("MY_DISCORD_BOT_TOKEN", "custom-token");
+        assert_eq!(resolve_env_placeholder("${MY_DISCORD_BOT_TOKEN}"), None);
+    }
+
+    #[test]
+    fn test_sanitize_channel_delivery_error_redacts_untrusted_body() {
+        assert_eq!(
+            sanitize_channel_delivery_error(
+                "<html>stacktrace and debug secrets</html>".to_string()
+            ),
+            "send path rejected request (provider details hidden for safety)"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_channel_delivery_error_redacts_short_standard_message() {
+        assert_eq!(
+            sanitize_channel_delivery_error("Unauthorized".to_string()),
+            "send path rejected request (provider details hidden for safety)"
+        );
+    }
+
+    #[test]
+    fn test_infer_setup_outcome_from_config_prefers_discord_then_telegram() {
+        let cfg = serde_json::json!({
+            "discord": { "botToken": "discord-token" },
+            "telegram": { "botToken": "telegram-token" },
+            "gateway": { "hooks": { "enabled": true } }
+        });
+        assert_eq!(infer_setup_outcome_from_config(&cfg), SetupOutcome::Discord);
+
+        let cfg = serde_json::json!({
+            "telegram": { "botToken": "telegram-token" },
+            "gateway": { "hooks": { "enabled": true } }
+        });
+        assert_eq!(
+            infer_setup_outcome_from_config(&cfg),
+            SetupOutcome::Telegram
+        );
+    }
+
+    #[test]
+    fn test_infer_setup_outcome_from_config_hooks_then_local() {
+        let hooks_cfg = serde_json::json!({
+            "gateway": { "hooks": { "enabled": true } }
+        });
+        assert_eq!(
+            infer_setup_outcome_from_config(&hooks_cfg),
+            SetupOutcome::Hooks
+        );
+
+        let local_cfg = serde_json::json!({});
+        assert_eq!(
+            infer_setup_outcome_from_config(&local_cfg),
+            SetupOutcome::LocalChat
+        );
+    }
+
+    #[test]
+    fn test_infer_setup_outcome_ignores_empty_or_unresolved_channel_tokens() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let _env_guard = unset_env_var_scoped("CARAPACE_TEST_VERIFY_MISSING_TELEGRAM_TOKEN");
+        let empty_discord_token_cfg = serde_json::json!({
+            "discord": { "enabled": true, "botToken": "   " },
+            "gateway": { "hooks": { "enabled": true } }
+        });
+        assert_eq!(
+            infer_setup_outcome_from_config(&empty_discord_token_cfg),
+            SetupOutcome::Hooks
+        );
+
+        let unresolved_placeholder_cfg = serde_json::json!({
+            "telegram": { "enabled": true, "botToken": "${CARAPACE_TEST_VERIFY_MISSING_TELEGRAM_TOKEN}" },
+            "gateway": { "hooks": { "enabled": true } }
+        });
+        assert_eq!(
+            infer_setup_outcome_from_config(&unresolved_placeholder_cfg),
+            SetupOutcome::Hooks
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Setup subcommand tests
     // -----------------------------------------------------------------------
@@ -3240,14 +6357,13 @@ mod tests {
 
     #[test]
     fn test_handle_setup_errors_when_config_exists_no_force() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
         let temp = tempfile::TempDir::new().unwrap();
         let config_path = temp.path().join("carapace.json");
         std::fs::write(&config_path, "{}").unwrap();
 
-        // Point config to our temp file.
-        std::env::set_var("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
+        let _env_guard = set_env_var_scoped("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
         let result = handle_setup(false);
-        std::env::remove_var("CARAPACE_CONFIG_PATH");
 
         assert!(
             result.is_err(),
@@ -3257,13 +6373,13 @@ mod tests {
 
     #[test]
     fn test_handle_setup_force_creates_config() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
         let temp = tempfile::TempDir::new().unwrap();
         let config_path = temp.path().join("carapace.json");
         std::fs::write(&config_path, "{}").unwrap();
 
-        std::env::set_var("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
+        let _env_guard = set_env_var_scoped("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
         let result = handle_setup(true);
-        std::env::remove_var("CARAPACE_CONFIG_PATH");
 
         assert!(
             result.is_ok(),
@@ -3274,12 +6390,12 @@ mod tests {
 
     #[test]
     fn test_handle_setup_creates_valid_json5_config() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
         let temp = tempfile::TempDir::new().unwrap();
         let config_path = temp.path().join("carapace.json");
 
-        std::env::set_var("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
+        let _env_guard = set_env_var_scoped("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
         let result = handle_setup(false);
-        std::env::remove_var("CARAPACE_CONFIG_PATH");
 
         assert!(result.is_ok(), "Setup should succeed");
 
@@ -3290,12 +6406,12 @@ mod tests {
 
     #[test]
     fn test_handle_setup_default_values() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
         let temp = tempfile::TempDir::new().unwrap();
         let config_path = temp.path().join("carapace.json");
 
-        std::env::set_var("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
+        let _env_guard = set_env_var_scoped("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
         let result = handle_setup(false);
-        std::env::remove_var("CARAPACE_CONFIG_PATH");
 
         assert!(result.is_ok());
 
@@ -3303,17 +6419,262 @@ mod tests {
         let parsed: serde_json::Value = json5::from_str(&content).unwrap();
 
         assert_eq!(
-            parsed["gateway"]["port"], 3001,
-            "Default port should be 3001"
+            parsed["gateway"]["port"], DEFAULT_PORT,
+            "Default port should match server default"
         );
         assert_eq!(
             parsed["gateway"]["bind"], "loopback",
             "Default bind should be loopback"
         );
         assert_eq!(
+            parsed["gateway"]["auth"]["mode"], "token",
+            "Default auth mode should be token"
+        );
+        assert!(
+            parsed["gateway"]["auth"]["token"]
+                .as_str()
+                .map(|v| !v.is_empty())
+                .unwrap_or(false),
+            "Default setup should generate a non-empty gateway token"
+        );
+        assert_eq!(
             parsed["agents"]["defaults"]["model"], "claude-sonnet-4-20250514",
             "Default model should be claude-sonnet-4-20250514"
         );
+    }
+
+    #[test]
+    fn test_handle_setup_interactive_hidden_input_skips_telegram_validation_on_blank_token() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let env = setup_interactive_test_env(SetupInteractiveTestHarness {
+            force_interactive: Some(true),
+            visible_inputs: VecDeque::from(vec![
+                "y".to_string(),
+                "openai".to_string(),
+                "".to_string(),
+                "n".to_string(),
+                "".to_string(),
+                "".to_string(),
+                "telegram".to_string(),
+                "n".to_string(),
+                "n".to_string(),
+                "n".to_string(),
+                "n".to_string(),
+                "n".to_string(),
+            ]),
+            hidden_inputs: VecDeque::from(vec![
+                "".to_string(),
+                "hidden-token-123".to_string(),
+                "".to_string(),
+            ]),
+            ..Default::default()
+        });
+
+        let result = handle_setup(true);
+        assert!(result.is_ok(), "interactive setup should succeed");
+
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.hidden_prompt_count, 3);
+        assert_eq!(state.channel_validation_calls, 0);
+        assert_eq!(state.provider_validation_calls, 0);
+        assert!(state.visible_inputs.is_empty());
+        assert!(state.hidden_inputs.is_empty());
+
+        let content = std::fs::read_to_string(&env.config_path).unwrap();
+        let parsed: serde_json::Value = json5::from_str(&content).unwrap();
+        assert_eq!(parsed["gateway"]["auth"]["token"], "hidden-token-123");
+        assert!(
+            parsed.get("telegram").is_none(),
+            "telegram config should be absent when token is blank"
+        );
+    }
+
+    #[test]
+    fn test_handle_setup_interactive_visible_input_validates_telegram_token() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let env = setup_interactive_test_env(SetupInteractiveTestHarness {
+            force_interactive: Some(true),
+            visible_inputs: VecDeque::from(vec![
+                "n".to_string(),
+                "openai".to_string(),
+                "sk-openai-visible".to_string(),
+                "n".to_string(),
+                "".to_string(),
+                "y".to_string(),
+                "".to_string(),
+                "".to_string(),
+                "telegram".to_string(),
+                "12345:abc".to_string(),
+                "y".to_string(),
+                "".to_string(),
+                "n".to_string(),
+                "n".to_string(),
+                "n".to_string(),
+                "n".to_string(),
+                "n".to_string(),
+            ]),
+            channel_validation_results: VecDeque::from(vec![Ok(())]),
+            ..Default::default()
+        });
+
+        let result = handle_setup(true);
+        assert!(result.is_ok(), "interactive setup should succeed");
+
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.hidden_prompt_count, 0);
+        assert_eq!(state.channel_validation_calls, 1);
+        assert_eq!(state.provider_validation_calls, 0);
+        assert!(state.channel_validation_results.is_empty());
+        assert!(state.visible_inputs.is_empty());
+
+        let content = std::fs::read_to_string(&env.config_path).unwrap();
+        let parsed: serde_json::Value = json5::from_str(&content).unwrap();
+        assert_eq!(parsed["telegram"]["enabled"], true);
+        assert_eq!(parsed["telegram"]["botToken"], "12345:abc");
+    }
+
+    #[test]
+    fn test_handle_setup_interactive_telegram_validation_failure_aborts_when_user_declines_continue(
+    ) {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let env = setup_interactive_test_env(SetupInteractiveTestHarness {
+            force_interactive: Some(true),
+            visible_inputs: VecDeque::from(vec![
+                "n".to_string(),
+                "openai".to_string(),
+                "sk-openai-visible".to_string(),
+                "n".to_string(),
+                "".to_string(),
+                "y".to_string(),
+                "".to_string(),
+                "".to_string(),
+                "telegram".to_string(),
+                "12345:abc".to_string(),
+                "y".to_string(),
+                "n".to_string(),
+            ]),
+            channel_validation_results: VecDeque::from(vec![Err(
+                "telegram token rejected".to_string()
+            )]),
+            ..Default::default()
+        });
+
+        let result = handle_setup(true);
+        assert!(
+            result.is_err(),
+            "setup should abort after validation failure"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("setup aborted after credential validation failure"),
+            "unexpected setup error"
+        );
+        assert!(
+            !env.config_path.exists(),
+            "config file should not be written when setup aborts"
+        );
+
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.hidden_prompt_count, 0);
+        assert_eq!(state.channel_validation_calls, 1);
+        assert_eq!(state.provider_validation_calls, 0);
+        assert!(state.channel_validation_results.is_empty());
+        assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
+    fn test_handle_setup_interactive_hidden_input_skips_discord_validation_on_blank_token() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let env = setup_interactive_test_env(SetupInteractiveTestHarness {
+            force_interactive: Some(true),
+            visible_inputs: VecDeque::from(vec![
+                "y".to_string(),
+                "openai".to_string(),
+                "".to_string(),
+                "n".to_string(),
+                "".to_string(),
+                "".to_string(),
+                "discord".to_string(),
+                "n".to_string(),
+                "n".to_string(),
+                "n".to_string(),
+                "n".to_string(),
+                "n".to_string(),
+            ]),
+            hidden_inputs: VecDeque::from(vec![
+                "".to_string(),
+                "hidden-token-123".to_string(),
+                "".to_string(),
+            ]),
+            ..Default::default()
+        });
+
+        let result = handle_setup(true);
+        assert!(result.is_ok(), "interactive setup should succeed");
+
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.hidden_prompt_count, 3);
+        assert_eq!(state.channel_validation_calls, 0);
+        assert_eq!(state.provider_validation_calls, 0);
+        assert!(state.visible_inputs.is_empty());
+        assert!(state.hidden_inputs.is_empty());
+
+        let content = std::fs::read_to_string(&env.config_path).unwrap();
+        let parsed: serde_json::Value = json5::from_str(&content).unwrap();
+        assert_eq!(parsed["gateway"]["auth"]["token"], "hidden-token-123");
+        assert!(
+            parsed.get("discord").is_none(),
+            "discord config should be absent when token is blank"
+        );
+    }
+
+    #[test]
+    fn test_handle_setup_interactive_discord_validation_failure_aborts_when_user_declines_continue()
+    {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let env = setup_interactive_test_env(SetupInteractiveTestHarness {
+            force_interactive: Some(true),
+            visible_inputs: VecDeque::from(vec![
+                "n".to_string(),
+                "openai".to_string(),
+                "sk-openai-visible".to_string(),
+                "n".to_string(),
+                "".to_string(),
+                "y".to_string(),
+                "".to_string(),
+                "".to_string(),
+                "discord".to_string(),
+                "discord-bot-token".to_string(),
+                "y".to_string(),
+                "n".to_string(),
+            ]),
+            channel_validation_results: VecDeque::from(vec![Err(
+                "discord token rejected".to_string()
+            )]),
+            ..Default::default()
+        });
+
+        let result = handle_setup(true);
+        assert!(
+            result.is_err(),
+            "setup should abort after validation failure"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("setup aborted after credential validation failure"),
+            "unexpected setup error"
+        );
+        assert!(
+            !env.config_path.exists(),
+            "config file should not be written when setup aborts"
+        );
+
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.hidden_prompt_count, 0);
+        assert_eq!(state.channel_validation_calls, 1);
+        assert_eq!(state.provider_validation_calls, 0);
+        assert!(state.channel_validation_results.is_empty());
+        assert!(state.visible_inputs.is_empty());
     }
 
     // -----------------------------------------------------------------------

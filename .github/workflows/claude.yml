@@ -1,0 +1,50 @@
+name: Claude Code
+
+on:
+  issue_comment:
+    types: [created]
+  issues:
+    types: [opened]
+
+concurrency:
+  group: claude-${{ github.event.issue.number || github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  claude:
+    if: |
+      github.actor != 'claude[bot]' &&
+      (
+        (
+          github.event_name == 'issue_comment' &&
+          !github.event.issue.pull_request &&
+          contains(github.event.comment.body || '', '@claude') &&
+          contains(fromJson('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
+        ) ||
+        (
+          github.event_name == 'issues' &&
+          (contains(github.event.issue.body || '', '@claude') || contains(github.event.issue.title || '', '@claude')) &&
+          contains(fromJson('["OWNER","MEMBER","COLLABORATOR"]'), github.event.issue.author_association)
+        )
+      )
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 1
+
+      - name: Run Claude Code
+        id: claude
+        uses: anthropics/claude-code-action@220272d38887a1caed373da96a9ffdb0919c26cc # v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+
+          additional_permissions: |
+            actions: read

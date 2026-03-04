@@ -58,7 +58,6 @@ impl std::fmt::Display for AgentRunStatus {
 }
 
 /// Represents an active agent run
-#[derive(Debug)]
 pub struct AgentRun {
     /// Unique run identifier
     pub run_id: String,
@@ -96,7 +95,7 @@ pub struct AgentRunResult {
 }
 
 /// Registry for tracking active agent runs
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct AgentRunRegistry {
     /// Active runs by run_id
     runs: HashMap<String, AgentRun>,
@@ -1817,14 +1816,14 @@ pub(super) fn handle_sessions_archive_delete(
 struct AgentRequestParams<'a> {
     message: &'a str,
     idempotency_key: &'a str,
-    session_key: Option<String>,
+    session_hint: Option<String>,
     stream: bool,
 }
 
 /// Extract and validate agent request parameters (message, idempotencyKey, sessionKey, stream).
 fn parse_agent_request_params<'a>(
     params: Option<&'a Value>,
-    default_session_key: Option<&'a str>,
+    fallback_session_hint: Option<&'a str>,
 ) -> Result<AgentRequestParams<'a>, ErrorShape> {
     let message = params
         .and_then(|v| v.get("message"))
@@ -1841,13 +1840,13 @@ fn parse_agent_request_params<'a>(
         .and_then(|v| v.get("idempotencyKey"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "idempotencyKey is required", None))?;
-    let session_key = params
+    let session_hint = params
         .and_then(|v| v.get("sessionKey"))
         .and_then(|v| v.as_str())
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
-        .or_else(|| default_session_key.map(|s| s.to_string()));
+        .or_else(|| fallback_session_hint.map(|s| s.to_string()));
     let stream = params
         .and_then(|v| v.get("stream"))
         .and_then(|v| v.as_bool())
@@ -1856,7 +1855,7 @@ fn parse_agent_request_params<'a>(
     Ok(AgentRequestParams {
         message,
         idempotency_key,
-        session_key,
+        session_hint,
         stream,
     })
 }
@@ -1955,14 +1954,13 @@ pub(super) fn handle_agent(
         .filter(|s| !s.is_empty())
         .unwrap_or(sender_id.as_str())
         .to_string();
-    let explicit_key = agent_params.session_key.as_deref();
     let session = sessions::get_or_create_scoped_session(
         state.session_store(),
         &cfg,
         channel.as_str(),
         sender_id.as_str(),
         peer_id.as_str(),
-        explicit_key,
+        agent_params.session_hint.as_deref(),
         metadata,
     )
     .map_err(|err| {

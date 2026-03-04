@@ -1,22 +1,22 @@
-# Gateway HTTP API
+# Carapace HTTP API
 
-This document describes the gateway HTTP endpoints wired in the current Rust gateway implementation.
-It focuses on endpoints handled directly by the gateway server and the Control UI.
+This document describes the HTTP endpoints wired in the current Rust Carapace implementation.
+It focuses on endpoints handled directly by the service and the Control UI.
 
 ## Authentication Overview
 
 Endpoints fall into two buckets:
 
-- **Hooks** use a separate hooks token (`gateway.hooks.token`) and do **not** use gateway auth.
-- **Gateway endpoints** use **gateway auth** (token/password) or **Tailscale Serve** when enabled.
+- **Hooks** use a separate hooks token (`gateway.hooks.token`) and do **not** use service auth.
+- **Service endpoints** use **service auth** (token/password) or **Tailscale Serve** when enabled.
 
-Gateway auth uses a bearer token in the `Authorization` header:
+Service auth uses a bearer token in the `Authorization` header:
 
 ```
 Authorization: Bearer ${CARAPACE_GATEWAY_TOKEN}
 ```
 
-If gateway auth mode is `password`, the same bearer token is treated as the password.
+If service auth mode is `password`, the same bearer token is treated as the password.
 If auth mode is `none` (loopback-only), the endpoints are open to local loopback requests.
 If Tailscale Serve auth is enabled, verified Tailscale identity can satisfy auth for non-local requests.
 
@@ -30,11 +30,10 @@ Max body size is configurable via `gateway.hooks.maxBodyBytes`.
 The path **must not** be `/`.
 
 ### Auth
-Hooks require a **hooks token** (not gateway auth). Accepted forms:
+Hooks require a **hooks token** (not service auth). Accepted forms:
 
 - `Authorization: Bearer ${CARAPACE_HOOKS_TOKEN}`
 - `X-Carapace-Token: ${CARAPACE_HOOKS_TOKEN}`
-- `?token=${CARAPACE_HOOKS_TOKEN}` (deprecated; logs a warning)
 
 ### Common behavior
 - Method: **POST** only
@@ -52,6 +51,12 @@ Error body format for JSON parse/validation errors:
 ```json
 { "ok": false, "error": "{message}" }
 ```
+
+### Production secret hygiene
+
+For production deployments, set `CARAPACE_SERVER_SECRET`.
+When this is unset, hooks sender-scoping key derivation falls back to a built-in
+constant intended for local/dev use, not long-lived production environments.
 
 #### POST `{basePath}/wake`
 Trigger a wake event.
@@ -104,7 +109,7 @@ Responses:
 ```
 
 #### POST `{basePath}/*` (hook mappings)
-If hook mappings are configured, the gateway applies them to the incoming payload.
+If hook mappings are configured, Carapace applies them to the incoming payload.
 Possible responses:
 - 200 OK / 202 Accepted for mapped actions
 - 204 No Content if mapping returns `null`
@@ -114,7 +119,7 @@ Possible responses:
 ## Channel Webhooks
 
 Inbound channel integrations are handled via dedicated HTTP endpoints.
-These are **not** protected by gateway auth; each channel uses its own
+These are **not** protected by service auth; each channel uses its own
 validation mechanism.
 
 Common behavior:
@@ -140,14 +145,15 @@ Slack Events API endpoint.
 
 ## Plugin Webhooks
 
-Plugins can register webhook paths. The gateway routes any request under
+Plugins can register webhook paths. Carapace routes any request under
 `/plugins/{plugin_id}/...` to the owning plugin.
 
 Common behavior:
 - Method: **any**
 - Max body size: 256 KB (override via `gateway.hooks.maxBodyBytes`)
-- Auth: **none at the gateway layer** — plugins must validate their own secrets
-  (e.g., shared tokens or signatures).
+- Auth: hooks token required (same auth check as `/hooks/*`).
+  Plugins may still perform additional validation (for example shared secrets or
+  signatures in request payloads/headers).
 - Response: status, headers, and body are forwarded from the plugin.
 
 ### `ANY /plugins/{plugin_id}/*`
@@ -160,7 +166,7 @@ Common behavior:
 ### POST `/v1/chat/completions`
 OpenAI-style Chat Completions endpoint (when enabled).
 
-Auth: **gateway auth** (Bearer token/password or Tailscale Serve).
+Auth: **service auth** (Bearer token/password or Tailscale Serve).
 
 Request body (subset supported):
 ```json
@@ -216,7 +222,7 @@ Errors:
 ### POST `/tools/invoke`
 Executes a single tool by name (when enabled).
 
-Auth: **gateway auth** (Bearer token/password or Tailscale Serve).
+Auth: **service auth** (Bearer token/password or Tailscale Serve).
 
 Request headers:
 - `Authorization: Bearer ${CARAPACE_GATEWAY_TOKEN}`
@@ -279,11 +285,284 @@ Errors:
 - 404 Not Found (invalid agent ID or no local avatar)
 - 405 Method Not Allowed (non-GET/HEAD)
 
+## Control API
+
+Control endpoints use service auth (Bearer token/password or Tailscale Serve
+identity), not hooks token.
+
+### GET `/control/status`
+
+Returns gateway/runtime status + diagnostics snapshot.
+
+Response:
+
+```json
+{
+  "ok": true,
+  "version": "0.1.0-previewX",
+  "startedAt": "2026-02-24T00:00:00Z",
+  "uptimeSeconds": 123,
+  "connectedChannels": 1,
+  "totalChannels": 2,
+  "runtime": {
+    "name": "carapace",
+    "version": "0.1.0-previewX",
+    "platform": "linux",
+    "arch": "x86_64"
+  },
+  "diagnostics": { "...": "..." }
+}
+```
+
+### GET `/control/channels`
+
+Returns channel connectivity state:
+
+```json
+{
+  "total": 2,
+  "connected": 1,
+  "channels": [
+    {
+      "id": "telegram",
+      "name": "telegram",
+      "status": "connected",
+      "lastConnectedAt": "2026-02-24T00:00:00Z",
+      "lastError": null
+    }
+  ]
+}
+```
+
+### GET `/control/config`
+
+Returns a **redacted** config snapshot plus optimistic-concurrency hash:
+
+```json
+{
+  "ok": true,
+  "config": { "...": "..." },
+  "hash": "abc123..."
+}
+```
+
+Secret-like keys are redacted as `"[REDACTED]"`.
+
+### PATCH `/control/config`
+
+Applies a **safe allowlisted** single-path update with optimistic concurrency.
+Only `gateway.controlUi.*` paths are accepted on this endpoint.
+
+Request:
+
+```json
+{
+  "path": "gateway.controlUi.enabled",
+  "value": true,
+  "baseHash": "abc123..."
+}
+```
+
+Responses:
+- `200 OK` with `{ "ok": true, "applied": {...}, "hash": "..." }`
+- `400 Bad Request` for invalid JSON/path/baseHash usage
+- `403 Forbidden` for non-allowlisted paths or protected paths
+- `409 Conflict` when config changed since provided hash
+- `422 Unprocessable Entity` for schema-invalid updates
+
+### POST `/control/config`
+
+Legacy broader config-mutation endpoint.
+
+Request shape is the same as `PATCH /control/config` (`path`, `value`,
+optional `baseHash`), but unlike PATCH it is not limited to
+`gateway.controlUi.*` (protected prefixes still remain blocked).
+
+Responses:
+- `200 OK` with `{ "ok": true, "applied": {...}, "hash": "..." }`
+- `400 Bad Request` for invalid JSON/path/baseHash usage
+- `403 Forbidden` for protected paths
+- `409 Conflict` when config changed since provided hash
+- `422 Unprocessable Entity` for schema-invalid updates
+
+## Control Task API
+
+Control task endpoints are part of the service control plane and use **service
+auth** (Bearer token/password or Tailscale Serve identity), not hooks token.
+
+If runtime state is unavailable (for example startup race/misconfiguration),
+task endpoints return:
+
+```json
+{ "ok": false, "error": "Task queue unavailable" }
+```
+
+with `503 Service Unavailable`.
+
+### Durable task model
+
+Task lifecycle states:
+- `queued`
+- `running`
+- `blocked`
+- `retry_wait`
+- `done`
+- `failed`
+- `cancelled`
+
+Continuation policy fields (camelCase):
+- `maxAttempts` (default `100`)
+- `maxTotalRuntimeMs` (default `604800000`)
+- `maxTurns` (default `25`)
+- `maxRunTimeoutSeconds` (default `600`)
+
+Blocked tasks may include `blockedReason` values such as:
+- `approval_required`
+- `config_missing`
+- `delivery_failure`
+- `external_dependency`
+- `operator_action_required`
+- `unknown`
+
+### POST `/control/tasks`
+
+Create a durable objective task.
+
+Request:
+
+```json
+{
+  "payload": { "kind": "systemEvent", "text": "run nightly summary" },
+  "nextRunAtMs": 1735689600000,
+  "policy": {
+    "maxAttempts": 10,
+    "maxTotalRuntimeMs": 3600000,
+    "maxTurns": 10,
+    "maxRunTimeoutSeconds": 120
+  }
+}
+```
+
+`payload.kind` supports:
+- `systemEvent`
+- `agentTurn`
+
+Responses:
+- `201 Created` with `{ "ok": true, "task": { ... } }`
+- `400 Bad Request` for invalid JSON/payload/policy
+- `503 Service Unavailable` when queue is full or unavailable
+
+### GET `/control/tasks`
+
+List tasks (newest-first).
+
+Query params:
+- `state` optional (`queued`, `running`, `blocked`, `retry_wait`, `done`, `failed`, `cancelled`)
+- `limit` optional (max rows returned)
+
+Response:
+
+```json
+{
+  "ok": true,
+  "total": 42,
+  "tasks": [ ... ]
+}
+```
+
+Errors:
+- `400 Bad Request` (invalid state filter)
+
+### GET `/control/tasks/{id}`
+
+Fetch one task by ID.
+
+Responses:
+- `200 OK` with `{ "ok": true, "task": { ... } }`
+- `404 Not Found` when missing
+
+### PATCH `/control/tasks/{id}`
+
+Patch mutable task fields:
+- `payload` (full replacement; validated as `CronPayload`)
+- `policy` (partial policy patch)
+- `reason` (stored into `lastError`, max 1024 chars)
+
+Request:
+
+```json
+{
+  "payload": { "kind": "systemEvent", "text": "updated task payload" },
+  "policy": { "maxRunTimeoutSeconds": 45 },
+  "reason": "operator patch"
+}
+```
+
+Responses:
+- `200 OK` on success
+- `400 Bad Request` for invalid JSON/payload/policy/reason length or empty patch body
+- `404 Not Found` when missing
+- `409 Conflict` when state is not patchable (`running`/`done`) or changed concurrently
+
+### POST `/control/tasks/{id}/cancel`
+
+Cancel a task (optional body `{ "reason": "..." }`).
+
+Responses:
+- `200 OK` on success
+- `400 Bad Request` for invalid reason length/JSON
+- `404 Not Found` when missing
+- `409 Conflict` when already terminal (`done`/`failed`/`cancelled`) or changed concurrently
+
+### POST `/control/tasks/{id}/retry`
+
+Move a retryable task to `retry_wait`.
+
+Request:
+
+```json
+{ "delayMs": 500, "reason": "operator retry" }
+```
+
+If `reason` is omitted/blank, default is `"retried by operator"`.
+
+Responses:
+- `200 OK` on success
+- `400 Bad Request` for invalid reason length/JSON
+- `404 Not Found` when missing
+- `409 Conflict` when not retryable in current state (`queued`/`running`/`done`) or changed concurrently
+
+### POST `/control/tasks/{id}/resume`
+
+Resume a blocked task (moves `blocked -> retry_wait`).
+
+Request:
+
+```json
+{ "delayMs": 1000, "reason": "operator resume" }
+```
+
+If `reason` is omitted/blank, default is `"resumed by operator"`.
+
+Responses:
+- `200 OK` on success
+- `400 Bad Request` for invalid reason length/JSON
+- `404 Not Found` when missing
+- `409 Conflict` when task is not blocked
+
+### Audit coverage
+
+Successful task mutations emit audit event type `task_mutated` with:
+- `task_id`
+- `action` (`cancel` / `patch` / `retry` / `resume`)
+- `actor` (remote IP or `unknown`)
+- `resulting_state`
+
 ## Health / Status
 
 ### GET `/health`
 
-Returns gateway health status. No authentication required.
+Returns service health status. No authentication required.
 
 Response:
 - 200 OK
@@ -301,18 +580,6 @@ The following handlers are available but require additional documentation:
 - Slash command handlers
 - Interactive component handlers
 
-### Plugin HTTP Handlers
-- `POST /plugins/{pluginId}/{path}` - Plugin webhook routes
-- Registered via `registerHttpRoute()` in plugin API
-- Each plugin's routes are namespaced under `/plugins/{pluginId}/`
-- Authentication: uses the hooks token (same as `/hooks/*`)
-
-**BREAKING CHANGE from Node gateway:**
-The Node gateway allowed plugins to register arbitrary paths (e.g., `/my-webhook`).
-The Rust gateway enforces namespacing for security isolation. All plugin routes
-are prefixed with `/plugins/{pluginId}/`. Existing webhook integrations must
-update their URLs accordingly.
-
 ### Canvas Host / A2UI Endpoints
 - `/a2ui/*` - Artifact-to-UI canvas host
 - Static asset serving for canvas artifacts
@@ -324,7 +591,7 @@ update their URLs accordingly.
 - Tool use and function calling
 
 These endpoints require additional documentation of:
-- Authentication requirements (which use gateway auth vs hooks token vs none)
+- Authentication requirements (which use service auth vs hooks token vs none)
 - Request/response schemas
 - Error handling behavior
 

@@ -168,7 +168,7 @@ async fn run_discord_session(
                                 info!("Discord gateway READY");
                             } else if t == "MESSAGE_CREATE" {
                                 if let Some(ref d) = payload.d {
-                                    handle_message_create(&state, d, bot_user_id.as_deref());
+                                    handle_message_create(&state, d, bot_user_id.as_deref()).await;
                                 }
                             }
                         }
@@ -269,7 +269,11 @@ async fn send_json(write: &Arc<Mutex<WsWrite>>, payload: &Value) -> Result<(), S
         .map_err(|e| e.to_string())
 }
 
-fn handle_message_create(state: &Arc<WsServerState>, data: &Value, bot_user_id: Option<&str>) {
+async fn handle_message_create(
+    state: &Arc<WsServerState>,
+    data: &Value,
+    bot_user_id: Option<&str>,
+) {
     let author = match data.get("author") {
         Some(a) => a,
         None => return,
@@ -305,7 +309,9 @@ fn handle_message_create(state: &Arc<WsServerState>, data: &Value, bot_user_id: 
         channel_id,
         content,
         Some(channel_id.to_string()),
-    ) {
+    )
+    .await
+    {
         error!("Discord inbound dispatch failed: {}", err);
     }
 }

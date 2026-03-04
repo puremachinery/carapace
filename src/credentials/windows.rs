@@ -153,14 +153,11 @@ impl CredentialBackend for WindowsCredentialBackend {
         // Windows Credential Manager is always available when user is logged in
         // Try a test operation to verify
         let test_key = CredentialKey::new("_health", "_check", "_test");
-        let entry = match self.get_entry(&test_key) {
-            Ok(e) => e,
-            Err(_) => {
-                self.available.store(false, Ordering::Release);
-                self.checked.store(true, Ordering::Release);
-                return false;
-            }
-        };
+        if self.get_entry(&test_key).is_err() {
+            self.available.store(false, Ordering::Release);
+            self.checked.store(true, Ordering::Release);
+            return false;
+        }
 
         let account_key = test_key.to_account_key();
         let outcome = tokio::task::spawn_blocking(move || {

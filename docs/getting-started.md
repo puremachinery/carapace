@@ -1,64 +1,79 @@
 # Getting Started
 
+Carapace is a security-focused personal AI assistant that runs locally and
+connects through Signal, Telegram, Discord, Slack, webhooks, or console.
+
 This guide covers first‑run setup, security basics, and day‑to‑day operations.
 It’s intentionally practical: copy/paste steps, then customize.
 
+If you prefer outcome-first walkthroughs (for example "add Discord"), see
+the [Cookbook](cookbook/README.md).
+If you want the website flow instead of Markdown docs, start at
+<https://getcara.io>:
+- <https://getcara.io/install.html>
+- <https://getcara.io/first-run.html>
+- <https://getcara.io/security.html>
+- <https://getcara.io/ops.html>
+- <https://getcara.io/get-unstuck.html>
+
 ## Prerequisites
 
-- A `cara` binary on your PATH (from GitHub Releases)
-- A supported LLM provider API key (OpenAI/Anthropic/etc), or Ollama
-- Optional: TLS certs if exposing the gateway publicly
+- A `cara` binary on your PATH
+- A supported LLM provider API key (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
+  `GOOGLE_API_KEY`, or `VENICE_API_KEY`), or local Ollama
+- Optional: TLS certs if exposing Carapace publicly
 
-If you want to build from source, see [CONTRIBUTING.md](../CONTRIBUTING.md).
+Install options:
+- Prebuilt binaries + signature/checksum verification:
+  [docs/site/install.md](site/install.md)
+- Source build: [CONTRIBUTING.md](../CONTRIBUTING.md)
 
-## Quick Start (Local, Token Auth)
+## Quick Start (Recommended: setup wizard)
 
-1) Generate a gateway token:
-
-```bash
-export CARAPACE_GATEWAY_TOKEN="$(openssl rand -hex 32)"
-```
-
-2) Create a minimal config (save as `carapace.json5`):
-
-```json5
-{
-  "gateway": {
-    "auth": { "mode": "token", "token": "${CARAPACE_GATEWAY_TOKEN}" }
-  },
-  "openai": {
-    "apiKey": "${OPENAI_API_KEY}"
-  }
-}
-```
-
-3) Run the gateway:
+Run the interactive setup:
 
 ```bash
-CARAPACE_CONFIG_PATH=./carapace.json5 cara
+cara setup
 ```
 
-4) Verify:
+Then start Carapace:
 
 ```bash
-cara status --host 127.0.0.1 --port 18789
+cara
 ```
 
-Or:
+In another terminal:
 
 ```bash
-curl -H "Authorization: Bearer ${CARAPACE_GATEWAY_TOKEN}" http://localhost:18789/health
+cara verify --outcome auto --port 18789
+cara verify --outcome autonomy --port 18789
+cara status --port 18789
+cara chat --port 18789
 ```
 
-Expected response:
+The setup wizard asks for:
+- which model provider you want to use,
+- how locked down you want access to be,
+- whether to keep the service local-only or reachable on your network,
+- your first desired outcome (`local-chat`, `discord`, `telegram`, or `hooks`).
 
-```json
-{ "status": "ok", "version": "x.y.z", "uptimeSeconds": 12 }
-```
+If you picked a custom port in setup, use that instead of `18789`.
+If your selected outcome is `discord` or `telegram`, `cara verify` may also
+need destination flags (`--discord-to` / `--telegram-to`).
+`cara verify --outcome autonomy` submits a real durable task and verifies it
+starts and reaches `done`/`blocked`.
 
-If you set `gateway.port`, use that port instead of `18789`.
+Helpful REPL commands:
+- `/help` — show available commands
+- `/new` — start a fresh chat session
+- `/exit` or `/quit` — leave chat
+
+For full first-run flow, use [site/first-run.md](site/first-run.md).
+Manual configuration is documented in `config.example.json5`.
 
 ## Configuration Basics
+
+If you just want a working first run, you can skip this section and come back later.
 
 Config is JSON5 and can live in:
 - `${CARAPACE_CONFIG_PATH}` (highest priority)
@@ -72,16 +87,17 @@ See `config.example.json5` and `docs/protocol/config.md` for all keys.
 ### Secrets at Rest
 
 If `CARAPACE_CONFIG_PASSWORD` is set, secrets at known paths are encrypted
-at rest (AES‑256‑GCM). If the password is missing or wrong, encrypted values
-are scrubbed on load.
+at rest (AES‑256‑GCM). If the password is missing or wrong at startup,
+encrypted values are replaced with empty strings in the loaded config (the
+on-disk file is not modified).
 
 ## Security Baseline
 
 Minimum recommendations:
 
-- Use gateway auth (`gateway.auth.mode = token` or `password`).
-- Use TLS if the gateway is reachable outside localhost.
 - Do **not** expose hooks (`/hooks/*`) without a hooks token.
+- Use service auth (`gateway.auth.mode = token` or `password`).
+- Use TLS if Carapace is reachable outside localhost.
 - Rotate tokens if the state directory is exposed.
 
 ### Auth Modes
@@ -95,21 +111,29 @@ Minimum recommendations:
 }
 ```
 
-`mode = none` is **local‑direct only** (loopback); remote requests are denied.
+`mode = none` is **localhost only**; remote requests are denied.
 
-## Running Behind a Reverse Proxy
+## Control UI
 
-If you terminate TLS in a reverse proxy:
+Enable the Control UI:
 
-1) Keep the gateway on localhost or a private network.
-2) Forward `/` to the gateway.
-3) Preserve request headers.
-4) Set `gateway.trustedProxies` to your proxy IPs so local‑direct detection
-   works correctly.
+```json5
+{
+  "gateway": {
+    "controlUi": { "enabled": true }
+  }
+}
+```
+
+Then visit `/ui` on the Carapace host.
+You can override the base path via `gateway.controlUi.basePath`.
+If you are modifying the frontend assets, rebuild with `./scripts/build-control-ui.sh`.
 
 ## Hooks (Web API)
 
-Hooks are separate from gateway auth and require a hooks token.
+Hooks let external systems send messages through Carapace — useful for CI/CD
+notifications, monitoring alerts, or custom integrations. They are separate
+from service auth and require their own token.
 
 ```json5
 {
@@ -124,54 +148,38 @@ Hooks are separate from gateway auth and require a hooks token.
 
 See `docs/protocol/http.md` for request/response shapes.
 
-## Control UI
+## Running Behind a Reverse Proxy
 
-Enable the Control UI:
+If you terminate TLS in a reverse proxy:
 
-```json5
-{
-  "gateway": {
-    "controlUi": { "enabled": true }
-  }
-}
-```
-
-Then visit `/ui` on the gateway host.
-You can override the base path via `gateway.controlUi.basePath`.
+1) Keep Carapace on localhost or a private network.
+2) Forward `/` to Carapace.
+3) Preserve request headers.
+4) Set `gateway.trustedProxies` to your proxy IPs so local‑direct detection
+   works correctly.
 
 ## Operations
+Use the dedicated ops guide for day-2 workflows:
+- [site/ops.md](site/ops.md)
+- [site/get-unstuck.md](site/get-unstuck.md)
 
-### Health Checks
-
-- `GET /health` – liveness
-- `GET /health/ready` – readiness (storage + provider reachability)
-
-### Logs
-
-Use the CLI:
+Most common commands:
 
 ```bash
-cara logs --follow
-```
-
-### Backups
-
-```bash
-cara backup --out ./carapace-backup.tar.gz
-cara restore --path ./carapace-backup.tar.gz
-```
-
-### Update
-
-```bash
+cara status --port 18789
+cara logs -n 200
+cara backup --output ./carapace-backup.tar.gz
 cara update
 ```
 
+`cara logs` prints the last N log lines; it does not stream continuously.
+
 ## Troubleshooting
 
-- **401 Unauthorized**: check gateway token or hooks token.
+- **401 Unauthorized**: check auth token or hooks token.
 - **403 Forbidden**: CSRF or Origin failure for Control UI endpoints.
 - **LLM requests fail**: verify provider key and model name.
 - **No replies**: ensure an LLM provider is configured; check `/health/ready`.
 
 If unsure, start with `RUST_LOG=debug` and inspect logs.
+For a structured checklist, use [site/get-unstuck.md](site/get-unstuck.md).

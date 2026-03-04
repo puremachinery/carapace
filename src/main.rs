@@ -8,6 +8,7 @@ mod cli;
 mod config;
 mod credentials;
 mod cron;
+mod crypto;
 mod devices;
 mod discovery;
 mod exec;
@@ -18,10 +19,13 @@ mod media;
 mod messages;
 mod nodes;
 mod plugins;
+mod runtime_bridge;
 mod server;
 mod sessions;
 mod tailscale;
+mod tasks;
 mod tls;
+mod update;
 mod usage;
 
 use std::net::SocketAddr;
@@ -31,6 +35,7 @@ use std::time::Duration;
 use axum::routing::get;
 use axum::Router;
 use clap::Parser;
+use serde::Deserialize;
 use serde_json::Value;
 use tracing::{error, info, warn};
 
@@ -93,6 +98,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cli::handle_update(check, version.as_deref()).await
         }
 
+        Some(Command::Task(sub)) => {
+            init_logging_from_env()?;
+            cli::handle_task(sub).await
+        }
+
+        Some(Command::Chat { new, port }) => {
+            init_logging_from_env()?;
+            cli::chat::handle_chat(new, port).await
+        }
+
+        Some(Command::Verify {
+            outcome,
+            port,
+            discord_to,
+            telegram_to,
+        }) => cli::handle_verify(outcome, port, discord_to, telegram_to).await,
+
         Some(Command::Tls(sub)) => {
             match sub {
                 TlsCommand::InitCa { output } => {
@@ -136,12 +158,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     init_logging_from_env()?;
     let cfg = load_and_validate_config()?;
 
-    let state_dir = server::ws::resolve_state_dir();
-    std::fs::create_dir_all(&state_dir)?;
-    std::fs::create_dir_all(state_dir.join("sessions"))?;
-    std::fs::create_dir_all(state_dir.join("cron"))?;
-    logging::audit::AuditLog::init(state_dir.clone()).await;
-    init_media_store_cleanup().await;
+    let state_dir = server::startup::prepare_runtime_environment().await?;
     let gateway_registry = Arc::new(gateway::GatewayRegistry::new(state_dir.clone()));
     if let Err(e) = gateway_registry.load() {
         warn!(error = %e, "failed to load gateway registry");
@@ -153,10 +170,12 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let tools_registry = Arc::new(plugins::tools::ToolsRegistry::new());
     let hook_registry = Arc::new(hooks::registry::HookRegistry::new());
 
-    let ws_state = server::ws::build_ws_state_from_config().await?;
-    let ws_state = configure_ws_with_llm(ws_state, &cfg)?;
-    let ws_state =
-        configure_ws_with_registries(ws_state, tools_registry.clone(), plugin_registry.clone())?;
+    let ws_state = server::startup::build_ws_state_with_runtime_dependencies(
+        &cfg,
+        tools_registry.clone(),
+        plugin_registry.clone(),
+    )
+    .await?;
     let ws_state = register_console_channel(ws_state)?;
     let ws_state = register_signal_channel_if_configured(ws_state, &cfg)?;
     let ws_state = register_telegram_channel_if_configured(ws_state, &cfg)?;
@@ -173,6 +192,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     spawn_network_services(&cfg, &tls_setup, resolved.address.port(), &shutdown_rx);
     spawn_signal_receive_loop_if_configured(&cfg, &ws_state, &shutdown_rx);
+    spawn_telegram_receive_loop_if_configured(&cfg, &ws_state, &shutdown_rx);
     spawn_discord_gateway_loop_if_configured(&cfg, &ws_state, &shutdown_rx);
     spawn_gateway_lifecycle(gateway_registry.clone(), gateway_config, &shutdown_rx);
 
@@ -207,15 +227,18 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Initialize logging based on the CARAPACE_DEV environment variable.
 fn init_logging_from_env() -> Result<(), Box<dyn std::error::Error>> {
-    let log_config = if std::env::var("CARAPACE_DEV")
+    let dev_mode = std::env::var("CARAPACE_DEV")
         .map(|v| !v.is_empty() && v != "0" && v.to_lowercase() != "false")
-        .unwrap_or(false)
-    {
+        .unwrap_or(false);
+    let log_config = if dev_mode {
         logging::LogConfig::development()
     } else {
         logging::LogConfig::production()
     };
     logging::init_logging(log_config)?;
+    if dev_mode {
+        warn!("CARAPACE_DEV is enabled; using development logging");
+    }
     Ok(())
 }
 
@@ -236,40 +259,6 @@ fn resolve_bind_config(
 
     let bind_mode = server::bind::parse_bind_mode(bind_str);
     Ok(server::bind::resolve_bind_with_metadata(&bind_mode, port)?)
-}
-
-/// Configure LLM providers on the WsServerState via the provider factory.
-fn configure_ws_with_llm(
-    ws_state: Arc<server::ws::WsServerState>,
-    cfg: &Value,
-) -> Result<Arc<server::ws::WsServerState>, Box<dyn std::error::Error>> {
-    match agent::factory::build_providers(cfg)? {
-        Some(multi_provider) => {
-            let inner = Arc::try_unwrap(ws_state)
-                .map_err(|_| "WsServerState Arc should have single owner at startup")?;
-            Ok(Arc::new(inner.with_llm_provider(Arc::new(multi_provider))))
-        }
-        None => {
-            info!("No LLM provider configured (set ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_API_KEY, and/or configure Ollama to enable)");
-            Ok(ws_state)
-        }
-    }
-}
-
-/// Attach shared registries (tools + plugins) to the WsServerState.
-fn configure_ws_with_registries(
-    ws_state: Arc<server::ws::WsServerState>,
-    tools_registry: Arc<plugins::tools::ToolsRegistry>,
-    plugin_registry: Arc<plugins::PluginRegistry>,
-) -> Result<Arc<server::ws::WsServerState>, Box<dyn std::error::Error>> {
-    tools_registry.set_plugin_registry(plugin_registry.clone());
-    let inner = Arc::try_unwrap(ws_state)
-        .map_err(|_| "WsServerState Arc should have single owner at startup")?;
-    Ok(Arc::new(
-        inner
-            .with_tools_registry(tools_registry)
-            .with_plugin_registry(plugin_registry),
-    ))
 }
 
 /// Register the built-in console channel (for testing/demo) on the WsServerState.
@@ -380,7 +369,7 @@ fn resolve_telegram_config(cfg: &Value) -> Option<TelegramConfig> {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .or_else(|| std::env::var("TELEGRAM_BASE_URL").ok())
-        .unwrap_or_else(|| "https://api.telegram.org".to_string());
+        .unwrap_or_else(|| channels::telegram::TELEGRAM_DEFAULT_API_BASE_URL.to_string());
 
     Some(TelegramConfig {
         base_url,
@@ -413,7 +402,7 @@ fn resolve_discord_config(cfg: &Value) -> Option<DiscordConfig> {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .or_else(|| std::env::var("DISCORD_BASE_URL").ok())
-        .unwrap_or_else(|| "https://discord.com/api/v10".to_string());
+        .unwrap_or_else(|| channels::discord::DISCORD_DEFAULT_API_BASE_URL.to_string());
 
     let gateway_url = discord_cfg
         .and_then(|s| s.get("gatewayUrl"))
@@ -642,6 +631,103 @@ fn spawn_signal_receive_loop_if_configured(
     ));
 }
 
+const TELEGRAM_DELETE_WEBHOOK_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Deserialize)]
+struct TelegramDeleteWebhookResponse {
+    ok: bool,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+fn build_telegram_delete_webhook_url(base_url: &str, bot_token: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    format!("{base}/bot{bot_token}/deleteWebhook?drop_pending_updates=false")
+}
+
+async fn clear_telegram_webhook_before_polling(base_url: &str, bot_token: &str) {
+    let delete_url = build_telegram_delete_webhook_url(base_url, bot_token);
+    let client = match reqwest::Client::builder()
+        .timeout(TELEGRAM_DELETE_WEBHOOK_TIMEOUT)
+        .build()
+    {
+        Ok(client) => client,
+        Err(err) => {
+            warn!(
+                error = %err,
+                "Failed to build Telegram deleteWebhook client; polling may not receive updates if a webhook is still registered"
+            );
+            return;
+        }
+    };
+
+    match client.post(&delete_url).send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            match resp.json::<TelegramDeleteWebhookResponse>().await {
+                Ok(payload) if status.is_success() && payload.ok => {
+                    info!("Telegram deleteWebhook succeeded before enabling polling");
+                }
+                Ok(payload) => {
+                    let description = payload
+                        .description
+                        .unwrap_or_else(|| "unknown Telegram API error".to_string());
+                    warn!(
+                        status = %status,
+                        error = %description,
+                        "Telegram deleteWebhook failed; polling may not receive updates if a webhook is still registered"
+                    );
+                }
+                Err(err) => {
+                    warn!(
+                        status = %status,
+                        error = %err,
+                        "Failed to parse Telegram deleteWebhook response; polling may not receive updates if a webhook is still registered"
+                    );
+                }
+            }
+        }
+        Err(err) => {
+            warn!(
+                error = %err,
+                "Telegram deleteWebhook request failed; polling may not receive updates if a webhook is still registered"
+            );
+        }
+    }
+}
+
+/// Spawn the Telegram long-polling receive loop when webhook auth is not configured.
+fn spawn_telegram_receive_loop_if_configured(
+    cfg: &Value,
+    ws_state: &Arc<server::ws::WsServerState>,
+    shutdown_rx: &tokio::sync::watch::Receiver<bool>,
+) {
+    let tc = match resolve_telegram_config(cfg) {
+        Some(c) => c,
+        None => return,
+    };
+
+    if channels::telegram_inbound::resolve_webhook_secret(cfg).is_some() {
+        info!("Telegram webhook secret configured; inbound webhook mode enabled");
+        return;
+    }
+
+    info!("Telegram webhook secret not configured; enabling long-polling fallback");
+    let ws_state = ws_state.clone();
+    let shutdown_rx = shutdown_rx.clone();
+    tokio::spawn(async move {
+        clear_telegram_webhook_before_polling(&tc.base_url, &tc.bot_token).await;
+        channels::telegram_receive::telegram_receive_loop(
+            tc.base_url,
+            tc.bot_token,
+            ws_state.clone(),
+            ws_state.channel_registry().clone(),
+            shutdown_rx,
+        )
+        .await;
+    });
+}
+
 /// Spawn the Discord gateway loop if configured.
 fn spawn_discord_gateway_loop_if_configured(
     cfg: &Value,
@@ -682,19 +768,6 @@ fn spawn_gateway_lifecycle(
             warn!(error = %e, "remote gateway lifecycle exited with error");
         }
     });
-}
-
-async fn init_media_store_cleanup() {
-    let store = match media::MediaStore::new(media::StoreConfig::default()).await {
-        Ok(store) => store,
-        Err(e) => {
-            warn!(error = %e, "failed to initialize media store");
-            return;
-        }
-    };
-    let store = Arc::new(store);
-    let _cleanup = store.clone().start_cleanup_task();
-    info!("media store cleanup task started");
 }
 
 /// Parse TLS configuration and set up certificates if enabled.

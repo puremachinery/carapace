@@ -258,7 +258,7 @@ pub(super) fn handle_usage_session(params: Option<&Value>) -> Result<Value, Erro
 
     match usage::get_session_usage(session_key) {
         Some(usage) => Ok(json!({
-            "sessionKey": usage.session_key,
+            "sessionKey": session_key,
             "inputTokens": usage.input_tokens,
             "outputTokens": usage.output_tokens,
             "totalTokens": usage.input_tokens + usage.output_tokens,

@@ -25,7 +25,7 @@ use uuid::Uuid;
 
 use crate::{
     agent, auth, channels, config, credentials, cron, devices, exec, messages, nodes, plugins,
-    sessions,
+    sessions, tasks,
 };
 
 #[cfg(test)]
@@ -44,9 +44,6 @@ pub use handlers::AgentRunStatus;
 
 // Re-export AgentRun for use by cron executor and tests
 pub use handlers::sessions::AgentRun;
-
-// Re-export update functions for use by CLI
-pub(crate) use handlers::{apply_staged_update, cleanup_old_binaries};
 
 // Re-export config persistence types for use by control endpoint
 pub(crate) use handlers::{
@@ -458,6 +455,8 @@ pub struct WsServerState {
     exec_manager: exec::ExecApprovalManager,
     /// Cron job scheduler
     pub cron_scheduler: cron::CronScheduler,
+    /// Durable task queue for long-running autonomy workflows.
+    pub task_queue: Arc<tasks::TaskQueue>,
     /// Agent run registry for tracking active/completed agent invocations
     pub agent_run_registry: Mutex<handlers::AgentRunRegistry>,
     /// System event history (enqueued via system-event method)
@@ -530,6 +529,7 @@ impl WsServerState {
             }),
             exec_manager: exec::ExecApprovalManager::new(),
             cron_scheduler: cron::CronScheduler::in_memory(),
+            task_queue: Arc::new(tasks::TaskQueue::in_memory()),
             agent_run_registry: Mutex::new(handlers::AgentRunRegistry::new()),
             system_event_history: Mutex::new(Vec::new()),
             llm_provider: parking_lot::RwLock::new(None),
@@ -539,7 +539,7 @@ impl WsServerState {
         }
     }
 
-    pub fn new_persistent(
+    fn new_persistent_unloaded(
         config: WsServerConfig,
         state_dir: PathBuf,
     ) -> Result<Self, WsConfigError> {
@@ -580,10 +580,12 @@ impl WsServerState {
             }),
             exec_manager: exec::ExecApprovalManager::new(),
             cron_scheduler: {
-                let scheduler =
-                    cron::CronScheduler::new(true, Some(state_dir.join("cron").join("jobs.json")));
-                scheduler.load();
-                scheduler
+                cron::CronScheduler::new(true, Some(state_dir.join("cron").join("jobs.json")))
+            },
+            task_queue: {
+                Arc::new(tasks::TaskQueue::new(Some(
+                    state_dir.join("tasks").join("queue.json"),
+                )))
             },
             agent_run_registry: Mutex::new(handlers::AgentRunRegistry::new()),
             system_event_history: Mutex::new(Vec::new()),
@@ -592,6 +594,55 @@ impl WsServerState {
             plugin_registry: None,
             connection_tracker,
         })
+    }
+
+    /// Construct persistent WS server state, including async-safe task queue
+    /// load/recovery and async-safe cron scheduler load.
+    pub async fn new_persistent(
+        config: WsServerConfig,
+        state_dir: PathBuf,
+    ) -> Result<Self, WsConfigError> {
+        let cleanup_state_dir = state_dir.clone();
+        let state = Self::new_persistent_unloaded(config, state_dir)?;
+        let state = tokio::task::spawn_blocking(move || {
+            state.cron_scheduler.load();
+            state
+        })
+        .await
+        .map_err(|err| {
+            let reason = if err.is_panic() {
+                "panicked"
+            } else if err.is_cancelled() {
+                "was cancelled"
+            } else {
+                "failed"
+            };
+            WsConfigError::Runtime(format!(
+                "cron scheduler load worker {reason} during startup: {err}"
+            ))
+        })?;
+        state
+            .task_queue
+            .load_async()
+            .await
+            .map_err(WsConfigError::Runtime)?;
+        tokio::task::spawn_blocking(move || {
+            crate::update::cleanup_old_binaries(&cleanup_state_dir)
+        })
+        .await
+        .map_err(|err| {
+            let reason = if err.is_panic() {
+                "panicked"
+            } else if err.is_cancelled() {
+                "was cancelled"
+            } else {
+                "failed"
+            };
+            WsConfigError::Runtime(format!(
+                "update cleanup worker {reason} during startup: {err}"
+            ))
+        })?;
+        Ok(state)
     }
 
     pub fn with_node_pairing(mut self, registry: Arc<nodes::NodePairingRegistry>) -> Self {
@@ -689,6 +740,11 @@ impl WsServerState {
     /// Get the outbound message pipeline.
     pub fn message_pipeline(&self) -> &Arc<messages::outbound::MessagePipeline> {
         &self.message_pipeline
+    }
+
+    /// Get the durable task queue.
+    pub fn task_queue(&self) -> &Arc<tasks::TaskQueue> {
+        &self.task_queue
     }
 
     /// Get the channel registry.
@@ -975,71 +1031,112 @@ pub enum WsConfigError {
     Nodes(#[from] nodes::NodePairingError),
     #[error(transparent)]
     Devices(#[from] devices::DevicePairingError),
+    #[error("{0}")]
+    Runtime(String),
 }
 
-pub async fn build_ws_state_from_config() -> Result<Arc<WsServerState>, WsConfigError> {
-    let cfg = config::load_config()?;
+fn resolve_session_integrity_config(cfg: &Value) -> crate::sessions::integrity::IntegrityConfig {
+    let Some(integrity_cfg) = cfg.get("sessions").and_then(|s| s.get("integrity")) else {
+        return crate::sessions::integrity::IntegrityConfig::default();
+    };
+
+    match serde_json::from_value::<crate::sessions::integrity::IntegrityConfig>(
+        integrity_cfg.clone(),
+    ) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "invalid sessions.integrity config; using secure defaults"
+            );
+            crate::sessions::integrity::IntegrityConfig::default()
+        }
+    }
+}
+
+fn resolve_session_integrity_secret(
+    auth: &auth::ResolvedGatewayAuth,
+    env_server_secret: Option<String>,
+) -> Option<(String, &'static str)> {
+    if let Some(secret) = env_server_secret.filter(|value| !value.is_empty()) {
+        return Some((secret, "CARAPACE_SERVER_SECRET"));
+    }
+    if let Some(secret) = auth
+        .token
+        .as_ref()
+        .filter(|value| !value.is_empty())
+        .cloned()
+    {
+        return Some((secret, "gateway token"));
+    }
+    if let Some(secret) = auth
+        .password
+        .as_ref()
+        .filter(|value| !value.is_empty())
+        .cloned()
+    {
+        return Some((secret, "gateway password"));
+    }
+    None
+}
+
+pub async fn build_ws_state_owned_from_value(cfg: &Value) -> Result<WsServerState, WsConfigError> {
     let state_dir = resolve_state_dir();
     if let Err(err) = credentials::migrate_plaintext_credentials(state_dir.clone()).await {
         tracing::warn!(error = %err, "Credential migration failed");
     }
-    let config = build_ws_config_from_files().await?;
-    let mut state = WsServerState::new_persistent(config, state_dir)?;
+    let config = build_ws_config_from_value(cfg).await?;
+    let mut state = WsServerState::new_persistent(config, state_dir).await?;
 
-    // Wire session integrity HMAC key from config
-    let sessions_cfg = cfg.get("sessions").and_then(|s| s.get("integrity"));
-    let integrity_enabled = sessions_cfg
-        .and_then(|i| i.get("enabled"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    // Wire session integrity HMAC key from resolved auth/server secret.
+    let integrity_config = resolve_session_integrity_config(cfg);
+    if integrity_config.enabled {
+        let integrity_secret = resolve_session_integrity_secret(
+            &state.config.auth.resolved,
+            std::env::var("CARAPACE_SERVER_SECRET").ok(),
+        );
 
-    if integrity_enabled {
-        // Derive HMAC key from the gateway auth token (server secret)
-        let server_secret = std::env::var("CARAPACE_GATEWAY_TOKEN")
-            .or_else(|_| std::env::var("CARAPACE_SERVER_SECRET"))
-            .unwrap_or_default();
-
-        if !server_secret.is_empty() {
+        if let Some((server_secret, source)) = integrity_secret {
             let hmac_key = crate::sessions::integrity::derive_hmac_key(server_secret.as_bytes());
-
-            let integrity_action = sessions_cfg
-                .and_then(|i| i.get("action"))
-                .and_then(|v| v.as_str())
-                .map(|s| match s {
-                    "reject" => crate::sessions::integrity::IntegrityAction::Reject,
-                    _ => crate::sessions::integrity::IntegrityAction::Warn,
-                })
-                .unwrap_or(crate::sessions::integrity::IntegrityAction::Warn);
 
             let session_store = sessions::SessionStore::with_base_path(
                 state.session_store.base_path().to_path_buf(),
             )
             .with_hmac_key(hmac_key)
-            .with_integrity_action(integrity_action);
+            .with_integrity_action(integrity_config.action);
             state.session_store = Arc::new(session_store);
 
             tracing::info!(
-                action = ?integrity_action,
+                action = ?integrity_config.action,
+                source = source,
                 "session integrity verification enabled"
             );
         } else {
             tracing::warn!(
                 "sessions.integrity.enabled is true but no server secret found \
-                 (set CARAPACE_GATEWAY_TOKEN or CARAPACE_SERVER_SECRET)"
+                 (set gateway.auth.token/password or CARAPACE_SERVER_SECRET); \
+                 sessions will run without integrity verification"
             );
         }
     }
 
-    let state = Arc::new(state);
     Ok(state)
 }
 
-pub async fn build_ws_config_from_files() -> Result<WsServerConfig, WsConfigError> {
+pub async fn build_ws_state_owned_from_config() -> Result<WsServerState, WsConfigError> {
     let cfg = config::load_config()?;
+    build_ws_state_owned_from_value(&cfg).await
+}
+
+pub async fn build_ws_state_from_config() -> Result<Arc<WsServerState>, WsConfigError> {
+    Ok(Arc::new(build_ws_state_owned_from_config().await?))
+}
+
+pub async fn build_ws_config_from_value(cfg: &Value) -> Result<WsServerConfig, WsConfigError> {
     let gateway = cfg.get("gateway").and_then(|v| v.as_object());
 
-    let resolved_auth = resolve_gateway_auth_config(gateway, &cfg).await?;
-    let options = parse_ws_server_options(gateway, &cfg);
+    let resolved_auth = resolve_gateway_auth_config(gateway, cfg).await?;
+    let options = parse_ws_server_options(gateway, cfg);
 
     Ok(WsServerConfig {
         auth: WsAuthConfig {
@@ -1058,6 +1155,11 @@ pub async fn build_ws_config_from_files() -> Result<WsServerConfig, WsConfigErro
         ws_message_rate: options.ws_message_rate,
         ws_message_burst: options.ws_message_burst,
     })
+}
+
+pub async fn build_ws_config_from_files() -> Result<WsServerConfig, WsConfigError> {
+    let cfg = config::load_config()?;
+    build_ws_config_from_value(&cfg).await
 }
 
 /// Resolve gateway auth configuration from config objects, environment variables,
@@ -1665,65 +1767,99 @@ async fn handle_socket(
         }
     });
 
+    let handshake =
+        match perform_socket_handshake(&mut receiver, &tx, &state, remote_addr, &headers).await {
+            Ok(handshake) => handshake,
+            Err(()) => {
+                drop(tx);
+                let _ = send_task.await;
+                return;
+            }
+        };
+    let HandshakeContext {
+        conn_id,
+        role,
+        scopes,
+        connect_params,
+        device_id,
+        remote_ip_for_presence,
+        json_depth_limit,
+    } = handshake;
+    let conn = ConnectionContext {
+        conn_id,
+        role,
+        scopes,
+        client: connect_params.client,
+        device_id,
+    };
+    run_connection_lifecycle(
+        &mut receiver,
+        &tx,
+        &state,
+        conn,
+        remote_ip_for_presence,
+        json_depth_limit,
+    )
+    .await;
+
+    drop(tx);
+    let _ = send_task.await;
+}
+
+struct HandshakeContext {
+    conn_id: String,
+    role: String,
+    scopes: Vec<String>,
+    connect_params: ConnectParams,
+    device_id: Option<String>,
+    remote_ip_for_presence: Option<String>,
+    json_depth_limit: usize,
+}
+
+async fn perform_socket_handshake(
+    receiver: &mut futures_util::stream::SplitStream<WebSocket>,
+    tx: &mpsc::UnboundedSender<Message>,
+    state: &Arc<WsServerState>,
+    remote_addr: SocketAddr,
+    headers: &HeaderMap,
+) -> Result<HandshakeContext, ()> {
     let nonce = Uuid::new_v4().to_string();
-    send_challenge(&tx, &nonce);
+    send_challenge(tx, &nonce);
 
     let json_depth_limit = state.config.max_json_depth.unwrap_or(MAX_JSON_DEPTH);
-
     let (req_id, mut connect_params) =
-        match receive_initial_handshake(&mut receiver, &tx, json_depth_limit).await {
-            Ok(result) => result,
-            Err(()) => return,
-        };
+        receive_initial_handshake(receiver, tx, json_depth_limit).await?;
 
     let is_local =
-        auth::is_local_direct_request(remote_addr, &headers, &state.config.trusted_proxies);
-
-    let (role, scopes) = match validate_connect_params(&tx, &req_id, &mut connect_params, is_local)
-    {
-        Ok(result) => result,
-        Err(()) => return,
-    };
-
-    let device_id = match authenticate_connection(
-        &state,
-        &tx,
+        auth::is_local_direct_request(remote_addr, headers, &state.config.trusted_proxies);
+    let (role, scopes) = validate_connect_params(tx, &req_id, &mut connect_params, is_local)?;
+    let device_id = authenticate_connection(
+        state,
+        tx,
         &req_id,
         &connect_params,
-        &headers,
+        headers,
         remote_addr,
         &nonce,
         is_local,
         &role,
         &scopes,
-    ) {
-        Ok(id) => id,
-        Err(()) => return,
-    };
+    )?;
 
     let conn_id = Uuid::new_v4().to_string();
-    let issued_token = match device_id.as_ref() {
-        Some(id) => match ensure_device_token(&state, id, &role, &scopes) {
-            Ok(token) => Some(token),
-            Err(err) => {
-                warn!("failed to issue device token for {}: {}", id, err);
-                let err_resp = error_shape(
-                    ERROR_INVALID_REQUEST,
-                    &format!("device token issuance failed: {}", err),
-                    None,
-                );
-                let _ = send_response(&tx, &req_id, false, None, Some(err_resp));
-                let _ = send_close(&tx, 1008, "device token issuance failed");
-                return;
-            }
-        },
-        None => None,
-    };
+    let issued_token = issue_device_token_for_connection(
+        state,
+        tx,
+        &req_id,
+        device_id.as_deref(),
+        &role,
+        &scopes,
+    )?;
 
     if role == "node" {
-        finalize_node_commands(&state, &mut connect_params);
+        finalize_node_commands(state, &mut connect_params);
         register_node_session(
-            &state,
+            state,
             &connect_params,
             &conn_id,
             device_id.clone(),
@@ -1737,28 +1873,64 @@ async fn handle_socket(
     } else {
         Some(remote_addr.ip().to_string())
     };
+    let hello = build_hello_response(state, &conn_id, issued_token);
+    let _ = send_response(tx, &req_id, true, Some(json!(hello)), None);
 
-    let hello = build_hello_response(&state, &conn_id, issued_token);
-    let _ = send_response(&tx, &req_id, true, Some(json!(hello)), None);
-
-    let conn = ConnectionContext {
-        conn_id: conn_id.clone(),
+    Ok(HandshakeContext {
+        conn_id,
         role,
         scopes,
-        client: connect_params.client.clone(),
+        connect_params,
         device_id,
-    };
+        remote_ip_for_presence,
+        json_depth_limit,
+    })
+}
 
+fn issue_device_token_for_connection(
+    state: &Arc<WsServerState>,
+    tx: &mpsc::UnboundedSender<Message>,
+    req_id: &str,
+    device_id: Option<&str>,
+    role: &str,
+    scopes: &[String],
+) -> Result<Option<devices::IssuedDeviceToken>, ()> {
+    match device_id {
+        Some(id) => match ensure_device_token(state, id, role, scopes) {
+            Ok(token) => Ok(Some(token)),
+            Err(err) => {
+                warn!("failed to issue device token for {}: {}", id, err);
+                let err_resp = error_shape(
+                    ERROR_INVALID_REQUEST,
+                    &format!("device token issuance failed: {}", err),
+                    None,
+                );
+                let _ = send_response(tx, req_id, false, None, Some(err_resp));
+                let _ = send_close(tx, 1008, "device token issuance failed");
+                Err(())
+            }
+        },
+        None => Ok(None),
+    }
+}
+
+async fn run_connection_lifecycle(
+    receiver: &mut futures_util::stream::SplitStream<WebSocket>,
+    tx: &mpsc::UnboundedSender<Message>,
+    state: &Arc<WsServerState>,
+    conn: ConnectionContext,
+    remote_ip_for_presence: Option<String>,
+    json_depth_limit: usize,
+) {
     state.register_connection(&conn, tx.clone(), remote_ip_for_presence);
 
     let tick_task = spawn_tick_task(tx.clone(), state.clone());
-    let mut ws_rate_limiter = create_ws_rate_limiter(&state);
+    let mut ws_rate_limiter = create_ws_rate_limiter(state);
     let mut ws_rate_warn_count: u32 = 0;
-
     run_message_loop(
-        &mut receiver,
-        &tx,
-        &state,
+        receiver,
+        tx,
+        state,
         &conn,
         json_depth_limit,
         &mut ws_rate_limiter,
@@ -1767,9 +1939,6 @@ async fn handle_socket(
     .await;
 
     tick_task.abort();
-    drop(tx);
-    let _ = send_task.await;
-
     state.unregister_connection(&conn.conn_id);
     state.node_registry.lock().unregister(&conn.conn_id);
 }

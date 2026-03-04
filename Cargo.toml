@@ -13,19 +13,19 @@ axum = { version = "0.8", features = ["ws"] }
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 reqwest = { version = "0.13", features = ["rustls", "stream", "json", "blocking", "multipart", "form"], default-features = false }
-hickory-resolver = "0.24"
+hickory-resolver = "0.25"
 url = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 json5 = "1"
 regex = "1"
-dirs = "5"
+dirs = "6"
 uuid = { version = "1", features = ["v4"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter", "time"] }
 keyring = { version = "2.3.3", default-features = false, features = ["platform-macos", "platform-windows", "linux-default-keyutils"] }
-wasmtime = { version = "41", features = ["component-model"] }
-thiserror = "1"
+wasmtime = { version = "42", features = ["component-model"] }
+thiserror = "2"
 parking_lot = "0.12"
 base64 = "0.22"
 ed25519-dalek = { version = "2", features = ["std", "zeroize"] }
@@ -40,14 +40,14 @@ sha2 = "0.10"
 hkdf = "0.12"
 hmac = "0.12"
 pbkdf2 = "0.12"
-mdns-sd = "0.17"
+mdns-sd = "0.18"
 rcgen = "0.14"
 x509-parser = "0.18"
 tokio-rustls = "0.26"
 rustls = "0.23"
 rustls-pki-types = "1"
 axum-server = { version = "0.8", features = ["tls-rustls"] }
-notify = { version = "6", default-features = false, features = ["macos_fsevent"] }
+notify = { version = "8.2.0", default-features = false, features = ["macos_fsevent"] }
 flate2 = "1"
 tar = "0.4"
 aes-gcm = "0.10"
@@ -56,6 +56,14 @@ libc = "0.2"
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 urlencoding = "2"
 crc32fast = "1"
+rpassword = "7"
+sigstore = { version = "0.13", default-features = false, features = ["bundle", "verify", "sigstore-trust-root", "rustls-tls"] }
+
+[target.'cfg(windows)'.dependencies]
+win32job = "2.0.3"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Threading"] }
+rappct = "0.13.3"
+self-replace = "1.5"
 
 [dev-dependencies]
 insta = { version = "1", features = ["json"] }
@@ -68,6 +76,7 @@ gateway = []
 auth-profiles = []
 keychain-tests = []
 secret-service-tests = []
+credential-manager-tests = []
 
 [lib]
 name = "carapace"

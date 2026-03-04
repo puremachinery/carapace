@@ -111,7 +111,7 @@ pub async fn signal_receive_loop(
                 match resp.json::<Vec<SignalEnvelope>>().await {
                     Ok(envelopes) => {
                         for envelope in envelopes {
-                            process_envelope(&envelope, &state);
+                            process_envelope(&envelope, &state).await;
                         }
                     }
                     Err(e) => {
@@ -154,7 +154,7 @@ pub async fn signal_receive_loop(
 }
 
 /// Process a single inbound Signal envelope by routing it into the chat pipeline.
-fn process_envelope(envelope: &SignalEnvelope, state: &Arc<WsServerState>) {
+async fn process_envelope(envelope: &SignalEnvelope, state: &Arc<WsServerState>) {
     let data_message = match &envelope.data_message {
         Some(dm) => dm,
         None => return, // Not a data message (e.g., receipt, typing indicator)
@@ -209,9 +209,11 @@ fn process_envelope(envelope: &SignalEnvelope, state: &Arc<WsServerState>) {
     };
 
     // Append the user message
-    if let Err(e) = state
-        .session_store()
-        .append_message(crate::sessions::ChatMessage::user(session.id.clone(), text))
+    if let Err(e) = crate::sessions::append_message_blocking(
+        state.session_store().clone(),
+        crate::sessions::ChatMessage::user(session.id.clone(), text),
+    )
+    .await
     {
         error!("Failed to append Signal message: {}", e);
         return;

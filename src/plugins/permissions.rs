@@ -282,15 +282,15 @@ pub fn compute_effective_permissions(
 
     // HTTP permissions
     let (http_url_matchers, http_max_rpm, has_http) =
-        compute_http_permissions(declared.http.as_ref(), override_cfg);
+        compute_http_permissions(plugin_id, declared.http.as_ref(), override_cfg);
 
     // Credential permissions
     let (credential_key_matchers, has_credentials) =
-        compute_credential_permissions(declared.credentials.as_ref(), override_cfg);
+        compute_credential_permissions(plugin_id, declared.credentials.as_ref(), override_cfg);
 
     // Media permissions
     let (media_url_matchers, has_media) =
-        compute_media_permissions(declared.media.as_ref(), override_cfg);
+        compute_media_permissions(plugin_id, declared.media.as_ref(), override_cfg);
 
     EffectivePermissions {
         plugin_id: plugin_id.to_string(),
@@ -305,6 +305,7 @@ pub fn compute_effective_permissions(
 }
 
 fn compute_http_permissions(
+    plugin_id: &str,
     declared: Option<&HttpPermission>,
     override_cfg: Option<&PermissionOverride>,
 ) -> (Vec<UrlMatcher>, Option<usize>, bool) {
@@ -328,15 +329,13 @@ fn compute_http_permissions(
         declared.and_then(|d| d.max_requests_per_minute)
     };
 
-    let matchers = patterns
-        .iter()
-        .filter_map(|p| UrlMatcher::new(p).ok())
-        .collect();
+    let matchers = compile_url_matchers(plugin_id, "http", &patterns);
 
     (matchers, max_rpm, has_http)
 }
 
 fn compute_credential_permissions(
+    plugin_id: &str,
     declared: Option<&CredentialPermission>,
     override_cfg: Option<&PermissionOverride>,
 ) -> (Vec<GlobMatcher>, bool) {
@@ -353,15 +352,13 @@ fn compute_credential_permissions(
     let has_credentials =
         declared.is_some() || override_cfg.is_some_and(|o| o.credential_allowed_keys.is_some());
 
-    let matchers = patterns
-        .iter()
-        .filter_map(|p| GlobMatcher::new(p).ok())
-        .collect();
+    let matchers = compile_glob_matchers(plugin_id, "credentials", &patterns);
 
     (matchers, has_credentials)
 }
 
 fn compute_media_permissions(
+    plugin_id: &str,
     declared: Option<&MediaPermission>,
     override_cfg: Option<&PermissionOverride>,
 ) -> (Vec<UrlMatcher>, bool) {
@@ -378,12 +375,47 @@ fn compute_media_permissions(
     let has_media =
         declared.is_some() || override_cfg.is_some_and(|o| o.media_allowed_urls.is_some());
 
-    let matchers = patterns
-        .iter()
-        .filter_map(|p| UrlMatcher::new(p).ok())
-        .collect();
+    let matchers = compile_url_matchers(plugin_id, "media", &patterns);
 
     (matchers, has_media)
+}
+
+fn compile_url_matchers(plugin_id: &str, scope: &str, patterns: &[String]) -> Vec<UrlMatcher> {
+    patterns
+        .iter()
+        .filter_map(|pattern| match UrlMatcher::new(pattern) {
+            Ok(matcher) => Some(matcher),
+            Err(error) => {
+                tracing::warn!(
+                    plugin_id = %plugin_id,
+                    scope = %scope,
+                    pattern = %pattern,
+                    error = %error,
+                    "invalid URL permission pattern ignored"
+                );
+                None
+            }
+        })
+        .collect()
+}
+
+fn compile_glob_matchers(plugin_id: &str, scope: &str, patterns: &[String]) -> Vec<GlobMatcher> {
+    patterns
+        .iter()
+        .filter_map(|pattern| match GlobMatcher::new(pattern) {
+            Ok(matcher) => Some(matcher),
+            Err(error) => {
+                tracing::warn!(
+                    plugin_id = %plugin_id,
+                    scope = %scope,
+                    pattern = %pattern,
+                    error = %error,
+                    "invalid glob permission pattern ignored"
+                );
+                None
+            }
+        })
+        .collect()
 }
 
 // ============== Pattern Matching ==============

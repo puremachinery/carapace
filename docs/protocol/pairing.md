@@ -1,6 +1,6 @@
 # Node and Device Pairing
 
-The Gateway manages two separate pairing subsystems for remote entities:
+Carapace manages two separate pairing subsystems for remote entities:
 
 1. **Node pairing** (`node.pair.*`) - For application-level nodes (iOS app, headless services)
 2. **Device pairing** (`device.pair.*`) - For WS connection-level device identity
@@ -37,10 +37,10 @@ Pending requests expire after **5 minutes** (configurable via `PAIRING_EXPIRY_MS
 
 ## How Pairing Works
 
-1. Entity connects to Gateway WS and sends `node.pair.request` (or `device.pair.request`)
-2. Gateway creates a **pending request** and emits `node.pair.requested` event
-3. Operator approves or rejects via CLI or UI
-4. On approval, Gateway issues a **new token** (tokens rotate on re-pair)
+1. Entity connects to the Carapace WS endpoint and sends `node.pair.request` (or `device.pair.request`)
+2. Carapace creates a **pending request** and emits `node.pair.requested` event
+3. Operator approves or rejects via CLI or control API
+4. On approval, Carapace issues a **new token** (tokens rotate on re-pair)
 5. Entity stores token and uses it for future authentication
 
 ## Protocol Methods
@@ -111,25 +111,20 @@ Tokens are sensitive credentials:
 - **Expiry**: Device tokens expire after 90 days by default
 
 ```rust
-// From src/nodes/mod.rs
+// From src/nodes/mod.rs — tokens are SHA-256 hashed before storage
 fn hash_token(token: &str) -> String {
     let digest = Sha256::digest(token.as_bytes());
     hex::encode(digest)
 }
-
-fn constant_time_eq(a: &str, b: &str) -> bool {
-    if a.len() != b.len() { return false; }
-    let mut result = 0u8;
-    for (x, y) in a.bytes().zip(b.bytes()) {
-        result |= x ^ y;
-    }
-    result == 0
-}
 ```
+
+Verification uses the canonical `timing_safe_eq` from `src/auth/mod.rs`, which
+hashes both inputs to fixed-length SHA-256 digests before XOR comparison —
+eliminating length side-channels. See [Security](../security.md) for details.
 
 ## Storage
 
-Pairing state is stored under the Gateway state directory:
+Pairing state is stored under the Carapace state directory:
 
 Examples below use the Linux config directory (`~/.config/carapace`).
 
@@ -172,4 +167,4 @@ Both modules include comprehensive test coverage. See also [Security](../securit
 | Purpose | Application-level pairing | WS connection identity |
 | Capabilities | Audio, camera, location, etc. | Roles and scopes |
 | Token expiry | 30 days | 90 days |
-| Use case | iOS/Android apps, headless nodes | CLI, macOS app, web UI |
+| Use case | iOS/Android apps, headless nodes | CLI and other paired operator clients |

@@ -8,8 +8,9 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hickory_resolver::config::{ResolverConfig, ResolverOpts};
-use hickory_resolver::TokioAsyncResolver;
+use hickory_resolver::config::ResolverConfig;
+use hickory_resolver::name_server::TokioConnectionProvider;
+use hickory_resolver::TokioResolver;
 use parking_lot::RwLock;
 use reqwest::Client;
 use serde_json::Value;
@@ -386,20 +387,20 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
     /// 4. Disables redirects to prevent redirect-based SSRF bypass
     /// 5. Streams response with size limits to prevent memory exhaustion
     pub async fn http_fetch(&self, req: HttpRequest) -> Result<HttpResponse, HostError> {
-        let method = self.validate_http_request(&req)?;
+        let (method, parsed_url) = self.validate_http_request(&req)?;
 
-        let (host, port) = parse_host_and_port(&req.url)?;
+        let (host, port) = parse_host_and_port(&parsed_url)?;
 
         let client = self.build_secure_http_client(&host, port).await?;
 
         tracing::debug!(
             plugin_id = %self.plugin_id,
             method = %method,
-            url = %req.url,
+            url = %parsed_url,
             "HTTP fetch request"
         );
 
-        let response = send_http_request(client, &method, req).await?;
+        let response = send_http_request(client, &method, &parsed_url, req).await?;
 
         // Check content-length header if present
         let content_length = response.content_length();
@@ -431,14 +432,23 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
         })
     }
 
-    /// Validate an HTTP request's URL, method, body size, rate limit, and permissions.
-    /// Returns the validated uppercase method string.
-    fn validate_http_request(&self, req: &HttpRequest) -> Result<String, HostError> {
+    /// Validate an HTTP request's URL, method, body size, rate limit, and
+    /// permissions. Returns the validated uppercase method string and parsed URL.
+    fn validate_http_request(&self, req: &HttpRequest) -> Result<(String, url::Url), HostError> {
         if req.url.len() > MAX_URL_LENGTH {
             return Err(HostError::UrlTooLong {
                 size: req.url.len(),
                 max: MAX_URL_LENGTH,
             });
+        }
+
+        let parsed_url =
+            url::Url::parse(&req.url).map_err(|_| HostError::Http("Invalid URL".to_string()))?;
+        if parsed_url.scheme() != "https" {
+            return Err(HostError::Http(format!(
+                "Only HTTPS URLs are allowed, got '{}'",
+                parsed_url.scheme()
+            )));
         }
 
         SsrfProtection::validate_url_with_config(&req.url, &self.ssrf_config)?;
@@ -465,7 +475,7 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
             return Err(HostError::Http(format!("Invalid HTTP method: {}", method)));
         }
 
-        Ok(method)
+        Ok((method, parsed_url))
     }
 
     /// Build an HTTP client with SSRF protection, DNS pinning, and no redirects.
@@ -524,8 +534,11 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
     /// returns a public IP but later returns a private IP.
     async fn resolve_and_validate_dns(&self, host: &str) -> Result<IpAddr, HostError> {
         // Create a resolver
-        let resolver =
-            TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default());
+        let resolver = TokioResolver::builder_with_config(
+            ResolverConfig::default(),
+            TokioConnectionProvider::default(),
+        )
+        .build();
 
         // Resolve the hostname
         let lookup = resolver
@@ -574,6 +587,15 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
         // Validate URL for SSRF
         SsrfProtection::validate_url_with_config(url, &self.ssrf_config)?;
 
+        let parsed_url =
+            url::Url::parse(url).map_err(|_| HostError::MediaFetch("Invalid URL".to_string()))?;
+        if parsed_url.scheme() != "https" {
+            return Err(HostError::MediaFetch(format!(
+                "Only HTTPS URLs are allowed, got '{}'",
+                parsed_url.scheme()
+            )));
+        }
+
         // Fine-grained permission check: verify the media URL is in the plugin's allowed patterns
         self.permission_enforcer
             .check_media_url(url)
@@ -582,18 +604,20 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
         // Check rate limit (media fetch counts as HTTP request)
         self.rate_limiters.check_http_request(&self.plugin_id)?;
 
-        let client = self.build_media_fetch_client(url, timeout_ms).await?;
+        let client = self
+            .build_media_fetch_client(&parsed_url, timeout_ms)
+            .await?;
 
         tracing::debug!(
             plugin_id = %self.plugin_id,
-            url = %url,
+            url = %parsed_url,
             max_bytes = ?max_bytes,
             "Media fetch request"
         );
 
         // Fetch the media
         let response = client
-            .get(url)
+            .get(parsed_url)
             .send()
             .await
             .map_err(|e| HostError::MediaFetch(format!("Request failed: {}", e)))?;
@@ -671,18 +695,15 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
     /// pinned HTTP client for the media fetch request.
     async fn build_media_fetch_client(
         &self,
-        url: &str,
+        parsed_url: &url::Url,
         timeout_ms: Option<u32>,
     ) -> Result<Client, HostError> {
-        let parsed_url = url::Url::parse(url)
-            .map_err(|e| HostError::MediaFetch(format!("Invalid URL: {}", e)))?;
-
         let host = parsed_url
             .host_str()
             .ok_or_else(|| HostError::MediaFetch("URL has no host".to_string()))?
             .to_string();
 
-        let port = parsed_url.port_or_known_default().unwrap_or(80);
+        let port = parsed_url.port_or_known_default().unwrap_or(443);
 
         let timeout = Duration::from_millis(
             timeout_ms
@@ -788,16 +809,13 @@ impl<B: CredentialBackend + 'static> PluginHostContextBuilder<B> {
 }
 
 /// Parse host and port from a URL string.
-fn parse_host_and_port(url: &str) -> Result<(String, u16), HostError> {
-    let parsed_url =
-        url::Url::parse(url).map_err(|e| HostError::Http(format!("Invalid URL: {}", e)))?;
-
+fn parse_host_and_port(parsed_url: &url::Url) -> Result<(String, u16), HostError> {
     let host = parsed_url
         .host_str()
         .ok_or_else(|| HostError::Http("URL has no host".to_string()))?
         .to_string();
 
-    let port = parsed_url.port_or_known_default().unwrap_or(80);
+    let port = parsed_url.port_or_known_default().unwrap_or(443);
 
     Ok((host, port))
 }
@@ -806,6 +824,7 @@ fn parse_host_and_port(url: &str) -> Result<(String, u16), HostError> {
 async fn send_http_request(
     client: Client,
     method: &str,
+    url: &url::Url,
     req: HttpRequest,
 ) -> Result<reqwest::Response, HostError> {
     let reqwest_method = match method {
@@ -819,7 +838,7 @@ async fn send_http_request(
         _ => unreachable!(),
     };
 
-    let mut request_builder = client.request(reqwest_method, &req.url);
+    let mut request_builder = client.request(reqwest_method, url.clone());
 
     for (name, value) in &req.headers {
         request_builder = request_builder.header(name, value);
@@ -878,7 +897,7 @@ mod tests {
         // Should block localhost
         let req = HttpRequest {
             method: "GET".to_string(),
-            url: "http://localhost/secret".to_string(),
+            url: "https://localhost/secret".to_string(),
             headers: vec![],
             body: None,
         };
@@ -919,12 +938,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_http_fetch_rejects_non_https_url() {
+        let ctx = create_test_context("test-plugin").await;
+        let req = HttpRequest {
+            method: "GET".to_string(),
+            url: "http://example.com/data".to_string(),
+            headers: vec![],
+            body: None,
+        };
+        let result = ctx.http_fetch(req).await;
+        match result {
+            Err(HostError::Http(msg)) => {
+                assert!(
+                    msg.contains("Only HTTPS URLs are allowed"),
+                    "unexpected error: {msg}"
+                );
+            }
+            other => panic!("expected HostError::Http for non-https URL, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn test_media_fetch_ssrf_blocking() {
         let ctx = create_test_context("test-plugin").await;
 
         // Should block private IP
         let result = ctx
-            .media_fetch("http://10.0.0.1/image.png", None, None)
+            .media_fetch("https://10.0.0.1/image.png", None, None)
             .await;
         assert!(result.is_err());
     }
@@ -1073,7 +1113,7 @@ mod tests {
         // Should block Tailscale IP (100.x.x.x) by default
         let req = HttpRequest {
             method: "GET".to_string(),
-            url: "http://100.100.50.25/api".to_string(),
+            url: "https://100.100.50.25/api".to_string(),
             headers: vec![],
             body: None,
         };
@@ -1095,7 +1135,7 @@ mod tests {
         // but it should NOT fail at SSRF validation stage
         let req = HttpRequest {
             method: "GET".to_string(),
-            url: "http://100.100.50.25/api".to_string(),
+            url: "https://100.100.50.25/api".to_string(),
             headers: vec![],
             body: None,
         };
@@ -1154,7 +1194,7 @@ mod tests {
         // Should allow Tailscale IP (SSRF validation passes)
         let req = HttpRequest {
             method: "GET".to_string(),
-            url: "http://100.100.50.25/api".to_string(),
+            url: "https://100.100.50.25/api".to_string(),
             headers: vec![],
             body: None,
         };

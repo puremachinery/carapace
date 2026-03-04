@@ -16,7 +16,7 @@ build-release:
 
 # Run all tests with nextest (faster, better output)
 test:
-    cargo nextest run --all-targets
+    ./scripts/run-nextest-guarded.sh --all-targets
 
 # Run all tests with standard cargo test
 test-cargo:
@@ -24,15 +24,23 @@ test-cargo:
 
 # Run library tests only
 test-lib:
-    cargo nextest run --lib
+    ./scripts/run-nextest-guarded.sh --lib
 
 # Run tests with verbose output
 test-verbose:
-    cargo nextest run --no-capture
+    ./scripts/run-nextest-guarded.sh --no-capture
 
 # Run a specific test by name
 test-one NAME:
-    cargo nextest run {{NAME}}
+    ./scripts/run-nextest-guarded.sh {{NAME}}
+
+# Run websocket golden snapshot tests.
+test-ws-golden:
+    ./scripts/run-nextest-guarded.sh --all-targets server::ws::golden_tests::golden_trace
+
+# Run the fastest websocket golden guard for update/status contract drift.
+test-ws-golden-quick:
+    ./scripts/run-nextest-guarded.sh --all-targets --test cara server::ws::golden_tests::golden_trace::golden_update_status
 
 # Run tests and show coverage summary
 test-coverage:
@@ -57,6 +65,10 @@ fmt-check:
 # Run all checks (lint + fmt + test)
 check: lint fmt-check test
 
+# Enforce sync/async runtime bridge boundaries.
+runtime-bridge-guard:
+    ./scripts/check-runtime-bridge-usage.sh
+
 # Build documentation
 doc:
     cargo doc --no-deps
@@ -77,12 +89,36 @@ watch:
 watch-lint:
     cargo watch -x clippy
 
-# Setup git hooks for pre-commit (fmt, clippy) and pre-push (tests)
+# Run the same markdown tab check used in CI docs-check.
+docs-check:
+    @echo "Checking Markdown files for hard tabs"
+    @tab="$$(printf '\t')"; \
+      if grep -RIn "$$tab" --include='*.md' --exclude-dir=.git --exclude-dir=target .; then \
+        echo "Found tab characters in Markdown files; please use spaces."; \
+        exit 1; \
+      fi
+
+# Run the same workflow lint used in CI (requires actionlint).
+workflow-lint:
+    @if command -v actionlint >/dev/null 2>&1; then \
+      actionlint -color -shellcheck=; \
+    else \
+      echo "actionlint not found. Install from https://github.com/rhysd/actionlint"; \
+      exit 1; \
+    fi
+
+# Setup git hooks for pre-commit and pre-push checks.
 setup-hooks:
-    @echo "Hooks are stored locally in .git/hooks"
+    ./scripts/setup-hooks.sh
 
-# Run pre-commit checks manually
-pre-commit: fmt-check lint
+# Run pre-commit hook checks manually.
+pre-commit:
+    ./scripts/hooks/pre-commit
 
-# Run pre-push checks manually
-pre-push: test
+# Run pre-push hook checks manually.
+pre-push:
+    ./scripts/hooks/pre-push origin </dev/null
+
+# Create a PR safely from a markdown body file (avoids shell backtick expansion).
+pr-create TITLE BODY_FILE BASE='master' HEAD='':
+    ./scripts/create-pr.sh "{{TITLE}}" "{{BODY_FILE}}" "{{BASE}}" "{{HEAD}}"

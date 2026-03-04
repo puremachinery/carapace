@@ -474,6 +474,55 @@ fn hash_key_prefix(key: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::ffi::OsString;
+    use std::sync::{LazyLock, Mutex};
+
+    // Serializes env-var touching tests in this module.
+    static ENV_VAR_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    const PROVIDER_ENV_KEYS: &[&str] = &[
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_BASE_URL",
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "OLLAMA_BASE_URL",
+        "GOOGLE_API_KEY",
+        "GOOGLE_API_BASE_URL",
+        "VENICE_API_KEY",
+        "VENICE_BASE_URL",
+        "AWS_REGION",
+        "AWS_DEFAULT_REGION",
+        "AWS_ACCESS_KEY_ID",
+    ];
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    fn unset_env_var_scoped(key: &'static str) -> EnvVarGuard {
+        let previous = std::env::var_os(key);
+        std::env::remove_var(key);
+        EnvVarGuard { key, previous }
+    }
+
+    fn with_clean_provider_env<T>(f: impl FnOnce() -> T) -> T {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let _guards: Vec<EnvVarGuard> = PROVIDER_ENV_KEYS
+            .iter()
+            .map(|key| unset_env_var_scoped(key))
+            .collect();
+        f()
+    }
 
     #[test]
     fn test_fingerprint_empty_config() {
@@ -491,53 +540,66 @@ mod tests {
 
     #[test]
     fn test_fingerprint_with_config_keys() {
-        let cfg = json!({
-            "anthropic": { "apiKey": "sk-ant-test123" },
-            "openai": { "apiKey": "sk-openai-test456" },
-            "google": { "apiKey": "AIza-test789" }
+        with_clean_provider_env(|| {
+            let cfg = json!({
+                "anthropic": { "apiKey": "sk-ant-test123" },
+                "openai": { "apiKey": "sk-openai-test456" },
+                "google": { "apiKey": "AIza-test789" }
+            });
+            let fp = fingerprint_providers(&cfg);
+            assert!(fp.anthropic.is_some());
+            assert!(fp.openai.is_some());
+            assert!(fp.gemini.is_some());
+            assert!(fp.ollama.is_none());
         });
-        let fp = fingerprint_providers(&cfg);
-        assert!(fp.anthropic.is_some());
-        assert!(fp.openai.is_some());
-        assert!(fp.gemini.is_some());
-        assert!(fp.ollama.is_none());
     }
 
     #[test]
     fn test_fingerprint_detects_key_change() {
-        let cfg1 = json!({ "anthropic": { "apiKey": "key-a" } });
-        let cfg2 = json!({ "anthropic": { "apiKey": "key-b" } });
-        let fp1 = fingerprint_providers(&cfg1);
-        let fp2 = fingerprint_providers(&cfg2);
-        assert_ne!(fp1, fp2);
+        with_clean_provider_env(|| {
+            let cfg1 = json!({ "anthropic": { "apiKey": "key-a" } });
+            let cfg2 = json!({ "anthropic": { "apiKey": "key-b" } });
+            let fp1 = fingerprint_providers(&cfg1);
+            let fp2 = fingerprint_providers(&cfg2);
+            assert_ne!(fp1, fp2);
+        });
     }
 
     #[test]
     fn test_fingerprint_same_key_same_hash() {
-        let cfg = json!({ "anthropic": { "apiKey": "key-same" } });
-        let fp1 = fingerprint_providers(&cfg);
-        let fp2 = fingerprint_providers(&cfg);
-        assert_eq!(fp1, fp2);
+        with_clean_provider_env(|| {
+            let cfg = json!({ "anthropic": { "apiKey": "key-same" } });
+            let fp1 = fingerprint_providers(&cfg);
+            let fp2 = fingerprint_providers(&cfg);
+            assert_eq!(fp1, fp2);
+        });
     }
 
     #[test]
     fn test_fingerprint_ollama_configured() {
-        let cfg = json!({ "providers": { "ollama": { "baseUrl": "http://localhost:11434" } } });
-        let fp = fingerprint_providers(&cfg);
-        assert!(fp.ollama.is_some());
-        let (configured, url) = fp.ollama.unwrap();
-        assert!(configured);
-        assert_eq!(url.as_deref(), Some("http://localhost:11434"));
+        with_clean_provider_env(|| {
+            let cfg = json!({ "providers": { "ollama": { "baseUrl": "http://localhost:11434" } } });
+            let fp = fingerprint_providers(&cfg);
+            assert!(fp.ollama.is_some());
+            let (configured, url) = fp.ollama.unwrap();
+            assert!(configured);
+            assert_eq!(url.as_deref(), Some("http://localhost:11434"));
+        });
     }
 
     #[test]
     fn test_fingerprint_bedrock_configured() {
-        let cfg = json!({
-            "bedrock": {
-                "region": "us-east-1",
-                "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
-                "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
-            }
+        with_clean_provider_env(|| {
+            let cfg = json!({
+                "bedrock": {
+                    "region": "us-east-1",
+                    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+                    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+                }
+            });
+            let fp = fingerprint_providers(&cfg);
+            assert!(fp.bedrock.is_some());
+            assert_eq!(fp.bedrock.as_ref().unwrap().len(), 16); // 8 bytes = 16 hex chars
         });
         let fp = fingerprint_providers(&cfg);
         assert!(fp.bedrock.is_some());
@@ -546,47 +608,53 @@ mod tests {
 
     #[test]
     fn test_fingerprint_bedrock_detects_change() {
-        let cfg1 = json!({
-            "bedrock": {
-                "region": "us-east-1",
-                "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
-                "secretAccessKey": "secret1"
-            }
+        with_clean_provider_env(|| {
+            let cfg1 = json!({
+                "bedrock": {
+                    "region": "us-east-1",
+                    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+                    "secretAccessKey": "secret1"
+                }
+            });
+            let cfg2 = json!({
+                "bedrock": {
+                    "region": "us-west-2",
+                    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+                    "secretAccessKey": "secret1"
+                }
+            });
+            let fp1 = fingerprint_providers(&cfg1);
+            let fp2 = fingerprint_providers(&cfg2);
+            assert_ne!(fp1.bedrock, fp2.bedrock);
         });
-        let cfg2 = json!({
-            "bedrock": {
-                "region": "us-west-2",
-                "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
-                "secretAccessKey": "secret1"
-            }
-        });
-        let fp1 = fingerprint_providers(&cfg1);
-        let fp2 = fingerprint_providers(&cfg2);
-        assert_ne!(fp1.bedrock, fp2.bedrock);
     }
 
     #[test]
     fn test_fingerprint_bedrock_disabled() {
-        let cfg = json!({
-            "bedrock": {
-                "region": "us-east-1",
-                "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
-                "secretAccessKey": "secret",
-                "enabled": false
-            }
+        with_clean_provider_env(|| {
+            let cfg = json!({
+                "bedrock": {
+                    "region": "us-east-1",
+                    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+                    "secretAccessKey": "secret",
+                    "enabled": false
+                }
+            });
+            let fp = fingerprint_providers(&cfg);
+            assert!(fp.bedrock.is_none());
         });
-        let fp = fingerprint_providers(&cfg);
-        assert!(fp.bedrock.is_none());
     }
 
     #[test]
     fn test_fingerprint_bedrock_partial_creds() {
-        // Only region, missing access key — should be None
-        let cfg = json!({
-            "bedrock": { "region": "us-east-1" }
+        with_clean_provider_env(|| {
+            // Only region, missing access key — should be None
+            let cfg = json!({
+                "bedrock": { "region": "us-east-1" }
+            });
+            let fp = fingerprint_providers(&cfg);
+            assert!(fp.bedrock.is_none());
         });
-        let fp = fingerprint_providers(&cfg);
-        assert!(fp.bedrock.is_none());
     }
 
     #[test]

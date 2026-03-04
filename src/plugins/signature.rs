@@ -10,18 +10,22 @@ use serde::{Deserialize, Serialize};
 
 use super::loader::LoaderError;
 
+fn default_true() -> bool {
+    true
+}
+
 /// Signature verification configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignatureConfig {
     /// Master switch — when `false`, signature checks are skipped.
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub enabled: bool,
     /// When `true`, unsigned skills are rejected (otherwise just warned).
-    #[serde(default)]
+    #[serde(default = "default_true", alias = "requireSignature")]
     pub require_signature: bool,
     /// Hex-encoded Ed25519 public keys of trusted publishers.
     /// If non-empty, the skill's publisher key must be in this list.
-    #[serde(default)]
+    #[serde(default, alias = "trustedPublishers")]
     pub trusted_publishers: Vec<String>,
 }
 
@@ -520,6 +524,15 @@ mod tests {
         assert_eq!(parsed.enabled, config.enabled);
         assert_eq!(parsed.require_signature, config.require_signature);
         assert_eq!(parsed.trusted_publishers, config.trusted_publishers);
+    }
+
+    #[test]
+    fn test_config_serde_partial_uses_secure_defaults() {
+        let json = r#"{"trustedPublishers":["abc123"]}"#;
+        let parsed: SignatureConfig = serde_json::from_str(json).unwrap();
+        assert!(parsed.enabled);
+        assert!(parsed.require_signature);
+        assert_eq!(parsed.trusted_publishers, vec!["abc123".to_string()]);
     }
 
     // ==================== Signature Parsing ====================

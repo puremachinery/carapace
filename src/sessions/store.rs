@@ -59,6 +59,29 @@ impl From<serde_json::Error> for SessionStoreError {
     }
 }
 
+fn session_store_error_kind(err: &SessionStoreError) -> &'static str {
+    match err {
+        SessionStoreError::NotFound(_) => "not_found",
+        SessionStoreError::AlreadyExists(_) => "already_exists",
+        SessionStoreError::Io(_) => "io",
+        SessionStoreError::Serialization(_) => "serialization",
+        SessionStoreError::InvalidSessionKey(_) => "invalid_session_key",
+        SessionStoreError::CompactionInProgress(_) => "compaction_in_progress",
+        SessionStoreError::AlreadyArchived(_) => "already_archived",
+        SessionStoreError::NotArchived(_) => "not_archived",
+        SessionStoreError::ArchiveNotFound(_) => "archive_not_found",
+        SessionStoreError::InvalidUserId(_) => "invalid_user_id",
+    }
+}
+
+fn integrity_error_kind(err: &super::integrity::IntegrityError) -> &'static str {
+    match err {
+        super::integrity::IntegrityError::Io(_) => "io",
+        super::integrity::IntegrityError::VerificationFailed { .. } => "verification_failed",
+        super::integrity::IntegrityError::Rejected { .. } => "rejected",
+    }
+}
+
 /// Status of a session
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -631,7 +654,7 @@ impl SessionStore {
     fn verify_history_hmac(
         &self,
         history_path: &Path,
-        session_id: &str,
+        _session_id: &str,
     ) -> Result<(), SessionStoreError> {
         if let Some(ref key) = self.hmac_key {
             let integrity_config = super::integrity::IntegrityConfig {
@@ -648,8 +671,7 @@ impl SessionStore {
                 }
                 Err(e) => {
                     tracing::warn!(
-                        session_id = %session_id,
-                        error = %e,
+                        error_kind = integrity_error_kind(&e),
                         "session history integrity verification issue"
                     );
                 }
@@ -967,9 +989,8 @@ impl SessionStore {
                 }
                 Err(e) => {
                     warn!(
-                        session_id = %session.id,
                         user_id = %user_id,
-                        error = %e,
+                        error_kind = session_store_error_kind(&e),
                         "failed to export session history during user data export"
                     );
                     warnings.push(format!("failed to export session {}: {}", session.id, e));
@@ -1005,9 +1026,8 @@ impl SessionStore {
         for session in &sessions {
             if let Err(e) = self.delete_session(&session.id) {
                 warn!(
-                    session_id = %session.id,
                     user_id = %user_id,
-                    error = %e,
+                    error_kind = session_store_error_kind(&e),
                     "failed to delete session during user purge"
                 );
             } else {
@@ -1033,8 +1053,7 @@ impl SessionStore {
         for session in &expired {
             if let Err(e) = self.delete_session(&session.id) {
                 warn!(
-                    session_id = %session.id,
-                    error = %e,
+                    error_kind = session_store_error_kind(&e),
                     "failed to delete expired session"
                 );
             }
@@ -1169,10 +1188,9 @@ impl SessionStore {
 
             let msg: ChatMessage = match serde_json::from_str(&line) {
                 Ok(m) => m,
-                Err(e) => {
+                Err(_) => {
                     tracing::warn!(
-                        session_id = %session_id,
-                        error = %e,
+                        error_kind = "invalid_jsonl",
                         "skipping corrupt JSONL line in session history"
                     );
                     continue;
@@ -1638,7 +1656,10 @@ impl SessionStore {
                 Ok(result) => results.push(result),
                 Err(e) => {
                     // Log but continue with other sessions
-                    warn!("Failed to archive session {}: {}", session_id, e);
+                    warn!(
+                        error_kind = session_store_error_kind(&e),
+                        "failed to archive inactive session"
+                    );
                 }
             }
         }
@@ -1677,8 +1698,7 @@ impl SessionStore {
                 }
                 Err(e) => {
                     tracing::warn!(
-                        session_id = %session_id,
-                        error = %e,
+                        error_kind = integrity_error_kind(&e),
                         "session integrity verification issue"
                     );
                 }

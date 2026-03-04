@@ -1,0 +1,269 @@
+#!/bin/bash
+# Pre-push hook:
+# - docs/site/meta-only pushes: skip checks
+# - shell-script-only pushes: run shell syntax/lint checks
+# - non-shell script-only pushes: skip checks
+# - websocket changes: run websocket golden snapshot checks
+# - Rust-impacting pushes: run cargo nextest
+# Install via: just setup-hooks
+
+set -euo pipefail
+
+remote_name="${1:-origin}"
+
+default_remote_ref="$(git symbolic-ref --quiet --short "refs/remotes/${remote_name}/HEAD" 2>/dev/null || true)"
+default_branch="${default_remote_ref#"${remote_name}"/}"
+if [ -z "$default_branch" ]; then
+    if git show-ref --verify --quiet "refs/remotes/${remote_name}/main"; then
+        default_branch="main"
+    elif git show-ref --verify --quiet "refs/remotes/${remote_name}/master"; then
+        default_branch="master"
+    fi
+fi
+
+is_zero_sha() {
+    [ "$1" = "0000000000000000000000000000000000000000" ]
+}
+
+is_docs_or_site_only_path() {
+    # Justfile changes are developer-workflow metadata, not runtime behavior.
+    case "$1" in
+        docs/*|website/*|.github/*|.local/*|Justfile|justfile|*.md|*.MD|*.txt|*.rst|*.adoc|*.yml|*.yaml)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+is_rust_impacting_path() {
+    case "$1" in
+        src/*|tests/*|benches/*|examples/*|fuzz/*|Cargo.toml|Cargo.lock|build.rs|rust-toolchain|rust-toolchain.toml|.cargo/*)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+is_shell_script_path() {
+    case "$1" in
+        *.sh|scripts/hooks/pre-commit|scripts/hooks/pre-push)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+is_script_path() {
+    case "$1" in
+        scripts/*|*.sh)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+is_ws_golden_relevant_path() {
+    case "$1" in
+        # In shell `case`, `*` matches `/` too, so this covers nested ws paths.
+        src/server/ws/*)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+ensure_nextest_installed() {
+    if ! command -v cargo-nextest >/dev/null 2>&1; then
+        echo "cargo-nextest is required. Install with: cargo install --locked cargo-nextest"
+        exit 1
+    fi
+}
+
+run_shell_checks() {
+    local -a shell_targets=("$@")
+
+    if [ "${#shell_targets[@]}" -eq 0 ]; then
+        echo "Shell script changes detected, but no existing shell scripts to validate (they may have been deleted)."
+        return 0
+    fi
+
+    echo "Running bash -n on changed shell scripts..."
+    if ! bash -n "${shell_targets[@]}"; then
+        echo "Shell syntax check failed."
+        return 1
+    fi
+
+    if command -v shellcheck >/dev/null 2>&1; then
+        echo "Running shellcheck on changed shell scripts..."
+        if ! shellcheck "${shell_targets[@]}"; then
+            echo "shellcheck reported issues."
+            return 1
+        fi
+    else
+        echo "shellcheck not installed; skipping shell lint."
+    fi
+
+    return 0
+}
+
+declare -a changed_files=()
+saw_ref_updates=0
+
+while read -r local_ref local_sha _remote_ref remote_sha; do
+    [ -z "${local_ref:-}" ] && continue
+    saw_ref_updates=1
+
+    # Deleted refs have an all-zero local SHA; nothing to validate.
+    if is_zero_sha "$local_sha"; then
+        continue
+    fi
+
+    if is_zero_sha "$remote_sha"; then
+        if [ -z "$default_branch" ]; then
+            # Can't determine a reliable base branch; force tests to be safe.
+            changed_files+=("__force_tests__")
+            continue
+        fi
+
+        base_ref="${remote_name}/${default_branch}"
+        if ! git show-ref --verify --quiet "refs/remotes/${base_ref}"; then
+            # Can't resolve base branch ref locally; force tests to be safe.
+            changed_files+=("__force_tests__")
+            continue
+        fi
+
+        base_sha="$(git merge-base "$local_sha" "$base_ref" 2>/dev/null || true)"
+        if [ -n "$base_sha" ]; then
+            range="${base_sha}..${local_sha}"
+        else
+            # If no merge base, we can't reliably calculate the full diff range.
+            changed_files+=("__force_tests__")
+            continue
+        fi
+    else
+        range="${remote_sha}..${local_sha}"
+    fi
+
+    if ! diff_output="$(git diff --name-only "$range")"; then
+        changed_files+=("__force_tests__")
+        continue
+    fi
+
+    while IFS= read -r path; do
+        [ -n "$path" ] && changed_files+=("$path")
+    done <<< "$diff_output"
+done
+
+if [ "$saw_ref_updates" -eq 0 ]; then
+    echo "No push ref payload detected (manual run); running tests."
+    changed_files=("__manual__")
+fi
+
+if [ "${#changed_files[@]}" -eq 0 ]; then
+    echo "No changed files detected in ref updates; skipping tests."
+    exit 0
+fi
+
+needs_nextest=0
+needs_full_nextest=0
+needs_script_checks=0
+needs_non_shell_script_only=0
+needs_ws_golden=0
+declare -a shell_targets_to_check=()
+for path in "${changed_files[@]}"; do
+    if is_docs_or_site_only_path "$path"; then
+        continue
+    fi
+
+    if is_ws_golden_relevant_path "$path"; then
+        needs_ws_golden=1
+    fi
+
+    if is_rust_impacting_path "$path"; then
+        needs_nextest=1
+        if ! is_ws_golden_relevant_path "$path"; then
+            needs_full_nextest=1
+        fi
+        continue
+    fi
+
+    if is_shell_script_path "$path"; then
+        needs_script_checks=1
+        if [ -f "$path" ]; then
+            shell_targets_to_check+=("$path")
+        fi
+        continue
+    fi
+
+    if is_script_path "$path"; then
+        needs_non_shell_script_only=1
+        continue
+    fi
+
+    # Unknown paths are treated as code-impacting to stay conservative.
+    needs_nextest=1
+    needs_full_nextest=1
+done
+
+if [ "$needs_nextest" -eq 0 ] && [ "$needs_script_checks" -eq 0 ]; then
+    if [ "$needs_non_shell_script_only" -eq 1 ]; then
+        echo "Non-shell script-only changes detected; no shell checks to run."
+    else
+        echo "Docs/website/meta-only changes detected; skipping checks."
+    fi
+    exit 0
+fi
+
+if [ "$needs_script_checks" -eq 1 ]; then
+    echo "Shell script changes detected. Running shell checks..."
+    if ! run_shell_checks "${shell_targets_to_check[@]}"; then
+        echo "Shell checks failed. Fix issues before pushing."
+        exit 1
+    fi
+fi
+
+if [ "$needs_ws_golden" -eq 1 ] && [ "$needs_full_nextest" -eq 0 ]; then
+    echo "WebSocket changes detected. Running websocket golden snapshot checks..."
+    ensure_nextest_installed
+    if ! ./scripts/run-nextest-guarded.sh --locked --all-targets server::ws::golden_tests::golden_trace; then
+        echo "Websocket golden snapshot checks failed."
+        echo "If output changes are intentional, update snapshots and commit them before pushing."
+        exit 1
+    fi
+elif [ "$needs_ws_golden" -eq 1 ] && [ "$needs_full_nextest" -eq 1 ]; then
+    echo "WebSocket changes detected, but full cargo nextest is already required."
+    echo "Skipping standalone websocket golden run to avoid duplicate execution."
+fi
+
+if [ "$needs_nextest" -eq 1 ] && [ "$needs_full_nextest" -eq 0 ] && [ "$needs_ws_golden" -eq 1 ]; then
+    echo "Only websocket golden-relevant Rust changes detected; skipping full cargo nextest run."
+    echo "All applicable checks passed, pushing..."
+    exit 0
+fi
+
+if [ "$needs_nextest" -eq 0 ]; then
+    echo "No Rust-impacting changes detected; skipping cargo nextest."
+    echo "All applicable checks passed, pushing..."
+    exit 0
+fi
+
+echo "Rust-impacting changes detected. Running tests before push..."
+
+ensure_nextest_installed
+
+if ! ./scripts/run-nextest-guarded.sh --locked --all-targets; then
+    echo "Tests failed. Fix failing tests before pushing."
+    exit 1
+fi
+
+echo "All tests passed, pushing..."

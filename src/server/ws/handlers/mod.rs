@@ -36,7 +36,6 @@ use system::*;
 pub(super) use talk::*;
 pub(super) use tts::*;
 pub(super) use update::*;
-pub(crate) use update::{apply_staged_update, cleanup_old_binaries};
 pub(super) use usage::*;
 pub(super) use voicewake::*;
 
@@ -636,33 +635,85 @@ fn dispatch_config(
     }
 }
 
-/// Dispatch session methods.
-fn dispatch_sessions(
+/// Dispatch session methods on a blocking worker thread.
+async fn dispatch_sessions(
     method: &str,
     params: Option<&Value>,
     state: &Arc<WsServerState>,
     conn: &ConnectionContext,
 ) -> Option<Result<Value, ErrorShape>> {
-    match method {
-        "sessions.list" => Some(handle_sessions_list(state, params)),
-        "sessions.preview" => Some(handle_sessions_preview(state, params)),
-        "sessions.create" => Some(handle_sessions_create(state, params)),
-        "sessions.load" => Some(handle_sessions_load(state, params)),
-        "sessions.fork" => Some(handle_sessions_fork(state, params)),
-        "sessions.rename" => Some(handle_sessions_rename(state, params)),
-        "sessions.switch" => Some(handle_sessions_switch(state, params, conn)),
-        "sessions.patch" => Some(handle_sessions_patch(state, params)),
-        "sessions.reset" => Some(handle_sessions_reset(state, params)),
-        "sessions.delete" => Some(handle_sessions_delete(state, params)),
-        "sessions.compact" => Some(handle_sessions_compact(state, params)),
-        "sessions.archive" => Some(handle_sessions_archive(state, params)),
-        "sessions.restore" => Some(handle_sessions_restore(state, params)),
-        "sessions.archives" => Some(handle_sessions_archives(state, params)),
-        "sessions.archive.delete" => Some(handle_sessions_archive_delete(state, params)),
-        "sessions.export_user" => Some(handle_sessions_export_user(state, params)),
-        "sessions.purge_user" => Some(handle_sessions_purge_user(state, params)),
-        _ => None,
+    let is_session_method = matches!(
+        method,
+        "sessions.list"
+            | "sessions.preview"
+            | "sessions.create"
+            | "sessions.load"
+            | "sessions.fork"
+            | "sessions.rename"
+            | "sessions.switch"
+            | "sessions.patch"
+            | "sessions.reset"
+            | "sessions.delete"
+            | "sessions.compact"
+            | "sessions.archive"
+            | "sessions.restore"
+            | "sessions.archives"
+            | "sessions.archive.delete"
+            | "sessions.export_user"
+            | "sessions.purge_user"
+    );
+    if !is_session_method {
+        return None;
     }
+
+    let method_owned = method.to_string();
+    let params_owned = params.cloned();
+    let state = Arc::clone(state);
+    let conn = conn.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        let params = params_owned.as_ref();
+        match method_owned.as_str() {
+            "sessions.list" => handle_sessions_list(&state, params),
+            "sessions.preview" => handle_sessions_preview(&state, params),
+            "sessions.create" => handle_sessions_create(&state, params),
+            "sessions.load" => handle_sessions_load(&state, params),
+            "sessions.fork" => handle_sessions_fork(&state, params),
+            "sessions.rename" => handle_sessions_rename(&state, params),
+            "sessions.switch" => handle_sessions_switch(&state, params, &conn),
+            "sessions.patch" => handle_sessions_patch(&state, params),
+            "sessions.reset" => handle_sessions_reset(&state, params),
+            "sessions.delete" => handle_sessions_delete(&state, params),
+            "sessions.compact" => handle_sessions_compact(&state, params),
+            "sessions.archive" => handle_sessions_archive(&state, params),
+            "sessions.restore" => handle_sessions_restore(&state, params),
+            "sessions.archives" => handle_sessions_archives(&state, params),
+            "sessions.archive.delete" => handle_sessions_archive_delete(&state, params),
+            "sessions.export_user" => handle_sessions_export_user(&state, params),
+            "sessions.purge_user" => handle_sessions_purge_user(&state, params),
+            _ => {
+                tracing::error!("unhandled session method dispatched to blocking worker");
+                Err(error_shape(
+                    ERROR_UNAVAILABLE,
+                    "internal server error: unhandled session method",
+                    Some(json!({ "method": method_owned })),
+                ))
+            }
+        }
+    })
+    .await;
+
+    Some(match result {
+        Ok(value) => value,
+        Err(err) => Err(error_shape(
+            ERROR_UNAVAILABLE,
+            "session operation task failed",
+            Some(json!({
+                "method": method,
+                "error": err.to_string()
+            })),
+        )),
+    })
 }
 
 /// Dispatch TTS and voice wake methods.
@@ -741,7 +792,6 @@ fn dispatch_cron_usage_update(
         "usage.daily" => Some(handle_usage_daily(params)),
         "usage.monthly" => Some(handle_usage_monthly(params)),
         "usage.reset" => Some(handle_usage_reset(params)),
-        "update.status" => Some(handle_update_status()),
         "update.setChannel" => Some(handle_update_set_channel(params)),
         "update.configure" => Some(handle_update_configure(params)),
         "update.dismiss" => Some(handle_update_dismiss()),
@@ -773,12 +823,11 @@ pub(super) async fn dispatch_method(
     if method == "config.reload" {
         return handle_config_reload(state).await;
     }
-
     // Sync sub-dispatchers
     if let Some(result) = dispatch_config(method, params, state) {
         return result;
     }
-    if let Some(result) = dispatch_sessions(method, params, state, conn) {
+    if let Some(result) = dispatch_sessions(method, params, state, conn).await {
         return result;
     }
     if let Some(result) = dispatch_tts_voice(method, params, state) {
@@ -837,6 +886,7 @@ pub(super) async fn dispatch_method(
 
         // Update (async)
         "update.run" => handle_update_run(params).await,
+        "update.status" => handle_update_status().await,
         "update.check" => handle_update_check().await,
         "update.install" => handle_update_install().await,
 

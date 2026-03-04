@@ -18,7 +18,7 @@ Carapace is a Rust rewrite of OpenClaw built from the ground up to address these
 
 **Carapace:**
 - **Fails closed.** When no auth token or password is configured, all connections are denied (`TokenMissingConfig` / `PasswordMissingConfig`). There is no "accidentally open" state.
-- **Localhost-only by default.** The gateway binds to `127.0.0.1`. External access requires the operator to explicitly set bind mode to `lan`, `tailnet`, or `all`. A default Carapace instance is unreachable from the internet.
+- **Localhost-only by default.** Carapace binds to `127.0.0.1`. External access requires the operator to explicitly set bind mode to `lan`, `tailnet`, or `all`. A default Carapace instance is unreachable from the internet.
 - **Timing-safe credential comparison.** Auth checks use constant-time SHA-256 digest comparison — no length side-channel.
 - **CSRF protection enabled by default.** Double-submit cookie with `__Host-` prefix, `SameSite=Strict`, origin/host validation.
 
@@ -27,7 +27,7 @@ Carapace is a Rust rewrite of OpenClaw built from the ground up to address these
 **How it was exploited:** Credentials stored in plaintext JSON and Markdown files. Commodity infostealers (RedLine, Lumma, Vidar) trivially harvest API keys, OAuth tokens, and credentials from the standard OpenClaw directory structure.
 
 **Carapace:**
-- **OS credential stores.** Secrets are stored in macOS Keychain, Linux Keyutils, or Windows Credential Manager — not in filesystem-accessible files.
+- **OS credential stores.** Secrets are stored in macOS Keychain, Linux Secret Service, or Windows Credential Manager — not in filesystem-accessible files.
 - **AES-256-GCM fallback.** When OS keychains are unavailable (containers, CI), secrets are encrypted with AES-256-GCM using PBKDF2-HMAC-SHA256 key derivation (600,000 iterations per OWASP 2024 recommendation). Each value has its own random salt and nonce.
 - **Zeroization.** Encryption keys and auth secrets are zeroized in memory after use via the `zeroize` crate.
 - An infostealer reading Carapace's state directory gets ciphertext and keychain references, not credentials.
@@ -45,12 +45,12 @@ Carapace is a Rust rewrite of OpenClaw built from the ground up to address these
 
 ### 4. Control UI Token Exfiltration (1-Click RCE)
 
-**How it was exploited (GHSA-g8p2-7wf7-98mq):** OpenClaw's Control UI accepted `gatewayUrl` as a query parameter. A malicious link could redirect the UI to an attacker-controlled server, leaking the auth token. Combined with the gateway's command execution capabilities, this was a 1-click RCE.
+**How it was exploited (GHSA-g8p2-7wf7-98mq):** OpenClaw's Control UI accepted `gatewayUrl` as a query parameter. A malicious link could redirect the UI to an attacker-controlled server, leaking the auth token. Combined with command execution capabilities, this was a 1-click RCE.
 
 **Carapace:**
-- The gateway URL is set server-side only. No query parameter override exists.
-- Control endpoints enforce CSRF protection and require gateway authentication.
-- Sensitive config paths (`gateway.auth`, `gateway.hooks.token`, `credentials`, `secrets`) are blocked from modification via the control API.
+- The service URL is set server-side only. No query parameter override exists.
+- Control endpoints enforce CSRF protection and require service authentication.
+- Control config writes are least-privilege by default (`PATCH /control/config` is limited to `gateway.controlUi.*`), and sensitive prefixes remain blocked on both PATCH and legacy POST paths (auth/hooks/credentials/secrets, provider API keys, provider base URLs, and channel tokens/secrets).
 
 ### 5. Prompt Injection
 
@@ -72,10 +72,11 @@ Prompt injection remains an industry-wide unsolved problem. No AI system fully p
 **Carapace:**
 - **macOS Seatbelt.** sandbox-exec SBPL profiles restrict filesystem, network, and IPC access.
 - **Linux Landlock.** Filesystem access rules via raw syscalls. Read/write restricted to declared paths only.
+- **Windows AppContainer + Job Objects.** `network_access=false` subprocesses launch with no network capabilities; allowlisted executable paths and process limits are enforced.
 - **Resource limits.** RLIMIT_CPU, RLIMIT_AS, RLIMIT_NOFILE per tool execution.
 - **Output content security.** HTML/Markdown sanitizer strips XSS vectors, dangerous tags, and non-image data URIs from agent output.
 
-*Caveat: sandbox primitives are implemented but subprocess wiring is not yet complete. See the status section below.*
+*Caveat: Unsupported targets still fail closed for sandbox-required subprocess paths instead of running unsandboxed. On Windows, deny-network execution is supported through the `*_command_output` helpers; `spawn_sandboxed_tokio_command` intentionally rejects `network_access=false` and fails closed.*
 
 ### 7. SSRF / DNS Rebinding
 
@@ -97,12 +98,12 @@ Prompt injection remains an industry-wide unsolved problem. No AI system fully p
 | Skills supply chain | No verification, no moderation | Ed25519 signatures + WASM sandbox |
 | Control UI token exfil | 1-click RCE via query param | No query param override; CSRF enforced |
 | Prompt injection | No defenses | Prompt guard + classifier + approval flow |
-| Process sandboxing | Full host privileges | Seatbelt / Landlock / rlimits |
+| Process sandboxing | Full host privileges | Seatbelt / Landlock / Windows AppContainer+Job / rlimits |
 | SSRF / DNS rebinding | No protections | Comprehensive IP + DNS defense |
 
 ## Why Rust
 
-Rust is not a silver bullet, but it eliminates vulnerability classes that are irrelevant to mention because they cannot happen:
+Rust is not a silver bullet, but it significantly reduces broad memory-safety vulnerability classes:
 
 - **Memory safety without GC.** No buffer overflows, use-after-free, or double-free — the categories that account for ~70% of CVEs in C/C++ codebases (per Microsoft and Google's published data). This matters for a long-running daemon that processes untrusted input.
 - **Thread safety at compile time.** The borrow checker prevents data races. No "works on my machine" concurrency bugs that surface under load.
@@ -112,11 +113,12 @@ Rust does not help with logic bugs, auth bypass, or prompt injection. Those requ
 
 ## Honest Caveats
 
-Carapace is in preview. The security architecture is real and tested (~5,000 automated tests, multi-platform CI), but some items are incomplete:
+Carapace is in preview. The security architecture is real and tested (large automated test coverage with multi-platform CI), but some items are incomplete. Verified-vs-partial feature state is tracked in `docs/feature-status.yaml` and `docs/feature-evidence.yaml`:
 
-- **Subprocess sandbox wiring.** Seatbelt/Landlock/rlimit primitives are implemented and tested, but not yet wired into tool subprocess execution. A tool that spawns a child process does not yet inherit the sandbox.
-- **Control UI.** The backend (routes, auth, CSRF) is complete. The frontend is not built yet.
-- **Channels.** Discord is verified end-to-end. Telegram requires a webhook (no long-polling), so it needs a tunnel or public endpoint. Signal and Slack are implemented but not yet smoke-tested in real environments.
+- **Platform backend coverage.** Seatbelt/Landlock/Windows AppContainer+Job subprocess wiring is implemented across probe/tailscale/whois/SSH tunnel callsites. Unsupported targets still fail closed. On Windows, deny-network execution is supported through command-output helpers, while spawned deny-network subprocess requests fail closed.
+- **Control UI.** Foundation is shipped (`/ui` auth/session handling, status/channels, redacted config read + safe patch path, task operator actions, pairing flow). Richer operator workflows and UX refinements remain in-progress.
+- **Channels.** Discord is verified end-to-end. Telegram supports webhook and localhost long-polling fallback. Signal and Slack are implemented but not yet smoke-tested in real environments.
+- **Smoke evidence process.** Live channel validation criteria and report template are tracked in `docs/channel-smoke.md`.
 - **Audit log emission.** The audit log module is implemented (append-only JSONL, 19 event types, 50 MB rotation) but event emission is not yet wired into all runtime paths.
 
 We'd rather ship an honest "here's what works and what doesn't" than pretend everything is finished.

@@ -1,4 +1,4 @@
-# carapace Gateway WebSocket Protocol
+# Carapace WebSocket Protocol
 
 Protocol Version: 3
 
@@ -59,7 +59,7 @@ Sent immediately on WebSocket connection:
       "nonce": "550e8400-e29b-41d4-a716-446655440000"
     },
     "auth": {
-      "token": "gateway-token"
+      "token": "carapace-token"
     }
   }
 }
@@ -166,18 +166,18 @@ Error:
 
 ## Methods
 
-Base methods (108+) plus channel plugin methods. Channel plugins may add additional methods.
+Base methods plus channel plugin methods. Channel plugins may add additional methods.
 
 Note: This list is a snapshot of the Rust implementation and may drift. The source of truth is
 `src/server/ws/handlers/mod.rs` (and related dispatchers). If this document and the code disagree,
 the code wins.
 
 ### Health & Status
-- `health` - Get gateway health status
-- `status` - Get gateway status summary
+- `health` - Get service health status
+- `status` - Get service status summary
 
 ### Logs
-- `logs.tail` - Stream log output
+- `logs.tail` - Fetch recent log output (snapshot tail)
 
 ### Channels
 - `channels.status` - Get channel connection status
@@ -274,7 +274,7 @@ Compatibility aliases:
 - `skills.update` - Update skills
 
 ### Updates
-- `update.run` - Run gateway update
+- `update.run` - Run Carapace update
 
 ### Cron
 - `cron.list` - List cron jobs
@@ -285,7 +285,7 @@ Compatibility aliases:
 - `cron.run` - Manually trigger cron job
 - `cron.runs` - List cron run history
 
-### Node Pairing (multi-gateway)
+### Node Pairing (multi-service)
 - `node.pair.request` - Request node pairing
 - `node.pair.list` - List pairing requests
 - `node.pair.approve` - Approve pairing
@@ -331,7 +331,7 @@ Compatibility aliases:
 - `set-heartbeats` - Configure heartbeat settings
 
 ### System
-- `wake` - Wake the gateway
+- `wake` - Wake Carapace
 - `send` - Send a message
 - `system.info` - Get system metadata
 - `system-presence` - Report system presence

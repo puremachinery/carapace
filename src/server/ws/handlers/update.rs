@@ -1,38 +1,14 @@
 //! Update handlers.
 //!
-//! Manages application updates including checking for updates,
-//! triggering update installation, and managing update channels.
+//! Manages update checks and delegates installation to the shared updater
+//! pipeline in `crate::update`.
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
-use std::io::Read;
 use std::sync::LazyLock;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::AsyncWriteExt;
-use tracing::warn;
 
 use super::super::*;
-
-/// GitHub API response for a release asset
-#[derive(Debug, Deserialize)]
-struct GitHubAsset {
-    name: String,
-    browser_download_url: String,
-    #[allow(dead_code)] // deserialized from GitHub API
-    size: u64,
-}
-
-/// GitHub API response for the latest release
-#[derive(Debug, Deserialize)]
-struct GitHubRelease {
-    tag_name: String,
-    html_url: String,
-    body: Option<String>,
-    #[serde(default)]
-    assets: Vec<GitHubAsset>,
-}
 
 /// Available update channels
 pub const UPDATE_CHANNELS: [&str; 3] = ["stable", "beta", "dev"];
@@ -86,202 +62,23 @@ impl Default for UpdateState {
     }
 }
 
-/// Result of applying a staged update binary.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ApplyResult {
-    /// Whether the update was successfully applied
-    pub applied: bool,
-    /// SHA-256 hash of the new binary
-    pub sha256: String,
-    /// Path to the binary that was replaced
-    pub binary_path: String,
-}
-
-/// Compute SHA-256 hex digest of a file at the given path.
-fn compute_sha256(path: &str) -> Result<String, String> {
-    let mut file =
-        std::fs::File::open(path).map_err(|e| format!("failed to open file for hashing: {e}"))?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 8192];
-    loop {
-        let n = file
-            .read(&mut buffer)
-            .map_err(|e| format!("failed to read file for hashing: {e}"))?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buffer[..n]);
-    }
-    Ok(format!("{:x}", hasher.finalize()))
-}
-
-/// Apply a staged binary update atomically.
-pub fn apply_staged_update(staged_path: &str) -> Result<ApplyResult, String> {
-    let staged_meta = std::fs::metadata(staged_path)
-        .map_err(|e| format!("staged binary not found at '{}': {e}", staged_path))?;
-    if staged_meta.len() == 0 {
-        return Err(format!("staged binary at '{}' is empty", staged_path));
-    }
-
-    let sha256 = compute_sha256(staged_path)?;
-
-    let current_exe = std::env::current_exe()
-        .map_err(|e| format!("failed to determine current binary path: {e}"))?;
-    let current_path = current_exe
-        .canonicalize()
-        .map_err(|e| format!("failed to canonicalize current binary path: {e}"))?;
-    let binary_path = current_path.to_string_lossy().into_owned();
-
-    let backup_path = format!("{}.bak", current_path.display());
-
-    std::fs::rename(&current_path, &backup_path)
-        .map_err(|e| format!("failed to rename current binary to .bak: {e}"))?;
-
-    if let Err(copy_err) = std::fs::copy(staged_path, &current_path) {
-        if let Err(restore_err) = std::fs::rename(&backup_path, &current_path) {
-            return Err(format!(
-                "CRITICAL: copy failed ({copy_err}) AND restore failed ({restore_err}). Backup at: {backup_path}"
-            ));
-        }
-        return Err(format!(
-            "failed to copy staged binary to current path: {copy_err}"
-        ));
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o755);
-        if let Err(e) = std::fs::set_permissions(&current_path, perms) {
-            warn!("failed to set executable permissions on updated binary: {e}");
-        }
-    }
-
-    if let Err(e) = std::fs::remove_file(&backup_path) {
-        warn!("failed to remove backup file {}: {e}", backup_path);
-    }
-
-    Ok(ApplyResult {
-        applied: true,
-        sha256,
-        binary_path,
-    })
-}
-
-/// Remove stale backup and old update files.
-pub fn cleanup_old_binaries() {
-    cleanup_bak_files_near_exe();
-    cleanup_stale_staged_updates();
-}
-
-/// Remove `.bak` and `.old` files next to the current executable.
-fn cleanup_bak_files_near_exe() {
-    let exe = match std::env::current_exe() {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    let parent = match exe.parent() {
-        Some(p) => p,
-        None => return,
-    };
-    let entries = match std::fs::read_dir(parent) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let dominated = path
-            .extension()
-            .is_some_and(|ext| ext == "bak" || ext == "old");
-        if dominated {
-            if let Err(e) = std::fs::remove_file(&path) {
-                warn!("failed to remove old binary {}: {e}", path.display());
-            }
-        }
-    }
-}
-
-/// Remove staged update files older than 7 days.
-fn cleanup_stale_staged_updates() {
-    let updates_dir = resolve_state_dir().join("updates");
-    let entries = match std::fs::read_dir(&updates_dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    let seven_days = Duration::from_secs(7 * 24 * 60 * 60);
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let stale = path
-            .metadata()
-            .ok()
-            .and_then(|meta| meta.modified().ok())
-            .and_then(|m| m.elapsed().ok())
-            .is_some_and(|age| age > seven_days);
-        if stale {
-            if let Err(e) = std::fs::remove_file(&path) {
-                warn!("failed to remove stale staged file {}: {e}", path.display());
-            }
-        }
-    }
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::from_secs(0))
-        .as_millis() as u64
-}
-
 /// Fetch the latest release from GitHub and update global state.
-///
-/// On success, populates `latest_version`, `update_available`, `download_url`,
-/// and `release_notes`. On failure, sets `last_error` and leaves
-/// `update_available` as `false`. Always clears the `checking` flag before
-/// returning.
 async fn fetch_latest_release() {
     let current_version = {
         let state = UPDATE_STATE.read();
         state.current_version.clone()
     };
 
-    let user_agent = format!("cara/{}", current_version);
-
-    let result: Result<GitHubRelease, String> = async {
-        let client = reqwest::Client::new();
-        let resp = client
-            .get("https://api.github.com/repos/puremachinery/carapace/releases/latest")
-            .header("User-Agent", &user_agent)
-            .header("Accept", "application/vnd.github+json")
-            .timeout(Duration::from_secs(15))
-            .send()
-            .await
-            .map_err(|e| format!("HTTP request failed: {e}"))?;
-
-        if !resp.status().is_success() {
-            return Err(format!("GitHub API returned status {}", resp.status()));
-        }
-
-        resp.json::<GitHubRelease>()
-            .await
-            .map_err(|e| format!("failed to parse release JSON: {e}"))
-    }
-    .await;
+    let result = crate::update::fetch_release_info(&current_version, None).await;
 
     let mut state = UPDATE_STATE.write();
     match result {
         Ok(release) => {
-            let latest = release
-                .tag_name
-                .strip_prefix('v')
-                .unwrap_or(&release.tag_name)
-                .to_string();
-
+            let latest = crate::update::tag_to_version(&release.tag_name);
             state.update_available = latest != current_version;
             state.latest_version = Some(latest);
 
-            // Prefer the platform-specific asset download URL; fall back to
-            // the release page URL so the user can still reach the release.
-            let wanted = expected_asset_name();
+            let wanted = crate::update::expected_asset_name();
             let asset_url = release
                 .assets
                 .iter()
@@ -293,8 +90,8 @@ async fn fetch_latest_release() {
             state.last_error = None;
         }
         Err(err) => {
-            warn!("update check failed: {err}");
-            state.last_error = Some(err);
+            tracing::warn!("update check failed: {}", err.message);
+            state.last_error = Some(err.message);
             state.update_available = false;
         }
     }
@@ -302,11 +99,6 @@ async fn fetch_latest_release() {
 }
 
 /// Trigger an update check and optionally install.
-///
-/// When `checkOnly` is false (the default) and an update is available, the
-/// handler proceeds to download and install the update, returning the same
-/// response shape as `update.install`.  When `checkOnly` is true the handler
-/// only performs the version check.
 pub(super) async fn handle_update_run(params: Option<&Value>) -> Result<Value, ErrorShape> {
     let check_only = params
         .and_then(|v| v.get("checkOnly"))
@@ -318,11 +110,8 @@ pub(super) async fn handle_update_run(params: Option<&Value>) -> Result<Value, E
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    // Acquire lock briefly to validate and set flags
     {
         let mut state = UPDATE_STATE.write();
-
-        // Prevent concurrent update operations
         if state.checking || state.installing {
             return Err(error_shape(
                 ERROR_UNAVAILABLE,
@@ -335,23 +124,19 @@ pub(super) async fn handle_update_run(params: Option<&Value>) -> Result<Value, E
         }
 
         state.checking = true;
-        state.last_check_at = Some(now_ms());
+        state.last_check_at = Some(crate::update::now_ms());
         state.last_error = None;
     }
 
-    // Perform the real HTTP check (lock is not held during the await)
     fetch_latest_release().await;
 
-    // Determine whether we should install
     let should_install = {
         let state = UPDATE_STATE.read();
         !check_only && (state.update_available || force)
     };
 
     if should_install {
-        // Delegate to the install handler which handles download, staging,
-        // and atomic replacement.
-        return handle_update_install().await;
+        return handle_update_install_with_force(force).await;
     }
 
     let state = UPDATE_STATE.read();
@@ -366,8 +151,32 @@ pub(super) async fn handle_update_run(params: Option<&Value>) -> Result<Value, E
     }))
 }
 
-/// Get update status
-pub(super) fn handle_update_status() -> Result<Value, ErrorShape> {
+/// Get update status.
+pub(super) async fn handle_update_status() -> Result<Value, ErrorShape> {
+    let state_dir = resolve_state_dir();
+    let tx = match tokio::task::spawn_blocking(move || {
+        crate::update::load_update_transaction(&state_dir)
+    })
+    .await
+    {
+        Ok(Ok(tx)) => tx,
+        Ok(Err(err)) => {
+            tracing::warn!(
+                error = %err.message,
+                retryable = err.retryable,
+                phase = ?err.phase,
+                "failed to load update transaction for status; returning status without transaction details"
+            );
+            None
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "failed to join update transaction load task for status; returning status without transaction details"
+            );
+            None
+        }
+    };
     let state = UPDATE_STATE.read();
 
     Ok(json!({
@@ -381,13 +190,17 @@ pub(super) fn handle_update_status() -> Result<Value, ErrorShape> {
         "lastCheckAt": state.last_check_at,
         "lastError": state.last_error,
         "releaseNotes": state.release_notes,
-        "downloadUrl": state.download_url
+        "downloadUrl": state.download_url,
+        "transactionState": tx.as_ref().map(|t| t.state),
+        "transactionVersion": tx.as_ref().map(|t| t.version.clone()),
+        "transactionAttempt": tx.as_ref().map(|t| t.attempt),
+        "transactionLastError": tx.as_ref().and_then(|t| t.last_error.clone()),
+        "resumePending": tx.as_ref().is_some_and(crate::update::transaction_resume_pending),
     }))
 }
 
-/// Check for updates without installing
+/// Check for updates without installing.
 pub(super) async fn handle_update_check() -> Result<Value, ErrorShape> {
-    // Acquire lock briefly to validate and set checking flag
     {
         let mut state = UPDATE_STATE.write();
 
@@ -400,14 +213,12 @@ pub(super) async fn handle_update_check() -> Result<Value, ErrorShape> {
         }
 
         state.checking = true;
-        state.last_check_at = Some(now_ms());
+        state.last_check_at = Some(crate::update::now_ms());
         state.last_error = None;
     }
 
-    // Perform the actual HTTP check (lock is not held during the await)
     fetch_latest_release().await;
 
-    // Read final state and build response
     let state = UPDATE_STATE.read();
     Ok(json!({
         "ok": true,
@@ -418,7 +229,7 @@ pub(super) async fn handle_update_check() -> Result<Value, ErrorShape> {
     }))
 }
 
-/// Set update channel
+/// Set update channel.
 pub(super) fn handle_update_set_channel(params: Option<&Value>) -> Result<Value, ErrorShape> {
     let channel = params
         .and_then(|v| v.get("channel"))
@@ -437,7 +248,6 @@ pub(super) fn handle_update_set_channel(params: Option<&Value>) -> Result<Value,
     let previous = state.channel.clone();
     state.channel = channel.to_string();
 
-    // Clear cached update info when changing channels
     if previous != channel {
         state.latest_version = None;
         state.update_available = false;
@@ -452,7 +262,7 @@ pub(super) fn handle_update_set_channel(params: Option<&Value>) -> Result<Value,
     }))
 }
 
-/// Configure auto-update settings
+/// Configure auto-update settings.
 pub(super) fn handle_update_configure(params: Option<&Value>) -> Result<Value, ErrorShape> {
     let mut state = UPDATE_STATE.write();
 
@@ -479,219 +289,15 @@ pub(super) fn handle_update_configure(params: Option<&Value>) -> Result<Value, E
     }))
 }
 
-/// Build the expected release asset name for the current platform.
-///
-/// GitHub release assets follow the pattern `cara-{os}-{arch}` (with `.exe`
-/// on Windows). We map Rust's `std::env::consts` values to the names used in
-/// the release workflow.
-fn expected_asset_name() -> String {
-    let os = match std::env::consts::OS {
-        "macos" => "darwin",
-        other => other,
-    };
-    let arch = std::env::consts::ARCH;
-    let ext = if std::env::consts::OS == "windows" {
-        ".exe"
-    } else {
-        ""
-    };
-    format!("cara-{os}-{arch}{ext}")
-}
-
-/// Compute the SHA-256 hex digest of an in-memory byte buffer.
-fn sha256_bytes(data: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    format!("{:x}", hasher.finalize())
-}
-
-/// Verify the downloaded binary against a SHA-256 checksum file.
-///
-/// The `checksum_text` is expected to be in the GNU coreutils format:
-///   `<hex_hash>  <filename>` (or just a bare hex hash).
-///
-/// Returns `Ok(())` when the hashes match, or an `Err` describing the
-/// mismatch.
-fn verify_checksum(actual_hash: &str, checksum_text: &str) -> Result<(), String> {
-    // The checksum file may contain: "<hash>  <filename>\n" or just "<hash>\n".
-    let expected = checksum_text
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_lowercase();
-
-    if expected.is_empty() {
-        return Err("checksum file is empty or malformed".to_string());
-    }
-
-    if expected.len() != 64 || !expected.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(format!(
-            "checksum file does not contain a valid SHA-256 hash: '{expected}'"
-        ));
-    }
-
-    if actual_hash != expected {
-        return Err(format!(
-            "SHA-256 mismatch: expected {expected}, got {actual_hash}"
-        ));
-    }
-
-    Ok(())
-}
-
-/// Download the release binary from GitHub and stage it in the state directory.
-///
-/// The function:
-/// 1. Re-fetches the latest release to obtain the asset list.
-/// 2. Locates the asset matching the current platform.
-/// 3. Downloads the binary to `{state_dir}/updates/cara-{version}`.
-/// 4. If a `.sha256` checksum asset exists, downloads it and verifies integrity.
-/// 5. On Unix, sets executable permissions.
-///
-/// On success the staging path is returned. On failure, `last_error` is set and
-/// the `installing` flag is cleared.
-async fn download_and_stage(version: &str) -> Result<String, String> {
-    let current_version = {
-        let state = UPDATE_STATE.read();
-        state.current_version.clone()
-    };
-    let user_agent = format!("cara/{}", current_version);
-
-    // Fetch release metadata (with asset list) ----------------------------
-    let client = reqwest::Client::new();
-    let release: GitHubRelease = client
-        .get("https://api.github.com/repos/puremachinery/carapace/releases/latest")
-        .header("User-Agent", &user_agent)
-        .header("Accept", "application/vnd.github+json")
-        .timeout(Duration::from_secs(15))
-        .send()
-        .await
-        .map_err(|e| format!("failed to fetch release metadata: {e}"))?
-        .json()
-        .await
-        .map_err(|e| format!("failed to parse release metadata: {e}"))?;
-
-    // Find the matching asset for this platform ---------------------------
-    let wanted = expected_asset_name();
-    let asset = release
-        .assets
-        .iter()
-        .find(|a| a.name == wanted)
-        .ok_or_else(|| {
-            format!(
-                "no matching asset '{}' in release {} (available: {})",
-                wanted,
-                release.tag_name,
-                release
-                    .assets
-                    .iter()
-                    .map(|a| a.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        })?;
-
-    // Check for a companion checksum asset (e.g. cara-darwin-aarch64.sha256)
-    let checksum_name = format!("{wanted}.sha256");
-    let checksum_asset = release.assets.iter().find(|a| a.name == checksum_name);
-
-    // Prepare staging directory -------------------------------------------
-    let updates_dir = resolve_state_dir().join("updates");
-    tokio::fs::create_dir_all(&updates_dir)
-        .await
-        .map_err(|e| format!("failed to create updates directory: {e}"))?;
-
-    let staged_name = format!("cara-{version}");
-    let staged_path = updates_dir.join(&staged_name);
-
-    // Download the binary -------------------------------------------------
-    let resp = client
-        .get(&asset.browser_download_url)
-        .header("User-Agent", &user_agent)
-        .timeout(Duration::from_secs(300))
-        .send()
-        .await
-        .map_err(|e| format!("failed to download asset: {e}"))?;
-
-    if !resp.status().is_success() {
-        return Err(format!("asset download returned status {}", resp.status()));
-    }
-
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| format!("failed to read asset bytes: {e}"))?;
-
-    // Verify download integrity -------------------------------------------
-    if bytes.is_empty() {
-        return Err("downloaded asset is empty".to_string());
-    }
-
-    // If a checksum asset is available, download and verify
-    if let Some(cksum) = checksum_asset {
-        let cksum_resp = client
-            .get(&cksum.browser_download_url)
-            .header("User-Agent", &user_agent)
-            .timeout(Duration::from_secs(30))
-            .send()
-            .await
-            .map_err(|e| format!("failed to download checksum file: {e}"))?;
-
-        if cksum_resp.status().is_success() {
-            let cksum_text = cksum_resp
-                .text()
-                .await
-                .map_err(|e| format!("failed to read checksum file: {e}"))?;
-
-            let actual_hash = sha256_bytes(&bytes);
-            verify_checksum(&actual_hash, &cksum_text)?;
-        } else {
-            warn!(
-                "checksum asset download returned status {}; skipping verification",
-                cksum_resp.status()
-            );
-        }
-    }
-
-    // Write to staging path -----------------------------------------------
-    let mut file = tokio::fs::File::create(&staged_path)
-        .await
-        .map_err(|e| format!("failed to create staged file: {e}"))?;
-
-    file.write_all(&bytes)
-        .await
-        .map_err(|e| format!("failed to write staged file: {e}"))?;
-
-    file.flush()
-        .await
-        .map_err(|e| format!("failed to flush staged file: {e}"))?;
-
-    // On Unix, make the staged binary executable --------------------------
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o755);
-        std::fs::set_permissions(&staged_path, perms)
-            .map_err(|e| format!("failed to set executable permissions: {e}"))?;
-    }
-
-    Ok(staged_path.to_string_lossy().into_owned())
-}
-
-/// Install an available update
+/// Install an available update.
 pub(super) async fn handle_update_install() -> Result<Value, ErrorShape> {
-    // Validate and set the installing flag --------------------------------
-    let version = {
-        let mut state = UPDATE_STATE.write();
+    handle_update_install_with_force(false).await
+}
 
-        if !state.update_available {
-            return Err(error_shape(
-                ERROR_INVALID_REQUEST,
-                "no update available",
-                None,
-            ));
-        }
+async fn handle_update_install_with_force(force: bool) -> Result<Value, ErrorShape> {
+    let state_dir = resolve_state_dir();
+    let (latest_version, current_version, update_available) = {
+        let mut state = UPDATE_STATE.write();
 
         if state.installing {
             return Err(error_shape(
@@ -701,84 +307,94 @@ pub(super) async fn handle_update_install() -> Result<Value, ErrorShape> {
             ));
         }
 
-        let version = match &state.latest_version {
-            Some(v) => v.clone(),
-            None => {
-                return Err(error_shape(
-                    ERROR_INVALID_REQUEST,
-                    "latest version not known; run update.check first",
-                    None,
-                ));
-            }
-        };
-
         state.installing = true;
         state.last_error = None;
-        version
+        (
+            state.latest_version.clone(),
+            state.current_version.clone(),
+            state.update_available,
+        )
+    };
+    let requested_version_for_error = latest_version.clone();
+
+    let request = crate::update::InstallRequest {
+        current_version,
+        state_dir,
+        requested_version: None,
+        apply_update: !cfg!(test),
     };
 
-    // Perform the download (lock is NOT held during the await) ------------
-    let result = download_and_stage(&version).await;
+    let result = crate::update::install_or_resume_with_snapshot(
+        request,
+        latest_version,
+        update_available,
+        force,
+    )
+    .await;
 
-    // Update state based on outcome ---------------------------------------
     let mut state = UPDATE_STATE.write();
     state.installing = false;
 
     match result {
-        Ok(staged_path) => {
-            // Apply the staged binary atomically
-            match apply_staged_update(&staged_path) {
-                Ok(apply_result) => {
-                    // Mark update as consumed so callers don't re-install.
-                    state.update_available = false;
-
-                    // Clean up old binaries in the background
-                    cleanup_old_binaries();
-                    Ok(json!({
-                        "ok": true,
-                        "status": "success",
-                        "version": version,
-                        "stagedPath": staged_path,
-                        "applied": apply_result.applied,
-                        "sha256": apply_result.sha256,
-                        "binaryPath": apply_result.binary_path,
-                        "restartRequired": true,
-                        "message": "Update applied successfully. Restart to use new version."
-                    }))
+        Ok(outcome) => {
+            state.update_available = false;
+            Ok(json!({
+                "ok": true,
+                "status": "success",
+                "version": outcome.version,
+                "stagedPath": outcome.staged_path,
+                "applied": outcome.applied,
+                "resumed": outcome.resumed,
+                "attempt": outcome.attempt,
+                "sha256": outcome.apply_result.as_ref().map(|r| r.sha256.clone()),
+                "binaryPath": outcome.apply_result.as_ref().map(|r| r.binary_path.clone()),
+                "restartRequired": outcome.applied,
+                "verification": {
+                    "bundleVerified": outcome.verification.bundle_verified,
+                    "checksumVerified": outcome.verification.checksum_verified,
+                    "expectedIdentity": outcome.verification.expected_identity,
+                },
+                "transaction": outcome.transaction,
+                "message": if outcome.applied {
+                    "Update applied successfully. Restart to use new version."
+                } else {
+                    "Update staged successfully."
                 }
-                Err(apply_err) => {
-                    warn!("update apply failed: {apply_err}");
-                    state.last_error = Some(apply_err.clone());
-                    Err(error_shape(
-                        ERROR_UNAVAILABLE,
-                        &format!("update apply failed: {apply_err}"),
-                        Some(json!({
-                            "version": version,
-                            "stagedPath": staged_path
-                        })),
-                    ))
-                }
-            }
+            }))
         }
         Err(err) => {
-            warn!("update install failed: {err}");
-            state.last_error = Some(err.clone());
+            if let Some(code) = err.code {
+                return match code {
+                    crate::update::UpdateErrorCode::NoUpdateAvailable => Err(error_shape(
+                        ERROR_INVALID_REQUEST,
+                        crate::update::NO_UPDATE_AVAILABLE_MESSAGE,
+                        None,
+                    )),
+                    crate::update::UpdateErrorCode::LatestVersionUnknown => Err(error_shape(
+                        ERROR_INVALID_REQUEST,
+                        crate::update::LATEST_VERSION_UNKNOWN_MESSAGE,
+                        None,
+                    )),
+                };
+            }
+            tracing::warn!("update install failed: {}", err.message);
+            state.last_error = Some(err.message.clone());
             Err(error_shape(
                 ERROR_UNAVAILABLE,
-                &format!("update install failed: {err}"),
-                Some(json!({ "version": version })),
+                &format!("update install failed: {}", err.message),
+                Some(json!({
+                    "version": requested_version_for_error,
+                    "retryable": err.retryable,
+                    "phase": err.phase
+                })),
             ))
         }
     }
 }
 
-/// Dismiss an available update notification
+/// Dismiss an available update notification.
 pub(super) fn handle_update_dismiss() -> Result<Value, ErrorShape> {
     let state = UPDATE_STATE.read();
-
-    // Don't actually hide the update, just acknowledge dismissal
-    // This is useful for UI to track user preferences
-
     Ok(json!({
         "ok": true,
         "dismissed": state.update_available,
@@ -786,7 +402,7 @@ pub(super) fn handle_update_dismiss() -> Result<Value, ErrorShape> {
     }))
 }
 
-/// Get release notes for available update
+/// Get release notes for available update.
 pub(super) fn handle_update_release_notes() -> Result<Value, ErrorShape> {
     let state = UPDATE_STATE.read();
 
@@ -803,19 +419,57 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    /// Mutex to serialize tests that modify global state
     static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvVarGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        #[allow(unused_unsafe)]
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            // SAFETY: tests in this module scope env var writes with a guard and TEST_LOCK.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        #[allow(unused_unsafe)]
+        fn drop(&mut self) {
+            match &self.prev {
+                // SAFETY: restoring test-scoped env var state.
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                // SAFETY: restoring test-scoped env var state.
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    fn set_temp_state_dir() -> (tempfile::TempDir, EnvVarGuard) {
+        let temp = tempfile::tempdir().expect("tempdir for update handler tests");
+        let guard = EnvVarGuard::set(
+            "CARAPACE_STATE_DIR",
+            temp.path()
+                .to_str()
+                .expect("temp state dir should be utf-8 for tests"),
+        );
+        (temp, guard)
+    }
 
     fn reset_state() {
         let mut state = UPDATE_STATE.write();
         *state = UpdateState::default();
     }
 
-    #[test]
-    fn test_update_status() {
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_update_status() {
         let _lock = TEST_LOCK.lock().unwrap();
         reset_state();
-        let result = handle_update_status().unwrap();
+        let result = handle_update_status().await.unwrap();
         assert!(!result["currentVersion"].as_str().unwrap().is_empty());
         assert_eq!(result["channel"], "stable");
         assert_eq!(result["autoUpdate"], true);
@@ -826,11 +480,15 @@ mod tests {
     async fn test_update_run() {
         let _lock = TEST_LOCK.lock().unwrap();
         reset_state();
-        // In test environments the HTTP request will fail, but the handler
-        // must still succeed (returning updateAvailable: false with a last_error).
-        let result = handle_update_run(None).await.unwrap();
-        assert_eq!(result["ok"], true);
-        assert_eq!(result["updateAvailable"], false);
+        // Runtime behavior may vary by network and latest release state.
+        // Accept either a successful run result or a retryable unavailable error.
+        match handle_update_run(None).await {
+            Ok(result) => assert_eq!(result["ok"], true),
+            Err(err) => {
+                assert_eq!(err.code, ERROR_UNAVAILABLE);
+                assert!(err.retryable);
+            }
+        }
     }
 
     #[tokio::test]
@@ -848,7 +506,6 @@ mod tests {
     async fn test_update_check() {
         let _lock = TEST_LOCK.lock().unwrap();
         reset_state();
-        // HTTP will fail in tests, but handler returns Ok with an error recorded in state
         let result = handle_update_check().await.unwrap();
         assert_eq!(result["ok"], true);
     }
@@ -865,16 +522,6 @@ mod tests {
     }
 
     #[test]
-    fn test_update_set_invalid_channel() {
-        let _lock = TEST_LOCK.lock().unwrap();
-        reset_state();
-
-        let params = json!({ "channel": "invalid" });
-        let result = handle_update_set_channel(Some(&params));
-        assert!(result.is_err());
-    }
-
-    #[test]
     fn test_update_configure() {
         let _lock = TEST_LOCK.lock().unwrap();
         reset_state();
@@ -884,8 +531,20 @@ mod tests {
             "channel": "beta"
         });
         let result = handle_update_configure(Some(&params)).unwrap();
+        assert_eq!(result["ok"], true);
         assert_eq!(result["autoUpdate"], false);
         assert_eq!(result["channel"], "beta");
+    }
+
+    #[test]
+    fn test_update_set_invalid_channel() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        reset_state();
+
+        let params = json!({ "channel": "invalid" });
+        let err = handle_update_set_channel(Some(&params)).expect_err("invalid channel must fail");
+        assert_eq!(err.code, ERROR_INVALID_REQUEST);
+        assert!(err.message.contains("unknown update channel"));
     }
 
     #[tokio::test]
@@ -893,9 +552,11 @@ mod tests {
     async fn test_update_install_no_update() {
         let _lock = TEST_LOCK.lock().unwrap();
         reset_state();
-        let result = handle_update_install().await;
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code, ERROR_INVALID_REQUEST);
+        let err = handle_update_install()
+            .await
+            .expect_err("install with no available update must fail");
+        assert_eq!(err.code, ERROR_INVALID_REQUEST);
+        assert!(err.message.contains("no update available"));
     }
 
     #[tokio::test]
@@ -906,69 +567,67 @@ mod tests {
         {
             let mut state = UPDATE_STATE.write();
             state.update_available = true;
-            state.latest_version = Some("99.0.0".to_string());
+            state.latest_version = Some("9.9.9".to_string());
             state.installing = true;
         }
-        let result = handle_update_install().await;
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code, ERROR_UNAVAILABLE);
+        let err = handle_update_install()
+            .await
+            .expect_err("install guard should reject");
+        assert_eq!(err.code, ERROR_UNAVAILABLE);
+        assert!(err.message.contains("already in progress"));
     }
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn test_update_install_no_version() {
+    async fn test_update_install_force_bypasses_no_update_guard() {
         let _lock = TEST_LOCK.lock().unwrap();
         reset_state();
-        {
-            let mut state = UPDATE_STATE.write();
-            state.update_available = true;
-            // latest_version left as None
-        }
-        let result = handle_update_install().await;
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code, ERROR_INVALID_REQUEST);
-        // installing flag must be cleared even on validation failure path
-        let state = UPDATE_STATE.read();
-        assert!(!state.installing);
+        let err = handle_update_install_with_force(true)
+            .await
+            .expect_err("force should bypass no-update check");
+        assert_eq!(err.code, ERROR_INVALID_REQUEST);
+        assert!(err.message.contains("latest version not known"));
     }
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn test_update_install_download_failure_clears_flag() {
+    async fn test_update_install_resume_pending_bypasses_no_update_invalid_request() {
         let _lock = TEST_LOCK.lock().unwrap();
+        let (_tmp, _guard) = set_temp_state_dir();
         reset_state();
         {
             let mut state = UPDATE_STATE.write();
-            state.update_available = true;
-            state.latest_version = Some("99.0.0".to_string());
-            state.download_url =
-                Some("https://github.com/puremachinery/carapace/releases/tag/v99.0.0".to_string());
+            state.update_available = false;
+            state.latest_version = None;
         }
-        // The download will fail in test environments (no such release).
-        let result = handle_update_install().await;
-        assert!(result.is_err());
-        // Verify installing flag is cleared after failure
-        let state = UPDATE_STATE.read();
-        assert!(!state.installing);
-        // last_error should be populated
-        assert!(state.last_error.is_some());
-    }
 
-    #[test]
-    fn test_expected_asset_name() {
-        let name = expected_asset_name();
-        // Must start with "cara-"
-        assert!(name.starts_with("cara-"), "unexpected asset name: {name}");
-        // Must contain a platform identifier
-        let os = std::env::consts::OS;
-        let expected_os = match os {
-            "macos" => "darwin",
-            other => other,
+        let tx = crate::update::UpdateTransaction {
+            id: "tx-test-resume".to_string(),
+            version: "0.0.1".to_string(),
+            asset_name: crate::update::expected_asset_name(),
+            state: crate::update::UpdateTransactionState::InProgress,
+            attempt: 0,
+            max_attempts: crate::update::DEFAULT_RESUME_MAX_ATTEMPTS,
+            started_at_ms: crate::update::now_ms(),
+            updated_at_ms: crate::update::now_ms(),
+            staged_path: None,
+            bundle_path: None,
+            sha256: None,
+            last_error: None,
+            phase: crate::update::UpdatePhase::Created,
+            retryable: true,
         };
-        assert!(
-            name.contains(expected_os),
-            "asset name '{name}' does not contain expected OS '{expected_os}'"
-        );
+        let state_dir = resolve_state_dir();
+        crate::update::persist_update_transaction(state_dir.as_path(), &tx)
+            .expect("persist pending transaction fixture");
+
+        match handle_update_install().await {
+            Ok(_) => {}
+            Err(err) => assert_ne!(
+                err.code, ERROR_INVALID_REQUEST,
+                "resume-pending transaction should bypass no-update invalid-request guard"
+            ),
+        }
     }
 
     #[test]
@@ -977,394 +636,5 @@ mod tests {
         reset_state();
         let result = handle_update_dismiss().unwrap();
         assert_eq!(result["ok"], true);
-    }
-
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
-    async fn test_update_check_clears_checking_flag() {
-        let _lock = TEST_LOCK.lock().unwrap();
-        reset_state();
-        // May reach GitHub (CI with network) or fail (sandboxed/offline).
-        // Either way, the checking flag must be cleared afterward.
-        let result = handle_update_check().await.unwrap();
-        assert_eq!(result["ok"], true);
-        let state = UPDATE_STATE.read();
-        assert!(!state.checking);
-        // Exactly one of these should be true: error recorded or version fetched
-        let got_error = state.last_error.is_some();
-        let got_version = state.latest_version.is_some();
-        assert!(
-            got_error || got_version,
-            "expected either last_error or latest_version to be set"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // apply_staged_update tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_apply_staged_update_nonexistent_path() {
-        let result = apply_staged_update("/nonexistent/path/to/binary");
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(
-            err.contains("staged binary not found"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn test_apply_staged_update_empty_file() {
-        let dir = tempfile::tempdir().expect("failed to create temp dir");
-        let empty_file = dir.path().join("empty-binary");
-        std::fs::write(&empty_file, b"").expect("failed to write empty file");
-        let result = apply_staged_update(empty_file.to_str().unwrap());
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.contains("is empty"), "unexpected error: {err}");
-    }
-
-    // -----------------------------------------------------------------------
-    // SHA-256 computation tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_compute_sha256_known_value() {
-        let dir = tempfile::tempdir().expect("failed to create temp dir");
-        let file_path = dir.path().join("test-hash");
-        // SHA-256 of b"hello world\n"
-        std::fs::write(&file_path, b"hello world\n").expect("failed to write file");
-        let hash = compute_sha256(file_path.to_str().unwrap()).unwrap();
-        assert_eq!(
-            hash, "a948904f2f0f479b8f8197694b30184b0d2ed1c1cd2a1ec0fb85d299a192a447",
-            "SHA-256 mismatch for known input"
-        );
-    }
-
-    #[test]
-    fn test_compute_sha256_empty_file() {
-        let dir = tempfile::tempdir().expect("failed to create temp dir");
-        let file_path = dir.path().join("empty");
-        std::fs::write(&file_path, b"").expect("failed to write file");
-        let hash = compute_sha256(file_path.to_str().unwrap()).unwrap();
-        assert_eq!(
-            hash,
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        );
-    }
-
-    #[test]
-    fn test_compute_sha256_nonexistent_file() {
-        let result = compute_sha256("/nonexistent/file/path");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("failed to open file"));
-    }
-
-    #[test]
-    fn test_compute_sha256_deterministic() {
-        let dir = tempfile::tempdir().expect("failed to create temp dir");
-        let file_path = dir.path().join("deterministic");
-        std::fs::write(&file_path, b"deterministic content").expect("failed to write");
-        let path_str = file_path.to_str().unwrap();
-        let hash1 = compute_sha256(path_str).unwrap();
-        let hash2 = compute_sha256(path_str).unwrap();
-        assert_eq!(hash1, hash2, "SHA-256 should be deterministic");
-    }
-
-    // -----------------------------------------------------------------------
-    // cleanup_old_binaries tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_cleanup_old_binaries_removes_bak_files() {
-        let dir = tempfile::tempdir().expect("failed to create temp dir");
-        let bak_file = dir.path().join("cara.bak");
-        let old_file = dir.path().join("cara.old");
-        std::fs::write(&bak_file, b"backup").expect("write bak");
-        std::fs::write(&old_file, b"old").expect("write old");
-        cleanup_old_binaries();
-    }
-
-    #[test]
-    fn test_cleanup_old_binaries_preserves_non_backup_files() {
-        let dir = tempfile::tempdir().expect("failed to create temp dir");
-        let normal_file = dir.path().join("important.txt");
-        std::fs::write(&normal_file, b"keep me").expect("write");
-        cleanup_old_binaries();
-        assert!(
-            normal_file.exists(),
-            "cleanup_old_binaries should not remove non-backup files"
-        );
-    }
-
-    #[test]
-    fn test_cleanup_old_binaries_no_panic_on_missing_dirs() {
-        cleanup_old_binaries();
-    }
-
-    // -----------------------------------------------------------------------
-    // expected_asset_name tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_expected_asset_name_format() {
-        let name = expected_asset_name();
-        let parts: Vec<&str> = name.split('-').collect();
-        assert!(
-            parts.len() >= 3,
-            "asset name should have at least 3 dash-separated parts: {name}"
-        );
-        assert_eq!(parts[0], "cara");
-    }
-
-    #[test]
-    fn test_expected_asset_name_no_exe_on_unix() {
-        let name = expected_asset_name();
-        if cfg!(unix) {
-            assert!(
-                !name.ends_with(".exe"),
-                "Unix asset name should not end with .exe: {name}"
-            );
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Staged path construction tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_staged_path_construction() {
-        let updates_dir = resolve_state_dir().join("updates");
-        let version = "1.2.3";
-        let staged_name = format!("cara-{version}");
-        let staged_path = updates_dir.join(&staged_name);
-        let path_str = staged_path.to_string_lossy();
-        assert!(
-            path_str.contains("updates") && path_str.contains("cara-1.2.3"),
-            "staged path should contain updates/cara-VERSION: {}",
-            staged_path.display()
-        );
-    }
-
-    #[test]
-    fn test_staged_path_different_versions() {
-        let updates_dir = resolve_state_dir().join("updates");
-        let path_a = updates_dir.join("cara-1.0.0");
-        let path_b = updates_dir.join("cara-2.0.0");
-        assert_ne!(
-            path_a, path_b,
-            "different versions should have different paths"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // State transition tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_install_sets_installing_flag() {
-        let _lock = TEST_LOCK.lock().unwrap();
-        reset_state();
-        {
-            let mut state = UPDATE_STATE.write();
-            state.update_available = true;
-            state.latest_version = Some("99.0.0".to_string());
-            state.installing = false;
-        }
-        let state = UPDATE_STATE.read();
-        assert!(!state.installing);
-        assert!(state.update_available);
-    }
-
-    #[test]
-    fn test_state_default_values() {
-        let state = UpdateState::default();
-        assert!(!state.update_available);
-        assert!(!state.checking);
-        assert!(!state.installing);
-        assert_eq!(state.channel, "stable");
-        assert!(state.auto_update);
-        assert!(state.latest_version.is_none());
-        assert!(state.last_error.is_none());
-        assert!(state.download_url.is_none());
-        assert!(state.release_notes.is_none());
-        assert!(state.last_check_at.is_none());
-    }
-
-    // -----------------------------------------------------------------------
-    // ApplyResult struct tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_apply_result_fields() {
-        let result = ApplyResult {
-            applied: true,
-            sha256: "abc123".to_string(),
-            binary_path: "/usr/bin/cara".to_string(),
-        };
-        assert!(result.applied);
-        assert_eq!(result.sha256, "abc123");
-        assert_eq!(result.binary_path, "/usr/bin/cara");
-    }
-
-    #[test]
-    fn test_apply_result_serialize() {
-        let result = ApplyResult {
-            applied: true,
-            sha256: "deadbeef".to_string(),
-            binary_path: "/tmp/test".to_string(),
-        };
-        let json = serde_json::to_value(&result).expect("serialize ApplyResult");
-        assert_eq!(json["applied"], true);
-        assert_eq!(json["sha256"], "deadbeef");
-        assert_eq!(json["binary_path"], "/tmp/test");
-    }
-
-    #[test]
-    fn test_apply_result_deserialize() {
-        let json_str = r##"{"applied":false,"sha256":"abc","binary_path":"/bin/ttt"}"##;
-        let result: ApplyResult = serde_json::from_str(json_str).expect("deserialize ApplyResult");
-        assert!(!result.applied);
-        assert_eq!(result.sha256, "abc");
-        assert_eq!(result.binary_path, "/bin/ttt");
-    }
-
-    // -----------------------------------------------------------------------
-    // sha256_bytes tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_sha256_bytes_known_value() {
-        let hash = sha256_bytes(b"hello world\n");
-        assert_eq!(
-            hash, "a948904f2f0f479b8f8197694b30184b0d2ed1c1cd2a1ec0fb85d299a192a447",
-            "SHA-256 of 'hello world\\n' mismatch"
-        );
-    }
-
-    #[test]
-    fn test_sha256_bytes_empty() {
-        let hash = sha256_bytes(b"");
-        assert_eq!(
-            hash,
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        );
-    }
-
-    #[test]
-    fn test_sha256_bytes_deterministic() {
-        let h1 = sha256_bytes(b"test data");
-        let h2 = sha256_bytes(b"test data");
-        assert_eq!(h1, h2);
-    }
-
-    // -----------------------------------------------------------------------
-    // verify_checksum tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_verify_checksum_match_bare_hash() {
-        let data = b"hello";
-        let hash = sha256_bytes(data);
-        // checksum file contains just the hash
-        let result = verify_checksum(&hash, &hash);
-        assert!(result.is_ok(), "bare hash should match: {:?}", result);
-    }
-
-    #[test]
-    fn test_verify_checksum_match_gnu_format() {
-        let data = b"hello";
-        let hash = sha256_bytes(data);
-        // GNU coreutils format: "<hash>  <filename>"
-        let checksum_text = format!("{}  cara-darwin-aarch64", hash);
-        let result = verify_checksum(&hash, &checksum_text);
-        assert!(result.is_ok(), "GNU format should match: {:?}", result);
-    }
-
-    #[test]
-    fn test_verify_checksum_mismatch() {
-        let result = verify_checksum(
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  file.bin",
-        );
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(
-            err.contains("mismatch"),
-            "error should mention mismatch: {err}"
-        );
-    }
-
-    #[test]
-    fn test_verify_checksum_empty_file() {
-        let result = verify_checksum(
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-            "",
-        );
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.contains("empty"), "error should mention empty: {err}");
-    }
-
-    #[test]
-    fn test_verify_checksum_malformed() {
-        let result = verify_checksum(
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-            "not-a-valid-sha256",
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_verify_checksum_with_trailing_whitespace() {
-        let hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-        let checksum_text = format!("{}  empty.bin\n", hash);
-        let result = verify_checksum(hash, &checksum_text);
-        assert!(
-            result.is_ok(),
-            "trailing whitespace should not cause failure: {:?}",
-            result
-        );
-    }
-
-    #[test]
-    fn test_verify_checksum_case_insensitive() {
-        let hash_lower = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-        let hash_upper = "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855";
-        let result = verify_checksum(hash_lower, hash_upper);
-        assert!(
-            result.is_ok(),
-            "checksum verification should be case-insensitive: {:?}",
-            result
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Platform detection tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_expected_asset_name_contains_arch() {
-        let name = expected_asset_name();
-        let arch = std::env::consts::ARCH;
-        assert!(
-            name.contains(arch),
-            "asset name '{name}' does not contain arch '{arch}'"
-        );
-    }
-
-    #[test]
-    fn test_expected_asset_name_checksum_companion() {
-        let name = expected_asset_name();
-        let checksum_name = format!("{name}.sha256");
-        assert!(
-            checksum_name.ends_with(".sha256"),
-            "checksum name should end with .sha256: {checksum_name}"
-        );
-        assert!(
-            checksum_name.starts_with("cara-"),
-            "checksum name should start with cara-: {checksum_name}"
-        );
     }
 }

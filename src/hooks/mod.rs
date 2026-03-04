@@ -9,7 +9,7 @@ pub mod auth;
 pub mod handler;
 pub mod registry;
 
-pub use auth::{extract_hooks_token, timing_safe_equal, validate_hooks_token};
+pub use auth::{extract_hooks_token, validate_hooks_token};
 pub use handler::{
     validate_agent_request, validate_wake_request, AgentRequest, AgentResponse, HooksErrorResponse,
     ValidatedAgentRequest, ValidatedWakeRequest, WakeMode, WakeRequest, WakeResponse,

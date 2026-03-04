@@ -421,6 +421,9 @@ async fn watcher_task(
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::{LazyLock, Mutex};
+
+    static ENV_VAR_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     #[test]
     fn test_reload_mode_from_str() {
@@ -494,6 +497,17 @@ mod tests {
 
     #[test]
     fn test_perform_reload_with_no_config_file() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let missing_config_path = temp_dir.path().join("missing-carapace.json5");
+        let _config_path_guard = EnvVarGuard::set(
+            "CARAPACE_CONFIG_PATH",
+            missing_config_path.to_str().unwrap(),
+        );
+        let _state_dir_guard = EnvVarGuard::unset("CARAPACE_STATE_DIR");
+        let _disable_cache_guard = EnvVarGuard::set("CARAPACE_DISABLE_CONFIG_CACHE", "1");
+        crate::config::clear_cache();
+
         // When no config file exists, reload should succeed with defaults
         // (load_config_uncached returns defaults for missing files)
         let result = perform_reload(&ReloadMode::Hot);
@@ -501,6 +515,8 @@ mod tests {
         // for non-existent files
         assert!(result.success);
         assert_eq!(result.mode, "hot");
+
+        crate::config::clear_cache();
     }
 
     #[test]
@@ -585,6 +601,7 @@ mod tests {
     #[tokio::test]
     async fn test_reload_validation_with_temp_config() {
         use std::io::Write;
+        let _lock = ENV_VAR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::TempDir::new().unwrap();
         let config_path = dir.path().join("carapace.json5");
 
@@ -604,6 +621,7 @@ mod tests {
     #[tokio::test]
     async fn test_reload_invalid_config_fails() {
         use std::io::Write;
+        let _lock = ENV_VAR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::TempDir::new().unwrap();
         let config_path = dir.path().join("carapace.json5");
 
@@ -630,6 +648,15 @@ mod tests {
         fn set(key: &str, value: &str) -> Self {
             let prev = std::env::var(key).ok();
             std::env::set_var(key, value);
+            Self {
+                key: key.to_string(),
+                prev,
+            }
+        }
+
+        fn unset(key: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            std::env::remove_var(key);
             Self {
                 key: key.to_string(),
                 prev,

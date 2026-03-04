@@ -4,7 +4,12 @@
 
 If you discover a security vulnerability in carapace, please report it privately.
 
-**Email:** security@puremachinery.com
+**Preferred channel:** GitHub Private Vulnerability Reporting  
+https://github.com/puremachinery/carapace/security/advisories/new
+
+If the advisory form is unavailable, open a public issue titled
+`Security Contact Request` with no vulnerability details so we can move the
+report to a private channel.
 
 **What to include:**
 - Description of the vulnerability
@@ -17,7 +22,7 @@ If you discover a security vulnerability in carapace, please report it privately
 - A fix or mitigation plan within 7 days for critical issues
 - Credit in the release notes (unless you prefer anonymity)
 
-Please do **not** open a public GitHub issue for security vulnerabilities.
+Please do **not** post vulnerability details in a public GitHub issue.
 
 ## Supported Versions
 

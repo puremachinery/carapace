@@ -5,6 +5,7 @@
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter};
@@ -360,6 +361,52 @@ fn current_month() -> String {
     date[..7].to_string()
 }
 
+#[derive(Debug, Clone)]
+struct SessionIdentity {
+    session_id: String,
+    legacy_session_id: String,
+}
+
+fn canonical_session_digest(session_key: &str) -> Option<&str> {
+    let digest = session_key.strip_prefix("sid_")?;
+    if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(digest)
+}
+
+fn session_identity(session_key: &str) -> SessionIdentity {
+    if let Some(canonical_digest_hex) = canonical_session_digest(session_key) {
+        return SessionIdentity {
+            session_id: session_key.to_string(),
+            legacy_session_id: format!("sid_{}", &canonical_digest_hex[..24]),
+        };
+    }
+
+    let digest = Sha256::digest(session_key.as_bytes());
+    let digest_hex = hex::encode(digest);
+    let legacy_digest_hex = &digest_hex[..24];
+    SessionIdentity {
+        session_id: format!("sid_{digest_hex}"),
+        legacy_session_id: format!("sid_{legacy_digest_hex}"),
+    }
+}
+
+fn merge_session_usage(existing: &mut SessionUsage, incoming: SessionUsage) {
+    existing.input_tokens += incoming.input_tokens;
+    existing.output_tokens += incoming.output_tokens;
+    existing.requests += incoming.requests;
+    existing.cost_usd += incoming.cost_usd;
+    if existing.first_used_at == 0
+        || (incoming.first_used_at != 0 && incoming.first_used_at < existing.first_used_at)
+    {
+        existing.first_used_at = incoming.first_used_at;
+    }
+    if incoming.last_used_at > existing.last_used_at {
+        existing.last_used_at = incoming.last_used_at;
+    }
+}
+
 fn is_leap_year(year: u64) -> bool {
     (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
 }
@@ -397,9 +444,14 @@ pub struct UsageRecord {
     pub provider: String,
     /// Model name
     pub model: String,
-    /// Session key (optional)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub session_key: Option<String>,
+    /// Opaque session identifier (optional)
+    #[serde(
+        default,
+        alias = "session_key",
+        rename = "session_id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub session_id: Option<String>,
     /// Input tokens consumed
     pub input_tokens: u64,
     /// Output tokens generated
@@ -607,8 +659,9 @@ fn default_enabled() -> bool {
 /// Session-level usage tracking
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionUsage {
-    /// Session key
-    pub session_key: String,
+    /// Opaque session identifier
+    #[serde(alias = "session_key", rename = "session_id")]
+    pub session_id: String,
     /// Total input tokens
     pub input_tokens: u64,
     /// Total output tokens
@@ -669,7 +722,9 @@ impl UsageTracker {
                                 save_interval: Duration::from_secs(5),
                             };
                             if tracker.prune_data() {
-                                let _ = tracker.save();
+                                if let Err(error) = tracker.save() {
+                                    tracing::warn!(error = %error, "failed to persist pruned usage data");
+                                }
                             }
                             return tracker;
                         }
@@ -716,7 +771,9 @@ impl UsageTracker {
             None => true,
         };
         if should_flush {
-            let _ = self.save();
+            if let Err(error) = self.save() {
+                tracing::warn!(error = %error, "failed to persist usage data");
+            }
         }
     }
 
@@ -742,7 +799,7 @@ impl UsageTracker {
         &mut self,
         provider: &str,
         model: &str,
-        session_key: Option<&str>,
+        session_hint: Option<&str>,
         input_tokens: u64,
         output_tokens: u64,
     ) {
@@ -753,6 +810,7 @@ impl UsageTracker {
         let now = now_ms();
         let date = today_date();
         let month = current_month();
+        let resolved_session_identity = session_hint.map(session_identity);
 
         // Calculate cost
         let pricing = get_model_pricing(model).unwrap_or_else(default_pricing);
@@ -762,7 +820,9 @@ impl UsageTracker {
             timestamp: now,
             provider: provider.to_string(),
             model: model.to_string(),
-            session_key: session_key.map(|s| s.to_string()),
+            session_id: resolved_session_identity
+                .as_ref()
+                .map(|identity| identity.session_id.clone()),
             input_tokens,
             output_tokens,
             cost_usd: cost,
@@ -785,16 +845,22 @@ impl UsageTracker {
         monthly.add_record(&record);
 
         // Update session usage if session key provided
-        if let Some(key) = session_key {
+        if let (Some(identity), Some(raw_session_hint)) = (resolved_session_identity, session_hint)
+        {
+            // Backward compatibility: consolidate pre-migration keys into the
+            // canonical full-hash session id when a matching session appears.
+            self.promote_session_aliases(&identity, raw_session_hint);
             let session = self
                 .data
                 .sessions
-                .entry(key.to_string())
+                .entry(identity.session_id.clone())
                 .or_insert_with(|| SessionUsage {
-                    session_key: key.to_string(),
-                    first_used_at: now,
+                    session_id: identity.session_id.clone(),
                     ..Default::default()
                 });
+            if session.first_used_at == 0 {
+                session.first_used_at = now;
+            }
             session.input_tokens += input_tokens;
             session.output_tokens += output_tokens;
             session.requests += 1;
@@ -990,7 +1056,13 @@ impl UsageTracker {
 
     /// Get session usage
     pub fn get_session_usage(&self, session_key: &str) -> Option<&SessionUsage> {
-        self.data.sessions.get(session_key)
+        let identity = session_identity(session_key);
+        self.data
+            .sessions
+            .get(&identity.session_id)
+            .or_else(|| self.data.sessions.get(&identity.legacy_session_id))
+            // Backward compatibility for pre-hash usage.json data.
+            .or_else(|| self.data.sessions.get(session_key))
     }
 
     /// Get all session usage entries
@@ -1048,12 +1120,62 @@ impl UsageTracker {
 
     /// Reset usage for a specific session
     pub fn reset_session(&mut self, session_key: &str) -> bool {
-        if self.data.sessions.remove(session_key).is_some() {
+        let identity = session_identity(session_key);
+        let removed_by_id = self.data.sessions.remove(&identity.session_id).is_some();
+        let removed_by_legacy = self
+            .data
+            .sessions
+            .remove(&identity.legacy_session_id)
+            .is_some();
+        let removed_by_key = if session_key.starts_with("sid_") {
+            false
+        } else {
+            self.data.sessions.remove(session_key).is_some()
+        };
+        if removed_by_id || removed_by_legacy || removed_by_key {
             self.dirty = true;
             true
         } else {
             false
         }
+    }
+
+    fn promote_session_aliases(&mut self, identity: &SessionIdentity, raw_session_hint: &str) {
+        let mut migrated: Vec<SessionUsage> = Vec::with_capacity(2);
+        if let Some(legacy_usage) = self.data.sessions.remove(&identity.legacy_session_id) {
+            migrated.push(legacy_usage);
+        }
+
+        // Only remove raw plaintext alias keys when they are clearly distinct
+        // from canonical sid_* identifiers to avoid accidental collisions.
+        if !raw_session_hint.starts_with("sid_") {
+            if let Some(legacy_plaintext_usage) = self.data.sessions.remove(raw_session_hint) {
+                migrated.push(legacy_plaintext_usage);
+            }
+        }
+
+        if migrated.is_empty() {
+            return;
+        }
+
+        let session = self
+            .data
+            .sessions
+            .entry(identity.session_id.clone())
+            .or_insert_with(|| SessionUsage {
+                session_id: identity.session_id.clone(),
+                ..Default::default()
+            });
+        for migrated_usage in migrated {
+            merge_session_usage(session, migrated_usage);
+        }
+        self.dirty = true;
+    }
+
+    fn has_session_aliases(&self, identity: &SessionIdentity, raw_session_hint: &str) -> bool {
+        self.data.sessions.contains_key(&identity.legacy_session_id)
+            || (!raw_session_hint.starts_with("sid_")
+                && self.data.sessions.contains_key(raw_session_hint))
     }
 }
 
@@ -1199,14 +1321,18 @@ pub fn get_cost_breakdown(days: u64) -> CostBreakdown {
 pub fn enable_tracking() {
     let mut tracker = USAGE_TRACKER.write();
     tracker.enable();
-    let _ = tracker.save();
+    if let Err(error) = tracker.save() {
+        tracing::warn!(error = %error, "failed to persist usage tracking enable state");
+    }
 }
 
 /// Disable usage tracking (global tracker)
 pub fn disable_tracking() {
     let mut tracker = USAGE_TRACKER.write();
     tracker.disable();
-    let _ = tracker.save();
+    if let Err(error) = tracker.save() {
+        tracing::warn!(error = %error, "failed to persist usage tracking disable state");
+    }
 }
 
 /// Check if tracking is enabled (global tracker)
@@ -1217,7 +1343,21 @@ pub fn is_tracking_enabled() -> bool {
 
 /// Get session usage (global tracker)
 pub fn get_session_usage(session_key: &str) -> Option<SessionUsage> {
-    let tracker = USAGE_TRACKER.read();
+    let identity = session_identity(session_key);
+    {
+        let tracker = USAGE_TRACKER.read();
+        if !tracker.has_session_aliases(&identity, session_key) {
+            return tracker.get_session_usage(session_key).cloned();
+        }
+    }
+
+    let mut tracker = USAGE_TRACKER.write();
+    if tracker.has_session_aliases(&identity, session_key) {
+        tracker.promote_session_aliases(&identity, session_key);
+        if tracker.dirty {
+            tracker.maybe_save();
+        }
+    }
     tracker.get_session_usage(session_key).cloned()
 }
 
@@ -1249,14 +1389,18 @@ pub fn get_monthly_summaries(months: usize) -> Vec<MonthlySummary> {
 pub fn reset_all() {
     let mut tracker = USAGE_TRACKER.write();
     tracker.reset();
-    let _ = tracker.save();
+    if let Err(error) = tracker.save() {
+        tracing::warn!(error = %error, "failed to persist usage reset");
+    }
 }
 
 /// Reset session usage (global tracker)
 pub fn reset_session(session_key: &str) -> bool {
     let mut tracker = USAGE_TRACKER.write();
     let result = tracker.reset_session(session_key);
-    let _ = tracker.save();
+    if let Err(error) = tracker.save() {
+        tracing::warn!(error = %error, "failed to persist session usage reset");
+    }
     result
 }
 
@@ -1483,6 +1627,188 @@ mod tests {
     }
 
     #[test]
+    fn test_tracker_reset_session_removes_hashed_and_legacy_entries() {
+        let mut tracker = create_test_tracker();
+
+        let session_key = "legacy-session";
+        let identity = session_identity(session_key);
+        let session_id = identity.session_id.clone();
+        let legacy_session_id = identity.legacy_session_id.clone();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_else(|_| std::time::Duration::from_secs(0))
+            .as_millis() as u64;
+        let usage = SessionUsage {
+            session_id: session_id.clone(),
+            input_tokens: 10,
+            output_tokens: 20,
+            requests: 1,
+            cost_usd: 0.001,
+            first_used_at: now,
+            last_used_at: now,
+        };
+
+        tracker
+            .data
+            .sessions
+            .insert(session_id.clone(), usage.clone());
+        tracker
+            .data
+            .sessions
+            .insert(legacy_session_id.clone(), usage.clone());
+        tracker.data.sessions.insert(session_key.to_string(), usage);
+
+        assert!(tracker.reset_session(session_key));
+        assert!(!tracker.data.sessions.contains_key(session_key));
+        assert!(!tracker.data.sessions.contains_key(&session_id));
+        assert!(!tracker.data.sessions.contains_key(&legacy_session_id));
+    }
+
+    #[test]
+    fn test_get_session_usage_supports_legacy_hashed_id() {
+        let mut tracker = create_test_tracker();
+        let session_key = "legacy-hash-session";
+        let legacy_session_id = session_identity(session_key).legacy_session_id;
+
+        tracker.data.sessions.insert(
+            legacy_session_id.clone(),
+            SessionUsage {
+                session_id: legacy_session_id,
+                input_tokens: 7,
+                output_tokens: 9,
+                requests: 2,
+                cost_usd: 0.123,
+                first_used_at: 100,
+                last_used_at: 200,
+            },
+        );
+
+        let usage = tracker
+            .get_session_usage(session_key)
+            .expect("legacy hashed session should be resolved");
+        assert_eq!(usage.requests, 2);
+    }
+
+    #[test]
+    fn test_session_identity_preserves_canonical_sid_input() {
+        let raw_session_hint = "canonical-session";
+        let canonical_id = session_identity(raw_session_hint).session_id;
+        let legacy_id = session_identity(raw_session_hint).legacy_session_id;
+
+        let identity = session_identity(&canonical_id);
+
+        assert_eq!(identity.session_id, canonical_id);
+        assert_eq!(
+            identity.legacy_session_id, legacy_id,
+            "canonical sid should keep the same legacy alias for migration"
+        );
+    }
+
+    #[test]
+    fn test_record_migrates_legacy_keys_to_full_hash() {
+        let mut tracker = create_test_tracker();
+        let session_key = "migrate-me";
+        let identity = session_identity(session_key);
+        let full_session_id = identity.session_id.clone();
+        let legacy_session_id = identity.legacy_session_id.clone();
+
+        tracker.data.sessions.insert(
+            legacy_session_id.clone(),
+            SessionUsage {
+                session_id: legacy_session_id.clone(),
+                input_tokens: 100,
+                output_tokens: 200,
+                requests: 3,
+                cost_usd: 1.5,
+                first_used_at: 10,
+                last_used_at: 20,
+            },
+        );
+        tracker.data.sessions.insert(
+            session_key.to_string(),
+            SessionUsage {
+                session_id: session_key.to_string(),
+                input_tokens: 5,
+                output_tokens: 6,
+                requests: 1,
+                cost_usd: 0.2,
+                first_used_at: 5,
+                last_used_at: 8,
+            },
+        );
+
+        tracker.record(
+            "anthropic",
+            "claude-3-5-sonnet-20241022",
+            Some(session_key),
+            10,
+            20,
+        );
+
+        assert!(!tracker.data.sessions.contains_key(&legacy_session_id));
+        assert!(!tracker.data.sessions.contains_key(session_key));
+
+        let usage = tracker
+            .data
+            .sessions
+            .get(&full_session_id)
+            .expect("expected canonical full-hash session entry");
+        assert_eq!(usage.session_id, full_session_id);
+        assert_eq!(usage.input_tokens, 115);
+        assert_eq!(usage.output_tokens, 226);
+        assert_eq!(usage.requests, 5);
+        assert!(usage.cost_usd > 1.7);
+    }
+
+    #[test]
+    fn test_record_does_not_remove_sid_prefixed_raw_key_alias() {
+        let mut tracker = create_test_tracker();
+        let victim_key = "victim-session";
+        let victim_id = session_identity(victim_key).session_id;
+        let now = now_ms();
+
+        tracker.data.sessions.insert(
+            victim_id.clone(),
+            SessionUsage {
+                session_id: victim_id.clone(),
+                input_tokens: 1,
+                output_tokens: 1,
+                requests: 1,
+                cost_usd: 0.01,
+                first_used_at: now,
+                last_used_at: now,
+            },
+        );
+
+        // Contrived input where caller-provided raw key equals another canonical sid_* key.
+        tracker.record(
+            "anthropic",
+            "claude-3-5-sonnet-20241022",
+            Some(&victim_id),
+            10,
+            20,
+        );
+
+        assert_eq!(
+            tracker.data.sessions.len(),
+            1,
+            "canonical sid input should update in place, not create a second hashed entry"
+        );
+        assert!(
+            tracker.data.sessions.contains_key(&victim_id),
+            "sid_-prefixed raw key should not remove existing canonical sid entries"
+        );
+        let usage = tracker
+            .data
+            .sessions
+            .get(&victim_id)
+            .expect("expected existing canonical sid entry");
+        assert_eq!(usage.input_tokens, 11);
+        assert_eq!(usage.output_tokens, 21);
+        assert_eq!(usage.requests, 2);
+    }
+
+    #[test]
     fn test_tracker_persistence() {
         let temp_dir = std::env::temp_dir();
         let path = temp_dir.join(format!("usage_persist_test_{}.json", uuid::Uuid::new_v4()));
@@ -1533,14 +1859,14 @@ mod tests {
         tracker.data.sessions.insert(
             "old".to_string(),
             SessionUsage {
-                session_key: "old".to_string(),
+                session_id: "old".to_string(),
                 ..Default::default()
             },
         );
         tracker.data.sessions.insert(
             "recent".to_string(),
             SessionUsage {
-                session_key: "recent".to_string(),
+                session_id: "recent".to_string(),
                 first_used_at: now,
                 last_used_at: now,
                 ..Default::default()
@@ -1592,7 +1918,7 @@ mod tests {
         tracker.data.sessions.insert(
             "older".to_string(),
             SessionUsage {
-                session_key: "older".to_string(),
+                session_id: "older".to_string(),
                 first_used_at: now.saturating_sub(1_000),
                 last_used_at: now.saturating_sub(1_000),
                 ..Default::default()
@@ -1601,7 +1927,7 @@ mod tests {
         tracker.data.sessions.insert(
             "newer".to_string(),
             SessionUsage {
-                session_key: "newer".to_string(),
+                session_id: "newer".to_string(),
                 first_used_at: now,
                 last_used_at: now,
                 ..Default::default()
@@ -1693,7 +2019,7 @@ mod tests {
             timestamp: now_ms(),
             provider: "anthropic".to_string(),
             model: "claude-3-5-sonnet".to_string(),
-            session_key: None,
+            session_id: None,
             input_tokens: 1000,
             output_tokens: 500,
             cost_usd: 0.01,

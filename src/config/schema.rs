@@ -543,7 +543,7 @@ fn validate_skills_signature(obj: &serde_json::Map<String, Value>, issues: &mut 
     if let Some(enabled) = sig.get("enabled") {
         if !enabled.is_boolean() {
             issues.push(SchemaIssue {
-                severity: Severity::Warning,
+                severity: Severity::Error,
                 path: ".skills.signature.enabled".to_string(),
                 message: "enabled must be a boolean".to_string(),
             });
@@ -553,7 +553,7 @@ fn validate_skills_signature(obj: &serde_json::Map<String, Value>, issues: &mut 
     if let Some(require) = sig.get("requireSignature") {
         if !require.is_boolean() {
             issues.push(SchemaIssue {
-                severity: Severity::Warning,
+                severity: Severity::Error,
                 path: ".skills.signature.requireSignature".to_string(),
                 message: "requireSignature must be a boolean".to_string(),
             });
@@ -584,7 +584,7 @@ fn validate_skills_sandbox(obj: &serde_json::Map<String, Value>, issues: &mut Ve
     if let Some(enabled) = sandbox.get("enabled") {
         if !enabled.is_boolean() {
             issues.push(SchemaIssue {
-                severity: Severity::Warning,
+                severity: Severity::Error,
                 path: ".skills.sandbox.enabled".to_string(),
                 message: "enabled must be a boolean".to_string(),
             });
@@ -596,7 +596,7 @@ fn validate_skills_sandbox(obj: &serde_json::Map<String, Value>, issues: &mut Ve
             if let Some(val) = defaults.get(*key) {
                 if !val.is_boolean() {
                     issues.push(SchemaIssue {
-                        severity: Severity::Warning,
+                        severity: Severity::Error,
                         path: format!(".skills.sandbox.defaults.{}", key),
                         message: format!("{} must be a boolean", key),
                     });
@@ -619,7 +619,7 @@ fn validate_session_integrity(obj: &serde_json::Map<String, Value>, issues: &mut
     if let Some(enabled) = integrity.get("enabled") {
         if !enabled.is_boolean() {
             issues.push(SchemaIssue {
-                severity: Severity::Warning,
+                severity: Severity::Error,
                 path: ".sessions.integrity.enabled".to_string(),
                 message: "enabled must be a boolean".to_string(),
             });
@@ -630,7 +630,7 @@ fn validate_session_integrity(obj: &serde_json::Map<String, Value>, issues: &mut
         let valid = ["warn", "reject"];
         if !valid.contains(&action) {
             issues.push(SchemaIssue {
-                severity: Severity::Warning,
+                severity: Severity::Error,
                 path: ".sessions.integrity.action".to_string(),
                 message: format!("action should be one of warn/reject, got \"{}\"", action),
             });

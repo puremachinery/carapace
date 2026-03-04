@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::cron::executor::{execute_payload, CronRunOutcome};
+use crate::cron::executor::{execute_payload, CronRunOutcome, ExecutionLimits};
 use crate::cron::{CronJobStatus, CronRunMode};
 use crate::server::ws::{AgentRunStatus, WsServerState};
 
@@ -53,7 +53,9 @@ pub async fn cron_tick_loop(
                 let job_id = result.job_id.clone();
                 tokio::spawn(async move {
                     let start = std::time::Instant::now();
-                    let outcome = execute_payload(&job_id, &payload, &state).await;
+                    let outcome =
+                        execute_payload(&job_id, &payload, &state, ExecutionLimits::default())
+                            .await;
 
                     // For AgentTurn payloads, wait for the agent run to actually complete
                     // before reporting the cron job status.
@@ -90,7 +92,7 @@ pub async fn cron_tick_loop(
                             }
                         }
                         Ok(CronRunOutcome::Broadcast) => (CronJobStatus::Ok, None),
-                        Err(e) => (CronJobStatus::Error, Some(e)),
+                        Err(e) => (CronJobStatus::Error, Some(e.to_string())),
                     };
 
                     let duration_ms = start.elapsed().as_millis() as u64;

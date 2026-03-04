@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
-use hmac::Hmac;
+use pbkdf2::pbkdf2_hmac;
 use sha2::Sha256;
 use zeroize::Zeroize;
 
@@ -84,33 +84,8 @@ impl From<std::io::Error> for BackupCryptoError {
 
 /// Derive a 256-bit key from a passphrase and salt using PBKDF2-HMAC-SHA256.
 fn derive_key(passphrase: &[u8], salt: &[u8]) -> [u8; KEY_LEN] {
-    use hmac::Mac;
-
-    type HmacSha256 = Hmac<Sha256>;
-
-    let mut key = [0u8; KEY_LEN];
-    // PBKDF2: block_num = 1 since we only need 32 bytes (one HMAC-SHA256 block)
-    let mut u_prev = {
-        let mut mac =
-            <HmacSha256 as Mac>::new_from_slice(passphrase).expect("HMAC accepts any key length");
-        mac.update(salt);
-        mac.update(&1u32.to_be_bytes());
-        mac.finalize().into_bytes()
-    };
-
-    key.copy_from_slice(&u_prev);
-
-    for _ in 1..PBKDF2_ITERATIONS {
-        let mut mac =
-            <HmacSha256 as Mac>::new_from_slice(passphrase).expect("HMAC accepts any key length");
-        mac.update(&u_prev);
-        u_prev = mac.finalize().into_bytes();
-
-        for (k, u) in key.iter_mut().zip(u_prev.iter()) {
-            *k ^= u;
-        }
-    }
-
+    let mut key: [u8; KEY_LEN] = Default::default();
+    pbkdf2_hmac::<Sha256>(passphrase, salt, PBKDF2_ITERATIONS, &mut key);
     key
 }
 
@@ -223,7 +198,62 @@ pub fn decrypt_backup(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hmac::{Hmac, Mac};
     use tempfile::TempDir;
+
+    fn random_bytes<const N: usize>() -> [u8; N] {
+        let mut bytes = [0u8; N];
+        getrandom::fill(&mut bytes).expect("random test bytes");
+        bytes
+    }
+
+    fn random_passphrase() -> String {
+        hex::encode(random_bytes::<24>())
+    }
+
+    fn derive_key_with_iterations(
+        passphrase: &[u8],
+        salt: &[u8],
+        iterations: u32,
+    ) -> [u8; KEY_LEN] {
+        let mut key = [0u8; KEY_LEN];
+        pbkdf2_hmac::<Sha256>(passphrase, salt, iterations, &mut key);
+        key
+    }
+
+    fn derive_key_reference_pbkdf2(
+        passphrase: &[u8],
+        salt: &[u8],
+        iterations: u32,
+    ) -> [u8; KEY_LEN] {
+        type HmacSha256 = Hmac<Sha256>;
+
+        // This reference path derives exactly one PBKDF2 block. It is valid
+        // because KEY_LEN is fixed to the SHA-256 output size (32 bytes).
+        assert_eq!(KEY_LEN, 32, "reference PBKDF2 assumes one output block");
+        assert!(iterations >= 1, "PBKDF2 requires at least one iteration");
+
+        let mut first_block_input = Vec::with_capacity(salt.len() + 4);
+        first_block_input.extend_from_slice(salt);
+        first_block_input.extend_from_slice(&1u32.to_be_bytes());
+
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(passphrase).expect("HMAC key creation");
+        mac.update(&first_block_input);
+        let mut u_prev: [u8; KEY_LEN] = mac.finalize().into_bytes().into();
+        let mut out = u_prev;
+
+        for _ in 1..iterations {
+            let mut iter_mac =
+                <HmacSha256 as Mac>::new_from_slice(passphrase).expect("HMAC key creation");
+            iter_mac.update(&u_prev);
+            u_prev = iter_mac.finalize().into_bytes().into();
+            for (dst, src) in out.iter_mut().zip(u_prev.iter()) {
+                *dst ^= *src;
+            }
+        }
+
+        out
+    }
 
     #[test]
     fn test_constants() {
@@ -237,31 +267,73 @@ mod tests {
 
     #[test]
     fn test_derive_key_deterministic() {
-        let key1 = derive_key(b"test-passphrase", b"salt-value-32-bytes-exactly-here");
-        let key2 = derive_key(b"test-passphrase", b"salt-value-32-bytes-exactly-here");
+        let passphrase = random_passphrase();
+        let salt = random_bytes::<SALT_LEN>();
+        let key1 = derive_key(passphrase.as_bytes(), &salt);
+        let key2 = derive_key(passphrase.as_bytes(), &salt);
         assert_eq!(key1, key2);
     }
 
     #[test]
+    fn test_derive_key_matches_reference_pbkdf2() {
+        // Keep this test fast: compare crate and reference implementations
+        // using a reduced iteration count, not production cost.
+        let iterations = 10_000;
+        let passphrase = random_bytes::<24>();
+        let salt = random_bytes::<SALT_LEN>();
+        let key = derive_key_with_iterations(&passphrase, &salt, iterations);
+        let reference = derive_key_reference_pbkdf2(&passphrase, &salt, iterations);
+        assert_eq!(key, reference);
+    }
+
+    #[test]
+    fn test_derive_key_known_answer_vector() {
+        use sha2::Digest;
+
+        // Deterministic KAT inputs from hashed labels.
+        let passphrase = sha2::Sha256::digest(b"carapace-backup-kat-passphrase");
+        let salt = sha2::Sha256::digest(b"carapace-backup-kat-salt");
+        // Expected output generated independently via Python hashlib.pbkdf2_hmac:
+        // python3 -c 'import hashlib; p=hashlib.sha256(b"carapace-backup-kat-passphrase").digest(); s=hashlib.sha256(b"carapace-backup-kat-salt").digest(); print(hashlib.pbkdf2_hmac("sha256", p, s, 600000, 32).hex())'
+        let expected_hex = "696c6039c67c9ce83717fe1f72e32d9c8e0b46ceaef2fa6d59268ddc49653329";
+
+        let key = derive_key(passphrase.as_slice(), salt.as_slice());
+        assert_eq!(hex::encode(key), expected_hex);
+    }
+
+    #[test]
     fn test_derive_key_different_passphrases() {
-        let salt = [0xAA; SALT_LEN];
-        let key1 = derive_key(b"passphrase-one", &salt);
-        let key2 = derive_key(b"passphrase-two", &salt);
+        let salt = random_bytes::<SALT_LEN>();
+        let passphrase_one = random_passphrase();
+        let mut passphrase_two = random_passphrase();
+        if passphrase_one == passphrase_two {
+            passphrase_two.push('x');
+        }
+        let key1 = derive_key(passphrase_one.as_bytes(), &salt);
+        let key2 = derive_key(passphrase_two.as_bytes(), &salt);
         assert_ne!(key1, key2);
     }
 
     #[test]
     fn test_derive_key_different_salts() {
-        let salt1 = [0xAA; SALT_LEN];
-        let salt2 = [0xBB; SALT_LEN];
-        let key1 = derive_key(b"same-passphrase", &salt1);
-        let key2 = derive_key(b"same-passphrase", &salt2);
+        let passphrase = random_passphrase();
+        let salt1 = random_bytes::<SALT_LEN>();
+        let salt2 = loop {
+            let candidate = random_bytes::<SALT_LEN>();
+            if candidate != salt1 {
+                break candidate;
+            }
+        };
+        let key1 = derive_key(passphrase.as_bytes(), &salt1);
+        let key2 = derive_key(passphrase.as_bytes(), &salt2);
         assert_ne!(key1, key2);
     }
 
     #[test]
     fn test_derive_key_length() {
-        let key = derive_key(b"test", &[0u8; SALT_LEN]);
+        let passphrase = random_passphrase();
+        let salt = random_bytes::<SALT_LEN>();
+        let key = derive_key(passphrase.as_bytes(), &salt);
         assert_eq!(key.len(), KEY_LEN);
     }
 
@@ -278,13 +350,14 @@ mod tests {
 
         std::fs::write(&input_path, original_data).unwrap();
 
-        let info = encrypt_backup(&input_path, "my-secure-passphrase", &encrypted_path).unwrap();
+        let passphrase = random_passphrase();
+        let info = encrypt_backup(&input_path, &passphrase, &encrypted_path).unwrap();
         assert_eq!(info.output_path, encrypted_path);
         assert!(!info.salt_hex.is_empty());
         assert!(info.encrypted_size > 0);
         assert!(info.encrypted_size > HEADER_LEN as u64);
 
-        decrypt_backup(&encrypted_path, "my-secure-passphrase", &decrypted_path).unwrap();
+        decrypt_backup(&encrypted_path, &passphrase, &decrypted_path).unwrap();
 
         let decrypted_data = std::fs::read(&decrypted_path).unwrap();
         assert_eq!(decrypted_data, original_data);
@@ -299,8 +372,9 @@ mod tests {
 
         std::fs::write(&input_path, b"").unwrap();
 
-        encrypt_backup(&input_path, "pass", &encrypted_path).unwrap();
-        decrypt_backup(&encrypted_path, "pass", &decrypted_path).unwrap();
+        let passphrase = random_passphrase();
+        encrypt_backup(&input_path, &passphrase, &encrypted_path).unwrap();
+        decrypt_backup(&encrypted_path, &passphrase, &decrypted_path).unwrap();
 
         let decrypted = std::fs::read(&decrypted_path).unwrap();
         assert!(decrypted.is_empty());
@@ -316,8 +390,9 @@ mod tests {
         let large_data: Vec<u8> = (0..100_000).map(|i| (i % 256) as u8).collect();
         std::fs::write(&input_path, &large_data).unwrap();
 
-        encrypt_backup(&input_path, "passphrase123", &encrypted_path).unwrap();
-        decrypt_backup(&encrypted_path, "passphrase123", &decrypted_path).unwrap();
+        let passphrase = random_passphrase();
+        encrypt_backup(&input_path, &passphrase, &encrypted_path).unwrap();
+        decrypt_backup(&encrypted_path, &passphrase, &decrypted_path).unwrap();
 
         let decrypted = std::fs::read(&decrypted_path).unwrap();
         assert_eq!(decrypted, large_data);
@@ -331,9 +406,14 @@ mod tests {
         let decrypted_path = dir.path().join("data.dec");
 
         std::fs::write(&input_path, b"secret data").unwrap();
-        encrypt_backup(&input_path, "correct-passphrase", &encrypted_path).unwrap();
+        let correct_passphrase = random_passphrase();
+        let mut wrong_passphrase = random_passphrase();
+        if correct_passphrase == wrong_passphrase {
+            wrong_passphrase.push('x');
+        }
+        encrypt_backup(&input_path, &correct_passphrase, &encrypted_path).unwrap();
 
-        let result = decrypt_backup(&encrypted_path, "wrong-passphrase", &decrypted_path);
+        let result = decrypt_backup(&encrypted_path, &wrong_passphrase, &decrypted_path);
         assert!(matches!(result, Err(BackupCryptoError::DecryptionFailed)));
     }
 
@@ -349,7 +429,8 @@ mod tests {
         )
         .unwrap();
 
-        let result = decrypt_backup(&bad_file, "pass", &output);
+        let passphrase = random_passphrase();
+        let result = decrypt_backup(&bad_file, &passphrase, &output);
         assert!(matches!(result, Err(BackupCryptoError::InvalidMagic)));
     }
 
@@ -361,7 +442,8 @@ mod tests {
 
         std::fs::write(&short_file, b"CRPC_ENC").unwrap(); // only magic, no header
 
-        let result = decrypt_backup(&short_file, "pass", &output);
+        let passphrase = random_passphrase();
+        let result = decrypt_backup(&short_file, &passphrase, &output);
         assert!(matches!(result, Err(BackupCryptoError::InvalidMagic)));
     }
 
@@ -379,7 +461,8 @@ mod tests {
         data.extend_from_slice(b"fake ciphertext");
         std::fs::write(&bad_version, &data).unwrap();
 
-        let result = decrypt_backup(&bad_version, "pass", &output);
+        let passphrase = random_passphrase();
+        let result = decrypt_backup(&bad_version, &passphrase, &output);
         assert!(matches!(
             result,
             Err(BackupCryptoError::UnsupportedVersion(99))
@@ -395,7 +478,8 @@ mod tests {
         let output = dir.path().join("output.dat");
 
         std::fs::write(&input_path, b"test data").unwrap();
-        encrypt_backup(&input_path, "pass", &encrypted_path).unwrap();
+        let passphrase = random_passphrase();
+        encrypt_backup(&input_path, &passphrase, &encrypted_path).unwrap();
 
         // Corrupt the ciphertext by flipping bits
         let mut data = std::fs::read(&encrypted_path).unwrap();
@@ -404,7 +488,7 @@ mod tests {
         }
         std::fs::write(&corrupted_path, &data).unwrap();
 
-        let result = decrypt_backup(&corrupted_path, "pass", &output);
+        let result = decrypt_backup(&corrupted_path, &passphrase, &output);
         assert!(matches!(result, Err(BackupCryptoError::DecryptionFailed)));
     }
 
@@ -413,7 +497,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let result = encrypt_backup(
             &dir.path().join("nonexistent.dat"),
-            "pass",
+            &random_passphrase(),
             &dir.path().join("output.enc"),
         );
         assert!(matches!(result, Err(BackupCryptoError::IoError(_))));
@@ -426,7 +510,8 @@ mod tests {
         let encrypted_path = dir.path().join("data.enc");
 
         std::fs::write(&input_path, b"hello world").unwrap();
-        encrypt_backup(&input_path, "pass", &encrypted_path).unwrap();
+        let passphrase = random_passphrase();
+        encrypt_backup(&input_path, &passphrase, &encrypted_path).unwrap();
 
         let data = std::fs::read(&encrypted_path).unwrap();
         assert!(data.len() > HEADER_LEN);
@@ -442,8 +527,9 @@ mod tests {
         let enc2 = dir.path().join("enc2");
 
         std::fs::write(&input_path, b"same data").unwrap();
-        encrypt_backup(&input_path, "same-pass", &enc1).unwrap();
-        encrypt_backup(&input_path, "same-pass", &enc2).unwrap();
+        let passphrase = random_passphrase();
+        encrypt_backup(&input_path, &passphrase, &enc1).unwrap();
+        encrypt_backup(&input_path, &passphrase, &enc2).unwrap();
 
         let data1 = std::fs::read(&enc1).unwrap();
         let data2 = std::fs::read(&enc2).unwrap();

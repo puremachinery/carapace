@@ -186,8 +186,8 @@ impl LlmProvider for GeminiProvider {
         // Strip any prefix (gemini/, models/) to get the bare model name for the URL
         let model_name = strip_gemini_prefix(&request.model);
         let url = format!(
-            "{}/v1beta/models/{}:streamGenerateContent?alt=sse&key={}",
-            self.base_url, model_name, self.api_key
+            "{}/v1beta/models/{}:streamGenerateContent?alt=sse",
+            self.base_url, model_name
         );
 
         let response = tokio::select! {
@@ -197,6 +197,7 @@ impl LlmProvider for GeminiProvider {
             response = self
                 .client
                 .post(&url)
+                .header("x-goog-api-key", &self.api_key)
                 .header("content-type", "application/json")
                 .header("accept", "text/event-stream")
                 .json(&body)
@@ -503,21 +504,24 @@ mod tests {
     #[test]
     fn test_new_rejects_empty_api_key() {
         let result = GeminiProvider::new("".to_string());
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected empty API key to fail");
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("empty"), "error should mention empty: {err}");
+        assert!(
+            err.contains("empty"),
+            "expected 'empty' in error, got redacted"
+        );
     }
 
     #[test]
     fn test_new_rejects_whitespace_api_key() {
         let result = GeminiProvider::new("   ".to_string());
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected whitespace API key to fail");
     }
 
     #[test]
     fn test_new_accepts_valid_api_key() {
         let result = GeminiProvider::new("AIzaSyA-valid-key-1234567890".to_string());
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "expected valid API key to pass");
     }
 
     #[test]
@@ -552,9 +556,9 @@ mod tests {
         let result = GeminiProvider::new("test-key".to_string())
             .unwrap()
             .with_base_url("http://insecure.example.com".to_string());
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected http base URL to fail");
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("https"), "error should mention https: {err}");
+        assert!(err.contains("https"), "got: {err}");
     }
 
     #[test]
@@ -562,7 +566,7 @@ mod tests {
         let result = GeminiProvider::new("test-key".to_string())
             .unwrap()
             .with_base_url("not-a-url".to_string());
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected malformed base URL to fail");
     }
 
     // ==================== build_body tests ====================

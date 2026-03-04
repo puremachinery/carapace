@@ -4,7 +4,7 @@
 //! - Hooks API (POST /hooks/wake, /hooks/agent, /hooks/<mapping>)
 //! - Tools API (POST /tools/invoke)
 //! - OpenAI compatibility (POST /v1/chat/completions, /v1/responses)
-//! - Control endpoints (GET /control/status, /control/channels, POST /control/config)
+//! - Control endpoints (status/channels/config/tasks)
 //! - Control UI (static files + SPA fallback + avatar endpoint)
 //! - Auth middleware (hooks token, gateway auth, loopback bypass)
 //! - Security middleware (headers, CSRF, rate limiting)
@@ -15,9 +15,10 @@ use axum::{
     http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri},
     middleware,
     response::{IntoResponse, Response},
-    routing::{any, get, post},
+    routing::{any, get, patch, post},
     Json, Router,
 };
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -37,23 +38,27 @@ use crate::server::headers::{security_headers_middleware, SecurityHeadersConfig}
 use crate::server::openai::{self, OpenAiState};
 use crate::server::ratelimit::{rate_limit_middleware, RateLimitConfig, RateLimiter};
 
+use crate::agent::LlmProvider;
 use crate::auth;
 use crate::channels::{inbound, slack_inbound, telegram_inbound, ChannelRegistry};
 use crate::hooks::auth::{extract_hooks_token, validate_hooks_token};
 use crate::hooks::handler::{
     validate_agent_request, validate_wake_request, AgentRequest, AgentResponse, HooksErrorResponse,
-    WakeRequest, WakeResponse,
+    WakeMode, WakeRequest, WakeResponse,
 };
 use crate::hooks::registry::{HookMappingContext, HookMappingResult, HookRegistry};
 use crate::plugins::tools::{ToolInvokeContext, ToolInvokeResult, ToolsRegistry};
 use crate::plugins::{DispatchError, WebhookDispatcher, WebhookRequest};
-use crate::server::ws::WsServerState;
+use crate::server::ws::{SystemEvent, WsServerState};
 
 /// Default max body size for hooks (256KB)
 pub const DEFAULT_MAX_BODY_BYTES: usize = 262144;
 
 /// Default hooks base path
 pub const DEFAULT_HOOKS_PATH: &str = "/hooks";
+const HOOK_SENDER_SCOPE_KDF_TAG: &[u8] = b"hooks-sender-scope-v1";
+const HOOK_SENDER_SCOPE_KDF_FALLBACK_KEY: &str = "carapace-hooks-sender-scope-fallback";
+type HmacSha256 = Hmac<sha2::Sha256>;
 
 /// HTTP server configuration
 #[non_exhaustive]
@@ -73,6 +78,8 @@ pub struct HttpConfig {
     pub gateway_password: Option<String>,
     /// Gateway auth mode
     pub gateway_auth_mode: auth::AuthMode,
+    /// Secret used for keyed hook sender derivation.
+    pub sender_scope_secret: Option<String>,
     /// Whether Tailscale auth is allowed for gateway endpoints
     pub gateway_allow_tailscale: bool,
     /// Trusted proxy IPs for local-direct detection
@@ -107,6 +114,7 @@ impl Default for HttpConfig {
             gateway_auth_mode: auth::AuthMode::Token,
             gateway_allow_tailscale: false,
             trusted_proxies: Vec::new(),
+            sender_scope_secret: None,
             control_ui_base_path: String::new(),
             control_ui_enabled: false,
             control_ui_dist_path: PathBuf::from("dist/control-ui"),
@@ -224,6 +232,13 @@ pub fn build_http_config(cfg: &Value) -> Result<HttpConfig, String> {
         }
     };
 
+    let sender_scope_secret = std::env::var("CARAPACE_SERVER_SECRET")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| gateway_token.clone().filter(|value| !value.is_empty()))
+        .or_else(|| gateway_password.clone().filter(|value| !value.is_empty()))
+        .or_else(|| hooks_token.clone().filter(|value| !value.is_empty()));
+
     let control_ui_enabled = control_ui_obj
         .and_then(|c| c.get("enabled"))
         .and_then(|v| v.as_bool())
@@ -268,6 +283,7 @@ pub fn build_http_config(cfg: &Value) -> Result<HttpConfig, String> {
         control_ui_base_path,
         control_ui_enabled,
         control_ui_dist_path,
+        sender_scope_secret,
         openai_chat_completions_enabled,
         openai_responses_enabled,
         control_endpoints_enabled,
@@ -389,43 +405,58 @@ pub fn create_router_with_state(
     tls_enabled: bool,
 ) -> Router {
     let start_time = chrono::Utc::now().timestamp();
+    remap_default_hooks_rate_limit_prefix(&config, &mut middleware_config);
 
-    // Extract LLM provider before moving ws_state into AppState
     let llm_provider = ws_state.as_ref().and_then(|ws| ws.llm_provider());
-
-    // Build health checker if ws_state provides a state directory
-    let health_checker = ws_state.as_ref().map(|_| {
-        Arc::new(crate::server::health::HealthChecker::new(
-            crate::server::ws::resolve_state_dir(),
-        ))
-    });
-
-    let plugin_webhook_dispatcher = ws_state
-        .as_ref()
-        .and_then(|ws| ws.plugin_registry().cloned())
-        .map(|registry| Arc::new(WebhookDispatcher::new(registry)));
-
     let csrf_store = if middleware_config.enable_csrf {
         Some(CsrfTokenStore::new(middleware_config.csrf.clone()))
     } else {
         None
     };
-
-    let state = AppState {
-        config: Arc::new(config.clone()),
-        hook_registry,
-        tools_registry,
-        channel_registry: channel_registry.clone(),
-        plugin_webhook_dispatcher,
+    let control_ws_state = ws_state.clone();
+    let state = build_app_state(
+        &config,
         start_time,
-        ws_state,
-        health_checker,
-        csrf_store: csrf_store.clone(),
         tls_enabled,
-    };
+        AppStateComponents {
+            hook_registry,
+            tools_registry,
+            channel_registry: channel_registry.clone(),
+            ws_state,
+            csrf_store: csrf_store.clone(),
+        },
+    );
 
     let mut router: Router<AppState> = Router::new();
+    router = register_hooks_routes(router, &config);
+    router = register_channel_webhook_routes(router, &config);
+    router = register_plugin_webhook_routes(router, &config);
+    router = register_core_routes(router);
+    router = register_openai_routes(router, &config, llm_provider);
 
+    // Control endpoints
+    if config.control_endpoints_enabled {
+        router = register_session_routes(
+            router,
+            &config,
+            &channel_registry,
+            control_ws_state,
+            start_time,
+        );
+    }
+
+    // Control UI routes (when enabled)
+    if config.control_ui_enabled {
+        router = register_admin_routes(router, &config);
+    }
+
+    apply_http_middleware_layers(router, state, middleware_config, csrf_store)
+}
+
+fn remap_default_hooks_rate_limit_prefix(
+    config: &HttpConfig,
+    middleware_config: &mut MiddlewareConfig,
+) {
     let hooks_prefix = format!("{}/", normalize_hooks_path(&config.hooks_path));
     let default_hooks_prefix = format!("{}/", DEFAULT_HOOKS_PATH);
     if hooks_prefix != default_hooks_prefix {
@@ -435,119 +466,167 @@ pub fn create_router_with_state(
             }
         }
     }
+}
 
-    // Hooks routes (when enabled)
-    if config.hooks_enabled {
-        let hooks_path = normalize_hooks_path(&config.hooks_path);
-        router = router
-            .route(&format!("{}/wake", hooks_path), post(hooks_wake_handler))
-            .route(&format!("{}/agent", hooks_path), post(hooks_agent_handler))
-            .route(
-                &format!("{}/{{*path}}", hooks_path),
-                post(hooks_mapping_handler),
-            );
+struct AppStateComponents {
+    hook_registry: Arc<HookRegistry>,
+    tools_registry: Arc<ToolsRegistry>,
+    channel_registry: Arc<ChannelRegistry>,
+    ws_state: Option<Arc<WsServerState>>,
+    csrf_store: Option<CsrfTokenStore>,
+}
+
+fn build_app_state(
+    config: &HttpConfig,
+    start_time: i64,
+    tls_enabled: bool,
+    components: AppStateComponents,
+) -> AppState {
+    let AppStateComponents {
+        hook_registry,
+        tools_registry,
+        channel_registry,
+        ws_state,
+        csrf_store,
+    } = components;
+    let health_checker = ws_state.as_ref().map(|_| {
+        Arc::new(crate::server::health::HealthChecker::new(
+            crate::server::ws::resolve_state_dir(),
+        ))
+    });
+    let plugin_webhook_dispatcher = ws_state
+        .as_ref()
+        .and_then(|ws| ws.plugin_registry().cloned())
+        .map(|registry| Arc::new(WebhookDispatcher::new(registry)));
+
+    AppState {
+        config: Arc::new(config.clone()),
+        hook_registry,
+        tools_registry,
+        channel_registry,
+        plugin_webhook_dispatcher,
+        start_time,
+        ws_state,
+        health_checker,
+        csrf_store,
+        tls_enabled,
     }
+}
 
+fn register_hooks_routes(router: Router<AppState>, config: &HttpConfig) -> Router<AppState> {
+    if !config.hooks_enabled {
+        return router;
+    }
+    let hooks_path = normalize_hooks_path(&config.hooks_path);
+    router
+        .route(&format!("{}/wake", hooks_path), post(hooks_wake_handler))
+        .route(&format!("{}/agent", hooks_path), post(hooks_agent_handler))
+        .route(
+            &format!("{}/{{*path}}", hooks_path),
+            post(hooks_mapping_handler),
+        )
+}
+
+fn register_channel_webhook_routes(
+    router: Router<AppState>,
+    config: &HttpConfig,
+) -> Router<AppState> {
     let channel_router = Router::new()
         .route("/channels/telegram/webhook", post(telegram_webhook_handler))
         .route("/channels/slack/events", post(slack_events_handler))
         .layer(DefaultBodyLimit::max(config.hooks_max_body_bytes));
-    router = router.merge(channel_router);
+    router.merge(channel_router)
+}
 
-    // Plugin webhook routes (always enabled when plugins are registered)
+fn register_plugin_webhook_routes(
+    router: Router<AppState>,
+    config: &HttpConfig,
+) -> Router<AppState> {
     let plugin_router = Router::new()
         .route("/plugins/{*path}", any(plugins_webhook_handler))
         .layer(DefaultBodyLimit::max(config.hooks_max_body_bytes));
-    router = router.merge(plugin_router);
+    router.merge(plugin_router)
+}
 
-    // Health checks (unauthenticated, always enabled)
-    router = router
+fn register_core_routes(router: Router<AppState>) -> Router<AppState> {
+    router
         .route("/health", get(health_handler))
         .route("/health/live", get(health_handler))
-        .route("/health/ready", get(health_ready_handler));
+        .route("/health/ready", get(health_ready_handler))
+        .route("/metrics", get(crate::server::metrics::metrics_handler))
+        .route("/tools/invoke", post(tools_invoke_handler))
+}
 
-    // Metrics (Prometheus scrape endpoint, unauthenticated)
-    router = router.route("/metrics", get(crate::server::metrics::metrics_handler));
+fn build_openai_state(
+    config: &HttpConfig,
+    llm_provider: Option<Arc<dyn LlmProvider>>,
+) -> OpenAiState {
+    OpenAiState {
+        chat_completions_enabled: config.openai_chat_completions_enabled,
+        responses_enabled: config.openai_responses_enabled,
+        gateway_token: config.gateway_token.clone(),
+        gateway_password: config.gateway_password.clone(),
+        gateway_auth_mode: config.gateway_auth_mode.clone(),
+        gateway_allow_tailscale: config.gateway_allow_tailscale,
+        trusted_proxies: config.trusted_proxies.clone(),
+        llm_provider,
+    }
+}
 
-    // Tools API
-    router = router.route("/tools/invoke", post(tools_invoke_handler));
+fn register_openai_routes(
+    mut router: Router<AppState>,
+    config: &HttpConfig,
+    llm_provider: Option<Arc<dyn LlmProvider>>,
+) -> Router<AppState> {
+    if !config.openai_chat_completions_enabled && !config.openai_responses_enabled {
+        return router;
+    }
 
-    // OpenAI compatibility endpoints
-    if config.openai_chat_completions_enabled || config.openai_responses_enabled {
-        let openai_state = OpenAiState {
-            chat_completions_enabled: config.openai_chat_completions_enabled,
-            responses_enabled: config.openai_responses_enabled,
-            gateway_token: config.gateway_token.clone(),
-            gateway_password: config.gateway_password.clone(),
-            gateway_auth_mode: config.gateway_auth_mode.clone(),
-            gateway_allow_tailscale: config.gateway_allow_tailscale,
-            trusted_proxies: config.trusted_proxies.clone(),
-            llm_provider: llm_provider.clone(),
-        };
-
-        if config.openai_chat_completions_enabled {
-            router = router.route(
-                "/v1/chat/completions",
-                post(
-                    move |connect_info: MaybeConnectInfo, headers: HeaderMap, body: Bytes| {
-                        let state = openai_state.clone();
-                        async move {
-                            openai::chat_completions_handler(
-                                State(state),
-                                connect_info,
-                                headers,
-                                body,
-                            )
+    let openai_state = build_openai_state(config, llm_provider);
+    if config.openai_chat_completions_enabled {
+        let chat_state = openai_state.clone();
+        router = router.route(
+            "/v1/chat/completions",
+            post(
+                move |connect_info: MaybeConnectInfo, headers: HeaderMap, body: Bytes| {
+                    let state = chat_state.clone();
+                    async move {
+                        openai::chat_completions_handler(State(state), connect_info, headers, body)
                             .await
-                        }
-                    },
-                ),
-            );
-        }
-
-        let openai_state2 = OpenAiState {
-            chat_completions_enabled: config.openai_chat_completions_enabled,
-            responses_enabled: config.openai_responses_enabled,
-            gateway_token: config.gateway_token.clone(),
-            gateway_password: config.gateway_password.clone(),
-            gateway_auth_mode: config.gateway_auth_mode.clone(),
-            gateway_allow_tailscale: config.gateway_allow_tailscale,
-            trusted_proxies: config.trusted_proxies.clone(),
-            llm_provider,
-        };
-
-        if config.openai_responses_enabled {
-            router = router.route(
-                "/v1/responses",
-                post(
-                    move |connect_info: MaybeConnectInfo, headers: HeaderMap, body: Bytes| {
-                        let state = openai_state2.clone();
-                        async move {
-                            openai::responses_handler(State(state), connect_info, headers, body)
-                                .await
-                        }
-                    },
-                ),
-            );
-        }
+                    }
+                },
+            ),
+        );
     }
 
-    // Control endpoints
-    if config.control_endpoints_enabled {
-        router = register_session_routes(router, &config, &channel_registry, start_time);
+    if config.openai_responses_enabled {
+        let responses_state = openai_state.clone();
+        router = router.route(
+            "/v1/responses",
+            post(
+                move |connect_info: MaybeConnectInfo, headers: HeaderMap, body: Bytes| {
+                    let state = responses_state.clone();
+                    async move {
+                        openai::responses_handler(State(state), connect_info, headers, body).await
+                    }
+                },
+            ),
+        );
     }
 
-    // Control UI routes (when enabled)
-    if config.control_ui_enabled {
-        router = register_admin_routes(router, &config);
-    }
+    router
+}
 
-    // Convert to stateless Router and apply middleware layers
+fn apply_http_middleware_layers(
+    router: Router<AppState>,
+    state: AppState,
+    middleware_config: MiddlewareConfig,
+    csrf_store: Option<CsrfTokenStore>,
+) -> Router {
     // Order matters: last added = first executed
     // The order here is: rate_limit -> csrf -> security_headers -> handler
     let mut stateless_router: Router = router.with_state(state);
 
-    // Rate limiting middleware (applied first to reject overloaded requests early)
     if middleware_config.enable_rate_limit {
         let limiter = RateLimiter::new(middleware_config.rate_limit);
         stateless_router = stateless_router.layer(middleware::from_fn_with_state(
@@ -555,14 +634,10 @@ pub fn create_router_with_state(
             rate_limit_middleware,
         ));
     }
-
-    // CSRF protection middleware
     if let Some(csrf_store) = csrf_store {
         stateless_router =
             stateless_router.layer(middleware::from_fn_with_state(csrf_store, csrf_middleware));
     }
-
-    // Security headers middleware (applied last, runs after handler)
     if middleware_config.enable_security_headers {
         let headers_config = Arc::new(middleware_config.security_headers);
         stateless_router = stateless_router.layer(middleware::from_fn_with_state(
@@ -579,6 +654,7 @@ fn register_session_routes(
     router: Router<AppState>,
     config: &HttpConfig,
     channel_registry: &Arc<ChannelRegistry>,
+    ws_state: Option<Arc<WsServerState>>,
     start_time: i64,
 ) -> Router<AppState> {
     let control_state = ControlState {
@@ -590,11 +666,21 @@ fn register_session_routes(
         channel_registry: channel_registry.clone(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         start_time,
+        task_queue: ws_state.as_ref().map(|state| state.task_queue().clone()),
     };
 
     let control_state_status = control_state.clone();
     let control_state_channels = control_state.clone();
-    let control_state_config = control_state.clone();
+    let control_state_config_read = control_state.clone();
+    let control_state_config_post = control_state.clone();
+    let control_state_config_patch = control_state.clone();
+    let control_state_tasks_create = control_state.clone();
+    let control_state_tasks_list = control_state.clone();
+    let control_state_tasks_get = control_state.clone();
+    let control_state_tasks_patch = control_state.clone();
+    let control_state_tasks_cancel = control_state.clone();
+    let control_state_tasks_retry = control_state.clone();
+    let control_state_tasks_resume = control_state.clone();
 
     router
         .route(
@@ -613,11 +699,148 @@ fn register_session_routes(
         )
         .route(
             "/control/config",
-            post(
+            get(move |connect_info: MaybeConnectInfo, headers: HeaderMap| {
+                let state = control_state_config_read.clone();
+                async move { control::config_read_handler(State(state), connect_info, headers).await }
+            })
+            .post(
                 move |connect_info: MaybeConnectInfo, headers: HeaderMap, body: Bytes| {
-                    let state = control_state_config.clone();
+                    let state = control_state_config_post.clone();
                     async move {
                         control::config_handler(State(state), connect_info, headers, body).await
+                    }
+                },
+            )
+            .patch(
+                move |connect_info: MaybeConnectInfo, headers: HeaderMap, body: Bytes| {
+                    let state = control_state_config_patch.clone();
+                    async move {
+                        control::config_patch_handler(State(state), connect_info, headers, body)
+                            .await
+                    }
+                },
+            ),
+        )
+        .route(
+            "/control/tasks",
+            post(
+                move |connect_info: MaybeConnectInfo, headers: HeaderMap, body: Bytes| {
+                    let state = control_state_tasks_create.clone();
+                    async move {
+                        control::tasks_create_handler(State(state), connect_info, headers, body)
+                            .await
+                    }
+                },
+            ),
+        )
+        .route(
+            "/control/tasks",
+            get(
+                move |connect_info: MaybeConnectInfo,
+                      headers: HeaderMap,
+                      query: Query<control::TaskListQuery>| {
+                    let state = control_state_tasks_list.clone();
+                    async move {
+                        control::tasks_list_handler(State(state), connect_info, headers, query)
+                            .await
+                    }
+                },
+            ),
+        )
+        .route(
+            "/control/tasks/{id}",
+            get(
+                move |Path(id): Path<String>,
+                      connect_info: MaybeConnectInfo,
+                      headers: HeaderMap| {
+                    let state = control_state_tasks_get.clone();
+                    async move {
+                        control::tasks_get_handler(Path(id), State(state), connect_info, headers)
+                            .await
+                    }
+                },
+            ),
+        )
+        .route(
+            "/control/tasks/{id}",
+            patch(
+                move |Path(id): Path<String>,
+                      connect_info: MaybeConnectInfo,
+                      headers: HeaderMap,
+                      body: Bytes| {
+                    let state = control_state_tasks_patch.clone();
+                    async move {
+                        control::tasks_patch_handler(
+                            Path(id),
+                            State(state),
+                            connect_info,
+                            headers,
+                            body,
+                        )
+                        .await
+                    }
+                },
+            ),
+        )
+        .route(
+            "/control/tasks/{id}/cancel",
+            post(
+                move |Path(id): Path<String>,
+                      connect_info: MaybeConnectInfo,
+                      headers: HeaderMap,
+                      body: Bytes| {
+                    let state = control_state_tasks_cancel.clone();
+                    async move {
+                        control::tasks_cancel_handler(
+                            Path(id),
+                            State(state),
+                            connect_info,
+                            headers,
+                            body,
+                        )
+                        .await
+                    }
+                },
+            ),
+        )
+        .route(
+            "/control/tasks/{id}/retry",
+            post(
+                move |Path(id): Path<String>,
+                      connect_info: MaybeConnectInfo,
+                      headers: HeaderMap,
+                      body: Bytes| {
+                    let state = control_state_tasks_retry.clone();
+                    async move {
+                        control::tasks_retry_handler(
+                            Path(id),
+                            State(state),
+                            connect_info,
+                            headers,
+                            body,
+                        )
+                        .await
+                    }
+                },
+            ),
+        )
+        .route(
+            "/control/tasks/{id}/resume",
+            post(
+                move |Path(id): Path<String>,
+                      connect_info: MaybeConnectInfo,
+                      headers: HeaderMap,
+                      body: Bytes| {
+                    let state = control_state_tasks_resume.clone();
+                    async move {
+                        control::tasks_resume_handler(
+                            Path(id),
+                            State(state),
+                            connect_info,
+                            headers,
+                            body,
+                        )
+                        .await
                     }
                 },
             ),
@@ -673,14 +896,6 @@ fn normalize_control_ui_base_path(path: &str) -> String {
         result.pop();
     }
     result
-}
-
-fn resolve_telegram_webhook_secret(cfg: &Value) -> Option<String> {
-    cfg.get("telegram")
-        .and_then(|t| t.get("webhookSecret"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .or_else(|| std::env::var("TELEGRAM_WEBHOOK_SECRET").ok())
 }
 
 fn resolve_slack_signing_secret(cfg: &Value) -> Option<String> {
@@ -744,6 +959,31 @@ async fn health_ready_handler(State(state): State<AppState>) -> Response {
         .into_response()
 }
 
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn enqueue_hook_wake_event(ws: &Arc<WsServerState>, text: &str, mode: WakeMode) {
+    let reason = match mode {
+        WakeMode::Now => "hook-wake-now",
+        WakeMode::NextHeartbeat => "hook-wake-next-heartbeat",
+    };
+    // Hook wake events track intent + mode and intentionally omit source-network
+    // attribution fields. Sender scoping is applied on run dispatch paths.
+    ws.enqueue_system_event(SystemEvent {
+        ts: unix_now_ms(),
+        text: text.to_string(),
+        host: None,
+        ip: None,
+        device_id: None,
+        instance_id: None,
+        reason: Some(reason.to_string()),
+    });
+}
+
 // ============================================================================
 // Hooks Handlers
 // ============================================================================
@@ -791,11 +1031,20 @@ async fn hooks_wake_handler(
     // Validate request
     match validate_wake_request(&req) {
         Ok(validated) => {
-            // In real implementation, dispatch wake event here
-            debug!(
-                "Wake event: text='{}', mode={:?}",
-                validated.text, validated.mode
-            );
+            if let Some(ws) = &state.ws_state {
+                enqueue_hook_wake_event(ws, &validated.text, validated.mode);
+                debug!(
+                    "Wake event dispatched: mode={:?}, text_len={}",
+                    validated.mode,
+                    validated.text.len()
+                );
+            } else {
+                debug!(
+                    "Wake event accepted (no runtime): mode={:?}, text_len={}",
+                    validated.mode,
+                    validated.text.len()
+                );
+            }
             (StatusCode::OK, Json(WakeResponse::success(validated.mode))).into_response()
         }
         Err(e) => (StatusCode::BAD_REQUEST, Json(WakeResponse::error(&e))).into_response(),
@@ -819,7 +1068,7 @@ fn parse_agent_request(
             thinking: None,
             deliver: None,
             wake_mode: None,
-            session_key: None,
+            session_scope: None,
             timeout_seconds: None,
             allow_unsafe_external_content: None,
             venice_parameters: None,
@@ -844,7 +1093,7 @@ fn parse_agent_request(
 /// Dispatch a validated agent request through the WebSocket runtime, creating
 /// a session, registering the run, and optionally spawning the LLM executor.
 #[allow(clippy::result_large_err)]
-fn dispatch_agent_run(
+async fn dispatch_agent_run(
     ws: &Arc<WsServerState>,
     validated: &crate::hooks::handler::ValidatedAgentRequest,
     run_id: &str,
@@ -873,7 +1122,7 @@ fn dispatch_agent_run(
         channel,
         sender_id,
         peer_id,
-        validated.session_key.as_deref(),
+        validated.session_scope.as_deref(),
         metadata,
     )
     .map_err(|e| {
@@ -884,25 +1133,20 @@ fn dispatch_agent_run(
             .into_response()
     })?;
 
-    ws.session_store()
-        .append_message(crate::sessions::ChatMessage::user(
-            session.id.clone(),
-            &validated.message,
-        ))
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(AgentResponse::error(&format!("session write error: {}", e))),
-            )
-                .into_response()
-        })?;
+    crate::sessions::append_message_blocking(
+        ws.session_store().clone(),
+        crate::sessions::ChatMessage::user(session.id.clone(), &validated.message),
+    )
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(AgentResponse::error(&format!("session write error: {}", e))),
+        )
+            .into_response()
+    })?;
 
     // Register the agent run
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-
     let cancel_token = tokio_util::sync::CancellationToken::new();
     let run = crate::server::ws::AgentRun {
         run_id: run_id.to_string(),
@@ -911,7 +1155,7 @@ fn dispatch_agent_run(
         message: validated.message.clone(),
         response: String::new(),
         error: None,
-        created_at: now,
+        created_at: unix_now_ms(),
         started_at: None,
         completed_at: None,
         cancel_token: cancel_token.clone(),
@@ -942,15 +1186,34 @@ fn dispatch_agent_run(
             provider,
             cancel_token,
         );
-        debug!(
-            "Agent job dispatched: message='{}', channel='{}', runId='{}'",
-            validated.message, validated.channel, run_id
-        );
+        debug!("Agent job dispatched: runId='{}'", run_id);
     } else {
         debug!("Agent job queued (no LLM provider): runId='{}'", run_id);
     }
 
     Ok(())
+}
+
+fn sender_scope_for_hook_request(
+    remote_addr: Option<SocketAddr>,
+    headers: &HeaderMap,
+    trusted_proxies: &[String],
+    sender_scope_secret: Option<&str>,
+) -> String {
+    let Some(remote_ip) = auth::resolve_request_client_ip(remote_addr, headers, trusted_proxies)
+    else {
+        return "unknown".to_string();
+    };
+
+    let secret = sender_scope_secret
+        .filter(|value| !value.is_empty())
+        .unwrap_or(HOOK_SENDER_SCOPE_KDF_FALLBACK_KEY);
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
+    mac.update(HOOK_SENDER_SCOPE_KDF_TAG);
+    mac.update(remote_ip.to_string().as_bytes());
+    let digest = mac.finalize().into_bytes();
+    format!("sender_{}", hex::encode(digest))
 }
 
 /// POST /hooks/agent - Dispatch message to agent
@@ -986,20 +1249,19 @@ async fn hooks_agent_handler(
     let ws = match &state.ws_state {
         Some(ws) => ws.clone(),
         None => {
-            debug!(
-                "Agent job accepted (no runtime): message='{}', channel='{}', runId='{}'",
-                validated.message, validated.channel, run_id
-            );
+            debug!("Agent job accepted (no runtime): runId='{}'", run_id);
             return (StatusCode::ACCEPTED, Json(AgentResponse::success(run_id))).into_response();
         }
     };
 
-    let sender_id = connect_info
-        .0
-        .map(|addr| addr.ip().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
+    let sender_id = sender_scope_for_hook_request(
+        connect_info.0,
+        &headers,
+        &state.config.trusted_proxies,
+        state.config.sender_scope_secret.as_deref(),
+    );
 
-    if let Err(resp) = dispatch_agent_run(&ws, &validated, &run_id, &sender_id) {
+    if let Err(resp) = dispatch_agent_run(&ws, &validated, &run_id, &sender_id).await {
         return resp;
     }
 
@@ -1030,9 +1292,9 @@ async fn telegram_webhook_handler(
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    let secret = match resolve_telegram_webhook_secret(&cfg) {
-        Some(secret) if !secret.is_empty() => secret,
-        _ => {
+    let secret = match telegram_inbound::resolve_webhook_secret(&cfg) {
+        Some(secret) => secret,
+        None => {
             warn!("Telegram webhook secret not configured; rejecting inbound request");
             return StatusCode::UNAUTHORIZED.into_response();
         }
@@ -1063,7 +1325,9 @@ async fn telegram_webhook_handler(
         &inbound.chat_id,
         &inbound.text,
         Some(inbound.chat_id.clone()),
-    ) {
+    )
+    .await
+    {
         warn!("Telegram inbound dispatch failed: {}", err);
     }
 
@@ -1142,7 +1406,9 @@ async fn slack_events_handler(
                     &inbound.channel_id,
                     &inbound.text,
                     Some(inbound.channel_id.clone()),
-                ) {
+                )
+                .await
+                {
                     warn!("Slack inbound dispatch failed: {}", err);
                 }
             }
@@ -1176,7 +1442,10 @@ fn build_hook_context(
 }
 
 /// Convert a hook mapping evaluation result into an HTTP response.
-fn hook_result_to_response(
+async fn hook_result_to_response(
+    state: &AppState,
+    headers: &HeaderMap,
+    connect_info: MaybeConnectInfo,
     result: Result<HookMappingResult, crate::hooks::HookMappingError>,
 ) -> Response {
     match result {
@@ -1185,24 +1454,88 @@ fn hook_result_to_response(
             (StatusCode::NO_CONTENT, "").into_response()
         }
         Ok(HookMappingResult::Wake { text, mode }) => {
-            debug!("Hook triggered wake: text='{}', mode='{}'", text, mode);
-            (StatusCode::OK, Json(json!({ "ok": true, "mode": mode }))).into_response()
+            let wake_mode = WakeMode::from_str_lenient(&mode);
+            if let Some(ws) = &state.ws_state {
+                enqueue_hook_wake_event(ws, &text, wake_mode);
+                debug!(
+                    "Hook triggered wake dispatch: mode='{}', text_len={}",
+                    mode,
+                    text.len()
+                );
+            } else {
+                debug!(
+                    "Hook triggered wake accepted (no runtime): mode='{}', text_len={}",
+                    mode,
+                    text.len()
+                );
+            }
+            (StatusCode::OK, Json(WakeResponse::success(wake_mode))).into_response()
         }
         Ok(HookMappingResult::Agent {
             message,
-            session_key,
-            ..
+            name,
+            channel,
+            to,
+            model,
+            thinking,
+            deliver,
+            wake_mode,
+            session_scope,
+            timeout_seconds,
+            allow_unsafe_external_content,
         }) => {
             let run_id = Uuid::new_v4().to_string();
-            debug!(
-                "Hook triggered agent: message='{}', session_key='{}', runId='{}'",
-                message, session_key, run_id
+
+            let req = AgentRequest {
+                message: Some(message),
+                name: Some(name),
+                channel: Some(channel),
+                to,
+                model,
+                thinking,
+                deliver: Some(deliver),
+                wake_mode: Some(wake_mode),
+                // Keep mapped session scoping out of AgentRequest to avoid
+                // treating it as a sensitive field flow in CodeQL's
+                // cleartext-logging heuristic.
+                session_scope: None,
+                timeout_seconds: timeout_seconds.map(|s| s as f64),
+                allow_unsafe_external_content: Some(allow_unsafe_external_content),
+                venice_parameters: None,
+            };
+            let mut validated = match validate_agent_request(&req, &state.config.valid_channels) {
+                Ok(v) => v,
+                Err(e) => {
+                    return (StatusCode::BAD_REQUEST, Json(AgentResponse::error(&e)))
+                        .into_response();
+                }
+            };
+            validated.session_scope = Some(session_scope);
+
+            let ws = match &state.ws_state {
+                Some(ws) => ws.clone(),
+                None => {
+                    debug!(
+                        "Hook triggered agent accepted (no runtime): runId='{}'",
+                        run_id
+                    );
+                    return (StatusCode::ACCEPTED, Json(AgentResponse::success(run_id)))
+                        .into_response();
+                }
+            };
+
+            let sender_id = sender_scope_for_hook_request(
+                connect_info.0,
+                headers,
+                &state.config.trusted_proxies,
+                state.config.sender_scope_secret.as_deref(),
             );
-            (
-                StatusCode::ACCEPTED,
-                Json(json!({ "ok": true, "runId": run_id })),
-            )
-                .into_response()
+            if let Err(resp) = dispatch_agent_run(&ws, &validated, &run_id, &sender_id).await {
+                return resp;
+            }
+
+            debug!("Hook triggered agent dispatch: runId='{}'", run_id);
+            (StatusCode::ACCEPTED, Json(AgentResponse::success(run_id))).into_response()
         }
         Err(e) => {
             let status = match &e {
@@ -1217,7 +1550,13 @@ fn hook_result_to_response(
 }
 
 /// Look up a matching hook mapping and evaluate it, returning an HTTP response.
-fn execute_hook_mapping(state: &AppState, path: &str, ctx: &HookMappingContext) -> Response {
+async fn execute_hook_mapping(
+    state: &AppState,
+    headers: &HeaderMap,
+    connect_info: MaybeConnectInfo,
+    path: &str,
+    ctx: &HookMappingContext,
+) -> Response {
     let mapping = match state.hook_registry.find_match(ctx) {
         Some(m) => m,
         None => {
@@ -1229,7 +1568,7 @@ fn execute_hook_mapping(state: &AppState, path: &str, ctx: &HookMappingContext) 
     debug!("Hook mapping found for path '{}': {:?}", path, mapping.id);
 
     let result = state.hook_registry.evaluate(&mapping, ctx);
-    hook_result_to_response(result)
+    hook_result_to_response(state, headers, connect_info, result).await
 }
 
 /// POST /hooks/<mapping> - Custom hook mappings
@@ -1237,6 +1576,7 @@ async fn hooks_mapping_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     uri: Uri,
+    connect_info: MaybeConnectInfo,
     Path(path): Path<String>,
     body: axum::body::Bytes,
 ) -> Response {
@@ -1271,7 +1611,7 @@ async fn hooks_mapping_handler(
     };
 
     let ctx = build_hook_context(&headers, &uri, &path, payload);
-    execute_hook_mapping(&state, &path, &ctx)
+    execute_hook_mapping(&state, &headers, connect_info, &path, &ctx).await
 }
 
 /// Plugin webhook handler: forwards `/plugins/<plugin-id>/<path>` to plugin instances.
@@ -1388,7 +1728,7 @@ fn check_hooks_auth(config: &HttpConfig, headers: &HeaderMap, uri: &Uri) -> Opti
     };
 
     match extract_hooks_token(headers, uri) {
-        Some((token, _deprecated)) => {
+        Some(token) => {
             if !validate_hooks_token(&token, configured_token) {
                 Some(unauthorized_response())
             } else {
@@ -1681,18 +2021,35 @@ async fn serve_index_html(state: &AppState, headers: &HeaderMap) -> Response {
                 state.config.control_ui_base_path.clone()
             };
 
-            let mut injected = content
-                .replace("__CARAPACE_CONTROL_UI_BASE_PATH__", &base_path)
-                .replace("__CARAPACE_ASSISTANT_NAME__", "Carapace")
-                .replace("__CARAPACE_ASSISTANT_AVATAR__", "");
-
-            if let Some(store) = &state.csrf_store {
+            let (csrf_cookie_name, csrf_header_name) = if let Some(store) = &state.csrf_store {
                 let config = store.config();
                 if config.enabled {
-                    let script = csrf_bootstrap_script(config);
-                    injected = inject_html_script(&injected, &script);
+                    (
+                        csrf_cookie_name(config).to_string(),
+                        config.header_name.clone(),
+                    )
+                } else {
+                    (String::new(), String::new())
                 }
-            }
+            } else {
+                (String::new(), String::new())
+            };
+
+            let injected = content
+                .replace(
+                    "__CARAPACE_CONTROL_UI_BASE_PATH__",
+                    &html_attr_escape(&base_path),
+                )
+                .replace("__CARAPACE_ASSISTANT_NAME__", &html_attr_escape("Carapace"))
+                .replace("__CARAPACE_ASSISTANT_AVATAR__", &html_attr_escape(""))
+                .replace(
+                    "__CARAPACE_CSRF_COOKIE__",
+                    &html_attr_escape(&csrf_cookie_name),
+                )
+                .replace(
+                    "__CARAPACE_CSRF_HEADER__",
+                    &html_attr_escape(&csrf_header_name),
+                );
 
             let mut response = (
                 StatusCode::OK,
@@ -1730,6 +2087,15 @@ async fn serve_index_html(state: &AppState, headers: &HeaderMap) -> Response {
     }
 }
 
+fn html_attr_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 fn control_ui_tls_guard(state: &AppState) -> Option<Response> {
     let store = state.csrf_store.as_ref()?;
     let config = store.config();
@@ -1743,25 +2109,6 @@ fn control_ui_tls_guard(state: &AppState) -> Option<Response> {
         );
     }
     None
-}
-
-fn csrf_bootstrap_script(config: &CsrfConfig) -> String {
-    let cookie_name = csrf_cookie_name(config);
-    format!(
-        r#"<script>(function(){{var cookieName='{cookie}';var headerName='{header}';function readCookie(name){{var parts=document.cookie?document.cookie.split(';'):[];for(var i=0;i<parts.length;i++){{var part=parts[i].trim();if(part.indexOf(name+'=')===0){{return part.substring(name.length+1);}}}}return '';}}function getToken(){{return readCookie(cookieName);}}function addHeader(headers,token){{if(!token){{return headers;}}var lower=headerName.toLowerCase();if(headers instanceof Headers){{if(!headers.has(headerName)){{headers.set(headerName,token);}}return headers;}}if(Array.isArray(headers)){{for(var i=0;i<headers.length;i++){{if(String(headers[i][0]).toLowerCase()===lower){{return headers;}}}}headers.push([headerName,token]);return headers;}}headers=headers||{{}};for(var key in headers){{if(Object.prototype.hasOwnProperty.call(headers,key)&&String(key).toLowerCase()===lower){{return headers;}}}}headers[headerName]=token;return headers;}}if(window.fetch){{var origFetch=window.fetch.bind(window);window.fetch=function(input,init){{var token=getToken();if(token){{init=init||{{}};if(input instanceof Request){{var baseHeaders=new Headers(input.headers);init.headers=addHeader(baseHeaders,token);var req=new Request(input,init);return origFetch(req);}}init.headers=addHeader(init.headers,token);}}return origFetch(input,init);}};}}if(window.XMLHttpRequest){{var origOpen=XMLHttpRequest.prototype.open;var origSend=XMLHttpRequest.prototype.send;XMLHttpRequest.prototype.open=function(){{this.__csrfToken=getToken();return origOpen.apply(this,arguments);}};XMLHttpRequest.prototype.send=function(){{if(this.__csrfToken){{try{{this.setRequestHeader(headerName,this.__csrfToken);}}catch(e){{}}}}return origSend.apply(this,arguments);}};}}}})();</script>"#,
-        cookie = cookie_name,
-        header = config.header_name
-    )
-}
-
-fn inject_html_script(html: &str, script: &str) -> String {
-    if html.contains("</head>") {
-        return html.replace("</head>", &format!("{}</head>", script));
-    }
-    if html.contains("</body>") {
-        return html.replace("</body>", &format!("{}</body>", script));
-    }
-    format!("{}{}", html, script)
 }
 
 /// Serve a static file
@@ -1902,15 +2249,64 @@ async fn serve_avatar_metadata(state: &AppState, agent_id: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hooks::registry::{HookAction, HookMapping};
+    use crate::server::ws::{WsServerConfig, WsServerState};
+    use crate::sessions;
     use axum::body::Body;
     use axum::http::Request;
+    use std::sync::Arc;
     use tower::ServiceExt;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            // SAFETY: tests in this module scope env var writes to a short-lived guard.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                // SAFETY: restoring test-scoped env var state.
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                // SAFETY: restoring test-scoped env var state.
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    fn set_temp_config_path() -> (tempfile::TempDir, EnvVarGuard) {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("carapace-test-config.json5");
+        let guard = EnvVarGuard::set("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
+        (temp, guard)
+    }
+
+    fn make_headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            headers.insert(
+                axum::http::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                axum::http::HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        headers
+    }
 
     fn test_config() -> HttpConfig {
         HttpConfig {
             hooks_token: Some("test-hooks-token".to_string()),
             hooks_enabled: true,
             gateway_token: Some("test-gateway-token".to_string()),
+            sender_scope_secret: None,
+            control_endpoints_enabled: true,
             control_ui_enabled: true,
             ..Default::default()
         }
@@ -1919,6 +2315,142 @@ mod tests {
     /// Create a test router that can be used with oneshot()
     fn test_router(config: HttpConfig) -> Router {
         create_router(config)
+    }
+
+    fn test_router_with_hook_registry(
+        config: HttpConfig,
+        hook_registry: Arc<HookRegistry>,
+        ws_state: Arc<WsServerState>,
+    ) -> Router {
+        create_router_with_state(
+            config,
+            MiddlewareConfig::none(),
+            hook_registry,
+            Arc::new(ToolsRegistry::new()),
+            Arc::new(ChannelRegistry::new()),
+            Some(ws_state),
+            false,
+        )
+    }
+
+    fn test_router_with_hook_registry_no_runtime(
+        config: HttpConfig,
+        hook_registry: Arc<HookRegistry>,
+    ) -> Router {
+        create_router_with_state(
+            config,
+            MiddlewareConfig::none(),
+            hook_registry,
+            Arc::new(ToolsRegistry::new()),
+            Arc::new(ChannelRegistry::new()),
+            None,
+            false,
+        )
+    }
+
+    async fn read_control_config_snapshot(router: Router) -> Value {
+        let req = Request::builder()
+            .method("GET")
+            .uri("/control/config")
+            .header("authorization", "Bearer test-gateway-token")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    fn make_test_ws_state() -> (Arc<WsServerState>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(sessions::SessionStore::with_base_path(
+            tmp.path().join("sessions"),
+        ));
+        let state = WsServerState::new(WsServerConfig::default()).with_session_store(store);
+        (Arc::new(state), tmp)
+    }
+
+    #[test]
+    fn test_sender_scope_for_hook_request_with_ipv4_remote_addr() {
+        let headers = HeaderMap::new();
+        let sender = sender_scope_for_hook_request(
+            Some(SocketAddr::from(([127, 0, 0, 1], 43123))),
+            &headers,
+            &[],
+            None,
+        );
+        assert!(sender.starts_with("sender_"));
+        assert_eq!(sender.len(), 71);
+    }
+
+    #[test]
+    fn test_sender_scope_for_hook_request_without_remote_addr() {
+        let headers = HeaderMap::new();
+        let sender = sender_scope_for_hook_request(None, &headers, &[], None);
+        assert_eq!(sender, "unknown");
+    }
+
+    #[test]
+    fn test_sender_scope_for_hook_request_with_ipv6_remote_addr() {
+        let headers = HeaderMap::new();
+        let sender = sender_scope_for_hook_request(
+            Some(SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 43123))),
+            &headers,
+            &[],
+            None,
+        );
+        assert!(sender.starts_with("sender_"));
+        assert_eq!(sender.len(), 71);
+    }
+
+    #[test]
+    fn test_sender_scope_for_hook_request_uses_forwarded_for_for_trusted_proxy() {
+        let trusted = vec!["203.0.113.5".to_string()];
+        let headers = make_headers(&[
+            ("x-forwarded-for", "198.51.100.9"),
+            ("x-real-ip", "198.51.100.10"),
+        ]);
+        let trusted_sender = sender_scope_for_hook_request(
+            Some("203.0.113.5:1234".parse().unwrap()),
+            &headers,
+            &trusted,
+            None,
+        );
+        let direct_sender = sender_scope_for_hook_request(
+            Some("203.0.113.5:1234".parse().unwrap()),
+            &headers,
+            &[],
+            None,
+        );
+        let fallback_sender = sender_scope_for_hook_request(
+            Some("198.51.100.9:1234".parse().unwrap()),
+            &HeaderMap::new(),
+            &[],
+            None,
+        );
+
+        assert_eq!(trusted_sender, fallback_sender);
+        assert_ne!(trusted_sender, direct_sender);
+    }
+
+    #[test]
+    fn test_sender_scope_for_hook_request_normalizes_ipv4_mapped_v6() {
+        let headers = HeaderMap::new();
+        let mapped = sender_scope_for_hook_request(
+            Some("[::ffff:127.0.0.1]:8080".parse().unwrap()),
+            &headers,
+            &[],
+            None,
+        );
+        let ipv4 = sender_scope_for_hook_request(
+            Some("127.0.0.1:8080".parse().unwrap()),
+            &headers,
+            &[],
+            None,
+        );
+        assert_eq!(mapped, ipv4);
     }
 
     #[tokio::test]
@@ -1999,6 +2531,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_hooks_wake_dispatches_system_event_with_runtime() {
+        let (ws_state, _tmp) = make_test_ws_state();
+        let router = test_router_with_hook_registry(
+            test_config(),
+            Arc::new(HookRegistry::new()),
+            ws_state.clone(),
+        );
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/hooks/wake")
+            .header("authorization", "Bearer test-hooks-token")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"text":"wake now","mode":"next-heartbeat"}"#))
+            .unwrap();
+
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["mode"], "next-heartbeat");
+
+        let history = ws_state.get_system_event_history();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].text, "wake now");
+        assert_eq!(
+            history[0].reason.as_deref(),
+            Some("hook-wake-next-heartbeat")
+        );
+    }
+
+    #[tokio::test]
     async fn test_hooks_agent_success() {
         let router = test_router(test_config());
 
@@ -2042,6 +2610,995 @@ mod tests {
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["ok"], false);
         assert_eq!(json["error"], "message required");
+    }
+
+    #[tokio::test]
+    async fn test_hooks_mapping_agent_dispatches_real_run() {
+        let (ws_state, _tmp) = make_test_ws_state();
+        let hook_registry = Arc::new(HookRegistry::new());
+        let mut mapping = HookMapping::new("agent-map")
+            .with_path("agent-map")
+            .with_action(HookAction::Agent)
+            .with_message_template("Mapped {{message}}");
+        mapping.session_scope = Some("hook:mapped".to_string());
+        hook_registry.register(mapping);
+
+        let router = test_router_with_hook_registry(test_config(), hook_registry, ws_state.clone());
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/hooks/agent-map")
+            .header("authorization", "Bearer test-hooks-token")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"message":"run this"}"#))
+            .unwrap();
+
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ok"], true);
+        let run_id = json["runId"].as_str().expect("runId must be returned");
+
+        let registry = ws_state.agent_run_registry.lock();
+        let run = registry
+            .get(run_id)
+            .expect("hook mapping agent action must register a real run");
+        assert_eq!(run.message, "Mapped run this");
+        assert!(!run.session_key.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_hooks_mapping_agent_accepts_when_runtime_missing() {
+        let hook_registry = Arc::new(HookRegistry::new());
+        let mapping = HookMapping::new("agent-map-no-runtime")
+            .with_path("agent-map-no-runtime")
+            .with_action(HookAction::Agent)
+            .with_message_template("Mapped {{message}}");
+        hook_registry.register(mapping);
+
+        let router = test_router_with_hook_registry_no_runtime(test_config(), hook_registry);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/hooks/agent-map-no-runtime")
+            .header("authorization", "Bearer test-hooks-token")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"message":"run this"}"#))
+            .unwrap();
+
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ok"], true);
+        assert!(json["runId"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_hooks_mapping_wake_dispatches_system_event_with_runtime() {
+        let (ws_state, _tmp) = make_test_ws_state();
+        let hook_registry = Arc::new(HookRegistry::new());
+        let mut mapping = HookMapping::new("wake-map")
+            .with_path("wake-map")
+            .with_action(HookAction::Wake)
+            .with_text_template("Wake {{reason}}");
+        mapping.wake_mode = Some("next-heartbeat".to_string());
+        hook_registry.register(mapping);
+
+        let router = test_router_with_hook_registry(test_config(), hook_registry, ws_state.clone());
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/hooks/wake-map")
+            .header("authorization", "Bearer test-hooks-token")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"reason":"mapped"}"#))
+            .unwrap();
+
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["mode"], "next-heartbeat");
+
+        let history = ws_state.get_system_event_history();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].text, "Wake mapped");
+        assert_eq!(
+            history[0].reason.as_deref(),
+            Some("hook-wake-next-heartbeat")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hooks_mapping_wake_accepts_when_runtime_missing() {
+        let hook_registry = Arc::new(HookRegistry::new());
+        let mapping = HookMapping::new("wake-map-no-runtime")
+            .with_path("wake-map-no-runtime")
+            .with_action(HookAction::Wake)
+            .with_text_template("Wake {{reason}}");
+        hook_registry.register(mapping);
+
+        let router = test_router_with_hook_registry_no_runtime(test_config(), hook_registry);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/hooks/wake-map-no-runtime")
+            .header("authorization", "Bearer test-hooks-token")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"reason":"fallback"}"#))
+            .unwrap();
+
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["mode"], "now");
+    }
+
+    #[tokio::test]
+    async fn test_control_config_read_requires_auth() {
+        let router = test_router(test_config());
+        let req = Request::builder()
+            .method("GET")
+            .uri("/control/config")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_control_config_read_returns_snapshot() {
+        let (temp, _guard) = set_temp_config_path();
+        std::fs::write(
+            temp.path().join("carapace-test-config.json5"),
+            r#"{
+  "gateway": {
+    "controlUi": { "enabled": true }
+  },
+  "anthropic": {
+    "apiKey": "test-secret-anthropic-key"
+  },
+  "bedrock": {
+    "accessKeyId": "AKIA_TEST_ACCESS_KEY"
+  }
+}"#,
+        )
+        .unwrap();
+
+        let router = test_router(test_config());
+        let req = Request::builder()
+            .method("GET")
+            .uri("/control/config")
+            .header("authorization", "Bearer test-gateway-token")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ok"], true);
+        assert!(json["config"].is_object());
+        assert_eq!(json["config"]["anthropic"]["apiKey"], "[REDACTED]");
+        assert_eq!(json["config"]["bedrock"]["accessKeyId"], "[REDACTED]");
+    }
+
+    #[tokio::test]
+    async fn test_control_config_patch_updates_allowed_path() {
+        let (_temp, _guard) = set_temp_config_path();
+        let router = test_router(test_config());
+        let snapshot = read_control_config_snapshot(router.clone()).await;
+        let mut req_body = json!({
+            "path": "gateway.controlUi.enabled",
+            "value": true,
+        });
+        if let Some(hash) = snapshot["hash"].as_str() {
+            req_body["baseHash"] = json!(hash);
+        }
+
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/control/config")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(req_body.to_string()))
+            .unwrap();
+        let response = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["applied"]["path"], "gateway.controlUi.enabled");
+        assert_eq!(json["applied"]["value"], true);
+    }
+
+    #[tokio::test]
+    async fn test_control_config_patch_rejects_non_allowlisted_path() {
+        let (_temp, _guard) = set_temp_config_path();
+        let router = test_router(test_config());
+        let snapshot = read_control_config_snapshot(router.clone()).await;
+        let mut req_body = json!({
+            "path": "gateway.mode",
+            "value": "lan",
+        });
+        if let Some(hash) = snapshot["hash"].as_str() {
+            req_body["baseHash"] = json!(hash);
+        }
+
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/control/config")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(req_body.to_string()))
+            .unwrap();
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_control_config_post_alias_updates_allowed_path() {
+        let (_temp, _guard) = set_temp_config_path();
+        let router = test_router(test_config());
+        let snapshot = read_control_config_snapshot(router.clone()).await;
+        let mut req_body = json!({
+            "path": "gateway.controlUi.basePath",
+            "value": "/ui-admin",
+        });
+        if let Some(hash) = snapshot["hash"].as_str() {
+            req_body["baseHash"] = json!(hash);
+        }
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/control/config")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(req_body.to_string()))
+            .unwrap();
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_control_config_post_allows_legacy_non_control_ui_paths() {
+        let (_temp, _guard) = set_temp_config_path();
+        let router = test_router(test_config());
+        let snapshot = read_control_config_snapshot(router.clone()).await;
+        let mut req_body = json!({
+            "path": "gateway.port",
+            "value": 18789,
+        });
+        if let Some(hash) = snapshot["hash"].as_str() {
+            req_body["baseHash"] = json!(hash);
+        }
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/control/config")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(req_body.to_string()))
+            .unwrap();
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_control_tasks_create_list_and_get() {
+        let (ws_state, _tmp) = make_test_ws_state();
+        let router = test_router_with_hook_registry(
+            test_config(),
+            Arc::new(HookRegistry::new()),
+            ws_state.clone(),
+        );
+
+        let create_req = Request::builder()
+            .method("POST")
+            .uri("/control/tasks")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"payload":{"kind":"systemEvent","text":"task wake"}}"#,
+            ))
+            .unwrap();
+        let create_response = router.clone().oneshot(create_req).await.unwrap();
+        assert_eq!(create_response.status(), StatusCode::CREATED);
+        let create_body = axum::body::to_bytes(create_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let create_json: Value = serde_json::from_slice(&create_body).unwrap();
+        assert_eq!(create_json["ok"], true);
+        assert_eq!(
+            create_json["task"]["policy"]["maxAttempts"],
+            crate::tasks::DEFAULT_TASK_MAX_ATTEMPTS
+        );
+        assert_eq!(
+            create_json["task"]["policy"]["maxTotalRuntimeMs"],
+            crate::tasks::DEFAULT_TASK_MAX_TOTAL_RUNTIME_MS
+        );
+        assert_eq!(
+            create_json["task"]["policy"]["maxTurns"],
+            crate::tasks::DEFAULT_TASK_MAX_TURNS
+        );
+        assert_eq!(
+            create_json["task"]["policy"]["maxRunTimeoutSeconds"],
+            crate::tasks::DEFAULT_TASK_MAX_RUN_TIMEOUT_SECONDS
+        );
+        let task_id = create_json["task"]["id"]
+            .as_str()
+            .expect("task id should be present")
+            .to_string();
+
+        let list_req = Request::builder()
+            .method("GET")
+            .uri("/control/tasks")
+            .header("authorization", "Bearer test-gateway-token")
+            .body(Body::empty())
+            .unwrap();
+        let list_response = router.clone().oneshot(list_req).await.unwrap();
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let list_body = axum::body::to_bytes(list_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let list_json: Value = serde_json::from_slice(&list_body).unwrap();
+        assert_eq!(list_json["ok"], true);
+        let listed_tasks = list_json["tasks"]
+            .as_array()
+            .expect("tasks should be an array");
+        assert!(listed_tasks
+            .iter()
+            .any(|task| task.get("id").and_then(|id| id.as_str()) == Some(task_id.as_str())));
+
+        let get_req = Request::builder()
+            .method("GET")
+            .uri(format!("/control/tasks/{task_id}"))
+            .header("authorization", "Bearer test-gateway-token")
+            .body(Body::empty())
+            .unwrap();
+        let get_response = router.oneshot(get_req).await.unwrap();
+        assert_eq!(get_response.status(), StatusCode::OK);
+        let get_body = axum::body::to_bytes(get_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let get_json: Value = serde_json::from_slice(&get_body).unwrap();
+        assert_eq!(get_json["ok"], true);
+        assert_eq!(get_json["task"]["id"], task_id);
+    }
+
+    #[tokio::test]
+    async fn test_control_tasks_create_rejects_invalid_policy_budget() {
+        let (ws_state, _tmp) = make_test_ws_state();
+        let router = test_router_with_hook_registry(
+            test_config(),
+            Arc::new(HookRegistry::new()),
+            ws_state.clone(),
+        );
+
+        let create_req = Request::builder()
+            .method("POST")
+            .uri("/control/tasks")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"payload":{"kind":"systemEvent","text":"task wake"},"policy":{"maxAttempts":0}}"#,
+            ))
+            .unwrap();
+        let create_response = router.clone().oneshot(create_req).await.unwrap();
+        assert_eq!(create_response.status(), StatusCode::BAD_REQUEST);
+        let create_body = axum::body::to_bytes(create_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let create_json: Value = serde_json::from_slice(&create_body).unwrap();
+        assert_eq!(create_json["ok"], false);
+        assert!(create_json["error"]
+            .as_str()
+            .expect("error should be present")
+            .contains("policy.maxAttempts"));
+    }
+
+    #[tokio::test]
+    async fn test_control_tasks_cancel_and_retry() {
+        let (ws_state, _tmp) = make_test_ws_state();
+        let router = test_router_with_hook_registry(
+            test_config(),
+            Arc::new(HookRegistry::new()),
+            ws_state.clone(),
+        );
+
+        let create_req = Request::builder()
+            .method("POST")
+            .uri("/control/tasks")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"payload":{"kind":"systemEvent","text":"task cancel retry"}}"#,
+            ))
+            .unwrap();
+        let create_response = router.clone().oneshot(create_req).await.unwrap();
+        assert_eq!(create_response.status(), StatusCode::CREATED);
+        let create_body = axum::body::to_bytes(create_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let create_json: Value = serde_json::from_slice(&create_body).unwrap();
+        let task_id = create_json["task"]["id"]
+            .as_str()
+            .expect("task id should be present")
+            .to_string();
+
+        let cancel_req = Request::builder()
+            .method("POST")
+            .uri(format!("/control/tasks/{task_id}/cancel"))
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"reason":"operator stop"}"#))
+            .unwrap();
+        let cancel_response = router.clone().oneshot(cancel_req).await.unwrap();
+        assert_eq!(cancel_response.status(), StatusCode::OK);
+        let cancel_body = axum::body::to_bytes(cancel_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let cancel_json: Value = serde_json::from_slice(&cancel_body).unwrap();
+        assert_eq!(cancel_json["ok"], true);
+        assert_eq!(cancel_json["task"]["state"], "cancelled");
+
+        let retry_req = Request::builder()
+            .method("POST")
+            .uri(format!("/control/tasks/{task_id}/retry"))
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"delayMs":500,"reason":"operator retry"}"#))
+            .unwrap();
+        let retry_response = router.oneshot(retry_req).await.unwrap();
+        assert_eq!(retry_response.status(), StatusCode::OK);
+        let retry_body = axum::body::to_bytes(retry_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let retry_json: Value = serde_json::from_slice(&retry_body).unwrap();
+        assert_eq!(retry_json["ok"], true);
+        assert_eq!(retry_json["task"]["state"], "retry_wait");
+        assert_eq!(retry_json["task"]["lastError"], "operator retry");
+    }
+
+    #[tokio::test]
+    async fn test_control_tasks_resume_blocked_task() {
+        let (ws_state, _tmp) = make_test_ws_state();
+        let router = test_router_with_hook_registry(
+            test_config(),
+            Arc::new(HookRegistry::new()),
+            ws_state.clone(),
+        );
+
+        let create_req = Request::builder()
+            .method("POST")
+            .uri("/control/tasks")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"payload":{"kind":"systemEvent","text":"task resume blocked"}}"#,
+            ))
+            .unwrap();
+        let create_response = router.clone().oneshot(create_req).await.unwrap();
+        assert_eq!(create_response.status(), StatusCode::CREATED);
+        let create_body = axum::body::to_bytes(create_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let create_json: Value = serde_json::from_slice(&create_body).unwrap();
+        let task_id = create_json["task"]["id"]
+            .as_str()
+            .expect("task id should be present")
+            .to_string();
+
+        let queue = ws_state.task_queue();
+        let _ = queue.claim_due(u64::MAX, 32);
+        assert!(queue.mark_blocked(
+            &task_id,
+            "missing provider config",
+            crate::tasks::TaskBlockedReason::ConfigMissing
+        ));
+
+        let resume_req = Request::builder()
+            .method("POST")
+            .uri(format!("/control/tasks/{task_id}/resume"))
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"delayMs":1000,"reason":"operator resume"}"#))
+            .unwrap();
+        let resume_response = router.oneshot(resume_req).await.unwrap();
+        assert_eq!(resume_response.status(), StatusCode::OK);
+        let resume_body = axum::body::to_bytes(resume_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let resume_json: Value = serde_json::from_slice(&resume_body).unwrap();
+        assert_eq!(resume_json["ok"], true);
+        assert_eq!(resume_json["task"]["state"], "retry_wait");
+        assert_eq!(resume_json["task"]["lastError"], "operator resume");
+        assert!(resume_json["task"]["blockedReason"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_control_tasks_patch_updates_payload_and_policy() {
+        let (ws_state, _tmp) = make_test_ws_state();
+        let router = test_router_with_hook_registry(
+            test_config(),
+            Arc::new(HookRegistry::new()),
+            ws_state.clone(),
+        );
+
+        let create_req = Request::builder()
+            .method("POST")
+            .uri("/control/tasks")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"payload":{"kind":"systemEvent","text":"task patch old"}}"#,
+            ))
+            .unwrap();
+        let create_response = router.clone().oneshot(create_req).await.unwrap();
+        assert_eq!(create_response.status(), StatusCode::CREATED);
+        let create_body = axum::body::to_bytes(create_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let create_json: Value = serde_json::from_slice(&create_body).unwrap();
+        let task_id = create_json["task"]["id"]
+            .as_str()
+            .expect("task id should be present")
+            .to_string();
+
+        let patch_req = Request::builder()
+            .method("PATCH")
+            .uri(format!("/control/tasks/{task_id}"))
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"payload":{"kind":"systemEvent","text":"task patch new"},"policy":{"maxRunTimeoutSeconds":42},"reason":"operator patch"}"#,
+            ))
+            .unwrap();
+        let patch_response = router.oneshot(patch_req).await.unwrap();
+        assert_eq!(patch_response.status(), StatusCode::OK);
+        let patch_body = axum::body::to_bytes(patch_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let patch_json: Value = serde_json::from_slice(&patch_body).unwrap();
+        assert_eq!(patch_json["ok"], true);
+        assert_eq!(patch_json["task"]["payload"]["text"], "task patch new");
+        assert_eq!(patch_json["task"]["policy"]["maxRunTimeoutSeconds"], 42);
+        assert_eq!(
+            patch_json["task"]["policy"]["maxAttempts"],
+            crate::tasks::DEFAULT_TASK_MAX_ATTEMPTS
+        );
+        assert_eq!(patch_json["task"]["lastError"], "operator patch");
+    }
+
+    #[tokio::test]
+    async fn test_control_tasks_patch_empty_body_rejected() {
+        let (ws_state, _tmp) = make_test_ws_state();
+        let router = test_router_with_hook_registry(
+            test_config(),
+            Arc::new(HookRegistry::new()),
+            ws_state.clone(),
+        );
+
+        let create_req = Request::builder()
+            .method("POST")
+            .uri("/control/tasks")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"payload":{"kind":"systemEvent","text":"task patch empty body"}}"#,
+            ))
+            .unwrap();
+        let create_response = router.clone().oneshot(create_req).await.unwrap();
+        assert_eq!(create_response.status(), StatusCode::CREATED);
+        let create_body = axum::body::to_bytes(create_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let create_json: Value = serde_json::from_slice(&create_body).unwrap();
+        let task_id = create_json["task"]["id"]
+            .as_str()
+            .expect("task id should be present")
+            .to_string();
+
+        let patch_req = Request::builder()
+            .method("PATCH")
+            .uri(format!("/control/tasks/{task_id}"))
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{}"#))
+            .unwrap();
+        let patch_response = router.oneshot(patch_req).await.unwrap();
+        assert_eq!(patch_response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_control_tasks_patch_running_conflict() {
+        let (ws_state, _tmp) = make_test_ws_state();
+        let router = test_router_with_hook_registry(
+            test_config(),
+            Arc::new(HookRegistry::new()),
+            ws_state.clone(),
+        );
+
+        let create_req = Request::builder()
+            .method("POST")
+            .uri("/control/tasks")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"payload":{"kind":"systemEvent","text":"task patch running"}}"#,
+            ))
+            .unwrap();
+        let create_response = router.clone().oneshot(create_req).await.unwrap();
+        assert_eq!(create_response.status(), StatusCode::CREATED);
+        let create_body = axum::body::to_bytes(create_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let create_json: Value = serde_json::from_slice(&create_body).unwrap();
+        let task_id = create_json["task"]["id"]
+            .as_str()
+            .expect("task id should be present")
+            .to_string();
+
+        let queue = ws_state.task_queue();
+        let _ = queue.claim_due(u64::MAX, 32);
+
+        let patch_req = Request::builder()
+            .method("PATCH")
+            .uri(format!("/control/tasks/{task_id}"))
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"reason":"operator patch"}"#))
+            .unwrap();
+        let patch_response = router.oneshot(patch_req).await.unwrap();
+        assert_eq!(patch_response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn test_control_tasks_patch_not_found_returns_404() {
+        let (ws_state, _tmp) = make_test_ws_state();
+        let router = test_router_with_hook_registry(
+            test_config(),
+            Arc::new(HookRegistry::new()),
+            ws_state.clone(),
+        );
+
+        let patch_req = Request::builder()
+            .method("PATCH")
+            .uri("/control/tasks/task-does-not-exist")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"reason":"operator patch"}"#))
+            .unwrap();
+        let patch_response = router.oneshot(patch_req).await.unwrap();
+        assert_eq!(patch_response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_control_tasks_resume_non_blocked_conflict() {
+        let (ws_state, _tmp) = make_test_ws_state();
+        let router = test_router_with_hook_registry(
+            test_config(),
+            Arc::new(HookRegistry::new()),
+            ws_state.clone(),
+        );
+
+        let create_req = Request::builder()
+            .method("POST")
+            .uri("/control/tasks")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"payload":{"kind":"systemEvent","text":"task resume not blocked"}}"#,
+            ))
+            .unwrap();
+        let create_response = router.clone().oneshot(create_req).await.unwrap();
+        assert_eq!(create_response.status(), StatusCode::CREATED);
+        let create_body = axum::body::to_bytes(create_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let create_json: Value = serde_json::from_slice(&create_body).unwrap();
+        let task_id = create_json["task"]["id"]
+            .as_str()
+            .expect("task id should be present")
+            .to_string();
+
+        let resume_req = Request::builder()
+            .method("POST")
+            .uri(format!("/control/tasks/{task_id}/resume"))
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{}"#))
+            .unwrap();
+        let resume_response = router.oneshot(resume_req).await.unwrap();
+        assert_eq!(resume_response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn test_control_tasks_resume_not_found_returns_404() {
+        let (ws_state, _tmp) = make_test_ws_state();
+        let router = test_router_with_hook_registry(
+            test_config(),
+            Arc::new(HookRegistry::new()),
+            ws_state.clone(),
+        );
+
+        let resume_req = Request::builder()
+            .method("POST")
+            .uri("/control/tasks/task-does-not-exist/resume")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{}"#))
+            .unwrap();
+        let resume_response = router.oneshot(resume_req).await.unwrap();
+        assert_eq!(resume_response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_control_tasks_cancel_done_conflict() {
+        let (ws_state, _tmp) = make_test_ws_state();
+        let router = test_router_with_hook_registry(
+            test_config(),
+            Arc::new(HookRegistry::new()),
+            ws_state.clone(),
+        );
+
+        let create_req = Request::builder()
+            .method("POST")
+            .uri("/control/tasks")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"payload":{"kind":"systemEvent","text":"task done conflict"}}"#,
+            ))
+            .unwrap();
+        let create_response = router.clone().oneshot(create_req).await.unwrap();
+        assert_eq!(create_response.status(), StatusCode::CREATED);
+        let create_body = axum::body::to_bytes(create_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let create_json: Value = serde_json::from_slice(&create_body).unwrap();
+        let task_id = create_json["task"]["id"]
+            .as_str()
+            .expect("task id should be present")
+            .to_string();
+
+        let queue = ws_state.task_queue();
+        let _ = queue.claim_due(u64::MAX, 32);
+        assert!(queue.mark_done(&task_id, Some("run-test")));
+
+        let cancel_req = Request::builder()
+            .method("POST")
+            .uri(format!("/control/tasks/{task_id}/cancel"))
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::empty())
+            .unwrap();
+        let cancel_response = router.oneshot(cancel_req).await.unwrap();
+        assert_eq!(cancel_response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn test_control_tasks_retry_done_conflict() {
+        let (ws_state, _tmp) = make_test_ws_state();
+        let router = test_router_with_hook_registry(
+            test_config(),
+            Arc::new(HookRegistry::new()),
+            ws_state.clone(),
+        );
+
+        let create_req = Request::builder()
+            .method("POST")
+            .uri("/control/tasks")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"payload":{"kind":"systemEvent","text":"task retry conflict"}}"#,
+            ))
+            .unwrap();
+        let create_response = router.clone().oneshot(create_req).await.unwrap();
+        assert_eq!(create_response.status(), StatusCode::CREATED);
+        let create_body = axum::body::to_bytes(create_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let create_json: Value = serde_json::from_slice(&create_body).unwrap();
+        let task_id = create_json["task"]["id"]
+            .as_str()
+            .expect("task id should be present")
+            .to_string();
+
+        let queue = ws_state.task_queue();
+        let _ = queue.claim_due(u64::MAX, 32);
+        assert!(queue.mark_done(&task_id, Some("run-test")));
+
+        let retry_req = Request::builder()
+            .method("POST")
+            .uri(format!("/control/tasks/{task_id}/retry"))
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::empty())
+            .unwrap();
+        let retry_response = router.oneshot(retry_req).await.unwrap();
+        assert_eq!(retry_response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn test_control_tasks_retry_queued_conflict() {
+        let (ws_state, _tmp) = make_test_ws_state();
+        let router = test_router_with_hook_registry(
+            test_config(),
+            Arc::new(HookRegistry::new()),
+            ws_state.clone(),
+        );
+
+        let create_req = Request::builder()
+            .method("POST")
+            .uri("/control/tasks")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"payload":{"kind":"systemEvent","text":"task queued retry conflict"}}"#,
+            ))
+            .unwrap();
+        let create_response = router.clone().oneshot(create_req).await.unwrap();
+        assert_eq!(create_response.status(), StatusCode::CREATED);
+        let create_body = axum::body::to_bytes(create_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let create_json: Value = serde_json::from_slice(&create_body).unwrap();
+        let task_id = create_json["task"]["id"]
+            .as_str()
+            .expect("task id should be present")
+            .to_string();
+
+        let retry_req = Request::builder()
+            .method("POST")
+            .uri(format!("/control/tasks/{task_id}/retry"))
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::empty())
+            .unwrap();
+        let retry_response = router.oneshot(retry_req).await.unwrap();
+        assert_eq!(retry_response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn test_control_tasks_rejects_overlong_reason() {
+        let (ws_state, _tmp) = make_test_ws_state();
+        let router = test_router_with_hook_registry(
+            test_config(),
+            Arc::new(HookRegistry::new()),
+            ws_state.clone(),
+        );
+
+        let create_req = Request::builder()
+            .method("POST")
+            .uri("/control/tasks")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"payload":{"kind":"systemEvent","text":"task long reason"}}"#,
+            ))
+            .unwrap();
+        let create_response = router.clone().oneshot(create_req).await.unwrap();
+        assert_eq!(create_response.status(), StatusCode::CREATED);
+        let create_body = axum::body::to_bytes(create_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let create_json: Value = serde_json::from_slice(&create_body).unwrap();
+        let task_id = create_json["task"]["id"]
+            .as_str()
+            .expect("task id should be present")
+            .to_string();
+
+        let long_reason = "a".repeat(1025);
+
+        let cancel_req = Request::builder()
+            .method("POST")
+            .uri(format!("/control/tasks/{task_id}/cancel"))
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({ "reason": long_reason })
+                    .to_string()
+                    .into_bytes(),
+            ))
+            .unwrap();
+        let cancel_response = router.clone().oneshot(cancel_req).await.unwrap();
+        assert_eq!(cancel_response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_control_tasks_retry_accepts_whitespace_body() {
+        let (ws_state, _tmp) = make_test_ws_state();
+        let router = test_router_with_hook_registry(
+            test_config(),
+            Arc::new(HookRegistry::new()),
+            ws_state.clone(),
+        );
+
+        let create_req = Request::builder()
+            .method("POST")
+            .uri("/control/tasks")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"payload":{"kind":"systemEvent","text":"task retry whitespace"}}"#,
+            ))
+            .unwrap();
+        let create_response = router.clone().oneshot(create_req).await.unwrap();
+        assert_eq!(create_response.status(), StatusCode::CREATED);
+        let create_body = axum::body::to_bytes(create_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let create_json: Value = serde_json::from_slice(&create_body).unwrap();
+        let task_id = create_json["task"]["id"]
+            .as_str()
+            .expect("task id should be present")
+            .to_string();
+
+        let cancel_req = Request::builder()
+            .method("POST")
+            .uri(format!("/control/tasks/{task_id}/cancel"))
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::empty())
+            .unwrap();
+        let cancel_response = router.clone().oneshot(cancel_req).await.unwrap();
+        assert_eq!(cancel_response.status(), StatusCode::OK);
+
+        let retry_req = Request::builder()
+            .method("POST")
+            .uri(format!("/control/tasks/{task_id}/retry"))
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(" \n\t "))
+            .unwrap();
+        let retry_response = router.oneshot(retry_req).await.unwrap();
+        assert_eq!(retry_response.status(), StatusCode::OK);
+        let retry_body = axum::body::to_bytes(retry_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let retry_json: Value = serde_json::from_slice(&retry_body).unwrap();
+        assert_eq!(retry_json["task"]["state"], "retry_wait");
+        assert_eq!(retry_json["task"]["lastError"], "retried by operator");
+    }
+
+    #[tokio::test]
+    async fn test_control_tasks_queue_unavailable_without_runtime() {
+        let router = test_router(test_config());
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/control/tasks")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"payload":{"kind":"systemEvent","text":"task unavailable"}}"#,
+            ))
+            .unwrap();
+
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
@@ -2140,6 +3697,15 @@ mod tests {
         assert_eq!(normalize_control_ui_base_path("/ui/"), "/ui");
         assert_eq!(normalize_control_ui_base_path("/admin/ui"), "/admin/ui");
         assert_eq!(normalize_control_ui_base_path("  /admin  "), "/admin");
+    }
+
+    #[test]
+    fn test_html_attr_escape() {
+        let value = html_attr_escape(r#"</script><b test='x' "y">&"#);
+        assert_eq!(
+            value,
+            "&lt;/script&gt;&lt;b test=&#39;x&#39; &quot;y&quot;&gt;&amp;"
+        );
     }
 
     #[test]

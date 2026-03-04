@@ -101,6 +101,8 @@ impl ToolPolicy {
     ///
     /// Returns `ToolPolicy::AllowAll` for `None`, missing keys, or
     /// `"allow-all"`.
+    ///
+    /// Unknown policy values fail closed as `AllowList(empty)` (deny all tools).
     pub fn from_config(value: Option<&Value>) -> Self {
         let obj = match value.and_then(|v| v.as_object()) {
             Some(o) => o,
@@ -129,9 +131,9 @@ impl ToolPolicy {
             other => {
                 tracing::warn!(
                     policy = %other,
-                    "unrecognized tool policy value, falling back to AllowAll"
+                    "unrecognized tool policy value, failing closed (deny all tools)"
                 );
-                ToolPolicy::AllowAll
+                ToolPolicy::AllowList(HashSet::new())
             }
         }
     }
@@ -305,13 +307,14 @@ mod tests {
     }
 
     #[test]
-    fn test_from_config_unknown_policy_falls_back_to_allow_all() {
+    fn test_from_config_unknown_policy_fails_closed() {
         let val = json!({
             "policy": "unknown-mode",
             "list": ["time"]
         });
         let policy = ToolPolicy::from_config(Some(&val));
-        assert_eq!(policy, ToolPolicy::AllowAll);
+        assert_eq!(policy, ToolPolicy::AllowList(HashSet::new()));
+        assert!(!policy.is_allowed("time"));
     }
 
     #[test]

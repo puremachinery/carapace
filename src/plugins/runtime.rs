@@ -21,7 +21,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use parking_lot::RwLock;
@@ -63,6 +63,9 @@ pub const DEFAULT_EPOCH_TICK_INTERVAL: Duration = Duration::from_millis(100);
 /// wall-clock timeout. A tight infinite loop will exhaust fuel before the
 /// epoch deadline fires, giving a clearer error message.
 pub const DEFAULT_FUEL_BUDGET: u64 = 1_000_000_000;
+
+/// Bounded queue depth for per-plugin worker requests.
+const PLUGIN_WORKER_QUEUE_CAPACITY: usize = 64;
 
 fn compute_epoch_deadline_ticks(timeout: Duration) -> u64 {
     let interval_ms = DEFAULT_EPOCH_TICK_INTERVAL.as_millis().max(1);
@@ -135,34 +138,6 @@ impl ResourceLimiter for PluginResourceLimiter {
 //
 // These types mirror the WIT record definitions in wit/plugin.wit and are used
 // by the component model linker to marshal data between host and guest.
-
-/// Assert that a future is Send.
-///
-/// # Safety
-///
-/// The caller must guarantee that the future is actually Send-safe.
-/// This is needed because `CredentialBackend` uses `async fn` in trait
-/// which doesn't imply `Send` at the trait level, even though all concrete
-/// implementations are Send (the backend type `B` is bound as `Send + Sync`).
-unsafe fn assert_send<T>(
-    fut: impl std::future::Future<Output = T>,
-) -> impl std::future::Future<Output = T> + Send {
-    /// Wrapper that unsafely implements Send for a future.
-    struct AssertSend<F>(F);
-    // SAFETY: Caller guarantees the inner future is Send-safe.
-    unsafe impl<F> Send for AssertSend<F> {}
-    impl<F: std::future::Future> std::future::Future for AssertSend<F> {
-        type Output = F::Output;
-        fn poll(
-            self: std::pin::Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<Self::Output> {
-            // SAFETY: We are not moving the inner future, just projecting through the wrapper.
-            unsafe { self.map_unchecked_mut(|s| &mut s.0).poll(cx) }
-        }
-    }
-    AssertSend(fut)
-}
 
 /// WIT `http-request` record for the component model linker.
 #[derive(Clone, Debug, ComponentType, Lift, Lower)]
@@ -661,27 +636,35 @@ pub struct PluginInstanceHandle<B: CredentialBackend + Send + Sync + 'static> {
     /// Plugin manifest
     pub manifest: PluginManifest,
 
-    /// Epoch deadline ticks for wall-clock timeouts
+    /// Work queue for executing plugin calls on the dedicated runtime thread.
+    worker_tx: mpsc::SyncSender<PluginWorkerMessage<B>>,
+
+    /// Worker thread handle joined on drop.
+    worker_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+type PluginWorkerTask<B> = Box<dyn FnOnce(&mut PluginWorkerState<B>) + Send + 'static>;
+
+enum PluginWorkerMessage<B: CredentialBackend + Send + Sync + 'static> {
+    Run(PluginWorkerTask<B>),
+    Shutdown,
+}
+
+struct PluginWorkerState<B: CredentialBackend + Send + Sync + 'static> {
     epoch_deadline_ticks: u64,
-
-    /// The wasmtime store with plugin state
-    store: RwLock<Store<HostState<B>>>,
-
-    /// Component instance (for calling exports)
+    runtime: tokio::runtime::Runtime,
+    store: Store<HostState<B>>,
     instance: wasmtime::component::Instance,
-
-    /// Component (needed for export index lookups in wasmtime 29+)
     component: Component,
 }
 
-impl<B: CredentialBackend + Send + Sync + 'static> PluginInstanceHandle<B> {
+impl<B: CredentialBackend + Send + Sync + 'static> PluginWorkerState<B> {
     /// Look up a typed function from a named exported interface.
     ///
     /// Uses `Component::get_export_index` to navigate the interface hierarchy
     /// (wasmtime 24+ removed `Instance::exports()` in favour of index-based lookups).
     fn get_iface_typed_func<P, R>(
-        &self,
-        store: &mut Store<HostState<B>>,
+        &mut self,
         iface_name: &str,
         func_name: &str,
     ) -> Result<wasmtime::component::TypedFunc<P, R>, BindingError>
@@ -689,7 +672,6 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginInstanceHandle<B> {
         P: wasmtime::component::ComponentNamedList + Lower + Send + Sync + 'static,
         R: wasmtime::component::ComponentNamedList + Lift + Send + Sync + 'static,
     {
-        // Step 1: look up the exported interface index
         let iface_idx = self
             .component
             .get_export_index(None, iface_name)
@@ -697,7 +679,6 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginInstanceHandle<B> {
                 BindingError::CallError(format!("exported interface '{}' not found", iface_name))
             })?;
 
-        // Step 2: look up the function within that interface
         let func_idx = self
             .component
             .get_export_index(Some(&iface_idx), func_name)
@@ -708,9 +689,8 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginInstanceHandle<B> {
                 ))
             })?;
 
-        // Step 3: get the typed func from the instance using the index
         self.instance
-            .get_typed_func::<P, R>(&mut *store, &func_idx)
+            .get_typed_func::<P, R>(&mut self.store, &func_idx)
             .map_err(|e| {
                 BindingError::CallError(format!(
                     "failed to get typed func '{}.{}': {}",
@@ -719,77 +699,276 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginInstanceHandle<B> {
             })
     }
 
-    /// Call an exported function from a named interface with no parameters.
-    ///
-    /// Looks up the function `func_name` within the exported interface `iface_name`,
-    /// calls it asynchronously (required by the async-enabled engine), and returns
-    /// the result. Handles the `post_return_async` cleanup automatically.
-    fn call_export_no_args<R>(&self, iface_name: &str, func_name: &str) -> Result<R, BindingError>
+    fn classify_component_call_error(err: &wasmtime::Error) -> Option<RuntimeError> {
+        let trap = err
+            .downcast_ref::<wasmtime::Trap>()
+            .copied()
+            .or_else(|| err.root_cause().downcast_ref::<wasmtime::Trap>().copied());
+
+        match trap {
+            Some(wasmtime::Trap::OutOfFuel) => Some(RuntimeError::FuelExhausted {
+                budget: DEFAULT_FUEL_BUDGET,
+            }),
+            Some(wasmtime::Trap::Interrupt) => Some(RuntimeError::ExecutionTimeout),
+            _ => None,
+        }
+    }
+
+    fn map_component_call_error(
+        err: wasmtime::Error,
+        iface_name: &str,
+        func_name: &str,
+    ) -> BindingError {
+        if let Some(classified) = Self::classify_component_call_error(&err) {
+            BindingError::CallError(format!(
+                "call to '{}.{}' failed: {}",
+                iface_name, func_name, classified
+            ))
+        } else {
+            BindingError::CallError(format!(
+                "call to '{}.{}' failed: {}",
+                iface_name, func_name, err
+            ))
+        }
+    }
+
+    fn call_export_no_args<R>(
+        &mut self,
+        iface_name: &str,
+        func_name: &str,
+    ) -> Result<R, BindingError>
     where
         R: wasmtime::component::ComponentNamedList + Lift + Send + Sync + 'static,
     {
-        let mut store = self.store.write();
+        self.store.set_epoch_deadline(self.epoch_deadline_ticks);
 
-        store.set_epoch_deadline(self.epoch_deadline_ticks);
-
-        // Set fuel budget for this call
-        if let Err(e) = store.set_fuel(DEFAULT_FUEL_BUDGET) {
+        if let Err(e) = self.store.set_fuel(DEFAULT_FUEL_BUDGET) {
             return Err(BindingError::CallError(format!(
                 "failed to set fuel budget: {}",
                 e
             )));
         }
 
-        // Get the exported interface, then get the typed function
-        let func = self.get_iface_typed_func::<(), R>(&mut store, iface_name, func_name)?;
+        let func = self.get_iface_typed_func::<(), R>(iface_name, func_name)?;
 
-        // Call the function asynchronously (required by async-enabled engine)
-        // We bridge sync -> async using tokio's block_in_place + block_on
-        let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async { func.call_async(&mut *store, ()).await })
-        })
-        .map_err(|e: wasmtime::Error| {
-            let msg = e.to_string();
-            let msg_lower = msg.to_lowercase();
-            if msg_lower.contains("fuel") {
-                BindingError::CallError(format!(
-                    "WASM fuel exhausted during '{}.{}' (budget: {} instructions)",
-                    iface_name, func_name, DEFAULT_FUEL_BUDGET
-                ))
-            } else if msg_lower.contains("epoch") || msg_lower.contains("interrupt") {
-                BindingError::CallError(format!(
-                    "WASM execution timed out during '{}.{}' (timeout: {}s)",
-                    iface_name,
-                    func_name,
-                    DEFAULT_EXECUTION_TIMEOUT.as_secs()
-                ))
-            } else {
-                BindingError::CallError(format!(
-                    "call to '{}.{}' failed: {}",
-                    iface_name, func_name, msg
-                ))
-            }
-        })?;
-
-        // Post-return cleanup
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async { func.post_return_async(&mut *store).await })
-        })
-        .map_err(|e| {
-            BindingError::CallError(format!(
-                "post_return for '{}.{}' failed: {}",
-                iface_name, func_name, e
-            ))
-        })?;
+        let result = self
+            .runtime
+            .block_on(async { func.call_async(&mut self.store, ()).await })
+            .map_err(|err| Self::map_component_call_error(err, iface_name, func_name))?;
 
         Ok(result)
     }
 
-    /// Call an exported function from a named interface with one parameter.
-    ///
-    /// Same as [`call_export_no_args`] but accepts a single typed parameter.
+    fn call_export_one_arg<P, R>(
+        &mut self,
+        iface_name: &str,
+        func_name: &str,
+        param: P,
+    ) -> Result<R, BindingError>
+    where
+        P: wasmtime::component::ComponentNamedList + Lower + Send + Sync + 'static,
+        R: wasmtime::component::ComponentNamedList + Lift + Send + Sync + 'static,
+    {
+        self.store.set_epoch_deadline(self.epoch_deadline_ticks);
+
+        if let Err(e) = self.store.set_fuel(DEFAULT_FUEL_BUDGET) {
+            return Err(BindingError::CallError(format!(
+                "failed to set fuel budget: {}",
+                e
+            )));
+        }
+
+        let func = self.get_iface_typed_func::<P, R>(iface_name, func_name)?;
+
+        let result = self
+            .runtime
+            .block_on(async { func.call_async(&mut self.store, param).await })
+            .map_err(|err| Self::map_component_call_error(err, iface_name, func_name))?;
+
+        Ok(result)
+    }
+}
+
+impl<B: CredentialBackend + Send + Sync + 'static> Drop for PluginInstanceHandle<B> {
+    fn drop(&mut self) {
+        // Best-effort shutdown signal; dropping the sender also closes the channel.
+        let _ = self.worker_tx.try_send(PluginWorkerMessage::Shutdown);
+
+        let handle = match self.worker_thread.lock() {
+            Ok(mut guard) => guard.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+
+        if let Some(handle) = handle {
+            // Never block Drop on worker shutdown; join in a detached helper thread.
+            let _ = std::thread::Builder::new()
+                .name("plugin-worker-join".to_string())
+                .spawn(move || {
+                    let _ = handle.join();
+                });
+        }
+    }
+}
+
+impl<B: CredentialBackend + Send + Sync + 'static> PluginInstanceHandle<B> {
+    fn initialize_worker_state(
+        plugin_id: String,
+        wasm_bytes: Vec<u8>,
+        engine: Engine,
+        epoch_deadline_ticks: u64,
+        host_ctx: Arc<PluginHostContext<B>>,
+    ) -> Result<PluginWorkerState<B>, RuntimeError> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| {
+                RuntimeError::InstantiationError(format!("Failed to create runtime: {}", e))
+            })?;
+
+        let (store, instance, component) = runtime.block_on(async move {
+            let host_state = HostState {
+                plugin_id,
+                host_ctx,
+                limiter: PluginResourceLimiter {
+                    max_memory_bytes: MAX_PLUGIN_MEMORY_BYTES as usize,
+                    max_table_elements: MAX_PLUGIN_TABLE_ELEMENTS,
+                },
+            };
+
+            let mut store = Store::new(&engine, host_state);
+            store.limiter(|state| &mut state.limiter);
+            store.set_epoch_deadline(epoch_deadline_ticks);
+
+            if let Err(e) = store.set_fuel(DEFAULT_FUEL_BUDGET) {
+                return Err(RuntimeError::WasmtimeError(format!(
+                    "Failed to set initial fuel budget: {}",
+                    e
+                )));
+            }
+
+            let mut linker: Linker<HostState<B>> = Linker::new(&engine);
+            PluginRuntime::<B>::add_host_functions_to_linker(&mut linker)?;
+
+            let component = Component::new(&engine, &wasm_bytes).map_err(|e| {
+                RuntimeError::WasmtimeError(format!("Failed to create component: {}", e))
+            })?;
+
+            let instance = linker
+                .instantiate_async(&mut store, &component)
+                .await
+                .map_err(|e| RuntimeError::InstantiationError(e.to_string()))?;
+
+            Ok((store, instance, component))
+        })?;
+
+        Ok(PluginWorkerState {
+            epoch_deadline_ticks,
+            runtime,
+            store,
+            instance,
+            component,
+        })
+    }
+
+    fn spawn(
+        manifest: PluginManifest,
+        wasm_bytes: Vec<u8>,
+        engine: Engine,
+        epoch_deadline_ticks: u64,
+        host_ctx: Arc<PluginHostContext<B>>,
+    ) -> Result<Self, RuntimeError> {
+        let plugin_id = manifest.id.clone();
+        let (worker_tx, worker_rx) =
+            mpsc::sync_channel::<PluginWorkerMessage<B>>(PLUGIN_WORKER_QUEUE_CAPACITY);
+        let (init_tx, init_rx) = mpsc::channel::<Result<(), RuntimeError>>();
+
+        let thread = std::thread::Builder::new()
+            .name(format!("plugin-runtime-{}", plugin_id))
+            .spawn(move || {
+                let mut state = match Self::initialize_worker_state(
+                    plugin_id,
+                    wasm_bytes,
+                    engine,
+                    epoch_deadline_ticks,
+                    host_ctx,
+                ) {
+                    Ok(state) => {
+                        let _ = init_tx.send(Ok(()));
+                        state
+                    }
+                    Err(err) => {
+                        let _ = init_tx.send(Err(err));
+                        return;
+                    }
+                };
+
+                while let Ok(message) = worker_rx.recv() {
+                    match message {
+                        PluginWorkerMessage::Run(task) => task(&mut state),
+                        PluginWorkerMessage::Shutdown => break,
+                    }
+                }
+            })
+            .map_err(|e| {
+                RuntimeError::InstantiationError(format!(
+                    "failed to spawn plugin worker thread: {}",
+                    e
+                ))
+            })?;
+
+        match init_rx.recv() {
+            Ok(Ok(())) => Ok(Self {
+                manifest,
+                worker_tx,
+                worker_thread: Mutex::new(Some(thread)),
+            }),
+            Ok(Err(err)) => {
+                let _ = thread.join();
+                Err(err)
+            }
+            Err(_) => {
+                let _ = thread.join();
+                Err(RuntimeError::InstantiationError(
+                    "plugin worker exited before initialization completed".to_string(),
+                ))
+            }
+        }
+    }
+
+    fn execute_on_worker<T, F>(&self, operation: F) -> Result<T, BindingError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut PluginWorkerState<B>) -> Result<T, BindingError> + Send + 'static,
+    {
+        let (result_tx, result_rx) = mpsc::channel();
+        self.worker_tx
+            .try_send(PluginWorkerMessage::Run(Box::new(move |state| {
+                let _ = result_tx.send(operation(state));
+            })))
+            .map_err(|err| match err {
+                mpsc::TrySendError::Full(_) => {
+                    BindingError::CallError("plugin worker queue is full".to_string())
+                }
+                mpsc::TrySendError::Disconnected(_) => {
+                    BindingError::CallError("plugin worker is disconnected".to_string())
+                }
+            })?;
+
+        result_rx.recv().map_err(|err| {
+            BindingError::CallError(format!("plugin worker did not return a result: {err}"))
+        })?
+    }
+
+    /// Call an exported function from a named interface with no parameters.
+    fn call_export_no_args<R>(&self, iface_name: &str, func_name: &str) -> Result<R, BindingError>
+    where
+        R: wasmtime::component::ComponentNamedList + Lift + Send + Sync + 'static,
+    {
+        let iface = iface_name.to_string();
+        let func = func_name.to_string();
+        self.execute_on_worker(move |state| state.call_export_no_args::<R>(&iface, &func))
+    }
+
     fn call_export_one_arg<P, R>(
         &self,
         iface_name: &str,
@@ -800,59 +979,9 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginInstanceHandle<B> {
         P: wasmtime::component::ComponentNamedList + Lower + Send + Sync + 'static,
         R: wasmtime::component::ComponentNamedList + Lift + Send + Sync + 'static,
     {
-        let mut store = self.store.write();
-
-        store.set_epoch_deadline(self.epoch_deadline_ticks);
-
-        // Set fuel budget for this call
-        if let Err(e) = store.set_fuel(DEFAULT_FUEL_BUDGET) {
-            return Err(BindingError::CallError(format!(
-                "failed to set fuel budget: {}",
-                e
-            )));
-        }
-
-        let func = self.get_iface_typed_func::<P, R>(&mut store, iface_name, func_name)?;
-
-        let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async { func.call_async(&mut *store, param).await })
-        })
-        .map_err(|e: wasmtime::Error| {
-            let msg = e.to_string();
-            let msg_lower = msg.to_lowercase();
-            if msg_lower.contains("fuel") {
-                BindingError::CallError(format!(
-                    "WASM fuel exhausted during '{}.{}' (budget: {} instructions)",
-                    iface_name, func_name, DEFAULT_FUEL_BUDGET
-                ))
-            } else if msg_lower.contains("epoch") || msg_lower.contains("interrupt") {
-                BindingError::CallError(format!(
-                    "WASM execution timed out during '{}.{}' (timeout: {}s)",
-                    iface_name,
-                    func_name,
-                    DEFAULT_EXECUTION_TIMEOUT.as_secs()
-                ))
-            } else {
-                BindingError::CallError(format!(
-                    "call to '{}.{}' failed: {}",
-                    iface_name, func_name, msg
-                ))
-            }
-        })?;
-
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async { func.post_return_async(&mut *store).await })
-        })
-        .map_err(|e| {
-            BindingError::CallError(format!(
-                "post_return for '{}.{}' failed: {}",
-                iface_name, func_name, e
-            ))
-        })?;
-
-        Ok(result)
+        let iface = iface_name.to_string();
+        let func = func_name.to_string();
+        self.execute_on_worker(move |state| state.call_export_one_arg::<P, R>(&iface, &func, param))
     }
 }
 
@@ -916,7 +1045,6 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
         // Configure wasmtime engine
         let mut config = Config::new();
         config.wasm_component_model(true);
-        config.async_support(true);
         config.consume_fuel(true);
         config.epoch_interruption(true);
         // Memory limits are enforced per-instance via resource limiter
@@ -1036,57 +1164,26 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
             permission_enforcer,
         ));
 
-        // Create the host state
-        let host_state = HostState {
-            plugin_id: plugin_id.to_string(),
-            host_ctx,
-            limiter: PluginResourceLimiter {
-                max_memory_bytes: MAX_PLUGIN_MEMORY_BYTES as usize,
-                max_table_elements: MAX_PLUGIN_TABLE_ELEMENTS,
-            },
-        };
-
-        // Create the store with host state
-        let mut store = Store::new(&self.engine, host_state);
-        // SECURITY: enforce per-instance memory limits for plugin code.
-        store.limiter(|state| &mut state.limiter);
-
-        // Set epoch deadline for wall-clock timeout enforcement
-        store.set_epoch_deadline(self.epoch_deadline_ticks);
-
-        // Set initial fuel budget (replenished before each call)
-        if let Err(e) = store.set_fuel(DEFAULT_FUEL_BUDGET) {
-            return Err(RuntimeError::WasmtimeError(format!(
-                "Failed to set initial fuel budget: {}",
-                e
-            )));
-        }
-
-        // Create a linker and add host functions
-        let mut linker: Linker<HostState<B>> = Linker::new(&self.engine);
-
-        // Add our host functions to the linker
-        self.add_host_functions(&mut linker)?;
-
-        // Create component from the module bytes
-        let component = Component::new(&self.engine, &loaded.wasm_bytes).map_err(|e| {
-            RuntimeError::WasmtimeError(format!("Failed to create component: {}", e))
-        })?;
-
-        // Instantiate the component
-        let instance = linker
-            .instantiate_async(&mut store, &component)
+        // Initialize the dedicated plugin worker off the async runtime thread.
+        let manifest = loaded.manifest.clone();
+        let wasm_bytes = loaded.wasm_bytes.clone();
+        let engine = self.engine.clone();
+        let epoch_deadline_ticks = self.epoch_deadline_ticks;
+        let handle = Arc::new(
+            tokio::task::spawn_blocking(move || {
+                PluginInstanceHandle::spawn(
+                    manifest,
+                    wasm_bytes,
+                    engine,
+                    epoch_deadline_ticks,
+                    host_ctx,
+                )
+            })
             .await
-            .map_err(|e| RuntimeError::InstantiationError(e.to_string()))?;
-
-        // Create the instance handle
-        let handle = Arc::new(PluginInstanceHandle {
-            manifest: loaded.manifest.clone(),
-            epoch_deadline_ticks: self.epoch_deadline_ticks,
-            store: RwLock::new(store),
-            instance,
-            component,
-        });
+            .map_err(|e| {
+                RuntimeError::InstantiationError(format!("plugin worker join failed: {e}"))
+            })??,
+        );
 
         // Store the instance
         {
@@ -1109,7 +1206,7 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
     ///
     /// Sync functions (logging, config) use `func_wrap`.
     /// Async functions (credentials, HTTP, media) use `func_wrap_async`.
-    fn add_host_functions(&self, linker: &mut Linker<HostState<B>>) -> Result<(), RuntimeError> {
+    fn add_host_functions_to_linker(linker: &mut Linker<HostState<B>>) -> Result<(), RuntimeError> {
         let mut host_instance = linker.instance("host").map_err(|e| {
             RuntimeError::WasmtimeError(format!("Failed to create host instance in linker: {}", e))
         })?;
@@ -1210,13 +1307,9 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
                         + '_,
                 > {
                     let host_ctx = ctx.data().host_ctx.clone();
-                    // SAFETY: PluginHostContext<B> is Send+Sync (B: Send+Sync),
-                    // and all concrete CredentialBackend impls produce Send futures.
-                    Box::new(unsafe {
-                        assert_send(async move {
-                            let wit = WitHost::new(host_ctx);
-                            Ok((wit.credential_get(&key).await,))
-                        })
+                    Box::new(async move {
+                        let wit = WitHost::new(host_ctx);
+                        Ok((wit.credential_get(&key).await,))
                     })
                 },
             )
@@ -1233,12 +1326,9 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
                     dyn std::future::Future<Output = wasmtime::Result<(bool,)>> + Send + '_,
                 > {
                     let host_ctx = ctx.data().host_ctx.clone();
-                    // SAFETY: Same reasoning as credential-get above.
-                    Box::new(unsafe {
-                        assert_send(async move {
-                            let wit = WitHost::new(host_ctx);
-                            Ok((wit.credential_set(&key, &value).await,))
-                        })
+                    Box::new(async move {
+                        let wit = WitHost::new(host_ctx);
+                        Ok((wit.credential_set(&key, &value).await,))
                     })
                 },
             )
@@ -1442,12 +1532,6 @@ impl<B: CredentialBackend + Send + Sync + 'static> ChannelAdapter<B> {
     }
 }
 
-// SAFETY: ChannelAdapter only holds an Arc<PluginInstanceHandle<B>> whose interior
-// wasmtime Store is guarded by an RwLock.  All access goes through the lock,
-// so sharing across threads is safe.
-unsafe impl<B: CredentialBackend + Send + Sync + 'static> Send for ChannelAdapter<B> {}
-unsafe impl<B: CredentialBackend + Send + Sync + 'static> Sync for ChannelAdapter<B> {}
-
 impl<B: CredentialBackend + Send + Sync + 'static> ChannelPluginInstance for ChannelAdapter<B> {
     fn get_info(&self) -> Result<ChannelInfo, BindingError> {
         tracing::debug!(plugin_id = %self.plugin_id, "Calling WASM export channel-meta.get-info");
@@ -1509,12 +1593,6 @@ impl<B: CredentialBackend + Send + Sync + 'static> ToolAdapter<B> {
     }
 }
 
-// SAFETY: ToolAdapter only holds an Arc<PluginInstanceHandle<B>> whose interior
-// wasmtime Store is guarded by an RwLock.  All access goes through the lock,
-// so sharing across threads is safe.
-unsafe impl<B: CredentialBackend + Send + Sync + 'static> Send for ToolAdapter<B> {}
-unsafe impl<B: CredentialBackend + Send + Sync + 'static> Sync for ToolAdapter<B> {}
-
 impl<B: CredentialBackend + Send + Sync + 'static> ToolPluginInstance for ToolAdapter<B> {
     fn get_definitions(&self) -> Result<Vec<ToolDefinition>, BindingError> {
         tracing::debug!(plugin_id = %self.plugin_id, "Calling WASM export tool.get-definitions");
@@ -1559,12 +1637,6 @@ impl<B: CredentialBackend + Send + Sync + 'static> WebhookAdapter<B> {
     }
 }
 
-// SAFETY: WebhookAdapter only holds an Arc<PluginInstanceHandle<B>> whose interior
-// wasmtime Store is guarded by an RwLock.  All access goes through the lock,
-// so sharing across threads is safe.
-unsafe impl<B: CredentialBackend + Send + Sync + 'static> Send for WebhookAdapter<B> {}
-unsafe impl<B: CredentialBackend + Send + Sync + 'static> Sync for WebhookAdapter<B> {}
-
 impl<B: CredentialBackend + Send + Sync + 'static> WebhookPluginInstance for WebhookAdapter<B> {
     fn get_paths(&self) -> Result<Vec<String>, BindingError> {
         tracing::debug!(plugin_id = %self.plugin_id, "Calling WASM export webhook.get-paths");
@@ -1606,12 +1678,6 @@ impl<B: CredentialBackend + Send + Sync + 'static> ServiceAdapter<B> {
     }
 }
 
-// SAFETY: ServiceAdapter only holds an Arc<PluginInstanceHandle<B>> whose interior
-// wasmtime Store is guarded by an RwLock.  All access goes through the lock,
-// so sharing across threads is safe.
-unsafe impl<B: CredentialBackend + Send + Sync + 'static> Send for ServiceAdapter<B> {}
-unsafe impl<B: CredentialBackend + Send + Sync + 'static> Sync for ServiceAdapter<B> {}
-
 impl<B: CredentialBackend + Send + Sync + 'static> ServicePluginInstance for ServiceAdapter<B> {
     fn start(&self) -> Result<(), BindingError> {
         tracing::debug!(plugin_id = %self.plugin_id, "Calling WASM export service.start");
@@ -1650,12 +1716,6 @@ impl<B: CredentialBackend + Send + Sync + 'static> HookAdapter<B> {
         Self { plugin_id, handle }
     }
 }
-
-// SAFETY: HookAdapter only holds an Arc<PluginInstanceHandle<B>> whose interior
-// wasmtime Store is guarded by an RwLock.  All access goes through the lock,
-// so sharing across threads is safe.
-unsafe impl<B: CredentialBackend + Send + Sync + 'static> Send for HookAdapter<B> {}
-unsafe impl<B: CredentialBackend + Send + Sync + 'static> Sync for HookAdapter<B> {}
 
 impl<B: CredentialBackend + Send + Sync + 'static> HookPluginInstance for HookAdapter<B> {
     fn get_hooks(&self) -> Result<Vec<String>, BindingError> {

@@ -13,7 +13,7 @@ use crate::sessions::{get_or_create_scoped_session, ChatMessage, SessionMetadata
 /// Dispatch an inbound text message into the agent pipeline.
 ///
 /// Returns the run ID if queued successfully.
-pub fn dispatch_inbound_text(
+pub async fn dispatch_inbound_text(
     state: &Arc<WsServerState>,
     channel: &str,
     sender_id: &str,
@@ -48,9 +48,11 @@ pub fn dispatch_inbound_text(
     )
     .map_err(|e| format!("failed to get/create session: {}", e))?;
 
-    if let Err(e) = state
-        .session_store()
-        .append_message(ChatMessage::user(session.id.clone(), text))
+    if let Err(e) = crate::sessions::append_message_blocking(
+        state.session_store().clone(),
+        ChatMessage::user(session.id.clone(), text),
+    )
+    .await
     {
         return Err(format!("failed to append message: {}", e));
     }

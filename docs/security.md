@@ -1,10 +1,10 @@
 # Security
 
-Security architecture and threat model for carapace.
+Security architecture and threat model for Carapace.
 
 ## Threat Model
 
-The gateway enables an AI agent with:
+Carapace enables an AI agent with:
 - Shell command execution
 - File read/write access
 - Network access
@@ -71,7 +71,7 @@ graph TB
         Secrets["AES-256-GCM Encrypted Secrets<br/>(PBKDF2, 600K iterations)"]
         Sessions["HMAC-SHA256 Session Integrity"]
         Audit["Append-Only Audit Log<br/>(JSONL, 19 event types)"]
-        Keychain["Platform Credential Store<br/>(Keychain / Keyutils / Windows)"]
+        Keychain["Platform Credential Store<br/>(Keychain / Secret Service / Windows)"]
     end
 
     subgraph "Plugin Boundary"
@@ -183,7 +183,7 @@ Example uses the Linux config directory (`~/.config/carapace`).
 
 ```
 ~/.config/carapace/
-├── carapace.json           # Config (may contain tokens)
+├── carapace.json5          # Config (may contain tokens; legacy .json fallback)
 ├── credentials/            # Channel credentials, allowlists
 │   ├── whatsapp/          # WhatsApp session data
 │   └── *-allowFrom.json   # Pairing allowlists
@@ -194,10 +194,14 @@ Example uses the Linux config directory (`~/.config/carapace`).
 ├── agents/<id>/
 │   ├── sessions/*.jsonl   # Session transcripts
 │   └── auth-profiles.json # API keys, OAuth tokens
+├── tasks/
+│   └── queue.json         # Durable task payload/state (plaintext operational data)
 └── extensions/            # Installed plugins
 ```
 
 **File permissions**: Directories should be `700`, files `600`.
+**Task payload note**: `tasks/queue.json` is plaintext durable state for operator
+workflows. Do not store raw secrets in task payload text.
 
 ## Security Anti-Patterns
 
@@ -269,7 +273,7 @@ Even with access controls, prompt injection can occur via:
 - Files the agent reads
 - Messages from "trusted" but compromised accounts
 
-**Mitigations** (agent layer, not gateway):
+**Mitigations** (agent layer, not transport/runtime layer):
 - Inbound message classifier (LLM-based, off/warn/block modes) — secondary LLM
   call classifies messages for prompt injection, social engineering, instruction
   override, data exfiltration, and tool abuse before the main agent loop. Fail-open
@@ -282,21 +286,27 @@ Even with access controls, prompt injection can occur via:
 ## Control UI Security
 
 The control UI (`/control/*` endpoints) requires:
-- Gateway authentication (token or password)
+- Service authentication (token or password)
 - CSRF protection (double-submit cookie with `__Host-` prefix, `SameSite=Strict`, origin/host validation)
-- Protected config paths blocked from modification:
-  - `gateway.auth.*`
-  - `gateway.hooks.token`
-  - `credentials.*`
-  - `secrets.*`
+- Config mutation split:
+  - `PATCH /control/config` is restricted to `gateway.controlUi.*`
+  - `POST /control/config` is the legacy broader path (still blocked from protected prefixes)
+- Protected config prefixes blocked from control mutation include auth/hooks/credentials/secrets plus provider and channel secrets (for example `anthropic.apiKey`, `openai.apiKey`, `google.apiKey`, `venice.apiKey`, `bedrock.secretAccessKey`, `telegram.botToken`, `discord.botToken`, `slack.signingSecret`) and provider endpoint overrides (`*.baseUrl`).
 
 ```rust
 // From src/server/control.rs
-let blocked_prefixes = ["gateway.auth", "gateway.hooks.token", "credentials", "secrets"];
-for prefix in blocked_prefixes {
-    if req.path.starts_with(prefix) {
+let path = req.path.trim();
+
+for prefix in PROTECTED_CONFIG_PREFIXES {
+    if path.starts_with(prefix) {
         return Err(forbidden("Cannot modify protected configuration"));
     }
+}
+
+if restrict_to_control_ui_paths
+    && !(path == "gateway.controlUi" || path.starts_with("gateway.controlUi."))
+{
+    return Err(forbidden("Control API config writes are limited to gateway.controlUi.*"));
 }
 ```
 
@@ -319,14 +329,14 @@ let webhook_path = format!("/plugins/{}/{}", plugin_id, plugin_path);
 
 If compromise is suspected:
 
-1. **Stop**: Terminate gateway process
+1. **Stop**: Terminate the Carapace process
 2. **Rotate**:
-   - Gateway auth token/password
+   - Service auth token/password
    - Device/node tokens (revoke + re-pair)
    - API keys in auth-profiles.json
 3. **Audit**:
    - Review session transcripts for unexpected tool calls
-   - Check gateway logs for suspicious requests
+   - Check Carapace logs for suspicious requests
    - Review installed plugins
 4. **Harden**:
    - Tighten bind mode (prefer loopback)
@@ -353,9 +363,9 @@ Cron methods (`cron.add`, `cron.update`, `cron.remove`, `cron.run`) go through `
 
 What's missing is a **dedicated scope** (e.g., `operator.cron`) to grant an operator write access to sessions/chat without implicitly granting cron access. Today `operator.write` is an all-or-nothing bundle.
 
-**Why defer**: The gateway is a single-tenant personal agent — the operator is the owner. A dedicated `operator.cron` scope would matter in a multi-tenant or delegated-access scenario, which this project isn't targeting. The existing scope system blocks unauthenticated and read-only connections, which is sufficient for the current threat model.
+**Why defer**: Carapace is a single-tenant personal agent — the operator is the owner. A dedicated `operator.cron` scope would matter in a multi-tenant or delegated-access scenario, which this project isn't targeting. The existing scope system blocks unauthenticated and read-only connections, which is sufficient for the current threat model.
 
-**Counterargument addressed**: A compromised client with `operator.write` can already call `agent`, `chat.send`, `system-event`, and `sessions.delete`, all equally or more damaging than creating cron jobs. A cron-specific scope wouldn't meaningfully reduce blast radius without splitting every write method into its own scope — overengineering for a single-user gateway.
+**Counterargument addressed**: A compromised client with `operator.write` can already call `agent`, `chat.send`, `system-event`, and `sessions.delete`, all equally or more damaging than creating cron jobs. A cron-specific scope wouldn't meaningfully reduce blast radius without splitting every write method into its own scope — overengineering for a single-user personal assistant.
 
 ### TOCTOU race in compaction status check
 
@@ -385,7 +395,7 @@ The send path uses `mpsc::UnboundedSender<Message>` (`src/server/ws/mod.rs`). If
 
 **Effort**: Moderate. Every `send_json()` call site needs to handle the `Full` case.
 
-**Counterargument addressed**: "Just use a timer, it's simpler." A timer adds a `tokio::spawn` per connection, introduces a tuning parameter (how long is "stalled"?), and still lets the buffer grow unbounded between ticks. The bounded channel is both more correct and lower overhead. The counterargument to *both* fixes is that on a single-user gateway, only the operator can create this situation, and they're only hurting themselves — making this the weakest issue of the four.
+**Counterargument addressed**: "Just use a timer, it's simpler." A timer adds a `tokio::spawn` per connection, introduces a tuning parameter (how long is "stalled"?), and still lets the buffer grow unbounded between ticks. The bounded channel is both more correct and lower overhead. The counterargument to *both* fixes is that on a single-user assistant, only the operator can create this situation, and they're only hurting themselves — making this the weakest issue of the four.
 
 ### Resolved
 
@@ -405,4 +415,9 @@ The send path uses `mpsc::UnboundedSender<Message>` (`src/server/ws/mod.rs`). If
 
 ## Security Contacts
 
-Found a vulnerability? Report to: security@clawd.bot
+Report vulnerabilities privately via GitHub advisories:
+https://github.com/puremachinery/carapace/security/advisories/new
+
+If that form is unavailable, open a public issue titled
+`Security Contact Request` with no vulnerability details so we can move the
+report to a private channel.

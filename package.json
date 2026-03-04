@@ -1,0 +1,7 @@
+{
+  "name": "carapace-control-ui",
+  "private": true,
+  "scripts": {
+    "ui:build": "./scripts/build-control-ui.sh"
+  }
+}

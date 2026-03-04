@@ -1,0 +1,49 @@
+#!/bin/bash
+# Pre-commit hook: check formatting, run clippy, and scan for leaked secrets.
+# Install via: just setup-hooks
+
+set -euo pipefail
+
+if ! git diff --cached --quiet --diff-filter=ACMRD -- \
+    ':(glob)**/*.rs' \
+    ':(glob)**/Cargo.toml' \
+    ':(glob)**/Cargo.lock' \
+    ':(glob)**/rust-toolchain' \
+    ':(glob)**/rust-toolchain.toml' \
+    ':(glob)**/clippy.toml' \
+    ':(glob).cargo/**' \
+    ':(glob)**/.cargo/**'; then
+    # Force visible progress output so long builds don't look stalled,
+    # while respecting an explicit user preference if one is already set.
+    export CARGO_TERM_PROGRESS_WHEN="${CARGO_TERM_PROGRESS_WHEN:-always}"
+
+    echo "Rust/Cargo changes detected in staged files; running Rust checks..."
+    echo "Running cargo fmt --check..."
+    if ! cargo fmt --all --check; then
+        echo "Formatting check failed. Run 'cargo fmt' to fix."
+        exit 1
+    fi
+
+    declare -a clippy_cmd=(cargo clippy --locked --all-features --all-targets -- -D warnings)
+    echo "Running ${clippy_cmd[*]}..."
+    if ! "${clippy_cmd[@]}"; then
+        echo "Clippy check failed. Fix the warnings above."
+        exit 1
+    fi
+else
+    echo "No staged Rust/Cargo changes; skipping cargo fmt/clippy."
+fi
+
+# Scan staged changes for leaked secrets (if gitleaks is installed).
+if command -v gitleaks >/dev/null 2>&1; then
+    echo "Running gitleaks on staged changes..."
+    if ! gitleaks git --staged --no-banner; then
+        echo "gitleaks detected secrets in staged changes. Review and remove them."
+        echo "To see details: gitleaks git --staged --verbose"
+        exit 1
+    fi
+else
+    echo "gitleaks not installed, skipping secret scan. See https://github.com/gitleaks/gitleaks#install"
+fi
+
+echo "Pre-commit checks passed"

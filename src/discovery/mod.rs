@@ -333,11 +333,22 @@ pub async fn run_mdns_lifecycle(
 mod hostname {
     use std::ffi::OsString;
 
+    use crate::agent::sandbox::{
+        default_probe_sandbox_config, ensure_sandbox_supported, run_sandboxed_std_command_output,
+    };
+
+    fn run_hostname_command() -> Result<std::process::Output, std::io::Error> {
+        let sandbox = default_probe_sandbox_config();
+        ensure_sandbox_supported(Some(&sandbox))
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Unsupported, e.to_string()))?;
+        run_sandboxed_std_command_output("hostname", &[], Some(&sandbox))
+    }
+
     /// Get the system hostname via the `hostname` command.
     /// Falls back to environment variables if the command is not available.
     pub fn get() -> Result<OsString, std::io::Error> {
         // Try `hostname` command (available on macOS, Linux, and most Unix systems)
-        if let Ok(output) = std::process::Command::new("hostname").output() {
+        if let Ok(output) = run_hostname_command() {
             if output.status.success() {
                 let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 if !name.is_empty() {

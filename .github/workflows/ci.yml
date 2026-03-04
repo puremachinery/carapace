@@ -6,17 +6,81 @@ on:
   pull_request:
     branches: [main, master]
 
+concurrency:
+  group: ci-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
 jobs:
+  changes:
+    name: Detect Changed Categories
+    runs-on: ubuntu-latest
+    outputs:
+      docs: ${{ steps.filter.outputs.docs }}
+      workflow: ${{ steps.filter.outputs.workflow }}
+      rust_runtime: ${{ steps.filter.outputs.rust_runtime }}
+      windows_sensitive: ${{ steps.filter.outputs.windows_sensitive }}
+      docker: ${{ steps.filter.outputs.docker }}
+      control_ui: ${{ steps.filter.outputs.control_ui }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 2
+      - id: filter
+        uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3
+        with:
+          filters: |
+            docs:
+              - "docs/**"
+              - "**/*.md"
+              - "website/**"
+              - "LICENSE"
+            workflow:
+              - ".github/workflows/**"
+            rust_runtime:
+              - "src/**"
+              - "tests/**"
+              - "fuzz/**"
+              - "wit/**"
+              - "Cargo.toml"
+              - "Cargo.lock"
+              - "build.rs"
+              - "deny.toml"
+              - "config.example.json5"
+              - ".cargo/**"
+            windows_sensitive:
+              - "src/agent/sandbox.rs"
+              - "src/credentials/windows.rs"
+              - "src/discovery/mod.rs"
+              - "src/server/bind.rs"
+              - "src/tailscale/mod.rs"
+              - "Cargo.toml"
+              - "Cargo.lock"
+              - ".github/workflows/**"
+            docker:
+              - "Dockerfile"
+              - ".dockerignore"
+              - ".hadolint.yaml"
+            control_ui:
+              - "ui/control-ui/**"
+              - "dist/control-ui/**"
+              - "scripts/build-control-ui.sh"
+              - "package.json"
+
   fmt:
     name: Format
     runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.rust_runtime == 'true'
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
           components: rustfmt
       - run: cargo fmt --all --check
@@ -24,96 +88,212 @@ jobs:
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.rust_runtime == 'true'
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
       - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  runtime-bridge-guard:
+    name: Runtime Bridge Guard
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.rust_runtime == 'true'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Enforce runtime bridge boundaries
+        run: ./scripts/check-runtime-bridge-usage.sh
+
+  ws-golden:
+    name: WS Golden
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.rust_runtime == 'true'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - uses: taiki-e/install-action@602dc500e2b7e0e2486b4ce53909ba048de44e08 # nextest
+      - run: ./scripts/run-nextest-guarded.sh --all-targets server::ws::golden_tests::golden_trace
+      - name: Upload nextest stall diagnostics (ws-golden)
+        if: failure()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: nextest-list-stall-ws-golden-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .local/reports/nextest-list-stalls/**
+          if-no-files-found: ignore
+          retention-days: 14
 
   build:
     name: Build
     runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.rust_runtime == 'true' && github.event_name == 'push'
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
       - run: cargo build --all-targets
 
-  test:
+  test-pr:
+    name: Test (ubuntu PR)
+    runs-on: ubuntu-latest
+    needs: [changes, ws-golden]
+    if: needs.changes.outputs.rust_runtime == 'true' && needs.ws-golden.result == 'success' && github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - uses: taiki-e/install-action@602dc500e2b7e0e2486b4ce53909ba048de44e08 # nextest
+      - run: ./scripts/run-nextest-guarded.sh --all-targets
+      - name: Upload nextest stall diagnostics (test-pr)
+        if: failure()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: nextest-list-stall-test-pr-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .local/reports/nextest-list-stalls/**
+          if-no-files-found: ignore
+          retention-days: 14
+
+  test-push:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    needs: [changes, ws-golden]
+    if: needs.changes.outputs.rust_runtime == 'true' && needs.ws-golden.result == 'success' && github.event_name == 'push'
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@nextest
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - uses: taiki-e/install-action@602dc500e2b7e0e2486b4ce53909ba048de44e08 # nextest
+      - name: Run nextest (guarded)
+        if: runner.os != 'Windows'
+        run: ./scripts/run-nextest-guarded.sh --all-targets
+      - name: Run nextest (Windows)
+        if: runner.os == 'Windows'
+        run: cargo nextest run --all-targets
+      - name: Upload nextest stall diagnostics (test-push)
+        if: failure() && runner.os != 'Windows'
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: nextest-list-stall-test-push-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .local/reports/nextest-list-stalls/**
+          if-no-files-found: ignore
+          retention-days: 14
+
+  test-pr-windows:
+    name: Test (windows PR)
+    runs-on: windows-latest
+    needs: [changes, ws-golden]
+    if: needs.changes.outputs.rust_runtime == 'true' && needs.ws-golden.result == 'success' && github.event_name == 'pull_request' && needs.changes.outputs.windows_sensitive == 'true'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - uses: taiki-e/install-action@602dc500e2b7e0e2486b4ce53909ba048de44e08 # nextest
       - run: cargo nextest run --all-targets
 
   msrv:
     name: MSRV
     runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.rust_runtime == 'true' && github.event_name == 'push'
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.93.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # 1.93.0
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
       - run: cargo check --all-targets
 
   audit:
     name: Security Audit
     runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.rust_runtime == 'true'
     steps:
-      - uses: actions/checkout@v4
-      - uses: taiki-e/install-action@cargo-audit
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: taiki-e/install-action@468f60710537884ebb9b0e713dad1957996a55f2 # cargo-audit
       - run: cargo audit
 
   deny:
     name: Dependency Check
     runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.rust_runtime == 'true'
     steps:
-      - uses: actions/checkout@v4
-      - uses: taiki-e/install-action@cargo-deny
-      - run: cargo deny check
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: taiki-e/install-action@f63130e3904c76fd4045473e61389a5266ee4cc0 # cargo-deny
+      - name: Run cargo deny with transient-network retries
+        run: |
+          set -euo pipefail
+          max_attempts=3
+          delay_seconds=15
+
+          for attempt in $(seq 1 "$max_attempts"); do
+            echo "cargo deny check attempt ${attempt}/${max_attempts}"
+            if cargo deny check; then
+              exit 0
+            fi
+
+            if [ "$attempt" -lt "$max_attempts" ]; then
+              echo "cargo deny check failed (likely transient upstream/network issue); retrying in ${delay_seconds}s..."
+              sleep "$delay_seconds"
+              delay_seconds=$((delay_seconds * 2))
+            fi
+          done
+
+          echo "cargo deny check failed after ${max_attempts} attempts."
+          exit 1
 
   gitleaks:
     name: Secret Scan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
-      - uses: gitleaks/gitleaks-action@v2
+      - uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   hadolint:
     name: Dockerfile Lint
     runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.docker == 'true'
     steps:
-      - uses: actions/checkout@v4
-      - uses: hadolint/hadolint-action@v3.1.0
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: hadolint/hadolint-action@2332a7b74a6de0dda2e2221d575162eba76ba5e5 # v3.3.0
         with:
           dockerfile: Dockerfile
 
   trivy:
     name: Trivy Scan
     runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.rust_runtime == 'true' || needs.changes.outputs.docker == 'true'
+    env:
+      # Avoid transient mirror.gcr.io 404s when pulling Trivy databases.
+      TRIVY_DB_REPOSITORY: ghcr.io/aquasecurity/trivy-db:2
+      TRIVY_JAVA_DB_REPOSITORY: ghcr.io/aquasecurity/trivy-java-db:1
+      TRIVY_CHECKS_BUNDLE_REPOSITORY: ghcr.io/aquasecurity/trivy-checks:1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Run Trivy filesystem scan
-        uses: aquasecurity/trivy-action@0.33.1
+        uses: aquasecurity/trivy-action@e368e328979b113139d6f9068e03accaed98a518 # 0.34.1
         with:
           scan-type: fs
           scan-ref: .
           severity: CRITICAL,HIGH
           exit-code: 1
       - name: Run Trivy config scan
-        uses: aquasecurity/trivy-action@0.33.1
+        uses: aquasecurity/trivy-action@e368e328979b113139d6f9068e03accaed98a518 # 0.34.1
         with:
           scan-type: config
           scan-ref: .
@@ -123,16 +303,158 @@ jobs:
   geiger:
     name: Unsafe Code Audit
     runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.rust_runtime == 'true' && github.event_name == 'push'
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
       - name: Install cargo-geiger
         run: cargo install cargo-geiger
       - name: Report unsafe usage
         run: cargo geiger --all-targets --output-format ascii 2>&1 | tee geiger-report.txt
       - name: Upload geiger report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: geiger-report
           path: geiger-report.txt
+
+  workflow-lint:
+    name: Workflow Lint
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.workflow == 'true'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Run actionlint
+        uses: rhysd/actionlint@393031adb9afb225ee52ae2ccd7a5af5525e03e8 # v1.7.11
+        with:
+          args: -color -shellcheck=
+
+  docs-check:
+    name: Docs Check
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.docs == 'true'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Basic markdown sanity check
+        run: |
+          echo "Checking Markdown files for hard tabs"
+          if grep -RIn $'\t' --include='*.md' --exclude-dir=.git --exclude-dir=target .; then
+            echo "Found tab characters in Markdown files; please use spaces."
+            exit 1
+          fi
+
+  control-ui-sync:
+    name: Control UI Dist Sync
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.control_ui == 'true'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Verify source/dist parity
+        run: ./scripts/check-control-ui-dist.sh
+
+  ci-required:
+    name: CI Required
+    runs-on: ubuntu-latest
+    if: always()
+    needs:
+      - changes
+      - fmt
+      - clippy
+      - runtime-bridge-guard
+      - ws-golden
+      - build
+      - test-pr
+      - test-pr-windows
+      - test-push
+      - msrv
+      - audit
+      - deny
+      - gitleaks
+      - hadolint
+      - trivy
+      - geiger
+      - workflow-lint
+      - docs-check
+      - control-ui-sync
+    steps:
+      - name: Ensure dependent jobs are success or skipped
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          FMT_RESULT: ${{ needs.fmt.result }}
+          CLIPPY_RESULT: ${{ needs.clippy.result }}
+          RUNTIME_BRIDGE_GUARD_RESULT: ${{ needs['runtime-bridge-guard'].result }}
+          WS_GOLDEN_RESULT: ${{ needs['ws-golden'].result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          TEST_PR_RESULT: ${{ needs['test-pr'].result }}
+          TEST_PR_WINDOWS_RESULT: ${{ needs['test-pr-windows'].result }}
+          TEST_PUSH_RESULT: ${{ needs['test-push'].result }}
+          MSRV_RESULT: ${{ needs.msrv.result }}
+          AUDIT_RESULT: ${{ needs.audit.result }}
+          DENY_RESULT: ${{ needs.deny.result }}
+          GITLEAKS_RESULT: ${{ needs.gitleaks.result }}
+          HADOLINT_RESULT: ${{ needs.hadolint.result }}
+          TRIVY_RESULT: ${{ needs.trivy.result }}
+          GEIGER_RESULT: ${{ needs.geiger.result }}
+          WORKFLOW_LINT_RESULT: ${{ needs['workflow-lint'].result }}
+          DOCS_CHECK_RESULT: ${{ needs['docs-check'].result }}
+          CONTROL_UI_SYNC_RESULT: ${{ needs['control-ui-sync'].result }}
+        run: |
+          set -euo pipefail
+
+          names=(
+            "changes"
+            "fmt"
+            "clippy"
+            "runtime-bridge-guard"
+            "ws-golden"
+            "build"
+            "test-pr"
+            "test-pr-windows"
+            "test-push"
+            "msrv"
+            "audit"
+            "deny"
+            "gitleaks"
+            "hadolint"
+            "trivy"
+            "geiger"
+            "workflow-lint"
+            "docs-check"
+            "control-ui-sync"
+          )
+
+          results=(
+            "$CHANGES_RESULT"
+            "$FMT_RESULT"
+            "$CLIPPY_RESULT"
+            "$RUNTIME_BRIDGE_GUARD_RESULT"
+            "$WS_GOLDEN_RESULT"
+            "$BUILD_RESULT"
+            "$TEST_PR_RESULT"
+            "$TEST_PR_WINDOWS_RESULT"
+            "$TEST_PUSH_RESULT"
+            "$MSRV_RESULT"
+            "$AUDIT_RESULT"
+            "$DENY_RESULT"
+            "$GITLEAKS_RESULT"
+            "$HADOLINT_RESULT"
+            "$TRIVY_RESULT"
+            "$GEIGER_RESULT"
+            "$WORKFLOW_LINT_RESULT"
+            "$DOCS_CHECK_RESULT"
+            "$CONTROL_UI_SYNC_RESULT"
+          )
+
+          for i in "${!names[@]}"; do
+            name="${names[$i]}"
+            result="${results[$i]}"
+            echo "${name}: ${result}"
+            if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
+              echo "Job ${name} did not succeed"
+              exit 1
+            fi
+          done

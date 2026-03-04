@@ -333,14 +333,18 @@ pub(super) fn handle_cron_run(
             let job_name = job.as_ref().map(|j| j.name.clone());
             tokio::spawn(async move {
                 let start = std::time::Instant::now();
-                let outcome =
-                    crate::cron::executor::execute_payload(&job_id_owned, &payload, &state_clone)
-                        .await;
+                let outcome = crate::cron::executor::execute_payload(
+                    &job_id_owned,
+                    &payload,
+                    &state_clone,
+                    crate::cron::executor::ExecutionLimits::default(),
+                )
+                .await;
                 let duration_ms = start.elapsed().as_millis() as u64;
 
                 let (status, error) = match outcome {
                     Ok(_) => (CronJobStatus::Ok, None),
-                    Err(e) => (CronJobStatus::Error, Some(e)),
+                    Err(e) => (CronJobStatus::Error, Some(e.to_string())),
                 };
 
                 if let Err(e) = state_clone.cron_scheduler.mark_run_finished(

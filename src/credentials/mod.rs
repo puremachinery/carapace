@@ -362,19 +362,28 @@ impl RateLimitTracker {
 }
 
 /// Credential store trait
-#[allow(async_fn_in_trait)]
 pub trait CredentialBackend: Send + Sync {
     /// Get a credential by key (raw operation, no retry)
-    async fn get_raw(&self, key: &CredentialKey) -> Result<Option<String>, CredentialError>;
+    fn get_raw<'a>(
+        &'a self,
+        key: &'a CredentialKey,
+    ) -> impl std::future::Future<Output = Result<Option<String>, CredentialError>> + Send + 'a;
 
     /// Set a credential (raw operation, no retry)
-    async fn set_raw(&self, key: &CredentialKey, value: &str) -> Result<(), CredentialError>;
+    fn set_raw<'a>(
+        &'a self,
+        key: &'a CredentialKey,
+        value: &'a str,
+    ) -> impl std::future::Future<Output = Result<(), CredentialError>> + Send + 'a;
 
     /// Delete a credential (raw operation, no retry)
-    async fn delete_raw(&self, key: &CredentialKey) -> Result<(), CredentialError>;
+    fn delete_raw<'a>(
+        &'a self,
+        key: &'a CredentialKey,
+    ) -> impl std::future::Future<Output = Result<(), CredentialError>> + Send + 'a;
 
     /// Check if the credential store is available and unlocked
-    async fn is_available(&self) -> bool;
+    fn is_available(&self) -> impl std::future::Future<Output = bool> + Send + '_;
 }
 
 /// Main credential store that wraps a backend with retry logic and index management

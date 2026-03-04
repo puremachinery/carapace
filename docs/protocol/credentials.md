@@ -1,6 +1,6 @@
 # Credential Storage
 
-This document describes how carapace stores secrets.
+This document describes how Carapace stores secrets.
 
 ## Status
 
@@ -10,14 +10,14 @@ This document mixes current behavior with planned design. Sections labeled
 ## Scope
 
 Secrets covered:
-- Gateway auth tokens/passwords
+- Service auth tokens/passwords
 - Provider auth profiles (API keys, OAuth access/refresh tokens, bearer tokens)
 - Hooks token and browser control token
 - GitHub Copilot token cache
 - WhatsApp Web session material (treated as secret data)
 
 Non-secrets (allowed to remain on disk as plaintext metadata):
-- Config files (`carapace.json`) and include files
+- Config files (`carapace.json5`, with legacy `.json` fallback) and include files
 - Profile ordering/usage stats metadata (no secret fields)
 
 ## Storage API (Rust)
@@ -62,10 +62,10 @@ Minimum JSON schema per secret type:
     "enterpriseUrl": "..."
   }
   ```
-  Fields mirror the gateway's `AuthProfileCredential` shape; only the fields
+  Fields mirror the service's `AuthProfileCredential` shape; only the fields
   present for the specific `type` are required.
 
-- **Gateway auth**
+- **Service auth**
   ```json
   { "token": "..." }
   ```
@@ -116,15 +116,16 @@ No secret fields are written to this file.
 - **Account:** `kind:{agentId}:{id}`
 - **Storage:** JSON string payloads
 
-### Linux Keyutils (kernel keyring)
+### Linux Secret Service (GNOME Keyring / KWallet)
 
-- **Recommended crate:** `keyring` (Keyutils backend)
-- **Alternative:** `secret-service` when attribute queries are required (not used by default)
-- **Collection:** kernel keyring (no D-Bus dependency)
+- **Recommended crate:** `keyring` (Secret Service backend)
+- **Alternative:** `secret-service` when direct D-Bus attribute queries are required
+- **Collection:** Secret Service (D-Bus)
 
-**Fallback behavior if keyring storage is unavailable:**
+**Fallback behavior if Secret Service storage is unavailable:**
 - Do not persist secrets to disk.
-- Log a clear error instructing the operator to enable kernel keyring support.
+- Log a clear error instructing the operator to enable Secret Service
+  (for example, GNOME Keyring or KWallet).
 - Continue only with environment-sourced credentials for the current session.
 
 ### Windows Credential Manager
@@ -142,14 +143,14 @@ credential store health checks. The remainder of this section is planned unless 
 
 ### Locked Keychain / Unavailable Secret Store
 
-**Scenario:** Gateway starts but the OS secret store is locked or unavailable.
+**Scenario:** Carapace starts but the OS secret store is locked or unavailable.
 
 **Behavior by platform:**
 
 | Platform | Interactive Mode | Daemon Mode |
 |----------|-----------------|-------------|
 | macOS    | System prompts for keychain unlock | Fail with clear error; require unlock before daemon start |
-| Linux    | Keyutils unavailable: warn and continue with env-only credentials | Same; no automatic prompt possible |
+| Linux    | Secret Service unavailable: warn and continue with env-only credentials | Same; no automatic prompt possible |
 | Windows  | Credential Manager always available if user is logged in | N/A (Windows services run in session 0) |
 
 **Implementation notes:**
@@ -168,14 +169,14 @@ Keychain operations may block (e.g., waiting for user unlock prompt).
 | `delete`  | 5s      | 2       | None |
 
 **Retryable errors:**
-- Transient keyring backend errors (Linux keyutils)
+- Transient keyring backend errors (Linux Secret Service)
 - Keychain temporarily locked during transition
 - Transient I/O errors
 
 **Non-retryable errors:**
 - Keychain permanently locked (requires user action)
 - Access denied (permission error)
-- Keyring backend unavailable (e.g., kernel keyring disabled or unsupported)
+- Keyring backend unavailable (e.g., no Secret Service provider or D-Bus unavailable)
 
 ### Credential Rotation Atomicity (rollback best-effort)
 
