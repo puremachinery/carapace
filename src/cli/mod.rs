@@ -442,6 +442,7 @@ use rustls::{DigitallySignedStruct, Error as RustlsError, SignatureScheme};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+#[cfg(not(test))]
 use std::io::IsTerminal;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -2527,10 +2528,15 @@ fn setup_interactive_test_harness_take_channel_validation_result() -> Option<Res
 
 fn stdin_is_interactive() -> bool {
     #[cfg(test)]
-    if let Some(forced) = setup_interactive_test_harness_override_interactive() {
-        return forced;
+    {
+        // Keep tests deterministic: default to non-interactive unless explicitly forced.
+        return setup_interactive_test_harness_override_interactive().unwrap_or(false);
     }
-    std::io::stdin().is_terminal()
+
+    #[cfg(not(test))]
+    {
+        std::io::stdin().is_terminal()
+    }
 }
 
 fn prompt_setup_outcome() -> Result<SetupOutcome, Box<dyn std::error::Error>> {
