@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      pull-requests: write
+      pull-requests: read
       issues: read
       id-token: write
       actions: read
@@ -176,8 +176,7 @@ jobs:
           if [[ "${{ github.actor }}" != "dependabot[bot]" ]] && \
              [[ "${{ steps.workflow-change.outputs.changed }}" != "true" ]] && \
              [[ "${{ steps.claude-review.outcome }}" == "success" ]] && \
-             [[ "${{ steps.validate-review-json.outcome }}" == "success" ]] && \
-             [[ "${{ steps.upload-review-json.outcome }}" == "success" ]]; then
+             [[ "${{ steps.validate-review-json.outcome }}" == "success" ]]; then
             should_publish=true
           fi
           echo "should_publish=${should_publish}" >> "$GITHUB_OUTPUT"
@@ -385,12 +384,12 @@ jobs:
                 per_page: 100,
               });
               const marker = process.env.REVIEW_MARKER || '';
-              const publishedReview = reviews.find((r) => {
+              const publishedReviews = reviews.filter((r) => {
                 const login = r.user?.login || '';
                 const body = r.body || '';
                 return login === 'claude[bot]' && marker && body.includes(marker);
               });
-              const publishedReviewId = publishedReview?.id ?? null;
+              const publishedReviewIds = new Set(publishedReviews.map((r) => r.id));
 
               const strayReviews = reviews.filter((r) => {
                 const submitted = Date.parse(r.submitted_at || '');
@@ -424,7 +423,7 @@ jobs:
 
               const strayReviewComments = reviewComments.filter((c) => {
                 const created = Date.parse(c.created_at || '');
-                const onPublishedReview = publishedReviewId !== null && c.pull_request_review_id === publishedReviewId;
+                const onPublishedReview = publishedReviewIds.has(c.pull_request_review_id);
                 return isKnownClaudeBotAuthor(c.user) && !Number.isNaN(created) && created >= startedAt && !onPublishedReview;
               });
 
