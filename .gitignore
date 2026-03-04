@@ -34,3 +34,7 @@ run_local_with_signal.sh
 
 carapace.json
 src/server/ws/snapshots/
+
+# Test cache
+.nextest/
+/tmp/test_out.txt
