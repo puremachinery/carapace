@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 # Run cargo-nextest with a fail-fast watchdog for internal discovery stalls.
 # If a test binary hangs on `--list --format terse`, capture diagnostics and fail quickly.
+#
+# Runtime tuning knobs:
+# - NEXTEST_LIST_TIMEOUT_SECS
+# - NEXTEST_LIST_REPRO_TIMEOUT_SECS
+# - NEXTEST_LIST_STRACE_SECS
+# - NEXTEST_TERM_GRACE_SECS
+# - NEXTEST_LIST_WATCHDOG_POLL_SECS
+# - NEXTEST_LIST_SAMPLE_SECS
+# - NEXTEST_LIST_DIAG_DIR
 
 set -euo pipefail
 
@@ -69,9 +78,9 @@ process_is_running() {
     fi
 
     local stat
-    stat="$(ps -p "${pid}" -o stat= 2>/dev/null | tr -d '[:space:]' || true)"
+    stat="$(ps -p "${pid}" -o stat= 2>/dev/null | tr -d '[:space:]')"
     case "${stat}" in
-        Z*|*Z*)
+        ""|Z*|*Z*)
             return 1
             ;;
     esac
@@ -174,14 +183,36 @@ capture_diagnostics() {
     local repro_script="${base}.repro.sh"
     local repro_log="${base}.repro.log"
     local error_log="${base}.errors.log"
+    local stripped_cmd=""
     local suspected_binary=""
+    local -a suspected_pre_args=()
+    local -a repro_command=()
     local repro_cmd=""
 
-    suspected_binary="$(printf '%s\n' "${stalled_cmd}" \
+    stripped_cmd="$(printf '%s\n' "${stalled_cmd}" \
         | sed -E 's/[[:space:]]+--list[[:space:]]+--format[[:space:]]+terse.*$//' \
         | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
-    if [ -n "${suspected_binary}" ]; then
-        printf -v repro_cmd '%q --list --format terse' "${suspected_binary}"
+    if [ -n "${stripped_cmd}" ]; then
+        # shellcheck disable=SC2206
+        local -a parts=(${stripped_cmd})
+        suspected_binary="${parts[0]}"
+        if [ "${#parts[@]}" -gt 1 ]; then
+            suspected_pre_args=("${parts[@]:1}")
+        fi
+
+        repro_command=("${suspected_binary}")
+        if [ "${#suspected_pre_args[@]}" -gt 0 ]; then
+            repro_command+=("${suspected_pre_args[@]}")
+        fi
+        repro_command+=(--list --format terse)
+
+        printf -v repro_cmd '%q' "${repro_command[0]}"
+        if [ "${#repro_command[@]}" -gt 1 ]; then
+            local i
+            for ((i = 1; i < ${#repro_command[@]}; i++)); do
+                printf -v repro_cmd '%s %q' "${repro_cmd}" "${repro_command[i]}"
+            done
+        fi
     fi
     if [ -n "${repro_cmd}" ]; then
         echo "repro command: ${repro_cmd}" >&2
@@ -227,13 +258,13 @@ capture_diagnostics() {
             echo "#!/usr/bin/env bash"
             echo "set -euo pipefail"
             printf 'cd %q\n' "$(pwd)"
-            printf '%q --list --format terse\n' "${suspected_binary}"
+            printf '%s\n' "${repro_cmd}"
         } > "${repro_script}"
         chmod +x "${repro_script}"
 
         if [ -x "${suspected_binary}" ]; then
             set +e
-            "${suspected_binary}" --list --format terse > "${repro_log}" 2>&1 &
+            "${repro_command[@]}" > "${repro_log}" 2>&1 &
             repro_pid=$!
             remaining="${REPRO_TIMEOUT_SECS}"
             while [ "${remaining}" -gt 0 ]; do
