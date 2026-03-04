@@ -442,6 +442,7 @@ use rustls::{DigitallySignedStruct, Error as RustlsError, SignatureScheme};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+#[cfg(not(test))]
 use std::io::IsTerminal;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -2419,6 +2420,125 @@ fn parse_setup_outcome(raw: &str) -> Option<SetupOutcome> {
     }
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone, Default)]
+struct SetupInteractiveTestHarness {
+    force_interactive: Option<bool>,
+    visible_inputs: std::collections::VecDeque<String>,
+    hidden_inputs: std::collections::VecDeque<String>,
+    provider_validation_results: std::collections::VecDeque<Result<(), String>>,
+    channel_validation_results: std::collections::VecDeque<Result<(), String>>,
+    visible_prompt_count: usize,
+    hidden_prompt_count: usize,
+    provider_validation_calls: usize,
+    channel_validation_calls: usize,
+}
+
+#[cfg(test)]
+static SETUP_INTERACTIVE_TEST_HARNESS: std::sync::LazyLock<
+    std::sync::Mutex<Option<SetupInteractiveTestHarness>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+// Test harness state is process-global; harness-using tests must serialize via ENV_VAR_TEST_LOCK.
+
+#[cfg(test)]
+fn set_setup_interactive_test_harness(harness: SetupInteractiveTestHarness) {
+    let mut slot = SETUP_INTERACTIVE_TEST_HARNESS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert!(slot.is_none(), "setup test harness already installed");
+    *slot = Some(harness);
+}
+
+#[cfg(test)]
+fn clear_setup_interactive_test_harness() {
+    let mut slot = SETUP_INTERACTIVE_TEST_HARNESS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *slot = None;
+}
+
+#[cfg(test)]
+fn setup_interactive_test_harness_snapshot() -> Option<SetupInteractiveTestHarness> {
+    let slot = SETUP_INTERACTIVE_TEST_HARNESS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    slot.clone()
+}
+
+#[cfg(test)]
+fn setup_interactive_test_harness_override_interactive() -> Option<bool> {
+    let slot = SETUP_INTERACTIVE_TEST_HARNESS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    slot.as_ref().and_then(|state| state.force_interactive)
+}
+
+#[cfg(test)]
+fn setup_interactive_test_harness_take_prompt_input(prompt: &str, hidden: bool) -> Option<String> {
+    let mut slot = SETUP_INTERACTIVE_TEST_HARNESS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let state = slot.as_mut()?;
+    let value = if hidden {
+        state.hidden_prompt_count = state.hidden_prompt_count.saturating_add(1);
+        state.hidden_inputs.pop_front()
+    } else {
+        state.visible_prompt_count = state.visible_prompt_count.saturating_add(1);
+        state.visible_inputs.pop_front()
+    };
+    if value.is_some() {
+        return value;
+    }
+    drop(slot);
+    if hidden {
+        panic!("missing scripted hidden input for prompt: {prompt}");
+    }
+    panic!("missing scripted visible input for prompt: {prompt}");
+}
+
+#[cfg(test)]
+fn setup_interactive_test_harness_take_provider_validation_result() -> Option<Result<(), String>> {
+    let mut slot = SETUP_INTERACTIVE_TEST_HARNESS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let state = slot.as_mut()?;
+    state.provider_validation_calls = state.provider_validation_calls.saturating_add(1);
+    let result = state.provider_validation_results.pop_front();
+    if result.is_some() {
+        return result;
+    }
+    drop(slot);
+    panic!("missing scripted provider validation result");
+}
+
+#[cfg(test)]
+fn setup_interactive_test_harness_take_channel_validation_result() -> Option<Result<(), String>> {
+    let mut slot = SETUP_INTERACTIVE_TEST_HARNESS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let state = slot.as_mut()?;
+    state.channel_validation_calls = state.channel_validation_calls.saturating_add(1);
+    let result = state.channel_validation_results.pop_front();
+    if result.is_some() {
+        return result;
+    }
+    drop(slot);
+    panic!("missing scripted channel validation result");
+}
+
+fn stdin_is_interactive() -> bool {
+    #[cfg(test)]
+    {
+        // Keep tests deterministic: default to non-interactive unless explicitly forced.
+        setup_interactive_test_harness_override_interactive().unwrap_or(false)
+    }
+
+    #[cfg(not(test))]
+    {
+        std::io::stdin().is_terminal()
+    }
+}
+
 fn prompt_setup_outcome() -> Result<SetupOutcome, Box<dyn std::error::Error>> {
     loop {
         let selection = prompt_with_default(
@@ -2492,6 +2612,11 @@ fn print_setup_outcome_next_steps(outcome: SetupOutcome, port: u16, hooks_enable
 }
 
 fn prompt_line(prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
+    #[cfg(test)]
+    if let Some(scripted) = setup_interactive_test_harness_take_prompt_input(prompt, false) {
+        return Ok(scripted.trim().to_string());
+    }
+
     use std::io::{self, Write};
 
     print!("{}", prompt);
@@ -2502,6 +2627,11 @@ fn prompt_line(prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
 }
 
 fn prompt_hidden_line(prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
+    #[cfg(test)]
+    if let Some(scripted) = setup_interactive_test_harness_take_prompt_input(prompt, true) {
+        return Ok(scripted.trim().to_string());
+    }
+
     let input = rpassword::prompt_password(prompt)?;
     Ok(input.trim().to_string())
 }
@@ -2633,6 +2763,11 @@ fn prompt_custom_secret(
 }
 
 async fn validate_provider_credentials(provider: &str, api_key: &str) -> Result<(), String> {
+    #[cfg(test)]
+    if let Some(result) = setup_interactive_test_harness_take_provider_validation_result() {
+        return result;
+    }
+
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(8))
         .build()
@@ -2722,6 +2857,11 @@ fn prompt_and_configure_bot_channel(
 }
 
 async fn validate_channel_credentials(channel: &str, token: &str) -> Result<(), String> {
+    #[cfg(test)]
+    if let Some(result) = setup_interactive_test_harness_take_channel_validation_result() {
+        return result;
+    }
+
     match channel {
         "discord" => {
             let token = token.to_string();
@@ -3761,7 +3901,7 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
         std::fs::create_dir_all(parent)?;
     }
 
-    let interactive = std::io::stdin().is_terminal();
+    let interactive = stdin_is_interactive();
 
     let default_gateway_token = generate_hex_secret(32)?;
 
@@ -4601,7 +4741,9 @@ mod tests {
     use crate::runtime_bridge::{run_sync_blocking, CURRENT_THREAD_RUNTIME_MESSAGE};
     use clap::Parser;
     use ed25519_dalek::{Signature, VerifyingKey};
+    use std::collections::VecDeque;
     use std::ffi::OsString;
+    use std::path::PathBuf;
     use std::sync::{LazyLock, Mutex};
 
     // Serializes env-var touching tests in this module.
@@ -4637,6 +4779,54 @@ mod tests {
         EnvVarGuard {
             key: key.to_string(),
             previous,
+        }
+    }
+
+    struct SetupInteractiveHarnessGuard;
+
+    impl Drop for SetupInteractiveHarnessGuard {
+        fn drop(&mut self) {
+            clear_setup_interactive_test_harness();
+        }
+    }
+
+    fn install_setup_interactive_harness(
+        harness: SetupInteractiveTestHarness,
+    ) -> SetupInteractiveHarnessGuard {
+        set_setup_interactive_test_harness(harness);
+        SetupInteractiveHarnessGuard
+    }
+
+    struct SetupInteractiveTestEnv {
+        _temp: tempfile::TempDir,
+        config_path: PathBuf,
+        _config_guard: EnvVarGuard,
+        _openai_guard: EnvVarGuard,
+        _anthropic_guard: EnvVarGuard,
+        _telegram_guard: EnvVarGuard,
+        _discord_guard: EnvVarGuard,
+        _harness_guard: SetupInteractiveHarnessGuard,
+    }
+
+    fn setup_interactive_test_env(harness: SetupInteractiveTestHarness) -> SetupInteractiveTestEnv {
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_path = temp.path().join("carapace.json");
+        let config_guard =
+            set_env_var_scoped("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
+        let openai_guard = unset_env_var_scoped("OPENAI_API_KEY");
+        let anthropic_guard = unset_env_var_scoped("ANTHROPIC_API_KEY");
+        let telegram_guard = unset_env_var_scoped("TELEGRAM_BOT_TOKEN");
+        let discord_guard = unset_env_var_scoped("DISCORD_BOT_TOKEN");
+        let harness_guard = install_setup_interactive_harness(harness);
+        SetupInteractiveTestEnv {
+            _temp: temp,
+            config_path,
+            _config_guard: config_guard,
+            _openai_guard: openai_guard,
+            _anthropic_guard: anthropic_guard,
+            _telegram_guard: telegram_guard,
+            _discord_guard: discord_guard,
+            _harness_guard: harness_guard,
         }
     }
 
@@ -6177,6 +6367,240 @@ mod tests {
             parsed["agents"]["defaults"]["model"], "claude-sonnet-4-20250514",
             "Default model should be claude-sonnet-4-20250514"
         );
+    }
+
+    #[test]
+    fn test_handle_setup_interactive_hidden_input_skips_telegram_validation_on_blank_token() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let env = setup_interactive_test_env(SetupInteractiveTestHarness {
+            force_interactive: Some(true),
+            visible_inputs: VecDeque::from(vec![
+                "y".to_string(),
+                "openai".to_string(),
+                "".to_string(),
+                "n".to_string(),
+                "".to_string(),
+                "".to_string(),
+                "telegram".to_string(),
+                "n".to_string(),
+                "n".to_string(),
+                "n".to_string(),
+                "n".to_string(),
+                "n".to_string(),
+            ]),
+            hidden_inputs: VecDeque::from(vec![
+                "".to_string(),
+                "hidden-token-123".to_string(),
+                "".to_string(),
+            ]),
+            ..Default::default()
+        });
+
+        let result = handle_setup(true);
+        assert!(result.is_ok(), "interactive setup should succeed");
+
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.hidden_prompt_count, 3);
+        assert_eq!(state.channel_validation_calls, 0);
+        assert_eq!(state.provider_validation_calls, 0);
+        assert!(state.visible_inputs.is_empty());
+        assert!(state.hidden_inputs.is_empty());
+
+        let content = std::fs::read_to_string(&env.config_path).unwrap();
+        let parsed: serde_json::Value = json5::from_str(&content).unwrap();
+        assert_eq!(parsed["gateway"]["auth"]["token"], "hidden-token-123");
+        assert!(
+            parsed.get("telegram").is_none(),
+            "telegram config should be absent when token is blank"
+        );
+    }
+
+    #[test]
+    fn test_handle_setup_interactive_visible_input_validates_telegram_token() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let env = setup_interactive_test_env(SetupInteractiveTestHarness {
+            force_interactive: Some(true),
+            visible_inputs: VecDeque::from(vec![
+                "n".to_string(),
+                "openai".to_string(),
+                "sk-openai-visible".to_string(),
+                "n".to_string(),
+                "".to_string(),
+                "y".to_string(),
+                "".to_string(),
+                "".to_string(),
+                "telegram".to_string(),
+                "12345:abc".to_string(),
+                "y".to_string(),
+                "".to_string(),
+                "n".to_string(),
+                "n".to_string(),
+                "n".to_string(),
+                "n".to_string(),
+                "n".to_string(),
+            ]),
+            channel_validation_results: VecDeque::from(vec![Ok(())]),
+            ..Default::default()
+        });
+
+        let result = handle_setup(true);
+        assert!(result.is_ok(), "interactive setup should succeed");
+
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.hidden_prompt_count, 0);
+        assert_eq!(state.channel_validation_calls, 1);
+        assert_eq!(state.provider_validation_calls, 0);
+        assert!(state.channel_validation_results.is_empty());
+        assert!(state.visible_inputs.is_empty());
+
+        let content = std::fs::read_to_string(&env.config_path).unwrap();
+        let parsed: serde_json::Value = json5::from_str(&content).unwrap();
+        assert_eq!(parsed["telegram"]["enabled"], true);
+        assert_eq!(parsed["telegram"]["botToken"], "12345:abc");
+    }
+
+    #[test]
+    fn test_handle_setup_interactive_telegram_validation_failure_aborts_when_user_declines_continue(
+    ) {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let env = setup_interactive_test_env(SetupInteractiveTestHarness {
+            force_interactive: Some(true),
+            visible_inputs: VecDeque::from(vec![
+                "n".to_string(),
+                "openai".to_string(),
+                "sk-openai-visible".to_string(),
+                "n".to_string(),
+                "".to_string(),
+                "y".to_string(),
+                "".to_string(),
+                "".to_string(),
+                "telegram".to_string(),
+                "12345:abc".to_string(),
+                "y".to_string(),
+                "n".to_string(),
+            ]),
+            channel_validation_results: VecDeque::from(vec![Err(
+                "telegram token rejected".to_string()
+            )]),
+            ..Default::default()
+        });
+
+        let result = handle_setup(true);
+        assert!(
+            result.is_err(),
+            "setup should abort after validation failure"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("setup aborted after credential validation failure"),
+            "unexpected setup error"
+        );
+        assert!(
+            !env.config_path.exists(),
+            "config file should not be written when setup aborts"
+        );
+
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.hidden_prompt_count, 0);
+        assert_eq!(state.channel_validation_calls, 1);
+        assert_eq!(state.provider_validation_calls, 0);
+        assert!(state.channel_validation_results.is_empty());
+        assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
+    fn test_handle_setup_interactive_hidden_input_skips_discord_validation_on_blank_token() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let env = setup_interactive_test_env(SetupInteractiveTestHarness {
+            force_interactive: Some(true),
+            visible_inputs: VecDeque::from(vec![
+                "y".to_string(),
+                "openai".to_string(),
+                "".to_string(),
+                "n".to_string(),
+                "".to_string(),
+                "".to_string(),
+                "discord".to_string(),
+                "n".to_string(),
+                "n".to_string(),
+                "n".to_string(),
+                "n".to_string(),
+                "n".to_string(),
+            ]),
+            hidden_inputs: VecDeque::from(vec![
+                "".to_string(),
+                "hidden-token-123".to_string(),
+                "".to_string(),
+            ]),
+            ..Default::default()
+        });
+
+        let result = handle_setup(true);
+        assert!(result.is_ok(), "interactive setup should succeed");
+
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.hidden_prompt_count, 3);
+        assert_eq!(state.channel_validation_calls, 0);
+        assert_eq!(state.provider_validation_calls, 0);
+        assert!(state.visible_inputs.is_empty());
+        assert!(state.hidden_inputs.is_empty());
+
+        let content = std::fs::read_to_string(&env.config_path).unwrap();
+        let parsed: serde_json::Value = json5::from_str(&content).unwrap();
+        assert_eq!(parsed["gateway"]["auth"]["token"], "hidden-token-123");
+        assert!(
+            parsed.get("discord").is_none(),
+            "discord config should be absent when token is blank"
+        );
+    }
+
+    #[test]
+    fn test_handle_setup_interactive_discord_validation_failure_aborts_when_user_declines_continue()
+    {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let env = setup_interactive_test_env(SetupInteractiveTestHarness {
+            force_interactive: Some(true),
+            visible_inputs: VecDeque::from(vec![
+                "n".to_string(),
+                "openai".to_string(),
+                "sk-openai-visible".to_string(),
+                "n".to_string(),
+                "".to_string(),
+                "y".to_string(),
+                "".to_string(),
+                "".to_string(),
+                "discord".to_string(),
+                "discord-bot-token".to_string(),
+                "y".to_string(),
+                "n".to_string(),
+            ]),
+            channel_validation_results: VecDeque::from(vec![Err(
+                "discord token rejected".to_string()
+            )]),
+            ..Default::default()
+        });
+
+        let result = handle_setup(true);
+        assert!(
+            result.is_err(),
+            "setup should abort after validation failure"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("setup aborted after credential validation failure"),
+            "unexpected setup error"
+        );
+        assert!(
+            !env.config_path.exists(),
+            "config file should not be written when setup aborts"
+        );
+
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.hidden_prompt_count, 0);
+        assert_eq!(state.channel_validation_calls, 1);
+        assert_eq!(state.provider_validation_calls, 0);
+        assert!(state.channel_validation_results.is_empty());
+        assert!(state.visible_inputs.is_empty());
     }
 
     // -----------------------------------------------------------------------
