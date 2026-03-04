@@ -14,6 +14,7 @@ POLL_SECS="${NEXTEST_LIST_WATCHDOG_POLL_SECS:-1}"
 SAMPLE_SECS="${NEXTEST_LIST_SAMPLE_SECS:-5}"
 REPRO_TIMEOUT_SECS="${NEXTEST_LIST_REPRO_TIMEOUT_SECS:-120}"
 STRACE_SECS="${NEXTEST_LIST_STRACE_SECS:-3}"
+TERM_GRACE_SECS="${NEXTEST_TERM_GRACE_SECS:-5}"
 DIAG_DIR="${NEXTEST_LIST_DIAG_DIR:-.local/reports/nextest-list-stalls}"
 
 mkdir -p "${DIAG_DIR}"
@@ -55,6 +56,111 @@ etime_to_seconds() {
     echo $((days * 86400 + hours * 3600 + minutes * 60 + seconds))
 }
 
+record_diag_error() {
+    local error_log="$1"
+    shift
+    printf '[%s] %s\n' "$(timestamp)" "$*" >> "${error_log}"
+}
+
+process_is_running() {
+    local pid="$1"
+    if ! kill -0 "${pid}" >/dev/null 2>&1; then
+        return 1
+    fi
+
+    local stat
+    stat="$(ps -p "${pid}" -o stat= 2>/dev/null | tr -d '[:space:]' || true)"
+    case "${stat}" in
+        Z*|*Z*)
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+terminate_pid_bounded() {
+    local pid="$1"
+    local label="$2"
+    local error_log="$3"
+
+    if ! process_is_running "${pid}"; then
+        return 0
+    fi
+    if ! kill "${pid}" 2>> "${error_log}"; then
+        record_diag_error "${error_log}" "failed to send TERM to ${label} pid=${pid}"
+    fi
+
+    local remaining="${TERM_GRACE_SECS}"
+    while [ "${remaining}" -gt 0 ]; do
+        if ! process_is_running "${pid}"; then
+            return 0
+        fi
+        sleep 1
+        remaining=$((remaining - 1))
+    done
+
+    if process_is_running "${pid}"; then
+        if ! kill -KILL "${pid}" 2>> "${error_log}"; then
+            record_diag_error "${error_log}" "failed to send KILL to ${label} pid=${pid}"
+            return 1
+        fi
+    fi
+
+    local confirm_remaining="${TERM_GRACE_SECS}"
+    while [ "${confirm_remaining}" -gt 0 ]; do
+        if ! process_is_running "${pid}"; then
+            return 0
+        fi
+        sleep 1
+        confirm_remaining=$((confirm_remaining - 1))
+    done
+
+    record_diag_error "${error_log}" "${label} pid=${pid} still running after TERM/KILL grace windows"
+    return 1
+}
+
+capture_process_artifacts() {
+    local pid="$1"
+    local output_prefix="$2"
+    local error_log="${output_prefix}.errors.log"
+    local os
+    os="$(uname -s)"
+
+    if command -v lsof >/dev/null 2>&1; then
+        if ! lsof -p "${pid}" > "${output_prefix}.lsof.txt" 2>> "${error_log}"; then
+            record_diag_error "${error_log}" "lsof failed for pid=${pid}"
+        fi
+    fi
+
+    if [ "${os}" = "Darwin" ]; then
+        if command -v sample >/dev/null 2>&1; then
+            if ! sample "${pid}" "${SAMPLE_SECS}" -file "${output_prefix}.sample.txt" >> "${error_log}" 2>&1; then
+                record_diag_error "${error_log}" "sample failed for pid=${pid}"
+            fi
+        fi
+        return
+    fi
+
+    if [ "${os}" = "Linux" ]; then
+        if command -v gstack >/dev/null 2>&1; then
+            if ! gstack "${pid}" > "${output_prefix}.gstack.txt" 2>> "${error_log}"; then
+                record_diag_error "${error_log}" "gstack failed for pid=${pid}"
+            fi
+        elif command -v pstack >/dev/null 2>&1; then
+            if ! pstack "${pid}" > "${output_prefix}.pstack.txt" 2>> "${error_log}"; then
+                record_diag_error "${error_log}" "pstack failed for pid=${pid}"
+            fi
+        fi
+
+        if command -v strace >/dev/null 2>&1; then
+            strace -tt -f -p "${pid}" -o "${output_prefix}.strace.txt" >> "${error_log}" 2>&1 &
+            local strace_pid="$!"
+            sleep "${STRACE_SECS}"
+            terminate_pid_bounded "${strace_pid}" "strace" "${error_log}" || true
+        fi
+    fi
+}
+
 capture_diagnostics() {
     local stalled_pid="$1"
     local nextest_pid="$2"
@@ -67,11 +173,7 @@ capture_diagnostics() {
     local log_file="${base}.log"
     local repro_script="${base}.repro.sh"
     local repro_log="${base}.repro.log"
-    local stalled_sample="${base}.sample.txt"
-    local stalled_lsof="${base}.lsof.txt"
-    local stalled_gstack="${base}.gstack.txt"
-    local stalled_pstack="${base}.pstack.txt"
-    local stalled_strace="${base}.strace.txt"
+    local error_log="${base}.errors.log"
     local suspected_binary=""
     local repro_cmd=""
 
@@ -80,6 +182,11 @@ capture_diagnostics() {
         | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
     if [ -n "${suspected_binary}" ]; then
         printf -v repro_cmd '%q --list --format terse' "${suspected_binary}"
+    fi
+    if [ -n "${repro_cmd}" ]; then
+        echo "repro command: ${repro_cmd}" >&2
+    else
+        echo "repro command: unavailable (could not parse stalled child command)" >&2
     fi
 
     {
@@ -98,37 +205,22 @@ capture_diagnostics() {
         echo "repro_command=${repro_cmd}"
         echo
         echo "stalled process:"
-        ps -p "${stalled_pid}" -o pid=,ppid=,etime=,command= || true
+        if ! ps -p "${stalled_pid}" -o pid=,ppid=,etime=,command=; then
+            echo "ps_failed_for_stalled_pid=true"
+        fi
         echo
         echo "nextest process:"
-        ps -p "${nextest_pid}" -o pid=,ppid=,etime=,command= || true
+        if ! ps -p "${nextest_pid}" -o pid=,ppid=,etime=,command=; then
+            echo "ps_failed_for_nextest_pid=true"
+        fi
         echo
         echo "related process snapshot:"
-        ps -Ao pid=,ppid=,etime=,command= 2>/dev/null | rg "cargo-nextest|--list --format terse|target/debug/deps/" || true
+        if ! ps -Ao pid=,ppid=,etime=,command= 2>/dev/null | rg "cargo-nextest|--list --format terse|target/debug/deps/"; then
+            echo "no_related_processes_matched_snapshot_pattern"
+        fi
     } >"${log_file}"
 
-    if command -v lsof >/dev/null 2>&1; then
-        lsof -p "${stalled_pid}" > "${stalled_lsof}" 2>&1 || true
-    fi
-
-    if [ "$(uname -s)" = "Darwin" ]; then
-        if command -v sample >/dev/null 2>&1; then
-            sample "${stalled_pid}" "${SAMPLE_SECS}" -file "${stalled_sample}" >/dev/null 2>&1 || true
-        fi
-    elif [ "$(uname -s)" = "Linux" ]; then
-        if command -v gstack >/dev/null 2>&1; then
-            gstack "${stalled_pid}" > "${stalled_gstack}" 2>&1 || true
-        elif command -v pstack >/dev/null 2>&1; then
-            pstack "${stalled_pid}" > "${stalled_pstack}" 2>&1 || true
-        fi
-        if command -v strace >/dev/null 2>&1; then
-            strace -tt -f -p "${stalled_pid}" -o "${stalled_strace}" >/dev/null 2>&1 &
-            strace_pid=$!
-            sleep "${STRACE_SECS}"
-            kill -INT "${strace_pid}" >/dev/null 2>&1 || true
-            wait "${strace_pid}" || true
-        fi
-    fi
+    capture_process_artifacts "${stalled_pid}" "${base}"
 
     if [ -n "${suspected_binary}" ]; then
         {
@@ -145,7 +237,7 @@ capture_diagnostics() {
             repro_pid=$!
             remaining="${REPRO_TIMEOUT_SECS}"
             while [ "${remaining}" -gt 0 ]; do
-                if ! kill -0 "${repro_pid}" >/dev/null 2>&1; then
+                if ! process_is_running "${repro_pid}"; then
                     wait "${repro_pid}"
                     exit_code=$?
                     {
@@ -159,37 +251,14 @@ capture_diagnostics() {
                 remaining=$((remaining - 1))
             done
 
-            if [ "${remaining}" -eq 0 ] && kill -0 "${repro_pid}" >/dev/null 2>&1; then
+            if [ "${remaining}" -eq 0 ] && process_is_running "${repro_pid}"; then
                 {
                     echo
                     echo "repro_status=timed_out"
                     echo "repro_timeout_secs=${REPRO_TIMEOUT_SECS}"
                 } >> "${repro_log}"
-
-                if [ "$(uname -s)" = "Darwin" ]; then
-                    if command -v sample >/dev/null 2>&1; then
-                        sample "${repro_pid}" "${SAMPLE_SECS}" -file "${base}.repro.sample.txt" >/dev/null 2>&1 || true
-                    fi
-                elif [ "$(uname -s)" = "Linux" ]; then
-                    if command -v gstack >/dev/null 2>&1; then
-                        gstack "${repro_pid}" > "${base}.repro.gstack.txt" 2>&1 || true
-                    elif command -v pstack >/dev/null 2>&1; then
-                        pstack "${repro_pid}" > "${base}.repro.pstack.txt" 2>&1 || true
-                    fi
-                    if command -v strace >/dev/null 2>&1; then
-                        strace -tt -f -p "${repro_pid}" -o "${base}.repro.strace.txt" >/dev/null 2>&1 &
-                        repro_strace_pid=$!
-                        sleep "${STRACE_SECS}"
-                        kill -INT "${repro_strace_pid}" >/dev/null 2>&1 || true
-                        wait "${repro_strace_pid}" || true
-                    fi
-                fi
-                if command -v lsof >/dev/null 2>&1; then
-                    lsof -p "${repro_pid}" > "${base}.repro.lsof.txt" 2>&1 || true
-                fi
-
-                kill "${repro_pid}" >/dev/null 2>&1 || true
-                wait "${repro_pid}" || true
+                capture_process_artifacts "${repro_pid}" "${base}.repro"
+                terminate_pid_bounded "${repro_pid}" "repro process" "${error_log}" || true
             fi
             set -e
         else
@@ -198,14 +267,6 @@ capture_diagnostics() {
     fi
 
     echo "nextest discovery stall detected; diagnostics written to ${log_file}" >&2
-    if [ -n "${repro_cmd}" ]; then
-        echo "repro command: ${repro_cmd}" >&2
-    else
-        echo "repro command: unavailable (could not parse stalled child command)" >&2
-    fi
-    if [ -f "${stalled_sample}" ]; then
-        echo "macOS sample written to ${stalled_sample}" >&2
-    fi
     if [ -f "${repro_script}" ]; then
         echo "repro script written to ${repro_script}" >&2
     fi
@@ -241,9 +302,8 @@ while kill -0 "${nextest_pid}" >/dev/null 2>&1; do
         fi
 
         capture_diagnostics "${pid}" "${nextest_pid}" "${etime}" "${cmd}" "${age_secs}"
-        kill "${pid}" >/dev/null 2>&1 || true
-        kill "${nextest_pid}" >/dev/null 2>&1 || true
-        wait "${nextest_pid}" || true
+        terminate_pid_bounded "${pid}" "stalled list child" "${DIAG_DIR}/nextest-kill.errors.log" || true
+        terminate_pid_bounded "${nextest_pid}" "nextest parent" "${DIAG_DIR}/nextest-kill.errors.log" || true
         exit 124
     done < <(list_discovery_pid_etime_and_command "${nextest_pid}")
 
