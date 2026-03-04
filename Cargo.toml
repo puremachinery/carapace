@@ -23,7 +23,7 @@ dirs = "6"
 uuid = { version = "1", features = ["v4"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter", "time"] }
-keyring = { version = "2.3.3", default-features = false, features = ["platform-macos", "platform-windows", "linux-default-keyutils"] }
+keyring = { version = "3.6.3", default-features = false, features = ["apple-native", "windows-native", "linux-native"] }
 wasmtime = { version = "42", features = ["component-model"] }
 thiserror = "2"
 parking_lot = "0.12"

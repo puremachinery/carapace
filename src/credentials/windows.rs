@@ -127,7 +127,7 @@ impl CredentialBackend for WindowsCredentialBackend {
         let account_key = key.to_account_key();
         let outcome = tokio::task::spawn_blocking(move || {
             let entry = Entry::new(SERVICE_NAME, &account_key).map_err(Self::map_error)?;
-            match entry.delete_password() {
+            match entry.delete_credential() {
                 Ok(()) => Ok(()),
                 // Treat "not found" as success for delete (idempotent)
                 Err(keyring::Error::NoEntry) => Ok(()),
