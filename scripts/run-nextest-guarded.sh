@@ -198,8 +198,8 @@ capture_diagnostics() {
         | sed -E 's/[[:space:]]+--list[[:space:]]+--format[[:space:]]+terse.*$//' \
         | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
     if [ -n "${stripped_cmd}" ]; then
-        # shellcheck disable=SC2206
-        local -a parts=(${stripped_cmd})
+        local -a parts=()
+        IFS=' ' read -r -a parts <<< "${stripped_cmd}"
         suspected_binary="${parts[0]}"
         if [ "${#parts[@]}" -gt 1 ]; then
             suspected_pre_args=("${parts[@]:1}")
@@ -251,8 +251,15 @@ capture_diagnostics() {
         fi
         echo
         echo "related process snapshot:"
-        if ! ps -Ao pid=,ppid=,etime=,command= 2>/dev/null | rg "cargo-nextest|--list --format terse|target/debug/deps/"; then
-            echo "no_related_processes_matched_snapshot_pattern"
+        if command -v rg >/dev/null 2>&1; then
+            if ! ps -Ao pid=,ppid=,etime=,command= 2>&1 | rg "cargo-nextest|--list --format terse|target/debug/deps/" 2>&1; then
+                echo "no_related_processes_matched_snapshot_pattern"
+            fi
+        else
+            echo "rg_not_found_falling_back_to_grep"
+            if ! ps -Ao pid=,ppid=,etime=,command= 2>&1 | grep -E "cargo-nextest|--list --format terse|target/debug/deps/" 2>&1; then
+                echo "no_related_processes_matched_snapshot_pattern"
+            fi
         fi
     } >"${log_file}"
 
