@@ -2530,7 +2530,7 @@ fn stdin_is_interactive() -> bool {
     #[cfg(test)]
     {
         // Keep tests deterministic: default to non-interactive unless explicitly forced.
-        return setup_interactive_test_harness_override_interactive().unwrap_or(false);
+        setup_interactive_test_harness_override_interactive().unwrap_or(false)
     }
 
     #[cfg(not(test))]
