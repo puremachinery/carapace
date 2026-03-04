@@ -85,7 +85,7 @@ pub async fn signal_receive_loop(
         .build()
         .expect("failed to build Signal receive HTTP client");
     let receive_url = format!(
-        "{}/v1/receive/{}?timeout=5",
+        "{}/v1/receive/{}?timeout=5&send_read_receipts=true",
         base_url,
         urlencoding::encode(&phone_number)
     );
@@ -126,9 +126,6 @@ pub async fn signal_receive_loop(
                                     process_envelope(
                                         &envelope,
                                         &state,
-                                        client.clone(),
-                                        &base_url,
-                                        &phone_number,
                                     )
                                     .await;
                                 }
@@ -177,22 +174,12 @@ pub async fn signal_receive_loop(
     }
 }
 
-/// Builds the JSON payload for a Signal read receipt.
-fn build_read_receipt_payload(sender: &str, timestamp: u64) -> serde_json::Value {
-    serde_json::json!({
-        "receipt_type": "read",
-        "recipient": sender,
-        "timestamp": timestamp,
-    })
-}
+
 
 /// Process a single inbound Signal envelope by routing it into the chat pipeline.
 async fn process_envelope(
     envelope: &SignalEnvelope,
     state: &Arc<WsServerState>,
-    client: reqwest::Client,
-    base_url: &str,
-    phone_number: &str,
 ) {
     let data_message = match &envelope.data_message {
         Some(dm) => dm,
@@ -215,16 +202,6 @@ async fn process_envelope(
     {
         Some(s) => s,
         None => return, // No sender info
-    };
-
-    let receipt_recipient = match envelope
-        .source_number
-        .as_ref()
-        .or(envelope.source.as_ref())
-        .or(envelope.source_uuid.as_ref())
-    {
-        Some(s) => s.to_string(),
-        None => sender.to_string(), // Fallback (should be unreachable given `sender` matches same options)
     };
 
     info!(
@@ -326,48 +303,6 @@ async fn process_envelope(
             "Signal message queued (no LLM provider)"
         );
     }
-
-    // Fire off a read receipt asynchronously
-    let receipt_url = format!(
-        "{}/v1/receipts/{}",
-        base_url,
-        urlencoding::encode(phone_number)
-    );
-    let sender_clone = sender.to_string();
-    let timestamp = data_message.timestamp.or(envelope.timestamp).unwrap_or_else(|| {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64
-    });
-
-    let payload = build_read_receipt_payload(&receipt_recipient, timestamp);
-
-    tokio::spawn(async move {
-        match client.post(&receipt_url).json(&payload).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                debug!(
-                    sender = %sender_clone,
-                    timestamp = timestamp,
-                    "Signal read receipt sent successfully"
-                );
-            }
-            Ok(resp) => {
-                warn!(
-                    status = %resp.status(),
-                    sender = %sender_clone,
-                    "Failed to send Signal read receipt (HTTP Error)"
-                );
-            }
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    sender = %sender_clone,
-                    "Failed to send Signal read receipt (Network Error)"
-                );
-            }
-        }
-    });
 }
 
 #[cfg(test)]
@@ -499,11 +434,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_build_read_receipt_payload() {
-        let payload = build_read_receipt_payload("8fe77508-3017-48de-82ed-5722f4b48625", 1706745600000);
-        assert_eq!(payload["receipt_type"], "read");
-        assert_eq!(payload["recipient"], "8fe77508-3017-48de-82ed-5722f4b48625");
-        assert_eq!(payload["timestamp"], 1706745600000_u64);
-    }
 }
