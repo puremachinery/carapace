@@ -119,6 +119,14 @@ jobs:
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
       - uses: taiki-e/install-action@602dc500e2b7e0e2486b4ce53909ba048de44e08 # nextest
       - run: ./scripts/run-nextest-guarded.sh --all-targets server::ws::golden_tests::golden_trace
+      - name: Upload nextest stall diagnostics (ws-golden)
+        if: failure()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: nextest-list-stall-ws-golden-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .local/reports/nextest-list-stalls/**
+          if-no-files-found: ignore
+          retention-days: 14
 
   build:
     name: Build
@@ -142,6 +150,14 @@ jobs:
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
       - uses: taiki-e/install-action@602dc500e2b7e0e2486b4ce53909ba048de44e08 # nextest
       - run: ./scripts/run-nextest-guarded.sh --all-targets
+      - name: Upload nextest stall diagnostics (test-pr)
+        if: failure()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: nextest-list-stall-test-pr-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .local/reports/nextest-list-stalls/**
+          if-no-files-found: ignore
+          retention-days: 14
 
   test-push:
     name: Test (${{ matrix.os }})
@@ -163,6 +179,14 @@ jobs:
       - name: Run nextest (Windows)
         if: runner.os == 'Windows'
         run: cargo nextest run --all-targets
+      - name: Upload nextest stall diagnostics (test-push)
+        if: failure() && runner.os != 'Windows'
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: nextest-list-stall-test-push-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .local/reports/nextest-list-stalls/**
+          if-no-files-found: ignore
+          retention-days: 14
 
   test-pr-windows:
     name: Test (windows PR)
