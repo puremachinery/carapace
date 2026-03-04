@@ -190,9 +190,6 @@ capture_diagnostics() {
     local -a suspected_pre_args=()
     local -a repro_command=()
     local repro_cmd=""
-    local repro_pid=""
-    local remaining=""
-    local exit_code=""
 
     stripped_cmd="$(printf '%s\n' "${stalled_cmd}" \
         | sed -E 's/[[:space:]]+--list[[:space:]]+--format[[:space:]]+terse.*$//' \
@@ -241,23 +238,23 @@ capture_diagnostics() {
         echo "repro_command=${repro_cmd}"
         echo
         echo "stalled process:"
-        if ! ps -p "${stalled_pid}" -o pid=,ppid=,etime=,command=; then
+        if ! ps -ww -p "${stalled_pid}" -o pid=,ppid=,etime=,args=; then
             echo "ps_failed_for_stalled_pid=true"
         fi
         echo
         echo "nextest process:"
-        if ! ps -p "${nextest_pid}" -o pid=,ppid=,etime=,command=; then
+        if ! ps -ww -p "${nextest_pid}" -o pid=,ppid=,etime=,args=; then
             echo "ps_failed_for_nextest_pid=true"
         fi
         echo
         echo "related process snapshot:"
         if command -v rg >/dev/null 2>&1; then
-            if ! ps -Ao pid=,ppid=,etime=,command= 2>&1 | rg "cargo-nextest|--list --format terse|target/debug/deps/" 2>&1; then
+            if ! ps -ww -Ao pid=,ppid=,etime=,args= 2>&1 | rg "cargo-nextest|--list --format terse|target/debug/deps/" 2>&1; then
                 echo "no_related_processes_matched_snapshot_pattern"
             fi
         else
             echo "rg_not_found_falling_back_to_grep"
-            if ! ps -Ao pid=,ppid=,etime=,command= 2>&1 | grep -E "cargo-nextest|--list --format terse|target/debug/deps/" 2>&1; then
+            if ! ps -ww -Ao pid=,ppid=,etime=,args= 2>&1 | grep -E "cargo-nextest|--list --format terse|target/debug/deps/" 2>&1; then
                 echo "no_related_processes_matched_snapshot_pattern"
             fi
         fi
@@ -323,7 +320,7 @@ capture_diagnostics() {
 
 list_discovery_pid_etime_and_command() {
     local nextest_pid="$1"
-    ps -Ao pid=,ppid=,etime=,command= 2>/dev/null \
+    ps -ww -Ao pid=,ppid=,etime=,args= 2>/dev/null \
         | awk -v nextest_pid="${nextest_pid}" '
             $2 == nextest_pid && /--list --format terse/ {
                 pid=$1
