@@ -384,18 +384,18 @@ jobs:
                 per_page: 100,
               });
               const marker = process.env.REVIEW_MARKER || '';
-              const publishedReviews = reviews.filter((r) => {
-                const login = r.user?.login || '';
+              const isPublishedReview = (r) => {
                 const body = r.body || '';
-                return login === 'claude[bot]' && marker && body.includes(marker);
+                return isKnownClaudeBotAuthor(r.user) && marker && body.includes(marker);
+              };
+              const publishedReviews = reviews.filter((r) => {
+                return isPublishedReview(r);
               });
               const publishedReviewIds = new Set(publishedReviews.map((r) => r.id));
 
               const strayReviews = reviews.filter((r) => {
                 const submitted = Date.parse(r.submitted_at || '');
-                const body = r.body || '';
-                const isPublishedReview = marker && body.includes(marker);
-                return isKnownClaudeBotAuthor(r.user) && !Number.isNaN(submitted) && submitted >= startedAt && !isPublishedReview;
+                return isKnownClaudeBotAuthor(r.user) && !Number.isNaN(submitted) && submitted >= startedAt && !isPublishedReview(r);
               });
 
               for (const r of strayReviews) {
