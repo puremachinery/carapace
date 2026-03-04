@@ -31,6 +31,10 @@ pub struct SignalEnvelope {
     #[serde(default, rename = "sourceNumber")]
     pub source_number: Option<String>,
 
+    /// Source UUID.
+    #[serde(default, rename = "sourceUuid")]
+    pub source_uuid: Option<String>,
+
     /// Timestamp of the message.
     #[serde(default)]
     pub timestamp: Option<u64>,
@@ -119,7 +123,14 @@ pub async fn signal_receive_loop(
                             let env_val = item.get("envelope").unwrap_or(&item);
                             match serde_json::from_value::<SignalEnvelope>(env_val.clone()) {
                                 Ok(envelope) => {
-                                    process_envelope(&envelope, &state).await;
+                                    process_envelope(
+                                        &envelope,
+                                        &state,
+                                        client.clone(),
+                                        &base_url,
+                                        &phone_number,
+                                    )
+                                    .await;
                                 }
                                 Err(err) => {
                                     warn!("Failed to cleanly deserialize envelope: {} - JSON: {}", err, env_val);
@@ -166,8 +177,23 @@ pub async fn signal_receive_loop(
     }
 }
 
+/// Builds the JSON payload for a Signal read receipt.
+fn build_read_receipt_payload(sender: &str, timestamp: u64) -> serde_json::Value {
+    serde_json::json!({
+        "receipt_type": "read",
+        "recipient": sender,
+        "timestamp": timestamp,
+    })
+}
+
 /// Process a single inbound Signal envelope by routing it into the chat pipeline.
-async fn process_envelope(envelope: &SignalEnvelope, state: &Arc<WsServerState>) {
+async fn process_envelope(
+    envelope: &SignalEnvelope,
+    state: &Arc<WsServerState>,
+    client: reqwest::Client,
+    base_url: &str,
+    phone_number: &str,
+) {
     let data_message = match &envelope.data_message {
         Some(dm) => dm,
         None => {
@@ -181,7 +207,12 @@ async fn process_envelope(envelope: &SignalEnvelope, state: &Arc<WsServerState>)
         _ => return, // No text content
     };
 
-    let sender = match envelope.source_number.as_ref().or(envelope.source.as_ref()) {
+    let sender = match envelope
+        .source_uuid
+        .as_ref()
+        .or(envelope.source_number.as_ref())
+        .or(envelope.source.as_ref())
+    {
         Some(s) => s,
         None => return, // No sender info
     };
@@ -285,6 +316,48 @@ async fn process_envelope(envelope: &SignalEnvelope, state: &Arc<WsServerState>)
             "Signal message queued (no LLM provider)"
         );
     }
+
+    // Fire off a read receipt asynchronously
+    let receipt_url = format!(
+        "{}/v1/receipts/{}",
+        base_url,
+        urlencoding::encode(phone_number)
+    );
+    let sender_clone = sender.to_string();
+    let timestamp = data_message.timestamp.or(envelope.timestamp).unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+    });
+
+    let payload = build_read_receipt_payload(&sender_clone, timestamp);
+
+    tokio::spawn(async move {
+        match client.post(&receipt_url).json(&payload).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                debug!(
+                    sender = %sender_clone,
+                    timestamp = timestamp,
+                    "Signal read receipt sent successfully"
+                );
+            }
+            Ok(resp) => {
+                warn!(
+                    status = %resp.status(),
+                    sender = %sender_clone,
+                    "Failed to send Signal read receipt (HTTP Error)"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    sender = %sender_clone,
+                    "Failed to send Signal read receipt (Network Error)"
+                );
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -306,7 +379,7 @@ mod tests {
 
         let envelopes: Vec<SignalEnvelope> = serde_json::from_str(json).unwrap();
         assert_eq!(envelopes.len(), 1);
-        assert_eq!(envelopes[0].source_number.as_deref(), Some("+15559876543"));
+        assert_eq!(envelopes[0].source.as_deref().or(envelopes[0].source_number.as_deref()), Some("+15559876543"));
         let dm = envelopes[0].data_message.as_ref().unwrap();
         assert_eq!(dm.message.as_deref(), Some("Hello from Signal!"));
         assert_eq!(dm.timestamp, Some(1706745600000));
@@ -385,5 +458,42 @@ mod tests {
         assert_eq!(envelopes.len(), 1);
         let dm = envelopes[0].data_message.as_ref().unwrap();
         assert!(dm.message.is_none());
+    }
+
+    #[test]
+    fn test_parse_envelope_with_source_uuid_field() {
+        let json = r#"[
+            {
+                "sourceUuid": "8fe77508-3017-48de-82ed-5722f4b48625",
+                "sourceNumber": "+15559876543",
+                "dataMessage": {
+                    "message": "Hello"
+                }
+            }
+        ]"#;
+
+        let envelopes: Vec<SignalEnvelope> = serde_json::from_str(json).unwrap();
+        assert_eq!(envelopes.len(), 1);
+        assert_eq!(
+            envelopes[0].source_uuid.as_deref(),
+            Some("8fe77508-3017-48de-82ed-5722f4b48625")
+        );
+        assert_eq!(
+            envelopes[0]
+                .source_uuid
+                .as_ref()
+                .or(envelopes[0].source_number.as_ref())
+                .or(envelopes[0].source.as_ref())
+                .map(|s| s.as_str()),
+            Some("8fe77508-3017-48de-82ed-5722f4b48625")
+        );
+    }
+
+    #[test]
+    fn test_build_read_receipt_payload() {
+        let payload = build_read_receipt_payload("8fe77508-3017-48de-82ed-5722f4b48625", 1706745600000);
+        assert_eq!(payload["receipt_type"], "read");
+        assert_eq!(payload["recipient"], "8fe77508-3017-48de-82ed-5722f4b48625");
+        assert_eq!(payload["timestamp"], 1706745600000_u64);
     }
 }

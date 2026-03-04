@@ -51,7 +51,8 @@ expression: normalized
       "telegram",
       "discord",
       "slack",
-      "classifier"
+      "classifier",
+      "vertex"
     ],
     "properties": {
       "agents": {
@@ -178,6 +179,9 @@ expression: normalized
         "type": "object"
       },
       "venice": {
+        "type": "object"
+      },
+      "vertex": {
         "type": "object"
       },
       "web": {
