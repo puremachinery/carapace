@@ -636,18 +636,30 @@ mod tests {
     use super::*;
     use crate::cron::CronPayload;
     use crate::server::ws::WsServerConfig;
+    use std::ffi::OsString;
+    use std::sync::{LazyLock, Mutex, MutexGuard};
+
+    static TEST_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     struct EnvVarGuard {
         key: &'static str,
-        prev: Option<String>,
+        prev: Option<OsString>,
+        _lock: MutexGuard<'static, ()>,
     }
 
     impl EnvVarGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let prev = std::env::var(key).ok();
-            // SAFETY: tests scope env var mutation to a short-lived guard.
+        fn set(key: &'static str, value: &std::ffi::OsStr) -> Self {
+            let lock = TEST_ENV_LOCK
+                .lock()
+                .expect("test env lock should not be poisoned");
+            let prev = std::env::var_os(key);
+            // SAFETY: process-wide env mutation is guarded by TEST_ENV_LOCK.
             unsafe { std::env::set_var(key, value) };
-            Self { key, prev }
+            Self {
+                key,
+                prev,
+                _lock: lock,
+            }
         }
     }
 
@@ -666,8 +678,7 @@ mod tests {
     ) -> (tempfile::TempDir, EnvVarGuard, RuntimeTaskExecutor) {
         let temp = tempfile::tempdir().expect("create temp dir");
         let state_dir = temp.path().join("state");
-        let state_dir_str = state_dir.to_str().expect("state dir utf8");
-        let guard = EnvVarGuard::set("CARAPACE_STATE_DIR", state_dir_str);
+        let guard = EnvVarGuard::set("CARAPACE_STATE_DIR", state_dir.as_os_str());
         let state = Arc::new(WsServerState::new(WsServerConfig::default()));
         let executor = RuntimeTaskExecutor { state };
         (temp, guard, executor)
