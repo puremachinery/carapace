@@ -83,7 +83,7 @@ jobs:
 
             Required JSON output (example; must be valid JSON):
             {
-              "header": "LGTM for blocking issues.",
+              "header": "No high/medium findings. 1 low finding(s).",
               "summary": "one-paragraph summary",
               "inline_findings": [
                 {
@@ -107,13 +107,14 @@ jobs:
             }
 
             Rules:
-            - Allowed header values: "Blocking findings present." or "LGTM for blocking issues.".
+            - Allowed header values: "Blocking findings present.", "No high/medium findings. <N> low finding(s).", or "LGTM.".
             - Allowed severity values: "critical", "high", "medium".
             - Only in-scope critical/high/medium findings belong in inline_findings.
             - Never include low/info in inline_findings.
             - Low-only items go to optional_followups.
-            - If inline_findings is empty, header MUST be "LGTM for blocking issues.".
             - If inline_findings is non-empty, header MUST be "Blocking findings present.".
+            - If inline_findings is empty and both advisory_findings and optional_followups are empty, header MUST be "LGTM.".
+            - If inline_findings is empty and any advisory_findings/optional_followups exist, header MUST be "No high/medium findings. <N> low finding(s)." where <N> equals optional_followups length.
             - No markdown/code fences in .claude/review.json; emit valid JSON only.
           claude_args: |
             --allowedTools "Bash(git:*),Bash(rg:*),Bash(ls:*),Bash(find:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(jq:*),Bash(sed:*),Bash(echo:*),Bash(awk:*),Bash(wc:*),WebSearch,Write"
@@ -126,13 +127,16 @@ jobs:
           test -f .claude/review.json
           jq -e '
             type == "object" and
-            (.header == "Blocking findings present." or .header == "LGTM for blocking issues.") and
+            ((.header == "Blocking findings present.") or
+             (.header == "LGTM.") or
+             (.header | test("^No high/medium findings\\. [0-9]+ low finding\\(s\\)\\.$"))) and
             (.summary | type == "string" and (. | gsub("^\\s+|\\s+$"; "") | length > 0)) and
             (.inline_findings | type == "array") and
             (.advisory_findings | type == "array") and
             (.optional_followups | type == "array") and
-            (((.header == "LGTM for blocking issues.") and ((.inline_findings | length) == 0)) or
-             ((.header == "Blocking findings present.") and ((.inline_findings | length) > 0))) and
+            (((.inline_findings | length) > 0 and .header == "Blocking findings present.") or
+             ((.inline_findings | length) == 0 and (((.advisory_findings | length) + (.optional_followups | length)) == 0) and .header == "LGTM.") or
+             ((.inline_findings | length) == 0 and (((.advisory_findings | length) + (.optional_followups | length)) > 0) and .header == ("No high/medium findings. " + ((.optional_followups | length) | tostring) + " low finding(s)."))) and
             (all(.inline_findings[]?; (["critical","high","medium"] | index(.severity)) != null and
               .scope == "in-scope" and
               (.title | type == "string" and (. | gsub("^\\s+|\\s+$"; "") | length > 0)) and
