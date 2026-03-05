@@ -649,11 +649,9 @@ mod tests {
 
     impl EnvVarGuard {
         fn set(key: &'static str, value: &std::ffi::OsStr) -> Self {
-            let lock = TEST_ENV_LOCK
-                .lock()
-                .expect("test env lock should not be poisoned");
+            let lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let prev = std::env::var_os(key);
-            // SAFETY: process-wide env mutation is guarded by TEST_ENV_LOCK.
+            // SAFETY: env mutation in this test module is serialized by TEST_ENV_LOCK.
             unsafe { std::env::set_var(key, value) };
             Self {
                 key,
