@@ -698,4 +698,103 @@ mod tests {
             assert!(reqs.contains(&format!("DELETE_TYPING_{}", phone_number)), "Requests: {:?}", reqs);
         }
     }
+
+    #[tokio::test]
+    async fn test_signal_receive_to_response_latency() {
+        use axum::{routing::{get, post, put}, Router, extract::Path};
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+        use tokio::net::TcpListener;
+
+        let timestamps = Arc::new(Mutex::new(Vec::new()));
+
+        let app = Router::new()
+            .route(
+                "/v1/receive/{number}",
+                get({
+                    let ts = timestamps.clone();
+                    move |Path(_number): Path<String>| async move {
+                        let mut locked = ts.lock().unwrap();
+                        if locked.is_empty() {
+                            // First poll: record receive time and send a message
+                            locked.push(Instant::now());
+                            let json = serde_json::json!([{
+                                "source": "+15559876543",
+                                "timestamp": 1706745600000_u64,
+                                "dataMessage": {
+                                    "message": "Latency test",
+                                    "timestamp": 1706745600000_u64
+                                }
+                            }]);
+                            axum::Json(json)
+                        } else {
+                            // Subsequent polls: return empty immediately
+                            axum::Json(serde_json::json!([]))
+                        }
+                    }
+                })
+            )
+            .route(
+                "/v1/receipts/{number}",
+                post({
+                    let ts = timestamps.clone();
+                    move |Path(_number): Path<String>| async move {
+                        let mut locked = ts.lock().unwrap();
+                        if locked.len() == 1 {
+                             locked.push(Instant::now()); // Record response time
+                        }
+                        axum::http::StatusCode::OK
+                    }
+                })
+            )
+            .route(
+                "/v1/typing-indicator/{number}",
+                put(|| async move { axum::http::StatusCode::OK })
+                .delete(|| async move { axum::http::StatusCode::OK })
+            );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let base_url = format!("http://{}", addr);
+        let phone_number = "+15551234567";
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::sessions::SessionStore::with_base_path(
+            tmp.path().join("sessions"),
+        ));
+        let state = Arc::new(crate::server::ws::WsServerState::new(crate::server::ws::WsServerConfig::default()).with_session_store(store));
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let channel_registry = Arc::new(crate::channels::ChannelRegistry::new());
+
+        let loop_handle = tokio::spawn(super::signal_receive_loop(
+            base_url,
+            phone_number.to_string(),
+            state,
+            channel_registry,
+            shutdown_rx,
+        ));
+
+        // Wait a tiny bit for the loop to fetch and process the message containing the fake timestamp
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        shutdown_tx.send(true).unwrap();
+        let _ = loop_handle.await;
+
+        let locked_ts = timestamps.lock().unwrap();
+
+        // Output detailed timing if it failed
+        assert!(locked_ts.len() >= 2, "Test failed: mock server was not hit enough times. Got {} hits", locked_ts.len());
+
+        let receive_time = locked_ts[0];
+        let receipt_time = locked_ts[1];
+        let latency = receipt_time.duration_since(receive_time);
+
+        // Assert latency is extremely small (sub 50ms)
+        assert!(latency < Duration::from_millis(50), "Latency was too high: {latency:?}");
+    }
 }
