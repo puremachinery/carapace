@@ -637,6 +637,42 @@ mod tests {
     use crate::cron::CronPayload;
     use crate::server::ws::WsServerConfig;
 
+    struct EnvVarGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            // SAFETY: tests scope env var mutation to a short-lived guard.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                // SAFETY: restoring test-scoped env var state.
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                // SAFETY: restoring test-scoped env var state.
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    fn runtime_task_executor_with_temp_state(
+    ) -> (tempfile::TempDir, EnvVarGuard, RuntimeTaskExecutor) {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let state_dir = temp.path().join("state");
+        let state_dir_str = state_dir.to_str().expect("state dir utf8");
+        let guard = EnvVarGuard::set("CARAPACE_STATE_DIR", state_dir_str);
+        let state = Arc::new(WsServerState::new(WsServerConfig::default()));
+        let executor = RuntimeTaskExecutor { state };
+        (temp, guard, executor)
+    }
+
     fn durable_task_with_payload(payload: serde_json::Value, attempts: u32) -> DurableTask {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -670,8 +706,7 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_task_executor_retries_when_provider_missing() {
-        let state = Arc::new(WsServerState::new(WsServerConfig::default()));
-        let executor = RuntimeTaskExecutor { state };
+        let (_temp, _state_dir_guard, executor) = runtime_task_executor_with_temp_state();
         let payload = serde_json::to_value(CronPayload::AgentTurn {
             message: "hello".to_string(),
             model: None,
@@ -699,8 +734,7 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_task_executor_blocks_when_policy_max_attempts_reached() {
-        let state = Arc::new(WsServerState::new(WsServerConfig::default()));
-        let executor = RuntimeTaskExecutor { state };
+        let (_temp, _state_dir_guard, executor) = runtime_task_executor_with_temp_state();
         let payload = serde_json::to_value(CronPayload::AgentTurn {
             message: "hello".to_string(),
             model: None,
@@ -735,8 +769,7 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_task_executor_rejects_attempts_over_policy_budget() {
-        let state = Arc::new(WsServerState::new(WsServerConfig::default()));
-        let executor = RuntimeTaskExecutor { state };
+        let (_temp, _state_dir_guard, executor) = runtime_task_executor_with_temp_state();
         let policy = crate::tasks::TaskPolicy {
             max_attempts: 1,
             ..Default::default()
@@ -759,8 +792,7 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_task_executor_rejects_task_age_over_policy_budget() {
-        let state = Arc::new(WsServerState::new(WsServerConfig::default()));
-        let executor = RuntimeTaskExecutor { state };
+        let (_temp, _state_dir_guard, executor) = runtime_task_executor_with_temp_state();
         let policy = crate::tasks::TaskPolicy {
             max_total_runtime_ms: 1,
             ..Default::default()
@@ -783,8 +815,7 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_task_executor_rejects_run_timeout_over_policy_budget() {
-        let state = Arc::new(WsServerState::new(WsServerConfig::default()));
-        let executor = RuntimeTaskExecutor { state };
+        let (_temp, _state_dir_guard, executor) = runtime_task_executor_with_temp_state();
         let policy = crate::tasks::TaskPolicy {
             max_run_timeout_seconds: 10,
             ..Default::default()
@@ -817,8 +848,7 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_task_executor_preserves_legacy_task_behavior_for_old_age() {
-        let state = Arc::new(WsServerState::new(WsServerConfig::default()));
-        let executor = RuntimeTaskExecutor { state };
+        let (_temp, _state_dir_guard, executor) = runtime_task_executor_with_temp_state();
         let payload = serde_json::to_value(CronPayload::SystemEvent {
             text: "hello".to_string(),
         })
@@ -833,8 +863,7 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_task_executor_preserves_legacy_task_behavior_for_attempt_budget() {
-        let state = Arc::new(WsServerState::new(WsServerConfig::default()));
-        let executor = RuntimeTaskExecutor { state };
+        let (_temp, _state_dir_guard, executor) = runtime_task_executor_with_temp_state();
         let payload = serde_json::to_value(CronPayload::SystemEvent {
             text: "hello".to_string(),
         })
@@ -849,8 +878,7 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_task_executor_legacy_provider_missing_retries_below_legacy_limit() {
-        let state = Arc::new(WsServerState::new(WsServerConfig::default()));
-        let executor = RuntimeTaskExecutor { state };
+        let (_temp, _state_dir_guard, executor) = runtime_task_executor_with_temp_state();
         let payload = serde_json::to_value(CronPayload::AgentTurn {
             message: "hello".to_string(),
             model: None,
@@ -879,8 +907,7 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_task_executor_legacy_provider_missing_blocks_at_legacy_limit() {
-        let state = Arc::new(WsServerState::new(WsServerConfig::default()));
-        let executor = RuntimeTaskExecutor { state };
+        let (_temp, _state_dir_guard, executor) = runtime_task_executor_with_temp_state();
         let payload = serde_json::to_value(CronPayload::AgentTurn {
             message: "hello".to_string(),
             model: None,
