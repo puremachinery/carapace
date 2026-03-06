@@ -6,6 +6,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::Value;
 use tracing::{debug, error, info, warn};
@@ -70,9 +71,16 @@ pub struct SignalGroupInfo {
 
 /// Builds the receive URL for the signal-cli-rest-api with the read receipts flag.
 pub fn build_receive_url(base_url: &str, phone_number: &str) -> String {
+    let ws_base = if base_url.starts_with("http://") {
+        base_url.replace("http://", "ws://")
+    } else if base_url.starts_with("https://") {
+        base_url.replace("https://", "wss://")
+    } else {
+        base_url.to_string()
+    };
     format!(
-        "{}/v1/receive/{}?timeout=20&i=true",
-        base_url,
+        "{}/v1/receive/{}?i=true",
+        ws_base,
         urlencoding::encode(phone_number)
     )
 }
@@ -92,13 +100,13 @@ pub async fn signal_receive_loop(
     let client = reqwest::Client::builder()
         .timeout(RECEIVE_TIMEOUT)
         .build()
-        .expect("failed to build Signal receive HTTP client");
+        .expect("failed to build Signal HTTP client");
 
     let receive_url = build_receive_url(&base_url, &phone_number);
 
     info!(
         url = %receive_url,
-        "Signal receive loop started"
+        "Signal receive loop started (WebSocket)"
     );
 
     // Track consecutive errors to avoid spamming logs
@@ -113,8 +121,8 @@ pub async fn signal_receive_loop(
 
         let mut had_error = false;
 
-        match client.get(&receive_url).send().await {
-            Ok(resp) if resp.status().is_success() => {
+        match tokio_tungstenite::connect_async(&receive_url).await {
+            Ok((mut ws_stream, _)) => {
                 if consecutive_errors > 0 {
                     info!(
                         "Signal receive loop recovered after {} errors",
@@ -124,50 +132,64 @@ pub async fn signal_receive_loop(
                 }
                 channel_registry.update_status("signal", ChannelStatus::Connected);
 
-                match resp.json::<Vec<serde_json::Value>>().await {
-                    Ok(items) => {
-                        for item in items {
-                            info!("Raw JSON item received: {}", item);
-                            let env_val = item.get("envelope").unwrap_or(&item);
-                            match serde_json::from_value::<SignalEnvelope>(env_val.clone()) {
-                                Ok(envelope) => {
-                                    process_envelope(
-                                        &envelope,
-                                        &state,
-                                        client.clone(),
-                                        &base_url,
-                                        &phone_number,
-                                    )
-                                    .await;
+                loop {
+                    tokio::select! {
+                        msg_result = ws_stream.next() => {
+                            match msg_result {
+                                Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
+                                    info!("Raw JSON WS received: {}", text);
+                                    let item_result: Result<serde_json::Value, _> = serde_json::from_str(&text);
+                                    if let Ok(item) = item_result {
+                                        let env_val = item.get("envelope").unwrap_or(&item);
+                                        match serde_json::from_value::<SignalEnvelope>(env_val.clone()) {
+                                            Ok(envelope) => {
+                                                process_envelope(
+                                                    &envelope,
+                                                    &state,
+                                                    client.clone(),
+                                                    &base_url,
+                                                    &phone_number,
+                                                )
+                                                .await;
+                                            }
+                                            Err(err) => {
+                                                warn!("Failed to cleanly deserialize envelope: {} - JSON: {}", err, env_val);
+                                            }
+                                        }
+                                    }
                                 }
-                                Err(err) => {
-                                    warn!("Failed to cleanly deserialize envelope: {} - JSON: {}", err, env_val);
+                                Some(Ok(_)) => {} // Ignore binary, ping, pong
+                                Some(Err(e)) => {
+                                    warn!("Signal WebSocket error: {}", e);
+                                    had_error = true;
+                                    consecutive_errors += 1;
+                                    channel_registry.set_error("signal", e.to_string());
+                                    break;
+                                }
+                                None => {
+                                    warn!("Signal WebSocket closed by server");
+                                    had_error = true;
+                                    break;
                                 }
                             }
                         }
-                    }
-                    Err(e) => {
-                        error!("Failed to read Signal receive response: {}", e);
+                        _ = shutdown.changed() => {
+                            if *shutdown.borrow() {
+                                info!("Signal receive loop shutting down");
+                                return;
+                            }
+                        }
                     }
                 }
-            }
-            Ok(resp) => {
-                had_error = true;
-                consecutive_errors += 1;
-                let status = resp.status();
-                if consecutive_errors <= 3 {
-                    warn!("Signal receive HTTP {}", status);
-                }
-                channel_registry.set_error("signal", format!("HTTP {}", status));
             }
             Err(e) => {
                 had_error = true;
                 consecutive_errors += 1;
                 if consecutive_errors <= 3 {
-                    warn!("Signal receive error: {}", e);
+                    warn!("Signal WS connect error: {}", e);
                 } else if consecutive_errors == 4 {
                     warn!(
-                        "Signal receive errors continuing (suppressing further logs until recovery)"
+                        "Signal WS errors continuing (suppressing further logs until recovery)"
                     );
                 }
                 channel_registry.set_error("signal", e.to_string());
