@@ -762,7 +762,7 @@ mod tests {
                                         }
                                     }
                                 });
-                                let _ = socket.send(axum::extract::ws::Message::Text(json.to_string().into())).await;
+                                socket.send(axum::extract::ws::Message::Text(json.to_string().into())).await.expect("Failed to send message over websocket");
                             }
                         })
                     }
