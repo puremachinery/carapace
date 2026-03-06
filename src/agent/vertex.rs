@@ -288,7 +288,7 @@ impl ResponseAdapter for GeminiAdapter {
 
             // Check if tool use happened
             let has_tool_use =
-                parts.map_or(false, |p| p.iter().any(|x| x.get("functionCall").is_some()));
+                parts.is_some_and(|p| p.iter().any(|x| x.get("functionCall").is_some()));
             let stop_reason = if has_tool_use {
                 StopReason::ToolUse
             } else {

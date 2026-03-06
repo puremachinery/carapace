@@ -119,6 +119,7 @@ pub async fn signal_receive_loop(
             break;
         }
 
+        #[allow(unused_assignments)]
         let mut had_error = false;
 
         match tokio_tungstenite::connect_async(&receive_url).await {

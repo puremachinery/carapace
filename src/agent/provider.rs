@@ -318,10 +318,11 @@ impl LlmProvider for MultiProvider {
 
         // If the request is for the global fallback DEFAULT_MODEL, and Anthropic is NOT configured
         // but Vertex IS configured, we change the model to "default" so it runs Vertex's configured default model!
-        if request.model == crate::agent::DEFAULT_MODEL {
-            if self.anthropic.is_none() && self.vertex.is_some() {
-                request.model = "default".to_string();
-            }
+        if request.model == crate::agent::DEFAULT_MODEL
+            && self.anthropic.is_none()
+            && self.vertex.is_some()
+        {
+            request.model = "default".to_string();
         }
 
         provider.complete(request, cancel_token).await
