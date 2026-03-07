@@ -1014,6 +1014,13 @@ pub async fn list_models(
     location: &str,
     token: &str,
 ) -> Result<Vec<String>, AgentError> {
+    if project_id.is_empty() || !project_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
+        return Err(AgentError::Provider(format!("Invalid project_id identifier: {}", project_id)));
+    }
+    if location.is_empty() || !location.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
+        return Err(AgentError::Provider(format!("Invalid location identifier: {}", location)));
+    }
+
     let client = reqwest::Client::new();
     let publishers = ["google", "anthropic", "meta"];
     let mut all_models = Vec::new();
@@ -1207,6 +1214,15 @@ mod tests {
         // Missing default model test
         let provider_no_default = VertexProvider::new("my-project".to_string(), "us-central1".to_string(), None);
         assert!(provider_no_default.resolve_request_config("vertex/default").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_list_models_ssrf() {
+        assert!(list_models("my-project/../../something", "us-central1", "token").await.is_err());
+        assert!(list_models("my-project", "us-central1/../../", "token").await.is_err());
+        assert!(list_models("my-project%2f%2e%2e%2f", "us-central1", "token").await.is_err());
+        assert!(list_models("", "us-central1", "token").await.is_err());
+        assert!(list_models("my-project", "", "token").await.is_err());
     }
 
     #[test]
