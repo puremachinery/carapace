@@ -1047,83 +1047,7 @@ fn collect_vertex_part_events(parts: &[Value]) -> Vec<StreamEvent> {
     events
 }
 
-/// List available models from Vertex AI publishers.
-pub async fn list_models(
-    project_id: &str,
-    location: &str,
-    token: &str,
-) -> Result<Vec<String>, AgentError> {
-    if project_id.is_empty()
-        || !project_id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
-    {
-        return Err(AgentError::Provider(format!(
-            "Invalid project_id identifier: {}",
-            project_id
-        )));
-    }
-    if location.is_empty()
-        || !location
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
-    {
-        return Err(AgentError::Provider(format!(
-            "Invalid location identifier: {}",
-            location
-        )));
-    }
 
-    let client = reqwest::Client::new();
-    let publishers = ["google", "anthropic", "meta"];
-    let mut all_models = Vec::new();
-
-    for publisher in publishers {
-        let url = format!(
-            "https://{}-aiplatform.googleapis.com/v1beta1/projects/{}/locations/{}/publishers/{}/models",
-            location, project_id, location, publisher
-        );
-
-        let response = client
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", token))
-            .send()
-            .await
-            .map_err(|e| {
-                AgentError::Provider(format!("failed to list models for {publisher}: {e}"))
-            })?;
-
-        if !response.status().is_success() {
-            tracing::warn!(
-                "Failed to list models for {}: {}",
-                publisher,
-                response.status()
-            );
-            continue;
-        }
-
-        let body: Value = response.json().await.map_err(|e| {
-            AgentError::Provider(format!("failed to parse model list for {publisher}: {e}"))
-        })?;
-
-        if let Some(models) = body.get("models").and_then(|v| v.as_array()) {
-            for model in models {
-                if let Some(name) = model.get("name").and_then(|v| v.as_str()) {
-                    let parts: Vec<&str> = name.split('/').collect();
-                    if let Some(model_id) = parts.last() {
-                        if publisher == "google" {
-                            all_models.push(format!("vertex/{}", model_id));
-                        } else {
-                            all_models.push(format!("vertex/{}/{}", publisher, model_id));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(all_models)
-}
 
 #[cfg(test)]
 mod tests {
@@ -1308,24 +1232,7 @@ mod tests {
             .is_err());
     }
 
-    #[tokio::test]
-    async fn test_list_models_ssrf() {
-        assert!(
-            list_models("my-project/../../something", "us-central1", "token")
-                .await
-                .is_err()
-        );
-        assert!(list_models("my-project", "us-central1/../../", "token")
-            .await
-            .is_err());
-        assert!(
-            list_models("my-project%2f%2e%2e%2f", "us-central1", "token")
-                .await
-                .is_err()
-        );
-        assert!(list_models("", "us-central1", "token").await.is_err());
-        assert!(list_models("my-project", "", "token").await.is_err());
-    }
+
 
     #[test]
     fn test_gemini_adapter_parsing() {
