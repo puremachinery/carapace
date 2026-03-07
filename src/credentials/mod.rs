@@ -135,6 +135,24 @@ pub fn is_retryable(error: &CredentialError) -> bool {
     )
 }
 
+/// Delete a keyring credential entry with idempotent not-found semantics.
+pub(crate) async fn delete_keyring_entry(
+    account_key: String,
+    map_error: fn(keyring::Error) -> CredentialError,
+    task_name: &'static str,
+) -> Result<(), CredentialError> {
+    let outcome = tokio::task::spawn_blocking(move || {
+        let entry = keyring::Entry::new(SERVICE_NAME, &account_key).map_err(map_error)?;
+        match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(map_error(e)),
+        }
+    })
+    .await;
+
+    outcome.map_err(|e| CredentialError::Internal(format!("{task_name} task failed: {e}")))?
+}
+
 /// Retry policy configuration
 #[derive(Debug, Clone)]
 pub struct RetryPolicy {

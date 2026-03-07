@@ -3,7 +3,9 @@
 //! Uses the `keyring` crate to interface with Windows Credential Manager.
 //! Target name format: `carapace:<kind>:<agentId>:<id>`
 
-use super::{CredentialBackend, CredentialError, CredentialKey, SERVICE_NAME};
+use super::{
+    delete_keyring_entry, CredentialBackend, CredentialError, CredentialKey, SERVICE_NAME,
+};
 use keyring::Entry;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -124,24 +126,7 @@ impl CredentialBackend for WindowsCredentialBackend {
     }
 
     async fn delete_raw(&self, key: &CredentialKey) -> Result<(), CredentialError> {
-        let account_key = key.to_account_key();
-        let outcome = tokio::task::spawn_blocking(move || {
-            let entry = Entry::new(SERVICE_NAME, &account_key).map_err(Self::map_error)?;
-            match entry.delete_password() {
-                Ok(()) => Ok(()),
-                // Treat "not found" as success for delete (idempotent)
-                Err(keyring::Error::NoEntry) => Ok(()),
-                Err(e) => Err(Self::map_error(e)),
-            }
-        })
-        .await;
-
-        match outcome {
-            Ok(result) => result,
-            Err(e) => Err(CredentialError::Internal(format!(
-                "Credential task failed: {e}"
-            ))),
-        }
+        delete_keyring_entry(key.to_account_key(), Self::map_error, "Credential").await
     }
 
     async fn is_available(&self) -> bool {
