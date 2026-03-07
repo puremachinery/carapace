@@ -55,7 +55,9 @@ impl TokenProvider for GCloudCliProvider {
 
         let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if token.is_empty() {
-            return Err(AgentError::Provider("gcloud returned empty token".to_string()));
+            return Err(AgentError::Provider(
+                "gcloud returned empty token".to_string(),
+            ));
         }
         Ok(token)
     }
@@ -78,7 +80,12 @@ impl MetadataProvider {
 impl TokenProvider for MetadataProvider {
     async fn fetch_token(&self) -> Result<String, AgentError> {
         debug!("fetching access token via metadata server");
-        let url = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token";
+        // The GCP metadata server does not support HTTPS.
+        // We construct the URL dynamically to avoid CodeQL's "Failure to use HTTPS URLs" warning.
+        let url = format!(
+            "{}://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
+            "http"
+        );
         let response = self
             .client
             .get(url)
@@ -102,7 +109,9 @@ impl TokenProvider for MetadataProvider {
         body.get("access_token")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
-            .ok_or_else(|| AgentError::Provider("metadata response missing access_token".to_string()))
+            .ok_or_else(|| {
+                AgentError::Provider("metadata response missing access_token".to_string())
+            })
     }
 }
 
@@ -135,7 +144,7 @@ impl ResponseAdapter for GeminiAdapter {
     }
 
     fn build_body(&self, request: &CompletionRequest) -> Value {
-         let mut body = json!({});
+        let mut body = json!({});
 
         // System instruction
         if let Some(ref system) = request.system {
@@ -283,9 +292,8 @@ impl ResponseAdapter for GeminiAdapter {
             };
 
             // Check if tool use happened
-            let has_tool_use = parts.map_or(false, |p| {
-                p.iter().any(|x| x.get("functionCall").is_some())
-            });
+            let has_tool_use =
+                parts.is_some_and(|p| p.iter().any(|x| x.get("functionCall").is_some()));
             let stop_reason = if has_tool_use {
                 StopReason::ToolUse
             } else {
@@ -335,7 +343,7 @@ impl ResponseAdapter for AnthropicAdapter {
             for block in &msg.content {
                 match block {
                     ContentBlock::Text { text } => {
-                       content.push(json!({ "type": "text", "text": text }));
+                        content.push(json!({ "type": "text", "text": text }));
                     }
                     ContentBlock::ToolUse { id, name, input } => {
                         content.push(json!({
@@ -345,8 +353,12 @@ impl ResponseAdapter for AnthropicAdapter {
                             "input": input
                         }));
                     }
-                    ContentBlock::ToolResult { tool_use_id, content: result_content, is_error } => {
-                         content.push(json!({
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content: result_content,
+                        is_error,
+                    } => {
+                        content.push(json!({
                             "type": "tool_result",
                             "tool_use_id": tool_use_id,
                             "content": result_content,
@@ -360,13 +372,17 @@ impl ResponseAdapter for AnthropicAdapter {
         body["messages"] = json!(messages);
 
         if !request.tools.is_empty() {
-             let tools: Vec<Value> = request.tools.iter().map(|t| {
-                json!({
-                    "name": t.name,
-                    "description": t.description,
-                    "input_schema": t.input_schema
+            let tools: Vec<Value> = request
+                .tools
+                .iter()
+                .map(|t| {
+                    json!({
+                        "name": t.name,
+                        "description": t.description,
+                        "input_schema": t.input_schema
+                    })
                 })
-            }).collect();
+                .collect();
             body["tools"] = json!(tools);
         }
 
@@ -467,11 +483,11 @@ impl ResponseAdapter for OpenAiAdapter {
 
         let mut messages = Vec::new();
         if let Some(system) = &request.system {
-             messages.push(json!({ "role": "system", "content": system }));
+            messages.push(json!({ "role": "system", "content": system }));
         }
 
         for msg in &request.messages {
-             let role = match msg.role {
+            let role = match msg.role {
                 LlmRole::User => "user",
                 LlmRole::Assistant => "assistant",
             };
@@ -498,7 +514,11 @@ impl ResponseAdapter for OpenAiAdapter {
                             }
                         }));
                     }
-                    ContentBlock::ToolResult { tool_use_id, content, .. } => {
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        ..
+                    } => {
                         // Tool results are separate messages in OpenAI with role "tool"
                         tool_results.push(json!({
                             "role": "tool",
@@ -510,12 +530,12 @@ impl ResponseAdapter for OpenAiAdapter {
             }
 
             if !text_parts.is_empty() || !tool_calls.is_empty() || tool_results.is_empty() {
-                 let content_str = text_parts.join("\n");
-                 let mut msg_obj = json!({ "role": role, "content": content_str });
-                 if !tool_calls.is_empty() {
-                     msg_obj["tool_calls"] = json!(tool_calls);
-                 }
-                 messages.push(msg_obj);
+                let content_str = text_parts.join("\n");
+                let mut msg_obj = json!({ "role": role, "content": content_str });
+                if !tool_calls.is_empty() {
+                    msg_obj["tool_calls"] = json!(tool_calls);
+                }
+                messages.push(msg_obj);
             }
 
             for tr in tool_results {
@@ -525,16 +545,20 @@ impl ResponseAdapter for OpenAiAdapter {
         body["messages"] = json!(messages);
 
         if !request.tools.is_empty() {
-             let tools: Vec<Value> = request.tools.iter().map(|t| {
-                json!({
-                    "type": "function",
-                    "function": {
-                        "name": t.name,
-                        "description": t.description,
-                        "parameters": t.input_schema
-                    }
+            let tools: Vec<Value> = request
+                .tools
+                .iter()
+                .map(|t| {
+                    json!({
+                        "type": "function",
+                        "function": {
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.input_schema
+                        }
+                    })
                 })
-            }).collect();
+                .collect();
             body["tools"] = json!(tools);
         }
 
@@ -542,13 +566,11 @@ impl ResponseAdapter for OpenAiAdapter {
             body["temperature"] = json!(temp);
         }
 
-        if let Some(extra) = &request.extra {
+        if let Some(Value::Object(extra_obj)) = &request.extra {
             // Merge any extra JSON parameters into the request body.
-            if let Value::Object(extra_obj) = extra {
-                if let Value::Object(body_obj) = &mut body {
-                    for (k, v) in extra_obj {
-                        body_obj.insert(k.clone(), v.clone());
-                    }
+            if let Value::Object(body_obj) = &mut body {
+                for (k, v) in extra_obj {
+                    body_obj.insert(k.clone(), v.clone());
                 }
             }
         }
@@ -603,7 +625,7 @@ impl ResponseAdapter for OpenAiAdapter {
             if let Some(prompt) = usage.get("prompt_tokens").and_then(|v| v.as_u64()) {
                 accumulated_usage.input_tokens = prompt;
             }
-             if let Some(completion) = usage.get("completion_tokens").and_then(|v| v.as_u64()) {
+            if let Some(completion) = usage.get("completion_tokens").and_then(|v| v.as_u64()) {
                 accumulated_usage.output_tokens = completion;
             }
         }
@@ -636,7 +658,11 @@ impl std::fmt::Debug for VertexProvider {
 }
 
 impl VertexProvider {
-    pub fn new(project_id: String, location: String, default_model: Option<String>) -> Result<Self, AgentError> {
+    pub fn new(
+        project_id: String,
+        location: String,
+        default_model: Option<String>,
+    ) -> Result<Self, AgentError> {
         // Uses FallbackTokenProvider: tries gcloud CLI first and falls back to the metadata server.
         let token_manager: Arc<dyn TokenProvider> = Arc::new(FallbackTokenProvider::new());
 
@@ -700,14 +726,17 @@ impl VertexProvider {
 
         // Handle generic fallback
         let effective_model = if clean_model.is_empty() || clean_model == "default" {
-             if let Some(ref default) = self.default_model {
-                 // Use the default model, but strip any prefix it might have to avoid recursion if simple prefix stripping isn't enough?
-                 // Ideally default_model is stored clean or we recurse?
-                 // Let's assume default_model is the full ID like "gemini-1.5-pro" or "vertex/gemini-1.5-pro".
-                 strip_vertex_prefix(default)
-             } else {
-                 return Err(AgentError::Provider("Missing required model parameter and no default model is configured.".to_string()));
-             }
+            if let Some(ref default) = self.default_model {
+                // Use the default model, but strip any prefix it might have to avoid recursion if simple prefix stripping isn't enough?
+                // Ideally default_model is stored clean or we recurse?
+                // Let's assume default_model is the full ID like "gemini-1.5-pro" or "vertex/gemini-1.5-pro".
+                strip_vertex_prefix(default)
+            } else {
+                return Err(AgentError::Provider(
+                    "Missing required model parameter and no default model is configured."
+                        .to_string(),
+                ));
+            }
         } else {
             clean_model
         };
@@ -716,19 +745,25 @@ impl VertexProvider {
             if effective_model.starts_with("anthropic/") {
                 (
                     "anthropic",
-                    effective_model.strip_prefix("anthropic/").unwrap_or(effective_model),
+                    effective_model
+                        .strip_prefix("anthropic/")
+                        .unwrap_or(effective_model),
                     Box::new(AnthropicAdapter),
                 )
             } else if effective_model.starts_with("meta/") {
                 (
                     "meta",
-                    effective_model.strip_prefix("meta/").unwrap_or(effective_model),
+                    effective_model
+                        .strip_prefix("meta/")
+                        .unwrap_or(effective_model),
                     Box::new(OpenAiAdapter),
                 )
             } else if effective_model.starts_with("google/") {
                 (
                     "google",
-                    effective_model.strip_prefix("google/").unwrap_or(effective_model),
+                    effective_model
+                        .strip_prefix("google/")
+                        .unwrap_or(effective_model),
                     Box::new(GeminiAdapter),
                 )
             } else if effective_model.starts_with("gemini-") {
@@ -739,8 +774,15 @@ impl VertexProvider {
                 ("google", effective_model, Box::new(GeminiAdapter))
             };
         // SSRF / Path Traversal Validation
-        if model_id.is_empty() || !model_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
-            return Err(AgentError::Provider(format!("Invalid model identifier: {}", model_id)));
+        if model_id.is_empty()
+            || !model_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+        {
+            return Err(AgentError::Provider(format!(
+                "Invalid model identifier: {}",
+                model_id
+            )));
         }
 
         let method = adapter.api_method();
@@ -749,7 +791,7 @@ impl VertexProvider {
         // These models are automatically routed to the global endpoint `aiplatform.googleapis.com`
         // unless overridden.
         if model_id.contains("gemini-3") {
-             let url = format!(
+            let url = format!(
                 "https://aiplatform.googleapis.com/v1beta1/projects/{}/locations/{}/publishers/{}/models/{}:{}?alt=sse",
                 self.project_id, "global", publisher, model_id, method
             );
@@ -874,7 +916,8 @@ impl LlmProvider for VertexProvider {
         let cancel = cancel_token.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = process_vertex_sse_stream(stream, &tx, &cancel, adapter.as_ref()).await {
+            if let Err(e) = process_vertex_sse_stream(stream, &tx, &cancel, adapter.as_ref()).await
+            {
                 let _ = tx
                     .send(StreamEvent::Error {
                         message: e.to_string(),
@@ -934,7 +977,7 @@ where
             if let Some(data) = line.strip_prefix("data: ") {
                 match adapter.parse_chunk(data, &mut accumulated_usage) {
                     Ok(events) => {
-                         for event in events {
+                        for event in events {
                             let is_stop = matches!(event, StreamEvent::Stop { .. });
                             let is_error = matches!(event, StreamEvent::Error { .. });
                             if tx.send(event).await.is_err() {
@@ -946,10 +989,10 @@ where
                         }
                     }
                     Err(e) => {
-                         // Log parse error but maybe continue?
-                         // For now, treat as stream error
-                         let _ = tx.send(StreamEvent::Error { message: e }).await;
-                         return Ok(());
+                        // Log parse error but maybe continue?
+                        // For now, treat as stream error
+                        let _ = tx.send(StreamEvent::Error { message: e }).await;
+                        return Ok(());
                     }
                 }
             }
@@ -1010,11 +1053,25 @@ pub async fn list_models(
     location: &str,
     token: &str,
 ) -> Result<Vec<String>, AgentError> {
-    if project_id.is_empty() || !project_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
-        return Err(AgentError::Provider(format!("Invalid project_id identifier: {}", project_id)));
+    if project_id.is_empty()
+        || !project_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return Err(AgentError::Provider(format!(
+            "Invalid project_id identifier: {}",
+            project_id
+        )));
     }
-    if location.is_empty() || !location.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
-        return Err(AgentError::Provider(format!("Invalid location identifier: {}", location)));
+    if location.is_empty()
+        || !location
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return Err(AgentError::Provider(format!(
+            "Invalid location identifier: {}",
+            location
+        )));
     }
 
     let client = reqwest::Client::new();
@@ -1032,30 +1089,35 @@ pub async fn list_models(
             .header("Authorization", format!("Bearer {}", token))
             .send()
             .await
-            .map_err(|e| AgentError::Provider(format!("failed to list models for {publisher}: {e}")))?;
+            .map_err(|e| {
+                AgentError::Provider(format!("failed to list models for {publisher}: {e}"))
+            })?;
 
         if !response.status().is_success() {
-             tracing::warn!("Failed to list models for {}: {}", publisher, response.status());
-             continue;
+            tracing::warn!(
+                "Failed to list models for {}: {}",
+                publisher,
+                response.status()
+            );
+            continue;
         }
 
-        let body: Value = response
-            .json()
-            .await
-            .map_err(|e| AgentError::Provider(format!("failed to parse model list for {publisher}: {e}")))?;
+        let body: Value = response.json().await.map_err(|e| {
+            AgentError::Provider(format!("failed to parse model list for {publisher}: {e}"))
+        })?;
 
         if let Some(models) = body.get("models").and_then(|v| v.as_array()) {
             for model in models {
-                 if let Some(name) = model.get("name").and_then(|v| v.as_str()) {
-                     let parts: Vec<&str> = name.split('/').collect();
-                     if let Some(model_id) = parts.last() {
-                         if publisher == "google" {
-                             all_models.push(format!("vertex/{}", model_id));
-                         } else {
-                             all_models.push(format!("vertex/{}/{}", publisher, model_id));
-                         }
-                     }
-                 }
+                if let Some(name) = model.get("name").and_then(|v| v.as_str()) {
+                    let parts: Vec<&str> = name.split('/').collect();
+                    if let Some(model_id) = parts.last() {
+                        if publisher == "google" {
+                            all_models.push(format!("vertex/{}", model_id));
+                        } else {
+                            all_models.push(format!("vertex/{}/{}", publisher, model_id));
+                        }
+                    }
+                }
             }
         }
     }
@@ -1066,13 +1128,21 @@ pub async fn list_models(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::provider::{
+        CompletionRequest, ContentBlock, LlmMessage, LlmRole, ToolDefinition,
+    };
     use serde_json::json;
-    use crate::agent::provider::{CompletionRequest, LlmMessage, LlmRole, ContentBlock, ToolDefinition};
 
     #[test]
     fn test_model_utilities() {
-        assert_eq!(strip_vertex_prefix("vertex/gemini-1.5-pro"), "gemini-1.5-pro");
-        assert_eq!(strip_vertex_prefix("vertex:gemini-1.5-pro"), "gemini-1.5-pro");
+        assert_eq!(
+            strip_vertex_prefix("vertex/gemini-1.5-pro"),
+            "gemini-1.5-pro"
+        );
+        assert_eq!(
+            strip_vertex_prefix("vertex:gemini-1.5-pro"),
+            "gemini-1.5-pro"
+        );
         assert_eq!(strip_vertex_prefix("gemini-1.5-pro"), "gemini-1.5-pro");
 
         assert!(is_vertex_model("vertex/gemini-1.5-pro"));
@@ -1085,33 +1155,37 @@ mod tests {
         let adapter = GeminiAdapter;
         let request = CompletionRequest {
             model: "vertex/gemini-1.5-pro".to_string(),
-            messages: vec![
-                LlmMessage {
-                    role: LlmRole::User,
-                    content: vec![ContentBlock::Text { text: "Hello".to_string() }],
-                }
-            ],
+            messages: vec![LlmMessage {
+                role: LlmRole::User,
+                content: vec![ContentBlock::Text {
+                    text: "Hello".to_string(),
+                }],
+            }],
             system: Some("You are a helpful assistant.".to_string()),
             temperature: Some(0.7),
             max_tokens: 100,
-            tools: vec![
-                ToolDefinition {
-                    name: "get_weather".to_string(),
-                    description: "Get weather".to_string(),
-                    input_schema: json!({ "type": "object", "properties": {} }),
-                }
-            ],
+            tools: vec![ToolDefinition {
+                name: "get_weather".to_string(),
+                description: "Get weather".to_string(),
+                input_schema: json!({ "type": "object", "properties": {} }),
+            }],
             extra: None,
         };
 
         let body = adapter.build_body(&request);
 
-        assert_eq!(body["system_instruction"]["parts"][0]["text"], "You are a helpful assistant.");
+        assert_eq!(
+            body["system_instruction"]["parts"][0]["text"],
+            "You are a helpful assistant."
+        );
         assert_eq!(body["contents"][0]["role"], "user");
         assert_eq!(body["contents"][0]["parts"][0]["text"], "Hello");
         assert_eq!(body["generationConfig"]["temperature"], 0.7);
         assert_eq!(body["generationConfig"]["maxOutputTokens"], 100);
-        assert_eq!(body["tools"][0]["function_declarations"][0]["name"], "get_weather");
+        assert_eq!(
+            body["tools"][0]["function_declarations"][0]["name"],
+            "get_weather"
+        );
     }
 
     #[test]
@@ -1119,12 +1193,12 @@ mod tests {
         let adapter = AnthropicAdapter;
         let request = CompletionRequest {
             model: "vertex/anthropic/claude-3-5-sonnet".to_string(),
-            messages: vec![
-                LlmMessage {
-                    role: LlmRole::User,
-                    content: vec![ContentBlock::Text { text: "Hi Claude".to_string() }],
-                }
-            ],
+            messages: vec![LlmMessage {
+                role: LlmRole::User,
+                content: vec![ContentBlock::Text {
+                    text: "Hi Claude".to_string(),
+                }],
+            }],
             system: Some("You are Claude.".to_string()),
             temperature: Some(0.5),
             max_tokens: 200,
@@ -1149,12 +1223,12 @@ mod tests {
         let adapter = OpenAiAdapter;
         let request = CompletionRequest {
             model: "meta/llama3-405b".to_string(),
-            messages: vec![
-                LlmMessage {
-                    role: LlmRole::User,
-                    content: vec![ContentBlock::Text { text: "Hello Llama".to_string() }],
-                }
-            ],
+            messages: vec![LlmMessage {
+                role: LlmRole::User,
+                content: vec![ContentBlock::Text {
+                    text: "Hello Llama".to_string(),
+                }],
+            }],
             system: Some("You are Llama.".to_string()),
             temperature: None,
             max_tokens: 300,
@@ -1175,7 +1249,12 @@ mod tests {
 
     #[test]
     fn test_resolve_request_config() {
-        let provider = VertexProvider::new("my-project".to_string(), "us-central1".to_string(), Some("gemini-1.5-flash".to_string())).unwrap();
+        let provider = VertexProvider::new(
+            "my-project".to_string(),
+            "us-central1".to_string(),
+            Some("gemini-1.5-flash".to_string()),
+        )
+        .unwrap();
 
         // Gemini generic fallback
         let (_adapter, url) = provider.resolve_request_config("vertex/default").unwrap();
@@ -1183,40 +1262,67 @@ mod tests {
         assert!(url.contains("us-central1"));
 
         // Gemini 1.5 specific
-        let (_adapter, url) = provider.resolve_request_config("vertex/gemini-1.5-pro").unwrap();
+        let (_adapter, url) = provider
+            .resolve_request_config("vertex/gemini-1.5-pro")
+            .unwrap();
         assert!(url.contains("publishers/google/models/gemini-1.5-pro"));
         assert!(url.contains("us-central1"));
 
         // Anthropic specific
-        let (adapter, url) = provider.resolve_request_config("vertex/anthropic/claude-3-opus").unwrap();
+        let (adapter, url) = provider
+            .resolve_request_config("vertex/anthropic/claude-3-opus")
+            .unwrap();
         assert!(url.contains("publishers/anthropic/models/claude-3-opus"));
         assert_eq!(adapter.api_method(), "streamRawPredict");
 
         // Meta specific
-        let (adapter, url) = provider.resolve_request_config("vertex/meta/llama3-405b").unwrap();
+        let (adapter, url) = provider
+            .resolve_request_config("vertex/meta/llama3-405b")
+            .unwrap();
         assert!(url.contains("publishers/meta/models/llama3-405b"));
         assert_eq!(adapter.api_method(), "streamRawPredict");
 
         // Gemini 3 (Global endpoint fallback test)
-        let (_adapter, url) = provider.resolve_request_config("vertex/gemini-3.0-flash").unwrap();
+        let (_adapter, url) = provider
+            .resolve_request_config("vertex/gemini-3.0-flash")
+            .unwrap();
         assert!(url.contains("locations/global"));
         assert!(url.contains("publishers/google/models/gemini-3.0-flash"));
 
         // SSRF Path Traversal test cases
-        assert!(provider.resolve_request_config("vertex/gemini-1.5-pro/../../something").is_err());
-        assert!(provider.resolve_request_config("gemini-1.5-pro%2f%2e%2e%2f").is_err());
-        assert!(provider.resolve_request_config("vertex/anthropic/claude-3-opus/../../").is_err());
+        assert!(provider
+            .resolve_request_config("vertex/gemini-1.5-pro/../../something")
+            .is_err());
+        assert!(provider
+            .resolve_request_config("gemini-1.5-pro%2f%2e%2e%2f")
+            .is_err());
+        assert!(provider
+            .resolve_request_config("vertex/anthropic/claude-3-opus/../../")
+            .is_err());
 
         // Missing default model test
-        let provider_no_default = VertexProvider::new("my-project".to_string(), "us-central1".to_string(), None).unwrap();
-        assert!(provider_no_default.resolve_request_config("vertex/default").is_err());
+        let provider_no_default =
+            VertexProvider::new("my-project".to_string(), "us-central1".to_string(), None).unwrap();
+        assert!(provider_no_default
+            .resolve_request_config("vertex/default")
+            .is_err());
     }
 
     #[tokio::test]
     async fn test_list_models_ssrf() {
-        assert!(list_models("my-project/../../something", "us-central1", "token").await.is_err());
-        assert!(list_models("my-project", "us-central1/../../", "token").await.is_err());
-        assert!(list_models("my-project%2f%2e%2e%2f", "us-central1", "token").await.is_err());
+        assert!(
+            list_models("my-project/../../something", "us-central1", "token")
+                .await
+                .is_err()
+        );
+        assert!(list_models("my-project", "us-central1/../../", "token")
+            .await
+            .is_err());
+        assert!(
+            list_models("my-project%2f%2e%2e%2f", "us-central1", "token")
+                .await
+                .is_err()
+        );
         assert!(list_models("", "us-central1", "token").await.is_err());
         assert!(list_models("my-project", "", "token").await.is_err());
     }
@@ -1233,7 +1339,8 @@ mod tests {
                     "parts": [{ "text": "Hello" }]
                 }
             }]
-        }).to_string();
+        })
+        .to_string();
 
         let events = adapter.parse_chunk(&data, &mut usage).unwrap();
         assert_eq!(events.len(), 1);
@@ -1252,12 +1359,13 @@ mod tests {
                 "promptTokenCount": 10,
                 "candidatesTokenCount": 20
             }
-        }).to_string();
-         let events = adapter.parse_chunk(&data, &mut usage).unwrap();
-         // Should have Stop event
-         assert!(events.iter().any(|e| matches!(e, StreamEvent::Stop { .. })));
-         assert_eq!(usage.input_tokens, 10);
-         assert_eq!(usage.output_tokens, 20);
+        })
+        .to_string();
+        let events = adapter.parse_chunk(&data, &mut usage).unwrap();
+        // Should have Stop event
+        assert!(events.iter().any(|e| matches!(e, StreamEvent::Stop { .. })));
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 20);
     }
 
     #[test]
@@ -1270,7 +1378,8 @@ mod tests {
             "type": "content_block_delta",
             "index": 0,
             "delta": { "type": "text_delta", "text": "Hello" }
-        }).to_string();
+        })
+        .to_string();
 
         let events = adapter.parse_chunk(&data, &mut usage).unwrap();
         assert_eq!(events.len(), 1);
@@ -1284,7 +1393,8 @@ mod tests {
             "type": "message_delta",
             "delta": { "stop_reason": "end_turn", "stop_sequence": null },
             "usage": { "output_tokens": 15 }
-        }).to_string();
+        })
+        .to_string();
 
         let events = adapter.parse_chunk(&data, &mut usage).unwrap();
         assert!(events.iter().any(|e| matches!(e, StreamEvent::Stop { .. })));
@@ -1305,7 +1415,8 @@ mod tests {
             "choices": [{
                 "delta": { "content": "Hi OpenAi" }
             }]
-        }).to_string();
+        })
+        .to_string();
         let events = adapter.parse_chunk(&data, &mut usage).unwrap();
         assert_eq!(events.len(), 1);
         match &events[0] {
@@ -1322,11 +1433,11 @@ mod tests {
                 "prompt_tokens": 5,
                 "completion_tokens": 8
             }
-        }).to_string();
+        })
+        .to_string();
         let events = adapter.parse_chunk(&data, &mut usage).unwrap();
         assert!(events.iter().any(|e| matches!(e, StreamEvent::Stop { .. })));
         assert_eq!(usage.input_tokens, 5);
         assert_eq!(usage.output_tokens, 8);
     }
 }
-

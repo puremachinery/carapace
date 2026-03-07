@@ -1573,12 +1573,18 @@ pub async fn handle_list_models(
     let mut config_location = None;
 
     if project_id.is_none() || location.is_none() {
-         if let Ok(cfg) = crate::config::load_config() {
-             if let Some(vertex) = cfg.get("vertex") {
-                 config_project_id = vertex.get("projectId").and_then(|v| v.as_str()).map(String::from);
-                 config_location = vertex.get("location").and_then(|v| v.as_str()).map(String::from);
-             }
-         }
+        if let Ok(cfg) = crate::config::load_config() {
+            if let Some(vertex) = cfg.get("vertex") {
+                config_project_id = vertex
+                    .get("projectId")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                config_location = vertex
+                    .get("location")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+            }
+        }
     }
 
     let project = if let Some(p) = project_id {
@@ -1609,9 +1615,12 @@ pub async fn handle_list_models(
         project.clone(),
         effective_location.clone(),
         None,
-    ).map_err(|e| format!("Failed to create Vertex provider: {}", e))?;
-    let token = provider.get_token().await.map_err(|e| format!("Failed to get token: {}", e))?;
-
+    )
+    .map_err(|e| format!("Failed to create Vertex provider: {}", e))?;
+    let token = provider
+        .get_token()
+        .await
+        .map_err(|e| format!("Failed to get token: {}", e))?;
 
     let models = crate::agent::vertex::list_models(&project, &effective_location, &token).await?;
 
