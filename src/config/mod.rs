@@ -92,11 +92,20 @@ struct CachedConfig {
 static CONFIG_CACHE: LazyLock<RwLock<Option<CachedConfig>>> = LazyLock::new(|| RwLock::new(None));
 
 /// Get the config file path.
-/// Priority: CARAPACE_CONFIG_PATH > CARAPACE_STATE_DIR/carapace.json5 > ~/.config/carapace/carapace.json5
+/// Priority: CARAPACE_CONFIG_PATH > CARAPACE_STATE_DIR > CWD > ~/.config/carapace
 /// Falls back to .json extension if the .json5 file doesn't exist.
 pub fn get_config_path() -> PathBuf {
     if let Ok(path) = env::var("CARAPACE_CONFIG_PATH") {
         return PathBuf::from(path);
+    }
+
+    if let Ok(state_dir) = env::var("CARAPACE_STATE_DIR") {
+        let dir = PathBuf::from(state_dir);
+        let json5 = dir.join("carapace.json5");
+        if json5.exists() {
+            return json5;
+        }
+        return dir.join("carapace.json");
     }
 
     // Check current working directory
@@ -109,15 +118,6 @@ pub fn get_config_path() -> PathBuf {
         if json.exists() {
             return json;
         }
-    }
-
-    if let Ok(state_dir) = env::var("CARAPACE_STATE_DIR") {
-        let dir = PathBuf::from(state_dir);
-        let json5 = dir.join("carapace.json5");
-        if json5.exists() {
-            return json5;
-        }
-        return dir.join("carapace.json");
     }
 
     let base = dirs::config_dir()
@@ -877,12 +877,40 @@ mod tests {
         env::remove_var("CARAPACE_CONFIG_PATH");
         env::remove_var("CARAPACE_STATE_DIR");
 
+        // Use a temp dir for CWD so local configs don't interfere
+        let dir = TempDir::new().unwrap();
+        let original_cwd = env::current_dir().unwrap();
+        env::set_current_dir(dir.path()).unwrap();
+
         let path = get_config_path();
+
+        env::set_current_dir(original_cwd).unwrap();
+
         // Falls back to .json when .json5 doesn't exist on disk
         let expected_base = dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from(".config"))
             .join("carapace");
         assert_eq!(path, expected_base.join("carapace.json"));
+    }
+
+    #[test]
+    fn test_get_config_path_cwd() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        env::remove_var("CARAPACE_CONFIG_PATH");
+        env::remove_var("CARAPACE_STATE_DIR");
+
+        let dir = TempDir::new().unwrap();
+        let original_cwd = env::current_dir().unwrap();
+        env::set_current_dir(dir.path()).unwrap();
+
+        let json5_path = dir.path().join("carapace.json5");
+        File::create(&json5_path).unwrap();
+
+        let path = get_config_path();
+
+        env::set_current_dir(original_cwd).unwrap();
+
+        assert_eq!(path, json5_path);
     }
 
     #[test]

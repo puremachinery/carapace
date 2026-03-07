@@ -316,11 +316,13 @@ pub fn build_providers(cfg: &Value) -> Result<Option<MultiProvider>, Box<dyn std
             "LLM provider configured: Vertex (project: {}, location: {})",
             project_id, location
         );
-        Some(Arc::new(agent::vertex::VertexProvider::new(
-            project_id,
-            location,
-            vertex_config.model,
-        )) as Arc<dyn agent::LlmProvider>)
+        match agent::vertex::VertexProvider::new(project_id, location, vertex_config.model) {
+            Ok(provider) => Some(Arc::new(provider) as Arc<dyn agent::LlmProvider>),
+            Err(e) => {
+                warn!("Failed to configure Vertex provider: {}", e);
+                None
+            }
+        }
     } else {
         None
     };
@@ -452,7 +454,7 @@ pub fn fingerprint_providers(cfg: &Value) -> ProviderFingerprint {
         venice: venice_key.map(|k| (hash_key_prefix(&k), venice_url)),
         bedrock: if bedrock_enabled {
             match (bedrock_region, bedrock_access_key) {
-                (Some(r), Some(k)) => Some(format!("{}:{}...{}", r, &k[..4], &k[k.len() - 4..])),
+                (Some(r), Some(k)) => Some(hash_key_prefix(&format!("{}{}", r, k))),
                 _ => None,
             }
         } else {
@@ -461,7 +463,9 @@ pub fn fingerprint_providers(cfg: &Value) -> ProviderFingerprint {
         vertex: vertex_config.project_id.map(|p| {
             (
                 p,
-                vertex_config.location.unwrap_or_default(),
+                vertex_config
+                    .location
+                    .unwrap_or_else(|| "us-central1".to_string()),
                 vertex_config.model,
             )
         }),
@@ -499,6 +503,9 @@ mod tests {
         "AWS_REGION",
         "AWS_DEFAULT_REGION",
         "AWS_ACCESS_KEY_ID",
+        "VERTEX_PROJECT_ID",
+        "VERTEX_LOCATION",
+        "VERTEX_MODEL",
     ];
 
     struct EnvVarGuard {
@@ -532,16 +539,18 @@ mod tests {
 
     #[test]
     fn test_fingerprint_empty_config() {
-        // With no env vars and no config, all providers should be None
-        let cfg = json!({});
-        let fp = fingerprint_providers(&cfg);
-        assert!(fp.anthropic.is_none());
-        assert!(fp.openai.is_none());
-        assert!(fp.ollama.is_none());
-        assert!(fp.gemini.is_none());
-        assert!(fp.venice.is_none());
-        assert!(fp.bedrock.is_none());
-        assert!(fp.vertex.is_none());
+        with_clean_provider_env(|| {
+            // With no env vars and no config, all providers should be None
+            let cfg = json!({});
+            let fp = fingerprint_providers(&cfg);
+            assert!(fp.anthropic.is_none());
+            assert!(fp.openai.is_none());
+            assert!(fp.ollama.is_none());
+            assert!(fp.gemini.is_none());
+            assert!(fp.venice.is_none());
+            assert!(fp.bedrock.is_none());
+            assert!(fp.vertex.is_none());
+        });
     }
 
     #[test]

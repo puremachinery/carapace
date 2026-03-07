@@ -204,17 +204,6 @@ pub enum Command {
     /// Manage mTLS certificates for gateway-to-gateway communication.
     #[command(subcommand)]
     Tls(TlsCommand),
-
-    /// List available Vertex AI models (requires active gcloud session).
-    ListModels {
-        /// Vertex Project ID (optional, env: VERTEX_PROJECT_ID).
-        #[arg(long)]
-        project_id: Option<String>,
-
-        /// Vertex Location (optional, env: VERTEX_LOCATION, default: us-central1).
-        #[arg(long, default_value = "us-central1")]
-        location: String,
-    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1563,77 +1552,6 @@ fn current_time_ms() -> i64 {
         .as_millis() as i64
 }
 
-/// Run `list-models` subcommand.
-pub async fn handle_list_models(
-    project_id: &Option<String>,
-    location: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Attempt to load config to fill in missing gaps
-    let mut config_project_id = None;
-    let mut config_location = None;
-
-    if project_id.is_none() || location == "us-central1" {
-        if let Ok(cfg) = crate::config::load_config() {
-            if let Some(vertex) = cfg.get("vertex") {
-                config_project_id = vertex
-                    .get("projectId")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-                config_location = vertex
-                    .get("location")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-            }
-        }
-    }
-
-    let project = if let Some(p) = project_id {
-        p.clone()
-    } else {
-        std::env::var("VERTEX_PROJECT_ID")
-            .ok()
-            .or(config_project_id)
-            .ok_or("Project ID is required. Set VERTEX_PROJECT_ID, pass --project-id, or configure in carapace.toml.")?
-    };
-
-    let effective_location = if location != "us-central1" {
-        location.to_string()
-    } else {
-        std::env::var("VERTEX_LOCATION")
-            .ok()
-            .or(config_location)
-            .unwrap_or_else(|| "us-central1".to_string())
-    };
-
-    println!(
-        "Listing models for project: {}, location: {}...",
-        project, effective_location
-    );
-    println!("Fetching access token...");
-
-    let provider = crate::agent::vertex::VertexProvider::new(
-        project.clone(),
-        effective_location.clone(),
-        None,
-    );
-    let token = provider
-        .get_token()
-        .await
-        .map_err(|e| format!("Failed to get token: {}", e))?;
-
-    let models = crate::agent::vertex::list_models(&project, &effective_location, &token).await?;
-
-    if models.is_empty() {
-        println!("No models found (or permission denied).");
-    } else {
-        println!("Available Vertex Models:");
-        for model in models {
-            println!("  - {}", model);
-        }
-    }
-
-    Ok(())
-}
 fn ws_url_from_http(url: &Url) -> Result<String, Box<dyn std::error::Error>> {
     let scheme = match url.scheme() {
         "https" => "wss",
