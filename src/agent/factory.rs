@@ -452,7 +452,7 @@ pub fn fingerprint_providers(cfg: &Value) -> ProviderFingerprint {
         venice: venice_key.map(|k| (hash_key_prefix(&k), venice_url)),
         bedrock: if bedrock_enabled {
             match (bedrock_region, bedrock_access_key) {
-                (Some(r), Some(k)) => Some(format!("{}:{}...{}", r, &k[..4], &k[k.len() - 4..])),
+                (Some(r), Some(k)) => Some(hash_key_prefix(&format!("{}{}", r, k))),
                 _ => None,
             }
         } else {
