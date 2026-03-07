@@ -542,8 +542,15 @@ impl ResponseAdapter for OpenAiAdapter {
             body["temperature"] = json!(temp);
         }
 
-        if let Some(_extra) = &request.extra {
-            // merge extra params?
+        if let Some(extra) = &request.extra {
+            // Merge any extra JSON parameters into the request body.
+            if let Value::Object(extra_obj) = extra {
+                if let Value::Object(body_obj) = &mut body {
+                    for (k, v) in extra_obj {
+                        body_obj.insert(k.clone(), v.clone());
+                    }
+                }
+            }
         }
 
         body
