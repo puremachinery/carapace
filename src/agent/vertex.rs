@@ -723,14 +723,12 @@ impl VertexProvider {
                     Box::new(GeminiAdapter),
                 )
             } else if effective_model.starts_with("gemini-") {
-                // Determine if it's gemini (google)
-                 ("google", effective_model, Box::new(GeminiAdapter))
+                // Models prefixed with "gemini-" are treated as Google Gemini models on Vertex AI.
+                ("google", effective_model, Box::new(GeminiAdapter))
             } else {
-                // Default to Google/Gemini for unknown, or maybe OpenAI if likely 3rd party?
-                // Let's default to Google for now as it's "Vertex AI".
-                 ("google", effective_model, Box::new(GeminiAdapter))
+                // Fallback: treat other models as Google Gemini models within Vertex AI.
+                ("google", effective_model, Box::new(GeminiAdapter))
             };
-
         // SSRF / Path Traversal Validation
         if model_id.is_empty() || !model_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
             return Err(AgentError::Provider(format!("Invalid model identifier: {}", model_id)));
