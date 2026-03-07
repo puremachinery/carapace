@@ -693,7 +693,7 @@ impl VertexProvider {
     fn resolve_request_config(
         &self,
         model_name: &str,
-    ) -> (Box<dyn ResponseAdapter>, String) {
+    ) -> Result<(Box<dyn ResponseAdapter>, String), AgentError> {
         let clean_model = strip_vertex_prefix(model_name);
 
         // Handle generic fallback
@@ -704,8 +704,7 @@ impl VertexProvider {
                  // Let's assume default_model is the full ID like "gemini-1.5-pro" or "vertex/gemini-1.5-pro".
                  strip_vertex_prefix(default)
              } else {
-                 // Fallback if no default configured?
-                 "gemini-1.5-flash-001"
+                 return Err(AgentError::Provider("Missing required model parameter and no default model is configured.".to_string()));
              }
         } else {
             clean_model
@@ -741,6 +740,11 @@ impl VertexProvider {
                  ("google", effective_model, Box::new(GeminiAdapter))
             };
 
+        // SSRF / Path Traversal Validation
+        if model_id.is_empty() || !model_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
+            return Err(AgentError::Provider(format!("Invalid model identifier: {}", model_id)));
+        }
+
         let method = adapter.api_method();
 
         // Global endpoints for Gemini 3 and Experimental
@@ -751,14 +755,14 @@ impl VertexProvider {
                 "https://aiplatform.googleapis.com/v1beta1/projects/{}/locations/{}/publishers/{}/models/{}:{}?alt=sse",
                 self.project_id, "global", publisher, model_id, method
             );
-            return (adapter, url);
+            return Ok((adapter, url));
         }
 
         let url = format!(
             "https://{}-aiplatform.googleapis.com/v1beta1/projects/{}/locations/{}/publishers/{}/models/{}:{}?alt=sse",
             self.location, self.project_id, self.location, publisher, model_id, method
         );
-        (adapter, url)
+        Ok((adapter, url))
     }
 }
 
@@ -837,7 +841,7 @@ impl LlmProvider for VertexProvider {
         }
 
         let token = self.get_token().await?;
-        let (adapter, url) = self.resolve_request_config(&request.model);
+        let (adapter, url) = self.resolve_request_config(&request.model)?;
         let body = adapter.build_body(&request);
 
         let response = tokio::select! {
@@ -1169,29 +1173,38 @@ mod tests {
         let provider = VertexProvider::new("my-project".to_string(), "us-central1".to_string(), Some("gemini-1.5-flash".to_string()));
 
         // Gemini generic fallback
-        let (_adapter, url) = provider.resolve_request_config("vertex/default");
+        let (_adapter, url) = provider.resolve_request_config("vertex/default").unwrap();
         assert!(url.contains("publishers/google/models/gemini-1.5-flash"));
         assert!(url.contains("us-central1"));
 
         // Gemini 1.5 specific
-        let (_adapter, url) = provider.resolve_request_config("vertex/gemini-1.5-pro");
+        let (_adapter, url) = provider.resolve_request_config("vertex/gemini-1.5-pro").unwrap();
         assert!(url.contains("publishers/google/models/gemini-1.5-pro"));
         assert!(url.contains("us-central1"));
 
         // Anthropic specific
-        let (adapter, url) = provider.resolve_request_config("vertex/anthropic/claude-3-opus");
+        let (adapter, url) = provider.resolve_request_config("vertex/anthropic/claude-3-opus").unwrap();
         assert!(url.contains("publishers/anthropic/models/claude-3-opus"));
         assert_eq!(adapter.api_method(), "streamRawPredict");
 
         // Meta specific
-        let (adapter, url) = provider.resolve_request_config("vertex/meta/llama3-405b");
+        let (adapter, url) = provider.resolve_request_config("vertex/meta/llama3-405b").unwrap();
         assert!(url.contains("publishers/meta/models/llama3-405b"));
         assert_eq!(adapter.api_method(), "streamRawPredict");
 
         // Gemini 3 (Global endpoint fallback test)
-        let (_adapter, url) = provider.resolve_request_config("vertex/gemini-3.0-flash");
+        let (_adapter, url) = provider.resolve_request_config("vertex/gemini-3.0-flash").unwrap();
         assert!(url.contains("locations/global"));
         assert!(url.contains("publishers/google/models/gemini-3.0-flash"));
+
+        // SSRF Path Traversal test cases
+        assert!(provider.resolve_request_config("vertex/gemini-1.5-pro/../../something").is_err());
+        assert!(provider.resolve_request_config("gemini-1.5-pro%2f%2e%2e%2f").is_err());
+        assert!(provider.resolve_request_config("vertex/anthropic/claude-3-opus/../../").is_err());
+
+        // Missing default model test
+        let provider_no_default = VertexProvider::new("my-project".to_string(), "us-central1".to_string(), None);
+        assert!(provider_no_default.resolve_request_config("vertex/default").is_err());
     }
 
     #[test]
