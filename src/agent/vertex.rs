@@ -703,8 +703,6 @@ impl VertexProvider {
             clean_model
         };
 
-        // ... rest of logic uses effective_model
-
         let (publisher, model_id, adapter): (&str, &str, Box<dyn ResponseAdapter>) =
             if effective_model.starts_with("anthropic/") {
                 (
