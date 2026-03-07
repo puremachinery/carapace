@@ -483,7 +483,7 @@ impl ResponseAdapter for OpenAiAdapter {
 
             let mut text_parts = Vec::new();
             let mut tool_calls = Vec::new();
-            let mut tool_result: Option<Value> = None;
+            let mut tool_results = Vec::new();
 
             for block in &msg.content {
                 match block {
@@ -500,7 +500,7 @@ impl ResponseAdapter for OpenAiAdapter {
                     }
                     ContentBlock::ToolResult { tool_use_id, content, .. } => {
                         // Tool results are separate messages in OpenAI with role "tool"
-                        tool_result = Some(json!({
+                        tool_results.push(json!({
                             "role": "tool",
                             "tool_call_id": tool_use_id,
                             "content": content
@@ -509,15 +509,17 @@ impl ResponseAdapter for OpenAiAdapter {
                 }
             }
 
-            if let Some(tr) = tool_result {
-                 messages.push(tr);
-            } else {
+            if !text_parts.is_empty() || !tool_calls.is_empty() || tool_results.is_empty() {
                  let content_str = text_parts.join("\n");
                  let mut msg_obj = json!({ "role": role, "content": content_str });
                  if !tool_calls.is_empty() {
                      msg_obj["tool_calls"] = json!(tool_calls);
                  }
                  messages.push(msg_obj);
+            }
+
+            for tr in tool_results {
+                messages.push(tr);
             }
         }
         body["messages"] = json!(messages);
