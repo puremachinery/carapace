@@ -1148,7 +1148,7 @@ mod tests {
     fn test_openai_adapter_build_body() {
         let adapter = OpenAiAdapter;
         let request = CompletionRequest {
-            model: "vertex/meta/llama3-405b".to_string(),
+            model: "meta/llama3-405b".to_string(),
             messages: vec![
                 LlmMessage {
                     role: LlmRole::User,
@@ -1164,7 +1164,7 @@ mod tests {
 
         let body = adapter.build_body(&request);
 
-        assert_eq!(body["model"], "vertex/meta/llama3-405b");
+        assert_eq!(body["model"], "meta/llama3-405b");
         assert_eq!(body["stream"], true);
         assert_eq!(body["max_tokens"], 300);
         assert_eq!(body["messages"][0]["role"], "system");
