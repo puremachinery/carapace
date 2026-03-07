@@ -211,9 +211,9 @@ pub enum Command {
         #[arg(long)]
         project_id: Option<String>,
 
-        /// Vertex Location (optional, env: VERTEX_LOCATION, default: us-central1).
-        #[arg(long, default_value = "us-central1")]
-        location: String,
+        /// Vertex Location (optional, env: VERTEX_LOCATION).
+        #[arg(long)]
+        location: Option<String>,
     },
 }
 
@@ -1566,13 +1566,13 @@ fn current_time_ms() -> i64 {
 /// Run `list-models` subcommand.
 pub async fn handle_list_models(
     project_id: &Option<String>,
-    location: &str,
+    location: &Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Attempt to load config to fill in missing gaps
     let mut config_project_id = None;
     let mut config_location = None;
 
-    if project_id.is_none() || location == "us-central1" {
+    if project_id.is_none() || location.is_none() {
          if let Ok(cfg) = crate::config::load_config() {
              if let Some(vertex) = cfg.get("vertex") {
                  config_project_id = vertex.get("projectId").and_then(|v| v.as_str()).map(String::from);
@@ -1590,8 +1590,8 @@ pub async fn handle_list_models(
             .ok_or("Project ID is required. Set VERTEX_PROJECT_ID, pass --project-id, or configure in carapace.json5.")?
     };
 
-    let effective_location = if location != "us-central1" {
-        location.to_string()
+    let effective_location = if let Some(l) = location {
+        l.clone()
     } else {
         std::env::var("VERTEX_LOCATION")
             .ok()
