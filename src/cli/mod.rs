@@ -1609,7 +1609,7 @@ pub async fn handle_list_models(
         project.clone(),
         effective_location.clone(),
         None,
-    );
+    ).map_err(|e| format!("Failed to create Vertex provider: {}", e))?;
     let token = provider.get_token().await.map_err(|e| format!("Failed to get token: {}", e))?;
 
 

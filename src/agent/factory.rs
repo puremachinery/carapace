@@ -314,13 +314,17 @@ pub fn build_providers(cfg: &Value) -> Result<Option<MultiProvider>, Box<dyn std
             "LLM provider configured: Vertex (project: {}, location: {})",
             project_id, location
         );
-        Some(
-            Arc::new(agent::vertex::VertexProvider::new(
-                project_id,
-                location,
-                vertex_config.model,
-            )) as Arc<dyn agent::LlmProvider>,
-        )
+        match agent::vertex::VertexProvider::new(
+            project_id,
+            location,
+            vertex_config.model,
+        ) {
+            Ok(provider) => Some(Arc::new(provider) as Arc<dyn agent::LlmProvider>),
+            Err(e) => {
+                warn!("Failed to configure Vertex provider: {}", e);
+                None
+            }
+        }
     } else {
         None
     };

@@ -636,22 +636,24 @@ impl std::fmt::Debug for VertexProvider {
 }
 
 impl VertexProvider {
-    pub fn new(project_id: String, location: String, default_model: Option<String>) -> Self {
+    pub fn new(project_id: String, location: String, default_model: Option<String>) -> Result<Self, AgentError> {
         // Uses FallbackTokenProvider: tries gcloud CLI first and falls back to the metadata server.
         let token_manager: Arc<dyn TokenProvider> = Arc::new(FallbackTokenProvider::new());
 
-        Self {
-            client: reqwest::Client::builder()
-                .connect_timeout(Duration::from_secs(10))
-                .timeout(Duration::from_secs(300))
-                .build()
-                .expect("failed to build reqwest client"),
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(300))
+            .build()
+            .map_err(|e| AgentError::Provider(format!("failed to build HTTP client: {e}")))?;
+
+        Ok(Self {
+            client,
             project_id,
             location,
             token_manager,
             token_cache: Arc::new(RwLock::new(None)),
             default_model,
-        }
+        })
     }
 
     pub async fn get_token(&self) -> Result<String, AgentError> {
@@ -1173,7 +1175,7 @@ mod tests {
 
     #[test]
     fn test_resolve_request_config() {
-        let provider = VertexProvider::new("my-project".to_string(), "us-central1".to_string(), Some("gemini-1.5-flash".to_string()));
+        let provider = VertexProvider::new("my-project".to_string(), "us-central1".to_string(), Some("gemini-1.5-flash".to_string())).unwrap();
 
         // Gemini generic fallback
         let (_adapter, url) = provider.resolve_request_config("vertex/default").unwrap();
@@ -1206,7 +1208,7 @@ mod tests {
         assert!(provider.resolve_request_config("vertex/anthropic/claude-3-opus/../../").is_err());
 
         // Missing default model test
-        let provider_no_default = VertexProvider::new("my-project".to_string(), "us-central1".to_string(), None);
+        let provider_no_default = VertexProvider::new("my-project".to_string(), "us-central1".to_string(), None).unwrap();
         assert!(provider_no_default.resolve_request_config("vertex/default").is_err());
     }
 
