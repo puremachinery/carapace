@@ -119,198 +119,169 @@ impl TokenProvider for MetadataProvider {
 // Response Adapters
 // =================================================================================================
 
-/// Trait for adapting Vertex AI streaming responses from different model publishers.
-pub trait ResponseAdapter: Send + Sync + std::fmt::Debug {
-    /// Parse a raw SSE data chunk into a list of stream events.
-    fn parse_chunk(
-        &self,
-        data: &str,
-        accumulated_usage: &mut TokenUsage,
-    ) -> Result<Vec<StreamEvent>, String>;
+fn build_gemini_body(request: &CompletionRequest) -> Value {
+    let mut body = json!({});
 
-    /// Returns the API method to use (e.g. "streamGenerateContent" or "streamRawPredict").
-    fn api_method(&self) -> &'static str;
-
-    /// Build the JSON body for the request.
-    fn build_body(&self, request: &CompletionRequest) -> Value;
-}
-
-#[derive(Debug, Default)]
-pub struct GeminiAdapter;
-
-impl ResponseAdapter for GeminiAdapter {
-    fn api_method(&self) -> &'static str {
-        "streamGenerateContent"
+    // System instruction
+    if let Some(ref system) = request.system {
+        body["system_instruction"] = json!({
+            "parts": [{ "text": system }]
+        });
     }
 
-    fn build_body(&self, request: &CompletionRequest) -> Value {
-        let mut body = json!({});
+    // Convert LlmMessages to Gemini contents format
+    let mut contents: Vec<Value> = Vec::new();
 
-        // System instruction
-        if let Some(ref system) = request.system {
-            body["system_instruction"] = json!({
-                "parts": [{ "text": system }]
-            });
-        }
+    for msg in &request.messages {
+        let role = match msg.role {
+            LlmRole::User => "user",
+            LlmRole::Assistant => "model",
+        };
 
-        // Convert LlmMessages to Gemini contents format
-        let mut contents: Vec<Value> = Vec::new();
+        let mut parts: Vec<Value> = Vec::new();
 
-        for msg in &request.messages {
-            let role = match msg.role {
-                LlmRole::User => "user",
-                LlmRole::Assistant => "model",
-            };
-
-            let mut parts: Vec<Value> = Vec::new();
-
-            for block in &msg.content {
-                match block {
-                    ContentBlock::Text { text } => {
-                        parts.push(json!({ "text": text }));
-                    }
-                    ContentBlock::ToolUse { id: _, name, input } => {
-                        parts.push(json!({
-                            "functionCall": {
-                                "name": name,
-                                "args": input,
+        for block in &msg.content {
+            match block {
+                ContentBlock::Text { text } => {
+                    parts.push(json!({ "text": text }));
+                }
+                ContentBlock::ToolUse { id: _, name, input } => {
+                    parts.push(json!({
+                        "functionCall": {
+                            "name": name,
+                            "args": input,
+                        }
+                    }));
+                }
+                ContentBlock::ToolResult {
+                    tool_use_id: _,
+                    content,
+                    is_error: _,
+                } => {
+                    let tool_name = find_tool_name_for_result(&request.messages, block);
+                    parts.push(json!({
+                        "functionResponse": {
+                            "name": tool_name,
+                            "response": {
+                                "result": content,
                             }
-                        }));
-                    }
-                    ContentBlock::ToolResult {
-                        tool_use_id: _,
-                        content,
-                        is_error: _,
-                    } => {
-                        let tool_name = find_tool_name_for_result(&request.messages, block);
-                        parts.push(json!({
-                            "functionResponse": {
-                                "name": tool_name,
-                                "response": {
-                                    "result": content,
-                                }
-                            }
-                        }));
-                    }
+                        }
+                    }));
                 }
             }
-
-            if !parts.is_empty() {
-                contents.push(json!({
-                    "role": role,
-                    "parts": parts,
-                }));
-            }
         }
 
-        body["contents"] = json!(contents);
+        if !parts.is_empty() {
+            contents.push(json!({
+                "role": role,
+                "parts": parts,
+            }));
+        }
+    }
 
-        // Tools
-        if !request.tools.is_empty() {
-            let function_declarations: Vec<Value> = request
-                .tools
-                .iter()
-                .map(|t| {
-                    json!({
-                        "name": t.name,
-                        "description": t.description,
-                        "parameters": t.input_schema,
-                    })
+    body["contents"] = json!(contents);
+
+    // Tools
+    if !request.tools.is_empty() {
+        let function_declarations: Vec<Value> = request
+            .tools
+            .iter()
+            .map(|t| {
+                json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.input_schema,
                 })
-                .collect();
-            body["tools"] = json!([{
-                "function_declarations": function_declarations,
-            }]);
-        }
-
-        // Generation config
-        let mut generation_config = json!({
-            "maxOutputTokens": request.max_tokens,
-        });
-        if let Some(temp) = request.temperature {
-            generation_config["temperature"] = json!(temp);
-        }
-        body["generationConfig"] = generation_config;
-
-        body
+            })
+            .collect();
+        body["tools"] = json!([{
+            "function_declarations": function_declarations,
+        }]);
     }
 
-    fn parse_chunk(
-        &self,
-        data: &str,
-        accumulated_usage: &mut TokenUsage,
-    ) -> Result<Vec<StreamEvent>, String> {
-        let mut events = Vec::new();
-        // Parse the JSON data
-        let parsed: Value = match serde_json::from_str(data) {
-            Ok(v) => v,
-            Err(e) => return Err(format!("failed to parse JSON chunk: {}", e)),
-        };
-
-        if let Some(error) = parsed.get("error") {
-            let message = error
-                .get("message")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown API error")
-                .to_string();
-            return Ok(vec![StreamEvent::Error { message }]);
-        }
-
-        // Extract usage if present
-        extract_vertex_usage(&parsed, accumulated_usage);
-
-        // Extract candidates
-        let candidates = match parsed.get("candidates").and_then(|v| v.as_array()) {
-            Some(c) => c,
-            None => return Ok(events),
-        };
-
-        if candidates.is_empty() {
-            return Ok(events);
-        }
-
-        let candidate = &candidates[0];
-        let finish_reason = candidate.get("finishReason").and_then(|v| v.as_str());
-
-        // Extract content parts
-        let parts = candidate
-            .get("content")
-            .and_then(|c| c.get("parts"))
-            .and_then(|p| p.as_array());
-
-        if let Some(parts) = parts {
-            events.extend(collect_vertex_part_events(parts));
-        }
-
-        // Handle finish reason
-        if let Some(reason_str) = finish_reason {
-            let reason = match reason_str {
-                "STOP" => StopReason::EndTurn,
-                "MAX_TOKENS" => StopReason::MaxTokens,
-                "SAFETY" => StopReason::EndTurn,
-                _ => StopReason::EndTurn,
-            };
-
-            // Check if tool use happened
-            let has_tool_use =
-                parts.is_some_and(|p| p.iter().any(|x| x.get("functionCall").is_some()));
-            let stop_reason = if has_tool_use {
-                StopReason::ToolUse
-            } else {
-                reason
-            };
-
-            events.push(StreamEvent::Stop {
-                reason: stop_reason,
-                usage: *accumulated_usage,
-            });
-        }
-
-        Ok(events)
+    // Generation config
+    let mut generation_config = json!({
+        "maxOutputTokens": request.max_tokens,
+    });
+    if let Some(temp) = request.temperature {
+        generation_config["temperature"] = json!(temp);
     }
+    body["generationConfig"] = generation_config;
+
+    body
 }
 
+fn parse_gemini_chunk(
+    data: &str,
+    accumulated_usage: &mut TokenUsage,
+) -> Result<Vec<StreamEvent>, String> {
+    let mut events = Vec::new();
+    // Parse the JSON data
+    let parsed: Value = match serde_json::from_str(data) {
+        Ok(v) => v,
+        Err(e) => return Err(format!("failed to parse JSON chunk: {}", e)),
+    };
 
+    if let Some(error) = parsed.get("error") {
+        let message = error
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown API error")
+            .to_string();
+        return Ok(vec![StreamEvent::Error { message }]);
+    }
+
+    // Extract usage if present
+    extract_vertex_usage(&parsed, accumulated_usage);
+
+    // Extract candidates
+    let candidates = match parsed.get("candidates").and_then(|v| v.as_array()) {
+        Some(c) => c,
+        None => return Ok(events),
+    };
+
+    if candidates.is_empty() {
+        return Ok(events);
+    }
+
+    let candidate = &candidates[0];
+    let finish_reason = candidate.get("finishReason").and_then(|v| v.as_str());
+
+    // Extract content parts
+    let parts = candidate
+        .get("content")
+        .and_then(|c| c.get("parts"))
+        .and_then(|p| p.as_array());
+
+    if let Some(parts) = parts {
+        events.extend(collect_vertex_part_events(parts));
+    }
+
+    // Handle finish reason
+    if let Some(reason_str) = finish_reason {
+        let reason = match reason_str {
+            "STOP" => StopReason::EndTurn,
+            "MAX_TOKENS" => StopReason::MaxTokens,
+            "SAFETY" => StopReason::EndTurn,
+            _ => StopReason::EndTurn,
+        };
+
+        // Check if tool use happened
+        let has_tool_use = parts.is_some_and(|p| p.iter().any(|x| x.get("functionCall").is_some()));
+        let stop_reason = if has_tool_use {
+            StopReason::ToolUse
+        } else {
+            reason
+        };
+
+        events.push(StreamEvent::Stop {
+            reason: stop_reason,
+            usage: *accumulated_usage,
+        });
+    }
+
+    Ok(events)
+}
 
 // =================================================================================================
 // Vertex Provider
@@ -396,10 +367,7 @@ impl VertexProvider {
     /// - `vertex/anthropic/claude-3-opus` -> Anthropic, claude-3-opus, AnthropicAdapter
     /// - `vertex/meta/llama3-405b` -> Meta, llama3-405b, OpenAiAdapter
     /// - `vertex` (generic) -> `default_model` -> Resolve recursively
-    fn resolve_request_config(
-        &self,
-        model_name: &str,
-    ) -> Result<(Box<dyn ResponseAdapter>, String), AgentError> {
+    fn resolve_request_config(&self, model_name: &str) -> Result<String, AgentError> {
         let clean_model = strip_vertex_prefix(model_name);
 
         // Handle generic fallback
@@ -419,22 +387,20 @@ impl VertexProvider {
             clean_model
         };
 
-        let (publisher, model_id, adapter): (&str, &str, Box<dyn ResponseAdapter>) =
-            if effective_model.starts_with("google/") {
-                (
-                    "google",
-                    effective_model
-                        .strip_prefix("google/")
-                        .unwrap_or(effective_model),
-                    Box::new(GeminiAdapter),
-                )
-            } else if effective_model.starts_with("gemini-") {
-                // Models prefixed with "gemini-" are treated as Google Gemini models on Vertex AI.
-                ("google", effective_model, Box::new(GeminiAdapter))
-            } else {
-                // Fallback: treat other models as Google Gemini models within Vertex AI.
-                ("google", effective_model, Box::new(GeminiAdapter))
-            };
+        let (publisher, model_id): (&str, &str) = if effective_model.starts_with("google/") {
+            (
+                "google",
+                effective_model
+                    .strip_prefix("google/")
+                    .unwrap_or(effective_model),
+            )
+        } else if effective_model.starts_with("gemini-") {
+            // Models prefixed with "gemini-" are treated as Google Gemini models on Vertex AI.
+            ("google", effective_model)
+        } else {
+            // Fallback: treat other models as Google Gemini models within Vertex AI.
+            ("google", effective_model)
+        };
         // SSRF / Path Traversal Validation
         if model_id.is_empty()
             || !model_id
@@ -447,7 +413,7 @@ impl VertexProvider {
             )));
         }
 
-        let method = adapter.api_method();
+        let method = "streamGenerateContent";
 
         // Global endpoints for Gemini 3 and Experimental
         // These models are automatically routed to the global endpoint `aiplatform.googleapis.com`
@@ -457,14 +423,14 @@ impl VertexProvider {
                 "https://aiplatform.googleapis.com/v1beta1/projects/{}/locations/{}/publishers/{}/models/{}:{}?alt=sse",
                 self.project_id, "global", publisher, model_id, method
             );
-            return Ok((adapter, url));
+            return Ok(url);
         }
 
         let url = format!(
             "https://{}-aiplatform.googleapis.com/v1beta1/projects/{}/locations/{}/publishers/{}/models/{}:{}?alt=sse",
             self.location, self.project_id, self.location, publisher, model_id, method
         );
-        Ok((adapter, url))
+        Ok(url)
     }
 }
 
@@ -543,8 +509,8 @@ impl LlmProvider for VertexProvider {
         }
 
         let token = self.get_token().await?;
-        let (adapter, url) = self.resolve_request_config(&request.model)?;
-        let body = adapter.build_body(&request);
+        let url = self.resolve_request_config(&request.model)?;
+        let body = build_gemini_body(&request);
 
         let response = tokio::select! {
             _ = cancel_token.cancelled() => {
@@ -578,8 +544,7 @@ impl LlmProvider for VertexProvider {
         let cancel = cancel_token.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = process_vertex_sse_stream(stream, &tx, &cancel, adapter.as_ref()).await
-            {
+            if let Err(e) = process_vertex_sse_stream(stream, &tx, &cancel).await {
                 let _ = tx
                     .send(StreamEvent::Error {
                         message: e.to_string(),
@@ -602,7 +567,6 @@ async fn process_vertex_sse_stream<S>(
     mut stream: S,
     tx: &mpsc::Sender<StreamEvent>,
     cancel_token: &CancellationToken,
-    adapter: &dyn ResponseAdapter,
 ) -> Result<(), String>
 where
     S: futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
@@ -637,7 +601,7 @@ where
             consumed = newline_pos + 1;
 
             if let Some(data) = line.strip_prefix("data: ") {
-                match adapter.parse_chunk(data, &mut accumulated_usage) {
+                match parse_gemini_chunk(data, &mut accumulated_usage) {
                     Ok(events) => {
                         for event in events {
                             let is_stop = matches!(event, StreamEvent::Stop { .. });
@@ -709,8 +673,6 @@ fn collect_vertex_part_events(parts: &[Value]) -> Vec<StreamEvent> {
     events
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -738,7 +700,6 @@ mod tests {
 
     #[test]
     fn test_gemini_adapter_build_body() {
-        let adapter = GeminiAdapter;
         let request = CompletionRequest {
             model: "vertex/gemini-1.5-pro".to_string(),
             messages: vec![LlmMessage {
@@ -758,7 +719,7 @@ mod tests {
             extra: None,
         };
 
-        let body = adapter.build_body(&request);
+        let body = build_gemini_body(&request);
 
         assert_eq!(
             body["system_instruction"]["parts"][0]["text"],
@@ -774,8 +735,6 @@ mod tests {
         );
     }
 
-
-
     #[test]
     fn test_resolve_request_config() {
         let provider = VertexProvider::new(
@@ -786,21 +745,19 @@ mod tests {
         .unwrap();
 
         // Gemini generic fallback
-        let (_adapter, url) = provider.resolve_request_config("vertex/default").unwrap();
+        let url = provider.resolve_request_config("vertex/default").unwrap();
         assert!(url.contains("publishers/google/models/gemini-1.5-flash"));
         assert!(url.contains("us-central1"));
 
         // Gemini 1.5 specific
-        let (_adapter, url) = provider
+        let url = provider
             .resolve_request_config("vertex/gemini-1.5-pro")
             .unwrap();
         assert!(url.contains("publishers/google/models/gemini-1.5-pro"));
         assert!(url.contains("us-central1"));
 
-
-
         // Gemini 3 (Global endpoint fallback test)
-        let (_adapter, url) = provider
+        let url = provider
             .resolve_request_config("vertex/gemini-3.0-flash")
             .unwrap();
         assert!(url.contains("locations/global"));
@@ -814,7 +771,6 @@ mod tests {
             .resolve_request_config("gemini-1.5-pro%2f%2e%2e%2f")
             .is_err());
 
-
         // Missing default model test
         let provider_no_default =
             VertexProvider::new("my-project".to_string(), "us-central1".to_string(), None).unwrap();
@@ -823,11 +779,8 @@ mod tests {
             .is_err());
     }
 
-
-
     #[test]
     fn test_gemini_adapter_parsing() {
-        let adapter = GeminiAdapter;
         let mut usage = TokenUsage::default();
 
         // chunk with text
@@ -840,7 +793,7 @@ mod tests {
         })
         .to_string();
 
-        let events = adapter.parse_chunk(&data, &mut usage).unwrap();
+        let events = parse_gemini_chunk(&data, &mut usage).unwrap();
         assert_eq!(events.len(), 1);
         match &events[0] {
             StreamEvent::TextDelta { text } => assert_eq!(text, "Hello"),
@@ -859,12 +812,10 @@ mod tests {
             }
         })
         .to_string();
-        let events = adapter.parse_chunk(&data, &mut usage).unwrap();
+        let events = parse_gemini_chunk(&data, &mut usage).unwrap();
         // Should have Stop event
         assert!(events.iter().any(|e| matches!(e, StreamEvent::Stop { .. })));
         assert_eq!(usage.input_tokens, 10);
         assert_eq!(usage.output_tokens, 20);
     }
-
-
 }

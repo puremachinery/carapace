@@ -204,8 +204,6 @@ pub enum Command {
     /// Manage mTLS certificates for gateway-to-gateway communication.
     #[command(subcommand)]
     Tls(TlsCommand),
-
-
 }
 
 #[derive(Subcommand, Debug)]
@@ -1553,7 +1551,6 @@ fn current_time_ms() -> i64 {
         .unwrap_or_default()
         .as_millis() as i64
 }
-
 
 fn ws_url_from_http(url: &Url) -> Result<String, Box<dyn std::error::Error>> {
     let scheme = match url.scheme() {
