@@ -1587,7 +1587,7 @@ pub async fn handle_list_models(
         std::env::var("VERTEX_PROJECT_ID")
             .ok()
             .or(config_project_id)
-            .ok_or("Project ID is required. Set VERTEX_PROJECT_ID, pass --project-id, or configure in carapace.toml.")?
+            .ok_or("Project ID is required. Set VERTEX_PROJECT_ID, pass --project-id, or configure in carapace.json5.")?
     };
 
     let effective_location = if location != "us-central1" {
