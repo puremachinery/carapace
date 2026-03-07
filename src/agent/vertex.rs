@@ -630,16 +630,7 @@ impl std::fmt::Debug for VertexProvider {
 
 impl VertexProvider {
     pub fn new(project_id: String, location: String, default_model: Option<String>) -> Self {
-        // Determine auth strategy: check if gcloud is available, otherwise assume metadata
-        // For simplicity and robustness, we can try to detect or just default to a composite strategy.
-        // But per plan: "The provider will attempt to use GCloudCliProvider first. If gcloud is not found (NotFound), it falls back to MetadataProvider."
-        // We can't easily detect "NotFound" without running it.
-        // So we'll wrap a composite provider? Or just pick one?
-        // Let's implement a composite strategy inside `get_token` or use a trait object that does fallback.
-        // Actually, checking for gcloud existence is a bit racy or slow to do in `new`.
-        // Let's just default to GCloudCli for now as most users are local, AND verify if we are in cloud?
-        // The plan said: "If gcloud is not found (NotFound), it falls back".
-        // Let's make a `CompositeTokenProvider`.
+        // Uses FallbackTokenProvider: tries gcloud CLI first and falls back to the metadata server.
         let token_manager: Arc<dyn TokenProvider> = Arc::new(FallbackTokenProvider::new());
 
         Self {
