@@ -614,8 +614,9 @@ mod tests {
             });
             let fp = fingerprint_providers(&cfg);
             assert!(fp.bedrock.is_some());
-            let expected_hash = hash_key_prefix("us-east-1AKIAIOSFODNN7EXAMPLE");
-            assert_eq!(fp.bedrock.as_deref(), Some(expected_hash.as_str()));
+            let combined = format!("{}{}", "us-east-1", "AKIAIOSFODNN7EXAMPLE");
+            let expected_hash = hash_key_prefix(&combined);
+            assert_eq!(fp.bedrock, Some(expected_hash));
         });
     }
 
