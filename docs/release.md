@@ -13,20 +13,23 @@ Do not post vulnerability details in public issues.
 
 ## Compatibility Statement
 
-Current status: Carapace is still in preview.
+Current status: Carapace ships a stable release line, beginning with `v0.1.0`.
 
-- Preview tags (`vX.Y.Z-previewN`) are best-effort compatibility.
-- Before upgrading between preview tags, take a backup.
-- If an upgrade is not compatible with existing local state, release notes must
-  call this out with explicit migration/rollback steps.
-
-Stable-release compatibility policy (effective at first non-preview release):
+Stable-release compatibility policy is active:
 
 - Compatibility target is **N-1 -> N** for stable releases only.
   - Example: `v0.2.0` must support data/config from `v0.1.x` stable releases.
   - Preview tags are explicitly out of contract.
 - Every stable release note must include migration + rollback sections.
 - Any incompatible change must be explicitly called out in `Breaking Changes`.
+
+Historical preview-tag guidance:
+
+- Preview tags (`vX.Y.Z-previewN`) are best-effort compatibility only.
+- Before upgrading between preview tags or from preview to stable, take a
+  backup.
+- If an upgrade is not compatible with existing local state, release notes must
+  call this out with explicit migration/rollback steps.
 
 ### Versioned N-1 Contract (stable channel)
 
@@ -136,9 +139,10 @@ Every release should include these sections:
 2. Confirm no open critical/high security findings on `master`.
 3. Confirm docs are current for install, ops, and security behavior.
 4. Create annotated tag from `master`:
-   - `git tag -a vX.Y.Z-previewN -m "vX.Y.Z-previewN"`
+   - `git tag -a vX.Y.Z -m "vX.Y.Z"`
 5. Push tag:
-   - `git push origin vX.Y.Z-previewN`
+   - `git push origin vX.Y.Z`
+   - For intentional prereleases only: `vX.Y.Z-previewN`
 6. Wait for `.github/workflows/release.yml` to complete.
 7. Verify release artifacts are published (all target binaries + signatures +
    checksums).

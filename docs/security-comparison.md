@@ -113,7 +113,10 @@ Rust does not help with logic bugs, auth bypass, or prompt injection. Those requ
 
 ## Honest Caveats
 
-Carapace is in preview. The security architecture is real and tested (large automated test coverage with multi-platform CI), but some items are incomplete. Verified-vs-partial feature state is tracked in `docs/feature-status.yaml` and `docs/feature-evidence.yaml`:
+Carapace ships a stable release line. The security architecture is real and
+tested (large automated test coverage with multi-platform CI), but some items
+remain partial or incomplete. Verified-vs-partial feature state is tracked in
+`docs/feature-status.yaml` and `docs/feature-evidence.yaml`:
 
 - **Platform backend coverage.** Seatbelt/Landlock/Windows AppContainer+Job subprocess wiring is implemented across probe/tailscale/whois/SSH tunnel callsites. Unsupported targets still fail closed. On Windows, deny-network execution is supported through command-output helpers, while spawned deny-network subprocess requests fail closed.
 - **Control UI.** Foundation is shipped (`/ui` auth/session handling, status/channels, redacted config read + safe patch path, task operator actions, pairing flow). Richer operator workflows and UX refinements remain in-progress.

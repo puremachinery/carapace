@@ -187,13 +187,13 @@ HTML_MIDDLE
 HTML_CTA
     fi
 
-    cat <<'HTML_FOOT'
+    cat <<HTML_FOOT
     </main>
 
     <footer class="site-footer">
       <p>Carapace by PureMachinery.</p>
       <nav class="footer-links">
-        <a href="https://github.com/puremachinery/carapace/blob/main/SECURITY.md">Security policy</a>
+        <a href="${rel_prefix_html}/security-policy.html">Security policy</a>
         <a href="https://github.com/puremachinery/carapace/issues/new/choose">Report an issue</a>
       </nav>
     </footer>

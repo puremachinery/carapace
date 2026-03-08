@@ -40,6 +40,7 @@ jobs:
               - "docs/**"
               - "**/*.md"
               - "website/**"
+              - "scripts/check-docs-state-messaging.sh"
               - "LICENSE"
             workflow:
               - ".github/workflows/**"
@@ -345,6 +346,8 @@ jobs:
             echo "Found tab characters in Markdown files; please use spaces."
             exit 1
           fi
+      - name: Verify current docs/site state messaging
+        run: ./scripts/check-docs-state-messaging.sh
 
   control-ui-sync:
     name: Control UI Dist Sync

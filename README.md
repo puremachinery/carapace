@@ -1,6 +1,6 @@
 # carapace
 
-> **Under active development.** Kicking the tires is welcome, but don't expect everything to work yet.
+> **Stable release available.** Carapace is ready for real use on its verified stable paths; partial and in-progress areas are called out explicitly in the docs.
 
 A security-focused, open-source personal AI assistant. Runs on your machine. Works through Signal, Telegram, Discord, Slack, webhooks, and console. Supports Anthropic, OpenAI, Ollama, Gemini, Bedrock, and Venice AI. Extensible via WASM plugins. Written in Rust.
 
@@ -70,9 +70,10 @@ Use `/help` in chat for REPL commands (`/new`, `/exit`, `/quit`).
 If you use cloud models, set one provider key before launching (for example
 `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_API_KEY`, or `VENICE_API_KEY`).
 
-## Status (Preview)
+## Status
 
-This project is in preview. Core paths are tested and verified, but expect gaps.
+Carapace ships a stable release line. Core paths are tested and verified for
+routine use, while partial and in-progress areas remain explicitly documented.
 
 - Working now: setup wizard, local chat (`cara chat`), token auth enforcement,
   health/control endpoints (including durable task controls), control UI
@@ -88,10 +89,11 @@ of truth.
 ## Roadmap
 
 - [Roadmap](docs/roadmap.md) — what we're building now, next, and later
-- Up next: advanced Control UI flows and stable release gate
-- Recently shipped: long-running assistant MVP (durable queue + autonomy verify),
-  cross-platform subprocess sandboxing, guided setup (`cara setup`), and
-  first-run verifier (`cara verify`)
+- Up next: subscription-style provider onboarding, advanced Control UI flows,
+  and docs architecture polish
+- Recently shipped: first stable release, long-running assistant MVP (durable
+  queue + autonomy verify), cross-platform subprocess sandboxing, guided setup
+  (`cara setup`), and first-run verifier (`cara verify`)
 
 ## Docs
 

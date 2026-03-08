@@ -52,7 +52,8 @@ Quick checks:
 
 ## 4) Trust model and caveats
 
-Carapace is preview software. Verified and partial feature status is tracked in:
+Carapace ships a stable release line. Verified and partial feature status is
+tracked in:
 
 - [`docs/feature-status.yaml`](../feature-status.yaml)
 - [`docs/feature-evidence.yaml`](../feature-evidence.yaml)

@@ -7,9 +7,19 @@ on:
       - "website/**"
       - "docs/cookbook/**"
       - "docs/getting-started.md"
+      - "docs/release.md"
+      - "docs/cli.md"
+      - "docs/channels.md"
+      - "docs/channel-smoke.md"
+      - "docs/security.md"
+      - "docs/security-comparison.md"
+      - "docs/feature-status.yaml"
+      - "docs/feature-evidence.yaml"
       - "docs/site/**"
+      - "SECURITY.md"
       - "scripts/build-pages-content.sh"
       - "scripts/check-pages-links.sh"
+      - "scripts/check-docs-state-messaging.sh"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
 
@@ -34,6 +44,9 @@ jobs:
           rm -rf public
           mkdir -p public
           cp -R website/. public/
+
+      - name: Verify current docs/site state messaging
+        run: ./scripts/check-docs-state-messaging.sh
 
       - name: Install Pandoc
         run: |

@@ -299,14 +299,14 @@ Response:
 ```json
 {
   "ok": true,
-  "version": "0.1.0-previewX",
+  "version": "X.Y.Z",
   "startedAt": "2026-02-24T00:00:00Z",
   "uptimeSeconds": 123,
   "connectedChannels": 1,
   "totalChannels": 2,
   "runtime": {
     "name": "carapace",
-    "version": "0.1.0-previewX",
+    "version": "X.Y.Z",
     "platform": "linux",
     "arch": "x86_64"
   },
