@@ -29,8 +29,14 @@ stale_phrases=(
 
 failed=0
 
+if command -v rg >/dev/null 2>&1; then
+  search_cmd=(rg -n --fixed-strings)
+else
+  search_cmd=(grep -RInF --exclude-dir=.git)
+fi
+
 for phrase in "${stale_phrases[@]}"; do
-  if rg -n --fixed-strings "${phrase}" "${scan_paths[@]}"; then
+  if "${search_cmd[@]}" "${phrase}" "${scan_paths[@]}"; then
     echo >&2
     echo "Stale docs/site messaging found: ${phrase}" >&2
     failed=1
