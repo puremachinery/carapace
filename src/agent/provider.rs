@@ -233,11 +233,19 @@ impl MultiProvider {
                 ))
             })
         } else if crate::agent::gemini::is_gemini_model(model) {
-            self.gemini.as_deref().ok_or_else(|| {
-                AgentError::Provider(format!(
+            if self.gemini.is_some() {
+                self.gemini
+                    .as_deref()
+                    .ok_or_else(|| AgentError::Provider("".to_string()))
+            } else if self.vertex.is_some() {
+                self.vertex
+                    .as_deref()
+                    .ok_or_else(|| AgentError::Provider("".to_string()))
+            } else {
+                Err(AgentError::Provider(format!(
                     "model \"{model}\" requires Gemini provider, but no GOOGLE_API_KEY is configured"
-                ))
-            })
+                )))
+            }
         } else if crate::agent::openai::is_openai_model(model) {
             self.openai.as_deref().ok_or_else(|| {
                 AgentError::Provider(format!(
@@ -252,11 +260,19 @@ impl MultiProvider {
             })
         } else {
             // Default to Anthropic for claude-* and unknown models
-            self.anthropic.as_deref().ok_or_else(|| {
-                AgentError::Provider(format!(
+            if self.anthropic.is_some() {
+                self.anthropic
+                    .as_deref()
+                    .ok_or_else(|| AgentError::Provider("".to_string()))
+            } else if model == crate::agent::DEFAULT_MODEL && self.vertex.is_some() {
+                self.vertex
+                    .as_deref()
+                    .ok_or_else(|| AgentError::Provider("".to_string()))
+            } else {
+                Err(AgentError::Provider(format!(
                     "model \"{model}\" requires Anthropic provider, but no ANTHROPIC_API_KEY is configured"
-                ))
-            })
+                )))
+            }
         }
     }
 }
@@ -298,6 +314,15 @@ impl LlmProvider for MultiProvider {
         // so the Vertex API receives the bare model name (e.g. "gemini-2.0-flash").
         if request.model.starts_with("vertex/") || request.model.starts_with("vertex:") {
             request.model = crate::agent::vertex::strip_vertex_prefix(&request.model).to_string();
+        }
+
+        // If the request is for the global fallback DEFAULT_MODEL, and Anthropic is NOT configured
+        // but Vertex IS configured, we change the model to "default" so it runs Vertex's configured default model!
+        if request.model == crate::agent::DEFAULT_MODEL
+            && self.anthropic.is_none()
+            && self.vertex.is_some()
+        {
+            request.model = "default".to_string();
         }
 
         provider.complete(request, cancel_token).await

@@ -257,6 +257,16 @@ pub fn load_config_uncached(path: &Path) -> Result<Value, ConfigError> {
     Ok(value)
 }
 
+/// Save the configuration back to disk.
+pub fn save_config(config: &Value) -> std::io::Result<()> {
+    let path = get_config_path();
+    // We write standard JSON back out, which is valid JSON5.
+    let content = serde_json::to_string_pretty(config)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    fs::write(path, content)?;
+    Ok(())
+}
+
 /// Parse JSON5 content
 fn parse_json5(content: &str, path: &Path) -> Result<Value, ConfigError> {
     json5::from_str(content).map_err(|e| ConfigError::ParseError {
@@ -985,6 +995,27 @@ mod tests {
     fn test_clear_cache() {
         // Just verify it doesn't panic
         clear_cache();
+    }
+
+    #[test]
+    fn test_save_config() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("carapace.json5");
+        env::set_var("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
+
+        let config = serde_json::json!({
+            "gateway": { "port": 1234 }
+        });
+
+        // Save it
+        save_config(&config).unwrap();
+
+        // Load it
+        let loaded = load_config_uncached(&config_path).unwrap();
+        assert_eq!(loaded["gateway"]["port"], 1234);
+
+        env::remove_var("CARAPACE_CONFIG_PATH");
     }
 
     #[test]

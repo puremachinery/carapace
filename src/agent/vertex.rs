@@ -374,7 +374,7 @@ impl VertexProvider {
         let token = self.token_manager.fetch_token().await?;
         *cache = Some(CachedToken {
             token: token.clone(),
-            expires_at: Instant::now() + Duration::from_secs(3600), // Assume 1 hour validity
+            expires_at: Instant::now() + Duration::from_secs(240), // GCP Metadata refreshes tokens 5 mins before expiration. Caching for 4 mins is mathematically safe.
         });
 
         Ok(token)

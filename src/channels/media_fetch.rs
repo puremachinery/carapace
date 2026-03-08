@@ -173,6 +173,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::result_large_err)]
     fn resolve_and_validate_dns_inside_current_thread_runtime_is_panic_free() {
         let ssrf_config = SsrfConfig::default();
         let rt = tokio::runtime::Builder::new_current_thread()
