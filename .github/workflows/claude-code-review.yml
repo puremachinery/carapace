@@ -21,12 +21,9 @@ jobs:
 
     runs-on: ubuntu-latest
     permissions:
-      # anthropics/claude-code-action exchanges the job OIDC token for a GitHub
-      # app token using write-level defaults; keep the workflow grant aligned so
-      # the exchange succeeds and the deterministic publish step can post once.
-      contents: write
-      pull-requests: write
-      issues: write
+      contents: read
+      pull-requests: read
+      issues: read
       id-token: write
       actions: read
 
