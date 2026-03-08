@@ -324,7 +324,7 @@ impl VertexProvider {
 
         static LOCATION_REGEX: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
         let location_re = LOCATION_REGEX
-            .get_or_init(|| regex::Regex::new(r"^[a-z]+-[a-z]+\d+$").unwrap());
+            .get_or_init(|| regex::Regex::new(r"^[a-z]+(?:-[a-z]+)+\d+$").unwrap());
         if !location_re.is_match(&location) {
             return Err(AgentError::Provider(format!(
                 "Invalid GCP location: {}",
@@ -824,6 +824,22 @@ mod tests {
             None
         )
         .is_err());
+
+        // Valid location (multi-hyphen region)
+        assert!(VertexProvider::new(
+            "my-project".to_string(),
+            "northamerica-northeast1".to_string(),
+            None
+        )
+        .is_ok());
+
+        // Valid location (another multi-hyphen region name)
+        assert!(VertexProvider::new(
+            "my-project".to_string(),
+            "southamerica-east1".to_string(),
+            None
+        )
+        .is_ok());
 
         // Invalid location (no numbers)
         assert!(VertexProvider::new(
