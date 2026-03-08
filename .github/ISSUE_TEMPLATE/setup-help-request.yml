@@ -42,11 +42,11 @@ body:
     attributes:
       label: First outcome you want working
       options:
-        - local chat
+        - local chat (`local-chat`)
         - OpenAI-compatible endpoint
         - Discord
         - Telegram
-        - Hooks / automation
+        - Hooks / automation (`hooks`)
         - Other
     validations:
       required: true
@@ -121,4 +121,3 @@ body:
       label: What you already tried
       description: Commands, docs, or recipes you already used.
       placeholder: I followed First Run, exported ANTHROPIC_API_KEY, and ran `cara setup`, but `cara verify --outcome auto` still says no provider available.
-

@@ -26,10 +26,14 @@ choose `local-chat` as the first outcome and add channels only after
 
 ### Anthropic / OpenAI (fastest cloud path)
 
+Pick one of these, not both:
+
 ```bash
 export ANTHROPIC_API_KEY='...'
 cara setup
 ```
+
+Or:
 
 ```bash
 export OPENAI_API_KEY='...'
