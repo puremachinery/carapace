@@ -436,15 +436,15 @@ impl VertexProvider {
 
 #[derive(Debug)]
 struct FallbackTokenProvider {
-    primary: Box<dyn TokenProvider>,
-    fallback: Box<dyn TokenProvider>,
+    primary: GCloudCliProvider,
+    fallback: MetadataProvider,
 }
 
 impl FallbackTokenProvider {
     fn new() -> Self {
         Self {
-            primary: Box::new(GCloudCliProvider),
-            fallback: Box::new(MetadataProvider::new()),
+            primary: GCloudCliProvider,
+            fallback: MetadataProvider::new(),
         }
     }
 }
@@ -464,23 +464,23 @@ impl TokenProvider for FallbackTokenProvider {
     }
 }
 
-fn find_tool_name_for_result(messages: &[LlmMessage], block: &ContentBlock) -> String {
+fn find_tool_name_for_result<'a>(messages: &'a [LlmMessage], block: &ContentBlock) -> &'a str {
     let target_id = match block {
         ContentBlock::ToolResult { tool_use_id, .. } => tool_use_id,
-        _ => return "unknown".to_string(),
+        _ => return "unknown",
     };
 
     for msg in messages.iter().rev() {
         for b in &msg.content {
             if let ContentBlock::ToolUse { id, name, .. } = b {
                 if id == target_id {
-                    return name.clone();
+                    return name;
                 }
             }
         }
     }
 
-    "unknown".to_string()
+    "unknown"
 }
 
 pub fn strip_vertex_prefix(model: &str) -> &str {
