@@ -2420,6 +2420,154 @@ fn parse_setup_outcome(raw: &str) -> Option<SetupOutcome> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetupProvider {
+    Anthropic,
+    OpenAi,
+}
+
+impl SetupProvider {
+    fn prompt_key(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::OpenAi => "openai",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Anthropic => "Anthropic",
+            Self::OpenAi => "OpenAI",
+        }
+    }
+
+    fn api_key_env_var(self) -> &'static str {
+        match self {
+            Self::Anthropic => "ANTHROPIC_API_KEY",
+            Self::OpenAi => "OPENAI_API_KEY",
+        }
+    }
+
+    fn default_model(self) -> &'static str {
+        match self {
+            Self::Anthropic => "claude-sonnet-4-20250514",
+            Self::OpenAi => "gpt-4o",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetupProviderEnvState {
+    None,
+    AnthropicOnly,
+    OpenAiOnly,
+    Both,
+}
+
+impl SetupProviderEnvState {
+    fn default_provider(self) -> SetupProvider {
+        match self {
+            Self::OpenAiOnly => SetupProvider::OpenAi,
+            Self::None | Self::AnthropicOnly | Self::Both => SetupProvider::Anthropic,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProviderConfigStatus {
+    provider: SetupProvider,
+    env_var: Option<String>,
+    env_present: bool,
+}
+
+fn env_var_present(key: &str) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+}
+
+fn detect_setup_provider_env_state() -> SetupProviderEnvState {
+    match (
+        env_var_present("ANTHROPIC_API_KEY"),
+        env_var_present("OPENAI_API_KEY"),
+    ) {
+        (true, true) => SetupProviderEnvState::Both,
+        (true, false) => SetupProviderEnvState::AnthropicOnly,
+        (false, true) => SetupProviderEnvState::OpenAiOnly,
+        (false, false) => SetupProviderEnvState::None,
+    }
+}
+
+fn extract_env_placeholder_key(value: &str) -> Option<String> {
+    value
+        .trim()
+        .strip_prefix("${")
+        .and_then(|trimmed| trimmed.strip_suffix('}'))
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn configured_provider_status(
+    cfg: &Value,
+    provider: SetupProvider,
+) -> Option<ProviderConfigStatus> {
+    let api_key = cfg
+        .get(provider.prompt_key())
+        .and_then(|value| value.get("apiKey"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+
+    let env_var = extract_env_placeholder_key(api_key);
+    let env_present = env_var.as_deref().map(env_var_present).unwrap_or(false);
+
+    Some(ProviderConfigStatus {
+        provider,
+        env_var,
+        env_present,
+    })
+}
+
+fn configured_provider_statuses(cfg: &Value) -> Vec<ProviderConfigStatus> {
+    [SetupProvider::Anthropic, SetupProvider::OpenAi]
+        .into_iter()
+        .filter_map(|provider| configured_provider_status(cfg, provider))
+        .collect()
+}
+
+fn local_chat_verify_next_step(cfg: &Value) -> String {
+    let providers = configured_provider_statuses(cfg);
+    match providers.as_slice() {
+        [] => "run `cara setup --force`, choose one provider, keep `local-chat`, then retry `cara verify --outcome local-chat`".to_string(),
+        [provider] => {
+            if let Some(env_var) = provider.env_var.as_deref() {
+                if !provider.env_present {
+                    return format!(
+                        "set `${env_var}` in the same shell you use for `cara start` and `cara verify`, or rerun `cara setup --force` to write the key into config, then retry `cara verify --outcome local-chat`"
+                    );
+                }
+            }
+            format!(
+                "check {} API key/model and retry `cara verify --outcome local-chat`",
+                provider.provider.label()
+            )
+        }
+        _ => "multiple provider configs detected; keep one provider for first run or rerun `cara setup --force`, then retry `cara verify --outcome local-chat`".to_string(),
+    }
+}
+
+fn verify_failure_follow_up_url(outcome: VerifyOutcome) -> &'static str {
+    match outcome {
+        VerifyOutcome::Discord => "https://getcara.io/cookbook/discord-assistant.html",
+        VerifyOutcome::Telegram => "https://getcara.io/cookbook/telegram-webhook-assistant.html",
+        VerifyOutcome::Hooks | VerifyOutcome::LocalChat | VerifyOutcome::Autonomy => {
+            "https://getcara.io/help.html#guided-setup-help"
+        }
+    }
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, Default)]
 struct SetupInteractiveTestHarness {
@@ -2542,7 +2690,7 @@ fn stdin_is_interactive() -> bool {
 fn prompt_setup_outcome() -> Result<SetupOutcome, Box<dyn std::error::Error>> {
     loop {
         let selection = prompt_with_default(
-            "Pick your first-run outcome (local-chat/discord/telegram/hooks)",
+            "Pick your first-run outcome (fastest path: local-chat/discord/telegram/hooks)",
             SetupOutcome::LocalChat.prompt_key(),
         )?;
         if let Some(outcome) = parse_setup_outcome(&selection) {
@@ -2579,7 +2727,14 @@ fn print_setup_outcome_next_steps(outcome: SetupOutcome, port: u16, hooks_enable
     match outcome {
         SetupOutcome::LocalChat => {
             println!("First-run outcome: local assistant chat");
-            println!("Next step: run `cara chat --port {port}` when the service is up.");
+            println!(
+                "Next step: run `cara verify --outcome local-chat --port {port}` once the service is up."
+            );
+            println!("Then open chat with `cara chat --port {port}`.");
+            println!(
+                "Need step-by-step help? {}",
+                verify_failure_follow_up_url(VerifyOutcome::LocalChat)
+            );
         }
         SetupOutcome::Discord => {
             println!("First-run outcome: Discord assistant");
@@ -3216,6 +3371,7 @@ fn summarize_http_failure_body(status: reqwest::StatusCode, body: &str) -> Strin
 
 async fn verify_local_chat_outcome(
     port: u16,
+    cfg: &Value,
     checks: &mut Vec<VerifyCheckResult>,
 ) -> Result<(), String> {
     let mut setup_server_handle = match chat::ensure_local_gateway_running(port).await {
@@ -3257,7 +3413,7 @@ async fn verify_local_chat_outcome(
             checks.push(VerifyCheckResult::fail(
                 "Local chat roundtrip",
                 err,
-                "check provider API key/model and retry `cara verify --outcome local-chat`",
+                local_chat_verify_next_step(cfg),
             ));
             return Err("outcome verification failed".to_string());
         }
@@ -3792,7 +3948,7 @@ async fn run_outcome_verifier(
     let telegram_to = normalize_optional_input(telegram_to);
 
     let result = match outcome {
-        VerifyOutcome::LocalChat => verify_local_chat_outcome(port, &mut checks).await,
+        VerifyOutcome::LocalChat => verify_local_chat_outcome(port, &cfg, &mut checks).await,
         VerifyOutcome::Hooks => verify_hooks_outcome(port, &cfg, &mut checks).await,
         VerifyOutcome::Discord | VerifyOutcome::Telegram => {
             verify_channel_outcome(outcome, &cfg, discord_to, telegram_to, &mut checks).await
@@ -3801,6 +3957,7 @@ async fn run_outcome_verifier(
     };
     if let Err(err) = result {
         print_verify_summary(outcome, port, &checks);
+        println!("Next help path: {}", verify_failure_follow_up_url(outcome));
         return Err(err);
     }
 
@@ -3930,33 +4087,40 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
     if interactive {
         println!("Carapace setup wizard");
         println!("---------------------");
+        println!(
+            "Fastest first-run path: pick one provider, keep `local-chat`, then run `cara verify --outcome local-chat`."
+        );
         let hide_sensitive_input = prompt_yes_no("Hide sensitive input while typing?", true)?;
 
-        let default_provider = if std::env::var("ANTHROPIC_API_KEY").is_ok() {
-            "anthropic"
-        } else if std::env::var("OPENAI_API_KEY").is_ok() {
-            "openai"
-        } else {
-            "anthropic"
-        };
+        let provider_env_state = detect_setup_provider_env_state();
+        if matches!(provider_env_state, SetupProviderEnvState::Both) {
+            eprintln!("Both $ANTHROPIC_API_KEY and $OPENAI_API_KEY are set.");
+            eprintln!(
+                "Pick one provider for first run; setup will only write the provider you choose."
+            );
+        }
+        let default_provider = provider_env_state.default_provider().prompt_key();
 
         let provider = loop {
-            let selection =
-                prompt_with_default("Select provider (anthropic/openai)", default_provider)?;
+            let selection = prompt_with_default(
+                "Select provider for first run (pick one: anthropic/openai)",
+                default_provider,
+            )?;
             let normalized = selection.trim().to_lowercase();
             match normalized.as_str() {
-                "anthropic" | "claude" => break "anthropic",
-                "openai" | "gpt" => break "openai",
+                "anthropic" | "claude" => break SetupProvider::Anthropic,
+                "openai" | "gpt" => break SetupProvider::OpenAi,
                 _ => eprintln!("Please enter either \"anthropic\" or \"openai\"."),
             }
         };
 
-        let (env_var, default_model) = match provider {
-            "openai" => ("OPENAI_API_KEY", "gpt-4o"),
-            _ => ("ANTHROPIC_API_KEY", "claude-sonnet-4-20250514"),
-        };
+        let env_var = provider.api_key_env_var();
+        let default_model = provider.default_model();
 
-        let env_key = std::env::var(env_var).ok();
+        let env_key = std::env::var(env_var)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
         let mut effective_api_key = None;
         let api_key = if env_key.is_some() {
             let use_env = prompt_yes_no(&format!("Use API key from ${env_var}?"), true)?;
@@ -3983,11 +4147,13 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
         };
 
         if api_key.is_none() {
-            println!("No API key provided. You can set it later via ${env_var}.");
+            println!(
+                "No API key provided. Set ${env_var} in the same shell you use for `cara start` and `cara verify`, or rerun `cara setup --force` later."
+            );
         }
 
         if let Some(key) = effective_api_key.as_deref() {
-            validate_provider_credentials_interactive(provider, key)?;
+            validate_provider_credentials_interactive(provider.prompt_key(), key)?;
         }
 
         let auth_mode = prompt_choice(
@@ -4105,11 +4271,11 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
 
         config["agents"]["defaults"]["model"] = serde_json::json!(default_model);
         match provider {
-            "openai" => {
+            SetupProvider::OpenAi => {
                 let value = api_key.clone().unwrap_or_else(|| format!("${{{env_var}}}"));
                 config["openai"] = serde_json::json!({ "apiKey": value });
             }
-            _ => {
+            SetupProvider::Anthropic => {
                 let value = api_key.clone().unwrap_or_else(|| format!("${{{env_var}}}"));
                 config["anthropic"] = serde_json::json!({ "apiKey": value });
             }
@@ -6059,6 +6225,97 @@ mod tests {
     fn test_parse_setup_outcome_invalid() {
         assert_eq!(parse_setup_outcome(""), None);
         assert_eq!(parse_setup_outcome("unknown"), None);
+    }
+
+    #[test]
+    fn test_detect_setup_provider_env_state() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let _anthropic_guard = unset_env_var_scoped("ANTHROPIC_API_KEY");
+        let _openai_guard = unset_env_var_scoped("OPENAI_API_KEY");
+        assert_eq!(
+            detect_setup_provider_env_state(),
+            SetupProviderEnvState::None
+        );
+
+        let _anthropic_guard = set_env_var_scoped("ANTHROPIC_API_KEY", "sk-anthropic");
+        assert_eq!(
+            detect_setup_provider_env_state(),
+            SetupProviderEnvState::AnthropicOnly
+        );
+
+        let _anthropic_guard = unset_env_var_scoped("ANTHROPIC_API_KEY");
+        let _openai_guard = set_env_var_scoped("OPENAI_API_KEY", "sk-openai");
+        assert_eq!(
+            detect_setup_provider_env_state(),
+            SetupProviderEnvState::OpenAiOnly
+        );
+
+        let _anthropic_guard = set_env_var_scoped("ANTHROPIC_API_KEY", "sk-anthropic");
+        assert_eq!(
+            detect_setup_provider_env_state(),
+            SetupProviderEnvState::Both
+        );
+    }
+
+    #[test]
+    fn test_local_chat_verify_next_step_without_provider_config() {
+        let cfg = serde_json::json!({});
+        assert_eq!(
+            local_chat_verify_next_step(&cfg),
+            "run `cara setup --force`, choose one provider, keep `local-chat`, then retry `cara verify --outcome local-chat`"
+        );
+    }
+
+    #[test]
+    fn test_local_chat_verify_next_step_for_missing_provider_env_var() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let _env_guard = unset_env_var_scoped("ANTHROPIC_API_KEY");
+        let cfg = serde_json::json!({
+            "anthropic": { "apiKey": "${ANTHROPIC_API_KEY}" }
+        });
+        assert_eq!(
+            local_chat_verify_next_step(&cfg),
+            "set `$ANTHROPIC_API_KEY` in the same shell you use for `cara start` and `cara verify`, or rerun `cara setup --force` to write the key into config, then retry `cara verify --outcome local-chat`"
+        );
+    }
+
+    #[test]
+    fn test_local_chat_verify_next_step_for_configured_provider() {
+        let cfg = serde_json::json!({
+            "openai": { "apiKey": "sk-openai-inline" }
+        });
+        assert_eq!(
+            local_chat_verify_next_step(&cfg),
+            "check OpenAI API key/model and retry `cara verify --outcome local-chat`"
+        );
+    }
+
+    #[test]
+    fn test_local_chat_verify_next_step_for_multiple_providers() {
+        let cfg = serde_json::json!({
+            "anthropic": { "apiKey": "sk-anthropic-inline" },
+            "openai": { "apiKey": "sk-openai-inline" }
+        });
+        assert_eq!(
+            local_chat_verify_next_step(&cfg),
+            "multiple provider configs detected; keep one provider for first run or rerun `cara setup --force`, then retry `cara verify --outcome local-chat`"
+        );
+    }
+
+    #[test]
+    fn test_verify_failure_follow_up_url() {
+        assert_eq!(
+            verify_failure_follow_up_url(VerifyOutcome::LocalChat),
+            "https://getcara.io/help.html#guided-setup-help"
+        );
+        assert_eq!(
+            verify_failure_follow_up_url(VerifyOutcome::Discord),
+            "https://getcara.io/cookbook/discord-assistant.html"
+        );
+        assert_eq!(
+            verify_failure_follow_up_url(VerifyOutcome::Telegram),
+            "https://getcara.io/cookbook/telegram-webhook-assistant.html"
+        );
     }
 
     #[test]
