@@ -1,0 +1,109 @@
+name: Team setup / pilot request
+description: Tell us about a small-team evaluation, setup-assist need, or managed-pilot interest.
+title: "team pilot: <team or use case>"
+labels:
+  - feedback
+  - triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form if you are evaluating Carapace for a team or want help planning a small pilot.
+        This issue is public. Keep details high-level and do not include secrets, private customer data, or pricing-sensitive information you do not want public.
+        If needed, we can move detailed follow-up off-thread later.
+
+  - type: input
+    id: organization
+    attributes:
+      label: Organization or team name
+      description: Optional. Use a nickname if you do not want to post the exact name publicly.
+      placeholder: Acme infra team
+
+  - type: dropdown
+    id: team_size
+    attributes:
+      label: Team size
+      options:
+        - Just me
+        - 2-5
+        - 6-20
+        - 21+
+    validations:
+      required: true
+
+  - type: dropdown
+    id: interest
+    attributes:
+      label: What are you looking for?
+      options:
+        - Self-hosted setup help
+        - Self-hosted hardening review
+        - Managed pilot interest
+        - Still evaluating / not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: source
+    attributes:
+      label: What sent you here?
+      options:
+        - Homepage
+        - Help page
+        - Security comparison
+        - Getting Started docs
+        - GitHub README
+        - Social/community post
+        - Word of mouth
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: timeframe
+    attributes:
+      label: Expected timeframe
+      options:
+        - This week
+        - This month
+        - This quarter
+        - Exploring only
+    validations:
+      required: true
+
+  - type: textarea
+    id: use_case
+    attributes:
+      label: Use case
+      description: What do you want Carapace to do for your team?
+      placeholder: Internal assistant in Slack and webhooks for incident triage, with local-first control and explicit operator approval for risky actions.
+    validations:
+      required: true
+
+  - type: textarea
+    id: deployment
+    attributes:
+      label: Deployment expectations
+      description: Keep this high-level. Self-hosted, managed, local-only, tailnet, etc.
+      placeholder: Prefer self-hosted initially, possibly with Tailnet access and a later managed option if the pilot works.
+    validations:
+      required: true
+
+  - type: textarea
+    id: blockers
+    attributes:
+      label: Current blockers or evaluation questions
+      description: What would prevent a pilot from happening?
+      placeholder: Need clearer first-run path, provider guidance, and confidence that operator controls are understandable for a small team.
+    validations:
+      required: true
+
+  - type: textarea
+    id: success
+    attributes:
+      label: Success criteria
+      description: What would make this evaluation a success?
+      placeholder: A secure first setup, one real workflow working end to end, and a clear understanding of what ongoing operation looks like.
+    validations:
+      required: true
+

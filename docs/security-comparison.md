@@ -126,6 +126,14 @@ remain partial or incomplete. Verified-vs-partial feature state is tracked in
 
 We'd rather ship an honest "here's what works and what doesn't" than pretend everything is finished.
 
+## Evaluating Carapace
+
+If you are trying to decide whether Carapace is the right fit for your setup:
+
+- start with [Getting started](getting-started.md) and [First Run](site/first-run.md)
+- use the [Providers hub](site/providers.md) if the first decision is provider choice
+- use [Help](site/help.md) if you want guided setup help or a small-team evaluation path
+
 ## Links
 
 - [Repository](https://github.com/puremachinery/carapace)

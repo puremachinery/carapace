@@ -1,0 +1,124 @@
+name: Guided setup help
+description: Ask for help reaching your first useful Carapace outcome.
+title: "setup help: <goal>"
+labels:
+  - feedback
+  - triage
+  - onboarding
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form if you want help getting Carapace working for a concrete first outcome.
+        This issue is public. Do not include secrets, tokens, private customer data, or security-sensitive details.
+        If this is a security vulnerability, use private reporting instead:
+        https://github.com/puremachinery/carapace/security/advisories/new
+
+  - type: input
+    id: version
+    attributes:
+      label: Carapace version
+      description: Output of `cara version`, or `not installed yet`
+      placeholder: v0.1.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - macOS (Apple Silicon)
+        - macOS (Intel)
+        - Linux (x86_64)
+        - Linux (ARM64)
+        - Windows (x86_64)
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: first_outcome
+    attributes:
+      label: First outcome you want working
+      options:
+        - local chat
+        - OpenAI-compatible endpoint
+        - Discord
+        - Telegram
+        - Hooks / automation
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: provider
+    attributes:
+      label: Provider path
+      options:
+        - Anthropic
+        - OpenAI
+        - Gemini
+        - Ollama
+        - Bedrock
+        - Venice
+        - Not sure yet
+    validations:
+      required: true
+
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment target
+      options:
+        - Local-only on one machine
+        - LAN / home network
+        - Tailnet / private remote access
+        - Internet-facing
+        - Not sure yet
+    validations:
+      required: true
+
+  - type: dropdown
+    id: source
+    attributes:
+      label: What sent you here?
+      options:
+        - Homepage
+        - Install docs
+        - First Run docs
+        - Providers docs
+        - Help page
+        - Security comparison
+        - Cookbook
+        - GitHub README
+        - Social/community post
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: goal
+    attributes:
+      label: Desired outcome
+      description: What exactly should be working when this is solved?
+      placeholder: I want `cara setup` plus `cara verify --outcome auto` to pass, then I want one Discord reply to deliver successfully.
+    validations:
+      required: true
+
+  - type: textarea
+    id: blocker
+    attributes:
+      label: Current blocker
+      description: What stopped you today?
+      placeholder: Provider setup is unclear, or verify fails after setup, or I do not know which first path is recommended.
+    validations:
+      required: true
+
+  - type: textarea
+    id: tried
+    attributes:
+      label: What you already tried
+      description: Commands, docs, or recipes you already used.
+      placeholder: I followed First Run, exported ANTHROPIC_API_KEY, and ran `cara setup`, but `cara verify --outcome auto` still says no provider available.
+

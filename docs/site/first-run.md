@@ -11,6 +11,18 @@ Run `cara setup`, start Carapace, and complete your first useful assistant workf
   - `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_API_KEY`, or `VENICE_API_KEY`, or
   - local Ollama (`OLLAMA_BASE_URL`)
 
+## 0) Pick the simplest first path
+
+If you are not sure where to start:
+
+- choose `local-chat` as your first outcome
+- start with one provider only
+- use Anthropic/OpenAI for the fastest cloud path, or Ollama for the fastest fully local path
+- add Discord, Telegram, or hooks only after `cara verify --outcome auto` passes
+
+If provider choice is the blocker, use the [Providers hub](providers.md).
+If you want a maintainer to help you pick the shortest path, use [Help](help.md).
+
 ## 1) Run the setup wizard
 
 ```bash
@@ -71,4 +83,5 @@ require destination flags (`--discord-to` / `--telegram-to`) for send-path check
 ## Continue
 
 - Need a specific task flow? Go to [Cookbook](../cookbook/README.md)
+- Want guided help or a team evaluation path? Use [Help](help.md)
 - Stuck? Use [Get Unstuck](get-unstuck.md)

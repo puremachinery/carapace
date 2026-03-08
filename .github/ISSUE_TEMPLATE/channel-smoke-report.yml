@@ -20,7 +20,7 @@ body:
     attributes:
       label: Carapace version
       description: Output of `cara version`
-      placeholder: v0.1.0-preview5
+      placeholder: v0.1.0
     validations:
       required: true
 

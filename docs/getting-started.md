@@ -28,6 +28,18 @@ Install options:
   [docs/site/install.md](site/install.md)
 - Source build: [CONTRIBUTING.md](../CONTRIBUTING.md)
 
+## Recommended first path
+
+If you are starting from zero, optimize for a fast verified first outcome:
+
+- Choose `local-chat` first unless you already know you need a channel on day 1.
+- Fastest cloud start: set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`.
+- Fastest fully local start: run Ollama and point Carapace at `OLLAMA_BASE_URL`.
+- Add Discord, Telegram, or hooks only after `cara verify --outcome auto` passes.
+
+If you are still unsure which path fits your environment, use the
+[Providers hub](site/providers.md) or [Help page](site/help.md).
+
 ## Quick Start (Recommended: setup wizard)
 
 Run the interactive setup:
@@ -70,6 +82,12 @@ Helpful REPL commands:
 
 For full first-run flow, use [site/first-run.md](site/first-run.md).
 Manual configuration is documented in `config.example.json5`.
+
+## Need guided help?
+
+- [Guided setup help](site/help.md#guided-setup)
+- [Team setup / pilot request](site/help.md#team-pilot)
+- [Request a cookbook recipe](https://github.com/puremachinery/carapace/issues/new?template=cookbook-recipe-request.yml&title=cookbook%3A+%3Cuse+case%3E)
 
 ## Configuration Basics
 

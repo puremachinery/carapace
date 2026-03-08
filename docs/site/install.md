@@ -27,6 +27,16 @@ Quick path for first-time setup:
 2. Make it executable and move it onto your PATH (see "Install on your PATH" below).
 3. Run `cara version` to confirm.
 
+If you want the shortest stable first-run path after install, plan to start with:
+
+- one provider only
+- `local-chat` as the first outcome
+- channels after `cara verify --outcome auto` passes
+
+Use the [Providers hub](providers.md) if you are deciding between Anthropic,
+OpenAI, Ollama, Gemini, Bedrock, or Venice. Use [Help](help.md) if you want
+guided setup help instead of choosing alone.
+
 Signature and checksum verification (next two sections) are recommended,
 especially for production or automation.
 
@@ -186,5 +196,6 @@ cara version
 ## Next step
 
 - Continue with [First run](first-run.md)
+- Need guided help or a team evaluation path? Use [Help](help.md)
 - Or jump to [Cookbook recipes](../cookbook/README.md)
 - For maintainer/operator release policy (including `./scripts/smoke/verify-release-artifacts.sh` from repo root), see [Release & upgrade policy](../release.md)

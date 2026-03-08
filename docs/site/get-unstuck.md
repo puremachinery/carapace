@@ -94,6 +94,7 @@ so re-run it as needed while debugging.
 
 ## Ask for help or report problems
 
+- Guided setup or team evaluation: [Help](help.md)
 - Setup smoke feedback: <https://github.com/puremachinery/carapace/issues/new?template=setup-smoke-report.yml>
 - Bug report: <https://github.com/puremachinery/carapace/issues/new?template=bug-report.yml>
 - Feature request: <https://github.com/puremachinery/carapace/issues/new?template=feature-request.yml>

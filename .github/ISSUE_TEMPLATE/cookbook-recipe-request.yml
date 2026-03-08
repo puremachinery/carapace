@@ -11,6 +11,23 @@ body:
       value: |
         Tell us the outcome you want, and we can prioritize a cookbook walkthrough.
 
+  - type: dropdown
+    id: source
+    attributes:
+      label: What sent you here?
+      options:
+        - Homepage
+        - Help page
+        - Cookbook index
+        - Getting Started docs
+        - First Run docs
+        - Security comparison
+        - GitHub README
+        - Social/community post
+        - Other
+    validations:
+      required: true
+
   - type: textarea
     id: use_case
     attributes:

@@ -144,6 +144,7 @@ render_markdown_page() {
         <a href="${rel_prefix_html}/security-ops.html">Security/Ops</a>
         <a href="${rel_prefix_html}/reference.html">Reference</a>
         <a href="${rel_prefix_html}/cookbook/">Cookbook</a>
+        <a href="${rel_prefix_html}/help.html">Help</a>
         <a href="${rel_prefix_html}/docs.html">Docs</a>
         <a href="https://github.com/puremachinery/carapace">GitHub</a>
       </nav>
@@ -253,6 +254,10 @@ render_site_doc_page "ops" "Ops" \
   "Security"
 render_site_doc_page "get-unstuck" "Get Unstuck" \
   "Troubleshooting checks, logs, and issue-reporting paths for Carapace." \
+  "./getting-started.html" \
+  "Getting Started"
+render_site_doc_page "help" "Get Help" \
+  "Setup help, team evaluation, and request paths for Carapace." \
   "./getting-started.html" \
   "Getting Started"
 render_site_doc_page "docs" "Docs Hubs" \

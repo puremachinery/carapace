@@ -69,6 +69,9 @@ Use `/help` in chat for REPL commands (`/new`, `/exit`, `/quit`).
 
 If you use cloud models, set one provider key before launching (for example
 `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_API_KEY`, or `VENICE_API_KEY`).
+If you are not sure where to start, choose `local-chat` as your first outcome,
+start with one provider, and add channels only after `cara verify --outcome auto`
+passes.
 
 ## Status
 
@@ -101,6 +104,7 @@ of truth.
 - [Getting started](docs/getting-started.md) — full setup and operations
 - [Install](docs/site/install.md) — release binaries, signatures, and install commands
 - [First run](docs/site/first-run.md) — secure local startup and smoke checks
+- [Help](docs/site/help.md) — setup help, team evaluation, and cookbook request paths
 - [Security model](docs/security.md) — architecture and trust boundaries
 - [Security comparison](docs/security-comparison.md) — threat-by-threat view
 - [Channel setup](docs/channels.md) — Signal, Telegram, Discord, Slack, webhooks
