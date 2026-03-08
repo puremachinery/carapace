@@ -10,6 +10,8 @@ For what is already shipped and verified, see:
 
 ## Recently shipped
 
+- First stable release (`v0.1.0`) — stable compatibility policy and verified
+  update/release paths are now in effect for the stable channel.
 - Cross-platform subprocess sandbox hardening — macOS, Linux, and Windows
   enforce OS-level isolation for sandbox-required paths; unsupported platforms
   fail closed.
@@ -27,13 +29,6 @@ For what is already shipped and verified, see:
 
 ## Now
 
-- Stable (non-preview) release gate:
-  - migration/compatibility statement,
-  - backup/restore and update-path validation,
-  - cross-platform smoke evidence current.
-
-## Next
-
 - Subscription-style provider onboarding — OAuth/device-code style flows that
   reduce manual API-key setup friction while staying provider ToS-compliant.
 - Control UI depth — richer in-browser runbook/operator workflows and stronger
@@ -41,10 +36,13 @@ For what is already shipped and verified, see:
 - Docs architecture polish — tighter day-1/day-2 routing and clearer task-first
   command ladders across operational docs.
 
-## Later
+## Next
 
 - Additional channels (WhatsApp, iMessage, Teams, Matrix, WebChat).
 - Companion apps — native macOS, iOS, and Android clients.
+
+## Later
+
 - Browser control and live canvas / A2UI experiences.
 - Multi-agent routing and automatic model/provider failover.
 
