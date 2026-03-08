@@ -1,5 +1,6 @@
 ---
 source: src/server/ws/golden_tests.rs
+assertion_line: 760
 expression: normalized
 ---
 {
@@ -51,7 +52,8 @@ expression: normalized
       "telegram",
       "discord",
       "slack",
-      "classifier"
+      "classifier",
+      "vertex"
     ],
     "properties": {
       "agents": {
@@ -178,6 +180,9 @@ expression: normalized
         "type": "object"
       },
       "venice": {
+        "type": "object"
+      },
+      "vertex": {
         "type": "object"
       },
       "web": {
