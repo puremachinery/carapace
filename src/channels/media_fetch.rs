@@ -182,6 +182,7 @@ mod tests {
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             rt.block_on(async { resolve_and_validate_dns("localhost", &ssrf_config) })
+                .is_err()
         }));
 
         assert!(
@@ -189,7 +190,7 @@ mod tests {
             "DNS resolution helper should not panic in current-thread runtime"
         );
         assert!(
-            result.unwrap().is_err(),
+            result.unwrap(),
             "localhost resolution should return a transport/SSRF error in this test setup"
         );
     }

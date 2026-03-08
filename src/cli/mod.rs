@@ -2441,7 +2441,7 @@ impl SetupProvider {
         }
     }
 
-    fn api_key_env_var(self) -> &'static str {
+    fn credential_env_var_name(self) -> &'static str {
         match self {
             Self::Anthropic => "ANTHROPIC_API_KEY",
             Self::OpenAi => "OPENAI_API_KEY",
@@ -2473,11 +2473,14 @@ impl SetupProviderEnvState {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ProviderConfigStatus {
-    provider: SetupProvider,
-    env_var: Option<String>,
-    env_present: bool,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelProviderRoute {
+    Anthropic,
+    OpenAi,
+    Ollama,
+    Gemini,
+    Bedrock,
+    Venice,
 }
 
 fn env_var_present(key: &str) -> bool {
@@ -2509,52 +2512,215 @@ fn extract_env_placeholder_key(value: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn configured_provider_status(
-    cfg: &Value,
-    provider: SetupProvider,
-) -> Option<ProviderConfigStatus> {
-    let api_key = cfg
-        .get(provider.prompt_key())
-        .and_then(|value| value.get("apiKey"))
-        .and_then(|value| value.as_str())
+fn config_string(cfg: &Value, path: &[&str]) -> Option<String> {
+    let mut current = cfg;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    current
+        .as_str()
         .map(str::trim)
-        .filter(|value| !value.is_empty())?;
-
-    let env_var = extract_env_placeholder_key(api_key);
-    let env_present = env_var.as_deref().map(env_var_present).unwrap_or(false);
-
-    Some(ProviderConfigStatus {
-        provider,
-        env_var,
-        env_present,
-    })
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
-fn configured_provider_statuses(cfg: &Value) -> Vec<ProviderConfigStatus> {
-    [SetupProvider::Anthropic, SetupProvider::OpenAi]
-        .into_iter()
-        .filter_map(|provider| configured_provider_status(cfg, provider))
-        .collect()
+fn configured_provider_labels(cfg: &Value) -> Vec<&'static str> {
+    let fingerprint = crate::agent::factory::fingerprint_providers(cfg);
+    let mut labels = Vec::new();
+    if fingerprint.anthropic.is_some() {
+        labels.push("Anthropic");
+    }
+    if fingerprint.openai.is_some() {
+        labels.push("OpenAI");
+    }
+    if fingerprint.ollama.is_some() {
+        labels.push("Ollama");
+    }
+    if fingerprint.gemini.is_some() {
+        labels.push("Gemini");
+    }
+    if fingerprint.venice.is_some() {
+        labels.push("Venice");
+    }
+    if fingerprint.bedrock.is_some() {
+        labels.push("Bedrock");
+    }
+    labels
+}
+
+fn no_provider_configured_guidance() -> String {
+    "configure a provider for the selected model, or rerun `cara setup --force` for the Anthropic/OpenAI first-run path, then retry `cara verify --outcome local-chat`"
+        .to_string()
+}
+
+fn local_chat_model(cfg: &Value) -> String {
+    config_string(cfg, &["agents", "defaults", "model"])
+        .unwrap_or_else(|| SetupProvider::Anthropic.default_model().to_string())
+}
+
+fn local_chat_provider_route(model: &str) -> ModelProviderRoute {
+    if crate::agent::ollama::is_ollama_model(model) {
+        ModelProviderRoute::Ollama
+    } else if crate::agent::venice::is_venice_model(model) {
+        ModelProviderRoute::Venice
+    } else if crate::agent::gemini::is_gemini_model(model) {
+        ModelProviderRoute::Gemini
+    } else if crate::agent::openai::is_openai_model(model) {
+        ModelProviderRoute::OpenAi
+    } else if crate::agent::bedrock::is_bedrock_model(model) {
+        ModelProviderRoute::Bedrock
+    } else {
+        ModelProviderRoute::Anthropic
+    }
+}
+
+fn provider_api_key_guidance(cfg: &Value, provider: SetupProvider, config_path: &[&str]) -> String {
+    if env_var_present(provider.credential_env_var_name()) {
+        return format!(
+            "check {} API key/model and retry `cara verify --outcome local-chat`",
+            provider.label()
+        );
+    }
+
+    if let Some(configured) = config_string(cfg, config_path) {
+        if let Some(env_var) = extract_env_placeholder_key(&configured) {
+            if !env_var_present(&env_var) {
+                return format!(
+                    "set `${env_var}` in the same shell you use for `cara start` and `cara verify`, or rerun `cara setup --force` to write the key into config, then retry `cara verify --outcome local-chat`"
+                );
+            }
+        }
+
+        return format!(
+            "check {} API key/model and retry `cara verify --outcome local-chat`",
+            provider.label()
+        );
+    }
+
+    let configured = configured_provider_labels(cfg);
+    if configured.is_empty() {
+        no_provider_configured_guidance()
+    } else {
+        format!(
+            "the selected model currently routes to {}; configure {} or switch `agents.defaults.model` to one of the already configured providers ({}), then retry `cara verify --outcome local-chat`",
+            provider.label(),
+            provider.label(),
+            configured.join(", ")
+        )
+    }
+}
+
+fn alternate_provider_env_hints() -> Vec<&'static str> {
+    let mut hints = Vec::new();
+    if env_var_present("OLLAMA_BASE_URL") {
+        hints.push("OLLAMA_BASE_URL");
+    }
+    if env_var_present("GOOGLE_API_KEY") {
+        hints.push("GOOGLE_API_KEY");
+    }
+    if env_var_present("VENICE_API_KEY") {
+        hints.push("VENICE_API_KEY");
+    }
+    if env_var_present("AWS_REGION")
+        || env_var_present("AWS_DEFAULT_REGION")
+        || env_var_present("AWS_ACCESS_KEY_ID")
+        || env_var_present("AWS_SECRET_ACCESS_KEY")
+    {
+        hints.push("AWS_*");
+    }
+    hints
 }
 
 fn local_chat_verify_next_step(cfg: &Value) -> String {
-    let providers = configured_provider_statuses(cfg);
-    match providers.as_slice() {
-        [] => "run `cara setup --force`, choose one provider, keep `local-chat`, then retry `cara verify --outcome local-chat`".to_string(),
-        [provider] => {
-            if let Some(env_var) = provider.env_var.as_deref() {
-                if !provider.env_present {
-                    return format!(
-                        "set `${env_var}` in the same shell you use for `cara start` and `cara verify`, or rerun `cara setup --force` to write the key into config, then retry `cara verify --outcome local-chat`"
-                    );
+    let model = local_chat_model(cfg);
+    match local_chat_provider_route(&model) {
+        ModelProviderRoute::Anthropic => {
+            provider_api_key_guidance(cfg, SetupProvider::Anthropic, &["anthropic", "apiKey"])
+        }
+        ModelProviderRoute::OpenAi => {
+            provider_api_key_guidance(cfg, SetupProvider::OpenAi, &["openai", "apiKey"])
+        }
+        ModelProviderRoute::Gemini => {
+            if env_var_present("GOOGLE_API_KEY")
+                || config_string(cfg, &["google", "apiKey"]).is_some()
+            {
+                "check Gemini API key/model and retry `cara verify --outcome local-chat`"
+                    .to_string()
+            } else {
+                let configured = configured_provider_labels(cfg);
+                if configured.is_empty() {
+                    no_provider_configured_guidance()
+                } else {
+                    format!(
+                        "the selected model currently routes to Gemini; configure Gemini (`GOOGLE_API_KEY` or `google.apiKey`) or switch `agents.defaults.model` to one of the already configured providers ({}), then retry `cara verify --outcome local-chat`",
+                        configured.join(", ")
+                    )
                 }
             }
-            format!(
-                "check {} API key/model and retry `cara verify --outcome local-chat`",
-                provider.provider.label()
-            )
         }
-        _ => "multiple provider configs detected; keep one provider for first run or rerun `cara setup --force`, then retry `cara verify --outcome local-chat`".to_string(),
+        ModelProviderRoute::Venice => {
+            if env_var_present("VENICE_API_KEY")
+                || config_string(cfg, &["venice", "apiKey"]).is_some()
+            {
+                "check Venice API key/model and retry `cara verify --outcome local-chat`"
+                    .to_string()
+            } else {
+                let configured = configured_provider_labels(cfg);
+                if configured.is_empty() {
+                    no_provider_configured_guidance()
+                } else {
+                    format!(
+                        "the selected model currently routes to Venice; configure Venice (`VENICE_API_KEY` or `venice.apiKey`) or switch `agents.defaults.model` to one of the already configured providers ({}), then retry `cara verify --outcome local-chat`",
+                        configured.join(", ")
+                    )
+                }
+            }
+        }
+        ModelProviderRoute::Ollama => {
+            if env_var_present("OLLAMA_BASE_URL")
+                || config_string(cfg, &["providers", "ollama", "baseUrl"]).is_some()
+                || cfg
+                    .get("providers")
+                    .and_then(|value| value.get("ollama"))
+                    .is_some()
+            {
+                "check Ollama server reachability/base URL and selected model, then retry `cara verify --outcome local-chat`"
+                    .to_string()
+            } else {
+                let configured = configured_provider_labels(cfg);
+                if configured.is_empty() {
+                    no_provider_configured_guidance()
+                } else {
+                    format!(
+                        "the selected model currently routes to Ollama; configure Ollama (`OLLAMA_BASE_URL` or `providers.ollama.baseUrl`) or switch `agents.defaults.model` to one of the already configured providers ({}), then retry `cara verify --outcome local-chat`",
+                        configured.join(", ")
+                    )
+                }
+            }
+        }
+        ModelProviderRoute::Bedrock => {
+            let region = env_var_present("AWS_REGION")
+                || env_var_present("AWS_DEFAULT_REGION")
+                || config_string(cfg, &["bedrock", "region"]).is_some();
+            let access_key = env_var_present("AWS_ACCESS_KEY_ID")
+                || config_string(cfg, &["bedrock", "accessKeyId"]).is_some();
+            let secret_key = env_var_present("AWS_SECRET_ACCESS_KEY")
+                || config_string(cfg, &["bedrock", "secretAccessKey"]).is_some();
+            if region && access_key && secret_key {
+                "check AWS Bedrock region/credentials and selected model, then retry `cara verify --outcome local-chat`"
+                    .to_string()
+            } else {
+                let configured = configured_provider_labels(cfg);
+                if configured.is_empty() {
+                    no_provider_configured_guidance()
+                } else {
+                    format!(
+                        "the selected model currently routes to Bedrock; configure Bedrock (`AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` or `bedrock.*`) or switch `agents.defaults.model` to one of the already configured providers ({}), then retry `cara verify --outcome local-chat`",
+                        configured.join(", ")
+                    )
+                }
+            }
+        }
     }
 }
 
@@ -4087,12 +4253,22 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
     if interactive {
         println!("Carapace setup wizard");
         println!("---------------------");
+        println!("This interactive wizard currently writes Anthropic/OpenAI first-run config.");
         println!(
             "Fastest first-run path: pick one provider, keep `local-chat`, then run `cara verify --outcome local-chat`."
         );
         let hide_sensitive_input = prompt_yes_no("Hide sensitive input while typing?", true)?;
 
         let provider_env_state = detect_setup_provider_env_state();
+        let alternate_provider_envs = alternate_provider_env_hints();
+        if matches!(provider_env_state, SetupProviderEnvState::None)
+            && !alternate_provider_envs.is_empty()
+        {
+            eprintln!(
+                "Detected other provider env vars ({}). If you want Ollama, Gemini, Venice, or Bedrock first, use the Providers/Help docs after setup.",
+                alternate_provider_envs.join(", ")
+            );
+        }
         if matches!(provider_env_state, SetupProviderEnvState::Both) {
             eprintln!("Both $ANTHROPIC_API_KEY and $OPENAI_API_KEY are set.");
             eprintln!(
@@ -4114,7 +4290,7 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-        let env_var = provider.api_key_env_var();
+        let env_var = provider.credential_env_var_name();
         let default_model = provider.default_model();
 
         let env_key = std::env::var(env_var)
@@ -6230,31 +6406,41 @@ mod tests {
     #[test]
     fn test_detect_setup_provider_env_state() {
         let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
-        let _anthropic_guard = unset_env_var_scoped("ANTHROPIC_API_KEY");
-        let _openai_guard = unset_env_var_scoped("OPENAI_API_KEY");
-        assert_eq!(
-            detect_setup_provider_env_state(),
-            SetupProviderEnvState::None
-        );
+        {
+            let _anthropic_guard = unset_env_var_scoped("ANTHROPIC_API_KEY");
+            let _openai_guard = unset_env_var_scoped("OPENAI_API_KEY");
+            assert_eq!(
+                detect_setup_provider_env_state(),
+                SetupProviderEnvState::None
+            );
+        }
 
-        let _anthropic_guard = set_env_var_scoped("ANTHROPIC_API_KEY", "sk-anthropic");
-        assert_eq!(
-            detect_setup_provider_env_state(),
-            SetupProviderEnvState::AnthropicOnly
-        );
+        {
+            let _anthropic_guard = set_env_var_scoped("ANTHROPIC_API_KEY", "sk-anthropic");
+            let _openai_guard = unset_env_var_scoped("OPENAI_API_KEY");
+            assert_eq!(
+                detect_setup_provider_env_state(),
+                SetupProviderEnvState::AnthropicOnly
+            );
+        }
 
-        let _anthropic_guard = unset_env_var_scoped("ANTHROPIC_API_KEY");
-        let _openai_guard = set_env_var_scoped("OPENAI_API_KEY", "sk-openai");
-        assert_eq!(
-            detect_setup_provider_env_state(),
-            SetupProviderEnvState::OpenAiOnly
-        );
+        {
+            let _anthropic_guard = unset_env_var_scoped("ANTHROPIC_API_KEY");
+            let _openai_guard = set_env_var_scoped("OPENAI_API_KEY", "sk-openai");
+            assert_eq!(
+                detect_setup_provider_env_state(),
+                SetupProviderEnvState::OpenAiOnly
+            );
+        }
 
-        let _anthropic_guard = set_env_var_scoped("ANTHROPIC_API_KEY", "sk-anthropic");
-        assert_eq!(
-            detect_setup_provider_env_state(),
-            SetupProviderEnvState::Both
-        );
+        {
+            let _anthropic_guard = set_env_var_scoped("ANTHROPIC_API_KEY", "sk-anthropic");
+            let _openai_guard = set_env_var_scoped("OPENAI_API_KEY", "sk-openai");
+            assert_eq!(
+                detect_setup_provider_env_state(),
+                SetupProviderEnvState::Both
+            );
+        }
     }
 
     #[test]
@@ -6262,7 +6448,7 @@ mod tests {
         let cfg = serde_json::json!({});
         assert_eq!(
             local_chat_verify_next_step(&cfg),
-            "run `cara setup --force`, choose one provider, keep `local-chat`, then retry `cara verify --outcome local-chat`"
+            "configure a provider for the selected model, or rerun `cara setup --force` for the Anthropic/OpenAI first-run path, then retry `cara verify --outcome local-chat`"
         );
     }
 
@@ -6282,7 +6468,8 @@ mod tests {
     #[test]
     fn test_local_chat_verify_next_step_for_configured_provider() {
         let cfg = serde_json::json!({
-            "openai": { "apiKey": "sk-openai-inline" }
+            "openai": { "apiKey": "sk-openai-inline" },
+            "agents": { "defaults": { "model": "gpt-4o" } }
         });
         assert_eq!(
             local_chat_verify_next_step(&cfg),
@@ -6291,14 +6478,66 @@ mod tests {
     }
 
     #[test]
-    fn test_local_chat_verify_next_step_for_multiple_providers() {
+    fn test_local_chat_verify_next_step_for_env_only_openai() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let _openai_guard = set_env_var_scoped("OPENAI_API_KEY", "sk-openai-env");
+        let _anthropic_guard = unset_env_var_scoped("ANTHROPIC_API_KEY");
+        let cfg = serde_json::json!({
+            "agents": { "defaults": { "model": "gpt-4o" } }
+        });
+        assert_eq!(
+            local_chat_verify_next_step(&cfg),
+            "check OpenAI API key/model and retry `cara verify --outcome local-chat`"
+        );
+    }
+
+    #[test]
+    fn test_local_chat_verify_next_step_for_multi_provider_config_routes_by_model() {
         let cfg = serde_json::json!({
             "anthropic": { "apiKey": "sk-anthropic-inline" },
+            "openai": { "apiKey": "sk-openai-inline" },
+            "agents": { "defaults": { "model": "gpt-4o" } }
+        });
+        assert_eq!(
+            local_chat_verify_next_step(&cfg),
+            "check OpenAI API key/model and retry `cara verify --outcome local-chat`"
+        );
+    }
+
+    #[test]
+    fn test_local_chat_verify_next_step_for_ollama_model() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let _ollama_guard = set_env_var_scoped("OLLAMA_BASE_URL", "http://127.0.0.1:11434");
+        let cfg = serde_json::json!({
+            "agents": { "defaults": { "model": "ollama:llama3" } }
+        });
+        assert_eq!(
+            local_chat_verify_next_step(&cfg),
+            "check Ollama server reachability/base URL and selected model, then retry `cara verify --outcome local-chat`"
+        );
+    }
+
+    #[test]
+    fn test_local_chat_verify_next_step_for_missing_gemini_provider() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let _google_guard = unset_env_var_scoped("GOOGLE_API_KEY");
+        let cfg = serde_json::json!({
+            "agents": { "defaults": { "model": "gemini-2.0-flash" } }
+        });
+        assert_eq!(
+            local_chat_verify_next_step(&cfg),
+            "configure a provider for the selected model, or rerun `cara setup --force` for the Anthropic/OpenAI first-run path, then retry `cara verify --outcome local-chat`"
+        );
+    }
+
+    #[test]
+    fn test_local_chat_verify_next_step_for_model_provider_mismatch() {
+        let cfg = serde_json::json!({
             "openai": { "apiKey": "sk-openai-inline" }
         });
         assert_eq!(
             local_chat_verify_next_step(&cfg),
-            "multiple provider configs detected; keep one provider for first run or rerun `cara setup --force`, then retry `cara verify --outcome local-chat`"
+            "the selected model currently routes to Anthropic; configure Anthropic or switch `agents.defaults.model` to one of the already configured providers (OpenAI), then retry `cara verify --outcome local-chat`"
         );
     }
 
