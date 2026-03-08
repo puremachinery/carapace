@@ -16,7 +16,6 @@ Use the shortest matching doc path first:
 
 If those still leave you blocked, use one of the request paths below.
 
-<a id="guided-setup"></a>
 ## Guided setup help
 
 Use this when you want help getting to a concrete first outcome such as local chat, Discord, Telegram, hooks, or the OpenAI-compatible endpoint.
@@ -27,8 +26,7 @@ Use this when you want help getting to a concrete first outcome such as local ch
 
 [Open a guided setup help request](https://github.com/puremachinery/carapace/issues/new?template=setup-help-request.yml&title=setup+help%3A+%3Cgoal%3E)
 
-<a id="team-pilot"></a>
-## Team setup / pilot request
+## Team setup and pilot request
 
 Use this when you are evaluating Carapace for a small team, want guided setup or hardening help, or want to talk through a managed pilot at a high level.
 
@@ -55,4 +53,3 @@ Use this if the missing piece is not product behavior but the lack of a concrete
 If the issue is a security vulnerability, do not post it publicly.
 
 [Report a security vulnerability privately](https://github.com/puremachinery/carapace/security/advisories/new)
-

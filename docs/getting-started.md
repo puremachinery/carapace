@@ -85,8 +85,8 @@ Manual configuration is documented in `config.example.json5`.
 
 ## Need guided help?
 
-- [Guided setup help](site/help.md#guided-setup)
-- [Team setup / pilot request](site/help.md#team-pilot)
+- [Guided setup help](site/help.md#guided-setup-help)
+- [Team setup / pilot request](site/help.md#team-setup-and-pilot-request)
 - [Request a cookbook recipe](https://github.com/puremachinery/carapace/issues/new?template=cookbook-recipe-request.yml&title=cookbook%3A+%3Cuse+case%3E)
 
 ## Configuration Basics

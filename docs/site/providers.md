@@ -66,6 +66,7 @@ cara setup
 
 Supported env vars:
 
+- `ANTHROPIC_API_KEY`
 - `OPENAI_API_KEY`
 - `GOOGLE_API_KEY`
 - `OLLAMA_BASE_URL` (if non-default)
@@ -95,8 +96,8 @@ Use the full support matrix for channels/providers/platforms:
 
 ## Need help choosing?
 
-- [Guided setup help](help.md#guided-setup)
-- [Team setup / pilot request](help.md#team-pilot)
+- [Guided setup help](help.md#guided-setup-help)
+- [Team setup / pilot request](help.md#team-setup-and-pilot-request)
 
 ## Next paths
 
