@@ -312,6 +312,26 @@ impl VertexProvider {
         location: String,
         default_model: Option<String>,
     ) -> Result<Self, AgentError> {
+        static PROJECT_ID_REGEX: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let project_id_re = PROJECT_ID_REGEX
+            .get_or_init(|| regex::Regex::new(r"^[a-z][a-z0-9-]{4,28}[a-z0-9]$").unwrap());
+        if !project_id_re.is_match(&project_id) {
+            return Err(AgentError::Provider(format!(
+                "Invalid GCP project ID: {}",
+                project_id
+            )));
+        }
+
+        static LOCATION_REGEX: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let location_re = LOCATION_REGEX
+            .get_or_init(|| regex::Regex::new(r"^[a-z]+-[a-z]+\d+$").unwrap());
+        if !location_re.is_match(&location) {
+            return Err(AgentError::Provider(format!(
+                "Invalid GCP location: {}",
+                location
+            )));
+        }
+
         // Uses FallbackTokenProvider: tries gcloud CLI first and falls back to the metadata server.
         let token_manager: Arc<dyn TokenProvider> = Arc::new(FallbackTokenProvider::new());
 
@@ -777,6 +797,49 @@ mod tests {
         assert!(provider_no_default
             .resolve_request_config("vertex/default")
             .is_err());
+    }
+
+    #[test]
+    fn test_vertex_provider_validation() {
+        // Valid params
+        assert!(VertexProvider::new(
+            "my-project".to_string(),
+            "us-central1".to_string(),
+            None
+        )
+        .is_ok());
+
+        // Invalid project ID (too short)
+        assert!(VertexProvider::new(
+            "my-p".to_string(),
+            "us-central1".to_string(),
+            None
+        )
+        .is_err());
+
+        // Invalid project ID (invalid characters)
+        assert!(VertexProvider::new(
+            "my_project".to_string(),
+            "us-central1".to_string(),
+            None
+        )
+        .is_err());
+
+        // Invalid location (no numbers)
+        assert!(VertexProvider::new(
+            "my-project".to_string(),
+            "us-central".to_string(),
+            None
+        )
+        .is_err());
+
+        // Invalid location (invalid characters)
+        assert!(VertexProvider::new(
+            "my-project".to_string(),
+            "us_central1".to_string(),
+            None
+        )
+        .is_err());
     }
 
     #[test]
