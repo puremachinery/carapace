@@ -278,7 +278,7 @@ jobs:
     name: Trivy Scan
     runs-on: ubuntu-latest
     needs: changes
-    if: needs.changes.outputs.rust_runtime == 'true' || needs.changes.outputs.docker == 'true'
+    if: needs.changes.outputs.rust_runtime == 'true' || needs.changes.outputs.docker == 'true' || needs.changes.outputs.workflow == 'true'
     env:
       # trivy-action 0.34.1 defaults to v0.69.1, which exists as a tag but not a
       # published GitHub release. Pin an actual released version so the installer
