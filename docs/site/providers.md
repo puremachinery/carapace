@@ -24,6 +24,8 @@ Run `cara setup --provider <provider>` when you already know which provider you
 want, or plain `cara setup` if you want the wizard to ask. If you are unsure,
 choose `local-chat` as the first outcome and add channels only after
 `cara verify --outcome auto` passes.
+In headless or scripted environments, pass `--provider`; non-interactive
+`cara setup` now errors instead of writing a providerless config.
 
 ### Anthropic / OpenAI (fastest cloud path)
 

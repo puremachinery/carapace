@@ -4476,10 +4476,28 @@ fn prompt_optional_base_url_override(
     }))
 }
 
+fn render_setup_validation_failure(err: &crate::agent::AgentError) -> String {
+    match err {
+        crate::agent::AgentError::InvalidApiKey(_) => {
+            "Provider configuration check failed: the supplied credential is invalid or incomplete."
+                .to_string()
+        }
+        crate::agent::AgentError::InvalidBaseUrl(_) => {
+            "Provider configuration check failed: the supplied base URL is invalid or unsupported."
+                .to_string()
+        }
+        crate::agent::AgentError::Provider(_) => {
+            "Provider configuration check failed: the provider rejected the configuration."
+                .to_string()
+        }
+        _ => "Provider configuration check failed.".to_string(),
+    }
+}
+
 fn handle_setup_validation_failure(
-    err: impl std::fmt::Display,
+    err: crate::agent::AgentError,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    eprintln!("Provider configuration check failed: {err}");
+    eprintln!("{}", render_setup_validation_failure(&err));
     if prompt_yes_no("Continue setup and write config anyway?", false)? {
         Ok(())
     } else {
@@ -4988,6 +5006,11 @@ pub fn handle_setup(
         }
     } else if let Some(provider) = requested_provider {
         configure_provider_noninteractive(&mut config, provider);
+    } else {
+        return Err(
+            "non-interactive setup requires `--provider <provider>`; rerun with an explicit provider."
+                .into(),
+        );
     }
 
     // Write the config file using json5 (pretty-formatted).
@@ -6978,6 +7001,22 @@ mod tests {
                 vec![SetupProvider::Gemini]
             );
         }
+
+        {
+            let _anthropic_guard = set_env_var_scoped("ANTHROPIC_API_KEY", "sk-anthropic");
+            let _openai_guard = set_env_var_scoped("OPENAI_API_KEY", "sk-openai");
+            let _ollama_guard = unset_env_var_scoped("OLLAMA_BASE_URL");
+            let _google_guard = unset_env_var_scoped("GOOGLE_API_KEY");
+            let _venice_guard = unset_env_var_scoped("VENICE_API_KEY");
+            let _region_guard = unset_env_var_scoped("AWS_REGION");
+            let _default_region_guard = unset_env_var_scoped("AWS_DEFAULT_REGION");
+            let _access_guard = unset_env_var_scoped("AWS_ACCESS_KEY_ID");
+            let _secret_guard = unset_env_var_scoped("AWS_SECRET_ACCESS_KEY");
+            assert_eq!(
+                detect_setup_provider_env_hints(),
+                vec![SetupProvider::Anthropic, SetupProvider::OpenAi]
+            );
+        }
     }
 
     #[test]
@@ -7467,7 +7506,7 @@ mod tests {
         std::fs::write(&config_path, "{}").unwrap();
 
         let _env_guard = set_env_var_scoped("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
-        let result = handle_setup(true, None);
+        let result = handle_setup(true, Some(SetupProvider::Anthropic));
 
         assert!(
             result.is_ok(),
@@ -7477,7 +7516,7 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_setup_creates_valid_json5_config() {
+    fn test_handle_setup_noninteractive_without_provider_errors() {
         let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
         let temp = tempfile::TempDir::new().unwrap();
         let config_path = temp.path().join("carapace.json");
@@ -7485,21 +7524,28 @@ mod tests {
         let _env_guard = set_env_var_scoped("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
         let result = handle_setup(false, None);
 
-        assert!(result.is_ok(), "Setup should succeed");
-
-        let content = std::fs::read_to_string(&config_path).unwrap();
-        let parsed: serde_json::Value = json5::from_str(&content).unwrap();
-        assert!(parsed.is_object(), "Config should be a JSON object");
+        assert!(result.is_err(), "Setup should require --provider");
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("non-interactive setup requires `--provider <provider>`"),
+            "unexpected error message"
+        );
+        assert!(
+            !config_path.exists(),
+            "setup should not write a providerless config in non-interactive mode"
+        );
     }
 
     #[test]
-    fn test_handle_setup_default_values() {
+    fn test_handle_setup_noninteractive_provider_flag_keeps_default_gateway_values() {
         let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
         let temp = tempfile::TempDir::new().unwrap();
         let config_path = temp.path().join("carapace.json");
 
         let _env_guard = set_env_var_scoped("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
-        let result = handle_setup(false, None);
+        let result = handle_setup(false, Some(SetupProvider::Anthropic));
 
         assert!(result.is_ok());
 
@@ -7529,6 +7575,7 @@ mod tests {
             parsed["agents"]["defaults"]["model"], "claude-sonnet-4-20250514",
             "Default model should be claude-sonnet-4-20250514"
         );
+        assert_eq!(parsed["anthropic"]["apiKey"], "${ANTHROPIC_API_KEY}");
     }
 
     #[test]
@@ -7599,6 +7646,19 @@ mod tests {
             parsed["agents"]["defaults"]["model"],
             "bedrock:anthropic.claude-3-5-sonnet-20240620-v1:0"
         );
+    }
+
+    #[test]
+    fn test_render_setup_validation_failure_redacts_sensitive_input() {
+        let rendered = render_setup_validation_failure(&crate::agent::AgentError::InvalidBaseUrl(
+            "invalid URL \"https://user:secret@example.com\": bad input".to_string(),
+        ));
+        assert_eq!(
+            rendered,
+            "Provider configuration check failed: the supplied base URL is invalid or unsupported."
+        );
+        assert!(!rendered.contains("secret"));
+        assert!(!rendered.contains("example.com"));
     }
 
     #[test]
