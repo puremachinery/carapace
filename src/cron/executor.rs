@@ -348,6 +348,7 @@ fn register_agent_run(
     registry.register(crate::server::ws::AgentRun {
         run_id: run_id.to_string(),
         session_key: session_key.to_string(),
+        delivery_recipient_id: None,
         status: AgentRunStatus::Queued,
         message: message.to_string(),
         response: String::new(),

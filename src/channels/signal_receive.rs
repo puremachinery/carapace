@@ -60,9 +60,9 @@ pub struct SignalGroupInfo {
     pub group_id: Option<String>,
 }
 
-fn deserialize_signal_envelope_item(item: &Value) -> Result<SignalEnvelope, serde_json::Error> {
-    let envelope_value = item.get("envelope").unwrap_or(item);
-    serde_json::from_value(envelope_value.clone())
+fn deserialize_signal_envelope_item(item: Value) -> Result<SignalEnvelope, serde_json::Error> {
+    let envelope_value = item.get("envelope").unwrap_or(&item);
+    SignalEnvelope::deserialize(envelope_value)
 }
 
 /// Run the Signal receive loop.
@@ -116,7 +116,7 @@ pub async fn signal_receive_loop(
                 match resp.json::<Vec<Value>>().await {
                     Ok(items) => {
                         for item in items {
-                            match deserialize_signal_envelope_item(&item) {
+                            match deserialize_signal_envelope_item(item) {
                                 Ok(envelope) => {
                                     process_envelope(&envelope, &state).await;
                                 }
@@ -242,6 +242,7 @@ async fn process_envelope(envelope: &SignalEnvelope, state: &Arc<WsServerState>)
     let run = crate::server::ws::AgentRun {
         run_id: run_id.clone(),
         session_key: session.session_key.clone(),
+        delivery_recipient_id: Some(peer_id.clone()),
         status: crate::server::ws::AgentRunStatus::Queued,
         message: text.to_string(),
         response: String::new(),
@@ -394,7 +395,7 @@ mod tests {
             }
         });
 
-        let envelope = deserialize_signal_envelope_item(&item).unwrap();
+        let envelope = deserialize_signal_envelope_item(item).unwrap();
         assert_eq!(envelope.source_number.as_deref(), Some("+15559876543"));
         assert_eq!(
             envelope
@@ -419,7 +420,7 @@ mod tests {
             }
         });
 
-        let envelope = deserialize_signal_envelope_item(&item).unwrap();
+        let envelope = deserialize_signal_envelope_item(item).unwrap();
         let group = envelope
             .data_message
             .as_ref()

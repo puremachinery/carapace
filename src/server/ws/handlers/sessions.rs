@@ -63,6 +63,8 @@ pub struct AgentRun {
     pub run_id: String,
     /// Session key this run belongs to
     pub session_key: String,
+    /// Delivery recipient captured at enqueue time, if any.
+    pub delivery_recipient_id: Option<String>,
     /// Current status
     pub status: AgentRunStatus,
     /// Original message that started this run
@@ -1884,6 +1886,7 @@ fn setup_agent_session(
     let run = AgentRun {
         run_id: idempotency_key.to_string(),
         session_key: session.session_key.clone(),
+        delivery_recipient_id: None,
         status: AgentRunStatus::Queued,
         message: message.to_string(),
         response: String::new(),
@@ -2367,6 +2370,7 @@ fn trigger_agent_if_enabled(
     let run = AgentRun {
         run_id: idempotency_key.to_string(),
         session_key: session_key.to_string(),
+        delivery_recipient_id: None,
         status: AgentRunStatus::Queued,
         message: message.to_string(),
         response: String::new(),
@@ -2676,6 +2680,7 @@ mod tests {
         AgentRun {
             run_id: run_id.to_string(),
             session_key: session_key.to_string(),
+            delivery_recipient_id: None,
             status: AgentRunStatus::Queued,
             message: "test message".to_string(),
             response: String::new(),

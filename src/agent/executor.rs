@@ -950,6 +950,12 @@ pub async fn execute_run(
     } else {
         None
     };
+    let delivery_recipient_id = {
+        let registry = state.agent_run_registry.lock();
+        registry
+            .get(&run_id)
+            .and_then(|run| run.delivery_recipient_id.clone())
+    };
 
     finalize_run(
         &state,
@@ -966,10 +972,10 @@ pub async fn execute_run(
     // 5. Deliver response to originating channel if requested
     if let Some(text) = delivery_text {
         if !text.is_empty() {
-            if let (Some(channel_id), Some(chat_id)) = (&message_channel, &session.metadata.chat_id)
-            {
+            let recipient_id = delivery_recipient_id.or_else(|| session.metadata.chat_id.clone());
+            if let (Some(channel_id), Some(chat_id)) = (&message_channel, recipient_id) {
                 let metadata = crate::messages::outbound::MessageMetadata {
-                    recipient_id: Some(chat_id.clone()),
+                    recipient_id: Some(chat_id),
                     ..Default::default()
                 };
                 let outbound = crate::messages::outbound::OutboundMessage::new(
@@ -1171,6 +1177,7 @@ mod tests {
             registry.register(AgentRun {
                 run_id: run_id.to_string(),
                 session_key: session_key.to_string(),
+                delivery_recipient_id: None,
                 status: AgentRunStatus::Queued,
                 message: "Hello".to_string(),
                 response: String::new(),
@@ -1340,6 +1347,78 @@ mod tests {
         assert!(run.response.is_empty(), "response should be empty");
     }
 
+    #[tokio::test]
+    async fn test_delivery_uses_run_recipient_override() {
+        let (state, _tmp) = make_test_state();
+        let run_id = "run-signal-delivery-override";
+        let session_key = "signal:global";
+        let session = state
+            .session_store()
+            .get_or_create_session(
+                session_key,
+                sessions::SessionMetadata {
+                    channel: Some("signal".to_string()),
+                    chat_id: Some("stale-peer".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        state
+            .session_store()
+            .append_message(sessions::ChatMessage::user(&session.id, "Hello"))
+            .unwrap();
+
+        {
+            use crate::server::ws::{AgentRun, AgentRunStatus};
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            let mut registry = state.agent_run_registry.lock();
+            registry.register(AgentRun {
+                run_id: run_id.to_string(),
+                session_key: session_key.to_string(),
+                delivery_recipient_id: Some("fresh-peer".to_string()),
+                status: AgentRunStatus::Queued,
+                message: "Hello".to_string(),
+                response: String::new(),
+                error: None,
+                created_at: now,
+                started_at: None,
+                completed_at: None,
+                cancel_token: CancellationToken::new(),
+                waiters: Vec::new(),
+            });
+        }
+
+        let provider = Arc::new(MockProvider::text("Hello back!"));
+        let config = AgentConfig {
+            deliver: true,
+            max_turns: 5,
+            ..Default::default()
+        };
+
+        let result = execute_run(
+            run_id.to_string(),
+            session_key.to_string(),
+            config,
+            state.clone(),
+            provider,
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(result.is_ok(), "execute_run failed: {:?}", result.err());
+
+        let queued = state
+            .message_pipeline()
+            .next_for_channel("signal")
+            .expect("expected queued signal delivery");
+        assert_eq!(
+            queued.message.metadata.recipient_id.as_deref(),
+            Some("fresh-peer")
+        );
+    }
+
     /// Helper: register a run with a specific cancel token so tests can control it.
     fn setup_session_and_run_with_token(
         state: &WsServerState,
@@ -1365,6 +1444,7 @@ mod tests {
             registry.register(AgentRun {
                 run_id: run_id.to_string(),
                 session_key: session_key.to_string(),
+                delivery_recipient_id: None,
                 status: AgentRunStatus::Queued,
                 message: "Hello".to_string(),
                 response: String::new(),

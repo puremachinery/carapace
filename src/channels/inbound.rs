@@ -29,6 +29,7 @@ pub async fn dispatch_inbound_text(
         peer_id
     };
 
+    let delivery_recipient_id = chat_id.clone();
     let metadata = SessionMetadata {
         channel: Some(channel.to_string()),
         user_id: Some(sender_id.to_string()),
@@ -67,6 +68,7 @@ pub async fn dispatch_inbound_text(
     let run = AgentRun {
         run_id: run_id.clone(),
         session_key: session.session_key.clone(),
+        delivery_recipient_id,
         status: AgentRunStatus::Queued,
         message: text.to_string(),
         response: String::new(),
