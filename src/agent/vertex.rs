@@ -120,7 +120,7 @@ impl TokenProvider for MetadataProvider {
 }
 
 // =================================================================================================
-// Response Adapters
+// Request / Response Helpers
 // =================================================================================================
 
 fn build_gemini_body(request: &CompletionRequest) -> Value {
