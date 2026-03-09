@@ -2741,6 +2741,19 @@ fn alternate_provider_env_hints() -> Vec<&'static str> {
     hints
 }
 
+fn print_alternate_provider_first_run_guidance(alternate_provider_envs: &[&str]) {
+    eprintln!(
+        "Detected other provider env vars ({}).",
+        alternate_provider_envs.join(", ")
+    );
+    eprintln!("This interactive wizard only writes Anthropic/OpenAI first-run config.");
+    eprintln!(
+        "If you want Ollama, Gemini, Venice, or Bedrock first, stop here before writing config."
+    );
+    eprintln!("Providers hub: https://getcara.io/providers.html");
+    eprintln!("Guided setup help: https://getcara.io/help.html#guided-setup-help");
+}
+
 fn local_chat_verify_next_step(cfg: &Value) -> String {
     let model = local_chat_model(cfg);
     match local_chat_provider_route(&model) {
@@ -4315,18 +4328,23 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
         println!(
             "Fastest first-run path: pick one provider, keep `local-chat`, then run `cara verify --outcome local-chat`."
         );
-        let hide_sensitive_input = prompt_yes_no("Hide sensitive input while typing?", true)?;
 
         let provider_env_state = detect_setup_provider_env_state();
         let alternate_provider_envs = alternate_provider_env_hints();
         if matches!(provider_env_state, SetupProviderEnvState::None)
             && !alternate_provider_envs.is_empty()
         {
-            eprintln!(
-                "Detected other provider env vars ({}). This wizard still writes Anthropic/OpenAI first-run config; if you want Ollama, Gemini, Venice, or Bedrock first, stop here and use the Providers/Help docs instead of this wizard.",
-                alternate_provider_envs.join(", ")
-            );
+            print_alternate_provider_first_run_guidance(&alternate_provider_envs);
+            if !prompt_yes_no("Continue with the Anthropic/OpenAI wizard anyway?", false)? {
+                return Err(
+                    "setup canceled before writing Anthropic/OpenAI config for an alternate-provider first run"
+                        .into(),
+                );
+            }
         }
+
+        let hide_sensitive_input = prompt_yes_no("Hide sensitive input while typing?", true)?;
+
         if matches!(provider_env_state, SetupProviderEnvState::Both) {
             eprintln!("Both $ANTHROPIC_API_KEY and $OPENAI_API_KEY are set.");
             eprintln!(
@@ -7001,6 +7019,76 @@ mod tests {
             parsed["agents"]["defaults"]["model"], "claude-sonnet-4-20250514",
             "Default model should be claude-sonnet-4-20250514"
         );
+    }
+
+    #[test]
+    fn test_handle_setup_interactive_alternate_provider_declines_anthropic_openai_wizard() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let env = setup_interactive_test_env(SetupInteractiveTestHarness {
+            force_interactive: Some(true),
+            visible_inputs: VecDeque::from(vec!["n".to_string()]),
+            ..Default::default()
+        });
+        let _ollama_guard = set_env_var_scoped("OLLAMA_BASE_URL", "http://127.0.0.1:11434");
+
+        let result = handle_setup(true);
+        assert!(
+            result.is_err(),
+            "setup should abort before writing Anthropic/OpenAI config"
+        );
+        assert!(
+            !env.config_path.exists(),
+            "config should not be written when the user declines the wrong wizard path"
+        );
+
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.visible_prompt_count, 1);
+        assert_eq!(state.hidden_prompt_count, 0);
+        assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
+    fn test_handle_setup_interactive_alternate_provider_can_continue_anyway() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let env = setup_interactive_test_env(SetupInteractiveTestHarness {
+            force_interactive: Some(true),
+            visible_inputs: VecDeque::from(vec![
+                "y".to_string(),
+                "y".to_string(),
+                "openai".to_string(),
+                "".to_string(),
+                "".to_string(),
+                "".to_string(),
+                "".to_string(),
+                "".to_string(),
+                "".to_string(),
+                "".to_string(),
+                "n".to_string(),
+                "n".to_string(),
+                "n".to_string(),
+            ]),
+            hidden_inputs: VecDeque::from(vec!["".to_string()]),
+            ..Default::default()
+        });
+        let _ollama_guard = set_env_var_scoped("OLLAMA_BASE_URL", "http://127.0.0.1:11434");
+
+        let result = handle_setup(true);
+        assert!(
+            result.is_ok(),
+            "setup should continue when the user opts in"
+        );
+
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.visible_prompt_count, 13);
+        assert_eq!(state.hidden_prompt_count, 1);
+        assert_eq!(state.provider_validation_calls, 0);
+        assert!(state.visible_inputs.is_empty());
+        assert!(state.hidden_inputs.is_empty());
+
+        let content = std::fs::read_to_string(&env.config_path).unwrap();
+        let parsed: serde_json::Value = json5::from_str(&content).unwrap();
+        assert_eq!(parsed["openai"]["apiKey"], "${OPENAI_API_KEY}");
+        assert_eq!(parsed["agents"]["defaults"]["model"], "gpt-4o");
     }
 
     #[test]

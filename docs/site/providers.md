@@ -42,31 +42,44 @@ cara setup
 
 ### Ollama (fastest fully local path)
 
+The runtime supports Ollama today, but the interactive `cara setup` wizard
+still writes Anthropic/OpenAI first-run config. If `OLLAMA_BASE_URL` is set,
+`cara setup` will stop and ask whether you want to continue with that wizard
+anyway.
+
 ```bash
 export OLLAMA_BASE_URL='http://127.0.0.1:11434'
-cara setup
 ```
+
+If you are staying on Ollama first, use `config.example.json5` for the
+`providers.ollama` section and use [Guided setup help](help.md#guided-setup-help)
+if you want help getting to a verified local-chat first run.
 
 ### Gemini / Bedrock / Venice
 
-These are fully supported, but only choose them first if they already match your environment or provider preference.
+These are fully supported at runtime, but the interactive `cara setup` wizard
+still writes Anthropic/OpenAI first-run config. If the matching env vars are
+present, `cara setup` will stop and ask whether you want to continue with that
+wizard anyway.
 
 ```bash
 export GOOGLE_API_KEY='...'
-cara setup
 ```
 
 ```bash
 export AWS_REGION='us-east-1'
 export AWS_ACCESS_KEY_ID='...'
 export AWS_SECRET_ACCESS_KEY='...'
-cara setup
 ```
 
 ```bash
 export VENICE_API_KEY='...'
-cara setup
 ```
+
+If you are staying on Gemini, Bedrock, or Venice first, use
+`config.example.json5` for the provider section you need and use
+[Guided setup help](help.md#guided-setup-help) if you want a shorter path to a
+verified first run.
 
 Supported env vars:
 
