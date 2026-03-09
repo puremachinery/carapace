@@ -125,6 +125,7 @@ pub struct MultiProvider {
     gemini: Option<std::sync::Arc<dyn LlmProvider>>,
     bedrock: Option<std::sync::Arc<dyn LlmProvider>>,
     venice: Option<std::sync::Arc<dyn LlmProvider>>,
+    vertex: Option<std::sync::Arc<dyn LlmProvider>>,
 }
 
 impl std::fmt::Debug for MultiProvider {
@@ -136,6 +137,7 @@ impl std::fmt::Debug for MultiProvider {
             .field("gemini", &self.gemini.is_some())
             .field("bedrock", &self.bedrock.is_some())
             .field("venice", &self.venice.is_some())
+            .field("vertex", &self.vertex.is_some())
             .finish()
     }
 }
@@ -156,6 +158,7 @@ impl MultiProvider {
             gemini: None,
             bedrock: None,
             venice: None,
+            vertex: None,
         }
     }
 
@@ -183,6 +186,12 @@ impl MultiProvider {
         self
     }
 
+    /// Set the Vertex provider for Google Vertex AI models.
+    pub fn with_vertex(mut self, vertex: Option<std::sync::Arc<dyn LlmProvider>>) -> Self {
+        self.vertex = vertex;
+        self
+    }
+
     /// Returns `true` if at least one provider is configured.
     pub fn has_any_provider(&self) -> bool {
         self.anthropic.is_some()
@@ -191,6 +200,7 @@ impl MultiProvider {
             || self.gemini.is_some()
             || self.bedrock.is_some()
             || self.venice.is_some()
+            || self.vertex.is_some()
     }
 
     /// Select the appropriate backend provider for the given model.
@@ -201,7 +211,8 @@ impl MultiProvider {
     /// 3. Models matching Gemini patterns (gemini-*, gemini/*, models/gemini-*) -> Gemini
     /// 4. Models matching OpenAI patterns (gpt-*, o1-*, etc.) -> OpenAI
     /// 5. Models matching Bedrock patterns (bedrock:*, anthropic.claude-*, etc.) -> Bedrock
-    /// 6. Everything else -> Anthropic (default)
+    /// 6. Models matching Vertex patterns (vertex:*, vertex/*) -> Vertex
+    /// 7. Everything else -> Anthropic (default)
     fn select_provider(&self, model: &str) -> Result<&dyn LlmProvider, AgentError> {
         if crate::agent::ollama::is_ollama_model(model) {
             self.ollama.as_deref().ok_or_else(|| {
@@ -215,12 +226,26 @@ impl MultiProvider {
                     "model \"{model}\" requires Venice provider, but no VENICE_API_KEY is configured"
                 ))
             })
-        } else if crate::agent::gemini::is_gemini_model(model) {
-            self.gemini.as_deref().ok_or_else(|| {
+        } else if crate::agent::vertex::is_vertex_model(model) {
+            self.vertex.as_deref().ok_or_else(|| {
                 AgentError::Provider(format!(
-                    "model \"{model}\" requires Gemini provider, but no GOOGLE_API_KEY is configured"
+                    "model \"{model}\" requires Vertex provider, but it is not configured"
                 ))
             })
+        } else if crate::agent::gemini::is_gemini_model(model) {
+            if self.gemini.is_some() {
+                self.gemini
+                    .as_deref()
+                    .ok_or_else(|| AgentError::Provider("".to_string()))
+            } else if self.vertex.is_some() {
+                self.vertex
+                    .as_deref()
+                    .ok_or_else(|| AgentError::Provider("".to_string()))
+            } else {
+                Err(AgentError::Provider(format!(
+                    "model \"{model}\" requires Gemini provider, but no GOOGLE_API_KEY is configured"
+                )))
+            }
         } else if crate::agent::openai::is_openai_model(model) {
             self.openai.as_deref().ok_or_else(|| {
                 AgentError::Provider(format!(
@@ -235,11 +260,19 @@ impl MultiProvider {
             })
         } else {
             // Default to Anthropic for claude-* and unknown models
-            self.anthropic.as_deref().ok_or_else(|| {
-                AgentError::Provider(format!(
+            if self.anthropic.is_some() {
+                self.anthropic
+                    .as_deref()
+                    .ok_or_else(|| AgentError::Provider("".to_string()))
+            } else if model == crate::agent::DEFAULT_MODEL && self.vertex.is_some() {
+                self.vertex
+                    .as_deref()
+                    .ok_or_else(|| AgentError::Provider("".to_string()))
+            } else {
+                Err(AgentError::Provider(format!(
                     "model \"{model}\" requires Anthropic provider, but no ANTHROPIC_API_KEY is configured"
-                ))
-            })
+                )))
+            }
         }
     }
 }
@@ -275,6 +308,21 @@ impl LlmProvider for MultiProvider {
         // so the Bedrock API receives the bare model ID (e.g. "anthropic.claude-3-sonnet-20240229-v1:0").
         if crate::agent::bedrock::is_bedrock_model(&request.model) {
             request.model = crate::agent::bedrock::strip_bedrock_prefix(&request.model).to_string();
+        }
+
+        // Strip the vertex: or vertex/ prefix before forwarding to the provider,
+        // so the Vertex API receives the bare model name (e.g. "gemini-2.0-flash").
+        if request.model.starts_with("vertex/") || request.model.starts_with("vertex:") {
+            request.model = crate::agent::vertex::strip_vertex_prefix(&request.model).to_string();
+        }
+
+        // If the request is for the global fallback DEFAULT_MODEL, and Anthropic is NOT configured
+        // but Vertex IS configured, we change the model to "default" so it runs Vertex's configured default model!
+        if request.model == crate::agent::DEFAULT_MODEL
+            && self.anthropic.is_none()
+            && self.vertex.is_some()
+        {
+            request.model = "default".to_string();
         }
 
         provider.complete(request, cancel_token).await

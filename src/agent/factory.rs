@@ -51,6 +51,37 @@ fn try_build_provider<P: agent::LlmProvider + 'static>(
     }
 }
 
+struct VertexConfig {
+    project_id: Option<String>,
+    location: Option<String>,
+    model: Option<String>,
+}
+
+fn get_vertex_config(cfg: &Value) -> VertexConfig {
+    let vertex_cfg = cfg.get("vertex");
+    let project_id = vertex_cfg
+        .and_then(|v| v.get("projectId"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("VERTEX_PROJECT_ID").ok());
+    let location = vertex_cfg
+        .and_then(|v| v.get("location"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("VERTEX_LOCATION").ok());
+    let model = vertex_cfg
+        .and_then(|v| v.get("model"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("VERTEX_MODEL").ok());
+
+    VertexConfig {
+        project_id,
+        location,
+        model,
+    }
+}
+
 /// Try to build the Ollama provider with optional base URL, API key, and
 /// a non-blocking connectivity check.
 fn try_build_ollama_provider(
@@ -212,7 +243,6 @@ pub fn build_providers(cfg: &Value) -> Result<Option<MultiProvider>, Box<dyn std
         |p, url| p.with_base_url(url),
     )?;
 
-    // Bedrock
     let bedrock = {
         let bedrock_cfg = cfg.get("bedrock");
         // Check explicit disable
@@ -275,12 +305,35 @@ pub fn build_providers(cfg: &Value) -> Result<Option<MultiProvider>, Box<dyn std
         }
     };
 
+    // Vertex
+    let vertex_config = get_vertex_config(cfg);
+
+    let vertex_provider = if let Some(project_id) = vertex_config.project_id {
+        let location = vertex_config
+            .location
+            .unwrap_or_else(|| "us-central1".to_string());
+        info!(
+            "LLM provider configured: Vertex (project: {}, location: {}, model: {:?})",
+            project_id, location, vertex_config.model
+        );
+        match agent::vertex::VertexProvider::new(project_id, location, vertex_config.model) {
+            Ok(provider) => Some(Arc::new(provider) as Arc<dyn agent::LlmProvider>),
+            Err(e) => {
+                warn!("Failed to configure Vertex provider: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Build multi-provider dispatcher
     let multi_provider = MultiProvider::new(anthropic_provider, openai_provider)
         .with_ollama(ollama_provider)
         .with_gemini(gemini_provider)
         .with_venice(venice_provider)
-        .with_bedrock(bedrock);
+        .with_bedrock(bedrock)
+        .with_vertex(vertex_provider);
 
     if multi_provider.has_any_provider() {
         Ok(Some(multi_provider))
@@ -300,6 +353,7 @@ pub struct ProviderFingerprint {
     pub gemini: Option<(String, Option<String>)>,
     pub venice: Option<(String, Option<String>)>,
     pub bedrock: Option<String>,
+    pub vertex: Option<(String, String, Option<String>)>,
 }
 
 /// Compute a fingerprint of the provider configuration from config + env vars.
@@ -366,6 +420,8 @@ pub fn fingerprint_providers(cfg: &Value) -> ProviderFingerprint {
     });
 
     let bedrock_cfg = cfg.get("bedrock");
+    let vertex_config = get_vertex_config(cfg);
+
     let bedrock_enabled = bedrock_cfg
         .and_then(|b| b.get("enabled"))
         .and_then(|v| v.as_bool())
@@ -398,15 +454,21 @@ pub fn fingerprint_providers(cfg: &Value) -> ProviderFingerprint {
         venice: venice_key.map(|k| (hash_key_prefix(&k), venice_url)),
         bedrock: if bedrock_enabled {
             match (bedrock_region, bedrock_access_key) {
-                (Some(r), Some(ak)) => {
-                    let combined = format!("{}{}", r, ak);
-                    Some(hash_key_prefix(&combined))
-                }
+                (Some(r), Some(k)) => Some(hash_key_prefix(&format!("{}{}", r, k))),
                 _ => None,
             }
         } else {
             None
         },
+        vertex: vertex_config.project_id.map(|p| {
+            (
+                p,
+                vertex_config
+                    .location
+                    .unwrap_or_else(|| "us-central1".to_string()),
+                vertex_config.model,
+            )
+        }),
     }
 }
 
@@ -441,6 +503,9 @@ mod tests {
         "AWS_REGION",
         "AWS_DEFAULT_REGION",
         "AWS_ACCESS_KEY_ID",
+        "VERTEX_PROJECT_ID",
+        "VERTEX_LOCATION",
+        "VERTEX_MODEL",
     ];
 
     struct EnvVarGuard {
@@ -484,6 +549,7 @@ mod tests {
             assert!(fp.gemini.is_none());
             assert!(fp.venice.is_none());
             assert!(fp.bedrock.is_none());
+            assert!(fp.vertex.is_none());
         });
     }
 
@@ -548,7 +614,9 @@ mod tests {
             });
             let fp = fingerprint_providers(&cfg);
             assert!(fp.bedrock.is_some());
-            assert_eq!(fp.bedrock.as_ref().unwrap().len(), 16); // 8 bytes = 16 hex chars
+            let combined = format!("{}{}", "us-east-1", "AKIAIOSFODNN7EXAMPLE");
+            let expected_hash = hash_key_prefix(&combined);
+            assert_eq!(fp.bedrock, Some(expected_hash));
         });
     }
 
