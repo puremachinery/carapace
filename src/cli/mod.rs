@@ -4548,6 +4548,12 @@ fn configure_provider_interactive(
             } else {
                 None
             };
+            if api_key
+                .as_ref()
+                .is_some_and(|value| value.effective_value.is_none())
+            {
+                print_missing_setup_value_notice("OLLAMA_API_KEY", "Ollama API key");
+            }
 
             match crate::agent::ollama::OllamaProvider::new()
                 .and_then(|provider| {
