@@ -280,6 +280,10 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust_runtime == 'true' || needs.changes.outputs.docker == 'true'
     env:
+      # trivy-action 0.34.1 defaults to v0.69.1, which exists as a tag but not a
+      # published GitHub release. Pin an actual released version so the installer
+      # can download binaries deterministically.
+      TRIVY_VERSION: v0.69.3
       # Avoid transient mirror.gcr.io 404s when pulling Trivy databases.
       TRIVY_DB_REPOSITORY: ghcr.io/aquasecurity/trivy-db:2
       TRIVY_JAVA_DB_REPOSITORY: ghcr.io/aquasecurity/trivy-java-db:1
@@ -291,6 +295,7 @@ jobs:
         with:
           scan-type: fs
           scan-ref: .
+          version: ${{ env.TRIVY_VERSION }}
           severity: CRITICAL,HIGH
           exit-code: 1
       - name: Run Trivy config scan
@@ -298,6 +303,7 @@ jobs:
         with:
           scan-type: config
           scan-ref: .
+          version: ${{ env.TRIVY_VERSION }}
           severity: CRITICAL,HIGH
           exit-code: 1
 
