@@ -51,7 +51,8 @@ cara setup --provider ollama
 ```
 
 If your Ollama endpoint requires auth, the wizard will also offer an optional
-API key prompt and write `providers.ollama.apiKey`.
+API key prompt and can write `providers.ollama.apiKey` from either direct input
+or `${OLLAMA_API_KEY}`.
 
 ### Gemini / Bedrock / Venice
 
@@ -86,6 +87,7 @@ Supported env vars:
 - `OPENAI_API_KEY`
 - `GOOGLE_API_KEY`
 - `GOOGLE_API_BASE_URL` (Gemini override)
+- `OLLAMA_API_KEY` (optional Ollama auth)
 - `OLLAMA_BASE_URL` (if non-default)
 - `AWS_REGION` or `AWS_DEFAULT_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` (Bedrock)
 - `AWS_SESSION_TOKEN` (optional Bedrock session token)

@@ -48,9 +48,10 @@ Run the interactive setup:
 cara setup
 ```
 
-Or skip the provider menu explicitly:
+Or skip the provider menu explicitly by choosing one provider:
 
 ```bash
+# Choose ONE of these commands:
 cara setup --provider ollama
 cara setup --provider gemini
 ```

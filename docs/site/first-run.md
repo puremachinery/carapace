@@ -41,9 +41,10 @@ The wizard walks you through:
   - `hooks`
 - optional hooks token and Control UI toggle.
 
-Recommended explicit examples:
+Recommended explicit examples (pick one, based on your provider):
 
 ```bash
+# Pick ONE of these commands:
 cara setup --provider anthropic
 cara setup --provider ollama
 cara setup --provider gemini

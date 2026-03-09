@@ -2485,15 +2485,7 @@ impl SetupProvider {
     }
 
     fn parse_prompt(raw: &str) -> Option<Self> {
-        match raw.trim().to_lowercase().as_str() {
-            "anthropic" | "claude" => Some(Self::Anthropic),
-            "openai" | "gpt" => Some(Self::OpenAi),
-            "ollama" => Some(Self::Ollama),
-            "gemini" => Some(Self::Gemini),
-            "venice" => Some(Self::Venice),
-            "bedrock" => Some(Self::Bedrock),
-            _ => None,
-        }
+        <Self as clap::ValueEnum>::from_str(raw.trim(), true).ok()
     }
 }
 
@@ -2554,6 +2546,8 @@ fn default_setup_provider(provider_hints: &[SetupProvider]) -> SetupProvider {
     if let [provider] = provider_hints {
         *provider
     } else {
+        // When multiple hints exist, prefer the first detected provider so the
+        // wizard has a deterministic default without trying to infer intent.
         provider_hints
             .first()
             .copied()
@@ -2741,12 +2735,13 @@ fn provider_api_key_guidance(cfg: &Value, provider: SetupProvider, config_path: 
         "check {} API key/model and retry `cara verify --outcome local-chat`",
         provider.label()
     );
+    let Some(primary_env_var_name) = provider.api_key_env_var_name() else {
+        return provider_route_fallback_guidance(cfg, provider.label(), None);
+    };
     single_credential_provider_guidance(
         cfg,
         provider.label(),
-        provider
-            .api_key_env_var_name()
-            .expect("provider_api_key_guidance only supports API-key providers"),
+        primary_env_var_name,
         config_path,
         &configured_message,
         None,
@@ -4466,10 +4461,7 @@ fn prompt_optional_base_url_override(
         return Ok(None);
     }
 
-    let default_value = first_present_env_var(&[env_var])
-        .map(|(_, value)| value)
-        .unwrap_or_else(|| default_url.to_string());
-    let entered = prompt_with_default(&format!("{provider_label} base URL"), &default_value)?;
+    let entered = prompt_with_default(&format!("{provider_label} base URL"), default_url)?;
     Ok(Some(SetupConfigValue {
         config_value: entered.clone(),
         effective_value: Some(entered),
@@ -4548,15 +4540,11 @@ fn configure_provider_interactive(
 
             let api_key = if prompt_yes_no("Does this Ollama endpoint require an API key?", false)?
             {
-                let entered = prompt_sensitive_line("Ollama API key", hide_sensitive_input, true)?;
-                if entered.is_empty() {
-                    None
-                } else {
-                    Some(SetupConfigValue {
-                        config_value: entered.clone(),
-                        effective_value: Some(entered),
-                    })
-                }
+                Some(prompt_required_secret_config_value(
+                    "OLLAMA_API_KEY",
+                    "Ollama API key",
+                    hide_sensitive_input,
+                )?)
             } else {
                 None
             };
@@ -4789,10 +4777,16 @@ fn configure_provider_noninteractive(config: &mut Value, provider: SetupProvider
             let base_url = first_present_env_var(&["OLLAMA_BASE_URL"])
                 .map(|(env_var, _)| env_placeholder(env_var))
                 .unwrap_or_else(|| crate::agent::ollama::DEFAULT_OLLAMA_BASE_URL.to_string());
+            let mut ollama_config = serde_json::Map::new();
+            ollama_config.insert("baseUrl".to_string(), serde_json::json!(base_url));
+            if env_var_present("OLLAMA_API_KEY") {
+                ollama_config.insert(
+                    "apiKey".to_string(),
+                    serde_json::json!(env_placeholder("OLLAMA_API_KEY")),
+                );
+            }
             config["providers"] = serde_json::json!({
-                "ollama": {
-                    "baseUrl": base_url
-                }
+                "ollama": ollama_config
             });
         }
         SetupProvider::Gemini => {
@@ -7483,6 +7477,31 @@ mod tests {
     }
 
     #[test]
+    fn test_cli_setup_with_provider_aliases() {
+        let claude_cli = Cli::try_parse_from(["cara", "setup", "--provider", "claude"]).unwrap();
+        match claude_cli.command {
+            Some(Command::Setup {
+                force,
+                provider: Some(SetupProvider::Anthropic),
+            }) => {
+                assert!(!force);
+            }
+            other => panic!("Expected Setup with anthropic alias, got {:?}", other),
+        }
+
+        let gpt_cli = Cli::try_parse_from(["cara", "setup", "--provider", "gpt"]).unwrap();
+        match gpt_cli.command {
+            Some(Command::Setup {
+                force,
+                provider: Some(SetupProvider::OpenAi),
+            }) => {
+                assert!(!force);
+            }
+            other => panic!("Expected Setup with openai alias, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn test_handle_setup_errors_when_config_exists_no_force() {
         let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
         let temp = tempfile::TempDir::new().unwrap();
@@ -7595,6 +7614,28 @@ mod tests {
         let parsed: serde_json::Value = json5::from_str(&content).unwrap();
         assert_eq!(parsed["google"]["apiKey"], "${GOOGLE_API_KEY}");
         assert_eq!(parsed["agents"]["defaults"]["model"], "gemini-2.0-flash");
+    }
+
+    #[test]
+    fn test_handle_setup_noninteractive_provider_flag_writes_ollama_api_key_placeholder() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_path = temp.path().join("carapace.json");
+        let _config_guard =
+            set_env_var_scoped("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
+        let _base_url_guard = set_env_var_scoped("OLLAMA_BASE_URL", "http://127.0.0.1:11434");
+        let _api_key_guard = set_env_var_scoped("OLLAMA_API_KEY", "ollama-token");
+
+        let result = handle_setup(false, Some(SetupProvider::Ollama));
+        assert!(
+            result.is_ok(),
+            "non-interactive provider setup should succeed"
+        );
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let parsed: serde_json::Value = json5::from_str(&content).unwrap();
+        assert_eq!(parsed["providers"]["ollama"]["apiKey"], "${OLLAMA_API_KEY}");
+        assert_eq!(parsed["agents"]["defaults"]["model"], "ollama:llama3");
     }
 
     #[test]
