@@ -2524,25 +2524,44 @@ fn config_string(cfg: &Value, path: &[&str]) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn configured_provider_labels(cfg: &Value) -> Vec<&'static str> {
-    let fingerprint = crate::agent::factory::fingerprint_providers(cfg);
+fn usable_provider_labels(cfg: &Value) -> Vec<&'static str> {
     let mut labels = Vec::new();
-    if fingerprint.anthropic.is_some() {
+    if env_var_present("ANTHROPIC_API_KEY")
+        || config_string(cfg, &["anthropic", "apiKey"]).is_some()
+    {
         labels.push("Anthropic");
     }
-    if fingerprint.openai.is_some() {
+    if env_var_present("OPENAI_API_KEY") || config_string(cfg, &["openai", "apiKey"]).is_some() {
         labels.push("OpenAI");
     }
-    if fingerprint.ollama.is_some() {
+    if env_var_present("OLLAMA_BASE_URL")
+        || config_string(cfg, &["providers", "ollama", "baseUrl"]).is_some()
+        || cfg
+            .get("providers")
+            .and_then(|value| value.get("ollama"))
+            .is_some()
+    {
         labels.push("Ollama");
     }
-    if fingerprint.gemini.is_some() {
+    if env_var_present("GOOGLE_API_KEY") || config_string(cfg, &["google", "apiKey"]).is_some() {
         labels.push("Gemini");
     }
-    if fingerprint.venice.is_some() {
+    if env_var_present("VENICE_API_KEY") || config_string(cfg, &["venice", "apiKey"]).is_some() {
         labels.push("Venice");
     }
-    if fingerprint.bedrock.is_some() {
+    let bedrock_enabled = cfg
+        .get("bedrock")
+        .and_then(|value| value.get("enabled"))
+        .and_then(|value| value.as_bool())
+        != Some(false);
+    let bedrock_region = env_var_present("AWS_REGION")
+        || env_var_present("AWS_DEFAULT_REGION")
+        || config_string(cfg, &["bedrock", "region"]).is_some();
+    let bedrock_access_key = env_var_present("AWS_ACCESS_KEY_ID")
+        || config_string(cfg, &["bedrock", "accessKeyId"]).is_some();
+    let bedrock_secret_key = env_var_present("AWS_SECRET_ACCESS_KEY")
+        || config_string(cfg, &["bedrock", "secretAccessKey"]).is_some();
+    if bedrock_enabled && bedrock_region && bedrock_access_key && bedrock_secret_key {
         labels.push("Bedrock");
     }
     labels
@@ -2597,15 +2616,15 @@ fn provider_api_key_guidance(cfg: &Value, provider: SetupProvider, config_path: 
         );
     }
 
-    let configured = configured_provider_labels(cfg);
-    if configured.is_empty() {
+    let usable = usable_provider_labels(cfg);
+    if usable.is_empty() {
         no_provider_configured_guidance()
     } else {
         format!(
-            "the selected model currently routes to {}; configure {} or switch `agents.defaults.model` to one of the already configured providers ({}), then retry `cara verify --outcome local-chat`",
+            "the selected model currently routes to {}; configure {} or switch `agents.defaults.model` to one of the other usable providers ({}), then retry `cara verify --outcome local-chat`",
             provider.label(),
             provider.label(),
-            configured.join(", ")
+            usable.join(", ")
         )
     }
 }
@@ -2647,13 +2666,13 @@ fn local_chat_verify_next_step(cfg: &Value) -> String {
                 "check Gemini API key/model and retry `cara verify --outcome local-chat`"
                     .to_string()
             } else {
-                let configured = configured_provider_labels(cfg);
-                if configured.is_empty() {
+                let usable = usable_provider_labels(cfg);
+                if usable.is_empty() {
                     no_provider_configured_guidance()
                 } else {
                     format!(
-                        "the selected model currently routes to Gemini; configure Gemini (`GOOGLE_API_KEY` or `google.apiKey`) or switch `agents.defaults.model` to one of the already configured providers ({}), then retry `cara verify --outcome local-chat`",
-                        configured.join(", ")
+                        "the selected model currently routes to Gemini; configure Gemini (`GOOGLE_API_KEY` or `google.apiKey`) or switch `agents.defaults.model` to one of the other usable providers ({}), then retry `cara verify --outcome local-chat`",
+                        usable.join(", ")
                     )
                 }
             }
@@ -2665,13 +2684,13 @@ fn local_chat_verify_next_step(cfg: &Value) -> String {
                 "check Venice API key/model and retry `cara verify --outcome local-chat`"
                     .to_string()
             } else {
-                let configured = configured_provider_labels(cfg);
-                if configured.is_empty() {
+                let usable = usable_provider_labels(cfg);
+                if usable.is_empty() {
                     no_provider_configured_guidance()
                 } else {
                     format!(
-                        "the selected model currently routes to Venice; configure Venice (`VENICE_API_KEY` or `venice.apiKey`) or switch `agents.defaults.model` to one of the already configured providers ({}), then retry `cara verify --outcome local-chat`",
-                        configured.join(", ")
+                        "the selected model currently routes to Venice; configure Venice (`VENICE_API_KEY` or `venice.apiKey`) or switch `agents.defaults.model` to one of the other usable providers ({}), then retry `cara verify --outcome local-chat`",
+                        usable.join(", ")
                     )
                 }
             }
@@ -2687,13 +2706,13 @@ fn local_chat_verify_next_step(cfg: &Value) -> String {
                 "check Ollama server reachability/base URL and selected model, then retry `cara verify --outcome local-chat`"
                     .to_string()
             } else {
-                let configured = configured_provider_labels(cfg);
-                if configured.is_empty() {
+                let usable = usable_provider_labels(cfg);
+                if usable.is_empty() {
                     no_provider_configured_guidance()
                 } else {
                     format!(
-                        "the selected model currently routes to Ollama; configure Ollama (`OLLAMA_BASE_URL` or `providers.ollama.baseUrl`) or switch `agents.defaults.model` to one of the already configured providers ({}), then retry `cara verify --outcome local-chat`",
-                        configured.join(", ")
+                        "the selected model currently routes to Ollama; configure Ollama (`OLLAMA_BASE_URL` or `providers.ollama.baseUrl`) or switch `agents.defaults.model` to one of the other usable providers ({}), then retry `cara verify --outcome local-chat`",
+                        usable.join(", ")
                     )
                 }
             }
@@ -2710,13 +2729,13 @@ fn local_chat_verify_next_step(cfg: &Value) -> String {
                 "check AWS Bedrock region/credentials and selected model, then retry `cara verify --outcome local-chat`"
                     .to_string()
             } else {
-                let configured = configured_provider_labels(cfg);
-                if configured.is_empty() {
+                let usable = usable_provider_labels(cfg);
+                if usable.is_empty() {
                     no_provider_configured_guidance()
                 } else {
                     format!(
-                        "the selected model currently routes to Bedrock; configure Bedrock (`AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` or `bedrock.*`) or switch `agents.defaults.model` to one of the already configured providers ({}), then retry `cara verify --outcome local-chat`",
-                        configured.join(", ")
+                        "the selected model currently routes to Bedrock; configure Bedrock (`AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` or `bedrock.*`) or switch `agents.defaults.model` to one of the other usable providers ({}), then retry `cara verify --outcome local-chat`",
+                        usable.join(", ")
                     )
                 }
             }
@@ -4265,7 +4284,7 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
             && !alternate_provider_envs.is_empty()
         {
             eprintln!(
-                "Detected other provider env vars ({}). If you want Ollama, Gemini, Venice, or Bedrock first, use the Providers/Help docs after setup.",
+                "Detected other provider env vars ({}). This wizard still writes Anthropic/OpenAI first-run config; if you want Ollama, Gemini, Venice, or Bedrock first, stop here and use the Providers/Help docs instead of this wizard.",
                 alternate_provider_envs.join(", ")
             );
         }
@@ -6537,8 +6556,28 @@ mod tests {
         });
         assert_eq!(
             local_chat_verify_next_step(&cfg),
-            "the selected model currently routes to Anthropic; configure Anthropic or switch `agents.defaults.model` to one of the already configured providers (OpenAI), then retry `cara verify --outcome local-chat`"
+            "the selected model currently routes to Anthropic; configure Anthropic or switch `agents.defaults.model` to one of the other usable providers (OpenAI), then retry `cara verify --outcome local-chat`"
         );
+    }
+
+    #[test]
+    fn test_usable_provider_labels_ignores_empty_api_keys() {
+        let cfg = serde_json::json!({
+            "openai": { "apiKey": "   " },
+            "anthropic": { "apiKey": "sk-anthropic-inline" }
+        });
+        assert_eq!(usable_provider_labels(&cfg), vec!["Anthropic"]);
+    }
+
+    #[test]
+    fn test_usable_provider_labels_require_complete_bedrock_credentials() {
+        let cfg = serde_json::json!({
+            "bedrock": {
+                "region": "us-east-1",
+                "accessKeyId": "AKIA..."
+            }
+        });
+        assert!(usable_provider_labels(&cfg).is_empty());
     }
 
     #[test]
