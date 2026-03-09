@@ -52,7 +52,7 @@ export OLLAMA_BASE_URL='http://127.0.0.1:11434'
 ```
 
 If you are staying on Ollama first, skip the Anthropic/OpenAI wizard, copy the
-`providers.ollama` section from `config.example.json5`, and use
+`ollama` section from `config.example.json5`, and use
 [Guided setup help](help.md#guided-setup-help) if you want help getting to a
 verified local-chat first run.
 
@@ -64,6 +64,8 @@ still writes Anthropic/OpenAI first-run config. If neither
 present, `cara setup` will stop and ask whether you want to continue with that
 wizard anyway. For Bedrock, that means a region plus both
 `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`.
+If `GOOGLE_API_KEY` is only for other Google APIs and not for Gemini, unset it
+before running `cara setup`.
 
 ```bash
 export GOOGLE_API_KEY='...'

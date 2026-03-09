@@ -2749,6 +2749,9 @@ fn print_alternate_provider_first_run_guidance(alternate_provider_envs: &[&str])
     eprintln!(
         "If you want Ollama, Gemini, Venice, or Bedrock first, stop here before writing config."
     );
+    eprintln!(
+        "If any of those env vars are only for unrelated tooling, unset them and rerun `cara setup`."
+    );
     eprintln!("Providers hub: https://getcara.io/providers.html");
     eprintln!("Guided setup help: https://getcara.io/help.html#guided-setup-help");
 }
