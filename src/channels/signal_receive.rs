@@ -121,7 +121,7 @@ pub async fn signal_receive_loop(
                                     process_envelope(&envelope, &state).await;
                                 }
                                 Err(e) => {
-                                    debug!("Failed to parse Signal envelope item: {}", e);
+                                    warn!("Failed to parse Signal envelope item: {}", e);
                                 }
                             }
                         }
@@ -403,6 +403,26 @@ mod tests {
                 .as_ref()
                 .and_then(|dm| dm.message.as_deref()),
             Some("Hello from wrapped Signal")
+        );
+    }
+
+    #[test]
+    fn test_parse_unwrapped_envelope_item() {
+        let item = serde_json::json!({
+            "sourceNumber": "+15559876543",
+            "dataMessage": {
+                "message": "Hello direct"
+            }
+        });
+
+        let envelope = deserialize_signal_envelope_item(item).unwrap();
+        assert_eq!(envelope.source_number.as_deref(), Some("+15559876543"));
+        assert_eq!(
+            envelope
+                .data_message
+                .as_ref()
+                .and_then(|dm| dm.message.as_deref()),
+            Some("Hello direct")
         );
     }
 
