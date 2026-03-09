@@ -313,8 +313,8 @@ pub fn build_providers(cfg: &Value) -> Result<Option<MultiProvider>, Box<dyn std
             .location
             .unwrap_or_else(|| "us-central1".to_string());
         info!(
-            "LLM provider configured: Vertex (project: {}, location: {})",
-            project_id, location
+            "LLM provider configured: Vertex (project: {}, location: {}, model: {:?})",
+            project_id, location, vertex_config.model
         );
         match agent::vertex::VertexProvider::new(project_id, location, vertex_config.model) {
             Ok(provider) => Some(Arc::new(provider) as Arc<dyn agent::LlmProvider>),
