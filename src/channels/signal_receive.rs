@@ -60,6 +60,11 @@ pub struct SignalGroupInfo {
     pub group_id: Option<String>,
 }
 
+fn deserialize_signal_envelope_item(item: &Value) -> Result<SignalEnvelope, serde_json::Error> {
+    let envelope_value = item.get("envelope").unwrap_or(item);
+    serde_json::from_value(envelope_value.clone())
+}
+
 /// Run the Signal receive loop.
 ///
 /// Polls `GET {base_url}/v1/receive/{number}` every 2 seconds, parses inbound
@@ -108,10 +113,17 @@ pub async fn signal_receive_loop(
                 }
                 channel_registry.update_status("signal", ChannelStatus::Connected);
 
-                match resp.json::<Vec<SignalEnvelope>>().await {
-                    Ok(envelopes) => {
-                        for envelope in envelopes {
-                            process_envelope(&envelope, &state).await;
+                match resp.json::<Vec<Value>>().await {
+                    Ok(items) => {
+                        for item in items {
+                            match deserialize_signal_envelope_item(&item) {
+                                Ok(envelope) => {
+                                    process_envelope(&envelope, &state).await;
+                                }
+                                Err(e) => {
+                                    debug!("Failed to parse Signal envelope item: {}", e);
+                                }
+                            }
                         }
                     }
                     Err(e) => {
@@ -187,7 +199,7 @@ async fn process_envelope(envelope: &SignalEnvelope, state: &Arc<WsServerState>)
     let metadata = SessionMetadata {
         channel: Some("signal".to_string()),
         user_id: Some(sender.to_string()),
-        chat_id: group_id,
+        chat_id: Some(peer_id.clone()),
         ..Default::default()
     };
 
@@ -369,5 +381,51 @@ mod tests {
         assert_eq!(envelopes.len(), 1);
         let dm = envelopes[0].data_message.as_ref().unwrap();
         assert!(dm.message.is_none());
+    }
+
+    #[test]
+    fn test_parse_wrapped_envelope_item() {
+        let item = serde_json::json!({
+            "envelope": {
+                "sourceNumber": "+15559876543",
+                "dataMessage": {
+                    "message": "Hello from wrapped Signal"
+                }
+            }
+        });
+
+        let envelope = deserialize_signal_envelope_item(&item).unwrap();
+        assert_eq!(envelope.source_number.as_deref(), Some("+15559876543"));
+        assert_eq!(
+            envelope
+                .data_message
+                .as_ref()
+                .and_then(|dm| dm.message.as_deref()),
+            Some("Hello from wrapped Signal")
+        );
+    }
+
+    #[test]
+    fn test_parse_wrapped_group_envelope_item() {
+        let item = serde_json::json!({
+            "envelope": {
+                "source": "+15559876543",
+                "dataMessage": {
+                    "message": "Group hello",
+                    "groupInfo": {
+                        "groupId": "dGVzdGdyb3VwaWQ="
+                    }
+                }
+            }
+        });
+
+        let envelope = deserialize_signal_envelope_item(&item).unwrap();
+        let group = envelope
+            .data_message
+            .as_ref()
+            .and_then(|dm| dm.group_info.as_ref())
+            .and_then(|group| group.group_id.as_deref());
+        assert_eq!(group, Some("dGVzdGdyb3VwaWQ="));
+        assert_eq!(envelope.source_number.as_deref(), Some("+15559876543"));
     }
 }
