@@ -2524,29 +2524,55 @@ fn config_string(cfg: &Value, path: &[&str]) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn config_value_is_usable(value: &str) -> bool {
+    extract_env_placeholder_key(value)
+        .map(|env_var| env_var_present(&env_var))
+        .unwrap_or(true)
+}
+
+fn config_path_has_usable_value(cfg: &Value, path: &[&str]) -> bool {
+    config_string(cfg, path)
+        .map(|value| config_value_is_usable(&value))
+        .unwrap_or(false)
+}
+
+fn ollama_configured_for_guidance(cfg: &Value) -> bool {
+    if env_var_present("OLLAMA_BASE_URL") {
+        return true;
+    }
+
+    match cfg.get("providers").and_then(|value| value.get("ollama")) {
+        Some(ollama_cfg) => {
+            if let Some(base_url) = ollama_cfg.get("baseUrl").and_then(|value| value.as_str()) {
+                config_value_is_usable(base_url.trim()) && !base_url.trim().is_empty()
+            } else {
+                true
+            }
+        }
+        None => false,
+    }
+}
+
 fn usable_provider_labels(cfg: &Value) -> Vec<&'static str> {
     let mut labels = Vec::new();
     if env_var_present("ANTHROPIC_API_KEY")
-        || config_string(cfg, &["anthropic", "apiKey"]).is_some()
+        || config_path_has_usable_value(cfg, &["anthropic", "apiKey"])
     {
         labels.push("Anthropic");
     }
-    if env_var_present("OPENAI_API_KEY") || config_string(cfg, &["openai", "apiKey"]).is_some() {
+    if env_var_present("OPENAI_API_KEY") || config_path_has_usable_value(cfg, &["openai", "apiKey"])
+    {
         labels.push("OpenAI");
     }
-    if env_var_present("OLLAMA_BASE_URL")
-        || config_string(cfg, &["providers", "ollama", "baseUrl"]).is_some()
-        || cfg
-            .get("providers")
-            .and_then(|value| value.get("ollama"))
-            .is_some()
-    {
+    if ollama_configured_for_guidance(cfg) {
         labels.push("Ollama");
     }
-    if env_var_present("GOOGLE_API_KEY") || config_string(cfg, &["google", "apiKey"]).is_some() {
+    if env_var_present("GOOGLE_API_KEY") || config_path_has_usable_value(cfg, &["google", "apiKey"])
+    {
         labels.push("Gemini");
     }
-    if env_var_present("VENICE_API_KEY") || config_string(cfg, &["venice", "apiKey"]).is_some() {
+    if env_var_present("VENICE_API_KEY") || config_path_has_usable_value(cfg, &["venice", "apiKey"])
+    {
         labels.push("Venice");
     }
     let bedrock_enabled = cfg
@@ -2556,11 +2582,11 @@ fn usable_provider_labels(cfg: &Value) -> Vec<&'static str> {
         != Some(false);
     let bedrock_region = env_var_present("AWS_REGION")
         || env_var_present("AWS_DEFAULT_REGION")
-        || config_string(cfg, &["bedrock", "region"]).is_some();
+        || config_path_has_usable_value(cfg, &["bedrock", "region"]);
     let bedrock_access_key = env_var_present("AWS_ACCESS_KEY_ID")
-        || config_string(cfg, &["bedrock", "accessKeyId"]).is_some();
+        || config_path_has_usable_value(cfg, &["bedrock", "accessKeyId"]);
     let bedrock_secret_key = env_var_present("AWS_SECRET_ACCESS_KEY")
-        || config_string(cfg, &["bedrock", "secretAccessKey"]).is_some();
+        || config_path_has_usable_value(cfg, &["bedrock", "secretAccessKey"]);
     if bedrock_enabled && bedrock_region && bedrock_access_key && bedrock_secret_key {
         labels.push("Bedrock");
     }
@@ -2661,7 +2687,7 @@ fn local_chat_verify_next_step(cfg: &Value) -> String {
         }
         ModelProviderRoute::Gemini => {
             if env_var_present("GOOGLE_API_KEY")
-                || config_string(cfg, &["google", "apiKey"]).is_some()
+                || config_path_has_usable_value(cfg, &["google", "apiKey"])
             {
                 "check Gemini API key/model and retry `cara verify --outcome local-chat`"
                     .to_string()
@@ -2679,7 +2705,7 @@ fn local_chat_verify_next_step(cfg: &Value) -> String {
         }
         ModelProviderRoute::Venice => {
             if env_var_present("VENICE_API_KEY")
-                || config_string(cfg, &["venice", "apiKey"]).is_some()
+                || config_path_has_usable_value(cfg, &["venice", "apiKey"])
             {
                 "check Venice API key/model and retry `cara verify --outcome local-chat`"
                     .to_string()
@@ -2696,13 +2722,7 @@ fn local_chat_verify_next_step(cfg: &Value) -> String {
             }
         }
         ModelProviderRoute::Ollama => {
-            if env_var_present("OLLAMA_BASE_URL")
-                || config_string(cfg, &["providers", "ollama", "baseUrl"]).is_some()
-                || cfg
-                    .get("providers")
-                    .and_then(|value| value.get("ollama"))
-                    .is_some()
-            {
+            if ollama_configured_for_guidance(cfg) {
                 "check Ollama server reachability/base URL and selected model, then retry `cara verify --outcome local-chat`"
                     .to_string()
             } else {
@@ -2720,11 +2740,11 @@ fn local_chat_verify_next_step(cfg: &Value) -> String {
         ModelProviderRoute::Bedrock => {
             let region = env_var_present("AWS_REGION")
                 || env_var_present("AWS_DEFAULT_REGION")
-                || config_string(cfg, &["bedrock", "region"]).is_some();
+                || config_path_has_usable_value(cfg, &["bedrock", "region"]);
             let access_key = env_var_present("AWS_ACCESS_KEY_ID")
-                || config_string(cfg, &["bedrock", "accessKeyId"]).is_some();
+                || config_path_has_usable_value(cfg, &["bedrock", "accessKeyId"]);
             let secret_key = env_var_present("AWS_SECRET_ACCESS_KEY")
-                || config_string(cfg, &["bedrock", "secretAccessKey"]).is_some();
+                || config_path_has_usable_value(cfg, &["bedrock", "secretAccessKey"]);
             if region && access_key && secret_key {
                 "check AWS Bedrock region/credentials and selected model, then retry `cara verify --outcome local-chat`"
                     .to_string()
@@ -6570,6 +6590,18 @@ mod tests {
     }
 
     #[test]
+    fn test_usable_provider_labels_ignore_missing_env_placeholders() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let _openai_guard = unset_env_var_scoped("OPENAI_API_KEY");
+        let _venice_guard = unset_env_var_scoped("VENICE_API_KEY");
+        let cfg = serde_json::json!({
+            "openai": { "apiKey": "${OPENAI_API_KEY}" },
+            "venice": { "apiKey": "${VENICE_API_KEY}" }
+        });
+        assert!(usable_provider_labels(&cfg).is_empty());
+    }
+
+    #[test]
     fn test_usable_provider_labels_require_complete_bedrock_credentials() {
         let cfg = serde_json::json!({
             "bedrock": {
@@ -6578,6 +6610,40 @@ mod tests {
             }
         });
         assert!(usable_provider_labels(&cfg).is_empty());
+    }
+
+    #[test]
+    fn test_local_chat_verify_next_step_for_missing_venice_provider_env_var() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let _venice_guard = unset_env_var_scoped("VENICE_API_KEY");
+        let cfg = serde_json::json!({
+            "venice": { "apiKey": "${VENICE_API_KEY}" },
+            "agents": { "defaults": { "model": "venice:llama-3.3-70b" } }
+        });
+        assert_eq!(
+            local_chat_verify_next_step(&cfg),
+            "configure a provider for the selected model, or rerun `cara setup --force` for the Anthropic/OpenAI first-run path, then retry `cara verify --outcome local-chat`"
+        );
+    }
+
+    #[test]
+    fn test_local_chat_verify_next_step_for_missing_bedrock_provider_env_var() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let _region_guard = unset_env_var_scoped("AWS_REGION");
+        let _access_guard = unset_env_var_scoped("AWS_ACCESS_KEY_ID");
+        let _secret_guard = unset_env_var_scoped("AWS_SECRET_ACCESS_KEY");
+        let cfg = serde_json::json!({
+            "bedrock": {
+                "region": "${AWS_REGION}",
+                "accessKeyId": "${AWS_ACCESS_KEY_ID}",
+                "secretAccessKey": "${AWS_SECRET_ACCESS_KEY}"
+            },
+            "agents": { "defaults": { "model": "bedrock:anthropic.claude-3-5-sonnet-20240620-v1:0" } }
+        });
+        assert_eq!(
+            local_chat_verify_next_step(&cfg),
+            "configure a provider for the selected model, or rerun `cara setup --force` for the Anthropic/OpenAI first-run path, then retry `cara verify --outcome local-chat`"
+        );
     }
 
     #[test]
