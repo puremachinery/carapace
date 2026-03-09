@@ -40,9 +40,10 @@ The wizard walks you through:
   - `hooks`
 - optional hooks token and Control UI toggle.
 
-Today that interactive path writes Anthropic/OpenAI first-run config. If you
-start with Ollama, Gemini, Venice, or Bedrock env vars, `cara setup` will stop
-and point you to the provider/help path before it writes the wrong config.
+Today that interactive path writes Anthropic/OpenAI first-run config. If
+neither `ANTHROPIC_API_KEY` nor `OPENAI_API_KEY` is set and Carapace detects
+Ollama, Gemini, Venice, or a full Bedrock env set, `cara setup` will stop and
+point you to the provider/help path before it writes the wrong config.
 
 ## 2) Start Carapace
 

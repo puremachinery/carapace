@@ -2731,11 +2731,10 @@ fn alternate_provider_env_hints() -> Vec<&'static str> {
     if env_var_present("VENICE_API_KEY") {
         hints.push("VENICE_API_KEY");
     }
-    if env_var_present("AWS_REGION")
-        || env_var_present("AWS_DEFAULT_REGION")
-        || env_var_present("AWS_ACCESS_KEY_ID")
-        || env_var_present("AWS_SECRET_ACCESS_KEY")
-    {
+    let bedrock_region = env_var_present("AWS_REGION") || env_var_present("AWS_DEFAULT_REGION");
+    let bedrock_access_key = env_var_present("AWS_ACCESS_KEY_ID");
+    let bedrock_secret_key = env_var_present("AWS_SECRET_ACCESS_KEY");
+    if bedrock_region && bedrock_access_key && bedrock_secret_key {
         hints.push("AWS_*");
     }
     hints
@@ -4336,10 +4335,7 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
         {
             print_alternate_provider_first_run_guidance(&alternate_provider_envs);
             if !prompt_yes_no("Continue with the Anthropic/OpenAI wizard anyway?", false)? {
-                return Err(
-                    "setup canceled before writing Anthropic/OpenAI config for an alternate-provider first run"
-                        .into(),
-                );
+                return Err("setup canceled; no Anthropic/OpenAI config was written. Use https://getcara.io/providers.html for Ollama/Gemini/Venice/Bedrock setup, or https://getcara.io/help.html#guided-setup-help for guided help.".into());
             }
         }
 
@@ -6695,6 +6691,32 @@ mod tests {
             local_chat_verify_next_step(&cfg),
             "set `$AWS_REGION` in the same shell you use for `cara start` and `cara verify`, or rerun `cara setup --force` to write the key into config, then retry `cara verify --outcome local-chat`"
         );
+    }
+
+    #[test]
+    fn test_alternate_provider_env_hints_ignore_partial_aws_env() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let _region_guard = set_env_var_scoped("AWS_REGION", "us-east-1");
+        let _access_guard = unset_env_var_scoped("AWS_ACCESS_KEY_ID");
+        let _secret_guard = unset_env_var_scoped("AWS_SECRET_ACCESS_KEY");
+        let _google_guard = unset_env_var_scoped("GOOGLE_API_KEY");
+        let _ollama_guard = unset_env_var_scoped("OLLAMA_BASE_URL");
+        let _venice_guard = unset_env_var_scoped("VENICE_API_KEY");
+
+        assert!(alternate_provider_env_hints().is_empty());
+    }
+
+    #[test]
+    fn test_alternate_provider_env_hints_include_complete_bedrock_env() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let _region_guard = set_env_var_scoped("AWS_REGION", "us-east-1");
+        let _access_guard = set_env_var_scoped("AWS_ACCESS_KEY_ID", "AKIA...");
+        let _secret_guard = set_env_var_scoped("AWS_SECRET_ACCESS_KEY", "secret");
+        let _google_guard = unset_env_var_scoped("GOOGLE_API_KEY");
+        let _ollama_guard = unset_env_var_scoped("OLLAMA_BASE_URL");
+        let _venice_guard = unset_env_var_scoped("VENICE_API_KEY");
+
+        assert_eq!(alternate_provider_env_hints(), vec!["AWS_*"]);
     }
 
     #[test]

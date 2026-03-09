@@ -43,24 +43,27 @@ cara setup
 ### Ollama (fastest fully local path)
 
 The runtime supports Ollama today, but the interactive `cara setup` wizard
-still writes Anthropic/OpenAI first-run config. If `OLLAMA_BASE_URL` is set,
-`cara setup` will stop and ask whether you want to continue with that wizard
-anyway.
+still writes Anthropic/OpenAI first-run config. If `OLLAMA_BASE_URL` is set
+and neither `ANTHROPIC_API_KEY` nor `OPENAI_API_KEY` is set, `cara setup` will
+stop and ask whether you want to continue with that wizard anyway.
 
 ```bash
 export OLLAMA_BASE_URL='http://127.0.0.1:11434'
 ```
 
-If you are staying on Ollama first, use `config.example.json5` for the
-`providers.ollama` section and use [Guided setup help](help.md#guided-setup-help)
-if you want help getting to a verified local-chat first run.
+If you are staying on Ollama first, skip the Anthropic/OpenAI wizard, copy the
+`providers.ollama` section from `config.example.json5`, and use
+[Guided setup help](help.md#guided-setup-help) if you want help getting to a
+verified local-chat first run.
 
 ### Gemini / Bedrock / Venice
 
 These are fully supported at runtime, but the interactive `cara setup` wizard
-still writes Anthropic/OpenAI first-run config. If the matching env vars are
+still writes Anthropic/OpenAI first-run config. If neither
+`ANTHROPIC_API_KEY` nor `OPENAI_API_KEY` is set and the matching env vars are
 present, `cara setup` will stop and ask whether you want to continue with that
-wizard anyway.
+wizard anyway. For Bedrock, that means a region plus both
+`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`.
 
 ```bash
 export GOOGLE_API_KEY='...'
@@ -76,10 +79,10 @@ export AWS_SECRET_ACCESS_KEY='...'
 export VENICE_API_KEY='...'
 ```
 
-If you are staying on Gemini, Bedrock, or Venice first, use
-`config.example.json5` for the provider section you need and use
-[Guided setup help](help.md#guided-setup-help) if you want a shorter path to a
-verified first run.
+If you are staying on Gemini, Bedrock, or Venice first, skip the
+Anthropic/OpenAI wizard, copy the relevant provider section from
+`config.example.json5`, and use [Guided setup help](help.md#guided-setup-help)
+if you want a shorter path to a verified first run.
 
 Supported env vars:
 
