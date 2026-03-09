@@ -16,12 +16,12 @@ Find the right `cara` command by outcome instead of scanning the full CLI refere
 
 ## Setup and first value
 
-- Initial setup wizard: `cara setup`
+- Initial setup wizard: `cara setup` or `cara setup --provider <provider>`
 - Verify current setup outcome: `cara verify --outcome auto`
 - Start local chat: `cara chat`
 
 Command ladder:
-- Start with `cara setup`
+- Start with `cara setup` or `cara setup --provider <provider>`
 - Validate with `cara verify --outcome auto`
 - Move to `cara verify --outcome autonomy` for task-runtime proof
 

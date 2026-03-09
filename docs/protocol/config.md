@@ -121,6 +121,9 @@ All keys are optional. Unknown keys are rejected (strict schema).
 - `gateway` – service settings
 - `skills` – skills registry settings
 - `plugins` – plugin load/allowlist/config
+- `google` – Google Gemini provider settings (apiKey, baseUrl)
+- `providers` – provider-specific settings such as `providers.ollama`
+- `bedrock` – AWS Bedrock provider settings (region, accessKeyId, secretAccessKey, sessionToken)
 - `venice` – Venice AI provider settings (apiKey, baseUrl)
 - `classifier` – inbound message classifier (mode, model, blockThreshold)
 - `signal` – Signal channel settings (via signal-cli REST API)
@@ -148,6 +151,12 @@ This is a condensed map; refer to the JSON schema for full detail.
   - `enabled`, `allow`, `deny`, `load.paths`, `slots`, `entries`, `installs`
 - `auth`
   - `profiles`, `order`, `cooldowns`
+- `google`
+  - `apiKey`, `baseUrl`
+- `providers.ollama`
+  - `baseUrl`, `apiKey`
+- `bedrock`
+  - `region`, `accessKeyId`, `secretAccessKey`, `sessionToken`, `enabled`
 - `venice`
   - `apiKey`, `baseUrl`
 - `classifier`

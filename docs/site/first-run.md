@@ -30,7 +30,8 @@ cara setup
 ```
 
 The wizard walks you through:
-- provider + API key (with optional credential validation),
+- provider selection (or use `cara setup --provider <provider>` to skip the menu),
+- provider credentials and first-run model defaults,
 - gateway auth mode (`token`/`password`) and strong-secret generation,
 - bind + port,
 - first-run outcome:
@@ -40,10 +41,13 @@ The wizard walks you through:
   - `hooks`
 - optional hooks token and Control UI toggle.
 
-Today that interactive path writes Anthropic/OpenAI first-run config. If
-neither `ANTHROPIC_API_KEY` nor `OPENAI_API_KEY` is set and Carapace detects
-Ollama, Gemini, Venice, or a full Bedrock env set, `cara setup` will stop and
-point you to the provider/help path before it writes the wrong config.
+Recommended explicit examples:
+
+```bash
+cara setup --provider anthropic
+cara setup --provider ollama
+cara setup --provider gemini
+```
 
 ## 2) Start Carapace
 

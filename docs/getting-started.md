@@ -48,6 +48,13 @@ Run the interactive setup:
 cara setup
 ```
 
+Or skip the provider menu explicitly:
+
+```bash
+cara setup --provider ollama
+cara setup --provider gemini
+```
+
 Then start Carapace:
 
 ```bash
@@ -68,11 +75,6 @@ The setup wizard asks for:
 - how locked down you want access to be,
 - whether to keep the service local-only or reachable on your network,
 - your first desired outcome (`local-chat`, `discord`, `telegram`, or `hooks`).
-
-Today that interactive path writes Anthropic/OpenAI first-run config. If
-neither `ANTHROPIC_API_KEY` nor `OPENAI_API_KEY` is set and Carapace detects
-Ollama, Gemini, Venice, or a full Bedrock env set, `cara setup` will stop and
-point you to the provider/help path before it writes the wrong config.
 
 If you picked a custom port in setup, use that instead of `18789`.
 If your selected outcome is `discord` or `telegram`, `cara verify` may also

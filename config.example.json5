@@ -113,10 +113,18 @@
   //   // apiKey: "unused",                         // required but ignored by most local servers
   // },
 
-  // --- Ollama provider ------------------------------------------------------
-  // ollama: {
-  //   // baseUrl: "http://localhost:11434",       // default
-  //   // apiKey: "optional-key",                  // for remote instances with auth
+  // --- Google Gemini provider ----------------------------------------------
+  // google: {
+  //   apiKey: "${GOOGLE_API_KEY}",
+  //   // baseUrl: "https://generativelanguage.googleapis.com", // override with GOOGLE_API_BASE_URL
+  // },
+
+  // --- Provider-specific config --------------------------------------------
+  // providers: {
+  //   ollama: {
+  //     // baseUrl: "http://localhost:11434",     // default
+  //     // apiKey: "optional-key",                // for remote instances with auth
+  //   },
   // },
 
   // --- AWS Bedrock provider ------------------------------------------------

@@ -140,6 +140,10 @@ pub enum Command {
         /// Overwrite existing configuration if it already exists.
         #[arg(long)]
         force: bool,
+
+        /// Provider to configure for first run.
+        #[arg(long, value_enum)]
+        provider: Option<SetupProvider>,
     },
 
     /// Pair with a remote gateway node.
@@ -2420,10 +2424,20 @@ fn parse_setup_outcome(raw: &str) -> Option<SetupOutcome> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SetupProvider {
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetupProvider {
+    #[value(name = "anthropic", alias = "claude")]
     Anthropic,
+    #[value(name = "openai", alias = "gpt")]
     OpenAi,
+    #[value(name = "ollama")]
+    Ollama,
+    #[value(name = "gemini")]
+    Gemini,
+    #[value(name = "venice")]
+    Venice,
+    #[value(name = "bedrock")]
+    Bedrock,
 }
 
 impl SetupProvider {
@@ -2431,6 +2445,10 @@ impl SetupProvider {
         match self {
             Self::Anthropic => "anthropic",
             Self::OpenAi => "openai",
+            Self::Ollama => "ollama",
+            Self::Gemini => "gemini",
+            Self::Venice => "venice",
+            Self::Bedrock => "bedrock",
         }
     }
 
@@ -2438,13 +2456,20 @@ impl SetupProvider {
         match self {
             Self::Anthropic => "Anthropic",
             Self::OpenAi => "OpenAI",
+            Self::Ollama => "Ollama",
+            Self::Gemini => "Gemini",
+            Self::Venice => "Venice",
+            Self::Bedrock => "Bedrock",
         }
     }
 
-    fn credential_env_var_name(self) -> &'static str {
+    fn api_key_env_var_name(self) -> Option<&'static str> {
         match self {
-            Self::Anthropic => "ANTHROPIC_API_KEY",
-            Self::OpenAi => "OPENAI_API_KEY",
+            Self::Anthropic => Some("ANTHROPIC_API_KEY"),
+            Self::OpenAi => Some("OPENAI_API_KEY"),
+            Self::Gemini => Some("GOOGLE_API_KEY"),
+            Self::Venice => Some("VENICE_API_KEY"),
+            Self::Ollama | Self::Bedrock => None,
         }
     }
 
@@ -2452,23 +2477,22 @@ impl SetupProvider {
         match self {
             Self::Anthropic => "claude-sonnet-4-20250514",
             Self::OpenAi => "gpt-4o",
+            Self::Ollama => "ollama:llama3",
+            Self::Gemini => "gemini-2.0-flash",
+            Self::Venice => "venice:llama-3.3-70b",
+            Self::Bedrock => "bedrock:anthropic.claude-3-5-sonnet-20240620-v1:0",
         }
     }
-}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SetupProviderEnvState {
-    None,
-    AnthropicOnly,
-    OpenAiOnly,
-    Both,
-}
-
-impl SetupProviderEnvState {
-    fn default_provider(self) -> SetupProvider {
-        match self {
-            Self::OpenAiOnly => SetupProvider::OpenAi,
-            Self::None | Self::AnthropicOnly | Self::Both => SetupProvider::Anthropic,
+    fn parse_prompt(raw: &str) -> Option<Self> {
+        match raw.trim().to_lowercase().as_str() {
+            "anthropic" | "claude" => Some(Self::Anthropic),
+            "openai" | "gpt" => Some(Self::OpenAi),
+            "ollama" => Some(Self::Ollama),
+            "gemini" => Some(Self::Gemini),
+            "venice" => Some(Self::Venice),
+            "bedrock" => Some(Self::Bedrock),
+            _ => None,
         }
     }
 }
@@ -2490,15 +2514,50 @@ fn env_var_present(key: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn detect_setup_provider_env_state() -> SetupProviderEnvState {
-    match (
-        env_var_present("ANTHROPIC_API_KEY"),
-        env_var_present("OPENAI_API_KEY"),
-    ) {
-        (true, true) => SetupProviderEnvState::Both,
-        (true, false) => SetupProviderEnvState::AnthropicOnly,
-        (false, true) => SetupProviderEnvState::OpenAiOnly,
-        (false, false) => SetupProviderEnvState::None,
+fn env_var_value(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn detect_setup_provider_env_hints() -> Vec<SetupProvider> {
+    let mut providers = Vec::new();
+
+    if env_var_present("ANTHROPIC_API_KEY") {
+        providers.push(SetupProvider::Anthropic);
+    }
+    if env_var_present("OPENAI_API_KEY") {
+        providers.push(SetupProvider::OpenAi);
+    }
+    if env_var_present("OLLAMA_BASE_URL") {
+        providers.push(SetupProvider::Ollama);
+    }
+    if env_var_present("GOOGLE_API_KEY") {
+        providers.push(SetupProvider::Gemini);
+    }
+    if env_var_present("VENICE_API_KEY") {
+        providers.push(SetupProvider::Venice);
+    }
+
+    let bedrock_region = env_var_present("AWS_REGION") || env_var_present("AWS_DEFAULT_REGION");
+    let bedrock_access_key = env_var_present("AWS_ACCESS_KEY_ID");
+    let bedrock_secret_key = env_var_present("AWS_SECRET_ACCESS_KEY");
+    if bedrock_region && bedrock_access_key && bedrock_secret_key {
+        providers.push(SetupProvider::Bedrock);
+    }
+
+    providers
+}
+
+fn default_setup_provider(provider_hints: &[SetupProvider]) -> SetupProvider {
+    if let [provider] = provider_hints {
+        *provider
+    } else {
+        provider_hints
+            .first()
+            .copied()
+            .unwrap_or(SetupProvider::Anthropic)
     }
 }
 
@@ -2600,7 +2659,7 @@ fn usable_provider_labels(cfg: &Value) -> Vec<&'static str> {
 }
 
 fn no_provider_configured_guidance() -> String {
-    "configure a provider for the selected model, or rerun `cara setup --force` for the Anthropic/OpenAI first-run path, then retry `cara verify --outcome local-chat`"
+    "configure a provider for the selected model, or rerun `cara setup --force`, then retry `cara verify --outcome local-chat`"
         .to_string()
 }
 
@@ -2685,7 +2744,9 @@ fn provider_api_key_guidance(cfg: &Value, provider: SetupProvider, config_path: 
     single_credential_provider_guidance(
         cfg,
         provider.label(),
-        provider.credential_env_var_name(),
+        provider
+            .api_key_env_var_name()
+            .expect("provider_api_key_guidance only supports API-key providers"),
         config_path,
         &configured_message,
         None,
@@ -2718,42 +2779,6 @@ fn bedrock_provider_guidance(cfg: &Value) -> String {
         "Bedrock",
         Some("`AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` or `bedrock.*`"),
     )
-}
-
-fn alternate_provider_env_hints() -> Vec<&'static str> {
-    let mut hints = Vec::new();
-    if env_var_present("OLLAMA_BASE_URL") {
-        hints.push("OLLAMA_BASE_URL");
-    }
-    if env_var_present("GOOGLE_API_KEY") {
-        hints.push("GOOGLE_API_KEY");
-    }
-    if env_var_present("VENICE_API_KEY") {
-        hints.push("VENICE_API_KEY");
-    }
-    let bedrock_region = env_var_present("AWS_REGION") || env_var_present("AWS_DEFAULT_REGION");
-    let bedrock_access_key = env_var_present("AWS_ACCESS_KEY_ID");
-    let bedrock_secret_key = env_var_present("AWS_SECRET_ACCESS_KEY");
-    if bedrock_region && bedrock_access_key && bedrock_secret_key {
-        hints.push("AWS_*");
-    }
-    hints
-}
-
-fn print_alternate_provider_first_run_guidance(alternate_provider_envs: &[&str]) {
-    eprintln!(
-        "Detected other provider env vars ({}).",
-        alternate_provider_envs.join(", ")
-    );
-    eprintln!("This interactive wizard only writes Anthropic/OpenAI first-run config.");
-    eprintln!(
-        "If you want Ollama, Gemini, Venice, or Bedrock first, stop here before writing config."
-    );
-    eprintln!(
-        "If any of those env vars are only for unrelated tooling, unset them and rerun `cara setup`."
-    );
-    eprintln!("Providers hub: https://getcara.io/providers.html");
-    eprintln!("Guided setup help: https://getcara.io/help.html#guided-setup-help");
 }
 
 fn local_chat_verify_next_step(cfg: &Value) -> String {
@@ -4279,8 +4304,522 @@ async fn run_setup_post_checks(
     chat_result
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SetupConfigValue {
+    config_value: String,
+    effective_value: Option<String>,
+}
+
+fn env_placeholder(env_var: &str) -> String {
+    format!("${{{env_var}}}")
+}
+
+fn first_present_env_var(env_vars: &[&'static str]) -> Option<(&'static str, String)> {
+    for env_var in env_vars {
+        if let Some(value) = env_var_value(env_var) {
+            return Some((*env_var, value));
+        }
+    }
+    None
+}
+
+fn prompt_setup_provider_interactive(
+    requested_provider: Option<SetupProvider>,
+) -> Result<SetupProvider, Box<dyn std::error::Error>> {
+    if let Some(provider) = requested_provider {
+        return Ok(provider);
+    }
+
+    let provider_hints = detect_setup_provider_env_hints();
+    if provider_hints.len() > 1 {
+        let labels = provider_hints
+            .iter()
+            .map(|provider| provider.label())
+            .collect::<Vec<_>>();
+        eprintln!(
+            "Detected multiple provider env hints: {}.",
+            labels.join(", ")
+        );
+        eprintln!("Setup will only write the provider you choose.");
+    }
+
+    let default_provider = default_setup_provider(&provider_hints).prompt_key();
+    loop {
+        let selection = prompt_with_default(
+            "Select provider for first run (anthropic/openai/ollama/gemini/venice/bedrock)",
+            default_provider,
+        )?;
+        if let Some(provider) = SetupProvider::parse_prompt(&selection) {
+            return Ok(provider);
+        }
+        eprintln!("Please enter one of: anthropic, openai, ollama, gemini, venice, bedrock.");
+    }
+}
+
+fn print_missing_setup_value_notice(env_var: &str, label: &str) {
+    println!(
+        "No {label} provided. Set ${env_var} in the same shell you use for `cara start` and `cara verify`, or rerun `cara setup --force` later."
+    );
+}
+
+fn prompt_required_secret_config_value(
+    env_var: &'static str,
+    label: &str,
+    hide_sensitive_input: bool,
+) -> Result<SetupConfigValue, Box<dyn std::error::Error>> {
+    if let Some((env_name, env_value)) = first_present_env_var(&[env_var]) {
+        if prompt_yes_no(&format!("Use {label} from ${env_name}?"), true)? {
+            return Ok(SetupConfigValue {
+                config_value: env_placeholder(env_name),
+                effective_value: Some(env_value),
+            });
+        }
+    }
+
+    let entered = prompt_sensitive_line(label, hide_sensitive_input, true)?;
+    if entered.is_empty() {
+        Ok(SetupConfigValue {
+            config_value: env_placeholder(env_var),
+            effective_value: None,
+        })
+    } else {
+        Ok(SetupConfigValue {
+            config_value: entered.clone(),
+            effective_value: Some(entered),
+        })
+    }
+}
+
+fn prompt_optional_secret_config_value(
+    env_var: &'static str,
+    label: &str,
+    hide_sensitive_input: bool,
+) -> Result<Option<SetupConfigValue>, Box<dyn std::error::Error>> {
+    if let Some((env_name, env_value)) = first_present_env_var(&[env_var]) {
+        if prompt_yes_no(&format!("Use {label} from ${env_name}?"), true)? {
+            return Ok(Some(SetupConfigValue {
+                config_value: env_placeholder(env_name),
+                effective_value: Some(env_value),
+            }));
+        }
+    }
+
+    let entered = prompt_sensitive_line(label, hide_sensitive_input, true)?;
+    if entered.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(SetupConfigValue {
+            config_value: entered.clone(),
+            effective_value: Some(entered),
+        }))
+    }
+}
+
+fn prompt_required_visible_config_value(
+    env_vars: &[&'static str],
+    label: &str,
+    default_value: &str,
+) -> Result<SetupConfigValue, Box<dyn std::error::Error>> {
+    if let Some((env_name, env_value)) = first_present_env_var(env_vars) {
+        if prompt_yes_no(&format!("Use {label} from ${env_name}?"), true)? {
+            return Ok(SetupConfigValue {
+                config_value: env_placeholder(env_name),
+                effective_value: Some(env_value),
+            });
+        }
+
+        let entered = prompt_with_default(label, &env_value)?;
+        return Ok(SetupConfigValue {
+            config_value: entered.clone(),
+            effective_value: Some(entered),
+        });
+    }
+
+    let entered = prompt_with_default(label, default_value)?;
+    Ok(SetupConfigValue {
+        config_value: entered.clone(),
+        effective_value: Some(entered),
+    })
+}
+
+fn prompt_optional_base_url_override(
+    provider_label: &str,
+    env_var: &'static str,
+    default_url: &str,
+) -> Result<Option<SetupConfigValue>, Box<dyn std::error::Error>> {
+    if let Some((env_name, env_value)) = first_present_env_var(&[env_var]) {
+        if prompt_yes_no(
+            &format!("Use {provider_label} base URL from ${env_name}?"),
+            true,
+        )? {
+            return Ok(Some(SetupConfigValue {
+                config_value: env_placeholder(env_name),
+                effective_value: Some(env_value),
+            }));
+        }
+    }
+
+    if !prompt_yes_no(
+        &format!("Override default {provider_label} base URL?"),
+        false,
+    )? {
+        return Ok(None);
+    }
+
+    let default_value = first_present_env_var(&[env_var])
+        .map(|(_, value)| value)
+        .unwrap_or_else(|| default_url.to_string());
+    let entered = prompt_with_default(&format!("{provider_label} base URL"), &default_value)?;
+    Ok(Some(SetupConfigValue {
+        config_value: entered.clone(),
+        effective_value: Some(entered),
+    }))
+}
+
+fn handle_setup_validation_failure(
+    err: impl std::fmt::Display,
+) -> Result<(), Box<dyn std::error::Error>> {
+    eprintln!("Provider configuration check failed: {err}");
+    if prompt_yes_no("Continue setup and write config anyway?", false)? {
+        Ok(())
+    } else {
+        Err("setup aborted after credential validation failure".into())
+    }
+}
+
+fn configure_provider_interactive(
+    config: &mut Value,
+    provider: SetupProvider,
+    hide_sensitive_input: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    config["agents"]["defaults"]["model"] = serde_json::json!(provider.default_model());
+
+    match provider {
+        SetupProvider::Anthropic => {
+            let api_key = prompt_required_secret_config_value(
+                "ANTHROPIC_API_KEY",
+                "API key",
+                hide_sensitive_input,
+            )?;
+            if let Some(key) = api_key.effective_value.as_deref() {
+                validate_provider_credentials_interactive(provider.prompt_key(), key)?;
+            } else {
+                print_missing_setup_value_notice("ANTHROPIC_API_KEY", "API key");
+            }
+            config["anthropic"] = serde_json::json!({ "apiKey": api_key.config_value });
+        }
+        SetupProvider::OpenAi => {
+            let api_key = prompt_required_secret_config_value(
+                "OPENAI_API_KEY",
+                "API key",
+                hide_sensitive_input,
+            )?;
+            if let Some(key) = api_key.effective_value.as_deref() {
+                validate_provider_credentials_interactive(provider.prompt_key(), key)?;
+            } else {
+                print_missing_setup_value_notice("OPENAI_API_KEY", "API key");
+            }
+            config["openai"] = serde_json::json!({ "apiKey": api_key.config_value });
+        }
+        SetupProvider::Ollama => {
+            let base_url = prompt_required_visible_config_value(
+                &["OLLAMA_BASE_URL"],
+                "Ollama base URL",
+                crate::agent::ollama::DEFAULT_OLLAMA_BASE_URL,
+            )?;
+
+            let api_key = if prompt_yes_no("Does this Ollama endpoint require an API key?", false)?
+            {
+                let entered = prompt_sensitive_line("Ollama API key", hide_sensitive_input, true)?;
+                if entered.is_empty() {
+                    None
+                } else {
+                    Some(SetupConfigValue {
+                        config_value: entered.clone(),
+                        effective_value: Some(entered),
+                    })
+                }
+            } else {
+                None
+            };
+
+            match crate::agent::ollama::OllamaProvider::new()
+                .and_then(|provider| {
+                    provider.with_base_url(base_url.effective_value.clone().unwrap_or_default())
+                })
+                .map(|provider| {
+                    if let Some(api_key) = api_key
+                        .as_ref()
+                        .and_then(|value| value.effective_value.clone())
+                    {
+                        provider.with_api_key(api_key)
+                    } else {
+                        provider
+                    }
+                }) {
+                Ok(_) => {}
+                Err(err) => handle_setup_validation_failure(err)?,
+            }
+
+            let mut ollama_config = serde_json::Map::new();
+            ollama_config.insert(
+                "baseUrl".to_string(),
+                serde_json::json!(base_url.config_value),
+            );
+            if let Some(api_key) = api_key {
+                ollama_config.insert(
+                    "apiKey".to_string(),
+                    serde_json::json!(api_key.config_value),
+                );
+            }
+            config["providers"] = serde_json::json!({
+                "ollama": Value::Object(ollama_config)
+            });
+        }
+        SetupProvider::Gemini => {
+            let api_key = prompt_required_secret_config_value(
+                "GOOGLE_API_KEY",
+                "Gemini API key",
+                hide_sensitive_input,
+            )?;
+            if api_key.effective_value.is_none() {
+                print_missing_setup_value_notice("GOOGLE_API_KEY", "Gemini API key");
+            }
+            let base_url = prompt_optional_base_url_override(
+                "Gemini",
+                "GOOGLE_API_BASE_URL",
+                "https://generativelanguage.googleapis.com",
+            )?;
+
+            if let Some(key) = api_key.effective_value.clone() {
+                let validation =
+                    crate::agent::gemini::GeminiProvider::new(key).and_then(|provider| {
+                        if let Some(base_url) = base_url
+                            .as_ref()
+                            .and_then(|value| value.effective_value.clone())
+                        {
+                            provider.with_base_url(base_url)
+                        } else {
+                            Ok(provider)
+                        }
+                    });
+                if let Err(err) = validation {
+                    handle_setup_validation_failure(err)?;
+                }
+            }
+
+            let mut google_config = serde_json::Map::new();
+            google_config.insert(
+                "apiKey".to_string(),
+                serde_json::json!(api_key.config_value),
+            );
+            if let Some(base_url) = base_url {
+                google_config.insert(
+                    "baseUrl".to_string(),
+                    serde_json::json!(base_url.config_value),
+                );
+            }
+            config["google"] = Value::Object(google_config);
+        }
+        SetupProvider::Venice => {
+            let api_key = prompt_required_secret_config_value(
+                "VENICE_API_KEY",
+                "Venice API key",
+                hide_sensitive_input,
+            )?;
+            if api_key.effective_value.is_none() {
+                print_missing_setup_value_notice("VENICE_API_KEY", "Venice API key");
+            }
+            let base_url = prompt_optional_base_url_override(
+                "Venice",
+                "VENICE_BASE_URL",
+                "https://api.venice.ai/api",
+            )?;
+
+            if let Some(key) = api_key.effective_value.clone() {
+                let validation =
+                    crate::agent::venice::VeniceProvider::new(key).and_then(|provider| {
+                        if let Some(base_url) = base_url
+                            .as_ref()
+                            .and_then(|value| value.effective_value.clone())
+                        {
+                            provider.with_base_url(base_url)
+                        } else {
+                            Ok(provider)
+                        }
+                    });
+                if let Err(err) = validation {
+                    handle_setup_validation_failure(err)?;
+                }
+            }
+
+            let mut venice_config = serde_json::Map::new();
+            venice_config.insert(
+                "apiKey".to_string(),
+                serde_json::json!(api_key.config_value),
+            );
+            if let Some(base_url) = base_url {
+                venice_config.insert(
+                    "baseUrl".to_string(),
+                    serde_json::json!(base_url.config_value),
+                );
+            }
+            config["venice"] = Value::Object(venice_config);
+        }
+        SetupProvider::Bedrock => {
+            let region = prompt_required_visible_config_value(
+                &["AWS_REGION", "AWS_DEFAULT_REGION"],
+                "AWS Bedrock region",
+                "us-east-1",
+            )?;
+            let access_key = prompt_required_secret_config_value(
+                "AWS_ACCESS_KEY_ID",
+                "AWS access key ID",
+                hide_sensitive_input,
+            )?;
+            let secret_key = prompt_required_secret_config_value(
+                "AWS_SECRET_ACCESS_KEY",
+                "AWS secret access key",
+                hide_sensitive_input,
+            )?;
+
+            if access_key.effective_value.is_none() {
+                print_missing_setup_value_notice("AWS_ACCESS_KEY_ID", "AWS access key ID");
+            }
+            if secret_key.effective_value.is_none() {
+                print_missing_setup_value_notice("AWS_SECRET_ACCESS_KEY", "AWS secret access key");
+            }
+
+            let session_token = if env_var_present("AWS_SESSION_TOKEN") {
+                if prompt_yes_no("Use AWS session token from $AWS_SESSION_TOKEN?", true)? {
+                    Some(SetupConfigValue {
+                        config_value: env_placeholder("AWS_SESSION_TOKEN"),
+                        effective_value: env_var_value("AWS_SESSION_TOKEN"),
+                    })
+                } else if prompt_yes_no("Add an AWS session token?", false)? {
+                    let entered =
+                        prompt_sensitive_line("AWS session token", hide_sensitive_input, true)?;
+                    if entered.is_empty() {
+                        None
+                    } else {
+                        Some(SetupConfigValue {
+                            config_value: entered.clone(),
+                            effective_value: Some(entered),
+                        })
+                    }
+                } else {
+                    None
+                }
+            } else if prompt_yes_no("Add an AWS session token?", false)? {
+                prompt_optional_secret_config_value(
+                    "AWS_SESSION_TOKEN",
+                    "AWS session token",
+                    hide_sensitive_input,
+                )?
+            } else {
+                None
+            };
+
+            if let (Some(region), Some(access_key), Some(secret_key)) = (
+                region.effective_value.clone(),
+                access_key.effective_value.clone(),
+                secret_key.effective_value.clone(),
+            ) {
+                let validation =
+                    crate::agent::bedrock::BedrockProvider::new(region, access_key, secret_key)
+                        .map(|provider| {
+                            if let Some(session_token) = session_token
+                                .as_ref()
+                                .and_then(|value| value.effective_value.clone())
+                            {
+                                provider.with_session_token(session_token)
+                            } else {
+                                provider
+                            }
+                        });
+                if let Err(err) = validation {
+                    handle_setup_validation_failure(err)?;
+                }
+            }
+
+            config["bedrock"] = serde_json::json!({
+                "region": region.config_value,
+                "accessKeyId": access_key.config_value,
+                "secretAccessKey": secret_key.config_value
+            });
+            if let Some(session_token) = session_token {
+                config["bedrock"]["sessionToken"] = serde_json::json!(session_token.config_value);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn configure_provider_noninteractive(config: &mut Value, provider: SetupProvider) {
+    config["agents"]["defaults"]["model"] = serde_json::json!(provider.default_model());
+
+    match provider {
+        SetupProvider::Anthropic => {
+            config["anthropic"] =
+                serde_json::json!({ "apiKey": env_placeholder("ANTHROPIC_API_KEY") });
+        }
+        SetupProvider::OpenAi => {
+            config["openai"] = serde_json::json!({ "apiKey": env_placeholder("OPENAI_API_KEY") });
+        }
+        SetupProvider::Ollama => {
+            let base_url = first_present_env_var(&["OLLAMA_BASE_URL"])
+                .map(|(env_var, _)| env_placeholder(env_var))
+                .unwrap_or_else(|| crate::agent::ollama::DEFAULT_OLLAMA_BASE_URL.to_string());
+            config["providers"] = serde_json::json!({
+                "ollama": {
+                    "baseUrl": base_url
+                }
+            });
+        }
+        SetupProvider::Gemini => {
+            config["google"] = serde_json::json!({
+                "apiKey": env_placeholder("GOOGLE_API_KEY")
+            });
+            if env_var_present("GOOGLE_API_BASE_URL") {
+                config["google"]["baseUrl"] =
+                    serde_json::json!(env_placeholder("GOOGLE_API_BASE_URL"));
+            }
+        }
+        SetupProvider::Venice => {
+            config["venice"] = serde_json::json!({
+                "apiKey": env_placeholder("VENICE_API_KEY")
+            });
+            if env_var_present("VENICE_BASE_URL") {
+                config["venice"]["baseUrl"] = serde_json::json!(env_placeholder("VENICE_BASE_URL"));
+            }
+        }
+        SetupProvider::Bedrock => {
+            let region = if env_var_present("AWS_REGION") {
+                env_placeholder("AWS_REGION")
+            } else if env_var_present("AWS_DEFAULT_REGION") {
+                env_placeholder("AWS_DEFAULT_REGION")
+            } else {
+                "us-east-1".to_string()
+            };
+            config["bedrock"] = serde_json::json!({
+                "region": region,
+                "accessKeyId": env_placeholder("AWS_ACCESS_KEY_ID"),
+                "secretAccessKey": env_placeholder("AWS_SECRET_ACCESS_KEY")
+            });
+            if env_var_present("AWS_SESSION_TOKEN") {
+                config["bedrock"]["sessionToken"] =
+                    serde_json::json!(env_placeholder("AWS_SESSION_TOKEN"));
+            }
+        }
+    }
+}
+
 /// Run the `setup` subcommand -- interactive first-run wizard.
-pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
+pub fn handle_setup(
+    force: bool,
+    requested_provider: Option<SetupProvider>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let config_path = config::get_config_path();
 
     // Check if config already exists.
@@ -4326,86 +4865,14 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
     if interactive {
         println!("Carapace setup wizard");
         println!("---------------------");
-        println!("This interactive wizard currently writes Anthropic/OpenAI first-run config.");
+        println!("This interactive wizard writes first-run config for every supported provider.");
         println!(
             "Fastest first-run path: pick one provider, keep `local-chat`, then run `cara verify --outcome local-chat`."
         );
 
-        let provider_env_state = detect_setup_provider_env_state();
-        let alternate_provider_envs = alternate_provider_env_hints();
-        if matches!(provider_env_state, SetupProviderEnvState::None)
-            && !alternate_provider_envs.is_empty()
-        {
-            print_alternate_provider_first_run_guidance(&alternate_provider_envs);
-            if !prompt_yes_no("Continue with the Anthropic/OpenAI wizard anyway?", false)? {
-                return Err("setup canceled; no Anthropic/OpenAI config was written. Use https://getcara.io/providers.html for Ollama/Gemini/Venice/Bedrock setup, or https://getcara.io/help.html#guided-setup-help for guided help.".into());
-            }
-        }
-
         let hide_sensitive_input = prompt_yes_no("Hide sensitive input while typing?", true)?;
-
-        if matches!(provider_env_state, SetupProviderEnvState::Both) {
-            eprintln!("Both $ANTHROPIC_API_KEY and $OPENAI_API_KEY are set.");
-            eprintln!(
-                "Pick one provider for first run; setup will only write the provider you choose."
-            );
-        }
-        let default_provider = provider_env_state.default_provider().prompt_key();
-
-        let provider = loop {
-            let selection = prompt_with_default(
-                "Select provider for first run (pick one: anthropic/openai)",
-                default_provider,
-            )?;
-            let normalized = selection.trim().to_lowercase();
-            match normalized.as_str() {
-                "anthropic" | "claude" => break SetupProvider::Anthropic,
-                "openai" | "gpt" => break SetupProvider::OpenAi,
-                _ => eprintln!("Please enter either \"anthropic\" or \"openai\"."),
-            }
-        };
-
-        let env_var = provider.credential_env_var_name();
-        let default_model = provider.default_model();
-
-        let env_key = std::env::var(env_var)
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
-        let mut effective_api_key = None;
-        let api_key = if env_key.is_some() {
-            let use_env = prompt_yes_no(&format!("Use API key from ${env_var}?"), true)?;
-            if use_env {
-                effective_api_key = env_key.clone();
-                Some(format!("${{{env_var}}}"))
-            } else {
-                let entered = prompt_sensitive_line("API key", hide_sensitive_input, true)?;
-                if entered.is_empty() {
-                    None
-                } else {
-                    effective_api_key = Some(entered.clone());
-                    Some(entered)
-                }
-            }
-        } else {
-            let entered = prompt_sensitive_line("API key", hide_sensitive_input, true)?;
-            if entered.is_empty() {
-                None
-            } else {
-                effective_api_key = Some(entered.clone());
-                Some(entered)
-            }
-        };
-
-        if api_key.is_none() {
-            println!(
-                "No API key provided. Set ${env_var} in the same shell you use for `cara start` and `cara verify`, or rerun `cara setup --force` later."
-            );
-        }
-
-        if let Some(key) = effective_api_key.as_deref() {
-            validate_provider_credentials_interactive(provider.prompt_key(), key)?;
-        }
+        let provider = prompt_setup_provider_interactive(requested_provider)?;
+        configure_provider_interactive(&mut config, provider, hide_sensitive_input)?;
 
         let auth_mode = prompt_choice(
             "Gateway auth mode (token/password)",
@@ -4519,18 +4986,8 @@ pub fn handle_setup(force: bool) -> Result<(), Box<dyn std::error::Error>> {
                 "enabled": true
             });
         }
-
-        config["agents"]["defaults"]["model"] = serde_json::json!(default_model);
-        match provider {
-            SetupProvider::OpenAi => {
-                let value = api_key.clone().unwrap_or_else(|| format!("${{{env_var}}}"));
-                config["openai"] = serde_json::json!({ "apiKey": value });
-            }
-            SetupProvider::Anthropic => {
-                let value = api_key.clone().unwrap_or_else(|| format!("${{{env_var}}}"));
-                config["anthropic"] = serde_json::json!({ "apiKey": value });
-            }
-        }
+    } else if let Some(provider) = requested_provider {
+        configure_provider_noninteractive(&mut config, provider);
     }
 
     // Write the config file using json5 (pretty-formatted).
@@ -6479,23 +6936,27 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_setup_provider_env_state() {
+    fn test_detect_setup_provider_env_hints() {
         let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
         {
             let _anthropic_guard = unset_env_var_scoped("ANTHROPIC_API_KEY");
             let _openai_guard = unset_env_var_scoped("OPENAI_API_KEY");
-            assert_eq!(
-                detect_setup_provider_env_state(),
-                SetupProviderEnvState::None
-            );
+            let _ollama_guard = unset_env_var_scoped("OLLAMA_BASE_URL");
+            let _google_guard = unset_env_var_scoped("GOOGLE_API_KEY");
+            let _venice_guard = unset_env_var_scoped("VENICE_API_KEY");
+            let _region_guard = unset_env_var_scoped("AWS_REGION");
+            let _default_region_guard = unset_env_var_scoped("AWS_DEFAULT_REGION");
+            let _access_guard = unset_env_var_scoped("AWS_ACCESS_KEY_ID");
+            let _secret_guard = unset_env_var_scoped("AWS_SECRET_ACCESS_KEY");
+            assert!(detect_setup_provider_env_hints().is_empty());
         }
 
         {
             let _anthropic_guard = set_env_var_scoped("ANTHROPIC_API_KEY", "sk-anthropic");
             let _openai_guard = unset_env_var_scoped("OPENAI_API_KEY");
             assert_eq!(
-                detect_setup_provider_env_state(),
-                SetupProviderEnvState::AnthropicOnly
+                detect_setup_provider_env_hints(),
+                vec![SetupProvider::Anthropic]
             );
         }
 
@@ -6503,17 +6964,18 @@ mod tests {
             let _anthropic_guard = unset_env_var_scoped("ANTHROPIC_API_KEY");
             let _openai_guard = set_env_var_scoped("OPENAI_API_KEY", "sk-openai");
             assert_eq!(
-                detect_setup_provider_env_state(),
-                SetupProviderEnvState::OpenAiOnly
+                detect_setup_provider_env_hints(),
+                vec![SetupProvider::OpenAi]
             );
         }
 
         {
-            let _anthropic_guard = set_env_var_scoped("ANTHROPIC_API_KEY", "sk-anthropic");
-            let _openai_guard = set_env_var_scoped("OPENAI_API_KEY", "sk-openai");
+            let _anthropic_guard = unset_env_var_scoped("ANTHROPIC_API_KEY");
+            let _openai_guard = unset_env_var_scoped("OPENAI_API_KEY");
+            let _google_guard = set_env_var_scoped("GOOGLE_API_KEY", "google-key");
             assert_eq!(
-                detect_setup_provider_env_state(),
-                SetupProviderEnvState::Both
+                detect_setup_provider_env_hints(),
+                vec![SetupProvider::Gemini]
             );
         }
     }
@@ -6523,7 +6985,7 @@ mod tests {
         let cfg = serde_json::json!({});
         assert_eq!(
             local_chat_verify_next_step(&cfg),
-            "configure a provider for the selected model, or rerun `cara setup --force` for the Anthropic/OpenAI first-run path, then retry `cara verify --outcome local-chat`"
+            "configure a provider for the selected model, or rerun `cara setup --force`, then retry `cara verify --outcome local-chat`"
         );
     }
 
@@ -6601,7 +7063,7 @@ mod tests {
         });
         assert_eq!(
             local_chat_verify_next_step(&cfg),
-            "configure a provider for the selected model, or rerun `cara setup --force` for the Anthropic/OpenAI first-run path, then retry `cara verify --outcome local-chat`"
+            "configure a provider for the selected model, or rerun `cara setup --force`, then retry `cara verify --outcome local-chat`"
         );
     }
 
@@ -6697,7 +7159,7 @@ mod tests {
     }
 
     #[test]
-    fn test_alternate_provider_env_hints_ignore_partial_aws_env() {
+    fn test_detect_setup_provider_env_hints_ignore_partial_aws_env() {
         let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
         let _region_guard = set_env_var_scoped("AWS_REGION", "us-east-1");
         let _access_guard = unset_env_var_scoped("AWS_ACCESS_KEY_ID");
@@ -6706,11 +7168,11 @@ mod tests {
         let _ollama_guard = unset_env_var_scoped("OLLAMA_BASE_URL");
         let _venice_guard = unset_env_var_scoped("VENICE_API_KEY");
 
-        assert!(alternate_provider_env_hints().is_empty());
+        assert!(detect_setup_provider_env_hints().is_empty());
     }
 
     #[test]
-    fn test_alternate_provider_env_hints_include_complete_bedrock_env() {
+    fn test_detect_setup_provider_env_hints_include_complete_bedrock_env() {
         let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
         let _region_guard = set_env_var_scoped("AWS_REGION", "us-east-1");
         let _access_guard = set_env_var_scoped("AWS_ACCESS_KEY_ID", "AKIA...");
@@ -6719,7 +7181,10 @@ mod tests {
         let _ollama_guard = unset_env_var_scoped("OLLAMA_BASE_URL");
         let _venice_guard = unset_env_var_scoped("VENICE_API_KEY");
 
-        assert_eq!(alternate_provider_env_hints(), vec!["AWS_*"]);
+        assert_eq!(
+            detect_setup_provider_env_hints(),
+            vec![SetupProvider::Bedrock]
+        );
     }
 
     #[test]
@@ -6940,7 +7405,10 @@ mod tests {
     fn test_cli_setup_no_force() {
         let cli = Cli::try_parse_from(["cara", "setup"]).unwrap();
         match cli.command {
-            Some(Command::Setup { force }) => {
+            Some(Command::Setup {
+                force,
+                provider: None,
+            }) => {
                 assert!(!force);
             }
             other => panic!("Expected Setup, got {:?}", other),
@@ -6951,10 +7419,27 @@ mod tests {
     fn test_cli_setup_with_force() {
         let cli = Cli::try_parse_from(["cara", "setup", "--force"]).unwrap();
         match cli.command {
-            Some(Command::Setup { force }) => {
+            Some(Command::Setup {
+                force,
+                provider: None,
+            }) => {
                 assert!(force);
             }
             other => panic!("Expected Setup, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_setup_with_provider() {
+        let cli = Cli::try_parse_from(["cara", "setup", "--provider", "ollama"]).unwrap();
+        match cli.command {
+            Some(Command::Setup {
+                force,
+                provider: Some(SetupProvider::Ollama),
+            }) => {
+                assert!(!force);
+            }
+            other => panic!("Expected Setup with provider, got {:?}", other),
         }
     }
 
@@ -6966,7 +7451,7 @@ mod tests {
         std::fs::write(&config_path, "{}").unwrap();
 
         let _env_guard = set_env_var_scoped("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
-        let result = handle_setup(false);
+        let result = handle_setup(false, None);
 
         assert!(
             result.is_err(),
@@ -6982,7 +7467,7 @@ mod tests {
         std::fs::write(&config_path, "{}").unwrap();
 
         let _env_guard = set_env_var_scoped("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
-        let result = handle_setup(true);
+        let result = handle_setup(true, None);
 
         assert!(
             result.is_ok(),
@@ -6998,7 +7483,7 @@ mod tests {
         let config_path = temp.path().join("carapace.json");
 
         let _env_guard = set_env_var_scoped("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
-        let result = handle_setup(false);
+        let result = handle_setup(false, None);
 
         assert!(result.is_ok(), "Setup should succeed");
 
@@ -7014,7 +7499,7 @@ mod tests {
         let config_path = temp.path().join("carapace.json");
 
         let _env_guard = set_env_var_scoped("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
-        let result = handle_setup(false);
+        let result = handle_setup(false, None);
 
         assert!(result.is_ok());
 
@@ -7047,73 +7532,114 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_setup_interactive_alternate_provider_declines_anthropic_openai_wizard() {
+    fn test_handle_setup_noninteractive_provider_flag_writes_gemini_config() {
         let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
-        let env = setup_interactive_test_env(SetupInteractiveTestHarness {
-            force_interactive: Some(true),
-            visible_inputs: VecDeque::from(vec!["n".to_string()]),
-            ..Default::default()
-        });
-        let _ollama_guard = set_env_var_scoped("OLLAMA_BASE_URL", "http://127.0.0.1:11434");
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_path = temp.path().join("carapace.json");
+        let _env_guard = set_env_var_scoped("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
 
-        let result = handle_setup(true);
+        let result = handle_setup(false, Some(SetupProvider::Gemini));
         assert!(
-            result.is_err(),
-            "setup should abort before writing Anthropic/OpenAI config"
-        );
-        assert!(
-            !env.config_path.exists(),
-            "config should not be written when the user declines the wrong wizard path"
+            result.is_ok(),
+            "non-interactive provider setup should succeed"
         );
 
-        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
-        assert_eq!(state.visible_prompt_count, 1);
-        assert_eq!(state.hidden_prompt_count, 0);
-        assert!(state.visible_inputs.is_empty());
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let parsed: serde_json::Value = json5::from_str(&content).unwrap();
+        assert_eq!(parsed["google"]["apiKey"], "${GOOGLE_API_KEY}");
+        assert_eq!(parsed["agents"]["defaults"]["model"], "gemini-2.0-flash");
     }
 
     #[test]
-    fn test_handle_setup_interactive_alternate_provider_can_continue_anyway() {
+    fn test_handle_setup_noninteractive_provider_flag_writes_venice_config() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_path = temp.path().join("carapace.json");
+        let _env_guard = set_env_var_scoped("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
+
+        let result = handle_setup(false, Some(SetupProvider::Venice));
+        assert!(
+            result.is_ok(),
+            "non-interactive provider setup should succeed"
+        );
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let parsed: serde_json::Value = json5::from_str(&content).unwrap();
+        assert_eq!(parsed["venice"]["apiKey"], "${VENICE_API_KEY}");
+        assert_eq!(
+            parsed["agents"]["defaults"]["model"],
+            "venice:llama-3.3-70b"
+        );
+    }
+
+    #[test]
+    fn test_handle_setup_noninteractive_provider_flag_writes_bedrock_config() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_path = temp.path().join("carapace.json");
+        let _env_guard = set_env_var_scoped("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
+        let _region_guard = unset_env_var_scoped("AWS_REGION");
+        let _default_region_guard = unset_env_var_scoped("AWS_DEFAULT_REGION");
+
+        let result = handle_setup(false, Some(SetupProvider::Bedrock));
+        assert!(
+            result.is_ok(),
+            "non-interactive provider setup should succeed"
+        );
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let parsed: serde_json::Value = json5::from_str(&content).unwrap();
+        assert_eq!(parsed["bedrock"]["region"], "us-east-1");
+        assert_eq!(parsed["bedrock"]["accessKeyId"], "${AWS_ACCESS_KEY_ID}");
+        assert_eq!(
+            parsed["bedrock"]["secretAccessKey"],
+            "${AWS_SECRET_ACCESS_KEY}"
+        );
+        assert_eq!(
+            parsed["agents"]["defaults"]["model"],
+            "bedrock:anthropic.claude-3-5-sonnet-20240620-v1:0"
+        );
+    }
+
+    #[test]
+    fn test_handle_setup_interactive_selects_ollama_provider() {
         let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
         let env = setup_interactive_test_env(SetupInteractiveTestHarness {
             force_interactive: Some(true),
             visible_inputs: VecDeque::from(vec![
                 "y".to_string(),
-                "y".to_string(),
-                "openai".to_string(),
+                "ollama".to_string(),
+                "".to_string(),
+                "n".to_string(),
                 "".to_string(),
                 "".to_string(),
                 "".to_string(),
                 "".to_string(),
                 "".to_string(),
-                "".to_string(),
-                "".to_string(),
+                "n".to_string(),
+                "n".to_string(),
                 "n".to_string(),
                 "n".to_string(),
                 "n".to_string(),
             ]),
-            hidden_inputs: VecDeque::from(vec!["".to_string()]),
             ..Default::default()
         });
         let _ollama_guard = set_env_var_scoped("OLLAMA_BASE_URL", "http://127.0.0.1:11434");
 
-        let result = handle_setup(true);
-        assert!(
-            result.is_ok(),
-            "setup should continue when the user opts in"
-        );
+        let result = handle_setup(true, None);
+        assert!(result.is_ok(), "interactive Ollama setup should succeed");
 
         let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
-        assert_eq!(state.visible_prompt_count, 13);
-        assert_eq!(state.hidden_prompt_count, 1);
         assert_eq!(state.provider_validation_calls, 0);
         assert!(state.visible_inputs.is_empty());
-        assert!(state.hidden_inputs.is_empty());
 
         let content = std::fs::read_to_string(&env.config_path).unwrap();
         let parsed: serde_json::Value = json5::from_str(&content).unwrap();
-        assert_eq!(parsed["openai"]["apiKey"], "${OPENAI_API_KEY}");
-        assert_eq!(parsed["agents"]["defaults"]["model"], "gpt-4o");
+        assert_eq!(
+            parsed["providers"]["ollama"]["baseUrl"],
+            "${OLLAMA_BASE_URL}"
+        );
+        assert_eq!(parsed["agents"]["defaults"]["model"], "ollama:llama3");
     }
 
     #[test]
@@ -7143,7 +7669,7 @@ mod tests {
             ..Default::default()
         });
 
-        let result = handle_setup(true);
+        let result = handle_setup(true, None);
         assert!(result.is_ok(), "interactive setup should succeed");
 
         let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
@@ -7190,7 +7716,7 @@ mod tests {
             ..Default::default()
         });
 
-        let result = handle_setup(true);
+        let result = handle_setup(true, None);
         assert!(result.is_ok(), "interactive setup should succeed");
 
         let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
@@ -7232,7 +7758,7 @@ mod tests {
             ..Default::default()
         });
 
-        let result = handle_setup(true);
+        let result = handle_setup(true, None);
         assert!(
             result.is_err(),
             "setup should abort after validation failure"
@@ -7282,7 +7808,7 @@ mod tests {
             ..Default::default()
         });
 
-        let result = handle_setup(true);
+        let result = handle_setup(true, None);
         assert!(result.is_ok(), "interactive setup should succeed");
 
         let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
@@ -7327,7 +7853,7 @@ mod tests {
             ..Default::default()
         });
 
-        let result = handle_setup(true);
+        let result = handle_setup(true, None);
         assert!(
             result.is_err(),
             "setup should abort after validation failure"

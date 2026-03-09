@@ -88,7 +88,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             force,
         }) => cli::handle_reset(sessions, cron, usage, memory, all, force),
 
-        Some(Command::Setup { force }) => cli::handle_setup(force),
+        Some(Command::Setup { force, provider }) => cli::handle_setup(force, provider),
 
         Some(Command::Pair { url, name, trust }) => {
             cli::handle_pair(&url, name.as_deref(), trust).await

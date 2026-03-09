@@ -20,7 +20,8 @@ Optimize for the shortest verified first run, then change providers later if nee
 
 ## Start with one provider only
 
-Run `cara setup` after configuring exactly one provider path. If you are unsure,
+Run `cara setup --provider <provider>` when you already know which provider you
+want, or plain `cara setup` if you want the wizard to ask. If you are unsure,
 choose `local-chat` as the first outcome and add channels only after
 `cara verify --outcome auto` passes.
 
@@ -30,70 +31,64 @@ Pick one of these, not both:
 
 ```bash
 export ANTHROPIC_API_KEY='...'
-cara setup
+cara setup --provider anthropic
 ```
 
 Or:
 
 ```bash
 export OPENAI_API_KEY='...'
-cara setup
+cara setup --provider openai
 ```
 
 ### Ollama (fastest fully local path)
 
-The runtime supports Ollama today, but the interactive `cara setup` wizard
-still writes Anthropic/OpenAI first-run config. If `OLLAMA_BASE_URL` is set
-and neither `ANTHROPIC_API_KEY` nor `OPENAI_API_KEY` is set, `cara setup` will
-stop and ask whether you want to continue with that wizard anyway.
-
 ```bash
 export OLLAMA_BASE_URL='http://127.0.0.1:11434'
+cara setup --provider ollama
 ```
 
-If you are staying on Ollama first, skip the Anthropic/OpenAI wizard, copy the
-`ollama` section from `config.example.json5`, and use
-[Guided setup help](help.md#guided-setup-help) if you want help getting to a
-verified local-chat first run.
+If your Ollama endpoint requires auth, the wizard will also offer an optional
+API key prompt and write `providers.ollama.apiKey`.
 
 ### Gemini / Bedrock / Venice
 
-These are fully supported at runtime, but the interactive `cara setup` wizard
-still writes Anthropic/OpenAI first-run config. If neither
-`ANTHROPIC_API_KEY` nor `OPENAI_API_KEY` is set and the matching env vars are
-present, `cara setup` will stop and ask whether you want to continue with that
-wizard anyway. For Bedrock, that means a region plus both
-`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`.
-If `GOOGLE_API_KEY` is only for other Google APIs and not for Gemini, unset it
-before running `cara setup`.
+These providers are supported directly by the setup wizard now. If multiple
+provider env vars are already set, prefer the explicit provider flag so setup
+does not rely on the interactive default.
 
 ```bash
 export GOOGLE_API_KEY='...'
+cara setup --provider gemini
 ```
 
 ```bash
 export AWS_REGION='us-east-1'
 export AWS_ACCESS_KEY_ID='...'
 export AWS_SECRET_ACCESS_KEY='...'
+cara setup --provider bedrock
 ```
 
 ```bash
 export VENICE_API_KEY='...'
+cara setup --provider venice
 ```
 
-If you are staying on Gemini, Bedrock, or Venice first, skip the
-Anthropic/OpenAI wizard, copy the relevant provider section from
-`config.example.json5`, and use [Guided setup help](help.md#guided-setup-help)
-if you want a shorter path to a verified first run.
+If `GOOGLE_API_KEY` is only for other Google APIs and not for Gemini, unset it
+before running `cara setup`. If you need to override the default Gemini or
+Venice endpoint, the wizard will offer an optional base URL override.
 
 Supported env vars:
 
 - `ANTHROPIC_API_KEY`
 - `OPENAI_API_KEY`
 - `GOOGLE_API_KEY`
+- `GOOGLE_API_BASE_URL` (Gemini override)
 - `OLLAMA_BASE_URL` (if non-default)
-- `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` (Bedrock)
+- `AWS_REGION` or `AWS_DEFAULT_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` (Bedrock)
+- `AWS_SESSION_TOKEN` (optional Bedrock session token)
 - `VENICE_API_KEY`
+- `VENICE_BASE_URL` (Venice override)
 
 ## Common first-run mistakes
 
@@ -106,7 +101,7 @@ When in doubt:
 
 1. choose one provider
 2. choose `local-chat`
-3. run `cara setup`
+3. run `cara setup --provider <provider>`
 4. start `cara`
 5. run `cara verify --outcome auto --port 18789`
 
