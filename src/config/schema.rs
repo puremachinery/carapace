@@ -1005,6 +1005,40 @@ mod tests {
             .any(|i| i.path == ".hooks" && i.severity == Severity::Error));
     }
 
+    #[test]
+    fn test_vertex_config_valid() {
+        let cfg = json!({
+            "vertex": {
+                "projectId": "my-project",
+                "location": "us-central1",
+                "model": "gemini-2.0-flash"
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(!issues.iter().any(|i| i.path.starts_with(".vertex")));
+    }
+
+    #[test]
+    fn test_vertex_project_id_must_be_string() {
+        let cfg = json!({ "vertex": { "projectId": 123 } });
+        let issues = validate_schema(&cfg);
+        assert!(issues.iter().any(|i| i.path == ".vertex.projectId"));
+    }
+
+    #[test]
+    fn test_vertex_location_must_be_string() {
+        let cfg = json!({ "vertex": { "location": 123 } });
+        let issues = validate_schema(&cfg);
+        assert!(issues.iter().any(|i| i.path == ".vertex.location"));
+    }
+
+    #[test]
+    fn test_vertex_model_must_be_string() {
+        let cfg = json!({ "vertex": { "model": 123 } });
+        let issues = validate_schema(&cfg);
+        assert!(issues.iter().any(|i| i.path == ".vertex.model"));
+    }
+
     // --- logging ---
 
     #[test]

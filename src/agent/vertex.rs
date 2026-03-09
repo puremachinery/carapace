@@ -69,10 +69,13 @@ struct MetadataProvider {
 }
 
 impl MetadataProvider {
-    fn new() -> Self {
-        Self {
-            client: reqwest::Client::new(),
-        }
+    fn new() -> Result<Self, AgentError> {
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(5))
+            .build()
+            .map_err(|e| AgentError::Provider(format!("failed to build metadata client: {e}")))?;
+        Ok(Self { client })
     }
 }
 
@@ -334,7 +337,7 @@ impl VertexProvider {
         }
 
         // Uses FallbackTokenProvider: tries gcloud CLI first and falls back to the metadata server.
-        let token_manager: Arc<dyn TokenProvider> = Arc::new(FallbackTokenProvider::new());
+        let token_manager: Arc<dyn TokenProvider> = Arc::new(FallbackTokenProvider::new()?);
 
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
@@ -383,22 +386,19 @@ impl VertexProvider {
         Ok(token)
     }
 
-    /// Resolves the API endpoint for Google-published models on Vertex AI.
+    /// Resolves the API endpoint for Google-published Gemini models on Vertex AI.
     ///
     /// Rules:
     /// - `vertex/gemini-1.5-pro` -> Google publisher, gemini-1.5-pro
     /// - `vertex/google/gemini-1.5-pro` -> Google publisher, gemini-1.5-pro
     /// - `vertex` / `vertex:default` -> use `default_model`
-    /// - other publisher namespaces are rejected in this scoped implementation
+    /// - non-Gemini model IDs and other publisher namespaces are rejected in this scoped implementation
     fn resolve_request_config(&self, model_name: &str) -> Result<String, AgentError> {
         let clean_model = strip_vertex_prefix(model_name);
 
         // Handle generic fallback
         let effective_model = if clean_model.is_empty() || clean_model == "default" {
             if let Some(ref default) = self.default_model {
-                // Use the default model, but strip any prefix it might have to avoid recursion if simple prefix stripping isn't enough?
-                // Ideally default_model is stored clean or we recurse?
-                // Let's assume default_model is the full ID like "gemini-1.5-pro" or "vertex/gemini-1.5-pro".
                 strip_vertex_prefix(default)
             } else {
                 return Err(AgentError::Provider(
@@ -410,19 +410,25 @@ impl VertexProvider {
             clean_model
         };
 
-        let (publisher, model_id): (&str, &str) = if effective_model.starts_with("google/") {
-            (
-                "google",
-                effective_model
-                    .strip_prefix("google/")
-                    .unwrap_or(effective_model),
-            )
+        let (publisher, model_id): (&str, &str) = if let Some(model_id) =
+            effective_model.strip_prefix("google/")
+        {
+            if !model_id.starts_with("gemini-") {
+                return Err(AgentError::Provider(format!(
+                    "Unsupported Vertex model: {effective_model}. This provider currently supports Google Gemini models only."
+                )));
+            }
+            ("google", model_id)
         } else if effective_model.contains('/') {
             return Err(AgentError::Provider(format!(
-                "Unsupported Vertex model namespace: {effective_model}. This provider currently supports Google-published models only."
+                "Unsupported Vertex model namespace: {effective_model}. This provider currently supports Google Gemini models only."
+            )));
+        } else if !effective_model.starts_with("gemini-") {
+            return Err(AgentError::Provider(format!(
+                "Unsupported Vertex model: {effective_model}. This provider currently supports Google Gemini models only."
             )));
         } else {
-            // Bare model IDs are treated as Google-published models on Vertex AI.
+            // Bare Gemini model IDs are treated as Google-published models on Vertex AI.
             ("google", effective_model)
         };
         // SSRF / Path Traversal Validation
@@ -465,11 +471,11 @@ struct FallbackTokenProvider {
 }
 
 impl FallbackTokenProvider {
-    fn new() -> Self {
-        Self {
+    fn new() -> Result<Self, AgentError> {
+        Ok(Self {
             primary: GCloudCliProvider,
-            fallback: MetadataProvider::new(),
-        }
+            fallback: MetadataProvider::new()?,
+        })
     }
 }
 
@@ -545,7 +551,6 @@ impl LlmProvider for VertexProvider {
                 .post(&url)
                 .header("Authorization", format!("Bearer {}", token))
                 .header("content-type", "application/json")
-                // .header("accept", "text/event-stream") // Vertex sometimes is picky, but alt=sse should handle it.
                 .json(&body)
                 .send() => {
                     response.map_err(|e| AgentError::Provider(format!("HTTP request failed: {e}")))?
@@ -582,12 +587,11 @@ impl LlmProvider for VertexProvider {
     }
 }
 
-// Copy of MAX_SSE_BUFFER_BYTES from gemini.rs
+/// Maximum SSE line buffer size (1 MB). If a single SSE line exceeds this,
+/// the stream is treated as corrupted to prevent unbounded memory growth.
 const MAX_SSE_BUFFER_BYTES: usize = 1_048_576;
 
-// Logic mostly copied from gemini.rs but adapted if needed.
-// Vertex SSE format is identical to Gemini API usually?
-// Yes, Model Garden Gemini uses the same payload structure.
+/// Process a Vertex SSE byte stream into StreamEvents.
 async fn process_vertex_sse_stream<S>(
     mut stream: S,
     tx: &mpsc::Sender<StreamEvent>,
@@ -598,6 +602,7 @@ where
 {
     let mut buffer = String::new();
     let mut accumulated_usage = TokenUsage::default();
+    let mut last_finish_reason: Option<String> = None;
 
     loop {
         let chunk = tokio::select! {
@@ -629,6 +634,12 @@ where
                 match parse_gemini_chunk(data, &mut accumulated_usage) {
                     Ok(events) => {
                         for event in events {
+                            if let StreamEvent::Stop { reason, .. } = &event {
+                                last_finish_reason = Some(match reason {
+                                    StopReason::MaxTokens => "MAX_TOKENS".to_string(),
+                                    StopReason::ToolUse | StopReason::EndTurn => "STOP".to_string(),
+                                });
+                            }
                             let is_stop = matches!(event, StreamEvent::Stop { .. });
                             let is_error = matches!(event, StreamEvent::Error { .. });
                             if tx.send(event).await.is_err() {
@@ -652,6 +663,17 @@ where
             buffer.drain(..consumed);
         }
     }
+
+    let reason = match last_finish_reason.as_deref() {
+        Some("MAX_TOKENS") => StopReason::MaxTokens,
+        _ => StopReason::EndTurn,
+    };
+    let _ = tx
+        .send(StreamEvent::Stop {
+            reason,
+            usage: accumulated_usage,
+        })
+        .await;
 
     Ok(())
 }
@@ -856,7 +878,21 @@ mod tests {
             .expect_err("unsupported publisher namespace should fail");
         assert!(
             err.to_string()
-                .contains("supports Google-published models only"),
+                .contains("supports Google Gemini models only"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_vertex_provider_rejects_unsupported_bare_model() {
+        let provider =
+            VertexProvider::new("my-project".to_string(), "us-central1".to_string(), None).unwrap();
+        let err = provider
+            .resolve_request_config("vertex/claude-3-opus")
+            .expect_err("unsupported bare model should fail");
+        assert!(
+            err.to_string()
+                .contains("supports Google Gemini models only"),
             "unexpected error: {err}"
         );
     }

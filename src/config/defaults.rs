@@ -606,6 +606,30 @@ fn merge_defaults(target: &mut Value, defaults: Value) {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::ffi::OsString;
+    use std::sync::{LazyLock, Mutex};
+
+    static ENV_VAR_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => env::set_var(self.key, value),
+                None => env::remove_var(self.key),
+            }
+        }
+    }
+
+    fn unset_env_var_scoped(key: &'static str) -> EnvVarGuard {
+        let previous = env::var_os(key);
+        env::remove_var(key);
+        EnvVarGuard { key, previous }
+    }
 
     #[test]
     #[allow(clippy::cognitive_complexity)]
@@ -800,8 +824,8 @@ mod tests {
 
     #[test]
     fn test_vertex_project_id_omitted_when_missing() {
-        // Ensure env var is not set
-        env::remove_var("VERTEX_PROJECT_ID");
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let _guard = unset_env_var_scoped("VERTEX_PROJECT_ID");
 
         let mut config = json!({});
         apply_defaults(&mut config);

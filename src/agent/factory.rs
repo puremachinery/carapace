@@ -59,21 +59,24 @@ struct VertexConfig {
 
 fn get_vertex_config(cfg: &Value) -> VertexConfig {
     let vertex_cfg = cfg.get("vertex");
-    let project_id = vertex_cfg
-        .and_then(|v| v.get("projectId"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .or_else(|| std::env::var("VERTEX_PROJECT_ID").ok());
-    let location = vertex_cfg
-        .and_then(|v| v.get("location"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .or_else(|| std::env::var("VERTEX_LOCATION").ok());
-    let model = vertex_cfg
-        .and_then(|v| v.get("model"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .or_else(|| std::env::var("VERTEX_MODEL").ok());
+    let project_id = std::env::var("VERTEX_PROJECT_ID").ok().or_else(|| {
+        vertex_cfg
+            .and_then(|v| v.get("projectId"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    });
+    let location = std::env::var("VERTEX_LOCATION").ok().or_else(|| {
+        vertex_cfg
+            .and_then(|v| v.get("location"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    });
+    let model = std::env::var("VERTEX_MODEL").ok().or_else(|| {
+        vertex_cfg
+            .and_then(|v| v.get("model"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    });
 
     VertexConfig {
         project_id,
