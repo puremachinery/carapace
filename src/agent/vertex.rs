@@ -80,8 +80,9 @@ impl MetadataProvider {
 impl TokenProvider for MetadataProvider {
     async fn fetch_token(&self) -> Result<String, AgentError> {
         debug!("fetching access token via metadata server");
-        // The GCP metadata server does not support HTTPS.
-        // We construct the URL dynamically to avoid CodeQL's "Failure to use HTTPS URLs" warning.
+        // SAFETY: the GCP metadata server is a fixed link-local endpoint that only serves HTTP.
+        // HTTPS is not supported there, and this URL is fully static rather than user-controlled.
+        // We keep the scheme split to avoid the false-positive CodeQL "use HTTPS URLs" warning.
         let url = format!(
             "{}://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
             "http"
@@ -325,7 +326,7 @@ impl VertexProvider {
         static LOCATION_REGEX: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
         let location_re =
             LOCATION_REGEX.get_or_init(|| regex::Regex::new(r"^[a-z]+(?:-[a-z]+)+\d+$").unwrap());
-        if !location_re.is_match(&location) {
+        if location != "global" && !location_re.is_match(&location) {
             return Err(AgentError::Provider(format!(
                 "Invalid GCP location: {}",
                 location
@@ -374,19 +375,21 @@ impl VertexProvider {
         let token = self.token_manager.fetch_token().await?;
         *cache = Some(CachedToken {
             token: token.clone(),
-            expires_at: Instant::now() + Duration::from_secs(240), // GCP Metadata refreshes tokens 5 mins before expiration. Caching for 4 mins is mathematically safe.
+            // Keep token reuse short and conservative across both gcloud and metadata-server sources.
+            // With the 60-second freshness check above, cached tokens are reused for at most ~3 minutes.
+            expires_at: Instant::now() + Duration::from_secs(240),
         });
 
         Ok(token)
     }
 
-    /// Resolves the API endpoint, publisher, model ID, and storage adapter based on the model name.
+    /// Resolves the API endpoint for Google-published models on Vertex AI.
     ///
     /// Rules:
-    /// - `vertex/gemini-1.5-pro` -> Google, gemini-1.5-pro, GeminiAdapter
-    /// - `vertex/anthropic/claude-3-opus` -> Anthropic, claude-3-opus, AnthropicAdapter
-    /// - `vertex/meta/llama3-405b` -> Meta, llama3-405b, OpenAiAdapter
-    /// - `vertex` (generic) -> `default_model` -> Resolve recursively
+    /// - `vertex/gemini-1.5-pro` -> Google publisher, gemini-1.5-pro
+    /// - `vertex/google/gemini-1.5-pro` -> Google publisher, gemini-1.5-pro
+    /// - `vertex` / `vertex:default` -> use `default_model`
+    /// - other publisher namespaces are rejected in this scoped implementation
     fn resolve_request_config(&self, model_name: &str) -> Result<String, AgentError> {
         let clean_model = strip_vertex_prefix(model_name);
 
@@ -414,11 +417,12 @@ impl VertexProvider {
                     .strip_prefix("google/")
                     .unwrap_or(effective_model),
             )
-        } else if effective_model.starts_with("gemini-") {
-            // Models prefixed with "gemini-" are treated as Google Gemini models on Vertex AI.
-            ("google", effective_model)
+        } else if effective_model.contains('/') {
+            return Err(AgentError::Provider(format!(
+                "Unsupported Vertex model namespace: {effective_model}. This provider currently supports Google-published models only."
+            )));
         } else {
-            // Fallback: treat other models as Google Gemini models within Vertex AI.
+            // Bare model IDs are treated as Google-published models on Vertex AI.
             ("google", effective_model)
         };
         // SSRF / Path Traversal Validation
@@ -438,7 +442,7 @@ impl VertexProvider {
         // Global endpoints for Gemini 3 and Experimental
         // These models are automatically routed to the global endpoint `aiplatform.googleapis.com`
         // unless overridden.
-        if model_id.contains("gemini-3") {
+        if model_id.starts_with("gemini-3") {
             let url = format!(
                 "https://aiplatform.googleapis.com/v1beta1/projects/{}/locations/{}/publishers/{}/models/{}:{}?alt=sse",
                 self.project_id, "global", publisher, model_id, method
@@ -554,8 +558,9 @@ impl LlmProvider for VertexProvider {
                 .text()
                 .await
                 .unwrap_or_else(|_| "<unreadable>".to_string());
+            let safe_body = summarize_http_failure_body(&body);
             return Err(AgentError::Provider(format!(
-                "Vertex API returned {status}: {body}"
+                "Vertex API returned {status}: {safe_body}"
             )));
         }
 
@@ -805,6 +810,7 @@ mod tests {
         assert!(
             VertexProvider::new("my-project".to_string(), "us-central1".to_string(), None).is_ok()
         );
+        assert!(VertexProvider::new("my-project".to_string(), "global".to_string(), None).is_ok());
 
         // Invalid project ID (too short)
         assert!(VertexProvider::new("my-p".to_string(), "us-central1".to_string(), None).is_err());
@@ -838,6 +844,20 @@ mod tests {
         // Invalid location (invalid characters)
         assert!(
             VertexProvider::new("my-project".to_string(), "us_central1".to_string(), None).is_err()
+        );
+    }
+
+    #[test]
+    fn test_vertex_provider_rejects_unsupported_namespace() {
+        let provider =
+            VertexProvider::new("my-project".to_string(), "us-central1".to_string(), None).unwrap();
+        let err = provider
+            .resolve_request_config("vertex/anthropic/claude-3-opus")
+            .expect_err("unsupported publisher namespace should fail");
+        assert!(
+            err.to_string()
+                .contains("supports Google-published models only"),
+            "unexpected error: {err}"
         );
     }
 

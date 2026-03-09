@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -113,6 +114,35 @@ pub trait LlmProvider: Send + Sync {
     ) -> Result<mpsc::Receiver<StreamEvent>, AgentError>;
 }
 
+pub(crate) fn summarize_http_failure_body(body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return "(empty response body)".to_string();
+    }
+
+    let summary = serde_json::from_str::<serde_json::Value>(trimmed)
+        .ok()
+        .and_then(|parsed| {
+            parsed
+                .pointer("/error/message")
+                .and_then(|v| v.as_str())
+                .or_else(|| parsed.get("message").and_then(|v| v.as_str()))
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| trimmed.to_string());
+
+    let collapsed = summary.split_whitespace().collect::<Vec<_>>().join(" ");
+    const MAX_CHARS: usize = 200;
+    if collapsed.chars().count() > MAX_CHARS {
+        format!(
+            "{}...",
+            collapsed.chars().take(MAX_CHARS).collect::<String>()
+        )
+    } else {
+        collapsed
+    }
+}
+
 /// A provider that dispatches to Anthropic, OpenAI, Ollama, Gemini, or Bedrock
 /// based on the model identifier in the request.
 ///
@@ -203,6 +233,15 @@ impl MultiProvider {
             || self.vertex.is_some()
     }
 
+    fn normalize_model_for_routing<'a>(&self, model: &'a str) -> Cow<'a, str> {
+        if model == crate::agent::DEFAULT_MODEL && self.anthropic.is_none() && self.vertex.is_some()
+        {
+            Cow::Borrowed("vertex:default")
+        } else {
+            Cow::Borrowed(model)
+        }
+    }
+
     /// Select the appropriate backend provider for the given model.
     ///
     /// Dispatch order:
@@ -214,6 +253,9 @@ impl MultiProvider {
     /// 6. Models matching Vertex patterns (vertex:*, vertex/*) -> Vertex
     /// 7. Everything else -> Anthropic (default)
     fn select_provider(&self, model: &str) -> Result<&dyn LlmProvider, AgentError> {
+        let normalized_model = self.normalize_model_for_routing(model);
+        let model = normalized_model.as_ref();
+
         if crate::agent::ollama::is_ollama_model(model) {
             self.ollama.as_deref().ok_or_else(|| {
                 AgentError::Provider(format!(
@@ -233,14 +275,10 @@ impl MultiProvider {
                 ))
             })
         } else if crate::agent::gemini::is_gemini_model(model) {
-            if self.gemini.is_some() {
-                self.gemini
-                    .as_deref()
-                    .ok_or_else(|| AgentError::Provider("".to_string()))
-            } else if self.vertex.is_some() {
-                self.vertex
-                    .as_deref()
-                    .ok_or_else(|| AgentError::Provider("".to_string()))
+            if let Some(provider) = self.gemini.as_deref() {
+                Ok(provider)
+            } else if let Some(provider) = self.vertex.as_deref() {
+                Ok(provider)
             } else {
                 Err(AgentError::Provider(format!(
                     "model \"{model}\" requires Gemini provider, but no GOOGLE_API_KEY is configured"
@@ -260,14 +298,8 @@ impl MultiProvider {
             })
         } else {
             // Default to Anthropic for claude-* and unknown models
-            if self.anthropic.is_some() {
-                self.anthropic
-                    .as_deref()
-                    .ok_or_else(|| AgentError::Provider("".to_string()))
-            } else if model == crate::agent::DEFAULT_MODEL && self.vertex.is_some() {
-                self.vertex
-                    .as_deref()
-                    .ok_or_else(|| AgentError::Provider("".to_string()))
+            if let Some(provider) = self.anthropic.as_deref() {
+                Ok(provider)
             } else {
                 Err(AgentError::Provider(format!(
                     "model \"{model}\" requires Anthropic provider, but no ANTHROPIC_API_KEY is configured"
@@ -284,6 +316,9 @@ impl LlmProvider for MultiProvider {
         mut request: CompletionRequest,
         cancel_token: CancellationToken,
     ) -> Result<mpsc::Receiver<StreamEvent>, AgentError> {
+        request.model = self
+            .normalize_model_for_routing(&request.model)
+            .into_owned();
         let provider = self.select_provider(&request.model)?;
 
         // Strip the ollama: or ollama/ prefix before forwarding to the provider,
@@ -312,17 +347,8 @@ impl LlmProvider for MultiProvider {
 
         // Strip the vertex: or vertex/ prefix before forwarding to the provider,
         // so the Vertex API receives the bare model name (e.g. "gemini-2.0-flash").
-        if request.model.starts_with("vertex/") || request.model.starts_with("vertex:") {
+        if crate::agent::vertex::is_vertex_model(&request.model) {
             request.model = crate::agent::vertex::strip_vertex_prefix(&request.model).to_string();
-        }
-
-        // If the request is for the global fallback DEFAULT_MODEL, and Anthropic is NOT configured
-        // but Vertex IS configured, we change the model to "default" so it runs Vertex's configured default model!
-        if request.model == crate::agent::DEFAULT_MODEL
-            && self.anthropic.is_none()
-            && self.vertex.is_some()
-        {
-            request.model = "default".to_string();
         }
 
         provider.complete(request, cancel_token).await
@@ -544,5 +570,55 @@ mod tests {
         let provider =
             MultiProvider::new(None, None).with_bedrock(Some(std::sync::Arc::new(bedrock)));
         assert!(provider.has_any_provider());
+    }
+
+    #[test]
+    fn test_multi_provider_vertex_dispatch_succeeds_when_configured() {
+        let vertex = crate::agent::vertex::VertexProvider::new(
+            "my-project".to_string(),
+            "us-central1".to_string(),
+            None,
+        )
+        .unwrap();
+        let provider =
+            MultiProvider::new(None, None).with_vertex(Some(std::sync::Arc::new(vertex)));
+        let result = provider.select_provider("vertex:gemini-2.0-flash");
+        assert!(result.is_ok(), "expected Ok when Vertex is configured");
+    }
+
+    #[test]
+    fn test_multi_provider_default_model_routes_to_vertex_when_anthropic_missing() {
+        let vertex = crate::agent::vertex::VertexProvider::new(
+            "my-project".to_string(),
+            "us-central1".to_string(),
+            Some("gemini-2.0-flash".to_string()),
+        )
+        .unwrap();
+        let provider =
+            MultiProvider::new(None, None).with_vertex(Some(std::sync::Arc::new(vertex)));
+        let result = provider.select_provider(crate::agent::DEFAULT_MODEL);
+        assert!(
+            result.is_ok(),
+            "expected default model to route to Vertex when Anthropic is absent"
+        );
+    }
+
+    #[test]
+    fn test_summarize_http_failure_body_prefers_structured_message() {
+        let summary = summarize_http_failure_body(
+            r#"{"error":{"message":"quota exceeded for project my-project","status":"RESOURCE_EXHAUSTED"}}"#,
+        );
+        assert_eq!(summary, "quota exceeded for project my-project");
+    }
+
+    #[test]
+    fn test_summarize_http_failure_body_truncates_long_plaintext() {
+        let summary = summarize_http_failure_body(&"x".repeat(300));
+        assert!(
+            summary.len() <= 203,
+            "summary should be truncated: {}",
+            summary.len()
+        );
+        assert!(summary.ends_with("..."));
     }
 }

@@ -462,7 +462,7 @@ pub fn fingerprint_providers(cfg: &Value) -> ProviderFingerprint {
         },
         vertex: vertex_config.project_id.map(|p| {
             (
-                p,
+                hash_key_prefix(&p),
                 vertex_config
                     .location
                     .unwrap_or_else(|| "us-central1".to_string()),
@@ -668,6 +668,28 @@ mod tests {
             });
             let fp = fingerprint_providers(&cfg);
             assert!(fp.bedrock.is_none());
+        });
+    }
+
+    #[test]
+    fn test_fingerprint_vertex_hashes_project_id() {
+        with_clean_provider_env(|| {
+            let cfg = json!({
+                "vertex": {
+                    "projectId": "my-project",
+                    "location": "us-central1",
+                    "model": "gemini-2.0-flash"
+                }
+            });
+            let fp = fingerprint_providers(&cfg);
+            assert_eq!(
+                fp.vertex,
+                Some((
+                    hash_key_prefix("my-project"),
+                    "us-central1".to_string(),
+                    Some("gemini-2.0-flash".to_string())
+                ))
+            );
         });
     }
 
