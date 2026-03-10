@@ -92,11 +92,12 @@ of truth.
 ## Roadmap
 
 - [Roadmap](docs/roadmap.md) — what we're building now, next, and later
-- Up next: subscription-style provider onboarding, advanced Control UI flows,
-  and docs architecture polish
+- Up next: broader provider onboarding, advanced Control UI flows, and docs
+  architecture polish
 - Recently shipped: first stable release, long-running assistant MVP (durable
   queue + autonomy verify), cross-platform subprocess sandboxing, guided setup
-  (`cara setup`), and first-run verifier (`cara verify`)
+  (`cara setup`), first-run verifier (`cara verify`), and Gemini onboarding
+  (Google sign-in or API key via CLI and Control UI)
 
 ## Docs
 

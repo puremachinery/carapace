@@ -24,13 +24,17 @@ For what is already shipped and verified, see:
   (`cara verify --outcome autonomy`).
 - Outcome-driven setup flow (`cara setup`) with provider credential validation.
 - First-run verifier (`cara verify`) with pass/fail outcome checks.
+- Gemini onboarding — Google sign-in or API-key setup via `cara setup` and the
+  Control UI, backed by shared onboarding flow state and `google.authProfile`
+  runtime support.
 - Multi-page docs site with install/first-run/security/ops plus docs hubs,
   capability matrix, and task-oriented CLI index.
 
 ## Now
 
-- Subscription-style provider onboarding — OAuth/device-code style flows that
-  reduce manual API-key setup friction while staying provider ToS-compliant.
+- Broader provider onboarding — extend the new Gemini onboarding pattern to
+  additional providers while keeping auth surfaces and provider policy
+  boundaries explicit.
 - Control UI depth — richer in-browser runbook/operator workflows and stronger
   day-2 remediation UX.
 - Docs architecture polish — tighter day-1/day-2 routing and clearer task-first
