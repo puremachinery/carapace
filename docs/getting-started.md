@@ -210,7 +210,8 @@ cara update
 
 - **401 Unauthorized**: check auth token or hooks token.
 - **403 Forbidden**: CSRF or Origin failure for Control UI endpoints.
-- **LLM requests fail**: verify provider key and model name.
+- **LLM requests fail**: verify the selected provider credentials (API key or
+  auth profile) and model name.
 - **No replies**: ensure an LLM provider is configured; check `/health/ready`.
 
 If unsure, start with `RUST_LOG=debug` and inspect logs.
