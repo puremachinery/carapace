@@ -65,6 +65,25 @@ fn deserialize_signal_envelope_item(item: Value) -> Result<SignalEnvelope, serde
     SignalEnvelope::deserialize(envelope_value)
 }
 
+fn resolve_signal_sender_and_peer(
+    envelope: &SignalEnvelope,
+    data_message: &SignalDataMessage,
+) -> Option<(String, String)> {
+    let sender = envelope
+        .source_number
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    let group_id = data_message
+        .group_info
+        .as_ref()
+        .and_then(|group| group.group_id.as_deref())
+        .map(str::trim)
+        .filter(|id| !id.is_empty());
+    let peer_id = group_id.unwrap_or(sender).to_string();
+    Some((sender.to_string(), peer_id))
+}
+
 /// Run the Signal receive loop.
 ///
 /// Polls `GET {base_url}/v1/receive/{number}` every 2 seconds, parses inbound
@@ -92,8 +111,9 @@ pub async fn signal_receive_loop(
         "Signal receive loop started"
     );
 
-    // Track consecutive errors to avoid spamming logs
+    // Track consecutive transport and parse errors to avoid spamming logs.
     let mut consecutive_errors: u32 = 0;
+    let mut consecutive_parse_errors: u32 = 0;
 
     loop {
         // Check shutdown before polling
@@ -115,19 +135,42 @@ pub async fn signal_receive_loop(
 
                 match resp.json::<Vec<Value>>().await {
                     Ok(items) => {
+                        let mut had_parse_error = false;
                         for item in items {
                             match deserialize_signal_envelope_item(item) {
                                 Ok(envelope) => {
                                     process_envelope(&envelope, &state).await;
                                 }
                                 Err(e) => {
-                                    warn!("Failed to parse Signal envelope item: {}", e);
+                                    had_parse_error = true;
+                                    consecutive_parse_errors += 1;
+                                    if consecutive_parse_errors <= 3 {
+                                        warn!("Failed to parse Signal envelope item: {}", e);
+                                    } else if consecutive_parse_errors == 4 {
+                                        warn!(
+                                            "Signal receive parse errors continuing (suppressing further logs until recovery)"
+                                        );
+                                    }
                                 }
                             }
                         }
+                        if !had_parse_error && consecutive_parse_errors > 0 {
+                            info!(
+                                "Signal receive parse handling recovered after {} errors",
+                                consecutive_parse_errors
+                            );
+                            consecutive_parse_errors = 0;
+                        }
                     }
                     Err(e) => {
-                        warn!("Failed to parse Signal receive response: {}", e);
+                        consecutive_parse_errors += 1;
+                        if consecutive_parse_errors <= 3 {
+                            warn!("Failed to parse Signal receive response: {}", e);
+                        } else if consecutive_parse_errors == 4 {
+                            warn!(
+                                "Signal receive parse errors continuing (suppressing further logs until recovery)"
+                            );
+                        }
                     }
                 }
             }
@@ -177,9 +220,12 @@ async fn process_envelope(envelope: &SignalEnvelope, state: &Arc<WsServerState>)
         _ => return, // No text content
     };
 
-    let sender = match &envelope.source_number {
-        Some(s) => s,
-        None => return, // No sender info
+    let (sender, peer_id) = match resolve_signal_sender_and_peer(envelope, data_message) {
+        Some(ids) => ids,
+        None => {
+            warn!("Ignoring Signal envelope with empty sender or peer ID");
+            return;
+        }
     };
 
     debug!(
@@ -190,15 +236,9 @@ async fn process_envelope(envelope: &SignalEnvelope, state: &Arc<WsServerState>)
 
     let cfg = crate::config::load_config_shared()
         .unwrap_or_else(|_| Arc::new(Value::Object(serde_json::Map::new())));
-    let group_id = data_message
-        .group_info
-        .as_ref()
-        .and_then(|group| group.group_id.clone());
-    let peer_id = group_id.as_deref().unwrap_or(sender).to_string();
-
     let metadata = SessionMetadata {
         channel: Some("signal".to_string()),
-        user_id: Some(sender.to_string()),
+        user_id: Some(sender.clone()),
         chat_id: Some(peer_id.clone()),
         ..Default::default()
     };
@@ -208,7 +248,7 @@ async fn process_envelope(envelope: &SignalEnvelope, state: &Arc<WsServerState>)
         session_store,
         cfg.as_ref(),
         "signal",
-        sender,
+        sender.as_str(),
         peer_id.as_str(),
         None,
         metadata,
@@ -448,5 +488,44 @@ mod tests {
             .and_then(|group| group.group_id.as_deref());
         assert_eq!(group, Some("dGVzdGdyb3VwaWQ="));
         assert_eq!(envelope.source_number.as_deref(), Some("+15559876543"));
+    }
+
+    #[test]
+    fn test_resolve_sender_and_peer_rejects_empty_sender() {
+        let envelope = SignalEnvelope {
+            source_number: Some("   ".to_string()),
+            timestamp: None,
+            data_message: Some(SignalDataMessage {
+                message: Some("Hello".to_string()),
+                timestamp: None,
+                group_info: None,
+            }),
+        };
+
+        let ids =
+            resolve_signal_sender_and_peer(&envelope, envelope.data_message.as_ref().unwrap());
+        assert!(ids.is_none());
+    }
+
+    #[test]
+    fn test_resolve_sender_and_peer_ignores_empty_group_id() {
+        let envelope = SignalEnvelope {
+            source_number: Some("+15559876543".to_string()),
+            timestamp: None,
+            data_message: Some(SignalDataMessage {
+                message: Some("Hello".to_string()),
+                timestamp: None,
+                group_info: Some(SignalGroupInfo {
+                    group_id: Some("   ".to_string()),
+                }),
+            }),
+        };
+
+        let ids =
+            resolve_signal_sender_and_peer(&envelope, envelope.data_message.as_ref().unwrap());
+        assert_eq!(
+            ids,
+            Some(("+15559876543".to_string(), "+15559876543".to_string()))
+        );
     }
 }
