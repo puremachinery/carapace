@@ -65,14 +65,6 @@ fn deserialize_signal_envelope_item(item: Value) -> Result<SignalEnvelope, serde
     SignalEnvelope::deserialize(envelope_value)
 }
 
-fn is_phone_number_like_signal_recipient(id: &str) -> bool {
-    let digits = match id.strip_prefix('+') {
-        Some(digits) => digits,
-        None => return false,
-    };
-    !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
-}
-
 fn resolve_signal_sender_and_peer(
     envelope: &SignalEnvelope,
     data_message: &SignalDataMessage,
@@ -88,11 +80,24 @@ fn resolve_signal_sender_and_peer(
         .and_then(|group| group.group_id.as_deref())
         .map(str::trim)
         .filter(|id| !id.is_empty());
-    if group_id.is_some_and(is_phone_number_like_signal_recipient) {
+    // Signal outbound currently supports direct messages only; reject any
+    // group recipient until the send path grows real group-send support.
+    if group_id.is_some() {
         return None;
     }
-    let peer_id = group_id.unwrap_or(sender).to_string();
-    Some((sender.to_string(), peer_id))
+    Some((sender.to_string(), sender.to_string()))
+}
+
+fn summarize_signal_receive_response_error(error: &reqwest::Error) -> &'static str {
+    if error.is_decode() {
+        "invalid Signal receive response body"
+    } else if error.is_timeout() {
+        "timed out reading Signal receive response body"
+    } else if error.is_body() {
+        "failed to read Signal receive response body"
+    } else {
+        "failed to receive Signal response body"
+    }
 }
 
 fn record_signal_parse_failure<E: std::fmt::Display>(
@@ -184,13 +189,16 @@ pub async fn signal_receive_loop(
                         }
                     }
                     Err(e) => {
+                        let error_summary = summarize_signal_receive_response_error(&e);
                         record_signal_parse_failure(
                             "receive response",
-                            &e,
+                            error_summary,
                             &mut consecutive_parse_errors,
                         );
-                        channel_registry
-                            .set_error("signal", format!("receive parse failed: {}", e));
+                        channel_registry.set_error(
+                            "signal",
+                            format!("receive parse failed: {}", error_summary),
+                        );
                     }
                 }
             }
@@ -559,6 +567,25 @@ mod tests {
                 timestamp: None,
                 group_info: Some(SignalGroupInfo {
                     group_id: Some("+15551234567".to_string()),
+                }),
+            }),
+        };
+
+        let ids =
+            resolve_signal_sender_and_peer(&envelope, envelope.data_message.as_ref().unwrap());
+        assert!(ids.is_none());
+    }
+
+    #[test]
+    fn test_resolve_sender_and_peer_rejects_group_messages() {
+        let envelope = SignalEnvelope {
+            source_number: Some("+15559876543".to_string()),
+            timestamp: None,
+            data_message: Some(SignalDataMessage {
+                message: Some("Hello".to_string()),
+                timestamp: None,
+                group_info: Some(SignalGroupInfo {
+                    group_id: Some("dGVzdGdyb3VwaWQ=".to_string()),
                 }),
             }),
         };
