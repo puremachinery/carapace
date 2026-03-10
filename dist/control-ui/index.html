@@ -81,6 +81,45 @@
       </section>
 
       <section class="panel">
+        <h2>Gemini Onboarding</h2>
+        <p class="meta">Configure Gemini with either Google sign-in or a Gemini API key.</p>
+
+        <label class="inline-field" for="geminiAuthMode">
+          <span>Mode</span>
+          <select id="geminiAuthMode">
+            <option value="oauth">Google sign-in</option>
+            <option value="api-key">API key</option>
+          </select>
+        </label>
+
+        <div id="geminiOauthFields">
+          <label for="geminiClientId">Google OAuth client ID</label>
+          <input id="geminiClientId" type="text" placeholder="Google OAuth client ID" autocomplete="off" />
+
+          <label for="geminiClientSecret">Google OAuth client secret</label>
+          <input id="geminiClientSecret" type="password" placeholder="Google OAuth client secret" autocomplete="off" />
+
+          <div class="row">
+            <button id="geminiStartOauth" type="button">Start Google sign-in</button>
+            <button id="geminiRefreshOauth" type="button" class="secondary">Refresh sign-in status</button>
+            <button id="geminiApplyOauth" type="button" class="secondary">Apply Google sign-in</button>
+          </div>
+        </div>
+
+        <div id="geminiApiKeyFields" hidden>
+          <label for="geminiApiKey">Gemini API key</label>
+          <input id="geminiApiKey" type="password" placeholder="Gemini API key" autocomplete="off" />
+
+          <label for="geminiBaseUrl">Gemini base URL (optional)</label>
+          <input id="geminiBaseUrl" type="text" placeholder="https://generativelanguage.googleapis.com" autocomplete="off" />
+
+          <button id="geminiSaveApiKey" type="button">Save Gemini API key</button>
+        </div>
+
+        <p id="geminiOnboardingStatus" class="meta"></p>
+      </section>
+
+      <section class="panel">
         <h2>Control UI Settings</h2>
         <p class="meta">Safe write path via <code>PATCH /control/config</code> (only <code>gateway.controlUi.*</code>).</p>
 

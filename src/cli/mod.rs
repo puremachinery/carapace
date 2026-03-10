@@ -1923,16 +1923,8 @@ pub fn handle_version() {
 use std::io::Read as IoRead;
 use std::path::{Component, Path, PathBuf};
 
-/// Resolve the state directory (same logic as `server::ws::resolve_state_dir`
-/// but duplicated here to avoid pulling in the full server module for CLI-only
-/// commands).
 pub(crate) fn resolve_state_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("CARAPACE_STATE_DIR") {
-        return PathBuf::from(dir);
-    }
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from(".config"))
-        .join("carapace")
+    crate::paths::resolve_state_dir()
 }
 
 /// Resolve the memory store directory.

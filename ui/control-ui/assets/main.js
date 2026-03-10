@@ -289,11 +289,17 @@
     const authProfile = typeof google.authProfile === "string" ? google.authProfile : "";
     const apiKeyConfigured = typeof google.apiKey === "string" && google.apiKey.length > 0;
     const baseUrl = typeof google.baseUrl === "string" ? google.baseUrl : "";
+    const hasConflict = apiKeyConfigured && !!authProfile;
 
-    ui.geminiAuthModeSelect.value = authProfile ? "oauth" : "api-key";
+    ui.geminiAuthModeSelect.value = !apiKeyConfigured && authProfile ? "oauth" : "api-key";
     ui.geminiBaseUrlInput.value = baseUrl;
 
-    if (authProfile) {
+    if (hasConflict) {
+      setGeminiOnboardingStatus(
+        `Both a Google auth profile (${authProfile}) and a Gemini API key are configured. The API key will be used until you remove it.`,
+        false
+      );
+    } else if (authProfile) {
       setGeminiOnboardingStatus(`Gemini is configured to use Google auth profile ${authProfile}.`, false);
     } else if (apiKeyConfigured) {
       setGeminiOnboardingStatus("Gemini is configured to use an API key.", false);

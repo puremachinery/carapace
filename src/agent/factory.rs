@@ -239,7 +239,7 @@ pub fn build_providers(cfg: &Value) -> Result<Option<MultiProvider>, Box<dyn std
             _ => None,
         };
         if let Some(provider_config) = provider_config {
-            let state_dir = resolve_state_dir();
+            let state_dir = crate::paths::resolve_state_dir();
             let profile_store = ProfileStore::from_env(state_dir)?;
             profile_store.load()?;
             let mut provider = agent::gemini::GeminiProvider::with_oauth_profile(
@@ -532,15 +532,6 @@ fn hash_key_prefix(key: &str) -> String {
     hasher.update(key.as_bytes());
     let result = hasher.finalize();
     hex::encode(&result[..8])
-}
-
-fn resolve_state_dir() -> std::path::PathBuf {
-    if let Ok(dir) = std::env::var("CARAPACE_STATE_DIR") {
-        return std::path::PathBuf::from(dir);
-    }
-    dirs::config_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from(".config"))
-        .join("carapace")
 }
 
 #[cfg(test)]

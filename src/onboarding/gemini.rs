@@ -18,6 +18,9 @@ const FLOW_TTL: Duration = Duration::from_secs(30 * 60);
 
 static GEMINI_OAUTH_FLOWS: LazyLock<RwLock<HashMap<String, PendingGeminiOAuthFlow>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
+// Pending Gemini OAuth state is intentionally process-local for the current
+// single-gateway deployment model. Callback completion is not shared across
+// restarts or multiple replicas.
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -167,7 +170,7 @@ pub async fn complete_control_google_oauth_callback(
         if let Some(flow) = flows.get_mut(&flow_id) {
             flow.flow_state = GeminiOAuthFlowState::Failed(format!("OAuth provider error: {err}"));
         }
-        return Ok(());
+        return Err(format!("OAuth provider error: {err}"));
     }
 
     let code = code
@@ -376,49 +379,14 @@ pub async fn run_cli_google_oauth(
             let result = match query.error.filter(|value| !value.trim().is_empty()) {
                 Some(err) => Err(format!("OAuth provider error: {err}")),
                 None => {
-                    let returned_state = query.state.unwrap_or_default();
-                    let code = query.code.unwrap_or_default();
-                    if returned_state != state.expected_state {
-                        Err("OAuth callback state mismatch".to_string())
-                    } else if code.trim().is_empty() {
-                        Err("OAuth callback missing authorization code".to_string())
-                    } else {
-                        let tokens = match exchange_code(
-                            &state.provider_config,
-                            code.trim(),
-                            &state.code_verifier,
-                        )
-                        .await
-                        {
-                            Ok(tokens) => tokens,
-                            Err(err) => {
-                                return Html(callback_html(
-                                    "Gemini sign-in failed",
-                                    &err.to_string(),
-                                ))
-                            }
-                        };
-                        let userinfo = match fetch_user_info(
-                            OAuthProvider::Google,
-                            &state.provider_config,
-                            &tokens.access_token,
-                        )
-                        .await
-                        {
-                            Ok(userinfo) => userinfo,
-                            Err(err) => {
-                                return Html(callback_html(
-                                    "Gemini sign-in failed",
-                                    &err.to_string(),
-                                ))
-                            }
-                        };
-                        Ok(GeminiOAuthCompletion {
-                            client_id: state.provider_config.client_id.clone(),
-                            client_secret: state.provider_config.client_secret.clone(),
-                            auth_profile: build_google_auth_profile(tokens, userinfo),
-                        })
-                    }
+                    complete_cli_oauth_callback(
+                        &state.provider_config,
+                        &state.expected_state,
+                        &state.code_verifier,
+                        query.state.as_deref(),
+                        query.code.as_deref(),
+                    )
+                    .await
                 }
             };
 
@@ -634,11 +602,51 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn callback_html(title: &str, body: &str) -> String {
+pub(crate) fn callback_html(title: &str, body: &str) -> String {
+    let title = escape_html(title);
+    let body = escape_html(body);
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><title>{}</title></head><body><h1>{}</h1><p>{}</p></body></html>",
         title, title, body
     )
+}
+
+fn escape_html(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+async fn complete_cli_oauth_callback(
+    provider_config: &OAuthProviderConfig,
+    expected_state: &str,
+    code_verifier: &str,
+    returned_state: Option<&str>,
+    code: Option<&str>,
+) -> Result<GeminiOAuthCompletion, String> {
+    let returned_state = returned_state.unwrap_or_default();
+    let code = code.unwrap_or_default();
+    if returned_state != expected_state {
+        return Err("OAuth callback state mismatch".to_string());
+    }
+    if code.trim().is_empty() {
+        return Err("OAuth callback missing authorization code".to_string());
+    }
+
+    let tokens = exchange_code(provider_config, code.trim(), code_verifier)
+        .await
+        .map_err(|err| err.to_string())?;
+    let userinfo = fetch_user_info(OAuthProvider::Google, provider_config, &tokens.access_token)
+        .await
+        .map_err(|err| err.to_string())?;
+    Ok(GeminiOAuthCompletion {
+        client_id: provider_config.client_id.clone(),
+        client_secret: provider_config.client_secret.clone(),
+        auth_profile: build_google_auth_profile(tokens, userinfo),
+    })
 }
 
 #[cfg(test)]
@@ -765,5 +773,40 @@ mod tests {
             "https://gateway.example.com/control/onboarding/gemini/callback"
         );
         assert!(!started.flow_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_complete_control_google_oauth_callback_returns_provider_error() {
+        let started = start_control_google_oauth(
+            &json!({}),
+            Some("google-client-id".to_string()),
+            Some("google-client-secret".to_string()),
+            "https://gateway.example.com",
+        )
+        .expect("start oauth");
+
+        let state = {
+            let flows = GEMINI_OAUTH_FLOWS.read();
+            flows
+                .get(&started.flow_id)
+                .expect("stored flow")
+                .state
+                .clone()
+        };
+
+        let err = complete_control_google_oauth_callback(&state, None, Some("access_denied"))
+            .await
+            .expect_err("provider error should fail");
+        assert!(err.contains("OAuth provider error"));
+        let status = control_google_oauth_status(&started.flow_id).expect("flow status");
+        assert_eq!(status.status, "failed");
+    }
+
+    #[test]
+    fn test_callback_html_escapes_dynamic_content() {
+        let html = callback_html("<Gemini>", "\"bad\" & <script>");
+        assert!(html.contains("&lt;Gemini&gt;"));
+        assert!(html.contains("&quot;bad&quot; &amp; &lt;script&gt;"));
+        assert!(!html.contains("<script>"));
     }
 }

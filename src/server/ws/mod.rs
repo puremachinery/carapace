@@ -3632,10 +3632,5 @@ fn resolve_node_command_allowlist(
 }
 
 pub(crate) fn resolve_state_dir() -> PathBuf {
-    if let Ok(dir) = env::var("CARAPACE_STATE_DIR") {
-        return PathBuf::from(dir);
-    }
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from(".config"))
-        .join("carapace")
+    crate::paths::resolve_state_dir()
 }

@@ -19,6 +19,7 @@ mod media;
 mod messages;
 mod nodes;
 mod onboarding;
+mod paths;
 mod plugins;
 mod runtime_bridge;
 mod server;

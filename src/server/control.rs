@@ -16,7 +16,7 @@
 
 use axum::{
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{uri::Authority, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -26,6 +26,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use crate::auth;
+use crate::auth::profiles::build_auth_profiles_config;
 use crate::channels::{ChannelRegistry, ChannelStatus};
 use crate::config;
 use crate::cron::CronPayload;
@@ -221,9 +222,11 @@ pub struct ConfigReadResponse {
 #[serde(rename_all = "camelCase")]
 pub struct GeminiOAuthStartRequest {
     #[serde(default)]
-    pub client_id: Option<String>,
+    #[serde(rename = "clientId")]
+    pub oauth_client_id: Option<String>,
     #[serde(default)]
-    pub client_secret: Option<String>,
+    #[serde(rename = "clientSecret")]
+    pub oauth_client_secret: Option<String>,
     #[serde(default)]
     pub redirect_base_url: Option<String>,
 }
@@ -769,6 +772,7 @@ pub async fn gemini_oauth_start_handler(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
+        .or_else(|| configured_control_redirect_base_url(&snapshot.config))
         .or_else(|| control_request_base_url(&headers));
 
     let Some(redirect_base_url) = redirect_base_url else {
@@ -783,10 +787,10 @@ pub async fn gemini_oauth_start_handler(
 
     match onboarding::gemini::start_control_google_oauth(
         &snapshot.config,
-        req.client_id
+        req.oauth_client_id
             .map(|value| value.trim().to_string())
             .filter(|v| !v.is_empty()),
-        req.client_secret
+        req.oauth_client_secret
             .map(|value| value.trim().to_string())
             .filter(|v| !v.is_empty()),
         &redirect_base_url,
@@ -882,9 +886,7 @@ pub async fn gemini_oauth_callback_handler(
 
     (
         status,
-        axum::response::Html(format!(
-            "<!doctype html><html><head><meta charset=\"utf-8\"><title>{title}</title></head><body><h1>{title}</h1><p>{message}</p></body></html>"
-        )),
+        axum::response::Html(onboarding::gemini::callback_html(title, &message)),
     )
         .into_response()
 }
@@ -1453,22 +1455,45 @@ fn parse_optional_reason(reason: Option<String>) -> Result<Option<String>, Strin
     Ok(reason)
 }
 
+fn configured_control_redirect_base_url(cfg: &Value) -> Option<String> {
+    build_auth_profiles_config(cfg)
+        .redirect_base_url
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 fn control_request_base_url(headers: &HeaderMap) -> Option<String> {
     let host = headers
         .get("x-forwarded-host")
         .or_else(|| headers.get("host"))
         .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())?;
+        .and_then(sanitize_forwarded_host)?;
 
-    let proto = headers
-        .get("x-forwarded-proto")
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("http");
+    let proto = match headers.get("x-forwarded-proto") {
+        Some(value) => sanitize_forwarded_proto(value.to_str().ok()?)?,
+        None => "http".to_string(),
+    };
 
     Some(format!("{proto}://{host}"))
+}
+
+fn sanitize_forwarded_host(raw: &str) -> Option<String> {
+    let candidate = raw.split(',').next()?.trim();
+    if candidate.is_empty() || candidate.chars().any(char::is_whitespace) {
+        return None;
+    }
+    candidate
+        .parse::<Authority>()
+        .ok()
+        .map(|value| value.to_string())
+}
+
+fn sanitize_forwarded_proto(raw: &str) -> Option<String> {
+    let candidate = raw.split(',').next()?.trim().to_ascii_lowercase();
+    match candidate.as_str() {
+        "http" | "https" => Some(candidate),
+        _ => None,
+    }
 }
 
 /// Check control endpoint authentication
@@ -1669,5 +1694,46 @@ mod tests {
         let long_reason = "a".repeat(MAX_TASK_REASON_LEN + 1);
         let err = parse_optional_reason(Some(long_reason)).expect_err("expected bound error");
         assert!(err.contains("reason exceeds"));
+    }
+
+    #[test]
+    fn test_control_request_base_url_uses_sanitized_forwarded_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-host", "gateway.example.com".parse().unwrap());
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        assert_eq!(
+            control_request_base_url(&headers).as_deref(),
+            Some("https://gateway.example.com")
+        );
+    }
+
+    #[test]
+    fn test_control_request_base_url_rejects_invalid_forwarded_host() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-host", "bad host".parse().unwrap());
+        assert!(control_request_base_url(&headers).is_none());
+    }
+
+    #[test]
+    fn test_control_request_base_url_rejects_invalid_forwarded_proto() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-host", "gateway.example.com".parse().unwrap());
+        headers.insert("x-forwarded-proto", "javascript".parse().unwrap());
+        assert!(control_request_base_url(&headers).is_none());
+    }
+
+    #[test]
+    fn test_configured_control_redirect_base_url_reads_auth_profiles_config() {
+        let cfg = json!({
+            "auth": {
+                "profiles": {
+                    "redirectBaseUrl": "https://gateway.example.com"
+                }
+            }
+        });
+        assert_eq!(
+            configured_control_redirect_base_url(&cfg).as_deref(),
+            Some("https://gateway.example.com")
+        );
     }
 }
