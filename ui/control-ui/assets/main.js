@@ -15,6 +15,17 @@
     refreshAllButton: document.getElementById("refreshAll"),
     applyConfigButton: document.getElementById("applyConfig"),
     saveControlUiSettingsButton: document.getElementById("saveControlUiSettings"),
+    geminiAuthModeSelect: document.getElementById("geminiAuthMode"),
+    geminiOauthFields: document.getElementById("geminiOauthFields"),
+    geminiApiKeyFields: document.getElementById("geminiApiKeyFields"),
+    geminiClientIdInput: document.getElementById("geminiClientId"),
+    geminiClientSecretInput: document.getElementById("geminiClientSecret"),
+    geminiStartOauthButton: document.getElementById("geminiStartOauth"),
+    geminiRefreshOauthButton: document.getElementById("geminiRefreshOauth"),
+    geminiApplyOauthButton: document.getElementById("geminiApplyOauth"),
+    geminiApiKeyInput: document.getElementById("geminiApiKey"),
+    geminiBaseUrlInput: document.getElementById("geminiBaseUrl"),
+    geminiSaveApiKeyButton: document.getElementById("geminiSaveApiKey"),
     wsConnectButton: document.getElementById("wsConnect"),
     wsDisconnectButton: document.getElementById("wsDisconnect"),
     wsRefreshPairingsButton: document.getElementById("wsRefreshPairings"),
@@ -29,6 +40,7 @@
     channelsCards: document.getElementById("channelsCards"),
     configJson: document.getElementById("configJson"),
     authStatus: document.getElementById("authStatus"),
+    geminiOnboardingStatus: document.getElementById("geminiOnboardingStatus"),
     configUpdateStatus: document.getElementById("configUpdateStatus"),
     controlUiSettingsStatus: document.getElementById("controlUiSettingsStatus"),
     configPathInput: document.getElementById("configPath"),
@@ -73,6 +85,7 @@
       disableDeviceAuth: false,
     },
     currentConfigRoot: {},
+    geminiFlowId: null,
     isBusy: false,
 
     ws: null,
@@ -108,6 +121,7 @@
 
   renderJson(ui.taskDetailJson, {});
   updateSecurityContextStatus();
+  renderGeminiOnboardingForm();
   updateWsButtons();
   updateTaskActionButtons();
 
@@ -117,6 +131,11 @@
   ui.refreshAllButton.addEventListener("click", () => refreshAll().catch(noop));
   ui.applyConfigButton.addEventListener("click", () => applyConfigUpdate().catch(noop));
   ui.saveControlUiSettingsButton.addEventListener("click", () => saveControlUiSettings().catch(noop));
+  ui.geminiAuthModeSelect.addEventListener("change", renderGeminiOnboardingForm);
+  ui.geminiStartOauthButton.addEventListener("click", () => startGeminiOauth().catch(noop));
+  ui.geminiRefreshOauthButton.addEventListener("click", () => refreshGeminiOauthStatus().catch(noop));
+  ui.geminiApplyOauthButton.addEventListener("click", () => applyGeminiOauth().catch(noop));
+  ui.geminiSaveApiKeyButton.addEventListener("click", () => saveGeminiApiKey().catch(noop));
   ui.wsConnectButton.addEventListener("click", () => connectPairingSocket().catch(noop));
   ui.wsDisconnectButton.addEventListener("click", disconnectPairingSocket);
   ui.wsRefreshPairingsButton.addEventListener("click", () => refreshPairings().catch(noop));
@@ -190,6 +209,7 @@
         configResponse && typeof configResponse.config === "object" ? configResponse.config : {};
 
       applyControlUiFormFromConfig(state.currentConfigRoot);
+      applyGeminiFormFromConfig(state.currentConfigRoot);
       updateSecurityContextStatus();
       await ensureAssistantAvatar(state.currentConfigRoot);
       try {
@@ -264,6 +284,34 @@
     ui.controlUiDisableDeviceAuthInput.checked = next.disableDeviceAuth;
   }
 
+  function applyGeminiFormFromConfig(configRoot) {
+    const google = dig(configRoot, ["google"]) || {};
+    const authProfile = typeof google.authProfile === "string" ? google.authProfile : "";
+    const apiKeyConfigured = typeof google.apiKey === "string" && google.apiKey.length > 0;
+    const baseUrl = typeof google.baseUrl === "string" ? google.baseUrl : "";
+
+    ui.geminiAuthModeSelect.value = authProfile ? "oauth" : "api-key";
+    ui.geminiBaseUrlInput.value = baseUrl;
+
+    if (authProfile) {
+      setGeminiOnboardingStatus(`Gemini is configured to use Google auth profile ${authProfile}.`, false);
+    } else if (apiKeyConfigured) {
+      setGeminiOnboardingStatus("Gemini is configured to use an API key.", false);
+    } else {
+      setGeminiOnboardingStatus("Gemini is not configured yet.", false);
+    }
+
+    renderGeminiOnboardingForm();
+  }
+
+  function renderGeminiOnboardingForm() {
+    const mode = ui.geminiAuthModeSelect.value === "api-key" ? "api-key" : "oauth";
+    ui.geminiOauthFields.hidden = mode !== "oauth";
+    ui.geminiApiKeyFields.hidden = mode !== "api-key";
+    ui.geminiRefreshOauthButton.disabled = state.isBusy || !state.geminiFlowId;
+    ui.geminiApplyOauthButton.disabled = state.isBusy || !state.geminiFlowId;
+  }
+
   async function saveControlUiSettings() {
     const updates = [];
     const desired = {
@@ -315,6 +363,117 @@
       setControlUiSettingsStatus(String(err), true);
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function startGeminiOauth() {
+    const payload = {};
+    const clientId = ui.geminiClientIdInput.value.trim();
+    const clientSecret = ui.geminiClientSecretInput.value.trim();
+    if (clientId) {
+      payload.clientId = clientId;
+    }
+    if (clientSecret) {
+      payload.clientSecret = clientSecret;
+    }
+
+    setBusy(true);
+    try {
+      const response = await controlPost("/control/onboarding/gemini/oauth/start", payload);
+      state.geminiFlowId = response.flowId || null;
+      renderGeminiOnboardingForm();
+      setGeminiOnboardingStatus("Opened Google sign-in in a new tab. Return here after authorizing.", false);
+      if (response.authUrl) {
+        window.open(response.authUrl, "_blank", "noopener,noreferrer");
+      }
+    } catch (err) {
+      setGeminiOnboardingStatus(String(err), true);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function refreshGeminiOauthStatus() {
+    if (!state.geminiFlowId) {
+      setGeminiOnboardingStatus("Start Google sign-in first.", true);
+      return;
+    }
+
+    setBusy(true);
+    try {
+      const response = await controlGet(
+        `/control/onboarding/gemini/oauth/${encodeURIComponent(state.geminiFlowId)}`
+      );
+      const status = response && response.status ? response.status : {};
+      const stateText = String(status.status || "unknown");
+      if (stateText === "completed") {
+        setGeminiOnboardingStatus(
+          `Google sign-in completed${status.email ? ` for ${status.email}` : ""}. Click Apply Google sign-in.`,
+          false
+        );
+      } else if (stateText === "failed") {
+        setGeminiOnboardingStatus(String(status.error || "Gemini Google sign-in failed."), true);
+      } else {
+        setGeminiOnboardingStatus("Google sign-in is still pending.", false);
+      }
+    } catch (err) {
+      setGeminiOnboardingStatus(String(err), true);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function applyGeminiOauth() {
+    if (!state.geminiFlowId) {
+      setGeminiOnboardingStatus("Start Google sign-in first.", true);
+      return;
+    }
+
+    setBusy(true);
+    try {
+      const response = await controlPost(
+        `/control/onboarding/gemini/oauth/${encodeURIComponent(state.geminiFlowId)}/apply`,
+        {}
+      );
+      if (typeof response.hash === "string") {
+        state.configHash = response.hash;
+      }
+      state.geminiFlowId = null;
+      await refreshAll();
+      setGeminiOnboardingStatus("Gemini Google sign-in applied.", false);
+    } catch (err) {
+      setGeminiOnboardingStatus(String(err), true);
+    } finally {
+      setBusy(false);
+      renderGeminiOnboardingForm();
+    }
+  }
+
+  async function saveGeminiApiKey() {
+    const apiKey = ui.geminiApiKeyInput.value.trim();
+    if (!apiKey) {
+      setGeminiOnboardingStatus("Gemini API key is required.", true);
+      return;
+    }
+
+    setBusy(true);
+    try {
+      const response = await controlPost("/control/onboarding/gemini/api-key", {
+        apiKey,
+        baseUrl: ui.geminiBaseUrlInput.value.trim(),
+      });
+      if (typeof response.hash === "string") {
+        state.configHash = response.hash;
+      }
+      state.geminiFlowId = null;
+      ui.geminiApiKeyInput.value = "";
+      await refreshAll();
+      setGeminiOnboardingStatus("Gemini API key saved.", false);
+    } catch (err) {
+      setGeminiOnboardingStatus(String(err), true);
+    } finally {
+      setBusy(false);
+      renderGeminiOnboardingForm();
     }
   }
 
@@ -1134,6 +1293,9 @@
     ui.saveAuthButton.disabled = state.isBusy;
     ui.clearAuthButton.disabled = state.isBusy;
     ui.saveControlUiSettingsButton.disabled = state.isBusy;
+    ui.geminiAuthModeSelect.disabled = state.isBusy;
+    ui.geminiStartOauthButton.disabled = state.isBusy;
+    ui.geminiSaveApiKeyButton.disabled = state.isBusy;
     ui.refreshTasksButton.disabled = state.isBusy;
 
     ui.wsConnectButton.disabled = state.isBusy || (state.ws && state.ws.readyState === WebSocket.OPEN);
@@ -1142,6 +1304,7 @@
       state.isBusy || !(state.ws && state.ws.readyState === WebSocket.OPEN && state.wsAuthed);
 
     updateTaskActionButtons();
+    renderGeminiOnboardingForm();
   }
 
   function setAuthStatus(message, isError) {
@@ -1160,6 +1323,12 @@
     ui.controlUiSettingsStatus.textContent = message;
     ui.controlUiSettingsStatus.classList.toggle("error", Boolean(isError));
     ui.controlUiSettingsStatus.classList.toggle("success", !isError);
+  }
+
+  function setGeminiOnboardingStatus(message, isError) {
+    ui.geminiOnboardingStatus.textContent = message;
+    ui.geminiOnboardingStatus.classList.toggle("error", Boolean(isError));
+    ui.geminiOnboardingStatus.classList.toggle("success", !isError);
   }
 
   function setPairingStatus(message, isError) {

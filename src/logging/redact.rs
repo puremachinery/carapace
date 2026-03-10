@@ -19,6 +19,7 @@ const SECRET_KEY_NAMES: &[&str] = &[
     "password",
     "credentials",
     "client_secret",
+    "clientsecret",
     "refresh_token",
     "access_token",
 ];

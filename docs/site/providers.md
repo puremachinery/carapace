@@ -62,8 +62,22 @@ does not rely on the interactive default.
 
 ```bash
 export GOOGLE_API_KEY='...'
-cara setup --provider gemini
+cara setup --provider gemini --auth-mode api-key
 ```
+
+Gemini also supports Google sign-in:
+
+```bash
+export GOOGLE_OAUTH_CLIENT_ID='...'
+export GOOGLE_OAUTH_CLIENT_SECRET='...'
+cara setup --provider gemini --auth-mode oauth
+```
+
+Notes:
+
+- Gemini OAuth is interactive-only in the CLI because it completes through a loopback callback.
+- Control UI also supports Gemini onboarding with either Google sign-in or API key.
+- If you store Google OAuth client secrets in config, set `CARAPACE_CONFIG_PASSWORD` so they are encrypted at rest.
 
 ```bash
 export AWS_REGION='us-east-1'
@@ -87,6 +101,7 @@ Supported env vars:
 - `OPENAI_API_KEY`
 - `GOOGLE_API_KEY`
 - `GOOGLE_API_BASE_URL` (Gemini override)
+- `GOOGLE_OAUTH_CLIENT_ID` / `GOOGLE_OAUTH_CLIENT_SECRET` (Gemini Google sign-in)
 - `OLLAMA_API_KEY` (optional Ollama auth)
 - `OLLAMA_BASE_URL` (if non-default)
 - `AWS_REGION` or `AWS_DEFAULT_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` (Bedrock)

@@ -114,9 +114,26 @@
   // },
 
   // --- Google Gemini provider ----------------------------------------------
+  // authProfile uses a stored Google OAuth profile from auth.profiles.
   // google: {
   //   apiKey: "${GOOGLE_API_KEY}",
+  //   // authProfile: "google-abc123",
   //   // baseUrl: "https://generativelanguage.googleapis.com", // override with GOOGLE_API_BASE_URL
+  // },
+
+  // --- OAuth auth profiles --------------------------------------------------
+  // auth: {
+  //   profiles: {
+  //     enabled: true,
+  //     // redirectBaseUrl: "https://gateway.example.com",
+  //     providers: {
+  //       google: {
+  //         clientId: "${GOOGLE_OAUTH_CLIENT_ID}",
+  //         clientSecret: "${GOOGLE_OAUTH_CLIENT_SECRET}",
+  //         // redirectUri: "http://127.0.0.1:3000/auth/callback", // CLI loopback default
+  //       },
+  //     },
+  //   },
   // },
 
   // --- Provider-specific config --------------------------------------------

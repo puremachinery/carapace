@@ -573,6 +573,20 @@ pub struct ProfileStore {
 }
 
 impl ProfileStore {
+    /// Open the profile store for the given state directory.
+    ///
+    /// If `CARAPACE_CONFIG_PASSWORD` is set, token fields are encrypted at
+    /// rest using the same password-derived keying material used for config
+    /// secret sealing. Otherwise the store falls back to plaintext storage.
+    pub fn from_env(state_dir: PathBuf) -> Result<Self, AuthProfileError> {
+        match std::env::var("CARAPACE_CONFIG_PASSWORD") {
+            Ok(password) if !password.trim().is_empty() => {
+                Self::with_encryption(state_dir, password.as_bytes())
+            }
+            _ => Ok(Self::new(state_dir)),
+        }
+    }
+
     /// Create a new profile store that persists to `{state_dir}/auth_profiles.json`.
     ///
     /// Token fields are stored as plaintext.  Use [`with_encryption`](Self::with_encryption)
@@ -779,6 +793,38 @@ impl ProfileStore {
         guard.iter().find(|p| p.id == id).cloned()
     }
 
+    /// Find a profile by provider + stable user identity.
+    pub fn find_matching(
+        &self,
+        provider: OAuthProvider,
+        user_id: Option<&str>,
+        email: Option<&str>,
+    ) -> Option<AuthProfile> {
+        let guard = self.profiles.read();
+        guard
+            .iter()
+            .find(|profile| {
+                if profile.provider != provider {
+                    return false;
+                }
+
+                if let (Some(existing), Some(target)) = (profile.user_id.as_deref(), user_id) {
+                    if !existing.trim().is_empty() && existing == target {
+                        return true;
+                    }
+                }
+
+                if let (Some(existing), Some(target)) = (profile.email.as_deref(), email) {
+                    if !existing.trim().is_empty() && existing.eq_ignore_ascii_case(target) {
+                        return true;
+                    }
+                }
+
+                false
+            })
+            .cloned()
+    }
+
     /// List all profiles as summaries (no tokens exposed).
     pub fn list(&self) -> Vec<AuthProfileSummary> {
         let guard = self.profiles.read();
@@ -809,6 +855,20 @@ impl ProfileStore {
         }
         // Best-effort save; ignore errors for a timestamp update
         let _ = self.save_profiles(&guard);
+    }
+
+    /// Insert or replace a full profile by ID.
+    pub fn upsert(&self, profile: AuthProfile) -> Result<(), AuthProfileError> {
+        let mut guard = self.profiles.write();
+        if let Some(existing) = guard.iter_mut().find(|p| p.id == profile.id) {
+            *existing = profile;
+        } else {
+            if guard.len() >= MAX_PROFILES {
+                return Err(AuthProfileError::MaxProfilesExceeded);
+            }
+            guard.push(profile);
+        }
+        self.save_profiles(&guard)
     }
 }
 

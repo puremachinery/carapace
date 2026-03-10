@@ -11,6 +11,7 @@ use tracing::{info, warn};
 
 use crate::agent;
 use crate::agent::provider::MultiProvider;
+use crate::auth::profiles::{build_auth_profiles_config, OAuthProvider, ProfileStore};
 
 /// Try to build a provider from an API key + optional base URL.
 ///
@@ -211,19 +212,55 @@ pub fn build_providers(cfg: &Value) -> Result<Option<MultiProvider>, Box<dyn std
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
     });
+    let google_auth_profile = cfg
+        .get("google")
+        .and_then(|v| v.get("authProfile"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let google_base_url = std::env::var("GOOGLE_API_BASE_URL").ok().or_else(|| {
         cfg.get("google")
             .and_then(|v| v.get("baseUrl"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
     });
-    let gemini_provider = try_build_provider(
-        google_api_key,
-        google_base_url,
-        "Gemini",
-        agent::gemini::GeminiProvider::new,
-        |p, url| p.with_base_url(url),
-    )?;
+    let gemini_provider = if google_api_key.is_some() {
+        try_build_provider(
+            google_api_key,
+            google_base_url,
+            "Gemini",
+            agent::gemini::GeminiProvider::new,
+            |p, url| p.with_base_url(url),
+        )?
+    } else if let Some(profile_id) = google_auth_profile {
+        let auth_profiles_config = build_auth_profiles_config(cfg);
+        let provider_config = match auth_profiles_config.providers.get(&OAuthProvider::Google) {
+            Some(provider_config) if auth_profiles_config.enabled => Some(provider_config.clone()),
+            _ => None,
+        };
+        if let Some(provider_config) = provider_config {
+            let state_dir = resolve_state_dir();
+            let profile_store = ProfileStore::from_env(state_dir)?;
+            profile_store.load()?;
+            let mut provider = agent::gemini::GeminiProvider::with_oauth_profile(
+                Arc::new(profile_store),
+                profile_id,
+                provider_config,
+            )?;
+            if let Some(url) = google_base_url {
+                provider = provider.with_base_url(url)?;
+            }
+            info!("LLM provider configured: Gemini (Google auth profile)");
+            Some(Arc::new(provider) as Arc<dyn agent::LlmProvider>)
+        } else {
+            warn!(
+                "Gemini auth profile is configured, but auth.profiles.providers.google OAuth settings are missing or disabled"
+            );
+            None
+        }
+    } else {
+        None
+    };
 
     // Venice
     let venice_api_key = std::env::var("VENICE_API_KEY").ok().or_else(|| {
@@ -402,6 +439,11 @@ pub fn fingerprint_providers(cfg: &Value) -> ProviderFingerprint {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
     });
+    let google_auth_profile = cfg
+        .get("google")
+        .and_then(|v| v.get("authProfile"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     let google_url = std::env::var("GOOGLE_API_BASE_URL").ok().or_else(|| {
         cfg.get("google")
             .and_then(|v| v.get("baseUrl"))
@@ -453,7 +495,16 @@ pub fn fingerprint_providers(cfg: &Value) -> ProviderFingerprint {
         } else {
             None
         },
-        gemini: google_key.map(|k| (hash_key_prefix(&k), google_url)),
+        gemini: google_key
+            .map(|k| {
+                (
+                    format!("api-key:{}", hash_key_prefix(&k)),
+                    google_url.clone(),
+                )
+            })
+            .or_else(|| {
+                google_auth_profile.map(|profile| (format!("auth-profile:{profile}"), google_url))
+            }),
         venice: venice_key.map(|k| (hash_key_prefix(&k), venice_url)),
         bedrock: if bedrock_enabled {
             match (bedrock_region, bedrock_access_key) {
@@ -481,6 +532,15 @@ fn hash_key_prefix(key: &str) -> String {
     hasher.update(key.as_bytes());
     let result = hasher.finalize();
     hex::encode(&result[..8])
+}
+
+fn resolve_state_dir() -> std::path::PathBuf {
+    if let Ok(dir) = std::env::var("CARAPACE_STATE_DIR") {
+        return std::path::PathBuf::from(dir);
+    }
+    dirs::config_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from(".config"))
+        .join("carapace")
 }
 
 #[cfg(test)]
@@ -569,6 +629,20 @@ mod tests {
             assert!(fp.openai.is_some());
             assert!(fp.gemini.is_some());
             assert!(fp.ollama.is_none());
+        });
+    }
+
+    #[test]
+    fn test_fingerprint_with_gemini_auth_profile() {
+        with_clean_provider_env(|| {
+            let cfg = json!({
+                "google": { "authProfile": "google-abc123" }
+            });
+            let fp = fingerprint_providers(&cfg);
+            assert_eq!(
+                fp.gemini,
+                Some(("auth-profile:google-abc123".to_string(), None))
+            );
         });
     }
 

@@ -674,6 +674,10 @@ fn register_session_routes(
     let control_state_config_read = control_state.clone();
     let control_state_config_post = control_state.clone();
     let control_state_config_patch = control_state.clone();
+    let control_state_gemini_oauth_start = control_state.clone();
+    let control_state_gemini_oauth_status = control_state.clone();
+    let control_state_gemini_oauth_apply = control_state.clone();
+    let control_state_gemini_api_key = control_state.clone();
     let control_state_tasks_create = control_state.clone();
     let control_state_tasks_list = control_state.clone();
     let control_state_tasks_get = control_state.clone();
@@ -720,6 +724,80 @@ fn register_session_routes(
                     }
                 },
             ),
+        )
+        .route(
+            "/control/onboarding/gemini/oauth/start",
+            post(
+                move |connect_info: MaybeConnectInfo, headers: HeaderMap, body: Bytes| {
+                    let state = control_state_gemini_oauth_start.clone();
+                    async move {
+                        control::gemini_oauth_start_handler(
+                            State(state),
+                            connect_info,
+                            headers,
+                            body,
+                        )
+                        .await
+                    }
+                },
+            ),
+        )
+        .route(
+            "/control/onboarding/gemini/oauth/{id}",
+            get(
+                move |Path(id): Path<String>, connect_info: MaybeConnectInfo, headers: HeaderMap| {
+                    let state = control_state_gemini_oauth_status.clone();
+                    async move {
+                        control::gemini_oauth_status_handler(
+                            Path(id),
+                            State(state),
+                            connect_info,
+                            headers,
+                        )
+                        .await
+                    }
+                },
+            ),
+        )
+        .route(
+            "/control/onboarding/gemini/oauth/{id}/apply",
+            post(
+                move |Path(id): Path<String>, connect_info: MaybeConnectInfo, headers: HeaderMap| {
+                    let state = control_state_gemini_oauth_apply.clone();
+                    async move {
+                        control::gemini_oauth_apply_handler(
+                            Path(id),
+                            State(state),
+                            connect_info,
+                            headers,
+                        )
+                        .await
+                    }
+                },
+            ),
+        )
+        .route(
+            "/control/onboarding/gemini/api-key",
+            post(
+                move |connect_info: MaybeConnectInfo, headers: HeaderMap, body: Bytes| {
+                    let state = control_state_gemini_api_key.clone();
+                    async move {
+                        control::gemini_api_key_handler(
+                            State(state),
+                            connect_info,
+                            headers,
+                            body,
+                        )
+                        .await
+                    }
+                },
+            ),
+        )
+        .route(
+            "/control/onboarding/gemini/callback",
+            get(move |query: Query<control::GeminiOAuthCallbackQuery>| async move {
+                control::gemini_oauth_callback_handler(query).await
+            }),
         )
         .route(
             "/control/tasks",
@@ -2903,6 +2981,71 @@ mod tests {
             .unwrap();
         let response = router.oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_control_gemini_oauth_start_returns_flow() {
+        let (_temp, _guard) = set_temp_config_path();
+        let router = test_router(test_config());
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/control/onboarding/gemini/oauth/start")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"clientId":"google-client-id","clientSecret":"google-client-secret","redirectBaseUrl":"https://gateway.example.com"}"#,
+            ))
+            .unwrap();
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ok"], true);
+        assert!(json["flowId"].as_str().is_some());
+        assert!(json["authUrl"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("accounts.google.com"));
+        assert_eq!(
+            json["redirectUri"],
+            "https://gateway.example.com/control/onboarding/gemini/callback"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_control_gemini_api_key_writes_config() {
+        let (temp, _guard) = set_temp_config_path();
+        let config_path = temp.path().join("carapace-test-config.json5");
+        let router = test_router(test_config());
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/control/onboarding/gemini/api-key")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"apiKey":"AIza-test-key","baseUrl":"https://proxy.example.com"}"#,
+            ))
+            .unwrap();
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["applied"]["mode"], "apiKey");
+
+        let content = std::fs::read_to_string(config_path).expect("written config");
+        let parsed: Value = json5::from_str(&content).expect("valid json5 config");
+        assert_eq!(parsed["google"]["apiKey"], "AIza-test-key");
+        assert_eq!(parsed["google"]["baseUrl"], "https://proxy.example.com");
+        assert!(parsed["google"].get("authProfile").is_none());
     }
 
     #[tokio::test]

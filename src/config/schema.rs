@@ -106,6 +106,8 @@ pub fn validate_schema(config: &Value) -> Vec<SchemaIssue> {
     validate_gateway(obj, &mut issues);
     validate_hooks(obj, &mut issues);
     validate_logging(obj, &mut issues);
+    validate_auth(obj, &mut issues);
+    validate_google(obj, &mut issues);
     validate_agents(obj, &mut issues);
     validate_session(obj, &mut issues);
     validate_cron(obj, &mut issues);
@@ -331,6 +333,119 @@ fn validate_logging(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schem
                     message: format!("format should be one of json/text, got \"{}\"", s),
                 });
             }
+        }
+    }
+}
+
+fn validate_auth(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIssue>) {
+    let auth = match obj.get("auth").and_then(|v| v.as_object()) {
+        Some(a) => a,
+        None => return,
+    };
+
+    let profiles = match auth.get("profiles").and_then(|v| v.as_object()) {
+        Some(p) => p,
+        None => return,
+    };
+
+    if let Some(enabled) = profiles.get("enabled") {
+        if !enabled.is_boolean() {
+            issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: ".auth.profiles.enabled".to_string(),
+                message: "enabled must be a boolean".to_string(),
+            });
+        }
+    }
+
+    if let Some(redirect_base_url) = profiles.get("redirectBaseUrl") {
+        if !redirect_base_url.is_string() {
+            issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: ".auth.profiles.redirectBaseUrl".to_string(),
+                message: "redirectBaseUrl must be a string".to_string(),
+            });
+        }
+    }
+
+    let providers = match profiles.get("providers").and_then(|v| v.as_object()) {
+        Some(p) => p,
+        None => return,
+    };
+
+    for provider_key in ["google", "github", "discord"] {
+        let provider = match providers.get(provider_key).and_then(|v| v.as_object()) {
+            Some(p) => p,
+            None => continue,
+        };
+        for field in ["clientId", "clientSecret", "redirectUri"] {
+            if let Some(value) = provider.get(field) {
+                if !value.is_string() {
+                    issues.push(SchemaIssue {
+                        severity: Severity::Warning,
+                        path: format!(".auth.profiles.providers.{provider_key}.{field}"),
+                        message: format!("{field} must be a string"),
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn validate_google(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIssue>) {
+    let google = match obj.get("google").and_then(|v| v.as_object()) {
+        Some(g) => g,
+        None => return,
+    };
+
+    for (field, path) in [
+        ("apiKey", ".google.apiKey"),
+        ("baseUrl", ".google.baseUrl"),
+        ("authProfile", ".google.authProfile"),
+    ] {
+        if let Some(value) = google.get(field) {
+            if !value.is_string() {
+                issues.push(SchemaIssue {
+                    severity: Severity::Warning,
+                    path: path.to_string(),
+                    message: format!("{field} must be a string"),
+                });
+            }
+        }
+    }
+
+    let api_key = google
+        .get("apiKey")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    let auth_profile = google
+        .get("authProfile")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+
+    if api_key.is_some() && auth_profile.is_some() {
+        issues.push(SchemaIssue {
+            severity: Severity::Warning,
+            path: ".google".to_string(),
+            message: "configure either google.apiKey or google.authProfile, not both".to_string(),
+        });
+    }
+
+    if auth_profile.is_some() {
+        let auth_profiles_enabled = obj
+            .get("auth")
+            .and_then(|v| v.get("profiles"))
+            .and_then(|v| v.get("enabled"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if !auth_profiles_enabled {
+            issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: ".google.authProfile".to_string(),
+                message: "google.authProfile requires auth.profiles.enabled = true".to_string(),
+            });
         }
     }
 }
@@ -1037,6 +1152,54 @@ mod tests {
         let cfg = json!({ "vertex": { "model": 123 } });
         let issues = validate_schema(&cfg);
         assert!(issues.iter().any(|i| i.path == ".vertex.model"));
+    }
+
+    #[test]
+    fn test_google_auth_profile_requires_auth_profiles_enabled() {
+        let cfg = json!({
+            "google": { "authProfile": "google-abc123" },
+            "auth": { "profiles": { "enabled": false } }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(issues.iter().any(
+            |i| i.path == ".google.authProfile" && i.message.contains("auth.profiles.enabled")
+        ));
+    }
+
+    #[test]
+    fn test_google_api_key_and_auth_profile_warn() {
+        let cfg = json!({
+            "google": {
+                "apiKey": "${GOOGLE_API_KEY}",
+                "authProfile": "google-abc123"
+            },
+            "auth": { "profiles": { "enabled": true } }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(issues.iter().any(|i| i.path == ".google"
+            && i.message
+                .contains("either google.apiKey or google.authProfile")));
+    }
+
+    #[test]
+    fn test_auth_profiles_provider_secret_must_be_string() {
+        let cfg = json!({
+            "auth": {
+                "profiles": {
+                    "enabled": true,
+                    "providers": {
+                        "google": {
+                            "clientId": "abc",
+                            "clientSecret": 123
+                        }
+                    }
+                }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(issues
+            .iter()
+            .any(|i| i.path == ".auth.profiles.providers.google.clientSecret"));
     }
 
     // --- logging ---

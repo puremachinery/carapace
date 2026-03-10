@@ -22,6 +22,7 @@ pub mod logging;
 pub mod media;
 pub mod messages;
 pub mod nodes;
+pub mod onboarding;
 pub mod plugins;
 pub mod runtime_bridge;
 pub mod server;

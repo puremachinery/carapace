@@ -10,6 +10,7 @@ Run `cara setup`, start Carapace, and complete your first useful assistant workf
 - One supported provider configured:
   - `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_API_KEY`, or `VENICE_API_KEY`, or
   - local Ollama (`OLLAMA_BASE_URL`)
+  - for Gemini Google sign-in: `GOOGLE_OAUTH_CLIENT_ID` and `GOOGLE_OAUTH_CLIENT_SECRET`
 
 ## 0) Pick the simplest first path
 
@@ -31,7 +32,7 @@ cara setup
 
 The wizard walks you through:
 - provider selection (or use `cara setup --provider <provider>` to skip the menu),
-- provider credentials and first-run model defaults,
+- provider credentials or Gemini Google sign-in and first-run model defaults,
 - gateway auth mode (`token`/`password`) and strong-secret generation,
 - bind + port,
 - first-run outcome:
@@ -47,8 +48,13 @@ Recommended explicit examples (pick one, based on your provider):
 # Pick ONE of these commands:
 cara setup --provider anthropic
 cara setup --provider ollama
-cara setup --provider gemini
+cara setup --provider gemini --auth-mode api-key
+cara setup --provider gemini --auth-mode oauth
 ```
+
+Use `--auth-mode oauth` only in an interactive shell. It opens a Google sign-in
+URL and completes through a loopback callback. The Control UI can also onboard
+Gemini with Google sign-in or API key mode.
 
 ## 2) Start Carapace
 
