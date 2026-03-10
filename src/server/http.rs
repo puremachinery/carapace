@@ -1151,6 +1151,7 @@ async fn dispatch_agent_run(
     let run = crate::server::ws::AgentRun {
         run_id: run_id.to_string(),
         session_key: session.session_key.clone(),
+        delivery_recipient_id: None,
         status: crate::server::ws::AgentRunStatus::Queued,
         message: validated.message.clone(),
         response: String::new(),
