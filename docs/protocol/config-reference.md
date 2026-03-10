@@ -137,7 +137,13 @@ This block shapes how smart your AI behaves, how large its memory is, and perfor
   * *What it does:* How Carapace squishes old memory down to make room for new thoughts.
   * *Possible values:*
     * `"safeguard"` (Default) - Intelligently and safely summarizes or compresses older conversation history without losing the most critical recent information.
+* **`agents.defaults.contextPruning.mode`**
+  * *What it does:* How Carapace prunes or clears completely old historical memory (If Anthropic API key is detected)
+  * *Possible values:*
     * `"cache-ttl"` - Clears or prunes old memory strictly based on how long it has been stored (Time-to-Live).
+* **`agents.defaults.contextPruning.ttl`**
+  * *What it does:* The duration for the time-to-live before pruning occurs.
+  * *Possible values:* A time string like `"1h"` or `"30m"`.
 * **`agents.promptGuard`**
   * *What it does:* Enforces security guardrails to make sure the AI isn't tricked into attacking you (Prompt Injection).
   * *Possible values:*
