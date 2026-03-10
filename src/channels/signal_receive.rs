@@ -88,6 +88,15 @@ fn resolve_signal_sender_and_peer(
     Some((sender.to_string(), sender.to_string()))
 }
 
+fn signal_group_id(data_message: &SignalDataMessage) -> Option<&str> {
+    data_message
+        .group_info
+        .as_ref()
+        .and_then(|group| group.group_id.as_deref())
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+}
+
 fn summarize_signal_receive_response_error(error: &reqwest::Error) -> &'static str {
     if error.is_decode() {
         "invalid Signal receive response body"
@@ -189,15 +198,19 @@ pub async fn signal_receive_loop(
                         }
                     }
                     Err(e) => {
-                        let error_summary = summarize_signal_receive_response_error(&e);
+                        let sanitized_error = e.without_url();
+                        let error_summary =
+                            summarize_signal_receive_response_error(&sanitized_error);
+                        let error_detail = sanitized_error.to_string();
+                        let error_message = format!("{}: {}", error_summary, error_detail);
                         record_signal_parse_failure(
                             "receive response",
-                            error_summary,
+                            &error_message,
                             &mut consecutive_parse_errors,
                         );
                         channel_registry.set_error(
                             "signal",
-                            format!("receive parse failed: {}", error_summary),
+                            format!("receive parse failed: {}", error_message),
                         );
                     }
                 }
@@ -248,10 +261,15 @@ async fn process_envelope(envelope: &SignalEnvelope, state: &Arc<WsServerState>)
         _ => return, // No text content
     };
 
+    if signal_group_id(data_message).is_some() {
+        warn!("Ignoring Signal group message: Signal outbound currently supports direct messages only");
+        return;
+    }
+
     let (sender, peer_id) = match resolve_signal_sender_and_peer(envelope, data_message) {
         Some(ids) => ids,
         None => {
-            warn!("Ignoring Signal envelope with invalid sender or peer ID");
+            warn!("Ignoring Signal envelope with empty sender ID");
             return;
         }
     };
@@ -558,7 +576,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_sender_and_peer_rejects_phone_number_like_group_id() {
+    fn test_resolve_sender_and_peer_rejects_group_message_with_phone_number_like_id() {
         let envelope = SignalEnvelope {
             source_number: Some("+15559876543".to_string()),
             timestamp: None,
