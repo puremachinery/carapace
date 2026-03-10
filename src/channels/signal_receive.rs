@@ -127,7 +127,7 @@ pub async fn signal_receive_loop(
                         }
                     }
                     Err(e) => {
-                        debug!("Failed to parse Signal receive response: {}", e);
+                        warn!("Failed to parse Signal receive response: {}", e);
                     }
                 }
             }
