@@ -106,7 +106,7 @@ This block shapes how smart your AI behaves, how large its memory is, and perfor
 * **`agents.defaults.maxConcurrent`**
   * *What it does:* Maximum number of simultaneous main AI tasks that run.
   * *Possible values:* Positive integer. (Default: `4`)
-* **`agents.defaults.timeoutSeconds`**
+* **`agents.defaults.timeout`**
   * *What it does:* The maximum number of seconds an agent is allowed to think before giving up on a task.
   * *Possible values:* Positive integer. (Default: `300` - aka 5 minutes)
 * **`agents.defaults.contextTokens`**
