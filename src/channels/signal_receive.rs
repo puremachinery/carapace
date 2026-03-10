@@ -65,6 +65,14 @@ fn deserialize_signal_envelope_item(item: Value) -> Result<SignalEnvelope, serde
     SignalEnvelope::deserialize(envelope_value)
 }
 
+fn is_phone_number_like_signal_recipient(id: &str) -> bool {
+    let digits = match id.strip_prefix('+') {
+        Some(digits) => digits,
+        None => return false,
+    };
+    !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
+}
+
 fn resolve_signal_sender_and_peer(
     envelope: &SignalEnvelope,
     data_message: &SignalDataMessage,
@@ -80,8 +88,24 @@ fn resolve_signal_sender_and_peer(
         .and_then(|group| group.group_id.as_deref())
         .map(str::trim)
         .filter(|id| !id.is_empty());
+    if group_id.is_some_and(is_phone_number_like_signal_recipient) {
+        return None;
+    }
     let peer_id = group_id.unwrap_or(sender).to_string();
     Some((sender.to_string(), peer_id))
+}
+
+fn record_signal_parse_failure<E: std::fmt::Display>(
+    context: &str,
+    err: E,
+    consecutive_parse_errors: &mut u32,
+) {
+    *consecutive_parse_errors += 1;
+    if *consecutive_parse_errors <= 3 {
+        warn!("Failed to parse Signal {}: {}", context, err);
+    } else if *consecutive_parse_errors == 4 {
+        warn!("Signal receive parse errors continuing (suppressing further logs until recovery)");
+    }
 }
 
 /// Run the Signal receive loop.
@@ -131,10 +155,10 @@ pub async fn signal_receive_loop(
                     );
                     consecutive_errors = 0;
                 }
-                channel_registry.update_status("signal", ChannelStatus::Connected);
 
                 match resp.json::<Vec<Value>>().await {
                     Ok(items) => {
+                        channel_registry.update_status("signal", ChannelStatus::Connected);
                         let mut had_parse_error = false;
                         for item in items {
                             match deserialize_signal_envelope_item(item) {
@@ -143,14 +167,11 @@ pub async fn signal_receive_loop(
                                 }
                                 Err(e) => {
                                     had_parse_error = true;
-                                    consecutive_parse_errors += 1;
-                                    if consecutive_parse_errors <= 3 {
-                                        warn!("Failed to parse Signal envelope item: {}", e);
-                                    } else if consecutive_parse_errors == 4 {
-                                        warn!(
-                                            "Signal receive parse errors continuing (suppressing further logs until recovery)"
-                                        );
-                                    }
+                                    record_signal_parse_failure(
+                                        "envelope item",
+                                        &e,
+                                        &mut consecutive_parse_errors,
+                                    );
                                 }
                             }
                         }
@@ -163,14 +184,13 @@ pub async fn signal_receive_loop(
                         }
                     }
                     Err(e) => {
-                        consecutive_parse_errors += 1;
-                        if consecutive_parse_errors <= 3 {
-                            warn!("Failed to parse Signal receive response: {}", e);
-                        } else if consecutive_parse_errors == 4 {
-                            warn!(
-                                "Signal receive parse errors continuing (suppressing further logs until recovery)"
-                            );
-                        }
+                        record_signal_parse_failure(
+                            "receive response",
+                            &e,
+                            &mut consecutive_parse_errors,
+                        );
+                        channel_registry
+                            .set_error("signal", format!("receive parse failed: {}", e));
                     }
                 }
             }
@@ -223,7 +243,7 @@ async fn process_envelope(envelope: &SignalEnvelope, state: &Arc<WsServerState>)
     let (sender, peer_id) = match resolve_signal_sender_and_peer(envelope, data_message) {
         Some(ids) => ids,
         None => {
-            warn!("Ignoring Signal envelope with empty sender or peer ID");
+            warn!("Ignoring Signal envelope with invalid sender or peer ID");
             return;
         }
     };
@@ -527,5 +547,24 @@ mod tests {
             ids,
             Some(("+15559876543".to_string(), "+15559876543".to_string()))
         );
+    }
+
+    #[test]
+    fn test_resolve_sender_and_peer_rejects_phone_number_like_group_id() {
+        let envelope = SignalEnvelope {
+            source_number: Some("+15559876543".to_string()),
+            timestamp: None,
+            data_message: Some(SignalDataMessage {
+                message: Some("Hello".to_string()),
+                timestamp: None,
+                group_info: Some(SignalGroupInfo {
+                    group_id: Some("+15551234567".to_string()),
+                }),
+            }),
+        };
+
+        let ids =
+            resolve_signal_sender_and_peer(&envelope, envelope.data_message.as_ref().unwrap());
+        assert!(ids.is_none());
     }
 }
