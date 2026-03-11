@@ -131,7 +131,7 @@
   //     providers: {
   //       google: {
   //         clientId: "${GOOGLE_OAUTH_CLIENT_ID}",
-  //         // redirectUri: "http://127.0.0.1:3000/auth/callback", // CLI loopback default
+  //         // redirectUri: "http://127.0.0.1:<port>/auth/callback", // optional CLI loopback override
   //       },
   //     },
   //   },

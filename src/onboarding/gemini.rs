@@ -110,7 +110,7 @@ pub fn resolve_google_oauth_provider_config(
         );
     }
 
-    Ok(stored_provider_config
+    let mut provider_config = stored_provider_config
         .map(|cfg| cfg.to_provider_config(redirect_uri.clone()))
         .unwrap_or_else(|| {
             OAuthProvider::Google.default_config(
@@ -118,7 +118,11 @@ pub fn resolve_google_oauth_provider_config(
                 client_secret.trim(),
                 &redirect_uri,
             )
-        }))
+        });
+    provider_config.client_id = client_id.trim().to_string();
+    provider_config.client_secret = client_secret.trim().to_string();
+    provider_config.redirect_uri = redirect_uri;
+    Ok(provider_config)
 }
 
 pub fn start_control_google_oauth(
@@ -217,15 +221,7 @@ pub async fn complete_control_google_oauth_callback(
     }
     .await;
 
-    let mut flows = GEMINI_OAUTH_FLOWS.write();
-    if let Some(flow) = flows.get_mut(&flow_id) {
-        flow.flow_state = match result {
-            Ok(completion) => GeminiOAuthFlowState::Completed(Box::new(completion)),
-            Err(err) => GeminiOAuthFlowState::Failed(err),
-        };
-    }
-
-    Ok(())
+    finish_control_google_oauth_flow(&flow_id, result)
 }
 
 pub fn control_google_oauth_status(flow_id: &str) -> Result<GeminiOAuthStatus, String> {
@@ -304,7 +300,13 @@ pub async fn run_cli_google_oauth(
     client_secret_override: Option<String>,
 ) -> Result<GeminiOAuthCompletion, String> {
     require_encrypted_profile_store_for_google_oauth()?;
-    let redirect_uri = "http://127.0.0.1:3000/auth/callback".to_string();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(|err| format!("failed to bind local OAuth callback listener: {err}"))?;
+    let bind_addr = listener
+        .local_addr()
+        .map_err(|err| format!("failed to determine local OAuth callback port: {err}"))?;
+    let redirect_uri = format!("http://127.0.0.1:{}/auth/callback", bind_addr.port());
     let provider_config = resolve_google_oauth_provider_config(
         &cfg,
         client_id_override,
@@ -324,27 +326,9 @@ pub async fn run_cli_google_oauth(
     }
 
     let path = parsed_redirect.path().to_string();
-    let bind_addr = format!(
-        "{}:{}",
-        if host == "localhost" {
-            "127.0.0.1"
-        } else {
-            host
-        },
-        parsed_redirect
-            .port_or_known_default()
-            .ok_or_else(|| "redirect URI must include a port".to_string())?
-    );
-
     let state = format!("gemini-cli-{}", uuid::Uuid::new_v4());
     let (auth_url, verifier) =
         generate_auth_url(&provider_config, &state).map_err(|err| err.to_string())?;
-
-    let listener = tokio::net::TcpListener::bind(&bind_addr)
-        .await
-        .map_err(|err| {
-            format!("failed to bind local OAuth callback listener on {bind_addr}: {err}")
-        })?;
 
     println!();
     println!("Open this URL to sign in with Google for Gemini:");
@@ -560,6 +544,20 @@ fn ensure_google_oauth_config(config: &mut Value, client_id: &str, profile_id: &
     }
 }
 
+fn finish_control_google_oauth_flow(
+    flow_id: &str,
+    result: Result<GeminiOAuthCompletion, String>,
+) -> Result<(), String> {
+    let mut flows = GEMINI_OAUTH_FLOWS.write();
+    if let Some(flow) = flows.get_mut(flow_id) {
+        flow.flow_state = match &result {
+            Ok(completion) => GeminiOAuthFlowState::Completed(Box::new(completion.clone())),
+            Err(err) => GeminiOAuthFlowState::Failed(err.clone()),
+        };
+    }
+    result.map(|_| ())
+}
+
 fn require_encrypted_profile_store_for_google_oauth() -> Result<(), String> {
     if profile_store_encryption_enabled_from_env() {
         return Ok(());
@@ -587,10 +585,15 @@ fn apply_gemini_api_key_config(
         config["google"] = json!({});
     }
     config["google"]["apiKey"] = json!(api_key);
-    if let Some(url) = base_url.filter(|value| !value.trim().is_empty()) {
-        config["google"]["baseUrl"] = json!(url.trim());
-    }
     if let Some(google) = config.get_mut("google").and_then(Value::as_object_mut) {
+        match base_url.filter(|value| !value.trim().is_empty()) {
+            Some(url) => {
+                google.insert("baseUrl".to_string(), json!(url.trim()));
+            }
+            None => {
+                google.remove("baseUrl");
+            }
+        }
         google.remove("authProfile");
     }
     Ok(())
@@ -703,10 +706,14 @@ mod tests {
     use crate::auth::profiles::OAuthTokens;
     use crate::auth::profiles::UserInfo;
     use serde_json::json;
+    use std::sync::Mutex;
+
+    static ENV_VAR_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     struct EnvVarGuard {
         key: &'static str,
         previous: Option<String>,
+        _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl Drop for EnvVarGuard {
@@ -720,9 +727,14 @@ mod tests {
     }
 
     fn set_temp_env_var(key: &'static str, value: &str) -> EnvVarGuard {
+        let lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
         let previous = std::env::var(key).ok();
         unsafe { std::env::set_var(key, value) };
-        EnvVarGuard { key, previous }
+        EnvVarGuard {
+            key,
+            previous,
+            _lock: lock,
+        }
     }
 
     fn sample_tokens() -> OAuthTokens {
@@ -812,6 +824,45 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_google_oauth_provider_config_prefers_explicit_credentials_over_stored_profile()
+    {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_dir = temp.path().to_path_buf();
+        let _password_guard = set_temp_env_var("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+        let profile = build_google_auth_profile(
+            &OAuthProvider::Google.default_config(
+                "stored-client-id",
+                "stored-client-secret",
+                "http://127.0.0.1:3000/auth/callback",
+            ),
+            sample_tokens(),
+            sample_user_info(),
+        );
+        let profile_id = profile.id.clone();
+        let store = ProfileStore::from_env(state_dir.clone()).expect("profile store from env");
+        store.add(profile).expect("store profile");
+
+        let cfg = json!({
+            "google": {
+                "authProfile": profile_id
+            }
+        });
+
+        let provider = resolve_google_oauth_provider_config(
+            &cfg,
+            Some("override-client-id".to_string()),
+            Some("override-client-secret".to_string()),
+            "http://127.0.0.1:3555/auth/callback".to_string(),
+            &state_dir,
+        )
+        .expect("provider config");
+
+        assert_eq!(provider.client_id, "override-client-id");
+        assert_eq!(provider.client_secret, "override-client-secret");
+        assert_eq!(provider.redirect_uri, "http://127.0.0.1:3555/auth/callback");
+    }
+
+    #[test]
     fn test_apply_gemini_api_key_config_replaces_auth_profile() {
         let mut config = json!({
             "google": {
@@ -829,6 +880,19 @@ mod tests {
         assert_eq!(config["google"]["apiKey"], "AIza-test-key");
         assert_eq!(config["google"]["baseUrl"], "https://proxy.example.com");
         assert!(config["google"].get("authProfile").is_none());
+    }
+
+    #[test]
+    fn test_apply_gemini_api_key_config_clears_empty_base_url() {
+        let mut config = json!({
+            "google": {
+                "baseUrl": "https://proxy.example.com"
+            }
+        });
+
+        apply_gemini_api_key_config(&mut config, "AIza-test-key", None).expect("api key config");
+
+        assert!(config["google"].get("baseUrl").is_none());
     }
 
     #[test]
@@ -935,6 +999,36 @@ mod tests {
         assert!(err.contains("OAuth provider error"));
         let status = control_google_oauth_status(&started.flow_id).expect("flow status");
         assert_eq!(status.status, "failed");
+    }
+
+    #[test]
+    fn test_finish_control_google_oauth_flow_returns_err_and_marks_failed() {
+        let flow_id = "flow-failure".to_string();
+        GEMINI_OAUTH_FLOWS.write().insert(
+            flow_id.clone(),
+            PendingGeminiOAuthFlow {
+                id: flow_id.clone(),
+                state: "state-failure".to_string(),
+                code_verifier: "verifier".to_string(),
+                provider_config: OAuthProvider::Google.default_config(
+                    "client-id",
+                    "client-secret",
+                    "http://127.0.0.1:3000/auth/callback",
+                ),
+                created_at_ms: now_ms(),
+                flow_state: GeminiOAuthFlowState::Pending,
+            },
+        );
+
+        let err = finish_control_google_oauth_flow(&flow_id, Err("exchange failed".to_string()))
+            .expect_err("result should propagate failure");
+        assert_eq!(err, "exchange failed");
+
+        let status = control_google_oauth_status(&flow_id).expect("flow status");
+        assert_eq!(status.status, "failed");
+        assert_eq!(status.error.as_deref(), Some("exchange failed"));
+
+        GEMINI_OAUTH_FLOWS.write().remove(&flow_id);
     }
 
     #[test]

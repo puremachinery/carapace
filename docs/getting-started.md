@@ -61,7 +61,7 @@ cara setup --provider gemini --auth-mode oauth
 ```
 
 `--auth-mode oauth` is interactive-only in the CLI. It launches a Google
-sign-in flow and completes through a loopback callback. The Control UI exposes
+sign-in flow and completes through a loopback callback on a local port. The Control UI exposes
 the same Gemini onboarding choices if you prefer to do it in the browser.
 Gemini Google sign-in requires `CARAPACE_CONFIG_PASSWORD`.
 

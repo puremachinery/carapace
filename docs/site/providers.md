@@ -75,7 +75,7 @@ cara setup --provider gemini --auth-mode oauth
 
 Notes:
 
-- Gemini OAuth is interactive-only in the CLI because it completes through a loopback callback.
+- Gemini OAuth is interactive-only in the CLI because it completes through a loopback callback on a local port.
 - Control UI also supports Gemini onboarding with either Google sign-in or API key.
 - Gemini onboarding stores the Google OAuth client secret with the auth profile; it is not written into `config.json5`.
 - Gemini Google sign-in requires `CARAPACE_CONFIG_PASSWORD` so the stored auth profile is encrypted at rest.

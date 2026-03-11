@@ -21,6 +21,7 @@ use crate::config::secrets::{is_encrypted, SecretStore};
 
 /// Maximum number of auth profiles that can be stored.
 const MAX_PROFILES: usize = 20;
+const LAST_USED_WRITE_INTERVAL_MS: u64 = 5 * 60 * 1000;
 
 /// Shared HTTP client for all OAuth2 requests, with a 30-second timeout.
 static OAUTH_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
@@ -941,11 +942,21 @@ impl ProfileStore {
             .unwrap_or(0);
 
         let mut guard = self.profiles.write();
+        let mut should_persist = false;
         if let Some(profile) = guard.iter_mut().find(|p| p.id == id) {
-            profile.last_used_ms = Some(now_ms);
+            let is_stale = profile
+                .last_used_ms
+                .map(|last_used| now_ms.saturating_sub(last_used) >= LAST_USED_WRITE_INTERVAL_MS)
+                .unwrap_or(true);
+            if is_stale {
+                profile.last_used_ms = Some(now_ms);
+                should_persist = true;
+            }
         }
-        // Best-effort save; ignore errors for a timestamp update
-        let _ = self.save_profiles(&guard);
+        if should_persist {
+            // Best-effort save; ignore errors for a timestamp update
+            let _ = self.save_profiles(&guard);
+        }
     }
 
     /// Insert or replace a full profile by ID.
@@ -1460,6 +1471,27 @@ mod tests {
             profile.last_used_ms.is_some(),
             "last_used_ms should be set after update"
         );
+    }
+
+    #[test]
+    fn test_profile_store_update_last_used_skips_recent_timestamp() {
+        let dir = tempdir().unwrap();
+        let store = ProfileStore::new(dir.path().to_path_buf());
+
+        let mut profile = sample_profile("lu-recent");
+        profile.last_used_ms = Some(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        );
+        let expected = profile.last_used_ms;
+        store.add(profile).unwrap();
+
+        store.update_last_used("lu-recent");
+
+        let profile = store.get("lu-recent").unwrap();
+        assert_eq!(profile.last_used_ms, expected);
     }
 
     #[test]

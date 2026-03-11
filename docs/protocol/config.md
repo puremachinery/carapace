@@ -236,7 +236,7 @@ For Gemini onboarding:
 
 - Control UI Google sign-in uses `/control/onboarding/gemini/callback` based on the
   current UI base URL or `auth.profiles.redirectBaseUrl`
-- CLI Google sign-in uses a loopback callback (`http://127.0.0.1:3000/auth/callback`)
+- CLI Google sign-in uses a loopback callback on a local port (`http://127.0.0.1:<port>/auth/callback`)
 - Gemini onboarding accepts the Google OAuth client secret via environment or explicit onboarding input, then stores it with the auth profile instead of persisting it in config
 - `CARAPACE_CONFIG_PASSWORD` must be set when using Gemini Google sign-in so the stored auth profile is encrypted at rest
 - if Google OAuth client config is unavailable, Gemini onboarding must use API-key mode
