@@ -28,14 +28,20 @@ fn resolve_google_oauth_runtime_config(
         return None;
     }
     if let Some(stored) = profile.oauth_provider_config {
-        return Some(
-            stored.to_provider_config(
-                cfg.pointer("/auth/profiles/providers/google/redirectUri")
-                    .and_then(Value::as_str)
-                    .unwrap_or("http://localhost:3000/auth/callback")
-                    .to_string(),
-            ),
-        );
+        let redirect_uri = cfg
+            .pointer("/auth/profiles/providers/google/redirectUri")
+            .and_then(Value::as_str)
+            .unwrap_or("http://localhost:3000/auth/callback")
+            .to_string();
+        return Some(crate::auth::profiles::OAuthProviderConfig {
+            client_id: stored.client_id,
+            client_secret: stored.client_secret,
+            redirect_uri,
+            auth_url: stored.auth_url,
+            token_url: stored.token_url,
+            userinfo_url: stored.userinfo_url,
+            scopes: stored.scopes,
+        });
     }
     None
 }
@@ -233,12 +239,16 @@ pub fn build_providers(cfg: &Value) -> Result<Option<MultiProvider>, Box<dyn std
     let ollama_provider = try_build_ollama_provider(cfg)?;
 
     // Gemini
-    let google_api_key = std::env::var("GOOGLE_API_KEY").ok().or_else(|| {
-        cfg.get("google")
-            .and_then(|v| v.get("apiKey"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    });
+    let google_api_key = std::env::var("GOOGLE_API_KEY")
+        .ok()
+        .or_else(|| {
+            cfg.get("google")
+                .and_then(|v| v.get("apiKey"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let google_auth_profile = cfg
         .get("google")
         .and_then(|v| v.get("authProfile"))
@@ -463,12 +473,16 @@ pub fn fingerprint_providers(cfg: &Value) -> ProviderFingerprint {
     });
     let ollama_configured = ollama_url.is_some() || ollama_cfg.is_some();
 
-    let google_key = std::env::var("GOOGLE_API_KEY").ok().or_else(|| {
-        cfg.get("google")
-            .and_then(|v| v.get("apiKey"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    });
+    let google_key = std::env::var("GOOGLE_API_KEY")
+        .ok()
+        .or_else(|| {
+            cfg.get("google")
+                .and_then(|v| v.get("apiKey"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let google_auth_profile = cfg
         .get("google")
         .and_then(|v| v.get("authProfile"))
@@ -577,6 +591,8 @@ mod tests {
     const PROVIDER_ENV_KEYS: &[&str] = &[
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_BASE_URL",
+        "CARAPACE_CONFIG_PASSWORD",
+        "CARAPACE_STATE_DIR",
         "OPENAI_API_KEY",
         "OPENAI_BASE_URL",
         "OLLAMA_BASE_URL",
@@ -609,6 +625,12 @@ mod tests {
     fn unset_env_var_scoped(key: &'static str) -> EnvVarGuard {
         let previous = std::env::var_os(key);
         std::env::remove_var(key);
+        EnvVarGuard { key, previous }
+    }
+
+    fn set_env_var_scoped(key: &'static str, value: &str) -> EnvVarGuard {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
         EnvVarGuard { key, previous }
     }
 
@@ -663,6 +685,72 @@ mod tests {
             assert_eq!(
                 fp.gemini,
                 Some(("auth-profile:google-abc123".to_string(), None))
+            );
+        });
+    }
+
+    #[test]
+    fn test_fingerprint_ignores_blank_gemini_api_key_when_auth_profile_present() {
+        with_clean_provider_env(|| {
+            let _blank_key = set_env_var_scoped("GOOGLE_API_KEY", "   ");
+            let cfg = json!({
+                "google": { "authProfile": "google-abc123" }
+            });
+            let fp = fingerprint_providers(&cfg);
+            assert_eq!(
+                fp.gemini,
+                Some(("auth-profile:google-abc123".to_string(), None))
+            );
+        });
+    }
+
+    #[test]
+    fn test_build_providers_ignores_blank_gemini_api_key_when_auth_profile_present() {
+        with_clean_provider_env(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let _password = set_env_var_scoped("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+            let _state_dir = set_env_var_scoped(
+                "CARAPACE_STATE_DIR",
+                temp.path().to_str().expect("state dir path"),
+            );
+            let _blank_key = set_env_var_scoped("GOOGLE_API_KEY", "   ");
+
+            let provider_config = OAuthProvider::Google.default_config(
+                "google-client-id",
+                "google-client-secret",
+                "https://gateway.example.com/control/onboarding/gemini/callback",
+            );
+            let profile = crate::auth::profiles::AuthProfile {
+                id: "google-abc123".to_string(),
+                name: "Google user@example.com".to_string(),
+                provider: OAuthProvider::Google,
+                user_id: Some("user-123".to_string()),
+                email: Some("user@example.com".to_string()),
+                display_name: Some("Example User".to_string()),
+                avatar_url: None,
+                created_at_ms: 0,
+                last_used_ms: None,
+                tokens: crate::auth::profiles::OAuthTokens {
+                    access_token: "access-token".to_string(),
+                    refresh_token: Some("refresh-token".to_string()),
+                    token_type: "Bearer".to_string(),
+                    expires_at_ms: Some(u64::MAX),
+                    scope: Some("openid email profile".to_string()),
+                },
+                oauth_provider_config: Some(
+                    crate::auth::profiles::StoredOAuthProviderConfig::from(&provider_config),
+                ),
+            };
+            let store = ProfileStore::from_env(temp.path().to_path_buf()).expect("profile store");
+            store.add(profile).expect("store profile");
+
+            let cfg = json!({
+                "google": { "authProfile": "google-abc123" }
+            });
+            let providers = build_providers(&cfg).expect("build providers");
+            assert!(
+                providers.is_some(),
+                "blank GOOGLE_API_KEY should not mask auth-profile Gemini setup"
             );
         });
     }

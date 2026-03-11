@@ -131,7 +131,7 @@
   //     providers: {
   //       google: {
   //         clientId: "${GOOGLE_OAUTH_CLIENT_ID}",
-  //         // redirectUri: "http://127.0.0.1:<port>/auth/callback", // optional CLI loopback override
+  //         // redirectUri: "https://gateway.example.com/auth/callback", // hosted OAuth override; CLI uses an ephemeral loopback port
   //       },
   //     },
   //   },

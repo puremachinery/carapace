@@ -16,7 +16,7 @@
 
 use axum::{
     extract::{Path, Query, State},
-    http::{uri::Authority, HeaderMap, StatusCode},
+    http::{uri::Authority, HeaderMap, StatusCode, Uri},
     response::{IntoResponse, Response},
     Json,
 };
@@ -1463,6 +1463,10 @@ fn configured_control_redirect_base_url(cfg: &Value) -> Option<String> {
 }
 
 fn control_request_base_url(headers: &HeaderMap) -> Option<String> {
+    let origin_base_url = headers
+        .get("origin")
+        .and_then(|value| value.to_str().ok())
+        .and_then(sanitize_origin_base_url);
     let host = headers
         .get("x-forwarded-host")
         .or_else(|| headers.get("host"))
@@ -1471,10 +1475,30 @@ fn control_request_base_url(headers: &HeaderMap) -> Option<String> {
 
     let proto = match headers.get("x-forwarded-proto") {
         Some(value) => sanitize_forwarded_proto(value.to_str().ok()?)?,
-        None => "http".to_string(),
+        None => origin_base_url
+            .as_deref()
+            .and_then(|value| value.split("://").next())
+            .map(ToString::to_string)?,
     };
 
     Some(format!("{proto}://{host}"))
+}
+
+fn sanitize_origin_base_url(raw: &str) -> Option<String> {
+    let candidate = raw.split(',').next()?.trim();
+    if candidate.is_empty() || candidate.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let uri = candidate.parse::<Uri>().ok()?;
+    let scheme = uri.scheme_str()?.to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    let authority = uri.authority()?.as_str();
+    if authority.is_empty() || authority.chars().any(char::is_whitespace) {
+        return None;
+    }
+    Some(format!("{scheme}://{authority}"))
 }
 
 fn sanitize_forwarded_host(raw: &str) -> Option<String> {
@@ -1719,6 +1743,24 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-host", "gateway.example.com".parse().unwrap());
         headers.insert("x-forwarded-proto", "javascript".parse().unwrap());
+        assert!(control_request_base_url(&headers).is_none());
+    }
+
+    #[test]
+    fn test_control_request_base_url_uses_origin_when_forwarded_proto_missing() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "gateway.example.com".parse().unwrap());
+        headers.insert("origin", "https://gateway.example.com".parse().unwrap());
+        assert_eq!(
+            control_request_base_url(&headers).as_deref(),
+            Some("https://gateway.example.com")
+        );
+    }
+
+    #[test]
+    fn test_control_request_base_url_rejects_missing_proto_without_origin() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "gateway.example.com".parse().unwrap());
         assert!(control_request_base_url(&headers).is_none());
     }
 

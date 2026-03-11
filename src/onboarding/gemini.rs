@@ -169,6 +169,7 @@ pub async fn complete_control_google_oauth_callback(
     code: Option<&str>,
     error: Option<&str>,
 ) -> Result<(), String> {
+    cleanup_expired_flows();
     let flow_id = {
         let flows = GEMINI_OAUTH_FLOWS.read();
         flows
@@ -253,6 +254,7 @@ pub fn control_google_oauth_status(flow_id: &str) -> Result<GeminiOAuthStatus, S
 
 pub fn apply_control_google_oauth(flow_id: &str, state_dir: PathBuf) -> Result<Value, String> {
     require_encrypted_profile_store_for_google_oauth()?;
+    cleanup_expired_flows();
     let completion = {
         let flows = GEMINI_OAUTH_FLOWS.read();
         let flow = flows
@@ -1025,6 +1027,71 @@ mod tests {
         assert_eq!(status.error.as_deref(), Some("exchange failed"));
 
         GEMINI_OAUTH_FLOWS.write().remove(&flow_id);
+    }
+
+    #[tokio::test]
+    async fn test_complete_control_google_oauth_callback_rejects_expired_flow() {
+        let flow_id = "expired-callback-flow".to_string();
+        let state = "expired-callback-state".to_string();
+        GEMINI_OAUTH_FLOWS.write().insert(
+            flow_id.clone(),
+            PendingGeminiOAuthFlow {
+                id: flow_id.clone(),
+                state: state.clone(),
+                code_verifier: "verifier".to_string(),
+                provider_config: OAuthProvider::Google.default_config(
+                    "client-id",
+                    "client-secret",
+                    "https://gateway.example.com/control/onboarding/gemini/callback",
+                ),
+                created_at_ms: now_ms() - FLOW_TTL.as_millis() as u64 - 1,
+                flow_state: GeminiOAuthFlowState::Pending,
+            },
+        );
+
+        let err = complete_control_google_oauth_callback(&state, Some("code"), None)
+            .await
+            .expect_err("expired flow should fail");
+        assert!(err.contains("Unknown or expired"));
+        assert!(GEMINI_OAUTH_FLOWS.read().get(&flow_id).is_none());
+    }
+
+    #[test]
+    fn test_apply_control_google_oauth_rejects_expired_flow() {
+        let _password_guard = set_temp_env_var("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+        let flow_id = "expired-apply-flow".to_string();
+        GEMINI_OAUTH_FLOWS.write().insert(
+            flow_id.clone(),
+            PendingGeminiOAuthFlow {
+                id: flow_id.clone(),
+                state: "expired-apply-state".to_string(),
+                code_verifier: "verifier".to_string(),
+                provider_config: OAuthProvider::Google.default_config(
+                    "client-id",
+                    "client-secret",
+                    "https://gateway.example.com/control/onboarding/gemini/callback",
+                ),
+                created_at_ms: now_ms() - FLOW_TTL.as_millis() as u64 - 1,
+                flow_state: GeminiOAuthFlowState::Completed(Box::new(GeminiOAuthCompletion {
+                    client_id: "client-id".to_string(),
+                    auth_profile: build_google_auth_profile(
+                        &OAuthProvider::Google.default_config(
+                            "client-id",
+                            "client-secret",
+                            "https://gateway.example.com/control/onboarding/gemini/callback",
+                        ),
+                        sample_tokens(),
+                        sample_user_info(),
+                    ),
+                })),
+            },
+        );
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let err = apply_control_google_oauth(&flow_id, temp.path().to_path_buf())
+            .expect_err("expired flow should fail");
+        assert!(err.contains("Unknown or expired"));
+        assert!(GEMINI_OAUTH_FLOWS.read().get(&flow_id).is_none());
     }
 
     #[test]
