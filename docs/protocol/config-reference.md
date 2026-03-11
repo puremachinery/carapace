@@ -148,7 +148,7 @@ This block shapes how smart your AI behaves, how large its memory is, and perfor
     * `deliver`: Boolean. If `true`, the final message from this agent is pushed directly to the chat channel.
     * `toolPolicy`: String (`"allowlist"`, `"denylist"`, `"allowall"`) managing which tools this agent can use.
     * `exfiltrationGuard`: Boolean. If `true`, blocks tools known to be capable of sending data externally (preventing prompt injection data theft).
-    * `promptGuard` / `outputSanitizer` / `sandbox` / `classifier`: These agent-specific blocks override the global `agents.defaults` for this entity.
+    * `promptGuard` / `outputSanitizer` / `sandbox` / `classifier`: These agent-specific blocks override the global `agents.*` for this entity.
 
 * **`agents.defaults.maxConcurrent`**
   * *What it does:* Maximum number of simultaneous main AI tasks that run.
