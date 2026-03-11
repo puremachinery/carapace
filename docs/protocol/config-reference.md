@@ -299,14 +299,16 @@ Enable Carapace to listen and chat dynamically on different popular platforms.
       * `"warn"` (Default) - Issues a warning and attempts to auto-migrate missing data signatures harmlessly.
       * `"reject"` - The system will fail completely and shut down if it detects altered chat history.
 * **`session`**
-  * *What it does:* Governs active interactive chat settings.
+  * *What it does:* Governs active interactive chat behavior, specifically how Carapace decides "who is talking" and "which memory to look at" when a message arrives.
   * *Possible values:*
     * `scope`:
-      * `"per-sender"` - Maintains a separate distinct timeline and context for each conversational participant.
+      * `"per-sender"` (Default) - Every unique human user gets their own private, continuous memory timeline, regardless of what group chat or channel they are talking in.
+      * `"global"` - Every single person in a specific channel shares one massive group memory. The AI remembers the conversation of the entire room as one timeline.
+      * `"per-channel-peer"` - The AI maintains a unique memory timeline for each specific combination of a channel and a group/user (useful if someone acts differently in one server vs another).
     * `dmScope`:
-      * `"main"` - Routes direct messages to the general, main timeline sequence.
+      * `"main"` (Default) - Forces the AI to store your private Direct Messages in the exact same memory bank as your public group chat messages. If you DM the bot, it will remember the joke you made in the group chat earlier.
     * `typingMode`:
-      * `"thinking"` - Displays a typing indicator exclusively when the AI is currently utilizing reasoning cycles.
+      * `"thinking"` (Default) - Automatically bridges to your chat app (Discord, Signal, Telegram) to display that the bot is "typing..." exclusively when it is silently executing tools or running internal reasoning cycles. This lets you know it hasn't crashed when a task takes 30 seconds.
 * **`logging`**
   * *What it does:* Dictates what diagnostic events are printed into your terminal or backend system files.
   * *Possible values:*
