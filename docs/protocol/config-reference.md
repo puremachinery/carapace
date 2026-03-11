@@ -36,13 +36,16 @@ This section controls how the internal Carapace server connects to the outside w
   * *What it does:* Decides how external programs prove they're allowed to connect.
   * *Possible values:*
     * `mode`:
+      * `"none"` - Disables additional gateway-level authentication. Only use this for local development or when you fully trust the network and other protections in front of Carapace.
+      * `"local"` - Trusts connections that originate from the local machine or other trusted local mechanisms, without requiring a separate token/password.
       * `"token"` - Uses a generated secret API token for authentication.
       * `"password"` - Uses a standard password for authentication.
     * `token`: The secret text token string you specify (e.g., `"${CARAPACE_GATEWAY_TOKEN}"`).
     * `password`: A password string you specify (e.g., `"${CARAPACE_GATEWAY_PASSWORD}"`).
     * `allowTailscale`:
       * `true` - Permits connections that are already safely authenticated through Tailscale VPN.
-      * `false` - Still requires the token/password even if on Tailscale.
+      * `false` - Still requires the configured auth mode (for example, token/password) even if the connection is over Tailscale.
+      * *Default / implicit behavior:* If you do not set this explicitly, Carapace may automatically allow Tailscale-authenticated connections when `gateway.tailscale.mode` is configured to serve the gateway and depending on the selected auth `mode`. For predictable security, set `allowTailscale` explicitly to `true` or `false`.
 * **`gateway.reload`**
   * *What it does:* Setting for hot-reloading configurations when you save changes to the file.
   * *Possible values:*
