@@ -290,7 +290,9 @@ pub fn apply_control_google_oauth(flow_id: &str, state_dir: PathBuf) -> Result<V
 
 pub fn apply_control_gemini_api_key(input: GeminiApiKeyInput) -> Result<Value, String> {
     let mut config = read_config_snapshot().config;
-    apply_gemini_api_key_config(&mut config, &input.api_key, input.base_url.as_deref())?;
+    validate_gemini_api_key_input(&input.api_key, input.base_url.as_deref())
+        .map_err(|err| err.to_string())?;
+    write_gemini_api_key_config(&mut config, &input.api_key, input.base_url.as_deref());
     validate_and_persist_config(&config)?;
     Ok(json!({
         "mode": "apiKey"
@@ -579,18 +581,22 @@ fn require_encrypted_profile_store_for_google_oauth() -> Result<(), String> {
     )
 }
 
-fn apply_gemini_api_key_config(
-    config: &mut Value,
+pub fn validate_gemini_api_key_input(
     api_key: &str,
     base_url: Option<&str>,
-) -> Result<(), String> {
+) -> Result<(), crate::agent::AgentError> {
     if api_key.trim().is_empty() {
-        return Err("API key must not be empty".to_string());
+        return Err(crate::agent::AgentError::InvalidApiKey(
+            "API key must not be empty".to_string(),
+        ));
     }
     if let Some(url) = base_url.filter(|value| !value.trim().is_empty()) {
         validate_gemini_base_url(url.trim())?;
     }
+    Ok(())
+}
 
+pub fn write_gemini_api_key_config(config: &mut Value, api_key: &str, base_url: Option<&str>) {
     if !config.get("google").is_some_and(Value::is_object) {
         config["google"] = json!({});
     }
@@ -606,16 +612,17 @@ fn apply_gemini_api_key_config(
         }
         google.remove("authProfile");
     }
-    Ok(())
 }
 
-fn validate_gemini_base_url(url: &str) -> Result<(), String> {
-    let parsed = url::Url::parse(url).map_err(|err| format!("invalid URL \"{url}\": {err}"))?;
+fn validate_gemini_base_url(url: &str) -> Result<(), crate::agent::AgentError> {
+    let parsed = url::Url::parse(url).map_err(|err| {
+        crate::agent::AgentError::InvalidBaseUrl(format!("invalid URL \"{url}\": {err}"))
+    })?;
     if parsed.scheme() != "https" {
-        return Err(format!(
+        return Err(crate::agent::AgentError::InvalidBaseUrl(format!(
             "base URL must use https scheme, got \"{}\"",
             parsed.scheme()
-        ));
+        )));
     }
     Ok(())
 }
@@ -888,19 +895,20 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_gemini_api_key_config_replaces_auth_profile() {
+    fn test_write_gemini_api_key_config_replaces_auth_profile() {
         let mut config = json!({
             "google": {
                 "authProfile": "google-old"
             }
         });
 
-        apply_gemini_api_key_config(
+        validate_gemini_api_key_input("AIza-test-key", Some("https://proxy.example.com"))
+            .expect("api key validation");
+        write_gemini_api_key_config(
             &mut config,
             "AIza-test-key",
             Some("https://proxy.example.com"),
-        )
-        .expect("api key config");
+        );
 
         assert_eq!(config["google"]["apiKey"], "AIza-test-key");
         assert_eq!(config["google"]["baseUrl"], "https://proxy.example.com");
@@ -908,28 +916,24 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_gemini_api_key_config_clears_empty_base_url() {
+    fn test_write_gemini_api_key_config_clears_empty_base_url() {
         let mut config = json!({
             "google": {
                 "baseUrl": "https://proxy.example.com"
             }
         });
 
-        apply_gemini_api_key_config(&mut config, "AIza-test-key", None).expect("api key config");
+        validate_gemini_api_key_input("AIza-test-key", None).expect("api key validation");
+        write_gemini_api_key_config(&mut config, "AIza-test-key", None);
 
         assert!(config["google"].get("baseUrl").is_none());
     }
 
     #[test]
-    fn test_apply_gemini_api_key_config_rejects_non_https_base_url() {
-        let mut config = json!({});
-        let err = apply_gemini_api_key_config(
-            &mut config,
-            "AIza-test-key",
-            Some("http://proxy.example.com"),
-        )
-        .expect_err("non-https base URL should fail");
-        assert!(err.contains("https scheme"));
+    fn test_validate_gemini_api_key_input_rejects_non_https_base_url() {
+        let err = validate_gemini_api_key_input("AIza-test-key", Some("http://proxy.example.com"))
+            .expect_err("non-https base URL should fail");
+        assert!(err.to_string().contains("https scheme"));
     }
 
     #[test]

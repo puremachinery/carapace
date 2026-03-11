@@ -4562,34 +4562,22 @@ fn configure_gemini_provider_interactive(
             }
 
             if let Some(key) = api_key.effective_value.clone() {
-                let validation =
-                    crate::agent::gemini::GeminiProvider::new(key).and_then(|provider| {
-                        if let Some(base_url) = base_url
-                            .as_ref()
-                            .and_then(|value| value.effective_value.clone())
-                        {
-                            provider.with_base_url(base_url)
-                        } else {
-                            Ok(provider)
-                        }
-                    });
+                let validation = crate::onboarding::gemini::validate_gemini_api_key_input(
+                    &key,
+                    base_url
+                        .as_ref()
+                        .and_then(|value| value.effective_value.as_deref()),
+                );
                 if let Err(err) = validation {
                     handle_setup_validation_failure(err)?;
                 }
             }
 
-            let mut google_config = serde_json::Map::new();
-            google_config.insert(
-                "apiKey".to_string(),
-                serde_json::json!(api_key.config_value),
+            crate::onboarding::gemini::write_gemini_api_key_config(
+                config,
+                &api_key.config_value,
+                base_url.as_ref().map(|value| value.config_value.as_str()),
             );
-            if let Some(base_url) = base_url {
-                google_config.insert(
-                    "baseUrl".to_string(),
-                    serde_json::json!(base_url.config_value),
-                );
-            }
-            config["google"] = Value::Object(google_config);
         }
         GeminiSetupAuthMode::OAuth => {
             let client_id = prompt_google_oauth_client_value(
@@ -4909,13 +4897,13 @@ fn configure_provider_noninteractive(
         }
         SetupProvider::Gemini => match requested_auth_mode {
             Some(GeminiSetupAuthMode::ApiKey) => {
-                config["google"] = serde_json::json!({
-                    "apiKey": env_placeholder("GOOGLE_API_KEY")
-                });
-                if env_var_present("GOOGLE_API_BASE_URL") {
-                    config["google"]["baseUrl"] =
-                        serde_json::json!(env_placeholder("GOOGLE_API_BASE_URL"));
-                }
+                crate::onboarding::gemini::write_gemini_api_key_config(
+                    config,
+                    &env_placeholder("GOOGLE_API_KEY"),
+                    env_var_present("GOOGLE_API_BASE_URL")
+                        .then(|| env_placeholder("GOOGLE_API_BASE_URL"))
+                        .as_deref(),
+                );
             }
             Some(GeminiSetupAuthMode::OAuth) => {
                 return Err(
