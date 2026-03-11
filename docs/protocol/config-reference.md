@@ -93,7 +93,16 @@ This section controls how the internal Carapace server connects to the outside w
     * `autoReconnect`: `true` (automatically try to connect if disconnected) or `false`.
     * `reconnectIntervalMs`: Integer. How many milliseconds to wait before retrying a connection.
     * `maxReconnectAttempts`: Integer. The maximum number of failed attempts before giving up.
-    * `gateways`: An array (list) of connection objects dictating `name`, `url` (e.g., `"wss://..."`), and `autoConnect` values.
+    * `gateways`: An array (list) of connection objects. Each gateway object can include:
+      * `name`: String. A human-readable label for this remote gateway.
+      * `url`: String. The WebSocket URL for the remote gateway (e.g., `"wss://example.com/gateway"`).
+      * `autoConnect`: Boolean. Whether Carapace should automatically establish this connection on startup.
+      * `fingerprint`: String (optional). A pinned certificate fingerprint used for TOFU (trust-on-first-use) style verification.
+      * `ssh`: Object (optional). Settings for tunneling the remote gateway over SSH instead of connecting directly:
+        * `host`: String. SSH server hostname or IP address.
+        * `port`: Integer. SSH server port. (Default is typically `22` if omitted.)
+        * `user`: String. SSH username to authenticate as.
+        * `remotePort`: Integer. Remote port on the SSH server that exposes the gateway service.
 * **`gateway.tls`**
   * *What it does:* Configures standard HTTPS (TLS) for encrypting traffic to the gateway. We recommend reviewing the [Security documentation](./security.md) for more setup guidance.
   * *Possible values:*
