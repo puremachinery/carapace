@@ -766,14 +766,21 @@ pub async fn gemini_oauth_start_handler(
     };
 
     let snapshot = read_config_snapshot();
-    let redirect_base_url = req
+    let redirect_base_url = match req
         .redirect_base_url
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-        .or_else(|| configured_control_redirect_base_url(&snapshot.config))
-        .or_else(|| control_request_base_url(&headers));
+    {
+        Some(value) => match sanitize_control_redirect_base_url(value) {
+            Ok(validated) => Some(validated),
+            Err(msg) => {
+                return (StatusCode::BAD_REQUEST, Json(ControlError::new(msg))).into_response();
+            }
+        },
+        None => configured_control_redirect_base_url(&snapshot.config)
+            .or_else(|| control_request_base_url(&headers)),
+    };
 
     let Some(redirect_base_url) = redirect_base_url else {
         return (
@@ -1458,8 +1465,7 @@ fn parse_optional_reason(reason: Option<String>) -> Result<Option<String>, Strin
 fn configured_control_redirect_base_url(cfg: &Value) -> Option<String> {
     build_auth_profiles_config(cfg)
         .redirect_base_url
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+        .and_then(|value| sanitize_control_redirect_base_url(&value).ok())
 }
 
 fn control_request_base_url(headers: &HeaderMap) -> Option<String> {
@@ -1486,19 +1492,41 @@ fn control_request_base_url(headers: &HeaderMap) -> Option<String> {
 
 fn sanitize_origin_base_url(raw: &str) -> Option<String> {
     let candidate = raw.split(',').next()?.trim();
+    sanitize_control_redirect_base_url(candidate).ok()
+}
+
+fn sanitize_control_redirect_base_url(raw: &str) -> Result<String, &'static str> {
+    let candidate = raw.trim();
     if candidate.is_empty() || candidate.chars().any(char::is_whitespace) {
-        return None;
+        return Err("Invalid redirectBaseUrl: malformed URL");
     }
-    let uri = candidate.parse::<Uri>().ok()?;
-    let scheme = uri.scheme_str()?.to_ascii_lowercase();
+
+    let uri = candidate
+        .parse::<Uri>()
+        .map_err(|_| "Invalid redirectBaseUrl: malformed URL")?;
+    let scheme = uri
+        .scheme_str()
+        .ok_or("Invalid redirectBaseUrl: missing scheme")?
+        .to_ascii_lowercase();
     if scheme != "http" && scheme != "https" {
-        return None;
+        return Err("Invalid redirectBaseUrl: unsupported scheme (must be http or https)");
     }
-    let authority = uri.authority()?.as_str();
-    if authority.is_empty() || authority.chars().any(char::is_whitespace) {
-        return None;
+
+    let authority = uri
+        .authority()
+        .map(|value| value.as_str())
+        .filter(|value| !value.is_empty() && !value.chars().any(char::is_whitespace))
+        .ok_or("Invalid redirectBaseUrl: missing authority")?;
+
+    let path_and_query = uri
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or("/");
+    if path_and_query != "/" {
+        return Err("Invalid redirectBaseUrl: must not include a path or query");
     }
-    Some(format!("{scheme}://{authority}"))
+
+    Ok(format!("{scheme}://{authority}"))
 }
 
 fn sanitize_forwarded_host(raw: &str) -> Option<String> {
@@ -1777,5 +1805,30 @@ mod tests {
             configured_control_redirect_base_url(&cfg).as_deref(),
             Some("https://gateway.example.com")
         );
+    }
+
+    #[test]
+    fn test_configured_control_redirect_base_url_rejects_invalid_auth_profiles_config() {
+        let cfg = json!({
+            "auth": {
+                "profiles": {
+                    "redirectBaseUrl": "null"
+                }
+            }
+        });
+        assert!(configured_control_redirect_base_url(&cfg).is_none());
+    }
+
+    #[test]
+    fn test_sanitize_control_redirect_base_url_rejects_path_and_query() {
+        assert!(
+            sanitize_control_redirect_base_url("https://gateway.example.com/oauth?x=1").is_err()
+        );
+    }
+
+    #[test]
+    fn test_sanitize_control_redirect_base_url_rejects_non_http_scheme() {
+        assert!(sanitize_control_redirect_base_url("null").is_err());
+        assert!(sanitize_control_redirect_base_url("file:///tmp/ui").is_err());
     }
 }

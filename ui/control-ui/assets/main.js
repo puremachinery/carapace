@@ -373,9 +373,11 @@
   }
 
   async function startGeminiOauth() {
-    const payload = {
-      redirectBaseUrl: window.location.origin,
-    };
+    const payload = {};
+    const origin = window.location.origin;
+    if (origin && (origin.startsWith("http://") || origin.startsWith("https://"))) {
+      payload.redirectBaseUrl = origin;
+    }
     const clientId = ui.geminiClientIdInput.value.trim();
     const clientSecret = ui.geminiClientSecretInput.value.trim();
     if (clientId) {

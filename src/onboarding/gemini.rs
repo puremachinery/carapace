@@ -187,10 +187,15 @@ pub async fn complete_control_google_oauth_callback(
         return Err(format!("OAuth provider error: {err}"));
     }
 
-    let code = code
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| "Missing OAuth authorization code".to_string())?;
+    let code = match code.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(code) => code,
+        None => {
+            return finish_control_google_oauth_flow(
+                &flow_id,
+                Err("Missing OAuth authorization code".to_string()),
+            );
+        }
+    };
 
     let (provider_config, verifier) = {
         let flows = GEMINI_OAUTH_FLOWS.read();
@@ -368,14 +373,22 @@ pub async fn run_cli_google_oauth(
             State(state): State<CliOAuthState>,
             Query(query): Query<CallbackQuery>,
         ) -> Html<String> {
+            if !cli_oauth_callback_matches_expected_state(
+                &state.expected_state,
+                query.state.as_deref(),
+            ) {
+                return Html(callback_html(
+                    "Still waiting for Gemini sign-in",
+                    "Ignored an unrelated OAuth callback. Return to the active sign-in flow and continue.",
+                ));
+            }
+
             let result = match query.error.filter(|value| !value.trim().is_empty()) {
                 Some(err) => Err(format!("OAuth provider error: {err}")),
                 None => {
                     complete_cli_oauth_callback(
                         &state.provider_config,
-                        &state.expected_state,
                         &state.code_verifier,
-                        query.state.as_deref(),
                         query.code.as_deref(),
                     )
                     .await
@@ -571,12 +584,11 @@ fn apply_gemini_api_key_config(
     api_key: &str,
     base_url: Option<&str>,
 ) -> Result<(), String> {
-    let provider = crate::agent::gemini::GeminiProvider::new(api_key.to_string())
-        .map_err(|err| err.to_string())?;
+    if api_key.trim().is_empty() {
+        return Err("API key must not be empty".to_string());
+    }
     if let Some(url) = base_url.filter(|value| !value.trim().is_empty()) {
-        provider
-            .with_base_url(url.trim().to_string())
-            .map_err(|err| err.to_string())?;
+        validate_gemini_base_url(url.trim())?;
     }
 
     if !config.get("google").is_some_and(Value::is_object) {
@@ -593,6 +605,17 @@ fn apply_gemini_api_key_config(
             }
         }
         google.remove("authProfile");
+    }
+    Ok(())
+}
+
+fn validate_gemini_base_url(url: &str) -> Result<(), String> {
+    let parsed = url::Url::parse(url).map_err(|err| format!("invalid URL \"{url}\": {err}"))?;
+    if parsed.scheme() != "https" {
+        return Err(format!(
+            "base URL must use https scheme, got \"{}\"",
+            parsed.scheme()
+        ));
     }
     Ok(())
 }
@@ -643,18 +666,22 @@ fn escape_html(input: &str) -> String {
         .replace('\'', "&#39;")
 }
 
+fn cli_oauth_callback_matches_expected_state(
+    expected_state: &str,
+    returned_state: Option<&str>,
+) -> bool {
+    returned_state
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        == Some(expected_state)
+}
+
 async fn complete_cli_oauth_callback(
     provider_config: &OAuthProviderConfig,
-    expected_state: &str,
     code_verifier: &str,
-    returned_state: Option<&str>,
     code: Option<&str>,
 ) -> Result<GeminiOAuthCompletion, String> {
-    let returned_state = returned_state.unwrap_or_default();
     let code = code.unwrap_or_default();
-    if returned_state != expected_state {
-        return Err("OAuth callback state mismatch".to_string());
-    }
     if code.trim().is_empty() {
         return Err("OAuth callback missing authorization code".to_string());
     }
@@ -894,6 +921,18 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_gemini_api_key_config_rejects_non_https_base_url() {
+        let mut config = json!({});
+        let err = apply_gemini_api_key_config(
+            &mut config,
+            "AIza-test-key",
+            Some("http://proxy.example.com"),
+        )
+        .expect_err("non-https base URL should fail");
+        assert!(err.contains("https scheme"));
+    }
+
+    #[test]
     fn test_persist_cli_google_oauth_stores_profile_and_updates_config() {
         let temp = tempfile::tempdir().expect("tempdir");
         let _password_guard = set_temp_env_var("CARAPACE_CONFIG_PASSWORD", "test-config-password");
@@ -999,6 +1038,38 @@ mod tests {
         assert_eq!(status.status, "failed");
     }
 
+    #[tokio::test]
+    async fn test_complete_control_google_oauth_callback_marks_missing_code_failed() {
+        let _password_guard = set_temp_env_var("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+        let started = start_control_google_oauth(
+            &json!({}),
+            Some("google-client-id".to_string()),
+            Some("google-client-secret".to_string()),
+            "https://gateway.example.com",
+        )
+        .expect("start oauth");
+
+        let state = {
+            let flows = GEMINI_OAUTH_FLOWS.read();
+            flows
+                .get(&started.flow_id)
+                .expect("stored flow")
+                .state
+                .clone()
+        };
+
+        let err = complete_control_google_oauth_callback(&state, None, None)
+            .await
+            .expect_err("missing code should fail");
+        assert!(err.contains("Missing OAuth authorization code"));
+        let status = control_google_oauth_status(&started.flow_id).expect("flow status");
+        assert_eq!(status.status, "failed");
+        assert_eq!(
+            status.error.as_deref(),
+            Some("Missing OAuth authorization code")
+        );
+    }
+
     #[test]
     fn test_finish_control_google_oauth_flow_returns_err_and_marks_failed() {
         let flow_id = "flow-failure".to_string();
@@ -1100,5 +1171,29 @@ mod tests {
         assert!(html.contains("&lt;Gemini&gt;"));
         assert!(html.contains("&quot;bad&quot; &amp; &lt;script&gt;"));
         assert!(!html.contains("<script>"));
+    }
+
+    #[test]
+    fn test_cli_oauth_callback_matches_expected_state() {
+        assert!(cli_oauth_callback_matches_expected_state(
+            "gemini-state",
+            Some("gemini-state")
+        ));
+        assert!(cli_oauth_callback_matches_expected_state(
+            "gemini-state",
+            Some(" gemini-state ")
+        ));
+        assert!(!cli_oauth_callback_matches_expected_state(
+            "gemini-state",
+            None
+        ));
+        assert!(!cli_oauth_callback_matches_expected_state(
+            "gemini-state",
+            Some("wrong-state")
+        ));
+        assert!(!cli_oauth_callback_matches_expected_state(
+            "gemini-state",
+            Some("   ")
+        ));
     }
 }
