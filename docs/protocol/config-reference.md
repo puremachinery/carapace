@@ -246,9 +246,11 @@ Enable Carapace to listen and chat dynamically on different popular platforms.
       * `"info"` (Default) - Standard operational events.
       * `"warn"` - Non-critical issues or warnings.
       * `"error"` - Serious problems that require immediate attention.
-    * `format` (or `consoleStyle`):
-      * `"pretty"` (Default) - Colorful text suitable for human reading.
+    * `format`:
+      * `"text"` - Standard readable text format.
       * `"json"` - Structured data blob meant to be easily read by machines or logging pipelines.
+    * `consoleStyle`:
+      * `"pretty"` (Default) - Colorful text suitable for human reading in the console/terminal.
     * `redactSensitive`:
       * `"tools"` (Default) - Automatically blanks out potentially sensitive data passed back and forth between the AI and its tools to protect you.
 * **`skills.sandbox`** & **`skills.signature`**
