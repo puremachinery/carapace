@@ -24,10 +24,13 @@ This section controls how the internal Carapace server connects to the outside w
 * **`gateway.bind`**
   * *What it does:* Determines which networks can access the gateway.
   * *Possible values:*
-    * `"loopback"` (Default) - Only allows connections from this computer.
+    * `"loopback"` (Default) - Only allows connections from this computer (binds to `127.0.0.1` / `localhost`).
     * `"lan"` - Opens access to people on your local network.
-    * `"auto"` - Automatically chooses the most secure reasonable network.
+    * `"auto"` - Currently behaves like `"all"` / `"0.0.0.0"` and listens on all network interfaces. This is convenient for development but less secure than `"loopback"` because it exposes the gateway on every reachable interface.
     * `"tailnet"` - Exposes the gateway over a Tailscale VPN only.
+    * `"all"` / `"0.0.0.0"` - Explicitly listen on all network interfaces (same behavior and security considerations as `"auto"`).
+    * `"localhost"` - Alias for `"loopback"`.
+    * `"ts"` - Alias for `"tailnet"`.
     * Or any specific IP address like `"127.0.0.1"`.
 * **`gateway.auth`**
   * *What it does:* Decides how external programs prove they're allowed to connect.
