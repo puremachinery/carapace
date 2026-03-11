@@ -139,15 +139,15 @@ This block shapes how smart your AI behaves, how large its memory is, and perfor
   * *What it does:* An array of specific agent configurations. You can define multiple distinct "personas" or special-purpose AIs here.
   * *Possible values:* A list of objects containing these keys:
     * `id`: String. A unique name for this agent (e.g., `"coder"`, `"researcher"`).
-    * `default`: Boolean. Set to `true` to make this the primary agent used if no ID is specified.
-    * `model`: String. The exact LLM name used by this agent (e.g., `"claude-3-7-sonnet-20250219"`).
-    * `system`: String. The system prompt or core "identity" instructions for this specific agent.
+    * `default`: Boolean. Set to `true` to make this the primary agent used if no ID is specified. (Default: `false`)
+    * `model`: String. The exact LLM name used by this agent (e.g., `"claude-3-7-sonnet-20250219"`). (Default: Fallback to global default or `"claude-3-7-sonnet-20250219"`)
+    * `system`: String. The system prompt or core "identity" instructions for this specific agent. (Default: Built-in Carapace system prompt)
     * `maxTurns`: Integer. Maximum LLM round-trips allowed per single user request. **When the AI uses a tool (like reading a file or searching the web), it pauses its response, runs the tool, and sends the result back to itself to continue "thinking". That counts as one turn. If the AI gets stuck in a loop or encounters a complex task that requires many tool uses, this limit forcibly stops it after the specified number of turns to prevent runaway infinite loops and excessive API costs.** (Default: `25`).
-    * `maxTokens`: Integer. Maximum output tokens the LLM is permitted to generate in one response.
-    * `temperature`: Decimal. Creativity/randomness scaler (e.g., `0.0` for strict, `1.0` for creative).
-    * `deliver`: Boolean. If `true`, the final message from this agent is pushed directly to the chat channel.
-    * `toolPolicy`: String (`"allowlist"`, `"denylist"`, `"allowall"`) managing which tools this agent can use.
-    * `exfiltrationGuard`: Boolean. If `true`, blocks tools known to be capable of sending data externally (preventing prompt injection data theft).
+    * `maxTokens`: Integer. Maximum output tokens the LLM is permitted to generate in one response. (Default: `8192`)
+    * `temperature`: Decimal. Creativity/randomness scaler (e.g., `0.0` for strict, `1.0` for creative). (Default: `0.0` or model default)
+    * `deliver`: Boolean. If `true`, the final message from this agent is pushed directly to the chat channel. (Default: `true`)
+    * `toolPolicy`: String (`"allowlist"`, `"denylist"`, `"allowall"`) managing which tools this agent can use. (Default: `"allowall"`)
+    * `exfiltrationGuard`: Boolean. If `true`, blocks tools known to be capable of sending data externally (preventing prompt injection data theft). (Default: `false`)
     * `promptGuard` / `outputSanitizer` / `sandbox` / `classifier`: These agent-specific blocks override the global `agents.*` for this entity.
 
 * **`agents.defaults.maxConcurrent`**
