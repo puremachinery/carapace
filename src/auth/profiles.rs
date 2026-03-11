@@ -21,6 +21,7 @@ use crate::config::secrets::{is_encrypted, SecretStore};
 
 /// Maximum number of auth profiles that can be stored.
 const MAX_PROFILES: usize = 20;
+const LAST_USED_WRITE_INTERVAL_MS: u64 = 5 * 60 * 1000;
 
 /// Shared HTTP client for all OAuth2 requests, with a 30-second timeout.
 static OAUTH_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
@@ -105,6 +106,50 @@ pub struct OAuthTokens {
     pub scope: Option<String>,
 }
 
+/// Provider-specific OAuth configuration retained for runtime refresh.
+///
+/// This stores the provider metadata needed to refresh an OAuth-backed runtime
+/// session without relying on the application config as a secret transport.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredOAuthProviderConfig {
+    pub client_id: String,
+    pub client_secret: String,
+    #[serde(default)]
+    pub redirect_uri: String,
+    pub auth_url: String,
+    pub token_url: String,
+    pub userinfo_url: String,
+    pub scopes: Vec<String>,
+}
+
+impl StoredOAuthProviderConfig {
+    pub fn to_provider_config(&self, redirect_uri: String) -> OAuthProviderConfig {
+        OAuthProviderConfig {
+            client_id: self.client_id.clone(),
+            client_secret: self.client_secret.clone(),
+            redirect_uri,
+            auth_url: self.auth_url.clone(),
+            token_url: self.token_url.clone(),
+            userinfo_url: self.userinfo_url.clone(),
+            scopes: self.scopes.clone(),
+        }
+    }
+}
+
+impl From<&OAuthProviderConfig> for StoredOAuthProviderConfig {
+    fn from(value: &OAuthProviderConfig) -> Self {
+        Self {
+            client_id: value.client_id.clone(),
+            client_secret: value.client_secret.clone(),
+            redirect_uri: value.redirect_uri.clone(),
+            auth_url: value.auth_url.clone(),
+            token_url: value.token_url.clone(),
+            userinfo_url: value.userinfo_url.clone(),
+            scopes: value.scopes.clone(),
+        }
+    }
+}
+
 /// A stored auth profile.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthProfile {
@@ -118,6 +163,8 @@ pub struct AuthProfile {
     pub created_at_ms: u64,
     pub last_used_ms: Option<u64>,
     pub tokens: OAuthTokens,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_provider_config: Option<StoredOAuthProviderConfig>,
 }
 
 /// Profile summary (no tokens exposed).
@@ -573,6 +620,20 @@ pub struct ProfileStore {
 }
 
 impl ProfileStore {
+    /// Open the profile store for the given state directory.
+    ///
+    /// If `CARAPACE_CONFIG_PASSWORD` is set, token fields are encrypted at
+    /// rest using the same password-derived keying material used for config
+    /// secret sealing. Otherwise the store falls back to plaintext storage.
+    pub fn from_env(state_dir: PathBuf) -> Result<Self, AuthProfileError> {
+        match std::env::var("CARAPACE_CONFIG_PASSWORD") {
+            Ok(password) if !password.trim().is_empty() => {
+                Self::with_encryption(state_dir, password.as_bytes())
+            }
+            _ => Ok(Self::new(state_dir)),
+        }
+    }
+
     /// Create a new profile store that persists to `{state_dir}/auth_profiles.json`.
     ///
     /// Token fields are stored as plaintext.  Use [`with_encryption`](Self::with_encryption)
@@ -634,6 +695,11 @@ impl ProfileStore {
                 .unwrap_or(&[]);
             for profile in profiles.iter_mut() {
                 Self::decrypt_tokens(&mut profile.tokens, store, password);
+                Self::decrypt_provider_config_secret(
+                    &mut profile.oauth_provider_config,
+                    store,
+                    password,
+                );
             }
         }
 
@@ -666,6 +732,7 @@ impl ProfileStore {
         if let Some(ref store) = self.secret_store {
             for profile in to_save.iter_mut() {
                 Self::encrypt_tokens(&mut profile.tokens, store);
+                Self::encrypt_provider_config_secret(&mut profile.oauth_provider_config, store);
             }
         }
 
@@ -719,6 +786,26 @@ impl ProfileStore {
         }
     }
 
+    fn encrypt_provider_config_secret(
+        provider_config: &mut Option<StoredOAuthProviderConfig>,
+        store: &SecretStore,
+    ) {
+        let Some(provider_config) = provider_config.as_mut() else {
+            return;
+        };
+        if !is_encrypted(&provider_config.client_secret) {
+            match store.encrypt(&provider_config.client_secret) {
+                Ok(encrypted) => provider_config.client_secret = encrypted,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to encrypt oauth provider client_secret for profile: {}",
+                        e
+                    );
+                }
+            }
+        }
+    }
+
     /// Decrypt sensitive token fields in-place.  Plaintext values (no
     /// `enc:v1:` prefix) are left as-is for backward compatibility.
     ///
@@ -743,6 +830,28 @@ impl ProfileStore {
                         tracing::warn!("Failed to decrypt refresh_token for profile: {}; clearing token to prevent opaque downstream errors", e);
                         tokens.refresh_token = Some(String::new());
                     }
+                }
+            }
+        }
+    }
+
+    fn decrypt_provider_config_secret(
+        provider_config: &mut Option<StoredOAuthProviderConfig>,
+        store: &SecretStore,
+        password: &[u8],
+    ) {
+        let Some(provider_config) = provider_config.as_mut() else {
+            return;
+        };
+        if is_encrypted(&provider_config.client_secret) {
+            match store.decrypt_rekey(&provider_config.client_secret, password) {
+                Ok(plaintext) => provider_config.client_secret = plaintext,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to decrypt oauth provider client_secret for profile: {}; clearing secret to prevent opaque downstream errors",
+                        e
+                    );
+                    provider_config.client_secret = String::new();
                 }
             }
         }
@@ -779,6 +888,38 @@ impl ProfileStore {
         guard.iter().find(|p| p.id == id).cloned()
     }
 
+    /// Find a profile by provider + stable user identity.
+    pub fn find_matching(
+        &self,
+        provider: OAuthProvider,
+        user_id: Option<&str>,
+        email: Option<&str>,
+    ) -> Option<AuthProfile> {
+        let guard = self.profiles.read();
+        guard
+            .iter()
+            .find(|profile| {
+                if profile.provider != provider {
+                    return false;
+                }
+
+                if let (Some(existing), Some(target)) = (profile.user_id.as_deref(), user_id) {
+                    if !existing.trim().is_empty() && existing == target {
+                        return true;
+                    }
+                }
+
+                if let (Some(existing), Some(target)) = (profile.email.as_deref(), email) {
+                    if !existing.trim().is_empty() && existing.eq_ignore_ascii_case(target) {
+                        return true;
+                    }
+                }
+
+                false
+            })
+            .cloned()
+    }
+
     /// List all profiles as summaries (no tokens exposed).
     pub fn list(&self) -> Vec<AuthProfileSummary> {
         let guard = self.profiles.read();
@@ -804,12 +945,43 @@ impl ProfileStore {
             .unwrap_or(0);
 
         let mut guard = self.profiles.write();
+        let mut should_persist = false;
         if let Some(profile) = guard.iter_mut().find(|p| p.id == id) {
-            profile.last_used_ms = Some(now_ms);
+            let is_stale = profile
+                .last_used_ms
+                .map(|last_used| now_ms.saturating_sub(last_used) >= LAST_USED_WRITE_INTERVAL_MS)
+                .unwrap_or(true);
+            if is_stale {
+                profile.last_used_ms = Some(now_ms);
+                should_persist = true;
+            }
         }
-        // Best-effort save; ignore errors for a timestamp update
-        let _ = self.save_profiles(&guard);
+        if should_persist {
+            // Best-effort save; ignore errors for a timestamp update
+            let _ = self.save_profiles(&guard);
+        }
     }
+
+    /// Insert or replace a full profile by ID.
+    pub fn upsert(&self, profile: AuthProfile) -> Result<(), AuthProfileError> {
+        let mut guard = self.profiles.write();
+        if let Some(existing) = guard.iter_mut().find(|p| p.id == profile.id) {
+            *existing = profile;
+        } else {
+            if guard.len() >= MAX_PROFILES {
+                return Err(AuthProfileError::MaxProfilesExceeded);
+            }
+            guard.push(profile);
+        }
+        self.save_profiles(&guard)
+    }
+}
+
+pub fn profile_store_encryption_enabled_from_env() -> bool {
+    std::env::var("CARAPACE_CONFIG_PASSWORD")
+        .ok()
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -932,6 +1104,7 @@ mod tests {
             created_at_ms: now_ms,
             last_used_ms: None,
             tokens: sample_tokens(),
+            oauth_provider_config: None,
         }
     }
 
@@ -1301,6 +1474,27 @@ mod tests {
             profile.last_used_ms.is_some(),
             "last_used_ms should be set after update"
         );
+    }
+
+    #[test]
+    fn test_profile_store_update_last_used_skips_recent_timestamp() {
+        let dir = tempdir().unwrap();
+        let store = ProfileStore::new(dir.path().to_path_buf());
+
+        let mut profile = sample_profile("lu-recent");
+        profile.last_used_ms = Some(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        );
+        let expected = profile.last_used_ms;
+        store.add(profile).unwrap();
+
+        store.update_last_used("lu-recent");
+
+        let profile = store.get("lu-recent").unwrap();
+        assert_eq!(profile.last_used_ms, expected);
     }
 
     #[test]

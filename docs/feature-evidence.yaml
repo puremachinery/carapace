@@ -2,7 +2,7 @@
 # Keep this focused on audited entries in docs/feature-status.yaml.
 
 version: "1.0"
-updated_at: "2026-02-24"
+updated_at: "2026-03-10"
 
 features:
   - feature: "logs.tail"
@@ -856,8 +856,8 @@ features:
   - feature: "server.control api"
     status: "verified_done"
     runtime_wiring:
-      - "src/server/control.rs (status/channels/config + task create/list/get/patch/cancel/retry/resume handlers)"
-      - "src/server/http.rs (control routes including /control/tasks*)"
+      - "src/server/control.rs (status/channels/config + task create/list/get/patch/cancel/retry/resume handlers + Gemini onboarding handlers)"
+      - "src/server/http.rs (control routes including /control/tasks* and /control/onboarding/gemini/*)"
       - "src/tasks/mod.rs (durable queue primitives used by control handlers)"
     tests:
       - "src/server/control.rs::test_gateway_status_response_serialization"
@@ -866,6 +866,8 @@ features:
       - "src/server/http.rs::test_control_tasks_resume_not_found_returns_404"
       - "src/server/http.rs::test_control_tasks_patch_updates_payload_and_policy"
       - "src/server/http.rs::test_control_tasks_cancel_and_retry"
+      - "src/server/control.rs::test_control_request_base_url_uses_sanitized_forwarded_headers"
+      - "src/server/control.rs::test_configured_control_redirect_base_url_reads_auth_profiles_config"
 
   - feature: "tasks.durable queue + recovery"
     status: "verified_done"
@@ -1493,6 +1495,8 @@ features:
     status: "verified_done"
     runtime_wiring:
       - "src/cli/mod.rs::handle_setup (provider/auth/bind prompts + first-run outcome wiring for local chat/Discord/Telegram/hooks + optional hooks/control UI config)"
+      - "src/cli/mod.rs::configure_gemini_provider_interactive (Gemini API-key vs Google sign-in onboarding)"
+      - "src/onboarding/gemini.rs (shared Gemini onboarding backend for CLI + Control UI)"
       - "src/cli/mod.rs::validate_provider_credentials_interactive"
       - "src/cli/mod.rs::validate_channel_credentials_interactive"
       - "src/cli/mod.rs::run_setup_post_checks (status/chat smoke action)"
@@ -1500,6 +1504,9 @@ features:
       - "src/cli/mod.rs::test_handle_setup_*"
       - "src/cli/mod.rs::test_parse_setup_outcome_aliases"
       - "src/cli/mod.rs::test_parse_setup_outcome_invalid"
+      - "src/cli/mod.rs::test_handle_setup_interactive_selects_gemini_api_key_mode"
+      - "src/cli/mod.rs::test_handle_setup_noninteractive_gemini_oauth_requires_interactive"
+      - "src/onboarding/gemini.rs::test_persist_cli_google_oauth_stores_profile_and_updates_config"
 
   - feature: "wizard"
     status: "verified_done"
@@ -1892,8 +1899,13 @@ features:
     runtime_wiring:
       - "src/agent/gemini.rs::complete (cancel token + SSE streaming)"
       - "src/agent/gemini.rs::process_gemini_sse_stream (stream parsing)"
+      - "src/agent/gemini.rs::with_oauth_profile (Google OAuth profile runtime auth)"
+      - "src/agent/factory.rs (Gemini API-key vs auth-profile resolution)"
     tests:
       - "src/agent/gemini.rs::test_build_body_with_tools"
+      - "src/agent/gemini.rs::test_oauth_profile_auth_headers_uses_bearer_token"
+      - "src/agent/gemini.rs::test_oauth_profile_auth_headers_refreshes_expiring_token"
+      - "src/agent/factory.rs::test_fingerprint_with_gemini_auth_profile"
 
   - feature: "venice provider"
     status: "verified_done"

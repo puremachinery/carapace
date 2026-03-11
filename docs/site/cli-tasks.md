@@ -17,11 +17,13 @@ Find the right `cara` command by outcome instead of scanning the full CLI refere
 ## Setup and first value
 
 - Initial setup wizard: `cara setup` or `cara setup --provider <provider>`
+- Gemini onboarding modes: `cara setup --provider gemini --auth-mode oauth|api-key`
 - Verify current setup outcome: `cara verify --outcome auto`
 - Start local chat: `cara chat`
 
 Command ladder:
 - Start with `cara setup` or `cara setup --provider <provider>`
+- For Gemini, choose the credential mode explicitly when scripting: `--auth-mode oauth|api-key`
 - Validate with `cara verify --outcome auto`
 - Move to `cara verify --outcome autonomy` for task-runtime proof
 

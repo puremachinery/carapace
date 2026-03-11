@@ -21,7 +21,7 @@ feature_inventory_markdown: |
   - [x] **Anthropic provider** — streaming, tool use, cancellation (`anthropic.rs`)
   - [x] **OpenAI provider** — streaming, tool use, cancellation (`openai.rs`)
   - [x] **Ollama provider** — streaming, tool use, cancellation (`ollama.rs`)
-  - [x] **Gemini provider** — streaming, tool use, cancellation (`gemini.rs`)
+  - [x] **Gemini provider** — streaming, tool use, cancellation, API key or Google auth-profile runtime (`gemini.rs`)
   - [x] **Bedrock provider** — SigV4 signing, tool use, streaming via emitted events (`bedrock.rs`) wired via `factory.rs`
   - [x] **Venice AI provider** — OpenAI-compat wrapper, model prefix stripping (`venice.rs`). Wired in factory.rs, reads VENICE_API_KEY.
   - [x] **Provider auto-discovery** — env vars + config resolution (`factory.rs`)
@@ -43,6 +43,7 @@ feature_inventory_markdown: |
   - [x] **Token auth** — SHA-256 hashed token verification
   - [x] **Password auth** — timing-safe password comparison
   - [x] **Tailscale auth** — whois verification against tailnet ACLs
+  - [x] **OAuth profile store** — encrypted profile persistence, refresh-capable token reuse, provider/user matching (`profiles.rs`)
   - [x] **Localhost bypass** — AuthMode::None allows local-direct requests only
   - [x] **Fail-closed default** — denies by default when no auth configured
   - [x] **Timing-safe comparison** — SHA-256 hash-then-compare (no length leak)
@@ -67,7 +68,7 @@ feature_inventory_markdown: |
   - [x] **backup** — tar.gz archive of state directory
   - [x] **restore** — extract backup with path traversal protection
   - [x] **reset** — clear sessions/cron/usage/memory
-  - [x] **setup** — interactive configuration wizard
+  - [x] **setup** — interactive provider-first configuration wizard, including Gemini API-key or Google sign-in onboarding
   - [x] **pair** — device identity handshake + node pairing initiation (remote gateways supported)
   - [x] **update** — version check and self-update
   - [x] **chat** — interactive local REPL session over WebSocket
@@ -222,7 +223,7 @@ feature_inventory_markdown: |
   - [x] **Rate limiting** — per-IP quotas
   - [x] **Resource monitoring** — CPU/memory tracking
   - [x] **Content Security Policy** — CSP headers
-  - [x] **Control API** — status/channels/config plus task endpoints (`/control/tasks` create/list/get/patch/cancel/retry/resume)
+  - [x] **Control API** — status/channels/config plus task endpoints (`/control/tasks` create/list/get/patch/cancel/retry/resume) and Gemini onboarding endpoints
   - [x] **Graceful shutdown** — 30s drain period
 
   #### WebSocket Handlers

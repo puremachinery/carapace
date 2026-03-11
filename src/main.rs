@@ -18,12 +18,15 @@ mod logging;
 mod media;
 mod messages;
 mod nodes;
+mod onboarding;
+mod paths;
 mod plugins;
 mod runtime_bridge;
 mod server;
 mod sessions;
 mod tailscale;
 mod tasks;
+mod time;
 mod tls;
 mod update;
 mod usage;
@@ -88,7 +91,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             force,
         }) => cli::handle_reset(sessions, cron, usage, memory, all, force),
 
-        Some(Command::Setup { force, provider }) => cli::handle_setup(force, provider),
+        Some(Command::Setup {
+            force,
+            provider,
+            auth_mode,
+        }) => cli::handle_setup(force, provider, auth_mode),
 
         Some(Command::Pair { url, name, trust }) => {
             cli::handle_pair(&url, name.as_deref(), trust).await

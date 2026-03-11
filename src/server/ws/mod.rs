@@ -18,7 +18,7 @@ use std::env;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 use uuid::Uuid;
@@ -3029,10 +3029,7 @@ fn base64url_decode(input: &str) -> Result<Vec<u8>, ()> {
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_else(|_| Duration::from_secs(0))
-        .as_millis() as u64
+    crate::time::unix_now_ms_u64()
 }
 
 fn server_version() -> String {
@@ -3632,10 +3629,5 @@ fn resolve_node_command_allowlist(
 }
 
 pub(crate) fn resolve_state_dir() -> PathBuf {
-    if let Ok(dir) = env::var("CARAPACE_STATE_DIR") {
-        return PathBuf::from(dir);
-    }
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from(".config"))
-        .join("carapace")
+    crate::paths::resolve_state_dir()
 }

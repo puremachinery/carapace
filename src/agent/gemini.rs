@@ -6,18 +6,52 @@
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
+use std::sync::Arc;
+use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::provider::*;
 use crate::agent::AgentError;
+use crate::auth::profiles::{refresh_token, OAuthProviderConfig, ProfileStore};
+
+const TOKEN_REFRESH_MARGIN_MS: u64 = 60_000;
+
+enum GeminiAuth {
+    ApiKey(String),
+    OAuthProfile {
+        profile_store: Arc<ProfileStore>,
+        profile_id: String,
+        provider_config: OAuthProviderConfig,
+        refresh_lock: Arc<Mutex<()>>,
+    },
+}
+
+impl std::fmt::Debug for GeminiAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ApiKey(_) => f.debug_tuple("ApiKey").field(&"<redacted>").finish(),
+            Self::OAuthProfile { profile_id, .. } => f
+                .debug_struct("OAuthProfile")
+                .field("profile_id", profile_id)
+                .finish_non_exhaustive(),
+        }
+    }
+}
 
 /// Google Gemini API provider.
-#[derive(Debug)]
 pub struct GeminiProvider {
     client: reqwest::Client,
-    api_key: String,
+    auth: GeminiAuth,
     base_url: String,
+}
+
+impl std::fmt::Debug for GeminiProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GeminiProvider")
+            .field("auth", &self.auth)
+            .field("base_url", &self.base_url)
+            .finish()
+    }
 }
 
 impl GeminiProvider {
@@ -34,7 +68,34 @@ impl GeminiProvider {
             .map_err(|e| AgentError::Provider(format!("failed to build HTTP client: {e}")))?;
         Ok(Self {
             client,
-            api_key,
+            auth: GeminiAuth::ApiKey(api_key),
+            base_url: "https://generativelanguage.googleapis.com".to_string(),
+        })
+    }
+
+    pub fn with_oauth_profile(
+        profile_store: Arc<ProfileStore>,
+        profile_id: String,
+        provider_config: OAuthProviderConfig,
+    ) -> Result<Self, AgentError> {
+        if profile_id.trim().is_empty() {
+            return Err(AgentError::Provider(
+                "Gemini auth profile ID must not be empty".to_string(),
+            ));
+        }
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(300))
+            .build()
+            .map_err(|e| AgentError::Provider(format!("failed to build HTTP client: {e}")))?;
+        Ok(Self {
+            client,
+            auth: GeminiAuth::OAuthProfile {
+                profile_store,
+                profile_id,
+                provider_config,
+                refresh_lock: Arc::new(Mutex::new(())),
+            },
             base_url: "https://generativelanguage.googleapis.com".to_string(),
         })
     }
@@ -148,6 +209,85 @@ impl GeminiProvider {
 
         body
     }
+
+    async fn auth_headers(&self) -> Result<Vec<(&'static str, String)>, AgentError> {
+        match &self.auth {
+            GeminiAuth::ApiKey(api_key) => Ok(vec![("x-goog-api-key", api_key.clone())]),
+            GeminiAuth::OAuthProfile {
+                profile_store,
+                profile_id,
+                provider_config,
+                refresh_lock,
+            } => {
+                let mut profile = profile_store.get(profile_id).ok_or_else(|| {
+                    AgentError::Provider(format!(
+                        "configured Gemini auth profile \"{profile_id}\" was not found"
+                    ))
+                })?;
+                let now_ms = current_time_ms();
+                if profile
+                    .tokens
+                    .expires_at_ms
+                    .is_some_and(|expires_at| expires_at <= now_ms + TOKEN_REFRESH_MARGIN_MS)
+                {
+                    let _refresh_guard = refresh_lock.lock().await;
+                    let refreshed_profile = profile_store.get(profile_id).ok_or_else(|| {
+                        AgentError::Provider(format!(
+                            "configured Gemini auth profile \"{profile_id}\" was not found"
+                        ))
+                    })?;
+                    let now_ms_after_lock = current_time_ms();
+                    if refreshed_profile
+                        .tokens
+                        .expires_at_ms
+                        .is_none_or(|expires_at| {
+                            expires_at > now_ms_after_lock + TOKEN_REFRESH_MARGIN_MS
+                        })
+                    {
+                        profile = refreshed_profile;
+                    } else {
+                        let refresh_token_value = refreshed_profile
+                            .tokens
+                            .refresh_token
+                            .clone()
+                            .filter(|token| !token.trim().is_empty())
+                            .ok_or_else(|| {
+                                AgentError::Provider(format!(
+                                    "Gemini auth profile \"{profile_id}\" is expired and cannot be refreshed"
+                                ))
+                            })?;
+                        let refreshed = refresh_token(provider_config, &refresh_token_value)
+                            .await
+                            .map_err(|err| {
+                                AgentError::Provider(format!(
+                                    "failed to refresh Gemini auth profile \"{profile_id}\": {err}"
+                                ))
+                            })?;
+                        profile_store
+                            .update_tokens(profile_id, refreshed.clone())
+                            .map_err(|err| {
+                                AgentError::Provider(format!(
+                                    "failed to persist refreshed Gemini auth profile \"{profile_id}\": {err}"
+                                ))
+                            })?;
+                        profile = refreshed_profile;
+                        profile.tokens = refreshed;
+                    }
+                }
+
+                if profile.tokens.access_token.trim().is_empty() {
+                    return Err(AgentError::Provider(format!(
+                        "Gemini auth profile \"{profile_id}\" has no usable access token"
+                    )));
+                }
+                profile_store.update_last_used(profile_id);
+                Ok(vec![(
+                    "authorization",
+                    format!("Bearer {}", profile.tokens.access_token),
+                )])
+            }
+        }
+    }
 }
 
 /// Find the tool name that corresponds to a ToolResult block by searching
@@ -194,16 +334,23 @@ impl LlmProvider for GeminiProvider {
             _ = cancel_token.cancelled() => {
                 return Err(AgentError::Cancelled);
             }
-            response = self
-                .client
-                .post(&url)
-                .header("x-goog-api-key", &self.api_key)
-                .header("content-type", "application/json")
-                .header("accept", "text/event-stream")
-                .json(&body)
-                .send() => {
-                    response.map_err(|e| AgentError::Provider(format!("HTTP request failed: {e}")))?
+            response = async {
+                let mut request = self
+                    .client
+                    .post(&url)
+                    .header("content-type", "application/json")
+                    .header("accept", "text/event-stream");
+                for (name, value) in self.auth_headers().await? {
+                    request = request.header(name, value);
                 }
+                request
+                    .json(&body)
+                    .send()
+                    .await
+                    .map_err(|e| AgentError::Provider(format!("HTTP request failed: {e}")))
+            } => {
+                response?
+            }
         };
 
         if !response.status().is_success() {
@@ -213,7 +360,8 @@ impl LlmProvider for GeminiProvider {
                 .await
                 .unwrap_or_else(|_| "<unreadable>".to_string());
             return Err(AgentError::Provider(format!(
-                "API returned {status}: {body}"
+                "API returned {status}: {}",
+                summarize_http_failure_body(&body)
             )));
         }
 
@@ -234,6 +382,10 @@ impl LlmProvider for GeminiProvider {
 
         Ok(rx)
     }
+}
+
+fn current_time_ms() -> u64 {
+    crate::time::unix_now_ms_u64()
 }
 
 /// Maximum SSE line buffer size (1 MB). If a single SSE line exceeds this,
@@ -498,6 +650,9 @@ pub fn strip_gemini_prefix(model: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::profiles::{AuthProfile, OAuthProvider, OAuthTokens, ProfileStore};
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     // ==================== Provider construction tests ====================
 
@@ -522,6 +677,128 @@ mod tests {
     fn test_new_accepts_valid_api_key() {
         let result = GeminiProvider::new("AIzaSyA-valid-key-1234567890".to_string());
         assert!(result.is_ok(), "expected valid API key to pass");
+    }
+
+    #[tokio::test]
+    async fn test_with_oauth_profile_uses_stored_access_token() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ProfileStore::new(temp.path().to_path_buf());
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        store
+            .add(AuthProfile {
+                id: "google-test".to_string(),
+                name: "Gemini (Example User)".to_string(),
+                provider: OAuthProvider::Google,
+                user_id: Some("user-123".to_string()),
+                email: Some("user@example.com".to_string()),
+                display_name: Some("Example User".to_string()),
+                avatar_url: None,
+                created_at_ms: now_ms,
+                last_used_ms: None,
+                tokens: OAuthTokens {
+                    access_token: "access-token-123".to_string(),
+                    refresh_token: None,
+                    token_type: "Bearer".to_string(),
+                    expires_at_ms: Some(now_ms + 3_600_000),
+                    scope: Some("openid email profile".to_string()),
+                },
+                oauth_provider_config: None,
+            })
+            .expect("store profile");
+
+        let provider = GeminiProvider::with_oauth_profile(
+            Arc::new(store),
+            "google-test".to_string(),
+            OAuthProvider::Google.default_config(
+                "client-id",
+                "client-secret",
+                "http://127.0.0.1:3000/auth/callback",
+            ),
+        )
+        .expect("oauth-backed provider");
+
+        let headers = provider.auth_headers().await.expect("auth headers");
+        assert_eq!(
+            headers,
+            vec![("authorization", "Bearer access-token-123".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_with_oauth_profile_errors_when_profile_missing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ProfileStore::new(temp.path().to_path_buf());
+        let provider = GeminiProvider::with_oauth_profile(
+            Arc::new(store),
+            "missing-profile".to_string(),
+            OAuthProvider::Google.default_config(
+                "client-id",
+                "client-secret",
+                "http://127.0.0.1:3000/auth/callback",
+            ),
+        )
+        .expect("oauth-backed provider");
+
+        let err = provider
+            .auth_headers()
+            .await
+            .expect_err("missing profile should fail");
+        assert!(err
+            .to_string()
+            .contains("configured Gemini auth profile \"missing-profile\" was not found"));
+    }
+
+    #[tokio::test]
+    async fn test_with_oauth_profile_errors_when_access_token_empty() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ProfileStore::new(temp.path().to_path_buf());
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        store
+            .add(AuthProfile {
+                id: "google-empty-token".to_string(),
+                name: "Gemini (Empty Token)".to_string(),
+                provider: OAuthProvider::Google,
+                user_id: Some("user-123".to_string()),
+                email: Some("user@example.com".to_string()),
+                display_name: Some("Example User".to_string()),
+                avatar_url: None,
+                created_at_ms: now_ms,
+                last_used_ms: None,
+                tokens: OAuthTokens {
+                    access_token: "   ".to_string(),
+                    refresh_token: None,
+                    token_type: "Bearer".to_string(),
+                    expires_at_ms: Some(now_ms + 3_600_000),
+                    scope: Some("openid email profile".to_string()),
+                },
+                oauth_provider_config: None,
+            })
+            .expect("store profile");
+
+        let provider = GeminiProvider::with_oauth_profile(
+            Arc::new(store),
+            "google-empty-token".to_string(),
+            OAuthProvider::Google.default_config(
+                "client-id",
+                "client-secret",
+                "http://127.0.0.1:3000/auth/callback",
+            ),
+        )
+        .expect("oauth-backed provider");
+
+        let err = provider
+            .auth_headers()
+            .await
+            .expect_err("empty access token should fail");
+        assert!(err
+            .to_string()
+            .contains("Gemini auth profile \"google-empty-token\" has no usable access token"));
     }
 
     #[test]

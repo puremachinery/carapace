@@ -9,7 +9,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::LazyLock;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 use super::super::*;
@@ -499,10 +498,7 @@ fn create_wizard_steps(wizard_type: &str) -> Vec<WizardStep> {
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::from_secs(0))
-        .as_millis() as u64
+    crate::time::unix_now_ms_u64()
 }
 
 fn set_value_at_path(root: &mut Value, path: &str, value: Value) {

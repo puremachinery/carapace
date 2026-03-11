@@ -144,6 +144,10 @@ pub enum Command {
         /// Provider to configure for first run.
         #[arg(long, value_enum)]
         provider: Option<SetupProvider>,
+
+        /// Gemini auth mode (required for non-interactive Gemini setup).
+        #[arg(long, value_enum)]
+        auth_mode: Option<GeminiSetupAuthMode>,
     },
 
     /// Pair with a remote gateway node.
@@ -449,7 +453,7 @@ use std::collections::HashSet;
 #[cfg(not(test))]
 use std::io::IsTerminal;
 use std::sync::{LazyLock, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio_tungstenite::{
     connect_async, connect_async_tls_with_config, tungstenite::Message, Connector,
 };
@@ -467,6 +471,7 @@ const SECRET_KEYS: &[&str] = &[
     "password",
     "credentials",
     "client_secret",
+    "clientsecret",
     "refresh_token",
     "access_token",
 ];
@@ -1550,10 +1555,7 @@ fn derive_device_id(public_key: &[u8]) -> String {
 }
 
 fn current_time_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
+    crate::time::unix_now_ms_i64()
 }
 
 fn ws_url_from_http(url: &Url) -> Result<String, Box<dyn std::error::Error>> {
@@ -1918,16 +1920,8 @@ pub fn handle_version() {
 use std::io::Read as IoRead;
 use std::path::{Component, Path, PathBuf};
 
-/// Resolve the state directory (same logic as `server::ws::resolve_state_dir`
-/// but duplicated here to avoid pulling in the full server module for CLI-only
-/// commands).
 pub(crate) fn resolve_state_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("CARAPACE_STATE_DIR") {
-        return PathBuf::from(dir);
-    }
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from(".config"))
-        .join("carapace")
+    crate::paths::resolve_state_dir()
 }
 
 /// Resolve the memory store directory.
@@ -2487,6 +2481,14 @@ impl SetupProvider {
     fn parse_prompt(raw: &str) -> Option<Self> {
         <Self as clap::ValueEnum>::from_str(raw.trim(), true).ok()
     }
+}
+
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeminiSetupAuthMode {
+    #[value(name = "oauth")]
+    OAuth,
+    #[value(name = "api-key")]
+    ApiKey,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4351,6 +4353,29 @@ fn prompt_setup_provider_interactive(
     }
 }
 
+fn prompt_gemini_setup_auth_mode(
+    requested_mode: Option<GeminiSetupAuthMode>,
+) -> Result<GeminiSetupAuthMode, Box<dyn std::error::Error>> {
+    if let Some(mode) = requested_mode {
+        return Ok(mode);
+    }
+
+    loop {
+        let selection = prompt_choice(
+            "How should Gemini authenticate? (oauth/api-key)",
+            "oauth",
+            &["oauth", "api-key"],
+        )?;
+        match selection.as_str() {
+            "oauth" => return Ok(GeminiSetupAuthMode::OAuth),
+            "api-key" => return Ok(GeminiSetupAuthMode::ApiKey),
+            _ => {
+                eprintln!("Please choose either `oauth` or `api-key`.");
+            }
+        }
+    }
+}
+
 fn print_missing_setup_value_notice(env_var: &str, label: &str) {
     println!(
         "No {label} provided. Set ${env_var} in the same shell you use for `cara start` and `cara verify`, or rerun `cara setup --force` later."
@@ -4486,6 +4511,116 @@ fn render_setup_validation_failure(err: &crate::agent::AgentError) -> String {
     }
 }
 
+fn prompt_google_oauth_client_value(
+    env_var: &'static str,
+    label: &str,
+    hide_sensitive_input: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if let Some((env_name, env_value)) = first_present_env_var(&[env_var]) {
+        if prompt_yes_no(&format!("Use {label} from ${env_name}?"), true)? {
+            return Ok(env_value);
+        }
+    }
+
+    loop {
+        let entered = if hide_sensitive_input {
+            prompt_sensitive_line(label, true, false)?
+        } else {
+            prompt_line(&format!("Enter {label}: "))?
+        };
+        if !entered.trim().is_empty() {
+            return Ok(entered.trim().to_string());
+        }
+        eprintln!("{label} is required for Google sign-in.");
+    }
+}
+
+fn configure_gemini_provider_interactive(
+    config: &mut Value,
+    hide_sensitive_input: bool,
+    requested_auth_mode: Option<GeminiSetupAuthMode>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let auth_mode = prompt_gemini_setup_auth_mode(requested_auth_mode)?;
+    let base_url = prompt_optional_base_url_override(
+        "Gemini",
+        "GOOGLE_API_BASE_URL",
+        "https://generativelanguage.googleapis.com",
+    )?;
+
+    match auth_mode {
+        GeminiSetupAuthMode::ApiKey => {
+            let api_key = prompt_required_secret_config_value(
+                "GOOGLE_API_KEY",
+                "Gemini API key",
+                hide_sensitive_input,
+            )?;
+            if api_key.effective_value.is_none() {
+                print_missing_setup_value_notice("GOOGLE_API_KEY", "Gemini API key");
+            }
+
+            if let Some(key) = api_key.effective_value.clone() {
+                let validation = crate::onboarding::gemini::validate_gemini_api_key_input(
+                    &key,
+                    base_url
+                        .as_ref()
+                        .and_then(|value| value.effective_value.as_deref()),
+                );
+                if let Err(err) = validation {
+                    handle_setup_validation_failure(err)?;
+                }
+            }
+
+            crate::onboarding::gemini::write_gemini_api_key_config(
+                config,
+                &api_key.config_value,
+                base_url.as_ref().map(|value| value.config_value.as_str()),
+            );
+        }
+        GeminiSetupAuthMode::OAuth => {
+            let client_id = prompt_google_oauth_client_value(
+                "GOOGLE_OAUTH_CLIENT_ID",
+                "Google OAuth client ID",
+                false,
+            )?;
+            let client_secret = prompt_google_oauth_client_value(
+                "GOOGLE_OAUTH_CLIENT_SECRET",
+                "Google OAuth client secret",
+                hide_sensitive_input,
+            )?;
+
+            if let Some(url) = base_url
+                .as_ref()
+                .and_then(|value| value.effective_value.as_deref())
+            {
+                if let Err(err) =
+                    crate::onboarding::gemini::validate_gemini_base_url_input(Some(url))
+                {
+                    handle_setup_validation_failure(err)?;
+                }
+            }
+
+            let config_snapshot = config.clone();
+            let completion =
+                run_sync_blocking_send(crate::onboarding::gemini::run_cli_google_oauth(
+                    config_snapshot,
+                    Some(client_id.clone()),
+                    Some(client_secret.clone()),
+                ))
+                .map_err(|err| format!("Gemini Google sign-in runtime failed: {err}"))?;
+
+            let state_dir = resolve_state_dir();
+            std::fs::create_dir_all(&state_dir)?;
+            crate::onboarding::gemini::persist_cli_google_oauth(state_dir, config, completion)?;
+
+            if let Some(base_url) = base_url {
+                config["google"]["baseUrl"] = serde_json::json!(base_url.config_value);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn handle_setup_validation_failure(
     err: crate::agent::AgentError,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -4501,7 +4636,11 @@ fn configure_provider_interactive(
     config: &mut Value,
     provider: SetupProvider,
     hide_sensitive_input: bool,
+    requested_auth_mode: Option<GeminiSetupAuthMode>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if provider != SetupProvider::Gemini && requested_auth_mode.is_some() {
+        return Err("`--auth-mode` is currently only valid with `--provider gemini`.".into());
+    }
     config["agents"]["defaults"]["model"] = serde_json::json!(provider.default_model());
 
     match provider {
@@ -4589,49 +4728,11 @@ fn configure_provider_interactive(
             });
         }
         SetupProvider::Gemini => {
-            let api_key = prompt_required_secret_config_value(
-                "GOOGLE_API_KEY",
-                "Gemini API key",
+            configure_gemini_provider_interactive(
+                config,
                 hide_sensitive_input,
+                requested_auth_mode,
             )?;
-            if api_key.effective_value.is_none() {
-                print_missing_setup_value_notice("GOOGLE_API_KEY", "Gemini API key");
-            }
-            let base_url = prompt_optional_base_url_override(
-                "Gemini",
-                "GOOGLE_API_BASE_URL",
-                "https://generativelanguage.googleapis.com",
-            )?;
-
-            if let Some(key) = api_key.effective_value.clone() {
-                let validation =
-                    crate::agent::gemini::GeminiProvider::new(key).and_then(|provider| {
-                        if let Some(base_url) = base_url
-                            .as_ref()
-                            .and_then(|value| value.effective_value.clone())
-                        {
-                            provider.with_base_url(base_url)
-                        } else {
-                            Ok(provider)
-                        }
-                    });
-                if let Err(err) = validation {
-                    handle_setup_validation_failure(err)?;
-                }
-            }
-
-            let mut google_config = serde_json::Map::new();
-            google_config.insert(
-                "apiKey".to_string(),
-                serde_json::json!(api_key.config_value),
-            );
-            if let Some(base_url) = base_url {
-                google_config.insert(
-                    "baseUrl".to_string(),
-                    serde_json::json!(base_url.config_value),
-                );
-            }
-            config["google"] = Value::Object(google_config);
         }
         SetupProvider::Venice => {
             let api_key = prompt_required_secret_config_value(
@@ -4768,7 +4869,14 @@ fn configure_provider_interactive(
     Ok(())
 }
 
-fn configure_provider_noninteractive(config: &mut Value, provider: SetupProvider) {
+fn configure_provider_noninteractive(
+    config: &mut Value,
+    provider: SetupProvider,
+    requested_auth_mode: Option<GeminiSetupAuthMode>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if provider != SetupProvider::Gemini && requested_auth_mode.is_some() {
+        return Err("`--auth-mode` is currently only valid with `--provider gemini`.".into());
+    }
     config["agents"]["defaults"]["model"] = serde_json::json!(provider.default_model());
 
     match provider {
@@ -4795,15 +4903,28 @@ fn configure_provider_noninteractive(config: &mut Value, provider: SetupProvider
                 "ollama": ollama_config
             });
         }
-        SetupProvider::Gemini => {
-            config["google"] = serde_json::json!({
-                "apiKey": env_placeholder("GOOGLE_API_KEY")
-            });
-            if env_var_present("GOOGLE_API_BASE_URL") {
-                config["google"]["baseUrl"] =
-                    serde_json::json!(env_placeholder("GOOGLE_API_BASE_URL"));
+        SetupProvider::Gemini => match requested_auth_mode {
+            Some(GeminiSetupAuthMode::ApiKey) => {
+                crate::onboarding::gemini::write_gemini_api_key_config(
+                    config,
+                    &env_placeholder("GOOGLE_API_KEY"),
+                    env_var_present("GOOGLE_API_BASE_URL")
+                        .then(|| env_placeholder("GOOGLE_API_BASE_URL"))
+                        .as_deref(),
+                );
             }
-        }
+            Some(GeminiSetupAuthMode::OAuth) => {
+                return Err(
+                        "non-interactive Gemini Google sign-in is not supported; rerun interactively or use `--auth-mode api-key`."
+                            .into(),
+                    );
+            }
+            None => {
+                return Err(
+                    "non-interactive Gemini setup requires `--auth-mode oauth|api-key`.".into(),
+                );
+            }
+        },
         SetupProvider::Venice => {
             config["venice"] = serde_json::json!({
                 "apiKey": env_placeholder("VENICE_API_KEY")
@@ -4831,12 +4952,14 @@ fn configure_provider_noninteractive(config: &mut Value, provider: SetupProvider
             }
         }
     }
+    Ok(())
 }
 
 /// Run the `setup` subcommand -- interactive first-run wizard.
 pub fn handle_setup(
     force: bool,
     requested_provider: Option<SetupProvider>,
+    requested_auth_mode: Option<GeminiSetupAuthMode>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config_path = config::get_config_path();
 
@@ -4890,7 +5013,12 @@ pub fn handle_setup(
 
         let hide_sensitive_input = prompt_yes_no("Hide sensitive input while typing?", true)?;
         let provider = prompt_setup_provider_interactive(requested_provider)?;
-        configure_provider_interactive(&mut config, provider, hide_sensitive_input)?;
+        configure_provider_interactive(
+            &mut config,
+            provider,
+            hide_sensitive_input,
+            requested_auth_mode,
+        )?;
 
         let auth_mode = prompt_choice(
             "Gateway auth mode (token/password)",
@@ -5005,7 +5133,7 @@ pub fn handle_setup(
             });
         }
     } else if let Some(provider) = requested_provider {
-        configure_provider_noninteractive(&mut config, provider);
+        configure_provider_noninteractive(&mut config, provider, requested_auth_mode)?;
     } else {
         return Err(
             "non-interactive setup requires `--provider <provider>`; rerun with an explicit provider."
@@ -7447,6 +7575,7 @@ mod tests {
             Some(Command::Setup {
                 force,
                 provider: None,
+                auth_mode: None,
             }) => {
                 assert!(!force);
             }
@@ -7461,6 +7590,7 @@ mod tests {
             Some(Command::Setup {
                 force,
                 provider: None,
+                auth_mode: None,
             }) => {
                 assert!(force);
             }
@@ -7475,6 +7605,7 @@ mod tests {
             Some(Command::Setup {
                 force,
                 provider: Some(SetupProvider::Ollama),
+                auth_mode: None,
             }) => {
                 assert!(!force);
             }
@@ -7489,6 +7620,7 @@ mod tests {
             Some(Command::Setup {
                 force,
                 provider: Some(SetupProvider::Anthropic),
+                auth_mode: None,
             }) => {
                 assert!(!force);
             }
@@ -7500,10 +7632,37 @@ mod tests {
             Some(Command::Setup {
                 force,
                 provider: Some(SetupProvider::OpenAi),
+                auth_mode: None,
             }) => {
                 assert!(!force);
             }
             other => panic!("Expected Setup with openai alias, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_setup_with_gemini_auth_mode() {
+        let cli = Cli::try_parse_from([
+            "cara",
+            "setup",
+            "--provider",
+            "gemini",
+            "--auth-mode",
+            "oauth",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Setup {
+                force,
+                provider: Some(SetupProvider::Gemini),
+                auth_mode: Some(GeminiSetupAuthMode::OAuth),
+            }) => {
+                assert!(!force);
+            }
+            other => panic!(
+                "Expected Setup with Gemini OAuth auth mode, got {:?}",
+                other
+            ),
         }
     }
 
@@ -7515,7 +7674,7 @@ mod tests {
         std::fs::write(&config_path, "{}").unwrap();
 
         let _env_guard = set_env_var_scoped("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
-        let result = handle_setup(false, None);
+        let result = handle_setup(false, None, None);
 
         assert!(
             result.is_err(),
@@ -7531,7 +7690,7 @@ mod tests {
         std::fs::write(&config_path, "{}").unwrap();
 
         let _env_guard = set_env_var_scoped("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
-        let result = handle_setup(true, Some(SetupProvider::Anthropic));
+        let result = handle_setup(true, Some(SetupProvider::Anthropic), None);
 
         assert!(
             result.is_ok(),
@@ -7547,7 +7706,7 @@ mod tests {
         let config_path = temp.path().join("carapace.json");
 
         let _env_guard = set_env_var_scoped("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
-        let result = handle_setup(false, None);
+        let result = handle_setup(false, None, None);
 
         assert!(result.is_err(), "Setup should require --provider");
         assert!(
@@ -7570,7 +7729,7 @@ mod tests {
         let config_path = temp.path().join("carapace.json");
 
         let _env_guard = set_env_var_scoped("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
-        let result = handle_setup(false, Some(SetupProvider::Anthropic));
+        let result = handle_setup(false, Some(SetupProvider::Anthropic), None);
 
         assert!(result.is_ok());
 
@@ -7610,7 +7769,33 @@ mod tests {
         let config_path = temp.path().join("carapace.json");
         let _env_guard = set_env_var_scoped("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
 
-        let result = handle_setup(false, Some(SetupProvider::Gemini));
+        let result = handle_setup(false, Some(SetupProvider::Gemini), None);
+        assert!(result.is_err(), "Gemini should require explicit auth mode");
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("non-interactive Gemini setup requires `--auth-mode oauth|api-key`"),
+            "unexpected Gemini auth-mode error"
+        );
+        assert!(
+            !config_path.exists(),
+            "Gemini setup without auth mode should not write config"
+        );
+    }
+
+    #[test]
+    fn test_handle_setup_noninteractive_gemini_api_key_mode_writes_config() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_path = temp.path().join("carapace.json");
+        let _env_guard = set_env_var_scoped("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
+
+        let result = handle_setup(
+            false,
+            Some(SetupProvider::Gemini),
+            Some(GeminiSetupAuthMode::ApiKey),
+        );
         assert!(
             result.is_ok(),
             "non-interactive provider setup should succeed"
@@ -7623,6 +7808,31 @@ mod tests {
     }
 
     #[test]
+    fn test_handle_setup_noninteractive_gemini_oauth_mode_errors() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_path = temp.path().join("carapace.json");
+        let _env_guard = set_env_var_scoped("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
+
+        let result = handle_setup(
+            false,
+            Some(SetupProvider::Gemini),
+            Some(GeminiSetupAuthMode::OAuth),
+        );
+        assert!(result.is_err(), "non-interactive Gemini OAuth should fail");
+        assert!(
+            result.unwrap_err().to_string().contains(
+                "non-interactive Gemini Google sign-in is not supported; rerun interactively or use `--auth-mode api-key`."
+            ),
+            "unexpected Gemini OAuth non-interactive error"
+        );
+        assert!(
+            !config_path.exists(),
+            "non-interactive Gemini OAuth should not write config"
+        );
+    }
+
+    #[test]
     fn test_handle_setup_noninteractive_provider_flag_writes_ollama_api_key_placeholder() {
         let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
         let temp = tempfile::TempDir::new().unwrap();
@@ -7632,7 +7842,7 @@ mod tests {
         let _base_url_guard = set_env_var_scoped("OLLAMA_BASE_URL", "http://127.0.0.1:11434");
         let _api_key_guard = set_env_var_scoped("OLLAMA_API_KEY", "ollama-token");
 
-        let result = handle_setup(false, Some(SetupProvider::Ollama));
+        let result = handle_setup(false, Some(SetupProvider::Ollama), None);
         assert!(
             result.is_ok(),
             "non-interactive provider setup should succeed"
@@ -7651,7 +7861,7 @@ mod tests {
         let config_path = temp.path().join("carapace.json");
         let _env_guard = set_env_var_scoped("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
 
-        let result = handle_setup(false, Some(SetupProvider::Venice));
+        let result = handle_setup(false, Some(SetupProvider::Venice), None);
         assert!(
             result.is_ok(),
             "non-interactive provider setup should succeed"
@@ -7675,7 +7885,7 @@ mod tests {
         let _region_guard = unset_env_var_scoped("AWS_REGION");
         let _default_region_guard = unset_env_var_scoped("AWS_DEFAULT_REGION");
 
-        let result = handle_setup(false, Some(SetupProvider::Bedrock));
+        let result = handle_setup(false, Some(SetupProvider::Bedrock), None);
         assert!(
             result.is_ok(),
             "non-interactive provider setup should succeed"
@@ -7733,7 +7943,7 @@ mod tests {
         });
         let _ollama_guard = set_env_var_scoped("OLLAMA_BASE_URL", "http://127.0.0.1:11434");
 
-        let result = handle_setup(true, None);
+        let result = handle_setup(true, None, None);
         assert!(result.is_ok(), "interactive Ollama setup should succeed");
 
         let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
@@ -7776,7 +7986,7 @@ mod tests {
             ..Default::default()
         });
 
-        let result = handle_setup(true, None);
+        let result = handle_setup(true, None, None);
         assert!(result.is_ok(), "interactive setup should succeed");
 
         let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
@@ -7823,7 +8033,7 @@ mod tests {
             ..Default::default()
         });
 
-        let result = handle_setup(true, None);
+        let result = handle_setup(true, None, None);
         assert!(result.is_ok(), "interactive setup should succeed");
 
         let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
@@ -7865,7 +8075,7 @@ mod tests {
             ..Default::default()
         });
 
-        let result = handle_setup(true, None);
+        let result = handle_setup(true, None, None);
         assert!(
             result.is_err(),
             "setup should abort after validation failure"
@@ -7915,7 +8125,7 @@ mod tests {
             ..Default::default()
         });
 
-        let result = handle_setup(true, None);
+        let result = handle_setup(true, None, None);
         assert!(result.is_ok(), "interactive setup should succeed");
 
         let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
@@ -7960,7 +8170,7 @@ mod tests {
             ..Default::default()
         });
 
-        let result = handle_setup(true, None);
+        let result = handle_setup(true, None, None);
         assert!(
             result.is_err(),
             "setup should abort after validation failure"

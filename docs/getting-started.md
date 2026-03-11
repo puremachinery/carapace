@@ -21,6 +21,9 @@ If you want the website flow instead of Markdown docs, start at
 - A `cara` binary on your PATH
 - A supported LLM provider API key (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
   `GOOGLE_API_KEY`, or `VENICE_API_KEY`), or local Ollama
+- For Gemini Google sign-in: `GOOGLE_OAUTH_CLIENT_ID` and `GOOGLE_OAUTH_CLIENT_SECRET`
+  available in the shell running `cara setup`, or supplied through the Control UI onboarding form
+- For Gemini Google sign-in: `CARAPACE_CONFIG_PASSWORD`
 - Optional: TLS certs if exposing Carapace publicly
 
 Install options:
@@ -53,8 +56,14 @@ Or skip the provider menu explicitly by choosing one provider:
 ```bash
 # Choose ONE of these commands:
 cara setup --provider ollama
-cara setup --provider gemini
+cara setup --provider gemini --auth-mode api-key
+cara setup --provider gemini --auth-mode oauth
 ```
+
+`--auth-mode oauth` is interactive-only in the CLI. It launches a Google
+sign-in flow and completes through a loopback callback on a local port. The Control UI exposes
+the same Gemini onboarding choices if you prefer to do it in the browser.
+Gemini Google sign-in requires `CARAPACE_CONFIG_PASSWORD`.
 
 Then start Carapace:
 
@@ -204,7 +213,8 @@ cara update
 
 - **401 Unauthorized**: check auth token or hooks token.
 - **403 Forbidden**: CSRF or Origin failure for Control UI endpoints.
-- **LLM requests fail**: verify provider key and model name.
+- **LLM requests fail**: verify the selected provider credentials (API key or
+  auth profile) and model name.
 - **No replies**: ensure an LLM provider is configured; check `/health/ready`.
 
 If unsure, start with `RUST_LOG=debug` and inspect logs.

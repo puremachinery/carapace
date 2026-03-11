@@ -11,7 +11,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::sync::watch;
 use tracing::warn;
 use uuid::Uuid;
@@ -26,10 +26,7 @@ pub const DEFAULT_TASK_MAX_TURNS: u32 = 25;
 pub const DEFAULT_TASK_MAX_RUN_TIMEOUT_SECONDS: u32 = 600;
 
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+    crate::time::unix_now_ms_u64()
 }
 
 fn is_false(value: &bool) -> bool {

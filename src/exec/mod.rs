@@ -8,7 +8,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
@@ -260,10 +260,7 @@ pub fn create_manager() -> Arc<ExecApprovalManager> {
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_else(|_| Duration::from_secs(0))
-        .as_millis() as u64
+    crate::time::unix_now_ms_u64()
 }
 
 #[cfg(test)]

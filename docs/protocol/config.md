@@ -121,7 +121,7 @@ All keys are optional. Unknown keys are rejected (strict schema).
 - `gateway` – service settings
 - `skills` – skills registry settings
 - `plugins` – plugin load/allowlist/config
-- `google` – Google Gemini provider settings (apiKey, baseUrl)
+- `google` – Google Gemini provider settings (`apiKey`, `authProfile`, `baseUrl`)
 - `providers` – provider-specific settings such as `providers.ollama`
 - `bedrock` – AWS Bedrock provider settings (region, accessKeyId, secretAccessKey, sessionToken)
 - `venice` – Venice AI provider settings (apiKey, baseUrl)
@@ -152,7 +152,7 @@ This is a condensed map; refer to the JSON schema for full detail.
 - `auth`
   - `profiles`, `order`, `cooldowns`
 - `google`
-  - `apiKey`, `baseUrl`
+  - `apiKey`, `authProfile`, `baseUrl`
 - `providers.ollama`
   - `baseUrl`, `apiKey`
 - `bedrock`
@@ -176,6 +176,70 @@ This is a condensed map; refer to the JSON schema for full detail.
   - `gatewayUrl` (override Discord Gateway URL)
 - `slack`
   - `signingSecret` (validates Events API signatures)
+
+### Gemini credential modes
+
+Gemini can authenticate in either of these ways:
+
+- `google.apiKey` or `GOOGLE_API_KEY`
+- `google.authProfile` pointing at a stored Google OAuth profile under `auth.profiles`
+
+If both are present, runtime prefers the API key path.
+
+Example API-key config:
+
+```json5
+{
+  "google": {
+    "apiKey": "${GOOGLE_API_KEY}"
+  }
+}
+```
+
+Example auth-profile config:
+
+```json5
+{
+  "auth": {
+    "profiles": {
+      "enabled": true,
+      "providers": {
+        "google": {
+          "clientId": "${GOOGLE_OAUTH_CLIENT_ID}"
+        }
+      }
+    }
+  },
+  "google": {
+    "authProfile": "google-abc123"
+  }
+}
+```
+
+`cara setup --provider gemini` can now create either shape.
+Gemini Google sign-in also requires `CARAPACE_CONFIG_PASSWORD` because the
+stored auth profile contains refreshable credentials and the OAuth client secret.
+
+### `auth.profiles`
+
+`auth.profiles` stores OAuth onboarding configuration and redirect settings used
+to create stored auth profiles.
+
+Relevant subkeys:
+
+- `auth.profiles.enabled`
+- `auth.profiles.redirectBaseUrl`
+- `auth.profiles.providers.google.clientId`
+- `auth.profiles.providers.google.redirectUri`
+
+For Gemini onboarding:
+
+- Control UI Google sign-in uses `/control/onboarding/gemini/callback` based on the
+  current UI base URL or `auth.profiles.redirectBaseUrl`
+- CLI Google sign-in uses a loopback callback on a local port (`http://127.0.0.1:<port>/auth/callback`)
+- Gemini onboarding accepts the Google OAuth client secret via environment or explicit onboarding input, then stores it with the auth profile instead of persisting it in config
+- `CARAPACE_CONFIG_PASSWORD` must be set when using Gemini Google sign-in so the stored auth profile is encrypted at rest
+- if Google OAuth client config is unavailable, Gemini onboarding must use API-key mode
 
 ## Defaults
 

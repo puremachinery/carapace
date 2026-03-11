@@ -19,7 +19,6 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -1306,10 +1305,7 @@ fn compute_next_run(schedule: &CronSchedule, now: u64) -> Option<u64> {
 }
 
 pub(crate) fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_else(|_| Duration::from_secs(0))
-        .as_millis() as u64
+    crate::time::unix_now_ms_u64()
 }
 
 #[cfg(test)]

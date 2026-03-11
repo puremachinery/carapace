@@ -16,7 +16,7 @@
 
 use axum::{
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{uri::Authority, HeaderMap, StatusCode, Uri},
     response::{IntoResponse, Response},
     Json,
 };
@@ -26,10 +26,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use crate::auth;
+use crate::auth::profiles::build_auth_profiles_config;
 use crate::channels::{ChannelRegistry, ChannelStatus};
 use crate::config;
 use crate::cron::CronPayload;
 use crate::logging::audit::{audit, AuditEvent};
+use crate::onboarding;
 use crate::server::connect_info::MaybeConnectInfo;
 use crate::server::ws::{map_validation_issues, persist_config_file, read_config_snapshot};
 use crate::tasks::{DurableTask, TaskPolicy, TaskPolicyPatch, TaskQueue, TaskState};
@@ -39,6 +41,9 @@ const PROTECTED_CONFIG_PREFIXES: &[&str] = &[
     "gateway.hooks.token",
     "credentials",
     "secrets",
+    "auth.profiles.providers.google.clientSecret",
+    "auth.profiles.providers.github.clientSecret",
+    "auth.profiles.providers.discord.clientSecret",
     "anthropic.apiKey",
     "openai.apiKey",
     "google.apiKey",
@@ -211,6 +216,38 @@ pub struct ConfigReadResponse {
     /// SHA256 hash of current config file (if present)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeminiOAuthStartRequest {
+    #[serde(default)]
+    #[serde(rename = "clientId")]
+    pub oauth_client_id: Option<String>,
+    #[serde(default)]
+    #[serde(rename = "clientSecret")]
+    pub oauth_client_secret: Option<String>,
+    #[serde(default)]
+    pub redirect_base_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeminiApiKeyRequest {
+    pub api_key: String,
+    #[serde(default)]
+    pub base_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeminiOAuthCallbackQuery {
+    #[serde(default)]
+    pub code: Option<String>,
+    #[serde(default)]
+    pub state: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 /// Task create request.
@@ -707,6 +744,201 @@ pub async fn config_read_handler(
         }),
     )
         .into_response()
+}
+
+/// POST /control/onboarding/gemini/oauth/start - Begin Gemini Google sign-in.
+pub async fn gemini_oauth_start_handler(
+    State(state): State<ControlState>,
+    connect_info: MaybeConnectInfo,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let remote_addr = connect_info.0;
+    if let Some(err) = check_control_auth(&state, &headers, remote_addr) {
+        return err;
+    }
+
+    let req: GeminiOAuthStartRequest = match parse_optional_json(&body) {
+        Ok(req) => req,
+        Err(msg) => {
+            return (StatusCode::BAD_REQUEST, Json(ControlError::new(msg))).into_response();
+        }
+    };
+
+    let snapshot = read_config_snapshot();
+    let redirect_base_url = match req
+        .redirect_base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => match sanitize_control_redirect_base_url(value) {
+            Ok(validated) => Some(validated),
+            Err(msg) => {
+                return (StatusCode::BAD_REQUEST, Json(ControlError::new(msg))).into_response();
+            }
+        },
+        None => configured_control_redirect_base_url(&snapshot.config)
+            .or_else(|| control_request_base_url(&headers)),
+    };
+
+    let Some(redirect_base_url) = redirect_base_url else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ControlError::new(
+                "Unable to determine Control UI base URL for Gemini callback",
+            )),
+        )
+            .into_response();
+    };
+
+    match onboarding::gemini::start_control_google_oauth(
+        &snapshot.config,
+        req.oauth_client_id
+            .map(|value| value.trim().to_string())
+            .filter(|v| !v.is_empty()),
+        req.oauth_client_secret
+            .map(|value| value.trim().to_string())
+            .filter(|v| !v.is_empty()),
+        &redirect_base_url,
+    ) {
+        Ok(started) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "flowId": started.flow_id,
+                "authUrl": started.auth_url,
+                "redirectUri": started.redirect_uri,
+            })),
+        )
+            .into_response(),
+        Err(err) => (StatusCode::BAD_REQUEST, Json(ControlError::new(err))).into_response(),
+    }
+}
+
+/// GET /control/onboarding/gemini/oauth/{id} - Poll Gemini Google sign-in status.
+pub async fn gemini_oauth_status_handler(
+    Path(flow_id): Path<String>,
+    State(state): State<ControlState>,
+    connect_info: MaybeConnectInfo,
+    headers: HeaderMap,
+) -> Response {
+    let remote_addr = connect_info.0;
+    if let Some(err) = check_control_auth(&state, &headers, remote_addr) {
+        return err;
+    }
+
+    match onboarding::gemini::control_google_oauth_status(flow_id.trim()) {
+        Ok(status) => (
+            StatusCode::OK,
+            Json(json!({ "ok": true, "status": status })),
+        )
+            .into_response(),
+        Err(err) => (StatusCode::NOT_FOUND, Json(ControlError::new(err))).into_response(),
+    }
+}
+
+/// POST /control/onboarding/gemini/oauth/{id}/apply - Persist Gemini Google sign-in config.
+pub async fn gemini_oauth_apply_handler(
+    Path(flow_id): Path<String>,
+    State(state): State<ControlState>,
+    connect_info: MaybeConnectInfo,
+    headers: HeaderMap,
+) -> Response {
+    let remote_addr = connect_info.0;
+    if let Some(err) = check_control_auth(&state, &headers, remote_addr) {
+        return err;
+    }
+
+    match onboarding::gemini::apply_control_google_oauth(
+        flow_id.trim(),
+        crate::server::ws::resolve_state_dir(),
+    ) {
+        Ok(applied) => {
+            let snapshot = read_config_snapshot();
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "applied": applied,
+                    "hash": snapshot.hash,
+                })),
+            )
+                .into_response()
+        }
+        Err(err) => (StatusCode::BAD_REQUEST, Json(ControlError::new(err))).into_response(),
+    }
+}
+
+/// GET /control/onboarding/gemini/callback - OAuth callback landing page.
+pub async fn gemini_oauth_callback_handler(
+    Query(query): Query<GeminiOAuthCallbackQuery>,
+) -> Response {
+    let state = query.state.as_deref().unwrap_or_default();
+    let result: Result<(), String> = onboarding::gemini::complete_control_google_oauth_callback(
+        state,
+        query.code.as_deref(),
+        query.error.as_deref(),
+    )
+    .await;
+
+    let (status, title, message): (StatusCode, &str, String) = match result {
+        Ok(()) => (
+            StatusCode::OK,
+            "Gemini sign-in complete",
+            "You can return to the Control UI and finish applying the Gemini config.".to_string(),
+        ),
+        Err(err) => (StatusCode::BAD_REQUEST, "Gemini sign-in failed", err),
+    };
+
+    (
+        status,
+        axum::response::Html(onboarding::gemini::callback_html(title, &message)),
+    )
+        .into_response()
+}
+
+/// POST /control/onboarding/gemini/api-key - Persist Gemini API key config.
+pub async fn gemini_api_key_handler(
+    State(state): State<ControlState>,
+    connect_info: MaybeConnectInfo,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let remote_addr = connect_info.0;
+    if let Some(err) = check_control_auth(&state, &headers, remote_addr) {
+        return err;
+    }
+
+    let req: GeminiApiKeyRequest = match serde_json::from_slice(&body) {
+        Ok(req) => req,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ControlError::new(format!("Invalid JSON: {}", err))),
+            )
+                .into_response();
+        }
+    };
+
+    match onboarding::gemini::apply_control_gemini_api_key(onboarding::gemini::GeminiApiKeyInput {
+        api_key: req.api_key,
+        base_url: req.base_url,
+    }) {
+        Ok(applied) => {
+            let snapshot = read_config_snapshot();
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "applied": applied,
+                    "hash": snapshot.hash,
+                })),
+            )
+                .into_response()
+        }
+        Err(err) => (StatusCode::BAD_REQUEST, Json(ControlError::new(err))).into_response(),
+    }
 }
 
 /// POST /control/tasks - Create a durable task.
@@ -1230,6 +1462,92 @@ fn parse_optional_reason(reason: Option<String>) -> Result<Option<String>, Strin
     Ok(reason)
 }
 
+fn configured_control_redirect_base_url(cfg: &Value) -> Option<String> {
+    build_auth_profiles_config(cfg)
+        .redirect_base_url
+        .and_then(|value| sanitize_control_redirect_base_url(&value).ok())
+}
+
+fn control_request_base_url(headers: &HeaderMap) -> Option<String> {
+    let origin_base_url = headers
+        .get("origin")
+        .and_then(|value| value.to_str().ok())
+        .and_then(sanitize_origin_base_url);
+    let host = headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get("host"))
+        .and_then(|value| value.to_str().ok())
+        .and_then(sanitize_forwarded_host)?;
+
+    let proto = match headers.get("x-forwarded-proto") {
+        Some(value) => sanitize_forwarded_proto(value.to_str().ok()?)?,
+        None => origin_base_url
+            .as_deref()
+            .and_then(|value| value.split("://").next())
+            .map(ToString::to_string)?,
+    };
+
+    Some(format!("{proto}://{host}"))
+}
+
+fn sanitize_origin_base_url(raw: &str) -> Option<String> {
+    let candidate = raw.split(',').next()?.trim();
+    sanitize_control_redirect_base_url(candidate).ok()
+}
+
+fn sanitize_control_redirect_base_url(raw: &str) -> Result<String, &'static str> {
+    let candidate = raw.trim();
+    if candidate.is_empty() || candidate.chars().any(char::is_whitespace) {
+        return Err("Invalid redirectBaseUrl: malformed URL");
+    }
+
+    let uri = candidate
+        .parse::<Uri>()
+        .map_err(|_| "Invalid redirectBaseUrl: malformed URL")?;
+    let scheme = uri
+        .scheme_str()
+        .ok_or("Invalid redirectBaseUrl: missing scheme")?
+        .to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return Err("Invalid redirectBaseUrl: unsupported scheme (must be http or https)");
+    }
+
+    let authority = uri
+        .authority()
+        .map(|value| value.as_str())
+        .filter(|value| !value.is_empty() && !value.chars().any(char::is_whitespace))
+        .ok_or("Invalid redirectBaseUrl: missing authority")?;
+
+    let path_and_query = uri
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or("/");
+    if path_and_query != "/" {
+        return Err("Invalid redirectBaseUrl: must not include a path or query");
+    }
+
+    Ok(format!("{scheme}://{authority}"))
+}
+
+fn sanitize_forwarded_host(raw: &str) -> Option<String> {
+    let candidate = raw.split(',').next()?.trim();
+    if candidate.is_empty() || candidate.chars().any(char::is_whitespace) {
+        return None;
+    }
+    candidate
+        .parse::<Authority>()
+        .ok()
+        .map(|value| value.to_string())
+}
+
+fn sanitize_forwarded_proto(raw: &str) -> Option<String> {
+    let candidate = raw.split(',').next()?.trim().to_ascii_lowercase();
+    match candidate.as_str() {
+        "http" | "https" => Some(candidate),
+        _ => None,
+    }
+}
+
 /// Check control endpoint authentication
 fn check_control_auth(
     state: &ControlState,
@@ -1428,5 +1746,89 @@ mod tests {
         let long_reason = "a".repeat(MAX_TASK_REASON_LEN + 1);
         let err = parse_optional_reason(Some(long_reason)).expect_err("expected bound error");
         assert!(err.contains("reason exceeds"));
+    }
+
+    #[test]
+    fn test_control_request_base_url_uses_sanitized_forwarded_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-host", "gateway.example.com".parse().unwrap());
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        assert_eq!(
+            control_request_base_url(&headers).as_deref(),
+            Some("https://gateway.example.com")
+        );
+    }
+
+    #[test]
+    fn test_control_request_base_url_rejects_invalid_forwarded_host() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-host", "bad host".parse().unwrap());
+        assert!(control_request_base_url(&headers).is_none());
+    }
+
+    #[test]
+    fn test_control_request_base_url_rejects_invalid_forwarded_proto() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-host", "gateway.example.com".parse().unwrap());
+        headers.insert("x-forwarded-proto", "javascript".parse().unwrap());
+        assert!(control_request_base_url(&headers).is_none());
+    }
+
+    #[test]
+    fn test_control_request_base_url_uses_origin_when_forwarded_proto_missing() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "gateway.example.com".parse().unwrap());
+        headers.insert("origin", "https://gateway.example.com".parse().unwrap());
+        assert_eq!(
+            control_request_base_url(&headers).as_deref(),
+            Some("https://gateway.example.com")
+        );
+    }
+
+    #[test]
+    fn test_control_request_base_url_rejects_missing_proto_without_origin() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "gateway.example.com".parse().unwrap());
+        assert!(control_request_base_url(&headers).is_none());
+    }
+
+    #[test]
+    fn test_configured_control_redirect_base_url_reads_auth_profiles_config() {
+        let cfg = json!({
+            "auth": {
+                "profiles": {
+                    "redirectBaseUrl": "https://gateway.example.com"
+                }
+            }
+        });
+        assert_eq!(
+            configured_control_redirect_base_url(&cfg).as_deref(),
+            Some("https://gateway.example.com")
+        );
+    }
+
+    #[test]
+    fn test_configured_control_redirect_base_url_rejects_invalid_auth_profiles_config() {
+        let cfg = json!({
+            "auth": {
+                "profiles": {
+                    "redirectBaseUrl": "null"
+                }
+            }
+        });
+        assert!(configured_control_redirect_base_url(&cfg).is_none());
+    }
+
+    #[test]
+    fn test_sanitize_control_redirect_base_url_rejects_path_and_query() {
+        assert!(
+            sanitize_control_redirect_base_url("https://gateway.example.com/oauth?x=1").is_err()
+        );
+    }
+
+    #[test]
+    fn test_sanitize_control_redirect_base_url_rejects_non_http_scheme() {
+        assert!(sanitize_control_redirect_base_url("null").is_err());
+        assert!(sanitize_control_redirect_base_url("file:///tmp/ui").is_err());
     }
 }

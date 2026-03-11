@@ -67,8 +67,12 @@ See [docs/feature-status.yaml](docs/feature-status.yaml) and [docs/feature-evide
 
 Use `/help` in chat for REPL commands (`/new`, `/exit`, `/quit`).
 
-If you use cloud models, set one provider key before launching (for example
-`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_API_KEY`, or `VENICE_API_KEY`).
+If you use cloud models, finish one provider onboarding path before launching:
+set one provider key (for example `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
+`GOOGLE_API_KEY`, or `VENICE_API_KEY`) or use Gemini Google sign-in through
+`cara setup --provider gemini --auth-mode oauth` or the Control UI. Gemini
+Google sign-in also requires `CARAPACE_CONFIG_PASSWORD` so the stored auth
+profile stays encrypted at rest.
 If you are not sure where to start, choose `local-chat` as your first outcome,
 start with one provider, and add channels only after `cara verify --outcome auto`
 passes.
@@ -92,11 +96,12 @@ of truth.
 ## Roadmap
 
 - [Roadmap](docs/roadmap.md) — what we're building now, next, and later
-- Up next: subscription-style provider onboarding, advanced Control UI flows,
-  and docs architecture polish
+- Up next: broader provider onboarding, advanced Control UI flows, and docs
+  architecture polish
 - Recently shipped: first stable release, long-running assistant MVP (durable
   queue + autonomy verify), cross-platform subprocess sandboxing, guided setup
-  (`cara setup`), and first-run verifier (`cara verify`)
+  (`cara setup`), first-run verifier (`cara verify`), and Gemini onboarding
+  (Google sign-in or API key via CLI and Control UI)
 
 ## Docs
 
