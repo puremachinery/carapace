@@ -10,7 +10,7 @@ Your main configuration file is placed securely on your computer depending on yo
 * **macOS:** `~/Library/Application Support/carapace/carapace.json5`
 * **Windows:** `%APPDATA%\carapace\carapace.json5`
 
-You can explicitly set a custom folder by changing the `CARAPACE_STATE_DIR` or the full path via `CARAPACE_CONFIG_PATH` environment variables. The file is written in **JSON5**, which means you can safely use comments (like `// this is a comment`) and aren't heavily penalized for trailing commas or unquoted keys.
+You can explicitly set a custom folder by changing the `CARAPACE_STATE_DIR` or the full path via `CARAPACE_CONFIG_PATH` environment variables. The file is written in **JSON5**, which means you can safely use comments (like `// this is a comment`) and aren't heavily penalized for trailing commas or unquoted keys. If a `carapace.json5` file is not found at the expected location, Carapace will automatically fall back to loading `carapace.json` from the same directory.
 
 ---
 
