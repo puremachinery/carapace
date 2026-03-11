@@ -191,6 +191,26 @@ This block shapes how smart your AI behaves, how large its memory is, and perfor
 * **`agents.defaults.contextPruning.ttl`**
   * *What it does:* The duration for the time-to-live before pruning occurs.
   * *Possible values:* A time string like `"1h"` or `"30m"`.
+* **`agents.defaults.sandbox`**
+  * *What it does:* OS-level security sandboxing that strictly limits what tools and background scripts can do (CPU, memory, file access).
+  * *Possible values:*
+    * `enabled`: `true` (Default) or `false`.
+    * `maxCpuSeconds`: Integer. Maximum CPU time allowed per tool invocation. (Default: `30`)
+    * `maxMemoryMb`: Integer. Maximum virtual memory permitted. (Default: `512` MB)
+    * `maxFds`: Integer. Maximum open file descriptors (or process count on Windows). (Default: `256`)
+    * `allowedPaths`: Array of string paths the tool is permanently allowed to read/write to. (Default: `["/tmp", "/usr/bin", "/usr/local/bin", "/bin"]`)
+    * `networkAccess`: Boolean. Allowed to connect to the internet? (Default: `false`)
+    * `envFilter`: Array of string keys. If provided, only masks matching environment variables are allowed to pass through to the tool subprocess. Empty array `[]` permits all.
+* **`agents.defaults.classifier`**
+  * *What it does:* An LLM-based pre-dispatch filter that intercepts potentially malicious inbound prompts before they execute on the main agent.
+  * *Possible values:*
+    * `enabled`: `true` or `false` (Default).
+    * `mode`:
+      * `"off"` (Default) - Fully bypasses classifier warnings.
+      * `"warn"` - Flags suspicious messages with a warning but lets them through to the main AI.
+      * `"block"` - Completely blocks messages deemed dangerous.
+    * `model`: String specifying the smaller model to use (Default: `"gpt-4o-mini"`).
+    * `blockThreshold`: Decimal representing the threshold of confidence required from the classifier from `0.0` to `1.0`. (Default: `0.8`).
 * **`agents.promptGuard`**
   * *What it does:* Enforces security guardrails to make sure the AI isn't tricked into attacking you (Prompt Injection).
   * *Possible values:*
@@ -326,16 +346,6 @@ Enable Carapace to listen and chat dynamically on different popular platforms.
   * *Possible values:*
     * `pricing.default` object: Dictates `inputCostPerMTok` (Positive Decimal) and `outputCostPerMTok` (Positive Decimal) for models that lack specific pricing instructions.
     * `pricing.overrides` List: specific objects detailing `match` (String name like `"gpt-4o"`), `matchType` (`"exact"` match or `"contains"` string match), and per-token rates overrides that supersede defaults.
-* **`classifier`**
-  * *What it does:* Operates a lightweight, cheaper AI at the gateway to pre-read messages before the massive expensive one does, dropping dangerous or useless junk automatically.
-  * *Possible values:*
-    * `enabled`: `true` (Turn on pre-reading) or `false`.
-    * `mode`:
-      * `"off"` - Fully bypasses classifier warnings.
-      * `"warn"` - Flags suspicious messages with a warning but lets them through to the main AI.
-      * `"block"` - Completely blocks messages deemed dangerous.
-    * `model`: String specifying the smaller model to use (like `"gpt-4o-mini"`).
-    * `blockThreshold`: Decimal representing the threshold of confidence required from the classifier from `0.0` to `1.0`.
 * **`plugins`** (WASM expansions)
   * *What it does:* Lets users supercharge the system using fast runtime plugins.
   * *Possible values:*
