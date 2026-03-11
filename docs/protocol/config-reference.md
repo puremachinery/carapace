@@ -145,7 +145,7 @@ This block shapes how smart your AI behaves, how large its memory is, and perfor
     * `maxTurns`: Integer. Maximum LLM round-trips allowed per single user request. **When the AI uses a tool (like reading a file or searching the web), it pauses its response, runs the tool, and sends the result back to itself to continue "thinking". That counts as one turn. If the AI gets stuck in a loop or encounters a complex task that requires many tool uses, this limit forcibly stops it after the specified number of turns to prevent runaway infinite loops and excessive API costs.** (Default: `25`).
     * `maxTokens`: Integer. Maximum output tokens the LLM is permitted to generate in one response. (Default: `8192`)
     * `temperature`: Decimal. Creativity/randomness scaler (e.g., `0.0` for strict, `1.0` for creative). (Default: `0.0` or model default)
-    * `deliver`: Boolean. If `true`, the final message from this agent is pushed directly to the chat channel. (Default: `true`)
+    * `deliver`: Boolean. If `true`, the final message from this agent is pushed directly to the chat channel for you to read. If `false`, the agent operates silently in the background (typically as a sub-agent) and returns its finalized answer internally to whichever larger AI originally called it for help. (Default: `true`)
     * `toolPolicy`: String (`"allowlist"`, `"denylist"`, `"allowall"`) managing which tools this agent can use. (Default: `"allowall"`)
     * `exfiltrationGuard`: Boolean. If `true`, blocks tools known to be capable of sending data externally (preventing prompt injection data theft). (Default: `false`)
     * `promptGuard` / `outputSanitizer` / `sandbox` / `classifier`: These agent-specific blocks override the global `agents.*` for this entity.
