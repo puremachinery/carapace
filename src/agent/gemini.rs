@@ -231,48 +231,48 @@ impl GeminiProvider {
                     .is_some_and(|expires_at| expires_at <= now_ms + TOKEN_REFRESH_MARGIN_MS)
                 {
                     let _refresh_guard = refresh_lock.lock().await;
-                    profile = profile_store.get(profile_id).ok_or_else(|| {
+                    let refreshed_profile = profile_store.get(profile_id).ok_or_else(|| {
                         AgentError::Provider(format!(
                             "configured Gemini auth profile \"{profile_id}\" was not found"
                         ))
                     })?;
-                    let now_ms = current_time_ms();
-                    if profile
+                    let now_ms_after_lock = current_time_ms();
+                    if refreshed_profile
                         .tokens
                         .expires_at_ms
-                        .is_none_or(|expires_at| expires_at > now_ms + TOKEN_REFRESH_MARGIN_MS)
+                        .is_none_or(|expires_at| {
+                            expires_at > now_ms_after_lock + TOKEN_REFRESH_MARGIN_MS
+                        })
                     {
-                        profile_store.update_last_used(profile_id);
-                        return Ok(vec![(
-                            "authorization",
-                            format!("Bearer {}", profile.tokens.access_token),
-                        )]);
+                        profile = refreshed_profile;
+                    } else {
+                        let refresh_token_value = refreshed_profile
+                            .tokens
+                            .refresh_token
+                            .clone()
+                            .filter(|token| !token.trim().is_empty())
+                            .ok_or_else(|| {
+                                AgentError::Provider(format!(
+                                    "Gemini auth profile \"{profile_id}\" is expired and cannot be refreshed"
+                                ))
+                            })?;
+                        let refreshed = refresh_token(provider_config, &refresh_token_value)
+                            .await
+                            .map_err(|err| {
+                                AgentError::Provider(format!(
+                                    "failed to refresh Gemini auth profile \"{profile_id}\": {err}"
+                                ))
+                            })?;
+                        profile_store
+                            .update_tokens(profile_id, refreshed.clone())
+                            .map_err(|err| {
+                                AgentError::Provider(format!(
+                                    "failed to persist refreshed Gemini auth profile \"{profile_id}\": {err}"
+                                ))
+                            })?;
+                        profile = refreshed_profile;
+                        profile.tokens = refreshed;
                     }
-                    let refresh_token_value = profile
-                        .tokens
-                        .refresh_token
-                        .clone()
-                        .filter(|token| !token.trim().is_empty())
-                        .ok_or_else(|| {
-                            AgentError::Provider(format!(
-                                "Gemini auth profile \"{profile_id}\" is expired and cannot be refreshed"
-                            ))
-                        })?;
-                    let refreshed = refresh_token(provider_config, &refresh_token_value)
-                        .await
-                        .map_err(|err| {
-                            AgentError::Provider(format!(
-                                "failed to refresh Gemini auth profile \"{profile_id}\": {err}"
-                            ))
-                        })?;
-                    profile_store
-                        .update_tokens(profile_id, refreshed.clone())
-                        .map_err(|err| {
-                            AgentError::Provider(format!(
-                                "failed to persist refreshed Gemini auth profile \"{profile_id}\": {err}"
-                            ))
-                        })?;
-                    profile.tokens = refreshed;
                 }
 
                 if profile.tokens.access_token.trim().is_empty() {
@@ -752,6 +752,56 @@ mod tests {
         assert!(err
             .to_string()
             .contains("configured Gemini auth profile \"missing-profile\" was not found"));
+    }
+
+    #[tokio::test]
+    async fn test_with_oauth_profile_errors_when_access_token_empty() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ProfileStore::new(temp.path().to_path_buf());
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        store
+            .add(AuthProfile {
+                id: "google-empty-token".to_string(),
+                name: "Gemini (Empty Token)".to_string(),
+                provider: OAuthProvider::Google,
+                user_id: Some("user-123".to_string()),
+                email: Some("user@example.com".to_string()),
+                display_name: Some("Example User".to_string()),
+                avatar_url: None,
+                created_at_ms: now_ms,
+                last_used_ms: None,
+                tokens: OAuthTokens {
+                    access_token: "   ".to_string(),
+                    refresh_token: None,
+                    token_type: "Bearer".to_string(),
+                    expires_at_ms: Some(now_ms + 3_600_000),
+                    scope: Some("openid email profile".to_string()),
+                },
+                oauth_provider_config: None,
+            })
+            .expect("store profile");
+
+        let provider = GeminiProvider::with_oauth_profile(
+            Arc::new(store),
+            "google-empty-token".to_string(),
+            OAuthProvider::Google.default_config(
+                "client-id",
+                "client-secret",
+                "http://127.0.0.1:3000/auth/callback",
+            ),
+        )
+        .expect("oauth-backed provider");
+
+        let err = provider
+            .auth_headers()
+            .await
+            .expect_err("empty access token should fail");
+        assert!(err
+            .to_string()
+            .contains("Gemini auth profile \"google-empty-token\" has no usable access token"));
     }
 
     #[test]
