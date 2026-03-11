@@ -70,7 +70,9 @@ Use `/help` in chat for REPL commands (`/new`, `/exit`, `/quit`).
 If you use cloud models, finish one provider onboarding path before launching:
 set one provider key (for example `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
 `GOOGLE_API_KEY`, or `VENICE_API_KEY`) or use Gemini Google sign-in through
-`cara setup --provider gemini --auth-mode oauth` or the Control UI.
+`cara setup --provider gemini --auth-mode oauth` or the Control UI. Gemini
+Google sign-in also requires `CARAPACE_CONFIG_PASSWORD` so the stored auth
+profile stays encrypted at rest.
 If you are not sure where to start, choose `local-chat` as your first outcome,
 start with one provider, and add channels only after `cara verify --outcome auto`
 passes.

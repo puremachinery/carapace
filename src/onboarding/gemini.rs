@@ -9,8 +9,9 @@ use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::auth::profiles::{
-    exchange_code, fetch_user_info, generate_auth_url, AuthProfile, OAuthProvider,
-    OAuthProviderConfig, OAuthTokens, ProfileStore, StoredOAuthProviderConfig,
+    exchange_code, fetch_user_info, generate_auth_url, profile_store_encryption_enabled_from_env,
+    AuthProfile, OAuthProvider, OAuthProviderConfig, OAuthTokens, ProfileStore,
+    StoredOAuthProviderConfig,
 };
 use crate::server::ws::{map_validation_issues, persist_config_file, read_config_snapshot};
 
@@ -126,6 +127,7 @@ pub fn start_control_google_oauth(
     client_secret_override: Option<String>,
     redirect_base_url: &str,
 ) -> Result<GeminiOAuthStart, String> {
+    require_encrypted_profile_store_for_google_oauth()?;
     cleanup_expired_flows();
 
     let redirect_uri = format!(
@@ -258,6 +260,7 @@ pub fn control_google_oauth_status(flow_id: &str) -> Result<GeminiOAuthStatus, S
 }
 
 pub fn apply_control_google_oauth(flow_id: &str, state_dir: PathBuf) -> Result<Value, String> {
+    require_encrypted_profile_store_for_google_oauth()?;
     let completion = {
         let flows = GEMINI_OAUTH_FLOWS.read();
         let flow = flows
@@ -300,6 +303,7 @@ pub async fn run_cli_google_oauth(
     client_id_override: Option<String>,
     client_secret_override: Option<String>,
 ) -> Result<GeminiOAuthCompletion, String> {
+    require_encrypted_profile_store_for_google_oauth()?;
     let redirect_uri = "http://127.0.0.1:3000/auth/callback".to_string();
     let provider_config = resolve_google_oauth_provider_config(
         &cfg,
@@ -454,6 +458,7 @@ pub fn persist_cli_google_oauth(
     config: &mut Value,
     completion: GeminiOAuthCompletion,
 ) -> Result<String, String> {
+    require_encrypted_profile_store_for_google_oauth()?;
     let profile_id = upsert_google_profile(&state_dir, completion.auth_profile)?;
     ensure_google_oauth_config(config, &completion.client_id, &profile_id);
     Ok(profile_id)
@@ -553,6 +558,16 @@ fn ensure_google_oauth_config(config: &mut Value, client_id: &str, profile_id: &
         google.remove("apiKey");
         google.insert("authProfile".to_string(), json!(profile_id));
     }
+}
+
+fn require_encrypted_profile_store_for_google_oauth() -> Result<(), String> {
+    if profile_store_encryption_enabled_from_env() {
+        return Ok(());
+    }
+    Err(
+        "Gemini Google sign-in requires CARAPACE_CONFIG_PASSWORD so auth profile tokens and OAuth client secrets are encrypted at rest."
+            .to_string(),
+    )
 }
 
 fn apply_gemini_api_key_config(
@@ -763,6 +778,7 @@ mod tests {
     fn test_resolve_google_oauth_provider_config_uses_stored_profile_provider_config() {
         let temp = tempfile::tempdir().expect("tempdir");
         let state_dir = temp.path().to_path_buf();
+        let _password_guard = set_temp_env_var("CARAPACE_CONFIG_PASSWORD", "test-config-password");
         let profile = build_google_auth_profile(
             &OAuthProvider::Google.default_config(
                 "stored-client-id",
@@ -818,6 +834,7 @@ mod tests {
     #[test]
     fn test_persist_cli_google_oauth_stores_profile_and_updates_config() {
         let temp = tempfile::tempdir().expect("tempdir");
+        let _password_guard = set_temp_env_var("CARAPACE_CONFIG_PASSWORD", "test-config-password");
         let mut config = json!({});
         let completion = GeminiOAuthCompletion {
             client_id: "google-client-id".to_string(),
@@ -861,7 +878,21 @@ mod tests {
     }
 
     #[test]
+    fn test_start_control_google_oauth_requires_encrypted_profile_store() {
+        let err = start_control_google_oauth(
+            &json!({}),
+            Some("google-client-id".to_string()),
+            Some("google-client-secret".to_string()),
+            "https://gateway.example.com",
+        )
+        .expect_err("missing config password should fail");
+
+        assert!(err.contains("CARAPACE_CONFIG_PASSWORD"));
+    }
+
+    #[test]
     fn test_start_control_google_oauth_returns_control_callback() {
+        let _password_guard = set_temp_env_var("CARAPACE_CONFIG_PASSWORD", "test-config-password");
         let started = start_control_google_oauth(
             &json!({}),
             Some("google-client-id".to_string()),
@@ -880,6 +911,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_complete_control_google_oauth_callback_returns_provider_error() {
+        let _password_guard = set_temp_env_var("CARAPACE_CONFIG_PASSWORD", "test-config-password");
         let started = start_control_google_oauth(
             &json!({}),
             Some("google-client-id".to_string()),

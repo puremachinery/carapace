@@ -12,7 +12,9 @@ use tracing::{info, warn};
 
 use crate::agent;
 use crate::agent::provider::MultiProvider;
-use crate::auth::profiles::{OAuthProvider, ProfileStore};
+use crate::auth::profiles::{
+    profile_store_encryption_enabled_from_env, OAuthProvider, ProfileStore,
+};
 
 fn resolve_google_oauth_runtime_config(
     cfg: &Value,
@@ -258,26 +260,33 @@ pub fn build_providers(cfg: &Value) -> Result<Option<MultiProvider>, Box<dyn std
             |p, url| p.with_base_url(url),
         )?
     } else if let Some(profile_id) = google_auth_profile {
-        let state_dir = crate::paths::resolve_state_dir();
-        let provider_config = resolve_google_oauth_runtime_config(cfg, &state_dir, &profile_id);
-        if let Some(provider_config) = provider_config {
-            let profile_store = ProfileStore::from_env(state_dir)?;
-            profile_store.load()?;
-            let mut provider = agent::gemini::GeminiProvider::with_oauth_profile(
-                Arc::new(profile_store),
-                profile_id,
-                provider_config,
-            )?;
-            if let Some(url) = google_base_url {
-                provider = provider.with_base_url(url)?;
-            }
-            info!("LLM provider configured: Gemini (Google auth profile)");
-            Some(Arc::new(provider) as Arc<dyn agent::LlmProvider>)
-        } else {
+        if !profile_store_encryption_enabled_from_env() {
             warn!(
-                "Gemini auth profile is configured, but the stored Google OAuth provider settings are missing"
+                "Gemini auth profile requires CARAPACE_CONFIG_PASSWORD so auth profile tokens and OAuth client secrets stay encrypted at rest"
             );
             None
+        } else {
+            let state_dir = crate::paths::resolve_state_dir();
+            let provider_config = resolve_google_oauth_runtime_config(cfg, &state_dir, &profile_id);
+            if let Some(provider_config) = provider_config {
+                let profile_store = ProfileStore::from_env(state_dir)?;
+                profile_store.load()?;
+                let mut provider = agent::gemini::GeminiProvider::with_oauth_profile(
+                    Arc::new(profile_store),
+                    profile_id,
+                    provider_config,
+                )?;
+                if let Some(url) = google_base_url {
+                    provider = provider.with_base_url(url)?;
+                }
+                info!("LLM provider configured: Gemini (Google auth profile)");
+                Some(Arc::new(provider) as Arc<dyn agent::LlmProvider>)
+            } else {
+                warn!(
+                    "Gemini auth profile is configured, but the stored Google OAuth provider settings are missing"
+                );
+                None
+            }
         }
     } else {
         None

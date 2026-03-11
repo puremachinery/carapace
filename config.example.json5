@@ -125,6 +125,8 @@
   // auth: {
   //   profiles: {
   //     enabled: true,
+  //     // Gemini Google sign-in also requires CARAPACE_CONFIG_PASSWORD so
+  //     // stored auth profiles stay encrypted at rest.
   //     // redirectBaseUrl: "https://gateway.example.com",
   //     providers: {
   //       google: {

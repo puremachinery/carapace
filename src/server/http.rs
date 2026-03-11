@@ -2986,6 +2986,7 @@ mod tests {
     #[tokio::test]
     async fn test_control_gemini_oauth_start_returns_flow() {
         let (_temp, _guard) = set_temp_config_path();
+        let _password_guard = EnvVarGuard::set("CARAPACE_CONFIG_PASSWORD", "test-config-password");
         let router = test_router(test_config());
 
         let req = Request::builder()

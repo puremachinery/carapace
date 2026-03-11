@@ -963,6 +963,13 @@ impl ProfileStore {
     }
 }
 
+pub fn profile_store_encryption_enabled_from_env() -> bool {
+    std::env::var("CARAPACE_CONFIG_PASSWORD")
+        .ok()
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+}
+
 // ---------------------------------------------------------------------------
 // Config integration
 // ---------------------------------------------------------------------------

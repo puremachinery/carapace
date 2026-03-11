@@ -23,6 +23,7 @@ If you want the website flow instead of Markdown docs, start at
   `GOOGLE_API_KEY`, or `VENICE_API_KEY`), or local Ollama
 - For Gemini Google sign-in: `GOOGLE_OAUTH_CLIENT_ID` and `GOOGLE_OAUTH_CLIENT_SECRET`
   available in the shell running `cara setup`, or supplied through the Control UI onboarding form
+- For Gemini Google sign-in: `CARAPACE_CONFIG_PASSWORD`
 - Optional: TLS certs if exposing Carapace publicly
 
 Install options:
@@ -62,6 +63,7 @@ cara setup --provider gemini --auth-mode oauth
 `--auth-mode oauth` is interactive-only in the CLI. It launches a Google
 sign-in flow and completes through a loopback callback. The Control UI exposes
 the same Gemini onboarding choices if you prefer to do it in the browser.
+Gemini Google sign-in requires `CARAPACE_CONFIG_PASSWORD`.
 
 Then start Carapace:
 
