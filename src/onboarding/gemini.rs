@@ -110,18 +110,14 @@ pub fn resolve_google_oauth_provider_config(
         );
     }
 
-    let mut provider_config = stored_provider_config
-        .map(|cfg| cfg.to_provider_config(redirect_uri.clone()))
-        .unwrap_or_else(|| {
-            OAuthProvider::Google.default_config(
-                client_id.trim(),
-                client_secret.trim(),
-                &redirect_uri,
-            )
-        });
-    provider_config.client_id = client_id.trim().to_string();
-    provider_config.client_secret = client_secret.trim().to_string();
-    provider_config.redirect_uri = redirect_uri;
+    let mut provider_config =
+        OAuthProvider::Google.default_config(client_id.trim(), client_secret.trim(), &redirect_uri);
+    if let Some(stored) = stored_provider_config {
+        provider_config.auth_url = stored.auth_url;
+        provider_config.token_url = stored.token_url;
+        provider_config.userinfo_url = stored.userinfo_url;
+        provider_config.scopes = stored.scopes;
+    }
     Ok(provider_config)
 }
 
