@@ -4591,6 +4591,17 @@ fn configure_gemini_provider_interactive(
                 hide_sensitive_input,
             )?;
 
+            if let Some(url) = base_url
+                .as_ref()
+                .and_then(|value| value.effective_value.as_deref())
+            {
+                if let Err(err) =
+                    crate::onboarding::gemini::validate_gemini_base_url_input(Some(url))
+                {
+                    handle_setup_validation_failure(err)?;
+                }
+            }
+
             let config_snapshot = config.clone();
             let completion =
                 run_sync_blocking_send(crate::onboarding::gemini::run_cli_google_oauth(

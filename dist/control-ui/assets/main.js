@@ -387,16 +387,49 @@
       payload.clientSecret = clientSecret;
     }
 
+    let authWindow = null;
+    try {
+      authWindow = window.open("about:blank", "_blank", "noopener,noreferrer");
+    } catch (e) {
+      authWindow = null;
+    }
+
     setBusy(true);
     try {
       const response = await controlPost("/control/onboarding/gemini/oauth/start", payload);
       state.geminiFlowId = response.flowId || null;
       renderGeminiOnboardingForm();
-      setGeminiOnboardingStatus("Opened Google sign-in in a new tab. Return here after authorizing.", false);
-      if (response.authUrl) {
-        window.open(response.authUrl, "_blank", "noopener,noreferrer");
+      if (!response.authUrl) {
+        if (authWindow && !authWindow.closed) {
+          authWindow.close();
+        }
+        throw new Error("Gemini Google sign-in did not return an authorization URL.");
+      }
+
+      let popupOpened = false;
+      if (authWindow && !authWindow.closed) {
+        authWindow.location.href = response.authUrl;
+        popupOpened = true;
+      } else {
+        try {
+          popupOpened = Boolean(window.open(response.authUrl, "_blank", "noopener,noreferrer"));
+        } catch (e) {
+          popupOpened = false;
+        }
+      }
+
+      if (popupOpened) {
+        setGeminiOnboardingStatus("Opened Google sign-in in a new tab. Return here after authorizing.", false);
+      } else {
+        setGeminiOnboardingStatus(
+          `Popup blocked. Open this URL manually to continue Gemini Google sign-in: ${response.authUrl}`,
+          true
+        );
       }
     } catch (err) {
+      if (authWindow && !authWindow.closed) {
+        authWindow.close();
+      }
       setGeminiOnboardingStatus(String(err), true);
     } finally {
       setBusy(false);

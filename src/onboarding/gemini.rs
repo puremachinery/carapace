@@ -304,6 +304,21 @@ pub async fn run_cli_google_oauth(
     client_id_override: Option<String>,
     client_secret_override: Option<String>,
 ) -> Result<GeminiOAuthCompletion, String> {
+    run_cli_google_oauth_with_timeout(
+        cfg,
+        client_id_override,
+        client_secret_override,
+        Duration::from_secs(300),
+    )
+    .await
+}
+
+async fn run_cli_google_oauth_with_timeout(
+    cfg: Value,
+    client_id_override: Option<String>,
+    client_secret_override: Option<String>,
+    timeout: Duration,
+) -> Result<GeminiOAuthCompletion, String> {
     require_encrypted_profile_store_for_google_oauth()?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -348,8 +363,9 @@ pub async fn run_cli_google_oauth(
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
     let result_tx = std::sync::Arc::new(std::sync::Mutex::new(Some(result_tx)));
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let shutdown_tx_for_server = shutdown_tx.clone();
 
-    tokio::spawn(async move {
+    let server_task = tokio::spawn(async move {
         use axum::extract::{Query, State};
         use axum::response::Html;
         use axum::routing::get;
@@ -423,7 +439,7 @@ pub async fn run_cli_google_oauth(
                 code_verifier: verifier_for_server,
                 provider_config: provider_config_for_server,
                 sender: result_tx.clone(),
-                shutdown_tx: shutdown_tx.clone(),
+                shutdown_tx: shutdown_tx_for_server,
             });
 
         let server = axum::serve(listener, app).with_graceful_shutdown(async move {
@@ -442,12 +458,17 @@ pub async fn run_cli_google_oauth(
         }
     });
 
-    match tokio::time::timeout(Duration::from_secs(300), result_rx).await {
+    let result = match tokio::time::timeout(timeout, result_rx).await {
         Ok(Ok(Ok(completion))) => Ok(completion),
         Ok(Ok(Err(err))) => Err(err),
         Ok(Err(_)) => Err("Gemini OAuth callback channel closed unexpectedly".to_string()),
         Err(_) => Err("Timed out waiting for Gemini Google sign-in callback".to_string()),
-    }
+    };
+
+    let _ = shutdown_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(5), server_task).await;
+
+    result
 }
 
 pub fn persist_cli_google_oauth(
@@ -590,6 +611,15 @@ pub fn validate_gemini_api_key_input(
             "API key must not be empty".to_string(),
         ));
     }
+    if let Some(url) = base_url.filter(|value| !value.trim().is_empty()) {
+        validate_gemini_base_url(url.trim())?;
+    }
+    Ok(())
+}
+
+pub fn validate_gemini_base_url_input(
+    base_url: Option<&str>,
+) -> Result<(), crate::agent::AgentError> {
     if let Some(url) = base_url.filter(|value| !value.trim().is_empty()) {
         validate_gemini_base_url(url.trim())?;
     }
@@ -932,6 +962,13 @@ mod tests {
     #[test]
     fn test_validate_gemini_api_key_input_rejects_non_https_base_url() {
         let err = validate_gemini_api_key_input("AIza-test-key", Some("http://proxy.example.com"))
+            .expect_err("non-https base URL should fail");
+        assert!(err.to_string().contains("https scheme"));
+    }
+
+    #[test]
+    fn test_validate_gemini_base_url_input_rejects_non_https_base_url() {
+        let err = validate_gemini_base_url_input(Some("http://proxy.example.com"))
             .expect_err("non-https base URL should fail");
         assert!(err.to_string().contains("https scheme"));
     }
