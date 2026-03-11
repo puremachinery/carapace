@@ -135,6 +135,21 @@ This section controls how the internal Carapace server connects to the outside w
 
 This block shapes how smart your AI behaves, how large its memory is, and performance.
 
+* **`agents.list`**
+  * *What it does:* An array of specific agent configurations. You can define multiple distinct "personas" or special-purpose AIs here.
+  * *Possible values:* A list of objects containing these keys:
+    * `id`: String. A unique name for this agent (e.g., `"coder"`, `"researcher"`).
+    * `default`: Boolean. Set to `true` to make this the primary agent used if no ID is specified.
+    * `model`: String. The exact LLM name used by this agent (e.g., `"claude-3-7-sonnet-20250219"`).
+    * `system`: String. The system prompt or core "identity" instructions for this specific agent.
+    * `maxTurns`: Integer. Maximum LLM round-trips allowed per single user request.
+    * `maxTokens`: Integer. Maximum output tokens the LLM is permitted to generate in one response.
+    * `temperature`: Decimal. Creativity/randomness scaler (e.g., `0.0` for strict, `1.0` for creative).
+    * `deliver`: Boolean. If `true`, the final message from this agent is pushed directly to the chat channel.
+    * `toolPolicy`: String (`"allowlist"`, `"denylist"`, `"allowall"`) managing which tools this agent can use.
+    * `exfiltrationGuard`: Boolean. If `true`, blocks tools known to be capable of sending data externally (preventing prompt injection data theft).
+    * `promptGuard` / `outputSanitizer` / `sandbox` / `classifier`: These agent-specific blocks override the global `agents.defaults` for this entity.
+
 * **`agents.defaults.maxConcurrent`**
   * *What it does:* Maximum number of simultaneous main AI tasks that run.
   * *Possible values:* Positive integer. (Default: `4`)
