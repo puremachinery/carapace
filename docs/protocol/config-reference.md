@@ -91,11 +91,22 @@ This section controls how the internal Carapace server connects to the outside w
     * `reconnectIntervalMs`: Integer. How many milliseconds to wait before retrying a connection.
     * `maxReconnectAttempts`: Integer. The maximum number of failed attempts before giving up.
     * `gateways`: An array (list) of connection objects dictating `name`, `url` (e.g., `"wss://..."`), and `autoConnect` values.
-* **`gateway.tls`** & **`gateway.mtls`**
-  * *What it does:* Encryption rules for data. Standard HTTPS (TLS) or rigorous mutual-authentication (mTLS). We recommend reviewing the [Security documentation](./security.md) for more setup guidance.
+* **`gateway.tls`**
+  * *What it does:* Configures standard HTTPS (TLS) for encrypting traffic to the gateway. We recommend reviewing the [Security documentation](./security.md) for more setup guidance.
   * *Possible values:*
-    * `enabled`: `true` (enforce encryption) or `false`.
-    * You can supply filesystem paths to `"certPath"`, `"keyPath"`, `"caCert"`, `"nodeCert"`, `"nodeKey"`, and `"crlPath"`.
+    * `enabled`: `true` (enforce HTTPS) or `false` (plain HTTP).
+    * `autoGenerate`: `true` (automatically generate a self-signed certificate and key) or `false` (use the provided certificate files).
+    * `certPath`: String. Filesystem path to the server certificate presented to clients.
+    * `keyPath`: String. Filesystem path to the private key that matches `certPath`.
+* **`gateway.mtls`**
+  * *What it does:* Configures mutual TLS (mTLS), where both server and client authenticate using certificates. Used for higher-assurance deployments and automated clients.
+  * *Possible values:*
+    * `enabled`: `true` (enable mTLS processing for incoming connections) or `false`.
+    * `requireClientCert`: `true` (clients must present a valid certificate) or `false` (allow connections without a client certificate, while still supporting those that present one).
+    * `caCert`: String. Filesystem path to the CA certificate or bundle used to validate client certificates.
+    * `nodeCert`: String. Filesystem path to the certificate the gateway presents when doing mTLS.
+    * `nodeKey`: String. Filesystem path to the private key corresponding to `nodeCert`.
+    * `crlPath`: String. Optional filesystem path to a certificate revocation list used when validating client certificates.
 * **`gateway.trustedProxies`**
   * *What it does:* Recognizes traffic originating from trusted forwarders (like Nginx) to securely read real IP addresses.
   * *Possible values:* A list of IP addresses (e.g. `["127.0.0.1", "::1"]`).
