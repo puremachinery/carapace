@@ -114,6 +114,8 @@ pub struct OAuthTokens {
 pub struct StoredOAuthProviderConfig {
     pub client_id: String,
     pub client_secret: String,
+    #[serde(default)]
+    pub redirect_uri: String,
     pub auth_url: String,
     pub token_url: String,
     pub userinfo_url: String,
@@ -139,6 +141,7 @@ impl From<&OAuthProviderConfig> for StoredOAuthProviderConfig {
         Self {
             client_id: value.client_id.clone(),
             client_secret: value.client_secret.clone(),
+            redirect_uri: value.redirect_uri.clone(),
             auth_url: value.auth_url.clone(),
             token_url: value.token_url.clone(),
             userinfo_url: value.userinfo_url.clone(),

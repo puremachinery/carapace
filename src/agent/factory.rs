@@ -39,7 +39,9 @@ fn resolve_google_oauth_runtime_config(
         let redirect_uri = cfg
             .pointer("/auth/profiles/providers/google/redirectUri")
             .and_then(Value::as_str)
-            .unwrap_or("http://localhost:3000/auth/callback")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(&stored.redirect_uri)
             .to_string();
         return Some(crate::auth::profiles::OAuthProviderConfig {
             client_id: stored.client_id,
@@ -905,6 +907,52 @@ mod tests {
             assert!(
                 providers.is_some(),
                 "blank GOOGLE_API_KEY should not mask auth-profile Gemini setup"
+            );
+        });
+    }
+
+    #[test]
+    fn test_resolve_google_oauth_runtime_config_uses_stored_redirect_uri_when_missing() {
+        with_clean_provider_env(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let provider_config = OAuthProvider::Google.default_config(
+                "google-client-id",
+                "google-client-secret",
+                "https://gateway.example.com/control/onboarding/gemini/callback",
+            );
+            let profile = crate::auth::profiles::AuthProfile {
+                id: "google-abc123".to_string(),
+                name: "Google user@example.com".to_string(),
+                provider: OAuthProvider::Google,
+                user_id: Some("user-123".to_string()),
+                email: Some("user@example.com".to_string()),
+                display_name: Some("Example User".to_string()),
+                avatar_url: None,
+                created_at_ms: 0,
+                last_used_ms: None,
+                tokens: crate::auth::profiles::OAuthTokens {
+                    access_token: "access-token".to_string(),
+                    refresh_token: Some("refresh-token".to_string()),
+                    token_type: "Bearer".to_string(),
+                    expires_at_ms: Some(u64::MAX),
+                    scope: Some("openid email profile".to_string()),
+                },
+                oauth_provider_config: Some(
+                    crate::auth::profiles::StoredOAuthProviderConfig::from(&provider_config),
+                ),
+            };
+            let store = ProfileStore::from_env(temp.path().to_path_buf()).expect("profile store");
+            store.add(profile).expect("store profile");
+
+            let cfg = json!({
+                "google": { "authProfile": "google-abc123" }
+            });
+            let resolved = resolve_google_oauth_runtime_config(&cfg, temp.path(), "google-abc123")
+                .expect("runtime config");
+
+            assert_eq!(
+                resolved.redirect_uri,
+                "https://gateway.example.com/control/onboarding/gemini/callback"
             );
         });
     }

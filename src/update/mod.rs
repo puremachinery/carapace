@@ -8,7 +8,7 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
 #[cfg(test)]
@@ -186,10 +186,7 @@ impl fmt::Display for UpdateError {
 impl std::error::Error for UpdateError {}
 
 pub fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+    crate::time::unix_now_ms_u64()
 }
 
 pub fn expected_asset_name() -> String {

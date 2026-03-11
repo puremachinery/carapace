@@ -26,6 +26,7 @@ mod server;
 mod sessions;
 mod tailscale;
 mod tasks;
+mod time;
 mod tls;
 mod update;
 mod usage;

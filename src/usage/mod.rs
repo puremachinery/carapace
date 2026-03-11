@@ -315,10 +315,7 @@ fn parse_number(value: &serde_json::Value) -> Option<f64> {
 
 /// Get current timestamp in milliseconds
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::from_secs(0))
-        .as_millis() as u64
+    crate::time::unix_now_ms_u64()
 }
 
 /// Get current date as YYYY-MM-DD string

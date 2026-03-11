@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::LazyLock;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use crate::auth::profiles::{
     exchange_code, fetch_user_info, generate_auth_url, profile_store_encryption_enabled_from_env,
@@ -679,10 +679,7 @@ fn cleanup_expired_flows() {
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0)
+    crate::time::unix_now_ms_u64()
 }
 
 pub(crate) fn callback_html(title: &str, body: &str) -> String {

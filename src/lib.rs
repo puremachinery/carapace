@@ -30,6 +30,7 @@ pub mod server;
 pub mod sessions;
 pub mod tailscale;
 pub mod tasks;
+pub(crate) mod time;
 pub mod tls;
 pub mod update;
 pub mod usage;

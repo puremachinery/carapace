@@ -453,7 +453,7 @@ use std::collections::HashSet;
 #[cfg(not(test))]
 use std::io::IsTerminal;
 use std::sync::{LazyLock, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio_tungstenite::{
     connect_async, connect_async_tls_with_config, tungstenite::Message, Connector,
 };
@@ -1555,10 +1555,7 @@ fn derive_device_id(public_key: &[u8]) -> String {
 }
 
 fn current_time_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
+    crate::time::unix_now_ms_i64()
 }
 
 fn ws_url_from_http(url: &Url) -> Result<String, Box<dyn std::error::Error>> {

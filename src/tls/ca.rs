@@ -553,10 +553,7 @@ fn compute_fingerprint(cert_der: &CertificateDer<'_>) -> String {
 
 /// Get current time in milliseconds since Unix epoch.
 fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or(std::time::Duration::ZERO)
-        .as_millis() as u64
+    crate::time::unix_now_ms_u64()
 }
 
 /// Get the default CA directory path.

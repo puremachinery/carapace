@@ -19,7 +19,7 @@ use std::fs::{self, File};
 use std::io::Write as IoWrite;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
@@ -1514,10 +1514,7 @@ pub async fn run_gateway_lifecycle(
 
 /// Get the current time in milliseconds since the Unix epoch.
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO)
-        .as_millis() as u64
+    crate::time::unix_now_ms_u64()
 }
 
 // ============================================================================

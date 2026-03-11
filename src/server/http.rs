@@ -1038,10 +1038,7 @@ async fn health_ready_handler(State(state): State<AppState>) -> Response {
 }
 
 fn unix_now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+    crate::time::unix_now_ms_u64()
 }
 
 fn enqueue_hook_wake_event(ws: &Arc<WsServerState>, text: &str, mode: WakeMode) {

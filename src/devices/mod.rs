@@ -11,7 +11,6 @@ use std::fs::{self, File};
 use std::io::Write as IoWrite;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 /// Maximum number of paired devices
@@ -1198,10 +1197,7 @@ impl DevicePairingRegistry {
 
 /// Get current time in milliseconds
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO)
-        .as_millis() as u64
+    crate::time::unix_now_ms_u64()
 }
 
 fn scopes_allow(requested: &[String], allowed: &[String]) -> bool {
