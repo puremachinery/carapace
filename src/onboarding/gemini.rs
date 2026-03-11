@@ -179,6 +179,19 @@ pub async fn complete_control_google_oauth_callback(
             .ok_or_else(|| "Unknown or expired Gemini OAuth flow".to_string())?
     };
 
+    let existing_state = {
+        let flows = GEMINI_OAUTH_FLOWS.read();
+        flows
+            .get(&flow_id)
+            .map(|flow| flow.flow_state.clone())
+            .ok_or_else(|| "Unknown or expired Gemini OAuth flow".to_string())?
+    };
+    match existing_state {
+        GeminiOAuthFlowState::Completed(_) => return Ok(()),
+        GeminiOAuthFlowState::Failed(err) => return Err(err),
+        GeminiOAuthFlowState::Pending => {}
+    }
+
     if let Some(err) = error.filter(|value| !value.trim().is_empty()) {
         let mut flows = GEMINI_OAUTH_FLOWS.write();
         if let Some(flow) = flows.get_mut(&flow_id) {
@@ -1106,6 +1119,63 @@ mod tests {
             status.error.as_deref(),
             Some("Missing OAuth authorization code")
         );
+    }
+
+    #[tokio::test]
+    async fn test_complete_control_google_oauth_callback_preserves_completed_flow_on_retry() {
+        let flow_id = "flow-completed".to_string();
+        GEMINI_OAUTH_FLOWS.write().insert(
+            flow_id.clone(),
+            PendingGeminiOAuthFlow {
+                id: flow_id.clone(),
+                state: "state-completed".to_string(),
+                code_verifier: "verifier".to_string(),
+                provider_config: OAuthProvider::Google.default_config(
+                    "client-id",
+                    "client-secret",
+                    "https://gateway.example.com/control/onboarding/gemini/callback",
+                ),
+                created_at_ms: now_ms(),
+                flow_state: GeminiOAuthFlowState::Completed(Box::new(GeminiOAuthCompletion {
+                    client_id: "client-id".to_string(),
+                    auth_profile: AuthProfile {
+                        id: "google-abc123".to_string(),
+                        name: "Gemini (Example User)".to_string(),
+                        provider: OAuthProvider::Google,
+                        user_id: Some("user-123".to_string()),
+                        email: Some("user@example.com".to_string()),
+                        display_name: Some("Example User".to_string()),
+                        avatar_url: None,
+                        created_at_ms: now_ms(),
+                        last_used_ms: Some(now_ms()),
+                        tokens: OAuthTokens {
+                            access_token: "access-token".to_string(),
+                            refresh_token: Some("refresh-token".to_string()),
+                            token_type: "Bearer".to_string(),
+                            expires_at_ms: Some(now_ms() + 3_600_000),
+                            scope: Some("openid email profile".to_string()),
+                        },
+                        oauth_provider_config: Some(StoredOAuthProviderConfig::from(
+                            &OAuthProvider::Google.default_config(
+                                "client-id",
+                                "client-secret",
+                                "https://gateway.example.com/control/onboarding/gemini/callback",
+                            ),
+                        )),
+                    },
+                })),
+            },
+        );
+
+        let result =
+            complete_control_google_oauth_callback("state-completed", Some("reused-code"), None)
+                .await;
+        assert!(result.is_ok(), "completed retry should stay successful");
+
+        let status = control_google_oauth_status(&flow_id).expect("flow status");
+        assert_eq!(status.status, "completed");
+
+        GEMINI_OAUTH_FLOWS.write().remove(&flow_id);
     }
 
     #[test]

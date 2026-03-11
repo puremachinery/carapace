@@ -76,6 +76,56 @@ fn resolve_google_auth_profile_fingerprint(cfg: &Value) -> Option<String> {
     ))
 }
 
+fn build_gemini_provider(
+    cfg: &Value,
+    google_api_key: Option<String>,
+    google_auth_profile: Option<String>,
+    google_base_url: Option<String>,
+) -> Result<Option<Arc<dyn agent::LlmProvider>>, Box<dyn std::error::Error>> {
+    if google_api_key.is_some() {
+        return try_build_provider(
+            google_api_key,
+            google_base_url,
+            "Gemini",
+            agent::gemini::GeminiProvider::new,
+            |p, url| p.with_base_url(url),
+        );
+    }
+
+    let Some(profile_id) = google_auth_profile else {
+        return Ok(None);
+    };
+
+    if !profile_store_encryption_enabled_from_env() {
+        warn!(
+            "Gemini auth profile requires CARAPACE_CONFIG_PASSWORD so auth profile tokens and OAuth client secrets stay encrypted at rest"
+        );
+        return Ok(None);
+    }
+
+    let state_dir = crate::paths::resolve_state_dir();
+    let provider_config = resolve_google_oauth_runtime_config(cfg, &state_dir, &profile_id);
+    if let Some(provider_config) = provider_config {
+        let profile_store = ProfileStore::from_env(state_dir)?;
+        profile_store.load()?;
+        let mut provider = agent::gemini::GeminiProvider::with_oauth_profile(
+            Arc::new(profile_store),
+            profile_id,
+            provider_config,
+        )?;
+        if let Some(url) = google_base_url {
+            provider = provider.with_base_url(url)?;
+        }
+        info!("LLM provider configured: Gemini (Google auth profile)");
+        Ok(Some(Arc::new(provider) as Arc<dyn agent::LlmProvider>))
+    } else {
+        warn!(
+            "Gemini auth profile is configured, but the stored Google OAuth provider settings are missing"
+        );
+        Ok(None)
+    }
+}
+
 /// Try to build a provider from an API key + optional base URL.
 ///
 /// This is the shared pattern for Anthropic, OpenAI, and Gemini providers:
@@ -286,46 +336,8 @@ pub fn build_providers(cfg: &Value) -> Result<Option<MultiProvider>, Box<dyn std
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
     });
-    let gemini_provider = if google_api_key.is_some() {
-        try_build_provider(
-            google_api_key,
-            google_base_url,
-            "Gemini",
-            agent::gemini::GeminiProvider::new,
-            |p, url| p.with_base_url(url),
-        )?
-    } else if let Some(profile_id) = google_auth_profile {
-        if !profile_store_encryption_enabled_from_env() {
-            warn!(
-                "Gemini auth profile requires CARAPACE_CONFIG_PASSWORD so auth profile tokens and OAuth client secrets stay encrypted at rest"
-            );
-            None
-        } else {
-            let state_dir = crate::paths::resolve_state_dir();
-            let provider_config = resolve_google_oauth_runtime_config(cfg, &state_dir, &profile_id);
-            if let Some(provider_config) = provider_config {
-                let profile_store = ProfileStore::from_env(state_dir)?;
-                profile_store.load()?;
-                let mut provider = agent::gemini::GeminiProvider::with_oauth_profile(
-                    Arc::new(profile_store),
-                    profile_id,
-                    provider_config,
-                )?;
-                if let Some(url) = google_base_url {
-                    provider = provider.with_base_url(url)?;
-                }
-                info!("LLM provider configured: Gemini (Google auth profile)");
-                Some(Arc::new(provider) as Arc<dyn agent::LlmProvider>)
-            } else {
-                warn!(
-                    "Gemini auth profile is configured, but the stored Google OAuth provider settings are missing"
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let gemini_provider =
+        build_gemini_provider(cfg, google_api_key, google_auth_profile, google_base_url)?;
 
     // Venice
     let venice_api_key = std::env::var("VENICE_API_KEY").ok().or_else(|| {

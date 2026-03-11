@@ -386,6 +386,7 @@
     if (clientSecret) {
       payload.clientSecret = clientSecret;
     }
+    ui.geminiClientSecretInput.value = "";
 
     let authWindow = null;
     try {
