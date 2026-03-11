@@ -221,7 +221,7 @@ Enable Carapace to listen and chat dynamically on different popular platforms.
 
 ## 5. Security, Sessions, & Logs
 
-* **`sessions`** (or `session`)
+* **`sessions`**
   * *What it does:* Governs how long the system remembers your long-running chat history and whether it gets automatically purged.
   * *Possible values:*
     * `retention.enabled`: `true` (Automatically wipe old memory) or `false` (Keep memory forever). (Default: `true`)
@@ -231,6 +231,9 @@ Enable Carapace to listen and chat dynamically on different popular platforms.
     * `integrity.action`:
       * `"warn"` (Default) - Issues a warning and attempts to auto-migrate missing data signatures harmlessly.
       * `"reject"` - The system will fail completely and shut down if it detects altered chat history.
+* **`session`**
+  * *What it does:* Governs active interactive chat settings.
+  * *Possible values:*
     * `scope`:
       * `"per-sender"` - Maintains a separate distinct timeline and context for each conversational participant.
     * `dmScope`:
