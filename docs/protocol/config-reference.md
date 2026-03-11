@@ -85,6 +85,12 @@ This section controls how the internal Carapace server connects to the outside w
     * `mode`:
       * `"off"` - Disables Tailscale integration.
       * `"serve"` - Securely serves the gateway over your private Tailscale VPN network.
+      * `"funnel"` - Exposes the gateway to the public internet via Tailscale Funnel, while still running over your Tailscale connection.
+    * `externalPort`: Integer. The external port to expose when using Tailscale (for example with `"serve"` or `"funnel"` modes).
+    * `cliPath`: String. Filesystem path to the Tailscale CLI binary to use instead of the default lookup.
+    * `resetOnShutdown`:
+      * `true` - Attempts to reset any Tailscale serve/funnel configuration created by Carapace when the gateway shuts down.
+      * `false` - Leaves Tailscale serve/funnel configuration as-is on shutdown.
 * **`gateway.remote`**
   * *What it does:* Let your Carapace installation secretly connect outward to heavily guarded server installations.
   * *Possible values:*
