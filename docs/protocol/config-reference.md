@@ -334,16 +334,122 @@ Enable Carapace to listen and chat dynamically on different popular platforms.
 
 ---
 
-## Other Valid Schema Fields
+## 7. Other Valid Schema Fields
 
 These items are permitted in the configuration and perform specific functions to alter your system but generally accept empty JSON objects `{}` or internal flags:
 
-* `meta` (Update version tracking data)
-* `env` (Provides direct shell environment variable replacements `process.env` under `.vars`)
-* `wizard` (Tracks onboarding progress)
-* `diagnostics` (OpenTelemetry instrumentation)
-* `update` (Release channels)
-* `browser` (Puppeteer/Playwright integrations, `.enabled`, `.cdpUrl`, `.profiles`)
-* `ui` (Interface personalization setups)
-* `auth` (Authorizations & permissions profile mapping)
-* `talk` (Voice and Speech-to-Text configuration)
+* **`meta`**
+  * *What it does:* Update version tracking data indicating the last touched version or time. Carapace uses this automatically to keep track of upgrades.
+  * *Example:*
+
+    ```json5
+    "meta": {
+      "version": "1.2.0",
+      "lastUpdated": 1718049201
+    }
+    ```
+
+* **`env`**
+  * *What it does:* Injects direct shell environment variables (like passwords or paths) exactly as if you had typed them into your terminal `process.env` before starting Carapace. This happens *before* substitution occurs for the rest of your file, allowing you to centralize secrets.
+  * *Example:*
+
+    ```json5
+    "env": {
+      "vars": {
+        "OPENAI_API_KEY": "sk-your-secret-key",
+        "ANTHROPIC_API_KEY": "sk-ant-another-secret"
+      },
+      "shellEnv": { "enabled": true }
+    }
+    ```
+
+* **`wizard`**
+  * *What it does:* Tracks your current onboarding progress sequence through the application UI so that Carapace doesn't bother you with the welcome screen every time.
+  * *Example:*
+
+    ```json5
+    "wizard": {
+      "completedSteps": ["welcome", "api_keys", "profile"],
+      "hasFinishedOnboarding": true
+    }
+    ```
+
+* **`diagnostics`**
+  * *What it does:* OpenTelemetry instrumentation for profound performance tracing. This is mostly used by advanced developers to see exactly how long the AI takes to think or connect to the database.
+  * *Example:*
+
+    ```json5
+    "diagnostics": {
+      "enabled": true,
+      "endpoint": "http://localhost:4318/v1/traces"
+    }
+    ```
+
+* **`update`**
+  * *What it does:* Controls the release channel (stable vs beta) and automatic checking on startup. If you want cutting edge features, you switch this to `beta` or `canary`.
+  * *Example:*
+
+    ```json5
+    "update": {
+      "channel": "stable",
+      "checkOnStartup": true
+    }
+    ```
+
+* **`browser`**
+  * *What it does:* Set up Puppeteer or Playwright integrations so that the AI can open actual browser pages to scrape data, test UI, or read websites on your behalf.
+  * *Example:*
+
+    ```json5
+    "browser": {
+      "enabled": true,
+      "cdpUrl": "ws://localhost:9222",
+      "profiles": {
+        "scraper-profile": {
+          "cdpPort": 9223
+        }
+      }
+    }
+    ```
+
+* **`ui`**
+  * *What it does:* Interface personalization setups for the Control UI's visual identity, letting you change themes or layouts.
+  * *Example:*
+
+    ```json5
+    "ui": {
+      "theme": "dark",
+      "primaryColor": "#ff5500",
+      "sidebarState": "collapsed"
+    }
+    ```
+
+* **`auth`**
+  * *What it does:* Authorizations and permissions profile mapping. It allows you to lock down certain parts of the gateway to specific users or impose cooldowns to thwart brute-force login attempts.
+  * *Example:*
+
+    ```json5
+    "auth": {
+      "profiles": {
+        "admin": { "roles": ["superuser"] },
+        "guest": { "roles": ["read-only"] }
+      },
+      "cooldowns": {
+        "failedLoginDelayMs": 2000
+      }
+    }
+    ```
+
+* **`talk`**
+  * *What it does:* Configures Voice and Speech-to-Text behaviors for audible responses, allowing the AI to speak its answers out loud.
+  * *Example:*
+
+    ```json5
+    "talk": {
+      "enabled": true,
+      "provider": "openai",
+      "apiKey": "${OPENAI_API_KEY}",
+      "voice": "alloy",
+      "speed": 1.2
+    }
+    ```
