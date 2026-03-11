@@ -9,8 +9,8 @@ use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::auth::profiles::{
-    build_auth_profiles_config, exchange_code, fetch_user_info, generate_auth_url, AuthProfile,
-    OAuthProvider, OAuthProviderConfig, OAuthTokens, ProfileStore,
+    exchange_code, fetch_user_info, generate_auth_url, AuthProfile, OAuthProvider,
+    OAuthProviderConfig, OAuthTokens, ProfileStore, StoredOAuthProviderConfig,
 };
 use crate::server::ws::{map_validation_issues, persist_config_file, read_config_snapshot};
 
@@ -63,7 +63,6 @@ struct PendingGeminiOAuthFlow {
 #[derive(Debug, Clone)]
 pub struct GeminiOAuthCompletion {
     pub client_id: String,
-    pub client_secret: String,
     pub auth_profile: AuthProfile,
 }
 
@@ -82,15 +81,26 @@ pub fn resolve_google_oauth_provider_config(
     client_id_override: Option<String>,
     client_secret_override: Option<String>,
     redirect_uri: String,
+    state_dir: &Path,
 ) -> Result<OAuthProviderConfig, String> {
-    let auth_profiles_cfg = build_auth_profiles_config(cfg);
-    let existing = auth_profiles_cfg.providers.get(&OAuthProvider::Google);
+    let stored_provider_config = load_stored_google_provider_config(cfg, state_dir);
 
     let client_id = client_id_override
-        .or_else(|| existing.map(|cfg| cfg.client_id.clone()))
+        .or_else(|| std::env::var("GOOGLE_OAUTH_CLIENT_ID").ok())
+        .or_else(|| configured_google_oauth_client_id(cfg))
+        .or_else(|| {
+            stored_provider_config
+                .as_ref()
+                .map(|cfg| cfg.client_id.clone())
+        })
         .unwrap_or_default();
     let client_secret = client_secret_override
-        .or_else(|| existing.map(|cfg| cfg.client_secret.clone()))
+        .or_else(|| std::env::var("GOOGLE_OAUTH_CLIENT_SECRET").ok())
+        .or_else(|| {
+            stored_provider_config
+                .as_ref()
+                .map(|cfg| cfg.client_secret.clone())
+        })
         .unwrap_or_default();
 
     if client_id.trim().is_empty() || client_secret.trim().is_empty() {
@@ -99,15 +109,15 @@ pub fn resolve_google_oauth_provider_config(
         );
     }
 
-    let mut provider_cfg =
-        OAuthProvider::Google.default_config(client_id.trim(), client_secret.trim(), &redirect_uri);
-    if let Some(existing) = existing {
-        provider_cfg.scopes = existing.scopes.clone();
-        provider_cfg.auth_url = existing.auth_url.clone();
-        provider_cfg.token_url = existing.token_url.clone();
-        provider_cfg.userinfo_url = existing.userinfo_url.clone();
-    }
-    Ok(provider_cfg)
+    Ok(stored_provider_config
+        .map(|cfg| cfg.to_provider_config(redirect_uri.clone()))
+        .unwrap_or_else(|| {
+            OAuthProvider::Google.default_config(
+                client_id.trim(),
+                client_secret.trim(),
+                &redirect_uri,
+            )
+        }))
 }
 
 pub fn start_control_google_oauth(
@@ -127,6 +137,7 @@ pub fn start_control_google_oauth(
         client_id_override,
         client_secret_override,
         redirect_uri.clone(),
+        &crate::paths::resolve_state_dir(),
     )?;
 
     let state = format!("gemini-{}", uuid::Uuid::new_v4());
@@ -199,8 +210,7 @@ pub async fn complete_control_google_oauth_callback(
         .map_err(|err| err.to_string())?;
         Ok::<GeminiOAuthCompletion, String>(GeminiOAuthCompletion {
             client_id: provider_config.client_id.clone(),
-            client_secret: provider_config.client_secret.clone(),
-            auth_profile: build_google_auth_profile(tokens, userinfo),
+            auth_profile: build_google_auth_profile(&provider_config, tokens, userinfo),
         })
     }
     .await;
@@ -266,12 +276,7 @@ pub fn apply_control_google_oauth(flow_id: &str, state_dir: PathBuf) -> Result<V
 
     let snapshot = read_config_snapshot();
     let mut config = snapshot.config.clone();
-    ensure_google_oauth_config(
-        &mut config,
-        &completion.client_id,
-        &completion.client_secret,
-        &profile_id,
-    );
+    ensure_google_oauth_config(&mut config, &completion.client_id, &profile_id);
     validate_and_persist_config(&config)?;
     GEMINI_OAUTH_FLOWS.write().remove(flow_id);
 
@@ -301,6 +306,7 @@ pub async fn run_cli_google_oauth(
         client_id_override,
         client_secret_override,
         redirect_uri.clone(),
+        &crate::paths::resolve_state_dir(),
     )?;
 
     let parsed_redirect = url::Url::parse(&provider_config.redirect_uri)
@@ -449,16 +455,12 @@ pub fn persist_cli_google_oauth(
     completion: GeminiOAuthCompletion,
 ) -> Result<String, String> {
     let profile_id = upsert_google_profile(&state_dir, completion.auth_profile)?;
-    ensure_google_oauth_config(
-        config,
-        &completion.client_id,
-        &completion.client_secret,
-        &profile_id,
-    );
+    ensure_google_oauth_config(config, &completion.client_id, &profile_id);
     Ok(profile_id)
 }
 
 fn build_google_auth_profile(
+    provider_config: &OAuthProviderConfig,
     tokens: OAuthTokens,
     userinfo: crate::auth::profiles::UserInfo,
 ) -> AuthProfile {
@@ -489,6 +491,7 @@ fn build_google_auth_profile(
         created_at_ms: now_ms,
         last_used_ms: Some(now_ms),
         tokens,
+        oauth_provider_config: Some(StoredOAuthProviderConfig::from(provider_config)),
     }
 }
 
@@ -515,12 +518,7 @@ fn upsert_google_profile(state_dir: &Path, profile: AuthProfile) -> Result<Strin
     Ok(id)
 }
 
-fn ensure_google_oauth_config(
-    config: &mut Value,
-    client_id: &str,
-    client_secret: &str,
-    profile_id: &str,
-) {
+fn ensure_google_oauth_config(config: &mut Value, client_id: &str, profile_id: &str) {
     if !config.get("auth").is_some_and(Value::is_object) {
         config["auth"] = json!({});
     }
@@ -534,10 +532,19 @@ fn ensure_google_oauth_config(
     {
         config["auth"]["profiles"]["providers"] = json!({});
     }
-    config["auth"]["profiles"]["providers"]["google"] = json!({
-        "clientId": client_id,
-        "clientSecret": client_secret
-    });
+    if !config["auth"]["profiles"]["providers"]
+        .get("google")
+        .is_some_and(Value::is_object)
+    {
+        config["auth"]["profiles"]["providers"]["google"] = json!({});
+    }
+    config["auth"]["profiles"]["providers"]["google"]["clientId"] = json!(client_id);
+    if let Some(google_provider) = config["auth"]["profiles"]["providers"]
+        .get_mut("google")
+        .and_then(Value::as_object_mut)
+    {
+        google_provider.remove("clientSecret");
+    }
 
     if !config.get("google").is_some_and(Value::is_object) {
         config["google"] = json!({});
@@ -644,9 +651,35 @@ async fn complete_cli_oauth_callback(
         .map_err(|err| err.to_string())?;
     Ok(GeminiOAuthCompletion {
         client_id: provider_config.client_id.clone(),
-        client_secret: provider_config.client_secret.clone(),
-        auth_profile: build_google_auth_profile(tokens, userinfo),
+        auth_profile: build_google_auth_profile(provider_config, tokens, userinfo),
     })
+}
+
+fn configured_google_oauth_client_id(cfg: &Value) -> Option<String> {
+    cfg.pointer("/auth/profiles/providers/google/clientId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn load_stored_google_provider_config(
+    cfg: &Value,
+    state_dir: &Path,
+) -> Option<StoredOAuthProviderConfig> {
+    let profile_id = cfg
+        .get("google")
+        .and_then(|value| value.get("authProfile"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let store = ProfileStore::from_env(state_dir.to_path_buf()).ok()?;
+    store.load().ok()?;
+    let profile = store.get(profile_id)?;
+    if profile.provider != OAuthProvider::Google {
+        return None;
+    }
+    profile.oauth_provider_config
 }
 
 #[cfg(test)]
@@ -655,6 +688,27 @@ mod tests {
     use crate::auth::profiles::OAuthTokens;
     use crate::auth::profiles::UserInfo;
     use serde_json::json;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = &self.previous {
+                unsafe { std::env::set_var(self.key, value) };
+            } else {
+                unsafe { std::env::remove_var(self.key) };
+            }
+        }
+    }
+
+    fn set_temp_env_var(key: &'static str, value: &str) -> EnvVarGuard {
+        let previous = std::env::var(key).ok();
+        unsafe { std::env::set_var(key, value) };
+        EnvVarGuard { key, previous }
+    }
 
     fn sample_tokens() -> OAuthTokens {
         OAuthTokens {
@@ -676,18 +730,55 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_google_oauth_provider_config_uses_existing_config() {
+    fn test_resolve_google_oauth_provider_config_uses_configured_client_id_and_env_secret() {
         let cfg = json!({
             "auth": {
                 "profiles": {
                     "enabled": true,
                     "providers": {
                         "google": {
-                            "clientId": "existing-client-id",
-                            "clientSecret": "existing-client-secret"
+                            "clientId": "existing-client-id"
                         }
                     }
                 }
+            }
+        });
+        let _secret_guard = set_temp_env_var("GOOGLE_OAUTH_CLIENT_SECRET", "env-client-secret");
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        let provider = resolve_google_oauth_provider_config(
+            &cfg,
+            None,
+            None,
+            "http://127.0.0.1:3000/auth/callback".to_string(),
+            temp.path(),
+        )
+        .expect("provider config");
+
+        assert_eq!(provider.client_id, "existing-client-id");
+        assert_eq!(provider.client_secret, "env-client-secret");
+    }
+
+    #[test]
+    fn test_resolve_google_oauth_provider_config_uses_stored_profile_provider_config() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_dir = temp.path().to_path_buf();
+        let profile = build_google_auth_profile(
+            &OAuthProvider::Google.default_config(
+                "stored-client-id",
+                "stored-client-secret",
+                "http://127.0.0.1:3000/auth/callback",
+            ),
+            sample_tokens(),
+            sample_user_info(),
+        );
+        let profile_id = profile.id.clone();
+        let store = ProfileStore::from_env(state_dir.clone()).expect("profile store from env");
+        store.add(profile).expect("store profile");
+
+        let cfg = json!({
+            "google": {
+                "authProfile": profile_id
             }
         });
 
@@ -696,11 +787,12 @@ mod tests {
             None,
             None,
             "http://127.0.0.1:3000/auth/callback".to_string(),
+            &state_dir,
         )
         .expect("provider config");
 
-        assert_eq!(provider.client_id, "existing-client-id");
-        assert_eq!(provider.client_secret, "existing-client-secret");
+        assert_eq!(provider.client_id, "stored-client-id");
+        assert_eq!(provider.client_secret, "stored-client-secret");
     }
 
     #[test]
@@ -729,8 +821,15 @@ mod tests {
         let mut config = json!({});
         let completion = GeminiOAuthCompletion {
             client_id: "google-client-id".to_string(),
-            client_secret: "google-client-secret".to_string(),
-            auth_profile: build_google_auth_profile(sample_tokens(), sample_user_info()),
+            auth_profile: build_google_auth_profile(
+                &OAuthProvider::Google.default_config(
+                    "google-client-id",
+                    "google-client-secret",
+                    "http://127.0.0.1:3000/auth/callback",
+                ),
+                sample_tokens(),
+                sample_user_info(),
+            ),
         };
 
         let profile_id =
@@ -742,10 +841,9 @@ mod tests {
             config["auth"]["profiles"]["providers"]["google"]["clientId"],
             "google-client-id"
         );
-        assert_eq!(
-            config["auth"]["profiles"]["providers"]["google"]["clientSecret"],
-            "google-client-secret"
-        );
+        assert!(config["auth"]["profiles"]["providers"]["google"]
+            .get("clientSecret")
+            .is_none());
         assert_eq!(config["google"]["authProfile"], profile_id);
         assert!(config["google"].get("apiKey").is_none());
 
@@ -755,6 +853,11 @@ mod tests {
         let profile = store.get(&profile_id).expect("stored profile");
         assert_eq!(profile.provider, OAuthProvider::Google);
         assert_eq!(profile.email.as_deref(), Some("user@example.com"));
+        let stored_cfg = profile
+            .oauth_provider_config
+            .expect("stored Google OAuth provider config");
+        assert_eq!(stored_cfg.client_id, "google-client-id");
+        assert_eq!(stored_cfg.client_secret, "google-client-secret");
     }
 
     #[test]

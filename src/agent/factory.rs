@@ -3,6 +3,7 @@
 //! Extracts the ~200 lines of provider setup from `main.rs` into a reusable
 //! function, and provides fingerprinting for change detection during hot-reload.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -11,7 +12,31 @@ use tracing::{info, warn};
 
 use crate::agent;
 use crate::agent::provider::MultiProvider;
-use crate::auth::profiles::{build_auth_profiles_config, OAuthProvider, ProfileStore};
+use crate::auth::profiles::{OAuthProvider, ProfileStore};
+
+fn resolve_google_oauth_runtime_config(
+    cfg: &Value,
+    state_dir: &Path,
+    profile_id: &str,
+) -> Option<crate::auth::profiles::OAuthProviderConfig> {
+    let profile_store = ProfileStore::from_env(state_dir.to_path_buf()).ok()?;
+    profile_store.load().ok()?;
+    let profile = profile_store.get(profile_id)?;
+    if profile.provider != OAuthProvider::Google {
+        return None;
+    }
+    if let Some(stored) = profile.oauth_provider_config {
+        return Some(
+            stored.to_provider_config(
+                cfg.pointer("/auth/profiles/providers/google/redirectUri")
+                    .and_then(Value::as_str)
+                    .unwrap_or("http://localhost:3000/auth/callback")
+                    .to_string(),
+            ),
+        );
+    }
+    None
+}
 
 /// Try to build a provider from an API key + optional base URL.
 ///
@@ -233,13 +258,9 @@ pub fn build_providers(cfg: &Value) -> Result<Option<MultiProvider>, Box<dyn std
             |p, url| p.with_base_url(url),
         )?
     } else if let Some(profile_id) = google_auth_profile {
-        let auth_profiles_config = build_auth_profiles_config(cfg);
-        let provider_config = match auth_profiles_config.providers.get(&OAuthProvider::Google) {
-            Some(provider_config) if auth_profiles_config.enabled => Some(provider_config.clone()),
-            _ => None,
-        };
+        let state_dir = crate::paths::resolve_state_dir();
+        let provider_config = resolve_google_oauth_runtime_config(cfg, &state_dir, &profile_id);
         if let Some(provider_config) = provider_config {
-            let state_dir = crate::paths::resolve_state_dir();
             let profile_store = ProfileStore::from_env(state_dir)?;
             profile_store.load()?;
             let mut provider = agent::gemini::GeminiProvider::with_oauth_profile(
@@ -254,7 +275,7 @@ pub fn build_providers(cfg: &Value) -> Result<Option<MultiProvider>, Box<dyn std
             Some(Arc::new(provider) as Arc<dyn agent::LlmProvider>)
         } else {
             warn!(
-                "Gemini auth profile is configured, but auth.profiles.providers.google OAuth settings are missing or disabled"
+                "Gemini auth profile is configured, but the stored Google OAuth provider settings are missing"
             );
             None
         }

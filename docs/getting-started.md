@@ -22,6 +22,7 @@ If you want the website flow instead of Markdown docs, start at
 - A supported LLM provider API key (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
   `GOOGLE_API_KEY`, or `VENICE_API_KEY`), or local Ollama
 - For Gemini Google sign-in: `GOOGLE_OAUTH_CLIENT_ID` and `GOOGLE_OAUTH_CLIENT_SECRET`
+  available in the shell running `cara setup`, or supplied through the Control UI onboarding form
 - Optional: TLS certs if exposing Carapace publicly
 
 Install options:

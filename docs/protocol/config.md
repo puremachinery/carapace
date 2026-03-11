@@ -205,8 +205,7 @@ Example auth-profile config:
       "enabled": true,
       "providers": {
         "google": {
-          "clientId": "${GOOGLE_OAUTH_CLIENT_ID}",
-          "clientSecret": "${GOOGLE_OAUTH_CLIENT_SECRET}"
+          "clientId": "${GOOGLE_OAUTH_CLIENT_ID}"
         }
       }
     }
@@ -221,15 +220,14 @@ Example auth-profile config:
 
 ### `auth.profiles`
 
-`auth.profiles` stores OAuth client configuration used to create and refresh
-stored auth profiles.
+`auth.profiles` stores OAuth onboarding configuration and redirect settings used
+to create stored auth profiles.
 
 Relevant subkeys:
 
 - `auth.profiles.enabled`
 - `auth.profiles.redirectBaseUrl`
 - `auth.profiles.providers.google.clientId`
-- `auth.profiles.providers.google.clientSecret`
 - `auth.profiles.providers.google.redirectUri`
 
 For Gemini onboarding:
@@ -237,6 +235,7 @@ For Gemini onboarding:
 - Control UI Google sign-in uses `/control/onboarding/gemini/callback` based on the
   current UI base URL or `auth.profiles.redirectBaseUrl`
 - CLI Google sign-in uses a loopback callback (`http://127.0.0.1:3000/auth/callback`)
+- Gemini onboarding accepts the Google OAuth client secret via environment or explicit onboarding input, then stores it with the auth profile instead of persisting it in config
 - if Google OAuth client config is unavailable, Gemini onboarding must use API-key mode
 
 ## Defaults

@@ -687,6 +687,7 @@ mod tests {
                     expires_at_ms: Some(now_ms + 3_600_000),
                     scope: Some("openid email profile".to_string()),
                 },
+                oauth_provider_config: None,
             })
             .expect("store profile");
 

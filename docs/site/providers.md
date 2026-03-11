@@ -77,7 +77,7 @@ Notes:
 
 - Gemini OAuth is interactive-only in the CLI because it completes through a loopback callback.
 - Control UI also supports Gemini onboarding with either Google sign-in or API key.
-- If you store Google OAuth client secrets in config, set `CARAPACE_CONFIG_PASSWORD` so they are encrypted at rest.
+- Gemini onboarding stores the Google OAuth client secret with the auth profile; it is not written into `config.json5`.
 
 ```bash
 export AWS_REGION='us-east-1'

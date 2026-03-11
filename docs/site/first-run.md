@@ -10,7 +10,7 @@ Run `cara setup`, start Carapace, and complete your first useful assistant workf
 - One supported provider configured:
   - `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_API_KEY`, or `VENICE_API_KEY`, or
   - local Ollama (`OLLAMA_BASE_URL`)
-  - for Gemini Google sign-in: `GOOGLE_OAUTH_CLIENT_ID` and `GOOGLE_OAUTH_CLIENT_SECRET`
+  - for Gemini Google sign-in: `GOOGLE_OAUTH_CLIENT_ID` and `GOOGLE_OAUTH_CLIENT_SECRET` available in the shell running `cara setup`, or supplied through the Control UI onboarding form
 
 ## 0) Pick the simplest first path
 
