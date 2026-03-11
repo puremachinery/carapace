@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::provider::*;
@@ -22,6 +22,7 @@ enum GeminiAuth {
         profile_store: Arc<ProfileStore>,
         profile_id: String,
         provider_config: OAuthProviderConfig,
+        refresh_lock: Arc<Mutex<()>>,
     },
 }
 
@@ -93,6 +94,7 @@ impl GeminiProvider {
                 profile_store,
                 profile_id,
                 provider_config,
+                refresh_lock: Arc::new(Mutex::new(())),
             },
             base_url: "https://generativelanguage.googleapis.com".to_string(),
         })
@@ -215,6 +217,7 @@ impl GeminiProvider {
                 profile_store,
                 profile_id,
                 provider_config,
+                refresh_lock,
             } => {
                 let mut profile = profile_store.get(profile_id).ok_or_else(|| {
                     AgentError::Provider(format!(
@@ -227,6 +230,24 @@ impl GeminiProvider {
                     .expires_at_ms
                     .is_some_and(|expires_at| expires_at <= now_ms + TOKEN_REFRESH_MARGIN_MS)
                 {
+                    let _refresh_guard = refresh_lock.lock().await;
+                    profile = profile_store.get(profile_id).ok_or_else(|| {
+                        AgentError::Provider(format!(
+                            "configured Gemini auth profile \"{profile_id}\" was not found"
+                        ))
+                    })?;
+                    let now_ms = current_time_ms();
+                    if profile
+                        .tokens
+                        .expires_at_ms
+                        .is_none_or(|expires_at| expires_at > now_ms + TOKEN_REFRESH_MARGIN_MS)
+                    {
+                        profile_store.update_last_used(profile_id);
+                        return Ok(vec![(
+                            "authorization",
+                            format!("Bearer {}", profile.tokens.access_token),
+                        )]);
+                    }
                     let refresh_token_value = profile
                         .tokens
                         .refresh_token
