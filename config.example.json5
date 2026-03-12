@@ -133,12 +133,12 @@
   //     // Gemini Google sign-in also requires CARAPACE_CONFIG_PASSWORD so
   //     // stored auth profiles stay encrypted at rest.
   //     // redirectBaseUrl: "https://gateway.example.com",
-  //     // providers: {
-  //     //   google: {
+  //     providers: {
+  //       google: {
   //         clientId: "${GOOGLE_OAUTH_CLIENT_ID}",
   //         // redirectUri: "https://gateway.example.com/auth/callback", // hosted OAuth override; CLI uses an ephemeral loopback port
-  //     //   },
-  //     // },
+  //       },
+  //     },
   //   },
   // },
 

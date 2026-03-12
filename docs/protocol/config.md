@@ -90,6 +90,9 @@ Rules:
 
 All keys are optional. Unknown keys are rejected (strict schema).
 
+For a plain-English guide to the most commonly tuned sections, see
+[`docs/protocol/config-reference.md`](config-reference.md).
+
 - `meta` – config metadata (last touched version/time)
 - `env` – env injection + shell env fallback settings
 - `wizard` – onboarding metadata
@@ -264,7 +267,7 @@ For Gemini onboarding:
 
 ## Defaults
 
-Defaults are applied after validation. Key defaults include:
+Defaults are applied during config loading before validation. Key defaults include:
 
 - `messages.ackReactionScope`: `"group-mentions"`
 - `logging.consoleStyle`: `"pretty"`

@@ -42,8 +42,8 @@ This section controls how the internal Carapace server connects to the outside w
   * *What it does:* Decides how external programs prove they're allowed to connect.
   * *Possible values:*
     * `mode`:
-      * `"none"` - Disables additional gateway-level authentication. Only use this for local development or when you fully trust the network and other protections in front of Carapace.
-      * `"local"` - Trusts connections that originate from the local machine or other trusted local mechanisms, without requiring a separate token/password.
+      * `"none"` - Disables additional gateway-level authentication but still only permits direct connections from the local machine. Non-local-direct requests are rejected, so this does not allow unauthenticated remote access even if `gateway.bind` exposes the gateway on the network.
+      * `"local"` - Currently behaves the same as `"none"`: it only allows direct local connections and rejects non-local-direct requests unless another trusted path (for example Tailscale auth) succeeds.
       * `"token"` - Uses a generated secret API token for authentication.
       * `"password"` - Uses a standard password for authentication.
     * `token`: The secret text token string you specify (e.g., `"${CARAPACE_GATEWAY_TOKEN}"`).
