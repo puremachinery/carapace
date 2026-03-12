@@ -152,7 +152,6 @@ pub fn validate_write_path(
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // write_access used by write-tier tools (Task 9)
 struct FilesystemConfig {
     roots: Vec<PathBuf>,
     write_access: bool,
@@ -221,20 +220,29 @@ impl FilesystemConfig {
     }
 }
 
-/// Build the read-tier filesystem tools from the given configuration value.
+/// Build the filesystem tools from the given configuration value.
+///
+/// Read-tier tools (file_read, directory_list, file_stat, file_search) are always
+/// included. Write-tier tools (file_write, file_move) are only included when
+/// `writeAccess` is enabled in the configuration.
 pub fn filesystem_tools(cfg: &Value) -> Vec<BuiltinTool> {
     let config = FilesystemConfig::from_value(cfg);
     if config.poisoned {
         tracing::error!("filesystem tools disabled due to invalid configuration");
         return Vec::new();
     }
-    let tools = vec![
+    let mut tools = vec![
         file_read_tool(config.clone()),
         directory_list_tool(config.clone()),
         file_stat_tool(config.clone()),
-        file_search_tool(config),
+        file_search_tool(config.clone()),
     ];
-    // Write-tier tools added in a later task
+
+    if config.write_access {
+        tools.push(file_write_tool(config.clone()));
+        tools.push(file_move_tool(config.clone()));
+    }
+
     tools
 }
 
@@ -641,6 +649,135 @@ fn file_search_tool(config: FilesystemConfig) -> BuiltinTool {
 
             let result = run_blocking(do_search);
             ToolInvokeResult::success(result)
+        }),
+    }
+}
+
+fn file_write_tool(config: FilesystemConfig) -> BuiltinTool {
+    BuiltinTool {
+        name: "file_write".to_string(),
+        description: "Write content to a file within configured filesystem roots.".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Absolute path to write to." },
+                "content": { "type": "string", "description": "Content to write." },
+                "create_dirs": { "type": "boolean", "description": "Create parent directories if they don't exist (default true)." }
+            },
+            "required": ["path", "content"],
+            "additionalProperties": false
+        }),
+        handler: Box::new(move |args, _ctx| {
+            let path_str = match args.get("path").and_then(|v| v.as_str()) {
+                Some(p) => p,
+                None => return ToolInvokeResult::tool_error("missing required parameter: path"),
+            };
+            let content = match args.get("content").and_then(|v| v.as_str()) {
+                Some(c) => c,
+                None => return ToolInvokeResult::tool_error("missing required parameter: content"),
+            };
+            let create_dirs = args
+                .get("create_dirs")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+
+            let target = match validate_write_path(
+                path_str,
+                &config.roots,
+                &config.exclude_patterns,
+                create_dirs,
+            ) {
+                Ok(p) => p,
+                Err(e) => return ToolInvokeResult::tool_error(e),
+            };
+
+            match fs::write(&target, content) {
+                Ok(()) => ToolInvokeResult::success(json!({
+                    "bytesWritten": content.len(),
+                    "path": target.to_string_lossy()
+                })),
+                Err(e) => {
+                    let msg = if e.kind() == std::io::ErrorKind::PermissionDenied {
+                        format!("permission denied: \"{}\"", path_str)
+                    } else {
+                        format!("cannot write \"{}\": {}", path_str, e)
+                    };
+                    ToolInvokeResult::tool_error(msg)
+                }
+            }
+        }),
+    }
+}
+
+fn file_move_tool(config: FilesystemConfig) -> BuiltinTool {
+    BuiltinTool {
+        name: "file_move".to_string(),
+        description: "Move or rename a file within configured filesystem roots.".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "source": { "type": "string", "description": "Absolute path of the file to move." },
+                "destination": { "type": "string", "description": "Absolute destination path." }
+            },
+            "required": ["source", "destination"],
+            "additionalProperties": false
+        }),
+        handler: Box::new(move |args, _ctx| {
+            let source_str = match args.get("source").and_then(|v| v.as_str()) {
+                Some(p) => p,
+                None => return ToolInvokeResult::tool_error("missing required parameter: source"),
+            };
+            let dest_str = match args.get("destination").and_then(|v| v.as_str()) {
+                Some(p) => p,
+                None => {
+                    return ToolInvokeResult::tool_error("missing required parameter: destination")
+                }
+            };
+
+            let source = match validate_path(source_str, &config.roots, &config.exclude_patterns) {
+                Ok(p) => p,
+                Err(e) => return ToolInvokeResult::tool_error(e),
+            };
+
+            if source.is_dir() {
+                return ToolInvokeResult::tool_error(format!(
+                    "\"{}\" is a directory; file_move only supports files",
+                    source_str
+                ));
+            }
+
+            let dest =
+                match validate_write_path(dest_str, &config.roots, &config.exclude_patterns, false)
+                {
+                    Ok(p) => p,
+                    Err(e) => return ToolInvokeResult::tool_error(e),
+                };
+
+            let rename_result = fs::rename(&source, &dest);
+
+            #[cfg(windows)]
+            let rename_result = if rename_result.is_err() && dest.exists() {
+                fs::remove_file(&dest).and_then(|()| fs::rename(&source, &dest))
+            } else {
+                rename_result
+            };
+
+            match rename_result {
+                Ok(()) => ToolInvokeResult::success(json!({
+                    "source": source.to_string_lossy(),
+                    "destination": dest.to_string_lossy()
+                })),
+                Err(e) => {
+                    let msg = if e.raw_os_error() == Some(18) {
+                        "cannot move across filesystems".to_string()
+                    } else if e.kind() == std::io::ErrorKind::PermissionDenied {
+                        "permission denied".to_string()
+                    } else {
+                        format!("cannot move: {}", e)
+                    };
+                    ToolInvokeResult::tool_error(msg)
+                }
+            }
         }),
     }
 }
@@ -1055,12 +1192,17 @@ mod tests {
     fn filesystem_tools_with_budget(cfg: &serde_json::Value, budget: usize) -> Vec<BuiltinTool> {
         let mut config = FilesystemConfig::from_value(cfg);
         config.search_entry_budget = budget;
-        vec![
+        let mut tools = vec![
             file_read_tool(config.clone()),
             directory_list_tool(config.clone()),
             file_stat_tool(config.clone()),
-            file_search_tool(config),
-        ]
+            file_search_tool(config.clone()),
+        ];
+        if config.write_access {
+            tools.push(file_write_tool(config.clone()));
+            tools.push(file_move_tool(config.clone()));
+        }
+        tools
     }
 
     #[test]
@@ -1111,5 +1253,105 @@ mod tests {
             }
             _ => panic!("expected success"),
         }
+    }
+
+    // ===== file_write tests =====
+
+    #[test]
+    fn test_file_write_happy_path() {
+        let tmp = setup_test_tree();
+        let cfg = make_test_config(tmp.path(), true);
+        let tools = filesystem_tools(&cfg);
+        let tool = tools.iter().find(|t| t.name == "file_write").unwrap();
+        let new_path = tmp.path().join("written.txt");
+        let result = (tool.handler)(
+            json!({ "path": new_path.to_str().unwrap(), "content": "new content" }),
+            &test_ctx(),
+        );
+        match &result {
+            ToolInvokeResult::Success { result, .. } => {
+                assert_eq!(result["bytesWritten"], 11);
+            }
+            _ => panic!("expected success"),
+        }
+        assert_eq!(fs::read_to_string(&new_path).unwrap(), "new content");
+    }
+
+    #[test]
+    fn test_file_write_denied_without_write_access() {
+        let tmp = setup_test_tree();
+        let cfg = make_test_config(tmp.path(), false);
+        let tools = filesystem_tools(&cfg);
+        assert!(!tools.iter().any(|t| t.name == "file_write"));
+    }
+
+    #[test]
+    fn test_file_write_creates_dirs() {
+        let tmp = setup_test_tree();
+        let cfg = make_test_config(tmp.path(), true);
+        let tools = filesystem_tools(&cfg);
+        let tool = tools.iter().find(|t| t.name == "file_write").unwrap();
+        let new_path = tmp.path().join("new_dir/deep/file.txt");
+        let result = (tool.handler)(
+            json!({ "path": new_path.to_str().unwrap(), "content": "deep content" }),
+            &test_ctx(),
+        );
+        match &result {
+            ToolInvokeResult::Success { .. } => {}
+            _ => panic!("expected success"),
+        }
+        assert!(new_path.exists());
+    }
+
+    // ===== file_move tests =====
+
+    #[test]
+    fn test_file_move_happy_path() {
+        let tmp = setup_test_tree();
+        let cfg = make_test_config(tmp.path(), true);
+        let tools = filesystem_tools(&cfg);
+        let tool = tools.iter().find(|t| t.name == "file_move").unwrap();
+        let src = tmp.path().join("hello.txt");
+        let dst = tmp.path().join("moved.txt");
+        let result = (tool.handler)(
+            json!({ "source": src.to_str().unwrap(), "destination": dst.to_str().unwrap() }),
+            &test_ctx(),
+        );
+        match &result {
+            ToolInvokeResult::Success { .. } => {}
+            _ => panic!("expected success"),
+        }
+        assert!(!src.exists());
+        assert!(dst.exists());
+        assert_eq!(fs::read_to_string(&dst).unwrap(), "hello world");
+    }
+
+    #[test]
+    fn test_file_move_rejects_directory() {
+        let tmp = setup_test_tree();
+        let cfg = make_test_config(tmp.path(), true);
+        let tools = filesystem_tools(&cfg);
+        let tool = tools.iter().find(|t| t.name == "file_move").unwrap();
+        let result = (tool.handler)(
+            json!({
+                "source": tmp.path().join("subdir").to_str().unwrap(),
+                "destination": tmp.path().join("moved_dir").to_str().unwrap()
+            }),
+            &test_ctx(),
+        );
+        match &result {
+            ToolInvokeResult::Error { error, .. } => {
+                assert!(error.message.contains("directory"));
+            }
+            _ => panic!("expected error for directory move"),
+        }
+    }
+
+    #[test]
+    fn test_file_move_denied_without_write_access() {
+        let tmp = setup_test_tree();
+        let cfg = make_test_config(tmp.path(), false);
+        let tools = filesystem_tools(&cfg);
+        assert!(!tools.iter().any(|t| t.name == "file_move"));
     }
 }
