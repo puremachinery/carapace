@@ -10,9 +10,11 @@ use glob::Pattern;
 use serde_json::{json, Value};
 
 use crate::plugins::tools::{BuiltinTool, ToolInvokeContext, ToolInvokeResult};
+use crate::runtime_bridge::run_sync_blocking_send;
 
 const DEFAULT_SEARCH_ENTRY_BUDGET: usize = 10_000;
 const DEFAULT_MAX_READ_BYTES: u64 = 10_485_760;
+const DEFAULT_MAX_SEARCH_DEPTH: usize = 64;
 
 /// Check whether `path` is excluded by any of the configured patterns relative to `root`.
 ///
@@ -38,25 +40,30 @@ fn excluded_by(
     None
 }
 
-fn matching_root<'a>(canonical: &std::path::Path, roots: &'a [PathBuf]) -> Option<&'a PathBuf> {
+fn matching_roots<'a>(canonical: &std::path::Path, roots: &'a [PathBuf]) -> Vec<&'a PathBuf> {
     roots
         .iter()
-        .find(|root| canonical.starts_with(root.as_path()))
+        .filter(|root| canonical.starts_with(root.as_path()))
+        .collect()
 }
 
-fn validate_canonical_path<'a>(
+fn validate_canonical_path(
     canonical: &std::path::Path,
-    roots: &'a [PathBuf],
+    roots: &[PathBuf],
     exclude_patterns: &[Pattern],
-) -> Result<&'a PathBuf, String> {
-    let Some(root) = matching_root(canonical, roots) else {
+) -> Result<(), String> {
+    let matching = matching_roots(canonical, roots);
+    if matching.is_empty() {
         return Err(format!(
             "path \"{}\" is outside all configured filesystem roots",
             canonical.display()
         ));
-    };
+    }
 
-    if let Some(pattern) = excluded_by(canonical, root, exclude_patterns) {
+    if let Some(pattern) = matching
+        .into_iter()
+        .find_map(|root| excluded_by(canonical, root, exclude_patterns))
+    {
         return Err(format!(
             "path \"{}\" is excluded by pattern \"{}\"",
             canonical.display(),
@@ -64,7 +71,7 @@ fn validate_canonical_path<'a>(
         ));
     }
 
-    Ok(root)
+    Ok(())
 }
 
 fn canonicalize_allowed_path(
@@ -134,24 +141,28 @@ pub fn validate_write_path(
         let canonical_ancestor = std::fs::canonicalize(&ancestor)
             .map_err(|e| format!("cannot resolve ancestor \"{}\": {}", ancestor.display(), e))?;
 
-        let Some(root) = roots
-            .iter()
-            .find(|root| canonical_ancestor.starts_with(root))
-        else {
+        let matching = matching_roots(&canonical_ancestor, roots);
+        if matching.is_empty() {
             return Err(format!(
                 "path \"{}\" is outside all configured filesystem roots",
                 requested
             ));
-        };
+        }
 
         // Check exclude patterns on the planned path *before* creating directories.
-        let planned_path = canonical_ancestor.join(
-            parent
-                .strip_prefix(&ancestor)
-                .unwrap_or(std::path::Path::new("")),
-        );
+        let planned_relative = parent.strip_prefix(&ancestor).map_err(|_| {
+            format!(
+                "cannot resolve planned write path \"{}\" relative to ancestor \"{}\"",
+                parent.display(),
+                ancestor.display()
+            )
+        })?;
+        let planned_path = canonical_ancestor.join(planned_relative);
         let planned_full = planned_path.join(filename);
-        if let Some(pattern) = excluded_by(&planned_full, root, exclude_patterns) {
+        if let Some(pattern) = matching
+            .into_iter()
+            .find_map(|root| excluded_by(&planned_full, root, exclude_patterns))
+        {
             return Err(format!(
                 "path \"{}\" is excluded by pattern \"{}\"",
                 planned_full.display(),
@@ -166,21 +177,21 @@ pub fn validate_write_path(
     let canonical_parent = std::fs::canonicalize(parent)
         .map_err(|e| format!("cannot resolve parent \"{}\": {}", parent.display(), e))?;
 
-    let Some(root) = roots.iter().find(|root| canonical_parent.starts_with(root)) else {
-        return Err(format!(
-            "path \"{}\" is outside all configured filesystem roots",
-            requested
-        ));
-    };
-
     let full_path = canonical_parent.join(filename);
-
-    if let Some(pattern) = excluded_by(&full_path, root, exclude_patterns) {
-        return Err(format!(
-            "path \"{}\" is excluded by pattern \"{}\"",
-            full_path.display(),
-            pattern
-        ));
+    if full_path.exists() {
+        let meta = std::fs::symlink_metadata(&full_path)
+            .map_err(|e| format!("cannot inspect target \"{}\": {}", full_path.display(), e))?;
+        if meta.file_type().is_symlink() {
+            return Err(format!(
+                "refusing to write to symlink target \"{}\"",
+                full_path.display()
+            ));
+        }
+        let canonical_full = std::fs::canonicalize(&full_path)
+            .map_err(|e| format!("cannot resolve target \"{}\": {}", full_path.display(), e))?;
+        validate_canonical_path(&canonical_full, roots, exclude_patterns)?;
+    } else {
+        validate_canonical_path(&full_path, roots, exclude_patterns)?;
     }
 
     Ok(full_path)
@@ -495,11 +506,22 @@ fn file_stat_tool(config: Arc<FilesystemConfig>) -> BuiltinTool {
                 Some(p) => p,
                 None => return ToolInvokeResult::tool_error("missing required parameter: path"),
             };
+            let original_meta = match fs::symlink_metadata(path_str) {
+                Ok(m) => m,
+                Err(e) => {
+                    let msg = if e.kind() == std::io::ErrorKind::PermissionDenied {
+                        format!("permission denied: \"{}\"", path_str)
+                    } else {
+                        format!("cannot stat \"{}\": {}", path_str, e)
+                    };
+                    return ToolInvokeResult::tool_error(msg);
+                }
+            };
             let canonical = match validate_path(path_str, &config.roots, &config.exclude_patterns) {
                 Ok(p) => p,
                 Err(e) => return ToolInvokeResult::tool_error(e),
             };
-            let meta = match fs::symlink_metadata(&canonical) {
+            let meta = match fs::metadata(&canonical) {
                 Ok(m) => m,
                 Err(e) => {
                     let msg = if e.kind() == std::io::ErrorKind::PermissionDenied {
@@ -536,7 +558,7 @@ fn file_stat_tool(config: Arc<FilesystemConfig>) -> BuiltinTool {
                 "modified": modified,
                 "created": created,
                 "isDir": meta.is_dir(),
-                "isSymlink": meta.file_type().is_symlink(),
+                "isSymlink": original_meta.file_type().is_symlink(),
                 "permissions": permissions
             }))
         }),
@@ -568,7 +590,15 @@ fn file_search_tool(config: Arc<FilesystemConfig>) -> BuiltinTool {
                 Some(p) => p.to_string(),
                 None => return ToolInvokeResult::tool_error("missing required parameter: path"),
             };
-            let max_depth = args.get("max_depth").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+            let requested_max_depth =
+                args.get("max_depth").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+            if requested_max_depth > DEFAULT_MAX_SEARCH_DEPTH {
+                return ToolInvokeResult::tool_error(format!(
+                    "max_depth too large ({} > {})",
+                    requested_max_depth, DEFAULT_MAX_SEARCH_DEPTH
+                ));
+            }
+            let max_depth = requested_max_depth;
             let content_pattern = args
                 .get("content_pattern")
                 .and_then(|v| v.as_str())
@@ -606,8 +636,7 @@ fn file_search_tool(config: Arc<FilesystemConfig>) -> BuiltinTool {
                 None => None,
             };
 
-            let config = Arc::clone(&config);
-
+            let search_config = Arc::clone(&config);
             let do_search = move || {
                 struct WalkCtx<'a> {
                     max_depth: usize,
@@ -701,12 +730,12 @@ fn file_search_tool(config: Arc<FilesystemConfig>) -> BuiltinTool {
 
                 let mut ctx = WalkCtx {
                     max_depth,
-                    budget: config.search_entry_budget,
+                    budget: search_config.search_entry_budget,
                     glob_pattern: &glob_pattern,
                     content_regex: &content_regex,
-                    max_read: config.max_read_bytes,
-                    roots: &config.roots,
-                    exclude_patterns: &config.exclude_patterns,
+                    max_read: search_config.max_read_bytes,
+                    roots: &search_config.roots,
+                    exclude_patterns: &search_config.exclude_patterns,
                     matches: Vec::new(),
                     entries_scanned: 0,
                     truncated: false,
@@ -716,8 +745,18 @@ fn file_search_tool(config: Arc<FilesystemConfig>) -> BuiltinTool {
 
                 json!({ "matches": ctx.matches, "entriesScanned": ctx.entries_scanned, "truncated": ctx.truncated })
             };
+            let result = match run_sync_blocking_send(async move {
+                tokio::task::spawn_blocking(do_search)
+                    .await
+                    .map_err(|e| format!("filesystem search worker failed: {e}"))
+            }) {
+                Ok(result) => result,
+                Err(e) => {
+                    return ToolInvokeResult::tool_error(format!("filesystem search failed: {e}"))
+                }
+            };
 
-            ToolInvokeResult::success(do_search())
+            ToolInvokeResult::success(result)
         }),
     }
 }
@@ -745,6 +784,13 @@ fn file_write_tool(config: Arc<FilesystemConfig>) -> BuiltinTool {
                 Some(c) => c,
                 None => return ToolInvokeResult::tool_error("missing required parameter: content"),
             };
+            if content.len() as u64 > config.max_read_bytes {
+                return ToolInvokeResult::tool_error(format!(
+                    "content too large ({} bytes, max {})",
+                    content.len(),
+                    config.max_read_bytes
+                ));
+            }
             let create_dirs = args
                 .get("create_dirs")
                 .and_then(|v| v.as_bool())
@@ -1238,6 +1284,31 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_file_stat_reports_symlink() {
+        let tmp = setup_test_tree();
+        std::os::unix::fs::symlink(
+            tmp.path().join("hello.txt"),
+            tmp.path().join("hello-link.txt"),
+        )
+        .unwrap();
+        let cfg = make_test_config(tmp.path(), false);
+        let tools = filesystem_tools(&cfg);
+        let tool = tools.iter().find(|t| t.name == "file_stat").unwrap();
+        let result = (tool.handler)(
+            json!({ "path": tmp.path().join("hello-link.txt").to_str().unwrap() }),
+            &test_ctx(),
+        );
+        match &result {
+            ToolInvokeResult::Success { result, .. } => {
+                assert_eq!(result["isSymlink"], true);
+                assert_eq!(result["isDir"], false);
+            }
+            _ => panic!("expected success"),
+        }
+    }
+
     // ===== file_search tests =====
 
     #[test]
@@ -1708,6 +1779,28 @@ mod tests {
     }
 
     #[test]
+    fn test_file_search_rejects_excessive_max_depth() {
+        let tmp = setup_test_tree();
+        let cfg = make_test_config(tmp.path(), false);
+        let tools = filesystem_tools(&cfg);
+        let tool = tools.iter().find(|t| t.name == "file_search").unwrap();
+        let result = (tool.handler)(
+            json!({
+                "pattern": "*",
+                "path": tmp.path().to_str().unwrap(),
+                "max_depth": DEFAULT_MAX_SEARCH_DEPTH as u64 + 1
+            }),
+            &test_ctx(),
+        );
+        match &result {
+            ToolInvokeResult::Error { error, .. } => {
+                assert!(error.message.contains("max_depth too large"));
+            }
+            _ => panic!("expected error for overly large max_depth"),
+        }
+    }
+
+    #[test]
     fn test_validate_write_path_excludes_rejected() {
         let tmp = setup_test_tree();
         let roots = vec![tmp.path().canonicalize().unwrap()];
@@ -1736,6 +1829,75 @@ mod tests {
         assert!(result.is_err());
         // Verify the directory was NOT created since exclude check runs first.
         assert!(!tmp.path().join("secret_dir").exists());
+    }
+
+    #[test]
+    fn test_validate_path_denies_when_any_matching_root_excludes_path() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("private")).unwrap();
+        fs::write(tmp.path().join("private/secret.txt"), "secret").unwrap();
+        let roots = vec![
+            tmp.path().join("private").canonicalize().unwrap(),
+            tmp.path().canonicalize().unwrap(),
+        ];
+        let pattern = Pattern::new("private/**").unwrap();
+        let result = validate_path(
+            tmp.path().join("private/secret.txt").to_str().unwrap(),
+            &roots,
+            &[pattern],
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("excluded"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_validate_write_path_rejects_existing_symlink_target() {
+        let tmp = setup_test_tree();
+        let outside = TempDir::new().unwrap();
+        fs::write(outside.path().join("outside.txt"), "outside").unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("outside.txt"),
+            tmp.path().join("symlink-target.txt"),
+        )
+        .unwrap();
+        let roots = vec![tmp.path().canonicalize().unwrap()];
+        let result = validate_write_path(
+            tmp.path().join("symlink-target.txt").to_str().unwrap(),
+            &roots,
+            &[],
+            false,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("symlink target"));
+    }
+
+    #[test]
+    fn test_file_write_rejects_oversized_content() {
+        let tmp = setup_test_tree();
+        let cfg = json!({
+            "filesystem": {
+                "enabled": true,
+                "roots": [tmp.path().to_str().unwrap()],
+                "writeAccess": true,
+                "maxReadBytes": 8
+            }
+        });
+        let tools = filesystem_tools(&cfg);
+        let tool = tools.iter().find(|t| t.name == "file_write").unwrap();
+        let result = (tool.handler)(
+            json!({
+                "path": tmp.path().join("too-big.txt").to_str().unwrap(),
+                "content": "123456789"
+            }),
+            &test_ctx(),
+        );
+        match &result {
+            ToolInvokeResult::Error { error, .. } => {
+                assert!(error.message.contains("content too large"));
+            }
+            _ => panic!("expected oversized content error"),
+        }
     }
 
     #[test]

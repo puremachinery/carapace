@@ -909,10 +909,21 @@ fn validate_filesystem(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Sc
         None => return,
     };
 
-    let enabled = fs_cfg
-        .get("enabled")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let enabled = match fs_cfg.get("enabled") {
+        Some(Value::Bool(enabled)) => *enabled,
+        Some(other) => {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: ".filesystem.enabled".to_string(),
+                message: format!(
+                    "filesystem enabled must be a boolean, got {}",
+                    json_type_label(other)
+                ),
+            });
+            false
+        }
+        None => false,
+    };
 
     // Known keys inside filesystem block
     let known_keys = [
@@ -928,6 +939,32 @@ fn validate_filesystem(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Sc
                 severity: Severity::Warning,
                 path: format!(".filesystem.{}", key),
                 message: format!("Unknown filesystem configuration key: {}", key),
+            });
+        }
+    }
+
+    if let Some(write_access) = fs_cfg.get("writeAccess") {
+        if !write_access.is_boolean() {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: ".filesystem.writeAccess".to_string(),
+                message: format!(
+                    "filesystem writeAccess must be a boolean, got {}",
+                    json_type_label(write_access)
+                ),
+            });
+        }
+    }
+
+    if let Some(max_read_bytes) = fs_cfg.get("maxReadBytes") {
+        if !max_read_bytes.is_u64() {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: ".filesystem.maxReadBytes".to_string(),
+                message: format!(
+                    "filesystem maxReadBytes must be a non-negative integer, got {}",
+                    json_type_label(max_read_bytes)
+                ),
             });
         }
     }
@@ -1495,18 +1532,19 @@ mod tests {
 
     // ===== Filesystem validation =====
 
-    fn test_filesystem_root() -> String {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().to_path_buf();
-        std::mem::forget(dir);
-        path.to_string_lossy().into_owned()
+    fn test_filesystem_root() -> tempfile::TempDir {
+        tempfile::TempDir::new().unwrap()
     }
 
     fn nonexistent_filesystem_root() -> String {
-        std::env::temp_dir()
-            .join("carapace-schema-nonexistent-root-27364")
-            .to_string_lossy()
-            .into_owned()
+        loop {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().to_path_buf();
+            drop(dir);
+            if !path.exists() {
+                return path.to_string_lossy().into_owned();
+            }
+        }
     }
 
     #[test]
@@ -1515,7 +1553,7 @@ mod tests {
         let config = json!({
             "filesystem": {
                 "enabled": true,
-                "roots": [root],
+                "roots": [root.path().to_str().unwrap()],
                 "writeAccess": false
             }
         });
@@ -1576,7 +1614,7 @@ mod tests {
         let config = json!({
             "filesystem": {
                 "enabled": true,
-                "roots": [root],
+                "roots": [root.path().to_str().unwrap()],
                 "unknownSetting": true
             }
         });
@@ -1592,7 +1630,7 @@ mod tests {
         let config = json!({
             "filesystem": {
                 "enabled": true,
-                "roots": [root],
+                "roots": [root.path().to_str().unwrap()],
                 "excludePatterns": ["[invalid"]
             }
         });
@@ -1638,7 +1676,7 @@ mod tests {
         let config = json!({
             "filesystem": {
                 "enabled": true,
-                "roots": [root],
+                "roots": [root.path().to_str().unwrap()],
                 "excludePatterns": ["*.log", 123]
             }
         });
@@ -1649,6 +1687,58 @@ mod tests {
             .collect();
         assert_eq!(errors.len(), 1, "should flag the non-string pattern");
         assert!(errors[0].message.contains("must be a string"));
+    }
+
+    #[test]
+    fn test_filesystem_invalid_enabled_type_is_error() {
+        let config = json!({
+            "filesystem": {
+                "enabled": "yes",
+                "roots": []
+            }
+        });
+        let issues = validate_schema(&config);
+        assert!(issues.iter().any(|i| {
+            i.severity == Severity::Error
+                && i.path == ".filesystem.enabled"
+                && i.message.contains("must be a boolean")
+        }));
+    }
+
+    #[test]
+    fn test_filesystem_invalid_write_access_type_is_error() {
+        let root = test_filesystem_root();
+        let config = json!({
+            "filesystem": {
+                "enabled": true,
+                "roots": [root.path().to_str().unwrap()],
+                "writeAccess": "yes"
+            }
+        });
+        let issues = validate_schema(&config);
+        assert!(issues.iter().any(|i| {
+            i.severity == Severity::Error
+                && i.path == ".filesystem.writeAccess"
+                && i.message.contains("must be a boolean")
+        }));
+    }
+
+    #[test]
+    fn test_filesystem_invalid_max_read_bytes_type_is_error() {
+        let root = test_filesystem_root();
+        let config = json!({
+            "filesystem": {
+                "enabled": true,
+                "roots": [root.path().to_str().unwrap()],
+                "maxReadBytes": "lots"
+            }
+        });
+        let issues = validate_schema(&config);
+        assert!(issues.iter().any(|i| {
+            i.severity == Severity::Error
+                && i.path == ".filesystem.maxReadBytes"
+                && i.message.contains("must be a non-negative integer")
+        }));
     }
 
     // --- is_plausible_cron ---

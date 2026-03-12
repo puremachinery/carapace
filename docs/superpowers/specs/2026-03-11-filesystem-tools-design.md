@@ -66,7 +66,7 @@ All tools follow the existing `BuiltinTool` pattern from `src/agent/builtin_tool
 
 Read-tier tools and `file_write`/`file_move` use `std::fs` directly (synchronous), matching the pattern of the existing memory tools. These are single-file operations with bounded I/O.
 
-`file_search` is the exception: it traverses up to 10,000 filesystem entries with optional regex content matching, which can block for a noticeable duration. Wrap `file_search`'s traversal logic in `tokio::task::block_in_place(|| { ... })` to signal the multi-threaded runtime that the current worker thread is blocked, matching the pattern used in `src/runtime_bridge.rs`.
+`file_search` is the exception: it traverses up to 10,000 filesystem entries with optional regex content matching, which can block for a noticeable duration. Run the traversal through `crate::runtime_bridge::run_sync_blocking_send(async move { tokio::task::spawn_blocking(...) })` so multi-threaded runtimes get a proper blocking worker and current-thread runtimes use the existing spawned-runtime bridge instead of direct `block_in_place`.
 
 `file_search` has a hard entry budget of 10,000 filesystem entries scanned. When hit, returns partial results with `truncated: true`.
 
@@ -139,7 +139,8 @@ Approximately 25–35 new tests total. No golden/snapshot tests — pure logic t
 - **`file_write` to non-existent parent**: Create intermediate directories (path already validated).
 - **`file_move` destination exists**: On Unix, `fs::rename` atomically overwrites. On Windows, `fs::rename` fails if the destination exists — use `fs::remove_file` then `fs::rename` as a fallback. Both source and destination must pass path validation.
 - **`file_move` cross-device**: `fs::rename` fails with EXDEV when source and destination are on different filesystems. Since multiple `roots` could span mount points, return a clear tool error ("cannot move across filesystems") rather than a raw OS error. Copy-then-delete is out of scope for the initial implementation.
-- **`file_search` scalability**: Entry budget (10,000) is the protection. No wall-clock timeout — budget makes it deterministic. Handler runs in `block_in_place` to avoid starving tokio.
+- **`file_search` scalability**: Entry budget (10,000) and capped `max_depth` are the protection. No wall-clock timeout — budget makes it deterministic. Handler runs through `runtime_bridge` + `spawn_blocking` to avoid starving tokio.
+- **Config reload behavior**: Filesystem tool registration happens at startup. Changing `filesystem.*` config requires a process restart to take effect; hot reload does not currently add/remove tools or retune roots in-place.
 - **Symlink loops**: `canonicalize` returns `Err` → tool error.
 - **Empty roots when enabled**: Schema warns. Tools register but every path is denied (fail-closed).
 - **TOCTOU race conditions**: Not addressed. Canonicalize-then-operate is the standard pattern used by Claude Code and similar tools. Acceptable for a local assistant.
