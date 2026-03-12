@@ -20,8 +20,8 @@ The file is parsed as **JSON5** (comments, trailing commas allowed).
 2. Resolve `$include` directives (see below).
 3. Apply `env` entries into `process.env` **before** substitution.
 4. Substitute `${VAR}` references in string values.
-5. Validate against the schema.
-6. Apply defaults.
+5. Apply defaults.
+6. Validate against the schema.
 7. Normalize paths.
 8. Apply runtime overrides.
 
@@ -88,7 +88,8 @@ Rules:
 
 ## Schema: Top-Level Keys
 
-All keys are optional. Unknown keys are rejected (strict schema).
+All keys are optional. Unknown top-level keys produce schema warnings; they do
+not, by themselves, abort startup.
 
 For a plain-English guide to the most commonly tuned sections, see
 [`docs/protocol/config-reference.md`](config-reference.md).

@@ -51,7 +51,7 @@ This section controls how the internal Carapace server connects to the outside w
     * `allowTailscale`:
       * `true` - Permits connections that are already safely authenticated through Tailscale VPN.
       * `false` - Still requires the configured auth mode (for example, token/password) even if the connection is over Tailscale.
-      * *Default / implicit behavior:* If you do not set this explicitly, Carapace may automatically allow Tailscale-authenticated connections when `gateway.tailscale.mode` is configured to serve the gateway and depending on the selected auth `mode`. For predictable security, set `allowTailscale` explicitly to `true` or `false`.
+      * *Default / implicit behavior:* If you do not set this explicitly, behavior differs by server path. The HTTP gateway currently defaults this to `false`. The WebSocket path currently auto-allows Tailscale-authenticated connections when `gateway.tailscale.mode = "serve"` and the auth mode is not `password`. Set this explicitly to `true` or `false` for predictable security.
 * **`gateway.reload`**
   * *What it does:* Setting for hot-reloading configurations when you save changes to the file.
   * *Possible values:*
@@ -69,8 +69,8 @@ This section controls how the internal Carapace server connects to the outside w
     * `path`: String. Represents the file system directory where UI assets live (e.g. `"dist/control-ui"`).
     * `basePath`: String. Base URL path to mount the UI on the web server.
     * `allowInsecureAuth`:
-      * `true` - Allows logins over unencrypted HTTP connections.
-      * `false` - Requires a secure HTTPS connection to log in.
+      * `true` - Lets the Control UI satisfy the pairing check with token/password auth instead of requiring a local device identity.
+      * `false` - Keeps the normal device-identity requirement unless `dangerouslyDisableDeviceAuth` is also enabled.
     * `dangerouslyDisableDeviceAuth`:
       * `true` - Disables the device-auth pairing path for the Control UI.
       * `false` - Leaves device-auth pairing available.
@@ -200,12 +200,12 @@ This block shapes how smart your AI behaves and what limits apply during executi
   * *What it does:* OS-level sandboxing that limits what tools and background scripts can do.
   * *Possible values:*
     * `enabled`: `true` (Default) or `false`.
-    * `maxCpuSeconds`: Integer. (Default: `30`)
-    * `maxMemoryMb`: Integer. (Default: `512`)
-    * `maxFds`: Integer. (Default: `256`)
-    * `allowedPaths`: Array of string paths the tool is permanently allowed to read/write to. (Default: `["/tmp", "/usr/bin", "/usr/local/bin", "/bin"]`)
-    * `networkAccess`: Boolean. (Default: `false`)
-    * `envFilter`: Array of environment variable names to allow through to the sandbox. If empty, no filter is applied and all env vars pass through.
+    * `max_cpu_seconds`: Integer. (Default: `30`)
+    * `max_memory_mb`: Integer. (Default: `512`)
+    * `max_fds`: Integer. (Default: `256`)
+    * `allowed_paths`: Array of string paths the tool is permanently allowed to read/write to. (Default: `["/tmp", "/usr/bin", "/usr/local/bin", "/bin"]`)
+    * `network_access`: Boolean. (Default: `false`)
+    * `env_filter`: Array of environment variable names to allow through to the sandbox. If empty, no filter is applied and all env vars pass through.
 * **`agents.defaults.classifier`**
   * *What it does:* An LLM-based pre-dispatch filter that intercepts potentially malicious inbound prompts before they execute on the main agent.
   * *Possible values:*
@@ -217,7 +217,7 @@ This block shapes how smart your AI behaves and what limits apply during executi
   * *What it does:* Enforces prompt-injection guardrails.
   * *Possible values:*
     * `enabled`: `true` or `false`
-    * nested `preflight`, `tagging`, `postflight`, and `configLint` sections with their own `enabled` flags
+    * nested `preflight`, `tagging`, `postflight`, and `config_lint` sub-sections with their own `enabled` flags
 * **`agents.outputSanitizer`**
   * *What it does:* Scrubs unsafe output before it reaches users.
   * *Possible values:*
@@ -337,7 +337,7 @@ Enable Carapace to listen and respond on external chat platforms.
   * *Common values:*
     * `level`: `"trace"`, `"debug"`, `"info"` (Default), `"warn"`, `"error"`.
     * `format`: `"text"` or `"json"`.
-    * `consoleStyle`: `"pretty"` (Default).
+    * `consoleStyle`: String. Current default is `"pretty"`.
     * `redactSensitive`: `"tools"` (Default).
 * **`skills.sandbox`** and **`skills.signature`**
   * *What it does:* Controls sandboxing and signature policy for downloaded skills/plugins.
