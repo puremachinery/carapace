@@ -48,14 +48,14 @@ Six tools in two tiers, gated by config.
 |------|-----------|---------|
 | `file_read` | `path` (required), `offset` (bytes, optional), `limit` (bytes, optional) | `content`, `encoding` ("utf-8" or "base64"), `size`, `truncated` |
 | `directory_list` | `path` (required), `glob` (filter pattern, optional) | `entries[]` with `name`, `type` ("file"/"dir"/"symlink"), `size`, `modified` |
-| `file_stat` | `path` (required) | `size`, `modified`, `created`, `is_dir`, `is_symlink`, `permissions` |
-| `file_search` | `pattern` (required), `path` (root to search, required), `max_depth` (default 10), `content_pattern` (regex, optional) | `matches[]` with `path` and optional `line`/`snippet` |
+| `file_stat` | `path` (required) | `size`, `modified`, `created`, `isDir`, `isSymlink`, `permissions` |
+| `file_search` | `pattern` (required), `path` (root to search, required), `max_depth` (default 10), `content_pattern` (regex, optional) | `matches[]` with `path` and optional `line`/`snippet`, plus `entriesScanned` and `truncated` |
 
 ### Write tier (requires `writeAccess: true`)
 
 | Tool | Parameters | Returns |
 |------|-----------|---------|
-| `file_write` | `path` (required), `content` (required), `create_dirs` (default true) | `bytes_written`, `path` |
+| `file_write` | `path` (required), `content` (required), `create_dirs` (default true) | `bytesWritten`, `path` |
 | `file_move` | `source` (required), `destination` (required) | `source`, `destination` |
 
 No `file_delete` in the initial implementation. Agents can use `file_move` to move files to a staging area.
@@ -95,6 +95,7 @@ Steps:
 ### `directory_list` glob filter
 
 The optional `glob` parameter on `directory_list` matches against entry *names only* (not full paths) and applies only to immediate children of the listed directory (non-recursive). This is a display filter, not a search — use `file_search` for recursive matching.
+Invalid `glob` values return a tool error rather than silently disabling filtering.
 
 ## Testing Strategy
 
@@ -138,6 +139,7 @@ Approximately 25–35 new tests total. No golden/snapshot tests — pure logic t
 - **`maxReadBytes` exceeded**: Read up to the limit, return content plus `truncated: true` and `totalBytes`.
 - **`file_write` to non-existent parent**: Create intermediate directories (path already validated).
 - **`file_move` destination exists**: On Unix, `fs::rename` atomically overwrites. On Windows, `fs::rename` fails if the destination exists — use `fs::remove_file` then `fs::rename` as a fallback. Both source and destination must pass path validation.
+- **`file_move` symlink source**: Rejected. The initial implementation only moves regular files and refuses symlink sources rather than renaming the symlink target implicitly.
 - **`file_move` cross-device**: `fs::rename` fails with EXDEV when source and destination are on different filesystems. Since multiple `roots` could span mount points, return a clear tool error ("cannot move across filesystems") rather than a raw OS error. Copy-then-delete is out of scope for the initial implementation.
 - **`file_search` scalability**: Entry budget (10,000) and capped `max_depth` are the protection. No wall-clock timeout — budget makes it deterministic. Handler runs through `runtime_bridge` + `spawn_blocking` to avoid starving tokio.
 - **Config reload behavior**: Filesystem tool registration happens at startup. Changing `filesystem.*` config requires a process restart to take effect; hot reload does not currently add/remove tools or retune roots in-place.

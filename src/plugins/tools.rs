@@ -161,6 +161,10 @@ impl ToolsRegistry {
     ///
     /// Starts from the same baseline as `new()` (time, agent builtins), then
     /// conditionally registers filesystem tools when `filesystem.enabled` is true.
+    ///
+    /// Filesystem tool configuration is read once at startup. Changes to the
+    /// `filesystem` config block require a process restart to take effect, even
+    /// when hybrid hot-reload is enabled.
     pub fn with_config(cfg: &Value) -> Self {
         let registry = Self::new();
 

@@ -410,6 +410,12 @@ fn directory_list_tool(config: Arc<FilesystemConfig>) -> BuiltinTool {
                 Some(p) => p,
                 None => return ToolInvokeResult::tool_error("missing required parameter: path"),
             };
+            if !std::path::Path::new(path_str).is_absolute() {
+                return ToolInvokeResult::tool_error(format!(
+                    "path \"{}\" must be absolute",
+                    path_str
+                ));
+            }
             let canonical = match validate_path(path_str, &config.roots, &config.exclude_patterns) {
                 Ok(p) => p,
                 Err(e) => return ToolInvokeResult::tool_error(e),
@@ -420,10 +426,15 @@ fn directory_list_tool(config: Arc<FilesystemConfig>) -> BuiltinTool {
                     path_str
                 ));
             }
-            let glob_filter = args
-                .get("glob")
-                .and_then(|v| v.as_str())
-                .and_then(|s| Pattern::new(s).ok());
+            let glob_filter = match args.get("glob").and_then(|v| v.as_str()) {
+                Some(glob) => match Pattern::new(glob) {
+                    Ok(pattern) => Some(pattern),
+                    Err(e) => {
+                        return ToolInvokeResult::tool_error(format!("invalid glob pattern: {}", e))
+                    }
+                },
+                None => None,
+            };
 
             let entries = match fs::read_dir(&canonical) {
                 Ok(rd) => rd,
@@ -506,6 +517,16 @@ fn file_stat_tool(config: Arc<FilesystemConfig>) -> BuiltinTool {
                 Some(p) => p,
                 None => return ToolInvokeResult::tool_error("missing required parameter: path"),
             };
+            if !std::path::Path::new(path_str).is_absolute() {
+                return ToolInvokeResult::tool_error(format!(
+                    "path \"{}\" must be absolute",
+                    path_str
+                ));
+            }
+            let canonical = match validate_path(path_str, &config.roots, &config.exclude_patterns) {
+                Ok(p) => p,
+                Err(e) => return ToolInvokeResult::tool_error(e),
+            };
             let original_meta = match fs::symlink_metadata(path_str) {
                 Ok(m) => m,
                 Err(e) => {
@@ -516,10 +537,6 @@ fn file_stat_tool(config: Arc<FilesystemConfig>) -> BuiltinTool {
                     };
                     return ToolInvokeResult::tool_error(msg);
                 }
-            };
-            let canonical = match validate_path(path_str, &config.roots, &config.exclude_patterns) {
-                Ok(p) => p,
-                Err(e) => return ToolInvokeResult::tool_error(e),
             };
             let meta = match fs::metadata(&canonical) {
                 Ok(m) => m,
@@ -853,6 +870,23 @@ fn file_move_tool(config: Arc<FilesystemConfig>) -> BuiltinTool {
                 Ok(p) => p,
                 Err(e) => return ToolInvokeResult::tool_error(e),
             };
+            let source_meta = match fs::symlink_metadata(source_str) {
+                Ok(m) => m,
+                Err(e) => {
+                    let msg = if e.kind() == std::io::ErrorKind::PermissionDenied {
+                        format!("permission denied: \"{}\"", source_str)
+                    } else {
+                        format!("cannot stat \"{}\": {}", source_str, e)
+                    };
+                    return ToolInvokeResult::tool_error(msg);
+                }
+            };
+            if source_meta.file_type().is_symlink() {
+                return ToolInvokeResult::tool_error(format!(
+                    "\"{}\" is a symlink; file_move only supports regular files",
+                    source_str
+                ));
+            }
 
             if source.is_dir() {
                 return ToolInvokeResult::tool_error(format!(
@@ -884,9 +918,17 @@ fn file_move_tool(config: Arc<FilesystemConfig>) -> BuiltinTool {
                 })),
                 Err(e) => {
                     let msg = if e.kind() == std::io::ErrorKind::CrossesDevices {
-                        "cannot move across filesystems".to_string()
+                        format!(
+                            "cannot move across filesystems from \"{}\" to \"{}\"",
+                            source.display(),
+                            dest.display()
+                        )
                     } else if e.kind() == std::io::ErrorKind::PermissionDenied {
-                        "permission denied".to_string()
+                        format!(
+                            "permission denied moving \"{}\" to \"{}\"",
+                            source.display(),
+                            dest.display()
+                        )
                     } else {
                         format!("cannot move: {}", e)
                     };
@@ -1229,6 +1271,24 @@ mod tests {
     }
 
     #[test]
+    fn test_directory_list_invalid_glob_errors() {
+        let tmp = setup_test_tree();
+        let cfg = make_test_config(tmp.path(), false);
+        let tools = filesystem_tools(&cfg);
+        let tool = tools.iter().find(|t| t.name == "directory_list").unwrap();
+        let result = (tool.handler)(
+            json!({ "path": tmp.path().to_str().unwrap(), "glob": "[" }),
+            &test_ctx(),
+        );
+        match &result {
+            ToolInvokeResult::Error { error, .. } => {
+                assert!(error.message.contains("invalid glob pattern"));
+            }
+            _ => panic!("expected invalid glob error"),
+        }
+    }
+
+    #[test]
     fn test_directory_list_on_file_errors() {
         let tmp = setup_test_tree();
         let cfg = make_test_config(tmp.path(), false);
@@ -1506,6 +1566,33 @@ mod tests {
                 assert!(error.message.contains("directory"));
             }
             _ => panic!("expected error for directory move"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_file_move_rejects_symlink_source() {
+        let tmp = setup_test_tree();
+        std::os::unix::fs::symlink(
+            tmp.path().join("hello.txt"),
+            tmp.path().join("hello-link.txt"),
+        )
+        .unwrap();
+        let cfg = make_test_config(tmp.path(), true);
+        let tools = filesystem_tools(&cfg);
+        let tool = tools.iter().find(|t| t.name == "file_move").unwrap();
+        let result = (tool.handler)(
+            json!({
+                "source": tmp.path().join("hello-link.txt").to_str().unwrap(),
+                "destination": tmp.path().join("moved.txt").to_str().unwrap()
+            }),
+            &test_ctx(),
+        );
+        match &result {
+            ToolInvokeResult::Error { error, .. } => {
+                assert!(error.message.contains("is a symlink"));
+            }
+            _ => panic!("expected symlink-source error"),
         }
     }
 
