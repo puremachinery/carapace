@@ -185,7 +185,7 @@ struct AgentDefaultsSection {
     #[serde(default = "default_agent_max_concurrent")]
     max_concurrent: u32,
 
-    #[serde(default = "default_agent_timeout_seconds", alias = "timeout")]
+    #[serde(default = "default_agent_timeout_seconds")]
     timeout_seconds: u32,
 
     #[serde(default = "default_context_tokens")]
@@ -542,14 +542,10 @@ pub fn apply_defaults(config: &mut Value) {
         *config = Value::Object(serde_json::Map::new());
     }
 
-    let mut defaults_input = config.clone();
     let should_normalize_legacy_timeout = should_normalize_legacy_agent_timeout(config);
-    if should_normalize_legacy_timeout {
-        migrate_legacy_agent_timeout(&mut defaults_input);
-    }
 
     // Deserialize into typed struct — missing fields get defaults.
-    let with_defaults: ConfigWithDefaults = match serde_json::from_value(defaults_input) {
+    let with_defaults: ConfigWithDefaults = match serde_json::from_value(config.clone()) {
         Ok(v) => v,
         Err(e) => {
             debug!("config defaults: deserialization failed, using all defaults: {e}");
@@ -830,6 +826,23 @@ mod tests {
 
         assert_eq!(config["agents"]["defaults"]["timeoutSeconds"], 600);
         assert!(config["agents"]["defaults"].get("timeout").is_none());
+    }
+
+    #[test]
+    fn test_both_timeout_keys_keep_canonical_timeout_seconds() {
+        let mut config = json!({
+            "agents": {
+                "defaults": {
+                    "timeoutSeconds": 120,
+                    "timeout": 30
+                }
+            }
+        });
+
+        apply_defaults(&mut config);
+
+        assert_eq!(config["agents"]["defaults"]["timeoutSeconds"], 120);
+        assert_eq!(config["agents"]["defaults"]["timeout"], 30);
     }
 
     #[test]

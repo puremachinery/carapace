@@ -476,9 +476,9 @@ fn validate_agents(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schema
     if timeout_seconds.is_some() && timeout_legacy.is_some() {
         issues.push(SchemaIssue {
             severity: Severity::Warning,
-            path: ".agents.defaults".to_string(),
+            path: ".agents.defaults.timeout".to_string(),
             message:
-                "Both agents.defaults.timeoutSeconds and agents.defaults.timeout are set; timeout is legacy and may be ignored"
+                "Both agents.defaults.timeoutSeconds and agents.defaults.timeout are set; timeoutSeconds takes precedence and timeout is legacy and should be removed"
                     .to_string(),
         });
     }
@@ -1272,7 +1272,7 @@ mod tests {
     fn test_agents_defaults_warns_when_both_timeout_keys_are_set() {
         let cfg = json!({ "agents": { "defaults": { "timeoutSeconds": 60, "timeout": 30 } } });
         let issues = validate_schema(&cfg);
-        assert!(issues.iter().any(|i| i.path == ".agents.defaults"));
+        assert!(issues.iter().any(|i| i.path == ".agents.defaults.timeout"));
     }
 
     #[test]
