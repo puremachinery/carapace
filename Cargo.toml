@@ -19,6 +19,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 json5 = "1"
 regex = "1"
+glob = "0.3"
 dirs = "6"
 uuid = { version = "1", features = ["v4"] }
 tracing = "0.1"

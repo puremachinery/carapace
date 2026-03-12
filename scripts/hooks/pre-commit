@@ -16,6 +16,9 @@ if ! git diff --cached --quiet --diff-filter=ACMRD -- \
     # Force visible progress output so long builds don't look stalled,
     # while respecting an explicit user preference if one is already set.
     export CARGO_TERM_PROGRESS_WHEN="${CARGO_TERM_PROGRESS_WHEN:-always}"
+    # cargo 1.93+ requires an explicit width when progress mode is "always"
+    # (it cannot query the terminal width in a non-tty hook context).
+    export CARGO_TERM_PROGRESS_WIDTH="${CARGO_TERM_PROGRESS_WIDTH:-80}"
 
     echo "Rust/Cargo changes detected in staged files; running Rust checks..."
     echo "Running cargo fmt --check..."
