@@ -19,3 +19,9 @@ GEMINI.md
 fuzz/target
 fuzz/corpus
 fuzz/artifacts
+
+# Direnv and Nix
+.envrc
+.direnv/
+flake.nix
+flake.lock
