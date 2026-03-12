@@ -49,7 +49,7 @@ Six tools in two tiers, gated by config.
 | `file_read` | `path` (required), `offset` (bytes, optional), `limit` (bytes, optional) | `content`, `encoding` ("utf-8" or "base64"), `size`, `truncated` |
 | `directory_list` | `path` (required), `glob` (filter pattern, optional) | `entries[]` with `name`, `type` ("file"/"dir"/"symlink"), `size`, `modified` |
 | `file_stat` | `path` (required) | `size`, `modified`, `created`, `isDir`, `isSymlink`, `permissions` |
-| `file_search` | `pattern` (required), `path` (root to search, required), `max_depth` (default 10), `content_pattern` (regex, optional) | `matches[]` with `path` and optional `line`/`snippet`, plus `entriesScanned` and `truncated` |
+| `file_search` | `pattern` (required), `path` (root to search, required), `max_depth` (default 10), `content_pattern` (regex, optional) | `matches[]` with `path` and optional `line`/`snippet`, plus `entriesScanned`, `skippedNonUtf8`, and `truncated` |
 
 ### Write tier (requires `writeAccess: true`)
 
@@ -64,9 +64,7 @@ No `file_delete` in the initial implementation. Agents can use `file_move` to mo
 
 All tools follow the existing `BuiltinTool` pattern from `src/agent/builtin_tools.rs`: struct with name, description, `input_schema` (JSON Schema), and handler closure `Box<dyn Fn(Value, &ToolInvokeContext) -> ToolInvokeResult + Send + Sync>`.
 
-Read-tier tools and `file_write`/`file_move` use `std::fs` directly (synchronous), matching the pattern of the existing memory tools. These are single-file operations with bounded I/O.
-
-`file_search` is the exception: it traverses up to 10,000 filesystem entries with optional regex content matching, which can block for a noticeable duration. Run the traversal through `crate::runtime_bridge::run_sync_blocking_send(async move { tokio::task::spawn_blocking(...) })` so multi-threaded runtimes get a proper blocking worker and current-thread runtimes use the existing spawned-runtime bridge instead of direct `block_in_place`.
+All six filesystem tools use `std::fs`, but the handler bodies run through `crate::runtime_bridge::run_sync_blocking_send(async move { tokio::task::spawn_blocking(...) })` so synchronous filesystem I/O does not block Tokio worker threads. That keeps the runtime behavior consistent across both multi-threaded and current-thread runtimes.
 
 `file_search` has a hard entry budget of 10,000 filesystem entries scanned. When hit, returns partial results with `truncated: true`.
 
@@ -141,7 +139,7 @@ Approximately 25–35 new tests total. No golden/snapshot tests — pure logic t
 - **`file_move` destination exists**: On Unix, `fs::rename` atomically overwrites. On Windows, `fs::rename` fails if the destination exists — use `fs::remove_file` then `fs::rename` as a fallback. Both source and destination must pass path validation.
 - **`file_move` symlink source**: Rejected. The initial implementation only moves regular files and refuses symlink sources rather than renaming the symlink target implicitly.
 - **`file_move` cross-device**: `fs::rename` fails with EXDEV when source and destination are on different filesystems. Since multiple `roots` could span mount points, return a clear tool error ("cannot move across filesystems") rather than a raw OS error. Copy-then-delete is out of scope for the initial implementation.
-- **`file_search` scalability**: Entry budget (10,000) and capped `max_depth` are the protection. No wall-clock timeout — budget makes it deterministic. Handler runs through `runtime_bridge` + `spawn_blocking` to avoid starving tokio.
+- **`file_search` scalability**: Entry budget (10,000) and capped `max_depth` are the protection. No wall-clock timeout — budget makes it deterministic. Handler runs through `runtime_bridge` + `spawn_blocking` to avoid starving tokio. Non-UTF-8 files encountered during `content_pattern` matching are skipped and counted in `skippedNonUtf8`.
 - **Config reload behavior**: Filesystem tool registration happens at startup. Changing `filesystem.*` config requires a process restart to take effect; hot reload does not currently add/remove tools or retune roots in-place.
 - **Symlink loops**: `canonicalize` returns `Err` → tool error.
 - **Empty roots when enabled**: Schema warns. Tools register but every path is denied (fail-closed).

@@ -6,7 +6,7 @@
 
 **Architecture:** New `src/agent/filesystem_tools.rs` module provides path validation and tool handlers. Config defaults and schema validation follow existing patterns in `src/config/defaults.rs` and `src/config/schema.rs`. `ToolsRegistry::with_config()` conditionally registers filesystem tools at startup.
 
-**Tech Stack:** Rust std::fs, glob 0.3, regex, base64, serde_json, runtime_bridge::run_sync_blocking_send + tokio::task::spawn_blocking (for file_search).
+**Tech Stack:** Rust std::fs, glob 0.3, regex, base64, serde_json, runtime_bridge::run_sync_blocking_send + tokio::task::spawn_blocking (for all filesystem tool handlers).
 
 **Spec:** `docs/superpowers/specs/2026-03-11-filesystem-tools-design.md`
 
