@@ -50,6 +50,9 @@ struct ConfigWithDefaults {
 
     #[serde(default)]
     vertex: VertexDefaults,
+
+    #[serde(default)]
+    filesystem: FilesystemDefaults,
 }
 
 // ---------------------------------------------------------------------------
@@ -524,6 +527,48 @@ fn default_vertex_location() -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Filesystem defaults
+// ---------------------------------------------------------------------------
+
+/// Default max read bytes (10 MiB).
+const DEFAULT_FILESYSTEM_MAX_READ_BYTES: u64 = 10_485_760;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FilesystemDefaults {
+    #[serde(default)]
+    enabled: bool,
+
+    #[serde(default)]
+    roots: Vec<String>,
+
+    #[serde(default)]
+    write_access: bool,
+
+    #[serde(default = "default_filesystem_max_read_bytes")]
+    max_read_bytes: u64,
+
+    #[serde(default)]
+    exclude_patterns: Vec<String>,
+}
+
+impl Default for FilesystemDefaults {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            roots: Vec::new(),
+            write_access: false,
+            max_read_bytes: default_filesystem_max_read_bytes(),
+            exclude_patterns: Vec::new(),
+        }
+    }
+}
+
+fn default_filesystem_max_read_bytes() -> u64 {
+    DEFAULT_FILESYSTEM_MAX_READ_BYTES
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -555,6 +600,7 @@ pub fn apply_defaults(config: &mut Value) {
                 cron: CronDefaults::default(),
                 messages: MessagesDefaults::default(),
                 vertex: VertexDefaults::default(),
+                filesystem: FilesystemDefaults::default(),
             }
         }
     };
@@ -976,6 +1022,44 @@ mod tests {
             config["agents"]["defaults"]["compaction"]["mode"],
             DEFAULT_COMPACTION_MODE
         );
+    }
+
+    #[test]
+    fn test_filesystem_defaults_applied() {
+        let mut config = json!({});
+        apply_defaults(&mut config);
+
+        assert_eq!(config["filesystem"]["enabled"], false);
+        assert_eq!(config["filesystem"]["writeAccess"], false);
+        assert_eq!(config["filesystem"]["maxReadBytes"], 10_485_760);
+        assert!(config["filesystem"]["roots"].as_array().unwrap().is_empty());
+        assert!(config["filesystem"]["excludePatterns"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn test_filesystem_user_values_preserved() {
+        let mut config = json!({
+            "filesystem": {
+                "enabled": true,
+                "roots": ["/home/user/docs"],
+                "writeAccess": true,
+                "maxReadBytes": 1024
+            }
+        });
+        apply_defaults(&mut config);
+
+        assert_eq!(config["filesystem"]["enabled"], true);
+        assert_eq!(config["filesystem"]["writeAccess"], true);
+        assert_eq!(config["filesystem"]["maxReadBytes"], 1024);
+        assert_eq!(config["filesystem"]["roots"][0], "/home/user/docs");
+        // Missing field gets default
+        assert!(config["filesystem"]["excludePatterns"]
+            .as_array()
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
