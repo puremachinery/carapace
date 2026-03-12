@@ -542,8 +542,14 @@ pub fn apply_defaults(config: &mut Value) {
         *config = Value::Object(serde_json::Map::new());
     }
 
+    let mut defaults_input = config.clone();
+    let should_normalize_legacy_timeout = should_normalize_legacy_agent_timeout(config);
+    if should_normalize_legacy_timeout {
+        migrate_legacy_agent_timeout(&mut defaults_input);
+    }
+
     // Deserialize into typed struct — missing fields get defaults.
-    let with_defaults: ConfigWithDefaults = match serde_json::from_value(config.clone()) {
+    let with_defaults: ConfigWithDefaults = match serde_json::from_value(defaults_input) {
         Ok(v) => v,
         Err(e) => {
             debug!("config defaults: deserialization failed, using all defaults: {e}");
@@ -565,19 +571,10 @@ pub fn apply_defaults(config: &mut Value) {
     // Deep-merge: defaults go *under* user values (user wins).
     merge_defaults(config, defaults_value);
 
-    // Post-merge cross-field fixups: normalize legacy agents.defaults.timeout
-    // into the canonical timeoutSeconds key.
-    if let Some(defaults) = config
-        .get_mut("agents")
-        .and_then(|v| v.as_object_mut())
-        .and_then(|agents| agents.get_mut("defaults"))
-        .and_then(|v| v.as_object_mut())
-    {
-        if let Some(legacy_timeout) = defaults.remove("timeout") {
-            defaults
-                .entry("timeoutSeconds".to_string())
-                .or_insert(legacy_timeout);
-        }
+    // Post-merge cross-field fixups: normalize valid legacy timeout aliases,
+    // while preserving invalid legacy values for downstream schema warnings.
+    if should_normalize_legacy_timeout {
+        migrate_legacy_agent_timeout(config);
     }
 
     // Post-merge cross-field fixups: enforce session.mainKey = "main".
@@ -588,6 +585,32 @@ pub fn apply_defaults(config: &mut Value) {
             }
         }
         session.insert("mainKey".to_string(), Value::String("main".to_string()));
+    }
+}
+
+fn should_normalize_legacy_agent_timeout(config: &Value) -> bool {
+    let Some(defaults) = config.pointer("/agents/defaults").and_then(|v| v.as_object()) else {
+        return false;
+    };
+
+    !defaults.contains_key("timeoutSeconds")
+        && defaults
+            .get("timeout")
+            .and_then(|v| v.as_u64())
+            .filter(|v| *v > 0)
+            .is_some()
+}
+
+fn migrate_legacy_agent_timeout(config: &mut Value) {
+    let Some(defaults) = config
+        .pointer_mut("/agents/defaults")
+        .and_then(|v| v.as_object_mut())
+    else {
+        return;
+    };
+
+    if let Some(legacy_timeout) = defaults.remove("timeout") {
+        defaults.insert("timeoutSeconds".to_string(), legacy_timeout);
     }
 }
 
@@ -804,6 +827,25 @@ mod tests {
 
         assert_eq!(config["agents"]["defaults"]["timeoutSeconds"], 600);
         assert!(config["agents"]["defaults"].get("timeout").is_none());
+    }
+
+    #[test]
+    fn test_invalid_legacy_timeout_is_preserved_for_validation() {
+        let mut config = json!({
+            "agents": {
+                "defaults": {
+                    "timeout": "bad"
+                }
+            }
+        });
+
+        apply_defaults(&mut config);
+
+        assert_eq!(config["agents"]["defaults"]["timeout"], "bad");
+        assert_eq!(
+            config["agents"]["defaults"]["timeoutSeconds"],
+            DEFAULT_AGENT_TIMEOUT_SECONDS
+        );
     }
 
     #[test]
