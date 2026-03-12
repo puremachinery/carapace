@@ -1,6 +1,11 @@
-# Carapace Configuration Reference
+# Carapace Configuration Guide
 
-This document provides a comprehensive, plain-English reference for every setting you can configure in **Carapace**.
+This document is a practical, plain-English guide to the most commonly tuned **Carapace** configuration sections.
+
+It is **not** a complete schema reference. For the current top-level key list, validation notes, and provider/auth-specific details, use:
+
+- [`docs/protocol/config.md`](config.md)
+- [`config.example.json5`](../../config.example.json5)
 
 ## Where to Put Your Configuration
 
@@ -8,7 +13,7 @@ Your main configuration file is placed securely on your computer depending on yo
 
 * **Linux:** `~/.config/carapace/carapace.json5`
 * **macOS:** `~/Library/Application Support/carapace/carapace.json5`
-* **Windows:** `%APPDATA%\carapace\carapace.json5`
+* **Windows:** `%APPDATA%\\carapace\\carapace.json5`
 
 You can explicitly set a custom folder by changing the `CARAPACE_STATE_DIR` or the full path via `CARAPACE_CONFIG_PATH` environment variables. The file is written in **JSON5**, which means you can safely use comments (like `// this is a comment`) and aren't heavily penalized for trailing commas or unquoted keys. If a `carapace.json5` file is not found at the expected location, Carapace will automatically fall back to loading `carapace.json` from the same directory.
 
@@ -29,8 +34,9 @@ This section controls how the internal Carapace server connects to the outside w
     * `"auto"` - Currently behaves like `"all"` / `"0.0.0.0"` and listens on all network interfaces. This is convenient for development but less secure than `"loopback"` because it exposes the gateway on every reachable interface.
     * `"tailnet"` - Exposes the gateway over a Tailscale VPN only.
     * `"all"` / `"0.0.0.0"` - Explicitly listen on all network interfaces (same behavior and security considerations as `"auto"`).
-    * `"localhost"` - Alias for `"loopback"`.
-    * `"ts"` - Alias for `"tailnet"`.
+    * `"localhost"` / `"local"` - Aliases for `"loopback"`.
+    * `"local-network"` - Alias for `"lan"`.
+    * `"tailscale"` / `"ts"` - Aliases for `"tailnet"`.
     * Or any specific IP address like `"127.0.0.1"`.
 * **`gateway.auth`**
   * *What it does:* Decides how external programs prove they're allowed to connect.
@@ -65,6 +71,9 @@ This section controls how the internal Carapace server connects to the outside w
     * `allowInsecureAuth`:
       * `true` - Allows logins over unencrypted HTTP connections.
       * `false` - Requires a secure HTTPS connection to log in.
+    * `dangerouslyDisableDeviceAuth`:
+      * `true` - Disables the device-auth pairing path for the Control UI.
+      * `false` - Leaves device-auth pairing available.
 * **`gateway.hooks`**
   * *What it does:* Set up incoming webhook URLs for sending commands directly via API.
   * *Possible values:*
@@ -92,7 +101,7 @@ This section controls how the internal Carapace server connects to the outside w
       * `true` - Attempts to reset any Tailscale serve/funnel configuration created by Carapace when the gateway shuts down.
       * `false` - Leaves Tailscale serve/funnel configuration as-is on shutdown.
 * **`gateway.remote`**
-  * *What it does:* Let your Carapace installation secretly connect outward to heavily guarded server installations.
+  * *What it does:* Lets your Carapace installation connect outward to remote gateway installations.
   * *Possible values:*
     * `enabled`: `true` (activate remote connection) or `false` (disable remote connection).
     * `authToken`: String. The token verifying your identity to the remote server.
@@ -110,7 +119,7 @@ This section controls how the internal Carapace server connects to the outside w
         * `user`: String. SSH username to authenticate as.
         * `remotePort`: Integer. Remote port on the SSH server that exposes the gateway service.
 * **`gateway.tls`**
-  * *What it does:* Configures standard HTTPS (TLS) for encrypting traffic to the gateway. We recommend reviewing the [Security documentation](./security.md) for more setup guidance.
+  * *What it does:* Configures standard HTTPS (TLS) for encrypting traffic to the gateway. We recommend reviewing the [Security documentation](../security.md) for more setup guidance.
   * *Possible values:*
     * `enabled`: `true` (enforce HTTPS) or `false` (plain HTTP).
     * `autoGenerate`: `true` (automatically generate a self-signed certificate and key) or `false` (use the provided certificate files).
@@ -133,350 +142,248 @@ This section controls how the internal Carapace server connects to the outside w
 
 ## 2. Agents (AI Behavior & Capability Limits)
 
-This block shapes how smart your AI behaves, how large its memory is, and performance.
+This block shapes how smart your AI behaves and what limits apply during execution.
 
 * **`agents.list`**
-  * *What it does:* An array of specific agent configurations. You can define multiple distinct "personas" or special-purpose AIs here.
-  * *Possible values:* A list of objects containing these keys:
+  * *What it does:* An array of specific agent configurations. You can define multiple distinct personas or special-purpose agents here.
+  * *Possible values:* A list of objects containing keys such as:
     * `id`: String. A unique name for this agent (e.g., `"coder"`, `"researcher"`).
     * `default`: Boolean. Set to `true` to make this the primary agent used if no ID is specified. (Default: `false`)
-    * `model`: String. The exact LLM name used by this agent (e.g., `"claude-3-7-sonnet-20250219"`). (Default: Fallback to global default or `"claude-3-7-sonnet-20250219"`)
-    * `system`: String. The system prompt or core "identity" instructions for this specific agent. (Default: Built-in Carapace system prompt)
-    * `maxTurns`: Integer. Maximum LLM round-trips allowed per single user request. **When the AI uses a tool (like reading a file or searching the web), it pauses its response, runs the tool, and sends the result back to itself to continue "thinking". That counts as one turn. If the AI gets stuck in a loop or encounters a complex task that requires many tool uses, this limit forcibly stops it after the specified number of turns to prevent runaway infinite loops and excessive API costs.** (Default: `25`).
+    * `model`: String. The exact LLM name used by this agent.
+    * `system`: String. The system prompt or core identity instructions for this agent.
+    * `maxTurns`: Integer. Maximum LLM round-trips allowed per single user request. (Default: `25`)
     * `maxTokens`: Integer. Maximum output tokens the LLM is permitted to generate in one response. (Default: `8192`)
-    * `temperature`: Decimal. Creativity/randomness scaler (e.g., `0.0` for strict, `1.0` for creative). (Default: `0.0` or model default)
-    * `deliver`: Boolean. If `true`, the final message from this agent is pushed directly to the chat channel for you to read. If `false`, the agent operates silently in the background (typically as a sub-agent) and returns its finalized answer internally to whichever larger AI originally called it for help. (Default: `true`)
+    * `temperature`: Decimal. Creativity/randomness scaler.
+    * `deliver`: Boolean. Whether the final message from this agent is delivered to the channel. (Default: `true`)
     * `toolPolicy`: String (`"allowlist"`, `"denylist"`, `"allowall"`) managing which tools this agent can use. (Default: `"allowall"`)
-    * `exfiltrationGuard`: Boolean. If `true`, blocks tools known to be capable of sending data externally (preventing prompt injection data theft). (Default: `false`)
+    * `exfiltrationGuard`: Boolean. If `true`, blocks tools known to be capable of sending data externally. (Default: `false`)
     * `promptGuard` / `outputSanitizer` / `sandbox` / `classifier`: These agent-specific blocks override the global `agents.*` for this entity.
 
 * **`agents.defaults.maxConcurrent`**
   * *What it does:* Maximum number of simultaneous main AI tasks that run.
   * *Possible values:* Positive integer. (Default: `4`)
-* **`agents.defaults.timeout`**
+* **`agents.defaults.timeoutSeconds`**
   * *What it does:* The maximum number of seconds an agent is allowed to think before giving up on a task.
-  * *Possible values:* Positive integer. (Default: `300` - aka 5 minutes)
+  * *Possible values:* Positive integer. (Default: `300`)
 * **`agents.defaults.contextTokens`**
   * *What it does:* How much memory or text the AI can remember at once.
   * *Possible values:* Positive integer. (Default: `200000`)
 * **`agents.defaults.thinkingDefault`**
-  * *What it does:* Decides whether the AI is allowed extra time to "think" or reason internally before answering.
+  * *What it does:* Decides whether the AI is allowed extra time to reason internally before answering.
   * *Possible values:*
-    * `"off"` (Default) - Standard conversational mode with no hidden internal reasoning time.
-    * `"on"` - The AI will always reason internally extensively before every reply.
-    * `"auto"` - The AI automatically decides whether internal reasoning is necessary based on the complexity of your prompt.
+    * `"off"` (Default)
+    * `"on"`
+    * `"auto"`
 * **`agents.defaults.verboseDefault`**
-  * *What it does:* If checked, outputs massive detail on what the AI is executing mechanically under the hood.
+  * *What it does:* Controls whether internal tool and diagnostic detail is surfaced directly to the user.
   * *Possible values:*
-    * `"off"` (Default) - Hides internal tool usage details and raw process steps.
-    * `"on"` - Reveals full operational and diagnostic steps directly to the user's interface.
+    * `"off"` (Default)
+    * `"on"`
 * **`agents.defaults.blockStreamingDefault`**
-  * *What it does:* If toggled, the AI gathers its entire answer and sends it out in one massive chunk instead of typing it letter by letter.
+  * *What it does:* Controls whether responses are streamed incrementally or delivered as one completed chunk.
   * *Possible values:*
-    * `"off"` (Default) - Streams the text smoothly to your screen as the AI generates it.
-    * `"on"` - Waits until the entire response is completed on the server before displaying it.
+    * `"off"` (Default)
+    * `"on"`
 * **`agents.defaults.subagents`**
-  * *What it does:* Rules for smaller "child" AIs that the main AI commands to do distinct background jobs.
+  * *What it does:* Rules for smaller child agents that the main agent can dispatch for background work.
   * *Possible values:*
-    * `maxConcurrent`: Integer. The maximum amount of sub-agents permitted. (Default `8`)
-    * `archiveAfterMinutes`: Integer. The minutes before a dormant sub-agent is archived to save resources. (Default `60`)
+    * `maxConcurrent`: Integer. (Default: `8`)
+    * `archiveAfterMinutes`: Integer. (Default: `60`)
 * **`agents.defaults.compaction.mode`**
-  * *What it does:* How Carapace squishes old memory down to make room for new thoughts.
+  * *What it does:* Controls how older context is compacted to make room for new conversation state.
   * *Possible values:*
-    * `"safeguard"` (Default) - Intelligently and safely summarizes or compresses older conversation history without losing the most critical recent information.
-* **`agents.defaults.contextPruning.mode`**
-  * *What it does:* How Carapace prunes or clears completely old historical memory (If Anthropic API key is detected)
-  * *Possible values:*
-    * `"cache-ttl"` - Clears or prunes old memory strictly based on how long it has been stored (Time-to-Live).
-* **`agents.defaults.contextPruning.ttl`**
-  * *What it does:* The duration for the time-to-live before pruning occurs.
-  * *Possible values:* A time string like `"1h"` or `"30m"`.
+    * `"safeguard"` (Default)
 * **`agents.defaults.sandbox`**
-  * *What it does:* OS-level security sandboxing that strictly limits what tools and background scripts can do (CPU, memory, file access).
+  * *What it does:* OS-level sandboxing that limits what tools and background scripts can do.
   * *Possible values:*
     * `enabled`: `true` (Default) or `false`.
-    * `maxCpuSeconds`: Integer. Maximum CPU time allowed per tool invocation. (Default: `30`)
-    * `maxMemoryMb`: Integer. Maximum virtual memory permitted. (Default: `512` MB)
-    * `maxFds`: Integer. Maximum open file descriptors (or process count on Windows). (Default: `256`)
+    * `maxCpuSeconds`: Integer. (Default: `30`)
+    * `maxMemoryMb`: Integer. (Default: `512`)
+    * `maxFds`: Integer. (Default: `256`)
     * `allowedPaths`: Array of string paths the tool is permanently allowed to read/write to. (Default: `["/tmp", "/usr/bin", "/usr/local/bin", "/bin"]`)
-    * `networkAccess`: Boolean. Allowed to connect to the internet? (Default: `false`)
-    * `envFilter`: Array of string keys. If provided, only masks matching environment variables are allowed to pass through to the tool subprocess. Empty array `[]` permits all.
+    * `networkAccess`: Boolean. (Default: `false`)
+    * `envFilter`: Array of string keys. Empty array `[]` permits all.
 * **`agents.defaults.classifier`**
   * *What it does:* An LLM-based pre-dispatch filter that intercepts potentially malicious inbound prompts before they execute on the main agent.
   * *Possible values:*
     * `enabled`: `true` or `false` (Default).
-    * `mode`:
-      * `"off"` (Default) - Fully bypasses classifier warnings.
-      * `"warn"` - Flags suspicious messages with a warning but lets them through to the main AI.
-      * `"block"` - Completely blocks messages deemed dangerous.
+    * `mode`: `"off"` (Default), `"warn"`, or `"block"`.
     * `model`: String specifying the smaller model to use (Default: `"gpt-4o-mini"`).
-    * `blockThreshold`: Decimal representing the threshold of confidence required from the classifier from `0.0` to `1.0`. (Default: `0.8`).
+    * `blockThreshold`: Decimal from `0.0` to `1.0`. (Default: `0.8`)
 * **`agents.promptGuard`**
-  * *What it does:* Enforces security guardrails to make sure the AI isn't tricked into attacking you (Prompt Injection).
+  * *What it does:* Enforces prompt-injection guardrails.
   * *Possible values:*
-    * `enabled`:
-      * `true` - Enables Prompt Injection protections.
-      * `false` - Disables protections.
-    * You can also specifically enable `preflight`, `tagging`, `postflight`, and `configLint` sections by changing their sub-value to `enabled: true`.
+    * `enabled`: `true` or `false`
+    * nested `preflight`, `tagging`, `postflight`, and `configLint` sections with their own `enabled` flags
 * **`agents.outputSanitizer`**
-  * *What it does:* Scrubs the AI's final responses to keep malicious code off your computer screen.
+  * *What it does:* Scrubs unsafe output before it reaches users.
   * *Possible values:*
-    * `sanitizeHtml`: `true` (Strip out dangerous HTML) or `false` (Allow all HTML).
-    * `cspPolicy`: String representing a strict Content Security Policy.
+    * `sanitizeHtml`: `true` or `false`
+    * `cspPolicy`: String representing a Content Security Policy
 
 ---
 
-## 3. Providers & LLMs (Connecting to AI Brains)
+## 3. Providers & LLMs (Common Provider Settings)
 
-You can directly link different AI services seamlessly by pasting your secret API keys here.
+These are the most commonly used provider sections for first-run setup and day-1 operation.
 
-* **`anthropic`**, **`openai`**, **`google`**, **`venice`**, **`bedrock`**
-  * *What it does:* Connects directly to commercial AI clouds like Claude, ChatGPT, Gemini, Venice, or AWS.
-  * *Possible values:*
-    * `apiKey`: Your secret string password. (Can be drawn from environment variables safely like `"${OPENAI_API_KEY}"`).
-    * `baseUrl`: String. Useful if passing through an enterprise proxy.
-    * *(Bedrock specific)* `region`, `accessKeyId`, `secretAccessKey`, `sessionToken`, `enabled`.
-* **`providers.ollama`** (Or similar local programs)
-  * *What it does:* Connects to free AIs running on your own CPU/GPU locally.
-  * *Possible values:*
+* **`anthropic`**, **`openai`**, **`venice`**
+  * *What it does:* Connects directly to commercial AI clouds like Claude, ChatGPT, or Venice.
+  * *Common values:*
+    * `apiKey`: Secret credential string, often sourced from an environment variable like `"${OPENAI_API_KEY}"`.
+    * `baseUrl`: String. Useful if passing through an enterprise proxy or alternate endpoint.
+* **`google`**
+  * *What it does:* Connects to Gemini.
+  * *Common values:*
+    * `apiKey`: Secret credential string, often sourced from `GOOGLE_API_KEY`.
+    * `authProfile`: Stored Google OAuth profile ID for Gemini sign-in based auth.
+    * `baseUrl`: String. Useful for alternate endpoints or proxies.
+* **`bedrock`**
+  * *What it does:* Connects to AWS Bedrock.
+  * *Common values:*
+    * `region`
+    * `accessKeyId`
+    * `secretAccessKey`
+    * `sessionToken`
+    * `enabled`
+* **`providers.ollama`**
+  * *What it does:* Connects to local Ollama models.
+  * *Common values:*
     * `baseUrl`: String endpoint address. (Default: `"http://localhost:11434"`)
-    * `apiKey`: Your authentication key if you've locked your Ollama server.
-* **`vertex`** (Google Cloud Vertex AI)
-  * *What it does:* Connects directly to Google's specialized Enterprise AI.
-  * *Possible values:*
+    * `apiKey`: Optional authentication key if you've locked the Ollama server.
+* **`vertex`**
+  * *What it does:* Connects to Google Cloud Vertex AI.
+  * *Common values:*
     * `projectId`: String. Your Google Cloud Project ID.
-    * `location`: String. The server location region (Default: `"us-central1"`).
-    * `model`: String. The exact model tag.
+    * `location`: String. The server location region.
+    * `model`: String. The model tag.
 
 ---
 
-## 4. Channels (Chat Apps & Interfaces)
+## 4. Channels (Common Messaging Integrations)
 
-Enable Carapace to listen and chat dynamically on different popular platforms.
+Enable Carapace to listen and respond on external chat platforms.
 
-* **`signal`** (Signal Messenger)
-  * *What it does:* Uses `signal-cli` to let the AI text securely via a phone number.
-  * *Possible values:*
-    * `baseUrl`: String address to the CLI wrapper.
+* **`signal`**
+  * *What it does:* Uses `signal-cli` REST integration.
+  * *Common values:*
+    * `baseUrl`: String address to the REST wrapper.
     * `phoneNumber`: String. Your registered number (like `"+15551234567"`).
-    * `enabled`: `true` (Connect to Signal) or `false`.
+    * `enabled`: `true` or `false`.
 * **`telegram`**
-  * *What it does:* Connects a telegram bot.
-  * *Possible values:*
-    * `botToken`: String. The code from the BotFather.
-    * `webhookSecret`: String. Security token for highly secure inbound webhook updates.
-    * `baseUrl`: String. Replaces the default telegram endpoint.
-    * `enabled`: `true` (Connect to Telegram) or `false`.
+  * *What it does:* Connects a Telegram bot.
+  * *Common values:*
+    * `botToken`: String from BotFather.
+    * `webhookSecret`: String used to validate inbound webhook updates.
+    * `baseUrl`: String. Replaces the default Telegram endpoint.
+    * `enabled`: `true` or `false`.
 * **`discord`**
-  * *What it does:* Invites Carapace into Discord servers.
-  * *Possible values:*
-    * `botToken`: String. Your Discord Developer bot token.
+  * *What it does:* Connects Carapace to Discord.
+  * *Common values:*
+    * `botToken`: String. Your Discord bot token.
     * `gatewayEnabled`: `true` to connect via WebSocket.
-    * `gatewayIntents`: Integer mask for permissions (typically `37377`).
+    * `gatewayIntents`: Integer bitmask.
     * `gatewayUrl`: String.
     * `baseUrl`: String.
-    * `enabled`: `true` (Connect to Discord) or `false`.
+    * `enabled`: `true` or `false`.
 * **`slack`**
-  * *What it does:* Brings the agent to your Slack workflow.
-  * *Possible values:*
+  * *What it does:* Connects Carapace to Slack.
+  * *Common values:*
     * `botToken`: String starting with `xoxb-`.
-    * `signingSecret`: String to strictly enforce origin validity for Slack Events.
+    * `signingSecret`: String used to validate Slack Events requests.
     * `baseUrl`: String.
-    * `enabled`: `true` (Connect to Slack) or `false`.
+    * `enabled`: `true` or `false`.
 
 ---
 
-## 5. Security, Sessions, & Logs
+## 5. Security, Sessions, and Operations
 
 * **`sessions`**
-  * *What it does:* Governs how long the system remembers your long-running chat history and whether it gets automatically purged.
-  * *Possible values:*
-    * `retention.enabled`: `true` (Automatically wipe old memory) or `false` (Keep memory forever). (Default: `true`)
-    * `retention.days`: Integer representing days until unread memory is wiped. (Default: `30`)
-    * `retention.intervalHours`: Hourly cleanup rhythm. (Default: `6`)
-    * `integrity.enabled`: Validates chat history files so attackers can't forge secret payloads. (`true`/`false`, default `true`).
-    * `integrity.action`:
-      * `"warn"` (Default) - Issues a warning and attempts to auto-migrate missing data signatures harmlessly.
-      * `"reject"` - The system will fail completely and shut down if it detects altered chat history.
+  * *What it does:* Governs how long the system remembers long-running chat history and whether it gets automatically purged.
+  * *Common values:*
+    * `retention.enabled`: `true` or `false`. (Default: `true`)
+    * `retention.days`: Integer. (Default: `30`)
+    * `retention.intervalHours`: Integer. (Default: `6`)
+    * `integrity.enabled`: `true` or `false`. (Default: `true`)
+    * `integrity.action`: `"warn"` (Default) or `"reject"`.
 * **`session`**
-  * *What it does:* Governs active interactive chat behavior, specifically how Carapace decides "who is talking" and "which memory to look at" when a message arrives.
-  * *Possible values:*
-    * `scope`:
-      * `"per-sender"` (Default) - Every unique human user gets their own private, continuous memory timeline, regardless of what group chat or channel they are talking in.
-      * `"global"` - Every single person in a specific channel shares one massive group memory. The AI remembers the conversation of the entire room as one timeline.
-      * `"per-channel-peer"` - The AI maintains a unique memory timeline for each specific combination of a channel and a group/user (useful if someone acts differently in one server vs another).
-    * `dmScope`:
-      * `"main"` (Default) - Forces the AI to store your private Direct Messages in the exact same memory bank as your public group chat messages. If you DM the bot, it will remember the joke you made in the group chat earlier.
-    * `typingMode`:
-      * `"thinking"` (Default) - Automatically bridges to your chat app (Discord, Signal, Telegram) to display that the bot is "typing..." exclusively when it is silently executing tools or running internal reasoning cycles. This lets you know it hasn't crashed when a task takes 30 seconds.
+  * *What it does:* Governs active chat/session scoping behavior.
+  * *Common values:*
+    * `scope`: `"per-sender"` (Default), `"global"`, or `"per-channel-peer"`.
+    * `dmScope`: `"main"` (Default).
+    * `typingMode`: `"thinking"` (Default).
 * **`logging`**
-  * *What it does:* Dictates what diagnostic events are printed into your terminal or backend system files.
-  * *Possible values:*
-    * `level`:
-      * `"trace"` - Extremely detailed low-level logs.
-      * `"debug"` - Diagnostic information useful for active troubleshooting.
-      * `"info"` (Default) - Standard operational events.
-      * `"warn"` - Non-critical issues or warnings.
-      * `"error"` - Serious problems that require immediate attention.
-    * `format`:
-      * `"text"` - Standard readable text format.
-      * `"json"` - Structured data blob meant to be easily read by machines or logging pipelines.
-    * `consoleStyle`:
-      * `"pretty"` (Default) - Colorful text suitable for human reading in the console/terminal.
-    * `redactSensitive`:
-      * `"tools"` (Default) - Automatically blanks out potentially sensitive data passed back and forth between the AI and its tools to protect you.
-* **`skills.sandbox`** & **`skills.signature`**
-  * *What it does:* Stops downloaded third-party tricks/skills from destroying your computer or leaking.
-  * *Possible values:*
-    * `sandbox.enabled`: `true` (Run skills in a safe isolated box) or `false`.
-    * `sandbox.defaults.allowHttp`, `allowCredentials`, `allowMedia`: `true` or `false` to punch strictly sized holes in the sandbox if a skill explicitly requires it.
-    * `signature.enabled`, `signature.requireSignature`: `true` (Force skills to be cryptographically signed by their author) or `false`.
-    * `signature.trustedPublishers`: Array of trusted author names permitted strictly to bypass blocks.
-
----
-
-## 6. Utilities & Economy
-
+  * *What it does:* Dictates what diagnostic events are printed into terminal or backend logs.
+  * *Common values:*
+    * `level`: `"trace"`, `"debug"`, `"info"` (Default), `"warn"`, `"error"`.
+    * `format`: `"text"` or `"json"`.
+    * `consoleStyle`: `"pretty"` (Default).
+    * `redactSensitive`: `"tools"` (Default).
+* **`skills.sandbox`** and **`skills.signature`**
+  * *What it does:* Controls sandboxing and signature policy for downloaded skills/plugins.
+  * *Common values:*
+    * `sandbox.enabled`: `true` or `false`.
+    * `sandbox.defaults.allowHttp`, `allowCredentials`, `allowMedia`: `true` or `false`.
+    * `signature.enabled`, `signature.requireSignature`: `true` or `false`.
+    * `signature.trustedPublishers`: Array of trusted publisher names.
 * **`cron`**
-  * *What it does:* Tells the AI to wake up and perform chores on an automated timeline.
-  * *Possible values:*
-    * `enabled`: `true` (Activates cron scheduling) or `false`.
-    * `maxConcurrentRuns`: Integer. The maximum jobs permitted to happen simultaneously without being queued.
-    * `entries`: An Array of task job objects. Example object: `{ schedule: "0 * * * *", payload: {} }`.
-* **`usage`**
-  * *What it does:* Implements cost-tracking to make sure the AI doesn't bill you out of house and home running expensive models repeatedly.
-  * *Possible values:*
-    * `pricing.default` object: Dictates `inputCostPerMTok` (Positive Decimal) and `outputCostPerMTok` (Positive Decimal) for models that lack specific pricing instructions.
-    * `pricing.overrides` List: specific objects detailing `match` (String name like `"gpt-4o"`), `matchType` (`"exact"` match or `"contains"` string match), and per-token rates overrides that supersede defaults.
-* **`plugins`** (WASM expansions)
-  * *What it does:* Lets users supercharge the system using fast runtime plugins.
-  * *Possible values:*
+  * *What it does:* Schedules automated jobs.
+  * *Common values:*
     * `enabled`: `true` or `false`.
-    * `load.paths`: Array of directory strings outlining where the `*.wasm` plugins are installed on the local system.
+    * `maxConcurrentRuns`: Integer.
+    * `entries`: Array of cron job objects.
+* **`usage`**
+  * *What it does:* Tracks and prices model usage.
+  * *Common values:*
+    * `pricing.default.inputCostPerMTok`
+    * `pricing.default.outputCostPerMTok`
+    * `pricing.overrides[]` with `match`, `matchType`, `inputCostPerMTok`, and `outputCostPerMTok`
+* **`plugins`**
+  * *What it does:* Loads and manages WASM plugins.
+  * *Common values:*
+    * `enabled`: `true` or `false`.
+    * `load.paths`: Array of plugin directories.
 * **`messages`**
-  * *What it does:* Universal text messaging fallbacks.
-  * *Possible values:*
-    * `ackReactionScope`:
-      * `"group-mentions"` - The bot reacts to acknowledge a message only when specifically tagged in group chats.
+  * *What it does:* Messaging behavior defaults.
+  * *Common values:*
+    * `ackReactionScope`: `"group-mentions"`.
 
 ---
 
-## 7. Other Valid Schema Fields
+## Additional Config Areas
 
-These items are permitted in the configuration and perform specific functions to alter your system but generally accept empty JSON objects `{}` or internal flags:
+Carapace supports more configuration than this guide covers. If you need the broader surface area, check the current protocol docs and example config for:
 
-* **`meta`**
-  * *What it does:* Update version tracking data indicating the last touched version or time. Carapace uses this automatically to keep track of upgrades.
-  * *Example:*
+- `models`
+- `tools`
+- `bindings`
+- `broadcast`
+- `audio`
+- `media`
+- `commands`
+- `approvals`
+- `web`
+- `channels`
+- `discovery`
+- `canvasHost`
+- `nodeHost`
+- `meta`
+- `env`
+- `auth.profiles`
+- `browser`
+- `talk`
 
-    ```json5
-    "meta": {
-      "version": "1.2.0",
-      "lastUpdated": 1718049201
-    }
-    ```
+## Validation Rules (Highlights)
 
-* **`env`**
-  * *What it does:* Injects direct shell environment variables (like passwords or paths) exactly as if you had typed them into your terminal `process.env` before starting Carapace. This happens *before* substitution occurs for the rest of your file, allowing you to centralize secrets.
-  * *Example:*
+- Schema is strict: unknown top-level keys are rejected.
+- Duplicate agent directories are rejected.
+- `agents.list[].identity.avatar` must be workspace-relative or http(s)/data URI.
+- `plugins.allow/deny/entries/slots` must reference known plugin IDs.
+- `channels` keys must map to known channel IDs.
+- `browser.profiles` names must be `^[a-z0-9-]+$` and must set `cdpPort` or `cdpUrl`.
 
-    ```json5
-    "env": {
-      "vars": {
-        "OPENAI_API_KEY": "sk-your-secret-key",
-        "ANTHROPIC_API_KEY": "sk-ant-another-secret"
-      },
-      "shellEnv": { "enabled": true }
-    }
-    ```
+## Errors
 
-* **`wizard`**
-  * *What it does:* Tracks your current onboarding progress sequence through the application UI so that Carapace doesn't bother you with the welcome screen every time.
-  * *Example:*
-
-    ```json5
-    "wizard": {
-      "completedSteps": ["welcome", "api_keys", "profile"],
-      "hasFinishedOnboarding": true
-    }
-    ```
-
-* **`diagnostics`**
-  * *What it does:* OpenTelemetry instrumentation for profound performance tracing. This is mostly used by advanced developers to see exactly how long the AI takes to think or connect to the database.
-  * *Example:*
-
-    ```json5
-    "diagnostics": {
-      "enabled": true,
-      "endpoint": "http://localhost:4318/v1/traces"
-    }
-    ```
-
-* **`update`**
-  * *What it does:* Controls the release channel (stable vs beta) and automatic checking on startup. If you want cutting edge features, you switch this to `beta` or `canary`.
-  * *Example:*
-
-    ```json5
-    "update": {
-      "channel": "stable",
-      "checkOnStartup": true
-    }
-    ```
-
-* **`browser`**
-  * *What it does:* Set up Puppeteer or Playwright integrations so that the AI can open actual browser pages to scrape data, test UI, or read websites on your behalf.
-  * *Example:*
-
-    ```json5
-    "browser": {
-      "enabled": true,
-      "cdpUrl": "ws://localhost:9222",
-      "profiles": {
-        "scraper-profile": {
-          "cdpPort": 9223
-        }
-      }
-    }
-    ```
-
-* **`ui`**
-  * *What it does:* Interface personalization setups for the Control UI's visual identity, letting you change themes or layouts.
-  * *Example:*
-
-    ```json5
-    "ui": {
-      "theme": "dark",
-      "primaryColor": "#ff5500",
-      "sidebarState": "collapsed"
-    }
-    ```
-
-* **`auth`**
-  * *What it does:* Authorizations and permissions profile mapping. It allows you to lock down certain parts of the gateway to specific users or impose cooldowns to thwart brute-force login attempts.
-  * *Example:*
-
-    ```json5
-    "auth": {
-      "profiles": {
-        "admin": { "roles": ["superuser"] },
-        "guest": { "roles": ["read-only"] }
-      },
-      "cooldowns": {
-        "failedLoginDelayMs": 2000
-      }
-    }
-    ```
-
-* **`talk`**
-  * *What it does:* Configures Voice and Speech-to-Text behaviors for audible responses, allowing the AI to speak its answers out loud.
-  * *Example:*
-
-    ```json5
-    "talk": {
-      "enabled": true,
-      "provider": "openai",
-      "apiKey": "${OPENAI_API_KEY}",
-      "voice": "alloy",
-      "speed": 1.2
-    }
-    ```
+- JSON5 parse errors produce an invalid config snapshot.
+- `$include` errors raise `ConfigIncludeError` / `CircularIncludeError`.
+- Missing env vars in `${VAR}` substitution raise `MissingEnvVarError`.
