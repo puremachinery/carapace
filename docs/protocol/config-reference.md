@@ -149,6 +149,9 @@ This block shapes how smart your AI behaves and what limits apply during executi
   * *Possible values:* A list of objects containing keys such as:
     * `id`: String. A unique name for this agent (e.g., `"coder"`, `"researcher"`).
     * `default`: Boolean. Set to `true` to make this the primary agent used if no ID is specified. (Default: `false`)
+    * `identity.name`: String. Human-visible display name for the agent.
+    * `identity.description`: String. Short summary shown in UIs or listings.
+    * `identity.avatar`: String. Workspace-relative path or `http(s)` / `data:` URI used as the agent avatar.
     * `model`: String. The exact LLM name used by this agent.
     * `system`: String. The system prompt or core identity instructions for this agent.
     * `maxTurns`: Integer. Maximum LLM round-trips allowed per single user request. (Default: `25`)
@@ -202,7 +205,7 @@ This block shapes how smart your AI behaves and what limits apply during executi
     * `maxFds`: Integer. (Default: `256`)
     * `allowedPaths`: Array of string paths the tool is permanently allowed to read/write to. (Default: `["/tmp", "/usr/bin", "/usr/local/bin", "/bin"]`)
     * `networkAccess`: Boolean. (Default: `false`)
-    * `envFilter`: Array of string keys. Empty array `[]` permits all.
+    * `envFilter`: Array of environment variable names to allow through to the sandbox. If empty, no filter is applied and all env vars pass through.
 * **`agents.defaults.classifier`**
   * *What it does:* An LLM-based pre-dispatch filter that intercepts potentially malicious inbound prompts before they execute on the main agent.
   * *Possible values:*
@@ -236,15 +239,16 @@ These are the most commonly used provider sections for first-run setup and day-1
   * *What it does:* Connects to Gemini.
   * *Common values:*
     * `apiKey`: Secret credential string, often sourced from `GOOGLE_API_KEY`.
+    * `authProfile`: String. Name of a stored Google OAuth profile under `auth.profiles` (alternative to `apiKey`).
     * `baseUrl`: String. Useful for alternate endpoints or proxies.
 * **`bedrock`**
   * *What it does:* Connects to AWS Bedrock.
   * *Common values:*
-    * `region`
-    * `accessKeyId`
-    * `secretAccessKey`
-    * `sessionToken`
-    * `enabled`
+    * `region`: String. AWS region used for Bedrock runtime requests.
+    * `accessKeyId`: String. AWS access key ID for request signing.
+    * `secretAccessKey`: String. AWS secret key paired with `accessKeyId`.
+    * `sessionToken`: String. Optional temporary-session token for STS credentials.
+    * `enabled`: `true` or `false`.
 * **`providers.ollama`**
   * *What it does:* Connects to local Ollama models.
   * *Common values:*
@@ -254,7 +258,7 @@ These are the most commonly used provider sections for first-run setup and day-1
   * *What it does:* Connects to Google Cloud Vertex AI.
   * *Common values:*
     * `projectId`: String. Your Google Cloud Project ID.
-    * `location`: String. The server location region.
+    * `location`: String. The server location region. (Default: `"us-central1"`)
     * `model`: String. The model tag.
 
 * **`auth.profiles`**
@@ -326,6 +330,8 @@ Enable Carapace to listen and respond on external chat platforms.
     * `scope`: `"per-sender"` (Default), `"global"`, or `"per-channel-peer"`.
     * `dmScope`: `"main"` (Default).
     * `typingMode`: `"thinking"` (Default).
+    * `typingIntervalSeconds`: Integer. Seconds between typing-indicator pulses. (Default: `3`)
+    * `mainKey`: String. Identifier for the main session slot. Always enforced as `"main"` regardless of what you set. (Default: `"main"`)
 * **`logging`**
   * *What it does:* Dictates what diagnostic events are printed into terminal or backend logs.
   * *Common values:*
@@ -383,6 +389,7 @@ Carapace supports more configuration than this guide covers. If you need the bro
 - `nodeHost`
 - `meta`
 - `env`
+- `gateway.openai` for enabling the OpenAI-compatible `/v1/chat/completions` and `/v1/responses` endpoints
 - `browser`
 - `talk`
 
