@@ -170,7 +170,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 
     let resolved = resolve_bind_config(&cfg)?;
     let plugin_registry = Arc::new(plugins::PluginRegistry::new());
-    let tools_registry = Arc::new(plugins::tools::ToolsRegistry::new());
+    let tools_registry = Arc::new(plugins::tools::ToolsRegistry::with_config(&cfg));
     let hook_registry = Arc::new(hooks::registry::HookRegistry::new());
 
     let ws_state = server::startup::build_ws_state_with_runtime_dependencies(

@@ -157,6 +157,27 @@ impl ToolsRegistry {
         registry
     }
 
+    /// Create a tools registry pre-populated with configuration-driven tools.
+    ///
+    /// Starts from the same baseline as `new()` (time, agent builtins), then
+    /// conditionally registers filesystem tools when `filesystem.enabled` is true.
+    pub fn with_config(cfg: &Value) -> Self {
+        let registry = Self::new();
+
+        let fs_enabled = cfg
+            .pointer("/filesystem/enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        if fs_enabled {
+            for tool in crate::agent::filesystem_tools::filesystem_tools(cfg) {
+                registry.register_builtin_tool(tool);
+            }
+        }
+
+        registry
+    }
+
     /// Register a built-in tool
     pub fn register_builtin_tool(&self, tool: BuiltinTool) {
         let mut tools = self.builtin_tools.write();
@@ -727,5 +748,46 @@ mod tests {
         let json = serde_json::to_string(&error).unwrap();
         assert!(json.contains("\"ok\":false"));
         assert!(json.contains("\"type\":\"not_found\""));
+    }
+
+    #[test]
+    fn test_with_config_filesystem_disabled() {
+        let cfg = serde_json::json!({});
+        let registry = ToolsRegistry::with_config(&cfg);
+        let baseline = ToolsRegistry::new();
+        assert_eq!(registry.len(), baseline.len());
+    }
+
+    #[test]
+    fn test_with_config_filesystem_enabled_read_only() {
+        let cfg = serde_json::json!({
+            "filesystem": {
+                "enabled": true,
+                "roots": ["/tmp"],
+                "writeAccess": false
+            }
+        });
+        let registry = ToolsRegistry::with_config(&cfg);
+        assert!(registry.has_tool("file_read"));
+        assert!(registry.has_tool("directory_list"));
+        assert!(registry.has_tool("file_stat"));
+        assert!(registry.has_tool("file_search"));
+        assert!(!registry.has_tool("file_write"));
+        assert!(!registry.has_tool("file_move"));
+    }
+
+    #[test]
+    fn test_with_config_filesystem_enabled_write_access() {
+        let cfg = serde_json::json!({
+            "filesystem": {
+                "enabled": true,
+                "roots": ["/tmp"],
+                "writeAccess": true
+            }
+        });
+        let registry = ToolsRegistry::with_config(&cfg);
+        assert!(registry.has_tool("file_read"));
+        assert!(registry.has_tool("file_write"));
+        assert!(registry.has_tool("file_move"));
     }
 }

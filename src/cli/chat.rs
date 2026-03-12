@@ -82,7 +82,8 @@ async fn start_embedded_gateway(
 
     // Set up plugin/tools registries
     let plugin_registry = std::sync::Arc::new(crate::plugins::PluginRegistry::new());
-    let tools_registry = std::sync::Arc::new(crate::plugins::tools::ToolsRegistry::new());
+    let tools_registry =
+        std::sync::Arc::new(crate::plugins::tools::ToolsRegistry::with_config(&cfg));
     let ws_state = crate::server::startup::build_ws_state_with_runtime_dependencies(
         &cfg,
         tools_registry.clone(),
