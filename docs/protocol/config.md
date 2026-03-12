@@ -249,8 +249,9 @@ Relevant subkeys:
 
 - `auth.profiles.enabled`
 - `auth.profiles.redirectBaseUrl`
-- `auth.profiles.providers.google.clientId`
-- `auth.profiles.providers.google.redirectUri`
+- `auth.profiles.providers.google.{clientId,clientSecret,redirectUri}`
+- `auth.profiles.providers.github.{clientId,clientSecret,redirectUri}`
+- `auth.profiles.providers.discord.{clientId,clientSecret,redirectUri}`
 
 For Gemini onboarding:
 
