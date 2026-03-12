@@ -464,8 +464,23 @@ fn validate_agents(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schema
     if let Some(v) = defaults.get("maxConcurrent") {
         check_positive_integer(v, ".agents.defaults.maxConcurrent", issues);
     }
-    if let Some(v) = defaults.get("timeout") {
+    let timeout_seconds = defaults.get("timeoutSeconds");
+    let timeout_legacy = defaults.get("timeout");
+
+    if let Some(v) = timeout_seconds {
+        check_positive_integer(v, ".agents.defaults.timeoutSeconds", issues);
+    }
+    if let Some(v) = timeout_legacy {
         check_positive_integer(v, ".agents.defaults.timeout", issues);
+    }
+    if timeout_seconds.is_some() && timeout_legacy.is_some() {
+        issues.push(SchemaIssue {
+            severity: Severity::Warning,
+            path: ".agents.defaults.timeout".to_string(),
+            message:
+                "Both agents.defaults.timeoutSeconds and agents.defaults.timeout are set; timeoutSeconds takes precedence and timeout is legacy and should be removed"
+                    .to_string(),
+        });
     }
     if let Some(v) = defaults.get("contextTokens") {
         check_positive_integer(v, ".agents.defaults.contextTokens", issues);
@@ -1229,9 +1244,35 @@ mod tests {
 
     #[test]
     fn test_agents_defaults_valid() {
-        let cfg = json!({ "agents": { "defaults": { "maxConcurrent": 5, "timeout": 60, "contextTokens": 8000 } } });
+        let cfg = json!({ "agents": { "defaults": { "maxConcurrent": 5, "timeoutSeconds": 60, "contextTokens": 8000 } } });
         let issues = validate_schema(&cfg);
-        assert!(!issues.iter().any(|i| i.path.starts_with(".agents")));
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.path.starts_with(".agents.defaults")),
+            "Expected no issues for agents.defaults, but found: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_agents_defaults_timeout_legacy_alias_valid() {
+        let cfg = json!({ "agents": { "defaults": { "timeout": 60 } } });
+        let issues = validate_schema(&cfg);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.path.starts_with(".agents.defaults")),
+            "Expected no issues for agents.defaults, but found: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_agents_defaults_warns_when_both_timeout_keys_are_set() {
+        let cfg = json!({ "agents": { "defaults": { "timeoutSeconds": 60, "timeout": 30 } } });
+        let issues = validate_schema(&cfg);
+        assert!(issues.iter().any(|i| i.path == ".agents.defaults.timeout"));
     }
 
     #[test]
