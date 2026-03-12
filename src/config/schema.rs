@@ -464,7 +464,9 @@ fn validate_agents(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schema
     if let Some(v) = defaults.get("maxConcurrent") {
         check_positive_integer(v, ".agents.defaults.maxConcurrent", issues);
     }
-    if let Some(v) = defaults.get("timeout") {
+    if let Some(v) = defaults.get("timeoutSeconds") {
+        check_positive_integer(v, ".agents.defaults.timeoutSeconds", issues);
+    } else if let Some(v) = defaults.get("timeout") {
         check_positive_integer(v, ".agents.defaults.timeout", issues);
     }
     if let Some(v) = defaults.get("contextTokens") {
@@ -1229,9 +1231,16 @@ mod tests {
 
     #[test]
     fn test_agents_defaults_valid() {
-        let cfg = json!({ "agents": { "defaults": { "maxConcurrent": 5, "timeout": 60, "contextTokens": 8000 } } });
+        let cfg = json!({ "agents": { "defaults": { "maxConcurrent": 5, "timeoutSeconds": 60, "contextTokens": 8000 } } });
         let issues = validate_schema(&cfg);
         assert!(!issues.iter().any(|i| i.path.starts_with(".agents")));
+    }
+
+    #[test]
+    fn test_agents_defaults_timeout_legacy_alias_valid() {
+        let cfg = json!({ "agents": { "defaults": { "timeout": 60 } } });
+        let issues = validate_schema(&cfg);
+        assert!(!issues.iter().any(|i| i.path == ".agents.defaults.timeout"));
     }
 
     #[test]

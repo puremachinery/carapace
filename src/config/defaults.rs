@@ -185,7 +185,7 @@ struct AgentDefaultsSection {
     #[serde(default = "default_agent_max_concurrent")]
     max_concurrent: u32,
 
-    #[serde(default = "default_agent_timeout_seconds")]
+    #[serde(default = "default_agent_timeout_seconds", alias = "timeout")]
     timeout_seconds: u32,
 
     #[serde(default = "default_context_tokens")]
@@ -565,6 +565,21 @@ pub fn apply_defaults(config: &mut Value) {
     // Deep-merge: defaults go *under* user values (user wins).
     merge_defaults(config, defaults_value);
 
+    // Post-merge cross-field fixups: normalize legacy agents.defaults.timeout
+    // into the canonical timeoutSeconds key.
+    if let Some(defaults) = config
+        .get_mut("agents")
+        .and_then(|v| v.as_object_mut())
+        .and_then(|agents| agents.get_mut("defaults"))
+        .and_then(|v| v.as_object_mut())
+    {
+        if let Some(legacy_timeout) = defaults.remove("timeout") {
+            defaults
+                .entry("timeoutSeconds".to_string())
+                .or_insert(legacy_timeout);
+        }
+    }
+
     // Post-merge cross-field fixups: enforce session.mainKey = "main".
     if let Some(session) = config.get_mut("session").and_then(|v| v.as_object_mut()) {
         if let Some(mk) = session.get("mainKey").and_then(|v| v.as_str()) {
@@ -773,6 +788,22 @@ mod tests {
             config["logging"]["redactSensitive"],
             DEFAULT_REDACT_SENSITIVE
         );
+    }
+
+    #[test]
+    fn test_legacy_timeout_alias_preserved_as_timeout_seconds() {
+        let mut config = json!({
+            "agents": {
+                "defaults": {
+                    "timeout": 600
+                }
+            }
+        });
+
+        apply_defaults(&mut config);
+
+        assert_eq!(config["agents"]["defaults"]["timeoutSeconds"], 600);
+        assert!(config["agents"]["defaults"].get("timeout").is_none());
     }
 
     #[test]
