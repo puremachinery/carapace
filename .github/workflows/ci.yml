@@ -31,48 +31,73 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          fetch-depth: 2
+          fetch-depth: 0
       - id: filter
-        uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3
-        with:
-          filters: |
-            docs:
-              - "docs/**"
-              - "**/*.md"
-              - "website/**"
-              - "scripts/check-docs-state-messaging.sh"
-              - "LICENSE"
-            workflow:
-              - ".github/workflows/**"
-            rust_runtime:
-              - "src/**"
-              - "tests/**"
-              - "fuzz/**"
-              - "wit/**"
-              - "Cargo.toml"
-              - "Cargo.lock"
-              - "build.rs"
-              - "deny.toml"
-              - "config.example.json5"
-              - ".cargo/**"
-            windows_sensitive:
-              - "src/agent/sandbox.rs"
-              - "src/credentials/windows.rs"
-              - "src/discovery/mod.rs"
-              - "src/server/bind.rs"
-              - "src/tailscale/mod.rs"
-              - "Cargo.toml"
-              - "Cargo.lock"
-              - ".github/workflows/**"
-            docker:
-              - "Dockerfile"
-              - ".dockerignore"
-              - ".hadolint.yaml"
-            control_ui:
-              - "ui/control-ui/**"
-              - "dist/control-ui/**"
-              - "scripts/build-control-ui.sh"
-              - "package.json"
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docs=false
+          workflow=false
+          rust_runtime=false
+          windows_sensitive=false
+          docker=false
+          control_ui=false
+
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            base_sha="${{ github.event.pull_request.base.sha }}"
+            head_sha="${{ github.event.pull_request.head.sha }}"
+            mapfile -t changed_files < <(git diff --name-only "$base_sha...$head_sha")
+          else
+            before_sha="${{ github.event.before }}"
+            after_sha="${{ github.sha }}"
+            if [[ "$before_sha" == "0000000000000000000000000000000000000000" ]]; then
+              mapfile -t changed_files < <(git show --pretty='' --name-only "$after_sha")
+            else
+              mapfile -t changed_files < <(git diff --name-only "$before_sha" "$after_sha")
+            fi
+          fi
+
+          for path in "${changed_files[@]}"; do
+            [[ -z "$path" ]] && continue
+
+            if [[ "$path" == docs/* || "$path" == website/* || "$path" == *.md || "$path" == "scripts/check-docs-state-messaging.sh" || "$path" == "LICENSE" ]]; then
+              docs=true
+            fi
+
+            if [[ "$path" == .github/workflows/* ]]; then
+              workflow=true
+            fi
+
+            if [[ "$path" == src/* || "$path" == tests/* || "$path" == fuzz/* || "$path" == wit/* || "$path" == ".cargo/"* || "$path" == "Cargo.toml" || "$path" == "Cargo.lock" || "$path" == "build.rs" || "$path" == "deny.toml" || "$path" == "config.example.json5" ]]; then
+              rust_runtime=true
+            fi
+
+            if [[ "$path" == "src/agent/sandbox.rs" || "$path" == "src/credentials/windows.rs" || "$path" == "src/discovery/mod.rs" || "$path" == "src/server/bind.rs" || "$path" == "src/tailscale/mod.rs" || "$path" == "Cargo.toml" || "$path" == "Cargo.lock" || "$path" == .github/workflows/* ]]; then
+              windows_sensitive=true
+            fi
+
+            if [[ "$path" == "Dockerfile" || "$path" == ".dockerignore" || "$path" == ".hadolint.yaml" ]]; then
+              docker=true
+            fi
+
+            if [[ "$path" == ui/control-ui/* || "$path" == dist/control-ui/* || "$path" == "scripts/build-control-ui.sh" || "$path" == "package.json" ]]; then
+              control_ui=true
+            fi
+          done
+
+          {
+            echo "docs=$docs"
+            echo "workflow=$workflow"
+            echo "rust_runtime=$rust_runtime"
+            echo "windows_sensitive=$windows_sensitive"
+            echo "docker=$docker"
+            echo "control_ui=$control_ui"
+          } >> "$GITHUB_OUTPUT"
+
+          printf 'Changed files (%d):\n' "${#changed_files[@]}"
+          printf '  %s\n' "${changed_files[@]}"
+          echo "docs=$docs workflow=$workflow rust_runtime=$rust_runtime windows_sensitive=$windows_sensitive docker=$docker control_ui=$control_ui"
 
   fmt:
     name: Format
