@@ -34,9 +34,36 @@ jobs:
       id-token: write
       actions: read
     steps:
+      - name: Resolve PR head checkout target
+        id: pr_head
+        if: github.event_name == 'issue_comment' && github.event.issue.pull_request
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          pr_json="$(curl -fsSL \
+            -H 'Accept: application/vnd.github+json' \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "${{ github.api_url }}/repos/${{ github.repository }}/pulls/${{ github.event.issue.number }}")"
+
+          head_repo="$(printf '%s' "$pr_json" | jq -r '.head.repo.full_name')"
+          head_ref="$(printf '%s' "$pr_json" | jq -r '.head.ref')"
+
+          if [ -z "$head_repo" ] || [ "$head_repo" = "null" ] || [ -z "$head_ref" ] || [ "$head_ref" = "null" ]; then
+            echo "Failed to resolve PR head repository/ref for #${{ github.event.issue.number }}" >&2
+            exit 1
+          fi
+
+          echo "repository=$head_repo" >> "$GITHUB_OUTPUT"
+          echo "ref=$head_ref" >> "$GITHUB_OUTPUT"
+
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          repository: ${{ steps.pr_head.outputs.repository || github.repository }}
+          ref: ${{ steps.pr_head.outputs.ref || github.event.repository.default_branch }}
           fetch-depth: 1
 
       - name: Run Claude Code
