@@ -12,6 +12,7 @@ pub mod context;
 pub mod executor;
 pub mod exfiltration;
 pub mod factory;
+pub mod filesystem_tools;
 pub mod gemini;
 pub mod ollama;
 pub mod openai;
