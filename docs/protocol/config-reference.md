@@ -1,8 +1,8 @@
 # Carapace Configuration Guide
 
-This document is a practical, plain-English guide to the most commonly tuned **Carapace** configuration sections.
+This document is a source-grounded, plain-English guide to the most commonly tuned **Carapace** configuration sections.
 
-It is **not** a complete schema reference. For the current top-level key list, validation notes, and provider/auth-specific details, use:
+For raw load/validation semantics, the current top-level key list, and a runnable example config, use:
 
 - [`docs/protocol/config.md`](config.md)
 - [`config.example.json5`](../../config.example.json5)
@@ -236,7 +236,6 @@ These are the most commonly used provider sections for first-run setup and day-1
   * *What it does:* Connects to Gemini.
   * *Common values:*
     * `apiKey`: Secret credential string, often sourced from `GOOGLE_API_KEY`.
-    * `authProfile`: Stored Google OAuth profile ID for Gemini sign-in based auth.
     * `baseUrl`: String. Useful for alternate endpoints or proxies.
 * **`bedrock`**
   * *What it does:* Connects to AWS Bedrock.
@@ -257,6 +256,21 @@ These are the most commonly used provider sections for first-run setup and day-1
     * `projectId`: String. Your Google Cloud Project ID.
     * `location`: String. The server location region.
     * `model`: String. The model tag.
+
+* **`auth.profiles`**
+  * *What it does:* Defines OAuth provider configuration used by Carapace auth profiles.
+  * *Common values:*
+    * `enabled`: `true` or `false`.
+    * `redirectBaseUrl`: Base URL used to derive provider callback URLs when `redirectUri` is not set explicitly.
+    * `providers.google.clientId`
+    * `providers.google.clientSecret`
+    * `providers.google.redirectUri`
+    * `providers.github.clientId`
+    * `providers.github.clientSecret`
+    * `providers.github.redirectUri`
+    * `providers.discord.clientId`
+    * `providers.discord.clientSecret`
+    * `providers.discord.redirectUri`
 
 ---
 
@@ -369,7 +383,6 @@ Carapace supports more configuration than this guide covers. If you need the bro
 - `nodeHost`
 - `meta`
 - `env`
-- `auth.profiles`
 - `browser`
 - `talk`
 

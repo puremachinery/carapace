@@ -25,7 +25,9 @@
     },
 
     // tailscale: {
-    //   mode: "serve",      // "off" | "serve"
+    //   mode: "serve",      // "off" | "serve" | "funnel"
+    //   // externalPort: 443,
+    //   // resetOnShutdown: true,
     // },
 
     // TLS for public HTTP/WS
@@ -64,6 +66,9 @@
     // controlUi: {
     //   enabled: true,
     //   path: "dist/control-ui",
+    //   // basePath: "/control",
+    //   // allowInsecureAuth: false,
+    //   // dangerouslyDisableDeviceAuth: false,
     // },
 
     // Trusted reverse proxy IPs (for X-Forwarded-For)
@@ -128,13 +133,20 @@
   //     // Gemini Google sign-in also requires CARAPACE_CONFIG_PASSWORD so
   //     // stored auth profiles stay encrypted at rest.
   //     // redirectBaseUrl: "https://gateway.example.com",
-  //     providers: {
-  //       google: {
+  //     // providers: {
+  //     //   google: {
   //         clientId: "${GOOGLE_OAUTH_CLIENT_ID}",
   //         // redirectUri: "https://gateway.example.com/auth/callback", // hosted OAuth override; CLI uses an ephemeral loopback port
-  //       },
-  //     },
+  //     //   },
+  //     // },
   //   },
+  // },
+
+  // --- Google Cloud Vertex AI provider -------------------------------------
+  // vertex: {
+  //   // projectId: "my-gcp-project",            // or VERTEX_PROJECT_ID
+  //   // location: "us-central1",                // or VERTEX_LOCATION
+  //   // model: "vertex/google/gemini-2.0-flash" // or VERTEX_MODEL
   // },
 
   // --- Provider-specific config --------------------------------------------
@@ -230,7 +242,9 @@
   // --- Logging ----------------------------------------------------------
   // logging: {
   //   level: "info",          // "trace" | "debug" | "info" | "warn" | "error"
-  //   format: "pretty",       // "pretty" | "json"
+  //   format: "text",         // "text" | "json"
+  //   // consoleStyle: "pretty",
+  //   // redactSensitive: "tools",
   // },
 
   // --- Venice AI provider ------------------------------------------------

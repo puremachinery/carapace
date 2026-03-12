@@ -98,7 +98,7 @@ All keys are optional. Unknown keys are rejected (strict schema).
 - `update` – update channel and check‑on‑start
 - `browser` – browser control config and profiles
 - `ui` – Control UI identity settings
-- `auth` – auth profiles and provider order
+- `auth` – auth profile provider configuration and OAuth callback settings
 - `models` – provider/model catalog overrides
 - `nodeHost` – node browser proxy settings
 - `agents` – agents list, defaults, runtime caps
@@ -110,6 +110,7 @@ All keys are optional. Unknown keys are rejected (strict schema).
 - `messages` – messaging behavior defaults
 - `commands` – command policy/config
 - `approvals` – exec approval settings
+- `session` – legacy/global session defaults (`scope`, `dmScope`, `typingMode`, `typingIntervalSeconds`, `mainKey`)
 - `sessions` – session behavior (retention, cleanup)
 - `usage` – usage tracking configuration (pricing overrides)
 - `cron` – cron scheduler settings
@@ -121,7 +122,10 @@ All keys are optional. Unknown keys are rejected (strict schema).
 - `gateway` – service settings
 - `skills` – skills registry settings
 - `plugins` – plugin load/allowlist/config
+- `anthropic` – Anthropic provider settings (apiKey, baseUrl)
+- `openai` – OpenAI provider settings (apiKey, baseUrl)
 - `google` – Google Gemini provider settings (`apiKey`, `authProfile`, `baseUrl`)
+- `vertex` – Google Cloud Vertex AI provider settings (`projectId`, `location`, `model`)
 - `providers` – provider-specific settings such as `providers.ollama`
 - `bedrock` – AWS Bedrock provider settings (region, accessKeyId, secretAccessKey, sessionToken)
 - `venice` – Venice AI provider settings (apiKey, baseUrl)
@@ -137,7 +141,7 @@ This is a condensed map; refer to the JSON schema for full detail.
 
 - `gateway`
   - `port`, `mode`, `bind`, `controlUi`, `hooks`, `auth`, `trustedProxies`, `tailscale`, `remote`, `reload`, `tls`, `mtls`, `http.endpoints`, `nodes`
-  - `controlUi`: `enabled`, `path`, `basePath`
+  - `controlUi`: `enabled`, `path`, `basePath`, `allowInsecureAuth`, `dangerouslyDisableDeviceAuth`
   - `mtls` – service-to-service mTLS (`enabled`, `caCert`, `nodeCert`, `nodeKey`, `crlPath`, `requireClientCert`)
   - `remote` – outbound service connections (`enabled`, `authToken`, `autoReconnect`,
     `reconnectIntervalMs`, `maxReconnectAttempts`, `gateways[]`)
@@ -150,7 +154,12 @@ This is a condensed map; refer to the JSON schema for full detail.
 - `plugins`
   - `enabled`, `allow`, `deny`, `load.paths`, `slots`, `entries`, `installs`
 - `auth`
-  - `profiles`, `order`, `cooldowns`
+  - `profiles.enabled`, `profiles.redirectBaseUrl`
+  - `profiles.providers.{google,github,discord}.{clientId,clientSecret,redirectUri}`
+- `anthropic`
+  - `apiKey`, `baseUrl`
+- `openai`
+  - `apiKey`, `baseUrl`
 - `google`
   - `apiKey`, `authProfile`, `baseUrl`
 - `providers.ollama`
@@ -159,12 +168,23 @@ This is a condensed map; refer to the JSON schema for full detail.
   - `region`, `accessKeyId`, `secretAccessKey`, `sessionToken`, `enabled`
 - `venice`
   - `apiKey`, `baseUrl`
+- `vertex`
+  - `projectId`, `location`, `model`
 - `classifier`
   - `enabled`, `mode` (`off` | `warn` | `block`), `model`, `blockThreshold`
+- `session`
+  - `scope`, `dmScope`, `typingMode`, `typingIntervalSeconds`, `mainKey`
 - `sessions`
   - `retention.enabled`, `retention.days`, `retention.intervalHours`
   - `integrity.enabled` (default `true`), `integrity.action` (`warn` | `reject`, default `warn`)
   - Legacy: `sessions.retentionDays`, `session.retention.*`
+- `logging`
+  - `level`, `format`, `consoleStyle`, `redactSensitive`
+- `cron`
+  - `enabled`, `maxConcurrentRuns`, `entries[]`
+- `skills`
+  - `sandbox.enabled`, `sandbox.defaults.{allowHttp,allowCredentials,allowMedia}`
+  - `signature.enabled`, `signature.requireSignature`, `signature.trustedPublishers`
 - `usage`
   - `pricing.default` – fallback pricing (`inputCostPerMTok`, `outputCostPerMTok`)
   - `pricing.overrides[]` – per-model overrides (`match`, `matchType`, `inputCostPerMTok`, `outputCostPerMTok`)
@@ -246,13 +266,28 @@ For Gemini onboarding:
 Defaults are applied after validation. Key defaults include:
 
 - `messages.ackReactionScope`: `"group-mentions"`
+- `logging.consoleStyle`: `"pretty"`
 - `logging.redactSensitive`: `"tools"`
 - `agents.defaults.maxConcurrent`: `DEFAULT_AGENT_MAX_CONCURRENT`
+- `agents.defaults.timeoutSeconds`: `DEFAULT_AGENT_TIMEOUT_SECONDS`
+- `agents.defaults.contextTokens`: `DEFAULT_CONTEXT_TOKENS`
 - `agents.defaults.subagents.maxConcurrent`: `DEFAULT_SUBAGENT_MAX_CONCURRENT`
+- `agents.defaults.subagents.archiveAfterMinutes`: `60`
 - `agents.defaults.compaction.mode`: `"safeguard"`
-- `agents.defaults.contextPruning.mode`: `"cache-ttl"` (when anthropic auth is detected)
-  - `contextPruning.ttl`: `"1h"`
-  - `agents.defaults.heartbeat.every`: `"30m"` or `"1h"` depending on auth mode
+- `session.scope`: `"per-sender"`
+- `session.dmScope`: `"main"`
+- `session.typingMode`: `"thinking"`
+- `session.typingIntervalSeconds`: `3`
+- `session.mainKey`: `"main"` (enforced even if another value is supplied)
+- `cron.maxConcurrentRuns`: `2`
+- `gateway.port`: `18789`
+- `gateway.bind`: `"loopback"`
+- `gateway.reload.mode`: `"hybrid"`
+- `gateway.reload.debounceMs`: `300`
+- `gateway.hooks.path`: `"/hooks"`
+- `gateway.hooks.maxBodyBytes`: `262144`
+- `vertex.location`: `"us-central1"`
+- `vertex.projectId`: omitted unless `VERTEX_PROJECT_ID` is set
 - Model defaults when defined in `models.providers.*.models`:
   - `reasoning`: `false`
   - `input`: `["text"]`
