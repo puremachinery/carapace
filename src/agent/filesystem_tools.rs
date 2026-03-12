@@ -14,16 +14,6 @@ use crate::plugins::tools::{BuiltinTool, ToolInvokeContext, ToolInvokeResult};
 const DEFAULT_SEARCH_ENTRY_BUDGET: usize = 10_000;
 const DEFAULT_MAX_READ_BYTES: u64 = 10_485_760;
 
-/// Run a sync closure, signaling tokio when in a multi-threaded runtime.
-fn run_blocking<T>(f: impl FnOnce() -> T) -> T {
-    match tokio::runtime::Handle::try_current() {
-        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-            tokio::task::block_in_place(f)
-        }
-        _ => f(),
-    }
-}
-
 /// Check whether `path` is excluded by any of the configured patterns relative to `root`.
 ///
 /// Returns the matching pattern as a string if excluded, `None` otherwise.
@@ -48,29 +38,58 @@ fn excluded_by(
     None
 }
 
-/// Validate that a requested path is allowed by the configured roots and exclude patterns.
-pub fn validate_path(
-    requested: &str,
-    roots: &[PathBuf],
-    exclude_patterns: &[Pattern],
-) -> Result<PathBuf, String> {
-    let canonical = std::fs::canonicalize(requested)
-        .map_err(|e| format!("cannot resolve path \"{}\": {}", requested, e))?;
+fn matching_root<'a>(canonical: &std::path::Path, roots: &'a [PathBuf]) -> Option<&'a PathBuf> {
+    roots
+        .iter()
+        .find(|root| canonical.starts_with(root.as_path()))
+}
 
-    let Some(root) = roots.iter().find(|root| canonical.starts_with(root)) else {
+fn validate_canonical_path<'a>(
+    canonical: &std::path::Path,
+    roots: &'a [PathBuf],
+    exclude_patterns: &[Pattern],
+) -> Result<&'a PathBuf, String> {
+    let Some(root) = matching_root(canonical, roots) else {
         return Err(format!(
             "path \"{}\" is outside all configured filesystem roots",
             canonical.display()
         ));
     };
 
-    if let Some(pattern) = excluded_by(&canonical, root, exclude_patterns) {
+    if let Some(pattern) = excluded_by(canonical, root, exclude_patterns) {
         return Err(format!(
             "path \"{}\" is excluded by pattern \"{}\"",
             canonical.display(),
             pattern
         ));
     }
+
+    Ok(root)
+}
+
+fn canonicalize_allowed_path(
+    path: &std::path::Path,
+    roots: &[PathBuf],
+    exclude_patterns: &[Pattern],
+) -> Option<PathBuf> {
+    let canonical = std::fs::canonicalize(path).ok()?;
+    validate_canonical_path(&canonical, roots, exclude_patterns).ok()?;
+    Some(canonical)
+}
+
+/// Validate that a requested path is allowed by the configured roots and exclude patterns.
+pub fn validate_path(
+    requested: &str,
+    roots: &[PathBuf],
+    exclude_patterns: &[Pattern],
+) -> Result<PathBuf, String> {
+    if !std::path::Path::new(requested).is_absolute() {
+        return Err(format!("path \"{}\" must be absolute", requested));
+    }
+
+    let canonical = std::fs::canonicalize(requested)
+        .map_err(|e| format!("cannot resolve path \"{}\": {}", requested, e))?;
+    validate_canonical_path(&canonical, roots, exclude_patterns)?;
 
     Ok(canonical)
 }
@@ -87,6 +106,9 @@ pub fn validate_write_path(
     create_dirs: bool,
 ) -> Result<PathBuf, String> {
     let path = PathBuf::from(requested);
+    if !path.is_absolute() {
+        return Err(format!("path \"{}\" must be absolute", requested));
+    }
     let filename = path
         .file_name()
         .ok_or_else(|| format!("path \"{}\" has no filename", requested))?;
@@ -275,62 +297,40 @@ fn file_read_tool(config: Arc<FilesystemConfig>) -> BuiltinTool {
             "additionalProperties": false
         }),
         handler: Box::new(move |args, _ctx: &ToolInvokeContext| {
-            run_blocking(|| {
-                let path_str = match args.get("path").and_then(|v| v.as_str()) {
-                    Some(p) => p,
-                    None => {
-                        return ToolInvokeResult::tool_error("missing required parameter: path")
-                    }
-                };
-                let canonical =
-                    match validate_path(path_str, &config.roots, &config.exclude_patterns) {
-                        Ok(p) => p,
-                        Err(e) => return ToolInvokeResult::tool_error(e),
-                    };
-                let metadata = match fs::metadata(&canonical) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        return ToolInvokeResult::tool_error(format!(
-                            "cannot stat \"{}\": {}",
-                            path_str, e
-                        ))
-                    }
-                };
-                if metadata.is_dir() {
+            let path_str = match args.get("path").and_then(|v| v.as_str()) {
+                Some(p) => p,
+                None => return ToolInvokeResult::tool_error("missing required parameter: path"),
+            };
+            let canonical = match validate_path(path_str, &config.roots, &config.exclude_patterns) {
+                Ok(p) => p,
+                Err(e) => return ToolInvokeResult::tool_error(e),
+            };
+            let metadata = match fs::metadata(&canonical) {
+                Ok(m) => m,
+                Err(e) => {
                     return ToolInvokeResult::tool_error(format!(
-                        "\"{}\" is a directory, not a file",
-                        path_str
-                    ));
+                        "cannot stat \"{}\": {}",
+                        path_str, e
+                    ))
                 }
-                let file_size = metadata.len();
-                let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
-                let limit = args
-                    .get("limit")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(config.max_read_bytes)
-                    .min(config.max_read_bytes);
+            };
+            if metadata.is_dir() {
+                return ToolInvokeResult::tool_error(format!(
+                    "\"{}\" is a directory, not a file",
+                    path_str
+                ));
+            }
+            let file_size = metadata.len();
+            let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
+            let limit = args
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(config.max_read_bytes)
+                .min(config.max_read_bytes);
 
-                let mut file = match fs::File::open(&canonical) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        let msg = if e.kind() == std::io::ErrorKind::PermissionDenied {
-                            format!("permission denied: \"{}\"", path_str)
-                        } else {
-                            format!("cannot read \"{}\": {}", path_str, e)
-                        };
-                        return ToolInvokeResult::tool_error(msg);
-                    }
-                };
-
-                if offset > 0 {
-                    use std::io::Seek;
-                    if let Err(e) = file.seek(std::io::SeekFrom::Start(offset)) {
-                        return ToolInvokeResult::tool_error(format!("seek failed: {}", e));
-                    }
-                }
-
-                let mut buf = Vec::new();
-                if let Err(e) = file.take(limit).read_to_end(&mut buf) {
+            let mut file = match fs::File::open(&canonical) {
+                Ok(f) => f,
+                Err(e) => {
                     let msg = if e.kind() == std::io::ErrorKind::PermissionDenied {
                         format!("permission denied: \"{}\"", path_str)
                     } else {
@@ -338,27 +338,44 @@ fn file_read_tool(config: Arc<FilesystemConfig>) -> BuiltinTool {
                     };
                     return ToolInvokeResult::tool_error(msg);
                 }
+            };
 
-                let truncated = file_size > offset + buf.len() as u64;
-                let check_len = buf.len().min(8192);
-                let is_binary = buf[..check_len].contains(&0u8);
+            if offset > 0 {
+                use std::io::Seek;
+                if let Err(e) = file.seek(std::io::SeekFrom::Start(offset)) {
+                    return ToolInvokeResult::tool_error(format!("seek failed: {}", e));
+                }
+            }
 
-                let (content, encoding) = if is_binary {
-                    (
-                        base64::engine::general_purpose::STANDARD.encode(&buf),
-                        "base64",
-                    )
+            let mut buf = Vec::new();
+            if let Err(e) = file.take(limit).read_to_end(&mut buf) {
+                let msg = if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    format!("permission denied: \"{}\"", path_str)
                 } else {
-                    (String::from_utf8_lossy(&buf).into_owned(), "utf-8")
+                    format!("cannot read \"{}\": {}", path_str, e)
                 };
+                return ToolInvokeResult::tool_error(msg);
+            }
 
-                ToolInvokeResult::success(json!({
-                    "content": content,
-                    "encoding": encoding,
-                    "size": file_size,
-                    "truncated": truncated,
-                }))
-            })
+            let truncated = file_size > offset + buf.len() as u64;
+            let check_len = buf.len().min(8192);
+            let is_binary = buf[..check_len].contains(&0u8);
+
+            let (content, encoding) = if is_binary {
+                (
+                    base64::engine::general_purpose::STANDARD.encode(&buf),
+                    "base64",
+                )
+            } else {
+                (String::from_utf8_lossy(&buf).into_owned(), "utf-8")
+            };
+
+            ToolInvokeResult::success(json!({
+                "content": content,
+                "encoding": encoding,
+                "size": file_size,
+                "truncated": truncated,
+            }))
         }),
     }
 }
@@ -378,90 +395,82 @@ fn directory_list_tool(config: Arc<FilesystemConfig>) -> BuiltinTool {
             "additionalProperties": false
         }),
         handler: Box::new(move |args, _ctx: &ToolInvokeContext| {
-            run_blocking(|| {
-                let path_str = match args.get("path").and_then(|v| v.as_str()) {
-                    Some(p) => p,
-                    None => {
-                        return ToolInvokeResult::tool_error("missing required parameter: path")
-                    }
-                };
-                let canonical =
-                    match validate_path(path_str, &config.roots, &config.exclude_patterns) {
-                        Ok(p) => p,
-                        Err(e) => return ToolInvokeResult::tool_error(e),
+            let path_str = match args.get("path").and_then(|v| v.as_str()) {
+                Some(p) => p,
+                None => return ToolInvokeResult::tool_error("missing required parameter: path"),
+            };
+            let canonical = match validate_path(path_str, &config.roots, &config.exclude_patterns) {
+                Ok(p) => p,
+                Err(e) => return ToolInvokeResult::tool_error(e),
+            };
+            if !canonical.is_dir() {
+                return ToolInvokeResult::tool_error(format!(
+                    "\"{}\" is not a directory",
+                    path_str
+                ));
+            }
+            let glob_filter = args
+                .get("glob")
+                .and_then(|v| v.as_str())
+                .and_then(|s| Pattern::new(s).ok());
+
+            let entries = match fs::read_dir(&canonical) {
+                Ok(rd) => rd,
+                Err(e) => {
+                    let msg = if e.kind() == std::io::ErrorKind::PermissionDenied {
+                        format!("permission denied: \"{}\"", path_str)
+                    } else {
+                        format!("cannot read directory \"{}\": {}", path_str, e)
                     };
-                if !canonical.is_dir() {
-                    return ToolInvokeResult::tool_error(format!(
-                        "\"{}\" is not a directory",
-                        path_str
-                    ));
+                    return ToolInvokeResult::tool_error(msg);
                 }
-                let glob_filter = args
-                    .get("glob")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| Pattern::new(s).ok());
+            };
 
-                // Find the matching root for exclude-pattern checks on child entries.
-                let matching_root = config
-                    .roots
-                    .iter()
-                    .find(|r| canonical.starts_with(r.as_path()));
+            let mut results = Vec::new();
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
 
-                let entries = match fs::read_dir(&canonical) {
-                    Ok(rd) => rd,
-                    Err(e) => {
-                        let msg = if e.kind() == std::io::ErrorKind::PermissionDenied {
-                            format!("permission denied: \"{}\"", path_str)
-                        } else {
-                            format!("cannot read directory \"{}\": {}", path_str, e)
-                        };
-                        return ToolInvokeResult::tool_error(msg);
+                if let Some(ref pattern) = glob_filter {
+                    if !pattern.matches(&name) {
+                        continue;
                     }
-                };
-
-                let mut results = Vec::new();
-                for entry in entries.flatten() {
-                    let name = entry.file_name().to_string_lossy().into_owned();
-
-                    // Filter out entries matching exclude patterns.
-                    if let Some(root) = matching_root {
-                        let child_path = canonical.join(&name);
-                        if excluded_by(&child_path, root, &config.exclude_patterns).is_some() {
-                            continue;
-                        }
-                    }
-
-                    if let Some(ref pattern) = glob_filter {
-                        if !pattern.matches(&name) {
-                            continue;
-                        }
-                    }
-                    let meta = entry.metadata();
-                    let file_type = entry.file_type();
-                    let type_str = match file_type {
-                        Ok(ft) if ft.is_symlink() => "symlink",
-                        Ok(ft) if ft.is_dir() => "dir",
-                        _ => "file",
-                    };
-                    let (size, modified) = match meta {
-                        Ok(m) => {
-                            let size = m.len();
-                            let modified = m
-                                .modified()
-                                .ok()
-                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                                .map(|d| d.as_secs());
-                            (size, modified)
-                        }
-                        Err(_) => (0, None),
-                    };
-                    results.push(
-                        json!({ "name": name, "type": type_str, "size": size, "modified": modified }),
-                    );
                 }
 
-                ToolInvokeResult::success(json!({ "entries": results }))
-            })
+                let path = entry.path();
+                let Some(canonical_child) =
+                    canonicalize_allowed_path(&path, &config.roots, &config.exclude_patterns)
+                else {
+                    continue;
+                };
+
+                let file_type = match entry.file_type() {
+                    Ok(ft) => ft,
+                    Err(_) => continue,
+                };
+                let meta = entry.metadata();
+                let type_str = match file_type {
+                    ft if ft.is_symlink() => "symlink",
+                    _ if canonical_child.is_dir() => "dir",
+                    _ => "file",
+                };
+                let (size, modified) = match meta {
+                    Ok(m) => {
+                        let size = m.len();
+                        let modified = m
+                            .modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs());
+                        (size, modified)
+                    }
+                    Err(_) => (0, None),
+                };
+                results.push(
+                    json!({ "name": name, "type": type_str, "size": size, "modified": modified }),
+                );
+            }
+
+            ToolInvokeResult::success(json!({ "entries": results }))
         }),
     }
 }
@@ -482,59 +491,54 @@ fn file_stat_tool(config: Arc<FilesystemConfig>) -> BuiltinTool {
             "additionalProperties": false
         }),
         handler: Box::new(move |args, _ctx: &ToolInvokeContext| {
-            run_blocking(|| {
-                let path_str = match args.get("path").and_then(|v| v.as_str()) {
-                    Some(p) => p,
-                    None => {
-                        return ToolInvokeResult::tool_error("missing required parameter: path")
-                    }
-                };
-                let canonical =
-                    match validate_path(path_str, &config.roots, &config.exclude_patterns) {
-                        Ok(p) => p,
-                        Err(e) => return ToolInvokeResult::tool_error(e),
+            let path_str = match args.get("path").and_then(|v| v.as_str()) {
+                Some(p) => p,
+                None => return ToolInvokeResult::tool_error("missing required parameter: path"),
+            };
+            let canonical = match validate_path(path_str, &config.roots, &config.exclude_patterns) {
+                Ok(p) => p,
+                Err(e) => return ToolInvokeResult::tool_error(e),
+            };
+            let meta = match fs::symlink_metadata(&canonical) {
+                Ok(m) => m,
+                Err(e) => {
+                    let msg = if e.kind() == std::io::ErrorKind::PermissionDenied {
+                        format!("permission denied: \"{}\"", path_str)
+                    } else {
+                        format!("cannot stat \"{}\": {}", path_str, e)
                     };
-                let meta = match fs::symlink_metadata(&canonical) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        let msg = if e.kind() == std::io::ErrorKind::PermissionDenied {
-                            format!("permission denied: \"{}\"", path_str)
-                        } else {
-                            format!("cannot stat \"{}\": {}", path_str, e)
-                        };
-                        return ToolInvokeResult::tool_error(msg);
-                    }
-                };
-                let modified = meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs());
-                let created = meta
-                    .created()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs());
-
-                #[cfg(unix)]
-                let permissions = format!("{:o}", meta.permissions().mode() & 0o777);
-                #[cfg(not(unix))]
-                let permissions = if meta.permissions().readonly() {
-                    "readonly"
-                } else {
-                    "read-write"
+                    return ToolInvokeResult::tool_error(msg);
                 }
-                .to_string();
+            };
+            let modified = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs());
+            let created = meta
+                .created()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs());
 
-                ToolInvokeResult::success(json!({
-                    "size": meta.len(),
-                    "modified": modified,
-                    "created": created,
-                    "isDir": meta.is_dir(),
-                    "isSymlink": meta.file_type().is_symlink(),
-                    "permissions": permissions
-                }))
-            })
+            #[cfg(unix)]
+            let permissions = format!("{:o}", meta.permissions().mode() & 0o777);
+            #[cfg(not(unix))]
+            let permissions = if meta.permissions().readonly() {
+                "readonly"
+            } else {
+                "read-write"
+            }
+            .to_string();
+
+            ToolInvokeResult::success(json!({
+                "size": meta.len(),
+                "modified": modified,
+                "created": created,
+                "isDir": meta.is_dir(),
+                "isSymlink": meta.file_type().is_symlink(),
+                "permissions": permissions
+            }))
         }),
     }
 }
@@ -637,32 +641,30 @@ fn file_search_tool(config: Arc<FilesystemConfig>) -> BuiltinTool {
                         }
                         let path = entry.path();
                         let name = entry.file_name().to_string_lossy().into_owned();
-                        if path.is_dir() {
-                            // Prune directories that match an exclude pattern.
-                            let excluded = ctx.exclude_patterns.iter().any(|p| p.matches(&name));
-                            if !excluded {
-                                walk(&path, depth + 1, ctx);
-                            }
+                        let file_type = match entry.file_type() {
+                            Ok(ft) => ft,
+                            Err(_) => continue,
+                        };
+                        let Some(canonical) =
+                            canonicalize_allowed_path(&path, ctx.roots, ctx.exclude_patterns)
+                        else {
+                            continue;
+                        };
+
+                        if file_type.is_dir() {
+                            walk(&canonical, depth + 1, ctx);
+                            continue;
+                        }
+                        if file_type.is_symlink() && canonical.is_dir() {
                             continue;
                         }
                         if !ctx.glob_pattern.matches(&name) {
                             continue;
                         }
-                        // Verify path is within roots and not excluded.
-                        if let Ok(canonical) = std::fs::canonicalize(&path) {
-                            let Some(root) = ctx.roots.iter().find(|r| canonical.starts_with(r))
-                            else {
-                                continue;
-                            };
-                            if excluded_by(&canonical, root, ctx.exclude_patterns).is_some() {
-                                continue;
-                            }
-                        } else {
-                            continue;
-                        }
+
                         if let Some(ref regex) = ctx.content_regex {
                             let content_result = {
-                                let file = match fs::File::open(&path) {
+                                let file = match fs::File::open(&canonical) {
                                     Ok(f) => f,
                                     Err(_) => continue,
                                 };
@@ -684,14 +686,15 @@ fn file_search_tool(config: Arc<FilesystemConfig>) -> BuiltinTool {
                                             + 1;
                                     let line = content.lines().nth(line_num - 1).unwrap_or("");
                                     ctx.matches.push(json!({
-                                        "path": path.to_string_lossy(),
+                                        "path": canonical.to_string_lossy(),
                                         "line": line_num,
                                         "snippet": line.chars().take(200).collect::<String>()
                                     }));
                                 }
                             }
                         } else {
-                            ctx.matches.push(json!({ "path": path.to_string_lossy() }));
+                            ctx.matches
+                                .push(json!({ "path": canonical.to_string_lossy() }));
                         }
                     }
                 }
@@ -714,8 +717,7 @@ fn file_search_tool(config: Arc<FilesystemConfig>) -> BuiltinTool {
                 json!({ "matches": ctx.matches, "entriesScanned": ctx.entries_scanned, "truncated": ctx.truncated })
             };
 
-            let result = run_blocking(do_search);
-            ToolInvokeResult::success(result)
+            ToolInvokeResult::success(do_search())
         }),
     }
 }
@@ -735,49 +737,43 @@ fn file_write_tool(config: Arc<FilesystemConfig>) -> BuiltinTool {
             "additionalProperties": false
         }),
         handler: Box::new(move |args, _ctx| {
-            run_blocking(|| {
-                let path_str = match args.get("path").and_then(|v| v.as_str()) {
-                    Some(p) => p,
-                    None => {
-                        return ToolInvokeResult::tool_error("missing required parameter: path")
-                    }
-                };
-                let content = match args.get("content").and_then(|v| v.as_str()) {
-                    Some(c) => c,
-                    None => {
-                        return ToolInvokeResult::tool_error("missing required parameter: content")
-                    }
-                };
-                let create_dirs = args
-                    .get("create_dirs")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(true);
+            let path_str = match args.get("path").and_then(|v| v.as_str()) {
+                Some(p) => p,
+                None => return ToolInvokeResult::tool_error("missing required parameter: path"),
+            };
+            let content = match args.get("content").and_then(|v| v.as_str()) {
+                Some(c) => c,
+                None => return ToolInvokeResult::tool_error("missing required parameter: content"),
+            };
+            let create_dirs = args
+                .get("create_dirs")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
 
-                let target = match validate_write_path(
-                    path_str,
-                    &config.roots,
-                    &config.exclude_patterns,
-                    create_dirs,
-                ) {
-                    Ok(p) => p,
-                    Err(e) => return ToolInvokeResult::tool_error(e),
-                };
+            let target = match validate_write_path(
+                path_str,
+                &config.roots,
+                &config.exclude_patterns,
+                create_dirs,
+            ) {
+                Ok(p) => p,
+                Err(e) => return ToolInvokeResult::tool_error(e),
+            };
 
-                match fs::write(&target, content) {
-                    Ok(()) => ToolInvokeResult::success(json!({
-                        "bytesWritten": content.len(),
-                        "path": target.to_string_lossy()
-                    })),
-                    Err(e) => {
-                        let msg = if e.kind() == std::io::ErrorKind::PermissionDenied {
-                            format!("permission denied: \"{}\"", path_str)
-                        } else {
-                            format!("cannot write \"{}\": {}", path_str, e)
-                        };
-                        ToolInvokeResult::tool_error(msg)
-                    }
+            match fs::write(&target, content) {
+                Ok(()) => ToolInvokeResult::success(json!({
+                    "bytesWritten": content.len(),
+                    "path": target.to_string_lossy()
+                })),
+                Err(e) => {
+                    let msg = if e.kind() == std::io::ErrorKind::PermissionDenied {
+                        format!("permission denied: \"{}\"", path_str)
+                    } else {
+                        format!("cannot write \"{}\": {}", path_str, e)
+                    };
+                    ToolInvokeResult::tool_error(msg)
                 }
-            })
+            }
         }),
     }
 }
@@ -796,76 +792,61 @@ fn file_move_tool(config: Arc<FilesystemConfig>) -> BuiltinTool {
             "additionalProperties": false
         }),
         handler: Box::new(move |args, _ctx| {
-            run_blocking(|| {
-                let source_str = match args.get("source").and_then(|v| v.as_str()) {
-                    Some(p) => p,
-                    None => {
-                        return ToolInvokeResult::tool_error("missing required parameter: source")
-                    }
-                };
-                let dest_str = match args.get("destination").and_then(|v| v.as_str()) {
-                    Some(p) => p,
-                    None => {
-                        return ToolInvokeResult::tool_error(
-                            "missing required parameter: destination",
-                        )
-                    }
-                };
-
-                let source =
-                    match validate_path(source_str, &config.roots, &config.exclude_patterns) {
-                        Ok(p) => p,
-                        Err(e) => return ToolInvokeResult::tool_error(e),
-                    };
-
-                if source.is_dir() {
-                    return ToolInvokeResult::tool_error(format!(
-                        "\"{}\" is a directory; file_move only supports files",
-                        source_str
-                    ));
+            let source_str = match args.get("source").and_then(|v| v.as_str()) {
+                Some(p) => p,
+                None => return ToolInvokeResult::tool_error("missing required parameter: source"),
+            };
+            let dest_str = match args.get("destination").and_then(|v| v.as_str()) {
+                Some(p) => p,
+                None => {
+                    return ToolInvokeResult::tool_error("missing required parameter: destination")
                 }
+            };
 
-                let dest = match validate_write_path(
-                    dest_str,
-                    &config.roots,
-                    &config.exclude_patterns,
-                    false,
-                ) {
+            let source = match validate_path(source_str, &config.roots, &config.exclude_patterns) {
+                Ok(p) => p,
+                Err(e) => return ToolInvokeResult::tool_error(e),
+            };
+
+            if source.is_dir() {
+                return ToolInvokeResult::tool_error(format!(
+                    "\"{}\" is a directory; file_move only supports files",
+                    source_str
+                ));
+            }
+
+            let dest =
+                match validate_write_path(dest_str, &config.roots, &config.exclude_patterns, false)
+                {
                     Ok(p) => p,
                     Err(e) => return ToolInvokeResult::tool_error(e),
                 };
 
-                let rename_result = fs::rename(&source, &dest);
+            let rename_result = fs::rename(&source, &dest);
 
-                #[cfg(windows)]
-                let rename_result = if rename_result.is_err() && dest.exists() {
-                    fs::remove_file(&dest).and_then(|()| fs::rename(&source, &dest))
-                } else {
-                    rename_result
-                };
+            #[cfg(windows)]
+            let rename_result = if rename_result.is_err() && dest.exists() {
+                fs::remove_file(&dest).and_then(|()| fs::rename(&source, &dest))
+            } else {
+                rename_result
+            };
 
-                match rename_result {
-                    Ok(()) => ToolInvokeResult::success(json!({
-                        "source": source.to_string_lossy(),
-                        "destination": dest.to_string_lossy()
-                    })),
-                    Err(e) => {
-                        #[cfg(unix)]
-                        let is_cross_device = e.raw_os_error() == Some(libc::EXDEV);
-                        #[cfg(not(unix))]
-                        let is_cross_device = false;
-
-                        let msg = if is_cross_device {
-                            "cannot move across filesystems".to_string()
-                        } else if e.kind() == std::io::ErrorKind::PermissionDenied {
-                            "permission denied".to_string()
-                        } else {
-                            format!("cannot move: {}", e)
-                        };
-                        ToolInvokeResult::tool_error(msg)
-                    }
+            match rename_result {
+                Ok(()) => ToolInvokeResult::success(json!({
+                    "source": source.to_string_lossy(),
+                    "destination": dest.to_string_lossy()
+                })),
+                Err(e) => {
+                    let msg = if e.kind() == std::io::ErrorKind::CrossesDevices {
+                        "cannot move across filesystems".to_string()
+                    } else if e.kind() == std::io::ErrorKind::PermissionDenied {
+                        "permission denied".to_string()
+                    } else {
+                        format!("cannot move: {}", e)
+                    };
+                    ToolInvokeResult::tool_error(msg)
                 }
-            })
+            }
         }),
     }
 }
@@ -973,6 +954,27 @@ mod tests {
             &[],
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_write_path_rejects_relative_path() {
+        let tmp = setup_test_tree();
+        let roots = vec![tmp.path().canonicalize().unwrap()];
+        let result = validate_write_path("relative/file.txt", &roots, &[], true);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("must be absolute"));
+    }
+
+    #[test]
+    fn test_validate_path_rejects_relative_path() {
+        let tmp = setup_test_tree();
+        let roots = vec![tmp.path().canonicalize().unwrap()];
+        let result = validate_path("relative/path.txt", &roots, &[]);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("must be absolute"),
+            "should reject relative paths explicitly"
+        );
     }
 
     #[cfg(unix)]
@@ -1484,6 +1486,35 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_directory_list_skips_symlink_outside_root() {
+        let tmp = setup_test_tree();
+        let outside = TempDir::new().unwrap();
+        fs::write(outside.path().join("secret.txt"), "outside").unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.txt"),
+            tmp.path().join("outside-link.txt"),
+        )
+        .unwrap();
+        let cfg = make_test_config(tmp.path(), false);
+        let tools = filesystem_tools(&cfg);
+        let tool = tools.iter().find(|t| t.name == "directory_list").unwrap();
+        let result = (tool.handler)(json!({ "path": tmp.path().to_str().unwrap() }), &test_ctx());
+        match &result {
+            ToolInvokeResult::Success { result, .. } => {
+                let names: Vec<&str> = result["entries"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|e| e["name"].as_str().unwrap())
+                    .collect();
+                assert!(!names.contains(&"outside-link.txt"));
+            }
+            _ => panic!("expected success"),
+        }
+    }
+
     #[test]
     fn test_file_search_enforces_exclude_patterns() {
         let tmp = setup_test_tree();
@@ -1576,6 +1607,44 @@ mod tests {
                         .any(|m| m["path"].as_str().unwrap_or("").contains("secret.log")),
                     "content search should not return excluded files"
                 );
+            }
+            _ => panic!("expected success"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_file_search_skips_symlinked_directory_outside_root() {
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::write(tmp.path().join("inside.txt"), "inside").unwrap();
+        fs::create_dir_all(outside.path().join("deep")).unwrap();
+        fs::write(outside.path().join("deep/outside.txt"), "outside").unwrap();
+        std::os::unix::fs::symlink(outside.path(), tmp.path().join("outside-link")).unwrap();
+
+        let cfg = json!({
+            "filesystem": {
+                "enabled": true,
+                "roots": [tmp.path().to_str().unwrap()]
+            }
+        });
+        let tools = filesystem_tools(&cfg);
+        let tool = tools.iter().find(|t| t.name == "file_search").unwrap();
+        let result = (tool.handler)(
+            json!({ "pattern": "*.txt", "path": tmp.path().to_str().unwrap() }),
+            &test_ctx(),
+        );
+        match &result {
+            ToolInvokeResult::Success { result, .. } => {
+                let paths: Vec<&str> = result["matches"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|m| m["path"].as_str())
+                    .collect();
+                assert!(paths.iter().any(|p| p.contains("inside.txt")));
+                assert!(!paths.iter().any(|p| p.contains("outside.txt")));
+                assert!(!result["truncated"].as_bool().unwrap());
             }
             _ => panic!("expected success"),
         }

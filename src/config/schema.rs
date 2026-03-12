@@ -966,6 +966,15 @@ fn validate_filesystem(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Sc
                         message: format!("filesystem root does not exist: \"{}\"", s),
                     });
                 }
+            } else {
+                issues.push(SchemaIssue {
+                    severity: Severity::Error,
+                    path: format!(".filesystem.roots[{}]", i),
+                    message: format!(
+                        "filesystem root must be a string, got {}",
+                        json_type_label(root)
+                    ),
+                });
             }
         }
     }
@@ -985,6 +994,15 @@ fn validate_filesystem(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Sc
                         ),
                     });
                 }
+            } else {
+                issues.push(SchemaIssue {
+                    severity: Severity::Error,
+                    path: format!(".filesystem.excludePatterns[{}]", i),
+                    message: format!(
+                        "exclude pattern must be a string, got {}",
+                        json_type_label(pat)
+                    ),
+                });
             }
         }
     }
@@ -993,6 +1011,18 @@ fn validate_filesystem(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Sc
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Return a human-readable label for a JSON value's type.
+fn json_type_label(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
 
 /// Check that a value is a positive integer (> 0).
 fn check_positive_integer(value: &Value, path: &str, issues: &mut Vec<SchemaIssue>) {
@@ -1465,12 +1495,27 @@ mod tests {
 
     // ===== Filesystem validation =====
 
+    fn test_filesystem_root() -> String {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().to_path_buf();
+        std::mem::forget(dir);
+        path.to_string_lossy().into_owned()
+    }
+
+    fn nonexistent_filesystem_root() -> String {
+        std::env::temp_dir()
+            .join("carapace-schema-nonexistent-root-27364")
+            .to_string_lossy()
+            .into_owned()
+    }
+
     #[test]
     fn test_filesystem_valid_config() {
+        let root = test_filesystem_root();
         let config = json!({
             "filesystem": {
                 "enabled": true,
-                "roots": ["/tmp"],
+                "roots": [root],
                 "writeAccess": false
             }
         });
@@ -1512,10 +1557,11 @@ mod tests {
 
     #[test]
     fn test_filesystem_nonexistent_path_warns() {
+        let missing_root = nonexistent_filesystem_root();
         let config = json!({
             "filesystem": {
                 "enabled": true,
-                "roots": ["/nonexistent/path/that/does/not/exist/27364"]
+                "roots": [missing_root]
             }
         });
         let issues = validate_schema(&config);
@@ -1526,10 +1572,11 @@ mod tests {
 
     #[test]
     fn test_filesystem_unknown_key_warns() {
+        let root = test_filesystem_root();
         let config = json!({
             "filesystem": {
                 "enabled": true,
-                "roots": ["/tmp"],
+                "roots": [root],
                 "unknownSetting": true
             }
         });
@@ -1541,10 +1588,11 @@ mod tests {
 
     #[test]
     fn test_filesystem_invalid_exclude_pattern_is_error() {
+        let root = test_filesystem_root();
         let config = json!({
             "filesystem": {
                 "enabled": true,
-                "roots": ["/tmp"],
+                "roots": [root],
                 "excludePatterns": ["[invalid"]
             }
         });
@@ -1565,6 +1613,42 @@ mod tests {
         let issues = validate_schema(&config);
         // Should not produce errors when disabled
         assert!(!issues.iter().any(|i| i.severity == Severity::Error));
+    }
+
+    #[test]
+    fn test_filesystem_non_string_root_is_error() {
+        let config = json!({
+            "filesystem": {
+                "enabled": true,
+                "roots": [42, true]
+            }
+        });
+        let issues = validate_schema(&config);
+        let errors: Vec<_> = issues
+            .iter()
+            .filter(|i| i.severity == Severity::Error && i.path.contains("roots"))
+            .collect();
+        assert_eq!(errors.len(), 2, "should flag both non-string roots");
+        assert!(errors[0].message.contains("must be a string"));
+    }
+
+    #[test]
+    fn test_filesystem_non_string_exclude_pattern_is_error() {
+        let root = test_filesystem_root();
+        let config = json!({
+            "filesystem": {
+                "enabled": true,
+                "roots": [root],
+                "excludePatterns": ["*.log", 123]
+            }
+        });
+        let issues = validate_schema(&config);
+        let errors: Vec<_> = issues
+            .iter()
+            .filter(|i| i.severity == Severity::Error && i.path.contains("excludePatterns"))
+            .collect();
+        assert_eq!(errors.len(), 1, "should flag the non-string pattern");
+        assert!(errors[0].message.contains("must be a string"));
     }
 
     // --- is_plausible_cron ---
