@@ -542,6 +542,8 @@ pub fn apply_defaults(config: &mut Value) {
         *config = Value::Object(serde_json::Map::new());
     }
 
+    let should_normalize_legacy_timeout = should_normalize_legacy_agent_timeout(config);
+
     // Deserialize into typed struct — missing fields get defaults.
     let with_defaults: ConfigWithDefaults = match serde_json::from_value(config.clone()) {
         Ok(v) => v,
@@ -565,6 +567,12 @@ pub fn apply_defaults(config: &mut Value) {
     // Deep-merge: defaults go *under* user values (user wins).
     merge_defaults(config, defaults_value);
 
+    // Post-merge cross-field fixups: normalize valid legacy timeout aliases,
+    // while preserving invalid legacy values for downstream schema warnings.
+    if should_normalize_legacy_timeout {
+        migrate_legacy_agent_timeout(config);
+    }
+
     // Post-merge cross-field fixups: enforce session.mainKey = "main".
     if let Some(session) = config.get_mut("session").and_then(|v| v.as_object_mut()) {
         if let Some(mk) = session.get("mainKey").and_then(|v| v.as_str()) {
@@ -573,6 +581,35 @@ pub fn apply_defaults(config: &mut Value) {
             }
         }
         session.insert("mainKey".to_string(), Value::String("main".to_string()));
+    }
+}
+
+fn should_normalize_legacy_agent_timeout(config: &Value) -> bool {
+    let Some(defaults) = config
+        .pointer("/agents/defaults")
+        .and_then(|v| v.as_object())
+    else {
+        return false;
+    };
+
+    !defaults.contains_key("timeoutSeconds")
+        && defaults
+            .get("timeout")
+            .and_then(|v| v.as_u64())
+            .filter(|v| *v > 0)
+            .is_some()
+}
+
+fn migrate_legacy_agent_timeout(config: &mut Value) {
+    let Some(defaults) = config
+        .pointer_mut("/agents/defaults")
+        .and_then(|v| v.as_object_mut())
+    else {
+        return;
+    };
+
+    if let Some(legacy_timeout) = defaults.remove("timeout") {
+        defaults.insert("timeoutSeconds".to_string(), legacy_timeout);
     }
 }
 
@@ -772,6 +809,58 @@ mod tests {
         assert_eq!(
             config["logging"]["redactSensitive"],
             DEFAULT_REDACT_SENSITIVE
+        );
+    }
+
+    #[test]
+    fn test_legacy_timeout_alias_preserved_as_timeout_seconds() {
+        let mut config = json!({
+            "agents": {
+                "defaults": {
+                    "timeout": 600
+                }
+            }
+        });
+
+        apply_defaults(&mut config);
+
+        assert_eq!(config["agents"]["defaults"]["timeoutSeconds"], 600);
+        assert!(config["agents"]["defaults"].get("timeout").is_none());
+    }
+
+    #[test]
+    fn test_both_timeout_keys_keep_canonical_timeout_seconds() {
+        let mut config = json!({
+            "agents": {
+                "defaults": {
+                    "timeoutSeconds": 120,
+                    "timeout": 30
+                }
+            }
+        });
+
+        apply_defaults(&mut config);
+
+        assert_eq!(config["agents"]["defaults"]["timeoutSeconds"], 120);
+        assert_eq!(config["agents"]["defaults"]["timeout"], 30);
+    }
+
+    #[test]
+    fn test_invalid_legacy_timeout_is_preserved_for_validation() {
+        let mut config = json!({
+            "agents": {
+                "defaults": {
+                    "timeout": "bad"
+                }
+            }
+        });
+
+        apply_defaults(&mut config);
+
+        assert_eq!(config["agents"]["defaults"]["timeout"], "bad");
+        assert_eq!(
+            config["agents"]["defaults"]["timeoutSeconds"],
+            DEFAULT_AGENT_TIMEOUT_SECONDS
         );
     }
 
