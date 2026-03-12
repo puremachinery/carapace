@@ -589,7 +589,10 @@ pub fn apply_defaults(config: &mut Value) {
 }
 
 fn should_normalize_legacy_agent_timeout(config: &Value) -> bool {
-    let Some(defaults) = config.pointer("/agents/defaults").and_then(|v| v.as_object()) else {
+    let Some(defaults) = config
+        .pointer("/agents/defaults")
+        .and_then(|v| v.as_object())
+    else {
         return false;
     };
 

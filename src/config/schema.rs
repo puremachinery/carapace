@@ -1247,7 +1247,9 @@ mod tests {
         let cfg = json!({ "agents": { "defaults": { "maxConcurrent": 5, "timeoutSeconds": 60, "contextTokens": 8000 } } });
         let issues = validate_schema(&cfg);
         assert!(
-            !issues.iter().any(|i| i.path.starts_with(".agents.defaults")),
+            !issues
+                .iter()
+                .any(|i| i.path.starts_with(".agents.defaults")),
             "Expected no issues for agents.defaults, but found: {:?}",
             issues
         );
@@ -1258,7 +1260,9 @@ mod tests {
         let cfg = json!({ "agents": { "defaults": { "timeout": 60 } } });
         let issues = validate_schema(&cfg);
         assert!(
-            !issues.iter().any(|i| i.path.starts_with(".agents.defaults")),
+            !issues
+                .iter()
+                .any(|i| i.path.starts_with(".agents.defaults")),
             "Expected no issues for agents.defaults, but found: {:?}",
             issues
         );
@@ -1266,8 +1270,7 @@ mod tests {
 
     #[test]
     fn test_agents_defaults_warns_when_both_timeout_keys_are_set() {
-        let cfg =
-            json!({ "agents": { "defaults": { "timeoutSeconds": 60, "timeout": 30 } } });
+        let cfg = json!({ "agents": { "defaults": { "timeoutSeconds": 60, "timeout": 30 } } });
         let issues = validate_schema(&cfg);
         assert!(issues.iter().any(|i| i.path == ".agents.defaults"));
     }
