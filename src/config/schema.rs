@@ -121,10 +121,8 @@ pub fn validate_schema(config: &Value) -> Vec<SchemaIssue> {
 
     // Run agent config lint if prompt guard config lint is enabled
     if let Some(agents) = obj.get("agents") {
-        let lint_enabled = obj
-            .get("agents")
-            .and_then(|a| a.get("promptGuard"))
-            .and_then(|pg| pg.get("configLint"))
+        let lint_enabled = prompt_guard_obj(agents)
+            .and_then(prompt_guard_config_lint_obj)
             .and_then(|cl| cl.get("enabled"))
             .and_then(|e| e.as_bool())
             .unwrap_or(false);
@@ -586,38 +584,93 @@ fn validate_cron(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIs
 }
 
 fn validate_prompt_guard(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIssue>) {
-    let pg = match obj
-        .get("agents")
-        .and_then(|a| a.get("promptGuard"))
-        .and_then(|v| v.as_object())
-    {
-        Some(pg) => pg,
+    let (prompt_guard_key, pg) = match obj.get("agents").and_then(prompt_guard_entry) {
+        Some(entry) => entry,
         None => return,
     };
+    let prompt_guard_path = format!(".agents.{}", prompt_guard_key);
 
     if let Some(enabled) = pg.get("enabled") {
-        if !enabled.is_boolean() {
-            issues.push(SchemaIssue {
-                severity: Severity::Warning,
-                path: ".agents.promptGuard.enabled".to_string(),
-                message: "enabled must be a boolean".to_string(),
-            });
+        validate_enabled_bool(
+            enabled,
+            &format!("{prompt_guard_path}.enabled"),
+            Severity::Warning,
+            issues,
+        );
+    }
+
+    // Validate sub-sections have boolean enabled fields.
+    for section in &["preflight", "tagging", "postflight"] {
+        if let Some(sub) = pg.get(*section).and_then(|v| v.as_object()) {
+            if let Some(enabled) = sub.get("enabled") {
+                validate_enabled_bool(
+                    enabled,
+                    &format!("{prompt_guard_path}.{section}.enabled"),
+                    Severity::Warning,
+                    issues,
+                );
+            }
         }
     }
 
-    // Validate sub-sections have boolean enabled fields
-    for section in &["preflight", "tagging", "postflight", "configLint"] {
-        if let Some(sub) = pg.get(*section).and_then(|v| v.as_object()) {
-            if let Some(enabled) = sub.get("enabled") {
-                if !enabled.is_boolean() {
-                    issues.push(SchemaIssue {
-                        severity: Severity::Warning,
-                        path: format!(".agents.promptGuard.{}.enabled", section),
-                        message: "enabled must be a boolean".to_string(),
-                    });
-                }
-            }
+    if let Some(sub) = pg.get("config_lint").and_then(|v| v.as_object()) {
+        if let Some(enabled) = sub.get("enabled") {
+            validate_enabled_bool(
+                enabled,
+                &format!("{prompt_guard_path}.config_lint.enabled"),
+                Severity::Warning,
+                issues,
+            );
         }
+    }
+
+    if let Some(_legacy_config_lint) = pg.get("configLint") {
+        issues.push(SchemaIssue {
+            severity: Severity::Error,
+            path: format!("{prompt_guard_path}.configLint"),
+            message: "configLint is a legacy key; use config_lint".to_string(),
+        });
+    }
+}
+
+fn prompt_guard_obj(agents: &Value) -> Option<&serde_json::Map<String, Value>> {
+    prompt_guard_entry(agents).map(|(_, value)| value)
+}
+
+fn prompt_guard_entry(agents: &Value) -> Option<(&'static str, &serde_json::Map<String, Value>)> {
+    // `promptGuard` remains the canonical form. If both keys are present,
+    // prefer it and ignore the legacy/alternate snake_case wrapper.
+    agents
+        .get("promptGuard")
+        .and_then(|v| v.as_object())
+        .map(|v| ("promptGuard", v))
+        .or_else(|| {
+            agents
+                .get("prompt_guard")
+                .and_then(|v| v.as_object())
+                .map(|v| ("prompt_guard", v))
+        })
+}
+
+fn prompt_guard_config_lint_obj(
+    prompt_guard: &serde_json::Map<String, Value>,
+) -> Option<&serde_json::Map<String, Value>> {
+    // The lint-enable path intentionally resolves only the canonical key.
+    prompt_guard.get("config_lint").and_then(|v| v.as_object())
+}
+
+fn validate_enabled_bool(
+    enabled: &Value,
+    path: &str,
+    severity: Severity,
+    issues: &mut Vec<SchemaIssue>,
+) {
+    if !enabled.is_boolean() {
+        issues.push(SchemaIssue {
+            severity,
+            path: path.to_string(),
+            message: "enabled must be a boolean".to_string(),
+        });
     }
 }
 
@@ -1317,6 +1370,127 @@ mod tests {
         assert!(issues
             .iter()
             .any(|i| i.path == ".agents.outputSanitizer.cspPolicy"));
+    }
+
+    #[test]
+    fn test_prompt_guard_config_lint_camel_case_rejected() {
+        let cfg = json!({
+            "agents": {
+                "promptGuard": {
+                    "configLint": {
+                        "enabled": true
+                    }
+                }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(issues.iter().any(|i| {
+            i.path == ".agents.promptGuard.configLint"
+                && i.severity == Severity::Error
+                && i.message.contains("use config_lint")
+        }));
+    }
+
+    #[test]
+    fn test_prompt_guard_config_lint_snake_case_valid() {
+        let cfg = json!({
+            "agents": {
+                "promptGuard": {
+                    "config_lint": {
+                        "enabled": true
+                    }
+                }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.path.starts_with(".agents.promptGuard.config_lint")),
+            "Expected no config_lint issues, but found: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_prompt_guard_config_lint_snake_case_enabled_must_be_bool() {
+        let cfg = json!({
+            "agents": {
+                "promptGuard": {
+                    "config_lint": {
+                        "enabled": "true"
+                    }
+                }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(issues
+            .iter()
+            .any(|i| i.path == ".agents.promptGuard.config_lint.enabled"));
+    }
+
+    #[test]
+    fn test_prompt_guard_config_lint_snake_case_triggers_lint_checks() {
+        let cfg = json!({
+            "agents": {
+                "promptGuard": {
+                    "config_lint": {
+                        "enabled": true
+                    }
+                },
+                "list": [{
+                    "toolPolicy": "AllowAll"
+                }]
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(issues
+            .iter()
+            .any(|i| i.path == ".agents.list[0].toolPolicy"));
+        assert!(issues.iter().any(|i| i.path == ".agents.list[0].maxTokens"));
+        assert!(issues.iter().any(|i| i.path == ".agents.list[0].model"));
+    }
+
+    #[test]
+    fn test_prompt_guard_config_lint_camel_case_does_not_trigger_lint_checks() {
+        let cfg = json!({
+            "agents": {
+                "promptGuard": {
+                    "configLint": {
+                        "enabled": true
+                    }
+                },
+                "list": [{
+                    "toolPolicy": "AllowAll"
+                }]
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(issues.iter().any(|i| {
+            i.path == ".agents.promptGuard.configLint" && i.severity == Severity::Error
+        }));
+        assert!(!issues.iter().any(|i| i.path.starts_with(".agents.list[0]")));
+    }
+
+    #[test]
+    fn test_prompt_guard_snake_case_paths_reflect_variant() {
+        let cfg = json!({
+            "agents": {
+                "prompt_guard": {
+                    "enabled": "true",
+                    "configLint": {
+                        "enabled": "true"
+                    }
+                }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(issues
+            .iter()
+            .any(|i| i.path == ".agents.prompt_guard.enabled"));
+        assert!(issues
+            .iter()
+            .any(|i| i.path == ".agents.prompt_guard.configLint"));
     }
 
     // --- session retention ---
