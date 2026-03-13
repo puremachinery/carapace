@@ -29,6 +29,13 @@ const DEFAULT_CACHE_TTL_MS: u64 = 200;
 
 /// Env var for config secret encryption/decryption.
 const CONFIG_PASSWORD_ENV: &str = "CARAPACE_CONFIG_PASSWORD";
+const LOADER_CONTROL_ENV_VARS: &[&str] = &[
+    "CARAPACE_CONFIG_PATH",
+    "CARAPACE_STATE_DIR",
+    "CARAPACE_DISABLE_CONFIG_CACHE",
+    "CARAPACE_CONFIG_CACHE_MS",
+    CONFIG_PASSWORD_ENV,
+];
 
 /// JSON pointer paths that should be encrypted at rest.
 const CONFIG_SECRET_PATHS: &[&str] = &[
@@ -335,6 +342,16 @@ fn collect_config_env_entry(
         return Ok(());
     }
 
+    if is_loader_control_env_var(key) {
+        return Err(ConfigError::ValidationError {
+            path: path.to_string(),
+            message: format!(
+                "{} cannot be set from config.env because it controls config loading behavior",
+                key
+            ),
+        });
+    }
+
     let Some(value) = value else {
         tracing::warn!(env_var = %key, "ignoring non-string config env value");
         return Ok(());
@@ -353,6 +370,12 @@ fn collect_config_env_entry(
 
 fn is_valid_env_var_name(key: &str) -> bool {
     !key.is_empty() && !key.contains('=') && !key.contains('\0')
+}
+
+fn is_loader_control_env_var(key: &str) -> bool {
+    LOADER_CONTROL_ENV_VARS
+        .iter()
+        .any(|blocked| blocked.eq_ignore_ascii_case(key))
 }
 
 fn resolve_config_env_vars(
@@ -1334,6 +1357,60 @@ mod tests {
 
         env::remove_var("TEST_NESTED_ENV_INCLUDE");
         reset_config_env_state_for_test();
+    }
+
+    fn assert_loader_control_env_var_is_rejected(config_content: &str, expected_path: &str) {
+        let _lock = ENV_LOCK.lock().unwrap();
+        reset_config_env_state_for_test();
+
+        let dir = TempDir::new().unwrap();
+        let main_path = create_temp_config(&dir, "config.json5", config_content);
+
+        let result = load_config_uncached(&main_path);
+        assert!(matches!(
+            result,
+            Err(ConfigError::ValidationError { path, .. }) if path == expected_path
+        ));
+    }
+
+    #[test]
+    fn test_loader_control_env_var_in_env_vars_is_rejected() {
+        assert_loader_control_env_var_is_rejected(
+            r#"{
+                "env": {
+                    "vars": {
+                        "CARAPACE_CONFIG_PATH": "/tmp/redirected.json5"
+                    }
+                }
+            }"#,
+            ".env.vars.CARAPACE_CONFIG_PATH",
+        );
+    }
+
+    #[test]
+    fn test_loader_control_env_var_as_direct_env_field_is_rejected() {
+        assert_loader_control_env_var_is_rejected(
+            r#"{
+                "env": {
+                    "CARAPACE_STATE_DIR": "/tmp/redirected-state"
+                }
+            }"#,
+            ".env.CARAPACE_STATE_DIR",
+        );
+    }
+
+    #[test]
+    fn test_loader_control_env_var_case_variant_is_rejected() {
+        assert_loader_control_env_var_is_rejected(
+            r#"{
+                "env": {
+                    "vars": {
+                        "carapace_config_path": "/tmp/redirected.json5"
+                    }
+                }
+            }"#,
+            ".env.vars.carapace_config_path",
+        );
     }
 
     #[test]
