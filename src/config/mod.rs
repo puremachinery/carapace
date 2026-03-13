@@ -267,7 +267,7 @@ pub fn load_config_uncached(path: &Path) -> Result<Value, ConfigError> {
     // lookups rely on these values, but the mutation is serialized and rolled
     // back if substitution fails.
     let mut env_state = CONFIG_ENV_STATE.lock();
-    let resolved_env = resolve_config_env_vars(&value)?;
+    let resolved_env = resolve_config_env_vars(&value, &env_state)?;
     let previous_env_state = env_state.clone();
     apply_config_env_vars(&resolved_env, &mut env_state);
 
@@ -291,16 +291,21 @@ pub fn load_config_uncached(path: &Path) -> Result<Value, ConfigError> {
     Ok(value)
 }
 
-fn collect_config_env_vars(value: &Value) -> Vec<(String, String)> {
+fn collect_config_env_vars(value: &Value) -> Result<Vec<(String, String)>, ConfigError> {
     let Some(env_obj) = value.get("env").and_then(|v| v.as_object()) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
 
     let mut collected = Vec::new();
 
     if let Some(vars_obj) = env_obj.get("vars").and_then(|v| v.as_object()) {
         for (key, value) in vars_obj {
-            collect_config_env_entry(&mut collected, key, value.as_str());
+            collect_config_env_entry(
+                &mut collected,
+                key,
+                value.as_str(),
+                &format!(".env.vars.{}", key),
+            )?;
         }
     }
 
@@ -308,42 +313,63 @@ fn collect_config_env_vars(value: &Value) -> Vec<(String, String)> {
         if key == "vars" || key == "shellEnv" {
             continue;
         }
-        collect_config_env_entry(&mut collected, key, value.as_str());
+        collect_config_env_entry(
+            &mut collected,
+            key,
+            value.as_str(),
+            &format!(".env.{}", key),
+        )?;
     }
 
-    collected
+    Ok(collected)
 }
 
-fn collect_config_env_entry(entries: &mut Vec<(String, String)>, key: &str, value: Option<&str>) {
+fn collect_config_env_entry(
+    entries: &mut Vec<(String, String)>,
+    key: &str,
+    value: Option<&str>,
+    path: &str,
+) -> Result<(), ConfigError> {
     if !is_valid_env_var_name(key) {
         tracing::warn!(env_var = %key, "ignoring invalid config env key");
-        return;
+        return Ok(());
     }
 
     let Some(value) = value else {
         tracing::warn!(env_var = %key, "ignoring non-string config env value");
-        return;
+        return Ok(());
+    };
+
+    if value.contains('\0') {
+        return Err(ConfigError::ValidationError {
+            path: path.to_string(),
+            message: "env values must not contain NUL bytes".to_string(),
+        });
     };
 
     entries.push((key.to_string(), value.to_string()));
+    Ok(())
 }
 
 fn is_valid_env_var_name(key: &str) -> bool {
     !key.is_empty() && !key.contains('=') && !key.contains('\0')
 }
 
-fn resolve_config_env_vars(value: &Value) -> Result<HashMap<String, String>, ConfigError> {
+fn resolve_config_env_vars(
+    value: &Value,
+    state: &InjectedConfigEnvState,
+) -> Result<HashMap<String, String>, ConfigError> {
     let raw_entries = collect_config_env_vars(value);
-    if raw_entries.is_empty() {
+    if raw_entries.as_ref().is_ok_and(|entries| entries.is_empty()) {
         return Ok(HashMap::new());
     }
 
-    let raw: HashMap<String, String> = raw_entries.into_iter().collect();
+    let raw: HashMap<String, String> = raw_entries?.into_iter().collect();
     let mut resolved = HashMap::new();
     let mut resolving = HashSet::new();
 
     for key in raw.keys() {
-        resolve_config_env_var(key, &raw, &mut resolved, &mut resolving)?;
+        resolve_config_env_var(key, &raw, state, &mut resolved, &mut resolving)?;
     }
 
     Ok(resolved)
@@ -352,6 +378,7 @@ fn resolve_config_env_vars(value: &Value) -> Result<HashMap<String, String>, Con
 fn resolve_config_env_var(
     key: &str,
     raw: &HashMap<String, String>,
+    state: &InjectedConfigEnvState,
     resolved: &mut HashMap<String, String>,
     resolving: &mut HashSet<String>,
 ) -> Result<String, ConfigError> {
@@ -372,17 +399,34 @@ fn resolve_config_env_var(
 
     let value = substitute_env_in_string_with(raw_value, |var_name| {
         if raw.contains_key(var_name) {
-            resolve_config_env_var(var_name, raw, resolved, resolving)
+            resolve_config_env_var(var_name, raw, state, resolved, resolving)
         } else {
-            env::var(var_name).map_err(|_| ConfigError::MissingEnvVar {
-                var: var_name.to_string(),
-            })
+            resolve_external_env_var(var_name, state)
         }
     })?;
 
     resolving.remove(key);
     resolved.insert(key.to_string(), value.clone());
     Ok(value)
+}
+
+fn resolve_external_env_var(
+    key: &str,
+    state: &InjectedConfigEnvState,
+) -> Result<String, ConfigError> {
+    if state.active_values.contains_key(key) {
+        let previous = state.previous_values.get(key).cloned().flatten();
+        let value = previous.ok_or_else(|| ConfigError::MissingEnvVar {
+            var: key.to_string(),
+        })?;
+        return value.into_string().map_err(|_| ConfigError::MissingEnvVar {
+            var: key.to_string(),
+        });
+    }
+
+    env::var(key).map_err(|_| ConfigError::MissingEnvVar {
+        var: key.to_string(),
+    })
 }
 
 fn apply_config_env_vars(next: &HashMap<String, String>, state: &mut InjectedConfigEnvState) {
@@ -401,6 +445,13 @@ fn apply_config_env_vars(next: &HashMap<String, String>, state: &mut InjectedCon
     }
 
     for (key, value) in next {
+        if state
+            .active_values
+            .get(key)
+            .is_some_and(|current| current == value)
+        {
+            continue;
+        }
         if !state.active_values.contains_key(key) {
             state.previous_values.insert(key.clone(), env::var_os(key));
         }
@@ -1243,6 +1294,49 @@ mod tests {
     }
 
     #[test]
+    fn test_nested_env_include_injects_before_substitution() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        reset_config_env_state_for_test();
+        env::remove_var("TEST_NESTED_ENV_INCLUDE");
+
+        let dir = TempDir::new().unwrap();
+        create_temp_config(
+            &dir,
+            "env-vars.json5",
+            r#"{
+                "vars": {
+                    "TEST_NESTED_ENV_INCLUDE": "nested-token"
+                }
+            }"#,
+        );
+        let main_path = create_temp_config(
+            &dir,
+            "main.json5",
+            r#"{
+                "env": {
+                    "$include": "./env-vars.json5",
+                    "shellEnv": {
+                        "PATH": ["/tmp/example"]
+                    }
+                },
+                "gateway": {
+                    "auth": {
+                        "token": "${TEST_NESTED_ENV_INCLUDE}"
+                    }
+                }
+            }"#,
+        );
+
+        let config = load_config_uncached(&main_path).unwrap();
+
+        assert_eq!(config["gateway"]["auth"]["token"], "nested-token");
+        assert_eq!(env::var("TEST_NESTED_ENV_INCLUDE").unwrap(), "nested-token");
+
+        env::remove_var("TEST_NESTED_ENV_INCLUDE");
+        reset_config_env_state_for_test();
+    }
+
+    #[test]
     fn test_env_vars_and_string_fields_both_inject() {
         let _lock = ENV_LOCK.lock().unwrap();
         reset_config_env_state_for_test();
@@ -1458,6 +1552,77 @@ mod tests {
         );
 
         env::remove_var("TEST_RELOAD_ROLLBACK_ENV");
+        reset_config_env_state_for_test();
+    }
+
+    #[test]
+    fn test_removed_injected_env_does_not_resolve_new_references() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        reset_config_env_state_for_test();
+        env::remove_var("TEST_STALE_CONFIG_ENV");
+        env::remove_var("TEST_STALE_CONFIG_COMBINED");
+
+        let dir = TempDir::new().unwrap();
+        let first_path = create_temp_config(
+            &dir,
+            "first.json5",
+            r#"{
+                "env": {
+                    "vars": {
+                        "TEST_STALE_CONFIG_ENV": "first-token"
+                    }
+                },
+                "meta": {
+                    "lastVersion": "${TEST_STALE_CONFIG_ENV}"
+                }
+            }"#,
+        );
+        let second_path = create_temp_config(
+            &dir,
+            "second.json5",
+            r#"{
+                "env": {
+                    "vars": {
+                        "TEST_STALE_CONFIG_COMBINED": "${TEST_STALE_CONFIG_ENV}-suffix"
+                    }
+                }
+            }"#,
+        );
+
+        let first = load_config_uncached(&first_path).unwrap();
+        assert_eq!(first["meta"]["lastVersion"], "first-token");
+        assert_eq!(env::var("TEST_STALE_CONFIG_ENV").unwrap(), "first-token");
+
+        let second = load_config_uncached(&second_path);
+        assert!(matches!(
+            second,
+            Err(ConfigError::MissingEnvVar { var }) if var == "TEST_STALE_CONFIG_ENV"
+        ));
+
+        env::remove_var("TEST_STALE_CONFIG_ENV");
+        env::remove_var("TEST_STALE_CONFIG_COMBINED");
+        reset_config_env_state_for_test();
+    }
+
+    #[test]
+    fn test_config_env_with_nul_byte_is_rejected() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        reset_config_env_state_for_test();
+
+        let dir = TempDir::new().unwrap();
+        let main_path = create_temp_config(
+            &dir,
+            "config.json5",
+            "{\n  env: {\n    vars: {\n      TEST_BAD_VALUE: \"bad\\0value\"\n    }\n  }\n}",
+        );
+
+        let result = load_config_uncached(&main_path);
+        assert!(matches!(
+            result,
+            Err(ConfigError::ValidationError { path, message })
+            if path == ".env.vars.TEST_BAD_VALUE" && message.contains("NUL bytes")
+        ));
+
         reset_config_env_state_for_test();
     }
 
