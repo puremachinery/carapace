@@ -16,7 +16,7 @@ jobs:
       cleanup_started_at: ${{ steps.cleanup-window.outputs.started_at }}
       should_publish: ${{ steps.publish-decision.outputs.should_publish }}
       publish_result: ${{ steps.publish-review.outcome }}
-    if: github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.draft == false && github.actor != 'dependabot[bot]'
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.draft == false && github.event.pull_request.user.login != 'dependabot[bot]'
 
     runs-on: ubuntu-latest
     permissions:
@@ -333,7 +333,7 @@ jobs:
   cleanup-claude-stray-artifacts:
     name: Cleanup stray Claude artifacts from this run
     needs: [claude-review]
-    if: always() && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.draft == false && github.actor != 'dependabot[bot]'
+    if: always() && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.draft == false && github.event.pull_request.user.login != 'dependabot[bot]'
     runs-on: ubuntu-latest
     permissions:
       issues: write
