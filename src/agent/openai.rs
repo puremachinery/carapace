@@ -5,6 +5,7 @@
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
+use reqwest::header::HeaderValue;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -67,6 +68,11 @@ impl OpenAiProvider {
                 "OpenAI HTTP-Referer header must not be empty".to_string(),
             ));
         }
+        HeaderValue::from_str(value).map_err(|e| {
+            AgentError::Provider(format!(
+                "OpenAI HTTP-Referer header must be a valid HTTP header value: {e}"
+            ))
+        })?;
         self.http_referer = Some(value.to_string());
         Ok(self)
     }
@@ -78,6 +84,11 @@ impl OpenAiProvider {
                 "OpenAI X-Title header must not be empty".to_string(),
             ));
         }
+        HeaderValue::from_str(value).map_err(|e| {
+            AgentError::Provider(format!(
+                "OpenAI X-Title header must be a valid HTTP header value: {e}"
+            ))
+        })?;
         self.title = Some(value.to_string());
         Ok(self)
     }
@@ -1089,6 +1100,30 @@ mod tests {
     fn test_default_base_url() {
         let provider = OpenAiProvider::new("test-key".to_string()).unwrap();
         assert_eq!(provider.base_url, "https://api.openai.com");
+    }
+
+    #[test]
+    fn test_http_referer_rejects_invalid_header_value() {
+        let result = OpenAiProvider::new("test-key".to_string())
+            .unwrap()
+            .with_http_referer("https://example.com/\napp".to_string());
+        assert!(result.is_err(), "expected invalid header value to fail");
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("valid HTTP header value"));
+    }
+
+    #[test]
+    fn test_title_rejects_invalid_header_value() {
+        let result = OpenAiProvider::new("test-key".to_string())
+            .unwrap()
+            .with_title("Carapace\nInjected".to_string());
+        assert!(result.is_err(), "expected invalid header value to fail");
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("valid HTTP header value"));
     }
 
     #[test]

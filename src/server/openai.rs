@@ -314,12 +314,9 @@ struct SseBodyStream {
 impl SseBodyStream {
     fn new(
         rx: tokio::sync::mpsc::Receiver<Result<String, Infallible>>,
-        cancel_token: CancellationToken,
+        guard: CancelOnDrop,
     ) -> Self {
-        Self {
-            rx,
-            _guard: CancelOnDrop::new(cancel_token),
-        }
+        Self { rx, _guard: guard }
     }
 }
 
@@ -405,6 +402,7 @@ async fn stream_llm_provider(
         extra: None,
     };
 
+    let cancel_guard = CancelOnDrop::new(cancel_token.clone());
     let rx = match provider.complete(request, cancel_token.clone()).await {
         Ok(rx) => rx,
         Err(e) => {
@@ -490,7 +488,7 @@ async fn stream_llm_provider(
         let _ = tx.send(Ok("data: [DONE]\n\n".to_string())).await;
     });
 
-    let body = Body::from_stream(SseBodyStream::new(output_rx, cancel_token));
+    let body = Body::from_stream(SseBodyStream::new(output_rx, cancel_guard));
     sse_response(body)
 }
 
@@ -1419,6 +1417,22 @@ mod tests {
         }
     }
 
+    struct SlowCancellationAwareProvider {
+        cancelled_tx: parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    impl SlowCancellationAwareProvider {
+        fn new() -> (Self, tokio::sync::oneshot::Receiver<()>) {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            (
+                Self {
+                    cancelled_tx: parking_lot::Mutex::new(Some(tx)),
+                },
+                rx,
+            )
+        }
+    }
+
     #[async_trait]
     impl LlmProvider for MockLlmProvider {
         async fn complete(
@@ -1455,6 +1469,25 @@ mod tests {
             }
             let (_tx, rx) = mpsc::channel(1);
             Ok(rx)
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for SlowCancellationAwareProvider {
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+            cancel_token: CancellationToken,
+        ) -> Result<mpsc::Receiver<StreamEvent>, AgentError> {
+            if let Some(tx) = self.cancelled_tx.lock().take() {
+                let cancel_wait = cancel_token.clone();
+                tokio::spawn(async move {
+                    cancel_wait.cancelled().await;
+                    let _ = tx.send(());
+                });
+            }
+            std::future::pending::<()>().await;
+            unreachable!("slow cancellation provider should be aborted before completing");
         }
     }
 
@@ -1619,6 +1652,36 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(1), cancelled_rx)
             .await
             .expect("provider cancellation was not signaled after streaming response drop")
+            .expect("cancellation signal channel unexpectedly dropped");
+    }
+
+    #[tokio::test]
+    async fn test_stream_llm_provider_cancels_when_request_future_is_dropped_before_response() {
+        let (provider, cancelled_rx) = SlowCancellationAwareProvider::new();
+        let handle = tokio::spawn(async move {
+            stream_llm_provider(
+                Arc::new(provider),
+                "gpt-4o".to_string(),
+                None,
+                vec![LlmMessage {
+                    role: LlmRole::User,
+                    content: vec![ContentBlock::Text {
+                        text: "Hi".to_string(),
+                    }],
+                }],
+                "chatcmpl_test".to_string(),
+                chrono::Utc::now().timestamp(),
+                CancellationToken::new(),
+            )
+            .await
+        });
+
+        tokio::task::yield_now().await;
+        handle.abort();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), cancelled_rx)
+            .await
+            .expect("provider cancellation was not signaled after streaming request drop")
             .expect("cancellation signal channel unexpectedly dropped");
     }
 
