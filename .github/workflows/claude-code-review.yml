@@ -1,8 +1,8 @@
 name: Claude Code Review
 
 on:
-  # Use default-branch workflow content for the review job, but only allow
-  # same-repo PR heads below. The PR head is checked out explicitly by SHA.
+  # Use default-branch workflow content for same-repo automatic PR reviews.
+  # Review uses GitHub PR context only; do not check out PR head in this job.
   pull_request_target:
     types: [opened, synchronize, ready_for_review, reopened]
 
@@ -14,13 +14,14 @@ jobs:
   claude-review:
     outputs:
       cleanup_started_at: ${{ steps.cleanup-window.outputs.started_at }}
-      review_verified: ${{ steps.verify-review.outputs.review_verified }}
+      should_publish: ${{ steps.publish-decision.outputs.should_publish }}
+      publish_result: ${{ steps.publish-review.outcome }}
     if: github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.draft == false && github.actor != 'dependabot[bot]'
 
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      pull-requests: write
+      pull-requests: read
       issues: read
       id-token: write
       actions: read
@@ -32,132 +33,298 @@ jobs:
           # Safety buffer handles small clock skew between runner and GitHub timestamps.
           echo "started_at=$(date -u -d '2 minutes ago' +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
-      - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          fetch-depth: 1
-          ref: ${{ github.event.pull_request.head.sha }}
-          persist-credentials: false
-
-      - name: Run Claude Code Review
+      - name: Run Claude review analysis (GitHub-context only)
         id: claude-review
-        uses: anthropics/claude-code-action@26ec041249acb0a944c0a47b6c0c13f05dbc5b44 # v1
-        env:
-          GH_TOKEN: ${{ github.token }}
+        continue-on-error: true
+        uses: anthropics/claude-code-action@220272d38887a1caed373da96a9ffdb0919c26cc # v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          settings: |
+            {
+              "permissions": {
+                "deny": [
+                  "Bash",
+                  "Edit",
+                  "Glob",
+                  "Grep",
+                  "LS",
+                  "MultiEdit",
+                  "NotebookEdit",
+                  "NotebookRead",
+                  "Read",
+                  "Task",
+                  "TodoWrite",
+                  "WebFetch",
+                  "WebSearch",
+                  "Write"
+                ]
+              }
+            }
           prompt: |
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ github.event.pull_request.number }}
 
-            Review this pull request for:
+            Analyze this pull request for:
             - correctness/regressions
             - security risks
             - test coverage gaps
             - maintainability concerns
 
-            STRICT REVIEW POLICY
-            1) Submit exactly one GitHub pull-request review per run.
-            2) Inline comments are allowed ONLY for in-scope high/medium findings with concrete impact.
-            3) Every finding must include:
-               - severity (high/medium/low/info)
-               - scope tag: in-scope or out-of-scope for this PR
-               - concrete impact and concise fix
-            4) Dedupe aggressively across pushes:
-               - Before posting, fetch existing PR review threads/comments with gh api.
-               - Do NOT post a new inline/root-cause comment if the same unresolved root cause is already present.
-               - If a finding is still relevant but already called out, mention it only in the top-level review summary.
-            5) Low findings:
-               - Do NOT post inline.
-               - Include them only in one top-level "Optional follow-ups (non-blocking)" section.
-            6) Info findings:
-               - Suppress entirely.
-            7) Blocking policy:
-               - Only in-scope high/medium findings are blocking for this PR.
-               - Out-of-scope high/medium findings are advisory only.
-            8) Consistency requirement:
-               - If there are any non-info findings, do NOT say "LGTM."
-               - "LGTM." is allowed only when there are zero findings after info suppression.
-               - If there are no in-scope high/medium findings but there are advisory or low findings, start with "No high/medium findings. <N> low finding(s)." where <N> is the count of in-scope low findings and may be 0.
-               - Never place high/medium findings inside "Optional follow-ups (non-blocking)".
+            IMPORTANT:
+            - Do NOT post any GitHub reviews/comments.
+            - Do NOT call gh APIs for comments/reviews.
+            - Do NOT modify repository contents, create commits/branches, or open/update pull requests.
+            - Review this pull request using GitHub PR context; do not rely on a checked-out workspace.
+            - Return only the structured review object that matches the provided schema.
+            - Do not wrap the structured output in markdown or code fences.
 
-            Output requirements:
-            - Post exactly one GitHub PR review, not an issue comment.
-            - Start the review body with exactly one of:
-              - "Blocking findings present."
-              - "No high/medium findings. <N> low finding(s)."
-              - "LGTM."
-            - If blocking findings exist, include a "### Blocking findings (required before merge)" section.
-            - Keep out-of-scope high/medium findings in a separate "### Advisory findings (out-of-scope)" section.
-            - Keep "### Optional follow-ups (non-blocking)" limited to low findings only.
-            - Keep the review concise and avoid repetitive wording.
-            - Include this exact HTML comment as the final line of the top-level review body: <!-- claude-review-run:${{ github.run_id }}:${{ github.run_attempt }} -->
-            - Use the GitHub Review API flow (pending review -> inline comments -> submit review).
-            - Do not use issue-comment endpoints.
-            - Do not leave final feedback only in tool output.
+            Required structured output example:
+            {
+              "header": "No in-scope blocking findings.",
+              "summary": "one-paragraph summary",
+              "inline_findings": [
+                {
+                  "severity": "high",
+                  "scope": "in-scope",
+                  "title": "short finding title",
+                  "body": "one-paragraph explanation",
+                  "path": "repo/relative/path.ext",
+                  "line": 123
+                }
+              ],
+              "advisory_findings": [
+                {
+                  "severity": "medium",
+                  "scope": "out-of-scope",
+                  "title": "short advisory title",
+                  "body": "one-paragraph explanation"
+                }
+              ],
+              "optional_followups": ["non-blocking follow-up item"]
+            }
+
+            Rules:
+            - Allowed header values: "Blocking findings present.", "No in-scope blocking findings.", or "LGTM.".
+            - Allowed severity values: "critical", "high", "medium".
+            - Only in-scope critical/high/medium findings belong in inline_findings.
+            - Never include low/info in inline_findings.
+            - Low-only items go to optional_followups.
+            - If inline_findings is non-empty, header MUST be "Blocking findings present.".
+            - If inline_findings is empty and both advisory_findings and optional_followups are empty, header MUST be "LGTM.".
+            - If inline_findings is empty and any advisory_findings/optional_followups exist, header MUST be "No in-scope blocking findings.".
           claude_args: |
-            --allowedTools "Bash(gh api:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr review:*),Bash(git:*),Bash(rg:*),Bash(jq:*),Bash(cat:*),Bash(head:*),Bash(sed:*),Bash(echo:*),Bash(awk:*),Bash(wc:*),WebSearch"
+            --json-schema '{"type":"object","additionalProperties":false,"properties":{"header":{"type":"string","enum":["Blocking findings present.","LGTM.","No in-scope blocking findings."]},"summary":{"type":"string","pattern":"\\S"},"inline_findings":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{"severity":{"type":"string","enum":["critical","high","medium"]},"scope":{"type":"string","enum":["in-scope"]},"title":{"type":"string","pattern":"\\S"},"body":{"type":"string","pattern":"\\S"},"path":{"type":"string","pattern":"\\S"},"line":{"type":"integer","minimum":1}},"required":["severity","scope","title","body","path","line"]}},"advisory_findings":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{"severity":{"type":"string","enum":["critical","high","medium"]},"scope":{"type":"string","enum":["out-of-scope"]},"title":{"type":"string","pattern":"\\S"},"body":{"type":"string","pattern":"\\S"}},"required":["severity","scope","title","body"]}},"optional_followups":{"type":"array","items":{"type":"string","pattern":"\\S"}}},"required":["header","summary","inline_findings","advisory_findings","optional_followups"]}'
 
-      - name: Verify Claude review was published
-        id: verify-review
+      - name: Persist structured review output
+        id: persist-review-json
+        if: steps.claude-review.outcome == 'success'
+        env:
+          REVIEW_JSON: ${{ steps.claude-review.outputs.structured_output }}
+          REVIEW_JSON_PATH: ${{ runner.temp }}/claude-review.json
+        run: |
+          if [ -z "$REVIEW_JSON" ]; then
+            echo "ERROR: Structured review output is empty."
+            exit 1
+          fi
+          printf '%s' "$REVIEW_JSON" > "$REVIEW_JSON_PATH"
+
+      - name: Validate Claude review output JSON
+        id: validate-review-json
+        if: steps.claude-review.outcome == 'success'
+        continue-on-error: true
+        env:
+          REVIEW_JSON_PATH: ${{ runner.temp }}/claude-review.json
+        run: |
+          test -f "$REVIEW_JSON_PATH"
+          jq -e '
+            type == "object" and
+            ((.header == "Blocking findings present.") or
+             (.header == "LGTM.") or
+             (.header == "No in-scope blocking findings.")) and
+            (.summary | type == "string" and (. | gsub("^\\s+|\\s+$"; "") | length > 0)) and
+            (.inline_findings | type == "array") and
+            (.advisory_findings | type == "array") and
+            (.optional_followups | type == "array") and
+            (((.inline_findings | length) > 0 and .header == "Blocking findings present.") or
+             ((.inline_findings | length) == 0 and (((.advisory_findings | length) + (.optional_followups | length)) == 0) and .header == "LGTM.") or
+             ((.inline_findings | length) == 0 and (((.advisory_findings | length) + (.optional_followups | length)) > 0) and .header == "No in-scope blocking findings.")) and
+            (all(.inline_findings[]?; (["critical","high","medium"] | index(.severity)) != null and
+              .scope == "in-scope" and
+              (.title | type == "string" and (. | gsub("^\\s+|\\s+$"; "") | length > 0)) and
+              (.body | type == "string" and (. | gsub("^\\s+|\\s+$"; "") | length > 0)) and
+              (.path | type == "string" and (. | gsub("^\\s+|\\s+$"; "") | length > 0)) and
+              (.line | type == "number" and floor == . and . >= 1))) and
+            (all(.advisory_findings[]?; (["critical","high","medium"] | index(.severity)) != null and
+              .scope == "out-of-scope" and
+              (.title | type == "string" and (. | gsub("^\\s+|\\s+$"; "") | length > 0)) and
+              (.body | type == "string" and (. | gsub("^\\s+|\\s+$"; "") | length > 0)))) and
+            (all(.optional_followups[]?; type == "string" and (. | gsub("^\\s+|\\s+$"; "") | length > 0)))
+          ' "$REVIEW_JSON_PATH" >/dev/null
+
+      - name: Upload Claude review output
+        id: upload-review-json
+        if: steps.claude-review.outcome == 'success'
+        continue-on-error: true
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: claude-review-json
+          path: ${{ runner.temp }}/claude-review.json
+          if-no-files-found: warn
+
+      - name: Fail on unexpected Claude failure
+        if: steps.claude-review.outcome == 'failure'
+        run: |
+          echo "Claude analysis failed."
+          echo "  steps.claude-review.outcome=${{ steps.claude-review.outcome }}"
+          echo "  steps.persist-review-json.outcome=${{ steps.persist-review-json.outcome }}"
+          echo "  steps.validate-review-json.outcome=${{ steps.validate-review-json.outcome }}"
+          echo "  steps.upload-review-json.outcome=${{ steps.upload-review-json.outcome }}"
+          exit 1
+
+      - name: Decide publish eligibility
+        id: publish-decision
+        if: always()
+        run: |
+          should_publish=false
+          if [[ "${{ steps.claude-review.outcome }}" == "success" ]] && \
+             [[ "${{ steps.validate-review-json.outcome }}" == "success" ]]; then
+            should_publish=true
+          fi
+          echo "should_publish=${should_publish}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish deterministic single review as claude[bot]
+        id: publish-review
+        if: steps.publish-decision.outputs.should_publish == 'true'
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
         env:
-          RUN_STARTED_AT: ${{ steps.cleanup-window.outputs.started_at }}
+          REVIEW_JSON_PATH: ${{ runner.temp }}/claude-review.json
           REVIEW_MARKER: "<!-- claude-review-run:${{ github.run_id }}:${{ github.run_attempt }} -->"
         with:
-          retries: 3
-          retry-exempt-status-codes: 400,401,403,404,422
+          github-token: ${{ steps.claude-review.outputs.github_token }}
           script: |
-            const startedAt = Date.parse(process.env.RUN_STARTED_AT || '');
-            if (Number.isNaN(startedAt)) {
-              core.setOutput('review_verified', 'false');
-              core.setFailed(`Invalid RUN_STARTED_AT: ${process.env.RUN_STARTED_AT}`);
+            const fs = require('fs');
+            const path = process.env.REVIEW_JSON_PATH || '';
+            if (!path || !fs.existsSync(path)) {
+              core.setFailed(`Validated review output file not found: ${path}`);
               return;
             }
+            const raw = fs.readFileSync(path, 'utf8');
+            if (!raw.trim()) {
+              core.setFailed(`Validated review output file is empty: ${path}`);
+              return;
+            }
+            const review = JSON.parse(raw);
 
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const pull_number = context.payload.pull_request.number;
-            const knownClaudeAuthors = new Set(['claude', 'claude[bot]']);
-            const isKnownClaudeBotAuthor = (user) => {
-              const login = user?.login || '';
-              const type = user?.type || '';
-              return knownClaudeAuthors.has(login) && type === 'Bot';
-            };
-            const reviewMarker = process.env.REVIEW_MARKER || '';
+            const commit_id = context.payload.pull_request.head.sha;
 
-            const reviews = await github.paginate(github.rest.pulls.listReviews, {
+            const files = await github.paginate(github.rest.pulls.listFiles, {
               owner,
               repo,
               pull_number,
               per_page: 100,
             });
 
-            const runReviews = reviews
-              .filter((review) => {
-                const submitted = Date.parse(review.submitted_at || '');
-                const body = review.body || '';
-                return isKnownClaudeBotAuthor(review.user)
-                  && !Number.isNaN(submitted)
-                  && submitted >= startedAt
-                  && reviewMarker
-                  && body.includes(reviewMarker);
-              })
-              .sort((a, b) => Date.parse(a.submitted_at || 0) - Date.parse(b.submitted_at || 0));
-
-            core.setOutput('review_verified', runReviews.length > 0 ? 'true' : 'false');
-
-            if (runReviews.length === 0) {
-              core.setFailed('Claude review step finished but no claude-authored PR review was found for this run.');
-              return;
+            function parseAddedLines(patch) {
+              const lines = new Set();
+              if (!patch) return lines;
+              let newLine = 0;
+              for (const l of patch.split('\n')) {
+                const m = l.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+                if (m) {
+                  newLine = Number(m[1]);
+                  continue;
+                }
+                if (l.startsWith('+') && !l.startsWith('+++ ')) {
+                  lines.add(newLine);
+                  newLine += 1;
+                } else if (l.startsWith('-') && !l.startsWith('--- ')) {
+                } else if (l.startsWith('\\')) {
+                } else {
+                  newLine += 1;
+                }
+              }
+              return lines;
             }
 
-            core.info(`Found ${runReviews.length} claude-authored review(s) for this run. Cleanup will keep the newest one.`);
+            const changedLinesByPath = new Map();
+            for (const f of files) {
+              changedLinesByPath.set(f.filename, parseAddedLines(f.patch || ''));
+            }
+
+            const inline = Array.isArray(review.inline_findings) ? review.inline_findings : [];
+            const advisory = Array.isArray(review.advisory_findings) ? review.advisory_findings : [];
+            const followups = Array.isArray(review.optional_followups) ? review.optional_followups : [];
+
+            const comments = [];
+            const unplaced = [];
+
+            for (const finding of inline) {
+              const p = String(finding.path || '').trim();
+              const lineNumber = Number(finding.line);
+              const lineSet = changedLinesByPath.get(p);
+              if (!p || !Number.isInteger(lineNumber) || lineNumber <= 0 || !lineSet || !lineSet.has(lineNumber)) {
+                unplaced.push(finding);
+                continue;
+              }
+              comments.push({
+                path: p,
+                line: lineNumber,
+                side: 'RIGHT',
+                body: `[${finding.severity}, in-scope] ${finding.title}\n\n${finding.body}`,
+              });
+            }
+
+            let body = `${review.header}\n\n${String(review.summary || '').trim()}`;
+            const reviewMarker = process.env.REVIEW_MARKER || '';
+
+            if (inline.length > 0) {
+              body += '\n\n### Blocking findings (required before merge)\n';
+              for (const f of inline) {
+                const loc = (f.path && f.line) ? ` (${f.path}:${f.line})` : '';
+                body += `\n- [${f.severity}, in-scope] ${f.title}${loc}: ${f.body}`;
+              }
+            }
+            if (advisory.length > 0) {
+              body += '\n\n### Advisory findings (out-of-scope)\n';
+              for (const f of advisory) {
+                body += `\n- [${f.severity}, out-of-scope] ${f.title}: ${f.body}`;
+              }
+            }
+            if (followups.length > 0) {
+              body += '\n\n### Optional follow-ups (non-blocking)\n';
+              for (const f of followups) {
+                body += `\n- ${f}`;
+              }
+            }
+            if (unplaced.length > 0) {
+              body += `\n\nNote: ${unplaced.length} blocking finding(s) could not be placed inline because the requested path/line was not in the current PR diff.`;
+            }
+            if (reviewMarker) {
+              body += `\n\n${reviewMarker}`;
+            }
+
+            const payload = {
+              owner,
+              repo,
+              pull_number,
+              event: 'COMMENT',
+              body,
+              commit_id,
+            };
+            if (comments.length > 0) {
+              payload.comments = comments;
+            }
+
+            await github.rest.pulls.createReview(payload);
+            core.info(`Published one claude[bot] review with ${comments.length} inline comment(s).`);
 
   cleanup-claude-stray-artifacts:
-    name: Cleanup Claude review artifacts from this run
+    name: Cleanup stray Claude artifacts from this run
     needs: [claude-review]
-    if: always()
+    if: always() && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.draft == false && github.actor != 'dependabot[bot]'
     runs-on: ubuntu-latest
     permissions:
       issues: write
@@ -168,8 +335,8 @@ jobs:
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
         env:
           RUN_STARTED_AT: ${{ needs.claude-review.outputs.cleanup_started_at }}
-          REVIEW_VERIFIED: ${{ needs.claude-review.outputs.review_verified }}
-          REVIEW_JOB_RESULT: ${{ needs.claude-review.result }}
+          SHOULD_PUBLISH: ${{ needs.claude-review.outputs.should_publish }}
+          PUBLISH_RESULT: ${{ needs.claude-review.outputs.publish_result }}
           REVIEW_MARKER: "<!-- claude-review-run:${{ github.run_id }}:${{ github.run_attempt }} -->"
         with:
           retries: 3
@@ -186,7 +353,7 @@ jobs:
               const repo = context.repo.repo;
               const issue_number = context.payload.pull_request.number;
               const strayAuthors = new Set(['claude', 'claude[bot]']);
-              const reviewMarker = process.env.REVIEW_MARKER || '';
+              const marker = process.env.REVIEW_MARKER || '';
               const isKnownClaudeBotAuthor = (user) => {
                 const login = user?.login || '';
                 const type = user?.type || '';
@@ -199,12 +366,10 @@ jobs:
                 issue_number,
                 per_page: 100,
               });
-
               const strayIssueComments = issueComments.filter((c) => {
                 const created = Date.parse(c.created_at || '');
                 return isKnownClaudeBotAuthor(c.user) && !Number.isNaN(created) && created >= startedAt;
               });
-
               for (const c of strayIssueComments) {
                 await github.rest.issues.deleteComment({ owner, repo, comment_id: c.id });
               }
@@ -216,33 +381,26 @@ jobs:
                 pull_number: issue_number,
                 per_page: 100,
               });
-              const isPublishedReview = (review) => {
-                const body = review.body || '';
-                return isKnownClaudeBotAuthor(review.user) && reviewMarker && body.includes(reviewMarker);
+              const isPublishedReview = (r) => {
+                const body = r.body || '';
+                return isKnownClaudeBotAuthor(r.user) && marker && body.includes(marker);
               };
-              const runReviews = reviews
-                .filter((r) => {
-                  const submitted = Date.parse(r.submitted_at || '');
-                  return isKnownClaudeBotAuthor(r.user) && !Number.isNaN(submitted) && submitted >= startedAt;
-                })
-                .sort((a, b) => Date.parse(a.submitted_at || 0) - Date.parse(b.submitted_at || 0));
+              const runReviews = reviews.filter((r) => {
+                const submitted = Date.parse(r.submitted_at || '');
+                return isKnownClaudeBotAuthor(r.user) && !Number.isNaN(submitted) && submitted >= startedAt;
+              }).sort((a, b) => Date.parse(a.submitted_at || 0) - Date.parse(b.submitted_at || 0));
 
-              const publishedRunReviews = runReviews.filter(isPublishedReview);
               let keepReview = null;
-              if (runReviews.length === 0) {
-                if (process.env.REVIEW_VERIFIED === 'true' || process.env.REVIEW_JOB_RESULT === 'success') {
-                  core.warning('Expected at least one claude-authored PR review in this run, found none during cleanup.');
-                } else {
-                  core.info('No claude-authored PR review found during cleanup because the main review job already failed before verification completed.');
-                }
-              } else {
-                keepReview = publishedRunReviews.length > 0
-                  ? publishedRunReviews[publishedRunReviews.length - 1]
-                  : null;
+              const publishedReviews = runReviews.filter(isPublishedReview);
+              if (publishedReviews.length > 0) {
+                keepReview = publishedReviews[publishedReviews.length - 1];
+              } else if (runReviews.length > 0) {
+                keepReview = runReviews[runReviews.length - 1];
+                core.warning(`No marked Claude review found for marker ${marker}; preserving newest Claude review ${keepReview.id} instead of minimizing all run reviews.`);
               }
 
-              const strayReviews = runReviews.filter((r) => !isPublishedReview(r));
-
+              const publishedReviewIds = new Set(keepReview ? [keepReview.id] : []);
+              const strayReviews = runReviews.filter((r) => !keepReview || r.id !== keepReview.id);
               for (const r of strayReviews) {
                 try {
                   await github.graphql(
@@ -257,11 +415,7 @@ jobs:
                   core.warning(`Failed to minimize review ${r.id}: ${err.message}`);
                 }
               }
-              if (keepReview) {
-                core.info(`Kept review ${keepReview.id} and minimized ${strayReviews.length} stray claude-authored review(s).`);
-              } else {
-                core.info(`No kept review for this run; minimized ${strayReviews.length} stray claude-authored review(s).`);
-              }
+              core.info(`Minimized ${strayReviews.length} stray claude-authored review(s).`);
 
               const reviewComments = await github.paginate(github.rest.pulls.listReviewComments, {
                 owner,
@@ -269,15 +423,11 @@ jobs:
                 pull_number: issue_number,
                 per_page: 100,
               });
-
               const strayReviewComments = reviewComments.filter((c) => {
                 const created = Date.parse(c.created_at || '');
-                return isKnownClaudeBotAuthor(c.user)
-                  && !Number.isNaN(created)
-                  && created >= startedAt
-                  && (!keepReview || c.pull_request_review_id !== keepReview.id);
+                const onKeptReview = publishedReviewIds.has(c.pull_request_review_id);
+                return isKnownClaudeBotAuthor(c.user) && !Number.isNaN(created) && created >= startedAt && !onKeptReview;
               });
-
               for (const c of strayReviewComments) {
                 try {
                   await github.graphql(
@@ -293,6 +443,23 @@ jobs:
                 }
               }
               core.info(`Minimized ${strayReviewComments.length} stray claude-authored review comment(s).`);
+
+              if (process.env.SHOULD_PUBLISH === 'true' && process.env.PUBLISH_RESULT === 'success') {
+                const refreshed = await github.paginate(github.rest.pulls.listReviews, {
+                  owner,
+                  repo,
+                  pull_number: issue_number,
+                  per_page: 100,
+                });
+                const published = refreshed.filter((r) => {
+                  const login = r.user?.login || '';
+                  const body = r.body || '';
+                  return login === 'claude[bot]' && marker && body.includes(marker);
+                });
+                if (published.length !== 1) {
+                  core.setFailed(`Expected exactly one published review from claude[bot] for marker ${marker}, found ${published.length}.`);
+                }
+              }
             } catch (err) {
               const status = err?.status || err?.response?.status;
               if ([500, 502, 503, 504].includes(status)) {
