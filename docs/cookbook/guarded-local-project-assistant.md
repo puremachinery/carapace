@@ -79,8 +79,9 @@ running `cara verify` or `cara chat`.
 
 ```bash
 export CARAPACE_CONFIG_PATH="$PWD/carapace.json5"
-# If this is a fresh shell, reuse the same gateway token value from step 0.
-# export CARAPACE_GATEWAY_TOKEN="same-token-from-step-0"
+# If this is a fresh shell, reuse the same gateway token value from the
+# prerequisites export step above.
+# export CARAPACE_GATEWAY_TOKEN="same-token-from-prerequisites"
 
 cara verify --outcome local-chat --port 18789
 cara chat --port 18789
