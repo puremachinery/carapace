@@ -21,6 +21,7 @@ See what works today across channels, providers, and platforms, including caveat
 | Anthropic | Verified | Streaming + tools + cancellation. |
 | OpenAI | Verified | Streaming + tools + cancellation. |
 | Gemini | Verified | Streaming + tools + cancellation. |
+| Vertex AI | Verified | Google-published Gemini models on Vertex AI are supported. |
 | Ollama | Verified | Local serving path supported. |
 | Bedrock | Verified | SigV4 + streaming/event path wired. |
 | Venice AI | Verified | OpenAI-compatible wrapper/provider wiring. |

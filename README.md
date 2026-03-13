@@ -2,13 +2,13 @@
 
 > **Stable release available.** Carapace is ready for real use on its verified stable paths; partial and in-progress areas are called out explicitly in the docs.
 
-A security-focused, open-source personal AI assistant. Runs on your machine. Works through Signal, Telegram, Discord, Slack, webhooks, and console. Supports Anthropic, OpenAI, Ollama, Gemini, Bedrock, and Venice AI. Extensible via WASM plugins and guarded filesystem tools. Written in Rust.
+A security-focused, open-source personal AI assistant. Runs on your machine. Works through Signal, Telegram, Discord, Slack, webhooks, and console. Supports Anthropic, OpenAI, Ollama, Gemini, Vertex AI, Bedrock, and Venice AI. Extensible via WASM plugins and guarded filesystem tools. Written in Rust.
 
 A hardened alternative to openclaw / clawdbot — for when your assistant needs a hard shell.
 
 ## Features
 
-- **Multi-provider LLM engine** — Anthropic, OpenAI, Ollama, Google Gemini, AWS Bedrock, Venice AI with streaming, tool dispatch, and cancellation
+- **Multi-provider LLM engine** — Anthropic, OpenAI, Ollama, Google Gemini, Vertex AI, AWS Bedrock, and Venice AI with streaming, tool dispatch, and cancellation
 - **Multi-channel messaging** — Signal, Telegram, Discord, Slack, console, and webhooks
 - **Tooling and local workspace access** — built-in agent tools, guarded filesystem tools for explicit roots, and channel-specific tool schemas
 - **Signed plugin runtime** — plugins are signature-verified and run with strict permissions and resource limits
@@ -104,9 +104,9 @@ of truth.
   architecture polish
 - Recently shipped: first stable release, long-running assistant MVP (durable
   queue + autonomy verify), cross-platform subprocess sandboxing, guided setup
-  (`cara setup`), first-run verifier (`cara verify`), and Gemini onboarding
-  (Google sign-in or API key via CLI and Control UI), plus guarded filesystem
-  tools for explicit workspace roots
+  (`cara setup`), first-run verifier (`cara verify`), Gemini onboarding
+  (Google sign-in or API key via CLI and Control UI), Vertex AI provider
+  support, and guarded filesystem tools for explicit workspace roots
 
 ## Docs
 

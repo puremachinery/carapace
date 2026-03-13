@@ -73,20 +73,18 @@ Start Cara:
 CARAPACE_CONFIG_PATH=./carapace.json5 cara
 ```
 
-In another terminal:
+In another terminal, point the CLI at the same config file. If you opened a
+fresh shell, re-export the same gateway token value from the first step before
+running `cara verify` or `cara chat`.
 
 ```bash
 export CARAPACE_CONFIG_PATH="$PWD/carapace.json5"
-# Reuse the same gateway token value you exported before starting Cara.
-export CARAPACE_GATEWAY_TOKEN="paste-the-same-token-here"
+# If this is a fresh shell, reuse the same gateway token value from step 0.
+# export CARAPACE_GATEWAY_TOKEN="same-token-from-step-0"
 
 cara verify --outcome local-chat --port 18789
 cara chat --port 18789
 ```
-
-If you open a fresh shell instead of reusing the one where you exported the
-variables above, re-export `CARAPACE_GATEWAY_TOKEN` there first. The CLI needs
-the same config path and gateway token context as the running server.
 
 Then try prompts that exercise the guarded workspace tools:
 
