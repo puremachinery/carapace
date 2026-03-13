@@ -318,7 +318,16 @@ jobs:
               payload.comments = comments;
             }
 
-            await github.rest.pulls.createReview(payload);
+            const createdReview = await github.rest.pulls.createReview(payload);
+            const reviewAuthor = createdReview?.data?.user || {};
+            const reviewLogin = String(reviewAuthor.login || '');
+            const reviewType = String(reviewAuthor.type || '');
+            if (reviewLogin !== 'claude[bot]' || reviewType !== 'Bot') {
+              core.setFailed(
+                `Expected review to publish as claude[bot], got ${reviewLogin || '<unknown>'} (${reviewType || 'unknown'}).`,
+              );
+              return;
+            }
             core.info(`Published one claude[bot] review with ${comments.length} inline comment(s).`);
 
   cleanup-claude-stray-artifacts:
