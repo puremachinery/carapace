@@ -373,7 +373,9 @@ fn is_valid_env_var_name(key: &str) -> bool {
 }
 
 fn is_loader_control_env_var(key: &str) -> bool {
-    LOADER_CONTROL_ENV_VARS.contains(&key)
+    LOADER_CONTROL_ENV_VARS
+        .iter()
+        .any(|blocked| blocked.eq_ignore_ascii_case(key))
 }
 
 fn resolve_config_env_vars(
@@ -1357,15 +1359,23 @@ mod tests {
         reset_config_env_state_for_test();
     }
 
-    #[test]
-    fn test_loader_control_env_var_in_env_vars_is_rejected() {
+    fn assert_loader_control_env_var_is_rejected(config_content: &str, expected_path: &str) {
         let _lock = ENV_LOCK.lock().unwrap();
         reset_config_env_state_for_test();
 
         let dir = TempDir::new().unwrap();
-        let main_path = create_temp_config(
-            &dir,
-            "config.json5",
+        let main_path = create_temp_config(&dir, "config.json5", config_content);
+
+        let result = load_config_uncached(&main_path);
+        assert!(matches!(
+            result,
+            Err(ConfigError::ValidationError { path, .. }) if path == expected_path
+        ));
+    }
+
+    #[test]
+    fn test_loader_control_env_var_in_env_vars_is_rejected() {
+        assert_loader_control_env_var_is_rejected(
             r#"{
                 "env": {
                     "vars": {
@@ -1373,36 +1383,34 @@ mod tests {
                     }
                 }
             }"#,
+            ".env.vars.CARAPACE_CONFIG_PATH",
         );
-
-        let result = load_config_uncached(&main_path);
-        assert!(matches!(
-            result,
-            Err(ConfigError::ValidationError { path, .. }) if path == ".env.vars.CARAPACE_CONFIG_PATH"
-        ));
     }
 
     #[test]
     fn test_loader_control_env_var_as_direct_env_field_is_rejected() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        reset_config_env_state_for_test();
-
-        let dir = TempDir::new().unwrap();
-        let main_path = create_temp_config(
-            &dir,
-            "config.json5",
+        assert_loader_control_env_var_is_rejected(
             r#"{
                 "env": {
                     "CARAPACE_STATE_DIR": "/tmp/redirected-state"
                 }
             }"#,
+            ".env.CARAPACE_STATE_DIR",
         );
+    }
 
-        let result = load_config_uncached(&main_path);
-        assert!(matches!(
-            result,
-            Err(ConfigError::ValidationError { path, .. }) if path == ".env.CARAPACE_STATE_DIR"
-        ));
+    #[test]
+    fn test_loader_control_env_var_case_variant_is_rejected() {
+        assert_loader_control_env_var_is_rejected(
+            r#"{
+                "env": {
+                    "vars": {
+                        "carapace_config_path": "/tmp/redirected.json5"
+                    }
+                }
+            }"#,
+            ".env.vars.carapace_config_path",
+        );
     }
 
     #[test]
