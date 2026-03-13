@@ -199,12 +199,6 @@ jobs:
               ].join('\n');
             }
 
-            const me = await github.rest.users.getAuthenticated();
-            if (me.data.login !== 'claude[bot]') {
-              core.setFailed(`Expected claude[bot] token for publishing comment, got ${me.data.login}.`);
-              return;
-            }
-
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
