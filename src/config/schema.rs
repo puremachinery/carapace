@@ -988,7 +988,21 @@ fn validate_filesystem(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Sc
         return;
     }
 
-    let roots = fs_cfg.get("roots").and_then(|v| v.as_array());
+    let roots = match fs_cfg.get("roots") {
+        Some(value) if !value.is_array() => {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: ".filesystem.roots".to_string(),
+                message: format!(
+                    "filesystem roots must be an array, got {}",
+                    json_type_label(value)
+                ),
+            });
+            None
+        }
+        Some(value) => value.as_array(),
+        None => None,
+    };
 
     let is_empty = roots.is_none_or(|a| a.is_empty());
     if is_empty {
@@ -1031,7 +1045,22 @@ fn validate_filesystem(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Sc
     }
 
     // Validate excludePatterns syntax
-    if let Some(patterns) = fs_cfg.get("excludePatterns").and_then(|v| v.as_array()) {
+    let patterns = match fs_cfg.get("excludePatterns") {
+        Some(value) if !value.is_array() => {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: ".filesystem.excludePatterns".to_string(),
+                message: format!(
+                    "filesystem excludePatterns must be an array, got {}",
+                    json_type_label(value)
+                ),
+            });
+            None
+        }
+        Some(value) => value.as_array(),
+        None => None,
+    };
+    if let Some(patterns) = patterns {
         for (i, pat) in patterns.iter().enumerate() {
             if let Some(s) = pat.as_str() {
                 if glob::Pattern::new(s).is_err() {
@@ -1752,6 +1781,40 @@ mod tests {
             i.severity == Severity::Error
                 && i.path == ".filesystem.maxReadBytes"
                 && i.message.contains("must be a non-negative integer")
+        }));
+    }
+
+    #[test]
+    fn test_filesystem_roots_non_array_is_error() {
+        let config = json!({
+            "filesystem": {
+                "enabled": true,
+                "roots": "/tmp"
+            }
+        });
+        let issues = validate_schema(&config);
+        assert!(issues.iter().any(|i| {
+            i.severity == Severity::Error
+                && i.path == ".filesystem.roots"
+                && i.message.contains("must be an array")
+        }));
+    }
+
+    #[test]
+    fn test_filesystem_exclude_patterns_non_array_is_error() {
+        let root = test_filesystem_root();
+        let config = json!({
+            "filesystem": {
+                "enabled": true,
+                "roots": [root.path().to_str().unwrap()],
+                "excludePatterns": "*.log"
+            }
+        });
+        let issues = validate_schema(&config);
+        assert!(issues.iter().any(|i| {
+            i.severity == Severity::Error
+                && i.path == ".filesystem.excludePatterns"
+                && i.message.contains("must be an array")
         }));
     }
 

@@ -205,20 +205,28 @@ pub fn validate_write_path(
         .map_err(|e| format!("cannot resolve parent \"{}\": {}", parent.display(), e))?;
 
     let full_path = canonical_parent.join(filename);
-    if full_path.exists() {
-        let meta = std::fs::symlink_metadata(&full_path)
-            .map_err(|e| format!("cannot inspect target \"{}\": {}", full_path.display(), e))?;
-        if meta.file_type().is_symlink() {
+    match std::fs::symlink_metadata(&full_path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(format!(
+                    "refusing to write to symlink target \"{}\"",
+                    full_path.display()
+                ));
+            }
+            let canonical_full = std::fs::canonicalize(&full_path)
+                .map_err(|e| format!("cannot resolve target \"{}\": {}", full_path.display(), e))?;
+            validate_canonical_path(&canonical_full, roots, exclude_patterns)?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            validate_canonical_path(&full_path, roots, exclude_patterns)?;
+        }
+        Err(e) => {
             return Err(format!(
-                "refusing to write to symlink target \"{}\"",
-                full_path.display()
+                "cannot inspect target \"{}\": {}",
+                full_path.display(),
+                e
             ));
         }
-        let canonical_full = std::fs::canonicalize(&full_path)
-            .map_err(|e| format!("cannot resolve target \"{}\": {}", full_path.display(), e))?;
-        validate_canonical_path(&canonical_full, roots, exclude_patterns)?;
-    } else {
-        validate_canonical_path(&full_path, roots, exclude_patterns)?;
     }
 
     Ok(full_path)
@@ -512,12 +520,6 @@ fn directory_list_tool(config: Arc<FilesystemConfig>) -> BuiltinTool {
             };
             let config = Arc::clone(&config);
             run_blocking_tool("filesystem directory list", move || {
-                if !std::path::Path::new(&path_str).is_absolute() {
-                    return ToolInvokeResult::tool_error(format!(
-                        "path \"{}\" must be absolute",
-                        path_str
-                    ));
-                }
                 let canonical =
                     match validate_path(&path_str, &config.roots, &config.exclude_patterns) {
                         Ok(p) => p,
@@ -823,7 +825,7 @@ fn file_search_tool(config: Arc<FilesystemConfig>) -> BuiltinTool {
                                 };
                                 let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
                                 // Skip files larger than 2x max_read for content matching.
-                                if file_size > ctx.max_read * 2 {
+                                if file_size > ctx.max_read.saturating_mul(2) {
                                     None
                                 } else {
                                     let limit = ctx.max_read.min(file_size);
@@ -871,6 +873,21 @@ fn file_search_tool(config: Arc<FilesystemConfig>) -> BuiltinTool {
                     skipped_non_utf8: 0,
                     truncated: false,
                 };
+
+                if !canonical_root.is_dir() {
+                    return ToolInvokeResult::tool_error(format!(
+                        "\"{}\" is not a directory",
+                        search_root
+                    ));
+                }
+                if let Err(e) = fs::read_dir(&canonical_root) {
+                    let msg = if e.kind() == std::io::ErrorKind::PermissionDenied {
+                        format!("permission denied: \"{}\"", search_root)
+                    } else {
+                        format!("cannot read directory \"{}\": {}", search_root, e)
+                    };
+                    return ToolInvokeResult::tool_error(msg);
+                }
 
                 walk(&canonical_root, 0, &mut ctx);
 
@@ -1739,6 +1756,20 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_validate_write_path_rejects_broken_symlink_target() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("broken-link.txt");
+        std::os::unix::fs::symlink("/definitely/not/real/target", &target).unwrap();
+        let roots = vec![tmp.path().canonicalize().unwrap()];
+        let result = validate_write_path(target.to_str().unwrap(), &roots, &[], true);
+        match result {
+            Err(msg) => assert!(msg.contains("symlink target")),
+            Ok(path) => panic!("expected broken symlink rejection, got {}", path.display()),
+        }
+    }
+
     #[test]
     fn test_file_move_denied_without_write_access() {
         let tmp = setup_test_tree();
@@ -2205,6 +2236,26 @@ mod tests {
                 assert_eq!(result["truncated"], false);
             }
             _ => panic!("expected success"),
+        }
+    }
+
+    #[test]
+    fn test_file_search_rejects_non_directory_root() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("not-a-dir.txt");
+        fs::write(&file, "hello").unwrap();
+        let cfg = make_test_config(tmp.path(), false);
+        let tools = filesystem_tools(&cfg);
+        let tool = tools.iter().find(|t| t.name == "file_search").unwrap();
+        let result = (tool.handler)(
+            json!({ "pattern": "*.txt", "path": file.to_str().unwrap() }),
+            &test_ctx(),
+        );
+        match result {
+            ToolInvokeResult::Error { error, .. } => {
+                assert!(error.message.contains("not a directory"));
+            }
+            _ => panic!("expected non-directory root error"),
         }
     }
 }
