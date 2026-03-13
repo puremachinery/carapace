@@ -236,6 +236,11 @@ pub fn load_config_shared() -> Result<Arc<Value>, ConfigError> {
 pub fn load_config_uncached(path: &Path) -> Result<Value, ConfigError> {
     // Return empty object with defaults if file doesn't exist
     if !path.exists() {
+        let mut env_state = CONFIG_ENV_STATE.lock();
+        let empty_env_state = InjectedConfigEnvState::default();
+        restore_config_env_state(&empty_env_state, &mut env_state);
+        drop(env_state);
+
         let mut empty = Value::Object(serde_json::Map::new());
         defaults::apply_defaults(&mut empty);
         crate::usage::update_pricing_from_config(&empty);
@@ -1453,6 +1458,40 @@ mod tests {
         );
 
         env::remove_var("TEST_RELOAD_ROLLBACK_ENV");
+        reset_config_env_state_for_test();
+    }
+
+    #[test]
+    fn test_missing_config_clears_previous_injected_environment() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        reset_config_env_state_for_test();
+        env::remove_var("TEST_MISSING_CONFIG_ENV");
+
+        let dir = TempDir::new().unwrap();
+        let working_path = create_temp_config(
+            &dir,
+            "working.json5",
+            r#"{
+                "env": {
+                    "vars": {
+                        "TEST_MISSING_CONFIG_ENV": "from-config"
+                    }
+                },
+                "meta": {
+                    "lastVersion": "${TEST_MISSING_CONFIG_ENV}"
+                }
+            }"#,
+        );
+
+        let working = load_config_uncached(&working_path).unwrap();
+        assert_eq!(working["meta"]["lastVersion"], "from-config");
+        assert_eq!(env::var("TEST_MISSING_CONFIG_ENV").unwrap(), "from-config");
+
+        let missing_path = dir.path().join("deleted.json5");
+        let missing = load_config_uncached(&missing_path).unwrap();
+        assert!(missing.is_object());
+        assert!(env::var("TEST_MISSING_CONFIG_ENV").is_err());
+
         reset_config_env_state_for_test();
     }
 }
