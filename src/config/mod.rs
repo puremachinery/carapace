@@ -245,6 +245,10 @@ pub fn load_config_uncached(path: &Path) -> Result<Value, ConfigError> {
     visited.insert(path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
     resolve_includes(&mut value, path, &mut visited, 0)?;
 
+    // Export config-provided env vars before ${VAR} substitution so included
+    // env blocks can satisfy later placeholders and runtime env lookups.
+    inject_config_env_vars(&value);
+
     // Apply environment variable substitution
     substitute_env_vars(&mut value)?;
 
@@ -258,6 +262,43 @@ pub fn load_config_uncached(path: &Path) -> Result<Value, ConfigError> {
     crate::usage::update_pricing_from_config(&value);
 
     Ok(value)
+}
+
+fn inject_config_env_vars(value: &Value) {
+    let Some(env_obj) = value.get("env").and_then(|v| v.as_object()) else {
+        return;
+    };
+
+    if let Some(vars_obj) = env_obj.get("vars").and_then(|v| v.as_object()) {
+        for (key, value) in vars_obj {
+            inject_config_env_entry(key, value.as_str());
+        }
+    }
+
+    for (key, value) in env_obj {
+        if key == "vars" || key == "shellEnv" {
+            continue;
+        }
+        inject_config_env_entry(key, value.as_str());
+    }
+}
+
+fn inject_config_env_entry(key: &str, value: Option<&str>) {
+    if !is_valid_env_var_name(key) {
+        tracing::warn!(env_var = %key, "ignoring invalid config env key");
+        return;
+    }
+
+    let Some(value) = value else {
+        tracing::warn!(env_var = %key, "ignoring non-string config env value");
+        return;
+    };
+
+    env::set_var(key, value);
+}
+
+fn is_valid_env_var_name(key: &str) -> bool {
+    !key.is_empty() && !key.contains('=') && !key.contains('\0')
 }
 
 /// Parse JSON5 content
@@ -1000,5 +1041,91 @@ mod tests {
         let config = load_config_uncached(&main_path).unwrap();
 
         assert_eq!(config["items"][0]["name"], "item1");
+    }
+
+    #[test]
+    fn test_include_env_vars_are_injected_before_substitution() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        env::remove_var("CARAPACE_GATEWAY_TOKEN");
+        env::remove_var("GCLOUD_PROJECT_ID");
+
+        let dir = TempDir::new().unwrap();
+        create_temp_config(
+            &dir,
+            "vars.json5",
+            r#"{
+                "env": {
+                    "vars": {
+                        "CARAPACE_GATEWAY_TOKEN": "sometoken"
+                    },
+                    "GCLOUD_PROJECT_ID": "someproject"
+                }
+            }"#,
+        );
+        let main_path = create_temp_config(
+            &dir,
+            "main.json5",
+            r#"{
+                "$include": "./vars.json5",
+                "gateway": {
+                    "auth": {
+                        "token": "${CARAPACE_GATEWAY_TOKEN}"
+                    }
+                },
+                "vertex": {
+                    "projectId": "${GCLOUD_PROJECT_ID}"
+                }
+            }"#,
+        );
+
+        let config = load_config_uncached(&main_path).unwrap();
+
+        assert_eq!(config["gateway"]["auth"]["token"], "sometoken");
+        assert_eq!(config["vertex"]["projectId"], "someproject");
+        assert_eq!(env::var("CARAPACE_GATEWAY_TOKEN").unwrap(), "sometoken");
+        assert_eq!(env::var("GCLOUD_PROJECT_ID").unwrap(), "someproject");
+
+        env::remove_var("CARAPACE_GATEWAY_TOKEN");
+        env::remove_var("GCLOUD_PROJECT_ID");
+    }
+
+    #[test]
+    fn test_env_vars_and_string_fields_both_inject() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        env::remove_var("TEST_API_KEY_FROM_ENV_BLOCK");
+        env::remove_var("TEST_OTHER_FLAG");
+
+        let dir = TempDir::new().unwrap();
+        let main_path = create_temp_config(
+            &dir,
+            "config.json5",
+            r#"{
+                "env": {
+                    "vars": {
+                        "TEST_API_KEY_FROM_ENV_BLOCK": "sk-test-from-env-block"
+                    },
+                    "TEST_OTHER_FLAG": "enabled"
+                },
+                "openai": {
+                    "apiKey": "${TEST_API_KEY_FROM_ENV_BLOCK}"
+                },
+                "meta": {
+                    "lastVersion": "${TEST_OTHER_FLAG}"
+                }
+            }"#,
+        );
+
+        let config = load_config_uncached(&main_path).unwrap();
+
+        assert_eq!(config["openai"]["apiKey"], "sk-test-from-env-block");
+        assert_eq!(config["meta"]["lastVersion"], "enabled");
+        assert_eq!(
+            env::var("TEST_API_KEY_FROM_ENV_BLOCK").unwrap(),
+            "sk-test-from-env-block"
+        );
+        assert_eq!(env::var("TEST_OTHER_FLAG").unwrap(), "enabled");
+
+        env::remove_var("TEST_API_KEY_FROM_ENV_BLOCK");
+        env::remove_var("TEST_OTHER_FLAG");
     }
 }
