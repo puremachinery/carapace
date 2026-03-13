@@ -16,6 +16,7 @@ Navigate docs by outcome area instead of file-by-file browsing.
 - [Getting Started](../getting-started.md)
 - [Install](install.md)
 - [First Run](first-run.md)
+- [Guarded local project assistant recipe](../cookbook/guarded-local-project-assistant.md)
 - [Help](help.md)
 - [Cookbook recipes](../cookbook/README.md)
 
@@ -32,6 +33,7 @@ Navigate docs by outcome area instead of file-by-file browsing.
 - [Help](help.md)
 - [Get Unstuck](get-unstuck.md)
 - [Cookbook recipes](../cookbook/README.md)
+- [Guarded local project assistant recipe](../cookbook/guarded-local-project-assistant.md)
 - [Request a cookbook recipe](https://github.com/puremachinery/carapace/issues/new?template=cookbook-recipe-request.yml&title=cookbook%3A+%3Cuse+case%3E)
 
 ## Topic hubs
@@ -40,6 +42,7 @@ Navigate docs by outcome area instead of file-by-file browsing.
   - [Getting Started](../getting-started.md)
   - [Install](install.md)
   - [First Run](first-run.md)
+  - [Guarded local project assistant recipe](../cookbook/guarded-local-project-assistant.md)
   - [Help](help.md)
 
 - **Channels**

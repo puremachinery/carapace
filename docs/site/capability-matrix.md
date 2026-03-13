@@ -25,6 +25,12 @@ See what works today across channels, providers, and platforms, including caveat
 | Bedrock | Verified | SigV4 + streaming/event path wired. |
 | Venice AI | Verified | OpenAI-compatible wrapper/provider wiring. |
 
+## Tools / local workspace
+
+| Area | Support level | Notes / caveats |
+|---|---|---|
+| Filesystem tools | Verified | `file_read`, `directory_list`, `file_stat`, and `file_search` register when `filesystem.enabled = true`. `file_write` and `file_move` require `filesystem.writeAccess = true`. Access stays inside configured roots and excludes, and config changes require restart. |
+
 ## Platform/runtime
 
 | Area | Support level | Notes / caveats |

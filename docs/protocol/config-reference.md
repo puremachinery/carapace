@@ -278,7 +278,26 @@ These are the most commonly used provider sections for first-run setup and day-1
 
 ---
 
-## 4. Channels (Common Messaging Integrations)
+## 4. Local Workspace Tools
+
+* **`filesystem`**
+  * *What it does:* Enables guarded local filesystem tools so Cara can inspect,
+    search, and optionally modify files inside explicit workspace roots.
+  * *Common values:*
+    * `enabled`: `true` or `false`. When `false` or omitted, filesystem tools are not registered.
+    * `roots`: Array of absolute existing paths. Cara only serves file operations inside these roots.
+    * `writeAccess`: `true` or `false`. When `true`, Cara also registers `file_write` and `file_move`.
+    * `maxReadBytes`: Integer byte cap for `file_read` and per-file content matching in `file_search`. (Default: `10485760`)
+    * `excludePatterns`: Array of glob patterns denied even inside allowed roots (for example `[".git", "node_modules", "*.env"]`).
+  * *Behavior notes:*
+    * `file_read`, `directory_list`, `file_stat`, and `file_search` register when `filesystem.enabled = true`.
+    * `file_write` and `file_move` only register when `filesystem.writeAccess = true`.
+    * Invalid filesystem config fail-closes and disables the tool set at runtime.
+    * Filesystem tool registration happens at startup; changing `filesystem.*` requires restart.
+
+---
+
+## 5. Channels (Common Messaging Integrations)
 
 Enable Carapace to listen and respond on external chat platforms.
 
@@ -314,7 +333,7 @@ Enable Carapace to listen and respond on external chat platforms.
 
 ---
 
-## 5. Security, Sessions, and Operations
+## 6. Security, Sessions, and Operations
 
 * **`sessions`**
   * *What it does:* Governs how long the system remembers long-running chat history and whether it gets automatically purged.
@@ -395,7 +414,7 @@ Carapace supports more configuration than this guide covers. If you need the bro
 
 ## Validation Rules (Highlights)
 
-- Schema is strict: unknown top-level keys are rejected.
+- Unknown top-level keys produce schema warnings; they do not, by themselves, abort startup.
 - Duplicate agent directories are rejected.
 - `agents.list[].identity.avatar` must be workspace-relative or http(s)/data URI.
 - `plugins.allow/deny/entries/slots` must reference known plugin IDs.

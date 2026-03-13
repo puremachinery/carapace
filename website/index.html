@@ -6,12 +6,12 @@
     <title>Carapace | Security-first personal AI assistant</title>
     <meta
       name="description"
-      content="Carapace is a security-first, local-first personal AI assistant with channel integrations, policy controls, and auditable behavior."
+      content="Carapace is a security-first, local-first personal AI assistant with channel integrations, guarded local workspace tools, policy controls, and auditable behavior."
     />
     <meta property="og:title" content="Carapace" />
     <meta
       property="og:description"
-      content="Security-first personal AI assistant. Local-first by default, with auditable controls and channel integrations."
+      content="Security-first personal AI assistant. Local-first by default, with auditable controls, guarded local workspace tools, and channel integrations."
     />
     <meta property="og:type" content="website" />
     <meta property="og:url" content="https://puremachinery.github.io/carapace/" />
@@ -60,8 +60,9 @@
         </ul>
         <p class="lede">
           Carapace runs local-first, keeps security controls explicit, and gives you
-          auditable behavior across chat channels and tooling integrations. Works
-          through Signal, Telegram, Discord, Slack, webhooks, and console.
+          auditable behavior across chat channels and guarded local workspace
+          tools. Works through Signal, Telegram, Discord, Slack, webhooks, and
+          console.
         </p>
         <div class="cta-row">
           <a class="button button-primary" href="./install.html">Install in minutes</a>
@@ -97,6 +98,11 @@ cara</code></pre>
           If you are unsure which first path to choose, start with one provider and
           <code>local-chat</code>, then add channels after
           <code>cara verify --outcome auto</code> passes.
+        </p>
+        <p class="muted">
+          Want a local project assistant? Enable <code>filesystem</code> for one
+          workspace root and start with the
+          <a href="./cookbook/guarded-local-project-assistant.html">guarded local project assistant recipe</a>.
         </p>
       </section>
 
@@ -135,6 +141,11 @@ cara</code></pre>
               Add Carapace to Discord
             </a>
           </li>
+          <li>
+            <a href="./cookbook/guarded-local-project-assistant.html">
+              Use Cara as a guarded local project assistant
+            </a>
+          </li>
         </ul>
         <p>
           Want a missing recipe?
@@ -163,6 +174,13 @@ cara</code></pre>
           <p>
             Secure defaults, credential handling, and policy boundaries are treated as
             first-class concerns.
+          </p>
+        </article>
+        <article class="panel feature-card">
+          <h3>Guarded local tools</h3>
+          <p>
+            Enable read/search access for explicit workspace roots, then opt into
+            write and move operations only when you want them.
           </p>
         </article>
         <article class="panel feature-card">

@@ -157,6 +157,17 @@
   //   },
   // },
 
+  // --- Filesystem tools ---------------------------------------------------
+  // Filesystem tool registration happens at startup. Restart Cara after
+  // changing filesystem.* so the tool set picks up the new roots and limits.
+  // filesystem: {
+  //   enabled: true,
+  //   roots: ["/absolute/path/to/workspace"],
+  //   // writeAccess: false,                     // set true to enable file_write + file_move
+  //   // maxReadBytes: 10485760,                // 10 MiB per read / content-search file
+  //   // excludePatterns: [".git", "node_modules", "target", "*.env"],
+  // },
+
   // --- AWS Bedrock provider ------------------------------------------------
   // bedrock: {
   //   region: "us-east-1",                          // or AWS_REGION / AWS_DEFAULT_REGION

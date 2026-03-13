@@ -126,6 +126,7 @@ For a plain-English guide to the most commonly tuned sections, see
 - `gateway` – service settings
 - `skills` – skills registry settings
 - `plugins` – plugin load/allowlist/config
+- `filesystem` – root-scoped filesystem tool registration and limits
 - `anthropic` – Anthropic provider settings (apiKey, baseUrl)
 - `openai` – OpenAI provider settings (apiKey, baseUrl)
 - `google` – Google Gemini provider settings (`apiKey`, `authProfile`, `baseUrl`)
@@ -157,6 +158,8 @@ This is a condensed map; refer to the JSON schema for full detail.
   - `enabled`, `controlUrl`, `cdpUrl`, `profiles` (names must match `/^[a-z0-9-]+$/`)
 - `plugins`
   - `enabled`, `allow`, `deny`, `load.paths`, `slots`, `entries`, `installs`
+- `filesystem`
+  - `enabled`, `roots`, `writeAccess`, `maxReadBytes`, `excludePatterns`
 - `auth`
   - `profiles.enabled`, `profiles.redirectBaseUrl`
   - `profiles.providers.{google,github,discord}.{clientId,clientSecret,redirectUri}`
@@ -266,6 +269,33 @@ For Gemini onboarding:
 - `CARAPACE_CONFIG_PASSWORD` must be set when using Gemini Google sign-in so the stored auth profile is encrypted at rest
 - if Google OAuth client config is unavailable, Gemini onboarding must use API-key mode
 
+### `filesystem`
+
+`filesystem` controls the built-in local filesystem tools.
+
+Relevant subkeys:
+
+- `filesystem.enabled`
+- `filesystem.roots`
+- `filesystem.writeAccess`
+- `filesystem.maxReadBytes`
+- `filesystem.excludePatterns`
+
+Behavior:
+
+- when `filesystem.enabled` is absent or `false`, filesystem tools are not registered
+- when enabled, read-tier tools are registered:
+  - `file_read`
+  - `directory_list`
+  - `file_stat`
+  - `file_search`
+- `file_write` and `file_move` are only registered when `filesystem.writeAccess = true`
+- `filesystem.roots` should be absolute existing paths
+- `filesystem.excludePatterns` deny matching paths even when they are inside an allowed root
+- malformed filesystem config is treated fail-closed and disables filesystem tools at runtime
+- changing `filesystem.*` requires a process restart because tool registration happens at startup
+- if enabled with an empty `roots` list, the tools register but every requested path is denied
+
 ## Defaults
 
 Defaults are applied during config loading before validation. Key defaults include:
@@ -291,6 +321,11 @@ Defaults are applied during config loading before validation. Key defaults inclu
 - `gateway.reload.debounceMs`: `300`
 - `gateway.hooks.path`: `"/hooks"`
 - `gateway.hooks.maxBodyBytes`: `262144`
+- `filesystem.enabled`: `false`
+- `filesystem.writeAccess`: `false`
+- `filesystem.maxReadBytes`: `10485760`
+- `filesystem.roots`: `[]`
+- `filesystem.excludePatterns`: `[]`
 - `vertex.location`: `"us-central1"`
 - `vertex.projectId`: omitted unless `VERTEX_PROJECT_ID` is set
 - Model defaults when defined in `models.providers.*.models`:
@@ -305,7 +340,7 @@ Defaults are applied during config loading before validation. Key defaults inclu
 
 ## Validation Rules (Highlights)
 
-- Schema is strict: unknown keys are rejected.
+- Unknown top-level keys produce schema warnings; they do not, by themselves, abort startup.
 - Duplicate agent directories are rejected.
 - `agents.list[].identity.avatar` must be workspace‑relative or http(s)/data URI.
 - `plugins.allow/deny/entries/slots` must reference known plugin IDs.

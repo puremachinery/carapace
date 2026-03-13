@@ -27,6 +27,9 @@ For what is already shipped and verified, see:
 - Gemini onboarding — Google sign-in or API-key setup via `cara setup` and the
   Control UI, backed by shared onboarding flow state and `google.authProfile`
   runtime support.
+- Filesystem tools — guarded local workspace read/search/stat/list plus opt-in
+  write/move within explicit roots, with config-gated registration and
+  fail-closed validation.
 - Multi-page docs site with install/first-run/security/ops plus docs hubs,
   capability matrix, and task-oriented CLI index.
 

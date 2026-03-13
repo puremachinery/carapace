@@ -14,7 +14,8 @@ Jump quickly to architecture and protocol details when you need exact behavior.
 
 - [HTTP protocol](../protocol/http.md)
 - [WebSocket protocol](../protocol/websocket.md)
-- [Configuration schema/reference](../protocol/config.md)
+- [Configuration format and load semantics](../protocol/config.md)
+- [Configuration guide](../protocol/config-reference.md)
 - [Credentials model](../protocol/credentials.md)
 - [Pairing protocol](../protocol/pairing.md)
 
