@@ -8,11 +8,12 @@ pub mod schema;
 pub mod secrets;
 pub mod watcher;
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use regex::Regex;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
@@ -93,6 +94,15 @@ struct CachedConfig {
 
 /// Global config cache
 static CONFIG_CACHE: LazyLock<RwLock<Option<CachedConfig>>> = LazyLock::new(|| RwLock::new(None));
+
+#[derive(Clone, Default)]
+struct InjectedConfigEnvState {
+    active_values: HashMap<String, String>,
+    previous_values: HashMap<String, Option<OsString>>,
+}
+
+static CONFIG_ENV_STATE: LazyLock<Mutex<InjectedConfigEnvState>> =
+    LazyLock::new(|| Mutex::new(InjectedConfigEnvState::default()));
 
 /// Get the config file path.
 /// Priority: CARAPACE_CONFIG_PATH > CARAPACE_STATE_DIR/carapace.json5 > ~/.config/carapace/carapace.json5
@@ -247,10 +257,22 @@ pub fn load_config_uncached(path: &Path) -> Result<Value, ConfigError> {
 
     // Export config-provided env vars before ${VAR} substitution so included
     // env blocks can satisfy later placeholders and runtime env lookups.
-    inject_config_env_vars(&value);
+    //
+    // This intentionally mutates process env because later config/runtime
+    // lookups rely on these values, but the mutation is serialized and rolled
+    // back if substitution fails.
+    let mut env_state = CONFIG_ENV_STATE.lock();
+    let resolved_env = resolve_config_env_vars(&value)?;
+    let previous_env_state = env_state.clone();
+    apply_config_env_vars(&resolved_env, &mut env_state);
 
-    // Apply environment variable substitution
-    substitute_env_vars(&mut value)?;
+    // Apply environment variable substitution against the process env after the
+    // config-provided values have been installed.
+    if let Err(err) = substitute_env_vars(&mut value) {
+        restore_config_env_state(&previous_env_state, &mut env_state);
+        return Err(err);
+    }
+    drop(env_state);
 
     // Apply config defaults (fill in missing sections/fields with
     // production-ready values — mirrors clawdbot's apply* pipeline).
@@ -264,14 +286,16 @@ pub fn load_config_uncached(path: &Path) -> Result<Value, ConfigError> {
     Ok(value)
 }
 
-fn inject_config_env_vars(value: &Value) {
+fn collect_config_env_vars(value: &Value) -> Vec<(String, String)> {
     let Some(env_obj) = value.get("env").and_then(|v| v.as_object()) else {
-        return;
+        return Vec::new();
     };
+
+    let mut collected = Vec::new();
 
     if let Some(vars_obj) = env_obj.get("vars").and_then(|v| v.as_object()) {
         for (key, value) in vars_obj {
-            inject_config_env_entry(key, value.as_str());
+            collect_config_env_entry(&mut collected, key, value.as_str());
         }
     }
 
@@ -279,11 +303,13 @@ fn inject_config_env_vars(value: &Value) {
         if key == "vars" || key == "shellEnv" {
             continue;
         }
-        inject_config_env_entry(key, value.as_str());
+        collect_config_env_entry(&mut collected, key, value.as_str());
     }
+
+    collected
 }
 
-fn inject_config_env_entry(key: &str, value: Option<&str>) {
+fn collect_config_env_entry(entries: &mut Vec<(String, String)>, key: &str, value: Option<&str>) {
     if !is_valid_env_var_name(key) {
         tracing::warn!(env_var = %key, "ignoring invalid config env key");
         return;
@@ -294,11 +320,110 @@ fn inject_config_env_entry(key: &str, value: Option<&str>) {
         return;
     };
 
-    env::set_var(key, value);
+    entries.push((key.to_string(), value.to_string()));
 }
 
 fn is_valid_env_var_name(key: &str) -> bool {
     !key.is_empty() && !key.contains('=') && !key.contains('\0')
+}
+
+fn resolve_config_env_vars(value: &Value) -> Result<HashMap<String, String>, ConfigError> {
+    let raw_entries = collect_config_env_vars(value);
+    if raw_entries.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let raw: HashMap<String, String> = raw_entries.into_iter().collect();
+    let mut resolved = HashMap::new();
+    let mut resolving = HashSet::new();
+
+    for key in raw.keys() {
+        resolve_config_env_var(key, &raw, &mut resolved, &mut resolving)?;
+    }
+
+    Ok(resolved)
+}
+
+fn resolve_config_env_var(
+    key: &str,
+    raw: &HashMap<String, String>,
+    resolved: &mut HashMap<String, String>,
+    resolving: &mut HashSet<String>,
+) -> Result<String, ConfigError> {
+    if let Some(value) = resolved.get(key) {
+        return Ok(value.clone());
+    }
+
+    if !resolving.insert(key.to_string()) {
+        return Err(ConfigError::ValidationError {
+            path: ".env".to_string(),
+            message: format!("circular config env reference involving {}", key),
+        });
+    }
+
+    let raw_value = raw.get(key).ok_or_else(|| ConfigError::MissingEnvVar {
+        var: key.to_string(),
+    })?;
+
+    let value = substitute_env_in_string_with(raw_value, |var_name| {
+        if raw.contains_key(var_name) {
+            resolve_config_env_var(var_name, raw, resolved, resolving)
+        } else {
+            env::var(var_name).map_err(|_| ConfigError::MissingEnvVar {
+                var: var_name.to_string(),
+            })
+        }
+    })?;
+
+    resolving.remove(key);
+    resolved.insert(key.to_string(), value.clone());
+    Ok(value)
+}
+
+fn apply_config_env_vars(next: &HashMap<String, String>, state: &mut InjectedConfigEnvState) {
+    let next_keys: HashSet<String> = next.keys().cloned().collect();
+
+    for key in state.active_values.keys().cloned().collect::<Vec<_>>() {
+        if next_keys.contains(&key) {
+            continue;
+        }
+
+        match state.previous_values.remove(&key).flatten() {
+            Some(previous) => env::set_var(&key, previous),
+            None => env::remove_var(&key),
+        }
+        state.active_values.remove(&key);
+    }
+
+    for (key, value) in next {
+        if !state.active_values.contains_key(key) {
+            state.previous_values.insert(key.clone(), env::var_os(key));
+        }
+        env::set_var(key, value);
+        state.active_values.insert(key.clone(), value.clone());
+    }
+}
+
+fn restore_config_env_state(
+    previous: &InjectedConfigEnvState,
+    current: &mut InjectedConfigEnvState,
+) {
+    for key in current.active_values.keys().cloned().collect::<Vec<_>>() {
+        if previous.active_values.contains_key(&key) {
+            continue;
+        }
+
+        match current.previous_values.remove(&key).flatten() {
+            Some(value) => env::set_var(&key, value),
+            None => env::remove_var(&key),
+        }
+    }
+
+    for (key, value) in &previous.active_values {
+        env::set_var(key, value);
+    }
+
+    *current = previous.clone();
 }
 
 /// Parse JSON5 content
@@ -479,6 +604,17 @@ fn substitute_env_vars(value: &mut Value) -> Result<(), ConfigError> {
 
 /// Substitute environment variables in a single string
 fn substitute_env_in_string(s: &str) -> Result<String, ConfigError> {
+    substitute_env_in_string_with(s, |var_name| {
+        env::var(var_name).map_err(|_| ConfigError::MissingEnvVar {
+            var: var_name.to_string(),
+        })
+    })
+}
+
+fn substitute_env_in_string_with<F>(s: &str, mut resolver: F) -> Result<String, ConfigError>
+where
+    F: FnMut(&str) -> Result<String, ConfigError>,
+{
     // Regex pattern for env vars: ${VAR} where VAR is uppercase with underscores and digits
     static ENV_VAR_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"\$\$?\{([A-Z_][A-Z0-9_]*)\}")
@@ -502,9 +638,7 @@ fn substitute_env_in_string(s: &str) -> Result<String, ConfigError> {
             result.push_str(&format!("${{{}}}", var_name));
         } else {
             // Not escaped - substitute with env var value
-            let value = env::var(var_name).map_err(|_| ConfigError::MissingEnvVar {
-                var: var_name.to_string(),
-            })?;
+            let value = resolver(var_name)?;
             result.push_str(&value);
         }
 
@@ -588,6 +722,12 @@ mod tests {
         let mut file = File::create(&path).unwrap();
         file.write_all(content.as_bytes()).unwrap();
         path
+    }
+
+    fn reset_config_env_state_for_test() {
+        let mut state = CONFIG_ENV_STATE.lock();
+        let empty = InjectedConfigEnvState::default();
+        restore_config_env_state(&empty, &mut state);
     }
 
     #[test]
@@ -1046,8 +1186,9 @@ mod tests {
     #[test]
     fn test_include_env_vars_are_injected_before_substitution() {
         let _lock = ENV_LOCK.lock().unwrap();
-        env::remove_var("CARAPACE_GATEWAY_TOKEN");
-        env::remove_var("GCLOUD_PROJECT_ID");
+        reset_config_env_state_for_test();
+        env::remove_var("TEST_INCLUDED_GATEWAY_TOKEN");
+        env::remove_var("TEST_INCLUDED_VERTEX_PROJECT_ID");
 
         let dir = TempDir::new().unwrap();
         create_temp_config(
@@ -1056,9 +1197,9 @@ mod tests {
             r#"{
                 "env": {
                     "vars": {
-                        "CARAPACE_GATEWAY_TOKEN": "sometoken"
+                        "TEST_INCLUDED_GATEWAY_TOKEN": "sometoken"
                     },
-                    "GCLOUD_PROJECT_ID": "someproject"
+                    "TEST_INCLUDED_VERTEX_PROJECT_ID": "someproject"
                 }
             }"#,
         );
@@ -1069,11 +1210,11 @@ mod tests {
                 "$include": "./vars.json5",
                 "gateway": {
                     "auth": {
-                        "token": "${CARAPACE_GATEWAY_TOKEN}"
+                        "token": "${TEST_INCLUDED_GATEWAY_TOKEN}"
                     }
                 },
                 "vertex": {
-                    "projectId": "${GCLOUD_PROJECT_ID}"
+                    "projectId": "${TEST_INCLUDED_VERTEX_PROJECT_ID}"
                 }
             }"#,
         );
@@ -1082,16 +1223,24 @@ mod tests {
 
         assert_eq!(config["gateway"]["auth"]["token"], "sometoken");
         assert_eq!(config["vertex"]["projectId"], "someproject");
-        assert_eq!(env::var("CARAPACE_GATEWAY_TOKEN").unwrap(), "sometoken");
-        assert_eq!(env::var("GCLOUD_PROJECT_ID").unwrap(), "someproject");
+        assert_eq!(
+            env::var("TEST_INCLUDED_GATEWAY_TOKEN").unwrap(),
+            "sometoken"
+        );
+        assert_eq!(
+            env::var("TEST_INCLUDED_VERTEX_PROJECT_ID").unwrap(),
+            "someproject"
+        );
 
-        env::remove_var("CARAPACE_GATEWAY_TOKEN");
-        env::remove_var("GCLOUD_PROJECT_ID");
+        env::remove_var("TEST_INCLUDED_GATEWAY_TOKEN");
+        env::remove_var("TEST_INCLUDED_VERTEX_PROJECT_ID");
+        reset_config_env_state_for_test();
     }
 
     #[test]
     fn test_env_vars_and_string_fields_both_inject() {
         let _lock = ENV_LOCK.lock().unwrap();
+        reset_config_env_state_for_test();
         env::remove_var("TEST_API_KEY_FROM_ENV_BLOCK");
         env::remove_var("TEST_OTHER_FLAG");
 
@@ -1127,5 +1276,183 @@ mod tests {
 
         env::remove_var("TEST_API_KEY_FROM_ENV_BLOCK");
         env::remove_var("TEST_OTHER_FLAG");
+        reset_config_env_state_for_test();
+    }
+
+    #[test]
+    fn test_config_env_values_can_reference_other_config_env_values() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        reset_config_env_state_for_test();
+        env::remove_var("TEST_BASE_TOKEN");
+        env::remove_var("TEST_COMPOSED_TOKEN");
+
+        let dir = TempDir::new().unwrap();
+        let main_path = create_temp_config(
+            &dir,
+            "config.json5",
+            r#"{
+                "env": {
+                    "vars": {
+                        "TEST_BASE_TOKEN": "base-token",
+                        "TEST_COMPOSED_TOKEN": "${TEST_BASE_TOKEN}-suffix"
+                    }
+                },
+                "gateway": {
+                    "auth": {
+                        "token": "${TEST_COMPOSED_TOKEN}"
+                    }
+                }
+            }"#,
+        );
+
+        let config = load_config_uncached(&main_path).unwrap();
+
+        assert_eq!(config["gateway"]["auth"]["token"], "base-token-suffix");
+        assert_eq!(
+            env::var("TEST_COMPOSED_TOKEN").unwrap(),
+            "base-token-suffix"
+        );
+
+        env::remove_var("TEST_BASE_TOKEN");
+        env::remove_var("TEST_COMPOSED_TOKEN");
+        reset_config_env_state_for_test();
+    }
+
+    #[test]
+    fn test_removed_config_env_vars_restore_previous_environment() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        reset_config_env_state_for_test();
+        env::set_var("TEST_RELOAD_ENV", "preexisting");
+
+        let dir = TempDir::new().unwrap();
+        let first_path = create_temp_config(
+            &dir,
+            "first.json5",
+            r#"{
+                "env": {
+                    "vars": {
+                        "TEST_RELOAD_ENV": "from-config"
+                    }
+                },
+                "meta": {
+                    "lastVersion": "${TEST_RELOAD_ENV}"
+                }
+            }"#,
+        );
+        let second_path = create_temp_config(
+            &dir,
+            "second.json5",
+            r#"{
+                "meta": {
+                    "lastVersion": "${TEST_RELOAD_ENV}"
+                }
+            }"#,
+        );
+
+        let first = load_config_uncached(&first_path).unwrap();
+        assert_eq!(first["meta"]["lastVersion"], "from-config");
+        assert_eq!(env::var("TEST_RELOAD_ENV").unwrap(), "from-config");
+
+        let second = load_config_uncached(&second_path).unwrap();
+        assert_eq!(second["meta"]["lastVersion"], "preexisting");
+        assert_eq!(env::var("TEST_RELOAD_ENV").unwrap(), "preexisting");
+
+        env::remove_var("TEST_RELOAD_ENV");
+        reset_config_env_state_for_test();
+    }
+
+    #[test]
+    fn test_failed_substitution_restores_previous_environment() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        reset_config_env_state_for_test();
+        env::set_var("TEST_FAILED_SUBSTITUTION_ENV", "preexisting");
+        env::remove_var("TEST_MISSING_AFTER_INJECTION");
+
+        let dir = TempDir::new().unwrap();
+        let broken_path = create_temp_config(
+            &dir,
+            "broken.json5",
+            r#"{
+                "env": {
+                    "vars": {
+                        "TEST_FAILED_SUBSTITUTION_ENV": "from-config"
+                    }
+                },
+                "meta": {
+                    "lastVersion": "${TEST_MISSING_AFTER_INJECTION}"
+                }
+            }"#,
+        );
+
+        let result = load_config_uncached(&broken_path);
+        assert!(matches!(
+            result,
+            Err(ConfigError::MissingEnvVar { var }) if var == "TEST_MISSING_AFTER_INJECTION"
+        ));
+        assert_eq!(
+            env::var("TEST_FAILED_SUBSTITUTION_ENV").unwrap(),
+            "preexisting"
+        );
+
+        env::remove_var("TEST_FAILED_SUBSTITUTION_ENV");
+        reset_config_env_state_for_test();
+    }
+
+    #[test]
+    fn test_failed_reload_restores_previous_injected_environment() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        reset_config_env_state_for_test();
+        env::remove_var("TEST_RELOAD_ROLLBACK_ENV");
+        env::remove_var("TEST_RELOAD_ROLLBACK_MISSING");
+
+        let dir = TempDir::new().unwrap();
+        let working_path = create_temp_config(
+            &dir,
+            "working.json5",
+            r#"{
+                "env": {
+                    "vars": {
+                        "TEST_RELOAD_ROLLBACK_ENV": "from-first-load"
+                    }
+                },
+                "meta": {
+                    "lastVersion": "${TEST_RELOAD_ROLLBACK_ENV}"
+                }
+            }"#,
+        );
+        let broken_path = create_temp_config(
+            &dir,
+            "broken.json5",
+            r#"{
+                "env": {
+                    "vars": {
+                        "TEST_RELOAD_ROLLBACK_ENV": "from-broken-load"
+                    }
+                },
+                "meta": {
+                    "lastVersion": "${TEST_RELOAD_ROLLBACK_MISSING}"
+                }
+            }"#,
+        );
+
+        let first = load_config_uncached(&working_path).unwrap();
+        assert_eq!(first["meta"]["lastVersion"], "from-first-load");
+        assert_eq!(
+            env::var("TEST_RELOAD_ROLLBACK_ENV").unwrap(),
+            "from-first-load"
+        );
+
+        let result = load_config_uncached(&broken_path);
+        assert!(matches!(
+            result,
+            Err(ConfigError::MissingEnvVar { var }) if var == "TEST_RELOAD_ROLLBACK_MISSING"
+        ));
+        assert_eq!(
+            env::var("TEST_RELOAD_ROLLBACK_ENV").unwrap(),
+            "from-first-load"
+        );
+
+        env::remove_var("TEST_RELOAD_ROLLBACK_ENV");
+        reset_config_env_state_for_test();
     }
 }
