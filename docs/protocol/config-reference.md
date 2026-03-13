@@ -292,7 +292,7 @@ These are the most commonly used provider sections for first-run setup and day-1
   * *Behavior notes:*
     * `file_read`, `directory_list`, `file_stat`, and `file_search` register when `filesystem.enabled = true`.
     * `file_write` and `file_move` only register when `filesystem.writeAccess = true`.
-    * Invalid filesystem config fail-closes and disables the tool set at runtime.
+    * Invalid filesystem config normally fails startup with schema errors. Runtime tool registration also fail-closes and disables the tool set if malformed config somehow bypasses validation.
     * Filesystem tool registration happens at startup; changing `filesystem.*` requires restart.
 
 ---

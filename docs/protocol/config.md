@@ -292,7 +292,7 @@ Behavior:
 - `file_write` and `file_move` are only registered when `filesystem.writeAccess = true`
 - `filesystem.roots` should be absolute existing paths
 - `filesystem.excludePatterns` deny matching paths even when they are inside an allowed root
-- malformed filesystem config is treated fail-closed and disables filesystem tools at runtime
+- malformed filesystem config fail-closes startup with schema errors; if validation is bypassed in a runtime/test path, filesystem tool registration still disables itself rather than enabling a partial tool set
 - changing `filesystem.*` requires a process restart because tool registration happens at startup
 - if enabled with an empty `roots` list, the tools register but every requested path is denied
 
