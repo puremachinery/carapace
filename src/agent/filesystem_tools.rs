@@ -98,6 +98,12 @@ where
     }
 }
 
+#[cfg(windows)]
+fn is_windows_existing_destination_rename_error(err: &std::io::Error) -> bool {
+    matches!(err.kind(), std::io::ErrorKind::AlreadyExists)
+        || matches!(err.raw_os_error(), Some(80 | 183))
+}
+
 /// Validate that a requested path is allowed by the configured roots and exclude patterns.
 ///
 /// SECURITY: this check canonicalizes and validates the path before later file operations, but
@@ -619,12 +625,6 @@ fn file_stat_tool(config: Arc<FilesystemConfig>) -> BuiltinTool {
             };
             let config = Arc::clone(&config);
             run_blocking_tool("filesystem stat", move || {
-                if !std::path::Path::new(&path_str).is_absolute() {
-                    return ToolInvokeResult::tool_error(format!(
-                        "path \"{}\" must be absolute",
-                        path_str
-                    ));
-                }
                 let canonical =
                     match validate_path(&path_str, &config.roots, &config.exclude_patterns) {
                         Ok(p) => p,
@@ -1037,7 +1037,10 @@ fn file_move_tool(config: Arc<FilesystemConfig>) -> BuiltinTool {
                 let rename_result = fs::rename(&source, &dest);
 
                 #[cfg(windows)]
-                let rename_result = if rename_result.is_err() && dest.exists() {
+                let rename_result = if matches!(
+                    rename_result.as_ref().err(),
+                    Some(err) if dest.exists() && is_windows_existing_destination_rename_error(err)
+                ) {
                     // Windows std::fs::rename does not replace an existing destination.
                     // This remove-then-rename fallback still has an inherent TOCTOU gap:
                     // another process can recreate `dest` between the remove and rename.
@@ -1768,6 +1771,20 @@ mod tests {
             Err(msg) => assert!(msg.contains("symlink target")),
             Ok(path) => panic!("expected broken symlink rejection, got {}", path.display()),
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_existing_destination_rename_error_detection() {
+        assert!(is_windows_existing_destination_rename_error(
+            &std::io::Error::from_raw_os_error(80)
+        ));
+        assert!(is_windows_existing_destination_rename_error(
+            &std::io::Error::from_raw_os_error(183)
+        ));
+        assert!(!is_windows_existing_destination_rename_error(
+            &std::io::Error::from_raw_os_error(5)
+        ));
     }
 
     #[test]
