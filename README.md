@@ -2,16 +2,17 @@
 
 > **Stable release available.** Carapace is ready for real use on its verified stable paths; partial and in-progress areas are called out explicitly in the docs.
 
-A security-focused, open-source personal AI assistant. Runs on your machine. Works through Signal, Telegram, Discord, Slack, webhooks, and console. Supports Anthropic, OpenAI, Ollama, Gemini, Bedrock, and Venice AI. Extensible via WASM plugins. Written in Rust.
+A security-focused, open-source personal AI assistant. Runs on your machine. Works through Signal, Telegram, Discord, Slack, webhooks, and console. Supports Anthropic, OpenAI, Ollama, Gemini, Vertex AI, Bedrock, and Venice AI. Extensible via WASM plugins and guarded filesystem tools. Written in Rust.
 
 A hardened alternative to openclaw / clawdbot — for when your assistant needs a hard shell.
 
 ## Features
 
-- **Multi-provider LLM engine** — Anthropic, OpenAI, Ollama, Google Gemini, AWS Bedrock, Venice AI with streaming, tool dispatch, and cancellation
-- **Multi-channel messaging** — Signal, Telegram, Discord, Slack, console, and webhooks. 10 built-in tools + 15 channel-specific tool schemas
+- **Multi-provider LLM engine** — Anthropic, OpenAI, Ollama, Google Gemini, Vertex AI, AWS Bedrock, and Venice AI with streaming, tool dispatch, and cancellation
+- **Multi-channel messaging** — Signal, Telegram, Discord, Slack, console, and webhooks
+- **Tooling and local workspace access** — built-in agent tools, guarded filesystem tools for explicit roots, and channel-specific tool schemas
 - **Signed plugin runtime** — plugins are signature-verified and run with strict permissions and resource limits
-- **Secure defaults** — local-first binding, locked-down auth behavior, encrypted secret storage, guarded tool execution, and OS-level subprocess sandboxing for protected paths
+- **Secure defaults** — local-first binding, locked-down auth behavior, encrypted secret storage, guarded tool execution, root-scoped filesystem access, and OS-level subprocess sandboxing for protected paths
 - **Infrastructure** — TLS, mTLS, mDNS discovery, config hot-reload, Tailscale integration, Prometheus metrics, audit logging. Multi-node clustering is partially implemented
 
 ## Expectations vs OpenClaw
@@ -76,6 +77,9 @@ profile stays encrypted at rest.
 If you are not sure where to start, choose `local-chat` as your first outcome,
 start with one provider, and add channels only after `cara verify --outcome auto`
 passes.
+If you want Cara to inspect one local project directory, enable the
+`filesystem` block for a single workspace root and start with the
+[guarded local project assistant recipe](docs/cookbook/guarded-local-project-assistant.md).
 
 ## Status
 
@@ -100,8 +104,9 @@ of truth.
   architecture polish
 - Recently shipped: first stable release, long-running assistant MVP (durable
   queue + autonomy verify), cross-platform subprocess sandboxing, guided setup
-  (`cara setup`), first-run verifier (`cara verify`), and Gemini onboarding
-  (Google sign-in or API key via CLI and Control UI)
+  (`cara setup`), first-run verifier (`cara verify`), Gemini onboarding
+  (Google sign-in or API key via CLI and Control UI), Vertex AI provider
+  support, and guarded filesystem tools for explicit workspace roots
 
 ## Docs
 

@@ -21,9 +21,16 @@ See what works today across channels, providers, and platforms, including caveat
 | Anthropic | Verified | Streaming + tools + cancellation. |
 | OpenAI | Verified | Streaming + tools + cancellation. |
 | Gemini | Verified | Streaming + tools + cancellation. |
+| Vertex AI | Verified | Google-published Gemini models on Vertex AI are supported. |
 | Ollama | Verified | Local serving path supported. |
 | Bedrock | Verified | SigV4 + streaming/event path wired. |
 | Venice AI | Verified | OpenAI-compatible wrapper/provider wiring. |
+
+## Tools / local workspace
+
+| Area | Support level | Notes / caveats |
+|---|---|---|
+| Filesystem tools | Verified | `file_read`, `directory_list`, `file_stat`, and `file_search` register when `filesystem.enabled = true`. `file_write` and `file_move` require `filesystem.writeAccess = true`. Access stays inside configured roots and excludes, and config changes require restart. |
 
 ## Platform/runtime
 

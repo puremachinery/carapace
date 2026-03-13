@@ -28,7 +28,7 @@ feature_inventory_markdown: |
   - [x] **Base URL override** — custom API endpoints for all providers
   - [x] **Agent execution loop** — turn loop, tool dispatch, max turns/tokens, cancellation (`mod.rs`)
   - [x] **Agent supervisor** — panic recovery, spawn_run, timeout enforcement
-  - [x] **Tool dispatch** — built-in tools (10) + plugin tools, policy enforcement (`tool.rs`)
+  - [x] **Tool dispatch** — built-in tools + plugin tools, policy enforcement (`tool.rs`)
   - [x] **Tool policy** — allow-all / allow-list / deny-list per config (`tool_policy.rs`)
   - [x] **Prompt guard — preflight** — regex injection/escalation/exfiltration patterns (`prompt_guard/preflight.rs`)
   - [x] **Prompt guard — postflight** — output content scanning with custom patterns (`prompt_guard/postflight.rs`)
@@ -37,6 +37,8 @@ feature_inventory_markdown: |
   - [x] **Exfiltration guard** — filters tool definitions + blocks sensitive tools at dispatch (`exfiltration.rs`)
   - [~] **OS-level process sandbox** — Seatbelt (macOS), Landlock (Linux), Windows Job Objects + AppContainer, rlimits (`sandbox.rs`), subprocess wrappers wired across runtime probes/tailscale/whois/SSH tunnel; unsupported OSes fail closed and Windows spawned deny-network paths currently fail closed
   - [x] **Channel-specific tools** — 15 platform-specific tool schemas (`channel_tools.rs`)
+  - [x] **Filesystem tools (read tier)** — `file_read`, `directory_list`, `file_stat`, and `file_search` gated by `filesystem.enabled`, explicit roots/excludes, and runtime-bridge-backed blocking I/O (`filesystem_tools.rs`, `tools.rs`)
+  - [x] **Filesystem tools (write tier)** — `file_write` and `file_move` gated by `filesystem.writeAccess`, with fail-closed config parsing and path/symlink protections (`filesystem_tools.rs`, `tools.rs`)
 
   ### Authentication (`src/auth/`)
 
@@ -209,7 +211,7 @@ feature_inventory_markdown: |
   - [x] **Tool dispatch** — tool invocation routing with collision warnings
   - [x] **Hook dispatch** — lifecycle hook routing
   - [x] **Webhook dispatch** — HTTP webhook routing
-  - [x] **Builtin tools** — 11 core tools (current_time, web_fetch, media_analyze, memory_read/write/list, message_send, session_list/read, config_read, math_eval)
+  - [x] **Builtin tools** — 12 always-on core tools (`time` plus current_time, web_fetch, media_analyze, memory_read/write/list, message_send, session_list/read, config_read, math_eval) plus up to 6 config-gated filesystem tools when `filesystem.enabled` is true (`file_write` and `file_move` also require `filesystem.writeAccess = true`)
 
   ### Server (`src/server/`)
 

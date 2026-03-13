@@ -7,6 +7,7 @@ If you are new to Carapace, start with:
 
 ## Recipes
 
+- [Use Cara as a guarded local project assistant](guarded-local-project-assistant.md)
 - [Use Cara with VS Code, JetBrains, chat UIs, and scripts](openai-compatible-endpoint.md)
 - [Add Carapace to Discord](discord-assistant.md)
 - [Add Carapace to Telegram](telegram-webhook-assistant.md)

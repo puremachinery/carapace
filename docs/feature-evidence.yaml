@@ -2,9 +2,26 @@
 # Keep this focused on audited entries in docs/feature-status.yaml.
 
 version: "1.0"
-updated_at: "2026-03-10"
+updated_at: "2026-03-12"
 
 features:
+  - feature: "filesystem tools"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/agent/filesystem_tools.rs (path validation + file_read/directory_list/file_stat/file_search/file_write/file_move)"
+      - "src/plugins/tools.rs::ToolsRegistry::with_config (startup-time conditional registration from filesystem config)"
+      - "src/config/defaults.rs (filesystem defaults)"
+      - "src/config/schema.rs::validate_filesystem (schema validation + fail-closed checks)"
+    tests:
+      - "src/plugins/tools.rs::test_with_config_filesystem_enabled_read_only"
+      - "src/plugins/tools.rs::test_with_config_filesystem_enabled_write_access"
+      - "src/agent/filesystem_tools.rs::test_file_read_happy_path"
+      - "src/agent/filesystem_tools.rs::test_file_search_with_content_pattern"
+      - "src/agent/filesystem_tools.rs::test_file_write_happy_path"
+      - "src/agent/filesystem_tools.rs::test_file_move_happy_path"
+      - "src/config/schema.rs::test_filesystem_valid_config"
+      - "src/config/defaults.rs::test_filesystem_defaults_applied"
+
   - feature: "logs.tail"
     status: "verified_done"
     runtime_wiring:

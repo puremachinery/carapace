@@ -38,6 +38,9 @@ If you are starting from zero, optimize for a fast verified first outcome:
 - Choose `local-chat` first unless you already know you need a channel on day 1.
 - Fastest cloud start: set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`.
 - Fastest fully local start: run Ollama and point Carapace at `OLLAMA_BASE_URL`.
+- If you want a guarded local workspace assistant, start with the
+  [guarded local project assistant recipe](cookbook/guarded-local-project-assistant.md)
+  after your first successful local-chat verify.
 - Add Discord, Telegram, or hooks only after `cara verify --outcome auto` passes.
 
 If you are still unsure which path fits your environment, use the
