@@ -19,7 +19,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
-      issues: read
+      issues: write
       id-token: write
     steps:
       - name: Resolve PR context
@@ -163,7 +163,7 @@ jobs:
           REQUEST_COMMENT_URL: ${{ github.event.comment.html_url }}
           REQUEST_COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
         with:
-          github-token: ${{ steps.claude.outputs.github_token }}
+          github-token: ${{ github.token }}
           script: |
             const fs = require('fs');
             const marker = process.env.REVIEW_MARKER || '';
