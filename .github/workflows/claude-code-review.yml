@@ -1,7 +1,9 @@
 name: Claude Code Review
 
 on:
-  pull_request:
+  # Use default-branch workflow content for the review job, but only allow
+  # same-repo PR heads below. The PR head is checked out explicitly by SHA.
+  pull_request_target:
     types: [opened, synchronize, ready_for_review, reopened]
 
 concurrency:
@@ -34,7 +36,7 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 1
-          ref: refs/pull/${{ github.event.pull_request.number }}/head
+          ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
 
       - name: Run Claude Code Review
@@ -223,6 +225,7 @@ jobs:
                 })
                 .sort((a, b) => Date.parse(a.submitted_at || 0) - Date.parse(b.submitted_at || 0));
 
+              const publishedRunReviews = runReviews.filter(isPublishedReview);
               let keepReview = null;
               if (runReviews.length === 0) {
                 if (process.env.REVIEW_VERIFIED === 'true' || process.env.REVIEW_JOB_RESULT === 'success') {
@@ -231,7 +234,9 @@ jobs:
                   core.info('No claude-authored PR review found during cleanup because the main review job already failed before verification completed.');
                 }
               } else {
-                keepReview = runReviews.find(isPublishedReview) || null;
+                keepReview = publishedRunReviews.length > 0
+                  ? publishedRunReviews[publishedRunReviews.length - 1]
+                  : null;
               }
 
               const strayReviews = runReviews.filter((r) => !isPublishedReview(r));
