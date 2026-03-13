@@ -18,6 +18,8 @@ pub struct OpenAiProvider {
     client: reqwest::Client,
     api_key: String,
     base_url: String,
+    http_referer: Option<String>,
+    title: Option<String>,
 }
 
 impl OpenAiProvider {
@@ -36,6 +38,8 @@ impl OpenAiProvider {
             client,
             api_key,
             base_url: "https://api.openai.com".to_string(),
+            http_referer: None,
+            title: None,
         })
     }
 
@@ -53,6 +57,28 @@ impl OpenAiProvider {
         }
         // Strip trailing slash for consistent path joining
         self.base_url = url.trim_end_matches('/').to_string();
+        Ok(self)
+    }
+
+    pub fn with_http_referer(mut self, value: String) -> Result<Self, AgentError> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(AgentError::Provider(
+                "OpenAI HTTP-Referer header must not be empty".to_string(),
+            ));
+        }
+        self.http_referer = Some(value.to_string());
+        Ok(self)
+    }
+
+    pub fn with_title(mut self, value: String) -> Result<Self, AgentError> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(AgentError::Provider(
+                "OpenAI X-Title header must not be empty".to_string(),
+            ));
+        }
+        self.title = Some(value.to_string());
         Ok(self)
     }
 
@@ -110,18 +136,24 @@ impl OpenAiProvider {
         }
         let url = format!("{}/v1/chat/completions", self.base_url);
 
+        let mut request_builder = self
+            .client
+            .post(&url)
+            .header("authorization", format!("Bearer {}", self.api_key))
+            .header("content-type", "application/json")
+            .header("accept", "text/event-stream");
+        if let Some(ref value) = self.http_referer {
+            request_builder = request_builder.header("HTTP-Referer", value);
+        }
+        if let Some(ref value) = self.title {
+            request_builder = request_builder.header("X-Title", value);
+        }
+
         let response = tokio::select! {
             _ = cancel_token.cancelled() => {
                 return Err(AgentError::Cancelled);
             }
-            response = self
-                .client
-                .post(&url)
-                .header("authorization", format!("Bearer {}", self.api_key))
-                .header("content-type", "application/json")
-                .header("accept", "text/event-stream")
-                .json(&body)
-                .send() => {
+            response = request_builder.json(&body).send() => {
                     response.map_err(|e| AgentError::Provider(format!("HTTP request failed: {e}")))?
                 }
         };

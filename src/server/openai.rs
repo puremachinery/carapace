@@ -11,11 +11,13 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use futures_util::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::agent::provider::{
@@ -287,6 +289,51 @@ fn convert_to_llm_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<Llm
     (system, llm_messages)
 }
 
+#[derive(Debug)]
+struct CancelOnDrop {
+    token: CancellationToken,
+}
+
+impl CancelOnDrop {
+    fn new(token: CancellationToken) -> Self {
+        Self { token }
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.token.cancel();
+    }
+}
+
+struct SseBodyStream {
+    rx: tokio::sync::mpsc::Receiver<Result<String, Infallible>>,
+    _guard: CancelOnDrop,
+}
+
+impl SseBodyStream {
+    fn new(
+        rx: tokio::sync::mpsc::Receiver<Result<String, Infallible>>,
+        cancel_token: CancellationToken,
+    ) -> Self {
+        Self {
+            rx,
+            _guard: CancelOnDrop::new(cancel_token),
+        }
+    }
+}
+
+impl Stream for SseBodyStream {
+    type Item = Result<String, Infallible>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.rx.poll_recv(cx)
+    }
+}
+
 /// Call the LLM provider and collect the full response (non-streaming collection).
 ///
 /// Returns `(response_text, usage)` on success.
@@ -295,6 +342,7 @@ async fn call_llm_provider(
     model: &str,
     system: Option<String>,
     messages: Vec<LlmMessage>,
+    cancel_token: CancellationToken,
 ) -> Result<(String, TokenUsage), String> {
     let request = CompletionRequest {
         model: model.to_string(),
@@ -306,9 +354,9 @@ async fn call_llm_provider(
         extra: None,
     };
 
+    let _cancel_guard = CancelOnDrop::new(cancel_token.clone());
     let mut rx = provider
-        // TODO: plumb request-level cancellation into provider calls.
-        .complete(request, tokio_util::sync::CancellationToken::new())
+        .complete(request, cancel_token)
         .await
         .map_err(|e| format!("LLM provider error: {}", e))?;
 
@@ -345,6 +393,7 @@ async fn stream_llm_provider(
     messages: Vec<LlmMessage>,
     response_id: String,
     created: i64,
+    cancel_token: CancellationToken,
 ) -> Response {
     let request = CompletionRequest {
         model: model.clone(),
@@ -356,58 +405,92 @@ async fn stream_llm_provider(
         extra: None,
     };
 
-    let rx = match provider
-        // TODO: plumb request-level cancellation into provider calls.
-        .complete(request, tokio_util::sync::CancellationToken::new())
-        .await
-    {
+    let rx = match provider.complete(request, cancel_token.clone()).await {
         Ok(rx) => rx,
         Err(e) => {
             return build_error_sse_response(e.to_string());
         }
     };
 
-    let stream = async_stream::stream! {
+    let (tx, output_rx) = tokio::sync::mpsc::channel::<Result<String, Infallible>>(16);
+    tokio::spawn(async move {
         let mut rx = rx;
 
-        yield Ok::<_, Infallible>(format_sse_chunk(&build_chunk(
-            &response_id, created, &model,
-            Some("assistant".to_string()), None, None,
-        )));
+        if tx
+            .send(Ok(format_sse_chunk(&build_chunk(
+                &response_id,
+                created,
+                &model,
+                Some("assistant".to_string()),
+                None,
+                None,
+            ))))
+            .await
+            .is_err()
+        {
+            return;
+        }
 
         while let Some(event) = rx.recv().await {
-            match event {
-                StreamEvent::TextDelta { text } => {
-                    yield Ok::<_, Infallible>(format_sse_chunk(&build_chunk(
-                        &response_id, created, &model, None, Some(text), None,
-                    )));
-                }
+            let (line, should_finish) = match event {
+                StreamEvent::TextDelta { text } => (
+                    Ok(format_sse_chunk(&build_chunk(
+                        &response_id,
+                        created,
+                        &model,
+                        None,
+                        Some(text),
+                        None,
+                    ))),
+                    false,
+                ),
                 StreamEvent::Stop { reason, .. } => {
                     let finish = match reason {
                         StopReason::EndTurn => "stop",
                         StopReason::MaxTokens => "length",
                         StopReason::ToolUse => "stop",
                     };
-                    yield Ok::<_, Infallible>(format_sse_chunk(&build_chunk(
-                        &response_id, created, &model, None, None, Some(finish.to_string()),
-                    )));
-                    break;
+                    (
+                        Ok(format_sse_chunk(&build_chunk(
+                            &response_id,
+                            created,
+                            &model,
+                            None,
+                            None,
+                            Some(finish.to_string()),
+                        ))),
+                        true,
+                    )
                 }
                 StreamEvent::Error { message } => {
                     tracing::error!(error = %message, "streaming LLM error");
-                    yield Ok::<_, Infallible>(format_sse_chunk(&build_chunk(
-                        &response_id, created, &model, None, None, Some("stop".to_string()),
-                    )));
-                    break;
+                    (
+                        Ok(format_sse_chunk(&build_chunk(
+                            &response_id,
+                            created,
+                            &model,
+                            None,
+                            None,
+                            Some("stop".to_string()),
+                        ))),
+                        true,
+                    )
                 }
-                StreamEvent::ToolUse { .. } => {}
+                StreamEvent::ToolUse { .. } => continue,
+            };
+
+            if tx.send(line).await.is_err() {
+                return;
+            }
+            if should_finish {
+                break;
             }
         }
 
-        yield Ok::<_, Infallible>("data: [DONE]\n\n".to_string());
-    };
+        let _ = tx.send(Ok("data: [DONE]\n\n".to_string())).await;
+    });
 
-    let body = Body::from_stream(stream);
+    let body = Body::from_stream(SseBodyStream::new(output_rx, cancel_token));
     sse_response(body)
 }
 
@@ -555,12 +638,22 @@ pub async fn chat_completions_handler(
 
     if req.stream {
         // Streaming response via the LLM provider
-        return stream_llm_provider(provider, model, system, llm_messages, response_id, created)
-            .await;
+        let cancel_token = CancellationToken::new();
+        return stream_llm_provider(
+            provider,
+            model,
+            system,
+            llm_messages,
+            response_id,
+            created,
+            cancel_token,
+        )
+        .await;
     }
 
     // Non-streaming response: call the LLM provider and collect the result
-    match call_llm_provider(&*provider, &model, system, llm_messages).await {
+    let cancel_token = CancellationToken::new();
+    match call_llm_provider(&*provider, &model, system, llm_messages, cancel_token).await {
         Ok((text, usage)) => {
             let response = ChatCompletionResponse {
                 id: response_id,
@@ -904,7 +997,8 @@ pub async fn responses_handler(
     };
 
     // Non-streaming: call the LLM provider and collect the result
-    match call_llm_provider(&*provider, &model, system, llm_messages).await {
+    let cancel_token = CancellationToken::new();
+    match call_llm_provider(&*provider, &model, system, llm_messages, cancel_token).await {
         Ok((text, usage)) => {
             let response = ResponsesResponse {
                 id: response_id,
@@ -1309,6 +1403,22 @@ mod tests {
         }
     }
 
+    struct CancellationAwareProvider {
+        cancelled_tx: parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    impl CancellationAwareProvider {
+        fn new() -> (Self, tokio::sync::oneshot::Receiver<()>) {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            (
+                Self {
+                    cancelled_tx: parking_lot::Mutex::new(Some(tx)),
+                },
+                rx,
+            )
+        }
+    }
+
     #[async_trait]
     impl LlmProvider for MockLlmProvider {
         async fn complete(
@@ -1330,6 +1440,24 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl LlmProvider for CancellationAwareProvider {
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+            cancel_token: CancellationToken,
+        ) -> Result<mpsc::Receiver<StreamEvent>, AgentError> {
+            if let Some(tx) = self.cancelled_tx.lock().take() {
+                tokio::spawn(async move {
+                    cancel_token.cancelled().await;
+                    let _ = tx.send(());
+                });
+            }
+            let (_tx, rx) = mpsc::channel(1);
+            Ok(rx)
+        }
+    }
+
     #[tokio::test]
     async fn test_call_llm_provider_text_response() {
         let provider = MockLlmProvider::text_response("Hello from LLM!", 50, 10);
@@ -1340,7 +1468,14 @@ mod tests {
             }],
         }];
 
-        let result = call_llm_provider(&provider, "claude-sonnet-4-20250514", None, messages).await;
+        let result = call_llm_provider(
+            &provider,
+            "claude-sonnet-4-20250514",
+            None,
+            messages,
+            CancellationToken::new(),
+        )
+        .await;
         assert!(result.is_ok());
         let (text, usage) = result.unwrap();
         assert_eq!(text, "Hello from LLM!");
@@ -1358,7 +1493,14 @@ mod tests {
             }],
         }];
 
-        let result = call_llm_provider(&provider, "claude-sonnet-4-20250514", None, messages).await;
+        let result = call_llm_provider(
+            &provider,
+            "claude-sonnet-4-20250514",
+            None,
+            messages,
+            CancellationToken::new(),
+        )
+        .await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "Rate limited");
     }
@@ -1387,7 +1529,14 @@ mod tests {
             }],
         }];
 
-        let result = call_llm_provider(&provider, "claude-sonnet-4-20250514", None, messages).await;
+        let result = call_llm_provider(
+            &provider,
+            "claude-sonnet-4-20250514",
+            None,
+            messages,
+            CancellationToken::new(),
+        )
+        .await;
         assert!(result.is_ok());
         let (text, _) = result.unwrap();
         assert_eq!(text, "Hello world!");
@@ -1408,11 +1557,69 @@ mod tests {
             "claude-sonnet-4-20250514",
             Some("You are helpful".to_string()),
             messages,
+            CancellationToken::new(),
         )
         .await;
         assert!(result.is_ok());
         let (text, _) = result.unwrap();
         assert_eq!(text, "I'm helpful!");
+    }
+
+    #[tokio::test]
+    async fn test_call_llm_provider_cancels_when_request_future_is_dropped() {
+        let (provider, cancelled_rx) = CancellationAwareProvider::new();
+        let messages = vec![LlmMessage {
+            role: LlmRole::User,
+            content: vec![ContentBlock::Text {
+                text: "Hi".to_string(),
+            }],
+        }];
+
+        let handle = tokio::spawn(async move {
+            call_llm_provider(
+                &provider,
+                "gpt-4o",
+                None,
+                messages,
+                CancellationToken::new(),
+            )
+            .await
+        });
+
+        tokio::task::yield_now().await;
+        handle.abort();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), cancelled_rx)
+            .await
+            .expect("provider cancellation was not signaled after request drop")
+            .expect("cancellation signal channel unexpectedly dropped");
+    }
+
+    #[tokio::test]
+    async fn test_stream_llm_provider_cancels_when_response_body_is_dropped() {
+        let (provider, cancelled_rx) = CancellationAwareProvider::new();
+        let response = stream_llm_provider(
+            Arc::new(provider),
+            "gpt-4o".to_string(),
+            None,
+            vec![LlmMessage {
+                role: LlmRole::User,
+                content: vec![ContentBlock::Text {
+                    text: "Hi".to_string(),
+                }],
+            }],
+            "chatcmpl_test".to_string(),
+            chrono::Utc::now().timestamp(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        drop(response);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), cancelled_rx)
+            .await
+            .expect("provider cancellation was not signaled after streaming response drop")
+            .expect("cancellation signal channel unexpectedly dropped");
     }
 
     // ============== Handler integration tests ==============
