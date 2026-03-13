@@ -99,6 +99,11 @@ where
 }
 
 /// Validate that a requested path is allowed by the configured roots and exclude patterns.
+///
+/// SECURITY: this check canonicalizes and validates the path before later file operations, but
+/// local filesystem mutations can still race between validation and use. That TOCTOU risk is
+/// accepted for this local-assistant feature; call sites should still minimize the gap and avoid
+/// broadening capabilities around symlink or directory traversal behavior.
 pub fn validate_path(
     requested: &str,
     roots: &[PathBuf],
@@ -238,14 +243,26 @@ impl FilesystemConfig {
             Some(Value::Array(arr)) => arr
                 .iter()
                 .filter_map(|value| match value.as_str() {
-                    Some(root) => match std::fs::canonicalize(root) {
-                        Ok(path) => Some(path),
-                        Err(e) => {
-                            tracing::error!(root = %root, error = %e, "filesystem root cannot be resolved; filesystem tools will be disabled");
+                    Some(root) => {
+                        let path = std::path::Path::new(root);
+                        if !path.is_absolute() {
+                            tracing::error!(
+                                root = %root,
+                                "filesystem root must be absolute; filesystem tools will be disabled"
+                            );
                             poisoned = true;
                             None
+                        } else {
+                            match std::fs::canonicalize(path) {
+                                Ok(path) => Some(path),
+                                Err(e) => {
+                                    tracing::error!(root = %root, error = %e, "filesystem root cannot be resolved; filesystem tools will be disabled");
+                                    poisoned = true;
+                                    None
+                                }
+                            }
                         }
-                    },
+                    }
                     None => {
                         tracing::error!(
                             "filesystem.roots contains a non-string entry; filesystem tools will be disabled"
@@ -440,7 +457,8 @@ fn file_read_tool(config: Arc<FilesystemConfig>) -> BuiltinTool {
                     return ToolInvokeResult::tool_error(msg);
                 }
 
-                let truncated = file_size > offset + buf.len() as u64;
+                let bytes_read = buf.len() as u64;
+                let truncated = file_size > offset.saturating_add(bytes_read);
                 let check_len = buf.len().min(8192);
                 let is_binary = buf[..check_len].contains(&0u8);
 
@@ -705,11 +723,6 @@ fn file_search_tool(config: Arc<FilesystemConfig>) -> BuiltinTool {
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
 
-            let canonical_root =
-                match validate_path(&search_root, &config.roots, &config.exclude_patterns) {
-                    Ok(p) => p,
-                    Err(e) => return ToolInvokeResult::tool_error(e),
-                };
             let glob_pattern = match Pattern::new(&name_pattern) {
                 Ok(p) => p,
                 Err(e) => {
@@ -739,6 +752,15 @@ fn file_search_tool(config: Arc<FilesystemConfig>) -> BuiltinTool {
 
             let search_config = Arc::clone(&config);
             let do_search = move || {
+                let canonical_root = match validate_path(
+                    &search_root,
+                    &search_config.roots,
+                    &search_config.exclude_patterns,
+                ) {
+                    Ok(p) => p,
+                    Err(e) => return ToolInvokeResult::tool_error(e),
+                };
+
                 struct WalkCtx<'a> {
                     max_depth: usize,
                     budget: usize,
@@ -852,25 +874,14 @@ fn file_search_tool(config: Arc<FilesystemConfig>) -> BuiltinTool {
 
                 walk(&canonical_root, 0, &mut ctx);
 
-                json!({
+                ToolInvokeResult::success(json!({
                     "matches": ctx.matches,
                     "entriesScanned": ctx.entries_scanned,
                     "skippedNonUtf8": ctx.skipped_non_utf8,
                     "truncated": ctx.truncated
-                })
+                }))
             };
-            let result = match run_sync_blocking_send(async move {
-                tokio::task::spawn_blocking(do_search)
-                    .await
-                    .map_err(|e| format!("filesystem search worker failed: {e}"))
-            }) {
-                Ok(result) => result,
-                Err(e) => {
-                    return ToolInvokeResult::tool_error(format!("filesystem search failed: {e}"))
-                }
-            };
-
-            ToolInvokeResult::success(result)
+            run_blocking_tool("filesystem search", do_search)
         }),
     }
 }
@@ -2157,6 +2168,18 @@ mod tests {
                 "enabled": true,
                 "roots": [tmp.path().to_str().unwrap()],
                 "excludePatterns": [123]
+            }
+        });
+        let tools = filesystem_tools(&cfg);
+        assert!(tools.is_empty());
+    }
+
+    #[test]
+    fn test_filesystem_tools_disable_on_relative_root_config() {
+        let cfg = json!({
+            "filesystem": {
+                "enabled": true,
+                "roots": ["./relative-root"]
             }
         });
         let tools = filesystem_tools(&cfg);

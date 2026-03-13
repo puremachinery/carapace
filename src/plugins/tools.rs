@@ -764,10 +764,11 @@ mod tests {
 
     #[test]
     fn test_with_config_filesystem_enabled_read_only() {
+        let root = tempfile::TempDir::new().unwrap();
         let cfg = serde_json::json!({
             "filesystem": {
                 "enabled": true,
-                "roots": ["/tmp"],
+                "roots": [root.path().to_str().unwrap()],
                 "writeAccess": false
             }
         });
@@ -782,10 +783,11 @@ mod tests {
 
     #[test]
     fn test_with_config_filesystem_enabled_write_access() {
+        let root = tempfile::TempDir::new().unwrap();
         let cfg = serde_json::json!({
             "filesystem": {
                 "enabled": true,
-                "roots": ["/tmp"],
+                "roots": [root.path().to_str().unwrap()],
                 "writeAccess": true
             }
         });

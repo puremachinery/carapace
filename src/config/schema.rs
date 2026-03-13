@@ -904,9 +904,23 @@ fn validate_vertex(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schema
 }
 
 fn validate_filesystem(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIssue>) {
-    let fs_cfg = match obj.get("filesystem").and_then(|v| v.as_object()) {
-        Some(f) => f,
+    let filesystem = match obj.get("filesystem") {
+        Some(value) => value,
         None => return,
+    };
+    let fs_cfg = match filesystem.as_object() {
+        Some(f) => f,
+        None => {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: ".filesystem".to_string(),
+                message: format!(
+                    "filesystem configuration must be an object, got {}",
+                    json_type_label(filesystem)
+                ),
+            });
+            return;
+        }
     };
 
     let enabled = match fs_cfg.get("enabled") {
@@ -998,7 +1012,7 @@ fn validate_filesystem(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Sc
                     });
                 } else if !path.exists() {
                     issues.push(SchemaIssue {
-                        severity: Severity::Warning,
+                        severity: Severity::Error,
                         path: format!(".filesystem.roots[{}]", i),
                         message: format!("filesystem root does not exist: \"{}\"", s),
                     });
@@ -1594,7 +1608,7 @@ mod tests {
     }
 
     #[test]
-    fn test_filesystem_nonexistent_path_warns() {
+    fn test_filesystem_nonexistent_path_is_error() {
         let missing_root = nonexistent_filesystem_root();
         let config = json!({
             "filesystem": {
@@ -1605,7 +1619,7 @@ mod tests {
         let issues = validate_schema(&config);
         assert!(issues
             .iter()
-            .any(|i| i.severity == Severity::Warning && i.message.contains("does not exist")));
+            .any(|i| i.severity == Severity::Error && i.message.contains("does not exist")));
     }
 
     #[test]
@@ -1738,6 +1752,19 @@ mod tests {
             i.severity == Severity::Error
                 && i.path == ".filesystem.maxReadBytes"
                 && i.message.contains("must be a non-negative integer")
+        }));
+    }
+
+    #[test]
+    fn test_filesystem_non_object_is_error() {
+        let config = json!({
+            "filesystem": true
+        });
+        let issues = validate_schema(&config);
+        assert!(issues.iter().any(|i| {
+            i.severity == Severity::Error
+                && i.path == ".filesystem"
+                && i.message.contains("must be an object")
         }));
     }
 
