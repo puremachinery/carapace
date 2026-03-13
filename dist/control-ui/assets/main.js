@@ -1031,7 +1031,7 @@
       scopes: ["operator.admin", "operator.pairing"],
       client: {
         id: "carapace-control-ui",
-        version: "0.1.0",
+        version: "0.2.0",
         platform: navigator.platform || "web",
         mode: "ui",
       },
