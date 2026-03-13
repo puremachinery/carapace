@@ -1,9 +1,10 @@
 name: Claude Code Review
 
 on:
-  # Use default-branch workflow content for same-repo automatic PR reviews.
-  # Review uses GitHub PR context only; do not check out PR head in this job.
-  pull_request_target:
+  # Use pull_request because Anthropic's app-token exchange currently succeeds on
+  # this event model. Review remains same-repo-only and GitHub-context-only;
+  # this workflow does not check out PR head.
+  pull_request:
     types: [opened, synchronize, ready_for_review, reopened]
 
 concurrency:
