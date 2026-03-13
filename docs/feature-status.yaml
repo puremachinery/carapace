@@ -211,7 +211,7 @@ feature_inventory_markdown: |
   - [x] **Tool dispatch** — tool invocation routing with collision warnings
   - [x] **Hook dispatch** — lifecycle hook routing
   - [x] **Webhook dispatch** — HTTP webhook routing
-  - [x] **Builtin tools** — 11 always-on core tools (current_time, web_fetch, media_analyze, memory_read/write/list, message_send, session_list/read, config_read, math_eval) plus 6 config-gated filesystem tools when `filesystem.enabled` is true
+  - [x] **Builtin tools** — 12 always-on core tools (`time` plus current_time, web_fetch, media_analyze, memory_read/write/list, message_send, session_list/read, config_read, math_eval) plus 6 config-gated filesystem tools when `filesystem.enabled` is true
 
   ### Server (`src/server/`)
 
