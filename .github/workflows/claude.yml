@@ -3,40 +3,27 @@ name: Claude Code
 on:
   issue_comment:
     types: [created]
-  issues:
-    types: [opened]
 
 concurrency:
-  group: claude-${{ github.event_name }}-${{ github.event.comment.id || github.event.issue.id || github.run_id }}
+  group: claude-pr-comment-${{ github.event.comment.id || github.run_id }}
   cancel-in-progress: true
 
 jobs:
-  claude:
+  claude-pr-review:
     if: |
       github.actor != 'claude[bot]' &&
-      (
-        (
-          github.event_name == 'issue_comment' &&
-          contains(github.event.comment.body || '', '@claude') &&
-          contains(fromJson('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
-        ) ||
-        (
-          github.event_name == 'issues' &&
-          (contains(github.event.issue.body || '', '@claude') || contains(github.event.issue.title || '', '@claude')) &&
-          contains(fromJson('["OWNER","MEMBER","COLLABORATOR"]'), github.event.issue.author_association)
-        )
-      )
+      github.event.issue.pull_request &&
+      contains(github.event.comment.body || '', '@claude') &&
+      contains(fromJson('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      pull-requests: write
-      issues: write
+      pull-requests: read
+      issues: read
       id-token: write
-      actions: read
     steps:
-      - name: Resolve PR head checkout target
-        id: pr_head
-        if: github.event_name == 'issue_comment' && github.event.issue.pull_request
+      - name: Resolve PR context
+        id: pr-context
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
@@ -48,29 +35,179 @@ jobs:
             -H 'X-GitHub-Api-Version: 2022-11-28' \
             "${{ github.api_url }}/repos/${{ github.repository }}/pulls/${{ github.event.issue.number }}")"
 
-          head_repo="$(printf '%s' "$pr_json" | jq -r '.head.repo.full_name')"
-          head_ref="$(printf '%s' "$pr_json" | jq -r '.head.ref')"
+          head_sha="$(printf '%s' "$pr_json" | jq -r '.head.sha')"
+          base_sha="$(printf '%s' "$pr_json" | jq -r '.base.sha')"
 
-          if [ -z "$head_repo" ] || [ "$head_repo" = "null" ] || [ -z "$head_ref" ] || [ "$head_ref" = "null" ]; then
-            echo "Failed to resolve PR head repository/ref for #${{ github.event.issue.number }}" >&2
+          if [ -z "$head_sha" ] || [ "$head_sha" = "null" ] || [ -z "$base_sha" ] || [ "$base_sha" = "null" ]; then
+            echo "Failed to resolve PR head/base sha for #${{ github.event.issue.number }}" >&2
             exit 1
           fi
 
-          echo "repository=$head_repo" >> "$GITHUB_OUTPUT"
-          echo "ref=$head_ref" >> "$GITHUB_OUTPUT"
+          {
+            echo "pr_number=${{ github.event.issue.number }}"
+            echo "head_sha=$head_sha"
+            echo "base_sha=$base_sha"
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          repository: ${{ steps.pr_head.outputs.repository || github.repository }}
-          ref: ${{ steps.pr_head.outputs.ref || github.event.repository.default_branch }}
-          fetch-depth: 1
-
-      - name: Run Claude Code
+      - name: Run Claude PR review analysis (GitHub-context only)
         id: claude
         uses: anthropics/claude-code-action@26ec041249acb0a944c0a47b6c0c13f05dbc5b44 # v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          settings: |
+            {
+              "permissions": {
+                "deny": [
+                  "Bash",
+                  "Edit",
+                  "Glob",
+                  "Grep",
+                  "LS",
+                  "MultiEdit",
+                  "NotebookEdit",
+                  "NotebookRead",
+                  "Read",
+                  "Task",
+                  "TodoWrite",
+                  "WebFetch",
+                  "WebSearch",
+                  "Write"
+                ]
+              }
+            }
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ steps.pr-context.outputs.pr_number }}
+            BASE SHA: ${{ steps.pr-context.outputs.base_sha }}
+            EXPECTED HEAD SHA: ${{ steps.pr-context.outputs.head_sha }}
+            REQUESTING COMMENT URL: ${{ github.event.comment.html_url }}
+            REQUESTING COMMENT AUTHOR: ${{ github.event.comment.user.login }}
+            REQUESTING COMMENT BODY:
+            ${{ github.event.comment.body }}
 
-          additional_permissions: |
-            actions: read
+            You are replying to a manual PR review request.
+
+            IMPORTANT:
+            - Review this pull request using GitHub PR context only; do not rely on a checked-out workspace.
+            - Do NOT post any GitHub comments or reviews yourself.
+            - Do NOT modify repository contents, branches, pull requests, or issues.
+            - Do NOT claim to have changed code.
+            - Respond as a safe reviewer only: explain findings, answer questions, or summarize concerns from the current PR state.
+            - If the requesting comment asks for review, prioritize correctness/regressions, security issues, and test gaps.
+            - Return only the structured object matching the schema below.
+            - Do not wrap the structured output in markdown or code fences.
+
+            Required structured output example:
+            {
+              "body": "Markdown response body"
+            }
+          claude_args: |
+            --json-schema '{"type":"object","additionalProperties":false,"properties":{"body":{"type":"string","pattern":"\\S"}},"required":["body"]}'
+
+      - name: Persist structured response
+        env:
+          RESPONSE_JSON: ${{ steps.claude.outputs.structured_output }}
+          RESPONSE_JSON_PATH: ${{ runner.temp }}/claude-pr-comment-response.json
+        run: |
+          if [ -z "$RESPONSE_JSON" ]; then
+            echo "ERROR: Structured response output is empty." >&2
+            exit 1
+          fi
+          printf '%s' "$RESPONSE_JSON" > "$RESPONSE_JSON_PATH"
+
+      - name: Validate structured response
+        env:
+          RESPONSE_JSON_PATH: ${{ runner.temp }}/claude-pr-comment-response.json
+        run: |
+          test -f "$RESPONSE_JSON_PATH"
+          jq -e '
+            type == "object" and
+            (.body | type == "string" and (. | gsub("^\\s+|\\s+$"; "") | length > 0))
+          ' "$RESPONSE_JSON_PATH" >/dev/null
+
+      - name: Re-resolve PR head before publish
+        id: pr-head-check
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          current_head_sha="$(curl -fsSL \
+            -H 'Accept: application/vnd.github+json' \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "${{ github.api_url }}/repos/${{ github.repository }}/pulls/${{ steps.pr-context.outputs.pr_number }}" | jq -r '.head.sha')"
+
+          if [ -z "$current_head_sha" ] || [ "$current_head_sha" = "null" ]; then
+            echo "Failed to re-resolve PR head sha for #${{ steps.pr-context.outputs.pr_number }}" >&2
+            exit 1
+          fi
+
+          {
+            echo "current_head_sha=$current_head_sha"
+            if [ "$current_head_sha" = "${{ steps.pr-context.outputs.head_sha }}" ]; then
+              echo "head_moved=false"
+            else
+              echo "head_moved=true"
+            fi
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish Claude reply comment
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        env:
+          RESPONSE_JSON_PATH: ${{ runner.temp }}/claude-pr-comment-response.json
+          REVIEW_MARKER: "<!-- claude-pr-comment-run:${{ github.run_id }}:${{ github.run_attempt }} -->"
+          HEAD_MOVED: ${{ steps.pr-head-check.outputs.head_moved }}
+          INITIAL_HEAD_SHA: ${{ steps.pr-context.outputs.head_sha }}
+          CURRENT_HEAD_SHA: ${{ steps.pr-head-check.outputs.current_head_sha }}
+          REQUEST_COMMENT_URL: ${{ github.event.comment.html_url }}
+          REQUEST_COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
+        with:
+          github-token: ${{ steps.claude.outputs.github_token }}
+          script: |
+            const fs = require('fs');
+            const marker = process.env.REVIEW_MARKER || '';
+            const replyHeader = `In response to [this comment](${process.env.REQUEST_COMMENT_URL}) from @${process.env.REQUEST_COMMENT_AUTHOR}.`;
+            const moved = process.env.HEAD_MOVED === 'true';
+            let body;
+
+            if (moved) {
+              body = [
+                marker,
+                replyHeader,
+                '',
+                `The PR head changed while this review was running (${process.env.INITIAL_HEAD_SHA} -> ${process.env.CURRENT_HEAD_SHA}).`,
+                'Please rerun `@claude review` on the current head.',
+              ].join('\n');
+            } else {
+              const path = process.env.RESPONSE_JSON_PATH || '';
+              if (!path || !fs.existsSync(path)) {
+                core.setFailed(`Validated structured response file not found: ${path}`);
+                return;
+              }
+              const raw = fs.readFileSync(path, 'utf8');
+              if (!raw.trim()) {
+                core.setFailed(`Validated structured response file is empty: ${path}`);
+                return;
+              }
+              const response = JSON.parse(raw);
+              body = [
+                marker,
+                replyHeader,
+                '',
+                response.body.trim(),
+              ].join('\n');
+            }
+
+            const me = await github.rest.users.getAuthenticated();
+            if (me.data.login !== 'claude[bot]') {
+              core.setFailed(`Expected claude[bot] token for publishing comment, got ${me.data.login}.`);
+              return;
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
