@@ -298,7 +298,6 @@ pub struct VertexProvider {
     location: String,
     token_manager: Arc<dyn TokenProvider>,
     token_cache: Arc<RwLock<Option<CachedToken>>>,
-    default_model: Option<String>,
 }
 
 impl std::fmt::Debug for VertexProvider {
@@ -311,11 +310,7 @@ impl std::fmt::Debug for VertexProvider {
 }
 
 impl VertexProvider {
-    pub fn new(
-        project_id: String,
-        location: String,
-        default_model: Option<String>,
-    ) -> Result<Self, AgentError> {
+    pub fn new(project_id: String, location: String) -> Result<Self, AgentError> {
         static PROJECT_ID_REGEX: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
         let project_id_re = PROJECT_ID_REGEX
             .get_or_init(|| regex::Regex::new(r"^[a-z][a-z0-9-]{4,28}[a-z0-9]$").unwrap());
@@ -351,7 +346,6 @@ impl VertexProvider {
             location,
             token_manager,
             token_cache: Arc::new(RwLock::new(None)),
-            default_model,
         })
     }
 
@@ -396,16 +390,10 @@ impl VertexProvider {
     fn resolve_request_config(&self, model_name: &str) -> Result<String, AgentError> {
         let clean_model = strip_vertex_prefix(model_name);
 
-        // Handle generic fallback
         let effective_model = if clean_model.is_empty() || clean_model == "default" {
-            if let Some(ref default) = self.default_model {
-                strip_vertex_prefix(default)
-            } else {
-                return Err(AgentError::Provider(
-                    "Missing required model parameter and no default model is configured."
-                        .to_string(),
-                ));
-            }
+            return Err(AgentError::Provider(
+                "Model name must be provided".to_string(),
+            ));
         } else {
             clean_model
         };
@@ -784,17 +772,12 @@ mod tests {
 
     #[test]
     fn test_resolve_request_config() {
-        let provider = VertexProvider::new(
-            "my-project".to_string(),
-            "us-central1".to_string(),
-            Some("gemini-1.5-flash".to_string()),
-        )
-        .unwrap();
+        let provider =
+            VertexProvider::new("my-project".to_string(), "us-central1".to_string()).unwrap();
 
-        // Gemini generic fallback
-        let url = provider.resolve_request_config("vertex/default").unwrap();
-        assert!(url.contains("publishers/google/models/gemini-1.5-flash"));
-        assert!(url.contains("us-central1"));
+        // Missing/default model should error
+        assert!(provider.resolve_request_config("vertex/default").is_err());
+        assert!(provider.resolve_request_config("").is_err());
 
         // Gemini 1.5 specific
         let url = provider
@@ -817,62 +800,47 @@ mod tests {
         assert!(provider
             .resolve_request_config("gemini-1.5-pro%2f%2e%2e%2f")
             .is_err());
-
-        // Missing default model test
-        let provider_no_default =
-            VertexProvider::new("my-project".to_string(), "us-central1".to_string(), None).unwrap();
-        assert!(provider_no_default
-            .resolve_request_config("vertex/default")
-            .is_err());
     }
 
     #[test]
     fn test_vertex_provider_validation() {
         // Valid params
-        assert!(
-            VertexProvider::new("my-project".to_string(), "us-central1".to_string(), None).is_ok()
-        );
-        assert!(VertexProvider::new("my-project".to_string(), "global".to_string(), None).is_ok());
+        assert!(VertexProvider::new("my-project".to_string(), "us-central1".to_string()).is_ok());
+        assert!(VertexProvider::new("my-project".to_string(), "global".to_string()).is_ok());
 
         // Invalid project ID (too short)
-        assert!(VertexProvider::new("my-p".to_string(), "us-central1".to_string(), None).is_err());
+        assert!(VertexProvider::new("my-p".to_string(), "us-central1".to_string()).is_err());
 
         // Invalid project ID (invalid characters)
-        assert!(
-            VertexProvider::new("my_project".to_string(), "us-central1".to_string(), None).is_err()
-        );
+        assert!(VertexProvider::new("my_project".to_string(), "us-central1".to_string()).is_err());
 
         // Valid location (multi-hyphen region)
         assert!(VertexProvider::new(
             "my-project".to_string(),
-            "northamerica-northeast1".to_string(),
-            None
+            "northamerica-northeast1".to_string()
         )
         .is_ok());
 
         // Valid location (another multi-hyphen region name)
-        assert!(VertexProvider::new(
-            "my-project".to_string(),
-            "southamerica-east1".to_string(),
-            None
-        )
-        .is_ok());
+        assert!(
+            VertexProvider::new("my-project".to_string(), "southamerica-east1".to_string()).is_ok()
+        );
 
         // Invalid location (no numbers)
         assert!(
-            VertexProvider::new("my-project".to_string(), "us-central".to_string(), None).is_err()
+            VertexProvider::new("my-project".to_string(), "us-central".to_string()).is_err()
         );
 
         // Invalid location (invalid characters)
         assert!(
-            VertexProvider::new("my-project".to_string(), "us_central1".to_string(), None).is_err()
+            VertexProvider::new("my-project".to_string(), "us_central1".to_string()).is_err()
         );
     }
 
     #[test]
     fn test_vertex_provider_rejects_unsupported_namespace() {
         let provider =
-            VertexProvider::new("my-project".to_string(), "us-central1".to_string(), None).unwrap();
+            VertexProvider::new("my-project".to_string(), "us-central1".to_string()).unwrap();
         let err = provider
             .resolve_request_config("vertex/anthropic/claude-3-opus")
             .expect_err("unsupported publisher namespace should fail");
@@ -886,7 +854,7 @@ mod tests {
     #[test]
     fn test_vertex_provider_rejects_unsupported_bare_model() {
         let provider =
-            VertexProvider::new("my-project".to_string(), "us-central1".to_string(), None).unwrap();
+            VertexProvider::new("my-project".to_string(), "us-central1".to_string()).unwrap();
         let err = provider
             .resolve_request_config("vertex/claude-3-opus")
             .expect_err("unsupported bare model should fail");

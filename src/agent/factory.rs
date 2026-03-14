@@ -168,7 +168,6 @@ fn try_build_provider<P: agent::LlmProvider + 'static>(
 struct VertexConfig {
     project_id: Option<String>,
     location: Option<String>,
-    model: Option<String>,
 }
 
 fn get_vertex_config(cfg: &Value) -> VertexConfig {
@@ -185,17 +184,9 @@ fn get_vertex_config(cfg: &Value) -> VertexConfig {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
     });
-    let model = std::env::var("VERTEX_MODEL").ok().or_else(|| {
-        vertex_cfg
-            .and_then(|v| v.get("model"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    });
-
     VertexConfig {
         project_id,
         location,
-        model,
     }
 }
 
@@ -489,10 +480,10 @@ pub fn build_providers(cfg: &Value) -> Result<Option<MultiProvider>, Box<dyn std
             .location
             .unwrap_or_else(|| "us-central1".to_string());
         info!(
-            "LLM provider configured: Vertex (project: {}, location: {}, model: {:?})",
-            project_id, location, vertex_config.model
+            "LLM provider configured: Vertex (project: {}, location: {})",
+            project_id, location
         );
-        match agent::vertex::VertexProvider::new(project_id, location, vertex_config.model) {
+        match agent::vertex::VertexProvider::new(project_id, location) {
             Ok(provider) => Some(Arc::new(provider) as Arc<dyn agent::LlmProvider>),
             Err(e) => {
                 warn!("Failed to configure Vertex provider: {}", e);
@@ -529,7 +520,7 @@ pub struct ProviderFingerprint {
     pub gemini: Option<(String, Option<String>)>,
     pub venice: Option<(String, Option<String>)>,
     pub bedrock: Option<String>,
-    pub vertex: Option<(String, String, Option<String>)>,
+    pub vertex: Option<(String, String)>,
 }
 
 /// Compute a fingerprint of the provider configuration from config + env vars.
@@ -672,7 +663,6 @@ pub fn fingerprint_providers(cfg: &Value) -> ProviderFingerprint {
                 vertex_config
                     .location
                     .unwrap_or_else(|| "us-central1".to_string()),
-                vertex_config.model,
             )
         }),
     }
@@ -716,7 +706,6 @@ mod tests {
         "AWS_ACCESS_KEY_ID",
         "VERTEX_PROJECT_ID",
         "VERTEX_LOCATION",
-        "VERTEX_MODEL",
     ];
 
     struct EnvVarGuard {
@@ -1229,7 +1218,6 @@ mod tests {
                 "vertex": {
                     "projectId": "my-project",
                     "location": "us-central1",
-                    "model": "gemini-2.0-flash"
                 }
             });
             let fp = fingerprint_providers(&cfg);
@@ -1238,7 +1226,6 @@ mod tests {
                 Some((
                     hash_key_prefix("my-project"),
                     "us-central1".to_string(),
-                    Some("gemini-2.0-flash".to_string())
                 ))
             );
         });

@@ -234,12 +234,7 @@ impl MultiProvider {
     }
 
     fn normalize_model_for_routing<'a>(&self, model: &'a str) -> Cow<'a, str> {
-        if model == crate::agent::DEFAULT_MODEL && self.anthropic.is_none() && self.vertex.is_some()
-        {
-            Cow::Borrowed("vertex:default")
-        } else {
-            Cow::Borrowed(model)
-        }
+        Cow::Borrowed(model)
     }
 
     /// Select the appropriate backend provider for the given model.
@@ -577,30 +572,12 @@ mod tests {
         let vertex = crate::agent::vertex::VertexProvider::new(
             "my-project".to_string(),
             "us-central1".to_string(),
-            None,
         )
         .unwrap();
         let provider =
             MultiProvider::new(None, None).with_vertex(Some(std::sync::Arc::new(vertex)));
         let result = provider.select_provider("vertex:gemini-2.0-flash");
         assert!(result.is_ok(), "expected Ok when Vertex is configured");
-    }
-
-    #[test]
-    fn test_multi_provider_default_model_routes_to_vertex_when_anthropic_missing() {
-        let vertex = crate::agent::vertex::VertexProvider::new(
-            "my-project".to_string(),
-            "us-central1".to_string(),
-            Some("gemini-2.0-flash".to_string()),
-        )
-        .unwrap();
-        let provider =
-            MultiProvider::new(None, None).with_vertex(Some(std::sync::Arc::new(vertex)));
-        let result = provider.select_provider(crate::agent::DEFAULT_MODEL);
-        assert!(
-            result.is_ok(),
-            "expected default model to route to Vertex when Anthropic is absent"
-        );
     }
 
     #[test]

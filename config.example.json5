@@ -148,7 +148,6 @@
   // vertex: {
   //   // projectId: "my-gcp-project",            // or VERTEX_PROJECT_ID
   //   // location: "us-central1",                // or VERTEX_LOCATION
-  //   // model: "vertex/google/gemini-2.0-flash" // or VERTEX_MODEL
   // },
 
   // --- Provider-specific config --------------------------------------------
