@@ -12,11 +12,24 @@ mod golden_trace {
     use crate::server::ws::*;
     use serde_json::{json, Value};
     use std::sync::Arc;
-
     // ───────────────────────── helpers ─────────────────────────
+
+    static INIT: std::sync::Once = std::sync::Once::new();
+
+    fn init_test_env() {
+        INIT.call_once(|| {
+            let state_dir = Box::leak(Box::new(tempfile::TempDir::new().unwrap()));
+            let config_path = state_dir.path().join("carapace.json5");
+            std::fs::write(&config_path, "{}").unwrap();
+
+            std::env::set_var("CARAPACE_STATE_DIR", state_dir.path());
+            std::env::set_var("CARAPACE_CONFIG_PATH", config_path);
+        });
+    }
 
     /// Create a default test server state (in-memory, no persistence).
     fn test_state() -> Arc<WsServerState> {
+        init_test_env();
         Arc::new(WsServerState::new(WsServerConfig::default()))
     }
 
