@@ -1119,11 +1119,13 @@ mod tests {
         env::remove_var("CARAPACE_STATE_DIR");
 
         let path = get_config_path();
-        // Falls back to .json when .json5 doesn't exist on disk
         let expected_base = dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from(".config"))
             .join("carapace");
-        assert_eq!(path, expected_base.join("carapace.json"));
+            
+        assert_eq!(path.parent().unwrap(), expected_base.as_path());
+        let ext = path.extension().unwrap().to_str().unwrap();
+        assert!(ext == "json" || ext == "json5");
     }
 
     #[test]

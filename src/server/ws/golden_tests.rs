@@ -15,9 +15,10 @@ mod golden_trace {
     // ───────────────────────── helpers ─────────────────────────
 
     struct EnvGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
+        _lock: parking_lot::MutexGuard<'static, ()>,
         prev_state: Option<String>,
         prev_config: Option<String>,
+        _temp_dir: tempfile::TempDir,
     }
 
     impl Drop for EnvGuard {
@@ -35,33 +36,35 @@ mod golden_trace {
         }
     }
 
-    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static TEST_LOCK: parking_lot::Mutex<()> = parking_lot::const_mutex(());
 
     fn init_test_env() -> EnvGuard {
-        let lock = TEST_LOCK.lock().unwrap();
+        let lock = TEST_LOCK.lock();
         let prev_state = std::env::var("CARAPACE_STATE_DIR").ok();
         let prev_config = std::env::var("CARAPACE_CONFIG_PATH").ok();
 
-        let state_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target/golden_test_state");
-        std::fs::create_dir_all(&state_dir).unwrap();
-        let config_path = state_dir.join("carapace.json5");
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("carapace.json5");
         std::fs::write(&config_path, "{}").unwrap();
 
-        std::env::set_var("CARAPACE_STATE_DIR", &state_dir);
-        std::env::set_var("CARAPACE_CONFIG_PATH", &config_path);
+        std::env::set_var("CARAPACE_STATE_DIR", temp_dir.path());
+        std::env::set_var("CARAPACE_CONFIG_PATH", config_path);
 
         EnvGuard {
             _lock: lock,
             prev_state,
             prev_config,
+            _temp_dir: temp_dir,
         }
     }
 
     /// Create a default test server state (in-memory, no persistence), returning the guard to hold the mocked env vars.
     fn test_state() -> (EnvGuard, Arc<WsServerState>) {
         let guard = init_test_env();
-        (guard, Arc::new(WsServerState::new(WsServerConfig::default())))
+        (
+            guard,
+            Arc::new(WsServerState::new(WsServerConfig::default())),
+        )
     }
 
     /// Create an admin connection context.
