@@ -16,8 +16,8 @@ mod golden_trace {
 
     struct EnvGuard {
         _lock: parking_lot::MutexGuard<'static, ()>,
-        prev_state: Option<String>,
-        prev_config: Option<String>,
+        prev_state: Option<std::ffi::OsString>,
+        prev_config: Option<std::ffi::OsString>,
         _temp_dir: tempfile::TempDir,
     }
 
@@ -40,8 +40,8 @@ mod golden_trace {
 
     fn init_test_env() -> EnvGuard {
         let lock = TEST_LOCK.lock();
-        let prev_state = std::env::var("CARAPACE_STATE_DIR").ok();
-        let prev_config = std::env::var("CARAPACE_CONFIG_PATH").ok();
+        let prev_state = std::env::var_os("CARAPACE_STATE_DIR");
+        let prev_config = std::env::var_os("CARAPACE_CONFIG_PATH");
 
         let temp_dir = tempfile::TempDir::new().unwrap();
         let config_path = temp_dir.path().join("carapace.json5");
