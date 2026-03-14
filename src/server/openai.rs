@@ -360,6 +360,7 @@ async fn call_llm_provider(
     let mut text = String::new();
     let mut stop_reason = StopReason::EndTurn;
     let mut usage = TokenUsage::default();
+    let mut saw_stop = false;
 
     while let Some(event) = rx.recv().await {
         match event {
@@ -369,16 +370,23 @@ async fn call_llm_provider(
             StreamEvent::Stop { reason, usage: u } => {
                 stop_reason = reason;
                 usage = u;
+                saw_stop = true;
                 break;
             }
             StreamEvent::Error { message } => {
                 return Err(message);
             }
             StreamEvent::ToolUse { .. } => {
-                // Tool calls are not supported in the OpenAI chat endpoint;
-                // treat as end of response.
+                return Err(
+                    "LLM provider emitted tool-use output, but OpenAI-compatible endpoints do not support tools for this request."
+                        .to_string(),
+                );
             }
         }
+    }
+
+    if !saw_stop {
+        return Err("LLM provider stream ended before emitting a stop event.".to_string());
     }
 
     Ok((text, stop_reason, usage))
@@ -412,6 +420,7 @@ async fn stream_llm_provider(
         }
     };
 
+    let forward_cancel = cancel_token.clone();
     let (tx, output_rx) = tokio::sync::mpsc::channel::<Result<String, Infallible>>(16);
     tokio::spawn(async move {
         let mut rx = rx;
@@ -451,7 +460,21 @@ async fn stream_llm_provider(
             return;
         }
 
-        while let Some(event) = rx.recv().await {
+        loop {
+            let maybe_event = tokio::select! {
+                _ = forward_cancel.cancelled() => break,
+                event = rx.recv() => event,
+            };
+
+            let Some(event) = maybe_event else {
+                let _ = tx
+                    .send(Ok(format_sse_error(&OpenAiError::api_error(
+                        "LLM provider stream ended before emitting a stop event.".to_string(),
+                    ))))
+                    .await;
+                break;
+            };
+
             let (line, should_finish) = match event {
                 StreamEvent::TextDelta { text } => (build_text_chunk(text), false),
                 StreamEvent::Stop { reason, .. } => (build_finish_chunk(reason), true),
@@ -459,7 +482,13 @@ async fn stream_llm_provider(
                     tracing::error!(error = %message, "streaming LLM error");
                     (Ok(format_sse_error(&OpenAiError::api_error(message))), true)
                 }
-                StreamEvent::ToolUse { .. } => continue,
+                StreamEvent::ToolUse { .. } => (
+                    Ok(format_sse_error(&OpenAiError::api_error(
+                        "LLM provider emitted tool-use output, but OpenAI-compatible endpoints do not support tools for this request."
+                            .to_string(),
+                    ))),
+                    true,
+                ),
             };
 
             if tx.send(line).await.is_err() {
@@ -1465,13 +1494,14 @@ mod tests {
             _request: CompletionRequest,
             cancel_token: CancellationToken,
         ) -> Result<mpsc::Receiver<StreamEvent>, AgentError> {
+            let (tx_stream, rx) = mpsc::channel(1);
             if let Some(tx) = self.cancelled_tx.lock().take() {
                 tokio::spawn(async move {
                     cancel_token.cancelled().await;
+                    drop(tx_stream);
                     let _ = tx.send(());
                 });
             }
-            let (_tx, rx) = mpsc::channel(1);
             Ok(rx)
         }
     }
@@ -1541,6 +1571,60 @@ mod tests {
         .await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "Rate limited");
+    }
+
+    #[tokio::test]
+    async fn test_call_llm_provider_tool_use_returns_error() {
+        let provider = MockLlmProvider::with_events(vec![StreamEvent::ToolUse {
+            id: "call_123".to_string(),
+            name: "lookup".to_string(),
+            input: serde_json::json!({"q": "hi"}),
+        }]);
+
+        let result = call_llm_provider(
+            &provider,
+            "gpt-4o",
+            None,
+            vec![LlmMessage {
+                role: LlmRole::User,
+                content: vec![ContentBlock::Text {
+                    text: "Hi".to_string(),
+                }],
+            }],
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("do not support tools for this request"));
+    }
+
+    #[tokio::test]
+    async fn test_call_llm_provider_premature_close_returns_error() {
+        let provider = MockLlmProvider::with_events(vec![StreamEvent::TextDelta {
+            text: "partial".to_string(),
+        }]);
+
+        let result = call_llm_provider(
+            &provider,
+            "gpt-4o",
+            None,
+            vec![LlmMessage {
+                role: LlmRole::User,
+                content: vec![ContentBlock::Text {
+                    text: "Hi".to_string(),
+                }],
+            }],
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("ended before emitting a stop event"));
     }
 
     #[tokio::test]
@@ -2036,6 +2120,49 @@ mod tests {
         assert!(body_str.contains("stream interrupted"));
         assert!(body_str.contains("data: [DONE]"));
         assert!(!body_str.contains("\"finish_reason\":\"stop\""));
+    }
+
+    #[tokio::test]
+    async fn test_chat_completions_streaming_tool_use_emits_error_sse() {
+        let provider = Arc::new(MockLlmProvider::with_events(vec![StreamEvent::ToolUse {
+            id: "call_123".to_string(),
+            name: "lookup".to_string(),
+            input: serde_json::json!({"q": "hi"}),
+        }]));
+        let state = OpenAiState {
+            chat_completions_enabled: true,
+            llm_provider: Some(provider),
+            gateway_token: Some("test-token".to_string()),
+            ..Default::default()
+        };
+
+        let body = serde_json::to_vec(&serde_json::json!({
+            "messages": [{"role": "user", "content": "Hello"}],
+            "stream": true
+        }))
+        .unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer test-token".parse().unwrap());
+
+        let response = chat_completions_handler(
+            State(state),
+            loopback_connect_info(),
+            headers,
+            axum::body::Bytes::from(body),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body_bytes.to_vec()).unwrap();
+
+        assert!(body_str.contains("\"type\":\"api_error\""));
+        assert!(body_str.contains("do not support tools for this request"));
+        assert!(body_str.contains("data: [DONE]"));
     }
 
     #[tokio::test]
