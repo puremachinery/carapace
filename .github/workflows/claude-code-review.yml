@@ -101,7 +101,7 @@ jobs:
             - Use `gh` only for read-only pull request inspection. Do NOT use it to post reviews/comments or mutate GitHub state.
             - Do NOT modify repository contents, create commits/branches, or open/update pull requests.
             - Review this pull request using GitHub PR context; do not rely on a checked-out workspace.
-            - If GitHub PR context is insufficient, use only the available read-only PR inspection commands: `gh pr view`, `gh pr diff`, read-only `gh api repos/${{ github.repository }}/pulls/...` requests, and `jq` to parse JSON output.
+            - If GitHub PR context is insufficient, use only the available read-only PR inspection commands: `gh pr view`, `gh pr diff`, and `jq` to parse PR JSON output.
             - Return only the structured review object that matches the provided schema.
             - Do not wrap the structured output in markdown or code fences.
 
@@ -140,7 +140,7 @@ jobs:
             - If inline_findings is empty and both advisory_findings and optional_followups are empty, header MUST be "LGTM.".
             - If inline_findings is empty and any advisory_findings/optional_followups exist, header MUST be "No in-scope blocking findings.".
           claude_args: |
-            --allowedTools "Bash(gh api:repos/${{ github.repository }}/pulls/*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(jq:*)"
+            --allowedTools "Bash(gh pr diff:*),Bash(gh pr view:*),Bash(jq:*)"
             --json-schema '{"type":"object","additionalProperties":false,"properties":{"header":{"type":"string","enum":["Blocking findings present.","LGTM.","No in-scope blocking findings."]},"summary":{"type":"string","pattern":"\\S"},"inline_findings":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{"severity":{"type":"string","enum":["critical","high","medium"]},"scope":{"type":"string","enum":["in-scope"]},"title":{"type":"string","pattern":"\\S"},"body":{"type":"string","pattern":"\\S"},"path":{"type":"string","pattern":"\\S"},"line":{"type":"integer","minimum":1}},"required":["severity","scope","title","body","path","line"]}},"advisory_findings":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{"severity":{"type":"string","enum":["critical","high","medium"]},"scope":{"type":"string","enum":["out-of-scope"]},"title":{"type":"string","pattern":"\\S"},"body":{"type":"string","pattern":"\\S"}},"required":["severity","scope","title","body"]}},"optional_followups":{"type":"array","items":{"type":"string","pattern":"\\S"}}},"required":["header","summary","inline_findings","advisory_findings","optional_followups"]}'
 
       - name: Persist structured review output
