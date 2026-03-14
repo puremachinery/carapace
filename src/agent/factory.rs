@@ -1223,10 +1223,7 @@ mod tests {
             let fp = fingerprint_providers(&cfg);
             assert_eq!(
                 fp.vertex,
-                Some((
-                    hash_key_prefix("my-project"),
-                    "us-central1".to_string(),
-                ))
+                Some((hash_key_prefix("my-project"), "us-central1".to_string(),))
             );
         });
     }

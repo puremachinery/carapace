@@ -827,14 +827,10 @@ mod tests {
         );
 
         // Invalid location (no numbers)
-        assert!(
-            VertexProvider::new("my-project".to_string(), "us-central".to_string()).is_err()
-        );
+        assert!(VertexProvider::new("my-project".to_string(), "us-central".to_string()).is_err());
 
         // Invalid location (invalid characters)
-        assert!(
-            VertexProvider::new("my-project".to_string(), "us_central1".to_string()).is_err()
-        );
+        assert!(VertexProvider::new("my-project".to_string(), "us_central1".to_string()).is_err());
     }
 
     #[test]
