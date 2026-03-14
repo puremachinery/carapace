@@ -1122,7 +1122,7 @@ mod tests {
         let expected_base = dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from(".config"))
             .join("carapace");
-            
+
         assert_eq!(path.parent().unwrap(), expected_base.as_path());
         let ext = path.extension().unwrap().to_str().unwrap();
         assert!(ext == "json" || ext == "json5");
