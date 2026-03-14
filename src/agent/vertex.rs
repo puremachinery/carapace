@@ -383,16 +383,17 @@ impl VertexProvider {
     /// Resolves the API endpoint for Google-published Gemini models on Vertex AI.
     ///
     /// Rules:
-    /// - `vertex/gemini-1.5-pro` -> Google publisher, gemini-1.5-pro
-    /// - `vertex/google/gemini-1.5-pro` -> Google publisher, gemini-1.5-pro
-    /// - `vertex` / `vertex:default` -> use `default_model`
+    /// - `vertex/gemini-1.5-pro` or `vertex:gemini-1.5-pro` -> Google publisher, gemini-1.5-pro
+    /// - `vertex/google/gemini-1.5-pro` or `vertex:google/gemini-1.5-pro` -> Google publisher, gemini-1.5-pro
+    /// - `vertex`, `vertex:default`, or an empty model name are invalid; an explicit Gemini model ID
+    ///   must be provided (for example: `vertex:gemini-1.5-pro`)
     /// - non-Gemini model IDs and other publisher namespaces are rejected in this scoped implementation
     fn resolve_request_config(&self, model_name: &str) -> Result<String, AgentError> {
         let clean_model = strip_vertex_prefix(model_name);
 
         let effective_model = if clean_model.is_empty() || clean_model == "default" {
             return Err(AgentError::Provider(
-                "Model name must be provided".to_string(),
+                "Model name must be provided; `vertex`, `vertex:default`, or an empty model are invalid. Please specify an explicit Gemini model like `vertex:gemini-1.5-pro`.".to_string(),
             ));
         } else {
             clean_model
