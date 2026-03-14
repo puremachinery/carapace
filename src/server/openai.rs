@@ -11,11 +11,13 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use futures_util::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::agent::provider::{
@@ -183,7 +185,7 @@ impl OpenAiError {
         OpenAiError {
             error: OpenAiErrorBody {
                 message: "Unauthorized".to_string(),
-                r#type: "unauthorized".to_string(),
+                r#type: "invalid_request_error".to_string(),
                 param: None,
                 code: None,
             },
@@ -287,15 +289,58 @@ fn convert_to_llm_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<Llm
     (system, llm_messages)
 }
 
+#[derive(Debug)]
+struct CancelOnDrop {
+    token: CancellationToken,
+}
+
+impl CancelOnDrop {
+    fn new(token: CancellationToken) -> Self {
+        Self { token }
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.token.cancel();
+    }
+}
+
+struct SseBodyStream {
+    rx: tokio::sync::mpsc::Receiver<Result<String, Infallible>>,
+    _guard: CancelOnDrop,
+}
+
+impl SseBodyStream {
+    fn new(
+        rx: tokio::sync::mpsc::Receiver<Result<String, Infallible>>,
+        guard: CancelOnDrop,
+    ) -> Self {
+        Self { rx, _guard: guard }
+    }
+}
+
+impl Stream for SseBodyStream {
+    type Item = Result<String, Infallible>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.rx.poll_recv(cx)
+    }
+}
+
 /// Call the LLM provider and collect the full response (non-streaming collection).
 ///
-/// Returns `(response_text, usage)` on success.
+/// Returns `(response_text, stop_reason, usage)` on success.
 async fn call_llm_provider(
     provider: &dyn LlmProvider,
     model: &str,
     system: Option<String>,
     messages: Vec<LlmMessage>,
-) -> Result<(String, TokenUsage), String> {
+    cancel_token: CancellationToken,
+) -> Result<(String, StopReason, TokenUsage), String> {
     let request = CompletionRequest {
         model: model.to_string(),
         messages,
@@ -306,35 +351,45 @@ async fn call_llm_provider(
         extra: None,
     };
 
+    let _cancel_guard = CancelOnDrop::new(cancel_token.clone());
     let mut rx = provider
-        // TODO: plumb request-level cancellation into provider calls.
-        .complete(request, tokio_util::sync::CancellationToken::new())
+        .complete(request, cancel_token)
         .await
         .map_err(|e| format!("LLM provider error: {}", e))?;
 
     let mut text = String::new();
+    let mut stop_reason = StopReason::EndTurn;
     let mut usage = TokenUsage::default();
+    let mut saw_stop = false;
 
     while let Some(event) = rx.recv().await {
         match event {
             StreamEvent::TextDelta { text: delta } => {
                 text.push_str(&delta);
             }
-            StreamEvent::Stop { usage: u, .. } => {
+            StreamEvent::Stop { reason, usage: u } => {
+                stop_reason = reason;
                 usage = u;
+                saw_stop = true;
                 break;
             }
             StreamEvent::Error { message } => {
                 return Err(message);
             }
             StreamEvent::ToolUse { .. } => {
-                // Tool calls are not supported in the OpenAI chat endpoint;
-                // treat as end of response.
+                return Err(
+                    "LLM provider emitted tool-use output, but OpenAI-compatible endpoints do not support tools for this request."
+                        .to_string(),
+                );
             }
         }
     }
 
-    Ok((text, usage))
+    if !saw_stop {
+        return Err("LLM provider stream ended before emitting a stop event.".to_string());
+    }
+
+    Ok((text, stop_reason, usage))
 }
 
 /// Stream LLM provider events as OpenAI-format SSE chunks.
@@ -345,6 +400,7 @@ async fn stream_llm_provider(
     messages: Vec<LlmMessage>,
     response_id: String,
     created: i64,
+    cancel_token: CancellationToken,
 ) -> Response {
     let request = CompletionRequest {
         model: model.clone(),
@@ -356,58 +412,97 @@ async fn stream_llm_provider(
         extra: None,
     };
 
-    let rx = match provider
-        // TODO: plumb request-level cancellation into provider calls.
-        .complete(request, tokio_util::sync::CancellationToken::new())
-        .await
-    {
+    let cancel_guard = CancelOnDrop::new(cancel_token.clone());
+    let rx = match provider.complete(request, cancel_token.clone()).await {
         Ok(rx) => rx,
         Err(e) => {
             return build_error_sse_response(e.to_string());
         }
     };
 
-    let stream = async_stream::stream! {
+    let forward_cancel = cancel_token.clone();
+    let (tx, output_rx) = tokio::sync::mpsc::channel::<Result<String, Infallible>>(16);
+    tokio::spawn(async move {
         let mut rx = rx;
+        let build_text_chunk = |text: String| {
+            Ok(format_sse_chunk(&build_chunk(
+                &response_id,
+                created,
+                &model,
+                None,
+                Some(text),
+                None,
+            )))
+        };
+        let build_finish_chunk = |reason: StopReason| {
+            Ok(format_sse_chunk(&build_chunk(
+                &response_id,
+                created,
+                &model,
+                None,
+                None,
+                Some(stop_reason_to_finish_reason(reason).to_string()),
+            )))
+        };
 
-        yield Ok::<_, Infallible>(format_sse_chunk(&build_chunk(
-            &response_id, created, &model,
-            Some("assistant".to_string()), None, None,
-        )));
+        if tx
+            .send(Ok(format_sse_chunk(&build_chunk(
+                &response_id,
+                created,
+                &model,
+                Some("assistant".to_string()),
+                None,
+                None,
+            ))))
+            .await
+            .is_err()
+        {
+            return;
+        }
 
-        while let Some(event) = rx.recv().await {
-            match event {
-                StreamEvent::TextDelta { text } => {
-                    yield Ok::<_, Infallible>(format_sse_chunk(&build_chunk(
-                        &response_id, created, &model, None, Some(text), None,
-                    )));
-                }
-                StreamEvent::Stop { reason, .. } => {
-                    let finish = match reason {
-                        StopReason::EndTurn => "stop",
-                        StopReason::MaxTokens => "length",
-                        StopReason::ToolUse => "stop",
-                    };
-                    yield Ok::<_, Infallible>(format_sse_chunk(&build_chunk(
-                        &response_id, created, &model, None, None, Some(finish.to_string()),
-                    )));
-                    break;
-                }
+        loop {
+            let maybe_event = tokio::select! {
+                _ = forward_cancel.cancelled() => break,
+                event = rx.recv() => event,
+            };
+
+            let Some(event) = maybe_event else {
+                let _ = tx
+                    .send(Ok(format_sse_error(&OpenAiError::api_error(
+                        "LLM provider stream ended before emitting a stop event.".to_string(),
+                    ))))
+                    .await;
+                break;
+            };
+
+            let (line, should_finish) = match event {
+                StreamEvent::TextDelta { text } => (build_text_chunk(text), false),
+                StreamEvent::Stop { reason, .. } => (build_finish_chunk(reason), true),
                 StreamEvent::Error { message } => {
                     tracing::error!(error = %message, "streaming LLM error");
-                    yield Ok::<_, Infallible>(format_sse_chunk(&build_chunk(
-                        &response_id, created, &model, None, None, Some("stop".to_string()),
-                    )));
-                    break;
+                    (Ok(format_sse_error(&OpenAiError::api_error(message))), true)
                 }
-                StreamEvent::ToolUse { .. } => {}
+                StreamEvent::ToolUse { .. } => (
+                    Ok(format_sse_error(&OpenAiError::api_error(
+                        "LLM provider emitted tool-use output, but OpenAI-compatible endpoints do not support tools for this request."
+                            .to_string(),
+                    ))),
+                    true,
+                ),
+            };
+
+            if tx.send(line).await.is_err() {
+                return;
+            }
+            if should_finish {
+                break;
             }
         }
 
-        yield Ok::<_, Infallible>("data: [DONE]\n\n".to_string());
-    };
+        let _ = tx.send(Ok("data: [DONE]\n\n".to_string())).await;
+    });
 
-    let body = Body::from_stream(stream);
+    let body = Body::from_stream(SseBodyStream::new(output_rx, cancel_guard));
     sse_response(body)
 }
 
@@ -433,11 +528,28 @@ fn build_chunk(
     }
 }
 
+fn stop_reason_to_finish_reason(reason: StopReason) -> &'static str {
+    match reason {
+        StopReason::EndTurn => "stop",
+        StopReason::MaxTokens => "length",
+        StopReason::ToolUse => "stop",
+    }
+}
+
 /// Serialize a chunk into an SSE `data:` line.
 fn format_sse_chunk(chunk: &ChatCompletionChunk) -> String {
     let json = serde_json::to_string(chunk).unwrap_or_else(|e| {
         tracing::error!(error = %e, "failed to serialize SSE chunk");
         r#"{"error":"serialization_failed"}"#.to_string()
+    });
+    format!("data: {}\n\n", json)
+}
+
+fn format_sse_error(error: &OpenAiError) -> String {
+    let json = serde_json::to_string(error).unwrap_or_else(|e| {
+        tracing::error!(error = %e, "failed to serialize SSE error");
+        r#"{"error":{"message":"serialization_failed","type":"api_error","param":null,"code":null}}"#
+            .to_string()
     });
     format!("data: {}\n\n", json)
 }
@@ -456,8 +568,10 @@ fn sse_response(body: Body) -> Response {
 /// Build an SSE error response for a provider failure.
 fn build_error_sse_response(error_msg: String) -> Response {
     let error_stream = async_stream::stream! {
-        let error_data = serde_json::to_string(&OpenAiError::api_error(error_msg)).unwrap_or_default();
-        yield Ok::<_, Infallible>(format!("data: {}\n\ndata: [DONE]\n\n", error_data));
+        yield Ok::<_, Infallible>(format!(
+            "{}data: [DONE]\n\n",
+            format_sse_error(&OpenAiError::api_error(error_msg))
+        ));
     };
     let body = Body::from_stream(error_stream);
     sse_response(body)
@@ -555,13 +669,23 @@ pub async fn chat_completions_handler(
 
     if req.stream {
         // Streaming response via the LLM provider
-        return stream_llm_provider(provider, model, system, llm_messages, response_id, created)
-            .await;
+        let cancel_token = CancellationToken::new();
+        return stream_llm_provider(
+            provider,
+            model,
+            system,
+            llm_messages,
+            response_id,
+            created,
+            cancel_token,
+        )
+        .await;
     }
 
     // Non-streaming response: call the LLM provider and collect the result
-    match call_llm_provider(&*provider, &model, system, llm_messages).await {
-        Ok((text, usage)) => {
+    let cancel_token = CancellationToken::new();
+    match call_llm_provider(&*provider, &model, system, llm_messages, cancel_token).await {
+        Ok((text, stop_reason, usage)) => {
             let response = ChatCompletionResponse {
                 id: response_id,
                 object: "chat.completion".to_string(),
@@ -574,7 +698,7 @@ pub async fn chat_completions_handler(
                         content: ChatContent::Text(text),
                         name: None,
                     },
-                    finish_reason: "stop".to_string(),
+                    finish_reason: stop_reason_to_finish_reason(stop_reason).to_string(),
                 }],
                 usage: ChatUsage {
                     prompt_tokens: usage.input_tokens,
@@ -904,8 +1028,9 @@ pub async fn responses_handler(
     };
 
     // Non-streaming: call the LLM provider and collect the result
-    match call_llm_provider(&*provider, &model, system, llm_messages).await {
-        Ok((text, usage)) => {
+    let cancel_token = CancellationToken::new();
+    match call_llm_provider(&*provider, &model, system, llm_messages, cancel_token).await {
+        Ok((text, _stop_reason, usage)) => {
             let response = ResponsesResponse {
                 id: response_id,
                 object: "response".to_string(),
@@ -1309,6 +1434,38 @@ mod tests {
         }
     }
 
+    struct CancellationAwareProvider {
+        cancelled_tx: parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    impl CancellationAwareProvider {
+        fn new() -> (Self, tokio::sync::oneshot::Receiver<()>) {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            (
+                Self {
+                    cancelled_tx: parking_lot::Mutex::new(Some(tx)),
+                },
+                rx,
+            )
+        }
+    }
+
+    struct SlowCancellationAwareProvider {
+        cancelled_tx: parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    impl SlowCancellationAwareProvider {
+        fn new() -> (Self, tokio::sync::oneshot::Receiver<()>) {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            (
+                Self {
+                    cancelled_tx: parking_lot::Mutex::new(Some(tx)),
+                },
+                rx,
+            )
+        }
+    }
+
     #[async_trait]
     impl LlmProvider for MockLlmProvider {
         async fn complete(
@@ -1330,6 +1487,44 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl LlmProvider for CancellationAwareProvider {
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+            cancel_token: CancellationToken,
+        ) -> Result<mpsc::Receiver<StreamEvent>, AgentError> {
+            let (tx_stream, rx) = mpsc::channel(1);
+            if let Some(tx) = self.cancelled_tx.lock().take() {
+                tokio::spawn(async move {
+                    cancel_token.cancelled().await;
+                    drop(tx_stream);
+                    let _ = tx.send(());
+                });
+            }
+            Ok(rx)
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for SlowCancellationAwareProvider {
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+            cancel_token: CancellationToken,
+        ) -> Result<mpsc::Receiver<StreamEvent>, AgentError> {
+            if let Some(tx) = self.cancelled_tx.lock().take() {
+                let cancel_wait = cancel_token.clone();
+                tokio::spawn(async move {
+                    cancel_wait.cancelled().await;
+                    let _ = tx.send(());
+                });
+            }
+            std::future::pending::<()>().await;
+            unreachable!("slow cancellation provider should be aborted before completing");
+        }
+    }
+
     #[tokio::test]
     async fn test_call_llm_provider_text_response() {
         let provider = MockLlmProvider::text_response("Hello from LLM!", 50, 10);
@@ -1340,10 +1535,18 @@ mod tests {
             }],
         }];
 
-        let result = call_llm_provider(&provider, "claude-sonnet-4-20250514", None, messages).await;
+        let result = call_llm_provider(
+            &provider,
+            "claude-sonnet-4-20250514",
+            None,
+            messages,
+            CancellationToken::new(),
+        )
+        .await;
         assert!(result.is_ok());
-        let (text, usage) = result.unwrap();
+        let (text, stop_reason, usage) = result.unwrap();
         assert_eq!(text, "Hello from LLM!");
+        assert_eq!(stop_reason, StopReason::EndTurn);
         assert_eq!(usage.input_tokens, 50);
         assert_eq!(usage.output_tokens, 10);
     }
@@ -1358,9 +1561,70 @@ mod tests {
             }],
         }];
 
-        let result = call_llm_provider(&provider, "claude-sonnet-4-20250514", None, messages).await;
+        let result = call_llm_provider(
+            &provider,
+            "claude-sonnet-4-20250514",
+            None,
+            messages,
+            CancellationToken::new(),
+        )
+        .await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "Rate limited");
+    }
+
+    #[tokio::test]
+    async fn test_call_llm_provider_tool_use_returns_error() {
+        let provider = MockLlmProvider::with_events(vec![StreamEvent::ToolUse {
+            id: "call_123".to_string(),
+            name: "lookup".to_string(),
+            input: serde_json::json!({"q": "hi"}),
+        }]);
+
+        let result = call_llm_provider(
+            &provider,
+            "gpt-4o",
+            None,
+            vec![LlmMessage {
+                role: LlmRole::User,
+                content: vec![ContentBlock::Text {
+                    text: "Hi".to_string(),
+                }],
+            }],
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("do not support tools for this request"));
+    }
+
+    #[tokio::test]
+    async fn test_call_llm_provider_premature_close_returns_error() {
+        let provider = MockLlmProvider::with_events(vec![StreamEvent::TextDelta {
+            text: "partial".to_string(),
+        }]);
+
+        let result = call_llm_provider(
+            &provider,
+            "gpt-4o",
+            None,
+            vec![LlmMessage {
+                role: LlmRole::User,
+                content: vec![ContentBlock::Text {
+                    text: "Hi".to_string(),
+                }],
+            }],
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("ended before emitting a stop event"));
     }
 
     #[tokio::test]
@@ -1387,9 +1651,16 @@ mod tests {
             }],
         }];
 
-        let result = call_llm_provider(&provider, "claude-sonnet-4-20250514", None, messages).await;
+        let result = call_llm_provider(
+            &provider,
+            "claude-sonnet-4-20250514",
+            None,
+            messages,
+            CancellationToken::new(),
+        )
+        .await;
         assert!(result.is_ok());
-        let (text, _) = result.unwrap();
+        let (text, _, _) = result.unwrap();
         assert_eq!(text, "Hello world!");
     }
 
@@ -1408,11 +1679,135 @@ mod tests {
             "claude-sonnet-4-20250514",
             Some("You are helpful".to_string()),
             messages,
+            CancellationToken::new(),
         )
         .await;
         assert!(result.is_ok());
-        let (text, _) = result.unwrap();
+        let (text, _, _) = result.unwrap();
         assert_eq!(text, "I'm helpful!");
+    }
+
+    #[tokio::test]
+    async fn test_call_llm_provider_preserves_max_tokens_stop_reason() {
+        let provider = MockLlmProvider::with_events(vec![
+            StreamEvent::TextDelta {
+                text: "Truncated".to_string(),
+            },
+            StreamEvent::Stop {
+                reason: StopReason::MaxTokens,
+                usage: TokenUsage {
+                    input_tokens: 40,
+                    output_tokens: 12,
+                },
+            },
+        ]);
+
+        let result = call_llm_provider(
+            &provider,
+            "gpt-4o",
+            None,
+            vec![LlmMessage {
+                role: LlmRole::User,
+                content: vec![ContentBlock::Text {
+                    text: "Hi".to_string(),
+                }],
+            }],
+            CancellationToken::new(),
+        )
+        .await
+        .expect("max-tokens completion should succeed");
+
+        let (text, stop_reason, usage) = result;
+        assert_eq!(text, "Truncated");
+        assert_eq!(stop_reason, StopReason::MaxTokens);
+        assert_eq!(usage.output_tokens, 12);
+    }
+
+    #[tokio::test]
+    async fn test_call_llm_provider_cancels_when_request_future_is_dropped() {
+        let (provider, cancelled_rx) = CancellationAwareProvider::new();
+        let messages = vec![LlmMessage {
+            role: LlmRole::User,
+            content: vec![ContentBlock::Text {
+                text: "Hi".to_string(),
+            }],
+        }];
+
+        let handle = tokio::spawn(async move {
+            call_llm_provider(
+                &provider,
+                "gpt-4o",
+                None,
+                messages,
+                CancellationToken::new(),
+            )
+            .await
+        });
+
+        tokio::task::yield_now().await;
+        handle.abort();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), cancelled_rx)
+            .await
+            .expect("provider cancellation was not signaled after request drop")
+            .expect("cancellation signal channel unexpectedly dropped");
+    }
+
+    #[tokio::test]
+    async fn test_stream_llm_provider_cancels_when_response_body_is_dropped() {
+        let (provider, cancelled_rx) = CancellationAwareProvider::new();
+        let response = stream_llm_provider(
+            Arc::new(provider),
+            "gpt-4o".to_string(),
+            None,
+            vec![LlmMessage {
+                role: LlmRole::User,
+                content: vec![ContentBlock::Text {
+                    text: "Hi".to_string(),
+                }],
+            }],
+            "chatcmpl_test".to_string(),
+            chrono::Utc::now().timestamp(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        drop(response);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), cancelled_rx)
+            .await
+            .expect("provider cancellation was not signaled after streaming response drop")
+            .expect("cancellation signal channel unexpectedly dropped");
+    }
+
+    #[tokio::test]
+    async fn test_stream_llm_provider_cancels_when_request_future_is_dropped_before_response() {
+        let (provider, cancelled_rx) = SlowCancellationAwareProvider::new();
+        let handle = tokio::spawn(async move {
+            stream_llm_provider(
+                Arc::new(provider),
+                "gpt-4o".to_string(),
+                None,
+                vec![LlmMessage {
+                    role: LlmRole::User,
+                    content: vec![ContentBlock::Text {
+                        text: "Hi".to_string(),
+                    }],
+                }],
+                "chatcmpl_test".to_string(),
+                chrono::Utc::now().timestamp(),
+                CancellationToken::new(),
+            )
+            .await
+        });
+
+        tokio::task::yield_now().await;
+        handle.abort();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), cancelled_rx)
+            .await
+            .expect("provider cancellation was not signaled after streaming request drop")
+            .expect("cancellation signal channel unexpectedly dropped");
     }
 
     // ============== Handler integration tests ==============
@@ -1531,6 +1926,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_chat_completions_non_streaming_max_tokens_maps_to_length() {
+        let provider = Arc::new(MockLlmProvider::with_events(vec![
+            StreamEvent::TextDelta {
+                text: "Partial answer".to_string(),
+            },
+            StreamEvent::Stop {
+                reason: StopReason::MaxTokens,
+                usage: TokenUsage {
+                    input_tokens: 64,
+                    output_tokens: 16,
+                },
+            },
+        ]));
+        let state = OpenAiState {
+            chat_completions_enabled: true,
+            llm_provider: Some(provider),
+            gateway_token: Some("test-token".to_string()),
+            ..Default::default()
+        };
+
+        let body = serde_json::to_vec(&serde_json::json!({
+            "messages": [{"role": "user", "content": "Hello"}]
+        }))
+        .unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer test-token".parse().unwrap());
+
+        let response = chat_completions_handler(
+            State(state),
+            loopback_connect_info(),
+            headers,
+            axum::body::Bytes::from(body),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        assert_eq!(parsed["choices"][0]["finish_reason"], "length");
+        assert_eq!(parsed["usage"]["prompt_tokens"], 64);
+        assert_eq!(parsed["usage"]["completion_tokens"], 16);
+    }
+
+    #[tokio::test]
     async fn test_chat_completions_provider_error_returns_500() {
         let provider = Arc::new(MockLlmProvider::error_response("API overloaded"));
         let state = OpenAiState {
@@ -1627,6 +2071,97 @@ mod tests {
         assert!(body_str.contains("Hello "));
         assert!(body_str.contains("world!"));
         assert!(body_str.contains("\"finish_reason\":\"stop\""));
+        assert!(body_str.contains("data: [DONE]"));
+    }
+
+    #[tokio::test]
+    async fn test_chat_completions_streaming_provider_error_emits_error_sse() {
+        let provider = Arc::new(MockLlmProvider::with_events(vec![
+            StreamEvent::TextDelta {
+                text: "Hello ".to_string(),
+            },
+            StreamEvent::Error {
+                message: "stream interrupted".to_string(),
+            },
+        ]));
+        let state = OpenAiState {
+            chat_completions_enabled: true,
+            llm_provider: Some(provider),
+            gateway_token: Some("test-token".to_string()),
+            ..Default::default()
+        };
+
+        let body = serde_json::to_vec(&serde_json::json!({
+            "messages": [{"role": "user", "content": "Hello"}],
+            "stream": true
+        }))
+        .unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer test-token".parse().unwrap());
+
+        let response = chat_completions_handler(
+            State(state),
+            loopback_connect_info(),
+            headers,
+            axum::body::Bytes::from(body),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body_bytes.to_vec()).unwrap();
+
+        assert!(body_str.contains("Hello "));
+        assert!(body_str.contains("\"type\":\"api_error\""));
+        assert!(body_str.contains("stream interrupted"));
+        assert!(body_str.contains("data: [DONE]"));
+        assert!(!body_str.contains("\"finish_reason\":\"stop\""));
+    }
+
+    #[tokio::test]
+    async fn test_chat_completions_streaming_tool_use_emits_error_sse() {
+        let provider = Arc::new(MockLlmProvider::with_events(vec![StreamEvent::ToolUse {
+            id: "call_123".to_string(),
+            name: "lookup".to_string(),
+            input: serde_json::json!({"q": "hi"}),
+        }]));
+        let state = OpenAiState {
+            chat_completions_enabled: true,
+            llm_provider: Some(provider),
+            gateway_token: Some("test-token".to_string()),
+            ..Default::default()
+        };
+
+        let body = serde_json::to_vec(&serde_json::json!({
+            "messages": [{"role": "user", "content": "Hello"}],
+            "stream": true
+        }))
+        .unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer test-token".parse().unwrap());
+
+        let response = chat_completions_handler(
+            State(state),
+            loopback_connect_info(),
+            headers,
+            axum::body::Bytes::from(body),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body_bytes.to_vec()).unwrap();
+
+        assert!(body_str.contains("\"type\":\"api_error\""));
+        assert!(body_str.contains("do not support tools for this request"));
         assert!(body_str.contains("data: [DONE]"));
     }
 

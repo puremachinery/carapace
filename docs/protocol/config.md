@@ -128,7 +128,7 @@ For a plain-English guide to the most commonly tuned sections, see
 - `plugins` – plugin load/allowlist/config
 - `filesystem` – root-scoped filesystem tool registration and limits
 - `anthropic` – Anthropic provider settings (apiKey, baseUrl)
-- `openai` – OpenAI provider settings (apiKey, baseUrl)
+- `openai` – OpenAI provider settings (apiKey, baseUrl, httpReferer, title)
 - `google` – Google Gemini provider settings (`apiKey`, `authProfile`, `baseUrl`)
 - `vertex` – Google Cloud Vertex AI provider settings (`projectId`, `location`, `model`)
 - `providers` – provider-specific settings such as `providers.ollama`
@@ -166,7 +166,7 @@ This is a condensed map; refer to the JSON schema for full detail.
 - `anthropic`
   - `apiKey`, `baseUrl`
 - `openai`
-  - `apiKey`, `baseUrl`
+  - `apiKey`, `baseUrl`, `httpReferer`, `title`
 - `google`
   - `apiKey`, `authProfile`, `baseUrl`
 - `providers.ollama`

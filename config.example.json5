@@ -113,6 +113,8 @@
   // openai: {
   //   apiKey: "${OPENAI_API_KEY}",
   //   // baseUrl: "https://api.openai.com",       // default
+  //   // httpReferer: "https://example.com/app", // sends HTTP-Referer header
+  //   // title: "Carapace",                      // sends X-Title header
   //   // For local servers (vLLM, llama.cpp, LM Studio, MLX):
   //   // baseUrl: "http://localhost:8000/v1",
   //   // apiKey: "unused",                         // required but ignored by most local servers

@@ -235,6 +235,10 @@ These are the most commonly used provider sections for first-run setup and day-1
   * *Common values:*
     * `apiKey`: Secret credential string, often sourced from an environment variable like `"${OPENAI_API_KEY}"`.
     * `baseUrl`: String. Useful if passing through an enterprise proxy or alternate endpoint.
+* **`openai`**
+  * *Additional values:*
+    * `httpReferer`: String. Sends the `HTTP-Referer` header to OpenAI-compatible backends that use it for app identification or routing.
+    * `title`: String. Sends the `X-Title` header to OpenAI-compatible backends that use it for app identification.
 * **`google`**
   * *What it does:* Connects to Gemini.
   * *Common values:*

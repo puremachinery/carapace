@@ -199,6 +199,55 @@ fn get_vertex_config(cfg: &Value) -> VertexConfig {
     }
 }
 
+struct OpenAiConfig {
+    api_key: Option<String>,
+    base_url: Option<String>,
+    http_referer: Option<String>,
+    title: Option<String>,
+}
+
+fn normalize_optional_trimmed(value: Option<String>) -> Option<String> {
+    value
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn normalize_optional_base_url(value: Option<String>) -> Option<String> {
+    normalize_optional_trimmed(value).map(|s| s.trim_end_matches('/').to_string())
+}
+
+fn get_openai_config(cfg: &Value) -> OpenAiConfig {
+    let openai_cfg = cfg.get("openai");
+    let get_optional_string = |env_keys: &[&str], cfg_key: &str| {
+        env_keys
+            .iter()
+            .find_map(|key| std::env::var(key).ok())
+            .or_else(|| {
+                openai_cfg
+                    .and_then(|v| v.get(cfg_key))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
+    };
+
+    let api_key = get_optional_string(&["OPENAI_API_KEY"], "apiKey");
+    let base_url =
+        normalize_optional_base_url(get_optional_string(&["OPENAI_BASE_URL"], "baseUrl"));
+    let http_referer =
+        normalize_optional_trimmed(get_optional_string(&["OPENAI_HTTP_REFERER"], "httpReferer"));
+    let title = normalize_optional_trimmed(get_optional_string(
+        &["OPENAI_X_TITLE", "OPENAI_TITLE"],
+        "title",
+    ));
+
+    OpenAiConfig {
+        api_key,
+        base_url,
+        http_referer,
+        title,
+    }
+}
+
 /// Try to build the Ollama provider with optional base URL, API key, and
 /// a non-blocking connectivity check.
 fn try_build_ollama_provider(
@@ -295,25 +344,35 @@ pub fn build_providers(cfg: &Value) -> Result<Option<MultiProvider>, Box<dyn std
     )?;
 
     // OpenAI
-    let openai_api_key = std::env::var("OPENAI_API_KEY").ok().or_else(|| {
-        cfg.get("openai")
-            .and_then(|v| v.get("apiKey"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    });
-    let openai_base_url = std::env::var("OPENAI_BASE_URL").ok().or_else(|| {
-        cfg.get("openai")
-            .and_then(|v| v.get("baseUrl"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    });
-    let openai_provider = try_build_provider(
-        openai_api_key,
-        openai_base_url,
-        "OpenAI",
-        agent::openai::OpenAiProvider::new,
-        |p, url| p.with_base_url(url),
-    )?;
+    let openai_cfg = get_openai_config(cfg);
+    let openai_provider = match openai_cfg.api_key {
+        Some(key) => match agent::openai::OpenAiProvider::new(key) {
+            Ok(provider) => {
+                let provider = if let Some(url) = openai_cfg.base_url {
+                    provider.with_base_url(url)?
+                } else {
+                    provider
+                };
+                let provider = if let Some(value) = openai_cfg.http_referer {
+                    provider.with_http_referer(value)?
+                } else {
+                    provider
+                };
+                let provider = if let Some(value) = openai_cfg.title {
+                    provider.with_title(value)?
+                } else {
+                    provider
+                };
+                info!("LLM provider configured: OpenAI");
+                Some(Arc::new(provider) as Arc<dyn agent::LlmProvider>)
+            }
+            Err(e) => {
+                warn!("Failed to configure OpenAI provider: {}", e);
+                None
+            }
+        },
+        None => None,
+    };
 
     // Ollama
     let ollama_provider = try_build_ollama_provider(cfg)?;
@@ -488,18 +547,12 @@ pub fn fingerprint_providers(cfg: &Value) -> ProviderFingerprint {
             .map(|s| s.to_string())
     });
 
-    let openai_key = std::env::var("OPENAI_API_KEY").ok().or_else(|| {
-        cfg.get("openai")
-            .and_then(|v| v.get("apiKey"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    });
-    let openai_url = std::env::var("OPENAI_BASE_URL").ok().or_else(|| {
-        cfg.get("openai")
-            .and_then(|v| v.get("baseUrl"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    });
+    let OpenAiConfig {
+        api_key: openai_api_key,
+        base_url: openai_base_url,
+        http_referer: openai_http_referer,
+        title: openai_title,
+    } = get_openai_config(cfg);
 
     let ollama_cfg = cfg.get("providers").and_then(|v| v.get("ollama"));
     let ollama_url = std::env::var("OLLAMA_BASE_URL").ok().or_else(|| {
@@ -565,7 +618,29 @@ pub fn fingerprint_providers(cfg: &Value) -> ProviderFingerprint {
 
     ProviderFingerprint {
         anthropic: anthropic_key.map(|k| (hash_key_prefix(&k), anthropic_url)),
-        openai: openai_key.map(|k| (hash_key_prefix(&k), openai_url)),
+        openai: openai_api_key.as_ref().map(|api_key| {
+            let api_key_hash = if openai_http_referer.is_none() && openai_title.is_none() {
+                hash_key_prefix(api_key)
+            } else {
+                let mut material = String::with_capacity(
+                    api_key.len()
+                        + openai_http_referer.as_deref().map_or(0, str::len)
+                        + openai_title.as_deref().map_or(0, str::len)
+                        + 2,
+                );
+                material.push_str(api_key);
+                material.push('\n');
+                if let Some(value) = openai_http_referer.as_deref() {
+                    material.push_str(value);
+                }
+                material.push('\n');
+                if let Some(value) = openai_title.as_deref() {
+                    material.push_str(value);
+                }
+                hash_key_prefix(&material)
+            };
+            (api_key_hash, openai_base_url.clone())
+        }),
         ollama: if ollama_configured {
             Some((true, ollama_url))
         } else {
@@ -628,6 +703,9 @@ mod tests {
         "CARAPACE_STATE_DIR",
         "OPENAI_API_KEY",
         "OPENAI_BASE_URL",
+        "OPENAI_HTTP_REFERER",
+        "OPENAI_X_TITLE",
+        "OPENAI_TITLE",
         "OLLAMA_BASE_URL",
         "GOOGLE_API_KEY",
         "GOOGLE_API_BASE_URL",
@@ -809,6 +887,79 @@ mod tests {
             });
             let fp = fingerprint_providers(&cfg);
             assert!(fp.gemini.is_none());
+        });
+    }
+
+    #[test]
+    fn test_openai_fingerprint_changes_when_extra_headers_change() {
+        with_clean_provider_env(|| {
+            let cfg_a = json!({
+                "openai": {
+                    "apiKey": "sk-openai-test456",
+                    "httpReferer": "https://example.com/app-a",
+                    "title": "Carapace A"
+                }
+            });
+            let cfg_b = json!({
+                "openai": {
+                    "apiKey": "sk-openai-test456",
+                    "httpReferer": "https://example.com/app-b",
+                    "title": "Carapace B"
+                }
+            });
+
+            let fp_a = fingerprint_providers(&cfg_a);
+            let fp_b = fingerprint_providers(&cfg_b);
+
+            assert_ne!(fp_a.openai, fp_b.openai);
+        });
+    }
+
+    #[test]
+    fn test_openai_fingerprint_normalizes_header_whitespace() {
+        with_clean_provider_env(|| {
+            let cfg_a = json!({
+                "openai": {
+                    "apiKey": "sk-openai-test456",
+                    "httpReferer": "https://example.com/app",
+                    "title": "Carapace"
+                }
+            });
+            let cfg_b = json!({
+                "openai": {
+                    "apiKey": "sk-openai-test456",
+                    "httpReferer": "  https://example.com/app  ",
+                    "title": "  Carapace  "
+                }
+            });
+
+            let fp_a = fingerprint_providers(&cfg_a);
+            let fp_b = fingerprint_providers(&cfg_b);
+
+            assert_eq!(fp_a.openai, fp_b.openai);
+        });
+    }
+
+    #[test]
+    fn test_openai_fingerprint_normalizes_base_url_trailing_slash() {
+        with_clean_provider_env(|| {
+            let cfg_a = json!({
+                "openai": {
+                    "apiKey": "sk-openai-test456",
+                    "baseUrl": "https://proxy.example.com/v1"
+                }
+            });
+            let cfg_b = json!({
+                "openai": {
+                    "apiKey": "sk-openai-test456",
+                    "baseUrl": "https://proxy.example.com/v1/"
+                }
+            });
+
+            let fp_a = fingerprint_providers(&cfg_a);
+            let fp_b = fingerprint_providers(&cfg_b);
+
+            assert_eq!(fp_a.openai, fp_b.openai);
         });
     }
 
