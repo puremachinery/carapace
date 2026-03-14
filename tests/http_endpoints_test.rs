@@ -476,7 +476,7 @@ async fn test_responses_no_auth_returns_401() {
         .await
         .unwrap();
     let parsed: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
-    assert_eq!(parsed["error"]["type"], "unauthorized");
+    assert_eq!(parsed["error"]["type"], "invalid_request_error");
 }
 
 #[tokio::test]

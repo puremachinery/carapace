@@ -5,6 +5,7 @@
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
+use reqwest::header::HeaderValue;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -18,6 +19,8 @@ pub struct OpenAiProvider {
     client: reqwest::Client,
     api_key: String,
     base_url: String,
+    http_referer: Option<String>,
+    title: Option<String>,
 }
 
 impl OpenAiProvider {
@@ -36,6 +39,8 @@ impl OpenAiProvider {
             client,
             api_key,
             base_url: "https://api.openai.com".to_string(),
+            http_referer: None,
+            title: None,
         })
     }
 
@@ -53,6 +58,38 @@ impl OpenAiProvider {
         }
         // Strip trailing slash for consistent path joining
         self.base_url = url.trim_end_matches('/').to_string();
+        Ok(self)
+    }
+
+    pub fn with_http_referer(mut self, value: String) -> Result<Self, AgentError> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(AgentError::Provider(
+                "OpenAI HTTP-Referer header must not be empty".to_string(),
+            ));
+        }
+        HeaderValue::from_str(value).map_err(|e| {
+            AgentError::Provider(format!(
+                "OpenAI HTTP-Referer header must be a valid HTTP header value: {e}"
+            ))
+        })?;
+        self.http_referer = Some(value.to_string());
+        Ok(self)
+    }
+
+    pub fn with_title(mut self, value: String) -> Result<Self, AgentError> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(AgentError::Provider(
+                "OpenAI X-Title header must not be empty".to_string(),
+            ));
+        }
+        HeaderValue::from_str(value).map_err(|e| {
+            AgentError::Provider(format!(
+                "OpenAI X-Title header must be a valid HTTP header value: {e}"
+            ))
+        })?;
+        self.title = Some(value.to_string());
         Ok(self)
     }
 
@@ -110,18 +147,24 @@ impl OpenAiProvider {
         }
         let url = format!("{}/v1/chat/completions", self.base_url);
 
+        let mut request_builder = self
+            .client
+            .post(&url)
+            .header("authorization", format!("Bearer {}", self.api_key))
+            .header("content-type", "application/json")
+            .header("accept", "text/event-stream");
+        if let Some(ref value) = self.http_referer {
+            request_builder = request_builder.header("HTTP-Referer", value);
+        }
+        if let Some(ref value) = self.title {
+            request_builder = request_builder.header("X-Title", value);
+        }
+
         let response = tokio::select! {
             _ = cancel_token.cancelled() => {
                 return Err(AgentError::Cancelled);
             }
-            response = self
-                .client
-                .post(&url)
-                .header("authorization", format!("Bearer {}", self.api_key))
-                .header("content-type", "application/json")
-                .header("accept", "text/event-stream")
-                .json(&body)
-                .send() => {
+            response = request_builder.json(&body).send() => {
                     response.map_err(|e| AgentError::Provider(format!("HTTP request failed: {e}")))?
                 }
         };
@@ -1057,6 +1100,30 @@ mod tests {
     fn test_default_base_url() {
         let provider = OpenAiProvider::new("test-key".to_string()).unwrap();
         assert_eq!(provider.base_url, "https://api.openai.com");
+    }
+
+    #[test]
+    fn test_http_referer_rejects_invalid_header_value() {
+        let result = OpenAiProvider::new("test-key".to_string())
+            .unwrap()
+            .with_http_referer("https://example.com/\napp".to_string());
+        assert!(result.is_err(), "expected invalid header value to fail");
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("valid HTTP header value"));
+    }
+
+    #[test]
+    fn test_title_rejects_invalid_header_value() {
+        let result = OpenAiProvider::new("test-key".to_string())
+            .unwrap()
+            .with_title("Carapace\nInjected".to_string());
+        assert!(result.is_err(), "expected invalid header value to fail");
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("valid HTTP header value"));
     }
 
     #[test]
