@@ -218,37 +218,27 @@ fn normalize_optional_base_url(value: Option<String>) -> Option<String> {
 
 fn get_openai_config(cfg: &Value) -> OpenAiConfig {
     let openai_cfg = cfg.get("openai");
-    let api_key = std::env::var("OPENAI_API_KEY").ok().or_else(|| {
-        openai_cfg
-            .and_then(|v| v.get("apiKey"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    });
-    let base_url =
-        normalize_optional_base_url(std::env::var("OPENAI_BASE_URL").ok().or_else(|| {
-            openai_cfg
-                .and_then(|v| v.get("baseUrl"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-        }));
-    let http_referer =
-        normalize_optional_trimmed(std::env::var("OPENAI_HTTP_REFERER").ok().or_else(|| {
-            openai_cfg
-                .and_then(|v| v.get("httpReferer"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-        }));
-    let title = normalize_optional_trimmed(
-        std::env::var("OPENAI_X_TITLE")
-            .ok()
-            .or_else(|| std::env::var("OPENAI_TITLE").ok())
+    let get_optional_string = |env_keys: &[&str], cfg_key: &str| {
+        env_keys
+            .iter()
+            .find_map(|key| std::env::var(key).ok())
             .or_else(|| {
                 openai_cfg
-                    .and_then(|v| v.get("title"))
+                    .and_then(|v| v.get(cfg_key))
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
-            }),
-    );
+            })
+    };
+
+    let api_key = get_optional_string(&["OPENAI_API_KEY"], "apiKey");
+    let base_url =
+        normalize_optional_base_url(get_optional_string(&["OPENAI_BASE_URL"], "baseUrl"));
+    let http_referer =
+        normalize_optional_trimmed(get_optional_string(&["OPENAI_HTTP_REFERER"], "httpReferer"));
+    let title = normalize_optional_trimmed(get_optional_string(
+        &["OPENAI_X_TITLE", "OPENAI_TITLE"],
+        "title",
+    ));
 
     OpenAiConfig {
         api_key,
@@ -256,6 +246,30 @@ fn get_openai_config(cfg: &Value) -> OpenAiConfig {
         http_referer,
         title,
     }
+}
+
+fn hash_openai_fingerprint(
+    api_key: &str,
+    http_referer: Option<&str>,
+    title: Option<&str>,
+) -> String {
+    if http_referer.is_none() && title.is_none() {
+        return hash_key_prefix(api_key);
+    }
+
+    let mut material = String::with_capacity(
+        api_key.len() + http_referer.map_or(0, str::len) + title.map_or(0, str::len) + 2,
+    );
+    material.push_str(api_key);
+    material.push('\n');
+    if let Some(value) = http_referer {
+        material.push_str(value);
+    }
+    material.push('\n');
+    if let Some(value) = title {
+        material.push_str(value);
+    }
+    hash_key_prefix(&material)
 }
 
 /// Try to build the Ollama provider with optional base URL, API key, and
@@ -532,17 +546,9 @@ pub fn build_providers(cfg: &Value) -> Result<Option<MultiProvider>, Box<dyn std
 ///
 /// API keys are hashed (SHA-256 prefix) rather than stored.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OpenAiFingerprint {
-    pub api_key_hash: String,
-    pub base_url: Option<String>,
-    pub http_referer: Option<String>,
-    pub title: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderFingerprint {
     pub anthropic: Option<(String, Option<String>)>,
-    pub openai: Option<OpenAiFingerprint>,
+    pub openai: Option<(String, Option<String>)>,
     pub ollama: Option<(bool, Option<String>)>,
     pub gemini: Option<(String, Option<String>)>,
     pub venice: Option<(String, Option<String>)>,
@@ -631,11 +637,15 @@ pub fn fingerprint_providers(cfg: &Value) -> ProviderFingerprint {
 
     ProviderFingerprint {
         anthropic: anthropic_key.map(|k| (hash_key_prefix(&k), anthropic_url)),
-        openai: openai_cfg.api_key.map(|k| OpenAiFingerprint {
-            api_key_hash: hash_key_prefix(&k),
-            base_url: openai_cfg.base_url,
-            http_referer: openai_cfg.http_referer,
-            title: openai_cfg.title,
+        openai: openai_cfg.api_key.as_deref().map(|k| {
+            (
+                hash_openai_fingerprint(
+                    k,
+                    openai_cfg.http_referer.as_deref(),
+                    openai_cfg.title.as_deref(),
+                ),
+                openai_cfg.base_url.clone(),
+            )
         }),
         ollama: if ollama_configured {
             Some((true, ollama_url))

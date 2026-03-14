@@ -415,6 +415,26 @@ async fn stream_llm_provider(
     let (tx, output_rx) = tokio::sync::mpsc::channel::<Result<String, Infallible>>(16);
     tokio::spawn(async move {
         let mut rx = rx;
+        let build_text_chunk = |text: String| {
+            Ok(format_sse_chunk(&build_chunk(
+                &response_id,
+                created,
+                &model,
+                None,
+                Some(text),
+                None,
+            )))
+        };
+        let build_finish_chunk = |reason: StopReason| {
+            Ok(format_sse_chunk(&build_chunk(
+                &response_id,
+                created,
+                &model,
+                None,
+                None,
+                Some(stop_reason_to_finish_reason(reason).to_string()),
+            )))
+        };
 
         if tx
             .send(Ok(format_sse_chunk(&build_chunk(
@@ -433,31 +453,8 @@ async fn stream_llm_provider(
 
         while let Some(event) = rx.recv().await {
             let (line, should_finish) = match event {
-                StreamEvent::TextDelta { text } => (
-                    Ok(format_sse_chunk(&build_chunk(
-                        &response_id,
-                        created,
-                        &model,
-                        None,
-                        Some(text),
-                        None,
-                    ))),
-                    false,
-                ),
-                StreamEvent::Stop { reason, .. } => {
-                    let finish = stop_reason_to_finish_reason(reason);
-                    (
-                        Ok(format_sse_chunk(&build_chunk(
-                            &response_id,
-                            created,
-                            &model,
-                            None,
-                            None,
-                            Some(finish.to_string()),
-                        ))),
-                        true,
-                    )
-                }
+                StreamEvent::TextDelta { text } => (build_text_chunk(text), false),
+                StreamEvent::Stop { reason, .. } => (build_finish_chunk(reason), true),
                 StreamEvent::Error { message } => {
                     tracing::error!(error = %message, "streaming LLM error");
                     (Ok(format_sse_error(&OpenAiError::api_error(message))), true)

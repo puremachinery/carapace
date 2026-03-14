@@ -16,13 +16,12 @@ jobs:
     outputs:
       cleanup_started_at: ${{ steps.cleanup-window.outputs.started_at }}
       should_publish: ${{ steps.publish-decision.outputs.should_publish }}
-      publish_result: ${{ steps.publish-review.outcome }}
     if: github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.draft == false && github.event.pull_request.user.login != 'dependabot[bot]'
 
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      pull-requests: write
+      pull-requests: read
       issues: read
       id-token: write
       actions: read
@@ -219,9 +218,24 @@ jobs:
           fi
           echo "should_publish=${should_publish}" >> "$GITHUB_OUTPUT"
 
+  publish-claude-review:
+    name: Publish Claude review
+    needs: [claude-review]
+    if: needs.claude-review.outputs.should_publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      pull-requests: write
+
+    steps:
+      - name: Download Claude review output
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: claude-review-json
+          path: ${{ runner.temp }}
+
       - name: Publish deterministic single review with Claude attribution
         id: publish-review
-        if: steps.publish-decision.outputs.should_publish == 'true'
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
         env:
           REVIEW_JSON_PATH: ${{ runner.temp }}/claude-review.json
@@ -359,7 +373,7 @@ jobs:
 
   cleanup-claude-stray-artifacts:
     name: Cleanup stray Claude artifacts from this run
-    needs: [claude-review]
+    needs: [claude-review, publish-claude-review]
     if: always() && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.draft == false && github.event.pull_request.user.login != 'dependabot[bot]'
     runs-on: ubuntu-latest
     permissions:
@@ -372,7 +386,7 @@ jobs:
         env:
           RUN_STARTED_AT: ${{ needs.claude-review.outputs.cleanup_started_at }}
           SHOULD_PUBLISH: ${{ needs.claude-review.outputs.should_publish }}
-          PUBLISH_RESULT: ${{ needs.claude-review.outputs.publish_result }}
+          PUBLISH_RESULT: ${{ needs.publish-claude-review.result }}
           REVIEW_MARKER: "<!-- claude-review-run:${{ github.run_id }}:${{ github.run_attempt }} -->"
         with:
           retries: 3
