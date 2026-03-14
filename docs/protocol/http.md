@@ -210,7 +210,7 @@ Errors:
 ```
 - 401 Unauthorized
 ```json
-{ "error": {"message": "Unauthorized", "type": "unauthorized"} }
+{ "error": {"message": "Unauthorized", "type": "invalid_request_error"} }
 ```
 - 500 Internal Server Error
 ```json

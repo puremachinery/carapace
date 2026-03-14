@@ -185,7 +185,7 @@ impl OpenAiError {
         OpenAiError {
             error: OpenAiErrorBody {
                 message: "Unauthorized".to_string(),
-                r#type: "unauthorized".to_string(),
+                r#type: "invalid_request_error".to_string(),
                 param: None,
                 code: None,
             },
@@ -333,14 +333,14 @@ impl Stream for SseBodyStream {
 
 /// Call the LLM provider and collect the full response (non-streaming collection).
 ///
-/// Returns `(response_text, usage)` on success.
+/// Returns `(response_text, stop_reason, usage)` on success.
 async fn call_llm_provider(
     provider: &dyn LlmProvider,
     model: &str,
     system: Option<String>,
     messages: Vec<LlmMessage>,
     cancel_token: CancellationToken,
-) -> Result<(String, TokenUsage), String> {
+) -> Result<(String, StopReason, TokenUsage), String> {
     let request = CompletionRequest {
         model: model.to_string(),
         messages,
@@ -358,6 +358,7 @@ async fn call_llm_provider(
         .map_err(|e| format!("LLM provider error: {}", e))?;
 
     let mut text = String::new();
+    let mut stop_reason = StopReason::EndTurn;
     let mut usage = TokenUsage::default();
 
     while let Some(event) = rx.recv().await {
@@ -365,7 +366,8 @@ async fn call_llm_provider(
             StreamEvent::TextDelta { text: delta } => {
                 text.push_str(&delta);
             }
-            StreamEvent::Stop { usage: u, .. } => {
+            StreamEvent::Stop { reason, usage: u } => {
+                stop_reason = reason;
                 usage = u;
                 break;
             }
@@ -379,7 +381,7 @@ async fn call_llm_provider(
         }
     }
 
-    Ok((text, usage))
+    Ok((text, stop_reason, usage))
 }
 
 /// Stream LLM provider events as OpenAI-format SSE chunks.
@@ -443,11 +445,7 @@ async fn stream_llm_provider(
                     false,
                 ),
                 StreamEvent::Stop { reason, .. } => {
-                    let finish = match reason {
-                        StopReason::EndTurn => "stop",
-                        StopReason::MaxTokens => "length",
-                        StopReason::ToolUse => "stop",
-                    };
+                    let finish = stop_reason_to_finish_reason(reason);
                     (
                         Ok(format_sse_chunk(&build_chunk(
                             &response_id,
@@ -462,17 +460,7 @@ async fn stream_llm_provider(
                 }
                 StreamEvent::Error { message } => {
                     tracing::error!(error = %message, "streaming LLM error");
-                    (
-                        Ok(format_sse_chunk(&build_chunk(
-                            &response_id,
-                            created,
-                            &model,
-                            None,
-                            None,
-                            Some("stop".to_string()),
-                        ))),
-                        true,
-                    )
+                    (Ok(format_sse_error(&OpenAiError::api_error(message))), true)
                 }
                 StreamEvent::ToolUse { .. } => continue,
             };
@@ -514,11 +502,28 @@ fn build_chunk(
     }
 }
 
+fn stop_reason_to_finish_reason(reason: StopReason) -> &'static str {
+    match reason {
+        StopReason::EndTurn => "stop",
+        StopReason::MaxTokens => "length",
+        StopReason::ToolUse => "stop",
+    }
+}
+
 /// Serialize a chunk into an SSE `data:` line.
 fn format_sse_chunk(chunk: &ChatCompletionChunk) -> String {
     let json = serde_json::to_string(chunk).unwrap_or_else(|e| {
         tracing::error!(error = %e, "failed to serialize SSE chunk");
         r#"{"error":"serialization_failed"}"#.to_string()
+    });
+    format!("data: {}\n\n", json)
+}
+
+fn format_sse_error(error: &OpenAiError) -> String {
+    let json = serde_json::to_string(error).unwrap_or_else(|e| {
+        tracing::error!(error = %e, "failed to serialize SSE error");
+        r#"{"error":{"message":"serialization_failed","type":"api_error","param":null,"code":null}}"#
+            .to_string()
     });
     format!("data: {}\n\n", json)
 }
@@ -537,8 +542,10 @@ fn sse_response(body: Body) -> Response {
 /// Build an SSE error response for a provider failure.
 fn build_error_sse_response(error_msg: String) -> Response {
     let error_stream = async_stream::stream! {
-        let error_data = serde_json::to_string(&OpenAiError::api_error(error_msg)).unwrap_or_default();
-        yield Ok::<_, Infallible>(format!("data: {}\n\ndata: [DONE]\n\n", error_data));
+        yield Ok::<_, Infallible>(format!(
+            "{}data: [DONE]\n\n",
+            format_sse_error(&OpenAiError::api_error(error_msg))
+        ));
     };
     let body = Body::from_stream(error_stream);
     sse_response(body)
@@ -652,7 +659,7 @@ pub async fn chat_completions_handler(
     // Non-streaming response: call the LLM provider and collect the result
     let cancel_token = CancellationToken::new();
     match call_llm_provider(&*provider, &model, system, llm_messages, cancel_token).await {
-        Ok((text, usage)) => {
+        Ok((text, stop_reason, usage)) => {
             let response = ChatCompletionResponse {
                 id: response_id,
                 object: "chat.completion".to_string(),
@@ -665,7 +672,7 @@ pub async fn chat_completions_handler(
                         content: ChatContent::Text(text),
                         name: None,
                     },
-                    finish_reason: "stop".to_string(),
+                    finish_reason: stop_reason_to_finish_reason(stop_reason).to_string(),
                 }],
                 usage: ChatUsage {
                     prompt_tokens: usage.input_tokens,
@@ -997,7 +1004,7 @@ pub async fn responses_handler(
     // Non-streaming: call the LLM provider and collect the result
     let cancel_token = CancellationToken::new();
     match call_llm_provider(&*provider, &model, system, llm_messages, cancel_token).await {
-        Ok((text, usage)) => {
+        Ok((text, _stop_reason, usage)) => {
             let response = ResponsesResponse {
                 id: response_id,
                 object: "response".to_string(),
@@ -1510,8 +1517,9 @@ mod tests {
         )
         .await;
         assert!(result.is_ok());
-        let (text, usage) = result.unwrap();
+        let (text, stop_reason, usage) = result.unwrap();
         assert_eq!(text, "Hello from LLM!");
+        assert_eq!(stop_reason, StopReason::EndTurn);
         assert_eq!(usage.input_tokens, 50);
         assert_eq!(usage.output_tokens, 10);
     }
@@ -1571,7 +1579,7 @@ mod tests {
         )
         .await;
         assert!(result.is_ok());
-        let (text, _) = result.unwrap();
+        let (text, _, _) = result.unwrap();
         assert_eq!(text, "Hello world!");
     }
 
@@ -1594,8 +1602,44 @@ mod tests {
         )
         .await;
         assert!(result.is_ok());
-        let (text, _) = result.unwrap();
+        let (text, _, _) = result.unwrap();
         assert_eq!(text, "I'm helpful!");
+    }
+
+    #[tokio::test]
+    async fn test_call_llm_provider_preserves_max_tokens_stop_reason() {
+        let provider = MockLlmProvider::with_events(vec![
+            StreamEvent::TextDelta {
+                text: "Truncated".to_string(),
+            },
+            StreamEvent::Stop {
+                reason: StopReason::MaxTokens,
+                usage: TokenUsage {
+                    input_tokens: 40,
+                    output_tokens: 12,
+                },
+            },
+        ]);
+
+        let result = call_llm_provider(
+            &provider,
+            "gpt-4o",
+            None,
+            vec![LlmMessage {
+                role: LlmRole::User,
+                content: vec![ContentBlock::Text {
+                    text: "Hi".to_string(),
+                }],
+            }],
+            CancellationToken::new(),
+        )
+        .await
+        .expect("max-tokens completion should succeed");
+
+        let (text, stop_reason, usage) = result;
+        assert_eq!(text, "Truncated");
+        assert_eq!(stop_reason, StopReason::MaxTokens);
+        assert_eq!(usage.output_tokens, 12);
     }
 
     #[tokio::test]
@@ -1801,6 +1845,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_chat_completions_non_streaming_max_tokens_maps_to_length() {
+        let provider = Arc::new(MockLlmProvider::with_events(vec![
+            StreamEvent::TextDelta {
+                text: "Partial answer".to_string(),
+            },
+            StreamEvent::Stop {
+                reason: StopReason::MaxTokens,
+                usage: TokenUsage {
+                    input_tokens: 64,
+                    output_tokens: 16,
+                },
+            },
+        ]));
+        let state = OpenAiState {
+            chat_completions_enabled: true,
+            llm_provider: Some(provider),
+            gateway_token: Some("test-token".to_string()),
+            ..Default::default()
+        };
+
+        let body = serde_json::to_vec(&serde_json::json!({
+            "messages": [{"role": "user", "content": "Hello"}]
+        }))
+        .unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer test-token".parse().unwrap());
+
+        let response = chat_completions_handler(
+            State(state),
+            loopback_connect_info(),
+            headers,
+            axum::body::Bytes::from(body),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        assert_eq!(parsed["choices"][0]["finish_reason"], "length");
+        assert_eq!(parsed["usage"]["prompt_tokens"], 64);
+        assert_eq!(parsed["usage"]["completion_tokens"], 16);
+    }
+
+    #[tokio::test]
     async fn test_chat_completions_provider_error_returns_500() {
         let provider = Arc::new(MockLlmProvider::error_response("API overloaded"));
         let state = OpenAiState {
@@ -1898,6 +1991,54 @@ mod tests {
         assert!(body_str.contains("world!"));
         assert!(body_str.contains("\"finish_reason\":\"stop\""));
         assert!(body_str.contains("data: [DONE]"));
+    }
+
+    #[tokio::test]
+    async fn test_chat_completions_streaming_provider_error_emits_error_sse() {
+        let provider = Arc::new(MockLlmProvider::with_events(vec![
+            StreamEvent::TextDelta {
+                text: "Hello ".to_string(),
+            },
+            StreamEvent::Error {
+                message: "stream interrupted".to_string(),
+            },
+        ]));
+        let state = OpenAiState {
+            chat_completions_enabled: true,
+            llm_provider: Some(provider),
+            gateway_token: Some("test-token".to_string()),
+            ..Default::default()
+        };
+
+        let body = serde_json::to_vec(&serde_json::json!({
+            "messages": [{"role": "user", "content": "Hello"}],
+            "stream": true
+        }))
+        .unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer test-token".parse().unwrap());
+
+        let response = chat_completions_handler(
+            State(state),
+            loopback_connect_info(),
+            headers,
+            axum::body::Bytes::from(body),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body_bytes.to_vec()).unwrap();
+
+        assert!(body_str.contains("Hello "));
+        assert!(body_str.contains("\"type\":\"api_error\""));
+        assert!(body_str.contains("stream interrupted"));
+        assert!(body_str.contains("data: [DONE]"));
+        assert!(!body_str.contains("\"finish_reason\":\"stop\""));
     }
 
     #[tokio::test]
