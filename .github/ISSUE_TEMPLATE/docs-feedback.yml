@@ -1,0 +1,72 @@
+name: Docs feedback
+description: Report stale, unclear, missing, or confusing documentation.
+title: "docs: <short summary>"
+labels:
+  - docs
+  - feedback
+  - triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form for documentation corrections, gaps, or clarity problems.
+        For cookbook-specific walkthrough requests, use the cookbook request form instead.
+
+  - type: dropdown
+    id: doc_type
+    attributes:
+      label: Docs feedback type
+      options:
+        - Stale or incorrect docs
+        - Missing docs
+        - Unclear or confusing docs
+        - Structural/navigation problem
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Primary docs area
+      options:
+        - README
+        - Getting Started docs
+        - First Run docs
+        - Providers docs
+        - Config / protocol docs
+        - Cookbook docs
+        - Website / help pages
+        - CONTRIBUTING / repo docs
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: location
+    attributes:
+      label: Current location
+      description: Link the page/file/section if you can.
+      placeholder: docs/protocol/config.md#vertex or https://getcara.io/getting-started.html
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What is wrong or missing?
+      description: Describe the current documentation problem.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What should the docs say or show instead?
+      description: Include the missing explanation, correction, or structure change you expected.
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Extra context
+      description: Commands, screenshots, related issues/PRs, or user journey details that would help.
