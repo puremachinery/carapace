@@ -45,8 +45,8 @@ body:
   - type: textarea
     id: location
     attributes:
-      label: Current location
-      description: Link the page/file/section if you can.
+      label: Current location (if any)
+      description: Link the page/file/section if this issue is about an existing docs location.
       placeholder: docs/protocol/config.md#vertex or https://getcara.io/getting-started.html
 
   - type: textarea
