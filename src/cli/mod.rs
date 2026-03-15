@@ -6812,7 +6812,7 @@ mod tests {
         env_guard.set("CARAPACE_STATE_DIR", state_dir.as_os_str());
         env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
 
-        handle_backup(Some(archive_path.to_str().unwrap())).unwrap();
+        handle_backup(Some(archive_path.to_string_lossy().as_ref())).unwrap();
         let sections = validate_backup_file(&archive_path).unwrap();
         assert!(
             sections.contains(&"tasks".to_string()),
@@ -6852,7 +6852,7 @@ mod tests {
         {
             env_guard.set("CARAPACE_STATE_DIR", source_state.as_os_str());
             env_guard.set("CARAPACE_CONFIG_PATH", source_config.as_os_str());
-            handle_backup(Some(archive_path.to_str().unwrap())).unwrap();
+            handle_backup(Some(archive_path.to_string_lossy().as_ref())).unwrap();
         }
 
         let target_state = temp.path().join("target-state");
@@ -6862,7 +6862,7 @@ mod tests {
         {
             env_guard.set("CARAPACE_STATE_DIR", target_state.as_os_str());
             env_guard.set("CARAPACE_CONFIG_PATH", target_config.as_os_str());
-            handle_restore(archive_path.to_str().unwrap(), true).unwrap();
+            handle_restore(archive_path.to_string_lossy().as_ref(), true).unwrap();
         }
 
         let restored_tasks =
@@ -7600,7 +7600,7 @@ mod tests {
         let config_path = temp.path().join("carapace.json");
         std::fs::write(&config_path, "{}").unwrap();
 
-        env_guard.set("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
         let result = handle_setup(false, None, None);
 
         assert!(
@@ -7616,7 +7616,7 @@ mod tests {
         let config_path = temp.path().join("carapace.json");
         std::fs::write(&config_path, "{}").unwrap();
 
-        env_guard.set("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
         let result = handle_setup(true, Some(SetupProvider::Anthropic), None);
 
         assert!(
@@ -7632,7 +7632,7 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let config_path = temp.path().join("carapace.json");
 
-        env_guard.set("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
         let result = handle_setup(false, None, None);
 
         assert!(result.is_err(), "Setup should require --provider");
@@ -7655,7 +7655,7 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let config_path = temp.path().join("carapace.json");
 
-        env_guard.set("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
         let result = handle_setup(false, Some(SetupProvider::Anthropic), None);
 
         assert!(result.is_ok());
@@ -7694,7 +7694,7 @@ mod tests {
         let mut env_guard = ScopedEnv::new();
         let temp = tempfile::TempDir::new().unwrap();
         let config_path = temp.path().join("carapace.json");
-        env_guard.set("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
 
         let result = handle_setup(false, Some(SetupProvider::Gemini), None);
         assert!(result.is_err(), "Gemini should require explicit auth mode");
@@ -7716,7 +7716,7 @@ mod tests {
         let mut env_guard = ScopedEnv::new();
         let temp = tempfile::TempDir::new().unwrap();
         let config_path = temp.path().join("carapace.json");
-        env_guard.set("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
 
         let result = handle_setup(
             false,
@@ -7739,7 +7739,7 @@ mod tests {
         let mut env_guard = ScopedEnv::new();
         let temp = tempfile::TempDir::new().unwrap();
         let config_path = temp.path().join("carapace.json");
-        env_guard.set("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
 
         let result = handle_setup(
             false,
@@ -7764,7 +7764,7 @@ mod tests {
         let mut env_guard = ScopedEnv::new();
         let temp = tempfile::TempDir::new().unwrap();
         let config_path = temp.path().join("carapace.json");
-        env_guard.set("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
         env_guard.set("OLLAMA_BASE_URL", "http://127.0.0.1:11434");
         env_guard.set("OLLAMA_API_KEY", "ollama-token");
 
@@ -7785,7 +7785,7 @@ mod tests {
         let mut env_guard = ScopedEnv::new();
         let temp = tempfile::TempDir::new().unwrap();
         let config_path = temp.path().join("carapace.json");
-        env_guard.set("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
 
         let result = handle_setup(false, Some(SetupProvider::Venice), None);
         assert!(
@@ -7807,7 +7807,7 @@ mod tests {
         let mut env_guard = ScopedEnv::new();
         let temp = tempfile::TempDir::new().unwrap();
         let config_path = temp.path().join("carapace.json");
-        env_guard.set("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
         env_guard.unset("AWS_REGION");
         env_guard.unset("AWS_DEFAULT_REGION");
 
