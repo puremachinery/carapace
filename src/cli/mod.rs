@@ -2847,7 +2847,7 @@ struct SetupInteractiveTestHarness {
 static SETUP_INTERACTIVE_TEST_HARNESS: std::sync::LazyLock<
     std::sync::Mutex<Option<SetupInteractiveTestHarness>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
-// Test harness state is process-global; harness-using tests must serialize via ENV_VAR_TEST_LOCK.
+// Test harness state is process-global; harness-using tests must hold a `ScopedEnv`.
 
 #[cfg(test)]
 fn set_setup_interactive_test_harness(harness: SetupInteractiveTestHarness) {
@@ -5764,48 +5764,11 @@ pub fn handle_tls_show_ca(ca_dir_opt: Option<&str>) -> Result<(), Box<dyn std::e
 mod tests {
     use super::*;
     use crate::runtime_bridge::{run_sync_blocking, CURRENT_THREAD_RUNTIME_MESSAGE};
+    use crate::test_support::env::ScopedEnv;
     use clap::Parser;
     use ed25519_dalek::{Signature, VerifyingKey};
     use std::collections::VecDeque;
-    use std::ffi::OsString;
     use std::path::PathBuf;
-    use std::sync::{LazyLock, Mutex};
-
-    // Serializes env-var touching tests in this module.
-    // Cross-module env-var tests should use a shared lock if they touch the same keys.
-    static ENV_VAR_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-
-    struct EnvVarGuard {
-        key: String,
-        previous: Option<OsString>,
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match self.previous.take() {
-                Some(value) => std::env::set_var(&self.key, value),
-                None => std::env::remove_var(&self.key),
-            }
-        }
-    }
-
-    fn set_env_var_scoped(key: &str, value: &str) -> EnvVarGuard {
-        let previous = std::env::var_os(key);
-        std::env::set_var(key, value);
-        EnvVarGuard {
-            key: key.to_string(),
-            previous,
-        }
-    }
-
-    fn unset_env_var_scoped(key: &str) -> EnvVarGuard {
-        let previous = std::env::var_os(key);
-        std::env::remove_var(key);
-        EnvVarGuard {
-            key: key.to_string(),
-            previous,
-        }
-    }
 
     struct SetupInteractiveHarnessGuard;
 
@@ -5825,32 +5788,25 @@ mod tests {
     struct SetupInteractiveTestEnv {
         _temp: tempfile::TempDir,
         config_path: PathBuf,
-        _config_guard: EnvVarGuard,
-        _openai_guard: EnvVarGuard,
-        _anthropic_guard: EnvVarGuard,
-        _telegram_guard: EnvVarGuard,
-        _discord_guard: EnvVarGuard,
         _harness_guard: SetupInteractiveHarnessGuard,
     }
 
-    fn setup_interactive_test_env(harness: SetupInteractiveTestHarness) -> SetupInteractiveTestEnv {
+    fn setup_interactive_test_env(
+        env_guard: &mut ScopedEnv,
+        harness: SetupInteractiveTestHarness,
+    ) -> SetupInteractiveTestEnv {
         let temp = tempfile::TempDir::new().unwrap();
         let config_path = temp.path().join("carapace.json");
-        let config_guard =
-            set_env_var_scoped("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
-        let openai_guard = unset_env_var_scoped("OPENAI_API_KEY");
-        let anthropic_guard = unset_env_var_scoped("ANTHROPIC_API_KEY");
-        let telegram_guard = unset_env_var_scoped("TELEGRAM_BOT_TOKEN");
-        let discord_guard = unset_env_var_scoped("DISCORD_BOT_TOKEN");
+        env_guard
+            .set("CARAPACE_CONFIG_PATH", config_path.as_os_str())
+            .unset("OPENAI_API_KEY")
+            .unset("ANTHROPIC_API_KEY")
+            .unset("TELEGRAM_BOT_TOKEN")
+            .unset("DISCORD_BOT_TOKEN");
         let harness_guard = install_setup_interactive_harness(harness);
         SetupInteractiveTestEnv {
             _temp: temp,
             config_path,
-            _config_guard: config_guard,
-            _openai_guard: openai_guard,
-            _anthropic_guard: anthropic_guard,
-            _telegram_guard: telegram_guard,
-            _discord_guard: discord_guard,
             _harness_guard: harness_guard,
         }
     }
@@ -6759,7 +6715,7 @@ mod tests {
 
     #[test]
     fn test_backup_restore_round_trip() {
-        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let mut env_guard = ScopedEnv::new();
         let temp = tempfile::TempDir::new().unwrap();
 
         // Set up source state directory.
@@ -6807,14 +6763,8 @@ mod tests {
         let target_state = temp.path().join("target");
         let target_config = temp.path().join("target-config.json5");
         std::fs::write(&target_config, "{}").unwrap();
-        let _state_guard = set_env_var_scoped(
-            "CARAPACE_STATE_DIR",
-            target_state.to_string_lossy().as_ref(),
-        );
-        let _config_guard = set_env_var_scoped(
-            "CARAPACE_CONFIG_PATH",
-            target_config.to_string_lossy().as_ref(),
-        );
+        env_guard.set("CARAPACE_STATE_DIR", target_state.as_os_str());
+        env_guard.set("CARAPACE_CONFIG_PATH", target_config.as_os_str());
         let (mut restored_sections, restored_sessions) =
             restore_files_from_tar(&archive_path).unwrap();
         assert_eq!(restored_sessions, 1);
@@ -6848,7 +6798,7 @@ mod tests {
 
     #[test]
     fn test_handle_backup_includes_tasks_section() {
-        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let mut env_guard = ScopedEnv::new();
         let temp = tempfile::TempDir::new().unwrap();
         let state_dir = temp.path().join("state");
         let tasks_dir = state_dir.join("tasks");
@@ -6859,14 +6809,10 @@ mod tests {
         std::fs::write(&config_path, "{}").unwrap();
         let archive_path = temp.path().join("backup-with-tasks.tar.gz");
 
-        let _state_guard =
-            set_env_var_scoped("CARAPACE_STATE_DIR", state_dir.to_string_lossy().as_ref());
-        let _config_guard = set_env_var_scoped(
-            "CARAPACE_CONFIG_PATH",
-            config_path.to_string_lossy().as_ref(),
-        );
+        env_guard.set("CARAPACE_STATE_DIR", state_dir.as_os_str());
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
 
-        handle_backup(Some(archive_path.to_string_lossy().as_ref())).unwrap();
+        handle_backup(Some(archive_path.to_str().unwrap())).unwrap();
         let sections = validate_backup_file(&archive_path).unwrap();
         assert!(
             sections.contains(&"tasks".to_string()),
@@ -6876,13 +6822,12 @@ mod tests {
 
     #[test]
     fn test_handle_backup_restore_round_trip_preserves_tasks() {
-        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let mut env_guard = ScopedEnv::new();
         let temp = tempfile::TempDir::new().unwrap();
         let home_dir = temp.path().join("home");
         std::fs::create_dir_all(&home_dir).unwrap();
-        let _home_guard = set_env_var_scoped("HOME", home_dir.to_string_lossy().as_ref());
-        let _userprofile_guard =
-            set_env_var_scoped("USERPROFILE", home_dir.to_string_lossy().as_ref());
+        env_guard.set("HOME", home_dir.as_os_str());
+        env_guard.set("USERPROFILE", home_dir.as_os_str());
 
         let source_state = temp.path().join("source-state");
         let source_tasks = source_state.join("tasks");
@@ -6905,15 +6850,9 @@ mod tests {
         let archive_path = temp.path().join("backup-roundtrip.tar.gz");
 
         {
-            let _state_guard = set_env_var_scoped(
-                "CARAPACE_STATE_DIR",
-                source_state.to_string_lossy().as_ref(),
-            );
-            let _config_guard = set_env_var_scoped(
-                "CARAPACE_CONFIG_PATH",
-                source_config.to_string_lossy().as_ref(),
-            );
-            handle_backup(Some(archive_path.to_string_lossy().as_ref())).unwrap();
+            env_guard.set("CARAPACE_STATE_DIR", source_state.as_os_str());
+            env_guard.set("CARAPACE_CONFIG_PATH", source_config.as_os_str());
+            handle_backup(Some(archive_path.to_str().unwrap())).unwrap();
         }
 
         let target_state = temp.path().join("target-state");
@@ -6921,15 +6860,9 @@ mod tests {
         std::fs::write(&target_config, "{}").unwrap();
 
         {
-            let _state_guard = set_env_var_scoped(
-                "CARAPACE_STATE_DIR",
-                target_state.to_string_lossy().as_ref(),
-            );
-            let _config_guard = set_env_var_scoped(
-                "CARAPACE_CONFIG_PATH",
-                target_config.to_string_lossy().as_ref(),
-            );
-            handle_restore(archive_path.to_string_lossy().as_ref(), true).unwrap();
+            env_guard.set("CARAPACE_STATE_DIR", target_state.as_os_str());
+            env_guard.set("CARAPACE_CONFIG_PATH", target_config.as_os_str());
+            handle_restore(archive_path.to_str().unwrap(), true).unwrap();
         }
 
         let restored_tasks =
@@ -6939,7 +6872,7 @@ mod tests {
 
     #[test]
     fn test_tasks_section_detected_and_restored_for_directory_entry() {
-        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let mut env_guard = ScopedEnv::new();
         let temp = tempfile::TempDir::new().unwrap();
         let archive_path = temp.path().join("tasks-dir-only.tar.gz");
 
@@ -6978,14 +6911,8 @@ mod tests {
         let target_config = temp.path().join("target-config.json5");
         std::fs::write(&target_config, "{}").unwrap();
 
-        let _state_guard = set_env_var_scoped(
-            "CARAPACE_STATE_DIR",
-            target_state.to_string_lossy().as_ref(),
-        );
-        let _config_guard = set_env_var_scoped(
-            "CARAPACE_CONFIG_PATH",
-            target_config.to_string_lossy().as_ref(),
-        );
+        env_guard.set("CARAPACE_STATE_DIR", target_state.as_os_str());
+        env_guard.set("CARAPACE_CONFIG_PATH", target_config.as_os_str());
 
         let (restored, _) = restore_files_from_tar(&archive_path).unwrap();
         assert!(restored.contains(&"tasks".to_string()));
@@ -7088,23 +7015,23 @@ mod tests {
 
     #[test]
     fn test_detect_setup_provider_env_hints() {
-        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let mut env_guard = ScopedEnv::new();
         {
-            let _anthropic_guard = unset_env_var_scoped("ANTHROPIC_API_KEY");
-            let _openai_guard = unset_env_var_scoped("OPENAI_API_KEY");
-            let _ollama_guard = unset_env_var_scoped("OLLAMA_BASE_URL");
-            let _google_guard = unset_env_var_scoped("GOOGLE_API_KEY");
-            let _venice_guard = unset_env_var_scoped("VENICE_API_KEY");
-            let _region_guard = unset_env_var_scoped("AWS_REGION");
-            let _default_region_guard = unset_env_var_scoped("AWS_DEFAULT_REGION");
-            let _access_guard = unset_env_var_scoped("AWS_ACCESS_KEY_ID");
-            let _secret_guard = unset_env_var_scoped("AWS_SECRET_ACCESS_KEY");
+            env_guard.unset("ANTHROPIC_API_KEY");
+            env_guard.unset("OPENAI_API_KEY");
+            env_guard.unset("OLLAMA_BASE_URL");
+            env_guard.unset("GOOGLE_API_KEY");
+            env_guard.unset("VENICE_API_KEY");
+            env_guard.unset("AWS_REGION");
+            env_guard.unset("AWS_DEFAULT_REGION");
+            env_guard.unset("AWS_ACCESS_KEY_ID");
+            env_guard.unset("AWS_SECRET_ACCESS_KEY");
             assert!(detect_setup_provider_env_hints().is_empty());
         }
 
         {
-            let _anthropic_guard = set_env_var_scoped("ANTHROPIC_API_KEY", "sk-anthropic");
-            let _openai_guard = unset_env_var_scoped("OPENAI_API_KEY");
+            env_guard.set("ANTHROPIC_API_KEY", "sk-anthropic");
+            env_guard.unset("OPENAI_API_KEY");
             assert_eq!(
                 detect_setup_provider_env_hints(),
                 vec![SetupProvider::Anthropic]
@@ -7112,8 +7039,8 @@ mod tests {
         }
 
         {
-            let _anthropic_guard = unset_env_var_scoped("ANTHROPIC_API_KEY");
-            let _openai_guard = set_env_var_scoped("OPENAI_API_KEY", "sk-openai");
+            env_guard.unset("ANTHROPIC_API_KEY");
+            env_guard.set("OPENAI_API_KEY", "sk-openai");
             assert_eq!(
                 detect_setup_provider_env_hints(),
                 vec![SetupProvider::OpenAi]
@@ -7121,9 +7048,9 @@ mod tests {
         }
 
         {
-            let _anthropic_guard = unset_env_var_scoped("ANTHROPIC_API_KEY");
-            let _openai_guard = unset_env_var_scoped("OPENAI_API_KEY");
-            let _google_guard = set_env_var_scoped("GOOGLE_API_KEY", "google-key");
+            env_guard.unset("ANTHROPIC_API_KEY");
+            env_guard.unset("OPENAI_API_KEY");
+            env_guard.set("GOOGLE_API_KEY", "google-key");
             assert_eq!(
                 detect_setup_provider_env_hints(),
                 vec![SetupProvider::Gemini]
@@ -7131,15 +7058,15 @@ mod tests {
         }
 
         {
-            let _anthropic_guard = set_env_var_scoped("ANTHROPIC_API_KEY", "sk-anthropic");
-            let _openai_guard = set_env_var_scoped("OPENAI_API_KEY", "sk-openai");
-            let _ollama_guard = unset_env_var_scoped("OLLAMA_BASE_URL");
-            let _google_guard = unset_env_var_scoped("GOOGLE_API_KEY");
-            let _venice_guard = unset_env_var_scoped("VENICE_API_KEY");
-            let _region_guard = unset_env_var_scoped("AWS_REGION");
-            let _default_region_guard = unset_env_var_scoped("AWS_DEFAULT_REGION");
-            let _access_guard = unset_env_var_scoped("AWS_ACCESS_KEY_ID");
-            let _secret_guard = unset_env_var_scoped("AWS_SECRET_ACCESS_KEY");
+            env_guard.set("ANTHROPIC_API_KEY", "sk-anthropic");
+            env_guard.set("OPENAI_API_KEY", "sk-openai");
+            env_guard.unset("OLLAMA_BASE_URL");
+            env_guard.unset("GOOGLE_API_KEY");
+            env_guard.unset("VENICE_API_KEY");
+            env_guard.unset("AWS_REGION");
+            env_guard.unset("AWS_DEFAULT_REGION");
+            env_guard.unset("AWS_ACCESS_KEY_ID");
+            env_guard.unset("AWS_SECRET_ACCESS_KEY");
             assert_eq!(
                 detect_setup_provider_env_hints(),
                 vec![SetupProvider::Anthropic, SetupProvider::OpenAi]
@@ -7158,8 +7085,8 @@ mod tests {
 
     #[test]
     fn test_local_chat_verify_next_step_for_missing_provider_env_var() {
-        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
-        let _env_guard = unset_env_var_scoped("ANTHROPIC_API_KEY");
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("ANTHROPIC_API_KEY");
         let cfg = serde_json::json!({
             "anthropic": { "apiKey": "${ANTHROPIC_API_KEY}" }
         });
@@ -7183,9 +7110,9 @@ mod tests {
 
     #[test]
     fn test_local_chat_verify_next_step_for_env_only_openai() {
-        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
-        let _openai_guard = set_env_var_scoped("OPENAI_API_KEY", "sk-openai-env");
-        let _anthropic_guard = unset_env_var_scoped("ANTHROPIC_API_KEY");
+        let mut env_guard = ScopedEnv::new();
+        env_guard.set("OPENAI_API_KEY", "sk-openai-env");
+        env_guard.unset("ANTHROPIC_API_KEY");
         let cfg = serde_json::json!({
             "agents": { "defaults": { "model": "gpt-4o" } }
         });
@@ -7210,8 +7137,8 @@ mod tests {
 
     #[test]
     fn test_local_chat_verify_next_step_for_ollama_model() {
-        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
-        let _ollama_guard = set_env_var_scoped("OLLAMA_BASE_URL", "http://127.0.0.1:11434");
+        let mut env_guard = ScopedEnv::new();
+        env_guard.set("OLLAMA_BASE_URL", "http://127.0.0.1:11434");
         let cfg = serde_json::json!({
             "agents": { "defaults": { "model": "ollama:llama3" } }
         });
@@ -7223,8 +7150,8 @@ mod tests {
 
     #[test]
     fn test_local_chat_verify_next_step_for_missing_gemini_provider() {
-        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
-        let _google_guard = unset_env_var_scoped("GOOGLE_API_KEY");
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("GOOGLE_API_KEY");
         let cfg = serde_json::json!({
             "agents": { "defaults": { "model": "gemini-2.0-flash" } }
         });
@@ -7236,8 +7163,8 @@ mod tests {
 
     #[test]
     fn test_local_chat_verify_next_step_for_missing_gemini_provider_env_var() {
-        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
-        let _google_guard = unset_env_var_scoped("GOOGLE_API_KEY");
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("GOOGLE_API_KEY");
         let cfg = serde_json::json!({
             "google": { "apiKey": "${GOOGLE_API_KEY}" },
             "agents": { "defaults": { "model": "gemini-2.0-flash" } }
@@ -7270,9 +7197,9 @@ mod tests {
 
     #[test]
     fn test_usable_provider_labels_ignore_missing_env_placeholders() {
-        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
-        let _openai_guard = unset_env_var_scoped("OPENAI_API_KEY");
-        let _venice_guard = unset_env_var_scoped("VENICE_API_KEY");
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("OPENAI_API_KEY");
+        env_guard.unset("VENICE_API_KEY");
         let cfg = serde_json::json!({
             "openai": { "apiKey": "${OPENAI_API_KEY}" },
             "venice": { "apiKey": "${VENICE_API_KEY}" }
@@ -7293,8 +7220,8 @@ mod tests {
 
     #[test]
     fn test_local_chat_verify_next_step_for_missing_venice_provider_env_var() {
-        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
-        let _venice_guard = unset_env_var_scoped("VENICE_API_KEY");
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("VENICE_API_KEY");
         let cfg = serde_json::json!({
             "venice": { "apiKey": "${VENICE_API_KEY}" },
             "agents": { "defaults": { "model": "venice:llama-3.3-70b" } }
@@ -7307,10 +7234,10 @@ mod tests {
 
     #[test]
     fn test_local_chat_verify_next_step_for_missing_bedrock_provider_env_var() {
-        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
-        let _region_guard = unset_env_var_scoped("AWS_REGION");
-        let _access_guard = unset_env_var_scoped("AWS_ACCESS_KEY_ID");
-        let _secret_guard = unset_env_var_scoped("AWS_SECRET_ACCESS_KEY");
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("AWS_REGION");
+        env_guard.unset("AWS_ACCESS_KEY_ID");
+        env_guard.unset("AWS_SECRET_ACCESS_KEY");
         let cfg = serde_json::json!({
             "bedrock": {
                 "region": "${AWS_REGION}",
@@ -7327,26 +7254,26 @@ mod tests {
 
     #[test]
     fn test_detect_setup_provider_env_hints_ignore_partial_aws_env() {
-        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
-        let _region_guard = set_env_var_scoped("AWS_REGION", "us-east-1");
-        let _access_guard = unset_env_var_scoped("AWS_ACCESS_KEY_ID");
-        let _secret_guard = unset_env_var_scoped("AWS_SECRET_ACCESS_KEY");
-        let _google_guard = unset_env_var_scoped("GOOGLE_API_KEY");
-        let _ollama_guard = unset_env_var_scoped("OLLAMA_BASE_URL");
-        let _venice_guard = unset_env_var_scoped("VENICE_API_KEY");
+        let mut env_guard = ScopedEnv::new();
+        env_guard.set("AWS_REGION", "us-east-1");
+        env_guard.unset("AWS_ACCESS_KEY_ID");
+        env_guard.unset("AWS_SECRET_ACCESS_KEY");
+        env_guard.unset("GOOGLE_API_KEY");
+        env_guard.unset("OLLAMA_BASE_URL");
+        env_guard.unset("VENICE_API_KEY");
 
         assert!(detect_setup_provider_env_hints().is_empty());
     }
 
     #[test]
     fn test_detect_setup_provider_env_hints_include_complete_bedrock_env() {
-        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
-        let _region_guard = set_env_var_scoped("AWS_REGION", "us-east-1");
-        let _access_guard = set_env_var_scoped("AWS_ACCESS_KEY_ID", "AKIA...");
-        let _secret_guard = set_env_var_scoped("AWS_SECRET_ACCESS_KEY", "secret");
-        let _google_guard = unset_env_var_scoped("GOOGLE_API_KEY");
-        let _ollama_guard = unset_env_var_scoped("OLLAMA_BASE_URL");
-        let _venice_guard = unset_env_var_scoped("VENICE_API_KEY");
+        let mut env_guard = ScopedEnv::new();
+        env_guard.set("AWS_REGION", "us-east-1");
+        env_guard.set("AWS_ACCESS_KEY_ID", "AKIA...");
+        env_guard.set("AWS_SECRET_ACCESS_KEY", "secret");
+        env_guard.unset("GOOGLE_API_KEY");
+        env_guard.unset("OLLAMA_BASE_URL");
+        env_guard.unset("VENICE_API_KEY");
 
         assert_eq!(
             detect_setup_provider_env_hints(),
@@ -7445,9 +7372,9 @@ mod tests {
 
     #[test]
     fn test_resolve_env_placeholder_handles_literal_and_placeholder_values() {
-        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let mut env_guard = ScopedEnv::new();
         let key = "DISCORD_BOT_TOKEN";
-        let _env_guard = set_env_var_scoped(key, "  resolved-value  ");
+        env_guard.set(key, "  resolved-value  ");
 
         assert_eq!(
             resolve_env_placeholder("${DISCORD_BOT_TOKEN}"),
@@ -7465,15 +7392,15 @@ mod tests {
 
     #[test]
     fn test_resolve_env_placeholder_missing_var_returns_none() {
-        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
-        let _env_guard = unset_env_var_scoped("DISCORD_BOT_TOKEN");
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("DISCORD_BOT_TOKEN");
         assert_eq!(resolve_env_placeholder("${DISCORD_BOT_TOKEN}"), None);
     }
 
     #[test]
     fn test_resolve_env_placeholder_rejects_non_allowlisted_keys() {
-        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
-        let _env_guard = set_env_var_scoped("CARAPACE_TEST_NON_ALLOWLISTED_SECRET", "secret");
+        let mut env_guard = ScopedEnv::new();
+        env_guard.set("CARAPACE_TEST_NON_ALLOWLISTED_SECRET", "secret");
         assert_eq!(
             resolve_env_placeholder("${CARAPACE_TEST_NON_ALLOWLISTED_SECRET}"),
             None
@@ -7482,8 +7409,8 @@ mod tests {
 
     #[test]
     fn test_resolve_env_placeholder_rejects_custom_bot_token_names() {
-        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
-        let _env_guard = set_env_var_scoped("MY_DISCORD_BOT_TOKEN", "custom-token");
+        let mut env_guard = ScopedEnv::new();
+        env_guard.set("MY_DISCORD_BOT_TOKEN", "custom-token");
         assert_eq!(resolve_env_placeholder("${MY_DISCORD_BOT_TOKEN}"), None);
     }
 
@@ -7543,8 +7470,8 @@ mod tests {
 
     #[test]
     fn test_infer_setup_outcome_ignores_empty_or_unresolved_channel_tokens() {
-        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
-        let _env_guard = unset_env_var_scoped("CARAPACE_TEST_VERIFY_MISSING_TELEGRAM_TOKEN");
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("CARAPACE_TEST_VERIFY_MISSING_TELEGRAM_TOKEN");
         let empty_discord_token_cfg = serde_json::json!({
             "discord": { "enabled": true, "botToken": "   " },
             "gateway": { "hooks": { "enabled": true } }
@@ -7668,12 +7595,12 @@ mod tests {
 
     #[test]
     fn test_handle_setup_errors_when_config_exists_no_force() {
-        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let mut env_guard = ScopedEnv::new();
         let temp = tempfile::TempDir::new().unwrap();
         let config_path = temp.path().join("carapace.json");
         std::fs::write(&config_path, "{}").unwrap();
 
-        let _env_guard = set_env_var_scoped("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
         let result = handle_setup(false, None, None);
 
         assert!(
@@ -7684,12 +7611,12 @@ mod tests {
 
     #[test]
     fn test_handle_setup_force_creates_config() {
-        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let mut env_guard = ScopedEnv::new();
         let temp = tempfile::TempDir::new().unwrap();
         let config_path = temp.path().join("carapace.json");
         std::fs::write(&config_path, "{}").unwrap();
 
-        let _env_guard = set_env_var_scoped("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
         let result = handle_setup(true, Some(SetupProvider::Anthropic), None);
 
         assert!(
@@ -7701,11 +7628,11 @@ mod tests {
 
     #[test]
     fn test_handle_setup_noninteractive_without_provider_errors() {
-        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let mut env_guard = ScopedEnv::new();
         let temp = tempfile::TempDir::new().unwrap();
         let config_path = temp.path().join("carapace.json");
 
-        let _env_guard = set_env_var_scoped("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
         let result = handle_setup(false, None, None);
 
         assert!(result.is_err(), "Setup should require --provider");
@@ -7724,11 +7651,11 @@ mod tests {
 
     #[test]
     fn test_handle_setup_noninteractive_provider_flag_keeps_default_gateway_values() {
-        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let mut env_guard = ScopedEnv::new();
         let temp = tempfile::TempDir::new().unwrap();
         let config_path = temp.path().join("carapace.json");
 
-        let _env_guard = set_env_var_scoped("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
         let result = handle_setup(false, Some(SetupProvider::Anthropic), None);
 
         assert!(result.is_ok());
@@ -7764,10 +7691,10 @@ mod tests {
 
     #[test]
     fn test_handle_setup_noninteractive_provider_flag_writes_gemini_config() {
-        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let mut env_guard = ScopedEnv::new();
         let temp = tempfile::TempDir::new().unwrap();
         let config_path = temp.path().join("carapace.json");
-        let _env_guard = set_env_var_scoped("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
 
         let result = handle_setup(false, Some(SetupProvider::Gemini), None);
         assert!(result.is_err(), "Gemini should require explicit auth mode");
@@ -7786,10 +7713,10 @@ mod tests {
 
     #[test]
     fn test_handle_setup_noninteractive_gemini_api_key_mode_writes_config() {
-        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let mut env_guard = ScopedEnv::new();
         let temp = tempfile::TempDir::new().unwrap();
         let config_path = temp.path().join("carapace.json");
-        let _env_guard = set_env_var_scoped("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
 
         let result = handle_setup(
             false,
@@ -7809,10 +7736,10 @@ mod tests {
 
     #[test]
     fn test_handle_setup_noninteractive_gemini_oauth_mode_errors() {
-        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let mut env_guard = ScopedEnv::new();
         let temp = tempfile::TempDir::new().unwrap();
         let config_path = temp.path().join("carapace.json");
-        let _env_guard = set_env_var_scoped("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
 
         let result = handle_setup(
             false,
@@ -7834,13 +7761,12 @@ mod tests {
 
     #[test]
     fn test_handle_setup_noninteractive_provider_flag_writes_ollama_api_key_placeholder() {
-        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let mut env_guard = ScopedEnv::new();
         let temp = tempfile::TempDir::new().unwrap();
         let config_path = temp.path().join("carapace.json");
-        let _config_guard =
-            set_env_var_scoped("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
-        let _base_url_guard = set_env_var_scoped("OLLAMA_BASE_URL", "http://127.0.0.1:11434");
-        let _api_key_guard = set_env_var_scoped("OLLAMA_API_KEY", "ollama-token");
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
+        env_guard.set("OLLAMA_BASE_URL", "http://127.0.0.1:11434");
+        env_guard.set("OLLAMA_API_KEY", "ollama-token");
 
         let result = handle_setup(false, Some(SetupProvider::Ollama), None);
         assert!(
@@ -7856,10 +7782,10 @@ mod tests {
 
     #[test]
     fn test_handle_setup_noninteractive_provider_flag_writes_venice_config() {
-        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let mut env_guard = ScopedEnv::new();
         let temp = tempfile::TempDir::new().unwrap();
         let config_path = temp.path().join("carapace.json");
-        let _env_guard = set_env_var_scoped("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
 
         let result = handle_setup(false, Some(SetupProvider::Venice), None);
         assert!(
@@ -7878,12 +7804,12 @@ mod tests {
 
     #[test]
     fn test_handle_setup_noninteractive_provider_flag_writes_bedrock_config() {
-        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let mut env_guard = ScopedEnv::new();
         let temp = tempfile::TempDir::new().unwrap();
         let config_path = temp.path().join("carapace.json");
-        let _env_guard = set_env_var_scoped("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
-        let _region_guard = unset_env_var_scoped("AWS_REGION");
-        let _default_region_guard = unset_env_var_scoped("AWS_DEFAULT_REGION");
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
+        env_guard.unset("AWS_REGION");
+        env_guard.unset("AWS_DEFAULT_REGION");
 
         let result = handle_setup(false, Some(SetupProvider::Bedrock), None);
         assert!(
@@ -7920,28 +7846,31 @@ mod tests {
 
     #[test]
     fn test_handle_setup_interactive_selects_ollama_provider() {
-        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
-        let env = setup_interactive_test_env(SetupInteractiveTestHarness {
-            force_interactive: Some(true),
-            visible_inputs: VecDeque::from(vec![
-                "y".to_string(),
-                "ollama".to_string(),
-                "".to_string(),
-                "n".to_string(),
-                "".to_string(),
-                "".to_string(),
-                "".to_string(),
-                "".to_string(),
-                "".to_string(),
-                "n".to_string(),
-                "n".to_string(),
-                "n".to_string(),
-                "n".to_string(),
-                "n".to_string(),
-            ]),
-            ..Default::default()
-        });
-        let _ollama_guard = set_env_var_scoped("OLLAMA_BASE_URL", "http://127.0.0.1:11434");
+        let mut env_guard = ScopedEnv::new();
+        let env = setup_interactive_test_env(
+            &mut env_guard,
+            SetupInteractiveTestHarness {
+                force_interactive: Some(true),
+                visible_inputs: VecDeque::from(vec![
+                    "y".to_string(),
+                    "ollama".to_string(),
+                    "".to_string(),
+                    "n".to_string(),
+                    "".to_string(),
+                    "".to_string(),
+                    "".to_string(),
+                    "".to_string(),
+                    "".to_string(),
+                    "n".to_string(),
+                    "n".to_string(),
+                    "n".to_string(),
+                    "n".to_string(),
+                    "n".to_string(),
+                ]),
+                ..Default::default()
+            },
+        );
+        env_guard.set("OLLAMA_BASE_URL", "http://127.0.0.1:11434");
 
         let result = handle_setup(true, None, None);
         assert!(result.is_ok(), "interactive Ollama setup should succeed");
@@ -7961,30 +7890,33 @@ mod tests {
 
     #[test]
     fn test_handle_setup_interactive_hidden_input_skips_telegram_validation_on_blank_token() {
-        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
-        let env = setup_interactive_test_env(SetupInteractiveTestHarness {
-            force_interactive: Some(true),
-            visible_inputs: VecDeque::from(vec![
-                "y".to_string(),
-                "openai".to_string(),
-                "".to_string(),
-                "n".to_string(),
-                "".to_string(),
-                "".to_string(),
-                "telegram".to_string(),
-                "n".to_string(),
-                "n".to_string(),
-                "n".to_string(),
-                "n".to_string(),
-                "n".to_string(),
-            ]),
-            hidden_inputs: VecDeque::from(vec![
-                "".to_string(),
-                "hidden-token-123".to_string(),
-                "".to_string(),
-            ]),
-            ..Default::default()
-        });
+        let mut env_guard = ScopedEnv::new();
+        let env = setup_interactive_test_env(
+            &mut env_guard,
+            SetupInteractiveTestHarness {
+                force_interactive: Some(true),
+                visible_inputs: VecDeque::from(vec![
+                    "y".to_string(),
+                    "openai".to_string(),
+                    "".to_string(),
+                    "n".to_string(),
+                    "".to_string(),
+                    "".to_string(),
+                    "telegram".to_string(),
+                    "n".to_string(),
+                    "n".to_string(),
+                    "n".to_string(),
+                    "n".to_string(),
+                    "n".to_string(),
+                ]),
+                hidden_inputs: VecDeque::from(vec![
+                    "".to_string(),
+                    "hidden-token-123".to_string(),
+                    "".to_string(),
+                ]),
+                ..Default::default()
+            },
+        );
 
         let result = handle_setup(true, None, None);
         assert!(result.is_ok(), "interactive setup should succeed");
@@ -8007,31 +7939,34 @@ mod tests {
 
     #[test]
     fn test_handle_setup_interactive_visible_input_validates_telegram_token() {
-        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
-        let env = setup_interactive_test_env(SetupInteractiveTestHarness {
-            force_interactive: Some(true),
-            visible_inputs: VecDeque::from(vec![
-                "n".to_string(),
-                "openai".to_string(),
-                "sk-openai-visible".to_string(),
-                "n".to_string(),
-                "".to_string(),
-                "y".to_string(),
-                "".to_string(),
-                "".to_string(),
-                "telegram".to_string(),
-                "12345:abc".to_string(),
-                "y".to_string(),
-                "".to_string(),
-                "n".to_string(),
-                "n".to_string(),
-                "n".to_string(),
-                "n".to_string(),
-                "n".to_string(),
-            ]),
-            channel_validation_results: VecDeque::from(vec![Ok(())]),
-            ..Default::default()
-        });
+        let mut env_guard = ScopedEnv::new();
+        let env = setup_interactive_test_env(
+            &mut env_guard,
+            SetupInteractiveTestHarness {
+                force_interactive: Some(true),
+                visible_inputs: VecDeque::from(vec![
+                    "n".to_string(),
+                    "openai".to_string(),
+                    "sk-openai-visible".to_string(),
+                    "n".to_string(),
+                    "".to_string(),
+                    "y".to_string(),
+                    "".to_string(),
+                    "".to_string(),
+                    "telegram".to_string(),
+                    "12345:abc".to_string(),
+                    "y".to_string(),
+                    "".to_string(),
+                    "n".to_string(),
+                    "n".to_string(),
+                    "n".to_string(),
+                    "n".to_string(),
+                    "n".to_string(),
+                ]),
+                channel_validation_results: VecDeque::from(vec![Ok(())]),
+                ..Default::default()
+            },
+        );
 
         let result = handle_setup(true, None, None);
         assert!(result.is_ok(), "interactive setup should succeed");
@@ -8052,28 +7987,31 @@ mod tests {
     #[test]
     fn test_handle_setup_interactive_telegram_validation_failure_aborts_when_user_declines_continue(
     ) {
-        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
-        let env = setup_interactive_test_env(SetupInteractiveTestHarness {
-            force_interactive: Some(true),
-            visible_inputs: VecDeque::from(vec![
-                "n".to_string(),
-                "openai".to_string(),
-                "sk-openai-visible".to_string(),
-                "n".to_string(),
-                "".to_string(),
-                "y".to_string(),
-                "".to_string(),
-                "".to_string(),
-                "telegram".to_string(),
-                "12345:abc".to_string(),
-                "y".to_string(),
-                "n".to_string(),
-            ]),
-            channel_validation_results: VecDeque::from(vec![Err(
-                "telegram token rejected".to_string()
-            )]),
-            ..Default::default()
-        });
+        let mut env_guard = ScopedEnv::new();
+        let env = setup_interactive_test_env(
+            &mut env_guard,
+            SetupInteractiveTestHarness {
+                force_interactive: Some(true),
+                visible_inputs: VecDeque::from(vec![
+                    "n".to_string(),
+                    "openai".to_string(),
+                    "sk-openai-visible".to_string(),
+                    "n".to_string(),
+                    "".to_string(),
+                    "y".to_string(),
+                    "".to_string(),
+                    "".to_string(),
+                    "telegram".to_string(),
+                    "12345:abc".to_string(),
+                    "y".to_string(),
+                    "n".to_string(),
+                ]),
+                channel_validation_results: VecDeque::from(vec![Err(
+                    "telegram token rejected".to_string()
+                )]),
+                ..Default::default()
+            },
+        );
 
         let result = handle_setup(true, None, None);
         assert!(
@@ -8100,30 +8038,33 @@ mod tests {
 
     #[test]
     fn test_handle_setup_interactive_hidden_input_skips_discord_validation_on_blank_token() {
-        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
-        let env = setup_interactive_test_env(SetupInteractiveTestHarness {
-            force_interactive: Some(true),
-            visible_inputs: VecDeque::from(vec![
-                "y".to_string(),
-                "openai".to_string(),
-                "".to_string(),
-                "n".to_string(),
-                "".to_string(),
-                "".to_string(),
-                "discord".to_string(),
-                "n".to_string(),
-                "n".to_string(),
-                "n".to_string(),
-                "n".to_string(),
-                "n".to_string(),
-            ]),
-            hidden_inputs: VecDeque::from(vec![
-                "".to_string(),
-                "hidden-token-123".to_string(),
-                "".to_string(),
-            ]),
-            ..Default::default()
-        });
+        let mut env_guard = ScopedEnv::new();
+        let env = setup_interactive_test_env(
+            &mut env_guard,
+            SetupInteractiveTestHarness {
+                force_interactive: Some(true),
+                visible_inputs: VecDeque::from(vec![
+                    "y".to_string(),
+                    "openai".to_string(),
+                    "".to_string(),
+                    "n".to_string(),
+                    "".to_string(),
+                    "".to_string(),
+                    "discord".to_string(),
+                    "n".to_string(),
+                    "n".to_string(),
+                    "n".to_string(),
+                    "n".to_string(),
+                    "n".to_string(),
+                ]),
+                hidden_inputs: VecDeque::from(vec![
+                    "".to_string(),
+                    "hidden-token-123".to_string(),
+                    "".to_string(),
+                ]),
+                ..Default::default()
+            },
+        );
 
         let result = handle_setup(true, None, None);
         assert!(result.is_ok(), "interactive setup should succeed");
@@ -8147,28 +8088,31 @@ mod tests {
     #[test]
     fn test_handle_setup_interactive_discord_validation_failure_aborts_when_user_declines_continue()
     {
-        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
-        let env = setup_interactive_test_env(SetupInteractiveTestHarness {
-            force_interactive: Some(true),
-            visible_inputs: VecDeque::from(vec![
-                "n".to_string(),
-                "openai".to_string(),
-                "sk-openai-visible".to_string(),
-                "n".to_string(),
-                "".to_string(),
-                "y".to_string(),
-                "".to_string(),
-                "".to_string(),
-                "discord".to_string(),
-                "discord-bot-token".to_string(),
-                "y".to_string(),
-                "n".to_string(),
-            ]),
-            channel_validation_results: VecDeque::from(vec![Err(
-                "discord token rejected".to_string()
-            )]),
-            ..Default::default()
-        });
+        let mut env_guard = ScopedEnv::new();
+        let env = setup_interactive_test_env(
+            &mut env_guard,
+            SetupInteractiveTestHarness {
+                force_interactive: Some(true),
+                visible_inputs: VecDeque::from(vec![
+                    "n".to_string(),
+                    "openai".to_string(),
+                    "sk-openai-visible".to_string(),
+                    "n".to_string(),
+                    "".to_string(),
+                    "y".to_string(),
+                    "".to_string(),
+                    "".to_string(),
+                    "discord".to_string(),
+                    "discord-bot-token".to_string(),
+                    "y".to_string(),
+                    "n".to_string(),
+                ]),
+                channel_validation_results: VecDeque::from(vec![Err(
+                    "discord token rejected".to_string()
+                )]),
+                ..Default::default()
+            },
+        );
 
         let result = handle_setup(true, None, None);
         assert!(

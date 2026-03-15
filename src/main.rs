@@ -26,6 +26,8 @@ mod server;
 mod sessions;
 mod tailscale;
 mod tasks;
+#[cfg(test)]
+mod test_support;
 mod time;
 mod tls;
 mod update;
