@@ -18,6 +18,7 @@ mod golden_trace {
         _lock: parking_lot::MutexGuard<'static, ()>,
         prev_state: Option<std::ffi::OsString>,
         prev_config: Option<std::ffi::OsString>,
+        prev_cache_disable: Option<std::ffi::OsString>,
         _temp_dir: tempfile::TempDir,
     }
 
@@ -33,6 +34,11 @@ mod golden_trace {
             } else {
                 std::env::remove_var("CARAPACE_CONFIG_PATH");
             }
+            if let Some(val) = &self.prev_cache_disable {
+                std::env::set_var("CARAPACE_DISABLE_CONFIG_CACHE", val);
+            } else {
+                std::env::remove_var("CARAPACE_DISABLE_CONFIG_CACHE");
+            }
         }
     }
 
@@ -42,6 +48,7 @@ mod golden_trace {
         let lock = TEST_LOCK.lock();
         let prev_state = std::env::var_os("CARAPACE_STATE_DIR");
         let prev_config = std::env::var_os("CARAPACE_CONFIG_PATH");
+        let prev_cache_disable = std::env::var_os("CARAPACE_DISABLE_CONFIG_CACHE");
 
         let temp_dir = tempfile::TempDir::new().unwrap();
         let config_path = temp_dir.path().join("carapace.json5");
@@ -49,11 +56,13 @@ mod golden_trace {
 
         std::env::set_var("CARAPACE_STATE_DIR", temp_dir.path());
         std::env::set_var("CARAPACE_CONFIG_PATH", config_path);
+        std::env::set_var("CARAPACE_DISABLE_CONFIG_CACHE", "1");
 
         EnvGuard {
             _lock: lock,
             prev_state,
             prev_config,
+            prev_cache_disable,
             _temp_dir: temp_dir,
         }
     }
