@@ -854,9 +854,6 @@ mod tests {
 
         let result = substitute_env_in_string("${TEST_VAR_ONE} ${TEST_VAR_TWO}!").unwrap();
         assert_eq!(result, "hello world!");
-
-        env_guard.unset("TEST_VAR_ONE");
-        env_guard.unset("TEST_VAR_TWO");
     }
 
     #[test]
@@ -883,8 +880,6 @@ mod tests {
 
         let result = substitute_env_in_string("Bearer ${TEST_API_KEY}").unwrap();
         assert_eq!(result, "Bearer sk-secret");
-
-        env_guard.unset("TEST_API_KEY");
     }
 
     #[test]
@@ -1094,8 +1089,6 @@ mod tests {
 
         let ttl = get_cache_ttl();
         assert_eq!(ttl, Some(Duration::from_millis(500)));
-
-        env_guard.unset("CARAPACE_CONFIG_CACHE_MS");
     }
 
     #[test]
@@ -1105,8 +1098,6 @@ mod tests {
 
         let ttl = get_cache_ttl();
         assert!(ttl.is_none());
-
-        env_guard.unset("CARAPACE_DISABLE_CONFIG_CACHE");
     }
 
     #[test]
