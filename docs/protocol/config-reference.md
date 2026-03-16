@@ -245,6 +245,14 @@ These are the most commonly used provider sections for first-run setup and day-1
     * `apiKey`: Secret credential string, often sourced from `GOOGLE_API_KEY`.
     * `authProfile`: String. Name of a stored Google OAuth profile under `auth.profiles` (alternative to `apiKey`).
     * `baseUrl`: String. Useful for alternate endpoints or proxies.
+* **`codex`**
+  * *What it does:* Connects to Codex using a stored OpenAI auth profile instead of an API key.
+  * *Common values:*
+    * `authProfile`: String. Name of a stored OpenAI OAuth profile under `auth.profiles`.
+  * *Behavior notes:*
+    * This is separate from the API-key `openai` provider.
+    * `cara setup --provider codex` writes `codex.authProfile` and defaults the agent model to `codex:default`.
+    * Codex sign-in requires `CARAPACE_CONFIG_PASSWORD` so the stored auth profile stays encrypted at rest.
 * **`bedrock`**
   * *What it does:* Connects to AWS Bedrock.
   * *Common values:*
@@ -273,6 +281,9 @@ These are the most commonly used provider sections for first-run setup and day-1
     * `providers.google.clientId`
     * `providers.google.clientSecret`
     * `providers.google.redirectUri`
+    * `providers.openai.clientId`
+    * `providers.openai.clientSecret`
+    * `providers.openai.redirectUri`
     * `providers.github.clientId`
     * `providers.github.clientSecret`
     * `providers.github.redirectUri`

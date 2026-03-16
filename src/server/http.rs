@@ -678,6 +678,9 @@ fn register_session_routes(
     let control_state_gemini_oauth_status = control_state.clone();
     let control_state_gemini_oauth_apply = control_state.clone();
     let control_state_gemini_api_key = control_state.clone();
+    let control_state_codex_oauth_start = control_state.clone();
+    let control_state_codex_oauth_status = control_state.clone();
+    let control_state_codex_oauth_apply = control_state.clone();
     let control_state_tasks_create = control_state.clone();
     let control_state_tasks_list = control_state.clone();
     let control_state_tasks_get = control_state.clone();
@@ -797,6 +800,58 @@ fn register_session_routes(
             "/control/onboarding/gemini/callback",
             get(move |query: Query<control::GeminiOAuthCallbackQuery>| async move {
                 control::gemini_oauth_callback_handler(query).await
+            }),
+        )
+        .route(
+            "/control/onboarding/codex/oauth/start",
+            post(
+                move |connect_info: MaybeConnectInfo, headers: HeaderMap, body: Bytes| {
+                    let state = control_state_codex_oauth_start.clone();
+                    async move {
+                        control::codex_oauth_start_handler(State(state), connect_info, headers, body)
+                            .await
+                    }
+                },
+            ),
+        )
+        .route(
+            "/control/onboarding/codex/oauth/{id}",
+            get(
+                move |Path(id): Path<String>, connect_info: MaybeConnectInfo, headers: HeaderMap| {
+                    let state = control_state_codex_oauth_status.clone();
+                    async move {
+                        control::codex_oauth_status_handler(
+                            Path(id),
+                            State(state),
+                            connect_info,
+                            headers,
+                        )
+                        .await
+                    }
+                },
+            ),
+        )
+        .route(
+            "/control/onboarding/codex/oauth/{id}/apply",
+            post(
+                move |Path(id): Path<String>, connect_info: MaybeConnectInfo, headers: HeaderMap| {
+                    let state = control_state_codex_oauth_apply.clone();
+                    async move {
+                        control::codex_oauth_apply_handler(
+                            Path(id),
+                            State(state),
+                            connect_info,
+                            headers,
+                        )
+                        .await
+                    }
+                },
+            ),
+        )
+        .route(
+            "/control/onboarding/codex/callback",
+            get(move |query: Query<control::CodexOAuthCallbackQuery>| async move {
+                control::codex_oauth_callback_handler(query).await
             }),
         )
         .route(
@@ -3044,6 +3099,40 @@ mod tests {
         assert_eq!(parsed["google"]["apiKey"], "AIza-test-key");
         assert_eq!(parsed["google"]["baseUrl"], "https://proxy.example.com");
         assert!(parsed["google"].get("authProfile").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_control_codex_oauth_start_returns_flow() {
+        let (_temp, _guard) = set_temp_config_path();
+        let _password_guard = EnvVarGuard::set("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+        let router = test_router(test_config());
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/control/onboarding/codex/oauth/start")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"clientId":"openai-client-id","clientSecret":"openai-client-secret","redirectBaseUrl":"https://gateway.example.com"}"#,
+            ))
+            .unwrap();
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ok"], true);
+        assert!(json["flowId"].as_str().is_some());
+        assert!(json["authUrl"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("auth.openai.com"));
+        assert_eq!(
+            json["redirectUri"],
+            "https://gateway.example.com/control/onboarding/codex/callback"
+        );
     }
 
     #[tokio::test]

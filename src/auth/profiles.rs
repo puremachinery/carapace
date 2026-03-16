@@ -84,6 +84,7 @@ pub enum OAuthProvider {
     Google,
     GitHub,
     Discord,
+    OpenAI,
 }
 
 impl fmt::Display for OAuthProvider {
@@ -92,6 +93,7 @@ impl fmt::Display for OAuthProvider {
             Self::Google => write!(f, "google"),
             Self::GitHub => write!(f, "github"),
             Self::Discord => write!(f, "discord"),
+            Self::OpenAI => write!(f, "openai"),
         }
     }
 }
@@ -272,6 +274,20 @@ impl OAuthProvider {
                 token_url: "https://discord.com/api/oauth2/token".to_string(),
                 userinfo_url: "https://discord.com/api/users/@me".to_string(),
                 scopes: vec!["identify".to_string(), "email".to_string()],
+            },
+            OAuthProvider::OpenAI => OAuthProviderConfig {
+                client_id: client_id.to_string(),
+                client_secret: client_secret.to_string(),
+                redirect_uri: redirect_uri.to_string(),
+                auth_url: "https://auth.openai.com/oauth/authorize".to_string(),
+                token_url: "https://auth.openai.com/oauth/token".to_string(),
+                userinfo_url: "https://api.openai.com/v1/me".to_string(),
+                scopes: vec![
+                    "openid".to_string(),
+                    "profile".to_string(),
+                    "email".to_string(),
+                    "offline_access".to_string(),
+                ],
             },
         }
     }
@@ -594,7 +610,62 @@ pub async fn fetch_user_info(
                 )
             }),
         }),
+        OAuthProvider::OpenAI => user_info_from_openai_token(access_token),
     }
+}
+
+fn user_info_from_openai_token(access_token: &str) -> Result<UserInfo, AuthProfileError> {
+    let payload = decode_jwt_payload(access_token).ok_or_else(|| {
+        AuthProfileError::UserInfoFailed("failed to decode OpenAI access token claims".to_string())
+    })?;
+    let auth_claim = payload
+        .pointer("/https://api.openai.com/auth")
+        .and_then(Value::as_object);
+    let profile_claim = payload
+        .pointer("/https://api.openai.com/profile")
+        .and_then(Value::as_object);
+
+    let user_id = auth_claim
+        .and_then(|claim| {
+            claim
+                .get("user_id")
+                .and_then(Value::as_str)
+                .or_else(|| claim.get("chatgpt_user_id").and_then(Value::as_str))
+                .or_else(|| claim.get("chatgpt_account_user_id").and_then(Value::as_str))
+        })
+        .or_else(|| payload.get("sub").and_then(Value::as_str))
+        .unwrap_or_default()
+        .to_string();
+    if user_id.trim().is_empty() {
+        return Err(AuthProfileError::UserInfoFailed(
+            "OpenAI access token did not contain a usable user id".to_string(),
+        ));
+    }
+
+    let email = profile_claim
+        .and_then(|claim| claim.get("email").and_then(Value::as_str))
+        .or_else(|| payload.get("email").and_then(Value::as_str))
+        .map(|s| s.to_string());
+    let display_name = email.clone().or_else(|| {
+        auth_claim
+            .and_then(|claim| claim.get("chatgpt_plan_type").and_then(Value::as_str))
+            .map(|plan| format!("OpenAI {plan}"))
+    });
+
+    Ok(UserInfo {
+        user_id,
+        email,
+        display_name,
+        avatar_url: None,
+    })
+}
+
+fn decode_jwt_payload(token: &str) -> Option<Value> {
+    let payload = token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload.as_bytes())
+        .ok()?;
+    serde_json::from_slice(&bytes).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -1027,6 +1098,7 @@ pub fn build_auth_profiles_config(cfg: &Value) -> AuthProfilesConfig {
             ("google", OAuthProvider::Google),
             ("github", OAuthProvider::GitHub),
             ("discord", OAuthProvider::Discord),
+            ("openai", OAuthProvider::OpenAI),
         ];
 
         for &(key, provider) in provider_entries {
@@ -1120,6 +1192,10 @@ mod tests {
         OAuthProvider::Discord.default_config("cid", "csecret", "https://example.com/cb")
     }
 
+    fn openai_config() -> OAuthProviderConfig {
+        OAuthProvider::OpenAI.default_config("cid", "csecret", "https://example.com/cb")
+    }
+
     fn random_password() -> Vec<u8> {
         let mut bytes = [0u8; 32];
         getrandom::fill(&mut bytes).expect("random test password bytes");
@@ -1135,14 +1211,17 @@ mod tests {
         let g = google_config();
         let gh = github_config();
         let d = discord_config();
+        let o = openai_config();
 
         assert!(g.auth_url.contains("accounts.google.com"));
         assert!(gh.auth_url.contains("github.com"));
         assert!(d.auth_url.contains("discord.com"));
+        assert!(o.auth_url.contains("auth.openai.com"));
 
         assert_eq!(g.client_id, "cid");
         assert_eq!(gh.client_secret, "csecret");
         assert_eq!(d.redirect_uri, "https://example.com/cb");
+        assert_eq!(o.redirect_uri, "https://example.com/cb");
     }
 
     #[test]
@@ -1173,6 +1252,18 @@ mod tests {
         assert_eq!(cfg.token_url, "https://discord.com/api/oauth2/token");
         assert_eq!(cfg.userinfo_url, "https://discord.com/api/users/@me");
         assert_eq!(cfg.scopes, vec!["identify", "email"]);
+    }
+
+    #[test]
+    fn test_openai_config_endpoints() {
+        let cfg = openai_config();
+        assert_eq!(cfg.auth_url, "https://auth.openai.com/oauth/authorize");
+        assert_eq!(cfg.token_url, "https://auth.openai.com/oauth/token");
+        assert_eq!(cfg.userinfo_url, "https://api.openai.com/v1/me");
+        assert_eq!(
+            cfg.scopes,
+            vec!["openid", "profile", "email", "offline_access"]
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1565,6 +1656,10 @@ mod tests {
                         "discord": {
                             "clientId": "dc-cid",
                             "clientSecret": "dc-cs"
+                        },
+                        "openai": {
+                            "clientId": "oa-cid",
+                            "clientSecret": "oa-cs"
                         }
                     }
                 }
@@ -1576,7 +1671,7 @@ mod tests {
             result.redirect_base_url.as_deref(),
             Some("https://gw.example.com")
         );
-        assert_eq!(result.providers.len(), 3);
+        assert_eq!(result.providers.len(), 4);
 
         let google = result.providers.get(&OAuthProvider::Google).unwrap();
         assert_eq!(google.client_id, "google-cid");
@@ -1588,6 +1683,11 @@ mod tests {
 
         let discord = result.providers.get(&OAuthProvider::Discord).unwrap();
         assert_eq!(discord.client_id, "dc-cid");
+
+        let openai = result.providers.get(&OAuthProvider::OpenAI).unwrap();
+        assert_eq!(openai.client_id, "oa-cid");
+        assert_eq!(openai.client_secret, "oa-cs");
+        assert_eq!(openai.redirect_uri, "https://gw.example.com/auth/callback");
     }
 
     #[test]
@@ -1611,6 +1711,7 @@ mod tests {
         assert_eq!(format!("{}", OAuthProvider::Google), "google");
         assert_eq!(format!("{}", OAuthProvider::GitHub), "github");
         assert_eq!(format!("{}", OAuthProvider::Discord), "discord");
+        assert_eq!(format!("{}", OAuthProvider::OpenAI), "openai");
     }
 
     #[test]
@@ -1709,6 +1810,9 @@ mod tests {
         let json = serde_json::to_string(&OAuthProvider::Discord).unwrap();
         assert_eq!(json, "\"discord\"");
 
+        let json = serde_json::to_string(&OAuthProvider::OpenAI).unwrap();
+        assert_eq!(json, "\"openai\"");
+
         // Deserialize
         let provider: OAuthProvider = serde_json::from_str("\"google\"").unwrap();
         assert_eq!(provider, OAuthProvider::Google);
@@ -1718,6 +1822,9 @@ mod tests {
 
         let provider: OAuthProvider = serde_json::from_str("\"discord\"").unwrap();
         assert_eq!(provider, OAuthProvider::Discord);
+
+        let provider: OAuthProvider = serde_json::from_str("\"openai\"").unwrap();
+        assert_eq!(provider, OAuthProvider::OpenAI);
     }
 
     // -----------------------------------------------------------------------

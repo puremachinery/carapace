@@ -8,6 +8,7 @@ pub mod bedrock;
 pub mod builtin_tools;
 pub mod channel_tools;
 pub mod classifier;
+pub mod codex;
 pub mod context;
 pub mod executor;
 pub mod exfiltration;

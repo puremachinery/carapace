@@ -44,6 +44,7 @@ const PROTECTED_CONFIG_PREFIXES: &[&str] = &[
     "auth.profiles.providers.google.clientSecret",
     "auth.profiles.providers.github.clientSecret",
     "auth.profiles.providers.discord.clientSecret",
+    "auth.profiles.providers.openai.clientSecret",
     "anthropic.apiKey",
     "openai.apiKey",
     "google.apiKey",
@@ -242,6 +243,30 @@ pub struct GeminiApiKeyRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GeminiOAuthCallbackQuery {
+    #[serde(default)]
+    pub code: Option<String>,
+    #[serde(default)]
+    pub state: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexOAuthStartRequest {
+    #[serde(default)]
+    #[serde(rename = "clientId")]
+    pub oauth_client_id: Option<String>,
+    #[serde(default)]
+    #[serde(rename = "clientSecret")]
+    pub oauth_client_secret: Option<String>,
+    #[serde(default)]
+    pub redirect_base_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexOAuthCallbackQuery {
     #[serde(default)]
     pub code: Option<String>,
     #[serde(default)]
@@ -870,6 +895,130 @@ pub async fn gemini_oauth_apply_handler(
     }
 }
 
+/// POST /control/onboarding/codex/oauth/start - Begin Codex OpenAI sign-in.
+pub async fn codex_oauth_start_handler(
+    State(state): State<ControlState>,
+    connect_info: MaybeConnectInfo,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let remote_addr = connect_info.0;
+    if let Some(err) = check_control_auth(&state, &headers, remote_addr) {
+        return err;
+    }
+
+    let req: CodexOAuthStartRequest = match parse_optional_json(&body) {
+        Ok(req) => req,
+        Err(msg) => {
+            return (StatusCode::BAD_REQUEST, Json(ControlError::new(msg))).into_response();
+        }
+    };
+
+    let snapshot = read_config_snapshot();
+    let redirect_base_url = match req
+        .redirect_base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => match sanitize_control_redirect_base_url(value) {
+            Ok(validated) => Some(validated),
+            Err(msg) => {
+                return (StatusCode::BAD_REQUEST, Json(ControlError::new(msg))).into_response();
+            }
+        },
+        None => configured_control_redirect_base_url(&snapshot.config)
+            .or_else(|| control_request_base_url(&headers)),
+    };
+
+    let Some(redirect_base_url) = redirect_base_url else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ControlError::new(
+                "Unable to determine Control UI base URL for Codex callback",
+            )),
+        )
+            .into_response();
+    };
+
+    match onboarding::codex::start_control_openai_oauth(
+        &snapshot.config,
+        req.oauth_client_id
+            .map(|value| value.trim().to_string())
+            .filter(|v| !v.is_empty()),
+        req.oauth_client_secret
+            .map(|value| value.trim().to_string())
+            .filter(|v| !v.is_empty()),
+        &redirect_base_url,
+    ) {
+        Ok(started) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "flowId": started.flow_id,
+                "authUrl": started.auth_url,
+                "redirectUri": started.redirect_uri,
+            })),
+        )
+            .into_response(),
+        Err(err) => (StatusCode::BAD_REQUEST, Json(ControlError::new(err))).into_response(),
+    }
+}
+
+/// GET /control/onboarding/codex/oauth/{id} - Poll Codex OpenAI sign-in status.
+pub async fn codex_oauth_status_handler(
+    Path(flow_id): Path<String>,
+    State(state): State<ControlState>,
+    connect_info: MaybeConnectInfo,
+    headers: HeaderMap,
+) -> Response {
+    let remote_addr = connect_info.0;
+    if let Some(err) = check_control_auth(&state, &headers, remote_addr) {
+        return err;
+    }
+
+    match onboarding::codex::control_openai_oauth_status(flow_id.trim()) {
+        Ok(status) => (
+            StatusCode::OK,
+            Json(json!({ "ok": true, "status": status })),
+        )
+            .into_response(),
+        Err(err) => (StatusCode::NOT_FOUND, Json(ControlError::new(err))).into_response(),
+    }
+}
+
+/// POST /control/onboarding/codex/oauth/{id}/apply - Persist Codex sign-in config.
+pub async fn codex_oauth_apply_handler(
+    Path(flow_id): Path<String>,
+    State(state): State<ControlState>,
+    connect_info: MaybeConnectInfo,
+    headers: HeaderMap,
+) -> Response {
+    let remote_addr = connect_info.0;
+    if let Some(err) = check_control_auth(&state, &headers, remote_addr) {
+        return err;
+    }
+
+    match onboarding::codex::apply_control_openai_oauth(
+        flow_id.trim(),
+        crate::server::ws::resolve_state_dir(),
+    ) {
+        Ok(applied) => {
+            let snapshot = read_config_snapshot();
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "applied": applied,
+                    "hash": snapshot.hash,
+                })),
+            )
+                .into_response()
+        }
+        Err(err) => (StatusCode::BAD_REQUEST, Json(ControlError::new(err))).into_response(),
+    }
+}
+
 /// GET /control/onboarding/gemini/callback - OAuth callback landing page.
 pub async fn gemini_oauth_callback_handler(
     Query(query): Query<GeminiOAuthCallbackQuery>,
@@ -894,6 +1043,34 @@ pub async fn gemini_oauth_callback_handler(
     (
         status,
         axum::response::Html(onboarding::gemini::callback_html(title, &message)),
+    )
+        .into_response()
+}
+
+/// GET /control/onboarding/codex/callback - OAuth callback landing page.
+pub async fn codex_oauth_callback_handler(
+    Query(query): Query<CodexOAuthCallbackQuery>,
+) -> Response {
+    let state = query.state.as_deref().unwrap_or_default();
+    let result: Result<(), String> = onboarding::codex::complete_control_openai_oauth_callback(
+        state,
+        query.code.as_deref(),
+        query.error.as_deref(),
+    )
+    .await;
+
+    let (status, title, message): (StatusCode, &str, String) = match result {
+        Ok(()) => (
+            StatusCode::OK,
+            "Codex sign-in complete",
+            "You can return to the Control UI and finish applying the Codex config.".to_string(),
+        ),
+        Err(err) => (StatusCode::BAD_REQUEST, "Codex sign-in failed", err),
+    };
+
+    (
+        status,
+        axum::response::Html(onboarding::codex::callback_html(title, &message)),
     )
         .into_response()
 }
