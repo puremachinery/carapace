@@ -97,7 +97,9 @@ cargo nextest run -E 'test(my_test_name)'
 
 - Keep each PR focused on a single feature, fix, or refactoring effort.
 - Include tests for all new functionality.
+- Use GitHub Issues for public contributor-facing work tracking.
 - Link any related GitHub issue in the PR description and close it when appropriate.
+- Treat roadmap documents as higher-level planning, not as a one-to-one checklist of GitHub issues.
 - CI must pass before merge. The pipeline checks:
   - `cargo fmt --check`
   - `cargo clippy -- -D warnings`
