@@ -24,8 +24,12 @@ const RECEIVE_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Debug, Deserialize)]
 pub struct SignalEnvelope {
     /// Source phone number (e.g. "+15559876543").
-    #[serde(default, rename = "sourceNumber", alias = "source")]
+    #[serde(default, rename = "sourceNumber")]
     pub source_number: Option<String>,
+
+    /// Legacy source field.
+    #[serde(default)]
+    pub source: Option<String>,
 
     /// Timestamp of the message.
     #[serde(default)]
@@ -52,6 +56,13 @@ pub struct SignalDataMessage {
     pub group_info: Option<SignalGroupInfo>,
 }
 
+impl SignalEnvelope {
+    /// Returns the effective source number, preferring `sourceNumber` over `source`.
+    pub fn effective_source_number(&self) -> Option<&str> {
+        self.source_number.as_deref().or(self.source.as_deref())
+    }
+}
+
 /// Group metadata on a Signal message.
 #[derive(Debug, Deserialize)]
 pub struct SignalGroupInfo {
@@ -70,8 +81,7 @@ fn resolve_signal_sender_and_peer(
     data_message: &SignalDataMessage,
 ) -> Option<(String, String)> {
     let sender = envelope
-        .source_number
-        .as_deref()
+        .effective_source_number()
         .map(str::trim)
         .filter(|s| !s.is_empty())?;
     let group_id = data_message
@@ -389,7 +399,7 @@ mod tests {
 
         let envelopes: Vec<SignalEnvelope> = serde_json::from_str(json).unwrap();
         assert_eq!(envelopes.len(), 1);
-        assert_eq!(envelopes[0].source_number.as_deref(), Some("+15559876543"));
+        assert_eq!(envelopes[0].effective_source_number(), Some("+15559876543"));
         let dm = envelopes[0].data_message.as_ref().unwrap();
         assert_eq!(dm.message.as_deref(), Some("Hello from Signal!"));
         assert_eq!(dm.timestamp, Some(1706745600000));
@@ -452,7 +462,24 @@ mod tests {
         ]"#;
 
         let envelopes: Vec<SignalEnvelope> = serde_json::from_str(json).unwrap();
-        assert_eq!(envelopes[0].source_number.as_deref(), Some("+15559876543"));
+        assert_eq!(envelopes[0].effective_source_number(), Some("+15559876543"));
+    }
+
+    #[test]
+    fn test_parse_envelope_with_duplicate_source_fields() {
+        let json = r#"[
+            {
+                "source": "+15559876543",
+                "sourceNumber": "+15559876543",
+                "dataMessage": {
+                    "message": "Hello from duplicate fields!"
+                }
+            }
+        ]"#;
+
+        let envelopes: Vec<SignalEnvelope> = serde_json::from_str(json).unwrap();
+        assert_eq!(envelopes.len(), 1);
+        assert_eq!(envelopes[0].effective_source_number(), Some("+15559876543"));
     }
 
     #[test]
@@ -482,7 +509,7 @@ mod tests {
         });
 
         let envelope = deserialize_signal_envelope_item(item).unwrap();
-        assert_eq!(envelope.source_number.as_deref(), Some("+15559876543"));
+        assert_eq!(envelope.effective_source_number(), Some("+15559876543"));
         assert_eq!(
             envelope
                 .data_message
@@ -502,7 +529,7 @@ mod tests {
         });
 
         let envelope = deserialize_signal_envelope_item(item).unwrap();
-        assert_eq!(envelope.source_number.as_deref(), Some("+15559876543"));
+        assert_eq!(envelope.effective_source_number(), Some("+15559876543"));
         assert_eq!(
             envelope
                 .data_message
@@ -533,13 +560,14 @@ mod tests {
             .and_then(|dm| dm.group_info.as_ref())
             .and_then(|group| group.group_id.as_deref());
         assert_eq!(group, Some("dGVzdGdyb3VwaWQ="));
-        assert_eq!(envelope.source_number.as_deref(), Some("+15559876543"));
+        assert_eq!(envelope.effective_source_number(), Some("+15559876543"));
     }
 
     #[test]
     fn test_resolve_sender_and_peer_rejects_empty_sender() {
         let envelope = SignalEnvelope {
             source_number: Some("   ".to_string()),
+            source: None,
             timestamp: None,
             data_message: Some(SignalDataMessage {
                 message: Some("Hello".to_string()),
@@ -557,6 +585,7 @@ mod tests {
     fn test_resolve_sender_and_peer_ignores_empty_group_id() {
         let envelope = SignalEnvelope {
             source_number: Some("+15559876543".to_string()),
+            source: None,
             timestamp: None,
             data_message: Some(SignalDataMessage {
                 message: Some("Hello".to_string()),
@@ -579,6 +608,7 @@ mod tests {
     fn test_resolve_sender_and_peer_rejects_group_message_with_phone_number_like_id() {
         let envelope = SignalEnvelope {
             source_number: Some("+15559876543".to_string()),
+            source: None,
             timestamp: None,
             data_message: Some(SignalDataMessage {
                 message: Some("Hello".to_string()),
@@ -598,6 +628,7 @@ mod tests {
     fn test_resolve_sender_and_peer_rejects_group_messages() {
         let envelope = SignalEnvelope {
             source_number: Some("+15559876543".to_string()),
+            source: None,
             timestamp: None,
             data_message: Some(SignalDataMessage {
                 message: Some("Hello".to_string()),
