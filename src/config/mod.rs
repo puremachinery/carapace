@@ -1342,6 +1342,8 @@ mod tests {
     }
 
     fn assert_loader_control_env_var_is_rejected(config_content: &str, expected_path: &str) {
+        // Hold the global env lock while reset_config_env_state_for_test()
+        // restores any previously injected config env vars.
         let _env_guard = ScopedEnv::new();
         reset_config_env_state_for_test();
 
@@ -1665,6 +1667,8 @@ mod tests {
 
     #[test]
     fn test_config_env_with_nul_byte_is_rejected() {
+        // Hold the global env lock while reset_config_env_state_for_test()
+        // restores any previously injected config env vars.
         let _env_guard = ScopedEnv::new();
         reset_config_env_state_for_test();
 
