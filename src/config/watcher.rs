@@ -420,10 +420,8 @@ async fn watcher_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::env::ScopedEnv;
     use serde_json::json;
-    use std::sync::{LazyLock, Mutex};
-
-    static ENV_VAR_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     #[test]
     fn test_reload_mode_from_str() {
@@ -497,15 +495,13 @@ mod tests {
 
     #[test]
     fn test_perform_reload_with_no_config_file() {
-        let _lock = ENV_VAR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut env_guard = ScopedEnv::new();
         let temp_dir = tempfile::TempDir::new().unwrap();
         let missing_config_path = temp_dir.path().join("missing-carapace.json5");
-        let _config_path_guard = EnvVarGuard::set(
-            "CARAPACE_CONFIG_PATH",
-            missing_config_path.to_str().unwrap(),
-        );
-        let _state_dir_guard = EnvVarGuard::unset("CARAPACE_STATE_DIR");
-        let _disable_cache_guard = EnvVarGuard::set("CARAPACE_DISABLE_CONFIG_CACHE", "1");
+        env_guard
+            .set("CARAPACE_CONFIG_PATH", missing_config_path.as_os_str())
+            .unset("CARAPACE_STATE_DIR")
+            .set("CARAPACE_DISABLE_CONFIG_CACHE", "1");
         crate::config::clear_cache();
 
         // When no config file exists, reload should succeed with defaults
@@ -601,7 +597,7 @@ mod tests {
     #[tokio::test]
     async fn test_reload_validation_with_temp_config() {
         use std::io::Write;
-        let _lock = ENV_VAR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut env_guard = ScopedEnv::new();
         let dir = tempfile::TempDir::new().unwrap();
         let config_path = dir.path().join("carapace.json5");
 
@@ -612,7 +608,7 @@ mod tests {
         }
 
         // Set the env var to point to our test config
-        let _guard = EnvVarGuard::set("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
         let result = perform_reload(&ReloadMode::Hot);
         assert!(result.success);
         assert_eq!(result.mode, "hot");
@@ -621,7 +617,7 @@ mod tests {
     #[tokio::test]
     async fn test_reload_invalid_config_fails() {
         use std::io::Write;
-        let _lock = ENV_VAR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut env_guard = ScopedEnv::new();
         let dir = tempfile::TempDir::new().unwrap();
         let config_path = dir.path().join("carapace.json5");
 
@@ -631,45 +627,10 @@ mod tests {
             f.write_all(b"this is not valid json5 {{{{").unwrap();
         }
 
-        let _guard = EnvVarGuard::set("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
         let result = perform_reload(&ReloadMode::Hybrid);
         assert!(!result.success);
         assert_eq!(result.mode, "hybrid");
         assert!(result.error.is_some());
-    }
-
-    /// RAII guard for temporarily setting an environment variable.
-    struct EnvVarGuard {
-        key: String,
-        prev: Option<String>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &str, value: &str) -> Self {
-            let prev = std::env::var(key).ok();
-            std::env::set_var(key, value);
-            Self {
-                key: key.to_string(),
-                prev,
-            }
-        }
-
-        fn unset(key: &str) -> Self {
-            let prev = std::env::var(key).ok();
-            std::env::remove_var(key);
-            Self {
-                key: key.to_string(),
-                prev,
-            }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match &self.prev {
-                Some(v) => std::env::set_var(&self.key, v),
-                None => std::env::remove_var(&self.key),
-            }
-        }
     }
 }

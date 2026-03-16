@@ -10,59 +10,28 @@ mod golden_trace {
     use crate::logging::buffer::{LogLevel, LOG_BUFFER};
     use crate::server::ws::handlers::dispatch_method;
     use crate::server::ws::*;
+    use crate::test_support::env::ScopedEnv;
     use serde_json::{json, Value};
     use std::sync::Arc;
     // ───────────────────────── helpers ─────────────────────────
 
     struct EnvGuard {
-        _lock: parking_lot::MutexGuard<'static, ()>,
-        prev_state: Option<std::ffi::OsString>,
-        prev_config: Option<std::ffi::OsString>,
-        prev_cache_disable: Option<std::ffi::OsString>,
+        _env: ScopedEnv,
         _temp_dir: tempfile::TempDir,
     }
 
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            if let Some(val) = &self.prev_state {
-                std::env::set_var("CARAPACE_STATE_DIR", val);
-            } else {
-                std::env::remove_var("CARAPACE_STATE_DIR");
-            }
-            if let Some(val) = &self.prev_config {
-                std::env::set_var("CARAPACE_CONFIG_PATH", val);
-            } else {
-                std::env::remove_var("CARAPACE_CONFIG_PATH");
-            }
-            if let Some(val) = &self.prev_cache_disable {
-                std::env::set_var("CARAPACE_DISABLE_CONFIG_CACHE", val);
-            } else {
-                std::env::remove_var("CARAPACE_DISABLE_CONFIG_CACHE");
-            }
-        }
-    }
-
-    static TEST_LOCK: parking_lot::Mutex<()> = parking_lot::const_mutex(());
-
     fn init_test_env() -> EnvGuard {
-        let lock = TEST_LOCK.lock();
-        let prev_state = std::env::var_os("CARAPACE_STATE_DIR");
-        let prev_config = std::env::var_os("CARAPACE_CONFIG_PATH");
-        let prev_cache_disable = std::env::var_os("CARAPACE_DISABLE_CONFIG_CACHE");
-
         let temp_dir = tempfile::TempDir::new().unwrap();
         let config_path = temp_dir.path().join("carapace.json5");
         std::fs::write(&config_path, "{}").unwrap();
 
-        std::env::set_var("CARAPACE_STATE_DIR", temp_dir.path());
-        std::env::set_var("CARAPACE_CONFIG_PATH", config_path);
-        std::env::set_var("CARAPACE_DISABLE_CONFIG_CACHE", "1");
+        let mut env = ScopedEnv::new();
+        env.set("CARAPACE_STATE_DIR", temp_dir.path())
+            .set("CARAPACE_CONFIG_PATH", config_path.as_os_str())
+            .set("CARAPACE_DISABLE_CONFIG_CACHE", "1");
 
         EnvGuard {
-            _lock: lock,
-            prev_state,
-            prev_config,
-            prev_cache_disable,
+            _env: env,
             _temp_dir: temp_dir,
         }
     }

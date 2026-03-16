@@ -30,6 +30,8 @@ pub mod server;
 pub mod sessions;
 pub mod tailscale;
 pub mod tasks;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub(crate) mod time;
 pub mod tls;
 pub mod update;
