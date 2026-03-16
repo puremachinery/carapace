@@ -118,6 +118,7 @@ impl CodexProvider {
                 self.profile_id
             )));
         }
+        self.profile_store.update_last_used(&self.profile_id);
         Ok(access_token.to_string())
     }
 
@@ -296,5 +297,36 @@ mod tests {
         assert!(err
             .to_string()
             .contains("Codex auth profile \"openai-empty-token\" has no usable access token"));
+    }
+
+    #[tokio::test]
+    async fn test_codex_provider_updates_last_used_after_access() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let provider_config = OAuthProvider::OpenAI.default_config(
+            "client-id",
+            "client-secret",
+            "http://127.0.0.1:3000/auth/callback",
+        );
+        let mut profile = sample_profile("openai-last-used");
+        profile.last_used_ms = None;
+        let store = Arc::new(ProfileStore::from_env(temp.path().to_path_buf()).expect("store"));
+        store.add(profile).expect("store profile");
+        let provider = CodexProvider::with_oauth_profile(
+            store.clone(),
+            "openai-last-used".to_string(),
+            provider_config,
+        )
+        .expect("provider");
+
+        let token = provider.access_token().await.expect("token");
+        assert_eq!(token, "access-token");
+        assert!(
+            store
+                .get("openai-last-used")
+                .expect("stored profile")
+                .last_used_ms
+                .is_some(),
+            "last_used_ms should update after successful Codex token access"
+        );
     }
 }
