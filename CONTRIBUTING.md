@@ -20,7 +20,7 @@ everything you need to get started, follow our conventions, and submit changes.
 ### Clone, Build, and Test
 
 ```sh
-git clone https://github.com/your-org/carapace.git
+git clone https://github.com/puremachinery/carapace.git
 cd carapace
 cargo build
 cargo nextest run   # preferred
@@ -97,7 +97,7 @@ cargo nextest run -E 'test(my_test_name)'
 
 - Keep each PR focused on a single feature, fix, or refactoring effort.
 - Include tests for all new functionality.
-- Update `TODO.md` if your change completes a tracked item.
+- Link any related GitHub issue in the PR description and close it when appropriate.
 - CI must pass before merge. The pipeline checks:
   - `cargo fmt --check`
   - `cargo clippy -- -D warnings`
@@ -123,7 +123,7 @@ The codebase is organized into focused modules under `src/`:
 
 ## Reporting Issues
 
-Please use [GitHub Issues](https://github.com/your-org/carapace/issues) to
+Please use [GitHub Issues](https://github.com/puremachinery/carapace/issues) to
 report bugs or request features. When filing a bug report, include:
 
 - **Rust version:** output of `rustc --version`
@@ -135,4 +135,4 @@ report bugs or request features. When filing a bug report, include:
 ## License
 
 By contributing to Carapace, you agree that your contributions will be licensed
-under the [MIT License](LICENSE).
+under the [Apache License 2.0](LICENSE).
