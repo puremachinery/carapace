@@ -10,9 +10,8 @@ For what is already shipped and verified, see:
 
 ## Recently shipped
 
-- Stable release line established (`v0.1.0`, `v0.2.0`) — stable compatibility
-  policy and verified update/release paths are now in effect for the stable
-  channel.
+- Stable compatibility policy established for the stable channel, with
+  verified update and release paths now in effect.
 - Cross-platform subprocess sandbox hardening — macOS, Linux, and Windows
   enforce OS-level isolation for sandbox-required paths; unsupported platforms
   fail closed.
