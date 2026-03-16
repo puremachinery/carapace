@@ -854,8 +854,8 @@ mod tests {
         )
         .expect("provider config");
 
-        assert_eq!(provider.client_id, "existing-client-id");
-        assert_eq!(provider.client_secret, "env-client-secret");
+        assert!(provider.client_id == "existing-client-id");
+        assert!(provider.client_secret == "env-client-secret");
     }
 
     #[test]
@@ -891,8 +891,8 @@ mod tests {
         )
         .expect("provider config");
 
-        assert_eq!(provider.client_id, "stored-client-id");
-        assert_eq!(provider.client_secret, "stored-client-secret");
+        assert!(provider.client_id == "stored-client-id");
+        assert!(provider.client_secret == "stored-client-secret");
     }
 
     #[test]
@@ -929,8 +929,8 @@ mod tests {
         )
         .expect("provider config");
 
-        assert_eq!(provider.client_id, "override-client-id");
-        assert_eq!(provider.client_secret, "override-client-secret");
+        assert!(provider.client_id == "override-client-id");
+        assert!(provider.client_secret == "override-client-secret");
         assert_eq!(provider.redirect_uri, "http://127.0.0.1:3555/auth/callback");
     }
 
@@ -1025,8 +1025,8 @@ mod tests {
         let stored_cfg = profile
             .oauth_provider_config
             .expect("stored Google OAuth provider config");
-        assert_eq!(stored_cfg.client_id, "google-client-id");
-        assert_eq!(stored_cfg.client_secret, "google-client-secret");
+        assert!(stored_cfg.client_id == "google-client-id");
+        assert!(stored_cfg.client_secret == "google-client-secret");
     }
 
     #[test]

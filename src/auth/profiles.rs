@@ -1236,8 +1236,8 @@ mod tests {
         assert!(d.auth_url.contains("discord.com"));
         assert!(o.auth_url.contains("auth.openai.com"));
 
-        assert_eq!(g.client_id, "cid");
-        assert_eq!(gh.client_secret, "csecret");
+        assert!(g.client_id == "cid");
+        assert!(gh.client_secret == "csecret");
         assert_eq!(d.redirect_uri, "https://example.com/cb");
         assert_eq!(o.redirect_uri, "https://example.com/cb");
     }
@@ -1370,8 +1370,8 @@ mod tests {
         let json = serde_json::to_string(&tokens).unwrap();
         let deserialized: OAuthTokens = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(deserialized.access_token, tokens.access_token);
-        assert_eq!(deserialized.refresh_token, tokens.refresh_token);
+        assert!(deserialized.access_token == tokens.access_token);
+        assert!(deserialized.refresh_token == tokens.refresh_token);
         assert_eq!(deserialized.token_type, tokens.token_type);
         assert_eq!(deserialized.expires_at_ms, tokens.expires_at_ms);
         assert_eq!(deserialized.scope, tokens.scope);
@@ -1559,7 +1559,7 @@ mod tests {
         store.update_tokens("upd", new_tokens).unwrap();
 
         let profile = store.get("upd").unwrap();
-        assert_eq!(profile.tokens.access_token, "new-access");
+        assert!(profile.tokens.access_token == "new-access");
         assert_eq!(
             profile.tokens.refresh_token,
             Some("new-refresh".to_string())
@@ -1692,19 +1692,19 @@ mod tests {
         assert_eq!(result.providers.len(), 4);
 
         let google = result.providers.get(&OAuthProvider::Google).unwrap();
-        assert_eq!(google.client_id, "google-cid");
-        assert_eq!(google.client_secret, "google-cs");
+        assert!(google.client_id == "google-cid");
+        assert!(google.client_secret == "google-cs");
         assert_eq!(google.redirect_uri, "https://gw.example.com/auth/callback");
 
         let github = result.providers.get(&OAuthProvider::GitHub).unwrap();
-        assert_eq!(github.client_id, "gh-cid");
+        assert!(github.client_id == "gh-cid");
 
         let discord = result.providers.get(&OAuthProvider::Discord).unwrap();
-        assert_eq!(discord.client_id, "dc-cid");
+        assert!(discord.client_id == "dc-cid");
 
         let openai = result.providers.get(&OAuthProvider::OpenAI).unwrap();
-        assert_eq!(openai.client_id, "oa-cid");
-        assert_eq!(openai.client_secret, "oa-cs");
+        assert!(openai.client_id == "oa-cid");
+        assert!(openai.client_secret == "oa-cs");
         assert_eq!(openai.redirect_uri, "https://gw.example.com/auth/callback");
     }
 
@@ -2018,7 +2018,7 @@ mod tests {
 
         // In-memory tokens should be plaintext
         let profile = store2.get("de-1").unwrap();
-        assert_eq!(profile.tokens.access_token, "access-123");
+        assert!(profile.tokens.access_token == "access-123");
 
         // Force a re-save
         store2.update_last_used("de-1");
@@ -2055,7 +2055,7 @@ mod tests {
         store2.load().unwrap();
 
         let loaded = store2.get("nrt-1").unwrap();
-        assert_eq!(loaded.tokens.access_token, "access-123");
-        assert_eq!(loaded.tokens.refresh_token, None);
+        assert!(loaded.tokens.access_token == "access-123");
+        assert!(loaded.tokens.refresh_token.is_none());
     }
 }

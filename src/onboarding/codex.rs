@@ -746,8 +746,8 @@ mod tests {
         )
         .expect("provider config");
 
-        assert_eq!(provider.client_id, "existing-client-id");
-        assert_eq!(provider.client_secret, "env-client-secret");
+        assert!(provider.client_id == "existing-client-id");
+        assert!(provider.client_secret == "env-client-secret");
     }
 
     #[test]
