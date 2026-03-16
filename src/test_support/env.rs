@@ -1,4 +1,5 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 
 use parking_lot::{Mutex, MutexGuard};
@@ -45,26 +46,87 @@ impl ScopedEnv {
 
     fn record_original(&mut self, key: &OsStr) -> OsString {
         let key = key.to_os_string();
-        self.original_values
-            .entry(key.clone())
-            .or_insert_with(|| std::env::var_os(&key));
-        self.mutation_order.push(key.clone());
+        match self.original_values.entry(key.clone()) {
+            Entry::Occupied(_) => {}
+            Entry::Vacant(entry) => {
+                self.mutation_order.push(key.clone());
+                entry.insert(std::env::var_os(&key));
+            }
+        }
         key
     }
 }
 
 impl Drop for ScopedEnv {
     fn drop(&mut self) {
-        let mut restored = HashSet::new();
         for key in self.mutation_order.iter().rev() {
-            if !restored.insert(key.clone()) {
-                continue;
-            }
-
             match self.original_values.remove(key).flatten() {
                 Some(value) => std::env::set_var(key, value),
                 None => std::env::remove_var(key),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ScopedEnv;
+    use std::ffi::OsString;
+
+    const TEST_KEY: &str = "CARAPACE_TEST_SCOPED_ENV_VALUE";
+    const MISSING_KEY: &str = "CARAPACE_TEST_SCOPED_ENV_MISSING";
+    const REUSE_KEY: &str = "CARAPACE_TEST_SCOPED_ENV_REUSE";
+
+    #[test]
+    fn test_scoped_env_restores_original_value_after_drop() {
+        std::env::set_var(TEST_KEY, "original");
+
+        {
+            let mut env_guard = ScopedEnv::new();
+            env_guard.set(TEST_KEY, "updated");
+            assert_eq!(std::env::var_os(TEST_KEY), Some(OsString::from("updated")));
+        }
+
+        assert_eq!(std::env::var_os(TEST_KEY), Some(OsString::from("original")));
+        std::env::remove_var(TEST_KEY);
+    }
+
+    #[test]
+    fn test_scoped_env_restores_missing_value_after_set() {
+        std::env::remove_var(MISSING_KEY);
+
+        {
+            let mut env_guard = ScopedEnv::new();
+            env_guard.set(MISSING_KEY, "temporary");
+            assert_eq!(
+                std::env::var_os(MISSING_KEY),
+                Some(OsString::from("temporary"))
+            );
+        }
+
+        assert_eq!(std::env::var_os(MISSING_KEY), None);
+    }
+
+    #[test]
+    fn test_scoped_env_preserves_first_original_across_unset_and_reset() {
+        std::env::set_var(REUSE_KEY, "original");
+
+        {
+            let mut env_guard = ScopedEnv::new();
+            env_guard.unset(REUSE_KEY);
+            assert_eq!(std::env::var_os(REUSE_KEY), None);
+
+            env_guard.set(REUSE_KEY, "temporary");
+            assert_eq!(
+                std::env::var_os(REUSE_KEY),
+                Some(OsString::from("temporary"))
+            );
+        }
+
+        assert_eq!(
+            std::env::var_os(REUSE_KEY),
+            Some(OsString::from("original"))
+        );
+        std::env::remove_var(REUSE_KEY);
     }
 }
