@@ -787,13 +787,10 @@ pub fn validate_config(config: &Value) -> Vec<ValidationIssue> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::env::ScopedEnv;
     use std::fs::File;
     use std::io::Write;
-    use std::sync::Mutex;
     use tempfile::TempDir;
-
-    /// Mutex to serialize tests that modify environment variables
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// Helper to create a temp config file
     fn create_temp_config(dir: &TempDir, name: &str, content: &str) -> PathBuf {
@@ -851,15 +848,12 @@ mod tests {
 
     #[test]
     fn test_env_var_substitution() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        env::set_var("TEST_VAR_ONE", "hello");
-        env::set_var("TEST_VAR_TWO", "world");
+        let mut env_guard = ScopedEnv::new();
+        env_guard.set("TEST_VAR_ONE", "hello");
+        env_guard.set("TEST_VAR_TWO", "world");
 
         let result = substitute_env_in_string("${TEST_VAR_ONE} ${TEST_VAR_TWO}!").unwrap();
         assert_eq!(result, "hello world!");
-
-        env::remove_var("TEST_VAR_ONE");
-        env::remove_var("TEST_VAR_TWO");
     }
 
     #[test]
@@ -870,8 +864,8 @@ mod tests {
 
     #[test]
     fn test_env_var_missing() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        env::remove_var("NONEXISTENT_VAR_12345");
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("NONEXISTENT_VAR_12345");
         let result = substitute_env_in_string("${NONEXISTENT_VAR_12345}");
 
         assert!(
@@ -881,13 +875,11 @@ mod tests {
 
     #[test]
     fn test_env_var_partial_string() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        env::set_var("TEST_API_KEY", "sk-secret");
+        let mut env_guard = ScopedEnv::new();
+        env_guard.set("TEST_API_KEY", "sk-secret");
 
         let result = substitute_env_in_string("Bearer ${TEST_API_KEY}").unwrap();
         assert_eq!(result, "Bearer sk-secret");
-
-        env::remove_var("TEST_API_KEY");
     }
 
     #[test]
@@ -1080,9 +1072,9 @@ mod tests {
 
     #[test]
     fn test_config_cache_ttl_default() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        env::remove_var("CARAPACE_CONFIG_CACHE_MS");
-        env::remove_var("CARAPACE_DISABLE_CONFIG_CACHE");
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("CARAPACE_CONFIG_CACHE_MS");
+        env_guard.unset("CARAPACE_DISABLE_CONFIG_CACHE");
 
         let ttl = get_cache_ttl();
         assert_eq!(ttl, Some(Duration::from_millis(200)));
@@ -1090,33 +1082,29 @@ mod tests {
 
     #[test]
     fn test_config_cache_ttl_custom() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let mut env_guard = ScopedEnv::new();
         // Ensure disabled cache env var is not set
-        env::remove_var("CARAPACE_DISABLE_CONFIG_CACHE");
-        env::set_var("CARAPACE_CONFIG_CACHE_MS", "500");
+        env_guard.unset("CARAPACE_DISABLE_CONFIG_CACHE");
+        env_guard.set("CARAPACE_CONFIG_CACHE_MS", "500");
 
         let ttl = get_cache_ttl();
         assert_eq!(ttl, Some(Duration::from_millis(500)));
-
-        env::remove_var("CARAPACE_CONFIG_CACHE_MS");
     }
 
     #[test]
     fn test_config_cache_disabled() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        env::set_var("CARAPACE_DISABLE_CONFIG_CACHE", "1");
+        let mut env_guard = ScopedEnv::new();
+        env_guard.set("CARAPACE_DISABLE_CONFIG_CACHE", "1");
 
         let ttl = get_cache_ttl();
         assert!(ttl.is_none());
-
-        env::remove_var("CARAPACE_DISABLE_CONFIG_CACHE");
     }
 
     #[test]
     fn test_get_config_path_default() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        env::remove_var("CARAPACE_CONFIG_PATH");
-        env::remove_var("CARAPACE_STATE_DIR");
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("CARAPACE_CONFIG_PATH");
+        env_guard.unset("CARAPACE_STATE_DIR");
 
         let path = get_config_path();
         let expected_base = dirs::config_dir()
@@ -1130,33 +1118,29 @@ mod tests {
 
     #[test]
     fn test_get_config_path_override() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        env::remove_var("CARAPACE_STATE_DIR");
-        env::set_var("CARAPACE_CONFIG_PATH", "/custom/path/config.json");
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("CARAPACE_STATE_DIR");
+        env_guard.set("CARAPACE_CONFIG_PATH", "/custom/path/config.json");
 
         let path = get_config_path();
         assert_eq!(path, PathBuf::from("/custom/path/config.json"));
-
-        env::remove_var("CARAPACE_CONFIG_PATH");
     }
 
     #[test]
     fn test_get_config_path_state_dir() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        env::remove_var("CARAPACE_CONFIG_PATH");
-        env::set_var("CARAPACE_STATE_DIR", "/custom/state");
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("CARAPACE_CONFIG_PATH");
+        env_guard.set("CARAPACE_STATE_DIR", "/custom/state");
 
         let path = get_config_path();
         // Falls back to .json when .json5 doesn't exist on disk
         assert_eq!(path, PathBuf::from("/custom/state/carapace.json"));
-
-        env::remove_var("CARAPACE_STATE_DIR");
     }
 
     #[test]
     fn test_env_substitution_in_nested_config() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        env::set_var("TEST_OPENAI_KEY", "sk-test-key");
+        let mut env_guard = ScopedEnv::new();
+        env_guard.set("TEST_OPENAI_KEY", "sk-test-key");
 
         let dir = TempDir::new().unwrap();
         let main_path = create_temp_config(
@@ -1177,14 +1161,12 @@ mod tests {
             config["models"]["providers"]["openai"]["apiKey"],
             "sk-test-key"
         );
-
-        env::remove_var("TEST_OPENAI_KEY");
     }
 
     #[test]
     fn test_secret_encryption_round_trip() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        env::set_var("CARAPACE_CONFIG_PASSWORD", "test-password");
+        let mut env_guard = ScopedEnv::new();
+        env_guard.set("CARAPACE_CONFIG_PASSWORD", "test-password");
 
         let dir = TempDir::new().unwrap();
         let main_path = create_temp_config(
@@ -1211,8 +1193,6 @@ mod tests {
         let reloaded = load_config_uncached(&main_path).unwrap();
         assert_eq!(reloaded["anthropic"]["apiKey"], "sk-test");
         assert_eq!(reloaded["gateway"]["auth"]["token"], "token123");
-
-        env::remove_var("CARAPACE_CONFIG_PASSWORD");
     }
 
     #[test]
@@ -1266,10 +1246,10 @@ mod tests {
 
     #[test]
     fn test_include_env_vars_are_injected_before_substitution() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let mut env_guard = ScopedEnv::new();
         reset_config_env_state_for_test();
-        env::remove_var("TEST_INCLUDED_GATEWAY_TOKEN");
-        env::remove_var("TEST_INCLUDED_VERTEX_PROJECT_ID");
+        env_guard.unset("TEST_INCLUDED_GATEWAY_TOKEN");
+        env_guard.unset("TEST_INCLUDED_VERTEX_PROJECT_ID");
 
         let dir = TempDir::new().unwrap();
         create_temp_config(
@@ -1313,16 +1293,16 @@ mod tests {
             "someproject"
         );
 
-        env::remove_var("TEST_INCLUDED_GATEWAY_TOKEN");
-        env::remove_var("TEST_INCLUDED_VERTEX_PROJECT_ID");
+        env_guard.unset("TEST_INCLUDED_GATEWAY_TOKEN");
+        env_guard.unset("TEST_INCLUDED_VERTEX_PROJECT_ID");
         reset_config_env_state_for_test();
     }
 
     #[test]
     fn test_nested_env_include_injects_before_substitution() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let mut env_guard = ScopedEnv::new();
         reset_config_env_state_for_test();
-        env::remove_var("TEST_NESTED_ENV_INCLUDE");
+        env_guard.unset("TEST_NESTED_ENV_INCLUDE");
 
         let dir = TempDir::new().unwrap();
         create_temp_config(
@@ -1357,12 +1337,14 @@ mod tests {
         assert_eq!(config["gateway"]["auth"]["token"], "nested-token");
         assert_eq!(env::var("TEST_NESTED_ENV_INCLUDE").unwrap(), "nested-token");
 
-        env::remove_var("TEST_NESTED_ENV_INCLUDE");
+        env_guard.unset("TEST_NESTED_ENV_INCLUDE");
         reset_config_env_state_for_test();
     }
 
     fn assert_loader_control_env_var_is_rejected(config_content: &str, expected_path: &str) {
-        let _lock = ENV_LOCK.lock().unwrap();
+        // Hold the global env lock while reset_config_env_state_for_test()
+        // restores any previously injected config env vars.
+        let _env_guard = ScopedEnv::new();
         reset_config_env_state_for_test();
 
         let dir = TempDir::new().unwrap();
@@ -1417,10 +1399,10 @@ mod tests {
 
     #[test]
     fn test_env_vars_and_string_fields_both_inject() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let mut env_guard = ScopedEnv::new();
         reset_config_env_state_for_test();
-        env::remove_var("TEST_API_KEY_FROM_ENV_BLOCK");
-        env::remove_var("TEST_OTHER_FLAG");
+        env_guard.unset("TEST_API_KEY_FROM_ENV_BLOCK");
+        env_guard.unset("TEST_OTHER_FLAG");
 
         let dir = TempDir::new().unwrap();
         let main_path = create_temp_config(
@@ -1452,17 +1434,17 @@ mod tests {
         );
         assert_eq!(env::var("TEST_OTHER_FLAG").unwrap(), "enabled");
 
-        env::remove_var("TEST_API_KEY_FROM_ENV_BLOCK");
-        env::remove_var("TEST_OTHER_FLAG");
+        env_guard.unset("TEST_API_KEY_FROM_ENV_BLOCK");
+        env_guard.unset("TEST_OTHER_FLAG");
         reset_config_env_state_for_test();
     }
 
     #[test]
     fn test_config_env_values_can_reference_other_config_env_values() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let mut env_guard = ScopedEnv::new();
         reset_config_env_state_for_test();
-        env::remove_var("TEST_BASE_TOKEN");
-        env::remove_var("TEST_COMPOSED_TOKEN");
+        env_guard.unset("TEST_BASE_TOKEN");
+        env_guard.unset("TEST_COMPOSED_TOKEN");
 
         let dir = TempDir::new().unwrap();
         let main_path = create_temp_config(
@@ -1491,16 +1473,16 @@ mod tests {
             "base-token-suffix"
         );
 
-        env::remove_var("TEST_BASE_TOKEN");
-        env::remove_var("TEST_COMPOSED_TOKEN");
+        env_guard.unset("TEST_BASE_TOKEN");
+        env_guard.unset("TEST_COMPOSED_TOKEN");
         reset_config_env_state_for_test();
     }
 
     #[test]
     fn test_removed_config_env_vars_restore_previous_environment() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let mut env_guard = ScopedEnv::new();
         reset_config_env_state_for_test();
-        env::set_var("TEST_RELOAD_ENV", "preexisting");
+        env_guard.set("TEST_RELOAD_ENV", "preexisting");
 
         let dir = TempDir::new().unwrap();
         let first_path = create_temp_config(
@@ -1535,16 +1517,16 @@ mod tests {
         assert_eq!(second["meta"]["lastVersion"], "preexisting");
         assert_eq!(env::var("TEST_RELOAD_ENV").unwrap(), "preexisting");
 
-        env::remove_var("TEST_RELOAD_ENV");
+        env_guard.unset("TEST_RELOAD_ENV");
         reset_config_env_state_for_test();
     }
 
     #[test]
     fn test_failed_substitution_restores_previous_environment() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let mut env_guard = ScopedEnv::new();
         reset_config_env_state_for_test();
-        env::set_var("TEST_FAILED_SUBSTITUTION_ENV", "preexisting");
-        env::remove_var("TEST_MISSING_AFTER_INJECTION");
+        env_guard.set("TEST_FAILED_SUBSTITUTION_ENV", "preexisting");
+        env_guard.unset("TEST_MISSING_AFTER_INJECTION");
 
         let dir = TempDir::new().unwrap();
         let broken_path = create_temp_config(
@@ -1572,16 +1554,16 @@ mod tests {
             "preexisting"
         );
 
-        env::remove_var("TEST_FAILED_SUBSTITUTION_ENV");
+        env_guard.unset("TEST_FAILED_SUBSTITUTION_ENV");
         reset_config_env_state_for_test();
     }
 
     #[test]
     fn test_failed_reload_restores_previous_injected_environment() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let mut env_guard = ScopedEnv::new();
         reset_config_env_state_for_test();
-        env::remove_var("TEST_RELOAD_ROLLBACK_ENV");
-        env::remove_var("TEST_RELOAD_ROLLBACK_MISSING");
+        env_guard.unset("TEST_RELOAD_ROLLBACK_ENV");
+        env_guard.unset("TEST_RELOAD_ROLLBACK_MISSING");
 
         let dir = TempDir::new().unwrap();
         let working_path = create_temp_config(
@@ -1630,16 +1612,16 @@ mod tests {
             "from-first-load"
         );
 
-        env::remove_var("TEST_RELOAD_ROLLBACK_ENV");
+        env_guard.unset("TEST_RELOAD_ROLLBACK_ENV");
         reset_config_env_state_for_test();
     }
 
     #[test]
     fn test_removed_injected_env_does_not_resolve_new_references() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let mut env_guard = ScopedEnv::new();
         reset_config_env_state_for_test();
-        env::remove_var("TEST_STALE_CONFIG_ENV");
-        env::remove_var("TEST_STALE_CONFIG_COMBINED");
+        env_guard.unset("TEST_STALE_CONFIG_ENV");
+        env_guard.unset("TEST_STALE_CONFIG_COMBINED");
 
         let dir = TempDir::new().unwrap();
         let first_path = create_temp_config(
@@ -1678,14 +1660,16 @@ mod tests {
             Err(ConfigError::MissingEnvVar { var }) if var == "TEST_STALE_CONFIG_ENV"
         ));
 
-        env::remove_var("TEST_STALE_CONFIG_ENV");
-        env::remove_var("TEST_STALE_CONFIG_COMBINED");
+        env_guard.unset("TEST_STALE_CONFIG_ENV");
+        env_guard.unset("TEST_STALE_CONFIG_COMBINED");
         reset_config_env_state_for_test();
     }
 
     #[test]
     fn test_config_env_with_nul_byte_is_rejected() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        // Hold the global env lock while reset_config_env_state_for_test()
+        // restores any previously injected config env vars.
+        let _env_guard = ScopedEnv::new();
         reset_config_env_state_for_test();
 
         let dir = TempDir::new().unwrap();
@@ -1707,9 +1691,9 @@ mod tests {
 
     #[test]
     fn test_missing_config_clears_previous_injected_environment() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let mut env_guard = ScopedEnv::new();
         reset_config_env_state_for_test();
-        env::remove_var("TEST_MISSING_CONFIG_ENV");
+        env_guard.unset("TEST_MISSING_CONFIG_ENV");
 
         let dir = TempDir::new().unwrap();
         let working_path = create_temp_config(
