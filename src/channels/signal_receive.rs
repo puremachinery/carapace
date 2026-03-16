@@ -59,7 +59,10 @@ pub struct SignalDataMessage {
 impl SignalEnvelope {
     /// Returns the effective source number, preferring `sourceNumber` over `source`.
     pub fn effective_source_number(&self) -> Option<&str> {
-        self.source_number.as_deref().or(self.source.as_deref())
+        self.source_number
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| self.source.as_deref().filter(|s| !s.trim().is_empty()))
     }
 }
 
@@ -463,6 +466,17 @@ mod tests {
 
         let envelopes: Vec<SignalEnvelope> = serde_json::from_str(json).unwrap();
         assert_eq!(envelopes[0].effective_source_number(), Some("+15559876543"));
+    }
+
+    #[test]
+    fn test_effective_source_number_empty_source_number_fallback() {
+        let envelope = SignalEnvelope {
+            source_number: Some("   ".to_string()),
+            source: Some("+15559876543".to_string()),
+            timestamp: None,
+            data_message: None,
+        };
+        assert_eq!(envelope.effective_source_number(), Some("+15559876543"));
     }
 
     #[test]
