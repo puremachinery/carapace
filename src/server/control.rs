@@ -231,15 +231,6 @@ impl OptionalTextInput {
     }
 }
 
-impl std::fmt::Debug for OptionalTextInput {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.0 {
-            Some(_) => f.write_str("OptionalTextInput(<provided>)"),
-            None => f.write_str("OptionalTextInput(None)"),
-        }
-    }
-}
-
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GeminiOAuthStartRequest {
@@ -1932,7 +1923,7 @@ mod tests {
     }
 
     #[test]
-    fn test_optional_text_input_trims_and_redacts_debug() {
+    fn test_optional_text_input_trims_nonempty_values() {
         let body = axum::body::Bytes::from_static(
             br#"{"clientId":"  openai-client-id  ","clientSecret":"  openai-client-secret  "}"#,
         );
@@ -1949,14 +1940,6 @@ mod tests {
                 .as_deref(),
             Some("openai-client-secret")
         );
-
-        let debug_repr = format!(
-            "{:?} {:?}",
-            OptionalTextInput(Some("client-id".to_string())),
-            OptionalTextInput(Some("client-secret".to_string()))
-        );
-        assert!(!debug_repr.contains("client-id"));
-        assert!(!debug_repr.contains("client-secret"));
     }
 
     #[test]
