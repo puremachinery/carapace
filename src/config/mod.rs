@@ -1124,8 +1124,6 @@ mod tests {
 
         let path = get_config_path();
         assert_eq!(path, PathBuf::from("/custom/path/config.json"));
-
-        env_guard.unset("CARAPACE_CONFIG_PATH");
     }
 
     #[test]
@@ -1137,8 +1135,6 @@ mod tests {
         let path = get_config_path();
         // Falls back to .json when .json5 doesn't exist on disk
         assert_eq!(path, PathBuf::from("/custom/state/carapace.json"));
-
-        env_guard.unset("CARAPACE_STATE_DIR");
     }
 
     #[test]
@@ -1165,8 +1161,6 @@ mod tests {
             config["models"]["providers"]["openai"]["apiKey"],
             "sk-test-key"
         );
-
-        env_guard.unset("TEST_OPENAI_KEY");
     }
 
     #[test]
@@ -1199,8 +1193,6 @@ mod tests {
         let reloaded = load_config_uncached(&main_path).unwrap();
         assert_eq!(reloaded["anthropic"]["apiKey"], "sk-test");
         assert_eq!(reloaded["gateway"]["auth"]["token"], "token123");
-
-        env_guard.unset("CARAPACE_CONFIG_PASSWORD");
     }
 
     #[test]
