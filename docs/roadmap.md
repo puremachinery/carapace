@@ -10,8 +10,9 @@ For what is already shipped and verified, see:
 
 ## Recently shipped
 
-- First stable release (`v0.1.0`) — stable compatibility policy and verified
-  update/release paths are now in effect for the stable channel.
+- Stable release line established (`v0.1.0`, `v0.2.0`) — stable compatibility
+  policy and verified update/release paths are now in effect for the stable
+  channel.
 - Cross-platform subprocess sandbox hardening — macOS, Linux, and Windows
   enforce OS-level isolation for sandbox-required paths; unsupported platforms
   fail closed.
@@ -32,16 +33,22 @@ For what is already shipped and verified, see:
   fail-closed validation.
 - Multi-page docs site with install/first-run/security/ops plus docs hubs,
   capability matrix, and task-oriented CLI index.
+- Docs architecture polish — tighter day-1/day-2 routing and clearer task-first
+  command ladders across operational docs.
 
 ## Now
 
-- Broader provider onboarding — extend the new Gemini onboarding pattern to
-  additional providers while keeping auth surfaces and provider policy
-  boundaries explicit.
+- Test-infra hardening for env-sensitive flows — reduce order-dependent flake in
+  config/setup/WebSocket test coverage before expanding onboarding further.
+- Subscription onboarding expansion — add Codex/OpenAI and Anthropic
+  subscription-oriented flows while keeping provider/auth boundaries explicit.
+- Guided provider onboarding and migration paths — strengthen setup
+  verification/remediation, add Bedrock and Vertex guided onboarding, and make
+  migration/import easier for users coming from adjacent assistants.
 - Control UI depth — richer in-browser runbook/operator workflows and stronger
-  day-2 remediation UX.
-- Docs architecture polish — tighter day-1/day-2 routing and clearer task-first
-  command ladders across operational docs.
+  day-2 remediation UX, including onboarding and provider-status parity.
+- Model/provider routing clarity — improve docs for current routing behavior and
+  evaluate clearer route-vs-agent and multimodal routing UX.
 
 ## Next
 
