@@ -219,28 +219,10 @@ pub struct ConfigReadResponse {
     pub hash: Option<String>,
 }
 
-#[derive(Default, Deserialize)]
-#[serde(transparent)]
-struct OptionalTextInput(Option<String>);
-
-impl OptionalTextInput {
-    fn into_trimmed_nonempty(self) -> Option<String> {
-        self.0
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-    }
-}
-
-#[derive(Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GeminiOAuthStartRequest {
-    #[serde(default)]
-    #[serde(rename = "clientId")]
-    oauth_client_id: OptionalTextInput,
-    #[serde(default)]
-    #[serde(rename = "clientSecret")]
-    oauth_client_secret: OptionalTextInput,
-    #[serde(default)]
+#[derive(Default)]
+struct OAuthStartInputs {
+    client_id_override: Option<String>,
+    client_secret_override: Option<String>,
     redirect_base_url: Option<String>,
 }
 
@@ -261,19 +243,6 @@ pub struct GeminiOAuthCallbackQuery {
     pub state: Option<String>,
     #[serde(default)]
     pub error: Option<String>,
-}
-
-#[derive(Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CodexOAuthStartRequest {
-    #[serde(default)]
-    #[serde(rename = "clientId")]
-    oauth_client_id: OptionalTextInput,
-    #[serde(default)]
-    #[serde(rename = "clientSecret")]
-    oauth_client_secret: OptionalTextInput,
-    #[serde(default)]
-    redirect_base_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -795,15 +764,15 @@ pub async fn gemini_oauth_start_handler(
         return err;
     }
 
-    let req: GeminiOAuthStartRequest = match parse_optional_json(&body) {
-        Ok(req) => req,
+    let inputs = match parse_oauth_start_inputs(&body) {
+        Ok(inputs) => inputs,
         Err(msg) => {
             return (StatusCode::BAD_REQUEST, Json(ControlError::new(msg))).into_response();
         }
     };
 
     let snapshot = read_config_snapshot();
-    let redirect_base_url = match req
+    let redirect_base_url = match inputs
         .redirect_base_url
         .as_deref()
         .map(str::trim)
@@ -831,8 +800,8 @@ pub async fn gemini_oauth_start_handler(
 
     match onboarding::gemini::start_control_google_oauth(
         &snapshot.config,
-        req.oauth_client_id.into_trimmed_nonempty(),
-        req.oauth_client_secret.into_trimmed_nonempty(),
+        inputs.client_id_override,
+        inputs.client_secret_override,
         &redirect_base_url,
     ) {
         Ok(started) => (
@@ -915,15 +884,15 @@ pub async fn codex_oauth_start_handler(
         return err;
     }
 
-    let req: CodexOAuthStartRequest = match parse_optional_json(&body) {
-        Ok(req) => req,
+    let inputs = match parse_oauth_start_inputs(&body) {
+        Ok(inputs) => inputs,
         Err(msg) => {
             return (StatusCode::BAD_REQUEST, Json(ControlError::new(msg))).into_response();
         }
     };
 
     let snapshot = read_config_snapshot();
-    let redirect_base_url = match req
+    let redirect_base_url = match inputs
         .redirect_base_url
         .as_deref()
         .map(str::trim)
@@ -951,8 +920,8 @@ pub async fn codex_oauth_start_handler(
 
     match onboarding::codex::start_control_openai_oauth(
         &snapshot.config,
-        req.oauth_client_id.into_trimmed_nonempty(),
-        req.oauth_client_secret.into_trimmed_nonempty(),
+        inputs.client_id_override,
+        inputs.client_secret_override,
         &redirect_base_url,
     ) {
         Ok(started) => (
@@ -1629,6 +1598,41 @@ where
     serde_json::from_slice(body).map_err(|e| format!("Invalid JSON: {}", e))
 }
 
+fn parse_oauth_start_inputs(body: &axum::body::Bytes) -> Result<OAuthStartInputs, String> {
+    if body.is_empty() || body.iter().all(|byte| byte.is_ascii_whitespace()) {
+        return Ok(OAuthStartInputs::default());
+    }
+
+    let value: Value = serde_json::from_slice(body).map_err(|e| format!("Invalid JSON: {}", e))?;
+    let Some(object) = value.as_object() else {
+        return Err("Invalid JSON: expected object".to_string());
+    };
+
+    Ok(OAuthStartInputs {
+        client_id_override: parse_optional_trimmed_string_field(object, "clientId")?,
+        client_secret_override: parse_optional_trimmed_string_field(object, "clientSecret")?,
+        redirect_base_url: parse_optional_trimmed_string_field(object, "redirectBaseUrl")?,
+    })
+}
+
+fn parse_optional_trimmed_string_field(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<String>, String> {
+    match object.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(trimmed.to_string()))
+            }
+        }
+        Some(_) => Err(format!("Invalid JSON: field '{key}' must be a string")),
+    }
+}
+
 fn parse_optional_reason(reason: Option<String>) -> Result<Option<String>, String> {
     let reason = reason
         .as_deref()
@@ -1923,17 +1927,24 @@ mod tests {
     }
 
     #[test]
-    fn test_optional_text_input_trims_nonempty_values() {
+    fn test_parse_oauth_start_inputs_trims_nonempty_values() {
         let body = axum::body::Bytes::from_static(
             br#"{"clientId":"  openai-client-id  ","clientSecret":"  openai-client-secret  "}"#,
         );
-        let parsed: CodexOAuthStartRequest = parse_optional_json(&body).expect("should parse json");
+        let inputs = parse_oauth_start_inputs(&body).expect("should parse json");
 
-        let client_id = parsed.oauth_client_id.into_trimmed_nonempty();
-        let client_secret = parsed.oauth_client_secret.into_trimmed_nonempty();
+        assert!(inputs.client_id_override.as_deref() == Some("openai-client-id"));
+        assert!(inputs.client_secret_override.as_deref() == Some("openai-client-secret"));
+    }
 
-        assert!(client_id.as_deref() == Some("openai-client-id"));
-        assert!(client_secret.as_deref() == Some("openai-client-secret"));
+    #[test]
+    fn test_parse_oauth_start_inputs_rejects_non_string_values() {
+        let body = axum::body::Bytes::from_static(br#"{"clientId":123}"#);
+        let err = match parse_oauth_start_inputs(&body) {
+            Ok(_) => panic!("non-string clientId should fail"),
+            Err(err) => err,
+        };
+        assert!(err.contains("field 'clientId' must be a string"));
     }
 
     #[test]
