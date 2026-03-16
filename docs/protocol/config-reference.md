@@ -153,12 +153,12 @@ This block shapes how smart your AI behaves and what limits apply during executi
     - `identity.description`: String. Short summary shown in UIs or listings.
     - `identity.avatar`: String. Workspace-relative path or `http(s)` / `data:` URI used as the agent avatar.
     - `model`: String. The exact LLM name used by this agent, determining both the underlying model and the provider.
-      - **Provider Routing:** The prefix of this string dictates the provider (e.g. `vertex:gemini-1.5-pro` routes to Vertex AI, `ollama:llama3` routes to Ollama).
-      - **Implicit Fallbacks:** If no explicit prefix like `vertex:`, `ollama:`, `bedrock:`, or `venice:` is present, the system routes based on the model name:
+      - **Provider Routing:** The prefix of this string dictates the provider, separated by a colon (`:`) or slash (`/`) (e.g. `vertex:gemini-1.5-pro` or `vertex/gemini-2.5-flash` routes to Vertex AI, `ollama:llama3` routes to Ollama).
+      - **Implicit Fallbacks:** If no explicit prefix is present, the system routes based on the model name:
         - `gemini-*` routes to Gemini (or Vertex AI if Gemini is not configured).
         - `gpt-*`, `o1-*`, `o3-*` route to OpenAI.
         - `anthropic.claude-*`, `amazon.titan-*`, `meta.llama*` route to Bedrock.
-        - `claude-*` and all unrecognized models default to Anthropic.
+        - `claude-*` and all unrecognized models default to Anthropic (or Vertex AI using `vertex:default` if Anthropic is not configured).
     - `system`: String. The system prompt or core identity instructions for this agent.
     - `maxTurns`: Integer. Maximum LLM round-trips allowed per single user request. (Default: `25`)
     - `maxTokens`: Integer. Maximum output tokens the LLM is permitted to generate in one response. (Default: `8192`)
