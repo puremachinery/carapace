@@ -1929,17 +1929,11 @@ mod tests {
         );
         let parsed: CodexOAuthStartRequest = parse_optional_json(&body).expect("should parse json");
 
-        assert_eq!(
-            parsed.oauth_client_id.into_trimmed_nonempty().as_deref(),
-            Some("openai-client-id")
-        );
-        assert_eq!(
-            parsed
-                .oauth_client_secret
-                .into_trimmed_nonempty()
-                .as_deref(),
-            Some("openai-client-secret")
-        );
+        let client_id = parsed.oauth_client_id.into_trimmed_nonempty();
+        let client_secret = parsed.oauth_client_secret.into_trimmed_nonempty();
+
+        assert!(client_id.as_deref() == Some("openai-client-id"));
+        assert!(client_secret.as_deref() == Some("openai-client-secret"));
     }
 
     #[test]

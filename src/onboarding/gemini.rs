@@ -44,14 +44,14 @@ pub struct GeminiOAuthStatus {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum GeminiOAuthFlowState {
     Pending,
     Completed(Box<GeminiOAuthCompletion>),
     Failed(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct PendingGeminiOAuthFlow {
     id: String,
     state: String,
@@ -61,13 +61,13 @@ struct PendingGeminiOAuthFlow {
     flow_state: GeminiOAuthFlowState,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GeminiOAuthCompletion {
     pub client_id: String,
     pub auth_profile: AuthProfile,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GeminiApiKeyInput {
     pub api_key: String,
     pub base_url: Option<String>,

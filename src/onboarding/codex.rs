@@ -42,14 +42,14 @@ pub struct CodexOAuthStatus {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum CodexOAuthFlowState {
     Pending,
     Completed(Box<CodexOAuthCompletion>),
     Failed(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct PendingCodexOAuthFlow {
     id: String,
     state: String,
@@ -59,7 +59,7 @@ struct PendingCodexOAuthFlow {
     flow_state: CodexOAuthFlowState,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CodexOAuthCompletion {
     pub client_id: String,
     pub auth_profile: AuthProfile,

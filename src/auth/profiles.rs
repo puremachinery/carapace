@@ -99,7 +99,7 @@ impl fmt::Display for OAuthProvider {
 }
 
 /// OAuth2 token set for a profile.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct OAuthTokens {
     pub access_token: String,
     pub refresh_token: Option<String>,
@@ -112,7 +112,7 @@ pub struct OAuthTokens {
 ///
 /// This stores the provider metadata needed to refresh an OAuth-backed runtime
 /// session without relying on the application config as a secret transport.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct StoredOAuthProviderConfig {
     pub client_id: String,
     pub client_secret: String,
@@ -153,7 +153,7 @@ impl From<&OAuthProviderConfig> for StoredOAuthProviderConfig {
 }
 
 /// A stored auth profile.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct AuthProfile {
     pub id: String,
     pub name: String,
@@ -220,7 +220,7 @@ pub struct UserInfo {
 }
 
 /// Provider-specific OAuth2 configuration.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OAuthProviderConfig {
     pub client_id: String,
     pub client_secret: String,
@@ -229,6 +229,20 @@ pub struct OAuthProviderConfig {
     pub token_url: String,
     pub userinfo_url: String,
     pub scopes: Vec<String>,
+}
+
+impl fmt::Debug for OAuthProviderConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OAuthProviderConfig")
+            .field("client_id", &"<redacted>")
+            .field("client_secret", &"<redacted>")
+            .field("redirect_uri", &self.redirect_uri)
+            .field("auth_url", &self.auth_url)
+            .field("token_url", &self.token_url)
+            .field("userinfo_url", &self.userinfo_url)
+            .field("scopes", &self.scopes)
+            .finish()
+    }
 }
 
 // ---------------------------------------------------------------------------
