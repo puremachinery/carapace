@@ -158,7 +158,8 @@ This block shapes how smart your AI behaves and what limits apply during executi
         - `gemini-*` routes to Gemini (or Vertex AI if Gemini is not configured).
         - `gpt-*`, `o1-*`, `o3-*` route to OpenAI.
         - `anthropic.claude-*`, `amazon.titan-*`, `meta.llama*` route to Bedrock.
-        - `claude-*` and all unrecognized models default to Anthropic (or Vertex AI using `vertex:default` if Anthropic is not configured).
+        - `claude-*` and all unrecognized models default to Anthropic.
+        - If the exact system default model (`claude-sonnet-4-20250514`) is requested and Anthropic is not configured, it will fall back to Vertex AI (`vertex:default`).
     - `system`: String. The system prompt or core identity instructions for this agent.
     - `maxTurns`: Integer. Maximum LLM round-trips allowed per single user request. (Default: `25`)
     - `maxTokens`: Integer. Maximum output tokens the LLM is permitted to generate in one response. (Default: `8192`)

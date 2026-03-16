@@ -119,7 +119,8 @@ Carapace automatically routes your requests to the correct AI provider based on 
   - `gemini-*` routes to Gemini (or Vertex AI if Gemini is not configured).
   - `gpt-*`, `o1-*`, `o3-*` route to OpenAI.
   - `anthropic.claude-*`, `amazon.titan-*`, `meta.llama*` route to Bedrock.
-  - `claude-*` and all other unrecognized models default to Anthropic (or Vertex AI using `vertex:default` if Anthropic is not configured).
+  - `claude-*` and all other unrecognized models default to Anthropic.
+  - If the exact system default model (`claude-sonnet-4-20250514`) is requested and Anthropic is not configured, it will fall back to Vertex AI (`vertex:default`).
 
 Here is an example `carapace.json5` snippet locking agents onto specific providers using prefixes:
 
