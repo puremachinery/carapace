@@ -10,6 +10,9 @@ static TEST_ENV_LOCK: Mutex<()> = parking_lot::const_mutex(());
 ///
 /// This holds a global mutex for the lifetime of the helper so env-sensitive
 /// tests cannot race each other across modules.
+///
+/// Under the current `parking_lot` configuration this guard is not `Send`, so
+/// async tests on a multi-thread runtime should not hold it across an `.await`.
 pub(crate) struct ScopedEnv {
     _lock: MutexGuard<'static, ()>,
     original_values: HashMap<OsString, Option<OsString>>,
@@ -77,9 +80,37 @@ mod tests {
     const MISSING_KEY: &str = "CARAPACE_TEST_SCOPED_ENV_MISSING";
     const REUSE_KEY: &str = "CARAPACE_TEST_SCOPED_ENV_REUSE";
 
+    struct SeededEnvVar {
+        key: &'static str,
+        original: Option<OsString>,
+    }
+
+    impl SeededEnvVar {
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, original }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let original = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, original }
+        }
+    }
+
+    impl Drop for SeededEnvVar {
+        fn drop(&mut self) {
+            match self.original.take() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
     #[test]
     fn test_scoped_env_restores_original_value_after_drop() {
-        std::env::set_var(TEST_KEY, "original");
+        let _seed = SeededEnvVar::set(TEST_KEY, "original");
 
         {
             let mut env_guard = ScopedEnv::new();
@@ -88,12 +119,11 @@ mod tests {
         }
 
         assert_eq!(std::env::var_os(TEST_KEY), Some(OsString::from("original")));
-        std::env::remove_var(TEST_KEY);
     }
 
     #[test]
     fn test_scoped_env_restores_missing_value_after_set() {
-        std::env::remove_var(MISSING_KEY);
+        let _seed = SeededEnvVar::unset(MISSING_KEY);
 
         {
             let mut env_guard = ScopedEnv::new();
@@ -109,7 +139,7 @@ mod tests {
 
     #[test]
     fn test_scoped_env_preserves_first_original_across_unset_and_reset() {
-        std::env::set_var(REUSE_KEY, "original");
+        let _seed = SeededEnvVar::set(REUSE_KEY, "original");
 
         {
             let mut env_guard = ScopedEnv::new();
@@ -127,6 +157,5 @@ mod tests {
             std::env::var_os(REUSE_KEY),
             Some(OsString::from("original"))
         );
-        std::env::remove_var(REUSE_KEY);
     }
 }
