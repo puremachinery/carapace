@@ -110,6 +110,38 @@ Supported env vars:
 - `VENICE_API_KEY`
 - `VENICE_BASE_URL` (Venice override)
 
+## Provider Routing
+
+Carapace automatically routes your requests to the correct AI provider based on the `model` string configured in your agent (see [agent.model](../protocol/config-reference.md)).
+
+- **Explicit Provider Prefixes**: You can force routing to a specific provider by using a prefix like `vertex:gemini-1.5-pro`, `ollama:llama3`, `bedrock:anthropic.claude-3-sonnet`, or `venice:llama-3.3-70b`.
+- **Implicit Fallbacks**: If you don't use a prefix, Carapace maps the bare model name:
+  - `gemini-*` routes to Gemini (or Vertex AI if Gemini is not configured).
+  - `gpt-*`, `o1-*`, `o3-*` route to OpenAI.
+  - `anthropic.claude-*`, `amazon.titan-*`, `meta.llama*` route to Bedrock.
+  - `claude-*` and all other unrecognized models default to Anthropic.
+
+Here is an example `carapace.json5` snippet locking agents onto specific providers using prefixes:
+
+```json5
+{
+  "agents": {
+    "list": [
+      {
+        "id": "researcher",
+        "model": "vertex:gemini-1.5-pro",
+        "system": "You are a specialized research assistant."
+      },
+      {
+        "id": "local-coder",
+        "model": "ollama:qwen2.5-coder",
+        "system": "You are a local coding assistant."
+      }
+    ]
+  }
+}
+```
+
 ## Common first-run mistakes
 
 - Multiple provider env vars are set, but you are not sure which one the setup path should use.
