@@ -129,7 +129,7 @@ Here is an example `carapace.json5` snippet locking agents onto specific provide
     "list": [
       {
         "id": "researcher",
-        "model": "vertex:gemini-1.5-pro",
+        "model": "vertex:gemini-2.5-flash",
         "system": "You are a specialized research assistant."
       },
       {
