@@ -156,7 +156,7 @@ This block shapes how smart your AI behaves and what limits apply during executi
       - **Provider Routing:** The prefix of this string dictates the provider, separated by a colon (`:`) or slash (`/`) (e.g. `vertex:gemini-1.5-pro` or `vertex/gemini-2.5-flash` routes to Vertex AI, `ollama:llama3` routes to Ollama).
       - **Implicit Fallbacks:** If no explicit prefix is present, the system routes based on the model name:
         - `gemini-*` routes to Gemini (or Vertex AI if Gemini is not configured).
-        - `gpt-*`, `o1-*`, `o3-*` route to OpenAI.
+        - `gpt-*`, `o1`, `o1-*`, `o3`, `o3-*`, and `chatgpt-*` route to OpenAI.
         - `anthropic.claude-*`, `amazon.titan-*`, `meta.llama*` route to Bedrock.
         - `claude-*` and all unrecognized models default to Anthropic.
         - If the exact system default model (`claude-sonnet-4-20250514`) is requested and Anthropic is not configured, it will fall back to Vertex AI (`vertex:default`).
