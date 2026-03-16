@@ -145,21 +145,22 @@ impl LlmProvider for CodexProvider {
 }
 
 pub fn is_codex_model(model: &str) -> bool {
-    let lower = model.to_lowercase();
-    lower.starts_with("codex:") || lower.starts_with("codex/")
+    codex_model_suffix(model).is_some()
 }
 
 pub fn strip_codex_prefix(model: &str) -> &str {
-    if let Some(rest) = model.strip_prefix("codex:") {
-        rest
-    } else if let Some(rest) = model.strip_prefix("codex/") {
-        rest
-    } else if let Some(rest) = model.strip_prefix("Codex:") {
-        rest
-    } else if let Some(rest) = model.strip_prefix("Codex/") {
-        rest
+    codex_model_suffix(model).unwrap_or(model)
+}
+
+fn codex_model_suffix(model: &str) -> Option<&str> {
+    let bytes = model.as_bytes();
+    if bytes.len() <= 6 {
+        return None;
+    }
+    if bytes[..5].eq_ignore_ascii_case(b"codex") && matches!(bytes[5], b':' | b'/') {
+        Some(&model[6..])
     } else {
-        model
+        None
     }
 }
 
@@ -210,6 +211,7 @@ mod tests {
         assert!(is_codex_model("codex:gpt-5.4"));
         assert!(is_codex_model("codex/default"));
         assert!(is_codex_model("Codex:gpt-5.4"));
+        assert!(is_codex_model("CODEX/GPT-5.4"));
         assert!(!is_codex_model("gpt-5.4"));
         assert!(!is_codex_model("openai:gpt-5.4"));
     }
@@ -219,6 +221,7 @@ mod tests {
         assert_eq!(strip_codex_prefix("codex:gpt-5.4"), "gpt-5.4");
         assert_eq!(strip_codex_prefix("codex/default"), "default");
         assert_eq!(strip_codex_prefix("Codex:gpt-5.4"), "gpt-5.4");
+        assert_eq!(strip_codex_prefix("CODEX/GPT-5.4"), "GPT-5.4");
         assert_eq!(strip_codex_prefix("gpt-5.4"), "gpt-5.4");
     }
 

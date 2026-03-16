@@ -697,37 +697,8 @@ fn load_stored_openai_provider_config(
 mod tests {
     use super::*;
     use crate::auth::profiles::{OAuthTokens, UserInfo};
+    use crate::test_support::env::ScopedEnv;
     use serde_json::json;
-    use std::sync::Mutex;
-
-    static ENV_VAR_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-
-    struct EnvVarGuard {
-        key: &'static str,
-        previous: Option<String>,
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            if let Some(value) = &self.previous {
-                unsafe { std::env::set_var(self.key, value) };
-            } else {
-                unsafe { std::env::remove_var(self.key) };
-            }
-        }
-    }
-
-    fn set_temp_env_var(key: &'static str, value: &str) -> EnvVarGuard {
-        let lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
-        let previous = std::env::var(key).ok();
-        unsafe { std::env::set_var(key, value) };
-        EnvVarGuard {
-            key,
-            previous,
-            _lock: lock,
-        }
-    }
 
     fn sample_tokens() -> OAuthTokens {
         OAuthTokens {
@@ -750,6 +721,8 @@ mod tests {
 
     #[test]
     fn test_resolve_openai_oauth_provider_config_uses_configured_client_id_and_env_secret() {
+        let mut env_guard = ScopedEnv::new();
+        env_guard.set(OPENAI_CLIENT_SECRET_ENV, "env-client-secret");
         let cfg = json!({
             "auth": {
                 "profiles": {
@@ -762,7 +735,6 @@ mod tests {
                 }
             }
         });
-        let _secret_guard = set_temp_env_var(OPENAI_CLIENT_SECRET_ENV, "env-client-secret");
         let temp = tempfile::tempdir().expect("tempdir");
 
         let provider = resolve_openai_oauth_provider_config(
@@ -780,8 +752,9 @@ mod tests {
 
     #[test]
     fn test_persist_cli_openai_oauth_stores_profile_and_updates_config() {
+        let mut env_guard = ScopedEnv::new();
+        env_guard.set("CARAPACE_CONFIG_PASSWORD", "test-config-password");
         let temp = tempfile::tempdir().expect("tempdir");
-        let _password_guard = set_temp_env_var("CARAPACE_CONFIG_PASSWORD", "test-config-password");
         let mut config = json!({});
         let completion = CodexOAuthCompletion {
             client_id: "openai-client-id".to_string(),
@@ -820,6 +793,8 @@ mod tests {
 
     #[test]
     fn test_start_control_openai_oauth_requires_encrypted_profile_store() {
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("CARAPACE_CONFIG_PASSWORD");
         let err = start_control_openai_oauth(
             &json!({}),
             Some("openai-client-id".to_string()),
@@ -833,7 +808,8 @@ mod tests {
 
     #[test]
     fn test_start_control_openai_oauth_returns_control_callback() {
-        let _password_guard = set_temp_env_var("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+        let mut env_guard = ScopedEnv::new();
+        env_guard.set("CARAPACE_CONFIG_PASSWORD", "test-config-password");
         let started = start_control_openai_oauth(
             &json!({}),
             Some("openai-client-id".to_string()),

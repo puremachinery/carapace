@@ -515,6 +515,10 @@ pub async fn fetch_user_info(
     provider_config: &OAuthProviderConfig,
     access_token: &str,
 ) -> Result<UserInfo, AuthProfileError> {
+    if provider == OAuthProvider::OpenAI {
+        return user_info_from_openai_token(access_token);
+    }
+
     let mut req = OAUTH_CLIENT
         .get(&provider_config.userinfo_url)
         .bearer_auth(access_token);
@@ -610,7 +614,7 @@ pub async fn fetch_user_info(
                 )
             }),
         }),
-        OAuthProvider::OpenAI => user_info_from_openai_token(access_token),
+        OAuthProvider::OpenAI => unreachable!("OpenAI user info is decoded from token claims"),
     }
 }
 
@@ -619,10 +623,10 @@ fn user_info_from_openai_token(access_token: &str) -> Result<UserInfo, AuthProfi
         AuthProfileError::UserInfoFailed("failed to decode OpenAI access token claims".to_string())
     })?;
     let auth_claim = payload
-        .pointer("/https://api.openai.com/auth")
+        .get("https://api.openai.com/auth")
         .and_then(Value::as_object);
     let profile_claim = payload
-        .pointer("/https://api.openai.com/profile")
+        .get("https://api.openai.com/profile")
         .and_then(Value::as_object);
 
     let user_id = auth_claim
@@ -1700,6 +1704,32 @@ mod tests {
         let result = build_auth_profiles_config(&cfg);
         assert!(!result.enabled);
         assert!(result.providers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_fetch_user_info_openai_uses_token_claims_without_http_request() {
+        let mut provider_config = OAuthProvider::OpenAI.default_config(
+            "client-id",
+            "client-secret",
+            "http://127.0.0.1:3000/auth/callback",
+        );
+        let payload = serde_json::json!({
+            "sub": "user-123",
+            "https://api.openai.com/profile": {
+                "email": "user@example.com"
+            }
+        });
+        let encoded_payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&payload).expect("serialize payload"));
+        let access_token = format!("header.{encoded_payload}.sig");
+        provider_config.userinfo_url = "http://127.0.0.1:1/should-not-be-called".to_string();
+
+        let user_info = fetch_user_info(OAuthProvider::OpenAI, &provider_config, &access_token)
+            .await
+            .expect("should decode token claims without calling userinfo endpoint");
+
+        assert_eq!(user_info.user_id, "user-123");
+        assert_eq!(user_info.email.as_deref(), Some("user@example.com"));
     }
 
     // -----------------------------------------------------------------------

@@ -219,17 +219,38 @@ pub struct ConfigReadResponse {
     pub hash: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Default, Deserialize)]
+#[serde(transparent)]
+struct OptionalTextInput(Option<String>);
+
+impl OptionalTextInput {
+    fn into_trimmed_nonempty(self) -> Option<String> {
+        self.0
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    }
+}
+
+impl std::fmt::Debug for OptionalTextInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(_) => f.write_str("OptionalTextInput(<provided>)"),
+            None => f.write_str("OptionalTextInput(None)"),
+        }
+    }
+}
+
+#[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct GeminiOAuthStartRequest {
+struct GeminiOAuthStartRequest {
     #[serde(default)]
     #[serde(rename = "clientId")]
-    pub oauth_client_id: Option<String>,
+    oauth_client_id: OptionalTextInput,
     #[serde(default)]
     #[serde(rename = "clientSecret")]
-    pub oauth_client_secret: Option<String>,
+    oauth_client_secret: OptionalTextInput,
     #[serde(default)]
-    pub redirect_base_url: Option<String>,
+    redirect_base_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -251,17 +272,17 @@ pub struct GeminiOAuthCallbackQuery {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CodexOAuthStartRequest {
+struct CodexOAuthStartRequest {
     #[serde(default)]
     #[serde(rename = "clientId")]
-    pub oauth_client_id: Option<String>,
+    oauth_client_id: OptionalTextInput,
     #[serde(default)]
     #[serde(rename = "clientSecret")]
-    pub oauth_client_secret: Option<String>,
+    oauth_client_secret: OptionalTextInput,
     #[serde(default)]
-    pub redirect_base_url: Option<String>,
+    redirect_base_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -819,12 +840,8 @@ pub async fn gemini_oauth_start_handler(
 
     match onboarding::gemini::start_control_google_oauth(
         &snapshot.config,
-        req.oauth_client_id
-            .map(|value| value.trim().to_string())
-            .filter(|v| !v.is_empty()),
-        req.oauth_client_secret
-            .map(|value| value.trim().to_string())
-            .filter(|v| !v.is_empty()),
+        req.oauth_client_id.into_trimmed_nonempty(),
+        req.oauth_client_secret.into_trimmed_nonempty(),
         &redirect_base_url,
     ) {
         Ok(started) => (
@@ -943,12 +960,8 @@ pub async fn codex_oauth_start_handler(
 
     match onboarding::codex::start_control_openai_oauth(
         &snapshot.config,
-        req.oauth_client_id
-            .map(|value| value.trim().to_string())
-            .filter(|v| !v.is_empty()),
-        req.oauth_client_secret
-            .map(|value| value.trim().to_string())
-            .filter(|v| !v.is_empty()),
+        req.oauth_client_id.into_trimmed_nonempty(),
+        req.oauth_client_secret.into_trimmed_nonempty(),
         &redirect_base_url,
     ) {
         Ok(started) => (
@@ -1916,6 +1929,34 @@ mod tests {
         let parsed: TaskCancelRequest =
             parse_optional_json(&body).expect("should parse as default");
         assert!(parsed.reason.is_none());
+    }
+
+    #[test]
+    fn test_optional_text_input_trims_and_redacts_debug() {
+        let body = axum::body::Bytes::from_static(
+            br#"{"clientId":"  openai-client-id  ","clientSecret":"  openai-client-secret  "}"#,
+        );
+        let parsed: CodexOAuthStartRequest = parse_optional_json(&body).expect("should parse json");
+
+        assert_eq!(
+            parsed.oauth_client_id.into_trimmed_nonempty().as_deref(),
+            Some("openai-client-id")
+        );
+        assert_eq!(
+            parsed
+                .oauth_client_secret
+                .into_trimmed_nonempty()
+                .as_deref(),
+            Some("openai-client-secret")
+        );
+
+        let debug_repr = format!(
+            "{:?} {:?}",
+            OptionalTextInput(Some("client-id".to_string())),
+            OptionalTextInput(Some("client-secret".to_string()))
+        );
+        assert!(!debug_repr.contains("client-id"));
+        assert!(!debug_repr.contains("client-secret"));
     }
 
     #[test]

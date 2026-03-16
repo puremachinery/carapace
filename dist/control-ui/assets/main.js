@@ -335,10 +335,8 @@
     const authProfile = typeof codex.authProfile === "string" ? codex.authProfile : "";
 
     if (authProfile) {
-      if (state.authCredential) {
-        setCodexOnboardingStatus(`Codex is configured to use OpenAI auth profile ${authProfile}.`, false);
-      }
-    } else if (state.authCredential) {
+      setCodexOnboardingStatus(`Codex is configured to use OpenAI auth profile ${authProfile}.`, false);
+    } else {
       setCodexOnboardingStatus("Codex is not configured yet.", false);
     }
 
