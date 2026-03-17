@@ -2383,41 +2383,18 @@ mod tests {
     use crate::hooks::registry::{HookAction, HookMapping};
     use crate::server::ws::{WsServerConfig, WsServerState};
     use crate::sessions;
+    use crate::test_support::env::ScopedEnv;
     use axum::body::Body;
     use axum::http::Request;
     use std::sync::Arc;
     use tower::ServiceExt;
 
-    struct EnvVarGuard {
-        key: &'static str,
-        prev: Option<String>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let prev = std::env::var(key).ok();
-            // SAFETY: tests in this module scope env var writes to a short-lived guard.
-            unsafe { std::env::set_var(key, value) };
-            Self { key, prev }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match &self.prev {
-                // SAFETY: restoring test-scoped env var state.
-                Some(value) => unsafe { std::env::set_var(self.key, value) },
-                // SAFETY: restoring test-scoped env var state.
-                None => unsafe { std::env::remove_var(self.key) },
-            }
-        }
-    }
-
-    fn set_temp_config_path() -> (tempfile::TempDir, EnvVarGuard) {
+    fn set_temp_config_path() -> (tempfile::TempDir, ScopedEnv) {
         let temp = tempfile::tempdir().unwrap();
         let config_path = temp.path().join("carapace-test-config.json5");
-        let guard = EnvVarGuard::set("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
-        (temp, guard)
+        let mut env_guard = ScopedEnv::new();
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+        (temp, env_guard)
     }
 
     fn make_headers(pairs: &[(&str, &str)]) -> HeaderMap {
@@ -3037,8 +3014,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_control_gemini_oauth_start_returns_flow() {
-        let (_temp, _guard) = set_temp_config_path();
-        let _password_guard = EnvVarGuard::set("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+        let (_temp, mut env_guard) = set_temp_config_path();
+        env_guard.set("CARAPACE_CONFIG_PASSWORD", "test-config-password");
         let router = test_router(test_config());
 
         let req = Request::builder()
@@ -3103,8 +3080,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_control_codex_oauth_start_returns_flow() {
-        let (_temp, _guard) = set_temp_config_path();
-        let _password_guard = EnvVarGuard::set("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+        let (_temp, mut env_guard) = set_temp_config_path();
+        env_guard.set("CARAPACE_CONFIG_PASSWORD", "test-config-password");
         let router = test_router(test_config());
 
         let req = Request::builder()

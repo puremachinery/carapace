@@ -632,6 +632,7 @@ fn begin_control_google_oauth_completion(
         GeminiOAuthFlowState::InProgress => Ok(ControlGoogleOAuthAction::AlreadyProcessing),
         GeminiOAuthFlowState::Pending => {
             flow.flow_state = GeminiOAuthFlowState::InProgress;
+            flow.created_at_ms = now_ms();
             Ok(ControlGoogleOAuthAction::Start {
                 flow_id: flow.id.clone(),
                 provider_config: flow.provider_config.clone(),
@@ -644,9 +645,7 @@ fn begin_control_google_oauth_completion(
 fn insert_google_oauth_flow(flow: PendingGeminiOAuthFlow) -> Result<(), String> {
     let cutoff = now_ms().saturating_sub(FLOW_TTL.as_millis() as u64);
     let mut flows = GEMINI_OAUTH_FLOWS.write();
-    flows.retain(|_, flow| {
-        flow.created_at_ms >= cutoff || matches!(flow.flow_state, GeminiOAuthFlowState::InProgress)
-    });
+    flows.retain(|_, flow| flow.created_at_ms >= cutoff);
     if flows.len() >= MAX_PENDING_OAUTH_FLOWS {
         return Err("Too many active Gemini sign-in flows. Wait for an existing flow to finish or expire and retry.".to_string());
     }
@@ -735,9 +734,9 @@ fn validate_and_persist_config(config: &Value) -> Result<(), String> {
 
 fn cleanup_expired_flows() {
     let cutoff = now_ms().saturating_sub(FLOW_TTL.as_millis() as u64);
-    GEMINI_OAUTH_FLOWS.write().retain(|_, flow| {
-        flow.created_at_ms >= cutoff || matches!(flow.flow_state, GeminiOAuthFlowState::InProgress)
-    });
+    GEMINI_OAUTH_FLOWS
+        .write()
+        .retain(|_, flow| flow.created_at_ms >= cutoff);
 }
 
 fn now_ms() -> u64 {
@@ -1345,6 +1344,40 @@ mod tests {
         assert_eq!(status.status, "pending");
 
         GEMINI_OAUTH_FLOWS.write().remove(&flow_id);
+    }
+
+    #[test]
+    fn test_start_control_google_oauth_evicts_stale_in_progress_flow() {
+        let _password_guard = set_temp_env_var("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+        let flow_id = "gemini-stale-in-progress".to_string();
+        GEMINI_OAUTH_FLOWS.write().insert(
+            flow_id.clone(),
+            PendingGeminiOAuthFlow {
+                id: flow_id.clone(),
+                state: "gemini-stale-state".to_string(),
+                code_verifier: "verifier".to_string(),
+                provider_config: OAuthProvider::Google.default_config(
+                    "client-id",
+                    "client-secret",
+                    "https://gateway.example.com/control/onboarding/gemini/callback",
+                ),
+                created_at_ms: now_ms() - FLOW_TTL.as_millis() as u64 - 1,
+                flow_state: GeminiOAuthFlowState::InProgress,
+            },
+        );
+
+        let started = start_control_google_oauth(
+            &json!({}),
+            Some("google-client-id".to_string()),
+            Some("google-client-secret".to_string()),
+            "https://gateway.example.com",
+        )
+        .expect("stale in-progress flow should be evicted");
+
+        assert_ne!(started.flow_id, flow_id);
+        assert!(GEMINI_OAUTH_FLOWS.read().get(&flow_id).is_none());
+
+        GEMINI_OAUTH_FLOWS.write().remove(&started.flow_id);
     }
 
     #[tokio::test]

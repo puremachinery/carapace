@@ -298,7 +298,7 @@ impl MultiProvider {
         } else if crate::agent::codex::is_codex_model(model) {
             self.codex.as_deref().ok_or_else(|| {
                 AgentError::Provider(format!(
-                    "model \"{model}\" requires Codex provider, but no codex.authProfile is configured"
+                    "model \"{model}\" requires Codex provider, but the Codex provider is unavailable; ensure codex.authProfile is configured, CARAPACE_CONFIG_PASSWORD is set, and the referenced OpenAI auth profile/provider config can be loaded"
                 ))
             })
         } else if crate::agent::openai::is_openai_model(model) {
