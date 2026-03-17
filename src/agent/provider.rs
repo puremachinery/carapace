@@ -151,6 +151,7 @@ pub(crate) fn summarize_http_failure_body(body: &str) -> String {
 pub struct MultiProvider {
     anthropic: Option<std::sync::Arc<dyn LlmProvider>>,
     openai: Option<std::sync::Arc<dyn LlmProvider>>,
+    codex: Option<std::sync::Arc<dyn LlmProvider>>,
     ollama: Option<std::sync::Arc<dyn LlmProvider>>,
     gemini: Option<std::sync::Arc<dyn LlmProvider>>,
     bedrock: Option<std::sync::Arc<dyn LlmProvider>>,
@@ -163,6 +164,7 @@ impl std::fmt::Debug for MultiProvider {
         f.debug_struct("MultiProvider")
             .field("anthropic", &self.anthropic.is_some())
             .field("openai", &self.openai.is_some())
+            .field("codex", &self.codex.is_some())
             .field("ollama", &self.ollama.is_some())
             .field("gemini", &self.gemini.is_some())
             .field("bedrock", &self.bedrock.is_some())
@@ -184,12 +186,19 @@ impl MultiProvider {
         Self {
             anthropic,
             openai,
+            codex: None,
             ollama: None,
             gemini: None,
             bedrock: None,
             venice: None,
             vertex: None,
         }
+    }
+
+    /// Set the Codex provider for subscription-backed OpenAI routing.
+    pub fn with_codex(mut self, codex: Option<std::sync::Arc<dyn LlmProvider>>) -> Self {
+        self.codex = codex;
+        self
     }
 
     /// Set the Ollama provider for local model inference.
@@ -226,6 +235,7 @@ impl MultiProvider {
     pub fn has_any_provider(&self) -> bool {
         self.anthropic.is_some()
             || self.openai.is_some()
+            || self.codex.is_some()
             || self.ollama.is_some()
             || self.gemini.is_some()
             || self.bedrock.is_some()
@@ -248,10 +258,11 @@ impl MultiProvider {
     /// 1. Models prefixed with `ollama:` or `ollama/` -> Ollama
     /// 2. Models prefixed with `venice:` -> Venice
     /// 3. Models matching Gemini patterns (gemini-*, gemini/*, models/gemini-*) -> Gemini
-    /// 4. Models matching OpenAI patterns (gpt-*, o1-*, etc.) -> OpenAI
-    /// 5. Models matching Bedrock patterns (bedrock:*, anthropic.claude-*, etc.) -> Bedrock
-    /// 6. Models matching Vertex patterns (vertex:*, vertex/*) -> Vertex
-    /// 7. Everything else -> Anthropic (default)
+    /// 4. Models prefixed with `codex:` or `codex/` -> Codex
+    /// 5. Models matching OpenAI patterns (gpt-*, o1-*, etc.) -> OpenAI
+    /// 6. Models matching Bedrock patterns (bedrock:*, anthropic.claude-*, etc.) -> Bedrock
+    /// 7. Models matching Vertex patterns (vertex:*, vertex/*) -> Vertex
+    /// 8. Everything else -> Anthropic (default)
     fn select_provider(&self, model: &str) -> Result<&dyn LlmProvider, AgentError> {
         let normalized_model = self.normalize_model_for_routing(model);
         let model = normalized_model.as_ref();
@@ -284,6 +295,12 @@ impl MultiProvider {
                     "model \"{model}\" requires Gemini provider, but no GOOGLE_API_KEY is configured"
                 )))
             }
+        } else if crate::agent::codex::is_codex_model(model) {
+            self.codex.as_deref().ok_or_else(|| {
+                AgentError::Provider(format!(
+                    "model \"{model}\" requires Codex provider, but the Codex provider is unavailable; ensure codex.authProfile is configured, CARAPACE_CONFIG_PASSWORD is set, and the referenced OpenAI auth profile/provider config can be loaded"
+                ))
+            })
         } else if crate::agent::openai::is_openai_model(model) {
             self.openai.as_deref().ok_or_else(|| {
                 AgentError::Provider(format!(
@@ -337,6 +354,12 @@ impl LlmProvider for MultiProvider {
         // so the Gemini API receives the bare model name (e.g. "gemini-2.0-flash").
         if crate::agent::gemini::is_gemini_model(&request.model) {
             request.model = crate::agent::gemini::strip_gemini_prefix(&request.model).to_string();
+        }
+
+        // Strip the codex: or codex/ prefix before forwarding to the provider,
+        // so the provider receives the bare model name (e.g. "gpt-5.4" or "default").
+        if crate::agent::codex::is_codex_model(&request.model) {
+            request.model = crate::agent::codex::strip_codex_prefix(&request.model).to_string();
         }
 
         // Strip the bedrock: or bedrock/ prefix before forwarding to the provider,
@@ -401,6 +424,18 @@ mod tests {
             Ok(_) => panic!("expected error"),
         };
         assert!(msg.contains("OpenAI"), "expected OpenAI in error: {msg}");
+    }
+
+    #[test]
+    fn test_multi_provider_select_codex_model() {
+        let provider = MultiProvider::new(None, None);
+        let err = provider.select_provider("codex:gpt-5.4");
+        assert!(err.is_err());
+        let msg = match err {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected error"),
+        };
+        assert!(msg.contains("Codex"), "expected Codex in error: {msg}");
     }
 
     #[test]
@@ -497,6 +532,26 @@ mod tests {
         let provider =
             MultiProvider::new(None, None).with_gemini(Some(std::sync::Arc::new(gemini)));
         assert!(provider.has_any_provider());
+    }
+
+    #[test]
+    fn test_multi_provider_has_any_provider_with_codex() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile_store = std::sync::Arc::new(
+            crate::auth::profiles::ProfileStore::from_env(temp.path().to_path_buf()).unwrap(),
+        );
+        let provider = crate::agent::codex::CodexProvider::with_oauth_profile(
+            profile_store,
+            "openai-abc123".to_string(),
+            crate::auth::profiles::OAuthProvider::OpenAI.default_config(
+                "client-id",
+                "client-secret",
+                "http://127.0.0.1:3000/auth/callback",
+            ),
+        )
+        .unwrap();
+        let multi = MultiProvider::new(None, None).with_codex(Some(std::sync::Arc::new(provider)));
+        assert!(multi.has_any_provider());
     }
 
     #[test]

@@ -120,6 +120,13 @@
   //   // apiKey: "unused",                         // required but ignored by most local servers
   // },
 
+  // --- Codex / OpenAI subscription-login provider ---------------------------
+  // Codex uses a stored OpenAI OAuth auth profile and requires
+  // CARAPACE_CONFIG_PASSWORD so refreshable tokens are encrypted at rest.
+  // codex: {
+  //   authProfile: "openai-abc123",
+  // },
+
   // --- Google Gemini provider ----------------------------------------------
   // authProfile uses a stored Google OAuth profile from auth.profiles.
   // google: {
@@ -132,12 +139,18 @@
   // auth: {
   //   profiles: {
   //     enabled: true,
-  //     // Gemini Google sign-in also requires CARAPACE_CONFIG_PASSWORD so
-  //     // stored auth profiles stay encrypted at rest.
+  //     // Gemini Google sign-in and Codex sign-in require
+  //     // CARAPACE_CONFIG_PASSWORD so stored auth profiles stay encrypted at
+  //     // rest.
   //     // redirectBaseUrl: "https://gateway.example.com",
   //     providers: {
   //       google: {
   //         clientId: "${GOOGLE_OAUTH_CLIENT_ID}",
+  //         // redirectUri: "https://gateway.example.com/auth/callback", // hosted OAuth override; CLI uses an ephemeral loopback port
+  //       },
+  //       openai: {
+  //         clientId: "${OPENAI_OAUTH_CLIENT_ID}",
+  //         // clientSecret: "${OPENAI_OAUTH_CLIENT_SECRET}", // setup/onboarding normally stores this with the encrypted auth profile instead of config
   //         // redirectUri: "https://gateway.example.com/auth/callback", // hosted OAuth override; CLI uses an ephemeral loopback port
   //       },
   //     },

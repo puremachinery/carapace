@@ -17,6 +17,7 @@ Find the right `cara` command by outcome instead of scanning the full CLI refere
 ## Setup and first value
 
 - Initial setup wizard: `cara setup` or `cara setup --provider <provider>`
+- Codex sign-in onboarding: `cara setup --provider codex`
 - Gemini onboarding modes: `cara setup --provider gemini --auth-mode oauth|api-key`
 - Verify current setup outcome: `cara verify --outcome auto`
 - Start local chat: `cara chat`
@@ -24,6 +25,7 @@ Find the right `cara` command by outcome instead of scanning the full CLI refere
 Command ladder:
 - Start with `cara setup` or `cara setup --provider <provider>`
 - For Gemini, choose the credential mode explicitly when scripting: `--auth-mode oauth|api-key`
+- For Codex, run interactive setup with `OPENAI_OAUTH_CLIENT_ID`, `OPENAI_OAUTH_CLIENT_SECRET`, and `CARAPACE_CONFIG_PASSWORD` available in the shell
 - Validate with `cara verify --outcome auto`
 - Move to `cara verify --outcome autonomy` for task-runtime proof
 

@@ -120,6 +120,25 @@
       </section>
 
       <section class="panel">
+        <h2>Codex Onboarding</h2>
+        <p class="meta">Configure Codex with OpenAI subscription login. This is separate from OpenAI API-key setup.</p>
+
+        <label for="codexClientId">OpenAI OAuth client ID</label>
+        <input id="codexClientId" type="text" placeholder="OpenAI OAuth client ID" autocomplete="off" />
+
+        <label for="codexClientSecret">OpenAI OAuth client secret</label>
+        <input id="codexClientSecret" type="password" placeholder="OpenAI OAuth client secret" autocomplete="off" />
+
+        <div class="row">
+          <button id="codexStartOauth" type="button">Start OpenAI sign-in</button>
+          <button id="codexRefreshOauth" type="button" class="secondary">Refresh sign-in status</button>
+          <button id="codexApplyOauth" type="button" class="secondary">Apply Codex sign-in</button>
+        </div>
+
+        <p id="codexOnboardingStatus" class="meta"></p>
+      </section>
+
+      <section class="panel">
         <h2>Control UI Settings</h2>
         <p class="meta">Safe write path via <code>PATCH /control/config</code> (only <code>gateway.controlUi.*</code>).</p>
 

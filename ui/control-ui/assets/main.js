@@ -26,6 +26,11 @@
     geminiApiKeyInput: document.getElementById("geminiApiKey"),
     geminiBaseUrlInput: document.getElementById("geminiBaseUrl"),
     geminiSaveApiKeyButton: document.getElementById("geminiSaveApiKey"),
+    codexClientIdInput: document.getElementById("codexClientId"),
+    codexClientSecretInput: document.getElementById("codexClientSecret"),
+    codexStartOauthButton: document.getElementById("codexStartOauth"),
+    codexRefreshOauthButton: document.getElementById("codexRefreshOauth"),
+    codexApplyOauthButton: document.getElementById("codexApplyOauth"),
     wsConnectButton: document.getElementById("wsConnect"),
     wsDisconnectButton: document.getElementById("wsDisconnect"),
     wsRefreshPairingsButton: document.getElementById("wsRefreshPairings"),
@@ -41,6 +46,7 @@
     configJson: document.getElementById("configJson"),
     authStatus: document.getElementById("authStatus"),
     geminiOnboardingStatus: document.getElementById("geminiOnboardingStatus"),
+    codexOnboardingStatus: document.getElementById("codexOnboardingStatus"),
     configUpdateStatus: document.getElementById("configUpdateStatus"),
     controlUiSettingsStatus: document.getElementById("controlUiSettingsStatus"),
     configPathInput: document.getElementById("configPath"),
@@ -86,6 +92,7 @@
     },
     currentConfigRoot: {},
     geminiFlowId: null,
+    codexFlowId: null,
     isBusy: false,
 
     ws: null,
@@ -122,6 +129,7 @@
   renderJson(ui.taskDetailJson, {});
   updateSecurityContextStatus();
   renderGeminiOnboardingForm();
+  renderCodexOnboardingForm();
   updateWsButtons();
   updateTaskActionButtons();
 
@@ -136,6 +144,9 @@
   ui.geminiRefreshOauthButton.addEventListener("click", () => refreshGeminiOauthStatus().catch(noop));
   ui.geminiApplyOauthButton.addEventListener("click", () => applyGeminiOauth().catch(noop));
   ui.geminiSaveApiKeyButton.addEventListener("click", () => saveGeminiApiKey().catch(noop));
+  ui.codexStartOauthButton.addEventListener("click", () => startCodexOauth().catch(noop));
+  ui.codexRefreshOauthButton.addEventListener("click", () => refreshCodexOauthStatus().catch(noop));
+  ui.codexApplyOauthButton.addEventListener("click", () => applyCodexOauth().catch(noop));
   ui.wsConnectButton.addEventListener("click", () => connectPairingSocket().catch(noop));
   ui.wsDisconnectButton.addEventListener("click", disconnectPairingSocket);
   ui.wsRefreshPairingsButton.addEventListener("click", () => refreshPairings().catch(noop));
@@ -210,6 +221,7 @@
 
       applyControlUiFormFromConfig(state.currentConfigRoot);
       applyGeminiFormFromConfig(state.currentConfigRoot);
+      applyCodexFormFromConfig(state.currentConfigRoot);
       updateSecurityContextStatus();
       await ensureAssistantAvatar(state.currentConfigRoot);
       try {
@@ -316,6 +328,24 @@
     ui.geminiApiKeyFields.hidden = mode !== "api-key";
     ui.geminiRefreshOauthButton.disabled = state.isBusy || !state.geminiFlowId;
     ui.geminiApplyOauthButton.disabled = state.isBusy || !state.geminiFlowId;
+  }
+
+  function applyCodexFormFromConfig(configRoot) {
+    const codex = dig(configRoot, ["codex"]) || {};
+    const authProfile = typeof codex.authProfile === "string" ? codex.authProfile : "";
+
+    if (authProfile) {
+      setCodexOnboardingStatus(`Codex is configured to use OpenAI auth profile ${authProfile}.`, false);
+    } else {
+      setCodexOnboardingStatus("Codex is not configured yet.", false);
+    }
+
+    renderCodexOnboardingForm();
+  }
+
+  function renderCodexOnboardingForm() {
+    ui.codexRefreshOauthButton.disabled = state.isBusy || !state.codexFlowId;
+    ui.codexApplyOauthButton.disabled = state.isBusy || !state.codexFlowId;
   }
 
   async function saveControlUiSettings() {
@@ -518,6 +548,127 @@
     } finally {
       setBusy(false);
       renderGeminiOnboardingForm();
+    }
+  }
+
+  async function startCodexOauth() {
+    const payload = {};
+    const origin = window.location.origin;
+    if (origin && (origin.startsWith("http://") || origin.startsWith("https://"))) {
+      payload.redirectBaseUrl = origin;
+    }
+    const clientId = ui.codexClientIdInput.value.trim();
+    const clientSecret = ui.codexClientSecretInput.value.trim();
+    if (clientId) {
+      payload.clientId = clientId;
+    }
+    if (clientSecret) {
+      payload.clientSecret = clientSecret;
+    }
+    ui.codexClientSecretInput.value = "";
+
+    let authWindow = null;
+    try {
+      authWindow = window.open("about:blank", "_blank", "noopener,noreferrer");
+    } catch (_err) {
+      authWindow = null;
+    }
+
+    setBusy(true);
+    try {
+      const response = await controlPost("/control/onboarding/codex/oauth/start", payload);
+      state.codexFlowId = response.flowId || null;
+      renderCodexOnboardingForm();
+      if (!response.authUrl) {
+        if (authWindow && !authWindow.closed) {
+          authWindow.close();
+        }
+        throw new Error("Codex sign-in did not return an authorization URL.");
+      }
+
+      let popupOpened = false;
+      if (authWindow && !authWindow.closed) {
+        authWindow.location.href = response.authUrl;
+        popupOpened = true;
+      } else {
+        try {
+          popupOpened = Boolean(window.open(response.authUrl, "_blank", "noopener,noreferrer"));
+        } catch (_err) {
+          popupOpened = false;
+        }
+      }
+
+      if (popupOpened) {
+        setCodexOnboardingStatus("Opened OpenAI sign-in in a new tab. Return here after authorizing.", false);
+      } else {
+        setCodexOnboardingStatus(
+          `Popup blocked. Open this URL manually to continue Codex sign-in: ${response.authUrl}`,
+          true
+        );
+      }
+    } catch (err) {
+      if (authWindow && !authWindow.closed) {
+        authWindow.close();
+      }
+      setCodexOnboardingStatus(String(err), true);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function refreshCodexOauthStatus() {
+    if (!state.codexFlowId) {
+      setCodexOnboardingStatus("Start OpenAI sign-in first.", true);
+      return;
+    }
+
+    setBusy(true);
+    try {
+      const response = await controlGet(
+        `/control/onboarding/codex/oauth/${encodeURIComponent(state.codexFlowId)}`
+      );
+      const status = response && response.status ? response.status : {};
+      const stateText = String(status.status || "unknown");
+      if (stateText === "completed") {
+        setCodexOnboardingStatus(
+          `OpenAI sign-in completed${status.email ? ` for ${status.email}` : ""}. Click Apply Codex sign-in.`,
+          false
+        );
+      } else if (stateText === "failed") {
+        setCodexOnboardingStatus(String(status.error || "Codex sign-in failed."), true);
+      } else {
+        setCodexOnboardingStatus("OpenAI sign-in is still pending.", false);
+      }
+    } catch (err) {
+      setCodexOnboardingStatus(String(err), true);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function applyCodexOauth() {
+    if (!state.codexFlowId) {
+      setCodexOnboardingStatus("Start OpenAI sign-in first.", true);
+      return;
+    }
+
+    setBusy(true);
+    try {
+      const response = await controlPost(
+        `/control/onboarding/codex/oauth/${encodeURIComponent(state.codexFlowId)}/apply`,
+        {}
+      );
+      if (typeof response.hash === "string") {
+        state.configHash = response.hash;
+      }
+      state.codexFlowId = null;
+      await refreshAll();
+      setCodexOnboardingStatus("Codex sign-in applied.", false);
+    } catch (err) {
+      setCodexOnboardingStatus(String(err), true);
+    } finally {
+      setBusy(false);
+      renderCodexOnboardingForm();
     }
   }
 
@@ -1340,6 +1491,7 @@
     ui.geminiAuthModeSelect.disabled = state.isBusy;
     ui.geminiStartOauthButton.disabled = state.isBusy;
     ui.geminiSaveApiKeyButton.disabled = state.isBusy;
+    ui.codexStartOauthButton.disabled = state.isBusy;
     ui.refreshTasksButton.disabled = state.isBusy;
 
     ui.wsConnectButton.disabled = state.isBusy || (state.ws && state.ws.readyState === WebSocket.OPEN);
@@ -1349,6 +1501,7 @@
 
     updateTaskActionButtons();
     renderGeminiOnboardingForm();
+    renderCodexOnboardingForm();
   }
 
   function setAuthStatus(message, isError) {
@@ -1373,6 +1526,12 @@
     ui.geminiOnboardingStatus.textContent = message;
     ui.geminiOnboardingStatus.classList.toggle("error", Boolean(isError));
     ui.geminiOnboardingStatus.classList.toggle("success", !isError);
+  }
+
+  function setCodexOnboardingStatus(message, isError) {
+    ui.codexOnboardingStatus.textContent = message;
+    ui.codexOnboardingStatus.classList.toggle("error", Boolean(isError));
+    ui.codexOnboardingStatus.classList.toggle("success", !isError);
   }
 
   function setPairingStatus(message, isError) {

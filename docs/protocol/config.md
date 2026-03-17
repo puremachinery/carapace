@@ -129,6 +129,7 @@ For a plain-English guide to the most commonly tuned sections, see
 - `filesystem` – root-scoped filesystem tool registration and limits
 - `anthropic` – Anthropic provider settings (apiKey, baseUrl)
 - `openai` – OpenAI provider settings (apiKey, baseUrl, httpReferer, title)
+- `codex` – Codex/OpenAI subscription settings (`authProfile`)
 - `google` – Google Gemini provider settings (`apiKey`, `authProfile`, `baseUrl`)
 - `vertex` – Google Cloud Vertex AI provider settings (`projectId`, `location`, `model`)
 - `providers` – provider-specific settings such as `providers.ollama`
@@ -162,11 +163,13 @@ This is a condensed map; refer to the JSON schema for full detail.
   - `enabled`, `roots`, `writeAccess`, `maxReadBytes`, `excludePatterns`
 - `auth`
   - `profiles.enabled`, `profiles.redirectBaseUrl`
-  - `profiles.providers.{google,github,discord}.{clientId,clientSecret,redirectUri}`
+  - `profiles.providers.{google,github,discord,openai}.{clientId,clientSecret,redirectUri}`
 - `anthropic`
   - `apiKey`, `baseUrl`
 - `openai`
   - `apiKey`, `baseUrl`, `httpReferer`, `title`
+- `codex`
+  - `authProfile`
 - `google`
   - `apiKey`, `authProfile`, `baseUrl`
 - `providers.ollama`
@@ -247,6 +250,44 @@ Example auth-profile config:
 Gemini Google sign-in also requires `CARAPACE_CONFIG_PASSWORD` because the
 stored auth profile contains refreshable credentials and the OAuth client secret.
 
+### Codex credential mode
+
+Codex is separate from the API-key `openai` provider.
+
+Codex uses:
+
+- `codex.authProfile` pointing at a stored OpenAI auth profile under `auth.profiles`
+- `auth.profiles.providers.openai.*` for OAuth client configuration
+
+Example config:
+
+```json5
+{
+  "auth": {
+    "profiles": {
+      "enabled": true,
+      "providers": {
+        "openai": {
+          "clientId": "${OPENAI_OAUTH_CLIENT_ID}"
+        }
+      }
+    }
+  },
+  "codex": {
+    "authProfile": "openai-abc123"
+  }
+}
+```
+
+Notes:
+
+- `cara setup --provider codex` writes this shape.
+- Codex sign-in requires `CARAPACE_CONFIG_PASSWORD` because the stored auth
+  profile contains refreshable tokens and the OAuth client secret.
+- `openai` remains the API-key provider. Do not add `openai.authProfile`.
+- Use explicit model routing such as `codex:default` or `codex:gpt-5.4` when you
+  want to pin requests to Codex.
+
 ### `auth.profiles`
 
 `auth.profiles` stores OAuth onboarding configuration and redirect settings used
@@ -257,6 +298,7 @@ Relevant subkeys:
 - `auth.profiles.enabled`
 - `auth.profiles.redirectBaseUrl`
 - `auth.profiles.providers.google.{clientId,clientSecret,redirectUri}`
+- `auth.profiles.providers.openai.{clientId,clientSecret,redirectUri}`
 - `auth.profiles.providers.github.{clientId,clientSecret,redirectUri}`
 - `auth.profiles.providers.discord.{clientId,clientSecret,redirectUri}`
 
