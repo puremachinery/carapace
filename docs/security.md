@@ -325,6 +325,27 @@ Plugins run in WASM sandboxes (`src/plugins/runtime.rs`) with:
 let webhook_path = format!("/plugins/{}/{}", plugin_id, plugin_path);
 ```
 
+## Filesystem Tool Security
+
+Built-in filesystem tools are separate from the WASM plugin runtime and are
+guarded by explicit config and path validation:
+
+- Disabled by default. Operators must opt in with `filesystem.enabled = true`.
+- Access is limited to explicit `filesystem.roots`; paths outside those roots
+  are denied.
+- `filesystem.excludePatterns` can deny subpaths even when they are inside an
+  allowed root.
+- Write operations are separately gated by `filesystem.writeAccess = true`.
+- Path validation canonicalizes paths before I/O, so `..` escapes and symlinks
+  that resolve outside allowed roots are denied.
+- Filesystem tools still go through the normal tool policy layer, so operators
+  can allow-list or deny-list them in addition to the root/exclude controls.
+- Invalid filesystem config fail-closes: schema validation blocks bad config at
+  startup, and runtime tool registration disables the filesystem tool set if a
+  malformed config somehow bypasses validation.
+- Tool registration happens at startup; changing `filesystem.*` requires a
+  process restart.
+
 ## Incident Response Checklist
 
 If compromise is suspected:

@@ -227,6 +227,8 @@ sequenceDiagram
 | OpenAI Compat | `src/server/openai.rs` | /v1/chat/completions, /v1/responses |
 | Control API | `src/server/control.rs` | /control/status, /control/channels, /control/config, /control/tasks* |
 | Auth | `src/auth/mod.rs` | Token/password verification, loopback detection |
+| Tool Registry | `src/plugins/tools.rs` | Registers built-in tools plus config-gated filesystem tools at startup |
+| Filesystem Tools | `src/agent/filesystem_tools.rs` | Root-scoped file read/search/stat/list plus opt-in write/move with path validation and exclude enforcement |
 | Channels | `src/channels/mod.rs` | Channel registry, status tracking |
 | Sessions | `src/sessions/store.rs` | Session CRUD, JSONL history, compaction, archiving |
 | Nodes | `src/nodes/mod.rs` | Node pairing state machine |
