@@ -408,10 +408,9 @@ pub async fn exchange_code(
             .text()
             .await
             .unwrap_or_else(|_| "<unreadable>".to_string());
-        return Err(AuthProfileError::TokenExchangeFailed(format!(
-            "HTTP {}: {}",
-            status, body
-        )));
+        return Err(AuthProfileError::TokenExchangeFailed(
+            format_oauth_token_error(status, &body),
+        ));
     }
 
     let body: Value = resp
@@ -448,10 +447,9 @@ pub async fn refresh_token(
             .text()
             .await
             .unwrap_or_else(|_| "<unreadable>".to_string());
-        return Err(AuthProfileError::TokenRefreshFailed(format!(
-            "HTTP {}: {}",
-            status, body
-        )));
+        return Err(AuthProfileError::TokenRefreshFailed(
+            format_oauth_token_error(status, &body),
+        ));
     }
 
     let body: Value = resp
@@ -467,6 +465,34 @@ pub async fn refresh_token(
     }
 
     Ok(tokens)
+}
+
+fn format_oauth_token_error(status: reqwest::StatusCode, body: &str) -> String {
+    let trimmed = body.trim();
+    if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
+        let error = parsed.get("error").and_then(Value::as_str);
+        let description = parsed.get("error_description").and_then(Value::as_str);
+        let error_uri = parsed.get("error_uri").and_then(Value::as_str);
+        let summary = match (error, description, error_uri) {
+            (Some(error), Some(description), Some(error_uri)) => {
+                format!("{error}: {description} ({error_uri})")
+            }
+            (Some(error), Some(description), None) => format!("{error}: {description}"),
+            (Some(error), None, Some(error_uri)) => format!("{error} ({error_uri})"),
+            (Some(error), None, None) => error.to_string(),
+            (None, Some(description), _) => description.to_string(),
+            _ => String::new(),
+        };
+        if !summary.is_empty() {
+            return format!("HTTP {status}: {summary}");
+        }
+    }
+
+    if trimmed.is_empty() {
+        format!("HTTP {status}")
+    } else {
+        format!("HTTP {status}: {trimmed}")
+    }
 }
 
 /// Parse an OAuth2 token JSON response into `OAuthTokens`.
@@ -1744,6 +1770,25 @@ mod tests {
 
         assert_eq!(user_info.user_id, "user-123");
         assert_eq!(user_info.email.as_deref(), Some("user@example.com"));
+    }
+
+    #[test]
+    fn test_format_oauth_token_error_uses_structured_fields() {
+        let message = format_oauth_token_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":"invalid_grant","error_description":"authorization code already used"}"#,
+        );
+        assert_eq!(
+            message,
+            "HTTP 400 Bad Request: invalid_grant: authorization code already used"
+        );
+    }
+
+    #[test]
+    fn test_format_oauth_token_error_falls_back_to_raw_body() {
+        let message =
+            format_oauth_token_error(reqwest::StatusCode::BAD_REQUEST, "plain-text failure");
+        assert_eq!(message, "HTTP 400 Bad Request: plain-text failure");
     }
 
     // -----------------------------------------------------------------------

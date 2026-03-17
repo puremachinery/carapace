@@ -15,6 +15,7 @@ use crate::auth::profiles::{
 use crate::server::ws::{map_validation_issues, persist_config_file, read_config_snapshot};
 
 const FLOW_TTL: Duration = Duration::from_secs(30 * 60);
+const MAX_PENDING_OAUTH_FLOWS: usize = 20;
 const OPENAI_CLIENT_ID_ENV: &str = "OPENAI_OAUTH_CLIENT_ID";
 const OPENAI_CLIENT_SECRET_ENV: &str = "OPENAI_OAUTH_CLIENT_SECRET";
 
@@ -45,6 +46,7 @@ pub struct CodexOAuthStatus {
 #[derive(Clone)]
 enum CodexOAuthFlowState {
     Pending,
+    InProgress,
     Completed(Box<CodexOAuthCompletion>),
     Failed(String),
 }
@@ -68,6 +70,17 @@ pub struct CodexOAuthCompletion {
 type CliOAuthSender = std::sync::Arc<
     std::sync::Mutex<Option<tokio::sync::oneshot::Sender<Result<CodexOAuthCompletion, String>>>>,
 >;
+
+enum ControlOpenAiOAuthAction {
+    AlreadyCompleted,
+    AlreadyFailed(String),
+    AlreadyProcessing,
+    Start {
+        flow_id: String,
+        provider_config: OAuthProviderConfig,
+        verifier: String,
+    },
+}
 
 pub fn resolve_openai_oauth_provider_config(
     cfg: &Value,
@@ -118,7 +131,6 @@ pub fn start_control_openai_oauth(
     redirect_base_url: &str,
 ) -> Result<CodexOAuthStart, String> {
     require_encrypted_profile_store_for_openai_oauth()?;
-    cleanup_expired_flows();
 
     let redirect_uri = format!(
         "{}/control/onboarding/codex/callback",
@@ -145,7 +157,7 @@ pub fn start_control_openai_oauth(
         created_at_ms: now_ms(),
         flow_state: CodexOAuthFlowState::Pending,
     };
-    CODEX_OAUTH_FLOWS.write().insert(flow_id.clone(), flow);
+    insert_openai_oauth_flow(flow)?;
 
     Ok(CodexOAuthStart {
         flow_id,
@@ -158,36 +170,32 @@ pub async fn complete_control_openai_oauth_callback(
     state_param: &str,
     code: Option<&str>,
     error: Option<&str>,
+    error_description: Option<&str>,
 ) -> Result<(), String> {
     cleanup_expired_flows();
-    let flow_id = {
-        let flows = CODEX_OAUTH_FLOWS.read();
-        flows
-            .values()
-            .find(|flow| flow.state == state_param)
-            .map(|flow| flow.id.clone())
-            .ok_or_else(|| "Unknown or expired Codex OAuth flow".to_string())?
+    let (flow_id, provider_config, verifier) = match begin_control_openai_oauth_completion(
+        state_param,
+    )? {
+        ControlOpenAiOAuthAction::AlreadyCompleted => return Ok(()),
+        ControlOpenAiOAuthAction::AlreadyFailed(err) => return Err(err),
+        ControlOpenAiOAuthAction::AlreadyProcessing => {
+            return Err(
+                "Codex sign-in callback is already being processed. Return to the Control UI and refresh status."
+                    .to_string(),
+            )
+        }
+        ControlOpenAiOAuthAction::Start {
+            flow_id,
+            provider_config,
+            verifier,
+        } => (flow_id, provider_config, verifier),
     };
-
-    let existing_state = {
-        let flows = CODEX_OAUTH_FLOWS.read();
-        flows
-            .get(&flow_id)
-            .map(|flow| flow.flow_state.clone())
-            .ok_or_else(|| "Unknown or expired Codex OAuth flow".to_string())?
-    };
-    match existing_state {
-        CodexOAuthFlowState::Completed(_) => return Ok(()),
-        CodexOAuthFlowState::Failed(err) => return Err(err),
-        CodexOAuthFlowState::Pending => {}
-    }
 
     if let Some(err) = error.filter(|value| !value.trim().is_empty()) {
-        let mut flows = CODEX_OAUTH_FLOWS.write();
-        if let Some(flow) = flows.get_mut(&flow_id) {
-            flow.flow_state = CodexOAuthFlowState::Failed(format!("OAuth provider error: {err}"));
-        }
-        return Err(format!("OAuth provider error: {err}"));
+        return finish_control_openai_oauth_flow(
+            &flow_id,
+            Err(format_oauth_provider_error(err, error_description)),
+        );
     }
 
     let code = match code.map(str::trim).filter(|value| !value.is_empty()) {
@@ -198,14 +206,6 @@ pub async fn complete_control_openai_oauth_callback(
                 Err("Missing OAuth authorization code".to_string()),
             );
         }
-    };
-
-    let (provider_config, verifier) = {
-        let flows = CODEX_OAUTH_FLOWS.read();
-        let flow = flows
-            .get(&flow_id)
-            .ok_or_else(|| "Unknown or expired Codex OAuth flow".to_string())?;
-        (flow.provider_config.clone(), flow.code_verifier.clone())
     };
 
     let result = async {
@@ -236,7 +236,7 @@ pub fn control_openai_oauth_status(flow_id: &str) -> Result<CodexOAuthStatus, St
         .get(flow_id)
         .ok_or_else(|| "Unknown or expired Codex OAuth flow".to_string())?;
     Ok(match &flow.flow_state {
-        CodexOAuthFlowState::Pending => CodexOAuthStatus {
+        CodexOAuthFlowState::Pending | CodexOAuthFlowState::InProgress => CodexOAuthStatus {
             flow_id: flow.id.clone(),
             status: "pending",
             profile_name: None,
@@ -270,7 +270,7 @@ pub fn apply_control_openai_oauth(flow_id: &str, state_dir: PathBuf) -> Result<V
             .ok_or_else(|| "Unknown or expired Codex OAuth flow".to_string())?;
         match &flow.flow_state {
             CodexOAuthFlowState::Completed(completion) => completion.as_ref().clone(),
-            CodexOAuthFlowState::Pending => {
+            CodexOAuthFlowState::Pending | CodexOAuthFlowState::InProgress => {
                 return Err("Codex sign-in is still pending".to_string());
             }
             CodexOAuthFlowState::Failed(err) => return Err(err.clone()),
@@ -375,6 +375,7 @@ async fn run_cli_openai_oauth_with_timeout(
             code: Option<String>,
             state: Option<String>,
             error: Option<String>,
+            error_description: Option<String>,
         }
 
         async fn callback_handler(
@@ -392,7 +393,10 @@ async fn run_cli_openai_oauth_with_timeout(
             }
 
             let result = match query.error.filter(|value| !value.trim().is_empty()) {
-                Some(err) => Err(format!("OAuth provider error: {err}")),
+                Some(err) => Err(format_oauth_provider_error(
+                    &err,
+                    query.error_description.as_deref(),
+                )),
                 None => {
                     complete_cli_oauth_callback(
                         &state.provider_config,
@@ -573,12 +577,57 @@ fn finish_control_openai_oauth_flow(
 ) -> Result<(), String> {
     let mut flows = CODEX_OAUTH_FLOWS.write();
     if let Some(flow) = flows.get_mut(flow_id) {
-        flow.flow_state = match &result {
-            Ok(completion) => CodexOAuthFlowState::Completed(Box::new(completion.clone())),
-            Err(err) => CodexOAuthFlowState::Failed(err.clone()),
-        };
+        match &flow.flow_state {
+            CodexOAuthFlowState::Completed(_) => return Ok(()),
+            CodexOAuthFlowState::Failed(err) => return Err(err.clone()),
+            CodexOAuthFlowState::Pending | CodexOAuthFlowState::InProgress => {
+                flow.flow_state = match &result {
+                    Ok(completion) => CodexOAuthFlowState::Completed(Box::new(completion.clone())),
+                    Err(err) => CodexOAuthFlowState::Failed(err.clone()),
+                };
+            }
+        }
     }
     result.map(|_| ())
+}
+
+fn begin_control_openai_oauth_completion(
+    state_param: &str,
+) -> Result<ControlOpenAiOAuthAction, String> {
+    let mut flows = CODEX_OAUTH_FLOWS.write();
+    let flow = flows
+        .values_mut()
+        .find(|flow| flow.state == state_param)
+        .ok_or_else(|| "Unknown or expired Codex OAuth flow".to_string())?;
+
+    match &flow.flow_state {
+        CodexOAuthFlowState::Completed(_) => Ok(ControlOpenAiOAuthAction::AlreadyCompleted),
+        CodexOAuthFlowState::Failed(err) => {
+            Ok(ControlOpenAiOAuthAction::AlreadyFailed(err.clone()))
+        }
+        CodexOAuthFlowState::InProgress => Ok(ControlOpenAiOAuthAction::AlreadyProcessing),
+        CodexOAuthFlowState::Pending => {
+            flow.flow_state = CodexOAuthFlowState::InProgress;
+            Ok(ControlOpenAiOAuthAction::Start {
+                flow_id: flow.id.clone(),
+                provider_config: flow.provider_config.clone(),
+                verifier: flow.code_verifier.clone(),
+            })
+        }
+    }
+}
+
+fn insert_openai_oauth_flow(flow: PendingCodexOAuthFlow) -> Result<(), String> {
+    let cutoff = now_ms().saturating_sub(FLOW_TTL.as_millis() as u64);
+    let mut flows = CODEX_OAUTH_FLOWS.write();
+    flows.retain(|_, flow| {
+        flow.created_at_ms >= cutoff || matches!(flow.flow_state, CodexOAuthFlowState::InProgress)
+    });
+    if flows.len() >= MAX_PENDING_OAUTH_FLOWS {
+        return Err("Too many active Codex sign-in flows. Wait for an existing flow to finish or expire and retry.".to_string());
+    }
+    flows.insert(flow.id.clone(), flow);
+    Ok(())
 }
 
 fn require_encrypted_profile_store_for_openai_oauth() -> Result<(), String> {
@@ -607,9 +656,9 @@ fn validate_and_persist_config(config: &Value) -> Result<(), String> {
 
 fn cleanup_expired_flows() {
     let cutoff = now_ms().saturating_sub(FLOW_TTL.as_millis() as u64);
-    CODEX_OAUTH_FLOWS
-        .write()
-        .retain(|_, flow| flow.created_at_ms >= cutoff);
+    CODEX_OAUTH_FLOWS.write().retain(|_, flow| {
+        flow.created_at_ms >= cutoff || matches!(flow.flow_state, CodexOAuthFlowState::InProgress)
+    });
 }
 
 fn now_ms() -> u64 {
@@ -632,6 +681,16 @@ fn escape_html(input: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
+}
+
+fn format_oauth_provider_error(error: &str, error_description: Option<&str>) -> String {
+    let description = error_description
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match description {
+        Some(description) => format!("OAuth provider error: {error} ({description})"),
+        None => format!("OAuth provider error: {error}"),
+    }
 }
 
 fn cli_oauth_callback_matches_expected_state(
@@ -824,6 +883,150 @@ mod tests {
             "https://gateway.example.com/control/onboarding/codex/callback"
         );
         assert!(!started.flow_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_complete_control_openai_oauth_callback_returns_provider_error_with_description() {
+        let mut env_guard = ScopedEnv::new();
+        env_guard.set("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+        let started = start_control_openai_oauth(
+            &json!({}),
+            Some("openai-client-id".to_string()),
+            Some("openai-client-secret".to_string()),
+            "https://gateway.example.com",
+        )
+        .expect("start oauth");
+
+        let state = {
+            let flows = CODEX_OAUTH_FLOWS.read();
+            flows
+                .get(&started.flow_id)
+                .expect("stored flow")
+                .state
+                .clone()
+        };
+
+        let err = complete_control_openai_oauth_callback(
+            &state,
+            None,
+            Some("access_denied"),
+            Some("User denied access"),
+        )
+        .await
+        .expect_err("provider error should fail");
+        assert!(err.contains("access_denied"));
+        assert!(err.contains("User denied access"));
+
+        let status = control_openai_oauth_status(&started.flow_id).expect("flow status");
+        assert_eq!(status.status, "failed");
+    }
+
+    #[test]
+    fn test_finish_control_openai_oauth_flow_preserves_completed_flow() {
+        let flow_id = "codex-flow-completed".to_string();
+        CODEX_OAUTH_FLOWS.write().insert(
+            flow_id.clone(),
+            PendingCodexOAuthFlow {
+                id: flow_id.clone(),
+                state: "codex-state-completed".to_string(),
+                code_verifier: "verifier".to_string(),
+                provider_config: OAuthProvider::OpenAI.default_config(
+                    "client-id",
+                    "client-secret",
+                    "https://gateway.example.com/control/onboarding/codex/callback",
+                ),
+                created_at_ms: now_ms(),
+                flow_state: CodexOAuthFlowState::Completed(Box::new(CodexOAuthCompletion {
+                    client_id: "client-id".to_string(),
+                    auth_profile: build_openai_auth_profile(
+                        &OAuthProvider::OpenAI.default_config(
+                            "client-id",
+                            "client-secret",
+                            "https://gateway.example.com/control/onboarding/codex/callback",
+                        ),
+                        sample_tokens(),
+                        sample_user_info(),
+                    ),
+                })),
+            },
+        );
+
+        let result = finish_control_openai_oauth_flow(&flow_id, Err("late failure".to_string()));
+        assert!(result.is_ok(), "completed flow should stay successful");
+
+        let status = control_openai_oauth_status(&flow_id).expect("flow status");
+        assert_eq!(status.status, "completed");
+
+        CODEX_OAUTH_FLOWS.write().remove(&flow_id);
+    }
+
+    #[tokio::test]
+    async fn test_complete_control_openai_oauth_callback_rejects_in_progress_flow() {
+        let flow_id = "codex-flow-in-progress".to_string();
+        let state = "codex-state-in-progress".to_string();
+        CODEX_OAUTH_FLOWS.write().insert(
+            flow_id.clone(),
+            PendingCodexOAuthFlow {
+                id: flow_id.clone(),
+                state: state.clone(),
+                code_verifier: "verifier".to_string(),
+                provider_config: OAuthProvider::OpenAI.default_config(
+                    "client-id",
+                    "client-secret",
+                    "https://gateway.example.com/control/onboarding/codex/callback",
+                ),
+                created_at_ms: now_ms(),
+                flow_state: CodexOAuthFlowState::InProgress,
+            },
+        );
+
+        let err = complete_control_openai_oauth_callback(&state, Some("code"), None, None)
+            .await
+            .expect_err("in-progress flow should not start another exchange");
+        assert!(err.contains("already being processed"));
+
+        let status = control_openai_oauth_status(&flow_id).expect("flow status");
+        assert_eq!(status.status, "pending");
+
+        CODEX_OAUTH_FLOWS.write().remove(&flow_id);
+    }
+
+    #[test]
+    fn test_start_control_openai_oauth_rejects_when_pending_flow_limit_reached() {
+        let mut env_guard = ScopedEnv::new();
+        env_guard.set("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+        let mut flows = CODEX_OAUTH_FLOWS.write();
+        flows.clear();
+        for i in 0..MAX_PENDING_OAUTH_FLOWS {
+            let id = format!("codex-flow-{i}");
+            flows.insert(
+                id.clone(),
+                PendingCodexOAuthFlow {
+                    id: id.clone(),
+                    state: format!("codex-state-{i}"),
+                    code_verifier: "verifier".to_string(),
+                    provider_config: OAuthProvider::OpenAI.default_config(
+                        "client-id",
+                        "client-secret",
+                        "https://gateway.example.com/control/onboarding/codex/callback",
+                    ),
+                    created_at_ms: now_ms(),
+                    flow_state: CodexOAuthFlowState::Pending,
+                },
+            );
+        }
+        drop(flows);
+
+        let err = start_control_openai_oauth(
+            &json!({}),
+            Some("openai-client-id".to_string()),
+            Some("openai-client-secret".to_string()),
+            "https://gateway.example.com",
+        )
+        .expect_err("flow limit should reject new sign-in starts");
+        assert!(err.contains("Too many active Codex sign-in flows"));
+
+        CODEX_OAUTH_FLOWS.write().clear();
     }
 
     #[test]

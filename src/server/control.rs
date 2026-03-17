@@ -243,6 +243,8 @@ pub struct GeminiOAuthCallbackQuery {
     pub state: Option<String>,
     #[serde(default)]
     pub error: Option<String>,
+    #[serde(default)]
+    pub error_description: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -254,6 +256,8 @@ pub struct CodexOAuthCallbackQuery {
     pub state: Option<String>,
     #[serde(default)]
     pub error: Option<String>,
+    #[serde(default)]
+    pub error_description: Option<String>,
 }
 
 /// Task create request.
@@ -1001,6 +1005,7 @@ pub async fn gemini_oauth_callback_handler(
         state,
         query.code.as_deref(),
         query.error.as_deref(),
+        query.error_description.as_deref(),
     )
     .await;
 
@@ -1029,6 +1034,7 @@ pub async fn codex_oauth_callback_handler(
         state,
         query.code.as_deref(),
         query.error.as_deref(),
+        query.error_description.as_deref(),
     )
     .await;
 

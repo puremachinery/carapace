@@ -21,6 +21,7 @@ pub struct CodexProvider {
     profile_store: Arc<ProfileStore>,
     profile_id: String,
     provider_config: OAuthProviderConfig,
+    client: reqwest::Client,
     refresh_lock: Arc<Mutex<()>>,
 }
 
@@ -47,6 +48,7 @@ impl CodexProvider {
             profile_store,
             profile_id,
             provider_config,
+            client: OpenAiProvider::build_http_client()?,
             refresh_lock: Arc::new(Mutex::new(())),
         })
     }
@@ -140,7 +142,7 @@ impl LlmProvider for CodexProvider {
     ) -> Result<tokio::sync::mpsc::Receiver<StreamEvent>, AgentError> {
         let access_token = self.access_token().await?;
         request.model = Self::effective_model(&request.model).to_string();
-        let provider = OpenAiProvider::new(access_token)?;
+        let provider = OpenAiProvider::with_client(access_token, self.client.clone())?;
         provider.complete(request, cancel_token).await
     }
 }
