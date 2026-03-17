@@ -165,28 +165,30 @@ jobs:
         run: |
           test -f "$REVIEW_JSON_PATH"
           jq -e '
+            def nonempty_string: type == "string" and (gsub("^\\s+|\\s+$"; "") | length > 0);
+            def allowed_severity: . as $severity | (["critical","high","medium"] | index($severity)) != null;
             type == "object" and
             ((.header == "Blocking findings present.") or
              (.header == "LGTM.") or
              (.header == "No in-scope blocking findings.")) and
-            (.summary | type == "string" and (. | gsub("^\\s+|\\s+$"; "") | length > 0)) and
+            (.summary | nonempty_string) and
             (.inline_findings | type == "array") and
             (.advisory_findings | type == "array") and
             (.optional_followups | type == "array") and
             (((.inline_findings | length) > 0 and .header == "Blocking findings present.") or
              ((.inline_findings | length) == 0 and (((.advisory_findings | length) + (.optional_followups | length)) == 0) and .header == "LGTM.") or
              ((.inline_findings | length) == 0 and (((.advisory_findings | length) + (.optional_followups | length)) > 0) and .header == "No in-scope blocking findings.")) and
-            (all(.inline_findings[]?; (["critical","high","medium"] | index(.severity)) != null and
+            (all(.inline_findings[]?; (.severity | allowed_severity) and
               .scope == "in-scope" and
-              (.title | type == "string" and (. | gsub("^\\s+|\\s+$"; "") | length > 0)) and
-              (.body | type == "string" and (. | gsub("^\\s+|\\s+$"; "") | length > 0)) and
-              (.path | type == "string" and (. | gsub("^\\s+|\\s+$"; "") | length > 0)) and
+              (.title | nonempty_string) and
+              (.body | nonempty_string) and
+              (.path | nonempty_string) and
               (.line | type == "number" and floor == . and . >= 1))) and
-            (all(.advisory_findings[]?; (["critical","high","medium"] | index(.severity)) != null and
+            (all(.advisory_findings[]?; (.severity | allowed_severity) and
               .scope == "out-of-scope" and
-              (.title | type == "string" and (. | gsub("^\\s+|\\s+$"; "") | length > 0)) and
-              (.body | type == "string" and (. | gsub("^\\s+|\\s+$"; "") | length > 0)))) and
-            (all(.optional_followups[]?; type == "string" and (. | gsub("^\\s+|\\s+$"; "") | length > 0)))
+              (.title | nonempty_string) and
+              (.body | nonempty_string))) and
+            (all(.optional_followups[]?; nonempty_string))
           ' "$REVIEW_JSON_PATH" >/dev/null
 
       - name: Upload Claude review output
