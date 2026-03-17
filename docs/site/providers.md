@@ -8,6 +8,8 @@ Pick a first provider with the shortest path to a verified useful outcome.
 
 - **Fastest cloud start**: Anthropic or OpenAI
   - One API key, common setup path, best fit if your immediate goal is "get to first reply quickly."
+- **Subscription-login path**: Codex
+  - Best fit if you want OpenAI subscription-backed usage separated cleanly from API-key OpenAI.
 - **Fastest local-only start**: Ollama
   - Best fit if your immediate goal is "keep everything local and verify the basic loop first."
 - **Existing cloud standardization**: Gemini or Bedrock
@@ -27,7 +29,7 @@ choose `local-chat` as the first outcome and add channels only after
 In headless or scripted environments, pass `--provider`; non-interactive
 `cara setup` now errors instead of writing a providerless config.
 
-### Anthropic / OpenAI (fastest cloud path)
+### Anthropic / OpenAI API key (fastest cloud path)
 
 Pick one of these, not both:
 
@@ -42,6 +44,23 @@ Or:
 export OPENAI_API_KEY='...'
 cara setup --provider openai
 ```
+
+### Codex (OpenAI subscription login)
+
+```bash
+export CARAPACE_CONFIG_PASSWORD='...'
+export OPENAI_OAUTH_CLIENT_ID='...'
+export OPENAI_OAUTH_CLIENT_SECRET='...'
+cara setup --provider codex
+```
+
+Notes:
+
+- Codex is separate from API-key `openai`.
+- Codex sign-in is interactive-only in the CLI because it completes through a loopback callback on a local port.
+- Control UI also supports Codex sign-in.
+- The resulting config uses `codex.authProfile` and defaults the agent model to `codex:default`.
+- `CARAPACE_CONFIG_PASSWORD` is required so the stored auth profile is encrypted at rest.
 
 ### Ollama (fastest fully local path)
 
@@ -100,6 +119,7 @@ Supported env vars:
 
 - `ANTHROPIC_API_KEY`
 - `OPENAI_API_KEY`
+- `OPENAI_OAUTH_CLIENT_ID` / `OPENAI_OAUTH_CLIENT_SECRET` (Codex OpenAI sign-in)
 - `GOOGLE_API_KEY`
 - `GOOGLE_API_BASE_URL` (Gemini override)
 - `GOOGLE_OAUTH_CLIENT_ID` / `GOOGLE_OAUTH_CLIENT_SECRET` (Gemini Google sign-in)

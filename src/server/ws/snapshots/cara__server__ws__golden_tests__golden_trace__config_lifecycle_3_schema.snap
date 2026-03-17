@@ -1,6 +1,5 @@
 ---
 source: src/server/ws/golden_tests.rs
-assertion_line: 689
 expression: normalized
 ---
 {
@@ -44,6 +43,7 @@ expression: normalized
       "anthropic",
       "sessions",
       "openai",
+      "codex",
       "google",
       "providers",
       "bedrock",
@@ -91,6 +91,9 @@ expression: normalized
         "type": "object"
       },
       "classifier": {
+        "type": "object"
+      },
+      "codex": {
         "type": "object"
       },
       "commands": {

@@ -678,6 +678,9 @@ fn register_session_routes(
     let control_state_gemini_oauth_status = control_state.clone();
     let control_state_gemini_oauth_apply = control_state.clone();
     let control_state_gemini_api_key = control_state.clone();
+    let control_state_codex_oauth_start = control_state.clone();
+    let control_state_codex_oauth_status = control_state.clone();
+    let control_state_codex_oauth_apply = control_state.clone();
     let control_state_tasks_create = control_state.clone();
     let control_state_tasks_list = control_state.clone();
     let control_state_tasks_get = control_state.clone();
@@ -797,6 +800,58 @@ fn register_session_routes(
             "/control/onboarding/gemini/callback",
             get(move |query: Query<control::GeminiOAuthCallbackQuery>| async move {
                 control::gemini_oauth_callback_handler(query).await
+            }),
+        )
+        .route(
+            "/control/onboarding/codex/oauth/start",
+            post(
+                move |connect_info: MaybeConnectInfo, headers: HeaderMap, body: Bytes| {
+                    let state = control_state_codex_oauth_start.clone();
+                    async move {
+                        control::codex_oauth_start_handler(State(state), connect_info, headers, body)
+                            .await
+                    }
+                },
+            ),
+        )
+        .route(
+            "/control/onboarding/codex/oauth/{id}",
+            get(
+                move |Path(id): Path<String>, connect_info: MaybeConnectInfo, headers: HeaderMap| {
+                    let state = control_state_codex_oauth_status.clone();
+                    async move {
+                        control::codex_oauth_status_handler(
+                            Path(id),
+                            State(state),
+                            connect_info,
+                            headers,
+                        )
+                        .await
+                    }
+                },
+            ),
+        )
+        .route(
+            "/control/onboarding/codex/oauth/{id}/apply",
+            post(
+                move |Path(id): Path<String>, connect_info: MaybeConnectInfo, headers: HeaderMap| {
+                    let state = control_state_codex_oauth_apply.clone();
+                    async move {
+                        control::codex_oauth_apply_handler(
+                            Path(id),
+                            State(state),
+                            connect_info,
+                            headers,
+                        )
+                        .await
+                    }
+                },
+            ),
+        )
+        .route(
+            "/control/onboarding/codex/callback",
+            get(move |query: Query<control::CodexOAuthCallbackQuery>| async move {
+                control::codex_oauth_callback_handler(query).await
             }),
         )
         .route(
@@ -2328,41 +2383,18 @@ mod tests {
     use crate::hooks::registry::{HookAction, HookMapping};
     use crate::server::ws::{WsServerConfig, WsServerState};
     use crate::sessions;
+    use crate::test_support::env::ScopedEnv;
     use axum::body::Body;
     use axum::http::Request;
     use std::sync::Arc;
     use tower::ServiceExt;
 
-    struct EnvVarGuard {
-        key: &'static str,
-        prev: Option<String>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let prev = std::env::var(key).ok();
-            // SAFETY: tests in this module scope env var writes to a short-lived guard.
-            unsafe { std::env::set_var(key, value) };
-            Self { key, prev }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match &self.prev {
-                // SAFETY: restoring test-scoped env var state.
-                Some(value) => unsafe { std::env::set_var(self.key, value) },
-                // SAFETY: restoring test-scoped env var state.
-                None => unsafe { std::env::remove_var(self.key) },
-            }
-        }
-    }
-
-    fn set_temp_config_path() -> (tempfile::TempDir, EnvVarGuard) {
+    fn set_temp_config_path() -> (tempfile::TempDir, ScopedEnv) {
         let temp = tempfile::tempdir().unwrap();
         let config_path = temp.path().join("carapace-test-config.json5");
-        let guard = EnvVarGuard::set("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
-        (temp, guard)
+        let mut env_guard = ScopedEnv::new();
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+        (temp, env_guard)
     }
 
     fn make_headers(pairs: &[(&str, &str)]) -> HeaderMap {
@@ -2982,8 +3014,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_control_gemini_oauth_start_returns_flow() {
-        let (_temp, _guard) = set_temp_config_path();
-        let _password_guard = EnvVarGuard::set("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+        let (_temp, mut env_guard) = set_temp_config_path();
+        env_guard.set("CARAPACE_CONFIG_PASSWORD", "test-config-password");
         let router = test_router(test_config());
 
         let req = Request::builder()
@@ -3044,6 +3076,40 @@ mod tests {
         assert_eq!(parsed["google"]["apiKey"], "AIza-test-key");
         assert_eq!(parsed["google"]["baseUrl"], "https://proxy.example.com");
         assert!(parsed["google"].get("authProfile").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_control_codex_oauth_start_returns_flow() {
+        let (_temp, mut env_guard) = set_temp_config_path();
+        env_guard.set("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+        let router = test_router(test_config());
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/control/onboarding/codex/oauth/start")
+            .header("authorization", "Bearer test-gateway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"clientId":"openai-client-id","clientSecret":"openai-client-secret","redirectBaseUrl":"https://gateway.example.com"}"#,
+            ))
+            .unwrap();
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ok"], true);
+        assert!(json["flowId"].as_str().is_some());
+        assert!(json["authUrl"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("auth.openai.com"));
+        assert_eq!(
+            json["redirectUri"],
+            "https://gateway.example.com/control/onboarding/codex/callback"
+        );
     }
 
     #[tokio::test]

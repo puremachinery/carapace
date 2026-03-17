@@ -2422,6 +2422,8 @@ fn parse_setup_outcome(raw: &str) -> Option<SetupOutcome> {
 pub enum SetupProvider {
     #[value(name = "anthropic", alias = "claude")]
     Anthropic,
+    #[value(name = "codex")]
+    Codex,
     #[value(name = "openai", alias = "gpt")]
     OpenAi,
     #[value(name = "ollama")]
@@ -2438,6 +2440,7 @@ impl SetupProvider {
     fn prompt_key(self) -> &'static str {
         match self {
             Self::Anthropic => "anthropic",
+            Self::Codex => "codex",
             Self::OpenAi => "openai",
             Self::Ollama => "ollama",
             Self::Gemini => "gemini",
@@ -2449,6 +2452,7 @@ impl SetupProvider {
     fn label(self) -> &'static str {
         match self {
             Self::Anthropic => "Anthropic",
+            Self::Codex => "Codex",
             Self::OpenAi => "OpenAI",
             Self::Ollama => "Ollama",
             Self::Gemini => "Gemini",
@@ -2460,6 +2464,7 @@ impl SetupProvider {
     fn api_key_env_var_name(self) -> Option<&'static str> {
         match self {
             Self::Anthropic => Some("ANTHROPIC_API_KEY"),
+            Self::Codex => None,
             Self::OpenAi => Some("OPENAI_API_KEY"),
             Self::Gemini => Some("GOOGLE_API_KEY"),
             Self::Venice => Some("VENICE_API_KEY"),
@@ -2470,6 +2475,7 @@ impl SetupProvider {
     fn default_model(self) -> &'static str {
         match self {
             Self::Anthropic => "claude-sonnet-4-20250514",
+            Self::Codex => "codex:default",
             Self::OpenAi => "gpt-4o",
             Self::Ollama => "ollama:llama3",
             Self::Gemini => "gemini-2.0-flash",
@@ -2494,6 +2500,7 @@ pub enum GeminiSetupAuthMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ModelProviderRoute {
     Anthropic,
+    Codex,
     OpenAi,
     Ollama,
     Gemini,
@@ -2523,6 +2530,12 @@ fn detect_setup_provider_env_hints() -> Vec<SetupProvider> {
     }
     if env_var_present("OPENAI_API_KEY") {
         providers.push(SetupProvider::OpenAi);
+    }
+    if env_var_present("CARAPACE_CONFIG_PASSWORD")
+        && env_var_present("OPENAI_OAUTH_CLIENT_ID")
+        && env_var_present("OPENAI_OAUTH_CLIENT_SECRET")
+    {
+        providers.push(SetupProvider::Codex);
     }
     if env_var_present("OLLAMA_BASE_URL") {
         providers.push(SetupProvider::Ollama);
@@ -2625,6 +2638,11 @@ fn usable_provider_labels(cfg: &Value) -> Vec<&'static str> {
     {
         labels.push("OpenAI");
     }
+    if config_path_has_usable_value(cfg, &["codex", "authProfile"])
+        && env_var_present("CARAPACE_CONFIG_PASSWORD")
+    {
+        labels.push("Codex");
+    }
     if ollama_configured_for_guidance(cfg) {
         labels.push("Ollama");
     }
@@ -2723,6 +2741,8 @@ fn local_chat_provider_route(model: &str) -> ModelProviderRoute {
         ModelProviderRoute::Venice
     } else if crate::agent::gemini::is_gemini_model(model) {
         ModelProviderRoute::Gemini
+    } else if crate::agent::codex::is_codex_model(model) {
+        ModelProviderRoute::Codex
     } else if crate::agent::openai::is_openai_model(model) {
         ModelProviderRoute::OpenAi
     } else if crate::agent::bedrock::is_bedrock_model(model) {
@@ -2778,12 +2798,29 @@ fn bedrock_provider_guidance(cfg: &Value) -> String {
     )
 }
 
+fn codex_provider_guidance(cfg: &Value) -> String {
+    if config_path_has_usable_value(cfg, &["codex", "authProfile"]) {
+        if env_var_present("CARAPACE_CONFIG_PASSWORD") {
+            return "check Codex auth profile/model and retry `cara verify --outcome local-chat`"
+                .to_string();
+        }
+        return "set `CARAPACE_CONFIG_PASSWORD` in the same shell you use for `cara start` and `cara verify`, then retry `cara verify --outcome local-chat`".to_string();
+    }
+
+    provider_route_fallback_guidance(
+        cfg,
+        "Codex",
+        Some("`codex.authProfile` plus `CARAPACE_CONFIG_PASSWORD` (or rerun `cara setup --provider codex`)"),
+    )
+}
+
 fn local_chat_verify_next_step(cfg: &Value) -> String {
     let model = local_chat_model(cfg);
     match local_chat_provider_route(&model) {
         ModelProviderRoute::Anthropic => {
             provider_api_key_guidance(cfg, SetupProvider::Anthropic, &["anthropic", "apiKey"])
         }
+        ModelProviderRoute::Codex => codex_provider_guidance(cfg),
         ModelProviderRoute::OpenAi => {
             provider_api_key_guidance(cfg, SetupProvider::OpenAi, &["openai", "apiKey"])
         }
@@ -4343,13 +4380,15 @@ fn prompt_setup_provider_interactive(
     let default_provider = default_setup_provider(&provider_hints).prompt_key();
     loop {
         let selection = prompt_with_default(
-            "Select provider for first run (anthropic/openai/ollama/gemini/venice/bedrock)",
+            "Select provider for first run (anthropic/codex/openai/ollama/gemini/venice/bedrock)",
             default_provider,
         )?;
         if let Some(provider) = SetupProvider::parse_prompt(&selection) {
             return Ok(provider);
         }
-        eprintln!("Please enter one of: anthropic, openai, ollama, gemini, venice, bedrock.");
+        eprintln!(
+            "Please enter one of: anthropic, codex, openai, ollama, gemini, venice, bedrock."
+        );
     }
 }
 
@@ -4511,7 +4550,7 @@ fn render_setup_validation_failure(err: &crate::agent::AgentError) -> String {
     }
 }
 
-fn prompt_google_oauth_client_value(
+fn prompt_oauth_client_value(
     env_var: &'static str,
     label: &str,
     hide_sensitive_input: bool,
@@ -4531,7 +4570,7 @@ fn prompt_google_oauth_client_value(
         if !entered.trim().is_empty() {
             return Ok(entered.trim().to_string());
         }
-        eprintln!("{label} is required for Google sign-in.");
+        eprintln!("{label} is required for OAuth sign-in.");
     }
 }
 
@@ -4577,12 +4616,12 @@ fn configure_gemini_provider_interactive(
             );
         }
         GeminiSetupAuthMode::OAuth => {
-            let client_id = prompt_google_oauth_client_value(
+            let client_id = prompt_oauth_client_value(
                 "GOOGLE_OAUTH_CLIENT_ID",
                 "Google OAuth client ID",
                 false,
             )?;
-            let client_secret = prompt_google_oauth_client_value(
+            let client_secret = prompt_oauth_client_value(
                 "GOOGLE_OAUTH_CLIENT_SECRET",
                 "Google OAuth client secret",
                 hide_sensitive_input,
@@ -4617,6 +4656,37 @@ fn configure_gemini_provider_interactive(
             }
         }
     }
+
+    Ok(())
+}
+
+fn configure_codex_provider_interactive(
+    config: &mut Value,
+    hide_sensitive_input: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!(
+        "Codex setup uses OpenAI subscription sign-in and stores a refreshable auth profile. OpenAI API-key setup remains under `--provider openai`."
+    );
+
+    let client_id =
+        prompt_oauth_client_value("OPENAI_OAUTH_CLIENT_ID", "OpenAI OAuth client ID", false)?;
+    let client_secret = prompt_oauth_client_value(
+        "OPENAI_OAUTH_CLIENT_SECRET",
+        "OpenAI OAuth client secret",
+        hide_sensitive_input,
+    )?;
+
+    let config_snapshot = config.clone();
+    let completion = run_sync_blocking_send(crate::onboarding::codex::run_cli_openai_oauth(
+        config_snapshot,
+        Some(client_id.clone()),
+        Some(client_secret.clone()),
+    ))
+    .map_err(|err| format!("Codex sign-in runtime failed: {err}"))?;
+
+    let state_dir = resolve_state_dir();
+    std::fs::create_dir_all(&state_dir)?;
+    crate::onboarding::codex::persist_cli_openai_oauth(state_dir, config, completion)?;
 
     Ok(())
 }
@@ -4656,6 +4726,9 @@ fn configure_provider_interactive(
                 print_missing_setup_value_notice("ANTHROPIC_API_KEY", "API key");
             }
             config["anthropic"] = serde_json::json!({ "apiKey": api_key.config_value });
+        }
+        SetupProvider::Codex => {
+            configure_codex_provider_interactive(config, hide_sensitive_input)?;
         }
         SetupProvider::OpenAi => {
             let api_key = prompt_required_secret_config_value(
@@ -4883,6 +4956,11 @@ fn configure_provider_noninteractive(
         SetupProvider::Anthropic => {
             config["anthropic"] =
                 serde_json::json!({ "apiKey": env_placeholder("ANTHROPIC_API_KEY") });
+        }
+        SetupProvider::Codex => {
+            return Err(
+                "non-interactive Codex sign-in is not supported; rerun interactively.".into(),
+            );
         }
         SetupProvider::OpenAi => {
             config["openai"] = serde_json::json!({ "apiKey": env_placeholder("OPENAI_API_KEY") });
@@ -7019,6 +7097,9 @@ mod tests {
         {
             env_guard.unset("ANTHROPIC_API_KEY");
             env_guard.unset("OPENAI_API_KEY");
+            env_guard.unset("OPENAI_OAUTH_CLIENT_ID");
+            env_guard.unset("OPENAI_OAUTH_CLIENT_SECRET");
+            env_guard.unset("CARAPACE_CONFIG_PASSWORD");
             env_guard.unset("OLLAMA_BASE_URL");
             env_guard.unset("GOOGLE_API_KEY");
             env_guard.unset("VENICE_API_KEY");
@@ -7032,6 +7113,9 @@ mod tests {
         {
             env_guard.set("ANTHROPIC_API_KEY", "sk-anthropic");
             env_guard.unset("OPENAI_API_KEY");
+            env_guard.unset("OPENAI_OAUTH_CLIENT_ID");
+            env_guard.unset("OPENAI_OAUTH_CLIENT_SECRET");
+            env_guard.unset("CARAPACE_CONFIG_PASSWORD");
             assert_eq!(
                 detect_setup_provider_env_hints(),
                 vec![SetupProvider::Anthropic]
@@ -7041,6 +7125,9 @@ mod tests {
         {
             env_guard.unset("ANTHROPIC_API_KEY");
             env_guard.set("OPENAI_API_KEY", "sk-openai");
+            env_guard.unset("OPENAI_OAUTH_CLIENT_ID");
+            env_guard.unset("OPENAI_OAUTH_CLIENT_SECRET");
+            env_guard.unset("CARAPACE_CONFIG_PASSWORD");
             assert_eq!(
                 detect_setup_provider_env_hints(),
                 vec![SetupProvider::OpenAi]
@@ -7051,6 +7138,9 @@ mod tests {
             env_guard.unset("ANTHROPIC_API_KEY");
             env_guard.unset("OPENAI_API_KEY");
             env_guard.set("GOOGLE_API_KEY", "google-key");
+            env_guard.unset("OPENAI_OAUTH_CLIENT_ID");
+            env_guard.unset("OPENAI_OAUTH_CLIENT_SECRET");
+            env_guard.unset("CARAPACE_CONFIG_PASSWORD");
             assert_eq!(
                 detect_setup_provider_env_hints(),
                 vec![SetupProvider::Gemini]
@@ -7058,8 +7148,24 @@ mod tests {
         }
 
         {
+            env_guard.unset("ANTHROPIC_API_KEY");
+            env_guard.unset("OPENAI_API_KEY");
+            env_guard.unset("GOOGLE_API_KEY");
+            env_guard.set("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+            env_guard.set("OPENAI_OAUTH_CLIENT_ID", "openai-client-id");
+            env_guard.set("OPENAI_OAUTH_CLIENT_SECRET", "openai-client-secret");
+            assert_eq!(
+                detect_setup_provider_env_hints(),
+                vec![SetupProvider::Codex]
+            );
+        }
+
+        {
             env_guard.set("ANTHROPIC_API_KEY", "sk-anthropic");
             env_guard.set("OPENAI_API_KEY", "sk-openai");
+            env_guard.unset("OPENAI_OAUTH_CLIENT_ID");
+            env_guard.unset("OPENAI_OAUTH_CLIENT_SECRET");
+            env_guard.unset("CARAPACE_CONFIG_PASSWORD");
             env_guard.unset("OLLAMA_BASE_URL");
             env_guard.unset("GOOGLE_API_KEY");
             env_guard.unset("VENICE_API_KEY");
@@ -7200,11 +7306,25 @@ mod tests {
         let mut env_guard = ScopedEnv::new();
         env_guard.unset("OPENAI_API_KEY");
         env_guard.unset("VENICE_API_KEY");
+        env_guard.unset("CARAPACE_CONFIG_PASSWORD");
         let cfg = serde_json::json!({
             "openai": { "apiKey": "${OPENAI_API_KEY}" },
             "venice": { "apiKey": "${VENICE_API_KEY}" }
         });
         assert!(usable_provider_labels(&cfg).is_empty());
+    }
+
+    #[test]
+    fn test_usable_provider_labels_require_config_password_for_codex() {
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("CARAPACE_CONFIG_PASSWORD");
+        let cfg = serde_json::json!({
+            "codex": { "authProfile": "openai-abc123" }
+        });
+        assert!(usable_provider_labels(&cfg).is_empty());
+
+        env_guard.set("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+        assert_eq!(usable_provider_labels(&cfg), vec!["Codex"]);
     }
 
     #[test]
@@ -7756,6 +7876,28 @@ mod tests {
         assert!(
             !config_path.exists(),
             "non-interactive Gemini OAuth should not write config"
+        );
+    }
+
+    #[test]
+    fn test_handle_setup_noninteractive_codex_errors() {
+        let mut env_guard = ScopedEnv::new();
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_path = temp.path().join("carapace.json");
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+
+        let result = handle_setup(false, Some(SetupProvider::Codex), None);
+        assert!(result.is_err(), "non-interactive Codex sign-in should fail");
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("non-interactive Codex sign-in is not supported; rerun interactively."),
+            "unexpected Codex non-interactive error"
+        );
+        assert!(
+            !config_path.exists(),
+            "non-interactive Codex sign-in should not write config"
         );
     }
 

@@ -61,6 +61,7 @@ const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "anthropic",
     "sessions",
     "openai",
+    "codex",
     "google",
     "providers",
     "bedrock",
@@ -109,6 +110,7 @@ pub fn validate_schema(config: &Value) -> Vec<SchemaIssue> {
     validate_logging(obj, &mut issues);
     validate_auth(obj, &mut issues);
     validate_google(obj, &mut issues);
+    validate_codex(obj, &mut issues);
     validate_agents(obj, &mut issues);
     validate_session(obj, &mut issues);
     validate_cron(obj, &mut issues);
@@ -373,7 +375,7 @@ fn validate_auth(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIs
         None => return,
     };
 
-    for provider_key in ["google", "github", "discord"] {
+    for provider_key in ["google", "github", "discord", "openai"] {
         let provider = match providers.get(provider_key).and_then(|v| v.as_object()) {
             Some(p) => p,
             None => continue,
@@ -445,6 +447,45 @@ fn validate_google(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schema
                 severity: Severity::Warning,
                 path: ".google.authProfile".to_string(),
                 message: "google.authProfile requires auth.profiles.enabled = true".to_string(),
+            });
+        }
+    }
+}
+
+fn validate_codex(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIssue>) {
+    let codex = match obj.get("codex").and_then(|v| v.as_object()) {
+        Some(c) => c,
+        None => return,
+    };
+
+    if let Some(value) = codex.get("authProfile") {
+        if !value.is_string() {
+            issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: ".codex.authProfile".to_string(),
+                message: "authProfile must be a string".to_string(),
+            });
+        }
+    }
+
+    let auth_profile = codex
+        .get("authProfile")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+
+    if auth_profile.is_some() {
+        let auth_profiles_enabled = obj
+            .get("auth")
+            .and_then(|v| v.get("profiles"))
+            .and_then(|v| v.get("enabled"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if !auth_profiles_enabled {
+            issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: ".codex.authProfile".to_string(),
+                message: "codex.authProfile requires auth.profiles.enabled = true".to_string(),
             });
         }
     }
@@ -1449,6 +1490,30 @@ mod tests {
     }
 
     #[test]
+    fn test_codex_auth_profile_requires_auth_profiles_enabled() {
+        let cfg = json!({
+            "codex": { "authProfile": "openai-abc123" },
+            "auth": { "profiles": { "enabled": false } }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.path == ".codex.authProfile"
+                    && i.message.contains("auth.profiles.enabled"))
+        );
+    }
+
+    #[test]
+    fn test_codex_auth_profile_must_be_string() {
+        let cfg = json!({
+            "codex": { "authProfile": 123 }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(issues.iter().any(|i| i.path == ".codex.authProfile"));
+    }
+
+    #[test]
     fn test_auth_profiles_provider_secret_must_be_string() {
         let cfg = json!({
             "auth": {
@@ -1467,6 +1532,27 @@ mod tests {
         assert!(issues
             .iter()
             .any(|i| i.path == ".auth.profiles.providers.google.clientSecret"));
+    }
+
+    #[test]
+    fn test_auth_profiles_openai_provider_secret_must_be_string() {
+        let cfg = json!({
+            "auth": {
+                "profiles": {
+                    "enabled": true,
+                    "providers": {
+                        "openai": {
+                            "clientId": "abc",
+                            "clientSecret": 123
+                        }
+                    }
+                }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(issues
+            .iter()
+            .any(|i| i.path == ".auth.profiles.providers.openai.clientSecret"));
     }
 
     // --- logging ---
