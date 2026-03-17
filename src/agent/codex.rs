@@ -67,21 +67,21 @@ impl CodexProvider {
             .is_some_and(|expires_at| expires_at <= now_ms + TOKEN_REFRESH_MARGIN_MS)
         {
             let _refresh_guard = self.refresh_lock.lock().await;
-            let refreshed_profile = self.profile_store.get(&self.profile_id).ok_or_else(|| {
+            let locked_profile = self.profile_store.get(&self.profile_id).ok_or_else(|| {
                 AgentError::Provider(format!(
                     "configured Codex auth profile \"{}\" was not found",
                     self.profile_id
                 ))
             })?;
             let now_ms_after_lock = current_time_ms();
-            if refreshed_profile
+            if locked_profile
                 .tokens
                 .expires_at_ms
                 .is_none_or(|expires_at| expires_at > now_ms_after_lock + TOKEN_REFRESH_MARGIN_MS)
             {
-                profile = refreshed_profile;
+                profile = locked_profile;
             } else {
-                let refresh_token_value = refreshed_profile
+                let refresh_token_value = locked_profile
                     .tokens
                     .refresh_token
                     .clone()
@@ -108,7 +108,11 @@ impl CodexProvider {
                             self.profile_id
                         ))
                     })?;
-                profile = refreshed_profile;
+                // `update_tokens` only mutates the stored token set. This method
+                // uses the refreshed access token immediately and updates
+                // `last_used_ms` by ID afterwards, so there is no need to
+                // re-fetch unrelated profile fields here.
+                profile = locked_profile;
                 profile.tokens = refreshed;
             }
         }

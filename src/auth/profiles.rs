@@ -669,6 +669,11 @@ fn user_info_from_openai_token(access_token: &str) -> Result<UserInfo, AuthProfi
         .get("https://api.openai.com/profile")
         .and_then(Value::as_object);
 
+    // OpenAI subscription tokens do not have a single stable public claim
+    // contract for user identity. We check the claim names observed in current
+    // Codex/OpenAI tokens and fall back to `sub`; if this starts failing, treat
+    // it as integration drift and revisit the provider contract before adding
+    // more heuristics here.
     let user_id = auth_claim
         .and_then(|claim| {
             claim
@@ -705,6 +710,10 @@ fn user_info_from_openai_token(access_token: &str) -> Result<UserInfo, AuthProfi
 }
 
 fn decode_jwt_payload(token: &str) -> Option<Value> {
+    // This is only used to extract profile metadata from an access token
+    // returned directly by the provider's token endpoint over TLS. It is not a
+    // general-purpose JWT verifier and intentionally does not validate
+    // signatures or claims for authorization decisions.
     let payload = token.split('.').nth(1)?;
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(payload.as_bytes())
