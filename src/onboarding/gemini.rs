@@ -16,6 +16,7 @@ use crate::auth::profiles::{
 use crate::server::ws::{map_validation_issues, persist_config_file, read_config_snapshot};
 
 const FLOW_TTL: Duration = Duration::from_secs(30 * 60);
+const MAX_PENDING_OAUTH_FLOWS: usize = 20;
 
 static GEMINI_OAUTH_FLOWS: LazyLock<RwLock<HashMap<String, PendingGeminiOAuthFlow>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
@@ -44,14 +45,15 @@ pub struct GeminiOAuthStatus {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum GeminiOAuthFlowState {
     Pending,
+    InProgress,
     Completed(Box<GeminiOAuthCompletion>),
     Failed(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct PendingGeminiOAuthFlow {
     id: String,
     state: String,
@@ -61,13 +63,13 @@ struct PendingGeminiOAuthFlow {
     flow_state: GeminiOAuthFlowState,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GeminiOAuthCompletion {
     pub client_id: String,
     pub auth_profile: AuthProfile,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GeminiApiKeyInput {
     pub api_key: String,
     pub base_url: Option<String>,
@@ -76,6 +78,17 @@ pub struct GeminiApiKeyInput {
 type CliOAuthSender = std::sync::Arc<
     std::sync::Mutex<Option<tokio::sync::oneshot::Sender<Result<GeminiOAuthCompletion, String>>>>,
 >;
+
+enum ControlGoogleOAuthAction {
+    AlreadyCompleted,
+    AlreadyFailed(String),
+    AlreadyProcessing,
+    Start {
+        flow_id: String,
+        provider_config: OAuthProviderConfig,
+        verifier: String,
+    },
+}
 
 pub fn resolve_google_oauth_provider_config(
     cfg: &Value,
@@ -128,7 +141,6 @@ pub fn start_control_google_oauth(
     redirect_base_url: &str,
 ) -> Result<GeminiOAuthStart, String> {
     require_encrypted_profile_store_for_google_oauth()?;
-    cleanup_expired_flows();
 
     let redirect_uri = format!(
         "{}/control/onboarding/gemini/callback",
@@ -155,7 +167,7 @@ pub fn start_control_google_oauth(
         created_at_ms: now_ms(),
         flow_state: GeminiOAuthFlowState::Pending,
     };
-    GEMINI_OAUTH_FLOWS.write().insert(flow_id.clone(), flow);
+    insert_google_oauth_flow(flow)?;
 
     Ok(GeminiOAuthStart {
         flow_id,
@@ -168,36 +180,32 @@ pub async fn complete_control_google_oauth_callback(
     state_param: &str,
     code: Option<&str>,
     error: Option<&str>,
+    error_description: Option<&str>,
 ) -> Result<(), String> {
     cleanup_expired_flows();
-    let flow_id = {
-        let flows = GEMINI_OAUTH_FLOWS.read();
-        flows
-            .values()
-            .find(|flow| flow.state == state_param)
-            .map(|flow| flow.id.clone())
-            .ok_or_else(|| "Unknown or expired Gemini OAuth flow".to_string())?
+    let (flow_id, provider_config, verifier) = match begin_control_google_oauth_completion(
+        state_param,
+    )? {
+        ControlGoogleOAuthAction::AlreadyCompleted => return Ok(()),
+        ControlGoogleOAuthAction::AlreadyFailed(err) => return Err(err),
+        ControlGoogleOAuthAction::AlreadyProcessing => {
+            return Err(
+                "Gemini sign-in callback is already being processed. Return to the Control UI and refresh status."
+                    .to_string(),
+            )
+        }
+        ControlGoogleOAuthAction::Start {
+            flow_id,
+            provider_config,
+            verifier,
+        } => (flow_id, provider_config, verifier),
     };
-
-    let existing_state = {
-        let flows = GEMINI_OAUTH_FLOWS.read();
-        flows
-            .get(&flow_id)
-            .map(|flow| flow.flow_state.clone())
-            .ok_or_else(|| "Unknown or expired Gemini OAuth flow".to_string())?
-    };
-    match existing_state {
-        GeminiOAuthFlowState::Completed(_) => return Ok(()),
-        GeminiOAuthFlowState::Failed(err) => return Err(err),
-        GeminiOAuthFlowState::Pending => {}
-    }
 
     if let Some(err) = error.filter(|value| !value.trim().is_empty()) {
-        let mut flows = GEMINI_OAUTH_FLOWS.write();
-        if let Some(flow) = flows.get_mut(&flow_id) {
-            flow.flow_state = GeminiOAuthFlowState::Failed(format!("OAuth provider error: {err}"));
-        }
-        return Err(format!("OAuth provider error: {err}"));
+        return finish_control_google_oauth_flow(
+            &flow_id,
+            Err(format_oauth_provider_error(err, error_description)),
+        );
     }
 
     let code = match code.map(str::trim).filter(|value| !value.is_empty()) {
@@ -208,14 +216,6 @@ pub async fn complete_control_google_oauth_callback(
                 Err("Missing OAuth authorization code".to_string()),
             );
         }
-    };
-
-    let (provider_config, verifier) = {
-        let flows = GEMINI_OAUTH_FLOWS.read();
-        let flow = flows
-            .get(&flow_id)
-            .ok_or_else(|| "Unknown or expired Gemini OAuth flow".to_string())?;
-        (flow.provider_config.clone(), flow.code_verifier.clone())
     };
 
     let result = async {
@@ -246,7 +246,7 @@ pub fn control_google_oauth_status(flow_id: &str) -> Result<GeminiOAuthStatus, S
         .get(flow_id)
         .ok_or_else(|| "Unknown or expired Gemini OAuth flow".to_string())?;
     Ok(match &flow.flow_state {
-        GeminiOAuthFlowState::Pending => GeminiOAuthStatus {
+        GeminiOAuthFlowState::Pending | GeminiOAuthFlowState::InProgress => GeminiOAuthStatus {
             flow_id: flow.id.clone(),
             status: "pending",
             profile_name: None,
@@ -280,7 +280,7 @@ pub fn apply_control_google_oauth(flow_id: &str, state_dir: PathBuf) -> Result<V
             .ok_or_else(|| "Unknown or expired Gemini OAuth flow".to_string())?;
         match &flow.flow_state {
             GeminiOAuthFlowState::Completed(completion) => completion.as_ref().clone(),
-            GeminiOAuthFlowState::Pending => {
+            GeminiOAuthFlowState::Pending | GeminiOAuthFlowState::InProgress => {
                 return Err("Gemini Google sign-in is still pending".to_string())
             }
             GeminiOAuthFlowState::Failed(err) => return Err(err.clone()),
@@ -398,6 +398,7 @@ async fn run_cli_google_oauth_with_timeout(
             code: Option<String>,
             state: Option<String>,
             error: Option<String>,
+            error_description: Option<String>,
         }
 
         async fn callback_handler(
@@ -415,7 +416,10 @@ async fn run_cli_google_oauth_with_timeout(
             }
 
             let result = match query.error.filter(|value| !value.trim().is_empty()) {
-                Some(err) => Err(format!("OAuth provider error: {err}")),
+                Some(err) => Err(format_oauth_provider_error(
+                    &err,
+                    query.error_description.as_deref(),
+                )),
                 None => {
                     complete_cli_oauth_callback(
                         &state.provider_config,
@@ -597,12 +601,56 @@ fn finish_control_google_oauth_flow(
 ) -> Result<(), String> {
     let mut flows = GEMINI_OAUTH_FLOWS.write();
     if let Some(flow) = flows.get_mut(flow_id) {
-        flow.flow_state = match &result {
-            Ok(completion) => GeminiOAuthFlowState::Completed(Box::new(completion.clone())),
-            Err(err) => GeminiOAuthFlowState::Failed(err.clone()),
-        };
+        match &flow.flow_state {
+            GeminiOAuthFlowState::Completed(_) => return Ok(()),
+            GeminiOAuthFlowState::Failed(err) => return Err(err.clone()),
+            GeminiOAuthFlowState::Pending | GeminiOAuthFlowState::InProgress => {
+                flow.flow_state = match &result {
+                    Ok(completion) => GeminiOAuthFlowState::Completed(Box::new(completion.clone())),
+                    Err(err) => GeminiOAuthFlowState::Failed(err.clone()),
+                };
+            }
+        }
     }
     result.map(|_| ())
+}
+
+fn begin_control_google_oauth_completion(
+    state_param: &str,
+) -> Result<ControlGoogleOAuthAction, String> {
+    let mut flows = GEMINI_OAUTH_FLOWS.write();
+    let flow = flows
+        .values_mut()
+        .find(|flow| flow.state == state_param)
+        .ok_or_else(|| "Unknown or expired Gemini OAuth flow".to_string())?;
+
+    match &flow.flow_state {
+        GeminiOAuthFlowState::Completed(_) => Ok(ControlGoogleOAuthAction::AlreadyCompleted),
+        GeminiOAuthFlowState::Failed(err) => {
+            Ok(ControlGoogleOAuthAction::AlreadyFailed(err.clone()))
+        }
+        GeminiOAuthFlowState::InProgress => Ok(ControlGoogleOAuthAction::AlreadyProcessing),
+        GeminiOAuthFlowState::Pending => {
+            flow.flow_state = GeminiOAuthFlowState::InProgress;
+            flow.created_at_ms = now_ms();
+            Ok(ControlGoogleOAuthAction::Start {
+                flow_id: flow.id.clone(),
+                provider_config: flow.provider_config.clone(),
+                verifier: flow.code_verifier.clone(),
+            })
+        }
+    }
+}
+
+fn insert_google_oauth_flow(flow: PendingGeminiOAuthFlow) -> Result<(), String> {
+    let cutoff = now_ms().saturating_sub(FLOW_TTL.as_millis() as u64);
+    let mut flows = GEMINI_OAUTH_FLOWS.write();
+    flows.retain(|_, flow| flow.created_at_ms >= cutoff);
+    if flows.len() >= MAX_PENDING_OAUTH_FLOWS {
+        return Err("Too many active Gemini sign-in flows. Wait for an existing flow to finish or expire and retry.".to_string());
+    }
+    flows.insert(flow.id.clone(), flow);
+    Ok(())
 }
 
 fn require_encrypted_profile_store_for_google_oauth() -> Result<(), String> {
@@ -711,6 +759,16 @@ fn escape_html(input: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
+}
+
+fn format_oauth_provider_error(error: &str, error_description: Option<&str>) -> String {
+    let description = error_description
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match description {
+        Some(description) => format!("OAuth provider error: {error} ({description})"),
+        None => format!("OAuth provider error: {error}"),
+    }
 }
 
 fn cli_oauth_callback_matches_expected_state(
@@ -854,8 +912,8 @@ mod tests {
         )
         .expect("provider config");
 
-        assert_eq!(provider.client_id, "existing-client-id");
-        assert_eq!(provider.client_secret, "env-client-secret");
+        assert!(provider.client_id == "existing-client-id");
+        assert!(provider.client_secret == "env-client-secret");
     }
 
     #[test]
@@ -891,8 +949,8 @@ mod tests {
         )
         .expect("provider config");
 
-        assert_eq!(provider.client_id, "stored-client-id");
-        assert_eq!(provider.client_secret, "stored-client-secret");
+        assert!(provider.client_id == "stored-client-id");
+        assert!(provider.client_secret == "stored-client-secret");
     }
 
     #[test]
@@ -929,8 +987,8 @@ mod tests {
         )
         .expect("provider config");
 
-        assert_eq!(provider.client_id, "override-client-id");
-        assert_eq!(provider.client_secret, "override-client-secret");
+        assert!(provider.client_id == "override-client-id");
+        assert!(provider.client_secret == "override-client-secret");
         assert_eq!(provider.redirect_uri, "http://127.0.0.1:3555/auth/callback");
     }
 
@@ -1025,8 +1083,8 @@ mod tests {
         let stored_cfg = profile
             .oauth_provider_config
             .expect("stored Google OAuth provider config");
-        assert_eq!(stored_cfg.client_id, "google-client-id");
-        assert_eq!(stored_cfg.client_secret, "google-client-secret");
+        assert!(stored_cfg.client_id == "google-client-id");
+        assert!(stored_cfg.client_secret == "google-client-secret");
     }
 
     #[test]
@@ -1081,10 +1139,16 @@ mod tests {
                 .clone()
         };
 
-        let err = complete_control_google_oauth_callback(&state, None, Some("access_denied"))
-            .await
-            .expect_err("provider error should fail");
-        assert!(err.contains("OAuth provider error"));
+        let err = complete_control_google_oauth_callback(
+            &state,
+            None,
+            Some("access_denied"),
+            Some("User denied access"),
+        )
+        .await
+        .expect_err("provider error should fail");
+        assert!(err.contains("access_denied"));
+        assert!(err.contains("User denied access"));
         let status = control_google_oauth_status(&started.flow_id).expect("flow status");
         assert_eq!(status.status, "failed");
     }
@@ -1109,7 +1173,7 @@ mod tests {
                 .clone()
         };
 
-        let err = complete_control_google_oauth_callback(&state, None, None)
+        let err = complete_control_google_oauth_callback(&state, None, None, None)
             .await
             .expect_err("missing code should fail");
         assert!(err.contains("Missing OAuth authorization code"));
@@ -1167,9 +1231,13 @@ mod tests {
             },
         );
 
-        let result =
-            complete_control_google_oauth_callback("state-completed", Some("reused-code"), None)
-                .await;
+        let result = complete_control_google_oauth_callback(
+            "state-completed",
+            Some("reused-code"),
+            None,
+            None,
+        )
+        .await;
         assert!(result.is_ok(), "completed retry should stay successful");
 
         let status = control_google_oauth_status(&flow_id).expect("flow status");
@@ -1208,6 +1276,110 @@ mod tests {
         GEMINI_OAUTH_FLOWS.write().remove(&flow_id);
     }
 
+    #[test]
+    fn test_finish_control_google_oauth_flow_preserves_completed_flow() {
+        let flow_id = "flow-preserve-completed".to_string();
+        GEMINI_OAUTH_FLOWS.write().insert(
+            flow_id.clone(),
+            PendingGeminiOAuthFlow {
+                id: flow_id.clone(),
+                state: "state-preserve-completed".to_string(),
+                code_verifier: "verifier".to_string(),
+                provider_config: OAuthProvider::Google.default_config(
+                    "client-id",
+                    "client-secret",
+                    "http://127.0.0.1:3000/auth/callback",
+                ),
+                created_at_ms: now_ms(),
+                flow_state: GeminiOAuthFlowState::Completed(Box::new(GeminiOAuthCompletion {
+                    client_id: "client-id".to_string(),
+                    auth_profile: build_google_auth_profile(
+                        &OAuthProvider::Google.default_config(
+                            "client-id",
+                            "client-secret",
+                            "http://127.0.0.1:3000/auth/callback",
+                        ),
+                        sample_tokens(),
+                        sample_user_info(),
+                    ),
+                })),
+            },
+        );
+
+        let result = finish_control_google_oauth_flow(&flow_id, Err("late failure".to_string()));
+        assert!(result.is_ok(), "completed flow should stay successful");
+
+        let status = control_google_oauth_status(&flow_id).expect("flow status");
+        assert_eq!(status.status, "completed");
+
+        GEMINI_OAUTH_FLOWS.write().remove(&flow_id);
+    }
+
+    #[tokio::test]
+    async fn test_complete_control_google_oauth_callback_rejects_in_progress_flow() {
+        let flow_id = "flow-in-progress".to_string();
+        let state = "state-in-progress".to_string();
+        GEMINI_OAUTH_FLOWS.write().insert(
+            flow_id.clone(),
+            PendingGeminiOAuthFlow {
+                id: flow_id.clone(),
+                state: state.clone(),
+                code_verifier: "verifier".to_string(),
+                provider_config: OAuthProvider::Google.default_config(
+                    "client-id",
+                    "client-secret",
+                    "https://gateway.example.com/control/onboarding/gemini/callback",
+                ),
+                created_at_ms: now_ms(),
+                flow_state: GeminiOAuthFlowState::InProgress,
+            },
+        );
+
+        let err = complete_control_google_oauth_callback(&state, Some("code"), None, None)
+            .await
+            .expect_err("in-progress flow should not start another exchange");
+        assert!(err.contains("already being processed"));
+
+        let status = control_google_oauth_status(&flow_id).expect("flow status");
+        assert_eq!(status.status, "pending");
+
+        GEMINI_OAUTH_FLOWS.write().remove(&flow_id);
+    }
+
+    #[test]
+    fn test_start_control_google_oauth_evicts_stale_in_progress_flow() {
+        let _password_guard = set_temp_env_var("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+        let flow_id = "gemini-stale-in-progress".to_string();
+        GEMINI_OAUTH_FLOWS.write().insert(
+            flow_id.clone(),
+            PendingGeminiOAuthFlow {
+                id: flow_id.clone(),
+                state: "gemini-stale-state".to_string(),
+                code_verifier: "verifier".to_string(),
+                provider_config: OAuthProvider::Google.default_config(
+                    "client-id",
+                    "client-secret",
+                    "https://gateway.example.com/control/onboarding/gemini/callback",
+                ),
+                created_at_ms: now_ms() - FLOW_TTL.as_millis() as u64 - 1,
+                flow_state: GeminiOAuthFlowState::InProgress,
+            },
+        );
+
+        let started = start_control_google_oauth(
+            &json!({}),
+            Some("google-client-id".to_string()),
+            Some("google-client-secret".to_string()),
+            "https://gateway.example.com",
+        )
+        .expect("stale in-progress flow should be evicted");
+
+        assert_ne!(started.flow_id, flow_id);
+        assert!(GEMINI_OAUTH_FLOWS.read().get(&flow_id).is_none());
+
+        GEMINI_OAUTH_FLOWS.write().remove(&started.flow_id);
+    }
+
     #[tokio::test]
     async fn test_complete_control_google_oauth_callback_rejects_expired_flow() {
         let flow_id = "expired-callback-flow".to_string();
@@ -1228,11 +1400,48 @@ mod tests {
             },
         );
 
-        let err = complete_control_google_oauth_callback(&state, Some("code"), None)
+        let err = complete_control_google_oauth_callback(&state, Some("code"), None, None)
             .await
             .expect_err("expired flow should fail");
         assert!(err.contains("Unknown or expired"));
         assert!(GEMINI_OAUTH_FLOWS.read().get(&flow_id).is_none());
+    }
+
+    #[test]
+    fn test_start_control_google_oauth_rejects_when_pending_flow_limit_reached() {
+        let _password_guard = set_temp_env_var("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+        let mut flows = GEMINI_OAUTH_FLOWS.write();
+        flows.clear();
+        for i in 0..MAX_PENDING_OAUTH_FLOWS {
+            let id = format!("flow-{i}");
+            flows.insert(
+                id.clone(),
+                PendingGeminiOAuthFlow {
+                    id: id.clone(),
+                    state: format!("state-{i}"),
+                    code_verifier: "verifier".to_string(),
+                    provider_config: OAuthProvider::Google.default_config(
+                        "client-id",
+                        "client-secret",
+                        "https://gateway.example.com/control/onboarding/gemini/callback",
+                    ),
+                    created_at_ms: now_ms(),
+                    flow_state: GeminiOAuthFlowState::Pending,
+                },
+            );
+        }
+        drop(flows);
+
+        let err = start_control_google_oauth(
+            &json!({}),
+            Some("google-client-id".to_string()),
+            Some("google-client-secret".to_string()),
+            "https://gateway.example.com",
+        )
+        .expect_err("flow limit should reject new sign-in starts");
+        assert!(err.contains("Too many active Gemini sign-in flows"));
+
+        GEMINI_OAUTH_FLOWS.write().clear();
     }
 
     #[test]

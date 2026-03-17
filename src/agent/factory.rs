@@ -24,6 +24,14 @@ fn resolve_google_auth_profile_id(cfg: &Value) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+fn resolve_openai_auth_profile_id(cfg: &Value) -> Option<String> {
+    cfg.get("codex")
+        .and_then(|v| v.get("authProfile"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 fn resolve_google_oauth_runtime_config(
     cfg: &Value,
     state_dir: &Path,
@@ -56,6 +64,38 @@ fn resolve_google_oauth_runtime_config(
     None
 }
 
+fn resolve_openai_oauth_runtime_config(
+    cfg: &Value,
+    state_dir: &Path,
+    profile_id: &str,
+) -> Option<crate::auth::profiles::OAuthProviderConfig> {
+    let profile_store = ProfileStore::from_env(state_dir.to_path_buf()).ok()?;
+    profile_store.load().ok()?;
+    let profile = profile_store.get(profile_id)?;
+    if profile.provider != OAuthProvider::OpenAI {
+        return None;
+    }
+    if let Some(stored) = profile.oauth_provider_config {
+        let redirect_uri = cfg
+            .pointer("/auth/profiles/providers/openai/redirectUri")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(&stored.redirect_uri)
+            .to_string();
+        return Some(crate::auth::profiles::OAuthProviderConfig {
+            client_id: stored.client_id,
+            client_secret: stored.client_secret,
+            redirect_uri,
+            auth_url: stored.auth_url,
+            token_url: stored.token_url,
+            userinfo_url: stored.userinfo_url,
+            scopes: stored.scopes,
+        });
+    }
+    None
+}
+
 fn resolve_google_auth_profile_fingerprint(cfg: &Value) -> Option<String> {
     let profile_id = resolve_google_auth_profile_id(cfg)?;
     let state_dir = crate::paths::resolve_state_dir();
@@ -63,6 +103,26 @@ fn resolve_google_auth_profile_fingerprint(cfg: &Value) -> Option<String> {
     profile_store.load().ok()?;
     let profile = profile_store.get(&profile_id)?;
     if profile.provider != OAuthProvider::Google {
+        return None;
+    }
+
+    let material =
+        serde_json::to_string(&(&profile_id, &profile.tokens, &profile.oauth_provider_config))
+            .ok()?;
+    Some(format!(
+        "auth-profile:{}:{}",
+        profile_id,
+        hash_key_prefix(&material)
+    ))
+}
+
+fn resolve_openai_auth_profile_fingerprint(cfg: &Value) -> Option<String> {
+    let profile_id = resolve_openai_auth_profile_id(cfg)?;
+    let state_dir = crate::paths::resolve_state_dir();
+    let profile_store = ProfileStore::from_env(state_dir).ok()?;
+    profile_store.load().ok()?;
+    let profile = profile_store.get(&profile_id)?;
+    if profile.provider != OAuthProvider::OpenAI {
         return None;
     }
 
@@ -121,6 +181,41 @@ fn build_gemini_provider(
     } else {
         warn!(
             "Gemini auth profile is configured, but the stored Google OAuth provider settings are missing"
+        );
+        Ok(None)
+    }
+}
+
+fn build_codex_provider(
+    cfg: &Value,
+    openai_auth_profile: Option<String>,
+) -> Result<Option<Arc<dyn agent::LlmProvider>>, Box<dyn std::error::Error>> {
+    let Some(profile_id) = openai_auth_profile else {
+        return Ok(None);
+    };
+
+    if !profile_store_encryption_enabled_from_env() {
+        warn!(
+            "Codex auth profile requires CARAPACE_CONFIG_PASSWORD so auth profile tokens and OAuth client secrets stay encrypted at rest"
+        );
+        return Ok(None);
+    }
+
+    let state_dir = crate::paths::resolve_state_dir();
+    let provider_config = resolve_openai_oauth_runtime_config(cfg, &state_dir, &profile_id);
+    if let Some(provider_config) = provider_config {
+        let profile_store = ProfileStore::from_env(state_dir)?;
+        profile_store.load()?;
+        let provider = agent::codex::CodexProvider::with_oauth_profile(
+            Arc::new(profile_store),
+            profile_id,
+            provider_config,
+        )?;
+        info!("LLM provider configured: Codex (OpenAI auth profile)");
+        Ok(Some(Arc::new(provider) as Arc<dyn agent::LlmProvider>))
+    } else {
+        warn!(
+            "Codex auth profile is configured, but the stored OpenAI OAuth provider settings are missing"
         );
         Ok(None)
     }
@@ -374,6 +469,10 @@ pub fn build_providers(cfg: &Value) -> Result<Option<MultiProvider>, Box<dyn std
         None => None,
     };
 
+    // Codex
+    let codex_auth_profile = resolve_openai_auth_profile_id(cfg);
+    let codex_provider = build_codex_provider(cfg, codex_auth_profile)?;
+
     // Ollama
     let ollama_provider = try_build_ollama_provider(cfg)?;
 
@@ -505,6 +604,7 @@ pub fn build_providers(cfg: &Value) -> Result<Option<MultiProvider>, Box<dyn std
 
     // Build multi-provider dispatcher
     let multi_provider = MultiProvider::new(anthropic_provider, openai_provider)
+        .with_codex(codex_provider)
         .with_ollama(ollama_provider)
         .with_gemini(gemini_provider)
         .with_venice(venice_provider)
@@ -525,6 +625,7 @@ pub fn build_providers(cfg: &Value) -> Result<Option<MultiProvider>, Box<dyn std
 pub struct ProviderFingerprint {
     pub anthropic: Option<(String, Option<String>)>,
     pub openai: Option<(String, Option<String>)>,
+    pub codex: Option<String>,
     pub ollama: Option<(bool, Option<String>)>,
     pub gemini: Option<(String, Option<String>)>,
     pub venice: Option<(String, Option<String>)>,
@@ -553,6 +654,7 @@ pub fn fingerprint_providers(cfg: &Value) -> ProviderFingerprint {
         http_referer: openai_http_referer,
         title: openai_title,
     } = get_openai_config(cfg);
+    let codex_profile_fingerprint = resolve_openai_auth_profile_fingerprint(cfg);
 
     let ollama_cfg = cfg.get("providers").and_then(|v| v.get("ollama"));
     let ollama_url = std::env::var("OLLAMA_BASE_URL").ok().or_else(|| {
@@ -641,6 +743,7 @@ pub fn fingerprint_providers(cfg: &Value) -> ProviderFingerprint {
             };
             (api_key_hash, openai_base_url.clone())
         }),
+        codex: codex_profile_fingerprint,
         ollama: if ollama_configured {
             Some((true, ollama_url))
         } else {
@@ -703,6 +806,8 @@ mod tests {
         "CARAPACE_STATE_DIR",
         "OPENAI_API_KEY",
         "OPENAI_BASE_URL",
+        "OPENAI_OAUTH_CLIENT_ID",
+        "OPENAI_OAUTH_CLIENT_SECRET",
         "OPENAI_HTTP_REFERER",
         "OPENAI_X_TITLE",
         "OPENAI_TITLE",
@@ -762,6 +867,7 @@ mod tests {
             let fp = fingerprint_providers(&cfg);
             assert!(fp.anthropic.is_none());
             assert!(fp.openai.is_none());
+            assert!(fp.codex.is_none());
             assert!(fp.ollama.is_none());
             assert!(fp.gemini.is_none());
             assert!(fp.venice.is_none());
@@ -829,6 +935,51 @@ mod tests {
             let fingerprint = fp.gemini.expect("gemini fingerprint");
             assert!(fingerprint.0.starts_with("auth-profile:google-abc123:"));
             assert_eq!(fingerprint.1, None);
+        });
+    }
+
+    #[test]
+    fn test_fingerprint_with_codex_auth_profile() {
+        with_clean_provider_env(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let _state_dir = set_env_var_scoped(
+                "CARAPACE_STATE_DIR",
+                temp.path().to_str().expect("state dir path"),
+            );
+            let provider_config = OAuthProvider::OpenAI.default_config(
+                "openai-client-id",
+                "openai-client-secret",
+                "https://gateway.example.com/control/onboarding/codex/callback",
+            );
+            let profile = crate::auth::profiles::AuthProfile {
+                id: "openai-abc123".to_string(),
+                name: "Codex user@example.com".to_string(),
+                provider: OAuthProvider::OpenAI,
+                user_id: Some("user-123".to_string()),
+                email: Some("user@example.com".to_string()),
+                display_name: Some("Example User".to_string()),
+                avatar_url: None,
+                created_at_ms: 0,
+                last_used_ms: None,
+                tokens: crate::auth::profiles::OAuthTokens {
+                    access_token: "access-token".to_string(),
+                    refresh_token: Some("refresh-token".to_string()),
+                    token_type: "Bearer".to_string(),
+                    expires_at_ms: Some(u64::MAX),
+                    scope: Some("openid email profile offline_access".to_string()),
+                },
+                oauth_provider_config: Some(
+                    crate::auth::profiles::StoredOAuthProviderConfig::from(&provider_config),
+                ),
+            };
+            let store = ProfileStore::from_env(temp.path().to_path_buf()).expect("profile store");
+            store.add(profile).expect("store profile");
+            let cfg = json!({
+                "codex": { "authProfile": "openai-abc123" }
+            });
+            let fp = fingerprint_providers(&cfg);
+            let fingerprint = fp.codex.expect("codex fingerprint");
+            assert!(fingerprint.starts_with("auth-profile:openai-abc123:"));
         });
     }
 
@@ -1070,6 +1221,56 @@ mod tests {
             assert!(
                 providers.is_some(),
                 "blank GOOGLE_API_KEY should not mask auth-profile Gemini setup"
+            );
+        });
+    }
+
+    #[test]
+    fn test_build_providers_with_codex_auth_profile() {
+        with_clean_provider_env(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let _password = set_env_var_scoped("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+            let _state_dir = set_env_var_scoped(
+                "CARAPACE_STATE_DIR",
+                temp.path().to_str().expect("state dir path"),
+            );
+
+            let provider_config = OAuthProvider::OpenAI.default_config(
+                "openai-client-id",
+                "openai-client-secret",
+                "https://gateway.example.com/control/onboarding/codex/callback",
+            );
+            let profile = crate::auth::profiles::AuthProfile {
+                id: "openai-abc123".to_string(),
+                name: "Codex user@example.com".to_string(),
+                provider: OAuthProvider::OpenAI,
+                user_id: Some("user-123".to_string()),
+                email: Some("user@example.com".to_string()),
+                display_name: Some("Example User".to_string()),
+                avatar_url: None,
+                created_at_ms: 0,
+                last_used_ms: None,
+                tokens: crate::auth::profiles::OAuthTokens {
+                    access_token: "access-token".to_string(),
+                    refresh_token: Some("refresh-token".to_string()),
+                    token_type: "Bearer".to_string(),
+                    expires_at_ms: Some(u64::MAX),
+                    scope: Some("openid email profile offline_access".to_string()),
+                },
+                oauth_provider_config: Some(
+                    crate::auth::profiles::StoredOAuthProviderConfig::from(&provider_config),
+                ),
+            };
+            let store = ProfileStore::from_env(temp.path().to_path_buf()).expect("profile store");
+            store.add(profile).expect("store profile");
+
+            let cfg = json!({
+                "codex": { "authProfile": "openai-abc123" }
+            });
+            let providers = build_providers(&cfg).expect("build providers");
+            assert!(
+                providers.is_some(),
+                "Codex auth profile should build a usable provider set"
             );
         });
     }

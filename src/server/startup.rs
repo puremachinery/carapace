@@ -207,7 +207,7 @@ pub async fn build_ws_state_with_runtime_dependencies(
         Some(multi_provider) => ws_state.with_llm_provider(Arc::new(multi_provider)),
         None => {
             info!(
-                "No LLM provider configured (set ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_API_KEY, VENICE_API_KEY, configure Ollama, or configure google.authProfile)"
+                "No LLM provider configured (set ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_API_KEY, VENICE_API_KEY, configure Ollama, configure google.authProfile, or configure codex.authProfile)"
             );
             ws_state
         }

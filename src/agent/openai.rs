@@ -25,16 +25,19 @@ pub struct OpenAiProvider {
 
 impl OpenAiProvider {
     pub fn new(api_key: String) -> Result<Self, AgentError> {
+        let client = Self::build_http_client()?;
+        Self::with_client(api_key, client)
+    }
+
+    pub(crate) fn with_client(
+        api_key: String,
+        client: reqwest::Client,
+    ) -> Result<Self, AgentError> {
         if api_key.trim().is_empty() {
             return Err(AgentError::InvalidApiKey(
                 "API key must not be empty".to_string(),
             ));
         }
-        let client = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(std::time::Duration::from_secs(300))
-            .build()
-            .map_err(|e| AgentError::Provider(format!("failed to build HTTP client: {e}")))?;
         Ok(Self {
             client,
             api_key,
@@ -42,6 +45,14 @@ impl OpenAiProvider {
             http_referer: None,
             title: None,
         })
+    }
+
+    pub(crate) fn build_http_client() -> Result<reqwest::Client, AgentError> {
+        reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(300))
+            .build()
+            .map_err(|e| AgentError::Provider(format!("failed to build HTTP client: {e}")))
     }
 
     pub fn with_base_url(mut self, url: String) -> Result<Self, AgentError> {

@@ -8,6 +8,8 @@ Pick a first provider with the shortest path to a verified useful outcome.
 
 - **Fastest cloud start**: Anthropic or OpenAI
   - One API key, common setup path, best fit if your immediate goal is "get to first reply quickly."
+- **Subscription-login path**: Codex
+  - Best fit if you want OpenAI subscription-backed usage separated cleanly from API-key OpenAI.
 - **Fastest local-only start**: Ollama
   - Best fit if your immediate goal is "keep everything local and verify the basic loop first."
 - **Existing cloud standardization**: Gemini or Bedrock
@@ -27,7 +29,7 @@ choose `local-chat` as the first outcome and add channels only after
 In headless or scripted environments, pass `--provider`; non-interactive
 `cara setup` now errors instead of writing a providerless config.
 
-### Anthropic / OpenAI (fastest cloud path)
+### Anthropic / OpenAI API key (fastest cloud path)
 
 Pick one of these, not both:
 
@@ -42,6 +44,23 @@ Or:
 export OPENAI_API_KEY='...'
 cara setup --provider openai
 ```
+
+### Codex (OpenAI subscription login)
+
+```bash
+export CARAPACE_CONFIG_PASSWORD='...'
+export OPENAI_OAUTH_CLIENT_ID='...'
+export OPENAI_OAUTH_CLIENT_SECRET='...'
+cara setup --provider codex
+```
+
+Notes:
+
+- Codex is separate from API-key `openai`.
+- Codex sign-in is interactive-only in the CLI because it completes through a loopback callback on a local port.
+- Control UI also supports Codex sign-in.
+- The resulting config uses `codex.authProfile` and defaults the agent model to `codex:default`.
+- `CARAPACE_CONFIG_PASSWORD` is required so the stored auth profile is encrypted at rest.
 
 ### Ollama (fastest fully local path)
 
@@ -100,6 +119,7 @@ Supported env vars:
 
 - `ANTHROPIC_API_KEY`
 - `OPENAI_API_KEY`
+- `OPENAI_OAUTH_CLIENT_ID` / `OPENAI_OAUTH_CLIENT_SECRET` (Codex OpenAI sign-in)
 - `GOOGLE_API_KEY`
 - `GOOGLE_API_BASE_URL` (Gemini override)
 - `GOOGLE_OAUTH_CLIENT_ID` / `GOOGLE_OAUTH_CLIENT_SECRET` (Gemini Google sign-in)
@@ -109,6 +129,39 @@ Supported env vars:
 - `AWS_SESSION_TOKEN` (optional Bedrock session token)
 - `VENICE_API_KEY`
 - `VENICE_BASE_URL` (Venice override)
+
+## Provider Routing
+
+Carapace automatically routes your requests to the correct AI provider based on the `model` string configured in your agent (see [agent.model](../protocol/config-reference.md)).
+
+- **Explicit Provider Prefixes**: You can force routing to a specific provider by using the explicit forms that provider currently supports. Examples: `vertex:gemini-2.5-pro` and `vertex/gemini-2.5-flash`, `bedrock:anthropic.claude-3-sonnet` and `bedrock/anthropic.claude-3-sonnet`, `ollama:llama3` and `ollama/llama3`, `codex:gpt-5.4` and `codex/gpt-5.4`, `venice:llama-3.3-70b`, plus Gemini-specific forms like `gemini/gemini-2.5-flash` and `models/gemini-2.5-flash`. OpenAI and Anthropic currently do not have explicit provider prefixes; they route via bare model-name matching and fallback behavior.
+- **Implicit Fallbacks**: If you don't use a prefix, Carapace maps the bare model name:
+  - `gemini-*` routes to Gemini (or Vertex AI if Gemini is not configured).
+  - `gpt-*`, `o1`, `o1-*`, `o3`, `o3-*`, and `chatgpt-*` route to OpenAI.
+  - `anthropic.claude-*`, `amazon.titan-*`, `meta.llama*` route to Bedrock.
+  - `claude-*` and all other unrecognized models default to Anthropic.
+  - If the exact system default model (`claude-sonnet-4-20250514`) is requested and Anthropic is not configured, it will fall back to Vertex AI (`vertex:default`).
+
+Here is an example `carapace.json5` snippet locking agents onto specific providers using prefixes:
+
+```json5
+{
+  "agents": {
+    "list": [
+      {
+        "id": "researcher",
+        "model": "vertex:gemini-2.5-flash",
+        "system": "You are a specialized research assistant."
+      },
+      {
+        "id": "local-coder",
+        "model": "ollama:qwen2.5-coder",
+        "system": "You are a local coding assistant."
+      }
+    ]
+  }
+}
+```
 
 ## Common first-run mistakes
 

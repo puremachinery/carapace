@@ -55,6 +55,7 @@ const CONFIG_SECRET_PATHS: &[&str] = &[
     "/auth/profiles/providers/google/clientSecret",
     "/auth/profiles/providers/github/clientSecret",
     "/auth/profiles/providers/discord/clientSecret",
+    "/auth/profiles/providers/openai/clientSecret",
     "/telegram/botToken",
     "/telegram/webhookSecret",
     "/discord/botToken",
