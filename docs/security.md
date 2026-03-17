@@ -338,6 +338,9 @@ guarded by explicit config and path validation:
 - Write operations are separately gated by `filesystem.writeAccess = true`.
 - Path validation canonicalizes paths before I/O, so `..` escapes and symlinks
   that resolve outside allowed roots are denied.
+- Filesystem operations still have an accepted local TOCTOU limitation: path
+  validation happens before later file operations, so a local filesystem change
+  can still race between validation and use.
 - Filesystem tools still go through the normal tool policy layer, so operators
   can allow-list or deny-list them in addition to the root/exclude controls.
 - Invalid filesystem config fail-closes: schema validation blocks bad config at
