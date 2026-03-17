@@ -114,7 +114,7 @@ Supported env vars:
 
 Carapace automatically routes your requests to the correct AI provider based on the `model` string configured in your agent (see [agent.model](../protocol/config-reference.md)).
 
-- **Explicit Provider Prefixes**: You can force routing to a specific provider by using a provider-specific prefix. All providers accept the `provider:model` form; some (such as Vertex AI and Bedrock) also accept `provider/model`. For example: `vertex:gemini-2.5-pro`, `vertex/gemini-2.5-flash`, `ollama:llama3`, `bedrock/anthropic.claude-3-sonnet`, or `venice:llama-3.3-70b`.
+- **Explicit Provider Prefixes**: You can force routing to a specific provider by using the explicit forms that provider currently supports. Examples: `vertex:gemini-2.5-pro` and `vertex/gemini-2.5-flash`, `bedrock:anthropic.claude-3-sonnet` and `bedrock/anthropic.claude-3-sonnet`, `ollama:llama3` and `ollama/llama3`, `codex:gpt-5.4` and `codex/gpt-5.4`, `venice:llama-3.3-70b`, plus Gemini-specific forms like `gemini/gemini-2.5-flash` and `models/gemini-2.5-flash`. OpenAI and Anthropic currently do not have explicit provider prefixes; they route via bare model-name matching and fallback behavior.
 - **Implicit Fallbacks**: If you don't use a prefix, Carapace maps the bare model name:
   - `gemini-*` routes to Gemini (or Vertex AI if Gemini is not configured).
   - `gpt-*`, `o1`, `o1-*`, `o3`, `o3-*`, and `chatgpt-*` route to OpenAI.

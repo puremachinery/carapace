@@ -153,7 +153,7 @@ This block shapes how smart your AI behaves and what limits apply during executi
     - `identity.description`: String. Short summary shown in UIs or listings.
     - `identity.avatar`: String. Workspace-relative path or `http(s)` / `data:` URI used as the agent avatar.
     - `model`: String. The exact LLM name used by this agent, determining both the underlying model and the provider.
-      - **Provider Routing:** The prefix of this string dictates the provider. All providers accept the `provider:model` form; some also accept `provider/model` (e.g. `vertex:gemini-1.5-pro` or `vertex/gemini-2.5-flash` routes to Vertex AI, `ollama:llama3` routes to Ollama).
+      - **Provider Routing:** Explicit routing syntax is provider-specific, not universal. Current examples include `vertex:model` and `vertex/model`, `bedrock:model` and `bedrock/model`, `ollama:model` and `ollama/model`, `codex:model` and `codex/model`, `venice:model`, plus Gemini-specific forms like `gemini/model` and `models/gemini-*`. OpenAI and Anthropic currently route via bare model-name matching rather than explicit `openai:` or `anthropic:` prefixes.
       - **Implicit Fallbacks:** If no explicit prefix is present, the system routes based on the model name:
         - `gemini-*` routes to Gemini (or Vertex AI if Gemini is not configured).
         - `gpt-*`, `o1`, `o1-*`, `o3`, `o3-*`, and `chatgpt-*` route to OpenAI.
