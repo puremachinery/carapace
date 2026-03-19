@@ -67,11 +67,13 @@ impl AnthropicProvider {
                     .content
                     .iter()
                     .map(|block| match block {
-                        ContentBlock::Text { text } => json!({
+                        ContentBlock::Text { text, .. } => json!({
                             "type": "text",
                             "text": text,
                         }),
-                        ContentBlock::ToolUse { id, name, input } => json!({
+                        ContentBlock::ToolUse {
+                            id, name, input, ..
+                        } => json!({
                             "type": "tool_use",
                             "id": id,
                             "name": name,
@@ -81,6 +83,7 @@ impl AnthropicProvider {
                             tool_use_id,
                             content,
                             is_error,
+                            ..
                         } => json!({
                             "type": "tool_result",
                             "tool_use_id": tool_use_id,
@@ -361,7 +364,10 @@ fn handle_content_block_delta(
             if text.is_empty() {
                 None
             } else {
-                Some(StreamEvent::TextDelta { text })
+                Some(StreamEvent::TextDelta {
+                    text,
+                    metadata: None,
+                })
             }
         }
         Some("input_json_delta") => {
@@ -390,7 +396,12 @@ fn handle_content_block_stop(
     };
     if let Some((id, name, input_json)) = tool_calls.remove(&index) {
         let input: Value = serde_json::from_str(&input_json).unwrap_or(json!({}));
-        Some(StreamEvent::ToolUse { id, name, input })
+        Some(StreamEvent::ToolUse {
+            id,
+            name,
+            input,
+            metadata: None,
+        })
     } else {
         None
     }
@@ -409,6 +420,7 @@ mod tests {
                 role: LlmRole::User,
                 content: vec![ContentBlock::Text {
                     text: "Hello".to_string(),
+                    metadata: None,
                 }],
             }],
             system: Some("You are helpful.".to_string()),
@@ -465,7 +477,7 @@ mod tests {
             &mut usage,
         );
         match event {
-            Some(StreamEvent::TextDelta { text }) => assert_eq!(text, "Hello"),
+            Some(StreamEvent::TextDelta { text, .. }) => assert_eq!(text, "Hello"),
             other => panic!("expected TextDelta, got {other:?}"),
         }
     }
@@ -500,7 +512,9 @@ mod tests {
             &mut usage,
         );
         match event {
-            Some(StreamEvent::ToolUse { id, name, input }) => {
+            Some(StreamEvent::ToolUse {
+                id, name, input, ..
+            }) => {
                 assert_eq!(id, "toolu_123");
                 assert_eq!(name, "get_weather");
                 assert_eq!(input["city"], "SF");
@@ -685,7 +699,7 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, StreamEvent::TextDelta { text } if text == "Hello")),
+                .any(|e| matches!(e, StreamEvent::TextDelta { text, .. } if text == "Hello")),
             "expected TextDelta with 'Hello', got: {:?}",
             events,
         );

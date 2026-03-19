@@ -231,7 +231,7 @@ fn convert_user_message_openai(msg: &LlmMessage, messages: &mut Vec<Value>) {
                         "content": content,
                     }));
                 }
-                ContentBlock::Text { text } => {
+                ContentBlock::Text { text, .. } => {
                     messages.push(json!({
                         "role": "user",
                         "content": text,
@@ -265,7 +265,9 @@ fn convert_assistant_message_openai(msg: &LlmMessage, messages: &mut Vec<Value>)
             .content
             .iter()
             .filter_map(|b| match b {
-                ContentBlock::ToolUse { id, name, input } => Some(json!({
+                ContentBlock::ToolUse {
+                    id, name, input, ..
+                } => Some(json!({
                     "id": id,
                     "type": "function",
                     "function": {
@@ -299,7 +301,7 @@ fn collect_text_blocks(content: &[ContentBlock]) -> String {
     content
         .iter()
         .filter_map(|b| match b {
-            ContentBlock::Text { text } => Some(text.as_str()),
+            ContentBlock::Text { text, .. } => Some(text.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -520,6 +522,7 @@ fn parse_sse_data(
         if !content.is_empty() {
             return Some(StreamEvent::TextDelta {
                 text: content.to_string(),
+                metadata: None,
             });
         }
     }
@@ -584,7 +587,12 @@ async fn flush_tool_calls_and_stop(
 
     for (_index, (id, name, args_json)) in sorted {
         let input: Value = serde_json::from_str(&args_json).unwrap_or(json!({}));
-        let event = StreamEvent::ToolUse { id, name, input };
+        let event = StreamEvent::ToolUse {
+            id,
+            name,
+            input,
+            metadata: None,
+        };
         if tx.send(event).await.is_err() {
             return None; // Receiver dropped
         }
@@ -623,6 +631,7 @@ mod tests {
                 role: LlmRole::User,
                 content: vec![ContentBlock::Text {
                     text: "Hello".to_string(),
+                    metadata: None,
                 }],
             }],
             system: Some("You are helpful.".to_string()),
@@ -691,6 +700,7 @@ mod tests {
                     role: LlmRole::User,
                     content: vec![ContentBlock::Text {
                         text: "What's the weather?".to_string(),
+                        metadata: None,
                     }],
                 },
                 LlmMessage {
@@ -698,11 +708,13 @@ mod tests {
                     content: vec![
                         ContentBlock::Text {
                             text: "Let me check.".to_string(),
+                            metadata: None,
                         },
                         ContentBlock::ToolUse {
                             id: "call_abc123".to_string(),
                             name: "get_weather".to_string(),
                             input: json!({"city": "SF"}),
+                            metadata: None,
                         },
                     ],
                 },
@@ -712,6 +724,7 @@ mod tests {
                         tool_use_id: "call_abc123".to_string(),
                         content: "72F and sunny".to_string(),
                         is_error: false,
+                        metadata: None,
                     }],
                 },
             ],
@@ -753,6 +766,7 @@ mod tests {
                 role: LlmRole::User,
                 content: vec![ContentBlock::Text {
                     text: "Hi".to_string(),
+                    metadata: None,
                 }],
             }],
             system: None,
@@ -780,7 +794,7 @@ mod tests {
             &mut usage,
         );
         match event {
-            Some(StreamEvent::TextDelta { text }) => assert_eq!(text, "Hello"),
+            Some(StreamEvent::TextDelta { text, .. }) => assert_eq!(text, "Hello"),
             other => panic!("expected TextDelta, got {other:?}"),
         }
     }
@@ -929,7 +943,9 @@ mod tests {
         // Should have sent ToolUse via the channel
         let event = rx.try_recv().unwrap();
         match event {
-            StreamEvent::ToolUse { id, name, input } => {
+            StreamEvent::ToolUse {
+                id, name, input, ..
+            } => {
                 assert_eq!(id, "call_1");
                 assert_eq!(name, "get_weather");
                 assert_eq!(input["city"], "SF");
@@ -997,14 +1013,14 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, StreamEvent::TextDelta { text } if text == "Hello")),
+                .any(|e| matches!(e, StreamEvent::TextDelta { text, .. } if text == "Hello")),
             "expected TextDelta 'Hello', got: {:?}",
             events,
         );
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, StreamEvent::TextDelta { text } if text == " world")),
+                .any(|e| matches!(e, StreamEvent::TextDelta { text, .. } if text == " world")),
             "expected TextDelta ' world', got: {:?}",
             events,
         );

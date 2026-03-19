@@ -2,8 +2,9 @@
 
 use crate::agent::prompt_guard::tagging::{self, ContentSource};
 use crate::agent::prompt_guard::TaggingConfig;
-use crate::agent::provider::{ContentBlock, LlmMessage, LlmRole};
+use crate::agent::provider::{ContentBlock, ContentBlockMetadata, LlmMessage, LlmRole};
 use crate::sessions::{ChatMessage, MessageRole};
+use serde_json::{json, Value};
 
 /// Convert session chat history into LLM messages.
 ///
@@ -42,22 +43,22 @@ pub fn build_context_with_tagging(
                     role: LlmRole::User,
                     content: vec![ContentBlock::Text {
                         text: msg.content.clone(),
+                        metadata: None,
                     }],
                 });
             }
             MessageRole::Assistant => {
-                // Check if the content looks like a tool_use block (JSON with tool calls)
-                // Otherwise treat as plain text
-                if let Some(tool_blocks) = try_parse_assistant_tool_use(&msg.content) {
+                if let Some(blocks) = try_parse_assistant_blocks(&msg.content) {
                     messages.push(LlmMessage {
                         role: LlmRole::Assistant,
-                        content: tool_blocks,
+                        content: blocks,
                     });
                 } else {
                     messages.push(LlmMessage {
                         role: LlmRole::Assistant,
                         content: vec![ContentBlock::Text {
                             text: msg.content.clone(),
+                            metadata: None,
                         }],
                     });
                 }
@@ -82,6 +83,7 @@ pub fn build_context_with_tagging(
                         tool_use_id,
                         content: tagged_content,
                         is_error,
+                        metadata: None,
                     }],
                 });
             }
@@ -97,39 +99,143 @@ pub fn build_context_with_tagging(
     (system, messages)
 }
 
-/// Try to parse assistant content as tool_use blocks.
+pub(crate) fn serialize_assistant_blocks(
+    blocks: &[ContentBlock],
+) -> Result<String, serde_json::Error> {
+    let serialized: Vec<Value> = blocks.iter().map(serialize_assistant_block).collect();
+    serde_json::to_string(&serialized)
+}
+
+fn serialize_assistant_block(block: &ContentBlock) -> Value {
+    match block {
+        ContentBlock::Text { text, metadata } => {
+            let mut block_json = json!({
+                "type": "text",
+                "text": text,
+            });
+            if let Some(metadata) = metadata {
+                block_json["metadata"] = serde_json::to_value(metadata).unwrap_or(Value::Null);
+            }
+            block_json
+        }
+        ContentBlock::ToolUse {
+            id,
+            name,
+            input,
+            metadata,
+        } => {
+            let mut block_json = json!({
+                "type": "tool_use",
+                "id": id,
+                "name": name,
+                "input": input,
+            });
+            if let Some(metadata) = metadata {
+                block_json["metadata"] = serde_json::to_value(metadata).unwrap_or(Value::Null);
+            }
+            block_json
+        }
+        ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+            metadata,
+        } => {
+            let mut block_json = json!({
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                "content": content,
+                "is_error": is_error,
+            });
+            if let Some(metadata) = metadata {
+                block_json["metadata"] = serde_json::to_value(metadata).unwrap_or(Value::Null);
+            }
+            block_json
+        }
+    }
+}
+
+fn parse_block_metadata(item: &Value) -> Option<ContentBlockMetadata> {
+    item.get("metadata")
+        .cloned()
+        .and_then(|metadata| serde_json::from_value(metadata).ok())
+}
+
+/// Try to parse assistant content as structured blocks.
 ///
-/// If the content is a JSON array of tool_use objects (stored from a previous
-/// run), we reconstruct the ContentBlock representation. Otherwise returns None.
-fn try_parse_assistant_tool_use(content: &str) -> Option<Vec<ContentBlock>> {
-    let parsed: serde_json::Value = serde_json::from_str(content).ok()?;
+/// Accepts the legacy tool-use JSON shape plus the newer metadata-bearing text
+/// block shape used for Gemini/Vertex thought-signature round-tripping.
+fn try_parse_assistant_blocks(content: &str) -> Option<Vec<ContentBlock>> {
+    let parsed: Value = serde_json::from_str(content).ok()?;
     let arr = parsed.as_array()?;
 
-    // Must have at least one tool_use block
-    if arr.is_empty() || arr.iter().all(|v| v["type"].as_str() != Some("tool_use")) {
+    if arr.is_empty() {
         return None;
     }
 
     let mut blocks = Vec::new();
+    let mut has_tool_use = false;
+    let mut has_provider_metadata = false;
+
     for item in arr {
-        match item["type"].as_str() {
+        match item.get("type").and_then(Value::as_str) {
             Some("text") => {
+                let metadata = parse_block_metadata(item);
+                has_provider_metadata |= metadata.is_some();
                 blocks.push(ContentBlock::Text {
-                    text: item["text"].as_str().unwrap_or("").to_string(),
+                    text: item
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    metadata,
                 });
             }
             Some("tool_use") => {
+                let metadata = parse_block_metadata(item);
+                has_provider_metadata |= metadata.is_some();
+                has_tool_use = true;
                 blocks.push(ContentBlock::ToolUse {
-                    id: item["id"].as_str().unwrap_or("").to_string(),
-                    name: item["name"].as_str().unwrap_or("").to_string(),
-                    input: item["input"].clone(),
+                    id: item
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    name: item
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    input: item.get("input").cloned().unwrap_or_else(|| json!({})),
+                    metadata,
                 });
             }
-            _ => {}
+            Some("tool_result") => {
+                let metadata = parse_block_metadata(item);
+                has_provider_metadata |= metadata.is_some();
+                blocks.push(ContentBlock::ToolResult {
+                    tool_use_id: item
+                        .get("tool_use_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    content: item
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    is_error: item
+                        .get("is_error")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    metadata,
+                });
+            }
+            _ => return None,
         }
     }
 
-    if blocks.is_empty() {
+    if blocks.is_empty() || (!has_tool_use && !has_provider_metadata) {
         None
     } else {
         Some(blocks)
@@ -157,7 +263,10 @@ mod tests {
         assert_eq!(messages[2].role, LlmRole::User);
 
         match &messages[0].content[0] {
-            ContentBlock::Text { text } => assert_eq!(text, "Hello"),
+            ContentBlock::Text { text, metadata } => {
+                assert_eq!(text, "Hello");
+                assert!(metadata.is_none());
+            }
             _ => panic!("expected Text block"),
         }
     }
@@ -171,7 +280,6 @@ mod tests {
 
         let (system, messages) = build_context(&history, Some("Base prompt"));
         assert_eq!(system.unwrap(), "Base prompt\n\nYou are a bot.");
-        // System message should not appear in messages array
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, LlmRole::User);
     }
@@ -187,17 +295,18 @@ mod tests {
         let (_, messages) = build_context(&history, None);
         assert_eq!(messages.len(), 3);
 
-        // Tool result should be a user message with ToolResult block
         assert_eq!(messages[2].role, LlmRole::User);
         match &messages[2].content[0] {
             ContentBlock::ToolResult {
                 tool_use_id,
                 content,
                 is_error,
+                metadata,
             } => {
                 assert_eq!(tool_use_id, "call_123");
                 assert_eq!(content, r#"{"temp": 72}"#);
                 assert!(!is_error);
+                assert!(metadata.is_none());
             }
             _ => panic!("expected ToolResult block"),
         }
@@ -242,16 +351,73 @@ mod tests {
         assert_eq!(messages[1].content.len(), 2);
 
         match &messages[1].content[0] {
-            ContentBlock::Text { text } => assert_eq!(text, "Let me check."),
+            ContentBlock::Text { text, metadata } => {
+                assert_eq!(text, "Let me check.");
+                assert!(metadata.is_none());
+            }
             _ => panic!("expected Text block"),
         }
         match &messages[1].content[1] {
-            ContentBlock::ToolUse { id, name, input } => {
+            ContentBlock::ToolUse {
+                id,
+                name,
+                input,
+                metadata,
+            } => {
                 assert_eq!(id, "call_1");
                 assert_eq!(name, "search");
                 assert_eq!(input["q"], "test");
+                assert!(metadata.is_none());
             }
             _ => panic!("expected ToolUse block"),
         }
+    }
+
+    #[test]
+    fn test_assistant_with_metadata_json() {
+        let structured = serde_json::to_string(&serde_json::json!([
+            {
+                "type": "text",
+                "text": "Thinking aloud",
+                "metadata": {
+                    "gemini": {
+                        "thoughtSignature": "sig-123"
+                    }
+                }
+            }
+        ]))
+        .unwrap();
+
+        let history = vec![ChatMessage::assistant("sess1", &structured)];
+        let (_, messages) = build_context(&history, None);
+        assert_eq!(messages.len(), 1);
+        match &messages[0].content[0] {
+            ContentBlock::Text { text, metadata } => {
+                assert_eq!(text, "Thinking aloud");
+                assert_eq!(
+                    metadata.as_ref().and_then(|m| m.gemini_thought_signature()),
+                    Some("sig-123")
+                );
+            }
+            _ => panic!("expected Text block"),
+        }
+    }
+
+    #[test]
+    fn test_serialize_assistant_blocks_with_metadata() {
+        let serialized = serialize_assistant_blocks(&[ContentBlock::Text {
+            text: "Hello".to_string(),
+            metadata: ContentBlockMetadata::with_gemini_thought_signature(Some(
+                "sig-xyz".to_string(),
+            )),
+        }])
+        .unwrap();
+        let parsed: Value = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(parsed[0]["type"], "text");
+        assert_eq!(parsed[0]["text"], "Hello");
+        assert_eq!(
+            parsed[0]["metadata"]["gemini"]["thoughtSignature"],
+            "sig-xyz"
+        );
     }
 }

@@ -113,8 +113,10 @@ impl BedrockProvider {
                     .content
                     .iter()
                     .map(|block| match block {
-                        ContentBlock::Text { text } => json!({"text": text}),
-                        ContentBlock::ToolUse { id, name, input } => json!({
+                        ContentBlock::Text { text, .. } => json!({"text": text}),
+                        ContentBlock::ToolUse {
+                            id, name, input, ..
+                        } => json!({
                             "toolUse": {
                                 "toolUseId": id,
                                 "name": name,
@@ -125,6 +127,7 @@ impl BedrockProvider {
                             tool_use_id,
                             content,
                             is_error,
+                            ..
                         } => json!({
                             "toolResult": {
                                 "toolUseId": tool_use_id,
@@ -589,6 +592,7 @@ async fn handle_bedrock_frame(
                 if !text.is_empty() {
                     tx.send(StreamEvent::TextDelta {
                         text: text.to_string(),
+                        metadata: None,
                     })
                     .await
                     .map_err(|_| "stream receiver dropped".to_string())?;
@@ -699,6 +703,7 @@ async fn finalize_tool_use(
         id: tool_use_id.to_string(),
         name,
         input,
+        metadata: None,
     })
     .await
     .map_err(|_| "stream receiver dropped".to_string())?;
@@ -955,6 +960,7 @@ mod tests {
                 role: LlmRole::User,
                 content: vec![ContentBlock::Text {
                     text: "Hello".to_string(),
+                    metadata: None,
                 }],
             }],
             system: None,
@@ -1046,6 +1052,7 @@ mod tests {
                     tool_use_id: "toolu_123".to_string(),
                     content: "72F and sunny".to_string(),
                     is_error: false,
+                    metadata: None,
                 }],
             }],
             system: None,
@@ -1075,6 +1082,7 @@ mod tests {
                     tool_use_id: "toolu_456".to_string(),
                     content: "Something went wrong".to_string(),
                     is_error: true,
+                    metadata: None,
                 }],
             }],
             system: None,
@@ -1099,6 +1107,7 @@ mod tests {
                     role: LlmRole::User,
                     content: vec![ContentBlock::Text {
                         text: "What's the weather?".to_string(),
+                        metadata: None,
                     }],
                 },
                 LlmMessage {
@@ -1106,11 +1115,13 @@ mod tests {
                     content: vec![
                         ContentBlock::Text {
                             text: "Let me check.".to_string(),
+                            metadata: None,
                         },
                         ContentBlock::ToolUse {
                             id: "toolu_abc".to_string(),
                             name: "get_weather".to_string(),
                             input: json!({"city": "SF"}),
+                            metadata: None,
                         },
                     ],
                 },
@@ -1120,6 +1131,7 @@ mod tests {
                         tool_use_id: "toolu_abc".to_string(),
                         content: "72F and sunny".to_string(),
                         is_error: false,
+                        metadata: None,
                     }],
                 },
             ],
@@ -1348,7 +1360,7 @@ mod tests {
         let events = collect_stream_events(frames).await;
         assert_eq!(events.len(), 2);
         match &events[0] {
-            StreamEvent::TextDelta { text } => assert_eq!(text, "Hello, world!"),
+            StreamEvent::TextDelta { text, .. } => assert_eq!(text, "Hello, world!"),
             other => panic!("expected TextDelta, got {other:?}"),
         }
         match &events[1] {
@@ -1382,7 +1394,9 @@ mod tests {
         let events = collect_stream_events(frames).await;
         assert_eq!(events.len(), 2);
         match &events[0] {
-            StreamEvent::ToolUse { id, name, input } => {
+            StreamEvent::ToolUse {
+                id, name, input, ..
+            } => {
                 assert_eq!(id, "toolu_abc");
                 assert_eq!(name, "get_weather");
                 assert_eq!(input["city"], "SF");

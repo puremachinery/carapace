@@ -10,6 +10,7 @@ GTM.md
 AGENTS.md
 CLAUDE.md
 GEMINI.md
+.claude/
 
 # AI Review System
 .review_state.yaml

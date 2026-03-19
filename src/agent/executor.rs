@@ -34,6 +34,7 @@ use tokio_util::sync::CancellationToken;
 /// Result of processing an LLM stream for a single turn.
 struct StreamResult {
     turn_text: String,
+    assistant_blocks: Vec<ContentBlock>,
     pending_tool_calls: Vec<(String, String, Value)>,
     stop_reason: StopReason,
     turn_usage: TokenUsage,
@@ -130,8 +131,42 @@ fn handle_stream_event(
     seq: &AtomicU64,
 ) -> Result<bool, AgentError> {
     match event {
-        StreamEvent::TextDelta { text } => {
+        StreamEvent::TextDelta { text, metadata } => {
+            if text.is_empty() && metadata.is_none() {
+                return Ok(false);
+            }
+
             result.turn_text.push_str(&text);
+            if metadata.is_none() {
+                if let Some(ContentBlock::Text {
+                    text: existing,
+                    metadata: existing_metadata,
+                }) = result.assistant_blocks.last_mut()
+                {
+                    if existing_metadata.is_none() {
+                        existing.push_str(&text);
+                    } else {
+                        result.assistant_blocks.push(ContentBlock::Text {
+                            text: text.clone(),
+                            metadata,
+                        });
+                    }
+                } else {
+                    result.assistant_blocks.push(ContentBlock::Text {
+                        text: text.clone(),
+                        metadata,
+                    });
+                }
+            } else {
+                result.assistant_blocks.push(ContentBlock::Text {
+                    text: text.clone(),
+                    metadata,
+                });
+            }
+
+            if text.is_empty() {
+                return Ok(false);
+            }
 
             broadcast_agent_event(
                 state,
@@ -155,7 +190,12 @@ fn handle_stream_event(
             Ok(false)
         }
 
-        StreamEvent::ToolUse { id, name, input } => {
+        StreamEvent::ToolUse {
+            id,
+            name,
+            input,
+            metadata,
+        } => {
             broadcast_agent_event(
                 state,
                 run_id,
@@ -167,6 +207,12 @@ fn handle_stream_event(
                     "input": &input,
                 }),
             );
+            result.assistant_blocks.push(ContentBlock::ToolUse {
+                id: id.clone(),
+                name: name.clone(),
+                input: input.clone(),
+                metadata,
+            });
             result.pending_tool_calls.push((id, name, input));
             Ok(false)
         }
@@ -218,6 +264,7 @@ async fn process_llm_stream(
 ) -> Result<StreamResult, AgentError> {
     let mut result = StreamResult {
         turn_text: String::new(),
+        assistant_blocks: Vec::new(),
         pending_tool_calls: Vec::new(),
         stop_reason: StopReason::EndTurn,
         turn_usage: TokenUsage::default(),
@@ -265,6 +312,143 @@ async fn process_llm_stream(
     Ok(result)
 }
 
+#[derive(Default)]
+struct TextSanitizationStats {
+    finding_count: usize,
+    blocked: bool,
+    html_modified: bool,
+}
+
+fn coalesce_assistant_blocks(blocks: &[ContentBlock]) -> Vec<ContentBlock> {
+    let mut coalesced = Vec::new();
+
+    for block in blocks {
+        match block {
+            ContentBlock::Text { text, metadata } => {
+                if text.is_empty() && metadata.is_none() {
+                    continue;
+                }
+
+                if metadata.is_none() {
+                    if let Some(ContentBlock::Text {
+                        text: existing,
+                        metadata: existing_metadata,
+                    }) = coalesced.last_mut()
+                    {
+                        if existing_metadata.is_none() {
+                            existing.push_str(text);
+                            continue;
+                        }
+                    }
+                }
+
+                coalesced.push(ContentBlock::Text {
+                    text: text.clone(),
+                    metadata: metadata.clone(),
+                });
+            }
+            _ => coalesced.push(block.clone()),
+        }
+    }
+
+    coalesced
+}
+
+fn sanitize_text_fragment(
+    text: &str,
+    config: &AgentConfig,
+    stats: &mut TextSanitizationStats,
+) -> String {
+    let mut sanitized = text.to_string();
+
+    if config.prompt_guard.enabled && config.prompt_guard.postflight.enabled {
+        let postflight_result =
+            postflight::filter_output(&sanitized, &config.prompt_guard.postflight);
+        if !postflight_result.is_clean() {
+            stats.finding_count += postflight_result.findings.len();
+            stats.blocked |= postflight_result.blocked;
+        }
+        sanitized = postflight_result.sanitized;
+    }
+
+    if config.output_sanitizer.sanitize_html {
+        let sanitized_output =
+            crate::agent::output_sanitizer::sanitize_output(&sanitized, &config.output_sanitizer);
+        if sanitized_output.was_modified {
+            stats.html_modified = true;
+        }
+        sanitized = sanitized_output.content;
+    }
+
+    sanitized
+}
+
+fn log_text_sanitization_stats(run_id: &str, stats: &TextSanitizationStats) {
+    if stats.finding_count > 0 {
+        tracing::warn!(
+            run_id = %run_id,
+            findings = stats.finding_count,
+            blocked = stats.blocked,
+            "prompt guard post-flight detected sensitive content in output"
+        );
+        if stats.blocked {
+            crate::logging::audit::audit(crate::logging::audit::AuditEvent::PromptGuardBlocked {
+                layer: "postflight".to_string(),
+                reason: format!("{} findings (output sanitized)", stats.finding_count),
+                run_id: run_id.to_string(),
+            });
+        }
+    }
+
+    if stats.html_modified {
+        tracing::info!(
+            run_id = %run_id,
+            "output sanitizer modified agent response for safe rendering"
+        );
+    }
+}
+
+fn sanitize_assistant_turn(
+    turn_text: &str,
+    assistant_blocks: &[ContentBlock],
+    config: &AgentConfig,
+    run_id: &str,
+) -> (String, Vec<ContentBlock>) {
+    let assistant_blocks = coalesce_assistant_blocks(assistant_blocks);
+    let has_provider_metadata = assistant_blocks
+        .iter()
+        .any(ContentBlock::has_provider_metadata);
+    let mut stats = TextSanitizationStats::default();
+
+    if !has_provider_metadata {
+        let sanitized_turn_text = sanitize_text_fragment(turn_text, config, &mut stats);
+        log_text_sanitization_stats(run_id, &stats);
+        return (sanitized_turn_text, assistant_blocks);
+    }
+
+    let mut sanitized_turn_text = String::new();
+    let mut sanitized_blocks = Vec::with_capacity(assistant_blocks.len());
+
+    for block in assistant_blocks {
+        match block {
+            ContentBlock::Text { text, metadata } => {
+                let sanitized_text = sanitize_text_fragment(&text, config, &mut stats);
+                sanitized_turn_text.push_str(&sanitized_text);
+                if !sanitized_text.is_empty() || metadata.is_some() {
+                    sanitized_blocks.push(ContentBlock::Text {
+                        text: sanitized_text,
+                        metadata,
+                    });
+                }
+            }
+            other => sanitized_blocks.push(other),
+        }
+    }
+
+    log_text_sanitization_stats(run_id, &stats);
+    (sanitized_turn_text, sanitized_blocks)
+}
+
 /// Build an assistant history message from accumulated turn text and tool-use blocks.
 ///
 /// Returns the `ChatMessage` ready for persistence, or `None` if there is
@@ -272,30 +456,40 @@ async fn process_llm_stream(
 fn build_assistant_message(
     session_id: &str,
     turn_text: &str,
-    pending_tool_calls: &[(String, String, Value)],
+    assistant_blocks: &[ContentBlock],
     output_tokens: u64,
 ) -> Option<ChatMessage> {
-    if turn_text.is_empty() && pending_tool_calls.is_empty() {
+    if assistant_blocks.is_empty() {
         return None;
     }
 
-    let content = if pending_tool_calls.is_empty() {
+    let has_tool_use = assistant_blocks
+        .iter()
+        .any(|block| matches!(block, ContentBlock::ToolUse { .. }));
+    let has_provider_metadata = assistant_blocks
+        .iter()
+        .any(ContentBlock::has_provider_metadata);
+
+    let content = if !has_tool_use && !has_provider_metadata {
         turn_text.to_string()
+    } else if has_provider_metadata {
+        crate::agent::context::serialize_assistant_blocks(assistant_blocks)
+            .unwrap_or_else(|_| turn_text.to_string())
     } else {
-        // Store tool_use blocks as JSON for context reconstruction
-        let mut blocks: Vec<Value> = Vec::new();
+        let mut blocks: Vec<ContentBlock> = Vec::new();
         if !turn_text.is_empty() {
-            blocks.push(json!({"type": "text", "text": turn_text}));
+            blocks.push(ContentBlock::Text {
+                text: turn_text.to_string(),
+                metadata: None,
+            });
         }
-        for (id, name, input) in pending_tool_calls {
-            blocks.push(json!({
-                "type": "tool_use",
-                "id": id,
-                "name": name,
-                "input": input,
-            }));
+        for block in assistant_blocks {
+            if let ContentBlock::ToolUse { .. } = block {
+                blocks.push(block.clone());
+            }
         }
-        serde_json::to_string(&blocks).unwrap_or_else(|_| turn_text.to_string())
+        crate::agent::context::serialize_assistant_blocks(&blocks)
+            .unwrap_or_else(|_| turn_text.to_string())
     };
 
     Some(ChatMessage::assistant(session_id, &content).with_tokens(output_tokens))
@@ -646,6 +840,7 @@ async fn execute_single_turn(
 
     let StreamResult {
         turn_text,
+        assistant_blocks,
         pending_tool_calls,
         stop_reason,
         turn_usage,
@@ -656,56 +851,14 @@ async fn execute_single_turn(
     *total_output_tokens += turn_usage.output_tokens;
     record_turn_usage(session_key, &config.model, &turn_usage);
 
-    // Post-flight filtering — MUST run before persistence to avoid storing
-    // unfiltered PII/credentials in session history.
-    let turn_text = if config.prompt_guard.enabled && config.prompt_guard.postflight.enabled {
-        let postflight_result =
-            postflight::filter_output(&turn_text, &config.prompt_guard.postflight);
-        if !postflight_result.is_clean() {
-            let finding_count = postflight_result.findings.len();
-            tracing::warn!(
-                run_id = %run_id,
-                findings = finding_count,
-                blocked = postflight_result.blocked,
-                "prompt guard post-flight detected sensitive content in output"
-            );
-            if postflight_result.blocked {
-                crate::logging::audit::audit(
-                    crate::logging::audit::AuditEvent::PromptGuardBlocked {
-                        layer: "postflight".to_string(),
-                        reason: format!("{finding_count} findings (output sanitized)"),
-                        run_id: run_id.to_string(),
-                    },
-                );
-            }
-        }
-        postflight_result.sanitized
-    } else {
-        turn_text
-    };
-
-    // Output sanitization — strip dangerous HTML/Markdown constructs so that
-    // agent output is safe for web UI rendering.  Runs after post-flight (PII
-    // redaction) and before persistence.
-    let turn_text = if config.output_sanitizer.sanitize_html {
-        let sanitized =
-            crate::agent::output_sanitizer::sanitize_output(&turn_text, &config.output_sanitizer);
-        if sanitized.was_modified {
-            tracing::info!(
-                run_id = %run_id,
-                "output sanitizer modified agent response for safe rendering"
-            );
-        }
-        sanitized.content
-    } else {
-        turn_text
-    };
+    let (turn_text, assistant_blocks) =
+        sanitize_assistant_turn(&turn_text, &assistant_blocks, config, run_id);
 
     // Append assistant message to history (after post-flight filtering)
     if let Some(msg) = build_assistant_message(
         session_id,
         &turn_text,
-        &pending_tool_calls,
+        &assistant_blocks,
         turn_usage.output_tokens,
     ) {
         crate::sessions::append_message_blocking(state.session_store().clone(), msg.clone())
@@ -1042,7 +1195,9 @@ fn sanitize_provider_error(message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::gemini::GeminiProvider;
     use crate::agent::provider::{LlmProvider, StopReason, StreamEvent, TokenUsage};
+    use crate::agent::vertex::build_gemini_body as build_vertex_gemini_body;
     use crate::agent::AgentConfig;
     use crate::server::ws::{WsServerConfig, WsServerState};
     use crate::sessions;
@@ -1073,6 +1228,7 @@ mod tests {
             Self::new(vec![vec![
                 StreamEvent::TextDelta {
                     text: text.to_string(),
+                    metadata: None,
                 },
                 StreamEvent::Stop {
                     reason: StopReason::EndTurn,
@@ -1093,6 +1249,7 @@ mod tests {
                         id: "tool_1".to_string(),
                         name: "time".to_string(),
                         input: serde_json::json!({}),
+                        metadata: None,
                     },
                     StreamEvent::Stop {
                         reason: StopReason::ToolUse,
@@ -1125,6 +1282,207 @@ mod tests {
                 }
             });
             Ok(rx)
+        }
+    }
+
+    struct RecordingProvider {
+        responses: parking_lot::Mutex<Vec<Vec<StreamEvent>>>,
+        requests: parking_lot::Mutex<Vec<CompletionRequest>>,
+    }
+
+    impl RecordingProvider {
+        fn new(responses: Vec<Vec<StreamEvent>>) -> Self {
+            let mut reversed = responses;
+            reversed.reverse();
+            Self {
+                responses: parking_lot::Mutex::new(reversed),
+                requests: parking_lot::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn requests(&self) -> Vec<CompletionRequest> {
+            self.requests.lock().clone()
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for RecordingProvider {
+        async fn complete(
+            &self,
+            request: crate::agent::provider::CompletionRequest,
+            _cancel_token: CancellationToken,
+        ) -> Result<mpsc::Receiver<StreamEvent>, crate::agent::AgentError> {
+            self.requests.lock().push(request);
+            let events = {
+                let mut responses = self.responses.lock();
+                responses.pop().unwrap_or_default()
+            };
+            let (tx, rx) = mpsc::channel(64);
+            tokio::spawn(async move {
+                for event in events {
+                    let _ = tx.send(event).await;
+                }
+            });
+            Ok(rx)
+        }
+    }
+
+    #[test]
+    fn test_build_assistant_message_preserves_text_metadata_in_history() {
+        let assistant_message = build_assistant_message(
+            "sess-metadata",
+            "Hello",
+            &[ContentBlock::Text {
+                text: "Hello".to_string(),
+                metadata: ContentBlockMetadata::with_gemini_thought_signature(Some(
+                    "sig-text".to_string(),
+                )),
+            }],
+            7,
+        )
+        .expect("assistant message should be created");
+
+        assert!(
+            assistant_message.content.starts_with('['),
+            "metadata-bearing assistant turns should be stored as structured blocks"
+        );
+
+        let (_system, messages) = crate::agent::context::build_context(&[assistant_message], None);
+        match &messages[0].content[0] {
+            ContentBlock::Text { text, metadata } => {
+                assert_eq!(text, "Hello");
+                assert_eq!(
+                    metadata
+                        .as_ref()
+                        .and_then(ContentBlockMetadata::gemini_thought_signature),
+                    Some("sig-text")
+                );
+            }
+            other => panic!("expected text block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_build_assistant_message_preserves_tool_use_metadata_in_history() {
+        let assistant_message = build_assistant_message(
+            "sess-tool-metadata",
+            "",
+            &[ContentBlock::ToolUse {
+                id: "tool_1".to_string(),
+                name: "get_weather".to_string(),
+                input: serde_json::json!({"city": "SF"}),
+                metadata: ContentBlockMetadata::with_gemini_thought_signature(Some(
+                    "sig-tool".to_string(),
+                )),
+            }],
+            5,
+        )
+        .expect("assistant message should be created");
+
+        let (_system, messages) = crate::agent::context::build_context(&[assistant_message], None);
+        match &messages[0].content[0] {
+            ContentBlock::ToolUse {
+                id,
+                name,
+                input,
+                metadata,
+            } => {
+                assert_eq!(id, "tool_1");
+                assert_eq!(name, "get_weather");
+                assert_eq!(input["city"], "SF");
+                assert_eq!(
+                    metadata
+                        .as_ref()
+                        .and_then(ContentBlockMetadata::gemini_thought_signature),
+                    Some("sig-tool")
+                );
+            }
+            other => panic!("expected tool-use block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_sanitize_assistant_turn_preserves_signature_only_part() {
+        let config = AgentConfig::default();
+        let (turn_text, assistant_blocks) = sanitize_assistant_turn(
+            "Hello",
+            &[
+                ContentBlock::Text {
+                    text: "Hel".to_string(),
+                    metadata: None,
+                },
+                ContentBlock::Text {
+                    text: "lo".to_string(),
+                    metadata: None,
+                },
+                ContentBlock::Text {
+                    text: "".to_string(),
+                    metadata: ContentBlockMetadata::with_gemini_thought_signature(Some(
+                        "sig-empty".to_string(),
+                    )),
+                },
+            ],
+            &config,
+            "run-sanitize-signature-only",
+        );
+
+        assert_eq!(turn_text, "Hello");
+        assert_eq!(assistant_blocks.len(), 2);
+        match &assistant_blocks[0] {
+            ContentBlock::Text { text, metadata } => {
+                assert_eq!(text, "Hello");
+                assert!(metadata.is_none());
+            }
+            other => panic!("expected coalesced text block, got {other:?}"),
+        }
+        match &assistant_blocks[1] {
+            ContentBlock::Text { text, metadata } => {
+                assert_eq!(text, "");
+                assert_eq!(
+                    metadata
+                        .as_ref()
+                        .and_then(ContentBlockMetadata::gemini_thought_signature),
+                    Some("sig-empty")
+                );
+            }
+            other => panic!("expected signature-only text block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_sanitize_assistant_turn_sanitizes_metadata_text_blocks() {
+        let config = AgentConfig::default();
+        let (turn_text, assistant_blocks) = sanitize_assistant_turn(
+            "<script>alert(1)</script>Hello",
+            &[
+                ContentBlock::Text {
+                    text: "<script>alert(1)</script>Hello".to_string(),
+                    metadata: None,
+                },
+                ContentBlock::Text {
+                    text: "".to_string(),
+                    metadata: ContentBlockMetadata::with_gemini_thought_signature(Some(
+                        "sig-empty".to_string(),
+                    )),
+                },
+            ],
+            &config,
+            "run-sanitize-metadata-text",
+        );
+
+        assert!(
+            !turn_text.contains("<script"),
+            "sanitized turn text should not preserve dangerous HTML"
+        );
+        match &assistant_blocks[0] {
+            ContentBlock::Text { text, metadata } => {
+                assert!(
+                    !text.contains("<script"),
+                    "persisted metadata-bearing history should use sanitized text"
+                );
+                assert!(metadata.is_none());
+            }
+            other => panic!("expected sanitized text block, got {other:?}"),
         }
     }
 
@@ -1265,6 +1623,7 @@ mod tests {
                     id: "tool_1".to_string(),
                     name: "time".to_string(),
                     input: serde_json::json!({}),
+                    metadata: None,
                 },
                 StreamEvent::Stop {
                     reason: StopReason::ToolUse,
@@ -1278,6 +1637,7 @@ mod tests {
             vec![
                 StreamEvent::TextDelta {
                     text: "The time is now.".to_string(),
+                    metadata: None,
                 },
                 StreamEvent::Stop {
                     reason: StopReason::EndTurn,
@@ -1308,6 +1668,146 @@ mod tests {
         let run = registry.get(run_id).unwrap();
         assert_eq!(run.status, crate::server::ws::AgentRunStatus::Completed);
         assert_eq!(run.response, "The time is now.");
+    }
+
+    #[tokio::test]
+    async fn test_execute_run_replays_gemini_tool_signature_in_next_request_body() {
+        let (state, _tmp) = make_test_state_with_tools();
+        let run_id = "run-gemini-thought-signature";
+        let session_key = "test-gemini-thought-signature";
+        setup_session_and_run(&state, session_key, run_id);
+
+        let provider = Arc::new(RecordingProvider::new(vec![
+            vec![
+                StreamEvent::ToolUse {
+                    id: "tool_1".to_string(),
+                    name: "time".to_string(),
+                    input: serde_json::json!({}),
+                    metadata: ContentBlockMetadata::with_gemini_thought_signature(Some(
+                        "sig-tool".to_string(),
+                    )),
+                },
+                StreamEvent::Stop {
+                    reason: StopReason::ToolUse,
+                    usage: TokenUsage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                    },
+                },
+            ],
+            vec![
+                StreamEvent::TextDelta {
+                    text: "Done.".to_string(),
+                    metadata: None,
+                },
+                StreamEvent::Stop {
+                    reason: StopReason::EndTurn,
+                    usage: TokenUsage {
+                        input_tokens: 20,
+                        output_tokens: 5,
+                    },
+                },
+            ],
+        ]));
+        let config = AgentConfig {
+            model: "gemini-2.0-flash".to_string(),
+            max_turns: 5,
+            ..Default::default()
+        };
+
+        let result = execute_run(
+            run_id.to_string(),
+            session_key.to_string(),
+            config,
+            state.clone(),
+            provider.clone(),
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(result.is_ok(), "execute_run failed: {:?}", result.err());
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2, "expected two LLM turns");
+
+        let body = GeminiProvider::new("test-key".to_string())
+            .expect("provider")
+            .build_body(&requests[1]);
+        let contents = body["contents"].as_array().expect("contents array");
+        let assistant_part = contents
+            .iter()
+            .find(|item| item["role"] == "model")
+            .expect("assistant model message");
+        assert_eq!(assistant_part["parts"][0]["functionCall"]["name"], "time");
+        assert_eq!(assistant_part["parts"][0]["thoughtSignature"], "sig-tool");
+    }
+
+    #[tokio::test]
+    async fn test_execute_run_replays_vertex_tool_signature_in_next_request_body() {
+        let (state, _tmp) = make_test_state_with_tools();
+        let run_id = "run-vertex-thought-signature";
+        let session_key = "test-vertex-thought-signature";
+        setup_session_and_run(&state, session_key, run_id);
+
+        let provider = Arc::new(RecordingProvider::new(vec![
+            vec![
+                StreamEvent::ToolUse {
+                    id: "tool_1".to_string(),
+                    name: "time".to_string(),
+                    input: serde_json::json!({}),
+                    metadata: ContentBlockMetadata::with_gemini_thought_signature(Some(
+                        "sig-tool".to_string(),
+                    )),
+                },
+                StreamEvent::Stop {
+                    reason: StopReason::ToolUse,
+                    usage: TokenUsage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                    },
+                },
+            ],
+            vec![
+                StreamEvent::TextDelta {
+                    text: "Done.".to_string(),
+                    metadata: None,
+                },
+                StreamEvent::Stop {
+                    reason: StopReason::EndTurn,
+                    usage: TokenUsage {
+                        input_tokens: 20,
+                        output_tokens: 5,
+                    },
+                },
+            ],
+        ]));
+        let config = AgentConfig {
+            model: "vertex:gemini-2.0-flash".to_string(),
+            max_turns: 5,
+            ..Default::default()
+        };
+
+        let result = execute_run(
+            run_id.to_string(),
+            session_key.to_string(),
+            config,
+            state.clone(),
+            provider.clone(),
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(result.is_ok(), "execute_run failed: {:?}", result.err());
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2, "expected two LLM turns");
+
+        let body = build_vertex_gemini_body(&requests[1]);
+        let contents = body["contents"].as_array().expect("contents array");
+        let assistant_part = contents
+            .iter()
+            .find(|item| item["role"] == "model")
+            .expect("assistant model message");
+        assert_eq!(assistant_part["parts"][0]["functionCall"]["name"], "time");
+        assert_eq!(assistant_part["parts"][0]["thoughtSignature"], "sig-tool");
     }
 
     #[tokio::test]
@@ -1551,12 +2051,15 @@ mod tests {
             vec![vec![
                 StreamEvent::TextDelta {
                     text: "chunk1".to_string(),
+                    metadata: None,
                 },
                 StreamEvent::TextDelta {
                     text: "chunk2".to_string(),
+                    metadata: None,
                 },
                 StreamEvent::TextDelta {
                     text: "chunk3".to_string(),
+                    metadata: None,
                 },
                 StreamEvent::Stop {
                     reason: StopReason::EndTurn,
@@ -1618,6 +2121,7 @@ mod tests {
                         id: "tool_1".to_string(),
                         name: "time".to_string(),
                         input: serde_json::json!({}),
+                        metadata: None,
                     },
                     StreamEvent::Stop {
                         reason: StopReason::ToolUse,
@@ -1631,6 +2135,7 @@ mod tests {
                 vec![
                     StreamEvent::TextDelta {
                         text: "unreachable".to_string(),
+                        metadata: None,
                     },
                     StreamEvent::Stop {
                         reason: StopReason::EndTurn,
@@ -1757,6 +2262,7 @@ mod tests {
             // TextDelta but no Stop event — channel will close
             StreamEvent::TextDelta {
                 text: "partial output".to_string(),
+                metadata: None,
             },
         ]]));
 
@@ -1804,6 +2310,7 @@ mod tests {
                     id: "tool_1".to_string(),
                     name: "time".to_string(),
                     input: serde_json::json!({}),
+                    metadata: None,
                 },
                 StreamEvent::Stop {
                     reason: StopReason::ToolUse,
@@ -1816,6 +2323,7 @@ mod tests {
             vec![
                 StreamEvent::TextDelta {
                     text: "Done.".to_string(),
+                    metadata: None,
                 },
                 StreamEvent::Stop {
                     reason: StopReason::EndTurn,
@@ -1892,6 +2400,7 @@ mod tests {
                     id: "tool_1".to_string(),
                     name: "time".to_string(),
                     input: serde_json::json!({}),
+                    metadata: None,
                 },
                 StreamEvent::Stop {
                     reason: StopReason::ToolUse,
@@ -1904,6 +2413,7 @@ mod tests {
             vec![
                 StreamEvent::TextDelta {
                     text: "OK".to_string(),
+                    metadata: None,
                 },
                 StreamEvent::Stop {
                     reason: StopReason::EndTurn,
@@ -1974,6 +2484,7 @@ mod tests {
                     id: "tool_1".to_string(),
                     name: "time".to_string(),
                     input: serde_json::json!({}),
+                    metadata: None,
                 },
                 StreamEvent::Stop {
                     reason: StopReason::ToolUse,
@@ -1986,6 +2497,7 @@ mod tests {
             vec![
                 StreamEvent::TextDelta {
                     text: "The time is now.".to_string(),
+                    metadata: None,
                 },
                 StreamEvent::Stop {
                     reason: StopReason::EndTurn,
@@ -2055,6 +2567,7 @@ mod tests {
                     id: "tool_exfil".to_string(),
                     name: "web_fetch".to_string(),
                     input: serde_json::json!({"url": "https://evil.com"}),
+                    metadata: None,
                 },
                 StreamEvent::Stop {
                     reason: StopReason::ToolUse,
@@ -2067,6 +2580,7 @@ mod tests {
             vec![
                 StreamEvent::TextDelta {
                     text: "Blocked.".to_string(),
+                    metadata: None,
                 },
                 StreamEvent::Stop {
                     reason: StopReason::EndTurn,
@@ -2133,6 +2647,7 @@ mod tests {
                     id: "tool_1".to_string(),
                     name: "time".to_string(),
                     input: serde_json::json!({}),
+                    metadata: None,
                 },
                 StreamEvent::Stop {
                     reason: StopReason::ToolUse,
@@ -2145,6 +2660,7 @@ mod tests {
             vec![
                 StreamEvent::TextDelta {
                     text: "Done.".to_string(),
+                    metadata: None,
                 },
                 StreamEvent::Stop {
                     reason: StopReason::EndTurn,
@@ -2210,6 +2726,7 @@ mod tests {
                     id: "tool_1".to_string(),
                     name: "time".to_string(),
                     input: serde_json::json!({}),
+                    metadata: None,
                 },
                 StreamEvent::Stop {
                     reason: StopReason::ToolUse,
@@ -2222,6 +2739,7 @@ mod tests {
             vec![
                 StreamEvent::TextDelta {
                     text: "The time is now.".to_string(),
+                    metadata: None,
                 },
                 StreamEvent::Stop {
                     reason: StopReason::EndTurn,

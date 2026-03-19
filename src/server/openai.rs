@@ -281,6 +281,7 @@ fn convert_to_llm_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<Llm
                 role,
                 content: vec![ContentBlock::Text {
                     text: m.content.to_text(),
+                    metadata: None,
                 }],
             }
         })
@@ -364,7 +365,7 @@ async fn call_llm_provider(
 
     while let Some(event) = rx.recv().await {
         match event {
-            StreamEvent::TextDelta { text: delta } => {
+            StreamEvent::TextDelta { text: delta, .. } => {
                 text.push_str(&delta);
             }
             StreamEvent::Stop { reason, usage: u } => {
@@ -476,7 +477,7 @@ async fn stream_llm_provider(
             };
 
             let (line, should_finish) = match event {
-                StreamEvent::TextDelta { text } => (build_text_chunk(text), false),
+                StreamEvent::TextDelta { text, .. } => (build_text_chunk(text), false),
                 StreamEvent::Stop { reason, .. } => (build_finish_chunk(reason), true),
                 StreamEvent::Error { message } => {
                     tracing::error!(error = %message, "streaming LLM error");
@@ -1277,7 +1278,7 @@ mod tests {
         assert_eq!(llm_msgs.len(), 1);
         assert_eq!(llm_msgs[0].role, LlmRole::User);
         match &llm_msgs[0].content[0] {
-            ContentBlock::Text { text } => assert_eq!(text, "Hello"),
+            ContentBlock::Text { text, .. } => assert_eq!(text, "Hello"),
             _ => panic!("expected Text block"),
         }
     }
@@ -1416,6 +1417,7 @@ mod tests {
             Self::with_events(vec![
                 StreamEvent::TextDelta {
                     text: text.to_string(),
+                    metadata: None,
                 },
                 StreamEvent::Stop {
                     reason: StopReason::EndTurn,
@@ -1532,6 +1534,7 @@ mod tests {
             role: LlmRole::User,
             content: vec![ContentBlock::Text {
                 text: "Hi".to_string(),
+                metadata: None,
             }],
         }];
 
@@ -1558,6 +1561,7 @@ mod tests {
             role: LlmRole::User,
             content: vec![ContentBlock::Text {
                 text: "Hi".to_string(),
+                metadata: None,
             }],
         }];
 
@@ -1579,6 +1583,7 @@ mod tests {
             id: "call_123".to_string(),
             name: "lookup".to_string(),
             input: serde_json::json!({"q": "hi"}),
+            metadata: None,
         }]);
 
         let result = call_llm_provider(
@@ -1589,6 +1594,7 @@ mod tests {
                 role: LlmRole::User,
                 content: vec![ContentBlock::Text {
                     text: "Hi".to_string(),
+                    metadata: None,
                 }],
             }],
             CancellationToken::new(),
@@ -1605,6 +1611,7 @@ mod tests {
     async fn test_call_llm_provider_premature_close_returns_error() {
         let provider = MockLlmProvider::with_events(vec![StreamEvent::TextDelta {
             text: "partial".to_string(),
+            metadata: None,
         }]);
 
         let result = call_llm_provider(
@@ -1615,6 +1622,7 @@ mod tests {
                 role: LlmRole::User,
                 content: vec![ContentBlock::Text {
                     text: "Hi".to_string(),
+                    metadata: None,
                 }],
             }],
             CancellationToken::new(),
@@ -1632,9 +1640,11 @@ mod tests {
         let provider = MockLlmProvider::with_events(vec![
             StreamEvent::TextDelta {
                 text: "Hello ".to_string(),
+                metadata: None,
             },
             StreamEvent::TextDelta {
                 text: "world!".to_string(),
+                metadata: None,
             },
             StreamEvent::Stop {
                 reason: StopReason::EndTurn,
@@ -1648,6 +1658,7 @@ mod tests {
             role: LlmRole::User,
             content: vec![ContentBlock::Text {
                 text: "Test".to_string(),
+                metadata: None,
             }],
         }];
 
@@ -1671,6 +1682,7 @@ mod tests {
             role: LlmRole::User,
             content: vec![ContentBlock::Text {
                 text: "Hi".to_string(),
+                metadata: None,
             }],
         }];
 
@@ -1692,6 +1704,7 @@ mod tests {
         let provider = MockLlmProvider::with_events(vec![
             StreamEvent::TextDelta {
                 text: "Truncated".to_string(),
+                metadata: None,
             },
             StreamEvent::Stop {
                 reason: StopReason::MaxTokens,
@@ -1710,6 +1723,7 @@ mod tests {
                 role: LlmRole::User,
                 content: vec![ContentBlock::Text {
                     text: "Hi".to_string(),
+                    metadata: None,
                 }],
             }],
             CancellationToken::new(),
@@ -1730,6 +1744,7 @@ mod tests {
             role: LlmRole::User,
             content: vec![ContentBlock::Text {
                 text: "Hi".to_string(),
+                metadata: None,
             }],
         }];
 
@@ -1764,6 +1779,7 @@ mod tests {
                 role: LlmRole::User,
                 content: vec![ContentBlock::Text {
                     text: "Hi".to_string(),
+                    metadata: None,
                 }],
             }],
             "chatcmpl_test".to_string(),
@@ -1792,6 +1808,7 @@ mod tests {
                     role: LlmRole::User,
                     content: vec![ContentBlock::Text {
                         text: "Hi".to_string(),
+                        metadata: None,
                     }],
                 }],
                 "chatcmpl_test".to_string(),
@@ -1930,6 +1947,7 @@ mod tests {
         let provider = Arc::new(MockLlmProvider::with_events(vec![
             StreamEvent::TextDelta {
                 text: "Partial answer".to_string(),
+                metadata: None,
             },
             StreamEvent::Stop {
                 reason: StopReason::MaxTokens,
@@ -2018,9 +2036,11 @@ mod tests {
         let provider = Arc::new(MockLlmProvider::with_events(vec![
             StreamEvent::TextDelta {
                 text: "Hello ".to_string(),
+                metadata: None,
             },
             StreamEvent::TextDelta {
                 text: "world!".to_string(),
+                metadata: None,
             },
             StreamEvent::Stop {
                 reason: StopReason::EndTurn,
@@ -2079,6 +2099,7 @@ mod tests {
         let provider = Arc::new(MockLlmProvider::with_events(vec![
             StreamEvent::TextDelta {
                 text: "Hello ".to_string(),
+                metadata: None,
             },
             StreamEvent::Error {
                 message: "stream interrupted".to_string(),
@@ -2128,6 +2149,7 @@ mod tests {
             id: "call_123".to_string(),
             name: "lookup".to_string(),
             input: serde_json::json!({"q": "hi"}),
+            metadata: None,
         }]));
         let state = OpenAiState {
             chat_completions_enabled: true,
