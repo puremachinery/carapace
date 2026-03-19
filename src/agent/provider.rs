@@ -116,6 +116,8 @@ pub struct GeminiPartMetadata {
     pub thought_signature: Option<String>,
 }
 
+const MAX_GEMINI_THOUGHT_SIGNATURE_BYTES: usize = 64 * 1024;
+
 impl ContentBlockMetadata {
     pub fn with_gemini_thought_signature(thought_signature: Option<String>) -> Option<Self> {
         thought_signature.map(|thought_signature| Self {
@@ -145,19 +147,32 @@ pub(crate) fn apply_gemini_thought_signature(
 }
 
 pub(crate) fn gemini_part_metadata(part: &Value) -> Option<ContentBlockMetadata> {
-    ContentBlockMetadata::with_gemini_thought_signature(
-        part.get("thoughtSignature")
-            .and_then(|value| value.as_str())
-            .map(str::to_owned),
-    )
+    let thought_signature = part
+        .get("thoughtSignature")
+        .and_then(|value| value.as_str())
+        .and_then(|value| {
+            if value.len() > MAX_GEMINI_THOUGHT_SIGNATURE_BYTES {
+                tracing::warn!(
+                    signature_bytes = value.len(),
+                    max_signature_bytes = MAX_GEMINI_THOUGHT_SIGNATURE_BYTES,
+                    "dropping oversized Gemini thoughtSignature"
+                );
+                None
+            } else {
+                Some(value.to_owned())
+            }
+        });
+    ContentBlockMetadata::with_gemini_thought_signature(thought_signature)
 }
 
 impl ContentBlock {
     pub fn metadata(&self) -> Option<&ContentBlockMetadata> {
         match self {
-            Self::Text { metadata, .. }
-            | Self::ToolUse { metadata, .. }
-            | Self::ToolResult { metadata, .. } => metadata.as_ref(),
+            Self::Text { metadata, .. } | Self::ToolUse { metadata, .. } => metadata.as_ref(),
+            // Gemini/Vertex provider metadata is only meaningful on model-generated
+            // parts. ToolResult represents a user-side functionResponse and
+            // intentionally does not participate in provider-metadata replay.
+            Self::ToolResult { .. } => None,
         }
     }
 
@@ -748,5 +763,19 @@ mod tests {
             summary.len()
         );
         assert!(summary.ends_with("..."));
+    }
+
+    #[test]
+    fn test_gemini_part_metadata_drops_oversized_thought_signature() {
+        let oversized = "a".repeat(MAX_GEMINI_THOUGHT_SIGNATURE_BYTES + 1);
+        let part = json!({
+            "text": "Hello",
+            "thoughtSignature": oversized,
+        });
+
+        assert!(
+            gemini_part_metadata(&part).is_none(),
+            "oversized thought signatures should be dropped instead of persisted"
+        );
     }
 }

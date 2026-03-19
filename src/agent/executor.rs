@@ -553,13 +553,22 @@ fn sanitize_assistant_turn(
     (sanitized_turn_text, sanitized_blocks)
 }
 
+fn combined_assistant_text(assistant_blocks: &[ContentBlock]) -> String {
+    assistant_blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Build an assistant history message from accumulated turn text and tool-use blocks.
 ///
 /// Returns the `ChatMessage` ready for persistence, or `None` if there is
 /// nothing to record (empty text and no tool calls).
 fn build_assistant_message(
     session_id: &str,
-    turn_text: &str,
     assistant_blocks: &[ContentBlock],
     output_tokens: u64,
 ) -> Option<ChatMessage> {
@@ -573,17 +582,18 @@ fn build_assistant_message(
     let has_provider_metadata = assistant_blocks
         .iter()
         .any(ContentBlock::has_provider_metadata);
+    let turn_text = combined_assistant_text(assistant_blocks);
 
     let content = if !has_tool_use && !has_provider_metadata {
-        turn_text.to_string()
+        turn_text.clone()
     } else if has_provider_metadata {
         crate::agent::context::serialize_assistant_blocks(assistant_blocks)
-            .unwrap_or_else(|_| turn_text.to_string())
+            .unwrap_or_else(|_| turn_text.clone())
     } else {
         let mut blocks: Vec<ContentBlock> = Vec::new();
         if !turn_text.is_empty() {
             blocks.push(ContentBlock::Text {
-                text: turn_text.to_string(),
+                text: turn_text.clone(),
                 metadata: None,
             });
         }
@@ -593,7 +603,7 @@ fn build_assistant_message(
             }
         }
         crate::agent::context::serialize_assistant_blocks(&blocks)
-            .unwrap_or_else(|_| turn_text.to_string())
+            .unwrap_or_else(|_| turn_text.clone())
     };
 
     Some(ChatMessage::assistant(session_id, &content).with_tokens(output_tokens))
@@ -958,12 +968,9 @@ async fn execute_single_turn(
     let (turn_text, assistant_blocks) = sanitize_assistant_turn(&assistant_blocks, config, run_id);
 
     // Append assistant message to history (after post-flight filtering)
-    if let Some(msg) = build_assistant_message(
-        session_id,
-        &turn_text,
-        &assistant_blocks,
-        turn_usage.output_tokens,
-    ) {
+    if let Some(msg) =
+        build_assistant_message(session_id, &assistant_blocks, turn_usage.output_tokens)
+    {
         crate::sessions::append_message_blocking(state.session_store().clone(), msg.clone())
             .await
             .map_err(|e| AgentError::SessionStore(e.to_string()))?;
@@ -1434,7 +1441,6 @@ mod tests {
     fn test_build_assistant_message_preserves_text_metadata_in_history() {
         let assistant_message = build_assistant_message(
             "sess-metadata",
-            "Hello",
             &[ContentBlock::Text {
                 text: "Hello".to_string(),
                 metadata: ContentBlockMetadata::with_gemini_thought_signature(Some(
@@ -1469,7 +1475,6 @@ mod tests {
     fn test_build_assistant_message_preserves_tool_use_metadata_in_history() {
         let assistant_message = build_assistant_message(
             "sess-tool-metadata",
-            "",
             &[ContentBlock::ToolUse {
                 id: "tool_1".to_string(),
                 name: "get_weather".to_string(),
