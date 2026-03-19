@@ -317,12 +317,18 @@ fn push_text_block(
     text: String,
     metadata: Option<ContentBlockMetadata>,
 ) {
+    let incoming_is_signature_only_boundary = text.is_empty() && metadata.is_some();
     if let Some(ContentBlock::Text {
         text: existing,
         metadata: existing_metadata,
     }) = blocks.last_mut()
     {
-        if *existing_metadata == metadata {
+        let existing_is_signature_only_boundary =
+            existing.is_empty() && existing_metadata.is_some();
+        if *existing_metadata == metadata
+            && !incoming_is_signature_only_boundary
+            && !existing_is_signature_only_boundary
+        {
             existing.push_str(&text);
             return;
         }
@@ -1610,6 +1616,45 @@ mod tests {
                 assert_eq!(metadata, &shared_metadata);
             }
             other => panic!("expected coalesced metadata-bearing text block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_sanitize_assistant_turn_preserves_empty_signature_only_boundary() {
+        let config = AgentConfig::default();
+        let shared_metadata =
+            ContentBlockMetadata::with_gemini_thought_signature(Some("sig-shared".to_string()));
+        let (turn_text, assistant_blocks) = sanitize_assistant_turn(
+            "Hello",
+            &[
+                ContentBlock::Text {
+                    text: "".to_string(),
+                    metadata: shared_metadata.clone(),
+                },
+                ContentBlock::Text {
+                    text: "Hello".to_string(),
+                    metadata: shared_metadata.clone(),
+                },
+            ],
+            &config,
+            "run-preserve-empty-signature-boundary",
+        );
+
+        assert_eq!(turn_text, "Hello");
+        assert_eq!(assistant_blocks.len(), 2);
+        match &assistant_blocks[0] {
+            ContentBlock::Text { text, metadata } => {
+                assert_eq!(text, "");
+                assert_eq!(metadata, &shared_metadata);
+            }
+            other => panic!("expected signature-only boundary block, got {other:?}"),
+        }
+        match &assistant_blocks[1] {
+            ContentBlock::Text { text, metadata } => {
+                assert_eq!(text, "Hello");
+                assert_eq!(metadata, &shared_metadata);
+            }
+            other => panic!("expected follow-on text block, got {other:?}"),
         }
     }
 

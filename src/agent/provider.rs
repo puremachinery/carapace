@@ -132,7 +132,10 @@ impl ContentBlockMetadata {
     }
 }
 
-pub fn apply_gemini_thought_signature(part: &mut Value, metadata: &Option<ContentBlockMetadata>) {
+pub(crate) fn apply_gemini_thought_signature(
+    part: &mut Value,
+    metadata: &Option<ContentBlockMetadata>,
+) {
     if let Some(thought_signature) = metadata
         .as_ref()
         .and_then(ContentBlockMetadata::gemini_thought_signature)
@@ -141,7 +144,7 @@ pub fn apply_gemini_thought_signature(part: &mut Value, metadata: &Option<Conten
     }
 }
 
-pub fn gemini_part_metadata(part: &Value) -> Option<ContentBlockMetadata> {
+pub(crate) fn gemini_part_metadata(part: &Value) -> Option<ContentBlockMetadata> {
     ContentBlockMetadata::with_gemini_thought_signature(
         part.get("thoughtSignature")
             .and_then(|value| value.as_str())

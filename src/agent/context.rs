@@ -231,7 +231,7 @@ fn try_parse_assistant_blocks(content: &str) -> Option<Vec<ContentBlock>> {
                     metadata,
                 });
             }
-            _ => return None,
+            _ => continue,
         }
     }
 
@@ -400,6 +400,54 @@ mod tests {
                 );
             }
             _ => panic!("expected Text block"),
+        }
+    }
+
+    #[test]
+    fn test_assistant_blocks_skip_unknown_block_types() {
+        let structured = serde_json::to_string(&serde_json::json!([
+            {
+                "type": "text",
+                "text": "Let me check."
+            },
+            {
+                "type": "future_type",
+                "payload": "ignored"
+            },
+            {
+                "type": "tool_use",
+                "id": "call_1",
+                "name": "search",
+                "input": {"q": "test"}
+            }
+        ]))
+        .unwrap();
+
+        let history = vec![ChatMessage::assistant("sess1", &structured)];
+        let (_, messages) = build_context(&history, None);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content.len(), 2);
+        match &messages[0].content[0] {
+            ContentBlock::Text { text, metadata } => {
+                assert_eq!(text, "Let me check.");
+                assert!(metadata.is_none());
+            }
+            other => panic!("expected text block, got {other:?}"),
+        }
+        match &messages[0].content[1] {
+            ContentBlock::ToolUse {
+                id,
+                name,
+                input,
+                metadata,
+            } => {
+                assert_eq!(id, "call_1");
+                assert_eq!(name, "search");
+                assert_eq!(input["q"], "test");
+                assert!(metadata.is_none());
+            }
+            other => panic!("expected tool_use block, got {other:?}"),
         }
     }
 
