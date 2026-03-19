@@ -52,7 +52,7 @@ For what is already shipped and verified, see:
 ## Next
 
 - Additional channels (WhatsApp, iMessage, Teams, Matrix, WebChat).
-- Companion apps — native macOS, iOS, and Android clients.
+- Companion apps — native macOS, Linux, iOS, and Android clients.
 
 ## Later
 
