@@ -44,18 +44,16 @@ jobs:
               pull_number: context.payload.pull_request.number,
               per_page: 100,
             });
-            const blocked = new Set([
-              ".github/workflows/claude-code-review.yml",
-              ".github/workflows/claude.yml",
-            ]);
-            const changed = files.some((file) => blocked.has(file.filename));
+            const changed = files.some((file) =>
+              file.filename.startsWith(".github/workflows/")
+            );
             core.setOutput("changed", changed ? "true" : "false");
 
       - name: Skip Claude review for workflow-change PR
         if: steps.workflow-change.outputs.changed == 'true'
         run: |
-          echo "Skipping Claude review because this PR modifies Claude workflow files."
-          echo "Anthropic requires the review workflow file to match the default branch content."
+          echo "Skipping Claude review because this PR modifies GitHub workflow files."
+          echo "This review job runs in GitHub-context-only mode and the Anthropic action currently assumes a checked-out git repository for workflow-change PRs."
 
       - name: Run Claude review analysis (GitHub-context only)
         id: claude-review
