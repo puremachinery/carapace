@@ -153,6 +153,7 @@ fn parse_block_metadata(item: &Value) -> Option<ContentBlockMetadata> {
     item.get("metadata")
         .cloned()
         .and_then(|metadata| serde_json::from_value(metadata).ok())
+        .filter(ContentBlockMetadata::has_effective_provider_metadata)
 }
 
 /// Try to parse assistant content as structured blocks.
@@ -175,7 +176,9 @@ fn try_parse_assistant_blocks(content: &str) -> Option<Vec<ContentBlock>> {
         match item.get("type").and_then(Value::as_str) {
             Some("text") => {
                 let metadata = parse_block_metadata(item);
-                has_provider_metadata |= metadata.is_some();
+                has_provider_metadata |= metadata
+                    .as_ref()
+                    .is_some_and(ContentBlockMetadata::has_effective_provider_metadata);
                 blocks.push(ContentBlock::Text {
                     text: item
                         .get("text")
@@ -187,7 +190,9 @@ fn try_parse_assistant_blocks(content: &str) -> Option<Vec<ContentBlock>> {
             }
             Some("tool_use") => {
                 let metadata = parse_block_metadata(item);
-                has_provider_metadata |= metadata.is_some();
+                has_provider_metadata |= metadata
+                    .as_ref()
+                    .is_some_and(ContentBlockMetadata::has_effective_provider_metadata);
                 has_tool_use = true;
                 blocks.push(ContentBlock::ToolUse {
                     id: item
@@ -498,6 +503,15 @@ mod tests {
         assert!(
             try_parse_assistant_blocks(r#"[{"type":"text","text":"Hello"}]"#).is_none(),
             "plain text-only arrays should fall back to the existing plain-string assistant history path"
+        );
+    }
+
+    #[test]
+    fn test_try_parse_assistant_blocks_ignores_empty_metadata_objects() {
+        assert!(
+            try_parse_assistant_blocks(r#"[{"type":"text","text":"Hello","metadata":{}}]"#)
+                .is_none(),
+            "empty metadata objects should not trigger structured assistant history preservation"
         );
     }
 }

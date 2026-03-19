@@ -1518,6 +1518,24 @@ mod tests {
     }
 
     #[test]
+    fn test_build_assistant_message_ignores_empty_metadata_objects() {
+        let assistant_message = build_assistant_message(
+            "sess-empty-metadata",
+            &[ContentBlock::Text {
+                text: "Hello".to_string(),
+                metadata: Some(ContentBlockMetadata::default()),
+            }],
+            3,
+        )
+        .expect("assistant message should be created");
+
+        assert_eq!(
+            assistant_message.content, "Hello",
+            "empty metadata should not force structured assistant-history persistence"
+        );
+    }
+
+    #[test]
     fn test_sanitize_assistant_turn_preserves_signature_only_part() {
         let config = AgentConfig::default();
         let (turn_text, assistant_blocks) = sanitize_assistant_turn(

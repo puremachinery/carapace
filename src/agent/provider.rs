@@ -131,6 +131,10 @@ impl ContentBlockMetadata {
             .as_ref()
             .and_then(|gemini| gemini.thought_signature.as_deref())
     }
+
+    pub fn has_effective_provider_metadata(&self) -> bool {
+        self.gemini_thought_signature().is_some()
+    }
 }
 
 pub(crate) fn apply_gemini_thought_signature(
@@ -173,7 +177,8 @@ impl ContentBlock {
     }
 
     pub fn has_provider_metadata(&self) -> bool {
-        self.metadata().is_some()
+        self.metadata()
+            .is_some_and(ContentBlockMetadata::has_effective_provider_metadata)
     }
 }
 

@@ -467,6 +467,39 @@ mod tests {
     }
 
     #[test]
+    fn test_build_body_ignores_signatures_from_structured_assistant_history() {
+        let provider = AnthropicProvider::new("test-key".to_string()).unwrap();
+        let assistant_content =
+            crate::agent::context::serialize_assistant_blocks(&[ContentBlock::Text {
+                text: "Hello".to_string(),
+                metadata: ContentBlockMetadata::with_gemini_thought_signature(Some(
+                    "sig-text".to_string(),
+                )),
+            }])
+            .unwrap();
+        let history = vec![crate::sessions::ChatMessage::assistant(
+            "sess-anthropic-history",
+            &assistant_content,
+        )];
+        let (_system, messages) = crate::agent::context::build_context(&history, None);
+        let request = CompletionRequest {
+            model: "claude-sonnet-4-20250514".to_string(),
+            messages,
+            system: None,
+            tools: vec![],
+            max_tokens: 1024,
+            temperature: None,
+            extra: None,
+        };
+
+        let body = provider.build_body(&request);
+        assert!(
+            !body.to_string().contains("thoughtSignature"),
+            "Anthropic requests should not forward stored Gemini thought signatures"
+        );
+    }
+
+    #[test]
     fn test_parse_text_delta() {
         let mut tool_calls = std::collections::HashMap::new();
         let mut usage = TokenUsage::default();
