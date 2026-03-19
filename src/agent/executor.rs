@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use uuid::Uuid;
 
 use crate::agent::context::{build_context, build_context_with_tagging};
 use crate::agent::prompt_guard::{postflight, preflight};
@@ -337,8 +338,8 @@ fn push_text_block(
     blocks.push(ContentBlock::Text { text, metadata });
 }
 
-fn metadata_boundary_marker(index: usize) -> String {
-    format!("\u{001f}CARAPACE_METADATA_BOUNDARY_{index}\u{001e}")
+fn metadata_boundary_marker(boundary_seed: &str, index: usize) -> String {
+    format!("\u{001f}CARAPACE_METADATA_BOUNDARY_{boundary_seed}_{index}\u{001e}")
 }
 
 fn sanitize_text_with_stats(text: &str, config: &AgentConfig) -> (String, TextSanitizationStats) {
@@ -359,6 +360,7 @@ fn append_text_sanitization_stats(
 fn split_sanitized_text_run(
     text_blocks: &[(String, Option<ContentBlockMetadata>)],
     sanitized_marked_text: &str,
+    boundary_seed: &str,
 ) -> Option<Vec<String>> {
     if text_blocks.is_empty() {
         return Some(Vec::new());
@@ -368,7 +370,7 @@ fn split_sanitized_text_run(
     let mut remaining = sanitized_marked_text;
 
     for marker_index in 0..text_blocks.len().saturating_sub(1) {
-        let marker = metadata_boundary_marker(marker_index);
+        let marker = metadata_boundary_marker(boundary_seed, marker_index);
         let marker_pos = remaining.find(&marker)?;
         segments.push(remaining[..marker_pos].to_string());
         remaining = &remaining[marker_pos + marker.len()..];
@@ -400,16 +402,18 @@ fn sanitize_text_run(
         return (sanitized_text, blocks);
     }
 
+    let boundary_seed = Uuid::new_v4().simple().to_string();
     let mut marked_text = String::new();
     for (index, (text, _)) in text_blocks.iter().enumerate() {
         if index > 0 {
-            marked_text.push_str(&metadata_boundary_marker(index - 1));
+            marked_text.push_str(&metadata_boundary_marker(&boundary_seed, index - 1));
         }
         marked_text.push_str(text);
     }
 
     let (sanitized_marked_text, _) = sanitize_text_with_stats(&marked_text, config);
-    if let Some(sanitized_segments) = split_sanitized_text_run(text_blocks, &sanitized_marked_text)
+    if let Some(sanitized_segments) =
+        split_sanitized_text_run(text_blocks, &sanitized_marked_text, &boundary_seed)
     {
         let reconstructed_text: String = sanitized_segments.concat();
         if reconstructed_text == sanitized_text {
@@ -496,7 +500,6 @@ fn log_text_sanitization_stats(run_id: &str, stats: &TextSanitizationStats) {
 }
 
 fn sanitize_assistant_turn(
-    _turn_text: &str,
     assistant_blocks: &[ContentBlock],
     config: &AgentConfig,
     run_id: &str,
@@ -940,7 +943,7 @@ async fn execute_single_turn(
     };
 
     let StreamResult {
-        turn_text,
+        turn_text: _,
         assistant_blocks,
         pending_tool_calls,
         stop_reason,
@@ -952,8 +955,7 @@ async fn execute_single_turn(
     *total_output_tokens += turn_usage.output_tokens;
     record_turn_usage(session_key, &config.model, &turn_usage);
 
-    let (turn_text, assistant_blocks) =
-        sanitize_assistant_turn(&turn_text, &assistant_blocks, config, run_id);
+    let (turn_text, assistant_blocks) = sanitize_assistant_turn(&assistant_blocks, config, run_id);
 
     // Append assistant message to history (after post-flight filtering)
     if let Some(msg) = build_assistant_message(
@@ -1506,7 +1508,6 @@ mod tests {
     fn test_sanitize_assistant_turn_preserves_signature_only_part() {
         let config = AgentConfig::default();
         let (turn_text, assistant_blocks) = sanitize_assistant_turn(
-            "Hello",
             &[
                 ContentBlock::Text {
                     text: "Hel".to_string(),
@@ -1554,7 +1555,6 @@ mod tests {
     fn test_sanitize_assistant_turn_sanitizes_metadata_text_blocks() {
         let config = AgentConfig::default();
         let (turn_text, assistant_blocks) = sanitize_assistant_turn(
-            "<script>alert(1)</script>Hello",
             &[
                 ContentBlock::Text {
                     text: "<script>alert(1)</script>Hello".to_string(),
@@ -1593,7 +1593,6 @@ mod tests {
         let shared_metadata =
             ContentBlockMetadata::with_gemini_thought_signature(Some("sig-shared".to_string()));
         let (turn_text, assistant_blocks) = sanitize_assistant_turn(
-            "Hello world",
             &[
                 ContentBlock::Text {
                     text: "Hello ".to_string(),
@@ -1625,7 +1624,6 @@ mod tests {
         let shared_metadata =
             ContentBlockMetadata::with_gemini_thought_signature(Some("sig-shared".to_string()));
         let (turn_text, assistant_blocks) = sanitize_assistant_turn(
-            "Hello",
             &[
                 ContentBlock::Text {
                     text: "".to_string(),
@@ -1662,7 +1660,6 @@ mod tests {
     fn test_sanitize_assistant_turn_falls_back_when_boundary_changes_sanitization() {
         let config = AgentConfig::default();
         let (turn_text, assistant_blocks) = sanitize_assistant_turn(
-            "<script>alert(1)</script>Hello",
             &[
                 ContentBlock::Text {
                     text: "<scr".to_string(),

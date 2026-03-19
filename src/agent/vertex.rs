@@ -170,10 +170,10 @@ pub(crate) fn build_gemini_body(request: &CompletionRequest) -> Value {
                     tool_use_id: _,
                     content,
                     is_error: _,
-                    metadata,
+                    metadata: _,
                 } => {
                     let tool_name = find_tool_name_for_result(&request.messages, block);
-                    let mut part = json!({
+                    let part = json!({
                         "functionResponse": {
                             "name": tool_name,
                             "response": {
@@ -181,7 +181,6 @@ pub(crate) fn build_gemini_body(request: &CompletionRequest) -> Value {
                             }
                         }
                     });
-                    apply_gemini_thought_signature(&mut part, metadata);
                     parts.push(part);
                 }
             }
