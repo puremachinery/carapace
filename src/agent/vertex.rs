@@ -170,13 +170,7 @@ pub(crate) fn build_gemini_body(request: &CompletionRequest) -> Value {
                     tool_use_id: _,
                     content,
                     is_error: _,
-                    metadata,
                 } => {
-                    if metadata.is_some() {
-                        tracing::warn!(
-                            "ignoring unsupported provider metadata on ToolResult block during Vertex replay"
-                        );
-                    }
                     let tool_name = find_tool_name_for_result(&request.messages, block);
                     let part = json!({
                         "functionResponse": {
@@ -852,7 +846,6 @@ mod tests {
                         tool_use_id: "call_abc123".to_string(),
                         content: "72F and sunny".to_string(),
                         is_error: false,
-                        metadata: None,
                     }],
                 },
             ],

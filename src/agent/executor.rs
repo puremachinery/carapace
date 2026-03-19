@@ -339,6 +339,10 @@ fn push_text_block(
 }
 
 fn metadata_boundary_marker(boundary_seed: &str, index: usize) -> String {
+    // These control characters are chosen as low-likelihood separators for the
+    // synthetic marked-text pass. If a sanitizer normalizes or strips them in a
+    // way that prevents boundary recovery, the equality check below falls back
+    // to sanitized plain text with metadata dropped for that run.
     format!("\u{001f}CARAPACE_METADATA_BOUNDARY_{boundary_seed}_{index}\u{001e}")
 }
 
@@ -411,6 +415,10 @@ fn sanitize_text_run(
         marked_text.push_str(text);
     }
 
+    // The marker-bearing pass is only used to recover per-block boundaries
+    // after sanitization. Its stats are intentionally discarded because the
+    // marked string contains synthetic delimiters; the authoritative
+    // audit/logging signal comes from the unmarked `original_text` pass above.
     let (sanitized_marked_text, _) = sanitize_text_with_stats(&marked_text, config);
     if let Some(sanitized_segments) =
         split_sanitized_text_run(text_blocks, &sanitized_marked_text, &boundary_seed)

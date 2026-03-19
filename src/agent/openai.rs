@@ -724,7 +724,6 @@ mod tests {
                         tool_use_id: "call_abc123".to_string(),
                         content: "72F and sunny".to_string(),
                         is_error: false,
-                        metadata: None,
                     }],
                 },
             ],
@@ -780,6 +779,43 @@ mod tests {
         // No system message
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["role"], "user");
+    }
+
+    #[test]
+    fn test_build_body_ignores_signatures_from_structured_assistant_history() {
+        let provider = OpenAiProvider::new("test-key".to_string()).unwrap();
+        let assistant_content =
+            crate::agent::context::serialize_assistant_blocks(&[ContentBlock::Text {
+                text: "Hello".to_string(),
+                metadata: ContentBlockMetadata::with_gemini_thought_signature(Some(
+                    "sig-text".to_string(),
+                )),
+            }])
+            .unwrap();
+        let history = vec![crate::sessions::ChatMessage::assistant(
+            "sess-openai-history",
+            &assistant_content,
+        )];
+        let (_system, messages) = crate::agent::context::build_context(&history, None);
+        let request = CompletionRequest {
+            model: "gpt-4o".to_string(),
+            messages,
+            system: None,
+            tools: vec![],
+            max_tokens: 1024,
+            temperature: None,
+            extra: None,
+        };
+
+        let body = provider.build_body(&request);
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[0]["content"], "Hello");
+        assert!(
+            !body.to_string().contains("thoughtSignature"),
+            "non-Gemini providers should not forward stored Gemini thought signatures"
+        );
     }
 
     // ==================== SSE parsing tests ====================

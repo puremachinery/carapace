@@ -97,7 +97,6 @@ pub enum ContentBlock {
         tool_use_id: String,
         content: String,
         is_error: bool,
-        metadata: Option<ContentBlockMetadata>,
     },
 }
 
@@ -169,9 +168,6 @@ impl ContentBlock {
     pub fn metadata(&self) -> Option<&ContentBlockMetadata> {
         match self {
             Self::Text { metadata, .. } | Self::ToolUse { metadata, .. } => metadata.as_ref(),
-            // Gemini/Vertex provider metadata is only meaningful on model-generated
-            // parts. ToolResult represents a user-side functionResponse and
-            // intentionally does not participate in provider-metadata replay.
             Self::ToolResult { .. } => None,
         }
     }

@@ -162,16 +162,10 @@ impl GeminiProvider {
                         tool_use_id: _,
                         content,
                         is_error: _,
-                        metadata,
                     } => {
                         // For tool results, we need to look up the tool name.
                         // Gemini uses functionResponse with name and response.
                         // We look backwards through messages to find the matching tool use name.
-                        if metadata.is_some() {
-                            tracing::warn!(
-                                "ignoring unsupported provider metadata on ToolResult block during Gemini replay"
-                            );
-                        }
                         let tool_name = find_tool_name_for_result(&request.messages, block);
                         let part = json!({
                             "functionResponse": {
@@ -1000,7 +994,6 @@ mod tests {
                         tool_use_id: "call_abc123".to_string(),
                         content: "72F and sunny".to_string(),
                         is_error: false,
-                        metadata: None,
                     }],
                 },
             ],
@@ -1161,7 +1154,6 @@ mod tests {
                         tool_use_id: "call_abc123".to_string(),
                         content: "72F and sunny".to_string(),
                         is_error: false,
-                        metadata: None,
                     }],
                 },
             ],

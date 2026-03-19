@@ -83,7 +83,6 @@ pub fn build_context_with_tagging(
                         tool_use_id,
                         content: tagged_content,
                         is_error,
-                        metadata: None,
                     }],
                 });
             }
@@ -139,11 +138,7 @@ fn serialize_assistant_block(block: &ContentBlock) -> Value {
             tool_use_id,
             content,
             is_error,
-            metadata: _,
         } => {
-            // ToolResult blocks are user-side function responses. Provider-specific
-            // metadata such as Gemini thought signatures is intentionally not
-            // serialized or replayed for them.
             json!({
                 "type": "tool_result",
                 "tool_use_id": tool_use_id,
@@ -212,9 +207,7 @@ fn try_parse_assistant_blocks(content: &str) -> Option<Vec<ContentBlock>> {
             Some("tool_result") => {
                 // Assistant turns do not currently serialize ToolResult blocks, but
                 // the parser stays tolerant here so future/external structured
-                // history entries are not dropped wholesale. Any metadata on
-                // ToolResult is intentionally ignored because provider metadata
-                // only applies to model-generated assistant parts.
+                // history entries are not dropped wholesale.
                 blocks.push(ContentBlock::ToolResult {
                     tool_use_id: item
                         .get("tool_use_id")
@@ -230,13 +223,15 @@ fn try_parse_assistant_blocks(content: &str) -> Option<Vec<ContentBlock>> {
                         .get("is_error")
                         .and_then(Value::as_bool)
                         .unwrap_or(false),
-                    metadata: None,
                 });
             }
             _ => continue,
         }
     }
 
+    // Plain text-only JSON arrays are intentionally not treated as structured
+    // assistant history. We only preserve the structured form when it carries
+    // tool-use state or provider metadata that would otherwise be lost.
     if blocks.is_empty() || (!has_tool_use && !has_provider_metadata) {
         None
     } else {
@@ -303,12 +298,10 @@ mod tests {
                 tool_use_id,
                 content,
                 is_error,
-                metadata,
             } => {
                 assert_eq!(tool_use_id, "call_123");
                 assert_eq!(content, r#"{"temp": 72}"#);
                 assert!(!is_error);
-                assert!(metadata.is_none());
             }
             _ => panic!("expected ToolResult block"),
         }
@@ -477,34 +470,34 @@ mod tests {
             tool_use_id: "tool-1".to_string(),
             content: "ok".to_string(),
             is_error: false,
-            metadata: ContentBlockMetadata::with_gemini_thought_signature(Some(
-                "sig-should-drop".to_string(),
-            )),
         }])
         .unwrap();
         let parsed: Value = serde_json::from_str(&serialized).unwrap();
         assert_eq!(parsed[0]["type"], "tool_result");
         assert!(
             parsed[0].get("metadata").is_none(),
-            "ToolResult metadata should not be serialized into assistant history"
+            "ToolResult blocks should serialize without provider metadata"
         );
     }
 
     #[test]
-    fn test_try_parse_assistant_blocks_ignores_tool_result_metadata() {
+    fn test_try_parse_assistant_blocks_accepts_tool_result_blocks() {
         let parsed = try_parse_assistant_blocks(
-            r#"[{"type":"tool_result","tool_use_id":"tool-1","content":"ok","is_error":false,"metadata":{"gemini":{"thoughtSignature":"sig-should-drop"}}},{"type":"tool_use","id":"call-1","name":"get_weather","input":{}}]"#,
+            r#"[{"type":"tool_result","tool_use_id":"tool-1","content":"ok","is_error":false},{"type":"tool_use","id":"call-1","name":"get_weather","input":{}}]"#,
         )
         .expect("assistant blocks should parse");
 
         match &parsed[0] {
-            ContentBlock::ToolResult { metadata, .. } => {
-                assert!(
-                    metadata.is_none(),
-                    "ToolResult metadata should be ignored during assistant history parse"
-                );
-            }
+            ContentBlock::ToolResult { .. } => {}
             other => panic!("expected ToolResult block, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_try_parse_assistant_blocks_returns_none_for_plain_text_json_array() {
+        assert!(
+            try_parse_assistant_blocks(r#"[{"type":"text","text":"Hello"}]"#).is_none(),
+            "plain text-only arrays should fall back to the existing plain-string assistant history path"
+        );
     }
 }

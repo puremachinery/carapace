@@ -636,7 +636,6 @@ mod tests {
                         tool_use_id: "call_abc123".to_string(),
                         content: "72F and sunny".to_string(),
                         is_error: false,
-                        metadata: None,
                     }],
                 },
             ],
