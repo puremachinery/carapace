@@ -137,32 +137,7 @@ fn handle_stream_event(
             }
 
             result.turn_text.push_str(&text);
-            if metadata.is_none() {
-                if let Some(ContentBlock::Text {
-                    text: existing,
-                    metadata: existing_metadata,
-                }) = result.assistant_blocks.last_mut()
-                {
-                    if existing_metadata.is_none() {
-                        existing.push_str(&text);
-                    } else {
-                        result.assistant_blocks.push(ContentBlock::Text {
-                            text: text.clone(),
-                            metadata,
-                        });
-                    }
-                } else {
-                    result.assistant_blocks.push(ContentBlock::Text {
-                        text: text.clone(),
-                        metadata,
-                    });
-                }
-            } else {
-                result.assistant_blocks.push(ContentBlock::Text {
-                    text: text.clone(),
-                    metadata,
-                });
-            }
+            push_text_block(&mut result.assistant_blocks, text.clone(), metadata);
 
             if text.is_empty() {
                 return Ok(false);
@@ -328,30 +303,136 @@ fn coalesce_assistant_blocks(blocks: &[ContentBlock]) -> Vec<ContentBlock> {
                 if text.is_empty() && metadata.is_none() {
                     continue;
                 }
-
-                if metadata.is_none() {
-                    if let Some(ContentBlock::Text {
-                        text: existing,
-                        metadata: existing_metadata,
-                    }) = coalesced.last_mut()
-                    {
-                        if existing_metadata.is_none() {
-                            existing.push_str(text);
-                            continue;
-                        }
-                    }
-                }
-
-                coalesced.push(ContentBlock::Text {
-                    text: text.clone(),
-                    metadata: metadata.clone(),
-                });
+                push_text_block(&mut coalesced, text.clone(), metadata.clone());
             }
             _ => coalesced.push(block.clone()),
         }
     }
 
     coalesced
+}
+
+fn push_text_block(
+    blocks: &mut Vec<ContentBlock>,
+    text: String,
+    metadata: Option<ContentBlockMetadata>,
+) {
+    if let Some(ContentBlock::Text {
+        text: existing,
+        metadata: existing_metadata,
+    }) = blocks.last_mut()
+    {
+        if *existing_metadata == metadata {
+            existing.push_str(&text);
+            return;
+        }
+    }
+
+    blocks.push(ContentBlock::Text { text, metadata });
+}
+
+fn metadata_boundary_marker(index: usize) -> String {
+    format!("\u{001f}CARAPACE_METADATA_BOUNDARY_{index}\u{001e}")
+}
+
+fn sanitize_text_with_stats(text: &str, config: &AgentConfig) -> (String, TextSanitizationStats) {
+    let mut stats = TextSanitizationStats::default();
+    let sanitized = sanitize_text_fragment(text, config, &mut stats);
+    (sanitized, stats)
+}
+
+fn append_text_sanitization_stats(
+    total: &mut TextSanitizationStats,
+    current: &TextSanitizationStats,
+) {
+    total.finding_count += current.finding_count;
+    total.blocked |= current.blocked;
+    total.html_modified |= current.html_modified;
+}
+
+fn split_sanitized_text_run(
+    text_blocks: &[(String, Option<ContentBlockMetadata>)],
+    sanitized_marked_text: &str,
+) -> Option<Vec<String>> {
+    if text_blocks.is_empty() {
+        return Some(Vec::new());
+    }
+
+    let mut segments = Vec::with_capacity(text_blocks.len());
+    let mut remaining = sanitized_marked_text;
+
+    for marker_index in 0..text_blocks.len().saturating_sub(1) {
+        let marker = metadata_boundary_marker(marker_index);
+        let marker_pos = remaining.find(&marker)?;
+        segments.push(remaining[..marker_pos].to_string());
+        remaining = &remaining[marker_pos + marker.len()..];
+    }
+
+    segments.push(remaining.to_string());
+    Some(segments)
+}
+
+fn sanitize_text_run(
+    text_blocks: &[(String, Option<ContentBlockMetadata>)],
+    config: &AgentConfig,
+    stats: &mut TextSanitizationStats,
+    run_id: &str,
+) -> (String, Vec<ContentBlock>) {
+    let original_text: String = text_blocks.iter().map(|(text, _)| text).cloned().collect();
+    let (sanitized_text, run_stats) = sanitize_text_with_stats(&original_text, config);
+    append_text_sanitization_stats(stats, &run_stats);
+
+    let has_provider_metadata = text_blocks.iter().any(|(_, metadata)| metadata.is_some());
+    if !has_provider_metadata {
+        let mut blocks = Vec::new();
+        if !sanitized_text.is_empty() {
+            blocks.push(ContentBlock::Text {
+                text: sanitized_text.clone(),
+                metadata: None,
+            });
+        }
+        return (sanitized_text, blocks);
+    }
+
+    let mut marked_text = String::new();
+    for (index, (text, _)) in text_blocks.iter().enumerate() {
+        if index > 0 {
+            marked_text.push_str(&metadata_boundary_marker(index - 1));
+        }
+        marked_text.push_str(text);
+    }
+
+    let (sanitized_marked_text, _) = sanitize_text_with_stats(&marked_text, config);
+    if let Some(sanitized_segments) = split_sanitized_text_run(text_blocks, &sanitized_marked_text)
+    {
+        let reconstructed_text: String = sanitized_segments.concat();
+        if reconstructed_text == sanitized_text {
+            let mut blocks = Vec::with_capacity(text_blocks.len());
+            for ((_, metadata), sanitized_segment) in text_blocks.iter().zip(sanitized_segments) {
+                if !sanitized_segment.is_empty() || metadata.is_some() {
+                    blocks.push(ContentBlock::Text {
+                        text: sanitized_segment,
+                        metadata: metadata.clone(),
+                    });
+                }
+            }
+            return (sanitized_text, blocks);
+        }
+    }
+
+    tracing::warn!(
+        run_id = %run_id,
+        "metadata-bearing text run required whole-turn sanitization fallback; dropping per-part metadata for that run"
+    );
+
+    let mut blocks = Vec::new();
+    if !sanitized_text.is_empty() {
+        blocks.push(ContentBlock::Text {
+            text: sanitized_text.clone(),
+            metadata: None,
+        });
+    }
+    (sanitized_text, blocks)
 }
 
 fn sanitize_text_fragment(
@@ -409,41 +490,55 @@ fn log_text_sanitization_stats(run_id: &str, stats: &TextSanitizationStats) {
 }
 
 fn sanitize_assistant_turn(
-    turn_text: &str,
+    _turn_text: &str,
     assistant_blocks: &[ContentBlock],
     config: &AgentConfig,
     run_id: &str,
 ) -> (String, Vec<ContentBlock>) {
     let assistant_blocks = coalesce_assistant_blocks(assistant_blocks);
-    let has_provider_metadata = assistant_blocks
-        .iter()
-        .any(ContentBlock::has_provider_metadata);
     let mut stats = TextSanitizationStats::default();
-
-    if !has_provider_metadata {
-        let sanitized_turn_text = sanitize_text_fragment(turn_text, config, &mut stats);
-        log_text_sanitization_stats(run_id, &stats);
-        return (sanitized_turn_text, assistant_blocks);
-    }
-
     let mut sanitized_turn_text = String::new();
     let mut sanitized_blocks = Vec::with_capacity(assistant_blocks.len());
+    let mut pending_text_run: Vec<(String, Option<ContentBlockMetadata>)> = Vec::new();
+
+    let flush_text_run = |pending_text_run: &mut Vec<(String, Option<ContentBlockMetadata>)>,
+                          sanitized_turn_text: &mut String,
+                          sanitized_blocks: &mut Vec<ContentBlock>,
+                          stats: &mut TextSanitizationStats| {
+        if pending_text_run.is_empty() {
+            return;
+        }
+
+        let (sanitized_text, sanitized_run_blocks) =
+            sanitize_text_run(pending_text_run, config, stats, run_id);
+        sanitized_turn_text.push_str(&sanitized_text);
+        sanitized_blocks.extend(sanitized_run_blocks);
+        pending_text_run.clear();
+    };
 
     for block in assistant_blocks {
         match block {
             ContentBlock::Text { text, metadata } => {
-                let sanitized_text = sanitize_text_fragment(&text, config, &mut stats);
-                sanitized_turn_text.push_str(&sanitized_text);
-                if !sanitized_text.is_empty() || metadata.is_some() {
-                    sanitized_blocks.push(ContentBlock::Text {
-                        text: sanitized_text,
-                        metadata,
-                    });
-                }
+                pending_text_run.push((text, metadata));
             }
-            other => sanitized_blocks.push(other),
+            other => {
+                flush_text_run(
+                    &mut pending_text_run,
+                    &mut sanitized_turn_text,
+                    &mut sanitized_blocks,
+                    &mut stats,
+                );
+                sanitized_blocks.push(other);
+            }
         }
     }
+
+    flush_text_run(
+        &mut pending_text_run,
+        &mut sanitized_turn_text,
+        &mut sanitized_blocks,
+        &mut stats,
+    );
 
     log_text_sanitization_stats(run_id, &stats);
     (sanitized_turn_text, sanitized_blocks)
@@ -1483,6 +1578,83 @@ mod tests {
                 assert!(metadata.is_none());
             }
             other => panic!("expected sanitized text block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_sanitize_assistant_turn_coalesces_identical_metadata_text_chunks() {
+        let config = AgentConfig::default();
+        let shared_metadata =
+            ContentBlockMetadata::with_gemini_thought_signature(Some("sig-shared".to_string()));
+        let (turn_text, assistant_blocks) = sanitize_assistant_turn(
+            "Hello world",
+            &[
+                ContentBlock::Text {
+                    text: "Hello ".to_string(),
+                    metadata: shared_metadata.clone(),
+                },
+                ContentBlock::Text {
+                    text: "world".to_string(),
+                    metadata: shared_metadata.clone(),
+                },
+            ],
+            &config,
+            "run-coalesce-identical-metadata",
+        );
+
+        assert_eq!(turn_text, "Hello world");
+        assert_eq!(assistant_blocks.len(), 1);
+        match &assistant_blocks[0] {
+            ContentBlock::Text { text, metadata } => {
+                assert_eq!(text, "Hello world");
+                assert_eq!(metadata, &shared_metadata);
+            }
+            other => panic!("expected coalesced metadata-bearing text block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_sanitize_assistant_turn_falls_back_when_boundary_changes_sanitization() {
+        let config = AgentConfig::default();
+        let (turn_text, assistant_blocks) = sanitize_assistant_turn(
+            "<script>alert(1)</script>Hello",
+            &[
+                ContentBlock::Text {
+                    text: "<scr".to_string(),
+                    metadata: ContentBlockMetadata::with_gemini_thought_signature(Some(
+                        "sig-a".to_string(),
+                    )),
+                },
+                ContentBlock::Text {
+                    text: "ipt>alert(1)</script>Hello".to_string(),
+                    metadata: ContentBlockMetadata::with_gemini_thought_signature(Some(
+                        "sig-b".to_string(),
+                    )),
+                },
+            ],
+            &config,
+            "run-cross-boundary-fallback",
+        );
+
+        assert!(
+            !turn_text.contains("<script"),
+            "whole-turn sanitization should remove dangerous HTML even when the tag spans metadata block boundaries"
+        );
+        assert_eq!(turn_text, "Hello");
+        assert_eq!(assistant_blocks.len(), 1);
+        match &assistant_blocks[0] {
+            ContentBlock::Text { text, metadata } => {
+                assert!(
+                    !text.contains("<script"),
+                    "fallback block should persist sanitized content"
+                );
+                assert_eq!(text, "Hello");
+                assert!(
+                    metadata.is_none(),
+                    "fallback path should drop per-part metadata when whole-turn sanitization crosses block boundaries"
+                );
+            }
+            other => panic!("expected fallback plain text block, got {other:?}"),
         }
     }
 
