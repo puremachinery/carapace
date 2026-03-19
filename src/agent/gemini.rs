@@ -115,7 +115,7 @@ impl GeminiProvider {
     }
 
     /// Build the JSON body for the Gemini streamGenerateContent API.
-    fn build_body(&self, request: &CompletionRequest) -> Value {
+    pub(crate) fn build_body(&self, request: &CompletionRequest) -> Value {
         let mut body = json!({});
 
         // System instruction
@@ -138,16 +138,25 @@ impl GeminiProvider {
 
             for block in &msg.content {
                 match block {
-                    ContentBlock::Text { text } => {
-                        parts.push(json!({ "text": text }));
+                    ContentBlock::Text { text, metadata } => {
+                        let mut part = json!({ "text": text });
+                        apply_gemini_thought_signature(&mut part, metadata);
+                        parts.push(part);
                     }
-                    ContentBlock::ToolUse { id: _, name, input } => {
-                        parts.push(json!({
+                    ContentBlock::ToolUse {
+                        id: _,
+                        name,
+                        input,
+                        metadata,
+                    } => {
+                        let mut part = json!({
                             "functionCall": {
                                 "name": name,
                                 "args": input,
                             }
-                        }));
+                        });
+                        apply_gemini_thought_signature(&mut part, metadata);
+                        parts.push(part);
                     }
                     ContentBlock::ToolResult {
                         tool_use_id: _,
@@ -158,14 +167,15 @@ impl GeminiProvider {
                         // Gemini uses functionResponse with name and response.
                         // We look backwards through messages to find the matching tool use name.
                         let tool_name = find_tool_name_for_result(&request.messages, block);
-                        parts.push(json!({
+                        let part = json!({
                             "functionResponse": {
                                 "name": tool_name,
                                 "response": {
                                     "result": content,
                                 }
                             }
-                        }));
+                        });
+                        parts.push(part);
                     }
                 }
             }
@@ -597,10 +607,12 @@ fn parse_gemini_finish_chunk(
 fn collect_gemini_part_events(parts: &[Value]) -> Vec<StreamEvent> {
     let mut events = Vec::new();
     for part in parts {
+        let metadata = gemini_part_metadata(part);
         if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
-            if !text.is_empty() {
+            if !text.is_empty() || metadata.is_some() {
                 events.push(StreamEvent::TextDelta {
                     text: text.to_string(),
+                    metadata: metadata.clone(),
                 });
             }
         }
@@ -616,6 +628,7 @@ fn collect_gemini_part_events(parts: &[Value]) -> Vec<StreamEvent> {
                 id,
                 name,
                 input: args,
+                metadata,
             });
         }
     }
@@ -857,6 +870,7 @@ mod tests {
                 role: LlmRole::User,
                 content: vec![ContentBlock::Text {
                     text: "Hello".to_string(),
+                    metadata: None,
                 }],
             }],
             system: Some("You are helpful.".to_string()),
@@ -896,6 +910,7 @@ mod tests {
                 role: LlmRole::User,
                 content: vec![ContentBlock::Text {
                     text: "Hi".to_string(),
+                    metadata: None,
                 }],
             }],
             system: None,
@@ -961,6 +976,7 @@ mod tests {
                     role: LlmRole::User,
                     content: vec![ContentBlock::Text {
                         text: "What's the weather?".to_string(),
+                        metadata: None,
                     }],
                 },
                 LlmMessage {
@@ -969,6 +985,7 @@ mod tests {
                         id: "call_abc123".to_string(),
                         name: "get_weather".to_string(),
                         input: json!({"city": "SF"}),
+                        metadata: None,
                     }],
                 },
                 LlmMessage {
@@ -1027,18 +1044,21 @@ mod tests {
                     role: LlmRole::User,
                     content: vec![ContentBlock::Text {
                         text: "Hello".to_string(),
+                        metadata: None,
                     }],
                 },
                 LlmMessage {
                     role: LlmRole::Assistant,
                     content: vec![ContentBlock::Text {
                         text: "Hi there!".to_string(),
+                        metadata: None,
                     }],
                 },
                 LlmMessage {
                     role: LlmRole::User,
                     content: vec![ContentBlock::Text {
                         text: "How are you?".to_string(),
+                        metadata: None,
                     }],
                 },
             ],
@@ -1068,6 +1088,7 @@ mod tests {
                 role: LlmRole::Assistant,
                 content: vec![ContentBlock::Text {
                     text: "I am a model response.".to_string(),
+                    metadata: None,
                 }],
             }],
             system: None,
@@ -1079,6 +1100,79 @@ mod tests {
         let body = provider.build_body(&request);
         let contents = body["contents"].as_array().unwrap();
         assert_eq!(contents[0]["role"], "model");
+    }
+
+    #[test]
+    fn test_build_body_preserves_text_thought_signature() {
+        let provider = GeminiProvider::new("test-key".to_string()).unwrap();
+        let request = CompletionRequest {
+            model: "gemini-2.0-flash".to_string(),
+            messages: vec![LlmMessage {
+                role: LlmRole::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "Hidden reasoning".to_string(),
+                    metadata: ContentBlockMetadata::with_gemini_thought_signature(Some(
+                        "sig-text".to_string(),
+                    )),
+                }],
+            }],
+            system: None,
+            tools: vec![],
+            max_tokens: 1024,
+            temperature: None,
+            extra: None,
+        };
+
+        let body = provider.build_body(&request);
+        assert_eq!(body["contents"][0]["parts"][0]["text"], "Hidden reasoning");
+        assert_eq!(
+            body["contents"][0]["parts"][0]["thoughtSignature"],
+            "sig-text"
+        );
+    }
+
+    #[test]
+    fn test_build_body_preserves_tool_call_thought_signature() {
+        let provider = GeminiProvider::new("test-key".to_string()).unwrap();
+        let request = CompletionRequest {
+            model: "gemini-2.0-flash".to_string(),
+            messages: vec![
+                LlmMessage {
+                    role: LlmRole::Assistant,
+                    content: vec![ContentBlock::ToolUse {
+                        id: "call_abc123".to_string(),
+                        name: "get_weather".to_string(),
+                        input: json!({"city": "SF"}),
+                        metadata: ContentBlockMetadata::with_gemini_thought_signature(Some(
+                            "sig-tool".to_string(),
+                        )),
+                    }],
+                },
+                LlmMessage {
+                    role: LlmRole::User,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: "call_abc123".to_string(),
+                        content: "72F and sunny".to_string(),
+                        is_error: false,
+                    }],
+                },
+            ],
+            system: None,
+            tools: vec![],
+            max_tokens: 1024,
+            temperature: None,
+            extra: None,
+        };
+
+        let body = provider.build_body(&request);
+        assert_eq!(
+            body["contents"][0]["parts"][0]["functionCall"]["name"],
+            "get_weather"
+        );
+        assert_eq!(
+            body["contents"][0]["parts"][0]["thoughtSignature"],
+            "sig-tool"
+        );
     }
 
     // ==================== SSE parsing tests ====================
@@ -1095,7 +1189,57 @@ mod tests {
         let events = events.unwrap();
         assert_eq!(events.len(), 1);
         match &events[0] {
-            StreamEvent::TextDelta { text } => assert_eq!(text, "Hello"),
+            StreamEvent::TextDelta { text, .. } => assert_eq!(text, "Hello"),
+            other => panic!("expected TextDelta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_text_delta_with_thought_signature() {
+        let mut usage = TokenUsage::default();
+        let mut finish_reason = None;
+        let events = parse_gemini_sse_data(
+            r#"{"candidates":[{"content":{"parts":[{"text":"Hello","thoughtSignature":"sig-text"}],"role":"model"}}]}"#,
+            &mut usage,
+            &mut finish_reason,
+        )
+        .expect("gemini response should parse");
+
+        match &events[0] {
+            StreamEvent::TextDelta { text, metadata } => {
+                assert_eq!(text, "Hello");
+                assert_eq!(
+                    metadata
+                        .as_ref()
+                        .and_then(ContentBlockMetadata::gemini_thought_signature),
+                    Some("sig-text")
+                );
+            }
+            other => panic!("expected TextDelta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_empty_text_part_with_thought_signature() {
+        let mut usage = TokenUsage::default();
+        let mut finish_reason = None;
+        let events = parse_gemini_sse_data(
+            r#"{"candidates":[{"content":{"parts":[{"text":"","thoughtSignature":"sig-empty"}],"role":"model"}}]}"#,
+            &mut usage,
+            &mut finish_reason,
+        )
+        .expect("gemini response should parse");
+
+        match &events[0] {
+            StreamEvent::TextDelta { text, metadata } => {
+                assert_eq!(text, "");
+                assert_eq!(
+                    metadata
+                        .as_ref()
+                        .and_then(ContentBlockMetadata::gemini_thought_signature),
+                    Some("sig-empty")
+                );
+            }
             other => panic!("expected TextDelta, got {other:?}"),
         }
     }
@@ -1112,12 +1256,45 @@ mod tests {
         let events = events.unwrap();
         assert_eq!(events.len(), 1);
         match &events[0] {
-            StreamEvent::ToolUse { name, input, id } => {
+            StreamEvent::ToolUse {
+                name, input, id, ..
+            } => {
                 assert_eq!(name, "get_weather");
                 assert_eq!(input["city"], "SF");
                 // ID should be a valid UUID
                 assert!(!id.is_empty());
                 assert!(uuid::Uuid::parse_str(id).is_ok());
+            }
+            other => panic!("expected ToolUse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_tool_call_with_thought_signature() {
+        let mut usage = TokenUsage::default();
+        let mut finish_reason = None;
+        let events = parse_gemini_sse_data(
+            r#"{"candidates":[{"content":{"parts":[{"functionCall":{"name":"get_weather","args":{"city":"SF"}},"thoughtSignature":"sig-tool"}],"role":"model"}}]}"#,
+            &mut usage,
+            &mut finish_reason,
+        )
+        .expect("gemini response should parse");
+
+        match &events[0] {
+            StreamEvent::ToolUse {
+                name,
+                input,
+                metadata,
+                ..
+            } => {
+                assert_eq!(name, "get_weather");
+                assert_eq!(input["city"], "SF");
+                assert_eq!(
+                    metadata
+                        .as_ref()
+                        .and_then(ContentBlockMetadata::gemini_thought_signature),
+                    Some("sig-tool")
+                );
             }
             other => panic!("expected ToolUse, got {other:?}"),
         }
@@ -1348,14 +1525,14 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, StreamEvent::TextDelta { text } if text == "Hello")),
+                .any(|e| matches!(e, StreamEvent::TextDelta { text, .. } if text == "Hello")),
             "expected TextDelta 'Hello', got: {:?}",
             events,
         );
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, StreamEvent::TextDelta { text } if text == " world")),
+                .any(|e| matches!(e, StreamEvent::TextDelta { text, .. } if text == " world")),
             "expected TextDelta ' world', got: {:?}",
             events,
         );
@@ -1430,7 +1607,7 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, StreamEvent::TextDelta { text } if text == "Hello")),
+                .any(|e| matches!(e, StreamEvent::TextDelta { text, .. } if text == "Hello")),
             "expected TextDelta 'Hello', got: {:?}",
             events,
         );

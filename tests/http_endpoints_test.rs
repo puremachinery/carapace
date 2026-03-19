@@ -373,6 +373,7 @@ impl LlmProvider for MockLlmProvider {
             let _ = tx
                 .send(StreamEvent::TextDelta {
                     text: "Mock response from LLM.".to_string(),
+                    metadata: None,
                 })
                 .await;
             let _ = tx

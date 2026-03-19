@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::borrow::Cow;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -12,13 +13,17 @@ use crate::agent::AgentError;
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
     /// Incremental text output.
-    TextDelta { text: String },
+    TextDelta {
+        text: String,
+        metadata: Option<ContentBlockMetadata>,
+    },
 
     /// The model wants to call a tool.
     ToolUse {
         id: String,
         name: String,
         input: serde_json::Value,
+        metadata: Option<ContentBlockMetadata>,
     },
 
     /// The model finished its turn.
@@ -80,17 +85,101 @@ pub enum LlmRole {
 pub enum ContentBlock {
     Text {
         text: String,
+        metadata: Option<ContentBlockMetadata>,
     },
     ToolUse {
         id: String,
         name: String,
         input: serde_json::Value,
+        metadata: Option<ContentBlockMetadata>,
     },
     ToolResult {
         tool_use_id: String,
         content: String,
         is_error: bool,
     },
+}
+
+/// Provider-specific metadata associated with a content part.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentBlockMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gemini: Option<GeminiPartMetadata>,
+}
+
+/// Gemini/Vertex-specific metadata carried on content parts.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeminiPartMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
+}
+
+const MAX_GEMINI_THOUGHT_SIGNATURE_BYTES: usize = 64 * 1024;
+
+impl ContentBlockMetadata {
+    pub fn with_gemini_thought_signature(thought_signature: Option<String>) -> Option<Self> {
+        thought_signature.map(|thought_signature| Self {
+            gemini: Some(GeminiPartMetadata {
+                thought_signature: Some(thought_signature),
+            }),
+        })
+    }
+
+    pub fn gemini_thought_signature(&self) -> Option<&str> {
+        self.gemini
+            .as_ref()
+            .and_then(|gemini| gemini.thought_signature.as_deref())
+    }
+
+    pub fn has_effective_provider_metadata(&self) -> bool {
+        self.gemini_thought_signature().is_some()
+    }
+}
+
+pub(crate) fn apply_gemini_thought_signature(
+    part: &mut Value,
+    metadata: &Option<ContentBlockMetadata>,
+) {
+    if let Some(thought_signature) = metadata
+        .as_ref()
+        .and_then(ContentBlockMetadata::gemini_thought_signature)
+    {
+        part["thoughtSignature"] = json!(thought_signature);
+    }
+}
+
+pub(crate) fn gemini_part_metadata(part: &Value) -> Option<ContentBlockMetadata> {
+    let thought_signature = part
+        .get("thoughtSignature")
+        .and_then(|value| value.as_str())
+        .and_then(|value| {
+            if value.len() > MAX_GEMINI_THOUGHT_SIGNATURE_BYTES {
+                tracing::warn!(
+                    signature_bytes = value.len(),
+                    max_signature_bytes = MAX_GEMINI_THOUGHT_SIGNATURE_BYTES,
+                    "dropping oversized Gemini thoughtSignature"
+                );
+                None
+            } else {
+                Some(value.to_owned())
+            }
+        });
+    ContentBlockMetadata::with_gemini_thought_signature(thought_signature)
+}
+
+impl ContentBlock {
+    pub fn metadata(&self) -> Option<&ContentBlockMetadata> {
+        match self {
+            Self::Text { metadata, .. } | Self::ToolUse { metadata, .. } => metadata.as_ref(),
+            Self::ToolResult { .. } => None,
+        }
+    }
+
+    pub fn has_provider_metadata(&self) -> bool {
+        self.metadata()
+            .is_some_and(ContentBlockMetadata::has_effective_provider_metadata)
+    }
 }
 
 /// A tool definition for the LLM.
@@ -675,5 +764,19 @@ mod tests {
             summary.len()
         );
         assert!(summary.ends_with("..."));
+    }
+
+    #[test]
+    fn test_gemini_part_metadata_drops_oversized_thought_signature() {
+        let oversized = "a".repeat(MAX_GEMINI_THOUGHT_SIGNATURE_BYTES + 1);
+        let part = json!({
+            "text": "Hello",
+            "thoughtSignature": oversized,
+        });
+
+        assert!(
+            gemini_part_metadata(&part).is_none(),
+            "oversized thought signatures should be dropped instead of persisted"
+        );
     }
 }

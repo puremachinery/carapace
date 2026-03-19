@@ -195,7 +195,7 @@ fn convert_user_message_ollama(msg: &LlmMessage, messages: &mut Vec<Value>) {
                         "content": content,
                     }));
                 }
-                ContentBlock::Text { text } => {
+                ContentBlock::Text { text, .. } => {
                     messages.push(json!({
                         "role": "user",
                         "content": text,
@@ -231,7 +231,9 @@ fn convert_assistant_message_ollama(msg: &LlmMessage, messages: &mut Vec<Value>)
             .content
             .iter()
             .filter_map(|b| match b {
-                ContentBlock::ToolUse { id, name, input } => Some(json!({
+                ContentBlock::ToolUse {
+                    id, name, input, ..
+                } => Some(json!({
                     "id": id,
                     "type": "function",
                     "function": {
@@ -265,7 +267,7 @@ fn collect_text_blocks_ollama(content: &[ContentBlock]) -> String {
     content
         .iter()
         .filter_map(|b| match b {
-            ContentBlock::Text { text } => Some(text.as_str()),
+            ContentBlock::Text { text, .. } => Some(text.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -544,6 +546,7 @@ mod tests {
                 role: LlmRole::User,
                 content: vec![ContentBlock::Text {
                     text: "Hello".to_string(),
+                    metadata: None,
                 }],
             }],
             system: Some("You are helpful.".to_string()),
@@ -609,6 +612,7 @@ mod tests {
                     role: LlmRole::User,
                     content: vec![ContentBlock::Text {
                         text: "What's the weather?".to_string(),
+                        metadata: None,
                     }],
                 },
                 LlmMessage {
@@ -616,11 +620,13 @@ mod tests {
                     content: vec![
                         ContentBlock::Text {
                             text: "Let me check.".to_string(),
+                            metadata: None,
                         },
                         ContentBlock::ToolUse {
                             id: "call_abc123".to_string(),
                             name: "get_weather".to_string(),
                             input: json!({"city": "SF"}),
+                            metadata: None,
                         },
                     ],
                 },
@@ -671,6 +677,7 @@ mod tests {
                 role: LlmRole::User,
                 content: vec![ContentBlock::Text {
                     text: "Hi".to_string(),
+                    metadata: None,
                 }],
             }],
             system: None,

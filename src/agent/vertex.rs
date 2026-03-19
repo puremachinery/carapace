@@ -123,7 +123,7 @@ impl TokenProvider for MetadataProvider {
 // Request / Response Helpers
 // =================================================================================================
 
-fn build_gemini_body(request: &CompletionRequest) -> Value {
+pub(crate) fn build_gemini_body(request: &CompletionRequest) -> Value {
     let mut body = json!({});
 
     // System instruction
@@ -146,16 +146,25 @@ fn build_gemini_body(request: &CompletionRequest) -> Value {
 
         for block in &msg.content {
             match block {
-                ContentBlock::Text { text } => {
-                    parts.push(json!({ "text": text }));
+                ContentBlock::Text { text, metadata } => {
+                    let mut part = json!({ "text": text });
+                    apply_gemini_thought_signature(&mut part, metadata);
+                    parts.push(part);
                 }
-                ContentBlock::ToolUse { id: _, name, input } => {
-                    parts.push(json!({
+                ContentBlock::ToolUse {
+                    id: _,
+                    name,
+                    input,
+                    metadata,
+                } => {
+                    let mut part = json!({
                         "functionCall": {
                             "name": name,
                             "args": input,
                         }
-                    }));
+                    });
+                    apply_gemini_thought_signature(&mut part, metadata);
+                    parts.push(part);
                 }
                 ContentBlock::ToolResult {
                     tool_use_id: _,
@@ -163,14 +172,15 @@ fn build_gemini_body(request: &CompletionRequest) -> Value {
                     is_error: _,
                 } => {
                     let tool_name = find_tool_name_for_result(&request.messages, block);
-                    parts.push(json!({
+                    let part = json!({
                         "functionResponse": {
                             "name": tool_name,
                             "response": {
                                 "result": content,
                             }
                         }
-                    }));
+                    });
+                    parts.push(part);
                 }
             }
         }
@@ -695,10 +705,12 @@ fn extract_vertex_usage(parsed: &Value, accumulated_usage: &mut TokenUsage) {
 fn collect_vertex_part_events(parts: &[Value]) -> Vec<StreamEvent> {
     let mut events = Vec::new();
     for part in parts {
+        let metadata = gemini_part_metadata(part);
         if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
-            if !text.is_empty() {
+            if !text.is_empty() || metadata.is_some() {
                 events.push(StreamEvent::TextDelta {
                     text: text.to_string(),
+                    metadata: metadata.clone(),
                 });
             }
         }
@@ -714,6 +726,7 @@ fn collect_vertex_part_events(parts: &[Value]) -> Vec<StreamEvent> {
                 id,
                 name,
                 input: args,
+                metadata,
             });
         }
     }
@@ -753,6 +766,7 @@ mod tests {
                 role: LlmRole::User,
                 content: vec![ContentBlock::Text {
                     text: "Hello".to_string(),
+                    metadata: None,
                 }],
             }],
             system: Some("You are a helpful assistant.".to_string()),
@@ -779,6 +793,77 @@ mod tests {
         assert_eq!(
             body["tools"][0]["function_declarations"][0]["name"],
             "get_weather"
+        );
+    }
+
+    #[test]
+    fn test_gemini_adapter_build_body_preserves_text_thought_signature() {
+        let request = CompletionRequest {
+            model: "vertex/gemini-1.5-pro".to_string(),
+            messages: vec![LlmMessage {
+                role: LlmRole::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "Hello".to_string(),
+                    metadata: ContentBlockMetadata::with_gemini_thought_signature(Some(
+                        "sig-text".to_string(),
+                    )),
+                }],
+            }],
+            system: None,
+            temperature: None,
+            max_tokens: 100,
+            tools: vec![],
+            extra: None,
+        };
+
+        let body = build_gemini_body(&request);
+        assert_eq!(body["contents"][0]["parts"][0]["text"], "Hello");
+        assert_eq!(
+            body["contents"][0]["parts"][0]["thoughtSignature"],
+            "sig-text"
+        );
+    }
+
+    #[test]
+    fn test_gemini_adapter_build_body_preserves_tool_call_thought_signature() {
+        let request = CompletionRequest {
+            model: "vertex/gemini-1.5-pro".to_string(),
+            messages: vec![
+                LlmMessage {
+                    role: LlmRole::Assistant,
+                    content: vec![ContentBlock::ToolUse {
+                        id: "call_abc123".to_string(),
+                        name: "get_weather".to_string(),
+                        input: json!({"city": "SF"}),
+                        metadata: ContentBlockMetadata::with_gemini_thought_signature(Some(
+                            "sig-tool".to_string(),
+                        )),
+                    }],
+                },
+                LlmMessage {
+                    role: LlmRole::User,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: "call_abc123".to_string(),
+                        content: "72F and sunny".to_string(),
+                        is_error: false,
+                    }],
+                },
+            ],
+            system: None,
+            temperature: None,
+            max_tokens: 100,
+            tools: vec![],
+            extra: None,
+        };
+
+        let body = build_gemini_body(&request);
+        assert_eq!(
+            body["contents"][0]["parts"][0]["functionCall"]["name"],
+            "get_weather"
+        );
+        assert_eq!(
+            body["contents"][0]["parts"][0]["thoughtSignature"],
+            "sig-tool"
         );
     }
 
@@ -914,8 +999,89 @@ mod tests {
         let events = parse_gemini_chunk(&data, &mut usage).unwrap();
         assert_eq!(events.len(), 1);
         match &events[0] {
-            StreamEvent::TextDelta { text } => assert_eq!(text, "Hello"),
+            StreamEvent::TextDelta { text, .. } => assert_eq!(text, "Hello"),
             _ => panic!("Expected TextDelta"),
+        }
+
+        let data = json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{ "text": "Hello", "thoughtSignature": "sig-text" }]
+                }
+            }]
+        })
+        .to_string();
+
+        let events = parse_gemini_chunk(&data, &mut usage).unwrap();
+        match &events[0] {
+            StreamEvent::TextDelta { text, metadata } => {
+                assert_eq!(text, "Hello");
+                assert_eq!(
+                    metadata
+                        .as_ref()
+                        .and_then(ContentBlockMetadata::gemini_thought_signature),
+                    Some("sig-text")
+                );
+            }
+            _ => panic!("Expected TextDelta"),
+        }
+
+        let data = json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{ "text": "", "thoughtSignature": "sig-empty" }]
+                }
+            }]
+        })
+        .to_string();
+
+        let events = parse_gemini_chunk(&data, &mut usage).unwrap();
+        match &events[0] {
+            StreamEvent::TextDelta { text, metadata } => {
+                assert_eq!(text, "");
+                assert_eq!(
+                    metadata
+                        .as_ref()
+                        .and_then(ContentBlockMetadata::gemini_thought_signature),
+                    Some("sig-empty")
+                );
+            }
+            _ => panic!("Expected TextDelta"),
+        }
+
+        let data = json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "functionCall": {
+                            "name": "get_weather",
+                            "args": { "city": "SF" }
+                        },
+                        "thoughtSignature": "sig-tool"
+                    }]
+                }
+            }]
+        })
+        .to_string();
+
+        let events = parse_gemini_chunk(&data, &mut usage).unwrap();
+        match &events[0] {
+            StreamEvent::ToolUse {
+                name,
+                input,
+                metadata,
+                ..
+            } => {
+                assert_eq!(name, "get_weather");
+                assert_eq!(input["city"], "SF");
+                assert_eq!(
+                    metadata
+                        .as_ref()
+                        .and_then(ContentBlockMetadata::gemini_thought_signature),
+                    Some("sig-tool")
+                );
+            }
+            _ => panic!("Expected ToolUse"),
         }
 
         // chunk with usage and finish reason

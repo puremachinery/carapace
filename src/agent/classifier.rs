@@ -187,6 +187,7 @@ pub async fn classify_message(
             role: LlmRole::User,
             content: vec![ContentBlock::Text {
                 text: message.to_string(),
+                metadata: None,
             }],
         }],
         system: Some(CLASSIFIER_SYSTEM_PROMPT.to_string()),
@@ -205,7 +206,7 @@ pub async fn classify_message(
     let mut response_text = String::new();
     while let Some(event) = rx.recv().await {
         match event {
-            StreamEvent::TextDelta { text } => response_text.push_str(&text),
+            StreamEvent::TextDelta { text, .. } => response_text.push_str(&text),
             StreamEvent::Stop { .. } => break,
             StreamEvent::Error { message } => {
                 CONSECUTIVE_FAILURES.fetch_add(1, Ordering::Relaxed);
@@ -629,6 +630,7 @@ mod tests {
                     let _ = tx
                         .send(StreamEvent::TextDelta {
                             text: r#"{"category": "clean", "confidence": 0.99, "reasoning": "Normal greeting"}"#.to_string(),
+                            metadata: None,
                         })
                         .await;
                     let _ = tx
@@ -675,6 +677,7 @@ mod tests {
                     let _ = tx
                         .send(StreamEvent::TextDelta {
                             text: r#"{"category": "prompt_injection", "confidence": 0.95, "reasoning": "Attempts to override system prompt"}"#.to_string(),
+                            metadata: None,
                         })
                         .await;
                     let _ = tx
