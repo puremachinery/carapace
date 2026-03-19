@@ -133,6 +133,13 @@ Every release should include these sections:
 - Remaining limitations or partial areas relevant to operators.
 ```
 
+Curated release notes are versioned in-repo at:
+
+- `docs/releases/vX.Y.Z.md`
+
+The tag-triggered release workflow publishes that exact file and fails closed if
+it is missing.
+
 ## Reproducible Release Checklist
 
 1. Confirm `master` is green (CI + CodeQL + required checks).
@@ -143,6 +150,8 @@ Every release should include these sections:
 5. Push tag:
    - `git push origin vX.Y.Z`
    - For intentional prereleases only: `vX.Y.Z-previewN`
+   - Before pushing the tag, commit `docs/releases/vX.Y.Z.md` with all required
+     release-note sections.
 6. Wait for `.github/workflows/release.yml` to complete.
 7. Verify release artifacts are published (all target binaries + signatures +
    checksums).
@@ -158,6 +167,7 @@ Every release should include these sections:
    - Optional live channel smoke:
      - `scripts/smoke/live-channel-smoke.sh`
 10. Confirm release notes contain all required sections above.
+    - The published GitHub release body should match `docs/releases/vX.Y.Z.md`.
 
 ## Distribution Notes
 

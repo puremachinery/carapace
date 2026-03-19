@@ -75,6 +75,8 @@ jobs:
     name: Create Release
     needs: build
     runs-on: ubuntu-latest
+    env:
+      RELEASE_NOTES_PATH: docs/releases/${{ github.ref_name }}.md
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -82,6 +84,14 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
+
+      - name: Validate curated release notes
+        run: |
+          set -euo pipefail
+          if [ ! -f "$RELEASE_NOTES_PATH" ]; then
+            echo "missing curated release notes: $RELEASE_NOTES_PATH" >&2
+            exit 1
+          fi
 
       - name: Generate checksums
         run: |
@@ -111,5 +121,5 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
         with:
-          generate_release_notes: true
+          body_path: ${{ env.RELEASE_NOTES_PATH }}
           files: artifacts/*
