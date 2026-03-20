@@ -2672,14 +2672,14 @@ fn default_setup_provider_choice(provider_hints: &[SetupProviderChoice]) -> Setu
     }
 }
 
-fn extract_env_placeholder_key(value: &str) -> Option<String> {
-    value
-        .trim()
-        .strip_prefix("${")
-        .and_then(|trimmed| trimmed.strip_suffix('}'))
-        .map(str::trim)
-        .filter(|key| !key.is_empty())
-        .map(ToOwned::to_owned)
+fn referenced_env_vars(value: &str) -> Vec<String> {
+    crate::config::env_var_references_in_string(value)
+}
+
+fn first_missing_env_var(value: &str) -> Option<String> {
+    referenced_env_vars(value)
+        .into_iter()
+        .find(|env_var| !env_var_present(env_var))
 }
 
 fn config_string(cfg: &Value, path: &[&str]) -> Option<String> {
@@ -2695,9 +2695,9 @@ fn config_string(cfg: &Value, path: &[&str]) -> Option<String> {
 }
 
 fn config_value_is_usable(value: &str) -> bool {
-    extract_env_placeholder_key(value)
-        .map(|env_var| env_var_present(&env_var))
-        .unwrap_or(true)
+    referenced_env_vars(value)
+        .into_iter()
+        .all(|env_var| env_var_present(&env_var))
 }
 
 fn config_path_has_usable_value(cfg: &Value, path: &[&str]) -> bool {
@@ -2707,9 +2707,7 @@ fn config_path_has_usable_value(cfg: &Value, path: &[&str]) -> bool {
 }
 
 fn unresolved_placeholder_env_var(cfg: &Value, path: &[&str]) -> Option<String> {
-    config_string(cfg, path)
-        .and_then(|value| extract_env_placeholder_key(&value))
-        .filter(|env_var| !env_var_present(env_var))
+    config_string(cfg, path).and_then(|value| first_missing_env_var(&value))
 }
 
 fn ollama_configured_for_guidance(cfg: &Value) -> bool {
@@ -2820,10 +2818,8 @@ fn single_credential_provider_guidance(
     }
 
     if let Some(configured) = config_string(cfg, config_path) {
-        if let Some(env_var) = extract_env_placeholder_key(&configured) {
-            if !env_var_present(&env_var) {
-                return missing_placeholder_guidance(&env_var);
-            }
+        if let Some(env_var) = first_missing_env_var(&configured) {
+            return missing_placeholder_guidance(&env_var);
         }
         return configured_message.to_string();
     }
@@ -4944,7 +4940,7 @@ fn handle_setup_validation_failure(
             format!("fix the value and rerun `{rerun}`"),
         ))
     } else {
-        Err("setup aborted after credential validation failure".into())
+        Err("setup aborted after provider configuration validation failure".into())
     }
 }
 
@@ -7658,6 +7654,24 @@ mod tests {
     }
 
     #[test]
+    fn test_local_chat_verify_next_step_for_missing_embedded_bedrock_env_var() {
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("AWS_REGION_SUFFIX");
+        let cfg = serde_json::json!({
+            "bedrock": {
+                "region": "us-${AWS_REGION_SUFFIX}-1",
+                "accessKeyId": "AKIA...",
+                "secretAccessKey": "secret"
+            },
+            "agents": { "defaults": { "model": "bedrock:anthropic.claude-3-5-sonnet-20240620-v1:0" } }
+        });
+        assert_eq!(
+            local_chat_verify_next_step(&cfg),
+            "set `$AWS_REGION_SUFFIX` in the same shell you use for `cara start` and `cara verify`, or rerun `cara setup --force` to write the key into config, then retry `cara verify --outcome local-chat`"
+        );
+    }
+
+    #[test]
     fn test_detect_setup_provider_env_hints_ignore_partial_aws_env() {
         let mut env_guard = ScopedEnv::new();
         env_guard.set("AWS_REGION", "us-east-1");
@@ -8567,6 +8581,26 @@ mod tests {
         assert_eq!(state.provider_validation_calls, 0);
         assert!(state.channel_validation_results.is_empty());
         assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
+    fn test_handle_setup_validation_failure_uses_provider_configuration_abort_message() {
+        let _guard = install_setup_interactive_harness(SetupInteractiveTestHarness {
+            visible_inputs: VecDeque::from(vec!["n".to_string()]),
+            ..Default::default()
+        });
+
+        let result = handle_setup_validation_failure(
+            SetupProvider::Gemini,
+            Some(GeminiSetupAuthMode::ApiKey),
+            crate::agent::AgentError::InvalidBaseUrl("bad".to_string()),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "setup aborted after provider configuration validation failure"
+        );
     }
 
     // -----------------------------------------------------------------------

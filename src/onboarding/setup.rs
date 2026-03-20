@@ -621,19 +621,27 @@ fn configured_value_check(
     rerun_command: &str,
 ) -> SetupCheck {
     match config_string(cfg, path) {
-        Some(value) => match extract_env_placeholder_key(&value) {
-            Some(env_var) if !env_var_present(&env_var) => SetupCheck::fail(
-                label,
-                format!("{label} references `${env_var}`, but it is not set"),
-                format!(
-                    "set `${env_var}` in the same shell or rerun `{rerun_command}` to rewrite the value"
-                ),
-            ),
-            Some(env_var) => {
-                SetupCheck::pass(label, format!("{label} resolves from `${env_var}`"))
+        Some(value) => {
+            let references = env_var_references(&value);
+            let missing = missing_env_var_references(&references);
+            if !missing.is_empty() {
+                let env_vars = format_env_var_list(&missing);
+                SetupCheck::fail(
+                    label,
+                    format!("{label} references {env_vars}, but they are not set"),
+                    format!(
+                        "set {env_vars} in the same shell or rerun `{rerun_command}` to rewrite the value"
+                    ),
+                )
+            } else if !references.is_empty() {
+                SetupCheck::pass(
+                    label,
+                    format!("{label} resolves from {}", format_env_var_list(&references)),
+                )
+            } else {
+                SetupCheck::pass(label, format!("{label} is written in config"))
             }
-            None => SetupCheck::pass(label, format!("{label} is written in config")),
-        },
+        }
         None => SetupCheck::fail(
             label,
             format!("{label} is not configured"),
@@ -644,15 +652,25 @@ fn configured_value_check(
 
 fn optional_configured_value_check(cfg: &Value, path: &[&str], label: &str) -> SetupCheck {
     match config_string(cfg, path) {
-        Some(value) => match extract_env_placeholder_key(&value) {
-            Some(env_var) if !env_var_present(&env_var) => SetupCheck::fail(
-                label,
-                format!("{label} references `${env_var}`, but it is not set"),
-                format!("set `${env_var}` before starting Carapace"),
-            ),
-            Some(env_var) => SetupCheck::pass(label, format!("{label} resolves from `${env_var}`")),
-            None => SetupCheck::pass(label, format!("{label} is written in config")),
-        },
+        Some(value) => {
+            let references = env_var_references(&value);
+            let missing = missing_env_var_references(&references);
+            if !missing.is_empty() {
+                let env_vars = format_env_var_list(&missing);
+                SetupCheck::fail(
+                    label,
+                    format!("{label} references {env_vars}, but they are not set"),
+                    format!("set {env_vars} before starting Carapace"),
+                )
+            } else if !references.is_empty() {
+                SetupCheck::pass(
+                    label,
+                    format!("{label} resolves from {}", format_env_var_list(&references)),
+                )
+            } else {
+                SetupCheck::pass(label, format!("{label} is written in config"))
+            }
+        }
         None => SetupCheck::skip(label, format!("{label} is not configured"), None),
     }
 }
@@ -670,24 +688,25 @@ where
     let Some(value) = config_string(cfg, path) else {
         return SetupCheck::skip(label, "no custom base URL configured", None);
     };
-    if let Some(env_var) = extract_env_placeholder_key(&value) {
-        if !env_var_present(&env_var) {
-            return SetupCheck::fail(
-                label,
-                format!("{label} references `${env_var}`, but it is not set"),
-                format!(
-                    "set `${env_var}` in the same shell or rerun `{rerun_command}` to rewrite the base URL"
-                ),
-            );
-        }
+    let references = env_var_references(&value);
+    let missing = missing_env_var_references(&references);
+    if !missing.is_empty() {
+        let env_vars = format_env_var_list(&missing);
+        return SetupCheck::fail(
+            label,
+            format!("{label} references {env_vars}, but they are not set"),
+            format!(
+                "set {env_vars} in the same shell or rerun `{rerun_command}` to rewrite the base URL"
+            ),
+        );
     }
 
     let effective = effective_config_value(&value).unwrap_or_else(|| value.clone());
     match validator(&effective) {
         Ok(()) => SetupCheck::pass(label, format!("{label} passed local validation")),
-        Err(_) => SetupCheck::fail(
+        Err(err) => SetupCheck::fail(
             label,
-            format!("{label} failed local validation"),
+            format!("{label} failed local validation: {err}"),
             format!("rerun `{rerun_command}` and correct the base URL"),
         ),
     }
@@ -733,24 +752,40 @@ fn config_string(cfg: &Value, path: &[&str]) -> Option<String> {
 }
 
 fn effective_config_value(value: &str) -> Option<String> {
-    extract_env_placeholder_key(value)
-        .and_then(|env_var| std::env::var(env_var).ok())
-        .map(|resolved| resolved.trim().to_string())
-        .filter(|resolved| !resolved.is_empty())
-        .or_else(|| {
-            let trimmed = value.trim();
-            (!trimmed.is_empty()).then(|| trimmed.to_string())
-        })
+    let references = env_var_references(value);
+    if references.is_empty() {
+        let trimmed = value.trim();
+        return (!trimmed.is_empty()).then(|| trimmed.to_string());
+    }
+
+    if missing_env_var_references(&references).is_empty() {
+        crate::config::substitute_env_in_string(value)
+            .ok()
+            .map(|resolved| resolved.trim().to_string())
+            .filter(|resolved| !resolved.is_empty())
+    } else {
+        None
+    }
 }
 
-fn extract_env_placeholder_key(value: &str) -> Option<String> {
-    value
-        .trim()
-        .strip_prefix("${")
-        .and_then(|trimmed| trimmed.strip_suffix('}'))
-        .map(str::trim)
-        .filter(|key| !key.is_empty())
-        .map(ToOwned::to_owned)
+fn env_var_references(value: &str) -> Vec<String> {
+    crate::config::env_var_references_in_string(value)
+}
+
+fn missing_env_var_references(env_vars: &[String]) -> Vec<String> {
+    env_vars
+        .iter()
+        .filter(|env_var| !env_var_present(env_var))
+        .cloned()
+        .collect()
+}
+
+fn format_env_var_list(env_vars: &[String]) -> String {
+    env_vars
+        .iter()
+        .map(|env_var| format!("`${env_var}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn model_provider_for_local_chat(model: &str) -> Option<SetupProvider> {
@@ -820,6 +855,48 @@ mod tests {
             .recommended_remediation()
             .expect("remediation")
             .contains("ANTHROPIC_API_KEY"));
+    }
+
+    #[test]
+    fn test_base_url_validation_check_resolves_embedded_env_placeholders() {
+        let cfg = json!({
+            "venice": { "baseUrl": "https://${SETUP_TEST_HOST}/v1" }
+        });
+        let mut env = ScopedEnv::new();
+        env.set("SETUP_TEST_HOST", "api.example.com");
+
+        let check = base_url_validation_check(
+            &cfg,
+            &["venice", "baseUrl"],
+            "Venice base URL validation",
+            "cara setup --provider venice",
+            |url| {
+                assert_eq!(url, "https://api.example.com/v1");
+                Ok(())
+            },
+        );
+
+        assert_eq!(check.status, SetupCheckStatus::Pass);
+    }
+
+    #[test]
+    fn test_base_url_validation_check_reports_missing_embedded_env_placeholders() {
+        let cfg = json!({
+            "venice": { "baseUrl": "https://${SETUP_TEST_HOST}/v1" }
+        });
+        let mut env = ScopedEnv::new();
+        env.unset("SETUP_TEST_HOST");
+
+        let check = base_url_validation_check(
+            &cfg,
+            &["venice", "baseUrl"],
+            "Venice base URL validation",
+            "cara setup --provider venice",
+            |_| Ok(()),
+        );
+
+        assert_eq!(check.status, SetupCheckStatus::Fail);
+        assert!(check.detail.contains("SETUP_TEST_HOST"));
     }
 
     #[test]

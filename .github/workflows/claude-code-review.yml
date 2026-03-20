@@ -2,8 +2,8 @@ name: Claude Code Review
 
 on:
   # Use pull_request because Anthropic's app-token exchange currently succeeds on
-  # this event model. Review remains same-repo-only and GitHub-context-only;
-  # this workflow does not check out PR head.
+  # this event model. Review remains same-repo-only; the workflow now checks out
+  # PR head because the Claude action currently expects a live git repository.
   pull_request:
     types: [opened, synchronize, ready_for_review, reopened]
 
@@ -57,7 +57,15 @@ jobs:
           echo "Skipping Claude review because this PR modifies Claude workflow files."
           echo "Anthropic requires the review workflow file to match the default branch content."
 
-      - name: Run Claude review analysis (GitHub-context only)
+      - name: Check out PR head for Claude review
+        if: steps.workflow-change.outputs.changed != 'true'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Run Claude review analysis
         id: claude-review
         if: steps.workflow-change.outputs.changed != 'true'
         continue-on-error: true
@@ -100,7 +108,7 @@ jobs:
             - Do NOT post any GitHub reviews/comments.
             - Use `gh` only for read-only pull request inspection. Do NOT use it to post reviews/comments or mutate GitHub state.
             - Do NOT modify repository contents, create commits/branches, or open/update pull requests.
-            - Review this pull request using GitHub PR context; do not rely on a checked-out workspace.
+            - Review this pull request using GitHub PR context and the checked-out diff; do not mutate repository contents.
             - If GitHub PR context is insufficient, use only the available read-only PR inspection commands: `gh pr view`, `gh pr diff`, and `jq` to parse PR JSON output.
             - Return only the structured review object that matches the provided schema.
             - Do not wrap the structured output in markdown or code fences.
