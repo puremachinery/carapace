@@ -479,16 +479,50 @@ fn download_skill_wasm(
     Ok((dest_path, bytes.to_vec()))
 }
 
-pub(super) fn handle_skills_status() -> Result<Value, ErrorShape> {
+pub(super) fn handle_skills_status(state: &WsServerState) -> Result<Value, ErrorShape> {
     let cfg = config::load_config().unwrap_or(Value::Object(serde_json::Map::new()));
     let workspace_dir = resolve_workspace_dir(&cfg);
-    let managed_skills_dir = workspace_dir.join("skills");
-
-    let skills_arr = build_skills_array(&cfg);
+    let managed_skills_dir = resolve_skills_dir();
+    let (plugins_enabled, configured_paths, runtime_errors, skills_arr, restart_required) =
+        if let Some(report) = state.plugin_activation_report() {
+            (
+                report.enabled,
+                report
+                    .configured_paths
+                    .iter()
+                    .map(|path| path.to_string_lossy().to_string())
+                    .collect::<Vec<_>>(),
+                report.errors.clone(),
+                build_skills_array_from_report(report),
+                report.restart_required_for_changes,
+            )
+        } else {
+            (
+                cfg.pointer("/plugins/enabled")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(true),
+                cfg.pointer("/plugins/load/paths")
+                    .and_then(|value| value.as_array())
+                    .map(|paths| {
+                        paths
+                            .iter()
+                            .filter_map(|value| value.as_str().map(|path| path.to_string()))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default(),
+                Vec::new(),
+                build_skills_array(&cfg),
+                true,
+            )
+        };
 
     Ok(json!({
         "workspaceDir": workspace_dir.to_string_lossy(),
         "managedSkillsDir": managed_skills_dir.to_string_lossy(),
+        "pluginsEnabled": plugins_enabled,
+        "configuredPluginPaths": configured_paths,
+        "restartRequiredForChanges": restart_required,
+        "errors": runtime_errors,
         "skills": skills_arr
     }))
 }
@@ -517,10 +551,39 @@ fn build_skills_array(cfg: &Value) -> Vec<Value> {
         .collect()
 }
 
+fn build_skills_array_from_report(
+    report: &crate::server::startup::PluginActivationReport,
+) -> Vec<Value> {
+    let mut skills = report
+        .entries
+        .iter()
+        .map(|entry| {
+            json!({
+                "name": entry.name,
+                "pluginId": entry.plugin_id,
+                "enabled": entry.enabled,
+                "installId": entry.install_id.clone().unwrap_or(Value::Null),
+                "requestedAt": entry.requested_at.map(Value::from).unwrap_or(Value::Null),
+                "source": entry.source.label(),
+                "state": entry.state.label(),
+                "path": entry.path.as_ref().map(|path| path.to_string_lossy().to_string()),
+                "reason": entry.reason,
+            })
+        })
+        .collect::<Vec<_>>();
+    skills.sort_by(|left, right| {
+        let left_name = left.get("name").and_then(Value::as_str).unwrap_or_default();
+        let right_name = right
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        left_name.cmp(right_name)
+    });
+    skills
+}
+
 pub(super) fn handle_skills_bins() -> Result<Value, ErrorShape> {
-    let cfg = config::load_config().unwrap_or(Value::Object(serde_json::Map::new()));
-    let workspace_dir = resolve_workspace_dir(&cfg);
-    let managed_skills_dir = workspace_dir.join("skills");
+    let managed_skills_dir = resolve_skills_dir();
 
     let bins = scan_skills_bins(&managed_skills_dir);
 
@@ -678,6 +741,10 @@ fn handle_skills_install_inner(
         "skills_dir": skills_dir.to_string_lossy(),
         "publisher_key": publisher_key,
         "signature": signature,
+        "activation": {
+            "state": "restart-required",
+            "message": "restart Carapace to activate the installed skill"
+        }
     }))
 }
 
@@ -792,12 +859,17 @@ fn handle_skills_update_inner(
         "skills_dir": skills_dir.to_string_lossy(),
         "publisher_key": publisher_key,
         "signature": signature,
+        "activation": {
+            "state": "restart-required",
+            "message": "restart Carapace to activate the updated skill"
+        }
     }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::ws::{WsServerConfig, WsServerState};
     use crate::test_support::env::ScopedEnv;
     use tempfile::TempDir;
 
@@ -905,6 +977,72 @@ mod tests {
         let cfg = json!({ "skills": { "entries": [1, 2, 3] } });
         let result = build_skills_array(&cfg);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_handle_skills_status_uses_plugin_activation_report() {
+        let state_dir = TempDir::new().unwrap();
+        let config_dir = TempDir::new().unwrap();
+        let config_path = config_dir.path().join("carapace.json");
+        let mut env = ScopedEnv::new();
+        env.set("CARAPACE_STATE_DIR", state_dir.path().as_os_str())
+            .set("CARAPACE_CONFIG_PATH", config_path.as_os_str())
+            .set("CARAPACE_DISABLE_CONFIG_CACHE", "1");
+        crate::config::clear_cache();
+
+        let state = WsServerState::new(WsServerConfig::default()).with_plugin_activation_report(
+            crate::server::startup::PluginActivationReport {
+                enabled: true,
+                managed_dir: state_dir.path().join("skills"),
+                configured_paths: vec![state_dir.path().join("dev-plugins")],
+                restart_required_for_changes: true,
+                errors: vec!["failed to read configured plugin path".to_string()],
+                entries: vec![crate::server::startup::PluginActivationEntry {
+                    name: "weather".to_string(),
+                    plugin_id: Some("weather".to_string()),
+                    source: crate::server::startup::PluginActivationSource::Managed,
+                    enabled: true,
+                    path: Some(state_dir.path().join("skills/weather.wasm")),
+                    requested_at: Some(1700000000000u64),
+                    install_id: Some(json!("install-weather")),
+                    state: crate::server::startup::PluginActivationState::Active,
+                    reason: None,
+                }],
+            },
+        );
+
+        let result = handle_skills_status(&state).unwrap();
+        assert_eq!(
+            result["managedSkillsDir"],
+            state_dir
+                .path()
+                .join("skills")
+                .to_string_lossy()
+                .to_string()
+        );
+        assert_eq!(result["pluginsEnabled"], true);
+        assert_eq!(
+            result["configuredPluginPaths"],
+            json!([state_dir
+                .path()
+                .join("dev-plugins")
+                .to_string_lossy()
+                .to_string()])
+        );
+        assert_eq!(result["restartRequiredForChanges"], true);
+        assert_eq!(
+            result["errors"],
+            json!(["failed to read configured plugin path"])
+        );
+        assert_eq!(result["skills"].as_array().unwrap().len(), 1);
+        let entry = &result["skills"][0];
+        assert_eq!(entry["name"], "weather");
+        assert_eq!(entry["pluginId"], "weather");
+        assert_eq!(entry["source"], "managed");
+        assert_eq!(entry["state"], "active");
+        assert_eq!(entry["enabled"], true);
+
+        crate::config::clear_cache();
     }
 
     #[test]
@@ -1234,6 +1372,23 @@ mod tests {
         assert_eq!(manifest["my-skill"]["name"], "my-skill");
         assert_eq!(manifest["my-skill"]["version"], "2.0.0");
         assert!(manifest["my-skill"]["installed_at"].is_number());
+    }
+
+    #[test]
+    fn test_install_reports_restart_required_activation() {
+        let dir = TempDir::new().unwrap();
+        let skills_dir = dir.path().join("skills");
+        let params = json!({ "name": "my-skill", "version": "2.0.0" });
+
+        let _env = TestConfigEnv::new();
+        let result = handle_skills_install_inner(Some(&params), &skills_dir).unwrap();
+
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["activation"]["state"], "restart-required");
+        assert_eq!(
+            result["activation"]["message"],
+            "restart Carapace to activate the installed skill"
+        );
     }
 
     // ---- Update handler tests ----

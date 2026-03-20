@@ -118,6 +118,7 @@ pub fn validate_schema(config: &Value) -> Vec<SchemaIssue> {
     validate_output_sanitizer(obj, &mut issues);
     validate_skills_signature(obj, &mut issues);
     validate_skills_sandbox(obj, &mut issues);
+    validate_plugins(obj, &mut issues);
     validate_session_integrity(obj, &mut issues);
     validate_usage(obj, &mut issues);
     validate_vertex(obj, &mut issues);
@@ -828,6 +829,53 @@ fn validate_skills_sandbox(obj: &serde_json::Map<String, Value>, issues: &mut Ve
                     });
                 }
             }
+        }
+    }
+}
+
+fn validate_plugins(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIssue>) {
+    let plugins = match obj.get("plugins").and_then(|value| value.as_object()) {
+        Some(plugins) => plugins,
+        None => return,
+    };
+
+    if let Some(enabled) = plugins.get("enabled") {
+        if !enabled.is_boolean() {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: ".plugins.enabled".to_string(),
+                message: "plugins.enabled must be a boolean".to_string(),
+            });
+        }
+    }
+
+    let Some(load) = plugins.get("load") else {
+        return;
+    };
+    let Some(load_obj) = load.as_object() else {
+        issues.push(SchemaIssue {
+            severity: Severity::Error,
+            path: ".plugins.load".to_string(),
+            message: "plugins.load must be an object".to_string(),
+        });
+        return;
+    };
+
+    if let Some(paths) = load_obj.get("paths") {
+        let Some(array) = paths.as_array() else {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: ".plugins.load.paths".to_string(),
+                message: "plugins.load.paths must be an array".to_string(),
+            });
+            return;
+        };
+        if array.iter().any(|value| !value.is_string()) {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: ".plugins.load.paths".to_string(),
+                message: "plugins.load.paths entries must be strings".to_string(),
+            });
         }
     }
 }
@@ -2129,6 +2177,52 @@ mod tests {
             i.severity == Severity::Error
                 && i.path == ".filesystem"
                 && i.message.contains("must be an object")
+        }));
+    }
+
+    #[test]
+    fn test_plugins_config_valid() {
+        let config = json!({
+            "plugins": {
+                "enabled": true,
+                "load": {
+                    "paths": ["/tmp/plugins", "/opt/carapace/plugins"]
+                }
+            }
+        });
+        let issues = validate_schema(&config);
+        assert!(!issues.iter().any(|i| i.path.starts_with(".plugins")));
+    }
+
+    #[test]
+    fn test_plugins_enabled_must_be_boolean() {
+        let config = json!({
+            "plugins": {
+                "enabled": "yes"
+            }
+        });
+        let issues = validate_schema(&config);
+        assert!(issues.iter().any(|i| {
+            i.severity == Severity::Error
+                && i.path == ".plugins.enabled"
+                && i.message.contains("must be a boolean")
+        }));
+    }
+
+    #[test]
+    fn test_plugins_load_paths_must_be_array_of_strings() {
+        let config = json!({
+            "plugins": {
+                "load": {
+                    "paths": ["/tmp/plugins", 42]
+                }
+            }
+        });
+        let issues = validate_schema(&config);
+        assert!(issues.iter().any(|i| {
+            i.severity == Severity::Error
+                && i.path == ".plugins.load.paths"
+                && i.message.contains("entries must be strings")
         }));
     }
 

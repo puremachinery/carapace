@@ -403,7 +403,10 @@ Enable Carapace to listen and respond on external chat platforms.
   - *What it does:* Loads and manages WASM plugins.
   - *Common values:*
     - `enabled`: `true` or `false`.
-    - `load.paths`: Array of plugin directories.
+    - `load.paths`: Array of explicit dev/advanced plugin directories.
+  - *Notes:*
+    - Managed skill installs live under `state_dir/skills` and are activated on restart.
+    - `plugins.enabled = false` disables both managed skill activation and configured `load.paths`.
 - **`messages`**
   - *What it does:* Messaging behavior defaults.
   - *Common values:*

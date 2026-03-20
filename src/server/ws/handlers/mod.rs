@@ -879,7 +879,7 @@ pub(super) async fn dispatch_method(
         // Models/agents/skills
         "models.list" => handle_models_list(),
         "agents.list" => handle_agents_list(),
-        "skills.status" => handle_skills_status(),
+        "skills.status" => handle_skills_status(state),
         "skills.bins" => handle_skills_bins(),
         "skills.install" => handle_skills_install(params),
         "skills.update" => handle_skills_update(params),

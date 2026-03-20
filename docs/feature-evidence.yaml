@@ -36,7 +36,10 @@ features:
     runtime_wiring:
       - "src/server/ws/handlers/skills.rs::handle_skills_status"
       - "src/server/ws/handlers/mod.rs (dispatch + READ_METHODS)"
+      - "src/server/startup.rs::build_ws_state_with_runtime_dependencies (attaches plugin activation report)"
+      - "src/server/ws/mod.rs::WsServerState::with_plugin_activation_report"
     tests:
+      - "src/server/ws/handlers/skills.rs::test_handle_skills_status_uses_plugin_activation_report"
       - "src/server/ws/golden_tests.rs::golden_skills_status"
       - "src/server/ws/snapshots/carapace__server__ws__golden_tests__golden_trace__golden_skills_status.snap"
 
@@ -656,7 +659,7 @@ features:
   - feature: "plugins.wasm component model"
     status: "verified_done"
     runtime_wiring:
-      - "Cargo.toml (wasmtime = 41 with component-model)"
+      - "Cargo.toml (wasmtime = 43 with component-model)"
       - "src/plugins/runtime.rs (wasm_component_model(true) + wasmtime::component APIs)"
 
   - feature: "plugins.ed25519 signature verification"
@@ -676,6 +679,24 @@ features:
     tests:
       - "src/plugins/loader.rs::test_load_all_empty_dir"
       - "src/plugins/loader.rs::test_plugin_manifest_validation"
+
+  - feature: "plugins.startup activation"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/server/startup.rs::bootstrap_plugin_runtime"
+      - "src/main.rs::run_server (shared startup wiring)"
+      - "src/cli/chat.rs::handle_chat_command (embedded startup wiring)"
+      - "src/server/ws/handlers/skills.rs::handle_skills_install_inner (restart-required activation response)"
+      - "src/server/ws/handlers/skills.rs::handle_skills_update_inner (restart-required activation response)"
+    tests:
+      - "src/server/startup.rs::bootstrap_plugin_runtime_respects_plugins_enabled_false"
+      - "src/server/startup.rs::bootstrap_plugin_runtime_reports_missing_manifest_for_managed_skill"
+      - "src/server/startup.rs::bootstrap_plugin_runtime_ignores_stray_managed_wasm_files"
+      - "src/server/startup.rs::bootstrap_plugin_runtime_reports_config_path_read_errors"
+      - "src/server/startup.rs::bootstrap_plugin_runtime_skips_unpinned_managed_manifest_entries"
+      - "src/server/startup.rs::load_plugin_candidate_reports_duplicate_plugin_ids_across_sources"
+      - "src/server/startup.rs::build_ws_state_with_runtime_dependencies_attaches_plugin_activation_report"
+      - "src/server/ws/handlers/skills.rs::test_install_reports_restart_required_activation"
 
   - feature: "plugins.credential isolation"
     status: "verified_done"

@@ -78,16 +78,14 @@ async fn start_embedded_gateway(
         Value::Object(serde_json::Map::new())
     });
 
-    crate::server::startup::prepare_runtime_environment().await?;
+    let state_dir = crate::server::startup::prepare_runtime_environment().await?;
 
-    // Set up plugin/tools registries
-    let plugin_registry = std::sync::Arc::new(crate::plugins::PluginRegistry::new());
     let tools_registry =
         std::sync::Arc::new(crate::plugins::tools::ToolsRegistry::with_config(&cfg));
     let ws_state = crate::server::startup::build_ws_state_with_runtime_dependencies(
         &cfg,
+        &state_dir,
         tools_registry.clone(),
-        plugin_registry.clone(),
     )
     .await?;
 

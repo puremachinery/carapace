@@ -199,9 +199,10 @@ feature_inventory_markdown: |
 
   ### Plugins (`src/plugins/`)
 
-  - [x] **WASM component model** — wasmtime 41 runtime
+  - [x] **WASM component model** — wasmtime 43 runtime
   - [x] **Ed25519 signature verification** — plugin authenticity (required by default)
   - [x] **Plugin loader** — .wasm file loading with manifest
+  - [x] **Plugin startup activation** — managed plugins from `state_dir/skills` plus explicit `plugins.load.paths`, disabled globally by `plugins.enabled = false`, restart required for activation changes
   - [x] **Credential isolation** — plugin ID prefixing
   - [x] **SSRF protection** — private IP/localhost blocking
   - [x] **Config access enforcement** — plugins.<id>.* only
@@ -237,7 +238,7 @@ feature_inventory_markdown: |
   - [x] **exec.approve/deny/list** — exec approval workflow
   - [x] **system.info** — system metadata + runtime stats
   - [x] **logs.tail** — streaming log buffer
-  - [x] **skills.status** — skill listing
+  - [x] **skills.status** — skill listing + activation state
   - [x] **cron.*** — cron job CRUD + lifecycle
   - [x] **tts.speak / tts.voices** — text-to-speech
   - [x] **voicewake.get / voicewake.keywords** — wake word config

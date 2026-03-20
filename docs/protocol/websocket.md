@@ -268,7 +268,7 @@ Compatibility aliases:
 ### Models & Skills
 - `models.list` - List available models
 - `agents.list` - List available agents
-- `skills.status` - Get skills status
+- `skills.status` - Get skills status, activation state, and restart requirements
 - `skills.bins` - List skill binaries
 - `skills.install` - Install a skill
 - `skills.update` - Update skills

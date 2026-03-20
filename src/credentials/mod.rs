@@ -286,6 +286,15 @@ pub async fn write_device_identity(state_dir: PathBuf, value: &str) -> Result<()
 }
 
 #[cfg(target_os = "macos")]
+pub(crate) type DefaultCredentialBackend = macos::MacOsCredentialBackend;
+
+#[cfg(target_os = "linux")]
+pub(crate) type DefaultCredentialBackend = linux::LinuxCredentialBackend;
+
+#[cfg(target_os = "windows")]
+pub(crate) type DefaultCredentialBackend = windows::WindowsCredentialBackend;
+
+#[cfg(target_os = "macos")]
 fn default_backend() -> macos::MacOsCredentialBackend {
     macos::MacOsCredentialBackend::new()
 }
@@ -298,6 +307,15 @@ fn default_backend() -> linux::LinuxCredentialBackend {
 #[cfg(target_os = "windows")]
 fn default_backend() -> windows::WindowsCredentialBackend {
     windows::WindowsCredentialBackend::new()
+}
+
+/// Build the default platform credential store for the given state dir.
+pub async fn create_default_store(
+    state_dir: PathBuf,
+) -> Result<Arc<CredentialStore<DefaultCredentialBackend>>, CredentialError> {
+    let backend = default_backend();
+    let store = CredentialStore::new(backend, state_dir).await?;
+    Ok(Arc::new(store))
 }
 
 impl std::fmt::Display for CredentialKey {
