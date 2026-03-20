@@ -2352,21 +2352,58 @@ enum SetupOutcome {
     Hooks,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetupProviderChoice {
+    Anthropic,
+    OpenAi,
+    Ollama,
+    Gemini,
+    Venice,
+    Bedrock,
+}
+
+impl SetupProviderChoice {
+    fn prompt_key(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::OpenAi => "openai",
+            Self::Ollama => "ollama",
+            Self::Gemini => "gemini",
+            Self::Venice => "venice",
+            Self::Bedrock => "bedrock",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Anthropic => "Anthropic",
+            Self::OpenAi => "OpenAI",
+            Self::Ollama => "Ollama",
+            Self::Gemini => "Gemini",
+            Self::Venice => "Venice",
+            Self::Bedrock => "Bedrock",
+        }
+    }
+
+    fn parse_prompt(raw: &str) -> Option<Self> {
+        match raw.trim().to_lowercase().as_str() {
+            "anthropic" | "claude" => Some(Self::Anthropic),
+            "openai" | "gpt" => Some(Self::OpenAi),
+            "ollama" => Some(Self::Ollama),
+            "gemini" => Some(Self::Gemini),
+            "venice" => Some(Self::Venice),
+            "bedrock" => Some(Self::Bedrock),
+            _ => None,
+        }
+    }
+}
+
 impl SetupOutcome {
     fn prompt_key(self) -> &'static str {
         match self {
             Self::LocalChat => "local-chat",
             Self::Discord => "discord",
             Self::Telegram => "telegram",
-            Self::Hooks => "hooks",
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::LocalChat => "local chat",
-            Self::Discord => "Discord",
-            Self::Telegram => "Telegram",
             Self::Hooks => "hooks",
         }
     }
@@ -2461,7 +2498,7 @@ impl SetupProvider {
     fn label(self) -> &'static str {
         match self {
             Self::Anthropic => "Anthropic",
-            Self::Codex => "Codex",
+            Self::Codex => "OpenAI",
             Self::OpenAi => "OpenAI",
             Self::Ollama => "Ollama",
             Self::Gemini => "Gemini",
@@ -2491,10 +2528,6 @@ impl SetupProvider {
             Self::Venice => "venice:llama-3.3-70b",
             Self::Bedrock => "bedrock:anthropic.claude-3-5-sonnet-20240620-v1:0",
         }
-    }
-
-    fn parse_prompt(raw: &str) -> Option<Self> {
-        <Self as clap::ValueEnum>::from_str(raw.trim(), true).ok()
     }
 }
 
@@ -2531,7 +2564,7 @@ impl From<GeminiSetupAuthMode> for crate::onboarding::setup::SetupAuthMode {
 
 #[derive(Debug, Clone, Default)]
 struct ProviderSetupResult {
-    observed_provider_check: Option<crate::onboarding::setup::SetupCheck>,
+    observed_provider_checks: Vec<crate::onboarding::setup::SetupCheck>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2559,6 +2592,7 @@ fn env_var_value(key: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+#[cfg(test)]
 fn detect_setup_provider_env_hints() -> Vec<SetupProvider> {
     let mut providers = Vec::new();
 
@@ -2594,16 +2628,47 @@ fn detect_setup_provider_env_hints() -> Vec<SetupProvider> {
     providers
 }
 
-fn default_setup_provider(provider_hints: &[SetupProvider]) -> SetupProvider {
+fn detect_setup_provider_choice_env_hints() -> Vec<SetupProviderChoice> {
+    let mut choices = Vec::new();
+
+    if env_var_present("ANTHROPIC_API_KEY") {
+        choices.push(SetupProviderChoice::Anthropic);
+    }
+    if env_var_present("OPENAI_API_KEY")
+        || (env_var_present("CARAPACE_CONFIG_PASSWORD")
+            && env_var_present("OPENAI_OAUTH_CLIENT_ID")
+            && env_var_present("OPENAI_OAUTH_CLIENT_SECRET"))
+    {
+        choices.push(SetupProviderChoice::OpenAi);
+    }
+    if env_var_present("OLLAMA_BASE_URL") {
+        choices.push(SetupProviderChoice::Ollama);
+    }
+    if env_var_present("GOOGLE_API_KEY") {
+        choices.push(SetupProviderChoice::Gemini);
+    }
+    if env_var_present("VENICE_API_KEY") {
+        choices.push(SetupProviderChoice::Venice);
+    }
+
+    let bedrock_region = env_var_present("AWS_REGION") || env_var_present("AWS_DEFAULT_REGION");
+    let bedrock_access_key = env_var_present("AWS_ACCESS_KEY_ID");
+    let bedrock_secret_key = env_var_present("AWS_SECRET_ACCESS_KEY");
+    if bedrock_region && bedrock_access_key && bedrock_secret_key {
+        choices.push(SetupProviderChoice::Bedrock);
+    }
+
+    choices
+}
+
+fn default_setup_provider_choice(provider_hints: &[SetupProviderChoice]) -> SetupProviderChoice {
     if let [provider] = provider_hints {
         *provider
     } else {
-        // When multiple hints exist, prefer the first detected provider so the
-        // wizard has a deterministic default without trying to infer intent.
         provider_hints
             .first()
             .copied()
-            .unwrap_or(SetupProvider::Anthropic)
+            .unwrap_or(SetupProviderChoice::Anthropic)
     }
 }
 
@@ -3451,7 +3516,7 @@ fn validate_provider_credentials_interactive(
         Err(err) => {
             eprintln!("Credential check failed: {}", err);
             if prompt_yes_no("Continue setup and write config anyway?", false)? {
-                Ok(crate::onboarding::setup::SetupCheck::fail(
+                Ok(crate::onboarding::setup::SetupCheck::validation_fail(
                     "Live provider validation",
                     err,
                     format!(
@@ -4452,13 +4517,12 @@ fn first_present_env_var(env_vars: &[&'static str]) -> Option<(&'static str, Str
 
 fn prompt_setup_provider_interactive(
     requested_provider: Option<SetupProvider>,
-    outcome: SetupOutcome,
 ) -> Result<SetupProvider, Box<dyn std::error::Error>> {
     if let Some(provider) = requested_provider {
         return Ok(provider);
     }
 
-    let provider_hints = detect_setup_provider_env_hints();
+    let provider_hints = detect_setup_provider_choice_env_hints();
     if provider_hints.len() > 1 {
         let labels = provider_hints
             .iter()
@@ -4471,19 +4535,49 @@ fn prompt_setup_provider_interactive(
         eprintln!("Setup will only write the provider you choose.");
     }
 
-    let default_provider = default_setup_provider(&provider_hints).prompt_key();
+    let default_provider = default_setup_provider_choice(&provider_hints).prompt_key();
     loop {
-        let prompt = format!(
-            "Select provider for your {} path (anthropic/codex/openai/ollama/gemini/venice/bedrock)",
-            outcome.label()
-        );
-        let selection = prompt_with_default(&prompt, default_provider)?;
-        if let Some(provider) = SetupProvider::parse_prompt(&selection) {
-            return Ok(provider);
+        let selection = prompt_with_default(
+            "Select provider for first run (anthropic/openai/ollama/gemini/venice/bedrock)",
+            default_provider,
+        )?;
+        if let Some(provider) = SetupProviderChoice::parse_prompt(&selection) {
+            return match provider {
+                SetupProviderChoice::Anthropic => Ok(SetupProvider::Anthropic),
+                SetupProviderChoice::OpenAi => prompt_openai_setup_provider_variant(),
+                SetupProviderChoice::Ollama => Ok(SetupProvider::Ollama),
+                SetupProviderChoice::Gemini => Ok(SetupProvider::Gemini),
+                SetupProviderChoice::Venice => Ok(SetupProvider::Venice),
+                SetupProviderChoice::Bedrock => Ok(SetupProvider::Bedrock),
+            };
         }
-        eprintln!(
-            "Please enter one of: anthropic, codex, openai, ollama, gemini, venice, bedrock."
-        );
+        eprintln!("Please enter one of: anthropic, openai, ollama, gemini, venice, bedrock.");
+    }
+}
+
+fn prompt_openai_setup_provider_variant() -> Result<SetupProvider, Box<dyn std::error::Error>> {
+    let default_variant = if env_var_present("OPENAI_API_KEY") {
+        "api-key"
+    } else if env_var_present("CARAPACE_CONFIG_PASSWORD")
+        && env_var_present("OPENAI_OAUTH_CLIENT_ID")
+        && env_var_present("OPENAI_OAUTH_CLIENT_SECRET")
+    {
+        "subscription-sign-in"
+    } else {
+        "api-key"
+    };
+
+    loop {
+        let selection = prompt_choice(
+            "How should OpenAI authenticate? (api-key/subscription-sign-in)",
+            default_variant,
+            &["api-key", "subscription-sign-in"],
+        )?;
+        match selection.as_str() {
+            "api-key" => return Ok(SetupProvider::OpenAi),
+            "subscription-sign-in" => return Ok(SetupProvider::Codex),
+            _ => eprintln!("Please choose either `api-key` or `subscription-sign-in`."),
+        }
     }
 }
 
@@ -4716,11 +4810,13 @@ fn configure_gemini_provider_interactive(
                         .and_then(|value| value.effective_value.as_deref()),
                 );
                 if let Err(err) = validation {
-                    handle_setup_validation_failure(
-                        SetupProvider::Gemini,
-                        Some(GeminiSetupAuthMode::ApiKey),
-                        err,
-                    )?;
+                    result
+                        .observed_provider_checks
+                        .push(handle_setup_validation_failure(
+                            SetupProvider::Gemini,
+                            Some(GeminiSetupAuthMode::ApiKey),
+                            err,
+                        )?);
                 }
             }
 
@@ -4749,11 +4845,13 @@ fn configure_gemini_provider_interactive(
                 if let Err(err) =
                     crate::onboarding::gemini::validate_gemini_base_url_input(Some(url))
                 {
-                    handle_setup_validation_failure(
-                        SetupProvider::Gemini,
-                        Some(GeminiSetupAuthMode::OAuth),
-                        err,
-                    )?;
+                    result
+                        .observed_provider_checks
+                        .push(handle_setup_validation_failure(
+                            SetupProvider::Gemini,
+                            Some(GeminiSetupAuthMode::OAuth),
+                            err,
+                        )?);
                 }
             }
 
@@ -4773,11 +4871,12 @@ fn configure_gemini_provider_interactive(
                 None => "stored Gemini auth profile".to_string(),
             };
             crate::onboarding::gemini::persist_cli_google_oauth(state_dir, config, completion)?;
-            result.observed_provider_check =
-                Some(crate::onboarding::setup::SetupCheck::validation_pass(
+            result.observed_provider_checks.push(
+                crate::onboarding::setup::SetupCheck::validation_pass(
                     "Live provider validation",
                     profile_detail,
-                ));
+                ),
+            );
 
             if let Some(base_url) = base_url {
                 config["google"]["baseUrl"] = serde_json::json!(base_url.config_value);
@@ -4793,7 +4892,7 @@ fn configure_codex_provider_interactive(
     hide_sensitive_input: bool,
 ) -> Result<ProviderSetupResult, Box<dyn std::error::Error>> {
     println!(
-        "Codex setup uses OpenAI subscription sign-in and stores a refreshable auth profile. OpenAI API-key setup remains under `--provider openai`."
+        "OpenAI subscription sign-in stores a refreshable auth profile. OpenAI API-key setup remains available through the OpenAI API-key path."
     );
 
     let client_id =
@@ -4815,16 +4914,16 @@ fn configure_codex_provider_interactive(
     let state_dir = resolve_state_dir();
     std::fs::create_dir_all(&state_dir)?;
     let profile_detail = match completion.auth_profile.email.as_deref() {
-        Some(email) => format!("stored Codex auth profile for {email}"),
-        None => "stored Codex auth profile".to_string(),
+        Some(email) => format!("stored OpenAI auth profile for {email}"),
+        None => "stored OpenAI auth profile".to_string(),
     };
     crate::onboarding::codex::persist_cli_openai_oauth(state_dir, config, completion)?;
 
     Ok(ProviderSetupResult {
-        observed_provider_check: Some(crate::onboarding::setup::SetupCheck::validation_pass(
+        observed_provider_checks: vec![crate::onboarding::setup::SetupCheck::validation_pass(
             "Live provider validation",
             profile_detail,
-        )),
+        )],
     })
 }
 
@@ -4832,13 +4931,17 @@ fn handle_setup_validation_failure(
     provider: SetupProvider,
     requested_auth_mode: Option<GeminiSetupAuthMode>,
     err: crate::agent::AgentError,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<crate::onboarding::setup::SetupCheck, Box<dyn std::error::Error>> {
     eprintln!("{}", render_setup_validation_failure(&err));
     let rerun = crate::onboarding::setup::SetupProvider::from(provider)
         .rerun_command(setup_provider_auth_mode_hint(provider, requested_auth_mode));
     eprintln!("Next step: fix the value and rerun `{rerun}`.");
     if prompt_yes_no("Continue setup and write config anyway?", false)? {
-        Ok(())
+        Ok(crate::onboarding::setup::SetupCheck::validation_fail(
+            "Provider configuration validation",
+            render_setup_validation_failure(&err),
+            format!("fix the value and rerun `{rerun}`"),
+        ))
     } else {
         Err("setup aborted after credential validation failure".into())
     }
@@ -4865,8 +4968,9 @@ fn configure_provider_interactive(
                 hide_sensitive_input,
             )?;
             if let Some(key) = api_key.effective_value.as_deref() {
-                result.observed_provider_check =
-                    Some(validate_provider_credentials_interactive(provider, key)?);
+                result
+                    .observed_provider_checks
+                    .push(validate_provider_credentials_interactive(provider, key)?);
             } else {
                 print_missing_setup_value_notice("ANTHROPIC_API_KEY", "API key");
             }
@@ -4882,8 +4986,9 @@ fn configure_provider_interactive(
                 hide_sensitive_input,
             )?;
             if let Some(key) = api_key.effective_value.as_deref() {
-                result.observed_provider_check =
-                    Some(validate_provider_credentials_interactive(provider, key)?);
+                result
+                    .observed_provider_checks
+                    .push(validate_provider_credentials_interactive(provider, key)?);
             } else {
                 print_missing_setup_value_notice("OPENAI_API_KEY", "API key");
             }
@@ -4928,7 +5033,9 @@ fn configure_provider_interactive(
                     }
                 }) {
                 Ok(_) => {}
-                Err(err) => handle_setup_validation_failure(provider, None, err)?,
+                Err(err) => result
+                    .observed_provider_checks
+                    .push(handle_setup_validation_failure(provider, None, err)?),
             }
 
             let mut ollama_config = serde_json::Map::new();
@@ -4981,7 +5088,9 @@ fn configure_provider_interactive(
                         }
                     });
                 if let Err(err) = validation {
-                    handle_setup_validation_failure(provider, None, err)?;
+                    result
+                        .observed_provider_checks
+                        .push(handle_setup_validation_failure(provider, None, err)?);
                 }
             }
 
@@ -5070,7 +5179,9 @@ fn configure_provider_interactive(
                             }
                         });
                 if let Err(err) = validation {
-                    handle_setup_validation_failure(provider, None, err)?;
+                    result
+                        .observed_provider_checks
+                        .push(handle_setup_validation_failure(provider, None, err)?);
                 }
             }
 
@@ -5238,8 +5349,7 @@ pub fn handle_setup(
         );
 
         let hide_sensitive_input = prompt_yes_no("Hide sensitive input while typing?", true)?;
-        setup_outcome = prompt_setup_outcome()?;
-        let provider = prompt_setup_provider_interactive(requested_provider, setup_outcome)?;
+        let provider = prompt_setup_provider_interactive(requested_provider)?;
         provider_setup_result = configure_provider_interactive(
             &mut config,
             provider,
@@ -5295,6 +5405,8 @@ pub fn handle_setup(
                 "password": auth_secret
             });
         }
+
+        setup_outcome = prompt_setup_outcome()?;
 
         match setup_outcome {
             SetupOutcome::Discord => {
@@ -5381,7 +5493,7 @@ pub fn handle_setup(
         &config,
         &resolve_state_dir(),
         configured_provider.into(),
-        provider_setup_result.observed_provider_check,
+        provider_setup_result.observed_provider_checks,
     );
     print_setup_assessment_summary(&setup_assessment);
     if let Some(remediation) = setup_assessment.recommended_remediation() {
@@ -8167,10 +8279,10 @@ mod tests {
                 force_interactive: Some(true),
                 visible_inputs: VecDeque::from(vec![
                     "y".to_string(),
-                    "".to_string(),
                     "ollama".to_string(),
-                    "y".to_string(),
-                    "n".to_string(),
+                    "".to_string(),
+                    "".to_string(),
+                    "".to_string(),
                     "".to_string(),
                     "".to_string(),
                     "".to_string(),
@@ -8211,12 +8323,13 @@ mod tests {
                 force_interactive: Some(true),
                 visible_inputs: VecDeque::from(vec![
                     "y".to_string(),
-                    "telegram".to_string(),
                     "openai".to_string(),
+                    "api-key".to_string(),
                     "".to_string(),
                     "n".to_string(),
                     "".to_string(),
                     "".to_string(),
+                    "telegram".to_string(),
                     "n".to_string(),
                     "n".to_string(),
                     "n".to_string(),
@@ -8260,14 +8373,15 @@ mod tests {
                 force_interactive: Some(true),
                 visible_inputs: VecDeque::from(vec![
                     "n".to_string(),
-                    "telegram".to_string(),
                     "openai".to_string(),
+                    "api-key".to_string(),
                     "sk-openai-visible".to_string(),
                     "n".to_string(),
                     "".to_string(),
                     "".to_string(),
                     "".to_string(),
                     "".to_string(),
+                    "telegram".to_string(),
                     "12345:abc".to_string(),
                     "y".to_string(),
                     "".to_string(),
@@ -8308,14 +8422,15 @@ mod tests {
                 force_interactive: Some(true),
                 visible_inputs: VecDeque::from(vec![
                     "n".to_string(),
-                    "telegram".to_string(),
                     "openai".to_string(),
+                    "api-key".to_string(),
                     "sk-openai-visible".to_string(),
                     "n".to_string(),
                     "".to_string(),
                     "".to_string(),
                     "".to_string(),
                     "".to_string(),
+                    "telegram".to_string(),
                     "12345:abc".to_string(),
                     "y".to_string(),
                     "n".to_string(),
@@ -8359,12 +8474,13 @@ mod tests {
                 force_interactive: Some(true),
                 visible_inputs: VecDeque::from(vec![
                     "y".to_string(),
-                    "discord".to_string(),
                     "openai".to_string(),
+                    "api-key".to_string(),
                     "".to_string(),
                     "n".to_string(),
                     "".to_string(),
                     "".to_string(),
+                    "discord".to_string(),
                     "n".to_string(),
                     "n".to_string(),
                     "n".to_string(),
@@ -8409,14 +8525,15 @@ mod tests {
                 force_interactive: Some(true),
                 visible_inputs: VecDeque::from(vec![
                     "n".to_string(),
-                    "discord".to_string(),
                     "openai".to_string(),
+                    "api-key".to_string(),
                     "sk-openai-visible".to_string(),
                     "n".to_string(),
                     "".to_string(),
                     "".to_string(),
                     "".to_string(),
                     "".to_string(),
+                    "discord".to_string(),
                     "discord-bot-token".to_string(),
                     "y".to_string(),
                     "n".to_string(),

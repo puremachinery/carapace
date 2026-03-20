@@ -20,7 +20,7 @@ impl SetupProvider {
     pub fn label(self) -> &'static str {
         match self {
             Self::Anthropic => "Anthropic",
-            Self::Codex => "Codex",
+            Self::Codex => "OpenAI",
             Self::OpenAi => "OpenAI",
             Self::Ollama => "Ollama",
             Self::Gemini => "Gemini",
@@ -155,6 +155,20 @@ impl SetupCheck {
             remediation,
         }
     }
+
+    pub fn validation_fail(
+        name: impl Into<String>,
+        detail: impl Into<String>,
+        remediation: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            status: SetupCheckStatus::Fail,
+            kind: SetupCheckKind::Validation,
+            detail: detail.into(),
+            remediation: Some(remediation.into()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,7 +220,7 @@ pub fn assess_provider_setup(
     cfg: &Value,
     state_dir: &Path,
     provider: SetupProvider,
-    observed_validation: Option<SetupCheck>,
+    observed_validations: Vec<SetupCheck>,
 ) -> SetupAssessment {
     let auth_mode = detect_auth_mode(cfg, provider);
     let rerun_command = provider.rerun_command(auth_mode);
@@ -228,7 +242,7 @@ pub fn assess_provider_setup(
             let profile_check = oauth_profile_id_check(
                 cfg,
                 &["codex", "authProfile"],
-                "Codex auth profile",
+                "OpenAI auth profile",
                 &rerun_command,
             );
             let profile_id = config_string(cfg, &["codex", "authProfile"]);
@@ -239,7 +253,7 @@ pub fn assess_provider_setup(
                     state_dir,
                     &profile_id,
                     OAuthProvider::OpenAI,
-                    "Codex auth profile",
+                    "OpenAI auth profile",
                     &rerun_command,
                 );
                 if let Some(summary) = summary {
@@ -391,17 +405,18 @@ pub fn assess_provider_setup(
         }
     }
 
-    if let Some(observed_validation) = observed_validation {
-        checks.push(observed_validation);
-    }
+    checks.extend(observed_validations);
 
     let has_fail = checks
         .iter()
         .any(|check| check.status == SetupCheckStatus::Fail);
+    let has_validation_check = checks
+        .iter()
+        .any(|check| check.kind == SetupCheckKind::Validation);
     let has_validation_pass = checks.iter().any(|check| {
         check.status == SetupCheckStatus::Pass && check.kind == SetupCheckKind::Validation
     });
-    if !has_fail && !has_validation_pass {
+    if !has_fail && !has_validation_check {
         checks.push(SetupCheck::skip(
             "Live provider validation",
             "setup completed without a live provider-side validation step",
@@ -783,7 +798,7 @@ mod tests {
         let mut env = ScopedEnv::new();
         env.unset("ANTHROPIC_API_KEY");
 
-        let assessment = assess_provider_setup(&cfg, temp.path(), SetupProvider::Anthropic, None);
+        let assessment = assess_provider_setup(&cfg, temp.path(), SetupProvider::Anthropic, vec![]);
 
         assert_eq!(assessment.status, SetupAssessmentStatus::Invalid);
         assert!(assessment
@@ -803,7 +818,7 @@ mod tests {
         let mut env = ScopedEnv::new();
         env.unset("CARAPACE_CONFIG_PASSWORD");
 
-        let assessment = assess_provider_setup(&cfg, temp.path(), SetupProvider::Codex, None);
+        let assessment = assess_provider_setup(&cfg, temp.path(), SetupProvider::Codex, vec![]);
 
         assert_eq!(assessment.status, SetupAssessmentStatus::Invalid);
         assert!(assessment
@@ -829,7 +844,7 @@ mod tests {
         let mut env = ScopedEnv::new();
         env.set("CARAPACE_CONFIG_PASSWORD", "test-password");
 
-        let assessment = assess_provider_setup(&cfg, temp.path(), SetupProvider::Gemini, None);
+        let assessment = assess_provider_setup(&cfg, temp.path(), SetupProvider::Gemini, vec![]);
 
         assert_eq!(assessment.status, SetupAssessmentStatus::Ready);
         assert_eq!(assessment.profile_name.as_deref(), Some("Sample Profile"));
@@ -844,11 +859,71 @@ mod tests {
             "openai": { "apiKey": "sk-test-value" }
         });
 
-        let assessment = assess_provider_setup(&cfg, temp.path(), SetupProvider::OpenAi, None);
+        let assessment = assess_provider_setup(&cfg, temp.path(), SetupProvider::OpenAi, vec![]);
 
         assert_eq!(assessment.status, SetupAssessmentStatus::Partial);
         assert!(assessment.checks.iter().any(|check| {
             check.name == "Live provider validation" && check.status == SetupCheckStatus::Skip
         }));
+    }
+
+    #[test]
+    fn test_assess_provider_setup_keeps_failed_validation_invalid() {
+        let temp = TempDir::new().unwrap();
+        let cfg = json!({
+            "agents": { "defaults": { "model": "gpt-4o" } },
+            "openai": { "apiKey": "sk-test-value" }
+        });
+
+        let assessment = assess_provider_setup(
+            &cfg,
+            temp.path(),
+            SetupProvider::OpenAi,
+            vec![SetupCheck::validation_fail(
+                "Provider configuration validation",
+                "provider config failed local validation",
+                "fix the value and rerun setup",
+            )],
+        );
+
+        assert_eq!(assessment.status, SetupAssessmentStatus::Invalid);
+        assert_eq!(
+            assessment
+                .checks
+                .iter()
+                .filter(|check| check.name == "Live provider validation")
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_assess_provider_setup_does_not_duplicate_skipped_validation() {
+        let temp = TempDir::new().unwrap();
+        let cfg = json!({
+            "agents": { "defaults": { "model": "gpt-4o" } },
+            "openai": { "apiKey": "sk-test-value" }
+        });
+
+        let assessment = assess_provider_setup(
+            &cfg,
+            temp.path(),
+            SetupProvider::OpenAi,
+            vec![SetupCheck::skip(
+                "Live provider validation",
+                "OpenAI credential validation was skipped",
+                Some("run `cara verify` after setup".to_string()),
+            )],
+        );
+
+        assert_eq!(assessment.status, SetupAssessmentStatus::Partial);
+        assert_eq!(
+            assessment
+                .checks
+                .iter()
+                .filter(|check| check.name == "Live provider validation")
+                .count(),
+            1
+        );
     }
 }
