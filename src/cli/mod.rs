@@ -2352,6 +2352,52 @@ enum SetupOutcome {
     Hooks,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetupProviderChoice {
+    Anthropic,
+    OpenAi,
+    Ollama,
+    Gemini,
+    Venice,
+    Bedrock,
+}
+
+impl SetupProviderChoice {
+    fn prompt_key(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::OpenAi => "openai",
+            Self::Ollama => "ollama",
+            Self::Gemini => "gemini",
+            Self::Venice => "venice",
+            Self::Bedrock => "bedrock",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Anthropic => "Anthropic",
+            Self::OpenAi => "OpenAI",
+            Self::Ollama => "Ollama",
+            Self::Gemini => "Gemini",
+            Self::Venice => "Venice",
+            Self::Bedrock => "Bedrock",
+        }
+    }
+
+    fn parse_prompt(raw: &str) -> Option<Self> {
+        match raw.trim().to_lowercase().as_str() {
+            "anthropic" | "claude" => Some(Self::Anthropic),
+            "openai" | "gpt" => Some(Self::OpenAi),
+            "ollama" => Some(Self::Ollama),
+            "gemini" => Some(Self::Gemini),
+            "venice" => Some(Self::Venice),
+            "bedrock" => Some(Self::Bedrock),
+            _ => None,
+        }
+    }
+}
+
 impl SetupOutcome {
     fn prompt_key(self) -> &'static str {
         match self {
@@ -2452,7 +2498,7 @@ impl SetupProvider {
     fn label(self) -> &'static str {
         match self {
             Self::Anthropic => "Anthropic",
-            Self::Codex => "Codex",
+            Self::Codex => "OpenAI",
             Self::OpenAi => "OpenAI",
             Self::Ollama => "Ollama",
             Self::Gemini => "Gemini",
@@ -2483,10 +2529,6 @@ impl SetupProvider {
             Self::Bedrock => "bedrock:anthropic.claude-3-5-sonnet-20240620-v1:0",
         }
     }
-
-    fn parse_prompt(raw: &str) -> Option<Self> {
-        <Self as clap::ValueEnum>::from_str(raw.trim(), true).ok()
-    }
 }
 
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -2495,6 +2537,34 @@ pub enum GeminiSetupAuthMode {
     OAuth,
     #[value(name = "api-key")]
     ApiKey,
+}
+
+impl From<SetupProvider> for crate::onboarding::setup::SetupProvider {
+    fn from(value: SetupProvider) -> Self {
+        match value {
+            SetupProvider::Anthropic => Self::Anthropic,
+            SetupProvider::Codex => Self::Codex,
+            SetupProvider::OpenAi => Self::OpenAi,
+            SetupProvider::Ollama => Self::Ollama,
+            SetupProvider::Gemini => Self::Gemini,
+            SetupProvider::Venice => Self::Venice,
+            SetupProvider::Bedrock => Self::Bedrock,
+        }
+    }
+}
+
+impl From<GeminiSetupAuthMode> for crate::onboarding::setup::SetupAuthMode {
+    fn from(value: GeminiSetupAuthMode) -> Self {
+        match value {
+            GeminiSetupAuthMode::OAuth => Self::OAuth,
+            GeminiSetupAuthMode::ApiKey => Self::ApiKey,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ProviderSetupResult {
+    observed_provider_checks: Vec<crate::onboarding::setup::SetupCheck>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2522,6 +2592,7 @@ fn env_var_value(key: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+#[cfg(test)]
 fn detect_setup_provider_env_hints() -> Vec<SetupProvider> {
     let mut providers = Vec::new();
 
@@ -2557,27 +2628,58 @@ fn detect_setup_provider_env_hints() -> Vec<SetupProvider> {
     providers
 }
 
-fn default_setup_provider(provider_hints: &[SetupProvider]) -> SetupProvider {
+fn detect_setup_provider_choice_env_hints() -> Vec<SetupProviderChoice> {
+    let mut choices = Vec::new();
+
+    if env_var_present("ANTHROPIC_API_KEY") {
+        choices.push(SetupProviderChoice::Anthropic);
+    }
+    if env_var_present("OPENAI_API_KEY")
+        || (env_var_present("CARAPACE_CONFIG_PASSWORD")
+            && env_var_present("OPENAI_OAUTH_CLIENT_ID")
+            && env_var_present("OPENAI_OAUTH_CLIENT_SECRET"))
+    {
+        choices.push(SetupProviderChoice::OpenAi);
+    }
+    if env_var_present("OLLAMA_BASE_URL") {
+        choices.push(SetupProviderChoice::Ollama);
+    }
+    if env_var_present("GOOGLE_API_KEY") {
+        choices.push(SetupProviderChoice::Gemini);
+    }
+    if env_var_present("VENICE_API_KEY") {
+        choices.push(SetupProviderChoice::Venice);
+    }
+
+    let bedrock_region = env_var_present("AWS_REGION") || env_var_present("AWS_DEFAULT_REGION");
+    let bedrock_access_key = env_var_present("AWS_ACCESS_KEY_ID");
+    let bedrock_secret_key = env_var_present("AWS_SECRET_ACCESS_KEY");
+    if bedrock_region && bedrock_access_key && bedrock_secret_key {
+        choices.push(SetupProviderChoice::Bedrock);
+    }
+
+    choices
+}
+
+fn default_setup_provider_choice(provider_hints: &[SetupProviderChoice]) -> SetupProviderChoice {
     if let [provider] = provider_hints {
         *provider
     } else {
-        // When multiple hints exist, prefer the first detected provider so the
-        // wizard has a deterministic default without trying to infer intent.
         provider_hints
             .first()
             .copied()
-            .unwrap_or(SetupProvider::Anthropic)
+            .unwrap_or(SetupProviderChoice::Anthropic)
     }
 }
 
-fn extract_env_placeholder_key(value: &str) -> Option<String> {
-    value
-        .trim()
-        .strip_prefix("${")
-        .and_then(|trimmed| trimmed.strip_suffix('}'))
-        .map(str::trim)
-        .filter(|key| !key.is_empty())
-        .map(ToOwned::to_owned)
+fn referenced_env_vars(value: &str) -> Vec<String> {
+    crate::config::env_var_references_in_string(value)
+}
+
+fn first_missing_env_var(value: &str) -> Option<String> {
+    referenced_env_vars(value)
+        .into_iter()
+        .find(|env_var| !env_var_present(env_var))
 }
 
 fn config_string(cfg: &Value, path: &[&str]) -> Option<String> {
@@ -2593,9 +2695,9 @@ fn config_string(cfg: &Value, path: &[&str]) -> Option<String> {
 }
 
 fn config_value_is_usable(value: &str) -> bool {
-    extract_env_placeholder_key(value)
-        .map(|env_var| env_var_present(&env_var))
-        .unwrap_or(true)
+    referenced_env_vars(value)
+        .into_iter()
+        .all(|env_var| env_var_present(&env_var))
 }
 
 fn config_path_has_usable_value(cfg: &Value, path: &[&str]) -> bool {
@@ -2605,9 +2707,7 @@ fn config_path_has_usable_value(cfg: &Value, path: &[&str]) -> bool {
 }
 
 fn unresolved_placeholder_env_var(cfg: &Value, path: &[&str]) -> Option<String> {
-    config_string(cfg, path)
-        .and_then(|value| extract_env_placeholder_key(&value))
-        .filter(|env_var| !env_var_present(env_var))
+    config_string(cfg, path).and_then(|value| first_missing_env_var(&value))
 }
 
 fn ollama_configured_for_guidance(cfg: &Value) -> bool {
@@ -2718,10 +2818,8 @@ fn single_credential_provider_guidance(
     }
 
     if let Some(configured) = config_string(cfg, config_path) {
-        if let Some(env_var) = extract_env_placeholder_key(&configured) {
-            if !env_var_present(&env_var) {
-                return missing_placeholder_guidance(&env_var);
-            }
+        if let Some(env_var) = first_missing_env_var(&configured) {
+            return missing_placeholder_guidance(&env_var);
         }
         return configured_message.to_string();
     }
@@ -3022,12 +3120,14 @@ fn prompt_optional_value_from_env(
 
 fn print_setup_outcome_next_steps(outcome: SetupOutcome, port: u16, hooks_enabled: bool) {
     println!();
+    let verify_command = format!(
+        "cara verify --outcome {} --port {port}",
+        outcome.prompt_key()
+    );
     match outcome {
         SetupOutcome::LocalChat => {
             println!("First-run outcome: local assistant chat");
-            println!(
-                "Next step: run `cara verify --outcome local-chat --port {port}` once the service is up."
-            );
+            println!("Next step: run `{verify_command}` once the service is up.");
             println!("Then open chat with `cara chat --port {port}`.");
             println!(
                 "Need step-by-step help? {}",
@@ -3036,18 +3136,25 @@ fn print_setup_outcome_next_steps(outcome: SetupOutcome, port: u16, hooks_enable
         }
         SetupOutcome::Discord => {
             println!("First-run outcome: Discord assistant");
-            println!("Next step: https://getcara.io/cookbook/discord-assistant.html");
+            println!("Next step: run `{verify_command}`.");
+            println!("For full send-path verification, rerun with `--discord-to <channel_id>`.");
+            println!("Docs: https://getcara.io/cookbook/discord-assistant.html");
             println!("Repo docs path: docs/cookbook/discord-assistant.md");
         }
         SetupOutcome::Telegram => {
             println!("First-run outcome: Telegram assistant");
-            println!("Next step: https://getcara.io/cookbook/telegram-webhook-assistant.html");
+            println!("Next step: run `{verify_command}`.");
+            println!("For full send-path verification, rerun with `--telegram-to <chat_id>`.");
+            println!("Docs: https://getcara.io/cookbook/telegram-webhook-assistant.html");
             println!("Repo docs path: docs/cookbook/telegram-webhook-assistant.md");
         }
         SetupOutcome::Hooks => {
             println!("First-run outcome: hooks automation");
+            println!("Next step: run `{verify_command}`.");
             if hooks_enabled {
-                println!("Next step: send a test hook to http://127.0.0.1:{port}/hooks/wake");
+                println!(
+                    "After verification, send a test hook to http://127.0.0.1:{port}/hooks/wake"
+                );
                 println!(
                     "Example: curl -X POST -H 'Authorization: Bearer <CARAPACE_HOOKS_TOKEN>' \\"
                 );
@@ -3060,6 +3167,35 @@ fn print_setup_outcome_next_steps(outcome: SetupOutcome, port: u16, hooks_enable
                     "Hooks outcome selected, but hooks are disabled. Enable `gateway.hooks.enabled` to use it."
                 );
             }
+        }
+    }
+}
+
+fn print_setup_assessment_summary(assessment: &crate::onboarding::setup::SetupAssessment) {
+    println!();
+    println!("Provider setup summary");
+    println!("----------------------");
+    println!("Provider: {}", assessment.provider.label());
+    if let Some(auth_mode) = assessment.auth_mode {
+        println!("Auth mode: {}", auth_mode.label());
+    }
+    if let Some(profile_name) = assessment.profile_name.as_deref() {
+        match assessment.email.as_deref() {
+            Some(email) => println!("Profile: {profile_name} ({email})"),
+            None => println!("Profile: {profile_name}"),
+        }
+    }
+    println!("Status: {}", assessment.status.label());
+    println!("{}", assessment.summary);
+    for check in &assessment.checks {
+        let status = match check.status {
+            crate::onboarding::setup::SetupCheckStatus::Pass => "PASS",
+            crate::onboarding::setup::SetupCheckStatus::Fail => "FAIL",
+            crate::onboarding::setup::SetupCheckStatus::Skip => "SKIP",
+        };
+        println!("[{status}] {}: {}", check.name, check.detail);
+        if let Some(remediation) = check.remediation.as_deref() {
+            println!("      next step: {remediation}");
         }
     }
 }
@@ -3345,28 +3481,47 @@ async fn validate_channel_credentials_owned(channel: String, token: String) -> R
 }
 
 fn validate_provider_credentials_interactive(
-    provider: &str,
+    provider: SetupProvider,
     api_key: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<crate::onboarding::setup::SetupCheck, Box<dyn std::error::Error>> {
     let validate_now = prompt_yes_no("Validate provider credentials now?", true)?;
     if !validate_now {
-        return Ok(());
+        return Ok(crate::onboarding::setup::SetupCheck::validation_skip(
+            "Live provider validation",
+            format!("{} credential validation was skipped", provider.label()),
+            Some(
+                "run `cara verify` after setup to exercise the configured provider path"
+                    .to_string(),
+            ),
+        ));
     }
 
-    let provider = provider.to_string();
+    let provider_key = provider.prompt_key().to_string();
     let api_key = api_key.to_string();
-    println!("Checking {} credentials...", provider);
-    match run_sync_blocking_send(validate_provider_credentials_owned(provider, api_key))
+    println!("Checking {} credentials...", provider.label());
+    match run_sync_blocking_send(validate_provider_credentials_owned(provider_key, api_key))
         .map_err(|err| format!("credential validation runtime failed: {err}"))
     {
         Ok(()) => {
             println!("Credential check succeeded.");
-            Ok(())
+            Ok(crate::onboarding::setup::SetupCheck::validation_pass(
+                "Live provider validation",
+                format!("{} credential validation succeeded", provider.label()),
+            ))
         }
         Err(err) => {
             eprintln!("Credential check failed: {}", err);
             if prompt_yes_no("Continue setup and write config anyway?", false)? {
-                Ok(())
+                let rerun_command = crate::onboarding::setup::SetupProvider::from(provider)
+                    .rerun_command(setup_provider_auth_mode_hint(provider, None));
+                Ok(crate::onboarding::setup::SetupCheck::validation_fail(
+                    "Live provider validation",
+                    err,
+                    format!(
+                        "fix the credential and rerun `{}` or run `cara verify` after updating config",
+                        rerun_command
+                    ),
+                ))
             } else {
                 Err("setup aborted after credential validation failure".into())
             }
@@ -4364,7 +4519,7 @@ fn prompt_setup_provider_interactive(
         return Ok(provider);
     }
 
-    let provider_hints = detect_setup_provider_env_hints();
+    let provider_hints = detect_setup_provider_choice_env_hints();
     if provider_hints.len() > 1 {
         let labels = provider_hints
             .iter()
@@ -4377,18 +4532,64 @@ fn prompt_setup_provider_interactive(
         eprintln!("Setup will only write the provider you choose.");
     }
 
-    let default_provider = default_setup_provider(&provider_hints).prompt_key();
+    let default_provider = default_setup_provider_choice(&provider_hints).prompt_key();
     loop {
         let selection = prompt_with_default(
-            "Select provider for first run (anthropic/codex/openai/ollama/gemini/venice/bedrock)",
+            "Select provider for first run (anthropic/openai/ollama/gemini/venice/bedrock)",
             default_provider,
         )?;
-        if let Some(provider) = SetupProvider::parse_prompt(&selection) {
-            return Ok(provider);
+        if let Some(provider) = SetupProviderChoice::parse_prompt(&selection) {
+            return match provider {
+                SetupProviderChoice::Anthropic => Ok(SetupProvider::Anthropic),
+                SetupProviderChoice::OpenAi => prompt_openai_setup_provider_variant(),
+                SetupProviderChoice::Ollama => Ok(SetupProvider::Ollama),
+                SetupProviderChoice::Gemini => Ok(SetupProvider::Gemini),
+                SetupProviderChoice::Venice => Ok(SetupProvider::Venice),
+                SetupProviderChoice::Bedrock => Ok(SetupProvider::Bedrock),
+            };
         }
-        eprintln!(
-            "Please enter one of: anthropic, codex, openai, ollama, gemini, venice, bedrock."
-        );
+        eprintln!("Please enter one of: anthropic, openai, ollama, gemini, venice, bedrock.");
+    }
+}
+
+fn prompt_openai_setup_provider_variant() -> Result<SetupProvider, Box<dyn std::error::Error>> {
+    let default_variant = if env_var_present("OPENAI_API_KEY") {
+        "api-key"
+    } else if env_var_present("CARAPACE_CONFIG_PASSWORD")
+        && env_var_present("OPENAI_OAUTH_CLIENT_ID")
+        && env_var_present("OPENAI_OAUTH_CLIENT_SECRET")
+    {
+        "subscription-sign-in"
+    } else {
+        "api-key"
+    };
+
+    loop {
+        let selection = prompt_choice(
+            "How should OpenAI authenticate? (api-key/subscription-sign-in)",
+            default_variant,
+            &["api-key", "subscription-sign-in"],
+        )?;
+        match selection.as_str() {
+            "api-key" => return Ok(SetupProvider::OpenAi),
+            "subscription-sign-in" => return Ok(SetupProvider::Codex),
+            _ => eprintln!("Please choose either `api-key` or `subscription-sign-in`."),
+        }
+    }
+}
+
+fn setup_provider_auth_mode_hint(
+    provider: SetupProvider,
+    requested_auth_mode: Option<GeminiSetupAuthMode>,
+) -> Option<crate::onboarding::setup::SetupAuthMode> {
+    match provider {
+        SetupProvider::Gemini => requested_auth_mode.map(Into::into),
+        SetupProvider::Codex => Some(crate::onboarding::setup::SetupAuthMode::OAuth),
+        SetupProvider::Anthropic | SetupProvider::OpenAi | SetupProvider::Venice => {
+            Some(crate::onboarding::setup::SetupAuthMode::ApiKey)
+        }
+        SetupProvider::Ollama => Some(crate::onboarding::setup::SetupAuthMode::BaseUrl),
+        SetupProvider::Bedrock => Some(crate::onboarding::setup::SetupAuthMode::StaticCredentials),
     }
 }
 
@@ -4578,13 +4779,14 @@ fn configure_gemini_provider_interactive(
     config: &mut Value,
     hide_sensitive_input: bool,
     requested_auth_mode: Option<GeminiSetupAuthMode>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<ProviderSetupResult, Box<dyn std::error::Error>> {
     let auth_mode = prompt_gemini_setup_auth_mode(requested_auth_mode)?;
     let base_url = prompt_optional_base_url_override(
         "Gemini",
         "GOOGLE_API_BASE_URL",
         "https://generativelanguage.googleapis.com",
     )?;
+    let mut result = ProviderSetupResult::default();
 
     match auth_mode {
         GeminiSetupAuthMode::ApiKey => {
@@ -4605,7 +4807,13 @@ fn configure_gemini_provider_interactive(
                         .and_then(|value| value.effective_value.as_deref()),
                 );
                 if let Err(err) = validation {
-                    handle_setup_validation_failure(err)?;
+                    result
+                        .observed_provider_checks
+                        .push(handle_setup_validation_failure(
+                            SetupProvider::Gemini,
+                            Some(GeminiSetupAuthMode::ApiKey),
+                            err,
+                        )?);
                 }
             }
 
@@ -4634,7 +4842,13 @@ fn configure_gemini_provider_interactive(
                 if let Err(err) =
                     crate::onboarding::gemini::validate_gemini_base_url_input(Some(url))
                 {
-                    handle_setup_validation_failure(err)?;
+                    result
+                        .observed_provider_checks
+                        .push(handle_setup_validation_failure(
+                            SetupProvider::Gemini,
+                            Some(GeminiSetupAuthMode::OAuth),
+                            err,
+                        )?);
                 }
             }
 
@@ -4649,7 +4863,17 @@ fn configure_gemini_provider_interactive(
 
             let state_dir = resolve_state_dir();
             std::fs::create_dir_all(&state_dir)?;
+            let profile_detail = match completion.auth_profile.email.as_deref() {
+                Some(email) => format!("stored Gemini auth profile for {email}"),
+                None => "stored Gemini auth profile".to_string(),
+            };
             crate::onboarding::gemini::persist_cli_google_oauth(state_dir, config, completion)?;
+            result.observed_provider_checks.push(
+                crate::onboarding::setup::SetupCheck::validation_pass(
+                    "Live provider validation",
+                    profile_detail,
+                ),
+            );
 
             if let Some(base_url) = base_url {
                 config["google"]["baseUrl"] = serde_json::json!(base_url.config_value);
@@ -4657,15 +4881,15 @@ fn configure_gemini_provider_interactive(
         }
     }
 
-    Ok(())
+    Ok(result)
 }
 
 fn configure_codex_provider_interactive(
     config: &mut Value,
     hide_sensitive_input: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<ProviderSetupResult, Box<dyn std::error::Error>> {
     println!(
-        "Codex setup uses OpenAI subscription sign-in and stores a refreshable auth profile. OpenAI API-key setup remains under `--provider openai`."
+        "OpenAI subscription sign-in stores a refreshable auth profile. OpenAI API-key setup remains available through the OpenAI API-key path."
     );
 
     let client_id =
@@ -4686,19 +4910,37 @@ fn configure_codex_provider_interactive(
 
     let state_dir = resolve_state_dir();
     std::fs::create_dir_all(&state_dir)?;
+    let profile_detail = match completion.auth_profile.email.as_deref() {
+        Some(email) => format!("stored OpenAI auth profile for {email}"),
+        None => "stored OpenAI auth profile".to_string(),
+    };
     crate::onboarding::codex::persist_cli_openai_oauth(state_dir, config, completion)?;
 
-    Ok(())
+    Ok(ProviderSetupResult {
+        observed_provider_checks: vec![crate::onboarding::setup::SetupCheck::validation_pass(
+            "Live provider validation",
+            profile_detail,
+        )],
+    })
 }
 
 fn handle_setup_validation_failure(
+    provider: SetupProvider,
+    requested_auth_mode: Option<GeminiSetupAuthMode>,
     err: crate::agent::AgentError,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<crate::onboarding::setup::SetupCheck, Box<dyn std::error::Error>> {
     eprintln!("{}", render_setup_validation_failure(&err));
+    let rerun = crate::onboarding::setup::SetupProvider::from(provider)
+        .rerun_command(setup_provider_auth_mode_hint(provider, requested_auth_mode));
+    eprintln!("Next step: fix the value and rerun `{rerun}`.");
     if prompt_yes_no("Continue setup and write config anyway?", false)? {
-        Ok(())
+        Ok(crate::onboarding::setup::SetupCheck::validation_fail(
+            "Provider configuration validation",
+            render_setup_validation_failure(&err),
+            format!("fix the value and rerun `{rerun}`"),
+        ))
     } else {
-        Err("setup aborted after credential validation failure".into())
+        Err("setup aborted after provider configuration validation failure".into())
     }
 }
 
@@ -4707,11 +4949,13 @@ fn configure_provider_interactive(
     provider: SetupProvider,
     hide_sensitive_input: bool,
     requested_auth_mode: Option<GeminiSetupAuthMode>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<ProviderSetupResult, Box<dyn std::error::Error>> {
     if provider != SetupProvider::Gemini && requested_auth_mode.is_some() {
         return Err("`--auth-mode` is currently only valid with `--provider gemini`.".into());
     }
     config["agents"]["defaults"]["model"] = serde_json::json!(provider.default_model());
+
+    let mut result = ProviderSetupResult::default();
 
     match provider {
         SetupProvider::Anthropic => {
@@ -4721,14 +4965,16 @@ fn configure_provider_interactive(
                 hide_sensitive_input,
             )?;
             if let Some(key) = api_key.effective_value.as_deref() {
-                validate_provider_credentials_interactive(provider.prompt_key(), key)?;
+                result
+                    .observed_provider_checks
+                    .push(validate_provider_credentials_interactive(provider, key)?);
             } else {
                 print_missing_setup_value_notice("ANTHROPIC_API_KEY", "API key");
             }
             config["anthropic"] = serde_json::json!({ "apiKey": api_key.config_value });
         }
         SetupProvider::Codex => {
-            configure_codex_provider_interactive(config, hide_sensitive_input)?;
+            result = configure_codex_provider_interactive(config, hide_sensitive_input)?;
         }
         SetupProvider::OpenAi => {
             let api_key = prompt_required_secret_config_value(
@@ -4737,7 +4983,9 @@ fn configure_provider_interactive(
                 hide_sensitive_input,
             )?;
             if let Some(key) = api_key.effective_value.as_deref() {
-                validate_provider_credentials_interactive(provider.prompt_key(), key)?;
+                result
+                    .observed_provider_checks
+                    .push(validate_provider_credentials_interactive(provider, key)?);
             } else {
                 print_missing_setup_value_notice("OPENAI_API_KEY", "API key");
             }
@@ -4782,7 +5030,9 @@ fn configure_provider_interactive(
                     }
                 }) {
                 Ok(_) => {}
-                Err(err) => handle_setup_validation_failure(err)?,
+                Err(err) => result
+                    .observed_provider_checks
+                    .push(handle_setup_validation_failure(provider, None, err)?),
             }
 
             let mut ollama_config = serde_json::Map::new();
@@ -4801,7 +5051,7 @@ fn configure_provider_interactive(
             });
         }
         SetupProvider::Gemini => {
-            configure_gemini_provider_interactive(
+            result = configure_gemini_provider_interactive(
                 config,
                 hide_sensitive_input,
                 requested_auth_mode,
@@ -4835,7 +5085,9 @@ fn configure_provider_interactive(
                         }
                     });
                 if let Err(err) = validation {
-                    handle_setup_validation_failure(err)?;
+                    result
+                        .observed_provider_checks
+                        .push(handle_setup_validation_failure(provider, None, err)?);
                 }
             }
 
@@ -4924,7 +5176,9 @@ fn configure_provider_interactive(
                             }
                         });
                 if let Err(err) = validation {
-                    handle_setup_validation_failure(err)?;
+                    result
+                        .observed_provider_checks
+                        .push(handle_setup_validation_failure(provider, None, err)?);
                 }
             }
 
@@ -4939,14 +5193,14 @@ fn configure_provider_interactive(
         }
     }
 
-    Ok(())
+    Ok(result)
 }
 
 fn configure_provider_noninteractive(
     config: &mut Value,
     provider: SetupProvider,
     requested_auth_mode: Option<GeminiSetupAuthMode>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<ProviderSetupResult, Box<dyn std::error::Error>> {
     if provider != SetupProvider::Gemini && requested_auth_mode.is_some() {
         return Err("`--auth-mode` is currently only valid with `--provider gemini`.".into());
     }
@@ -5030,7 +5284,7 @@ fn configure_provider_noninteractive(
             }
         }
     }
-    Ok(())
+    Ok(ProviderSetupResult::default())
 }
 
 /// Run the `setup` subcommand -- interactive first-run wizard.
@@ -5076,10 +5330,12 @@ pub fn handle_setup(
         }
     });
 
-    let mut setup_outcome = SetupOutcome::LocalChat;
+    let setup_outcome;
     let mut hooks_enabled = false;
     let mut verify_discord_to: Option<String> = None;
     let mut verify_telegram_to: Option<String> = None;
+    let configured_provider;
+    let provider_setup_result;
 
     if interactive {
         println!("Carapace setup wizard");
@@ -5091,12 +5347,13 @@ pub fn handle_setup(
 
         let hide_sensitive_input = prompt_yes_no("Hide sensitive input while typing?", true)?;
         let provider = prompt_setup_provider_interactive(requested_provider)?;
-        configure_provider_interactive(
+        provider_setup_result = configure_provider_interactive(
             &mut config,
             provider,
             hide_sensitive_input,
             requested_auth_mode,
         )?;
+        configured_provider = provider;
 
         let auth_mode = prompt_choice(
             "Gateway auth mode (token/password)",
@@ -5211,7 +5468,10 @@ pub fn handle_setup(
             });
         }
     } else if let Some(provider) = requested_provider {
-        configure_provider_noninteractive(&mut config, provider, requested_auth_mode)?;
+        provider_setup_result =
+            configure_provider_noninteractive(&mut config, provider, requested_auth_mode)?;
+        configured_provider = provider;
+        setup_outcome = infer_setup_outcome_from_config(&config);
     } else {
         return Err(
             "non-interactive setup requires `--provider <provider>`; rerun with an explicit provider."
@@ -5225,6 +5485,19 @@ pub fn handle_setup(
 
     println!("Config written to {}", config_path.display());
     println!("Start the server with: cara start");
+
+    let setup_assessment = crate::onboarding::setup::assess_provider_setup(
+        &config,
+        &resolve_state_dir(),
+        configured_provider.into(),
+        provider_setup_result.observed_provider_checks,
+    );
+    print_setup_assessment_summary(&setup_assessment);
+    if let Some(remediation) = setup_assessment.recommended_remediation() {
+        if setup_assessment.status == crate::onboarding::setup::SetupAssessmentStatus::Invalid {
+            println!("Next fix: {remediation}");
+        }
+    }
 
     if interactive {
         let port = config
@@ -5289,6 +5562,14 @@ pub fn handle_setup(
             }
         }
 
+        print_setup_outcome_next_steps(setup_outcome, port, hooks_enabled);
+    } else {
+        let port = config
+            .get("gateway")
+            .and_then(|v| v.get("port"))
+            .and_then(|v| v.as_u64())
+            .and_then(|v| u16::try_from(v).ok())
+            .unwrap_or(DEFAULT_PORT);
         print_setup_outcome_next_steps(setup_outcome, port, hooks_enabled);
     }
 
@@ -7373,6 +7654,24 @@ mod tests {
     }
 
     #[test]
+    fn test_local_chat_verify_next_step_for_missing_embedded_bedrock_env_var() {
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("AWS_REGION_SUFFIX");
+        let cfg = serde_json::json!({
+            "bedrock": {
+                "region": "us-${AWS_REGION_SUFFIX}-1",
+                "accessKeyId": "AKIA...",
+                "secretAccessKey": "secret"
+            },
+            "agents": { "defaults": { "model": "bedrock:anthropic.claude-3-5-sonnet-20240620-v1:0" } }
+        });
+        assert_eq!(
+            local_chat_verify_next_step(&cfg),
+            "set `$AWS_REGION_SUFFIX` in the same shell you use for `cara start` and `cara verify`, or rerun `cara setup --force` to write the key into config, then retry `cara verify --outcome local-chat`"
+        );
+    }
+
+    #[test]
     fn test_detect_setup_provider_env_hints_ignore_partial_aws_env() {
         let mut env_guard = ScopedEnv::new();
         env_guard.set("AWS_REGION", "us-east-1");
@@ -7997,7 +8296,7 @@ mod tests {
                     "y".to_string(),
                     "ollama".to_string(),
                     "".to_string(),
-                    "n".to_string(),
+                    "".to_string(),
                     "".to_string(),
                     "".to_string(),
                     "".to_string(),
@@ -8040,6 +8339,7 @@ mod tests {
                 visible_inputs: VecDeque::from(vec![
                     "y".to_string(),
                     "openai".to_string(),
+                    "api-key".to_string(),
                     "".to_string(),
                     "n".to_string(),
                     "".to_string(),
@@ -8089,10 +8389,11 @@ mod tests {
                 visible_inputs: VecDeque::from(vec![
                     "n".to_string(),
                     "openai".to_string(),
+                    "api-key".to_string(),
                     "sk-openai-visible".to_string(),
                     "n".to_string(),
                     "".to_string(),
-                    "y".to_string(),
+                    "".to_string(),
                     "".to_string(),
                     "".to_string(),
                     "telegram".to_string(),
@@ -8137,10 +8438,11 @@ mod tests {
                 visible_inputs: VecDeque::from(vec![
                     "n".to_string(),
                     "openai".to_string(),
+                    "api-key".to_string(),
                     "sk-openai-visible".to_string(),
                     "n".to_string(),
                     "".to_string(),
-                    "y".to_string(),
+                    "".to_string(),
                     "".to_string(),
                     "".to_string(),
                     "telegram".to_string(),
@@ -8188,6 +8490,7 @@ mod tests {
                 visible_inputs: VecDeque::from(vec![
                     "y".to_string(),
                     "openai".to_string(),
+                    "api-key".to_string(),
                     "".to_string(),
                     "n".to_string(),
                     "".to_string(),
@@ -8238,10 +8541,11 @@ mod tests {
                 visible_inputs: VecDeque::from(vec![
                     "n".to_string(),
                     "openai".to_string(),
+                    "api-key".to_string(),
                     "sk-openai-visible".to_string(),
                     "n".to_string(),
                     "".to_string(),
-                    "y".to_string(),
+                    "".to_string(),
                     "".to_string(),
                     "".to_string(),
                     "discord".to_string(),
@@ -8277,6 +8581,26 @@ mod tests {
         assert_eq!(state.provider_validation_calls, 0);
         assert!(state.channel_validation_results.is_empty());
         assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
+    fn test_handle_setup_validation_failure_uses_provider_configuration_abort_message() {
+        let _guard = install_setup_interactive_harness(SetupInteractiveTestHarness {
+            visible_inputs: VecDeque::from(vec!["n".to_string()]),
+            ..Default::default()
+        });
+
+        let result = handle_setup_validation_failure(
+            SetupProvider::Gemini,
+            Some(GeminiSetupAuthMode::ApiKey),
+            crate::agent::AgentError::InvalidBaseUrl("bad".to_string()),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "setup aborted after provider configuration validation failure"
+        );
     }
 
     // -----------------------------------------------------------------------

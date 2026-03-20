@@ -63,6 +63,12 @@ const CONFIG_SECRET_PATHS: &[&str] = &[
     "/slack/signingSecret",
 ];
 
+// Regex pattern for env vars: ${VAR} where VAR is uppercase with underscores and digits.
+// `$${VAR}` is treated as an escaped literal and should not be surfaced as a live reference.
+static ENV_VAR_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\$\$?\{([A-Z_][A-Z0-9_]*)\}").expect("failed to compile regex: env_var_pattern")
+});
+
 /// Configuration errors
 #[derive(Error, Debug)]
 pub enum ConfigError {
@@ -683,7 +689,7 @@ fn substitute_env_vars(value: &mut Value) -> Result<(), ConfigError> {
 }
 
 /// Substitute environment variables in a single string
-fn substitute_env_in_string(s: &str) -> Result<String, ConfigError> {
+pub(crate) fn substitute_env_in_string(s: &str) -> Result<String, ConfigError> {
     substitute_env_in_string_with(s, |var_name| {
         env::var(var_name).map_err(|_| ConfigError::MissingEnvVar {
             var: var_name.to_string(),
@@ -691,16 +697,37 @@ fn substitute_env_in_string(s: &str) -> Result<String, ConfigError> {
     })
 }
 
-fn substitute_env_in_string_with<F>(s: &str, mut resolver: F) -> Result<String, ConfigError>
+pub(crate) fn env_var_references_in_string(s: &str) -> Vec<String> {
+    let mut references = Vec::new();
+    let mut seen = HashSet::new();
+
+    for caps in ENV_VAR_PATTERN.captures_iter(s) {
+        let full_match = caps
+            .get(0)
+            .expect("env var regex must produce a full match");
+        if full_match.as_str().starts_with("$$") {
+            continue;
+        }
+        let reference = caps
+            .get(1)
+            .expect("env var regex must capture the variable name")
+            .as_str()
+            .to_string();
+        if seen.insert(reference.clone()) {
+            references.push(reference);
+        }
+    }
+
+    references
+}
+
+pub(crate) fn substitute_env_in_string_with<F>(
+    s: &str,
+    mut resolver: F,
+) -> Result<String, ConfigError>
 where
     F: FnMut(&str) -> Result<String, ConfigError>,
 {
-    // Regex pattern for env vars: ${VAR} where VAR is uppercase with underscores and digits
-    static ENV_VAR_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"\$\$?\{([A-Z_][A-Z0-9_]*)\}")
-            .expect("failed to compile regex: env_var_pattern")
-    });
-
     let mut result = String::with_capacity(s.len());
     let mut last_end = 0;
 
@@ -881,6 +908,13 @@ mod tests {
 
         let result = substitute_env_in_string("Bearer ${TEST_API_KEY}").unwrap();
         assert_eq!(result, "Bearer sk-secret");
+    }
+
+    #[test]
+    fn test_env_var_references_in_string_deduplicates_preserving_first_seen_order() {
+        let references = env_var_references_in_string("${HOST}:${HOST}/v1/${PORT}?mirror=${HOST}");
+
+        assert_eq!(references, vec!["HOST".to_string(), "PORT".to_string()]);
     }
 
     #[test]
