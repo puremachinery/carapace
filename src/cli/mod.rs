@@ -3516,13 +3516,14 @@ fn validate_provider_credentials_interactive(
         Err(err) => {
             eprintln!("Credential check failed: {}", err);
             if prompt_yes_no("Continue setup and write config anyway?", false)? {
+                let rerun_command = crate::onboarding::setup::SetupProvider::from(provider)
+                    .rerun_command(setup_provider_auth_mode_hint(provider, None));
                 Ok(crate::onboarding::setup::SetupCheck::validation_fail(
                     "Live provider validation",
                     err,
                     format!(
                         "fix the credential and rerun `{}` or run `cara verify` after updating config",
-                        crate::onboarding::setup::SetupProvider::from(provider)
-                            .rerun_command(setup_provider_auth_mode_hint(provider, None))
+                        rerun_command
                     ),
                 ))
             } else {

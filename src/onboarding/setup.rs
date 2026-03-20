@@ -247,20 +247,23 @@ pub fn assess_provider_setup(
             );
             let profile_id = config_string(cfg, &["codex", "authProfile"]);
             checks.push(profile_check);
+            let password_present = profile_store_password_present();
             checks.push(config_password_check(&rerun_command));
-            if let Some(profile_id) = profile_id {
-                let (check, summary) = auth_profile_summary_check(
-                    state_dir,
-                    &profile_id,
-                    OAuthProvider::OpenAI,
-                    "OpenAI auth profile",
-                    &rerun_command,
-                );
-                if let Some(summary) = summary {
-                    profile_name = Some(summary.name.clone());
-                    email = summary.email.clone();
+            if password_present {
+                if let Some(profile_id) = profile_id {
+                    let (check, summary) = auth_profile_summary_check(
+                        state_dir,
+                        &profile_id,
+                        OAuthProvider::OpenAI,
+                        "OpenAI auth profile",
+                        &rerun_command,
+                    );
+                    if let Some(summary) = summary {
+                        profile_name = Some(summary.name.clone());
+                        email = summary.email.clone();
+                    }
+                    checks.push(check);
                 }
-                checks.push(check);
             }
         }
         SetupProvider::OpenAi => {
@@ -307,20 +310,23 @@ pub fn assess_provider_setup(
                 );
                 let profile_id = config_string(cfg, &["google", "authProfile"]);
                 checks.push(profile_check);
+                let password_present = profile_store_password_present();
                 checks.push(config_password_check(&rerun_command));
-                if let Some(profile_id) = profile_id {
-                    let (check, summary) = auth_profile_summary_check(
-                        state_dir,
-                        &profile_id,
-                        OAuthProvider::Google,
-                        "Gemini auth profile",
-                        &rerun_command,
-                    );
-                    if let Some(summary) = summary {
-                        profile_name = Some(summary.name.clone());
-                        email = summary.email.clone();
+                if password_present {
+                    if let Some(profile_id) = profile_id {
+                        let (check, summary) = auth_profile_summary_check(
+                            state_dir,
+                            &profile_id,
+                            OAuthProvider::Google,
+                            "Gemini auth profile",
+                            &rerun_command,
+                        );
+                        if let Some(summary) = summary {
+                            profile_name = Some(summary.name.clone());
+                            email = summary.email.clone();
+                        }
+                        checks.push(check);
                     }
-                    checks.push(check);
                 }
                 if config_string(cfg, &["google", "baseUrl"]).is_some() {
                     checks.push(base_url_validation_check(
@@ -479,14 +485,12 @@ fn detect_auth_mode(cfg: &Value, provider: SetupProvider) -> Option<SetupAuthMod
 fn model_route_check(cfg: &Value, provider: SetupProvider, rerun_command: &str) -> SetupCheck {
     let model = config_string(cfg, &["agents", "defaults", "model"])
         .unwrap_or_else(|| provider.default_model().to_string());
-    let actual_provider = model_provider_for_local_chat(&model);
-    if actual_provider == provider {
-        SetupCheck::pass(
+    match model_provider_for_local_chat(&model) {
+        Some(actual_provider) if actual_provider == provider => SetupCheck::pass(
             "Default model route",
             format!("`agents.defaults.model` routes to {}", provider.label()),
-        )
-    } else {
-        SetupCheck::fail(
+        ),
+        Some(actual_provider) => SetupCheck::fail(
             "Default model route",
             format!(
                 "`agents.defaults.model` currently routes to {}, not {}",
@@ -498,7 +502,16 @@ fn model_route_check(cfg: &Value, provider: SetupProvider, rerun_command: &str) 
                 provider.default_model(),
                 rerun_command
             ),
-        )
+        ),
+        None => SetupCheck::fail(
+            "Default model route",
+            format!("`agents.defaults.model` uses an unrecognized provider route: `{model}`"),
+            format!(
+                "set `agents.defaults.model` to `{}` or rerun `{}`",
+                provider.default_model(),
+                rerun_command
+            ),
+        ),
     }
 }
 
@@ -740,21 +753,23 @@ fn extract_env_placeholder_key(value: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn model_provider_for_local_chat(model: &str) -> SetupProvider {
+fn model_provider_for_local_chat(model: &str) -> Option<SetupProvider> {
     if agent::ollama::is_ollama_model(model) {
-        SetupProvider::Ollama
+        Some(SetupProvider::Ollama)
     } else if agent::venice::is_venice_model(model) {
-        SetupProvider::Venice
+        Some(SetupProvider::Venice)
     } else if agent::gemini::is_gemini_model(model) {
-        SetupProvider::Gemini
+        Some(SetupProvider::Gemini)
     } else if agent::codex::is_codex_model(model) {
-        SetupProvider::Codex
+        Some(SetupProvider::Codex)
     } else if agent::openai::is_openai_model(model) {
-        SetupProvider::OpenAi
+        Some(SetupProvider::OpenAi)
     } else if agent::bedrock::is_bedrock_model(model) {
-        SetupProvider::Bedrock
+        Some(SetupProvider::Bedrock)
+    } else if model.trim_start().starts_with("claude") {
+        Some(SetupProvider::Anthropic)
     } else {
-        SetupProvider::Anthropic
+        None
     }
 }
 
@@ -826,6 +841,36 @@ mod tests {
             .iter()
             .any(|check| check.name == "Encrypted profile store"
                 && check.status == SetupCheckStatus::Fail));
+    }
+
+    #[test]
+    fn test_assess_provider_setup_skips_profile_store_load_when_password_missing() {
+        let temp = TempDir::new().unwrap();
+        let store = ProfileStore::new(temp.path().to_path_buf());
+        store
+            .add(sample_profile("openai-123", OAuthProvider::OpenAI))
+            .unwrap();
+
+        let cfg = json!({
+            "agents": { "defaults": { "model": "codex:default" } },
+            "auth": { "profiles": { "enabled": true } },
+            "codex": { "authProfile": "openai-123" }
+        });
+        let mut env = ScopedEnv::new();
+        env.unset("CARAPACE_CONFIG_PASSWORD");
+
+        let assessment = assess_provider_setup(&cfg, temp.path(), SetupProvider::Codex, vec![]);
+
+        assert_eq!(assessment.status, SetupAssessmentStatus::Invalid);
+        assert!(assessment
+            .checks
+            .iter()
+            .any(|check| check.name == "Encrypted profile store"
+                && check.status == SetupCheckStatus::Fail));
+        assert!(!assessment
+            .checks
+            .iter()
+            .any(|check| check.detail.contains("failed to read the profile store")));
     }
 
     #[test]
@@ -925,5 +970,23 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn test_assess_provider_setup_reports_unknown_model_route() {
+        let temp = TempDir::new().unwrap();
+        let cfg = json!({
+            "agents": { "defaults": { "model": "mistral:mixtral" } },
+            "openai": { "apiKey": "sk-test-value" }
+        });
+
+        let assessment = assess_provider_setup(&cfg, temp.path(), SetupProvider::OpenAi, vec![]);
+
+        assert_eq!(assessment.status, SetupAssessmentStatus::Invalid);
+        assert!(assessment.checks.iter().any(|check| {
+            check.name == "Default model route"
+                && check.status == SetupCheckStatus::Fail
+                && check.detail.contains("unrecognized provider route")
+        }));
     }
 }
