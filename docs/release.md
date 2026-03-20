@@ -133,31 +133,45 @@ Every release should include these sections:
 - Remaining limitations or partial areas relevant to operators.
 ```
 
+Curated release notes are versioned in-repo at:
+
+- `docs/releases/<tag>.md`
+
+Examples:
+
+- stable release: `docs/releases/vX.Y.Z.md`
+- prerelease: `docs/releases/vX.Y.Z-previewN.md`
+
+The tag-triggered release workflow publishes that exact file and fails closed if
+it is missing.
+
 ## Reproducible Release Checklist
 
 1. Confirm `master` is green (CI + CodeQL + required checks).
 2. Confirm no open critical/high security findings on `master`.
 3. Confirm docs are current for install, ops, and security behavior.
-4. Create annotated tag from `master`:
+4. Commit `docs/releases/<tag>.md` with all required release-note sections.
+5. Create annotated tag from `master`:
    - `git tag -a vX.Y.Z -m "vX.Y.Z"`
-5. Push tag:
-   - `git push origin vX.Y.Z`
    - For intentional prereleases only: `vX.Y.Z-previewN`
-6. Wait for `.github/workflows/release.yml` to complete.
-7. Verify release artifacts are published (all target binaries + signatures +
+6. Push tag:
+   - `git push origin <tag>`
+7. Wait for `.github/workflows/release.yml` to complete.
+8. Verify release artifacts are published (all target binaries + signatures +
    checksums).
-8. Verify published artifact authenticity/checksum workflow against the release (run from repo root).
+9. Verify published artifact authenticity/checksum workflow against the release (run from repo root).
    - `./scripts/smoke/verify-release-artifacts.sh`
    - Optional overrides:
      - `RELEASE_TAG=vX.Y.Z ./scripts/smoke/verify-release-artifacts.sh`
      - `CARA_ASSET=cara-x86_64-linux ./scripts/smoke/verify-release-artifacts.sh`
-9. Smoke-check the published binary on at least one Linux and one macOS path.
+10. Smoke-check the published binary on at least one Linux and one macOS path.
    - Suggested scripts:
      - `scripts/smoke/update-macos-local.sh`
      - `scripts/smoke/update-linux-orbstack.sh`
    - Optional live channel smoke:
      - `scripts/smoke/live-channel-smoke.sh`
-10. Confirm release notes contain all required sections above.
+11. Confirm release notes contain all required sections above.
+    - The published GitHub release body should match `docs/releases/<tag>.md`.
 
 ## Distribution Notes
 
