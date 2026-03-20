@@ -225,7 +225,6 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     }
 
-    server::startup::stop_plugin_services(&ws_state);
     info!("Gateway shut down");
     Ok(())
 }
@@ -988,6 +987,8 @@ async fn shutdown_signal(
     if let Err(e) = ws_state.session_store().flush_all() {
         error!("Failed to flush session store during shutdown: {}", e);
     }
+
+    server::startup::stop_plugin_services(&ws_state);
 
     // Brief grace period for in-flight operations to complete
     tokio::time::sleep(Duration::from_millis(250)).await;

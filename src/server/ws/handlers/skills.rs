@@ -482,39 +482,46 @@ fn download_skill_wasm(
 pub(super) fn handle_skills_status(state: &WsServerState) -> Result<Value, ErrorShape> {
     let cfg = config::load_config().unwrap_or(Value::Object(serde_json::Map::new()));
     let workspace_dir = resolve_workspace_dir(&cfg);
-    let managed_skills_dir = resolve_skills_dir();
-    let (plugins_enabled, configured_paths, runtime_errors, skills_arr, restart_required) =
-        if let Some(report) = state.plugin_activation_report() {
-            (
-                report.enabled,
-                report
-                    .configured_paths
-                    .iter()
-                    .map(|path| path.to_string_lossy().to_string())
-                    .collect::<Vec<_>>(),
-                report.errors.clone(),
-                build_skills_array_from_report(report),
-                report.restart_required_for_changes,
-            )
-        } else {
-            (
-                cfg.pointer("/plugins/enabled")
-                    .and_then(|value| value.as_bool())
-                    .unwrap_or(true),
-                cfg.pointer("/plugins/load/paths")
-                    .and_then(|value| value.as_array())
-                    .map(|paths| {
-                        paths
-                            .iter()
-                            .filter_map(|value| value.as_str().map(|path| path.to_string()))
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default(),
-                Vec::new(),
-                build_skills_array(&cfg),
-                true,
-            )
-        };
+    let (
+        managed_skills_dir,
+        plugins_enabled,
+        configured_paths,
+        runtime_errors,
+        skills_arr,
+        restart_required,
+    ) = if let Some(report) = state.plugin_activation_report() {
+        (
+            report.managed_dir.clone(),
+            report.enabled,
+            report
+                .configured_paths
+                .iter()
+                .map(|path| path.to_string_lossy().to_string())
+                .collect::<Vec<_>>(),
+            report.errors.clone(),
+            build_skills_array_from_report(report),
+            report.restart_required_for_changes,
+        )
+    } else {
+        (
+            resolve_skills_dir(),
+            cfg.pointer("/plugins/enabled")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(true),
+            cfg.pointer("/plugins/load/paths")
+                .and_then(|value| value.as_array())
+                .map(|paths| {
+                    paths
+                        .iter()
+                        .filter_map(|value| value.as_str().map(|path| path.to_string()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+            Vec::new(),
+            build_skills_array(&cfg),
+            true,
+        )
+    };
 
     Ok(json!({
         "workspaceDir": workspace_dir.to_string_lossy(),
@@ -981,11 +988,12 @@ mod tests {
 
     #[test]
     fn test_handle_skills_status_uses_plugin_activation_report() {
-        let state_dir = TempDir::new().unwrap();
+        let env_state_dir = TempDir::new().unwrap();
+        let report_state_dir = TempDir::new().unwrap();
         let config_dir = TempDir::new().unwrap();
         let config_path = config_dir.path().join("carapace.json");
         let mut env = ScopedEnv::new();
-        env.set("CARAPACE_STATE_DIR", state_dir.path().as_os_str())
+        env.set("CARAPACE_STATE_DIR", env_state_dir.path().as_os_str())
             .set("CARAPACE_CONFIG_PATH", config_path.as_os_str())
             .set("CARAPACE_DISABLE_CONFIG_CACHE", "1");
         crate::config::clear_cache();
@@ -993,8 +1001,8 @@ mod tests {
         let state = WsServerState::new(WsServerConfig::default()).with_plugin_activation_report(
             crate::server::startup::PluginActivationReport {
                 enabled: true,
-                managed_dir: state_dir.path().join("skills"),
-                configured_paths: vec![state_dir.path().join("dev-plugins")],
+                managed_dir: report_state_dir.path().join("skills"),
+                configured_paths: vec![report_state_dir.path().join("dev-plugins")],
                 restart_required_for_changes: true,
                 errors: vec!["failed to read configured plugin path".to_string()],
                 entries: vec![crate::server::startup::PluginActivationEntry {
@@ -1002,7 +1010,7 @@ mod tests {
                     plugin_id: Some("weather".to_string()),
                     source: crate::server::startup::PluginActivationSource::Managed,
                     enabled: true,
-                    path: Some(state_dir.path().join("skills/weather.wasm")),
+                    path: Some(report_state_dir.path().join("skills/weather.wasm")),
                     requested_at: Some(1700000000000u64),
                     install_id: Some(json!("install-weather")),
                     state: crate::server::startup::PluginActivationState::Active,
@@ -1014,7 +1022,7 @@ mod tests {
         let result = handle_skills_status(&state).unwrap();
         assert_eq!(
             result["managedSkillsDir"],
-            state_dir
+            report_state_dir
                 .path()
                 .join("skills")
                 .to_string_lossy()
@@ -1023,7 +1031,7 @@ mod tests {
         assert_eq!(result["pluginsEnabled"], true);
         assert_eq!(
             result["configuredPluginPaths"],
-            json!([state_dir
+            json!([report_state_dir
                 .path()
                 .join("dev-plugins")
                 .to_string_lossy()

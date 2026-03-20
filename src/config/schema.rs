@@ -834,9 +834,19 @@ fn validate_skills_sandbox(obj: &serde_json::Map<String, Value>, issues: &mut Ve
 }
 
 fn validate_plugins(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIssue>) {
-    let plugins = match obj.get("plugins").and_then(|value| value.as_object()) {
+    let Some(plugins_value) = obj.get("plugins") else {
+        return;
+    };
+    let plugins = match plugins_value.as_object() {
         Some(plugins) => plugins,
-        None => return,
+        None => {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: ".plugins".to_string(),
+                message: "plugins must be an object".to_string(),
+            });
+            return;
+        }
     };
 
     if let Some(enabled) = plugins.get("enabled") {
@@ -2206,6 +2216,19 @@ mod tests {
             i.severity == Severity::Error
                 && i.path == ".plugins.enabled"
                 && i.message.contains("must be a boolean")
+        }));
+    }
+
+    #[test]
+    fn test_plugins_must_be_object() {
+        let config = json!({
+            "plugins": "yes"
+        });
+        let issues = validate_schema(&config);
+        assert!(issues.iter().any(|i| {
+            i.severity == Severity::Error
+                && i.path == ".plugins"
+                && i.message.contains("must be an object")
         }));
     }
 

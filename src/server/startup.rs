@@ -93,6 +93,7 @@ pub struct PluginActivationReport {
     pub enabled: bool,
     pub managed_dir: PathBuf,
     pub configured_paths: Vec<PathBuf>,
+    /// Startup activation changes require restart in the current model.
     pub restart_required_for_changes: bool,
     pub entries: Vec<PluginActivationEntry>,
     pub errors: Vec<String>,
@@ -113,6 +114,7 @@ impl PluginActivationReport {
 
 struct PluginBootstrapResult {
     registry: Arc<PluginRegistry>,
+    runtime: Option<Arc<PluginRuntime<credentials::DefaultCredentialBackend>>>,
     activation_report: PluginActivationReport,
 }
 
@@ -345,6 +347,7 @@ async fn bootstrap_plugin_runtime(cfg: &Value, state_dir: &Path) -> PluginBootst
         }
         return PluginBootstrapResult {
             registry,
+            runtime: None,
             activation_report: report,
         };
     }
@@ -360,6 +363,7 @@ async fn bootstrap_plugin_runtime(cfg: &Value, state_dir: &Path) -> PluginBootst
                 .push(format!("failed to initialize plugin loader: {error}"));
             return PluginBootstrapResult {
                 registry,
+                runtime: None,
                 activation_report: report,
             };
         }
@@ -489,6 +493,7 @@ async fn bootstrap_plugin_runtime(cfg: &Value, state_dir: &Path) -> PluginBootst
     if loaded_plugin_ids.is_empty() {
         return PluginBootstrapResult {
             registry,
+            runtime: None,
             activation_report: report,
         };
     }
@@ -508,6 +513,7 @@ async fn bootstrap_plugin_runtime(cfg: &Value, state_dir: &Path) -> PluginBootst
             }
             return PluginBootstrapResult {
                 registry,
+                runtime: None,
                 activation_report: report,
             };
         }
@@ -521,7 +527,7 @@ async fn bootstrap_plugin_runtime(cfg: &Value, state_dir: &Path) -> PluginBootst
         sandbox_config,
         permission_config,
     ) {
-        Ok(runtime) => runtime,
+        Ok(runtime) => Arc::new(runtime),
         Err(error) => {
             report
                 .errors
@@ -535,6 +541,7 @@ async fn bootstrap_plugin_runtime(cfg: &Value, state_dir: &Path) -> PluginBootst
             }
             return PluginBootstrapResult {
                 registry,
+                runtime: None,
                 activation_report: report,
             };
         }
@@ -592,6 +599,7 @@ async fn bootstrap_plugin_runtime(cfg: &Value, state_dir: &Path) -> PluginBootst
 
     PluginBootstrapResult {
         registry: shared_registry,
+        runtime: Some(runtime),
         activation_report: report,
     }
 }
@@ -781,6 +789,7 @@ pub async fn build_ws_state_with_runtime_dependencies(
         ws_state
             .with_tools_registry(tools_registry)
             .with_plugin_registry(plugin_bootstrap.registry)
+            .with_plugin_runtime_opt(plugin_bootstrap.runtime)
             .with_plugin_activation_report(plugin_bootstrap.activation_report),
     ))
 }
@@ -870,7 +879,11 @@ impl ServerHandle {
 }
 
 pub fn stop_plugin_services(ws_state: &WsServerState) {
-    let Some(plugin_registry) = ws_state.plugin_registry().cloned() else {
+    let Some(plugin_registry) = ws_state
+        .plugin_runtime()
+        .map(|runtime| runtime.registry())
+        .or_else(|| ws_state.plugin_registry().cloned())
+    else {
         return;
     };
 

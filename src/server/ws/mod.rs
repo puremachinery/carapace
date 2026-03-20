@@ -23,6 +23,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::plugins::PluginRuntime;
 use crate::server::startup::PluginActivationReport;
 use crate::{
     agent, auth, channels, config, credentials, cron, devices, exec, messages, nodes, plugins,
@@ -468,6 +469,8 @@ pub struct WsServerState {
     tools_registry: Option<Arc<plugins::ToolsRegistry>>,
     /// Plugin registry for channel/tool/webhook plugins
     plugin_registry: Option<Arc<plugins::PluginRegistry>>,
+    /// Retained plugin runtime for instantiated plugin lifetimes and epoch ticker.
+    plugin_runtime: Option<Arc<PluginRuntime<credentials::DefaultCredentialBackend>>>,
     /// Startup-time plugin activation report
     plugin_activation_report: Option<PluginActivationReport>,
     /// WebSocket connection limiter
@@ -490,6 +493,10 @@ impl std::fmt::Debug for WsServerState {
             .field(
                 "plugin_registry",
                 &self.plugin_registry.as_ref().map(|_| ".."),
+            )
+            .field(
+                "plugin_runtime",
+                &self.plugin_runtime.as_ref().map(|_| ".."),
             )
             .field(
                 "plugin_activation_report",
@@ -542,6 +549,7 @@ impl WsServerState {
             llm_provider: parking_lot::RwLock::new(None),
             tools_registry: None,
             plugin_registry: None,
+            plugin_runtime: None,
             plugin_activation_report: None,
             connection_tracker,
         }
@@ -600,6 +608,7 @@ impl WsServerState {
             llm_provider: parking_lot::RwLock::new(None),
             tools_registry: None,
             plugin_registry: None,
+            plugin_runtime: None,
             plugin_activation_report: None,
             connection_tracker,
         })
@@ -685,6 +694,22 @@ impl WsServerState {
         self
     }
 
+    pub fn with_plugin_runtime(
+        mut self,
+        runtime: Arc<PluginRuntime<credentials::DefaultCredentialBackend>>,
+    ) -> Self {
+        self.plugin_runtime = Some(runtime);
+        self
+    }
+
+    pub fn with_plugin_runtime_opt(
+        mut self,
+        runtime: Option<Arc<PluginRuntime<credentials::DefaultCredentialBackend>>>,
+    ) -> Self {
+        self.plugin_runtime = runtime;
+        self
+    }
+
     pub fn with_plugin_activation_report(mut self, report: PluginActivationReport) -> Self {
         self.plugin_activation_report = Some(report);
         self
@@ -749,6 +774,12 @@ impl WsServerState {
     /// Get the plugin registry, if configured.
     pub fn plugin_registry(&self) -> Option<&Arc<plugins::PluginRegistry>> {
         self.plugin_registry.as_ref()
+    }
+
+    pub fn plugin_runtime(
+        &self,
+    ) -> Option<&Arc<PluginRuntime<credentials::DefaultCredentialBackend>>> {
+        self.plugin_runtime.as_ref()
     }
 
     pub fn plugin_activation_report(&self) -> Option<&PluginActivationReport> {
