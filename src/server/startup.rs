@@ -132,7 +132,7 @@ fn plugins_globally_enabled(cfg: &Value) -> bool {
         .unwrap_or(true)
 }
 
-fn configured_plugin_paths(cfg: &Value) -> Vec<PathBuf> {
+pub(crate) fn configured_plugin_paths(cfg: &Value) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     let mut seen = HashSet::new();
 
@@ -194,6 +194,8 @@ fn managed_skill_config_entries(cfg: &Value) -> Vec<ManagedSkillConfigEntry> {
             install_id: entry.get("installId").cloned(),
         })
         .collect::<Vec<_>>();
+    // Managed activation uses alphabetical order as the deterministic load order
+    // within this source. The API layer may sort again for presentation.
     managed.sort_by(|left, right| left.name.cmp(&right.name));
     managed
 }
@@ -207,6 +209,9 @@ fn manifest_entry_path(entry: &serde_json::Value, managed_dir: &Path, name: &str
 }
 
 fn canonical_prefix(path: &Path) -> PathBuf {
+    // Fall back to the declared path when canonicalization fails so callers can
+    // still perform a deterministic prefix check and report the real missing-path
+    // error from canonicalizing the candidate itself.
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
@@ -224,6 +229,8 @@ fn resolve_managed_skill_path(
         .get(&entry.name)
         .ok_or_else(|| "missing manifest entry in skills-manifest.json".to_string())?;
 
+    // This presence check is only the managed-policy gate. The actual byte-level
+    // SHA-256 verification still happens inside `PluginLoader::load_plugin`.
     if manifest_entry
         .get("sha256")
         .and_then(|value| value.as_str())
@@ -306,6 +313,7 @@ fn load_plugin_candidate(
             entry.state = PluginActivationState::Failed;
             entry.reason = Some(match error {
                 LoaderError::DuplicatePluginId(plugin_id) => {
+                    entry.plugin_id = Some(plugin_id.clone());
                     format!("plugin ID conflict with an earlier activation source: {plugin_id}")
                 }
                 other => other.to_string(),
@@ -315,17 +323,25 @@ fn load_plugin_candidate(
     }
 }
 
-async fn bootstrap_plugin_runtime(cfg: &Value, state_dir: &Path) -> PluginBootstrapResult {
+struct BlockingPluginBootstrapResult {
+    report: PluginActivationReport,
+    loader: Option<Arc<PluginLoader>>,
+    loaded_plugin_ids: Vec<String>,
+    report_index_by_plugin_id: HashMap<String, usize>,
+    sandbox_config: SandboxConfig,
+    permission_config: PermissionConfig,
+}
+
+fn discover_and_load_plugins(cfg: Value, state_dir: PathBuf) -> BlockingPluginBootstrapResult {
     let managed_dir = state_dir.join("skills");
-    let configured_paths = configured_plugin_paths(cfg);
-    let plugins_enabled = plugins_globally_enabled(cfg);
+    let configured_paths = configured_plugin_paths(&cfg);
+    let plugins_enabled = plugins_globally_enabled(&cfg);
     let mut report = PluginActivationReport::empty(
         managed_dir.clone(),
         configured_paths.clone(),
         plugins_enabled,
     );
-    let registry = Arc::new(PluginRegistry::new());
-    let managed_entries = managed_skill_config_entries(cfg);
+    let managed_entries = managed_skill_config_entries(&cfg);
 
     if !plugins_enabled {
         for entry in managed_entries {
@@ -345,15 +361,18 @@ async fn bootstrap_plugin_runtime(cfg: &Value, state_dir: &Path) -> PluginBootst
                 reason: Some("plugin loading is disabled by plugins.enabled=false".to_string()),
             });
         }
-        return PluginBootstrapResult {
-            registry,
-            runtime: None,
-            activation_report: report,
+        return BlockingPluginBootstrapResult {
+            report,
+            loader: None,
+            loaded_plugin_ids: Vec::new(),
+            report_index_by_plugin_id: HashMap::new(),
+            sandbox_config: plugin_sandbox_config_from_config(&cfg),
+            permission_config: PermissionConfig::default(),
         };
     }
 
-    let signature_config = plugin_signature_config_from_config(cfg);
-    let sandbox_config = plugin_sandbox_config_from_config(cfg);
+    let signature_config = plugin_signature_config_from_config(&cfg);
+    let sandbox_config = plugin_sandbox_config_from_config(&cfg);
     let permission_config = PermissionConfig::default();
     let loader = match PluginLoader::with_signature_config(managed_dir.clone(), signature_config) {
         Ok(loader) => Arc::new(loader),
@@ -361,10 +380,13 @@ async fn bootstrap_plugin_runtime(cfg: &Value, state_dir: &Path) -> PluginBootst
             report
                 .errors
                 .push(format!("failed to initialize plugin loader: {error}"));
-            return PluginBootstrapResult {
-                registry,
-                runtime: None,
-                activation_report: report,
+            return BlockingPluginBootstrapResult {
+                report,
+                loader: None,
+                loaded_plugin_ids: Vec::new(),
+                report_index_by_plugin_id: HashMap::new(),
+                sandbox_config,
+                permission_config,
             };
         }
     };
@@ -490,6 +512,61 @@ async fn bootstrap_plugin_runtime(cfg: &Value, state_dir: &Path) -> PluginBootst
     }
 
     let loaded_plugin_ids = loader.list_plugins();
+    BlockingPluginBootstrapResult {
+        report,
+        loader: Some(loader),
+        loaded_plugin_ids,
+        report_index_by_plugin_id,
+        sandbox_config,
+        permission_config,
+    }
+}
+
+async fn bootstrap_plugin_runtime(cfg: &Value, state_dir: &Path) -> PluginBootstrapResult {
+    let registry = Arc::new(PluginRegistry::new());
+    let fallback_report = PluginActivationReport::empty(
+        state_dir.join("skills"),
+        configured_plugin_paths(cfg),
+        plugins_globally_enabled(cfg),
+    );
+    let blocking = match tokio::task::spawn_blocking({
+        let cfg = cfg.clone();
+        let state_dir = state_dir.to_path_buf();
+        move || discover_and_load_plugins(cfg, state_dir)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            let mut report = fallback_report;
+            report
+                .errors
+                .push(format!("plugin bootstrap worker failed: {error}"));
+            return PluginBootstrapResult {
+                registry,
+                runtime: None,
+                activation_report: report,
+            };
+        }
+    };
+
+    let BlockingPluginBootstrapResult {
+        mut report,
+        loader,
+        loaded_plugin_ids,
+        report_index_by_plugin_id,
+        sandbox_config,
+        permission_config,
+    } = blocking;
+
+    let Some(loader) = loader else {
+        return PluginBootstrapResult {
+            registry,
+            runtime: None,
+            activation_report: report,
+        };
+    };
+
     if loaded_plugin_ids.is_empty() {
         return PluginBootstrapResult {
             registry,
@@ -1229,12 +1306,14 @@ mod tests {
     use super::*;
     use crate::cron::CronPayload;
     use crate::plugins::tools::ToolsRegistry;
+    use crate::plugins::{BindingError, ServicePluginInstance};
     use crate::server::ws::WsServerConfig;
     use crate::test_support::env::ScopedEnv;
     use serde_json::json;
     use sha2::{Digest, Sha256};
     use std::ffi::OsString;
     use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{LazyLock, Mutex, MutexGuard};
 
     static TEST_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -1326,6 +1405,39 @@ mod tests {
         std::fs::create_dir_all(dir).expect("create wasm dir");
         std::fs::write(&path, minimal_wasm_bytes()).expect("write wasm");
         path
+    }
+
+    struct MockServicePlugin {
+        stop_calls: AtomicUsize,
+        fail_stop: bool,
+    }
+
+    impl MockServicePlugin {
+        fn new(fail_stop: bool) -> Self {
+            Self {
+                stop_calls: AtomicUsize::new(0),
+                fail_stop,
+            }
+        }
+    }
+
+    impl ServicePluginInstance for MockServicePlugin {
+        fn start(&self) -> Result<(), BindingError> {
+            Ok(())
+        }
+
+        fn stop(&self) -> Result<(), BindingError> {
+            self.stop_calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_stop {
+                Err(BindingError::CallError("stop failed".to_string()))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn health(&self) -> Result<bool, BindingError> {
+            Ok(true)
+        }
     }
 
     #[tokio::test]
@@ -1708,6 +1820,45 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn bootstrap_plugin_runtime_rejects_managed_paths_outside_managed_dir() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let managed_dir = temp.path().join("skills");
+        let outside_dir = temp.path().join("outside");
+        let outside_path = write_minimal_wasm(&outside_dir, "alpha");
+        std::fs::create_dir_all(&managed_dir).expect("create managed dir");
+        std::fs::write(
+            managed_dir.join("skills-manifest.json"),
+            json!({
+                "alpha": {
+                    "path": outside_path.to_string_lossy().to_string(),
+                    "sha256": sha256_hex(&minimal_wasm_bytes())
+                }
+            })
+            .to_string(),
+        )
+        .expect("write manifest");
+        let cfg = json!({
+            "skills": {
+                "entries": {
+                    "alpha": { "enabled": true }
+                }
+            }
+        });
+
+        let result = bootstrap_plugin_runtime(&cfg, temp.path()).await;
+        let report = result.activation_report;
+
+        assert_eq!(report.entries.len(), 1);
+        let entry = &report.entries[0];
+        assert_eq!(entry.name, "alpha");
+        assert_eq!(entry.state, PluginActivationState::Failed);
+        assert!(entry
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("escapes")));
+    }
+
     #[test]
     fn load_plugin_candidate_reports_duplicate_plugin_ids_across_sources() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -1781,6 +1932,7 @@ mod tests {
             .find(|entry| entry.source == PluginActivationSource::ConfigPath)
             .expect("config-path entry");
         assert_eq!(duplicate.name, "alpha");
+        assert_eq!(duplicate.plugin_id.as_deref(), Some("alpha"));
         assert_eq!(duplicate.state, PluginActivationState::Failed);
         assert!(duplicate
             .reason
@@ -1812,5 +1964,20 @@ mod tests {
         assert!(report.entries.is_empty());
 
         crate::config::clear_cache();
+    }
+
+    #[test]
+    fn stop_plugin_services_stops_all_services_and_ignores_stop_errors() {
+        let ok_service = Arc::new(MockServicePlugin::new(false));
+        let failing_service = Arc::new(MockServicePlugin::new(true));
+        let registry = Arc::new(PluginRegistry::new());
+        registry.register_service("ok".to_string(), ok_service.clone());
+        registry.register_service("failing".to_string(), failing_service.clone());
+        let state = WsServerState::new(WsServerConfig::default()).with_plugin_registry(registry);
+
+        stop_plugin_services(&state);
+
+        assert_eq!(ok_service.stop_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(failing_service.stop_calls.load(Ordering::SeqCst), 1);
     }
 }

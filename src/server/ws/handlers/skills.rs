@@ -1,6 +1,7 @@
 //! Skills handlers.
 
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -499,7 +500,7 @@ pub(super) fn handle_skills_status(state: &WsServerState) -> Result<Value, Error
                 .map(|path| path.to_string_lossy().to_string())
                 .collect::<Vec<_>>(),
             report.errors.clone(),
-            build_skills_array_from_report(report),
+            build_skills_array_from_report_and_config(report, &cfg),
             report.restart_required_for_changes,
         )
     } else {
@@ -508,15 +509,10 @@ pub(super) fn handle_skills_status(state: &WsServerState) -> Result<Value, Error
             cfg.pointer("/plugins/enabled")
                 .and_then(|value| value.as_bool())
                 .unwrap_or(true),
-            cfg.pointer("/plugins/load/paths")
-                .and_then(|value| value.as_array())
-                .map(|paths| {
-                    paths
-                        .iter()
-                        .filter_map(|value| value.as_str().map(|path| path.to_string()))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default(),
+            crate::server::startup::configured_plugin_paths(&cfg)
+                .iter()
+                .map(|path| path.to_string_lossy().to_string())
+                .collect::<Vec<_>>(),
             Vec::new(),
             build_skills_array(&cfg),
             true,
@@ -561,6 +557,8 @@ fn build_skills_array(cfg: &Value) -> Vec<Value> {
 fn build_skills_array_from_report(
     report: &crate::server::startup::PluginActivationReport,
 ) -> Vec<Value> {
+    // Response serialization owns the user-facing ordering. Startup keeps its own
+    // deterministic load order for activation/conflict handling.
     let mut skills = report
         .entries
         .iter()
@@ -587,6 +585,60 @@ fn build_skills_array_from_report(
         left_name.cmp(right_name)
     });
     skills
+}
+
+fn pending_skill_value(skill: &Value) -> Value {
+    let enabled = skill
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    json!({
+        "name": skill.get("name").cloned().unwrap_or(Value::Null),
+        "pluginId": Value::Null,
+        "enabled": enabled,
+        "installId": skill.get("installId").cloned().unwrap_or(Value::Null),
+        "requestedAt": skill.get("requestedAt").cloned().unwrap_or(Value::Null),
+        "source": crate::server::startup::PluginActivationSource::Managed.label(),
+        "state": if enabled {
+            crate::server::startup::PluginActivationState::Ignored.label()
+        } else {
+            crate::server::startup::PluginActivationState::Disabled.label()
+        },
+        "path": Value::Null,
+        "reason": if enabled {
+            Value::String("skill is configured and will activate after restart".to_string())
+        } else {
+            Value::String("managed skill is disabled in skills.entries".to_string())
+        },
+    })
+}
+
+fn build_skills_array_from_report_and_config(
+    report: &crate::server::startup::PluginActivationReport,
+    cfg: &Value,
+) -> Vec<Value> {
+    let mut by_name = BTreeMap::new();
+    for skill in build_skills_array_from_report(report) {
+        let Some(name) = skill.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        by_name.insert(name.to_string(), skill);
+    }
+
+    for skill in build_skills_array(cfg) {
+        let Some(name) = skill.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        if let Some(existing) = by_name.get_mut(name) {
+            existing["enabled"] = skill.get("enabled").cloned().unwrap_or(Value::Bool(true));
+            existing["installId"] = skill.get("installId").cloned().unwrap_or(Value::Null);
+            existing["requestedAt"] = skill.get("requestedAt").cloned().unwrap_or(Value::Null);
+        } else {
+            by_name.insert(name.to_string(), pending_skill_value(&skill));
+        }
+    }
+
+    by_name.into_values().collect()
 }
 
 pub(super) fn handle_skills_bins() -> Result<Value, ErrorShape> {
@@ -1049,6 +1101,125 @@ mod tests {
         assert_eq!(entry["source"], "managed");
         assert_eq!(entry["state"], "active");
         assert_eq!(entry["enabled"], true);
+
+        crate::config::clear_cache();
+    }
+
+    #[test]
+    fn test_handle_skills_status_merges_pending_configured_skills_into_report() {
+        let env_state_dir = TempDir::new().unwrap();
+        let report_state_dir = TempDir::new().unwrap();
+        let config_dir = TempDir::new().unwrap();
+        let config_path = config_dir.path().join("carapace.json");
+        std::fs::write(
+            &config_path,
+            json!({
+                "skills": {
+                    "entries": {
+                        "weather": {
+                            "enabled": true,
+                            "installId": "install-weather-new",
+                            "requestedAt": 1700000001000u64
+                        },
+                        "calendar": {
+                            "enabled": true,
+                            "installId": "install-calendar",
+                            "requestedAt": 1700000002000u64
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut env = ScopedEnv::new();
+        env.set("CARAPACE_STATE_DIR", env_state_dir.path().as_os_str())
+            .set("CARAPACE_CONFIG_PATH", config_path.as_os_str())
+            .set("CARAPACE_DISABLE_CONFIG_CACHE", "1");
+        crate::config::clear_cache();
+
+        let state = WsServerState::new(WsServerConfig::default()).with_plugin_activation_report(
+            crate::server::startup::PluginActivationReport {
+                enabled: true,
+                managed_dir: report_state_dir.path().join("skills"),
+                configured_paths: vec![],
+                restart_required_for_changes: true,
+                errors: vec![],
+                entries: vec![crate::server::startup::PluginActivationEntry {
+                    name: "weather".to_string(),
+                    plugin_id: Some("weather".to_string()),
+                    source: crate::server::startup::PluginActivationSource::Managed,
+                    enabled: true,
+                    path: Some(report_state_dir.path().join("skills/weather.wasm")),
+                    requested_at: Some(1700000000000u64),
+                    install_id: Some(json!("install-weather")),
+                    state: crate::server::startup::PluginActivationState::Active,
+                    reason: None,
+                }],
+            },
+        );
+
+        let result = handle_skills_status(&state).unwrap();
+        assert_eq!(result["skills"].as_array().unwrap().len(), 2);
+        let weather = result["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == "weather")
+            .unwrap();
+        assert_eq!(weather["state"], "active");
+        assert_eq!(weather["installId"], "install-weather-new");
+        assert_eq!(weather["requestedAt"], 1700000001000u64);
+        let calendar = result["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == "calendar")
+            .unwrap();
+        assert_eq!(calendar["state"], "ignored");
+        assert_eq!(calendar["source"], "managed");
+        assert_eq!(
+            calendar["reason"],
+            "skill is configured and will activate after restart"
+        );
+
+        crate::config::clear_cache();
+    }
+
+    #[test]
+    fn test_handle_skills_status_without_report_normalizes_configured_plugin_paths() {
+        let env_state_dir = TempDir::new().unwrap();
+        let config_dir = TempDir::new().unwrap();
+        let config_path = config_dir.path().join("carapace.json");
+        std::fs::write(
+            &config_path,
+            json!({
+                "plugins": {
+                    "load": {
+                        "paths": [
+                            "  /tmp/plugins-a  ",
+                            "",
+                            "/tmp/plugins-a",
+                            "/tmp/plugins-b"
+                        ]
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut env = ScopedEnv::new();
+        env.set("CARAPACE_STATE_DIR", env_state_dir.path().as_os_str())
+            .set("CARAPACE_CONFIG_PATH", config_path.as_os_str())
+            .set("CARAPACE_DISABLE_CONFIG_CACHE", "1");
+        crate::config::clear_cache();
+
+        let state = WsServerState::new(WsServerConfig::default());
+        let result = handle_skills_status(&state).unwrap();
+        assert_eq!(
+            result["configuredPluginPaths"],
+            json!(["/tmp/plugins-a", "/tmp/plugins-b"])
+        );
 
         crate::config::clear_cache();
     }
