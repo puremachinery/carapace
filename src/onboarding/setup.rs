@@ -150,6 +150,20 @@ impl SetupCheck {
         Self {
             name: name.into(),
             status: SetupCheckStatus::Skip,
+            kind: SetupCheckKind::Requirement,
+            detail: detail.into(),
+            remediation,
+        }
+    }
+
+    pub fn validation_skip(
+        name: impl Into<String>,
+        detail: impl Into<String>,
+        remediation: Option<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            status: SetupCheckStatus::Skip,
             kind: SetupCheckKind::Validation,
             detail: detail.into(),
             remediation,
@@ -423,7 +437,7 @@ pub fn assess_provider_setup(
         check.status == SetupCheckStatus::Pass && check.kind == SetupCheckKind::Validation
     });
     if !has_fail && !has_validation_check {
-        checks.push(SetupCheck::skip(
+        checks.push(SetupCheck::validation_skip(
             "Live provider validation",
             "setup completed without a live provider-side validation step",
             None,
@@ -1031,7 +1045,7 @@ mod tests {
             &cfg,
             temp.path(),
             SetupProvider::OpenAi,
-            vec![SetupCheck::skip(
+            vec![SetupCheck::validation_skip(
                 "Live provider validation",
                 "OpenAI credential validation was skipped",
                 Some("run `cara verify` after setup".to_string()),
@@ -1044,6 +1058,36 @@ mod tests {
                 .checks
                 .iter()
                 .filter(|check| check.name == "Live provider validation")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_assess_provider_setup_adds_live_validation_skip_after_optional_requirement_skip() {
+        let temp = TempDir::new().unwrap();
+        let cfg = json!({
+            "agents": { "defaults": { "model": "ollama:llama3.2" } },
+            "providers": { "ollama": { "baseUrl": "http://127.0.0.1:11434" } }
+        });
+
+        let assessment = assess_provider_setup(&cfg, temp.path(), SetupProvider::Ollama, vec![]);
+
+        assert_eq!(assessment.status, SetupAssessmentStatus::Partial);
+        assert!(assessment.checks.iter().any(|check| {
+            check.name == "Ollama API key"
+                && check.status == SetupCheckStatus::Skip
+                && check.kind == SetupCheckKind::Requirement
+        }));
+        assert_eq!(
+            assessment
+                .checks
+                .iter()
+                .filter(|check| {
+                    check.name == "Live provider validation"
+                        && check.status == SetupCheckStatus::Skip
+                        && check.kind == SetupCheckKind::Validation
+                })
                 .count(),
             1
         );

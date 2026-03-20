@@ -3486,7 +3486,7 @@ fn validate_provider_credentials_interactive(
 ) -> Result<crate::onboarding::setup::SetupCheck, Box<dyn std::error::Error>> {
     let validate_now = prompt_yes_no("Validate provider credentials now?", true)?;
     if !validate_now {
-        return Ok(crate::onboarding::setup::SetupCheck::skip(
+        return Ok(crate::onboarding::setup::SetupCheck::validation_skip(
             "Live provider validation",
             format!("{} credential validation was skipped", provider.label()),
             Some(

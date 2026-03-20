@@ -699,6 +699,7 @@ pub(crate) fn substitute_env_in_string(s: &str) -> Result<String, ConfigError> {
 
 pub(crate) fn env_var_references_in_string(s: &str) -> Vec<String> {
     let mut references = Vec::new();
+    let mut seen = HashSet::new();
 
     for caps in ENV_VAR_PATTERN.captures_iter(s) {
         let full_match = caps
@@ -707,12 +708,14 @@ pub(crate) fn env_var_references_in_string(s: &str) -> Vec<String> {
         if full_match.as_str().starts_with("$$") {
             continue;
         }
-        references.push(
-            caps.get(1)
-                .expect("env var regex must capture the variable name")
-                .as_str()
-                .to_string(),
-        );
+        let reference = caps
+            .get(1)
+            .expect("env var regex must capture the variable name")
+            .as_str()
+            .to_string();
+        if seen.insert(reference.clone()) {
+            references.push(reference);
+        }
     }
 
     references
@@ -905,6 +908,13 @@ mod tests {
 
         let result = substitute_env_in_string("Bearer ${TEST_API_KEY}").unwrap();
         assert_eq!(result, "Bearer sk-secret");
+    }
+
+    #[test]
+    fn test_env_var_references_in_string_deduplicates_preserving_first_seen_order() {
+        let references = env_var_references_in_string("${HOST}:${HOST}/v1/${PORT}?mirror=${HOST}");
+
+        assert_eq!(references, vec!["HOST".to_string(), "PORT".to_string()]);
     }
 
     #[test]
