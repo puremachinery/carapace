@@ -310,7 +310,7 @@ fn default_backend() -> windows::WindowsCredentialBackend {
 }
 
 /// Build the default platform credential store for the given state dir.
-pub async fn create_default_store(
+pub(crate) async fn create_default_store(
     state_dir: PathBuf,
 ) -> Result<Arc<CredentialStore<DefaultCredentialBackend>>, CredentialError> {
     let backend = default_backend();

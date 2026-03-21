@@ -617,28 +617,38 @@ fn build_skills_array_from_report_and_config(
     report: &crate::server::startup::PluginActivationReport,
     cfg: &Value,
 ) -> Vec<Value> {
-    let mut by_name = BTreeMap::new();
+    let mut by_name: BTreeMap<String, Vec<Value>> = BTreeMap::new();
     for skill in build_skills_array_from_report(report) {
         let Some(name) = skill.get("name").and_then(Value::as_str) else {
             continue;
         };
-        by_name.insert(name.to_string(), skill);
+        by_name.entry(name.to_string()).or_default().push(skill);
     }
 
     for skill in build_skills_array(cfg) {
         let Some(name) = skill.get("name").and_then(Value::as_str) else {
             continue;
         };
-        if let Some(existing) = by_name.get_mut(name) {
-            existing["enabled"] = skill.get("enabled").cloned().unwrap_or(Value::Bool(true));
-            existing["installId"] = skill.get("installId").cloned().unwrap_or(Value::Null);
-            existing["requestedAt"] = skill.get("requestedAt").cloned().unwrap_or(Value::Null);
+        if let Some(existing_skills) = by_name.get_mut(name) {
+            if let Some(existing) = existing_skills.iter_mut().find(|entry| {
+                entry.get("source").and_then(Value::as_str)
+                    == Some(crate::server::startup::PluginActivationSource::Managed.label())
+            }) {
+                existing["enabled"] = skill.get("enabled").cloned().unwrap_or(Value::Bool(true));
+                existing["installId"] = skill.get("installId").cloned().unwrap_or(Value::Null);
+                existing["requestedAt"] = skill.get("requestedAt").cloned().unwrap_or(Value::Null);
+            } else {
+                existing_skills.push(pending_skill_value(&skill));
+            }
         } else {
-            by_name.insert(name.to_string(), pending_skill_value(&skill));
+            by_name.insert(name.to_string(), vec![pending_skill_value(&skill)]);
         }
     }
 
-    by_name.into_values().collect()
+    by_name
+        .into_values()
+        .flat_map(|skills| skills.into_iter())
+        .collect()
 }
 
 pub(super) fn handle_skills_bins() -> Result<Value, ErrorShape> {
@@ -1220,6 +1230,95 @@ mod tests {
             result["configuredPluginPaths"],
             json!(["/tmp/plugins-a", "/tmp/plugins-b"])
         );
+
+        crate::config::clear_cache();
+    }
+
+    #[test]
+    fn test_handle_skills_status_preserves_duplicate_name_report_entries() {
+        let config_dir = TempDir::new().unwrap();
+        let config_path = config_dir.path().join("carapace.json");
+        std::fs::write(
+            &config_path,
+            json!({
+                "skills": {
+                    "entries": {
+                        "weather": {
+                            "enabled": true,
+                            "installId": "install-weather",
+                            "requestedAt": 1700000003000u64
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut env = ScopedEnv::new();
+        env.set("CARAPACE_CONFIG_PATH", config_path.as_os_str())
+            .set("CARAPACE_DISABLE_CONFIG_CACHE", "1");
+        crate::config::clear_cache();
+
+        let state = WsServerState::new(WsServerConfig::default()).with_plugin_activation_report(
+            crate::server::startup::PluginActivationReport {
+                enabled: true,
+                managed_dir: PathBuf::from("/managed"),
+                configured_paths: vec![PathBuf::from("/plugins-dev")],
+                restart_required_for_changes: true,
+                errors: vec![],
+                entries: vec![
+                    crate::server::startup::PluginActivationEntry {
+                        name: "weather".to_string(),
+                        plugin_id: Some("weather".to_string()),
+                        source: crate::server::startup::PluginActivationSource::Managed,
+                        enabled: true,
+                        path: Some(PathBuf::from("/managed/weather.wasm")),
+                        requested_at: Some(1700000000000u64),
+                        install_id: Some(json!("install-weather-old")),
+                        state: crate::server::startup::PluginActivationState::Active,
+                        reason: None,
+                    },
+                    crate::server::startup::PluginActivationEntry {
+                        name: "weather".to_string(),
+                        plugin_id: Some("weather".to_string()),
+                        source: crate::server::startup::PluginActivationSource::ConfigPath,
+                        enabled: true,
+                        path: Some(PathBuf::from("/plugins-dev/weather.wasm")),
+                        requested_at: None,
+                        install_id: None,
+                        state: crate::server::startup::PluginActivationState::Failed,
+                        reason: Some(
+                            "plugin ID conflict with an earlier activation source: weather"
+                                .to_string(),
+                        ),
+                    },
+                ],
+            },
+        );
+
+        let result = handle_skills_status(&state).unwrap();
+        let weather_entries = result["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["name"] == "weather")
+            .collect::<Vec<_>>();
+        assert_eq!(weather_entries.len(), 2);
+        let managed_entry = weather_entries
+            .iter()
+            .find(|entry| entry["source"] == "managed")
+            .unwrap();
+        assert_eq!(managed_entry["installId"], "install-weather");
+        assert_eq!(managed_entry["requestedAt"], 1700000003000u64);
+        let config_entry = weather_entries
+            .iter()
+            .find(|entry| entry["source"] == "config")
+            .unwrap();
+        assert_eq!(config_entry["state"], "failed");
+        assert!(config_entry["reason"]
+            .as_str()
+            .unwrap()
+            .contains("plugin ID conflict"));
 
         crate::config::clear_cache();
     }

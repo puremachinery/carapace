@@ -694,15 +694,7 @@ impl WsServerState {
         self
     }
 
-    pub fn with_plugin_runtime(
-        mut self,
-        runtime: Arc<PluginRuntime<credentials::DefaultCredentialBackend>>,
-    ) -> Self {
-        self.plugin_runtime = Some(runtime);
-        self
-    }
-
-    pub fn with_plugin_runtime_opt(
+    pub(crate) fn with_plugin_runtime_opt(
         mut self,
         runtime: Option<Arc<PluginRuntime<credentials::DefaultCredentialBackend>>>,
     ) -> Self {
@@ -776,7 +768,7 @@ impl WsServerState {
         self.plugin_registry.as_ref()
     }
 
-    pub fn plugin_runtime(
+    pub(crate) fn plugin_runtime(
         &self,
     ) -> Option<&Arc<PluginRuntime<credentials::DefaultCredentialBackend>>> {
         self.plugin_runtime.as_ref()

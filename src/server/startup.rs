@@ -392,8 +392,20 @@ fn discover_and_load_plugins(cfg: Value, state_dir: PathBuf) -> BlockingPluginBo
     };
     let mut report_index_by_plugin_id = HashMap::new();
 
-    let manifest =
-        load_skills_manifest(&managed_dir).unwrap_or_else(|| Value::Object(Default::default()));
+    let (manifest, manifest_error) = match load_skills_manifest(&managed_dir) {
+        Ok(Some(manifest)) => (manifest, None),
+        Ok(None) => (Value::Object(Default::default()), None),
+        Err(error) => {
+            report.errors.push(error);
+            (
+                Value::Object(Default::default()),
+                Some(
+                    "managed skills manifest is invalid; fix skills-manifest.json and restart"
+                        .to_string(),
+                ),
+            )
+        }
+    };
     let managed_entry_names = managed_entries
         .iter()
         .map(|entry| entry.name.clone())
@@ -416,6 +428,13 @@ fn discover_and_load_plugins(cfg: Value, state_dir: PathBuf) -> BlockingPluginBo
             activation_entry.state = PluginActivationState::Disabled;
             activation_entry.reason =
                 Some("managed skill is disabled in skills.entries".to_string());
+            report.entries.push(activation_entry);
+            continue;
+        }
+
+        if let Some(reason) = manifest_error.as_ref() {
+            activation_entry.state = PluginActivationState::Failed;
+            activation_entry.reason = Some(reason.clone());
             report.entries.push(activation_entry);
             continue;
         }
@@ -1742,6 +1761,34 @@ mod tests {
         assert_eq!(
             alpha.reason.as_deref(),
             Some("missing manifest entry in skills-manifest.json")
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_plugin_runtime_reports_invalid_manifest_parse_error() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let managed_dir = temp.path().join("skills");
+        std::fs::create_dir_all(&managed_dir).expect("create managed dir");
+        std::fs::write(managed_dir.join("skills-manifest.json"), "{invalid-json").unwrap();
+        let cfg = json!({
+            "skills": {
+                "entries": {
+                    "alpha": { "enabled": true }
+                }
+            }
+        });
+
+        let result = bootstrap_plugin_runtime(&cfg, temp.path()).await;
+        let report = result.activation_report;
+
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.errors.len(), 1);
+        assert!(report.errors[0].contains("failed to parse"));
+        let alpha = &report.entries[0];
+        assert_eq!(alpha.state, PluginActivationState::Failed);
+        assert_eq!(
+            alpha.reason.as_deref(),
+            Some("managed skills manifest is invalid; fix skills-manifest.json and restart")
         );
     }
 

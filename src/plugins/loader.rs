@@ -52,6 +52,9 @@ pub enum LoaderError {
     #[error("Wasmtime engine error: {0}")]
     EngineError(String),
 
+    #[error("Failed to load skills manifest: {0}")]
+    SkillsManifestError(String),
+
     #[error(
         "Skill hash verification failed for '{skill_name}': expected {expected}, got {actual}"
     )]
@@ -588,11 +591,17 @@ pub fn verify_skill_hash_on_load(
 
 /// Load the skills manifest from the given directory.
 /// Returns `None` if the manifest file does not exist.
-pub fn load_skills_manifest(skills_dir: &Path) -> Option<serde_json::Value> {
+pub fn load_skills_manifest(skills_dir: &Path) -> Result<Option<serde_json::Value>, String> {
     let manifest_path = skills_dir.join(SKILLS_MANIFEST_FILE);
     match fs::read_to_string(&manifest_path) {
-        Ok(contents) => Some(serde_json::from_str(&contents).unwrap_or_default()),
-        Err(_) => None,
+        Ok(contents) => serde_json::from_str(&contents)
+            .map(Some)
+            .map_err(|error| format!("failed to parse {}: {error}", manifest_path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "failed to read {}: {error}",
+            manifest_path.display()
+        )),
     }
 }
 
@@ -700,7 +709,12 @@ impl PluginLoader {
         })?;
 
         // Read manifest once
-        let manifest_json = wasm_path.parent().and_then(load_skills_manifest);
+        let manifest_json = match wasm_path.parent() {
+            Some(parent) => {
+                load_skills_manifest(parent).map_err(LoaderError::SkillsManifestError)?
+            }
+            None => None,
+        };
 
         // Verify SHA-256 hash against the skills manifest (if present)
         if let Some(ref manifest) = manifest_json {
