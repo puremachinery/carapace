@@ -211,7 +211,10 @@ fn manifest_entry_path(entry: &serde_json::Value, managed_dir: &Path, name: &str
 fn canonical_prefix(path: &Path) -> PathBuf {
     // Fall back to the declared path when canonicalization fails so callers can
     // still perform a deterministic prefix check and report the real missing-path
-    // error from canonicalizing the candidate itself.
+    // error from canonicalizing the candidate itself. This remains safe because
+    // `resolve_managed_skill_path` still requires the candidate path itself to
+    // canonicalize successfully; if the managed directory does not exist, nothing
+    // underneath it can pass that later check.
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
@@ -321,6 +324,41 @@ fn load_plugin_candidate(
             report.entries.push(entry);
         }
     }
+}
+
+fn start_plugin_services(
+    shared_registry: &Arc<PluginRegistry>,
+    instantiated_service_ids: &[String],
+    report: &mut PluginActivationReport,
+    report_index_by_plugin_id: &HashMap<String, usize>,
+) -> Vec<String> {
+    let mut unload_plugin_ids = Vec::new();
+
+    for plugin_id in instantiated_service_ids {
+        let Some(service) = shared_registry
+            .get_services()
+            .into_iter()
+            .find_map(|(id, service)| {
+                if id == *plugin_id {
+                    Some(service)
+                } else {
+                    None
+                }
+            })
+        else {
+            continue;
+        };
+        if let Err(error) = service.start() {
+            if let Some(index) = report_index_by_plugin_id.get(plugin_id).copied() {
+                report.entries[index].state = PluginActivationState::Failed;
+                report.entries[index].reason =
+                    Some(format!("service plugin failed to start: {error}"));
+            }
+            unload_plugin_ids.push(plugin_id.clone());
+        }
+    }
+
+    unload_plugin_ids
 }
 
 struct BlockingPluginBootstrapResult {
@@ -667,30 +705,13 @@ async fn bootstrap_plugin_runtime(cfg: &Value, state_dir: &Path) -> PluginBootst
         }
     }
 
-    for plugin_id in instantiated_service_ids {
-        let Some(service) = shared_registry
-            .get_services()
-            .into_iter()
-            .find_map(
-                |(id, service)| {
-                    if id == plugin_id {
-                        Some(service)
-                    } else {
-                        None
-                    }
-                },
-            )
-        else {
-            continue;
-        };
-        if let Err(error) = service.start() {
-            if let Some(index) = report_index_by_plugin_id.get(&plugin_id).copied() {
-                report.entries[index].state = PluginActivationState::Failed;
-                report.entries[index].reason =
-                    Some(format!("service plugin failed to start: {error}"));
-            }
-            runtime.unload_plugin(&plugin_id).ok();
-        }
+    for plugin_id in start_plugin_services(
+        &shared_registry,
+        &instantiated_service_ids,
+        &mut report,
+        &report_index_by_plugin_id,
+    ) {
+        runtime.unload_plugin(&plugin_id).ok();
     }
 
     PluginBootstrapResult {
@@ -1459,6 +1480,22 @@ mod tests {
         }
     }
 
+    struct MockFailingStartServicePlugin;
+
+    impl ServicePluginInstance for MockFailingStartServicePlugin {
+        fn start(&self) -> Result<(), BindingError> {
+            Err(BindingError::CallError("start failed".to_string()))
+        }
+
+        fn stop(&self) -> Result<(), BindingError> {
+            Ok(())
+        }
+
+        fn health(&self) -> Result<bool, BindingError> {
+            Ok(true)
+        }
+    }
+
     #[tokio::test]
     async fn runtime_task_executor_retries_when_provider_missing() {
         let (_temp, _state_dir_guard, executor) = runtime_task_executor_with_temp_state();
@@ -2026,5 +2063,41 @@ mod tests {
 
         assert_eq!(ok_service.stop_calls.load(Ordering::SeqCst), 1);
         assert_eq!(failing_service.stop_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn start_plugin_services_marks_failures_for_unload() {
+        let registry = Arc::new(PluginRegistry::new());
+        registry.register_service(
+            "weather".to_string(),
+            Arc::new(MockFailingStartServicePlugin),
+        );
+        let mut report = PluginActivationReport::empty(PathBuf::from("/managed"), vec![], true);
+        report.entries.push(PluginActivationEntry {
+            name: "weather".to_string(),
+            plugin_id: Some("weather".to_string()),
+            source: PluginActivationSource::Managed,
+            enabled: true,
+            path: Some(PathBuf::from("/managed/weather.wasm")),
+            requested_at: None,
+            install_id: None,
+            state: PluginActivationState::Active,
+            reason: None,
+        });
+        let report_index_by_plugin_id = HashMap::from([(String::from("weather"), 0usize)]);
+
+        let unload_ids = start_plugin_services(
+            &registry,
+            &[String::from("weather")],
+            &mut report,
+            &report_index_by_plugin_id,
+        );
+
+        assert_eq!(unload_ids, vec![String::from("weather")]);
+        assert_eq!(report.entries[0].state, PluginActivationState::Failed);
+        assert_eq!(
+            report.entries[0].reason.as_deref(),
+            Some("service plugin failed to start: Function call error: start failed")
+        );
     }
 }
