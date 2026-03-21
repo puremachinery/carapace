@@ -42,7 +42,7 @@ const NO_PROVIDER_RETRY_DELAY_MS: u64 = 60_000;
 const NO_PROVIDER_LEGACY_MAX_RETRY_ATTEMPTS: u32 = 3_600;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PluginActivationSource {
+pub(crate) enum PluginActivationSource {
     Managed,
     ConfigPath,
 }
@@ -57,7 +57,7 @@ impl PluginActivationSource {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PluginActivationState {
+pub(crate) enum PluginActivationState {
     Active,
     Disabled,
     Ignored,
@@ -76,7 +76,7 @@ impl PluginActivationState {
 }
 
 #[derive(Debug, Clone)]
-pub struct PluginActivationEntry {
+pub(crate) struct PluginActivationEntry {
     pub name: String,
     pub plugin_id: Option<String>,
     pub source: PluginActivationSource,
@@ -89,7 +89,7 @@ pub struct PluginActivationEntry {
 }
 
 #[derive(Debug, Clone)]
-pub struct PluginActivationReport {
+pub(crate) struct PluginActivationReport {
     pub enabled: bool,
     pub managed_dir: PathBuf,
     pub configured_paths: Vec<PathBuf>,

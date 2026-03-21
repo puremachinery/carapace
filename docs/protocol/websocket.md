@@ -273,6 +273,10 @@ Compatibility aliases:
 - `skills.install` - Install a skill
 - `skills.update` - Update skills
 
+`skills.status` includes local filesystem metadata such as `managedSkillsDir`,
+`configuredPluginPaths`, and per-skill `path` values. Treat that response as
+trusted local/admin data rather than something to expose to untrusted clients.
+
 ### Updates
 - `update.run` - Run Carapace update
 

@@ -702,7 +702,7 @@ impl WsServerState {
         self
     }
 
-    pub fn with_plugin_activation_report(mut self, report: PluginActivationReport) -> Self {
+    pub(crate) fn with_plugin_activation_report(mut self, report: PluginActivationReport) -> Self {
         self.plugin_activation_report = Some(report);
         self
     }
@@ -774,7 +774,7 @@ impl WsServerState {
         self.plugin_runtime.as_ref()
     }
 
-    pub fn plugin_activation_report(&self) -> Option<&PluginActivationReport> {
+    pub(crate) fn plugin_activation_report(&self) -> Option<&PluginActivationReport> {
         self.plugin_activation_report.as_ref()
     }
 

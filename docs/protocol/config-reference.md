@@ -406,6 +406,8 @@ Enable Carapace to listen and respond on external chat platforms.
     - `load.paths`: Array of explicit dev/advanced plugin directories.
   - *Notes:*
     - Managed skill installs live under `state_dir/skills` and are activated on restart.
+    - Managed skill installs require `skills-manifest.json` entries with pinned `sha256` values.
+    - `plugins.load.paths` is an explicit dev/advanced path and does not use the managed-skill manifest `sha256` pinning flow; treat those directories as trusted local inputs.
     - `plugins.enabled = false` disables both managed skill activation and configured `load.paths`.
 - **`messages`**
   - *What it does:* Messaging behavior defaults.
