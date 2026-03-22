@@ -4,3 +4,4 @@
 //! [`env::ScopedEnv`] instead of ad hoc module-local guards.
 
 pub(crate) mod env;
+pub(crate) mod plugins;

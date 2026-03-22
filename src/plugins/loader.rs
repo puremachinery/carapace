@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
 use thiserror::Error;
 use wasmtime::component::Component as WasmComponent;
@@ -200,12 +200,20 @@ fn component_engine() -> Result<Engine, LoaderError> {
     Engine::new(&config).map_err(|e| LoaderError::EngineError(e.to_string()))
 }
 
+fn shared_component_validation_engine() -> Result<&'static Engine, LoaderError> {
+    static ENGINE: OnceLock<Result<Engine, String>> = OnceLock::new();
+    match ENGINE.get_or_init(|| component_engine().map_err(|error| error.to_string())) {
+        Ok(engine) => Ok(engine),
+        Err(message) => Err(LoaderError::EngineError(message.clone())),
+    }
+}
+
 pub(crate) fn validate_plugin_component_bytes(
     source: &str,
     wasm_bytes: &[u8],
 ) -> Result<(), LoaderError> {
-    let engine = component_engine()?;
-    WasmComponent::new(&engine, wasm_bytes).map_err(|e| LoaderError::WasmCompileError {
+    let engine = shared_component_validation_engine()?;
+    WasmComponent::new(engine, wasm_bytes).map_err(|e| LoaderError::WasmCompileError {
         path: source.to_string(),
         message: e.to_string(),
     })?;

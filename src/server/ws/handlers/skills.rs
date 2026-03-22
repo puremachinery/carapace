@@ -2,7 +2,7 @@
 
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -669,6 +669,21 @@ fn mark_removed_managed_skill(existing: &mut Value) {
     );
 }
 
+fn is_stray_managed_skill(existing: &Value) -> bool {
+    existing.get("source").and_then(Value::as_str)
+        == Some(crate::server::plugin_bootstrap::PluginActivationSource::Managed.label())
+        && existing.get("state").and_then(Value::as_str)
+            == Some(crate::server::plugin_bootstrap::PluginActivationState::Ignored.label())
+        && (existing.get("installId").is_none()
+            || existing.get("installId").is_some_and(Value::is_null))
+        && (existing.get("requestedAt").is_none()
+            || existing.get("requestedAt").is_some_and(Value::is_null))
+        && existing.get("reason").and_then(Value::as_str)
+            == Some(
+                "WASM file is present in the managed skills directory but not declared in skills.entries",
+            )
+}
+
 fn build_skills_array_from_report_and_config(
     report: &crate::server::plugin_bootstrap::PluginActivationReport,
     cfg: &Value,
@@ -720,6 +735,9 @@ fn build_skills_array_from_report_and_config(
             entry.get("source").and_then(Value::as_str)
                 == Some(crate::server::plugin_bootstrap::PluginActivationSource::Managed.label())
         }) {
+            if is_stray_managed_skill(existing) {
+                continue;
+            }
             mark_removed_managed_skill(existing);
         }
     }
@@ -813,19 +831,59 @@ fn handle_skills_install_inner(
         let parsed_url = validate_url(raw_url)?;
         let (dest, wasm_bytes) = download_skill_wasm(&parsed_url, skills_dir, &wasm_file_name)?;
         (Some(dest), Some(compute_sha256_hex(&wasm_bytes)))
-    } else if local_wasm_path.is_file() {
-        let wasm_metadata = std::fs::metadata(&local_wasm_path).map_err(|e| {
+    } else {
+        let mut local_wasm = match std::fs::File::open(&local_wasm_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(error_shape(
+                    ERROR_INVALID_REQUEST,
+                    "url is required unless a matching local WASM already exists in the managed skills directory",
+                    None,
+                ));
+            }
+            Err(error) => {
+                return Err(error_shape(
+                    ERROR_UNAVAILABLE,
+                    &format!(
+                        "failed to open existing skill binary at '{}': {}",
+                        local_wasm_path.display(),
+                        error
+                    ),
+                    None,
+                ));
+            }
+        };
+        let wasm_metadata = local_wasm.metadata().map_err(|e| {
             error_shape(
                 ERROR_UNAVAILABLE,
-                &format!("failed to stat existing skill binary: {}", e),
+                &format!(
+                    "failed to stat existing skill binary at '{}': {}",
+                    local_wasm_path.display(),
+                    e
+                ),
                 None,
             )
         })?;
+        if !wasm_metadata.is_file() {
+            return Err(error_shape(
+                ERROR_INVALID_REQUEST,
+                &format!(
+                    "existing skill binary at '{}' is not a regular file",
+                    local_wasm_path.display()
+                ),
+                None,
+            ));
+        }
         validate_skill_wasm_size(wasm_metadata.len(), "existing managed skill binary")?;
-        let wasm_bytes = std::fs::read(&local_wasm_path).map_err(|e| {
+        let mut wasm_bytes = Vec::new();
+        local_wasm.read_to_end(&mut wasm_bytes).map_err(|e| {
             error_shape(
                 ERROR_UNAVAILABLE,
-                &format!("failed to read existing skill binary: {}", e),
+                &format!(
+                    "failed to read existing skill binary at '{}': {}",
+                    local_wasm_path.display(),
+                    e
+                ),
                 None,
             )
         })?;
@@ -834,12 +892,6 @@ fn handle_skills_install_inner(
             Some(local_wasm_path.clone()),
             Some(compute_sha256_hex(&wasm_bytes)),
         )
-    } else {
-        return Err(error_shape(
-            ERROR_INVALID_REQUEST,
-            "url is required unless a matching local WASM already exists in the managed skills directory",
-            None,
-        ));
     };
 
     // Record metadata in the skills manifest
@@ -1043,10 +1095,8 @@ fn handle_skills_update_inner(
 mod tests {
     use super::*;
     use crate::server::ws::{WsServerConfig, WsServerState};
-    use crate::test_support::env::ScopedEnv;
+    use crate::test_support::{env::ScopedEnv, plugins::tool_plugin_component_bytes};
     use tempfile::TempDir;
-    use wit_component::{dummy_module, embed_component_metadata, ComponentEncoder, StringEncoding};
-    use wit_parser::{ManglingAndAbi, Resolve};
 
     struct TestConfigEnv {
         _env: ScopedEnv,
@@ -1073,25 +1123,6 @@ mod tests {
         fn drop(&mut self) {
             crate::config::clear_cache();
         }
-    }
-
-    fn tool_plugin_component_bytes() -> Vec<u8> {
-        let wit_path =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tool-plugin.wit");
-        let mut resolve = Resolve::default();
-        let (pkg, _) = resolve.push_path(&wit_path).expect("load plugin WIT");
-        let world = resolve
-            .select_world(&[pkg], Some("tool-plugin"))
-            .expect("select tool-plugin world");
-        let mut module = dummy_module(&resolve, world, ManglingAndAbi::Standard32);
-        embed_component_metadata(&mut module, &resolve, world, StringEncoding::UTF8)
-            .expect("embed component metadata");
-        ComponentEncoder::default()
-            .module(&module)
-            .expect("attach core module")
-            .validate(true)
-            .encode()
-            .expect("encode tool plugin component")
     }
 
     #[test]
@@ -1225,7 +1256,7 @@ mod tests {
         assert_eq!(result["pluginsEnabled"], true);
         assert_eq!(result["configuredPluginPathCount"], 1);
         assert_eq!(result["restartRequiredForChanges"], true);
-        assert_eq!(result["activationErrorCount"], 2);
+        assert_eq!(result["activationErrorCount"], 1);
         assert_eq!(result["skills"].as_array().unwrap().len(), 1);
         let entry = &result["skills"][0];
         assert_eq!(entry["name"], "weather");
@@ -1663,6 +1694,45 @@ mod tests {
         );
 
         crate::config::clear_cache();
+    }
+
+    #[test]
+    fn test_handle_skills_status_preserves_stray_managed_skill_reason() {
+        let state = WsServerState::new(WsServerConfig::default()).with_plugin_activation_report(
+            crate::server::plugin_bootstrap::PluginActivationReport {
+                enabled: true,
+                configured_paths: vec![],
+                restart_required_for_changes: true,
+                errors: vec![],
+                entries: vec![crate::server::plugin_bootstrap::PluginActivationEntry {
+                    name: "weather".to_string(),
+                    plugin_id: None,
+                    source: crate::server::plugin_bootstrap::PluginActivationSource::Managed,
+                    enabled: false,
+                    path: Some(PathBuf::from("/managed/weather.wasm")),
+                    requested_at: None,
+                    install_id: None,
+                    state: crate::server::plugin_bootstrap::PluginActivationState::Ignored,
+                    reason: Some(
+                        "WASM file is present in the managed skills directory but not declared in skills.entries"
+                            .to_string(),
+                    ),
+                }],
+            },
+        );
+
+        let result = handle_skills_status(&state).unwrap();
+        let weather = result["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == "weather")
+            .unwrap();
+        assert_eq!(weather["state"], "ignored");
+        assert_eq!(
+            weather["reason"],
+            "WASM file is present in the managed skills directory but not declared in skills.entries"
+        );
     }
 
     #[test]

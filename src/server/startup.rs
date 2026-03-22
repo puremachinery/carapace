@@ -650,7 +650,7 @@ mod tests {
         PluginActivationSource, PluginActivationState,
     };
     use crate::server::ws::WsServerConfig;
-    use crate::test_support::env::ScopedEnv;
+    use crate::test_support::{env::ScopedEnv, plugins::tool_plugin_component_bytes};
     use ed25519_dalek::SigningKey;
     use serde_json::json;
     use sha2::{Digest, Sha256};
@@ -659,8 +659,6 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{LazyLock, Mutex, MutexGuard};
-    use wit_component::{dummy_module, embed_component_metadata, ComponentEncoder, StringEncoding};
-    use wit_parser::{ManglingAndAbi, Resolve};
 
     static TEST_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -738,25 +736,6 @@ mod tests {
 
     fn minimal_wasm_bytes() -> Vec<u8> {
         vec![0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00]
-    }
-
-    fn tool_plugin_component_bytes() -> Vec<u8> {
-        let wit_path =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tool-plugin.wit");
-        let mut resolve = Resolve::default();
-        let (pkg, _) = resolve.push_path(&wit_path).expect("load plugin WIT");
-        let world = resolve
-            .select_world(&[pkg], Some("tool-plugin"))
-            .expect("select tool-plugin world");
-        let mut module = dummy_module(&resolve, world, ManglingAndAbi::Standard32);
-        embed_component_metadata(&mut module, &resolve, world, StringEncoding::UTF8)
-            .expect("embed component metadata");
-        ComponentEncoder::default()
-            .module(&module)
-            .expect("attach core module")
-            .validate(true)
-            .encode()
-            .expect("encode tool plugin component")
     }
 
     fn sha256_hex(bytes: &[u8]) -> String {
@@ -1277,6 +1256,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bootstrap_plugin_runtime_resolves_relative_manifest_paths_under_managed_dir() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let managed_dir = temp.path().join("skills");
+        let component_bytes = tool_plugin_component_bytes();
+        let wasm_path = write_wasm_bytes(&managed_dir, "alpha", &component_bytes);
+        std::fs::write(
+            managed_dir.join("skills-manifest.json"),
+            json!({
+                "alpha": {
+                    "path": "alpha.wasm",
+                    "sha256": sha256_hex(&component_bytes)
+                }
+            })
+            .to_string(),
+        )
+        .expect("write manifest");
+        let cfg = json!({
+            "skills": {
+                "signature": {
+                    "enabled": false,
+                    "requireSignature": false
+                },
+                "sandbox": { "enabled": false },
+                "entries": {
+                    "alpha": { "enabled": true }
+                }
+            }
+        });
+
+        let result = bootstrap_plugin_runtime(&cfg, temp.path()).await;
+        let report = result.activation_report;
+        let expected_path = std::fs::canonicalize(&wasm_path).expect("canonicalize wasm path");
+
+        assert!(result.runtime.is_some(), "activation report: {report:#?}");
+        assert_eq!(report.entries.len(), 1);
+        let entry = &report.entries[0];
+        assert_eq!(entry.state, PluginActivationState::Active);
+        assert_eq!(
+            entry
+                .path
+                .as_ref()
+                .map(|path| std::fs::canonicalize(path).expect("canonicalize report path"))
+                .as_deref(),
+            Some(expected_path.as_path())
+        );
+    }
+
+    #[tokio::test]
     async fn bootstrap_plugin_runtime_activates_valid_managed_tool_component() {
         let temp = tempfile::tempdir().expect("temp dir");
         let managed_dir = temp.path().join("skills");
@@ -1526,6 +1553,25 @@ mod tests {
             .reason
             .as_deref()
             .is_some_and(|reason| reason.contains("plugin ID conflict")));
+    }
+
+    #[test]
+    fn configured_plugin_paths_normalizes_equivalent_paths() {
+        let cfg = json!({
+            "plugins": {
+                "load": {
+                    "paths": [
+                        "plugins/tooling",
+                        "plugins/./tooling",
+                        "plugins//tooling"
+                    ]
+                }
+            }
+        });
+
+        let paths = crate::server::plugin_bootstrap::configured_plugin_paths(&cfg);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0], PathBuf::from("plugins/tooling"));
     }
 
     #[tokio::test]

@@ -120,7 +120,7 @@ pub(crate) fn configured_plugin_paths(cfg: &Value) -> Vec<PathBuf> {
         else {
             continue;
         };
-        let path_buf = PathBuf::from(path);
+        let path_buf = Path::new(path).components().collect::<PathBuf>();
         if seen.insert(path_buf.clone()) {
             paths.push(path_buf);
         }
@@ -168,11 +168,16 @@ fn managed_skill_config_entries(cfg: &Value) -> Vec<ManagedSkillConfigEntry> {
 }
 
 fn manifest_entry_path(entry: &serde_json::Value, managed_dir: &Path, name: &str) -> PathBuf {
-    entry
+    let path = entry
         .get("path")
         .and_then(|value| value.as_str())
         .map(PathBuf::from)
-        .unwrap_or_else(|| managed_dir.join(format!("{name}.wasm")))
+        .unwrap_or_else(|| PathBuf::from(format!("{name}.wasm")));
+    if path.is_relative() {
+        managed_dir.join(path)
+    } else {
+        path
+    }
 }
 
 fn canonical_prefix(path: &Path) -> Result<PathBuf, String> {
@@ -231,6 +236,8 @@ fn resolve_managed_skill_path(
 }
 
 fn discover_config_path_plugins(path: &Path) -> Result<Vec<PathBuf>, String> {
+    // Config-path loading is an explicit trusted-local-input escape hatch. We scan the
+    // directory as configured and intentionally do not apply managed-dir containment or pinning.
     let read_dir = std::fs::read_dir(path).map_err(|error| {
         format!(
             "failed to read configured plugin path {}: {error}",
