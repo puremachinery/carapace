@@ -683,7 +683,7 @@ features:
   - feature: "plugins.startup activation"
     status: "verified_done"
     runtime_wiring:
-      - "src/server/startup.rs::bootstrap_plugin_runtime"
+      - "src/server/plugin_bootstrap.rs::bootstrap_plugin_runtime"
       - "src/main.rs::run_server (shared startup wiring)"
       - "src/cli/chat.rs::handle_chat_command (embedded startup wiring)"
       - "src/server/ws/handlers/skills.rs::handle_skills_install_inner (restart-required activation response)"
@@ -694,6 +694,7 @@ features:
       - "src/server/startup.rs::bootstrap_plugin_runtime_ignores_stray_managed_wasm_files"
       - "src/server/startup.rs::bootstrap_plugin_runtime_reports_config_path_read_errors"
       - "src/server/startup.rs::bootstrap_plugin_runtime_skips_unpinned_managed_manifest_entries"
+      - "src/server/startup.rs::bootstrap_plugin_runtime_activates_valid_config_path_tool_component"
       - "src/server/startup.rs::load_plugin_candidate_reports_duplicate_plugin_ids_across_sources"
       - "src/server/startup.rs::build_ws_state_with_runtime_dependencies_attaches_plugin_activation_report"
       - "src/server/ws/handlers/skills.rs::test_install_reports_restart_required_activation"

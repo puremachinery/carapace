@@ -11,6 +11,7 @@ pub mod health;
 pub mod http;
 pub mod metrics;
 pub mod openai;
+pub(crate) mod plugin_bootstrap;
 pub mod ratelimit;
 pub mod resource_monitor;
 pub mod startup;

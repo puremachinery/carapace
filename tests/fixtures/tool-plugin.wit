@@ -1,0 +1,62 @@
+package carapace:plugin@1.0.0;
+
+interface types {
+    record plugin-error {
+        code: string,
+        message: string,
+        retryable: bool,
+    }
+
+    record tool-context {
+        agent-id: option<string>,
+        session-key: option<string>,
+        message-channel: option<string>,
+        sandboxed: bool,
+    }
+
+    record tool-result {
+        success: bool,
+        result-text: option<string>,
+        error: option<string>,
+    }
+}
+
+interface host {
+    log-info: func(message: string);
+    config-get: func(key: string) -> option<string>;
+}
+
+interface manifest {
+    enum plugin-kind {
+        tool,
+    }
+
+    record plugin-manifest {
+        id: string,
+        name: string,
+        description: string,
+        version: string,
+        kind: plugin-kind,
+    }
+
+    get-manifest: func() -> plugin-manifest;
+}
+
+interface tool {
+    use types.{tool-context, tool-result, plugin-error};
+
+    record tool-definition {
+        name: string,
+        description: string,
+        input-schema: string,
+    }
+
+    get-definitions: func() -> list<tool-definition>;
+    invoke: func(name: string, params: string, ctx: tool-context) -> result<tool-result, plugin-error>;
+}
+
+world tool-plugin {
+    import host;
+    export manifest;
+    export tool;
+}

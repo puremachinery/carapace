@@ -1,17 +1,15 @@
 ---
 source: src/server/ws/golden_tests.rs
-assertion_line: 515
+assertion_line: 514
 expression: normalized
 ---
 {
   "ok": true,
   "result": {
-    "configuredPluginPaths": [],
-    "errors": [],
-    "managedSkillsDir": "<PATH>",
+    "activationErrorCount": 0,
+    "configuredPluginPathCount": 0,
     "pluginsEnabled": true,
     "restartRequiredForChanges": true,
-    "skills": [],
-    "workspaceDir": "<PATH>"
+    "skills": []
   }
 }

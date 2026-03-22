@@ -268,14 +268,15 @@ Compatibility aliases:
 ### Models & Skills
 - `models.list` - List available models
 - `agents.list` - List available agents
-- `skills.status` - Get skills status, activation state, and restart requirements
+- `skills.status` - Get skills status, activation state, restart requirements, and sanitized activation issue counts
 - `skills.bins` - List skill binaries
 - `skills.install` - Install a skill
 - `skills.update` - Update skills
 
-`skills.status` includes local filesystem metadata such as `managedSkillsDir`,
-`configuredPluginPaths`, and per-skill `path` values. Treat that response as
-trusted local/admin data rather than something to expose to untrusted clients.
+`skills.status` intentionally avoids returning raw plugin filesystem paths and
+verbatim startup I/O errors. It reports activation state, restart requirements,
+sanitized per-skill reasons, and aggregate counts instead. Use server logs for
+detailed local filesystem diagnostics.
 
 ### Updates
 - `update.run` - Run Carapace update

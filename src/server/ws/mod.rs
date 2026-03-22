@@ -24,7 +24,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::plugins::PluginRuntime;
-use crate::server::startup::PluginActivationReport;
+use crate::server::plugin_bootstrap::PluginActivationReport;
 use crate::{
     agent, auth, channels, config, credentials, cron, devices, exec, messages, nodes, plugins,
     sessions, tasks,

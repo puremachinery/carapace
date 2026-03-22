@@ -343,12 +343,7 @@ mod golden_trace {
         }
 
         // Replace file-system paths.
-        if key == "path"
-            || key == "file"
-            || key == "storePath"
-            || key == "workspaceDir"
-            || key == "managedSkillsDir"
-        {
+        if key == "path" || key == "file" || key == "storePath" || key == "workspaceDir" {
             if let Some(s) = val.as_str() {
                 if s.contains('/') || s.contains('\\') {
                     *val = json!("<PATH>");

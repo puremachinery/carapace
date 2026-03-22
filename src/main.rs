@@ -988,7 +988,7 @@ async fn shutdown_signal(
         error!("Failed to flush session store during shutdown: {}", e);
     }
 
-    server::startup::stop_plugin_services(&ws_state);
+    server::plugin_bootstrap::stop_plugin_services(&ws_state);
 
     // Brief grace period for in-flight operations to complete
     tokio::time::sleep(Duration::from_millis(250)).await;

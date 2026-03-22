@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use wasmtime::component::{types::ComponentItem, Component};
 use wasmtime::Engine;
 
+const MAX_COMPONENT_CAPABILITY_DEPTH: usize = 32;
+
 /// WASM capabilities that can be discovered from module imports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -118,18 +120,43 @@ fn collect_item_capabilities(
     engine: &Engine,
     seen: &mut HashSet<WasmCapability>,
     capabilities: &mut Vec<WasmCapability>,
+    depth: usize,
 ) {
+    if depth > MAX_COMPONENT_CAPABILITY_DEPTH {
+        tracing::warn!(
+            item = item_name,
+            depth,
+            max_depth = MAX_COMPONENT_CAPABILITY_DEPTH,
+            "skipping deeply nested component capability enumeration"
+        );
+        return;
+    }
+
     record_capability(item_name, seen, capabilities);
 
     match item {
         ComponentItem::ComponentInstance(instance) => {
             for (export_name, export_item) in instance.exports(engine) {
-                collect_item_capabilities(&export_item, export_name, engine, seen, capabilities);
+                collect_item_capabilities(
+                    &export_item,
+                    export_name,
+                    engine,
+                    seen,
+                    capabilities,
+                    depth + 1,
+                );
             }
         }
         ComponentItem::Component(component) => {
             for (import_name, import_item) in component.imports(engine) {
-                collect_item_capabilities(&import_item, import_name, engine, seen, capabilities);
+                collect_item_capabilities(
+                    &import_item,
+                    import_name,
+                    engine,
+                    seen,
+                    capabilities,
+                    depth + 1,
+                );
             }
         }
         _ => {}
@@ -153,6 +180,7 @@ pub fn enumerate_capabilities(component: &Component, engine: &Engine) -> Discove
             engine,
             &mut seen,
             &mut capabilities,
+            0,
         );
     }
 

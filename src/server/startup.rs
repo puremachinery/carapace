@@ -4,9 +4,8 @@
 //! to spin up a real (non-TLS) Carapace server on an ephemeral port, exercise
 //! its HTTP and WebSocket endpoints, and shut it down cleanly.
 
-use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,17 +18,12 @@ use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
 use crate::config;
-use crate::credentials;
 use crate::cron;
 use crate::hooks::registry::HookRegistry;
 use crate::messages;
-use crate::plugins::loader::{load_skills_manifest, LoaderError};
-use crate::plugins::permissions::PermissionConfig;
-use crate::plugins::sandbox::SandboxConfig;
-use crate::plugins::signature::SignatureConfig;
 use crate::plugins::tools::ToolsRegistry;
-use crate::plugins::{PluginLoader, PluginRegistry, PluginRuntime};
 use crate::server::http::{HttpConfig, MiddlewareConfig};
+use crate::server::plugin_bootstrap::{bootstrap_plugin_runtime, stop_plugin_services};
 use crate::server::ws::WsServerState;
 use crate::sessions;
 use crate::tasks::{DurableTask, TaskBlockedReason, TaskExecutionOutcome, TaskExecutor};
@@ -40,686 +34,6 @@ struct RuntimeTaskExecutor {
 
 const NO_PROVIDER_RETRY_DELAY_MS: u64 = 60_000;
 const NO_PROVIDER_LEGACY_MAX_RETRY_ATTEMPTS: u32 = 3_600;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PluginActivationSource {
-    Managed,
-    ConfigPath,
-}
-
-impl PluginActivationSource {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Managed => "managed",
-            Self::ConfigPath => "config",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PluginActivationState {
-    Active,
-    Disabled,
-    Ignored,
-    Failed,
-}
-
-impl PluginActivationState {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Active => "active",
-            Self::Disabled => "disabled",
-            Self::Ignored => "ignored",
-            Self::Failed => "failed",
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct PluginActivationEntry {
-    pub name: String,
-    pub plugin_id: Option<String>,
-    pub source: PluginActivationSource,
-    pub enabled: bool,
-    pub path: Option<PathBuf>,
-    pub requested_at: Option<u64>,
-    pub install_id: Option<Value>,
-    pub state: PluginActivationState,
-    pub reason: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct PluginActivationReport {
-    pub enabled: bool,
-    pub managed_dir: PathBuf,
-    pub configured_paths: Vec<PathBuf>,
-    /// Startup activation changes require restart in the current model.
-    pub restart_required_for_changes: bool,
-    pub entries: Vec<PluginActivationEntry>,
-    pub errors: Vec<String>,
-}
-
-impl PluginActivationReport {
-    fn empty(managed_dir: PathBuf, configured_paths: Vec<PathBuf>, enabled: bool) -> Self {
-        Self {
-            enabled,
-            managed_dir,
-            configured_paths,
-            restart_required_for_changes: true,
-            entries: Vec::new(),
-            errors: Vec::new(),
-        }
-    }
-}
-
-struct PluginBootstrapResult {
-    registry: Arc<PluginRegistry>,
-    runtime: Option<Arc<PluginRuntime<credentials::DefaultCredentialBackend>>>,
-    activation_report: PluginActivationReport,
-}
-
-#[derive(Debug, Clone)]
-struct ManagedSkillConfigEntry {
-    name: String,
-    enabled: bool,
-    requested_at: Option<u64>,
-    install_id: Option<Value>,
-}
-
-fn plugins_globally_enabled(cfg: &Value) -> bool {
-    cfg.pointer("/plugins/enabled")
-        .and_then(|value| value.as_bool())
-        .unwrap_or(true)
-}
-
-pub(crate) fn configured_plugin_paths(cfg: &Value) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    let mut seen = HashSet::new();
-
-    let Some(array) = cfg
-        .pointer("/plugins/load/paths")
-        .and_then(|value| value.as_array())
-    else {
-        return paths;
-    };
-
-    for value in array {
-        let Some(path) = value
-            .as_str()
-            .map(str::trim)
-            .filter(|path| !path.is_empty())
-        else {
-            continue;
-        };
-        let path_buf = PathBuf::from(path);
-        if seen.insert(path_buf.clone()) {
-            paths.push(path_buf);
-        }
-    }
-
-    paths
-}
-
-fn plugin_signature_config_from_config(cfg: &Value) -> SignatureConfig {
-    cfg.pointer("/skills/signature")
-        .cloned()
-        .and_then(|value| serde_json::from_value(value).ok())
-        .unwrap_or_default()
-}
-
-fn plugin_sandbox_config_from_config(cfg: &Value) -> SandboxConfig {
-    cfg.pointer("/skills/sandbox")
-        .cloned()
-        .and_then(|value| serde_json::from_value(value).ok())
-        .unwrap_or_default()
-}
-
-fn managed_skill_config_entries(cfg: &Value) -> Vec<ManagedSkillConfigEntry> {
-    let Some(entries) = cfg
-        .pointer("/skills/entries")
-        .and_then(|value| value.as_object())
-    else {
-        return Vec::new();
-    };
-
-    let mut managed = entries
-        .iter()
-        .map(|(name, entry)| ManagedSkillConfigEntry {
-            name: name.clone(),
-            enabled: entry
-                .get("enabled")
-                .and_then(|value| value.as_bool())
-                .unwrap_or(true),
-            requested_at: entry.get("requestedAt").and_then(|value| value.as_u64()),
-            install_id: entry.get("installId").cloned(),
-        })
-        .collect::<Vec<_>>();
-    // Managed activation uses alphabetical order as the deterministic load order
-    // within this source. The API layer may sort again for presentation.
-    managed.sort_by(|left, right| left.name.cmp(&right.name));
-    managed
-}
-
-fn manifest_entry_path(entry: &serde_json::Value, managed_dir: &Path, name: &str) -> PathBuf {
-    entry
-        .get("path")
-        .and_then(|value| value.as_str())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| managed_dir.join(format!("{name}.wasm")))
-}
-
-fn canonical_prefix(path: &Path) -> PathBuf {
-    // Fall back to the declared path when canonicalization fails so callers can
-    // still perform a deterministic prefix check and report the real missing-path
-    // error from canonicalizing the candidate itself. This remains safe because
-    // `resolve_managed_skill_path` still requires the candidate path itself to
-    // canonicalize successfully; if the managed directory does not exist, nothing
-    // underneath it can pass that later check.
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
-}
-
-fn canonicalize_existing_path(path: &Path) -> Result<PathBuf, String> {
-    path.canonicalize()
-        .map_err(|error| format!("failed to resolve {}: {error}", path.display()))
-}
-
-fn resolve_managed_skill_path(
-    managed_dir: &Path,
-    manifest: &Value,
-    entry: &ManagedSkillConfigEntry,
-) -> Result<PathBuf, String> {
-    let manifest_entry = manifest
-        .get(&entry.name)
-        .ok_or_else(|| "missing manifest entry in skills-manifest.json".to_string())?;
-
-    // This presence check is only the managed-policy gate. The actual byte-level
-    // SHA-256 verification still happens inside `PluginLoader::load_plugin`.
-    if manifest_entry
-        .get("sha256")
-        .and_then(|value| value.as_str())
-        .is_none()
-    {
-        return Err("managed skill is missing a pinned sha256 in skills-manifest.json".to_string());
-    }
-
-    let path = manifest_entry_path(manifest_entry, managed_dir, &entry.name);
-    let canonical_managed_dir = canonical_prefix(managed_dir);
-    let canonical_path = canonicalize_existing_path(&path)?;
-    if !canonical_path.starts_with(&canonical_managed_dir) {
-        return Err(format!(
-            "managed skill path {} escapes {}",
-            canonical_path.display(),
-            canonical_managed_dir.display()
-        ));
-    }
-
-    let stem = canonical_path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .ok_or_else(|| "managed skill path has no valid UTF-8 file stem".to_string())?;
-    if stem != entry.name {
-        return Err(format!(
-            "managed skill path {} does not match configured entry {}",
-            canonical_path.display(),
-            entry.name
-        ));
-    }
-
-    Ok(canonical_path)
-}
-
-fn discover_config_path_plugins(path: &Path) -> Result<Vec<PathBuf>, String> {
-    let read_dir = std::fs::read_dir(path).map_err(|error| {
-        format!(
-            "failed to read configured plugin path {}: {error}",
-            path.display()
-        )
-    })?;
-
-    let mut wasm_paths = Vec::new();
-    for entry in read_dir {
-        let entry = entry.map_err(|error| {
-            format!(
-                "failed to read configured plugin path {}: {error}",
-                path.display()
-            )
-        })?;
-        let candidate = entry.path();
-        if candidate
-            .extension()
-            .and_then(|value| value.to_str())
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("wasm"))
-        {
-            wasm_paths.push(candidate);
-        }
-    }
-    wasm_paths.sort();
-    Ok(wasm_paths)
-}
-
-fn load_plugin_candidate(
-    loader: &PluginLoader,
-    report: &mut PluginActivationReport,
-    mut entry: PluginActivationEntry,
-    wasm_path: &Path,
-    report_index_by_plugin_id: &mut HashMap<String, usize>,
-) {
-    entry.path = Some(wasm_path.to_path_buf());
-    match loader.load_plugin(wasm_path) {
-        Ok(plugin_id) => {
-            entry.plugin_id = Some(plugin_id.clone());
-            let index = report.entries.len();
-            report_index_by_plugin_id.insert(plugin_id, index);
-            report.entries.push(entry);
-        }
-        Err(error) => {
-            entry.state = PluginActivationState::Failed;
-            entry.reason = Some(match error {
-                LoaderError::DuplicatePluginId(plugin_id) => {
-                    entry.plugin_id = Some(plugin_id.clone());
-                    format!("plugin ID conflict with an earlier activation source: {plugin_id}")
-                }
-                other => other.to_string(),
-            });
-            report.entries.push(entry);
-        }
-    }
-}
-
-fn start_plugin_services(
-    shared_registry: &Arc<PluginRegistry>,
-    instantiated_service_ids: &[String],
-    report: &mut PluginActivationReport,
-    report_index_by_plugin_id: &HashMap<String, usize>,
-) -> Vec<String> {
-    let mut unload_plugin_ids = Vec::new();
-
-    for plugin_id in instantiated_service_ids {
-        let Some(service) = shared_registry
-            .get_services()
-            .into_iter()
-            .find_map(|(id, service)| {
-                if id == *plugin_id {
-                    Some(service)
-                } else {
-                    None
-                }
-            })
-        else {
-            continue;
-        };
-        if let Err(error) = service.start() {
-            if let Some(index) = report_index_by_plugin_id.get(plugin_id).copied() {
-                report.entries[index].state = PluginActivationState::Failed;
-                report.entries[index].reason =
-                    Some(format!("service plugin failed to start: {error}"));
-            }
-            unload_plugin_ids.push(plugin_id.clone());
-        }
-    }
-
-    unload_plugin_ids
-}
-
-struct BlockingPluginBootstrapResult {
-    report: PluginActivationReport,
-    loader: Option<Arc<PluginLoader>>,
-    loaded_plugin_ids: Vec<String>,
-    report_index_by_plugin_id: HashMap<String, usize>,
-    sandbox_config: SandboxConfig,
-    permission_config: PermissionConfig,
-}
-
-fn discover_and_load_plugins(cfg: Value, state_dir: PathBuf) -> BlockingPluginBootstrapResult {
-    let managed_dir = state_dir.join("skills");
-    let configured_paths = configured_plugin_paths(&cfg);
-    let plugins_enabled = plugins_globally_enabled(&cfg);
-    let mut report = PluginActivationReport::empty(
-        managed_dir.clone(),
-        configured_paths.clone(),
-        plugins_enabled,
-    );
-    let managed_entries = managed_skill_config_entries(&cfg);
-
-    if !plugins_enabled {
-        for entry in managed_entries {
-            report.entries.push(PluginActivationEntry {
-                name: entry.name,
-                plugin_id: None,
-                source: PluginActivationSource::Managed,
-                enabled: entry.enabled,
-                path: None,
-                requested_at: entry.requested_at,
-                install_id: entry.install_id,
-                state: if entry.enabled {
-                    PluginActivationState::Ignored
-                } else {
-                    PluginActivationState::Disabled
-                },
-                reason: Some("plugin loading is disabled by plugins.enabled=false".to_string()),
-            });
-        }
-        return BlockingPluginBootstrapResult {
-            report,
-            loader: None,
-            loaded_plugin_ids: Vec::new(),
-            report_index_by_plugin_id: HashMap::new(),
-            sandbox_config: plugin_sandbox_config_from_config(&cfg),
-            permission_config: PermissionConfig::default(),
-        };
-    }
-
-    let signature_config = plugin_signature_config_from_config(&cfg);
-    let sandbox_config = plugin_sandbox_config_from_config(&cfg);
-    let permission_config = PermissionConfig::default();
-    let loader = match PluginLoader::with_signature_config(managed_dir.clone(), signature_config) {
-        Ok(loader) => Arc::new(loader),
-        Err(error) => {
-            report
-                .errors
-                .push(format!("failed to initialize plugin loader: {error}"));
-            return BlockingPluginBootstrapResult {
-                report,
-                loader: None,
-                loaded_plugin_ids: Vec::new(),
-                report_index_by_plugin_id: HashMap::new(),
-                sandbox_config,
-                permission_config,
-            };
-        }
-    };
-    let mut report_index_by_plugin_id = HashMap::new();
-
-    let (manifest, manifest_error) = match load_skills_manifest(&managed_dir) {
-        Ok(Some(manifest)) => (manifest, None),
-        Ok(None) => (Value::Object(Default::default()), None),
-        Err(error) => {
-            report.errors.push(error);
-            (
-                Value::Object(Default::default()),
-                Some(
-                    "managed skills manifest is invalid; fix skills-manifest.json and restart"
-                        .to_string(),
-                ),
-            )
-        }
-    };
-    let managed_entry_names = managed_entries
-        .iter()
-        .map(|entry| entry.name.clone())
-        .collect::<HashSet<_>>();
-
-    for entry in managed_entries {
-        let mut activation_entry = PluginActivationEntry {
-            name: entry.name.clone(),
-            plugin_id: None,
-            source: PluginActivationSource::Managed,
-            enabled: entry.enabled,
-            path: None,
-            requested_at: entry.requested_at,
-            install_id: entry.install_id.clone(),
-            state: PluginActivationState::Ignored,
-            reason: None,
-        };
-
-        if !entry.enabled {
-            activation_entry.state = PluginActivationState::Disabled;
-            activation_entry.reason =
-                Some("managed skill is disabled in skills.entries".to_string());
-            report.entries.push(activation_entry);
-            continue;
-        }
-
-        if let Some(reason) = manifest_error.as_ref() {
-            activation_entry.state = PluginActivationState::Failed;
-            activation_entry.reason = Some(reason.clone());
-            report.entries.push(activation_entry);
-            continue;
-        }
-
-        let wasm_path = match resolve_managed_skill_path(&managed_dir, &manifest, &entry) {
-            Ok(path) => path,
-            Err(reason) => {
-                activation_entry.state = PluginActivationState::Failed;
-                activation_entry.reason = Some(reason);
-                report.entries.push(activation_entry);
-                continue;
-            }
-        };
-
-        load_plugin_candidate(
-            loader.as_ref(),
-            &mut report,
-            activation_entry,
-            &wasm_path,
-            &mut report_index_by_plugin_id,
-        );
-    }
-
-    if let Ok(read_dir) = std::fs::read_dir(&managed_dir) {
-        let mut stray_paths = read_dir
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.extension()
-                    .and_then(|value| value.to_str())
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("wasm"))
-            })
-            .collect::<Vec<_>>();
-        stray_paths.sort();
-
-        for path in stray_paths {
-            let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
-                continue;
-            };
-            if managed_entry_names.contains(stem) {
-                continue;
-            }
-            report.entries.push(PluginActivationEntry {
-                name: stem.to_string(),
-                plugin_id: None,
-                source: PluginActivationSource::Managed,
-                enabled: false,
-                path: Some(path),
-                requested_at: None,
-                install_id: None,
-                state: PluginActivationState::Ignored,
-                reason: Some(
-                    "WASM file is present in the managed skills directory but not declared in skills.entries"
-                        .to_string(),
-                ),
-            });
-        }
-    }
-
-    for plugin_path in &configured_paths {
-        let wasm_paths = match discover_config_path_plugins(plugin_path) {
-            Ok(paths) => paths,
-            Err(error) => {
-                report.errors.push(error);
-                continue;
-            }
-        };
-
-        for wasm_path in wasm_paths {
-            let name = wasm_path
-                .file_stem()
-                .and_then(|value| value.to_str())
-                .unwrap_or("unknown-plugin")
-                .to_string();
-            let activation_entry = PluginActivationEntry {
-                name,
-                plugin_id: None,
-                source: PluginActivationSource::ConfigPath,
-                enabled: true,
-                path: Some(wasm_path.clone()),
-                requested_at: None,
-                install_id: None,
-                state: PluginActivationState::Ignored,
-                reason: None,
-            };
-            load_plugin_candidate(
-                loader.as_ref(),
-                &mut report,
-                activation_entry,
-                &wasm_path,
-                &mut report_index_by_plugin_id,
-            );
-        }
-    }
-
-    let loaded_plugin_ids = loader.list_plugins();
-    BlockingPluginBootstrapResult {
-        report,
-        loader: Some(loader),
-        loaded_plugin_ids,
-        report_index_by_plugin_id,
-        sandbox_config,
-        permission_config,
-    }
-}
-
-async fn bootstrap_plugin_runtime(cfg: &Value, state_dir: &Path) -> PluginBootstrapResult {
-    let registry = Arc::new(PluginRegistry::new());
-    let fallback_report = PluginActivationReport::empty(
-        state_dir.join("skills"),
-        configured_plugin_paths(cfg),
-        plugins_globally_enabled(cfg),
-    );
-    let blocking = match tokio::task::spawn_blocking({
-        let cfg = cfg.clone();
-        let state_dir = state_dir.to_path_buf();
-        move || discover_and_load_plugins(cfg, state_dir)
-    })
-    .await
-    {
-        Ok(result) => result,
-        Err(error) => {
-            let mut report = fallback_report;
-            report
-                .errors
-                .push(format!("plugin bootstrap worker failed: {error}"));
-            return PluginBootstrapResult {
-                registry,
-                runtime: None,
-                activation_report: report,
-            };
-        }
-    };
-
-    let BlockingPluginBootstrapResult {
-        mut report,
-        loader,
-        loaded_plugin_ids,
-        report_index_by_plugin_id,
-        sandbox_config,
-        permission_config,
-    } = blocking;
-
-    let Some(loader) = loader else {
-        return PluginBootstrapResult {
-            registry,
-            runtime: None,
-            activation_report: report,
-        };
-    };
-
-    if loaded_plugin_ids.is_empty() {
-        return PluginBootstrapResult {
-            registry,
-            runtime: None,
-            activation_report: report,
-        };
-    }
-
-    let credential_store = match credentials::create_default_store(state_dir.to_path_buf()).await {
-        Ok(store) => store,
-        Err(error) => {
-            report.errors.push(format!(
-                "failed to initialize plugin credential store: {error}"
-            ));
-            for plugin_id in loaded_plugin_ids {
-                if let Some(index) = report_index_by_plugin_id.get(&plugin_id).copied() {
-                    report.entries[index].state = PluginActivationState::Failed;
-                    report.entries[index].reason =
-                        Some(format!("plugin runtime unavailable: {error}"));
-                }
-            }
-            return PluginBootstrapResult {
-                registry,
-                runtime: None,
-                activation_report: report,
-            };
-        }
-    };
-
-    let runtime = match PluginRuntime::with_permissions_config(
-        loader.clone(),
-        credential_store,
-        Arc::new(crate::plugins::RateLimiterRegistry::new()),
-        crate::plugins::capabilities::SsrfConfig::default(),
-        sandbox_config,
-        permission_config,
-    ) {
-        Ok(runtime) => Arc::new(runtime),
-        Err(error) => {
-            report
-                .errors
-                .push(format!("failed to initialize plugin runtime: {error}"));
-            for plugin_id in loaded_plugin_ids {
-                if let Some(index) = report_index_by_plugin_id.get(&plugin_id).copied() {
-                    report.entries[index].state = PluginActivationState::Failed;
-                    report.entries[index].reason =
-                        Some(format!("plugin runtime unavailable: {error}"));
-                }
-            }
-            return PluginBootstrapResult {
-                registry,
-                runtime: None,
-                activation_report: report,
-            };
-        }
-    };
-    let shared_registry = runtime.registry();
-
-    let mut instantiated_service_ids = Vec::new();
-    for plugin_id in loaded_plugin_ids {
-        if let Some(index) = report_index_by_plugin_id.get(&plugin_id).copied() {
-            let entry = &mut report.entries[index];
-            match runtime.instantiate_plugin(&plugin_id).await {
-                Ok(()) => {
-                    entry.state = PluginActivationState::Active;
-                    entry.plugin_id = Some(plugin_id.clone());
-                    if let Some(loaded) = loader.get_plugin(&plugin_id) {
-                        if loaded.manifest.kind == crate::plugins::PluginKind::Service {
-                            instantiated_service_ids.push(plugin_id.clone());
-                        }
-                    }
-                }
-                Err(error) => {
-                    entry.state = PluginActivationState::Failed;
-                    entry.plugin_id = Some(plugin_id.clone());
-                    entry.reason = Some(error.to_string());
-                }
-            }
-        }
-    }
-
-    for plugin_id in start_plugin_services(
-        &shared_registry,
-        &instantiated_service_ids,
-        &mut report,
-        &report_index_by_plugin_id,
-    ) {
-        runtime.unload_plugin(&plugin_id).ok();
-    }
-
-    PluginBootstrapResult {
-        registry: shared_registry,
-        runtime: Some(runtime),
-        activation_report: report,
-    }
-}
 
 fn invalid_policy_budget_error(policy: &crate::tasks::TaskPolicy) -> Option<&'static str> {
     if policy.max_attempts == 0 {
@@ -991,24 +305,6 @@ impl ServerHandle {
             Ok(Ok(Err(e))) => error!("Server task returned error: {}", e),
             Ok(Err(e)) => error!("Server task panicked: {}", e),
             Err(_) => warn!("Server task did not finish within 5s timeout"),
-        }
-    }
-}
-
-pub fn stop_plugin_services(ws_state: &WsServerState) {
-    let Some(plugin_registry) = ws_state
-        .plugin_runtime()
-        .map(|runtime| runtime.registry())
-        .or_else(|| ws_state.plugin_registry().cloned())
-    else {
-        return;
-    };
-
-    for (plugin_id, service) in plugin_registry.get_services() {
-        if let Err(error) = service.stop() {
-            warn!(plugin_id = %plugin_id, error = %error, "error stopping service plugin");
-        } else {
-            info!(plugin_id = %plugin_id, "service plugin stopped");
         }
     }
 }
@@ -1347,14 +643,20 @@ mod tests {
     use crate::cron::CronPayload;
     use crate::plugins::signature::sign_wasm_bytes;
     use crate::plugins::tools::ToolsRegistry;
-    use crate::plugins::{BindingError, PluginKind, ServicePluginInstance};
+    use crate::plugins::{BindingError, PluginKind, PluginRegistry, ServicePluginInstance};
+    use crate::server::plugin_bootstrap::{
+        bootstrap_plugin_runtime, load_plugin_candidate, start_plugin_services,
+        stop_plugin_services, PluginActivationEntry, PluginActivationReport,
+        PluginActivationSource, PluginActivationState,
+    };
     use crate::server::ws::WsServerConfig;
     use crate::test_support::env::ScopedEnv;
     use ed25519_dalek::SigningKey;
     use serde_json::json;
     use sha2::{Digest, Sha256};
+    use std::collections::HashMap;
     use std::ffi::OsString;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{LazyLock, Mutex, MutexGuard};
     use wit_component::{dummy_module, embed_component_metadata, ComponentEncoder, StringEncoding};
@@ -1439,22 +741,10 @@ mod tests {
     }
 
     fn tool_plugin_component_bytes() -> Vec<u8> {
-        let wit_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("wit/plugin.wit");
-        let wit_source = std::fs::read_to_string(&wit_path).expect("read plugin WIT");
-        // `wit-parser` currently treats `from` as a reserved identifier, but the
-        // selected `tool-plugin` world does not depend on that channel-only field.
-        let sanitized_wit = wit_source
-            .replace("        from: string,", "        from-id: string,")
-            .replace(
-                "        result: option<string>,",
-                "        result-text: option<string>,",
-            )
-            .replace("        stream: bool,", "        streaming: bool,");
-        let temp = tempfile::tempdir().expect("temp WIT dir");
-        let temp_wit_path = temp.path().join("plugin.wit");
-        std::fs::write(&temp_wit_path, sanitized_wit).expect("write sanitized plugin WIT");
+        let wit_path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tool-plugin.wit");
         let mut resolve = Resolve::default();
-        let (pkg, _) = resolve.push_path(&temp_wit_path).expect("load plugin WIT");
+        let (pkg, _) = resolve.push_path(&wit_path).expect("load plugin WIT");
         let world = resolve
             .select_world(&[pkg], Some("tool-plugin"))
             .expect("select tool-plugin world");
@@ -2044,7 +1334,64 @@ mod tests {
         assert_eq!(entry.plugin_id.as_deref(), Some("alpha"));
         assert_eq!(entry.source, PluginActivationSource::Managed);
         assert_eq!(entry.state, PluginActivationState::Active);
-        assert_eq!(entry.path.as_deref(), Some(expected_path.as_path()));
+        assert_eq!(
+            entry
+                .path
+                .as_ref()
+                .map(|path| std::fs::canonicalize(path).expect("canonicalize report path"))
+                .as_deref(),
+            Some(expected_path.as_path())
+        );
+        assert_eq!(entry.reason, None);
+
+        let runtime = result.runtime.expect("runtime retained");
+        runtime.unload_plugin("alpha").expect("unload plugin");
+    }
+
+    #[tokio::test]
+    async fn bootstrap_plugin_runtime_activates_valid_config_path_tool_component() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let config_dir = temp.path().join("config-plugins");
+        let component_bytes = tool_plugin_component_bytes();
+        let wasm_path = write_wasm_bytes(&config_dir, "alpha", &component_bytes);
+        let cfg = json!({
+            "plugins": {
+                "load": {
+                    "paths": [config_dir.to_string_lossy().to_string()]
+                }
+            },
+            "skills": {
+                "signature": {
+                    "enabled": false,
+                    "requireSignature": false
+                },
+                "sandbox": { "enabled": false }
+            }
+        });
+
+        let result = bootstrap_plugin_runtime(&cfg, temp.path()).await;
+        let report = result.activation_report;
+        let expected_path = std::fs::canonicalize(&wasm_path).expect("canonicalize wasm path");
+
+        assert!(result.runtime.is_some(), "activation report: {report:#?}");
+        let tools = result.registry.get_tools();
+        assert_eq!(tools.len(), 1, "activation report: {report:#?}");
+        assert_eq!(tools[0].0, "alpha");
+
+        assert_eq!(report.entries.len(), 1);
+        let entry = &report.entries[0];
+        assert_eq!(entry.name, "alpha");
+        assert_eq!(entry.plugin_id.as_deref(), Some("alpha"));
+        assert_eq!(entry.source, PluginActivationSource::ConfigPath);
+        assert_eq!(entry.state, PluginActivationState::Active);
+        assert_eq!(
+            entry
+                .path
+                .as_ref()
+                .map(|path| std::fs::canonicalize(path).expect("canonicalize report path"))
+                .as_deref(),
+            Some(expected_path.as_path())
+        );
         assert_eq!(entry.reason, None);
 
         let runtime = result.runtime.expect("runtime retained");
@@ -2080,7 +1427,7 @@ mod tests {
             },
         )
         .expect("create plugin loader");
-        let mut report = PluginActivationReport::empty(managed_dir, vec![config_dir], true);
+        let mut report = PluginActivationReport::empty(vec![config_dir], true);
         let mut report_index_by_plugin_id = HashMap::new();
 
         load_plugin_candidate(
@@ -2152,7 +1499,6 @@ mod tests {
         let report = ws_state
             .plugin_activation_report()
             .expect("plugin activation report");
-        assert_eq!(report.managed_dir, state_dir.join("skills"));
         assert!(report.entries.is_empty());
 
         crate::config::clear_cache();
@@ -2180,7 +1526,7 @@ mod tests {
             "weather".to_string(),
             Arc::new(MockFailingStartServicePlugin),
         );
-        let mut report = PluginActivationReport::empty(PathBuf::from("/managed"), vec![], true);
+        let mut report = PluginActivationReport::empty(vec![], true);
         report.entries.push(PluginActivationEntry {
             name: "weather".to_string(),
             plugin_id: Some("weather".to_string()),
