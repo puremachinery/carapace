@@ -57,7 +57,7 @@ matches your plugin shape:
 
 ```toml
 [package.metadata.component]
-target = { path = "../path/to/carapace/wit/plugin.wit", world = "tool-plugin" }
+target = { path = "/path/to/your/carapace/repo/wit/plugin.wit", world = "tool-plugin" }
 ```
 
 Build:
@@ -72,14 +72,17 @@ fine. Rust + `cargo-component` is just the most direct path.
 
 ## What a minimal tool plugin exports
 
-A tool plugin must export:
+A tool plugin built against `tool-plugin` exports:
 
 - `manifest.get-manifest()`
 - `tool.get-definitions()`
 - `tool.invoke(...)`
 
 Its manifest kind should be `tool`, and its plugin ID must stay lowercase
-alphanumeric plus hyphens.
+alphanumeric plus hyphens with a maximum length of 32 characters.
+
+Tool definition names use a different rule: lowercase alphanumeric plus
+underscores, with a maximum length of 64 characters.
 
 For plugin config and credentials:
 
@@ -169,7 +172,8 @@ Runtime constraints worth designing for:
 
 - 64 MB memory limit per instance
 - 30 second execution timeout per function call
-- per-plugin HTTP and log rate limits
+- 100 HTTP requests per minute per plugin
+- 1000 log messages per minute per plugin
 - SSRF protections on host networking calls
 - webhook path namespacing under `/plugins/<plugin-id>/`
 
