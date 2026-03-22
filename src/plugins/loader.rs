@@ -380,6 +380,17 @@ fn parse_name_section_module_name(data: &[u8]) -> Option<String> {
     None
 }
 
+fn export_matches_name(export_name: &str, expected: &str) -> bool {
+    let export_name = export_name.split('@').next().unwrap_or(export_name);
+    export_name == expected
+        || export_name
+            .rsplit_once('/')
+            .is_some_and(|(_, suffix)| suffix == expected)
+        || export_name
+            .rsplit_once(':')
+            .is_some_and(|(_, suffix)| suffix == expected)
+}
+
 /// Determine [`PluginKind`] by inspecting which WIT interface exports a WASM module provides.
 ///
 /// Export name matching uses the WIT interface export naming conventions from
@@ -399,7 +410,11 @@ fn derive_plugin_kind_from_exports(engine: &Engine, component: &WasmComponent) -
         .map(|(name, _)| name)
         .collect();
 
-    let has = |needle: &str| export_names.iter().any(|name| name.contains(needle));
+    let has = |needle: &str| {
+        export_names
+            .iter()
+            .any(|name| export_matches_name(name, needle))
+    };
 
     if has("channel-adapter") || has("channel-meta") {
         PluginKind::Channel
@@ -1040,6 +1055,21 @@ mod tests {
         assert_eq!(PluginKind::Service.to_string(), "service");
         assert_eq!(PluginKind::Provider.to_string(), "provider");
         assert_eq!(PluginKind::Hook.to_string(), "hook");
+    }
+
+    #[test]
+    fn test_export_matches_name_requires_segment_match() {
+        assert!(export_matches_name("tool", "tool"));
+        assert!(export_matches_name("carapace:plugin/tool@1.0.0", "tool"));
+        assert!(export_matches_name(
+            "carapace:plugin/channel-adapter@1.0.0",
+            "channel-adapter"
+        ));
+        assert!(!export_matches_name(
+            "carapace:plugin/toolbox@1.0.0",
+            "tool"
+        ));
+        assert!(!export_matches_name("multi-tool-adapter", "tool"));
     }
 
     #[test]

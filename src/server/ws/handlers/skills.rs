@@ -672,16 +672,15 @@ fn mark_removed_managed_skill(existing: &mut Value) {
 fn is_stray_managed_skill(existing: &Value) -> bool {
     existing.get("source").and_then(Value::as_str)
         == Some(crate::server::plugin_bootstrap::PluginActivationSource::Managed.label())
+        && existing.get("enabled").and_then(Value::as_bool) == Some(false)
+        && (existing.get("pluginId").is_none()
+            || existing.get("pluginId").is_some_and(Value::is_null))
         && existing.get("state").and_then(Value::as_str)
             == Some(crate::server::plugin_bootstrap::PluginActivationState::Ignored.label())
         && (existing.get("installId").is_none()
             || existing.get("installId").is_some_and(Value::is_null))
         && (existing.get("requestedAt").is_none()
             || existing.get("requestedAt").is_some_and(Value::is_null))
-        && existing.get("reason").and_then(Value::as_str)
-            == Some(
-                "WASM file is present in the managed skills directory but not declared in skills.entries",
-            )
 }
 
 fn build_skills_array_from_report_and_config(
