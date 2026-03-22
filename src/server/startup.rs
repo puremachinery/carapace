@@ -1345,16 +1345,20 @@ pub async fn run_server_with_config(
 mod tests {
     use super::*;
     use crate::cron::CronPayload;
+    use crate::plugins::signature::sign_wasm_bytes;
     use crate::plugins::tools::ToolsRegistry;
-    use crate::plugins::{BindingError, ServicePluginInstance};
+    use crate::plugins::{BindingError, PluginKind, ServicePluginInstance};
     use crate::server::ws::WsServerConfig;
     use crate::test_support::env::ScopedEnv;
+    use ed25519_dalek::SigningKey;
     use serde_json::json;
     use sha2::{Digest, Sha256};
     use std::ffi::OsString;
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{LazyLock, Mutex, MutexGuard};
+    use wit_component::{dummy_module, embed_component_metadata, ComponentEncoder, StringEncoding};
+    use wit_parser::{ManglingAndAbi, Resolve};
 
     static TEST_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -1434,17 +1438,56 @@ mod tests {
         vec![0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00]
     }
 
+    fn tool_plugin_component_bytes() -> Vec<u8> {
+        let wit_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("wit/plugin.wit");
+        let wit_source = std::fs::read_to_string(&wit_path).expect("read plugin WIT");
+        // `wit-parser` currently treats `from` as a reserved identifier, but the
+        // selected `tool-plugin` world does not depend on that channel-only field.
+        let sanitized_wit = wit_source
+            .replace("        from: string,", "        from-id: string,")
+            .replace(
+                "        result: option<string>,",
+                "        result-text: option<string>,",
+            )
+            .replace("        stream: bool,", "        streaming: bool,");
+        let temp = tempfile::tempdir().expect("temp WIT dir");
+        let temp_wit_path = temp.path().join("plugin.wit");
+        std::fs::write(&temp_wit_path, sanitized_wit).expect("write sanitized plugin WIT");
+        let mut resolve = Resolve::default();
+        let (pkg, _) = resolve.push_path(&temp_wit_path).expect("load plugin WIT");
+        let world = resolve
+            .select_world(&[pkg], Some("tool-plugin"))
+            .expect("select tool-plugin world");
+        let mut module = dummy_module(&resolve, world, ManglingAndAbi::Standard32);
+        embed_component_metadata(&mut module, &resolve, world, StringEncoding::UTF8)
+            .expect("embed component metadata");
+        ComponentEncoder::default()
+            .module(&module)
+            .expect("attach core module")
+            .validate(true)
+            .encode()
+            .expect("encode tool plugin component")
+    }
+
     fn sha256_hex(bytes: &[u8]) -> String {
         let mut hasher = Sha256::new();
         hasher.update(bytes);
         hex::encode(hasher.finalize())
     }
 
-    fn write_minimal_wasm(dir: &Path, name: &str) -> PathBuf {
+    fn test_signing_key() -> SigningKey {
+        SigningKey::from_bytes(&[7u8; 32])
+    }
+
+    fn write_wasm_bytes(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
         let path = dir.join(format!("{name}.wasm"));
         std::fs::create_dir_all(dir).expect("create wasm dir");
-        std::fs::write(&path, minimal_wasm_bytes()).expect("write wasm");
+        std::fs::write(&path, bytes).expect("write wasm");
         path
+    }
+
+    fn write_minimal_wasm(dir: &Path, name: &str) -> PathBuf {
+        write_wasm_bytes(dir, name, &minimal_wasm_bytes())
     }
 
     struct MockServicePlugin {
@@ -1943,14 +1986,79 @@ mod tests {
             .is_some_and(|reason| reason.contains("escapes")));
     }
 
+    #[tokio::test]
+    async fn bootstrap_plugin_runtime_activates_valid_managed_tool_component() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let managed_dir = temp.path().join("skills");
+        let component_bytes = tool_plugin_component_bytes();
+        let wasm_path = write_wasm_bytes(&managed_dir, "alpha", &component_bytes);
+        let signing_key = test_signing_key();
+        let signature = sign_wasm_bytes(&component_bytes, &signing_key);
+        std::fs::write(
+            managed_dir.join("skills-manifest.json"),
+            json!({
+                "alpha": {
+                    "path": wasm_path.to_string_lossy().to_string(),
+                    "sha256": sha256_hex(&component_bytes),
+                    "publisher_key": hex::encode(signing_key.verifying_key().as_bytes()),
+                    "signature": hex::encode(signature.to_bytes())
+                }
+            })
+            .to_string(),
+        )
+        .expect("write manifest");
+        let loader = crate::plugins::PluginLoader::with_signature_config(
+            managed_dir.clone(),
+            crate::plugins::signature::SignatureConfig::default(),
+        )
+        .expect("create plugin loader");
+        let plugin_id = loader
+            .load_plugin(&wasm_path)
+            .expect("load signed component");
+        let loaded = loader
+            .get_plugin(&plugin_id)
+            .expect("retrieve loaded signed component");
+        assert_eq!(loaded.manifest.kind, PluginKind::Tool);
+
+        let cfg = json!({
+            "skills": {
+                "sandbox": { "enabled": false },
+                "entries": {
+                    "alpha": { "enabled": true }
+                }
+            }
+        });
+
+        let result = bootstrap_plugin_runtime(&cfg, temp.path()).await;
+        let report = result.activation_report;
+        let expected_path = std::fs::canonicalize(&wasm_path).expect("canonicalize wasm path");
+
+        assert!(result.runtime.is_some(), "activation report: {report:#?}");
+        let tools = result.registry.get_tools();
+        assert_eq!(tools.len(), 1, "activation report: {report:#?}");
+        assert_eq!(tools[0].0, "alpha");
+
+        assert_eq!(report.entries.len(), 1);
+        let entry = &report.entries[0];
+        assert_eq!(entry.name, "alpha");
+        assert_eq!(entry.plugin_id.as_deref(), Some("alpha"));
+        assert_eq!(entry.source, PluginActivationSource::Managed);
+        assert_eq!(entry.state, PluginActivationState::Active);
+        assert_eq!(entry.path.as_deref(), Some(expected_path.as_path()));
+        assert_eq!(entry.reason, None);
+
+        let runtime = result.runtime.expect("runtime retained");
+        runtime.unload_plugin("alpha").expect("unload plugin");
+    }
+
     #[test]
     fn load_plugin_candidate_reports_duplicate_plugin_ids_across_sources() {
         let temp = tempfile::tempdir().expect("temp dir");
         let managed_dir = temp.path().join("skills");
         let config_dir = temp.path().join("config-plugins");
-        let managed_bytes = minimal_wasm_bytes();
-        let managed_path = write_minimal_wasm(&managed_dir, "alpha");
-        let config_path = write_minimal_wasm(&config_dir, "alpha");
+        let managed_bytes = tool_plugin_component_bytes();
+        let managed_path = write_wasm_bytes(&managed_dir, "alpha", &managed_bytes);
+        let config_path = write_wasm_bytes(&config_dir, "alpha", &managed_bytes);
         std::fs::write(
             managed_dir.join("skills-manifest.json"),
             json!({

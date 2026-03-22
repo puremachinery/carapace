@@ -1,13 +1,14 @@
 //! Capability sandboxing for WASM plugins.
 //!
-//! Enumerates WASM module imports to discover required capabilities, then
+//! Enumerates WASM component imports to discover required capabilities, then
 //! enforces a capability policy that restricts which host functions a
 //! plugin may call.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
-use wasmtime::Module;
+use wasmtime::component::{types::ComponentItem, Component};
+use wasmtime::Engine;
 
 /// WASM capabilities that can be discovered from module imports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -80,7 +81,7 @@ impl Default for SandboxConfig {
     }
 }
 
-/// Capabilities discovered from a WASM module's imports.
+/// Capabilities discovered from a WASM component's imports.
 #[derive(Debug, Clone, Default)]
 pub struct DiscoveredCapabilities {
     /// Set of capabilities the module requires.
@@ -99,20 +100,60 @@ fn import_to_capability(import_name: &str) -> Option<WasmCapability> {
     }
 }
 
-/// Enumerate capabilities required by a compiled WASM module.
-///
-/// Uses `Module::imports()` to inspect host function imports and maps them
-/// to capability categories.
-pub fn enumerate_capabilities(module: &Module) -> DiscoveredCapabilities {
-    let mut seen = std::collections::HashSet::new();
-    let mut capabilities = Vec::new();
+fn record_capability(
+    import_name: &str,
+    seen: &mut HashSet<WasmCapability>,
+    capabilities: &mut Vec<WasmCapability>,
+) {
+    if let Some(cap) = import_to_capability(import_name) {
+        if seen.insert(cap) {
+            capabilities.push(cap);
+        }
+    }
+}
 
-    for import in module.imports() {
-        if let Some(cap) = import_to_capability(import.name()) {
-            if seen.insert(cap) {
-                capabilities.push(cap);
+fn collect_item_capabilities(
+    item: &ComponentItem,
+    item_name: &str,
+    engine: &Engine,
+    seen: &mut HashSet<WasmCapability>,
+    capabilities: &mut Vec<WasmCapability>,
+) {
+    record_capability(item_name, seen, capabilities);
+
+    match item {
+        ComponentItem::ComponentInstance(instance) => {
+            for (export_name, export_item) in instance.exports(engine) {
+                collect_item_capabilities(&export_item, export_name, engine, seen, capabilities);
             }
         }
+        ComponentItem::Component(component) => {
+            for (import_name, import_item) in component.imports(engine) {
+                collect_item_capabilities(&import_item, import_name, engine, seen, capabilities);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Enumerate capabilities required by a compiled WASM component.
+///
+/// Uses component-type import introspection to inspect imported host functions
+/// (typically nested under the imported `host` instance) and maps them to
+/// capability categories.
+pub fn enumerate_capabilities(component: &Component, engine: &Engine) -> DiscoveredCapabilities {
+    let mut seen = HashSet::new();
+    let mut capabilities = Vec::new();
+    let component_type = component.component_type();
+
+    for (import_name, import_item) in component_type.imports(engine) {
+        collect_item_capabilities(
+            &import_item,
+            import_name,
+            engine,
+            &mut seen,
+            &mut capabilities,
+        );
     }
 
     DiscoveredCapabilities { capabilities }

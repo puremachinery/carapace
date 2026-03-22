@@ -986,6 +986,8 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginInstanceHandle<B> {
 }
 
 impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
+    const HOST_INSTANCE_NAME: &'static str = "clawdbot:plugin/host@1.0.0";
+
     /// Create a new plugin runtime
     pub fn new(
         loader: Arc<PluginLoader>,
@@ -1200,15 +1202,28 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
     /// Add host functions to the linker.
     ///
     /// Registers all host interface functions defined in `wit/plugin.wit` with the
-    /// wasmtime component model linker. Each function is bound under the `"host"`
-    /// instance namespace and delegates to [`WitHost`] which wraps
+    /// wasmtime component model linker. Each function is bound under the package-
+    /// qualified host instance namespace and also exposed via the legacy bare
+    /// `"host"` alias for older ad hoc fixtures. Both delegate to [`WitHost`] which wraps
     /// [`PluginHostContext`] for the actual implementation.
     ///
     /// Sync functions (logging, config) use `func_wrap`.
     /// Async functions (credentials, HTTP, media) use `func_wrap_async`.
     fn add_host_functions_to_linker(linker: &mut Linker<HostState<B>>) -> Result<(), RuntimeError> {
-        let mut host_instance = linker.instance("host").map_err(|e| {
-            RuntimeError::WasmtimeError(format!("Failed to create host instance in linker: {}", e))
+        Self::add_host_functions_for_instance(linker, Self::HOST_INSTANCE_NAME)?;
+        Self::add_host_functions_for_instance(linker, "host")?;
+
+        Ok(())
+    }
+
+    fn add_host_functions_for_instance(
+        linker: &mut Linker<HostState<B>>,
+        instance_name: &str,
+    ) -> Result<(), RuntimeError> {
+        let mut host_instance = linker.instance(instance_name).map_err(|e| {
+            RuntimeError::WasmtimeError(format!(
+                "Failed to create {instance_name} instance in linker: {e}"
+            ))
         })?;
 
         Self::add_logging_fns(&mut host_instance)?;
