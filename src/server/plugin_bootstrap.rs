@@ -468,9 +468,11 @@ fn discover_and_load_plugins(cfg: Value, state_dir: PathBuf) -> BlockingPluginBo
             .filter_map(Result::ok)
             .map(|entry| entry.path())
             .filter(|path| {
-                path.extension()
-                    .and_then(|value| value.to_str())
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("wasm"))
+                path.is_file()
+                    && path
+                        .extension()
+                        .and_then(|value| value.to_str())
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("wasm"))
             })
             .collect::<Vec<_>>();
         stray_paths.sort();

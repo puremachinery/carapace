@@ -1510,6 +1510,46 @@ mod tests {
         assert_eq!(report.entries[0].state, PluginActivationState::Active);
     }
 
+    #[tokio::test]
+    async fn bootstrap_plugin_runtime_ignores_wasm_named_directories_in_managed_dir() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let managed_dir = temp.path().join("skills");
+        let component_bytes = tool_plugin_component_bytes();
+        let wasm_path = write_wasm_bytes(&managed_dir, "alpha", &component_bytes);
+        std::fs::create_dir_all(managed_dir.join("fake.wasm")).expect("create fake wasm directory");
+        std::fs::write(
+            managed_dir.join("skills-manifest.json"),
+            json!({
+                "alpha": {
+                    "path": wasm_path.to_string_lossy().to_string(),
+                    "sha256": sha256_hex(&component_bytes)
+                }
+            })
+            .to_string(),
+        )
+        .expect("write manifest");
+        let cfg = json!({
+            "skills": {
+                "signature": {
+                    "enabled": false,
+                    "requireSignature": false
+                },
+                "sandbox": { "enabled": false },
+                "entries": {
+                    "alpha": { "enabled": true }
+                }
+            }
+        });
+
+        let result = bootstrap_plugin_runtime(&cfg, temp.path()).await;
+        let report = result.activation_report;
+
+        assert!(result.runtime.is_some(), "activation report: {report:#?}");
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.entries[0].name, "alpha");
+        assert_eq!(report.entries[0].state, PluginActivationState::Active);
+    }
+
     #[test]
     fn load_plugin_candidate_reports_duplicate_plugin_ids_across_sources() {
         let temp = tempfile::tempdir().expect("temp dir");
