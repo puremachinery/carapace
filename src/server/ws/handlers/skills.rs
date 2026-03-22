@@ -562,9 +562,7 @@ fn build_skills_array(cfg: &Value) -> Vec<Value> {
 fn build_skills_array_from_report(
     report: &crate::server::startup::PluginActivationReport,
 ) -> Vec<Value> {
-    // Response serialization owns the user-facing ordering. Startup keeps its own
-    // deterministic load order for activation/conflict handling.
-    let mut skills = report
+    report
         .entries
         .iter()
         .map(|entry| {
@@ -580,16 +578,7 @@ fn build_skills_array_from_report(
                 "reason": entry.reason,
             })
         })
-        .collect::<Vec<_>>();
-    skills.sort_by(|left, right| {
-        let left_name = left.get("name").and_then(Value::as_str).unwrap_or_default();
-        let right_name = right
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        left_name.cmp(right_name)
-    });
-    skills
+        .collect()
 }
 
 fn pending_skill_value(skill: &Value) -> Value {
@@ -619,6 +608,9 @@ fn pending_skill_value(skill: &Value) -> Value {
 }
 
 fn merge_managed_skill_config(existing: &mut Value, skill: &Value) {
+    // The activation report is a startup-time snapshot. `skills.status` refreshes
+    // these config-owned fields so post-startup installs/enables show the current
+    // desired state even though activation itself still requires restart.
     let enabled = skill
         .get("enabled")
         .and_then(Value::as_bool)
@@ -662,6 +654,31 @@ fn merge_managed_skill_config(existing: &mut Value, skill: &Value) {
     );
 }
 
+fn mark_removed_managed_skill(existing: &mut Value) {
+    let previous_state = existing
+        .get("state")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    existing["enabled"] = Value::Bool(false);
+    existing["installId"] = Value::Null;
+    existing["requestedAt"] = Value::Null;
+    existing["state"] = Value::String(
+        crate::server::startup::PluginActivationState::Disabled
+            .label()
+            .to_string(),
+    );
+    existing["reason"] = Value::String(
+        if previous_state == crate::server::startup::PluginActivationState::Active.label() {
+            "managed skill is currently active and will be removed after restart".to_string()
+        } else {
+            "managed skill has been removed from skills.entries and will stay inactive after restart"
+                .to_string()
+        },
+    );
+}
+
 fn build_skills_array_from_report_and_config(
     report: &crate::server::startup::PluginActivationReport,
     cfg: &Value,
@@ -674,7 +691,14 @@ fn build_skills_array_from_report_and_config(
         by_name.entry(name.to_string()).or_default().push(skill);
     }
 
-    for skill in build_skills_array(cfg) {
+    let config_skills = build_skills_array(cfg);
+    let configured_names = config_skills
+        .iter()
+        .filter_map(|skill| skill.get("name").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect::<std::collections::HashSet<_>>();
+
+    for skill in config_skills {
         let Some(name) = skill.get("name").and_then(Value::as_str) else {
             continue;
         };
@@ -682,6 +706,8 @@ fn build_skills_array_from_report_and_config(
             if let Some(existing) = existing_skills.iter_mut().find(|entry| {
                 // Config-backed merge only targets the managed entry for a skill name.
                 // Config-path rows are runtime observations/conflicts and stay separate.
+                // There should be at most one managed row per skill name because startup
+                // only emits one managed activation entry per configured skill.
                 entry.get("source").and_then(Value::as_str)
                     == Some(crate::server::startup::PluginActivationSource::Managed.label())
             }) {
@@ -691,6 +717,18 @@ fn build_skills_array_from_report_and_config(
             }
         } else {
             by_name.insert(name.to_string(), vec![pending_skill_value(&skill)]);
+        }
+    }
+
+    for (name, skills) in &mut by_name {
+        if configured_names.contains(name) {
+            continue;
+        }
+        for existing in skills.iter_mut().filter(|entry| {
+            entry.get("source").and_then(Value::as_str)
+                == Some(crate::server::startup::PluginActivationSource::Managed.label())
+        }) {
+            mark_removed_managed_skill(existing);
         }
     }
 
@@ -1510,6 +1548,60 @@ mod tests {
         assert_eq!(
             weather["reason"],
             "managed skill is currently active and will be disabled after restart"
+        );
+
+        crate::config::clear_cache();
+    }
+
+    #[test]
+    fn test_handle_skills_status_marks_removed_managed_skill_as_pending_restart() {
+        let config_dir = TempDir::new().unwrap();
+        let config_path = config_dir.path().join("carapace.json");
+        std::fs::write(
+            &config_path,
+            json!({ "skills": { "entries": {} } }).to_string(),
+        )
+        .unwrap();
+        let mut env = ScopedEnv::new();
+        env.set("CARAPACE_CONFIG_PATH", config_path.as_os_str())
+            .set("CARAPACE_DISABLE_CONFIG_CACHE", "1");
+        crate::config::clear_cache();
+
+        let state = WsServerState::new(WsServerConfig::default()).with_plugin_activation_report(
+            crate::server::startup::PluginActivationReport {
+                enabled: true,
+                managed_dir: PathBuf::from("/managed"),
+                configured_paths: vec![],
+                restart_required_for_changes: true,
+                errors: vec![],
+                entries: vec![crate::server::startup::PluginActivationEntry {
+                    name: "weather".to_string(),
+                    plugin_id: Some("weather".to_string()),
+                    source: crate::server::startup::PluginActivationSource::Managed,
+                    enabled: true,
+                    path: Some(PathBuf::from("/managed/weather.wasm")),
+                    requested_at: Some(1700000000000u64),
+                    install_id: Some(json!("install-weather-old")),
+                    state: crate::server::startup::PluginActivationState::Active,
+                    reason: None,
+                }],
+            },
+        );
+
+        let result = handle_skills_status(&state).unwrap();
+        let weather = result["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == "weather")
+            .unwrap();
+        assert_eq!(weather["enabled"], false);
+        assert_eq!(weather["installId"], Value::Null);
+        assert_eq!(weather["requestedAt"], Value::Null);
+        assert_eq!(weather["state"], "disabled");
+        assert_eq!(
+            weather["reason"],
+            "managed skill is currently active and will be removed after restart"
         );
 
         crate::config::clear_cache();
