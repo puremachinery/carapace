@@ -97,10 +97,10 @@ fn validate_skill_name(name: &str) -> Result<(), ErrorShape> {
 fn validate_skill_wasm_bytes(bytes: &[u8], source: &str) -> Result<(), ErrorShape> {
     validate_skill_wasm_size(bytes.len() as u64, source)?;
 
-    if bytes.len() < 4 || bytes[..4] != WASM_MAGIC {
+    if bytes.len() < 8 || bytes[..4] != WASM_MAGIC || bytes[4..8] != [0x01, 0x00, 0x00, 0x00] {
         return Err(error_shape(
             ERROR_INVALID_REQUEST,
-            &format!("{source} is not a valid WASM module (bad magic bytes)"),
+            &format!("{source} is not a valid WASM module (bad magic/version bytes)"),
             None,
         ));
     }
@@ -454,10 +454,17 @@ pub(super) fn handle_skills_status(state: &WsServerState) -> Result<Value, Error
         skills_arr,
         restart_required,
     ) = if let Some(report) = state.plugin_activation_report() {
+        let failed_skill_count = report
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.state == crate::server::plugin_bootstrap::PluginActivationState::Failed
+            })
+            .count();
         (
             report.enabled,
             report.configured_paths.len(),
-            report.errors.len(),
+            report.errors.len() + failed_skill_count,
             build_skills_array_from_report_and_config(report, &cfg),
             report.restart_required_for_changes,
         )
@@ -1183,7 +1190,7 @@ mod tests {
         assert_eq!(result["pluginsEnabled"], true);
         assert_eq!(result["configuredPluginPathCount"], 1);
         assert_eq!(result["restartRequiredForChanges"], true);
-        assert_eq!(result["activationErrorCount"], 1);
+        assert_eq!(result["activationErrorCount"], 2);
         assert_eq!(result["skills"].as_array().unwrap().len(), 1);
         let entry = &result["skills"][0];
         assert_eq!(entry["name"], "weather");
@@ -1427,7 +1434,7 @@ mod tests {
         );
 
         let result = handle_skills_status(&state).unwrap();
-        assert_eq!(result["activationErrorCount"], 1);
+        assert_eq!(result["activationErrorCount"], 2);
         let weather = result["skills"]
             .as_array()
             .unwrap()
@@ -1872,6 +1879,17 @@ mod tests {
         assert_eq!(WASM_MAGIC, [0x00, 0x61, 0x73, 0x6D]);
         // "\0asm" in ASCII
         assert_eq!(&WASM_MAGIC[1..], b"asm");
+    }
+
+    #[test]
+    fn test_validate_skill_wasm_bytes_rejects_invalid_version() {
+        let err = validate_skill_wasm_bytes(
+            &[0x00, 0x61, 0x73, 0x6D, 0x02, 0x00, 0x00, 0x00],
+            "test skill",
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ERROR_INVALID_REQUEST);
+        assert!(err.message.contains("bad magic/version bytes"));
     }
 
     // ---- Install handler tests ----

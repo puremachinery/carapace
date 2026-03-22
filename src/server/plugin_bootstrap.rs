@@ -178,6 +178,10 @@ fn manifest_entry_path(entry: &serde_json::Value, managed_dir: &Path, name: &str
 fn canonical_prefix(path: &Path) -> Result<PathBuf, String> {
     match path.canonicalize() {
         Ok(canonical) => Ok(canonical),
+        // If the managed directory does not exist yet, fail closed by comparing against
+        // the raw path. Any candidate under that directory still has to canonicalize
+        // successfully in `resolve_managed_skill_path`, which cannot happen while the
+        // parent directory is absent.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(path.to_path_buf()),
         Err(error) => Err(format!(
             "failed to resolve managed skills directory {}: {error}",
@@ -377,6 +381,13 @@ fn discover_and_load_plugins(cfg: Value, state_dir: PathBuf) -> BlockingPluginBo
         }
     };
     let mut report_index_by_plugin_id = HashMap::new();
+
+    if !configured_paths.is_empty() {
+        tracing::warn!(
+            configured_path_count = configured_paths.len(),
+            "plugins.load.paths trusts local filesystem directories; managed sha256 pinning and containment checks are not applied"
+        );
+    }
 
     let (manifest, manifest_error) = match load_skills_manifest(&managed_dir) {
         Ok(Some(manifest)) => (manifest, None),
@@ -647,7 +658,7 @@ pub(crate) async fn bootstrap_plugin_runtime(
                 Err(error) => {
                     entry.state = PluginActivationState::Failed;
                     entry.plugin_id = Some(plugin_id.clone());
-                    entry.reason = Some(error.to_string());
+                    entry.reason = Some(describe_activation_error(&error));
                 }
             }
         }
@@ -669,6 +680,14 @@ pub(crate) async fn bootstrap_plugin_runtime(
     }
 }
 
+fn describe_activation_error(error: &crate::plugins::RuntimeError) -> String {
+    let rendered = error.to_string();
+    if rendered.contains("clawdbot:plugin/host@1.0.0") {
+        return "plugin was built against the deprecated clawdbot:plugin WIT namespace; rebuild it against carapace:plugin@1.0.0".to_string();
+    }
+    rendered
+}
+
 pub(crate) fn stop_plugin_services(ws_state: &WsServerState) {
     let runtime = ws_state.plugin_runtime().cloned();
     let Some(registry) = runtime
@@ -688,5 +707,24 @@ pub(crate) fn stop_plugin_services(ws_state: &WsServerState) {
                 tracing::warn!(plugin_id = %plugin_id, error = %error, "failed to unload service plugin");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::plugins::RuntimeError;
+
+    use super::describe_activation_error;
+
+    #[test]
+    fn describe_activation_error_explains_legacy_wit_namespace() {
+        let error = RuntimeError::InstantiationError(
+            "unknown import: clawdbot:plugin/host@1.0.0".to_string(),
+        );
+
+        assert_eq!(
+            describe_activation_error(&error),
+            "plugin was built against the deprecated clawdbot:plugin WIT namespace; rebuild it against carapace:plugin@1.0.0"
+        );
     }
 }

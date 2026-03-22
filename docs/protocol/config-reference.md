@@ -409,6 +409,7 @@ Enable Carapace to listen and respond on external chat platforms.
     - Managed skill installs require `skills-manifest.json` entries with pinned `sha256` values.
     - `plugins.load.paths` is an explicit dev/advanced path and does not use the managed-skill manifest `sha256` pinning flow; treat those directories as trusted local inputs.
     - `plugins.enabled = false` disables both managed skill activation and configured `load.paths`.
+    - Plugin components must target the current WIT package namespace `carapace:plugin@1.0.0`. Older binaries built against `clawdbot:plugin@1.0.0` must be rebuilt before they will activate successfully.
 - **`messages`**
   - *What it does:* Messaging behavior defaults.
   - *Common values:*

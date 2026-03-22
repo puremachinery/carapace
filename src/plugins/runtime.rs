@@ -1202,17 +1202,14 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
     /// Add host functions to the linker.
     ///
     /// Registers all host interface functions defined in `wit/plugin.wit` with the
-    /// wasmtime component model linker. Each function is bound under the package-
-    /// qualified host instance namespace and also exposed via the legacy bare
-    /// `"host"` alias for older ad hoc fixtures. Both delegate to [`WitHost`] which wraps
-    /// [`PluginHostContext`] for the actual implementation.
+    /// wasmtime component model linker under the package-qualified host instance
+    /// namespace from `wit/plugin.wit`. The host bindings delegate to
+    /// [`WitHost`], which wraps [`PluginHostContext`] for the actual implementation.
     ///
     /// Sync functions (logging, config) use `func_wrap`.
     /// Async functions (credentials, HTTP, media) use `func_wrap_async`.
     fn add_host_functions_to_linker(linker: &mut Linker<HostState<B>>) -> Result<(), RuntimeError> {
         Self::add_host_functions_for_instance(linker, Self::HOST_INSTANCE_NAME)?;
-        Self::add_host_functions_for_instance(linker, "host")?;
-
         Ok(())
     }
 

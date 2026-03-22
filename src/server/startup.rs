@@ -1349,6 +1349,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bootstrap_plugin_runtime_reports_managed_sha256_mismatch() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let managed_dir = temp.path().join("skills");
+        let component_bytes = tool_plugin_component_bytes();
+        let wasm_path = write_wasm_bytes(&managed_dir, "alpha", &component_bytes);
+        std::fs::write(
+            managed_dir.join("skills-manifest.json"),
+            json!({
+                "alpha": {
+                    "path": wasm_path.to_string_lossy().to_string(),
+                    "sha256": sha256_hex(b"wrong-bytes")
+                }
+            })
+            .to_string(),
+        )
+        .expect("write manifest");
+
+        let cfg = json!({
+            "skills": {
+                "sandbox": { "enabled": false },
+                "entries": {
+                    "alpha": { "enabled": true }
+                }
+            }
+        });
+
+        let result = bootstrap_plugin_runtime(&cfg, temp.path()).await;
+        let report = result.activation_report;
+
+        assert!(
+            result.runtime.is_none(),
+            "runtime should not be created when no plugins load: {report:#?}"
+        );
+        assert!(
+            result.registry.get_tools().is_empty(),
+            "activation report: {report:#?}"
+        );
+        assert_eq!(report.entries.len(), 1);
+        let entry = &report.entries[0];
+        assert_eq!(entry.name, "alpha");
+        assert_eq!(entry.source, PluginActivationSource::Managed);
+        assert_eq!(entry.state, PluginActivationState::Failed);
+        assert!(entry
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("Skill hash verification failed")));
+    }
+
+    #[tokio::test]
     async fn bootstrap_plugin_runtime_activates_valid_config_path_tool_component() {
         let temp = tempfile::tempdir().expect("temp dir");
         let config_dir = temp.path().join("config-plugins");
