@@ -28,6 +28,7 @@ A security-focused, open-source personal AI assistant.
 
 - [Architecture](architecture.md) — Component diagrams, request flows, design decisions
 - [Security](security.md) — Threat model, trust boundaries, implementation checklist
+- [Plugin Development](plugin-development.md) — WASM plugin authoring, local dev loading, and managed skill distribution rules
 
 ## Protocol Reference
 
