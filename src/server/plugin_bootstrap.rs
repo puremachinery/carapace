@@ -658,7 +658,7 @@ pub(crate) async fn bootstrap_plugin_runtime(
                 Err(error) => {
                     entry.state = PluginActivationState::Failed;
                     entry.plugin_id = Some(plugin_id.clone());
-                    entry.reason = Some(describe_activation_error(&error));
+                    entry.reason = Some(error.to_string());
                 }
             }
         }
@@ -680,14 +680,6 @@ pub(crate) async fn bootstrap_plugin_runtime(
     }
 }
 
-fn describe_activation_error(error: &crate::plugins::RuntimeError) -> String {
-    let rendered = error.to_string();
-    if rendered.contains("clawdbot:plugin/host@1.0.0") {
-        return "plugin was built against the deprecated clawdbot:plugin WIT namespace; rebuild it against carapace:plugin@1.0.0".to_string();
-    }
-    rendered
-}
-
 pub(crate) fn stop_plugin_services(ws_state: &WsServerState) {
     let runtime = ws_state.plugin_runtime().cloned();
     let Some(registry) = runtime
@@ -707,24 +699,5 @@ pub(crate) fn stop_plugin_services(ws_state: &WsServerState) {
                 tracing::warn!(plugin_id = %plugin_id, error = %error, "failed to unload service plugin");
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::plugins::RuntimeError;
-
-    use super::describe_activation_error;
-
-    #[test]
-    fn describe_activation_error_explains_legacy_wit_namespace() {
-        let error = RuntimeError::InstantiationError(
-            "unknown import: clawdbot:plugin/host@1.0.0".to_string(),
-        );
-
-        assert_eq!(
-            describe_activation_error(&error),
-            "plugin was built against the deprecated clawdbot:plugin WIT namespace; rebuild it against carapace:plugin@1.0.0"
-        );
     }
 }

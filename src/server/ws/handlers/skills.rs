@@ -14,10 +14,8 @@ use hickory_resolver::TokioResolver;
 use super::super::*;
 use super::config::{map_validation_issues, read_config_snapshot, write_config_file};
 use crate::plugins::capabilities::SsrfProtection;
+use crate::plugins::loader::{validate_plugin_component_bytes, LoaderError};
 use crate::runtime_bridge::{run_sync_blocking_send, BridgeError};
-
-/// WASM binary magic bytes: `\0asm`
-const WASM_MAGIC: [u8; 4] = [0x00, 0x61, 0x73, 0x6D];
 
 /// Maximum download size for a skill WASM binary (50 MB).
 const MAX_SKILL_DOWNLOAD_BYTES: usize = 50 * 1024 * 1024;
@@ -96,16 +94,18 @@ fn validate_skill_name(name: &str) -> Result<(), ErrorShape> {
 
 fn validate_skill_wasm_bytes(bytes: &[u8], source: &str) -> Result<(), ErrorShape> {
     validate_skill_wasm_size(bytes.len() as u64, source)?;
-
-    if bytes.len() < 8 || bytes[..4] != WASM_MAGIC || bytes[4..8] != [0x01, 0x00, 0x00, 0x00] {
-        return Err(error_shape(
+    validate_plugin_component_bytes(source, bytes).map_err(|error| match error {
+        LoaderError::WasmCompileError { message, .. } => error_shape(
             ERROR_INVALID_REQUEST,
-            &format!("{source} is not a valid WASM module (bad magic/version bytes)"),
+            &format!("{source} is not a valid WASM plugin component: {message}"),
             None,
-        ));
-    }
-
-    Ok(())
+        ),
+        other => error_shape(
+            ERROR_UNAVAILABLE,
+            &format!("failed to validate {source}: {other}"),
+            None,
+        ),
+    })
 }
 
 fn validate_skill_wasm_size(size_bytes: u64, source: &str) -> Result<(), ErrorShape> {
@@ -318,7 +318,7 @@ fn validate_and_resolve_dns(url: &url::Url) -> Result<(String, u16, Option<IpAdd
 }
 
 /// Build an HTTP client pinned to the validated IP (if any) and download the WASM
-/// binary.  Validates response status, size limit, and WASM magic bytes.
+/// binary. Validates response status, size limit, and component compatibility.
 fn download_with_pinned_ip(
     url: &url::Url,
     host: &str,
@@ -513,6 +513,17 @@ fn build_skills_array(cfg: &Value) -> Vec<Value> {
         .collect()
 }
 
+fn token_looks_like_filesystem_path(token: &str) -> bool {
+    token.starts_with('/')
+        || token.starts_with("./")
+        || token.starts_with("../")
+        || token.starts_with("~/")
+        || (token.len() > 2
+            && token.as_bytes()[1] == b':'
+            && matches!(token.as_bytes()[2], b'\\' | b'/'))
+        || (token.contains('\\') && !token.contains(':'))
+}
+
 fn sanitize_activation_reason(reason: &str) -> String {
     if reason.starts_with("failed to read configured plugin path ") {
         return "configured plugin directory is unreadable".to_string();
@@ -529,7 +540,10 @@ fn sanitize_activation_reason(reason: &str) -> String {
     if reason.starts_with("Failed to compile WASM component ") {
         return "failed to compile WASM plugin component".to_string();
     }
-    if reason.contains('/') || reason.contains('\\') {
+    if reason
+        .split_whitespace()
+        .any(token_looks_like_filesystem_path)
+    {
         return "plugin activation failed; see server logs for details".to_string();
     }
     reason.to_string()
@@ -1031,6 +1045,8 @@ mod tests {
     use crate::server::ws::{WsServerConfig, WsServerState};
     use crate::test_support::env::ScopedEnv;
     use tempfile::TempDir;
+    use wit_component::{dummy_module, embed_component_metadata, ComponentEncoder, StringEncoding};
+    use wit_parser::{ManglingAndAbi, Resolve};
 
     struct TestConfigEnv {
         _env: ScopedEnv,
@@ -1057,6 +1073,25 @@ mod tests {
         fn drop(&mut self) {
             crate::config::clear_cache();
         }
+    }
+
+    fn tool_plugin_component_bytes() -> Vec<u8> {
+        let wit_path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tool-plugin.wit");
+        let mut resolve = Resolve::default();
+        let (pkg, _) = resolve.push_path(&wit_path).expect("load plugin WIT");
+        let world = resolve
+            .select_world(&[pkg], Some("tool-plugin"))
+            .expect("select tool-plugin world");
+        let mut module = dummy_module(&resolve, world, ManglingAndAbi::Standard32);
+        embed_component_metadata(&mut module, &resolve, world, StringEncoding::UTF8)
+            .expect("embed component metadata");
+        ComponentEncoder::default()
+            .module(&module)
+            .expect("attach core module")
+            .validate(true)
+            .encode()
+            .expect("encode tool plugin component")
     }
 
     #[test]
@@ -1443,6 +1478,14 @@ mod tests {
             .unwrap();
         assert_eq!(weather["reason"], "failed to compile WASM plugin component");
         assert!(weather.get("path").is_none());
+    }
+
+    #[test]
+    fn test_sanitize_activation_reason_preserves_namespaced_identifiers() {
+        assert_eq!(
+            sanitize_activation_reason("unknown import: carapace:plugin/host@1.0.0"),
+            "unknown import: carapace:plugin/host@1.0.0"
+        );
     }
 
     #[test]
@@ -1871,25 +1914,17 @@ mod tests {
         assert_eq!(manifest, json!({}));
     }
 
-    // ---- WASM magic validation test ----
-
     #[test]
-    fn test_wasm_magic_bytes() {
-        // Verify the constant matches the WASM spec
-        assert_eq!(WASM_MAGIC, [0x00, 0x61, 0x73, 0x6D]);
-        // "\0asm" in ASCII
-        assert_eq!(&WASM_MAGIC[1..], b"asm");
-    }
-
-    #[test]
-    fn test_validate_skill_wasm_bytes_rejects_invalid_version() {
+    fn test_validate_skill_wasm_bytes_rejects_invalid_component() {
         let err = validate_skill_wasm_bytes(
             &[0x00, 0x61, 0x73, 0x6D, 0x02, 0x00, 0x00, 0x00],
             "test skill",
         )
         .unwrap_err();
         assert_eq!(err.code, ERROR_INVALID_REQUEST);
-        assert!(err.message.contains("bad magic/version bytes"));
+        assert!(err
+            .message
+            .contains("test skill is not a valid WASM plugin component"));
     }
 
     // ---- Install handler tests ----
@@ -1963,8 +1998,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let skills_dir = dir.path().join("skills");
         std::fs::create_dir_all(&skills_dir).unwrap();
-        let mut wasm_bytes = WASM_MAGIC.to_vec();
-        wasm_bytes.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
+        let wasm_bytes = tool_plugin_component_bytes();
         let wasm_path = skills_dir.join("my-skill.wasm");
         std::fs::write(&wasm_path, &wasm_bytes).unwrap();
         let params = json!({ "name": "my-skill", "version": "2.0.0" });
@@ -2012,8 +2046,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let skills_dir = dir.path().join("skills");
         std::fs::create_dir_all(&skills_dir).unwrap();
-        let mut wasm_bytes = WASM_MAGIC.to_vec();
-        wasm_bytes.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
+        let wasm_bytes = tool_plugin_component_bytes();
         std::fs::write(skills_dir.join("my-skill.wasm"), wasm_bytes).unwrap();
         let params = json!({ "name": "my-skill", "version": "2.0.0" });
 
@@ -2094,9 +2127,8 @@ mod tests {
     fn test_update_skill_found_by_wasm_file() {
         // Even if the manifest doesn't have the entry, a .wasm file on disk counts
         let dir = TempDir::new().unwrap();
-        // Create the wasm file (with valid magic bytes)
-        let mut wasm_bytes = WASM_MAGIC.to_vec();
-        wasm_bytes.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]); // version 1
+        // Create a valid plugin component file on disk.
+        let wasm_bytes = tool_plugin_component_bytes();
         std::fs::write(dir.path().join("disk-skill.wasm"), &wasm_bytes).unwrap();
 
         // No URL provided, so it should fail with "no update source" (not "not installed")
@@ -2200,16 +2232,13 @@ mod tests {
 
     #[test]
     fn test_skill_hash_computed_on_install() {
-        // Simulate an install without a URL (no download) but manually write a WASM
-        // file and manifest entry with a hash, then verify the hash is present.
+        // Simulate an install without a URL (no download) but manually write a plugin
+        // component file and manifest entry with a hash, then verify the hash is present.
         let dir = TempDir::new().unwrap();
         let skills_dir = dir.path().join("skills");
         std::fs::create_dir_all(&skills_dir).unwrap();
 
-        // Create a fake WASM binary with valid magic bytes
-        let mut wasm_bytes = WASM_MAGIC.to_vec();
-        wasm_bytes.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]); // version 1
-        wasm_bytes.extend_from_slice(b"test payload for hashing");
+        let wasm_bytes = tool_plugin_component_bytes();
 
         // Compute expected hash
         let expected_hash = compute_sha256_hex(&wasm_bytes);

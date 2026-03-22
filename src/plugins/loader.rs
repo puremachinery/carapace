@@ -194,6 +194,24 @@ impl std::fmt::Debug for LoadedPlugin {
 /// WASM binary magic bytes (\0asm)
 const WASM_MAGIC: [u8; 4] = [0x00, 0x61, 0x73, 0x6D];
 
+fn component_engine() -> Result<Engine, LoaderError> {
+    let mut config = Config::new();
+    config.wasm_component_model(true);
+    Engine::new(&config).map_err(|e| LoaderError::EngineError(e.to_string()))
+}
+
+pub(crate) fn validate_plugin_component_bytes(
+    source: &str,
+    wasm_bytes: &[u8],
+) -> Result<(), LoaderError> {
+    let engine = component_engine()?;
+    WasmComponent::new(&engine, wasm_bytes).map_err(|e| LoaderError::WasmCompileError {
+        path: source.to_string(),
+        message: e.to_string(),
+    })?;
+    Ok(())
+}
+
 /// WASM custom section ID
 const WASM_SECTION_CUSTOM: u8 = 0;
 
@@ -635,11 +653,7 @@ impl PluginLoader {
         plugins_dir: PathBuf,
         signature_config: super::signature::SignatureConfig,
     ) -> Result<Self, LoaderError> {
-        // Configure wasmtime engine
-        let mut config = Config::new();
-        config.wasm_component_model(true);
-
-        let engine = Engine::new(&config).map_err(|e| LoaderError::EngineError(e.to_string()))?;
+        let engine = component_engine()?;
 
         Ok(Self {
             engine,
