@@ -1474,6 +1474,42 @@ mod tests {
         runtime.unload_plugin("alpha").expect("unload plugin");
     }
 
+    #[tokio::test]
+    async fn bootstrap_plugin_runtime_ignores_wasm_named_directories_in_config_paths() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let config_dir = temp.path().join("config-plugins");
+        let component_bytes = tool_plugin_component_bytes();
+        write_wasm_bytes(&config_dir, "alpha", &component_bytes);
+        std::fs::create_dir_all(config_dir.join("fake.wasm")).expect("create fake wasm directory");
+        let cfg = json!({
+            "plugins": {
+                "load": {
+                    "paths": [config_dir.to_string_lossy().to_string()]
+                }
+            },
+            "skills": {
+                "signature": {
+                    "enabled": false,
+                    "requireSignature": false
+                },
+                "sandbox": { "enabled": false }
+            }
+        });
+
+        let result = bootstrap_plugin_runtime(&cfg, temp.path()).await;
+        let report = result.activation_report;
+
+        assert!(result.runtime.is_some(), "activation report: {report:#?}");
+        assert_eq!(
+            result.registry.get_tools().len(),
+            1,
+            "activation report: {report:#?}"
+        );
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.entries[0].name, "alpha");
+        assert_eq!(report.entries[0].state, PluginActivationState::Active);
+    }
+
     #[test]
     fn load_plugin_candidate_reports_duplicate_plugin_ids_across_sources() {
         let temp = tempfile::tempdir().expect("temp dir");

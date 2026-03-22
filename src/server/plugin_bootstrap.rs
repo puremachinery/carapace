@@ -254,10 +254,11 @@ fn discover_config_path_plugins(path: &Path) -> Result<Vec<PathBuf>, String> {
             )
         })?;
         let candidate = entry.path();
-        if candidate
-            .extension()
-            .and_then(|value| value.to_str())
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("wasm"))
+        if candidate.is_file()
+            && candidate
+                .extension()
+                .and_then(|value| value.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("wasm"))
         {
             wasm_paths.push(candidate);
         }
