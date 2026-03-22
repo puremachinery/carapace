@@ -1,4 +1,4 @@
-// Clawdbot Plugin Interface
+// Carapace Plugin Interface
 // WIT (WebAssembly Interface Types) definition for WASM plugins
 //
 // SECURITY MODEL
@@ -43,7 +43,7 @@
 //    - Only specific hooks allow payload modification (documented per hook)
 //    - Unauthorized modifications are ignored by the host
 
-package clawdbot:plugin@1.0.0;
+package carapace:plugin@1.0.0;
 
 // Core types shared across all capabilities
 interface types {

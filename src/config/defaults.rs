@@ -1,7 +1,7 @@
 //! Config defaults application
 //!
 //! Merges user-provided config with sane defaults so that partial configs work
-//! correctly. Ported from clawdbot's `src/config/defaults.ts` apply* functions.
+//! correctly.
 //!
 //! The top-level entry point is [`apply_defaults`], which takes a raw
 //! `serde_json::Value` (the JSON5-parsed config) and fills in any missing
@@ -59,7 +59,7 @@ struct ConfigWithDefaults {
 // Gateway / Server defaults
 // ---------------------------------------------------------------------------
 
-/// Default gateway port (matches clawdbot & bind.rs).
+/// Default gateway port.
 const DEFAULT_GATEWAY_PORT: u16 = 18789;
 
 /// Default bind mode.
@@ -150,7 +150,7 @@ struct GatewayControlUiDefaults {
 // Agent defaults
 // ---------------------------------------------------------------------------
 
-/// Default max concurrent agent runs (from clawdbot agent-limits.ts).
+/// Default max concurrent agent runs.
 const DEFAULT_AGENT_MAX_CONCURRENT: u32 = 4;
 
 /// Default max concurrent sub-agent runs.
@@ -171,7 +171,7 @@ const DEFAULT_VERBOSE: &str = "off";
 /// Default block streaming.
 const DEFAULT_BLOCK_STREAMING: &str = "off";
 
-/// Default compaction mode (from clawdbot defaults.ts).
+/// Default compaction mode.
 const DEFAULT_COMPACTION_MODE: &str = "safeguard";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -320,7 +320,7 @@ struct SessionDefaults {
     #[serde(default = "default_typing_interval_seconds")]
     typing_interval_seconds: u32,
 
-    /// The mainKey is always "main" (clawdbot enforces this).
+    /// The main key is always "main".
     #[serde(default = "default_main_key")]
     main_key: String,
 }
@@ -363,7 +363,7 @@ const DEFAULT_LOG_LEVEL: &str = "info";
 /// Default console style.
 const DEFAULT_CONSOLE_STYLE: &str = "pretty";
 
-/// Default redact mode (from clawdbot applyLoggingDefaults).
+/// Default redact mode.
 const DEFAULT_REDACT_SENSITIVE: &str = "tools";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -470,7 +470,7 @@ fn default_hooks_max_body_bytes() -> u32 {
 // Messages defaults
 // ---------------------------------------------------------------------------
 
-/// Default ack reaction scope (from clawdbot applyMessageDefaults).
+/// Default ack reaction scope.
 const DEFAULT_ACK_REACTION_SCOPE: &str = "group-mentions";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

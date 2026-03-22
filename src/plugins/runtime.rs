@@ -986,7 +986,7 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginInstanceHandle<B> {
 }
 
 impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
-    const HOST_INSTANCE_NAME: &'static str = "clawdbot:plugin/host@1.0.0";
+    const HOST_INSTANCE_NAME: &'static str = "carapace:plugin/host@1.0.0";
 
     /// Create a new plugin runtime
     pub fn new(

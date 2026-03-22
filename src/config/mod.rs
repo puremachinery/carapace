@@ -1,7 +1,7 @@
 //! Configuration parsing module
 //!
 //! Handles JSON5 configuration with includes, environment variable substitution,
-//! and caching. Derived from the legacy openclaw format (best-effort compatibility).
+//! and caching.
 
 pub mod defaults;
 pub mod schema;
@@ -293,8 +293,7 @@ pub fn load_config_uncached(path: &Path) -> Result<Value, ConfigError> {
     }
     drop(env_state);
 
-    // Apply config defaults (fill in missing sections/fields with
-    // production-ready values — mirrors clawdbot's apply* pipeline).
+    // Apply config defaults so missing sections and fields get production-ready values.
     defaults::apply_defaults(&mut value);
 
     // Resolve encrypted secrets if configured.

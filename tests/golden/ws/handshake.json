@@ -1,6 +1,6 @@
 {
   "$schema": "golden-trace-v1",
-  "description": "WebSocket connection handshake protocol - based on openclaw gateway source code",
+  "description": "WebSocket connection handshake protocol",
   "source_files": [
     "src/gateway/server/ws-connection.ts",
     "src/gateway/server/ws-connection/message-handler.ts",
