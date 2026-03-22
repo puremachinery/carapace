@@ -6,12 +6,10 @@ expression: normalized
 {
   "ok": true,
   "result": {
-    "configuredPluginPaths": [],
-    "errors": [],
-    "managedSkillsDir": "<PATH>",
+    "activationErrorCount": 0,
+    "configuredPluginPathCount": 0,
     "pluginsEnabled": true,
     "restartRequiredForChanges": true,
-    "skills": [],
-    "workspaceDir": "<PATH>"
+    "skills": []
   }
 }
