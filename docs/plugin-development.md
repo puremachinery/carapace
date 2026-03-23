@@ -5,11 +5,12 @@ runtime.
 
 The workflow that works today is:
 
-1. build a WASM component against [`wit/plugin.wit`](https://github.com/puremachinery/carapace/blob/main/wit/plugin.wit)
-2. load it locally through `plugins.load.paths`
-3. restart Carapace
-4. verify activation with `cara plugins status` and `cara logs`
-5. use `cara plugins install` / `cara plugins update` only when you want the
+1. choose a plugin shape and WIT world
+2. build a WASM component against [`wit/plugin.wit`](https://github.com/puremachinery/carapace/blob/main/wit/plugin.wit)
+3. load it locally through `plugins.load.paths`
+4. restart Carapace
+5. verify activation with `cara plugins status` and `cara logs`
+6. use `cara plugins install` / `cara plugins update` only when you want the
    managed distribution path
 
 This guide is intentionally written around the public surfaces that exist today:
@@ -66,12 +67,20 @@ There are two different names you will see in the plugin tooling:
 - **managed plugin `name`**
   - the name you pass to `cara plugins install <name>` or
     `cara plugins update <name>`
-  - identifies the managed artifact/config entry under `plugins.entries`
+  - identifies the managed artifact/install entry under `plugins.entries`
   - may contain ASCII alphanumeric characters, hyphens, and underscores
   - maximum length: `128`
 
 For simplest operations, keep the managed plugin name and the runtime
 `pluginId` the same.
+
+Reserved managed plugin names:
+
+- `enabled`
+- `entries`
+- `load`
+- `sandbox`
+- `signature`
 
 Manifest fields:
 
@@ -136,6 +145,51 @@ that matters is the built component file.
 
 Any toolchain that produces a valid WASM component for the same WIT contract is
 fine. Rust plus `cargo-component` is just the most direct path.
+
+## Fastest path: first tool plugin
+
+If you are building your first plugin, start with a tool plugin. It has the
+smallest surface and the fastest edit/build/restart loop.
+
+Recommended sequence:
+
+1. create a new component crate:
+
+   ```sh
+   cargo install cargo-component
+   cargo component new --lib my-tool
+   ```
+
+2. point it at Carapace's WIT and select the `tool-plugin` world:
+
+   ```toml
+   [package.metadata.component]
+   target = { path = "/absolute/path/to/carapace/wit/plugin.wit", world = "tool-plugin" }
+   ```
+
+3. implement the required exports for that world:
+   - `manifest.get-manifest()`
+   - `tool.get-definitions()`
+   - `tool.invoke(...)`
+
+4. build the component:
+
+   ```sh
+   cargo component build --release
+   ```
+
+5. copy the generated `.wasm` into a directory listed in `plugins.load.paths`
+
+6. restart Carapace and verify:
+
+   ```sh
+   cara plugins status --port 18789 --name my-tool
+   cara logs -n 200 --port 18789
+   ```
+
+If that path works, then move on to webhook, service, or channel plugins. The
+local development loop stays the same; only the WIT world and required exports
+change.
 
 ## Shape-specific contracts
 
@@ -337,7 +391,8 @@ Important managed-plugin behavior:
 
 - artifacts live under `state_dir/plugins`
 - metadata lives in `plugins-manifest.json`
-- config state lives under `plugins.entries.<name>`
+- install metadata lives under `plugins.entries.<name>`
+- operational runtime config still lives under `plugins.<plugin-id>.*`
 - install/update changes still require restart before activation
 - `--file` is local-only; use it for loopback targets, not remote servers
 - `cara plugins bins` lists the managed binary filenames currently present on
@@ -352,12 +407,16 @@ uses at load time, including:
 - optional `signature`
 - optional `url`
 
-`plugins.entries.<name>` carries the managed config state that shows up in
+`plugins.entries.<name>` carries the managed install metadata that shows up in
 `cara plugins status`, including:
 
 - `enabled`
 - `installId`
 - `requestedAt`
+
+Do not put runtime configuration like `apiKey`, webhook settings, or service
+options under `plugins.entries.<name>`. Those still belong under
+`plugins.<plugin-id>.*`.
 
 Optional publisher metadata:
 
