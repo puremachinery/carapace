@@ -5,12 +5,18 @@ runtime.
 
 The workflow that works today is:
 
-1. build a WASM component against [`wit/plugin.wit`](../wit/plugin.wit)
+1. build a WASM component against [`wit/plugin.wit`](https://github.com/puremachinery/carapace/blob/main/wit/plugin.wit)
 2. load it locally through `plugins.load.paths`
 3. restart Carapace
 4. verify activation with `cara plugins status` and `cara logs`
 5. use `cara plugins install` / `cara plugins update` only when you want the
    managed distribution path
+
+This guide is intentionally written around the public surfaces that exist today:
+
+- the WIT contract in `wit/plugin.wit`
+- the runtime loader behavior in `src/plugins/*`
+- the operator CLI in `cara plugins ...`
 
 ## What you can build
 
@@ -21,7 +27,7 @@ This guide covers these public plugin targets:
 | Tool | `tool-plugin` | Agent-callable tools |
 | Webhook | `webhook-plugin` | HTTP handlers under `/plugins/<plugin-id>/...` |
 | Service | `service-plugin` | Background lifecycle services |
-| Channel | `channel-plugin` | Channel metadata + adapter exports |
+| Channel | `channel-plugin` | Channel metadata + adapter exports, plus hook exports for channel lifecycle integration |
 
 Not covered here:
 
@@ -47,10 +53,57 @@ Carapace has two distinct plugin workflows:
 
 If you are writing a new plugin, start with `plugins.load.paths`.
 
+## Plugin identity, names, and manifest metadata
+
+There are two different names you will see in the plugin tooling:
+
+- **`pluginId`**
+  - comes from the plugin manifest `id`
+  - identifies the runtime plugin instance
+  - appears in `cara plugins status`
+  - must be lowercase alphanumeric plus hyphens
+  - maximum length: `32`
+- **managed plugin `name`**
+  - the name you pass to `cara plugins install <name>` or
+    `cara plugins update <name>`
+  - identifies the managed artifact/config entry under `plugins.entries`
+  - may contain ASCII alphanumeric characters, hyphens, and underscores
+  - maximum length: `128`
+
+For simplest operations, keep the managed plugin name and the runtime
+`pluginId` the same.
+
+Manifest fields:
+
+- `id`
+- `name`
+- `description`
+- `version`
+- `kind`
+
+Carapace can load a plugin even if you do not embed explicit manifest metadata.
+The loader derives metadata in this order:
+
+1. `plugin-manifest` custom section, if present
+2. component export inspection for the plugin kind
+3. file name / file metadata fallbacks
+
+Inference details:
+
+- `id`: file stem
+- `name`: component/module name if available, otherwise a display name derived
+  from the file stem
+- `version`: file modification time, formatted as `0.0.YYYYMMDDHHMMSS`
+- `kind`: inferred from exported interfaces, defaulting to `tool` if the
+  component exports are otherwise unrecognizable
+
+For reproducible managed distribution, prefer explicit manifest metadata rather
+than relying on inference.
+
 ## Build target
 
 Carapace plugins are WebAssembly Component Model components. Target the package
-namespace declared in [`wit/plugin.wit`](../wit/plugin.wit):
+namespace declared in [`wit/plugin.wit`](https://github.com/puremachinery/carapace/blob/main/wit/plugin.wit):
 
 ```wit
 package carapace:plugin@1.0.0;
@@ -84,7 +137,9 @@ that matters is the built component file.
 Any toolchain that produces a valid WASM component for the same WIT contract is
 fine. Rust plus `cargo-component` is just the most direct path.
 
-## What a minimal tool plugin exports
+## Shape-specific contracts
+
+### Tool plugins
 
 A tool plugin built against `tool-plugin` exports:
 
@@ -93,11 +148,6 @@ A tool plugin built against `tool-plugin` exports:
 - `tool.invoke(...)`
 
 Its manifest kind should be `tool`.
-
-Plugin ID rules:
-
-- lowercase alphanumeric plus hyphens
-- maximum length: `32`
 
 Tool definition name rules:
 
@@ -111,6 +161,92 @@ Config and credential lookups are exact:
 - `credential-set("token", value)` stores `<plugin-id>:token`
 
 Carapace does not translate `api_key` to `apiKey` for you.
+
+### Webhook plugins
+
+A webhook plugin built against `webhook-plugin` exports:
+
+- `manifest.get-manifest()`
+- `webhook.get-paths()`
+- `webhook.handle(...)`
+
+Webhook-specific behavior:
+
+- webhook paths are mounted under `/plugins/<plugin-id>/...`
+- `get-paths()` returns paths inside that namespace, without the
+  `/plugins/<plugin-id>/` prefix
+- request bodies are capped at `10 MB`
+- hop-by-hop headers are stripped before the plugin sees the request
+
+### Service plugins
+
+A service plugin built against `service-plugin` exports:
+
+- `manifest.get-manifest()`
+- `service.start()`
+- `service.stop()`
+- `service.health()`
+
+Service-specific behavior:
+
+- `start()` runs when the plugin is activated
+- `stop()` runs during shutdown or unload
+- `stop()` must finish within `5s`
+- `health()` is checked periodically, currently every `30s`
+
+### Channel plugins
+
+A channel plugin built against `channel-plugin` exports:
+
+- `manifest.get-manifest()`
+- `channel-meta.get-info()`
+- `channel-meta.get-capabilities()`
+- channel adapter methods such as:
+  - `send-text()`
+  - `send-media()`
+  - `send-poll()`
+  - `edit-message()`
+  - `delete-message()`
+  - `react()`
+- `hooks.get-hooks()`
+- `hooks.handle(...)`
+
+Channel-specific behavior:
+
+- `channel-info.id` uses the same lowercase alphanumeric plus hyphen rule as
+  plugin IDs
+- capabilities declare what the channel supports: polls, reactions, media,
+  threads, group management, and so on
+- the channel world includes hooks because channel plugins often need lifecycle
+  integration in addition to outbound delivery methods
+
+## Advanced manifest path
+
+If your build pipeline can embed a `plugin-manifest` custom section, Carapace
+will use it directly instead of inferring metadata from the file and component
+exports.
+
+The JSON structure matches the runtime `PluginManifest` shape:
+
+```json
+{
+  "id": "my-tool",
+  "name": "My Tool",
+  "description": "Example plugin",
+  "version": "1.0.0",
+  "kind": "tool"
+}
+```
+
+This is the most predictable path for managed distribution because it avoids:
+
+- filename-derived IDs
+- file-mtime-derived versions
+- kind inference from exports
+
+Embedding that custom section is toolchain-specific, so this guide keeps the
+main workflow on the plain `cargo-component` path and treats the custom-section
+manifest as an advanced option.
 
 ## Local development walkthrough
 
@@ -154,6 +290,16 @@ What success looks like in `cara plugins status`:
 - `state`: `active`
 - `reason`: `null`
 
+Useful status fields to watch:
+
+- `source`
+  - `config` for `plugins.load.paths`
+  - `managed` for managed installs
+- `enabled`
+- `requestedAt`
+- `restartRequiredForChanges`
+- `activationErrorCount`
+
 On each edit cycle:
 
 1. rebuild the component
@@ -170,6 +316,8 @@ Important behavior:
 - `plugins.load.paths` is trusted local input
 - there is no hot reload
 - plugin activation changes require restart
+- `cara plugins status --json` is the easiest way to inspect the full structured
+  runtime state if the default table output is not enough
 
 ## Managed plugins and distribution
 
@@ -192,6 +340,24 @@ Important managed-plugin behavior:
 - config state lives under `plugins.entries.<name>`
 - install/update changes still require restart before activation
 - `--file` is local-only; use it for loopback targets, not remote servers
+- `cara plugins bins` lists the managed binary filenames currently present on
+  disk
+
+`plugins-manifest.json` entries carry the managed artifact metadata Carapace
+uses at load time, including:
+
+- `sha256`
+- optional `version`
+- optional `publisher_key`
+- optional `signature`
+- optional `url`
+
+`plugins.entries.<name>` carries the managed config state that shows up in
+`cara plugins status`, including:
+
+- `enabled`
+- `installId`
+- `requestedAt`
 
 Optional publisher metadata:
 
@@ -206,11 +372,15 @@ Relevant config keys:
 - `plugins.signature.enabled`
 - `plugins.signature.requireSignature`
 - `plugins.signature.trustedPublishers`
+- `plugins.sandbox.enabled`
+- `plugins.sandbox.defaults.allowHttp`
+- `plugins.sandbox.defaults.allowCredentials`
+- `plugins.sandbox.defaults.allowMedia`
 
 ## Host capabilities and sandbox boundaries
 
 Every plugin imports the host interface from
-[`wit/plugin.wit`](../wit/plugin.wit).
+[`wit/plugin.wit`](https://github.com/puremachinery/carapace/blob/main/wit/plugin.wit).
 
 Common host functions:
 
@@ -230,6 +400,13 @@ Runtime limits worth designing for:
 - log limit: `1000/min` per plugin
 - HTTP body size: `10 MB` max
 - webhook paths live under `/plugins/<plugin-id>/...`
+
+Other behavioral rules worth knowing:
+
+- config reads are always scoped to `plugins.<plugin-id>.*`
+- credential reads/writes are always scoped to `<plugin-id>:...`
+- outbound HTTP and media fetches go through SSRF protections
+- plugin networking only supports `http` and `https`
 
 The WIT file is the authoritative ABI and capability reference.
 
@@ -252,3 +429,10 @@ The WIT file is the authoritative ABI and capability reference.
     - `cara plugins status --port 18789 --name <name>`
     - `cara plugins bins --port 18789`
   - check `plugins-manifest.json` completeness and `plugins.signature` policy
+- `cara plugins status` shows a different `pluginId` than you expected:
+  - check whether your plugin is using inferred metadata from the file stem
+  - prefer explicit manifest metadata for managed distribution
+- `cara plugins install` or `update` succeeded but the plugin is still not
+  active:
+  - managed install/update only stages the artifact and metadata
+  - activation still happens on restart
