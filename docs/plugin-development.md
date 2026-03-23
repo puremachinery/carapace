@@ -235,8 +235,9 @@ Webhook-specific behavior:
 - webhook paths are mounted under `/plugins/<plugin-id>/...`
 - `get-paths()` returns paths inside that namespace, without the
   `/plugins/<plugin-id>/` prefix
-- request bodies are capped at `10 MB`
-- hop-by-hop headers are stripped before the plugin sees the request
+- request bodies are capped by `hooks.maxBodyBytes` in the server config
+  (default: `256 KiB`)
+- Carapace currently forwards request headers through to the plugin as-is
 
 ### Service plugins
 
@@ -251,8 +252,9 @@ Service-specific behavior:
 
 - `start()` runs when the plugin is activated
 - `stop()` runs during shutdown or unload
-- `stop()` must finish within `5s`
-- `health()` is checked periodically, currently every `30s`
+- `stop()` should finish promptly so shutdown or unload is not blocked
+- `health()` is part of the service ABI, but the current runtime does not poll
+  it on a fixed interval
 
 ### Channel plugins
 
