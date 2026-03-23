@@ -11,22 +11,26 @@
 # - NEXTEST_LIST_SAMPLE_SECS
 # - NEXTEST_LIST_DIAG_DIR
 
-set -euo pipefail
+ensure_nextest_installed() {
+    if command -v cargo-nextest >/dev/null 2>&1; then
+        return 0
+    fi
 
-if ! command -v cargo-nextest >/dev/null 2>&1; then
     echo "cargo-nextest is required. Install with: cargo install --locked cargo-nextest" >&2
-    exit 1
-fi
+    return 1
+}
 
-LIST_TIMEOUT_SECS="${NEXTEST_LIST_TIMEOUT_SECS:-180}"
-POLL_SECS="${NEXTEST_LIST_WATCHDOG_POLL_SECS:-1}"
-SAMPLE_SECS="${NEXTEST_LIST_SAMPLE_SECS:-5}"
-REPRO_TIMEOUT_SECS="${NEXTEST_LIST_REPRO_TIMEOUT_SECS:-120}"
-STRACE_SECS="${NEXTEST_LIST_STRACE_SECS:-3}"
-TERM_GRACE_SECS="${NEXTEST_TERM_GRACE_SECS:-5}"
-DIAG_DIR="${NEXTEST_LIST_DIAG_DIR:-.local/reports/nextest-list-stalls}"
+initialize_runtime_config() {
+    LIST_TIMEOUT_SECS="${NEXTEST_LIST_TIMEOUT_SECS:-180}"
+    POLL_SECS="${NEXTEST_LIST_WATCHDOG_POLL_SECS:-1}"
+    SAMPLE_SECS="${NEXTEST_LIST_SAMPLE_SECS:-5}"
+    REPRO_TIMEOUT_SECS="${NEXTEST_LIST_REPRO_TIMEOUT_SECS:-120}"
+    STRACE_SECS="${NEXTEST_LIST_STRACE_SECS:-3}"
+    TERM_GRACE_SECS="${NEXTEST_TERM_GRACE_SECS:-5}"
+    DIAG_DIR="${NEXTEST_LIST_DIAG_DIR:-.local/reports/nextest-list-stalls}"
 
-mkdir -p "${DIAG_DIR}"
+    mkdir -p "${DIAG_DIR}"
+}
 
 timestamp() {
     date -u +"%Y%m%dT%H%M%SZ"
@@ -336,6 +340,9 @@ list_discovery_pid_etime_and_command() {
 }
 
 main() {
+    ensure_nextest_installed || return 1
+    initialize_runtime_config
+
     cargo nextest run "$@" &
     local nextest_pid=$!
 
@@ -350,7 +357,7 @@ main() {
             capture_diagnostics "${pid}" "${nextest_pid}" "${etime}" "${cmd}" "${age_secs}"
             terminate_pid_bounded "${pid}" "stalled list child" "${DIAG_DIR}/nextest-kill.errors.log" || true
             terminate_pid_bounded "${nextest_pid}" "nextest parent" "${DIAG_DIR}/nextest-kill.errors.log" || true
-            exit 124
+            return 124
         done < <(list_discovery_pid_etime_and_command "${nextest_pid}")
 
         sleep "${POLL_SECS}"
@@ -360,5 +367,6 @@ main() {
 }
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    set -euo pipefail
     main "$@"
 fi
