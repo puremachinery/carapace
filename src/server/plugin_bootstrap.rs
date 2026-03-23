@@ -87,6 +87,10 @@ pub(crate) struct PluginBootstrapResult {
     pub activation_report: PluginActivationReport,
 }
 
+#[cfg(test)]
+pub(crate) const TEST_FORCE_PLUGIN_LOADER_INIT_FAILURE_ENV: &str =
+    "CARAPACE_TEST_FORCE_PLUGIN_LOADER_INIT_FAILURE";
+
 #[derive(Debug, Clone)]
 struct ManagedPluginConfigEntry {
     name: String,
@@ -141,6 +145,39 @@ fn plugin_sandbox_config_from_config(cfg: &Value) -> SandboxConfig {
         .cloned()
         .and_then(|value| serde_json::from_value(value).ok())
         .unwrap_or_default()
+}
+
+fn managed_plugin_activation_entry(entry: &ManagedPluginConfigEntry) -> PluginActivationEntry {
+    PluginActivationEntry {
+        name: entry.name.clone(),
+        plugin_id: None,
+        source: PluginActivationSource::Managed,
+        enabled: entry.enabled,
+        path: None,
+        requested_at: entry.requested_at,
+        install_id: entry.install_id.clone(),
+        state: PluginActivationState::Ignored,
+        reason: None,
+    }
+}
+
+fn push_loader_init_failure_entries(
+    report: &mut PluginActivationReport,
+    managed_entries: &[ManagedPluginConfigEntry],
+    reason: &str,
+) {
+    for entry in managed_entries {
+        let mut activation_entry = managed_plugin_activation_entry(entry);
+        if entry.enabled {
+            activation_entry.state = PluginActivationState::Failed;
+            activation_entry.reason = Some(reason.to_string());
+        } else {
+            activation_entry.state = PluginActivationState::Disabled;
+            activation_entry.reason =
+                Some("managed plugin is disabled in plugins.entries".to_string());
+        }
+        report.entries.push(activation_entry);
+    }
 }
 
 fn managed_plugin_config_entries(cfg: &Value) -> Vec<ManagedPluginConfigEntry> {
@@ -254,6 +291,22 @@ fn resolve_managed_plugin_path(
     }
 
     Ok(canonical_path)
+}
+
+fn initialize_plugin_loader(
+    managed_dir: PathBuf,
+    signature_config: SignatureConfig,
+) -> Result<Arc<PluginLoader>, LoaderError> {
+    #[cfg(test)]
+    if let Some(message) = std::env::var_os(TEST_FORCE_PLUGIN_LOADER_INIT_FAILURE_ENV)
+        .filter(|value| !value.is_empty())
+    {
+        return Err(LoaderError::EngineError(
+            message.to_string_lossy().into_owned(),
+        ));
+    }
+
+    PluginLoader::with_signature_config(managed_dir, signature_config).map(Arc::new)
 }
 
 fn discover_config_path_plugins(path: &Path) -> Result<Vec<PathBuf>, String> {
@@ -393,12 +446,12 @@ fn discover_and_load_plugins(cfg: Value, state_dir: PathBuf) -> BlockingPluginBo
     let signature_config = plugin_signature_config_from_config(&cfg);
     let sandbox_config = plugin_sandbox_config_from_config(&cfg);
     let permission_config = PermissionConfig::default();
-    let loader = match PluginLoader::with_signature_config(managed_dir.clone(), signature_config) {
-        Ok(loader) => Arc::new(loader),
+    let loader = match initialize_plugin_loader(managed_dir.clone(), signature_config) {
+        Ok(loader) => loader,
         Err(error) => {
-            report
-                .errors
-                .push(format!("failed to initialize plugin loader: {error}"));
+            let reason = format!("failed to initialize plugin loader: {error}");
+            report.errors.push(reason.clone());
+            push_loader_init_failure_entries(&mut report, &managed_entries, &reason);
             return BlockingPluginBootstrapResult {
                 report,
                 loader: None,
@@ -438,17 +491,7 @@ fn discover_and_load_plugins(cfg: Value, state_dir: PathBuf) -> BlockingPluginBo
         .collect::<HashSet<_>>();
 
     for entry in managed_entries {
-        let mut activation_entry = PluginActivationEntry {
-            name: entry.name.clone(),
-            plugin_id: None,
-            source: PluginActivationSource::Managed,
-            enabled: entry.enabled,
-            path: None,
-            requested_at: entry.requested_at,
-            install_id: entry.install_id.clone(),
-            state: PluginActivationState::Ignored,
-            reason: None,
-        };
+        let mut activation_entry = managed_plugin_activation_entry(&entry);
 
         if !entry.enabled {
             activation_entry.state = PluginActivationState::Disabled;
