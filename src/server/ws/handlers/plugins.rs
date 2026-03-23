@@ -14,7 +14,9 @@ use hickory_resolver::TokioResolver;
 use super::super::*;
 use super::config::{map_validation_issues, read_config_snapshot, write_config_file};
 use crate::plugins::capabilities::SsrfProtection;
-use crate::plugins::loader::{validate_plugin_component_bytes, LoaderError, PLUGINS_MANIFEST_FILE};
+use crate::plugins::loader::{
+    is_reserved_plugin_id, validate_plugin_component_bytes, LoaderError, PLUGINS_MANIFEST_FILE,
+};
 use crate::runtime_bridge::{run_sync_blocking_send, BridgeError};
 
 /// Maximum download size for a plugin WASM binary (50 MB).
@@ -83,6 +85,16 @@ fn validate_plugin_name(name: &str) -> Result<(), ErrorShape> {
         return Err(error_shape(
             ERROR_INVALID_REQUEST,
             "plugin name may only contain ASCII alphanumeric characters, hyphens, and underscores",
+            None,
+        ));
+    }
+    if is_reserved_plugin_id(name) {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            &format!(
+                "plugin name '{}' is reserved for plugin configuration",
+                name
+            ),
             None,
         ));
     }
@@ -1848,6 +1860,13 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_plugin_name_reserved() {
+        let err = validate_plugin_name("entries").unwrap_err();
+        assert_eq!(err.code, ERROR_INVALID_REQUEST);
+        assert!(err.message.contains("reserved"));
+    }
+
+    #[test]
     fn test_validate_url_valid() {
         assert!(validate_url("https://example.com/plugin.wasm").is_ok());
         assert!(validate_url("http://localhost:8080/plugin.wasm").is_ok());
@@ -2059,6 +2078,16 @@ mod tests {
     }
 
     #[test]
+    fn test_install_reserved_name() {
+        let dir = TempDir::new().unwrap();
+        let params = json!({ "name": "entries" });
+        let result = handle_plugins_install_inner(Some(&params), dir.path());
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.message.contains("reserved"));
+    }
+
+    #[test]
     fn test_install_invalid_url_scheme() {
         let dir = TempDir::new().unwrap();
         let params = json!({ "name": "test-plugin", "url": "ftp://example.com/foo.wasm" });
@@ -2190,6 +2219,16 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.message.contains("alphanumeric"));
+    }
+
+    #[test]
+    fn test_update_reserved_name() {
+        let dir = TempDir::new().unwrap();
+        let params = json!({ "name": "signature" });
+        let result = handle_plugins_update_inner(Some(&params), dir.path());
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.message.contains("reserved"));
     }
 
     #[test]
