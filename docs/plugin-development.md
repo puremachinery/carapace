@@ -3,7 +3,7 @@
 This guide covers the plugin surface that Carapace currently ships and loads at
 runtime.
 
-The workflow that works today is:
+The workflow documented here is:
 
 1. choose a plugin shape and WIT world
 2. build a WASM component against [`wit/plugin.wit`](https://github.com/puremachinery/carapace/blob/main/wit/plugin.wit)
@@ -13,7 +13,8 @@ The workflow that works today is:
 6. use `cara plugins install` / `cara plugins update` only when you want the
    managed distribution path
 
-This guide is intentionally written around the public surfaces that exist today:
+This guide is intentionally written around the public surfaces Carapace exposes
+publicly:
 
 - the WIT contract in `wit/plugin.wit`
 - the runtime loader behavior in `src/plugins/*`
@@ -49,7 +50,8 @@ Carapace has two distinct plugin workflows:
 - **Managed plugins**
   - Use `cara plugins install` / `cara plugins update`
   - Artifacts live under `state_dir/plugins`
-  - Metadata lives in `plugins-manifest.json` and `plugins.entries`
+  - Artifact metadata lives in `plugins-manifest.json`
+  - Install lifecycle metadata lives in `plugins.entries`
   - Intended for managed distribution, not your normal inner loop
 
 If you are writing a new plugin, start with `plugins.load.paths`.
@@ -132,6 +134,10 @@ matches your plugin shape:
 [package.metadata.component]
 target = { path = "/absolute/path/to/carapace/wit/plugin.wit", world = "tool-plugin" }
 ```
+
+The absolute path above is just an example. A path relative to your component
+crate or a package/dependency reference is also fine as long as it resolves to
+the same `wit/plugin.wit` contract.
 
 Build:
 
@@ -368,6 +374,9 @@ Important behavior:
 - `plugins.enabled = false` disables both managed plugins and
   `plugins.load.paths`
 - `plugins.load.paths` is trusted local input
+- never place untrusted `.wasm` files in a `plugins.load.paths` directory;
+  plugins loaded from those paths can read plugin-scoped config and credentials
+  and can make outbound HTTP or media requests on your behalf
 - there is no hot reload
 - plugin activation changes require restart
 - `cara plugins status --json` is the easiest way to inspect the full structured
