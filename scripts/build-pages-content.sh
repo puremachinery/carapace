@@ -11,7 +11,8 @@
 #   - pandoc (https://pandoc.org/installing.html)
 #
 # This script is used by the Pages workflow to render docs/getting-started.md,
-# docs/site/*.md, and docs/cookbook/*.md into HTML pages for publishing.
+# docs/plugin-development.md, docs/site/*.md, and docs/cookbook/*.md into HTML
+# pages for publishing.
 set -euo pipefail
 
 out_dir="${1:-public}"
@@ -235,6 +236,18 @@ render_markdown_page \
   "" \
   "" \
   ""
+
+render_markdown_page \
+  "${repo_root}/docs/plugin-development.md" \
+  "${out_dir}/plugin-development.html" \
+  "Carapace | Plugin Development" \
+  "Author, load, verify, and distribute Carapace WASM plugins." \
+  "docs" \
+  "0" \
+  "." \
+  "./reference.html" \
+  "Reference" \
+  "Plugin Development"
 
 render_site_doc_page "install" "Install" \
   "Install Carapace binaries and verify signatures." \

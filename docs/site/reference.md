@@ -10,6 +10,10 @@ Jump quickly to architecture and protocol details when you need exact behavior.
 - [Security model](../security.md)
 - [Security comparison](../security-comparison.md)
 
+## Extensibility
+
+- [Plugin development](../plugin-development.md)
+
 ## Protocol reference
 
 - [HTTP protocol](../protocol/http.md)

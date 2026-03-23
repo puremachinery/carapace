@@ -71,3 +71,4 @@ Navigate docs by outcome area instead of file-by-file browsing.
 
 - **Reference**
   - [Reference hub](reference.md)
+  - [Plugin development guide](../plugin-development.md)

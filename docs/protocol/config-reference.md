@@ -410,6 +410,7 @@ Enable Carapace to listen and respond on external chat platforms.
     - `plugins.load.paths` is an explicit dev/advanced path and does not use the managed plugin manifest `sha256` pinning flow; treat those directories as trusted local inputs.
     - `plugins.enabled = false` disables both managed plugin activation and configured `load.paths`.
     - Plugin components must target the current WIT package namespace `carapace:plugin@1.0.0`.
+    - For plugin authoring and the supported local development workflow, see [Plugin Development](../plugin-development.md).
 - **`messages`**
   - *What it does:* Messaging behavior defaults.
   - *Common values:*
