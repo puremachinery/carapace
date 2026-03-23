@@ -647,7 +647,7 @@ mod tests {
     use crate::server::plugin_bootstrap::{
         bootstrap_plugin_runtime, load_plugin_candidate, start_plugin_services,
         stop_plugin_services, PluginActivationEntry, PluginActivationReport,
-        PluginActivationSource, PluginActivationState,
+        PluginActivationSource, PluginActivationState, TEST_FORCE_PLUGIN_LOADER_INIT_FAILURE_ENV,
     };
     use crate::server::ws::WsServerConfig;
     use crate::test_support::{env::ScopedEnv, plugins::tool_plugin_component_bytes};
@@ -1160,6 +1160,73 @@ mod tests {
             alpha.reason.as_deref(),
             Some("managed plugins manifest is invalid; fix plugins-manifest.json and restart")
         );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_plugin_runtime_reports_loader_init_failure_per_managed_plugin() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut env = ScopedEnv::new();
+        env.set(
+            TEST_FORCE_PLUGIN_LOADER_INIT_FAILURE_ENV,
+            "forced loader init failure",
+        );
+        let cfg = json!({
+            "plugins": {
+                "entries": {
+                    "alpha": {
+                        "enabled": true,
+                        "installId": "install-alpha",
+                        "requestedAt": 1700000001000u64
+                    },
+                    "beta": {
+                        "enabled": false,
+                        "installId": "install-beta",
+                        "requestedAt": 1700000002000u64
+                    }
+                }
+            }
+        });
+
+        let result = bootstrap_plugin_runtime(&cfg, temp.path()).await;
+        let report = result.activation_report;
+
+        assert!(result.runtime.is_none());
+        assert_eq!(report.errors.len(), 1);
+        assert_eq!(
+            report.errors[0],
+            "failed to initialize plugin loader: Wasmtime engine error: forced loader init failure"
+        );
+        assert_eq!(report.entries.len(), 2);
+
+        let alpha = report
+            .entries
+            .iter()
+            .find(|entry| entry.name == "alpha")
+            .expect("alpha entry");
+        assert!(alpha.enabled);
+        assert_eq!(alpha.state, PluginActivationState::Failed);
+        assert_eq!(
+            alpha.reason.as_deref(),
+            Some(
+                "failed to initialize plugin loader: Wasmtime engine error: forced loader init failure"
+            )
+        );
+        assert_eq!(alpha.install_id.as_ref(), Some(&json!("install-alpha")));
+        assert_eq!(alpha.requested_at, Some(1700000001000u64));
+
+        let beta = report
+            .entries
+            .iter()
+            .find(|entry| entry.name == "beta")
+            .expect("beta entry");
+        assert!(!beta.enabled);
+        assert_eq!(beta.state, PluginActivationState::Disabled);
+        assert_eq!(
+            beta.reason.as_deref(),
+            Some("managed plugin is disabled in plugins.entries")
+        );
+        assert_eq!(beta.install_id.as_ref(), Some(&json!("install-beta")));
+        assert_eq!(beta.requested_at, Some(1700000002000u64));
     }
 
     #[tokio::test]
