@@ -1,0 +1,24 @@
+[profile.full]
+inherits = "default"
+default-filter = "all()"
+
+[profile.fast]
+inherits = "default"
+default-filter = '''
+not kind(test)
+and not test(server::ws::golden_tests::golden_trace)
+and not test(bootstrap_plugin_runtime_activates_valid_managed_tool_component)
+and not test(bootstrap_plugin_runtime_activates_valid_config_path_tool_component)
+'''
+
+[profile.golden]
+inherits = "default"
+default-filter = "test(server::ws::golden_tests::golden_trace)"
+
+[profile.integration]
+inherits = "default"
+default-filter = '''
+kind(test)
++ test(bootstrap_plugin_runtime_activates_valid_managed_tool_component)
++ test(bootstrap_plugin_runtime_activates_valid_config_path_tool_component)
+'''

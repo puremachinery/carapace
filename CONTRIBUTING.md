@@ -23,8 +23,8 @@ everything you need to get started, follow our conventions, and submit changes.
 git clone https://github.com/puremachinery/carapace.git
 cd carapace
 cargo build
-cargo nextest run   # preferred
-cargo test          # fallback
+just test-fast      # recommended inner-loop lane
+just test-full      # broad local validation lane
 just setup-hooks    # install repository-managed git hooks
 ```
 
@@ -42,13 +42,15 @@ CARAPACE_DEV=1 cargo run
 2. Write tests first when possible.
 3. Run `cargo fmt` before committing.
 4. Run `cargo clippy -- -D warnings` before committing.
-5. Run `cargo nextest run` to verify all tests pass.
-6. If your PR changes workflows or docs, run `just workflow-lint` and/or `just docs-check`.
-7. Push your branch and open a pull request.
+5. Run `just test-fast` for the normal inner loop.
+6. Run `just test-golden` if you changed WebSocket protocol or golden surfaces.
+7. Run `just test-full` before broad runtime changes or when you want parity with push-time validation.
+8. If your PR changes workflows or docs, run `just workflow-lint` and/or `just docs-check`.
+9. Push your branch and open a pull request.
 
 Pre-commit hooks enforce formatting, lint checks, and staged secret scanning.
 Pre-push hooks run shell checks for shell-script-only pushes, run
-`cargo nextest run --all-targets` for Rust-impacting pushes, and skip checks
+the `golden` or `full` test lanes for Rust-impacting pushes as appropriate, and skip checks
 for docs/website/meta-only and non-shell script-only pushes.
 
 ## Code Style
@@ -81,16 +83,29 @@ Carapace has 4,776+ tests. We use several testing strategies:
 - **File-system tests:** Use `tempfile::TempDir` for any test that touches the
   file system. Never write to fixed paths.
 
-Run the full suite:
+Carapace uses named test lanes:
+
+- `just test-fast` — broad, fast Rust coverage for normal development and PRs
+- `just test-golden` — WebSocket golden contract coverage
+- `just test-integration` — slower top-level integration binaries plus expensive plugin activation positives
+- `just test-full` — broad all-targets validation used for push-time coverage
+
+Run the fast lane:
 
 ```sh
-cargo nextest run
+just test-fast
+```
+
+Run the full lane directly with cargo-nextest:
+
+```sh
+cargo nextest run --all-targets -P full
 ```
 
 Run a single test by name:
 
 ```sh
-cargo nextest run -E 'test(my_test_name)'
+just test-one my_test_name
 ```
 
 ## Pull Request Guidelines
@@ -103,8 +118,8 @@ cargo nextest run -E 'test(my_test_name)'
 - CI must pass before merge. The pipeline checks:
   - `cargo fmt --check`
   - `cargo clippy -- -D warnings`
-  - `cargo build`
-  - `cargo nextest run` on Linux, macOS, and Windows
+  - `fast` + `golden` lanes on PRs, plus Windows `fast` when the change is Windows-sensitive
+  - `full` lane on push to `master` across Linux, macOS, and Windows
   - Security audit
 
 ## Architecture Overview

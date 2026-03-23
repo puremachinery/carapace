@@ -5,6 +5,15 @@ on:
     branches: [main, master]
   pull_request:
     branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      test_lane:
+        description: Test lane to run manually
+        required: true
+        type: choice
+        options:
+          - integration
+          - full
 
 concurrency:
   group: ci-${{ github.head_ref || github.ref }}
@@ -21,6 +30,7 @@ jobs:
   changes:
     name: Detect Changed Categories
     runs-on: ubuntu-latest
+    if: github.event_name != 'workflow_dispatch'
     outputs:
       docs: ${{ steps.filter.outputs.docs }}
       workflow: ${{ steps.filter.outputs.workflow }}
@@ -144,7 +154,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
       - uses: taiki-e/install-action@602dc500e2b7e0e2486b4ce53909ba048de44e08 # nextest
-      - run: ./scripts/run-nextest-guarded.sh --all-targets server::ws::golden_tests::golden_trace
+      - name: Run nextest (golden lane)
+        run: ./scripts/run-nextest-guarded.sh --all-targets -P golden
       - name: Upload nextest stall diagnostics (ws-golden)
         if: failure()
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
@@ -175,7 +186,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
       - uses: taiki-e/install-action@602dc500e2b7e0e2486b4ce53909ba048de44e08 # nextest
-      - run: ./scripts/run-nextest-guarded.sh --all-targets
+      - name: Run nextest (fast lane)
+        run: ./scripts/run-nextest-guarded.sh --all-targets -P fast
       - name: Upload nextest stall diagnostics (test-pr)
         if: failure()
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
@@ -199,12 +211,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
       - uses: taiki-e/install-action@602dc500e2b7e0e2486b4ce53909ba048de44e08 # nextest
-      - name: Run nextest (guarded)
+      - name: Run nextest (full lane)
         if: runner.os != 'Windows'
-        run: ./scripts/run-nextest-guarded.sh --all-targets
-      - name: Run nextest (Windows)
+        run: ./scripts/run-nextest-guarded.sh --all-targets -P full
+      - name: Run nextest (Windows full lane)
         if: runner.os == 'Windows'
-        run: cargo nextest run --all-targets
+        run: cargo nextest run --all-targets -P full
       - name: Upload nextest stall diagnostics (test-push)
         if: failure() && runner.os != 'Windows'
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
@@ -224,7 +236,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
       - uses: taiki-e/install-action@602dc500e2b7e0e2486b4ce53909ba048de44e08 # nextest
-      - run: cargo nextest run --all-targets
+      - name: Run nextest (fast lane)
+        run: cargo nextest run --all-targets -P fast
 
   msrv:
     name: MSRV
@@ -280,6 +293,7 @@ jobs:
   gitleaks:
     name: Secret Scan
     runs-on: ubuntu-latest
+    if: github.event_name != 'workflow_dispatch'
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -390,10 +404,58 @@ jobs:
       - name: Verify source/dist parity
         run: ./scripts/check-control-ui-dist.sh
 
+  test-manual-integration:
+    name: Test (manual integration)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && inputs.test_lane == 'integration'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+      - uses: taiki-e/install-action@602dc500e2b7e0e2486b4ce53909ba048de44e08 # nextest
+      - name: Run nextest (integration lane)
+        run: ./scripts/run-nextest-guarded.sh --all-targets -P integration
+      - name: Upload nextest stall diagnostics (manual integration)
+        if: failure()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: nextest-list-stall-manual-integration-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .local/reports/nextest-list-stalls/**
+          if-no-files-found: ignore
+          retention-days: 14
+
+  test-manual-full:
+    name: Test (manual full / ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    if: github.event_name == 'workflow_dispatch' && inputs.test_lane == 'full'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+      - uses: taiki-e/install-action@602dc500e2b7e0e2486b4ce53909ba048de44e08 # nextest
+      - name: Run nextest (full lane)
+        if: runner.os != 'Windows'
+        run: ./scripts/run-nextest-guarded.sh --all-targets -P full
+      - name: Run nextest (Windows full lane)
+        if: runner.os == 'Windows'
+        run: cargo nextest run --all-targets -P full
+      - name: Upload nextest stall diagnostics (manual full)
+        if: failure() && runner.os != 'Windows'
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: nextest-list-stall-manual-full-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .local/reports/nextest-list-stalls/**
+          if-no-files-found: ignore
+          retention-days: 14
+
   ci-required:
     name: CI Required
     runs-on: ubuntu-latest
-    if: always()
+    if: always() && github.event_name != 'workflow_dispatch'
     needs:
       - changes
       - fmt
