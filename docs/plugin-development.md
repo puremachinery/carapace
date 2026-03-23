@@ -1,22 +1,18 @@
 # Plugin Development
 
 This guide covers the plugin surface that Carapace currently ships and loads at
-runtime. It is centered on the workflow that works today: build a WASM
-component, load it through `plugins.load.paths`, restart Carapace, and verify
-activation with `skills.status` and server logs.
+runtime.
 
-## Plugin vs skill
+The workflow that works today is:
 
-- A **plugin** is a WASM component that exports one or more interfaces from
-  [`wit/plugin.wit`](../wit/plugin.wit).
-- A **skill** is a managed plugin install. Managed installs are tracked under
-  `state_dir/skills`, recorded in `skills-manifest.json`, and activated on
-  restart.
+1. build a WASM component against [`wit/plugin.wit`](../wit/plugin.wit)
+2. load it locally through `plugins.load.paths`
+3. restart Carapace
+4. verify activation with `cara plugins status` and `cara logs`
+5. use `cara plugins install` / `cara plugins update` only when you want the
+   managed distribution path
 
-Every skill is a plugin. Not every plugin needs to go through the managed skill
-flow.
-
-## Supported public surface
+## What you can build
 
 This guide covers these public plugin targets:
 
@@ -29,17 +25,32 @@ This guide covers these public plugin targets:
 
 Not covered here:
 
-- **Provider plugins**: the WIT file contains `provider-plugin`, but the public
-  manifest contract does not expose a `provider` plugin kind today. Treat this
-  as unsupported for public plugin development.
-- **Hook-only or `full-plugin` compositions**: the runtime has hook support, but
-  there is no dedicated hook-only world in the public WIT contract. This guide
-  stays on the supported direct worlds above.
+- **Provider plugins**: `provider-plugin` exists in the WIT file, but the
+  public manifest/runtime contract does not expose it as a supported plugin
+  kind.
+- **Hook-only or `full-plugin` compositions**: the runtime has hook support,
+  but this guide stays on the direct public worlds above.
+
+## Two plugin workflows
+
+Carapace has two distinct plugin workflows:
+
+- **Local development**
+  - Use `plugins.load.paths`
+  - Fastest edit/build/restart loop
+  - Best default for authoring a plugin
+- **Managed plugins**
+  - Use `cara plugins install` / `cara plugins update`
+  - Artifacts live under `state_dir/plugins`
+  - Metadata lives in `plugins-manifest.json` and `plugins.entries`
+  - Intended for managed distribution, not your normal inner loop
+
+If you are writing a new plugin, start with `plugins.load.paths`.
 
 ## Build target
 
-Carapace plugins are WebAssembly Component Model components. Target the current
-package namespace in [`wit/plugin.wit`](../wit/plugin.wit):
+Carapace plugins are WebAssembly Component Model components. Target the package
+namespace declared in [`wit/plugin.wit`](../wit/plugin.wit):
 
 ```wit
 package carapace:plugin@1.0.0;
@@ -57,18 +68,21 @@ matches your plugin shape:
 
 ```toml
 [package.metadata.component]
-target = { path = "/path/to/your/carapace/repo/wit/plugin.wit", world = "tool-plugin" }
+target = { path = "/absolute/path/to/carapace/wit/plugin.wit", world = "tool-plugin" }
 ```
 
 Build:
 
 ```sh
 cargo component build --release
-# target/wasm32-wasip2/release/my_plugin.wasm
 ```
 
+Use the generated `.wasm` artifact from your component build output directory.
+The exact `target/.../release/` path can vary by toolchain version; the thing
+that matters is the built component file.
+
 Any toolchain that produces a valid WASM component for the same WIT contract is
-fine. Rust + `cargo-component` is just the most direct path.
+fine. Rust plus `cargo-component` is just the most direct path.
 
 ## What a minimal tool plugin exports
 
@@ -78,32 +92,30 @@ A tool plugin built against `tool-plugin` exports:
 - `tool.get-definitions()`
 - `tool.invoke(...)`
 
-Its manifest kind should be `tool`, and its plugin ID must stay lowercase
-alphanumeric plus hyphens with a maximum length of 32 characters.
+Its manifest kind should be `tool`.
 
-Tool definition names use a different rule: lowercase alphanumeric plus
-underscores, with a maximum length of 64 characters.
+Plugin ID rules:
 
-For plugin config and credentials:
+- lowercase alphanumeric plus hyphens
+- maximum length: `32`
+
+Tool definition name rules:
+
+- lowercase alphanumeric plus underscores
+- maximum length: `64`
+
+Config and credential lookups are exact:
 
 - `config-get("apiKey")` reads `plugins.<plugin-id>.apiKey`
 - `credential-get("token")` reads `<plugin-id>:token`
 - `credential-set("token", value)` stores `<plugin-id>:token`
 
-Those keys are exact. Carapace does not translate `api_key` to `apiKey` for you.
+Carapace does not translate `api_key` to `apiKey` for you.
 
-## Local development workflow
+## Local development walkthrough
 
-Use `plugins.load.paths` for local development. Do not use `state_dir/skills` as
-your day-to-day dev load path.
-
-1. Build your plugin component.
-2. Put the built `.wasm` file in a dedicated local plugin directory.
-3. Add that directory to `plugins.load.paths`.
-4. Add any plugin-local config under `plugins.<plugin-id>.*`.
-5. Start or restart Carapace.
-6. Check plugin activation in logs first, then verify the structured state with
-   `skills.status`.
+Use `plugins.load.paths` for day-to-day development. Do not use
+`state_dir/plugins` for your normal edit/build loop.
 
 Recommended config shape:
 
@@ -129,80 +141,78 @@ Concrete inner loop:
 ```sh
 mkdir -p /absolute/path/to/dev-plugins
 cargo component build --release
-cp target/wasm32-wasip2/release/my_plugin.wasm /absolute/path/to/dev-plugins/
+cp /path/to/generated/my_plugin.wasm /absolute/path/to/dev-plugins/
 cara start --port 18789
+cara plugins status --port 18789 --name my-tool
 cara logs -n 200 --port 18789
 ```
 
-On each edit/build cycle:
+What success looks like in `cara plugins status`:
+
+- `name`: your configured plugin name
+- `pluginId`: your plugin manifest ID
+- `state`: `active`
+- `reason`: `null`
+
+On each edit cycle:
 
 1. rebuild the component
 2. copy the new `.wasm` into your dev plugin directory
 3. restart Carapace
-4. check logs again
+4. rerun:
+   - `cara plugins status --port 18789 --name my-tool`
+   - `cara logs -n 200 --port 18789`
 
 Important behavior:
 
-- `plugins.enabled = false` disables both managed skill activation and
-  `plugins.load.paths`.
-- `plugins.load.paths` is the explicit dev/advanced path. Treat those
-  directories as trusted local input.
-- Activation changes require restart.
-- `skills.status` reports activation state, restart requirements, and sanitized
-  failure counts. Use server logs for detailed filesystem/runtime diagnostics.
+- `plugins.enabled = false` disables both managed plugins and
+  `plugins.load.paths`
+- `plugins.load.paths` is trusted local input
+- there is no hot reload
+- plugin activation changes require restart
 
-## Verifying activation
+## Managed plugins and distribution
 
-Use two checks together:
+Use managed plugins when you want the managed distribution path, not when you
+just want the fastest local development loop.
 
-1. **Fast smoke check via logs**
+Managed plugin commands:
 
-   ```sh
-   cara logs -n 200 --port 18789
-   ```
+```sh
+cara plugins install demo-plugin --file ./path/to/demo_plugin.wasm --port 18789
+cara plugins update demo-plugin --file ./path/to/demo_plugin.wasm --port 18789
+cara plugins bins --port 18789
+cara plugins status --port 18789 --name demo-plugin
+```
 
-   Look for your plugin ID or activation failures in the recent log output.
+Important managed-plugin behavior:
 
-2. **Structured status via `skills.status`**
+- artifacts live under `state_dir/plugins`
+- metadata lives in `plugins-manifest.json`
+- config state lives under `plugins.entries.<name>`
+- install/update changes still require restart before activation
+- `--file` is local-only; use it for loopback targets, not remote servers
 
-   `skills.status` is a WebSocket method, not a dedicated CLI subcommand today.
-   Use the Control UI or another WebSocket client if you need the structured
-   activation state. A successful load should show your plugin entry with:
+Optional publisher metadata:
 
-   - `name`: your configured skill or plugin name
-   - `pluginId`: your plugin manifest ID
-   - `state`: typically `active`
-   - `reason`: `null` when activation succeeded
+- `--publisher-key`
+- `--signature`
 
-   If `state` is `failed` or `ignored`, use the paired server logs for the full
-   local diagnostic detail.
+Those values are recorded at install/update time and enforced later at plugin
+load time according to `plugins.signature` policy.
 
-## Managed installs and distribution
+Relevant config keys:
 
-Managed installs are the distribution path, not the simplest inner-loop dev
-workflow.
-
-Managed skills:
-
-- live under `state_dir/skills`
-- are tracked in `skills-manifest.json`
-- use pinned `sha256` entries
-- can also carry `publisher_key` and `signature`
-- activate on restart
-
-Managed skill signature policy is controlled by:
-
-- `skills.signature.enabled`
-- `skills.signature.requireSignature`
-- `skills.signature.trustedPublishers`
-
-For normal `plugins.load.paths` development, you usually do not need to touch
-those settings. They matter when you are using the managed install flow.
+- `plugins.signature.enabled`
+- `plugins.signature.requireSignature`
+- `plugins.signature.trustedPublishers`
 
 ## Host capabilities and sandbox boundaries
 
-Every plugin imports the `host` interface from [`wit/plugin.wit`](../wit/plugin.wit).
-The most commonly used host functions are:
+Every plugin imports the host interface from
+[`wit/plugin.wit`](../wit/plugin.wit).
+
+Common host functions:
 
 | Host function | Purpose |
 |---|---|
@@ -212,28 +222,33 @@ The most commonly used host functions are:
 | `http-fetch(request)` | HTTP client with SSRF protection |
 | `media-fetch(url, max-bytes, timeout-ms)` | Media fetch with SSRF protection |
 
-Runtime constraints worth designing for:
+Runtime limits worth designing for:
 
-- 64 MB memory limit per instance
-- 30 second execution timeout per function call
-- 100 HTTP requests per minute per plugin
-- 1000 log messages per minute per plugin
-- SSRF protections on host networking calls
-- webhook path namespacing under `/plugins/<plugin-id>/`
+- memory: `64 MB` per plugin instance
+- execution timeout: `30s` per function call
+- HTTP limit: `100/min` per plugin
+- log limit: `1000/min` per plugin
+- HTTP body size: `10 MB` max
+- webhook paths live under `/plugins/<plugin-id>/...`
 
-The WIT file is the authoritative ABI and capability reference. Use it when you
-need the exact request/response shapes or lifecycle details.
+The WIT file is the authoritative ABI and capability reference.
 
 ## Troubleshooting
 
 - Plugin did not load:
   - confirm `plugins.enabled` is not `false`
-  - confirm the `.wasm` file is in a directory listed under `plugins.load.paths`
-  - confirm the file is a WASM component, not a core module
-- Config lookup returned `None`:
+  - confirm the `.wasm` file is inside a directory listed under
+    `plugins.load.paths`
+  - confirm you built a WASM component, not a core module
+  - restart Carapace and check both:
+    - `cara plugins status --port 18789`
+    - `cara logs -n 200 --port 18789`
+- `config-get(...)` returned `None`:
   - check the exact key under `plugins.<plugin-id>.*`
-  - use the same key name in `config-get(...)`
+  - use the same key name inside the plugin
 - Managed install did not activate:
   - restart Carapace
-  - check `skills.status`
-  - check `skills-manifest.json` completeness and signature policy
+  - run:
+    - `cara plugins status --port 18789 --name <name>`
+    - `cara plugins bins --port 18789`
+  - check `plugins-manifest.json` completeness and `plugins.signature` policy
