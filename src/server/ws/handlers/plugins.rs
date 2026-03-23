@@ -1080,7 +1080,9 @@ fn handle_plugins_update_inner(
         .entry(name.to_string())
         .or_insert_with(|| json!({}));
     let cfg_entry_obj = ensure_object(cfg_entry)?;
-    cfg_entry_obj.insert("enabled".to_string(), Value::Bool(true));
+    if !cfg_entry_obj.contains_key("enabled") {
+        cfg_entry_obj.insert("enabled".to_string(), Value::Bool(true));
+    }
     cfg_entry_obj.insert("requestedAt".to_string(), Value::Number(updated_at.into()));
 
     let issues = map_validation_issues(config::validate_config(&config_value));
@@ -2315,6 +2317,47 @@ mod tests {
         assert_eq!(
             updated_config["plugins"]["entries"]["my-plugin"]["requestedAt"].as_u64(),
             Some(updated_at)
+        );
+    }
+
+    #[test]
+    fn test_update_preserves_disabled_state() {
+        let dir = TempDir::new().unwrap();
+        let _env = TestConfigEnv::new();
+        let wasm_bytes = tool_plugin_component_bytes();
+        std::fs::write(dir.path().join("my-plugin.wasm"), &wasm_bytes).unwrap();
+
+        let manifest = json!({
+            "my-plugin": {
+                "name": "my-plugin",
+                "version": "1.0.0",
+                "installed_at": 1700000000000u64
+            }
+        });
+        write_plugins_manifest(dir.path(), &manifest).unwrap();
+
+        let config_path = config::get_config_path();
+        let config_value = json!({
+            "plugins": {
+                "entries": {
+                    "my-plugin": {
+                        "enabled": false,
+                        "requestedAt": 1700000000000u64
+                    }
+                }
+            }
+        });
+        write_config_file(&config_path, &config_value).unwrap();
+
+        let result =
+            handle_plugins_update_inner(Some(&json!({ "name": "my-plugin" })), dir.path()).unwrap();
+        assert_eq!(result["ok"], Value::Bool(true));
+
+        let updated_config = read_config_snapshot().config;
+        assert_eq!(
+            updated_config["plugins"]["entries"]["my-plugin"]["enabled"],
+            Value::Bool(false),
+            "update should preserve the operator's explicit disabled state"
         );
     }
 
