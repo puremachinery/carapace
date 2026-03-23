@@ -1,44 +1,12 @@
-#![allow(dead_code)]
-#![allow(unused_imports)]
-
-mod agent;
-mod auth;
-mod channels;
-mod cli;
-mod config;
-mod credentials;
-mod cron;
-mod crypto;
-mod devices;
-mod discovery;
-mod exec;
-mod gateway;
-mod hooks;
-mod logging;
-mod media;
-mod messages;
-mod nodes;
-mod onboarding;
-mod paths;
-mod plugins;
-mod runtime_bridge;
-mod server;
-mod sessions;
-mod tailscale;
-mod tasks;
-#[cfg(test)]
-mod test_support;
-mod time;
-mod tls;
-mod update;
-mod usage;
-
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::routing::get;
 use axum::Router;
+use carapace::{
+    channels, cli, config, discovery, gateway, hooks, logging, plugins, server, tailscale, tls,
+};
 use clap::Parser;
 use serde::Deserialize;
 use serde_json::Value;
@@ -990,7 +958,7 @@ async fn shutdown_signal(
         error!("Failed to flush session store during shutdown: {}", e);
     }
 
-    server::plugin_bootstrap::stop_plugin_services(&ws_state);
+    server::stop_plugin_services(&ws_state);
 
     // Brief grace period for in-flight operations to complete
     tokio::time::sleep(Duration::from_millis(250)).await;

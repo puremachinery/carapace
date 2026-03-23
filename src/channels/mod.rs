@@ -31,14 +31,14 @@ enum ChannelAuthErrorKind {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
-pub(crate) struct ChannelAuthError {
+pub struct ChannelAuthError {
     kind: ChannelAuthErrorKind,
     message: String,
 }
 
 impl ChannelAuthError {
     #[allow(dead_code)]
-    pub(crate) fn auth(message: impl Into<String>) -> Self {
+    pub fn auth(message: impl Into<String>) -> Self {
         Self {
             kind: ChannelAuthErrorKind::Auth,
             message: message.into(),
@@ -46,7 +46,7 @@ impl ChannelAuthError {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn transient(message: impl Into<String>) -> Self {
+    pub fn transient(message: impl Into<String>) -> Self {
         Self {
             kind: ChannelAuthErrorKind::Transient,
             message: message.into(),
@@ -54,18 +54,18 @@ impl ChannelAuthError {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn is_auth(&self) -> bool {
+    pub fn is_auth(&self) -> bool {
         self.kind == ChannelAuthErrorKind::Auth
     }
 
     #[allow(dead_code)]
-    pub(crate) fn message(&self) -> &str {
+    pub fn message(&self) -> &str {
         &self.message
     }
 }
 
 #[allow(dead_code)]
-pub(crate) type ChannelAuthResult = Result<(), ChannelAuthError>;
+pub type ChannelAuthResult = Result<(), ChannelAuthError>;
 
 /// Connection status of a channel
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
