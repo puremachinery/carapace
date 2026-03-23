@@ -101,7 +101,7 @@ Useful flags:
 - `--strict` — exit nonzero if activation errors exist, the filtered result is empty, or any returned plugin is not `active`
 
 #### `cara plugins bins`
-List managed plugin binaries tracked on disk (`plugins.bins`).
+List managed plugin binary names tracked on disk (`plugins.bins`).
 
 ```bash
 cara plugins bins
@@ -132,6 +132,7 @@ Options:
 Notes:
 - `--file` is local-only and stages the file into `state_dir/plugins/<name>.wasm` before calling `plugins.install`
 - `--file` is intended for direct loopback targets; SSH port-forwarded remotes are not a supported workflow
+- `--publisher-key` and `--signature` are recorded at install/update time; signature verification happens later at plugin load time according to `plugins.signature` policy
 - managed plugin installs still require a Carapace restart before activation
 - remote hosts use the same TLS/plaintext flags as `cara logs`
 

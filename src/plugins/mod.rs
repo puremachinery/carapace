@@ -34,6 +34,35 @@
 //!    - Logging: 1000 messages/minute rate limit per plugin
 //!    - Body size: 10MB max for HTTP request/response bodies
 
+/// Maximum managed plugin artifact size accepted by install/update paths.
+pub(crate) const MAX_MANAGED_PLUGIN_ARTIFACT_BYTES: u64 = 50 * 1024 * 1024;
+
+/// Validate a managed plugin name used for `plugins.install` / `plugins.update`.
+pub(crate) fn validate_managed_plugin_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("plugin name must not be empty".to_string());
+    }
+    if name.len() > 128 {
+        return Err("plugin name is too long (max 128 characters)".to_string());
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(
+            "plugin name may only contain ASCII alphanumeric characters, hyphens, and underscores"
+                .to_string(),
+        );
+    }
+    if crate::plugins::loader::is_reserved_plugin_id(name) {
+        return Err(format!(
+            "plugin name '{}' is reserved for plugin configuration",
+            name
+        ));
+    }
+    Ok(())
+}
+
 pub mod bindings;
 pub mod capabilities;
 pub mod dispatch;

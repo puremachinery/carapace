@@ -269,7 +269,7 @@ Compatibility aliases:
 - `models.list` - List available models
 - `agents.list` - List available agents
 - `plugins.status` - Get plugin status, activation state, restart requirements, and sanitized activation issue counts
-- `plugins.bins` - List managed plugin binaries
+- `plugins.bins` - List managed plugin binary names
 - `plugins.install` - Install a managed plugin
 - `plugins.update` - Update managed plugins
 

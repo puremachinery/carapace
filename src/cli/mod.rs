@@ -352,82 +352,49 @@ pub enum PluginsCommand {
     },
 
     /// Install a managed plugin.
-    #[command(group(
-        clap::ArgGroup::new("source")
-            .required(true)
-            .multiple(false)
-            .args(["url", "file"])
-    ))]
-    Install {
-        /// Managed plugin name.
-        name: String,
-
-        /// Download URL for the plugin artifact.
-        #[arg(long, group = "source")]
-        url: Option<String>,
-
-        /// Local plugin artifact to copy into the managed plugins directory before installing.
-        #[arg(long, group = "source")]
-        file: Option<PathBuf>,
-
-        /// Optional plugin version string.
-        #[arg(long)]
-        version: Option<String>,
-
-        /// Optional publisher public key.
-        #[arg(long = "publisher-key")]
-        publisher_key: Option<String>,
-
-        /// Optional detached plugin signature.
-        #[arg(long)]
-        signature: Option<String>,
-
-        /// Print JSON instead of human-readable output.
-        #[arg(long)]
-        json: bool,
-
-        #[command(flatten)]
-        connection: WsConnectionArgs,
-    },
+    Install(PluginMutationArgs),
 
     /// Update a managed plugin.
-    #[command(group(
-        clap::ArgGroup::new("source")
-            .required(true)
-            .multiple(false)
-            .args(["url", "file"])
-    ))]
-    Update {
-        /// Managed plugin name.
-        name: String,
+    Update(PluginMutationArgs),
+}
 
-        /// Download URL for the updated plugin artifact.
-        #[arg(long, group = "source")]
-        url: Option<String>,
+#[derive(clap::Args, Debug)]
+#[command(group(
+    clap::ArgGroup::new("source")
+        .required(true)
+        .multiple(false)
+        .args(["url", "file"])
+))]
+pub struct PluginMutationArgs {
+    /// Managed plugin name.
+    name: String,
 
-        /// Local plugin artifact to copy into the managed plugins directory before updating.
-        #[arg(long, group = "source")]
-        file: Option<PathBuf>,
+    /// Download URL for the plugin artifact.
+    #[arg(long, group = "source")]
+    url: Option<String>,
 
-        /// Optional plugin version string.
-        #[arg(long)]
-        version: Option<String>,
+    /// Local plugin artifact to copy into the managed plugins directory.
+    #[arg(long, group = "source")]
+    file: Option<PathBuf>,
 
-        /// Optional publisher public key.
-        #[arg(long = "publisher-key")]
-        publisher_key: Option<String>,
+    /// Optional plugin version string.
+    #[arg(long)]
+    version: Option<String>,
 
-        /// Optional detached plugin signature.
-        #[arg(long)]
-        signature: Option<String>,
+    /// Optional publisher public key.
+    #[arg(long = "publisher-key")]
+    publisher_key: Option<String>,
 
-        /// Print JSON instead of human-readable output.
-        #[arg(long)]
-        json: bool,
+    /// Optional detached plugin signature.
+    #[arg(long)]
+    signature: Option<String>,
 
-        #[command(flatten)]
-        connection: WsConnectionArgs,
-    },
+    /// Print JSON instead of human-readable output.
+    #[arg(long)]
+    json: bool,
+
+    #[command(flatten)]
+    connection: WsConnectionArgs,
 }
 
 #[derive(clap::Args, Debug)]
@@ -1317,17 +1284,6 @@ struct PluginStatusCliOptions {
     state: Option<PluginStateSelection>,
     only_failed: bool,
     strict: bool,
-}
-
-struct PluginMutationCliOptions {
-    connection: WsConnectionArgs,
-    name: String,
-    url: Option<String>,
-    file: Option<PathBuf>,
-    version: Option<String>,
-    publisher_key: Option<String>,
-    signature: Option<String>,
-    json_output: bool,
 }
 
 pub(crate) type WsStream =
@@ -2283,32 +2239,15 @@ fn print_plugin_bins_human(response: &PluginsBinsResponse) {
     }
 }
 
-fn validate_local_plugin_artifact(
-    file: &Path,
-    bytes: &[u8],
-) -> Result<(), Box<dyn std::error::Error>> {
-    crate::plugins::loader::validate_plugin_component_bytes(&file.display().to_string(), bytes)
-        .map_err(|error| {
-            cli_error(format!(
-                "invalid plugin component '{}': {}",
-                file.display(),
-                error
-            ))
-        })
+fn validate_local_plugin_artifact(file_label: &str, bytes: &[u8]) -> Result<(), String> {
+    crate::plugins::loader::validate_plugin_component_bytes(file_label, bytes)
+        .map_err(|error| format!("invalid plugin component '{}': {}", file_label, error))
 }
 
-fn copy_plugin_file_into_managed_dir(
-    connection: &WsConnectionArgs,
-    name: &str,
+async fn read_and_validate_local_plugin_artifact(
     file: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if !is_loopback_host(&connection.host) {
-        return Err(cli_error(
-            "--file is only supported for loopback targets; use --url for remote plugin management",
-        ));
-    }
-
-    let metadata = std::fs::metadata(file).map_err(|err| {
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let metadata = tokio::fs::metadata(file).await.map_err(|err| {
         cli_error(format!(
             "failed to stat plugin file '{}': {}",
             file.display(),
@@ -2321,25 +2260,58 @@ fn copy_plugin_file_into_managed_dir(
             file.display()
         )));
     }
-    let bytes = std::fs::read(file).map_err(|err| {
+    if metadata.len() > crate::plugins::MAX_MANAGED_PLUGIN_ARTIFACT_BYTES {
+        return Err(cli_error(format!(
+            "plugin file '{}' exceeds maximum size ({} bytes > {} bytes)",
+            file.display(),
+            metadata.len(),
+            crate::plugins::MAX_MANAGED_PLUGIN_ARTIFACT_BYTES
+        )));
+    }
+
+    let bytes = tokio::fs::read(file).await.map_err(|err| {
         cli_error(format!(
             "failed to read plugin file '{}': {}",
             file.display(),
             err
         ))
     })?;
-    validate_local_plugin_artifact(file, &bytes)?;
+    let file_label = file.display().to_string();
+    tokio::task::spawn_blocking(move || {
+        validate_local_plugin_artifact(&file_label, &bytes)?;
+        Ok::<Vec<u8>, String>(bytes)
+    })
+    .await
+    .map_err(|err| cli_error(format!("plugin validation task failed: {}", err)))?
+    .map_err(cli_error)
+}
+
+async fn copy_plugin_file_into_managed_dir(
+    connection: &WsConnectionArgs,
+    name: &str,
+    file: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !is_loopback_host(&connection.host) {
+        return Err(cli_error(
+            "--file is only supported for loopback targets; use --url for remote plugin management",
+        ));
+    }
+    crate::plugins::validate_managed_plugin_name(name).map_err(cli_error)?;
+
+    let bytes = read_and_validate_local_plugin_artifact(file).await?;
 
     let managed_plugins_dir = resolve_state_dir().join("plugins");
-    std::fs::create_dir_all(&managed_plugins_dir).map_err(|err| {
-        cli_error(format!(
-            "failed to create managed plugins directory '{}': {}",
-            managed_plugins_dir.display(),
-            err
-        ))
-    })?;
+    tokio::fs::create_dir_all(&managed_plugins_dir)
+        .await
+        .map_err(|err| {
+            cli_error(format!(
+                "failed to create managed plugins directory '{}': {}",
+                managed_plugins_dir.display(),
+                err
+            ))
+        })?;
     let dest = managed_plugins_dir.join(format!("{}.wasm", name));
-    std::fs::write(&dest, &bytes).map_err(|err| {
+    tokio::fs::write(&dest, &bytes).await.map_err(|err| {
         cli_error(format!(
             "failed to stage plugin file into '{}': {}",
             dest.display(),
@@ -2439,10 +2411,10 @@ async fn handle_plugins_bins_cli(
 }
 
 async fn handle_plugins_install_cli(
-    options: PluginMutationCliOptions,
+    options: PluginMutationArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(file) = options.file.as_deref() {
-        copy_plugin_file_into_managed_dir(&options.connection, &options.name, file)?;
+        copy_plugin_file_into_managed_dir(&options.connection, &options.name, file).await?;
     }
     let payload = send_cli_ws_request(
         &options.connection,
@@ -2458,7 +2430,7 @@ async fn handle_plugins_install_cli(
         ),
     )
     .await?;
-    if options.json_output {
+    if options.json {
         print_pretty_json(&payload)?;
         return Ok(());
     }
@@ -2477,10 +2449,10 @@ async fn handle_plugins_install_cli(
 }
 
 async fn handle_plugins_update_cli(
-    options: PluginMutationCliOptions,
+    options: PluginMutationArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(file) = options.file.as_deref() {
-        copy_plugin_file_into_managed_dir(&options.connection, &options.name, file)?;
+        copy_plugin_file_into_managed_dir(&options.connection, &options.name, file).await?;
     }
     let payload = send_cli_ws_request(
         &options.connection,
@@ -2496,7 +2468,7 @@ async fn handle_plugins_update_cli(
         ),
     )
     .await?;
-    if options.json_output {
+    if options.json {
         print_pretty_json(&payload)?;
         return Ok(());
     }
@@ -2541,50 +2513,8 @@ pub async fn handle_plugins(command: PluginsCommand) -> Result<(), Box<dyn std::
         PluginsCommand::Bins { json, connection } => {
             handle_plugins_bins_cli(connection, json).await
         }
-        PluginsCommand::Install {
-            name,
-            url,
-            file,
-            version,
-            publisher_key,
-            signature,
-            json,
-            connection,
-        } => {
-            handle_plugins_install_cli(PluginMutationCliOptions {
-                connection,
-                name,
-                url,
-                file,
-                version,
-                publisher_key,
-                signature,
-                json_output: json,
-            })
-            .await
-        }
-        PluginsCommand::Update {
-            name,
-            url,
-            file,
-            version,
-            publisher_key,
-            signature,
-            json,
-            connection,
-        } => {
-            handle_plugins_update_cli(PluginMutationCliOptions {
-                connection,
-                name,
-                url,
-                file,
-                version,
-                publisher_key,
-                signature,
-                json_output: json,
-            })
-            .await
-        }
+        PluginsCommand::Install(args) => handle_plugins_install_cli(args).await,
+        PluginsCommand::Update(args) => handle_plugins_update_cli(args).await,
     }
 }
 
@@ -7122,7 +7052,7 @@ mod tests {
         ])
         .unwrap();
         match cli.command {
-            Some(Command::Plugins(PluginsCommand::Install {
+            Some(Command::Plugins(PluginsCommand::Install(PluginMutationArgs {
                 name,
                 url,
                 file,
@@ -7130,7 +7060,7 @@ mod tests {
                 publisher_key,
                 signature,
                 ..
-            })) => {
+            }))) => {
                 assert_eq!(name, "demo-plugin");
                 assert_eq!(url, None);
                 assert_eq!(file, Some(PathBuf::from("./demo.wasm")));
@@ -7173,13 +7103,13 @@ mod tests {
         ])
         .unwrap();
         match cli.command {
-            Some(Command::Plugins(PluginsCommand::Update {
+            Some(Command::Plugins(PluginsCommand::Update(PluginMutationArgs {
                 name,
                 url,
                 file,
                 json,
                 ..
-            })) => {
+            }))) => {
                 assert_eq!(name, "demo-plugin");
                 assert_eq!(url.as_deref(), Some("https://example.com/demo.wasm"));
                 assert_eq!(file, None);
@@ -7189,8 +7119,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_copy_plugin_file_into_managed_dir_requires_loopback_host() {
+    #[tokio::test]
+    async fn test_copy_plugin_file_into_managed_dir_requires_loopback_host() {
         let temp = tempfile::TempDir::new().unwrap();
         let plugin_path = temp.path().join("demo.wasm");
         std::fs::write(&plugin_path, tool_plugin_component_bytes()).unwrap();
@@ -7202,14 +7132,16 @@ mod tests {
             allow_plaintext: false,
         };
 
-        let err = copy_plugin_file_into_managed_dir(&connection, "demo", &plugin_path).unwrap_err();
+        let err = copy_plugin_file_into_managed_dir(&connection, "demo", &plugin_path)
+            .await
+            .unwrap_err();
         assert!(err
             .to_string()
             .contains("--file is only supported for loopback"));
     }
 
-    #[test]
-    fn test_copy_plugin_file_into_managed_dir_stages_file() {
+    #[tokio::test]
+    async fn test_copy_plugin_file_into_managed_dir_stages_file() {
         let mut env_guard = ScopedEnv::new();
         let temp = tempfile::TempDir::new().unwrap();
         env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
@@ -7224,13 +7156,34 @@ mod tests {
             allow_plaintext: false,
         };
 
-        copy_plugin_file_into_managed_dir(&connection, "demo-plugin", &plugin_path).unwrap();
+        copy_plugin_file_into_managed_dir(&connection, "demo-plugin", &plugin_path)
+            .await
+            .unwrap();
         let staged = temp.path().join("plugins").join("demo-plugin.wasm");
         assert!(staged.is_file());
         assert_eq!(
             std::fs::read(staged).unwrap(),
             tool_plugin_component_bytes()
         );
+    }
+
+    #[tokio::test]
+    async fn test_copy_plugin_file_into_managed_dir_rejects_invalid_plugin_name() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let plugin_path = temp.path().join("demo-input.wasm");
+        std::fs::write(&plugin_path, tool_plugin_component_bytes()).unwrap();
+        let connection = WsConnectionArgs {
+            port: Some(18789),
+            host: "127.0.0.1".to_string(),
+            tls: false,
+            trust: false,
+            allow_plaintext: false,
+        };
+
+        let err = copy_plugin_file_into_managed_dir(&connection, "../escape", &plugin_path)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("plugin name may only contain"));
     }
 
     #[test]

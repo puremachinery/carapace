@@ -10,7 +10,7 @@ mod golden_trace {
     use crate::logging::buffer::{LogLevel, LOG_BUFFER};
     use crate::server::ws::handlers::dispatch_method;
     use crate::server::ws::*;
-    use crate::test_support::env::ScopedEnv;
+    use crate::test_support::{env::ScopedEnv, plugins::tool_plugin_component_bytes};
     use serde_json::{json, Value};
     use std::sync::Arc;
     // ───────────────────────── helpers ─────────────────────────
@@ -18,6 +18,12 @@ mod golden_trace {
     struct EnvGuard {
         _env: ScopedEnv,
         _temp_dir: tempfile::TempDir,
+    }
+
+    impl EnvGuard {
+        fn state_dir(&self) -> &std::path::Path {
+            self._temp_dir.path()
+        }
     }
 
     fn init_test_env() -> EnvGuard {
@@ -497,6 +503,79 @@ mod golden_trace {
         let result = dispatch_method("plugins.bins", Some(&json!({})), &state, &conn).await;
         let normalized = normalize_for_snapshot(&result);
         insta::assert_json_snapshot!("golden_plugins_bins", normalized);
+    }
+
+    #[tokio::test]
+    async fn plugins_install_dispatch_adopts_staged_local_artifact() {
+        let (guard, state) = test_state();
+        let managed_dir = guard.state_dir().join("plugins");
+        std::fs::create_dir_all(&managed_dir).unwrap();
+        std::fs::write(
+            managed_dir.join("demo-plugin.wasm"),
+            tool_plugin_component_bytes(),
+        )
+        .unwrap();
+
+        let conn = admin_conn();
+        register_conn(&state, &conn);
+        let result = dispatch_method(
+            "plugins.install",
+            Some(&json!({
+                "name": "demo-plugin",
+                "version": "1.2.3"
+            })),
+            &state,
+            &conn,
+        )
+        .await
+        .expect("plugins.install should succeed");
+
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["name"], "demo-plugin");
+        assert_eq!(result["version"], "1.2.3");
+        assert_eq!(result["activation"]["state"], "restart-required");
+    }
+
+    #[tokio::test]
+    async fn plugins_update_dispatch_adopts_staged_local_artifact() {
+        let (guard, state) = test_state();
+        let managed_dir = guard.state_dir().join("plugins");
+        std::fs::create_dir_all(&managed_dir).unwrap();
+        std::fs::write(
+            managed_dir.join("demo-plugin.wasm"),
+            tool_plugin_component_bytes(),
+        )
+        .unwrap();
+        std::fs::write(
+            managed_dir.join("plugins-manifest.json"),
+            serde_json::to_vec_pretty(&json!({
+                "demo-plugin": {
+                    "name": "demo-plugin",
+                    "installed_at": 1700000000000u64
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let conn = admin_conn();
+        register_conn(&state, &conn);
+        let result = dispatch_method(
+            "plugins.update",
+            Some(&json!({
+                "name": "demo-plugin",
+                "version": "2.0.0"
+            })),
+            &state,
+            &conn,
+        )
+        .await
+        .expect("plugins.update should succeed");
+
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["name"], "demo-plugin");
+        assert_eq!(result["version"], "2.0.0");
+        assert_eq!(result["activation"]["state"], "restart-required");
     }
 
     // ───────────────────────── Exec approvals ─────────────────────────

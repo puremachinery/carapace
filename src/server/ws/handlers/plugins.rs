@@ -14,13 +14,12 @@ use hickory_resolver::TokioResolver;
 use super::super::*;
 use super::config::{map_validation_issues, read_config_snapshot, write_config_file};
 use crate::plugins::capabilities::SsrfProtection;
-use crate::plugins::loader::{
-    is_reserved_plugin_id, validate_plugin_component_bytes, LoaderError, PLUGINS_MANIFEST_FILE,
-};
+use crate::plugins::loader::{validate_plugin_component_bytes, LoaderError, PLUGINS_MANIFEST_FILE};
+use crate::plugins::{validate_managed_plugin_name, MAX_MANAGED_PLUGIN_ARTIFACT_BYTES};
 use crate::runtime_bridge::{run_sync_blocking_send, BridgeError};
 
-/// Maximum download size for a plugin WASM binary (50 MB).
-const MAX_PLUGIN_DOWNLOAD_BYTES: usize = 50 * 1024 * 1024;
+/// Maximum download size for a managed plugin WASM binary (50 MB).
+const MAX_PLUGIN_DOWNLOAD_BYTES: usize = MAX_MANAGED_PLUGIN_ARTIFACT_BYTES as usize;
 
 /// Default HTTP timeout for plugin downloads (60 seconds).
 const PLUGIN_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
@@ -64,41 +63,8 @@ fn resolve_plugins_dir() -> PathBuf {
 /// Validate that a plugin name is safe: non-empty, ASCII alphanumeric plus hyphens and
 /// underscores, no path separators, and reasonable length.
 fn validate_plugin_name(name: &str) -> Result<(), ErrorShape> {
-    if name.is_empty() {
-        return Err(error_shape(
-            ERROR_INVALID_REQUEST,
-            "plugin name must not be empty",
-            None,
-        ));
-    }
-    if name.len() > 128 {
-        return Err(error_shape(
-            ERROR_INVALID_REQUEST,
-            "plugin name is too long (max 128 characters)",
-            None,
-        ));
-    }
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        return Err(error_shape(
-            ERROR_INVALID_REQUEST,
-            "plugin name may only contain ASCII alphanumeric characters, hyphens, and underscores",
-            None,
-        ));
-    }
-    if is_reserved_plugin_id(name) {
-        return Err(error_shape(
-            ERROR_INVALID_REQUEST,
-            &format!(
-                "plugin name '{}' is reserved for plugin configuration",
-                name
-            ),
-            None,
-        ));
-    }
-    Ok(())
+    validate_managed_plugin_name(name)
+        .map_err(|message| error_shape(ERROR_INVALID_REQUEST, &message, None))
 }
 
 fn validate_plugin_wasm_bytes(bytes: &[u8], source: &str) -> Result<(), ErrorShape> {
@@ -865,10 +831,7 @@ fn scan_plugins_bins(dir: &std::path::Path) -> Vec<Value> {
                 .is_some_and(|extension| extension == "wasm")
         {
             let name = entry.file_name().to_string_lossy().to_string();
-            bins.push(json!({
-                "name": name,
-                "path": path.to_string_lossy(),
-            }));
+            bins.push(json!({ "name": name }));
         }
     }
     bins
@@ -994,8 +957,6 @@ fn handle_plugins_install_inner(
         "name": name,
         "version": version,
         "installed_at": installed_at,
-        "path": wasm_path.map(|p| p.to_string_lossy().to_string()),
-        "plugins_dir": plugins_dir.to_string_lossy(),
         "publisher_key": publisher_key,
         "signature": signature,
         "activation": {
@@ -1104,16 +1065,39 @@ fn handle_plugins_update_inner(
     }
     if let Some(source_url) = source_url {
         entry_obj.insert("url".to_string(), Value::String(source_url));
+    } else {
+        entry_obj.remove("url");
     }
     write_plugins_manifest(plugins_dir, &manifest)?;
+
+    let mut config_value = read_config_snapshot().config;
+    let root = ensure_object(&mut config_value)?;
+    let plugins = root.entry("plugins").or_insert_with(|| json!({}));
+    let plugins_obj = ensure_object(plugins)?;
+    let entries = plugins_obj.entry("entries").or_insert_with(|| json!({}));
+    let entries_obj = ensure_object(entries)?;
+    let cfg_entry = entries_obj
+        .entry(name.to_string())
+        .or_insert_with(|| json!({}));
+    let cfg_entry_obj = ensure_object(cfg_entry)?;
+    cfg_entry_obj.insert("enabled".to_string(), Value::Bool(true));
+    cfg_entry_obj.insert("requestedAt".to_string(), Value::Number(updated_at.into()));
+
+    let issues = map_validation_issues(config::validate_config(&config_value));
+    if !issues.is_empty() {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            "invalid config",
+            Some(json!({ "issues": issues })),
+        ));
+    }
+    write_config_file(&config::get_config_path(), &config_value)?;
 
     Ok(json!({
         "ok": true,
         "name": name,
         "version": version,
         "updated_at": updated_at,
-        "path": dest.to_string_lossy(),
-        "plugins_dir": plugins_dir.to_string_lossy(),
         "publisher_key": publisher_key,
         "signature": signature,
         "activation": {
@@ -1813,16 +1797,7 @@ mod tests {
         let names: Vec<&str> = result.iter().map(|v| v["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"plugin-a.wasm"));
         assert!(names.contains(&"plugin-b.wasm"));
-
-        // Verify paths are absolute
-        for bin in &result {
-            let path = bin["path"].as_str().unwrap();
-            assert!(
-                std::path::Path::new(path).is_absolute(),
-                "path should be absolute: {}",
-                path
-            );
-        }
+        assert!(result.iter().all(|bin| bin.get("path").is_none()));
     }
 
     // ---- Validation tests ----
@@ -2251,6 +2226,7 @@ mod tests {
     #[test]
     fn test_update_adopts_existing_local_wasm_without_url() {
         let dir = TempDir::new().unwrap();
+        let _env = TestConfigEnv::new();
         // Pre-create a manifest entry so the plugin is "installed"
         let manifest = json!({
             "my-plugin": {
@@ -2273,12 +2249,15 @@ mod tests {
             value["activation"]["state"],
             Value::String("restart-required".to_string())
         );
+        let read_back = read_plugins_manifest(dir.path());
+        assert!(read_back["my-plugin"].get("url").is_none());
     }
 
     #[test]
     fn test_update_plugin_found_by_wasm_file() {
         // Even if the manifest doesn't have the entry, a .wasm file on disk counts
         let dir = TempDir::new().unwrap();
+        let _env = TestConfigEnv::new();
         // Create a valid plugin component file on disk.
         let wasm_bytes = tool_plugin_component_bytes();
         std::fs::write(dir.path().join("disk-plugin.wasm"), &wasm_bytes).unwrap();
@@ -2293,6 +2272,50 @@ mod tests {
         let value = result.unwrap();
         assert_eq!(value["ok"], Value::Bool(true));
         assert_eq!(value["name"], Value::String("disk-plugin".to_string()));
+    }
+
+    #[test]
+    fn test_update_refreshes_requested_at_and_clears_stale_url() {
+        let dir = TempDir::new().unwrap();
+        let _env = TestConfigEnv::new();
+        let wasm_bytes = tool_plugin_component_bytes();
+        std::fs::write(dir.path().join("my-plugin.wasm"), &wasm_bytes).unwrap();
+
+        let manifest = json!({
+            "my-plugin": {
+                "name": "my-plugin",
+                "version": "1.0.0",
+                "installed_at": 1700000000000u64,
+                "url": "https://example.com/old.wasm"
+            }
+        });
+        write_plugins_manifest(dir.path(), &manifest).unwrap();
+
+        let config_path = config::get_config_path();
+        let config_value = json!({
+            "plugins": {
+                "entries": {
+                    "my-plugin": {
+                        "enabled": true,
+                        "requestedAt": 1700000000000u64
+                    }
+                }
+            }
+        });
+        write_config_file(&config_path, &config_value).unwrap();
+
+        let result =
+            handle_plugins_update_inner(Some(&json!({ "name": "my-plugin" })), dir.path()).unwrap();
+        let updated_at = result["updated_at"].as_u64().unwrap();
+
+        let read_back = read_plugins_manifest(dir.path());
+        assert!(read_back["my-plugin"].get("url").is_none());
+
+        let updated_config = read_config_snapshot().config;
+        assert_eq!(
+            updated_config["plugins"]["entries"]["my-plugin"]["requestedAt"].as_u64(),
+            Some(updated_at)
+        );
     }
 
     #[test]
