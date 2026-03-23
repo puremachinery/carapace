@@ -951,7 +951,6 @@ fn handle_plugins_install_inner(
         .or_insert_with(|| json!({}));
     let cfg_entry_obj = ensure_object(cfg_entry)?;
     cfg_entry_obj.insert("enabled".to_string(), Value::Bool(true));
-    cfg_entry_obj.insert("name".to_string(), Value::String(name.to_string()));
     cfg_entry_obj.insert(
         "requestedAt".to_string(),
         Value::Number(installed_at.into()),
