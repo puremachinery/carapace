@@ -196,7 +196,7 @@ const OPERATOR_ADMIN_REQUIRED_METHODS: [&str; 43] = [
     "update.install",
     "update.dismiss",
     "update.releaseNotes",
-    // Skills
+    // Plugins
     "plugins.install",
     "plugins.update",
     // Cron

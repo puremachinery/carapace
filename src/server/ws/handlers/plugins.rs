@@ -1,4 +1,4 @@
-//! Plugins handlers.
+//! Plugin handlers.
 
 use serde_json::{json, Value};
 use std::collections::BTreeMap;

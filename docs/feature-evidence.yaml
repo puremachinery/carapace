@@ -690,7 +690,7 @@ features:
       - "src/server/ws/handlers/plugins.rs::handle_plugins_update_inner (restart-required activation response)"
     tests:
       - "src/server/startup.rs::bootstrap_plugin_runtime_respects_plugins_enabled_false"
-      - "src/server/startup.rs::bootstrap_plugin_runtime_reports_missing_manifest_for_managed_skill"
+      - "src/server/startup.rs::bootstrap_plugin_runtime_reports_missing_manifest_for_managed_plugin"
       - "src/server/startup.rs::bootstrap_plugin_runtime_ignores_stray_managed_wasm_files"
       - "src/server/startup.rs::bootstrap_plugin_runtime_reports_config_path_read_errors"
       - "src/server/startup.rs::bootstrap_plugin_runtime_skips_unpinned_managed_manifest_entries"
