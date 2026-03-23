@@ -43,7 +43,7 @@ impl SlackChannel {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn validate(&self) -> ChannelAuthResult {
+    pub fn validate(&self) -> ChannelAuthResult {
         let client = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(VALIDATION_TIMEOUT_SECS))
             .build()

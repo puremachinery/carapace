@@ -23,6 +23,9 @@ pub use control::{
     ConfigUpdateRequest, ConfigUpdateResponse, ControlError, ControlState, GatewayStatusResponse,
     RuntimeInfo,
 };
+pub fn stop_plugin_services(ws_state: &ws::WsServerState) {
+    plugin_bootstrap::stop_plugin_services(ws_state);
+}
 pub use openai::{
     chat_completions_handler, responses_handler, ChatChoice, ChatCompletionChunk,
     ChatCompletionResponse, ChatCompletionsRequest, ChatContent, ChatMessage, ChatUsage,
