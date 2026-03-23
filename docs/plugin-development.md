@@ -13,8 +13,8 @@ The workflow documented here is:
 6. use `cara plugins install` / `cara plugins update` only when you want the
    managed distribution path
 
-This guide is intentionally written around the public surfaces Carapace exposes
-publicly:
+This guide is intentionally written around the public surfaces Carapace
+exposes:
 
 - the WIT contract in `wit/plugin.wit`
 - the runtime loader behavior in `src/plugins/*`
@@ -240,7 +240,8 @@ Webhook-specific behavior:
 - webhook paths are mounted under `/plugins/<plugin-id>/...`
 - `get-paths()` returns paths inside that namespace, without the
   `/plugins/<plugin-id>/` prefix
-- request bodies are capped by `hooks.maxBodyBytes` in the server config
+- request bodies are capped by `gateway.hooks.maxBodyBytes` in the server
+  config
   (default: `256 KiB`)
 - Carapace currently forwards request headers through to the plugin as-is
 
@@ -483,7 +484,7 @@ Other behavioral rules worth knowing:
 - config reads are always scoped to `plugins.<plugin-id>.*`
 - credential reads/writes are always scoped to `<plugin-id>:...`
 - outbound HTTP and media fetches go through SSRF protections
-- plugin networking only supports `http` and `https`
+- plugin networking only supports `https`
 
 The WIT file is the authoritative ABI and capability reference.
 
