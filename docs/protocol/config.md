@@ -157,7 +157,7 @@ This is a condensed map; refer to the JSON schema for full detail.
 - `browser`
   - `enabled`, `controlUrl`, `cdpUrl`, `profiles` (names must match `/^[a-z0-9-]+$/`)
 - `plugins`
-  - `enabled`, `allow`, `deny`, `load.paths`, `entries`, `sandbox`, `signature`, `installs`
+  - `enabled`, `load.paths`, `entries`, `sandbox`, `signature`
 - `filesystem`
   - `enabled`, `roots`, `writeAccess`, `maxReadBytes`, `excludePatterns`
 - `auth`
@@ -381,7 +381,7 @@ Defaults are applied during config loading before validation. Key defaults inclu
 - Unknown top-level keys produce schema warnings; they do not, by themselves, abort startup.
 - Duplicate agent directories are rejected.
 - `agents.list[].identity.avatar` must be workspace‑relative or http(s)/data URI.
-- `plugins.allow/deny/entries/slots` must reference known plugin IDs.
+- `plugins.entries.<plugin-id>` may only contain `enabled`, `installId`, and `requestedAt`.
 - `channels` keys must map to known channel IDs.
 - `browser.profiles` names must be `^[a-z0-9-]+$` and must set `cdpPort` or `cdpUrl`.
 

@@ -386,7 +386,7 @@ Enable Carapace to listen and respond on external chat platforms.
     - `sandbox.enabled`: `true` or `false`.
     - `sandbox.defaults.allowHttp`, `allowCredentials`, `allowMedia`: `true` or `false`.
     - `signature.enabled`, `signature.requireSignature`: `true` or `false`.
-    - `signature.trustedPublishers`: Array of trusted publisher names.
+    - `signature.trustedPublishers`: Array of hex-encoded Ed25519 public keys.
 - **`cron`**
   - *What it does:* Schedules automated jobs.
   - *Common values:*
@@ -445,7 +445,7 @@ Carapace supports more configuration than this guide covers. If you need the bro
 - Unknown top-level keys produce schema warnings; they do not, by themselves, abort startup.
 - Duplicate agent directories are rejected.
 - `agents.list[].identity.avatar` must be workspace-relative or http(s)/data URI.
-- `plugins.allow/deny/entries/slots` must reference known plugin IDs.
+- `plugins.entries.<plugin-id>` may only contain `enabled`, `installId`, and `requestedAt`.
 - `channels` keys must map to known channel IDs.
 - `browser.profiles` names must be `^[a-z0-9-]+$` and must set `cdpPort` or `cdpUrl`.
 
