@@ -2293,47 +2293,25 @@ struct ManagedPluginFileTransaction {
 }
 
 impl ManagedPluginFileTransaction {
-    async fn commit(self) -> Result<(), Box<dyn std::error::Error>> {
+    async fn commit(self) -> Option<String> {
         if let Some(backup) = self.backup {
-            match tokio::fs::remove_file(&backup).await {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => {
-                    return Err(cli_error(format!(
+            if let Err(err) = tokio::fs::remove_file(&backup).await {
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    return Some(format!(
                         "plugin request succeeded, but failed to remove staging backup '{}': {}",
                         backup.display(),
                         err
-                    )));
+                    ));
                 }
             }
         }
-        Ok(())
+        None
     }
 
     async fn rollback(self) -> Result<String, Box<dyn std::error::Error>> {
         match self.backup {
             Some(backup) => {
-                match tokio::fs::remove_file(&self.dest).await {
-                    Ok(()) => {}
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(err) => {
-                        return Err(cli_error(format!(
-                            "failed to remove staged plugin artifact '{}' during rollback: {}",
-                            self.dest.display(),
-                            err
-                        )));
-                    }
-                }
-                tokio::fs::rename(&backup, &self.dest)
-                    .await
-                    .map_err(|err| {
-                        cli_error(format!(
-                            "failed to restore previous plugin artifact from '{}' to '{}': {}",
-                            backup.display(),
-                            self.dest.display(),
-                            err
-                        ))
-                    })?;
+                restore_previous_plugin_artifact(&backup, &self.dest).await?;
                 Ok(format!(
                     "restored previous local managed artifact at '{}'",
                     self.dest.display()
@@ -2368,6 +2346,32 @@ fn plugin_cli_backup_path(dest: &Path) -> Result<PathBuf, Box<dyn std::error::Er
     let mut backup_name = file_name.to_os_string();
     backup_name.push(".cli-backup");
     Ok(dest.with_file_name(backup_name))
+}
+
+async fn restore_previous_plugin_artifact(
+    backup: &Path,
+    dest: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Err(err) = tokio::fs::remove_file(dest).await {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            return Err(cli_error(format!(
+                "failed to remove staged plugin artifact '{}' during rollback: {}",
+                dest.display(),
+                err
+            )));
+        }
+    }
+
+    tokio::fs::rename(backup, dest).await.map_err(|err| {
+        cli_error(format!(
+            "failed to restore previous plugin artifact from '{}' to '{}': {}",
+            backup.display(),
+            dest.display(),
+            err
+        ))
+    })?;
+
+    Ok(())
 }
 
 async fn stage_plugin_file_into_managed_dir(
@@ -2449,16 +2453,14 @@ async fn stage_plugin_file_into_managed_dir(
             err
         );
         if had_existing {
-            let restore_result = tokio::fs::rename(&backup, &dest).await;
+            let restore_result = restore_previous_plugin_artifact(&backup, &dest).await;
             return match restore_result {
                 Ok(()) => Err(cli_error(format!(
                     "{write_message}; restored previous local managed artifact at '{}'",
                     dest.display()
                 ))),
                 Err(restore_err) => Err(cli_error(format!(
-                    "{write_message}; rollback also failed from '{}' to '{}': {}",
-                    backup.display(),
-                    dest.display(),
+                    "{write_message}; rollback also failed: {}",
                     restore_err
                 ))),
             };
@@ -2477,7 +2479,9 @@ async fn finalize_plugin_file_mutation<T>(
 ) -> Result<T, Box<dyn std::error::Error>> {
     match (staged_file, result) {
         (Some(transaction), Ok(value)) => {
-            transaction.commit().await?;
+            if let Some(warning) = transaction.commit().await {
+                eprintln!("warning: {warning}");
+            }
             Ok(value)
         }
         (Some(transaction), Err(err)) => {
@@ -7341,9 +7345,11 @@ mod tests {
             allow_plaintext: false,
         };
 
-        stage_plugin_file_into_managed_dir(&connection, "demo-plugin", &plugin_path)
-            .await
-            .unwrap();
+        let transaction =
+            stage_plugin_file_into_managed_dir(&connection, "demo-plugin", &plugin_path)
+                .await
+                .unwrap();
+        assert!(transaction.commit().await.is_none());
         let staged = temp.path().join("plugins").join("demo-plugin.wasm");
         assert!(staged.is_file());
         assert_eq!(
@@ -7458,13 +7464,50 @@ mod tests {
             stage_plugin_file_into_managed_dir(&connection, "demo-plugin", &plugin_path)
                 .await
                 .unwrap();
-        transaction.commit().await.unwrap();
+        assert!(transaction.commit().await.is_none());
 
         assert_eq!(
             std::fs::read(&existing).unwrap(),
             tool_plugin_component_bytes()
         );
         assert!(!plugins_dir.join("demo-plugin.wasm.cli-backup").exists());
+    }
+
+    #[tokio::test]
+    async fn test_restore_previous_plugin_artifact_replaces_partial_dest() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let dest = temp.path().join("demo-plugin.wasm");
+        let backup = temp.path().join("demo-plugin.wasm.cli-backup");
+        std::fs::write(&dest, b"partial-new-bytes").unwrap();
+        std::fs::write(&backup, b"old-plugin-bytes").unwrap();
+
+        restore_previous_plugin_artifact(&backup, &dest)
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(&dest).unwrap(), b"old-plugin-bytes");
+        assert!(!backup.exists());
+    }
+
+    #[tokio::test]
+    async fn test_commit_returns_warning_when_backup_cleanup_fails() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let dest = temp.path().join("demo-plugin.wasm");
+        let backup = temp.path().join("demo-plugin.wasm.cli-backup");
+        std::fs::write(&dest, b"new-plugin-bytes").unwrap();
+        std::fs::create_dir_all(&backup).unwrap();
+
+        let warning = ManagedPluginFileTransaction {
+            dest,
+            backup: Some(backup.clone()),
+        }
+        .commit()
+        .await;
+
+        let rendered = warning.expect("expected warning");
+        assert!(rendered.contains("plugin request succeeded"));
+        assert!(rendered.contains("failed to remove staging backup"));
+        assert!(backup.exists());
     }
 
     #[tokio::test]
