@@ -61,11 +61,12 @@ If you are writing a new plugin, start with `plugins.load.paths`.
 There are two different names you will see in the plugin tooling:
 
 - **`pluginId`**
-  - comes from the plugin manifest `id`
+  - comes from the `.wasm` filename stem at load time
   - identifies the runtime plugin instance
   - appears in `cara plugins status`
   - must be lowercase alphanumeric plus hyphens
   - maximum length: `32`
+  - should match the manifest `id` if you embed explicit manifest metadata
 - **managed plugin `name`**
   - the name you pass to `cara plugins install <name>` or
     `cara plugins update <name>`
@@ -84,13 +85,17 @@ Reserved managed plugin names:
 - `sandbox`
 - `signature`
 
-Manifest fields:
+Core manifest fields:
 
 - `id`
 - `name`
 - `description`
 - `version`
 - `kind`
+
+Optional manifest fields:
+
+- `permissions`
 
 Carapace can load a plugin even if you do not embed explicit manifest metadata.
 The loader derives metadata in this order:
@@ -288,7 +293,7 @@ If your build pipeline can embed a `plugin-manifest` custom section, Carapace
 will use it directly instead of inferring metadata from the file and component
 exports.
 
-The JSON structure matches the runtime `PluginManifest` shape:
+The JSON structure below shows the core `PluginManifest` fields:
 
 ```json
 {
@@ -302,7 +307,7 @@ The JSON structure matches the runtime `PluginManifest` shape:
 
 This is the most predictable path for managed distribution because it avoids:
 
-- filename-derived IDs
+- filename-stem/runtime-ID mismatches
 - file-mtime-derived versions
 - kind inference from exports
 
@@ -339,7 +344,7 @@ Concrete inner loop:
 ```sh
 mkdir -p /absolute/path/to/dev-plugins
 cargo component build --release
-cp /path/to/generated/my_plugin.wasm /absolute/path/to/dev-plugins/
+cp /path/to/generated/my_plugin.wasm /absolute/path/to/dev-plugins/my-tool.wasm
 cara start --port 18789
 cara plugins status --port 18789 --name my-tool
 cara logs -n 200 --port 18789
@@ -348,7 +353,7 @@ cara logs -n 200 --port 18789
 What success looks like in `cara plugins status`:
 
 - `name`: your configured plugin name
-- `pluginId`: your plugin manifest ID
+- `pluginId`: the loaded plugin filename stem / runtime plugin ID
 - `state`: `active`
 - `reason`: `null`
 
@@ -417,6 +422,8 @@ uses at load time, including:
 - optional `publisher_key`
 - optional `signature`
 - optional `url`
+- optional `path` (absolute or relative to `state_dir/plugins`); when omitted,
+  Carapace defaults to `<name>.wasm`
 
 `plugins.entries.<name>` carries the managed install metadata that shows up in
 `cara plugins status`, including:
