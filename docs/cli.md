@@ -132,6 +132,7 @@ Options:
 Notes:
 - `--file` is local-only and stages the file into `state_dir/plugins/<name>.wasm` before calling `plugins.install`
 - `--file` is intended for direct loopback targets; SSH port-forwarded remotes are not a supported workflow
+- if the follow-up `plugins.install` request fails, the CLI restores the previous local managed artifact state when possible and reports the recovery action explicitly
 - `--publisher-key` and `--signature` are recorded at install/update time; signature verification happens later at plugin load time according to `plugins.signature` policy
 - managed plugin installs still require a Carapace restart before activation
 - remote hosts use the same TLS/plaintext flags as `cara logs`
@@ -152,7 +153,9 @@ cara plugins update demo-plugin --file ./target/wasm32-wasip1/release/demo_plugi
 `cara plugins update` accepts the same flags as `cara plugins install`.
 If `--file` is used, the CLI stages the file into `state_dir/plugins/<name>.wasm`
 and the server adopts that managed artifact on update. Managed plugin updates
-still require restart before the new artifact becomes active.
+still require restart before the new artifact becomes active. If the update
+request fails after local staging, the CLI restores the previous local managed
+artifact state when possible and reports the recovery action explicitly.
 
 ### `cara chat`
 Start an interactive chat REPL (`chat.send` over WebSocket).
