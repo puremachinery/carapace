@@ -62,7 +62,8 @@ etime_to_seconds() {
         seconds="${a:-0}"
     fi
 
-    echo $((days * 86400 + hours * 3600 + minutes * 60 + seconds))
+    # `ps etime` is zero-padded; force base-10 so values like `08` do not trip bash's octal parsing.
+    echo $((10#${days} * 86400 + 10#${hours} * 3600 + 10#${minutes} * 60 + 10#${seconds}))
 }
 
 record_diag_error() {
@@ -254,6 +255,7 @@ capture_diagnostics() {
             fi
         else
             echo "rg_not_found_falling_back_to_grep"
+            # shellcheck disable=SC2009
             if ! ps -ww -Ao pid=,ppid=,etime=,args= 2>&1 | grep -E "cargo-nextest|--list --format terse|target/debug/deps/" 2>&1; then
                 echo "no_related_processes_matched_snapshot_pattern"
             fi
@@ -333,24 +335,30 @@ list_discovery_pid_etime_and_command() {
         || true
 }
 
-cargo nextest run "$@" &
-nextest_pid=$!
+main() {
+    cargo nextest run "$@" &
+    local nextest_pid=$!
 
-while kill -0 "${nextest_pid}" >/dev/null 2>&1; do
-    while IFS='|' read -r pid etime cmd; do
-        [ -z "${pid}" ] && continue
-        age_secs="$(etime_to_seconds "${etime}")"
-        if [ "${age_secs}" -lt "${LIST_TIMEOUT_SECS}" ]; then
-            continue
-        fi
+    while kill -0 "${nextest_pid}" >/dev/null 2>&1; do
+        while IFS='|' read -r pid etime cmd; do
+            [ -z "${pid}" ] && continue
+            age_secs="$(etime_to_seconds "${etime}")"
+            if [ "${age_secs}" -lt "${LIST_TIMEOUT_SECS}" ]; then
+                continue
+            fi
 
-        capture_diagnostics "${pid}" "${nextest_pid}" "${etime}" "${cmd}" "${age_secs}"
-        terminate_pid_bounded "${pid}" "stalled list child" "${DIAG_DIR}/nextest-kill.errors.log" || true
-        terminate_pid_bounded "${nextest_pid}" "nextest parent" "${DIAG_DIR}/nextest-kill.errors.log" || true
-        exit 124
-    done < <(list_discovery_pid_etime_and_command "${nextest_pid}")
+            capture_diagnostics "${pid}" "${nextest_pid}" "${etime}" "${cmd}" "${age_secs}"
+            terminate_pid_bounded "${pid}" "stalled list child" "${DIAG_DIR}/nextest-kill.errors.log" || true
+            terminate_pid_bounded "${nextest_pid}" "nextest parent" "${DIAG_DIR}/nextest-kill.errors.log" || true
+            exit 124
+        done < <(list_discovery_pid_etime_and_command "${nextest_pid}")
 
-    sleep "${POLL_SECS}"
-done
+        sleep "${POLL_SECS}"
+    done
 
-wait "${nextest_pid}"
+    wait "${nextest_pid}"
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    main "$@"
+fi
