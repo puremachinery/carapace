@@ -5,7 +5,7 @@ expression: normalized
 {
   "error": {
     "code": "INVALID_REQUEST",
-    "message": "method 'plugins.bins' is only allowed for node role",
+    "message": "method 'node.event' is only allowed for node role",
     "retryable": false
   },
   "ok": false

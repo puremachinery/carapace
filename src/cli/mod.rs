@@ -5,6 +5,7 @@
 //! - `config show|get|set|path` -- read/write configuration
 //! - `status` -- query a running instance for health info
 //! - `logs` -- tail log entries from a running instance
+//! - `plugins` -- inspect and manage plugins on a running instance
 //! - `version` -- print build/version info
 //! - `backup` -- create a backup archive of all gateway data
 //! - `restore` -- restore from a backup archive
@@ -87,6 +88,10 @@ pub enum Command {
         #[arg(long)]
         allow_plaintext: bool,
     },
+
+    /// Inspect and manage plugins on a running instance.
+    #[command(subcommand)]
+    Plugins(PluginsCommand),
 
     /// Print version, build date, and git commit information.
     Version,
@@ -260,6 +265,168 @@ pub enum TlsCommand {
         /// Directory containing the cluster CA files.
         #[arg(long)]
         ca_dir: Option<String>,
+    },
+}
+
+#[derive(clap::Args, Debug, Clone)]
+pub struct WsConnectionArgs {
+    /// Port of the running instance (default: from config or 18789).
+    #[arg(short, long)]
+    port: Option<u16>,
+
+    /// Host of the running instance.
+    #[arg(long, default_value = "127.0.0.1")]
+    host: String,
+
+    /// Use TLS (wss://) for remote connections.
+    #[arg(long)]
+    tls: bool,
+
+    /// Accept invalid TLS certificates (only with --tls).
+    #[arg(long)]
+    trust: bool,
+
+    /// Allow plaintext ws:// for non-loopback hosts (unsafe).
+    #[arg(long)]
+    allow_plaintext: bool,
+}
+
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginSourceSelection {
+    Managed,
+    Config,
+}
+
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginStateSelection {
+    Active,
+    Disabled,
+    Ignored,
+    Failed,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PluginsCommand {
+    /// Show plugin activation state and restart requirements.
+    Status {
+        /// Print JSON instead of human-readable output.
+        #[arg(long)]
+        json: bool,
+
+        /// Filter by configured plugin name.
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Filter by instantiated plugin ID.
+        #[arg(long = "plugin-id")]
+        plugin_id: Option<String>,
+
+        /// Filter by plugin source.
+        #[arg(long, value_enum)]
+        source: Option<PluginSourceSelection>,
+
+        /// Filter by plugin activation state.
+        #[arg(long, value_enum)]
+        state: Option<PluginStateSelection>,
+
+        /// Show only failed plugin entries.
+        #[arg(long)]
+        only_failed: bool,
+
+        /// Exit nonzero if activation errors exist or filtered results are not all active.
+        #[arg(long)]
+        strict: bool,
+
+        #[command(flatten)]
+        connection: WsConnectionArgs,
+    },
+
+    /// List managed plugin binaries present on disk.
+    Bins {
+        /// Print JSON instead of human-readable output.
+        #[arg(long)]
+        json: bool,
+
+        #[command(flatten)]
+        connection: WsConnectionArgs,
+    },
+
+    /// Install a managed plugin.
+    #[command(group(
+        clap::ArgGroup::new("source")
+            .required(true)
+            .multiple(false)
+            .args(["url", "file"])
+    ))]
+    Install {
+        /// Managed plugin name.
+        name: String,
+
+        /// Download URL for the plugin artifact.
+        #[arg(long, group = "source")]
+        url: Option<String>,
+
+        /// Local plugin artifact to copy into the managed plugins directory before installing.
+        #[arg(long, group = "source")]
+        file: Option<PathBuf>,
+
+        /// Optional plugin version string.
+        #[arg(long)]
+        version: Option<String>,
+
+        /// Optional publisher public key.
+        #[arg(long = "publisher-key")]
+        publisher_key: Option<String>,
+
+        /// Optional detached plugin signature.
+        #[arg(long)]
+        signature: Option<String>,
+
+        /// Print JSON instead of human-readable output.
+        #[arg(long)]
+        json: bool,
+
+        #[command(flatten)]
+        connection: WsConnectionArgs,
+    },
+
+    /// Update a managed plugin.
+    #[command(group(
+        clap::ArgGroup::new("source")
+            .required(true)
+            .multiple(false)
+            .args(["url", "file"])
+    ))]
+    Update {
+        /// Managed plugin name.
+        name: String,
+
+        /// Download URL for the updated plugin artifact.
+        #[arg(long, group = "source")]
+        url: Option<String>,
+
+        /// Local plugin artifact to copy into the managed plugins directory before updating.
+        #[arg(long, group = "source")]
+        file: Option<PathBuf>,
+
+        /// Optional plugin version string.
+        #[arg(long)]
+        version: Option<String>,
+
+        /// Optional publisher public key.
+        #[arg(long = "publisher-key")]
+        publisher_key: Option<String>,
+
+        /// Optional detached plugin signature.
+        #[arg(long)]
+        signature: Option<String>,
+
+        /// Print JSON instead of human-readable output.
+        #[arg(long)]
+        json: bool,
+
+        #[command(flatten)]
+        connection: WsConnectionArgs,
     },
 }
 
@@ -447,7 +614,7 @@ use getrandom::fill;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, Error as RustlsError, SignatureScheme};
-use serde_json::Value;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 #[cfg(not(test))]
@@ -1078,6 +1245,89 @@ struct LogsTailResponse {
     entries: Vec<LogsTailEntry>,
     #[serde(default)]
     truncated: bool,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginStatusEntry {
+    name: String,
+    #[serde(default)]
+    plugin_id: Option<String>,
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    install_id: Option<Value>,
+    #[serde(default)]
+    requested_at: Option<u64>,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginsStatusResponse {
+    plugins_enabled: bool,
+    configured_plugin_path_count: usize,
+    restart_required_for_changes: bool,
+    activation_error_count: usize,
+    #[serde(default)]
+    plugins: Vec<PluginStatusEntry>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginBinEntry {
+    name: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginsBinsResponse {
+    #[serde(default)]
+    bins: Vec<PluginBinEntry>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginActivationSummary {
+    state: String,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginMutationResponse {
+    name: String,
+    #[serde(default)]
+    version: Option<String>,
+    activation: PluginActivationSummary,
+}
+
+struct PluginStatusCliOptions {
+    connection: WsConnectionArgs,
+    json_output: bool,
+    name: Option<String>,
+    plugin_id: Option<String>,
+    source: Option<PluginSourceSelection>,
+    state: Option<PluginStateSelection>,
+    only_failed: bool,
+    strict: bool,
+}
+
+struct PluginMutationCliOptions {
+    connection: WsConnectionArgs,
+    name: String,
+    url: Option<String>,
+    file: Option<PathBuf>,
+    version: Option<String>,
+    publisher_key: Option<String>,
+    signature: Option<String>,
+    json_output: bool,
 }
 
 pub(crate) type WsStream =
@@ -1753,21 +2003,21 @@ fn extract_pairing_request_id(details: &Value) -> Option<String> {
         .map(|id| id.to_string())
 }
 
-pub async fn handle_logs(
+fn cli_error(message: impl Into<String>) -> Box<dyn std::error::Error> {
+    std::io::Error::other(message.into()).into()
+}
+
+fn validate_cli_ws_transport(
     host: &str,
-    port: Option<u16>,
-    lines: usize,
     tls: bool,
     trust: bool,
     allow_plaintext: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let port = resolve_port(port);
-
     let is_loopback = is_loopback_host(host);
     if !is_loopback && !tls && !allow_plaintext {
-        eprintln!("Remote logs require TLS or explicit plaintext opt-in.");
-        eprintln!("Use --tls for wss:// or pass --allow-plaintext to override.");
-        std::process::exit(1);
+        return Err(cli_error(
+            "remote WebSocket commands require TLS or explicit plaintext opt-in; use --tls or pass --allow-plaintext",
+        ));
     }
     if !is_loopback && !tls && allow_plaintext {
         eprintln!(
@@ -1777,7 +2027,22 @@ pub async fn handle_logs(
     if trust && !tls {
         eprintln!("Warning: --trust has no effect without --tls.");
     }
+    Ok(())
+}
 
+async fn connect_cli_ws_authenticated(
+    connection: &WsConnectionArgs,
+    role: &str,
+    scopes: &[&str],
+) -> Result<(WsWrite, WsRead), Box<dyn std::error::Error>> {
+    validate_cli_ws_transport(
+        &connection.host,
+        connection.tls,
+        connection.trust,
+        connection.allow_plaintext,
+    )?;
+
+    let port = resolve_port(connection.port);
     let auth = resolve_gateway_auth().await;
     if auth.token.is_none() && auth.password.is_none() {
         eprintln!("No gateway auth credentials found.");
@@ -1786,28 +2051,21 @@ pub async fn handle_logs(
 
     let state_dir = resolve_state_dir();
     let device_identity = load_or_create_device_identity(&state_dir).await?;
-
-    let ws_url = if tls {
-        format!("wss://{}:{}/ws", host, port)
+    let ws_url = if connection.tls {
+        format!("wss://{}:{}/ws", connection.host, port)
     } else {
-        format!("ws://{}:{}/ws", host, port)
+        format!("ws://{}:{}/ws", connection.host, port)
     };
-    let ws_stream = match connect_ws(&ws_url, trust).await {
-        Ok(conn) => conn,
-        Err(err) => {
-            eprintln!("Could not connect to carapace at {}:{}", host, port);
-            eprintln!("  Error: {}", err);
-            eprintln!();
-            eprintln!("Is the server running? Start it with: cara start");
-            std::process::exit(1);
-        }
-    };
+    let ws_stream = connect_ws(&ws_url, connection.trust).await.map_err(|err| {
+        cli_error(format!(
+            "could not connect to carapace at {}:{}: {}",
+            connection.host, port, err
+        ))
+    })?;
     let (mut ws_write, mut ws_read) = ws_stream.split();
 
     let nonce = await_connect_challenge(&mut ws_read, &mut ws_write).await?;
-
-    let role = "operator";
-    let scopes = vec!["operator.read".to_string()];
+    let scope_values: Vec<String> = scopes.iter().map(|scope| (*scope).to_string()).collect();
     let mut connect_params = serde_json::json!({
         "minProtocol": 3,
         "maxProtocol": 3,
@@ -1818,7 +2076,7 @@ pub async fn handle_logs(
             "mode": "cli"
         },
         "role": role,
-        "scopes": scopes.clone()
+        "scopes": scope_values.clone()
     });
     let GatewayAuth { token, password } = auth;
     let token_for_signature = token.clone();
@@ -1832,7 +2090,7 @@ pub async fn handle_logs(
         "cli",
         "cli",
         role,
-        &scopes,
+        &scope_values,
         token_for_signature.as_deref(),
         Some(&nonce),
     )?;
@@ -1848,41 +2106,511 @@ pub async fn handle_logs(
         .await?;
 
     if let Err(err) = await_ws_response_with_error(&mut ws_read, &mut ws_write, "connect-1").await {
-        if err.code.as_deref() == Some("NOT_PAIRED") && err.message.contains("pairing required") {
-            eprintln!("Device pairing required for this CLI.");
+        let message = if err.code.as_deref() == Some("NOT_PAIRED")
+            && err.message.contains("pairing required")
+        {
+            let mut message =
+                "device pairing required for this CLI; approve the request in the control UI and retry".to_string();
             if let Some(details) = err.details.as_ref() {
                 if let Some(request_id) = extract_pairing_request_id(details) {
-                    eprintln!("Pairing request ID: {}", request_id);
+                    message.push_str(&format!(" (request ID: {request_id})"));
                 }
             }
-            eprintln!("Approve the request in the control UI, then retry.");
+            message
         } else if err.message.contains("device identity required") {
-            eprintln!("WebSocket connect failed: {}", err.message);
-            eprintln!("This gateway requires a paired device for WebSocket access.");
-            eprintln!("Set gateway.auth.token for local CLI access or use the control UI.");
+            format!(
+                "{}; this gateway requires a paired device for WebSocket access. Set gateway.auth.token for local CLI access or use the control UI",
+                err.message
+            )
         } else {
-            eprintln!("WebSocket connect failed: {}", err.message);
-        }
-        return Err(Box::new(err));
+            err.message.clone()
+        };
+        return Err(cli_error(format!("WebSocket connect failed: {message}")));
     }
 
-    let logs_frame = serde_json::json!({
+    Ok((ws_write, ws_read))
+}
+
+async fn send_cli_ws_request(
+    connection: &WsConnectionArgs,
+    role: &str,
+    scopes: &[&str],
+    method: &str,
+    params: Value,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let (mut ws_write, mut ws_read) =
+        connect_cli_ws_authenticated(connection, role, scopes).await?;
+    let request_id = format!("cli-{}", method.replace('.', "-"));
+    let frame = serde_json::json!({
         "type": "req",
-        "id": "logs-1",
-        "method": "logs.tail",
-        "params": { "limit": lines }
+        "id": request_id,
+        "method": method,
+        "params": params,
     });
     ws_write
-        .send(Message::Text(serde_json::to_string(&logs_frame)?.into()))
+        .send(Message::Text(serde_json::to_string(&frame)?.into()))
         .await?;
+    await_ws_response_with_error(&mut ws_read, &mut ws_write, &request_id)
+        .await
+        .map_err(|err| cli_error(format!("{method} failed: {}", err.message)))
+}
 
-    let payload = match await_ws_response(&mut ws_read, &mut ws_write, "logs-1").await {
-        Ok(payload) => payload,
-        Err(err) => {
-            eprintln!("logs.tail failed: {}", err);
-            std::process::exit(1);
+fn plugin_source_label(source: PluginSourceSelection) -> &'static str {
+    match source {
+        PluginSourceSelection::Managed => "managed",
+        PluginSourceSelection::Config => "config",
+    }
+}
+
+fn plugin_state_label(state: PluginStateSelection) -> &'static str {
+    match state {
+        PluginStateSelection::Active => "active",
+        PluginStateSelection::Disabled => "disabled",
+        PluginStateSelection::Ignored => "ignored",
+        PluginStateSelection::Failed => "failed",
+    }
+}
+
+fn plugin_entry_matches_filters(
+    entry: &PluginStatusEntry,
+    name: Option<&str>,
+    plugin_id: Option<&str>,
+    source: Option<PluginSourceSelection>,
+    state: Option<PluginStateSelection>,
+    only_failed: bool,
+) -> bool {
+    if let Some(name) = name {
+        if entry.name != name {
+            return false;
         }
+    }
+    if let Some(plugin_id) = plugin_id {
+        if entry.plugin_id.as_deref() != Some(plugin_id) {
+            return false;
+        }
+    }
+    if let Some(source) = source {
+        if entry.source.as_deref() != Some(plugin_source_label(source)) {
+            return false;
+        }
+    }
+    if let Some(state) = state {
+        if entry.state.as_deref() != Some(plugin_state_label(state)) {
+            return false;
+        }
+    }
+    if only_failed && entry.state.as_deref() != Some("failed") {
+        return false;
+    }
+    true
+}
+
+fn maybe_fail_strict_plugin_status(
+    response: &PluginsStatusResponse,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if response.activation_error_count > 0 {
+        return Err(cli_error(format!(
+            "plugin activation errors reported: {}",
+            response.activation_error_count
+        )));
+    }
+    if response.plugins.is_empty() {
+        return Err(cli_error("no matching plugins found"));
+    }
+    let non_active = response
+        .plugins
+        .iter()
+        .filter(|entry| entry.state.as_deref() != Some("active"))
+        .map(|entry| entry.name.as_str())
+        .collect::<Vec<_>>();
+    if !non_active.is_empty() {
+        return Err(cli_error(format!(
+            "one or more matching plugins are not active: {}",
+            non_active.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+fn print_plugin_status_human(response: &PluginsStatusResponse) {
+    println!("Plugin status");
+    println!("=============");
+    println!("  Plugins enabled: {}", response.plugins_enabled);
+    println!(
+        "  Configured plugin paths: {}",
+        response.configured_plugin_path_count
+    );
+    println!(
+        "  Restart required for changes: {}",
+        response.restart_required_for_changes
+    );
+    println!("  Activation errors: {}", response.activation_error_count);
+    println!();
+
+    if response.plugins.is_empty() {
+        println!("No matching plugins found.");
+        return;
+    }
+
+    for entry in &response.plugins {
+        let state = entry.state.as_deref().unwrap_or("unknown");
+        let source = entry.source.as_deref().unwrap_or("-");
+        let enabled = entry.enabled.unwrap_or(true);
+        let plugin_id = entry.plugin_id.as_deref().unwrap_or("-");
+        println!(
+            "{} [{}] {} (enabled: {}, pluginId: {})",
+            entry.name, source, state, enabled, plugin_id
+        );
+        if let Some(reason) = entry.reason.as_deref().filter(|reason| !reason.is_empty()) {
+            println!("  reason: {}", reason);
+        }
+    }
+}
+
+fn print_plugin_bins_human(response: &PluginsBinsResponse) {
+    if response.bins.is_empty() {
+        println!("No managed plugin binaries found.");
+        return;
+    }
+    let mut names = response
+        .bins
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    for name in names {
+        println!("{}", name);
+    }
+}
+
+fn validate_local_plugin_artifact(
+    file: &Path,
+    bytes: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    crate::plugins::loader::validate_plugin_component_bytes(&file.display().to_string(), bytes)
+        .map_err(|error| {
+            cli_error(format!(
+                "invalid plugin component '{}': {}",
+                file.display(),
+                error
+            ))
+        })
+}
+
+fn copy_plugin_file_into_managed_dir(
+    connection: &WsConnectionArgs,
+    name: &str,
+    file: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !is_loopback_host(&connection.host) {
+        return Err(cli_error(
+            "--file is only supported for loopback targets; use --url for remote plugin management",
+        ));
+    }
+
+    let metadata = std::fs::metadata(file).map_err(|err| {
+        cli_error(format!(
+            "failed to stat plugin file '{}': {}",
+            file.display(),
+            err
+        ))
+    })?;
+    if !metadata.is_file() {
+        return Err(cli_error(format!(
+            "plugin file '{}' is not a regular file",
+            file.display()
+        )));
+    }
+    let bytes = std::fs::read(file).map_err(|err| {
+        cli_error(format!(
+            "failed to read plugin file '{}': {}",
+            file.display(),
+            err
+        ))
+    })?;
+    validate_local_plugin_artifact(file, &bytes)?;
+
+    let managed_plugins_dir = resolve_state_dir().join("plugins");
+    std::fs::create_dir_all(&managed_plugins_dir).map_err(|err| {
+        cli_error(format!(
+            "failed to create managed plugins directory '{}': {}",
+            managed_plugins_dir.display(),
+            err
+        ))
+    })?;
+    let dest = managed_plugins_dir.join(format!("{}.wasm", name));
+    std::fs::write(&dest, &bytes).map_err(|err| {
+        cli_error(format!(
+            "failed to stage plugin file into '{}': {}",
+            dest.display(),
+            err
+        ))
+    })?;
+    Ok(())
+}
+
+fn plugin_mutation_params(
+    name: &str,
+    url: Option<&str>,
+    version: Option<&str>,
+    publisher_key: Option<&str>,
+    signature: Option<&str>,
+) -> Value {
+    let mut params = serde_json::Map::new();
+    params.insert("name".to_string(), Value::String(name.to_string()));
+    if let Some(url) = url {
+        params.insert("url".to_string(), Value::String(url.to_string()));
+    }
+    if let Some(version) = version.filter(|value| !value.trim().is_empty()) {
+        params.insert(
+            "version".to_string(),
+            Value::String(version.trim().to_string()),
+        );
+    }
+    if let Some(publisher_key) = publisher_key.filter(|value| !value.trim().is_empty()) {
+        params.insert(
+            "publisherKey".to_string(),
+            Value::String(publisher_key.trim().to_string()),
+        );
+    }
+    if let Some(signature) = signature.filter(|value| !value.trim().is_empty()) {
+        params.insert(
+            "signature".to_string(),
+            Value::String(signature.trim().to_string()),
+        );
+    }
+    Value::Object(params)
+}
+
+async fn handle_plugins_status_cli(
+    options: PluginStatusCliOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let payload = send_cli_ws_request(
+        &options.connection,
+        "operator",
+        &["operator.read"],
+        "plugins.status",
+        json!({}),
+    )
+    .await?;
+    let mut response: PluginsStatusResponse = serde_json::from_value(payload)?;
+    response.plugins.retain(|entry| {
+        plugin_entry_matches_filters(
+            entry,
+            options.name.as_deref(),
+            options.plugin_id.as_deref(),
+            options.source,
+            options.state,
+            options.only_failed,
+        )
+    });
+
+    if options.json_output {
+        print_pretty_json(&serde_json::to_value(&response)?)?;
+    } else {
+        print_plugin_status_human(&response);
+    }
+
+    if options.strict {
+        maybe_fail_strict_plugin_status(&response)?;
+    }
+    Ok(())
+}
+
+async fn handle_plugins_bins_cli(
+    connection: WsConnectionArgs,
+    json_output: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let payload = send_cli_ws_request(
+        &connection,
+        "operator",
+        &["operator.read"],
+        "plugins.bins",
+        json!({}),
+    )
+    .await?;
+    if json_output {
+        print_pretty_json(&payload)?;
+        return Ok(());
+    }
+    let response: PluginsBinsResponse = serde_json::from_value(payload)?;
+    print_plugin_bins_human(&response);
+    Ok(())
+}
+
+async fn handle_plugins_install_cli(
+    options: PluginMutationCliOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(file) = options.file.as_deref() {
+        copy_plugin_file_into_managed_dir(&options.connection, &options.name, file)?;
+    }
+    let payload = send_cli_ws_request(
+        &options.connection,
+        "operator",
+        &["operator.admin"],
+        "plugins.install",
+        plugin_mutation_params(
+            &options.name,
+            options.url.as_deref(),
+            options.version.as_deref(),
+            options.publisher_key.as_deref(),
+            options.signature.as_deref(),
+        ),
+    )
+    .await?;
+    if options.json_output {
+        print_pretty_json(&payload)?;
+        return Ok(());
+    }
+    let response: PluginMutationResponse = serde_json::from_value(payload)?;
+    println!("Plugin install requested");
+    println!("  Name: {}", response.name);
+    if let Some(version) = response.version.as_deref() {
+        println!("  Version: {}", version);
+    }
+    if let Some(message) = response.activation.message.as_deref() {
+        println!("  Activation: {} ({})", response.activation.state, message);
+    } else {
+        println!("  Activation: {}", response.activation.state);
+    }
+    Ok(())
+}
+
+async fn handle_plugins_update_cli(
+    options: PluginMutationCliOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(file) = options.file.as_deref() {
+        copy_plugin_file_into_managed_dir(&options.connection, &options.name, file)?;
+    }
+    let payload = send_cli_ws_request(
+        &options.connection,
+        "operator",
+        &["operator.admin"],
+        "plugins.update",
+        plugin_mutation_params(
+            &options.name,
+            options.url.as_deref(),
+            options.version.as_deref(),
+            options.publisher_key.as_deref(),
+            options.signature.as_deref(),
+        ),
+    )
+    .await?;
+    if options.json_output {
+        print_pretty_json(&payload)?;
+        return Ok(());
+    }
+    let response: PluginMutationResponse = serde_json::from_value(payload)?;
+    println!("Plugin update requested");
+    println!("  Name: {}", response.name);
+    if let Some(version) = response.version.as_deref() {
+        println!("  Version: {}", version);
+    }
+    if let Some(message) = response.activation.message.as_deref() {
+        println!("  Activation: {} ({})", response.activation.state, message);
+    } else {
+        println!("  Activation: {}", response.activation.state);
+    }
+    Ok(())
+}
+
+pub async fn handle_plugins(command: PluginsCommand) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        PluginsCommand::Status {
+            json,
+            name,
+            plugin_id,
+            source,
+            state,
+            only_failed,
+            strict,
+            connection,
+        } => {
+            handle_plugins_status_cli(PluginStatusCliOptions {
+                connection,
+                json_output: json,
+                name,
+                plugin_id,
+                source,
+                state,
+                only_failed,
+                strict,
+            })
+            .await
+        }
+        PluginsCommand::Bins { json, connection } => {
+            handle_plugins_bins_cli(connection, json).await
+        }
+        PluginsCommand::Install {
+            name,
+            url,
+            file,
+            version,
+            publisher_key,
+            signature,
+            json,
+            connection,
+        } => {
+            handle_plugins_install_cli(PluginMutationCliOptions {
+                connection,
+                name,
+                url,
+                file,
+                version,
+                publisher_key,
+                signature,
+                json_output: json,
+            })
+            .await
+        }
+        PluginsCommand::Update {
+            name,
+            url,
+            file,
+            version,
+            publisher_key,
+            signature,
+            json,
+            connection,
+        } => {
+            handle_plugins_update_cli(PluginMutationCliOptions {
+                connection,
+                name,
+                url,
+                file,
+                version,
+                publisher_key,
+                signature,
+                json_output: json,
+            })
+            .await
+        }
+    }
+}
+
+pub async fn handle_logs(
+    host: &str,
+    port: Option<u16>,
+    lines: usize,
+    tls: bool,
+    trust: bool,
+    allow_plaintext: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let connection = WsConnectionArgs {
+        port,
+        host: host.to_string(),
+        tls,
+        trust,
+        allow_plaintext,
     };
+    let payload = send_cli_ws_request(
+        &connection,
+        "operator",
+        &["operator.read"],
+        "logs.tail",
+        json!({ "limit": lines }),
+    )
+    .await?;
 
     let response: LogsTailResponse = serde_json::from_value(payload)?;
     for entry in response.entries {
@@ -6123,7 +6851,7 @@ pub fn handle_tls_show_ca(ca_dir_opt: Option<&str>) -> Result<(), Box<dyn std::e
 mod tests {
     use super::*;
     use crate::runtime_bridge::{run_sync_blocking, CURRENT_THREAD_RUNTIME_MESSAGE};
-    use crate::test_support::env::ScopedEnv;
+    use crate::test_support::{env::ScopedEnv, plugins::tool_plugin_component_bytes};
     use clap::Parser;
     use ed25519_dalek::{Signature, VerifyingKey};
     use std::collections::VecDeque;
@@ -6295,6 +7023,214 @@ mod tests {
             }
             other => panic!("Expected Logs, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_cli_plugins_status_defaults() {
+        let cli = Cli::try_parse_from(["cara", "plugins", "status"]).unwrap();
+        match cli.command {
+            Some(Command::Plugins(PluginsCommand::Status {
+                json,
+                name,
+                plugin_id,
+                source,
+                state,
+                only_failed,
+                strict,
+                connection,
+            })) => {
+                assert!(!json);
+                assert_eq!(name, None);
+                assert_eq!(plugin_id, None);
+                assert_eq!(source, None);
+                assert_eq!(state, None);
+                assert!(!only_failed);
+                assert!(!strict);
+                assert_eq!(connection.port, None);
+                assert_eq!(connection.host, "127.0.0.1");
+                assert!(!connection.tls);
+                assert!(!connection.trust);
+                assert!(!connection.allow_plaintext);
+            }
+            other => panic!("Expected Plugins(Status), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_plugins_status_filters() {
+        let cli = Cli::try_parse_from([
+            "cara",
+            "plugins",
+            "status",
+            "--plugin-id",
+            "demo.tool",
+            "--source",
+            "managed",
+            "--state",
+            "failed",
+            "--only-failed",
+            "--strict",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Plugins(PluginsCommand::Status {
+                plugin_id,
+                source,
+                state,
+                only_failed,
+                strict,
+                ..
+            })) => {
+                assert_eq!(plugin_id.as_deref(), Some("demo.tool"));
+                assert_eq!(source, Some(PluginSourceSelection::Managed));
+                assert_eq!(state, Some(PluginStateSelection::Failed));
+                assert!(only_failed);
+                assert!(strict);
+            }
+            other => panic!("Expected Plugins(Status), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_plugins_bins_defaults() {
+        let cli = Cli::try_parse_from(["cara", "plugins", "bins"]).unwrap();
+        match cli.command {
+            Some(Command::Plugins(PluginsCommand::Bins { json, connection })) => {
+                assert!(!json);
+                assert_eq!(connection.port, None);
+                assert_eq!(connection.host, "127.0.0.1");
+            }
+            other => panic!("Expected Plugins(Bins), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_plugins_install_with_file() {
+        let cli = Cli::try_parse_from([
+            "cara",
+            "plugins",
+            "install",
+            "demo-plugin",
+            "--file",
+            "./demo.wasm",
+            "--version",
+            "1.2.3",
+            "--publisher-key",
+            "pubkey",
+            "--signature",
+            "sig",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Plugins(PluginsCommand::Install {
+                name,
+                url,
+                file,
+                version,
+                publisher_key,
+                signature,
+                ..
+            })) => {
+                assert_eq!(name, "demo-plugin");
+                assert_eq!(url, None);
+                assert_eq!(file, Some(PathBuf::from("./demo.wasm")));
+                assert_eq!(version.as_deref(), Some("1.2.3"));
+                assert_eq!(publisher_key.as_deref(), Some("pubkey"));
+                assert_eq!(signature.as_deref(), Some("sig"));
+            }
+            other => panic!("Expected Plugins(Install), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_plugins_install_requires_exactly_one_source() {
+        let err = Cli::try_parse_from([
+            "cara",
+            "plugins",
+            "install",
+            "demo-plugin",
+            "--url",
+            "https://example.com/demo.wasm",
+            "--file",
+            "./demo.wasm",
+        ])
+        .unwrap_err();
+        let rendered = err.to_string();
+        assert!(rendered.contains("--url"));
+        assert!(rendered.contains("--file"));
+    }
+
+    #[test]
+    fn test_cli_plugins_update_with_url() {
+        let cli = Cli::try_parse_from([
+            "cara",
+            "plugins",
+            "update",
+            "demo-plugin",
+            "--url",
+            "https://example.com/demo.wasm",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Plugins(PluginsCommand::Update {
+                name,
+                url,
+                file,
+                json,
+                ..
+            })) => {
+                assert_eq!(name, "demo-plugin");
+                assert_eq!(url.as_deref(), Some("https://example.com/demo.wasm"));
+                assert_eq!(file, None);
+                assert!(json);
+            }
+            other => panic!("Expected Plugins(Update), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_copy_plugin_file_into_managed_dir_requires_loopback_host() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let plugin_path = temp.path().join("demo.wasm");
+        std::fs::write(&plugin_path, tool_plugin_component_bytes()).unwrap();
+        let connection = WsConnectionArgs {
+            port: Some(18789),
+            host: "10.0.0.12".to_string(),
+            tls: true,
+            trust: false,
+            allow_plaintext: false,
+        };
+
+        let err = copy_plugin_file_into_managed_dir(&connection, "demo", &plugin_path).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("--file is only supported for loopback"));
+    }
+
+    #[test]
+    fn test_copy_plugin_file_into_managed_dir_stages_file() {
+        let mut env_guard = ScopedEnv::new();
+        let temp = tempfile::TempDir::new().unwrap();
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
+
+        let plugin_path = temp.path().join("demo-input.wasm");
+        std::fs::write(&plugin_path, tool_plugin_component_bytes()).unwrap();
+        let connection = WsConnectionArgs {
+            port: Some(18789),
+            host: "127.0.0.1".to_string(),
+            tls: false,
+            trust: false,
+            allow_plaintext: false,
+        };
+
+        copy_plugin_file_into_managed_dir(&connection, "demo-plugin", &plugin_path).unwrap();
+        let staged = temp.path().join("plugins").join("demo-plugin.wasm");
+        assert!(staged.is_file());
+        assert_eq!(
+            std::fs::read(staged).unwrap(),
+            tool_plugin_component_bytes()
+        );
     }
 
     #[test]

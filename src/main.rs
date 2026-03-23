@@ -75,6 +75,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             allow_plaintext,
         }) => cli::handle_logs(&host, port, lines, tls, trust, allow_plaintext).await,
 
+        Some(Command::Plugins(sub)) => cli::handle_plugins(sub).await,
+
         Some(Command::Version) => {
             cli::handle_version();
             Ok(())

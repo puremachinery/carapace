@@ -81,6 +81,78 @@ Remote hosts require TLS or explicit plaintext opt-in:
 - `--trust` — accept invalid TLS certs (only with `--tls`)
 - `--allow-plaintext` — permit `ws://` on non-loopback hosts (unsafe; warns)
 
+### `cara plugins`
+Inspect runtime plugin status and manage installed plugins.
+
+#### `cara plugins status`
+Fetch plugin activation state via WebSocket (`plugins.status`).
+
+```bash
+cara plugins status --strict
+```
+
+Useful flags:
+- `--json` — print JSON instead of human-readable output
+- `--name <name>` — filter by configured plugin name
+- `--plugin-id <id>` — filter by instantiated plugin ID
+- `--source <managed|config>` — filter by activation source
+- `--state <active|disabled|ignored|failed>` — filter by activation state
+- `--only-failed` — show only failed plugin entries
+- `--strict` — exit nonzero if activation errors exist, the filtered result is empty, or any returned plugin is not `active`
+
+#### `cara plugins bins`
+List managed plugin binaries tracked on disk (`plugins.bins`).
+
+```bash
+cara plugins bins
+```
+
+Use `--json` to print the raw response payload.
+
+#### `cara plugins install`
+Install a managed plugin (`plugins.install`).
+
+```bash
+cara plugins install demo-plugin --url https://example.com/demo-plugin.wasm
+```
+
+Local file workflow:
+
+```bash
+cara plugins install demo-plugin --file ./target/wasm32-wasip1/release/demo_plugin.wasm
+```
+
+Options:
+- exactly one of `--url <url>` or `--file <path>` is required
+- `--version <version>` — optional version string stored in the managed manifest
+- `--publisher-key <key>` — optional publisher key to record with the managed artifact
+- `--signature <signature>` — optional detached signature to record with the managed artifact
+- `--json` — print the raw response payload
+
+Notes:
+- `--file` is local-only and stages the file into `state_dir/plugins/<name>.wasm` before calling `plugins.install`
+- `--file` is intended for direct loopback targets; SSH port-forwarded remotes are not a supported workflow
+- managed plugin installs still require a Carapace restart before activation
+- remote hosts use the same TLS/plaintext flags as `cara logs`
+
+#### `cara plugins update`
+Update a managed plugin (`plugins.update`).
+
+```bash
+cara plugins update demo-plugin --url https://example.com/demo-plugin.wasm
+```
+
+Local file workflow:
+
+```bash
+cara plugins update demo-plugin --file ./target/wasm32-wasip1/release/demo_plugin.wasm
+```
+
+`cara plugins update` accepts the same flags as `cara plugins install`.
+If `--file` is used, the CLI stages the file into `state_dir/plugins/<name>.wasm`
+and the server adopts that managed artifact on update. Managed plugin updates
+still require restart before the new artifact becomes active.
+
 ### `cara chat`
 Start an interactive chat REPL (`chat.send` over WebSocket).
 

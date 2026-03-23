@@ -151,8 +151,7 @@ fn normalize_ws_request<'a>(method: &'a str, params: Option<&Value>) -> (&'a str
 /// These methods can ONLY be called by node connections.
 /// Non-node roles are explicitly blocked from calling these.
 /// This matches Node.js gateway behavior in src/gateway/server-methods.ts.
-pub(super) const NODE_ONLY_METHODS: [&str; 3] =
-    ["node.invoke.result", "node.event", "plugins.bins"];
+pub(super) const NODE_ONLY_METHODS: [&str; 2] = ["node.invoke.result", "node.event"];
 
 /// Methods that require operator.admin scope for operator role
 ///
@@ -237,6 +236,7 @@ const READ_METHODS: &[&str] = &[
     "models.list",
     "agents.list",
     "plugins.status",
+    "plugins.bins",
     "cron.status",
     "cron.list",
     "cron.runs",

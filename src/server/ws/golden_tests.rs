@@ -88,26 +88,6 @@ mod golden_trace {
         }
     }
 
-    /// Create a node connection context for node-only methods.
-    fn node_conn() -> ConnectionContext {
-        ConnectionContext {
-            conn_id: "test-node-conn".to_string(),
-            role: "node".to_string(),
-            scopes: vec![],
-            client: ClientInfo {
-                id: "node-host".to_string(),
-                version: "1.0.0".to_string(),
-                platform: "test".to_string(),
-                mode: "node".to_string(),
-                display_name: None,
-                device_family: None,
-                model_identifier: None,
-                instance_id: None,
-            },
-            device_id: Some("node-test-1".to_string()),
-        }
-    }
-
     /// Register a connection so handlers that inspect connection state work.
     fn register_conn(state: &WsServerState, conn: &ConnectionContext) {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -509,11 +489,10 @@ mod golden_trace {
 
     golden_test!(golden_plugins_status, "plugins.status", json!({}));
 
-    /// `plugins.bins` is a node-only method; use a node connection.
     #[tokio::test]
     async fn golden_plugins_bins() {
         let (_guard, state) = test_state();
-        let conn = node_conn();
+        let conn = admin_conn();
         register_conn(&state, &conn);
         let result = dispatch_method("plugins.bins", Some(&json!({})), &state, &conn).await;
         let normalized = normalize_for_snapshot(&result);
@@ -564,7 +543,7 @@ mod golden_trace {
         let (_guard, state) = test_state();
         let conn = admin_conn(); // admin, not node
         register_conn(&state, &conn);
-        let result = dispatch_method("plugins.bins", Some(&json!({})), &state, &conn).await;
+        let result = dispatch_method("node.event", Some(&json!({})), &state, &conn).await;
         let normalized = normalize_for_snapshot(&result);
         insta::assert_json_snapshot!("golden_node_only_method_forbidden", normalized);
     }

@@ -639,6 +639,7 @@ fn test_method_authorization_read_methods() {
         "config.get",
         "sessions.list",
         "channels.status",
+        "plugins.bins",
     ];
 
     for method in read_methods {

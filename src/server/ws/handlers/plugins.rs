@@ -132,6 +132,71 @@ fn validate_plugin_wasm_size(size_bytes: u64, source: &str) -> Result<(), ErrorS
     Ok(())
 }
 
+fn adopt_existing_managed_plugin_wasm(
+    local_wasm_path: &Path,
+) -> Result<(PathBuf, String), ErrorShape> {
+    let mut local_wasm = match std::fs::File::open(local_wasm_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(error_shape(
+                ERROR_INVALID_REQUEST,
+                "url is required unless a matching local WASM already exists in the managed plugins directory",
+                None,
+            ));
+        }
+        Err(error) => {
+            return Err(error_shape(
+                ERROR_UNAVAILABLE,
+                &format!(
+                    "failed to open existing plugin binary at '{}': {}",
+                    local_wasm_path.display(),
+                    error
+                ),
+                None,
+            ));
+        }
+    };
+    let wasm_metadata = local_wasm.metadata().map_err(|e| {
+        error_shape(
+            ERROR_UNAVAILABLE,
+            &format!(
+                "failed to stat existing plugin binary at '{}': {}",
+                local_wasm_path.display(),
+                e
+            ),
+            None,
+        )
+    })?;
+    if !wasm_metadata.is_file() {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            &format!(
+                "existing plugin binary at '{}' is not a regular file",
+                local_wasm_path.display()
+            ),
+            None,
+        ));
+    }
+    validate_plugin_wasm_size(wasm_metadata.len(), "existing managed plugin binary")?;
+    let mut wasm_bytes = Vec::new();
+    local_wasm.read_to_end(&mut wasm_bytes).map_err(|e| {
+        error_shape(
+            ERROR_UNAVAILABLE,
+            &format!(
+                "failed to read existing plugin binary at '{}': {}",
+                local_wasm_path.display(),
+                e
+            ),
+            None,
+        )
+    })?;
+    validate_plugin_wasm_bytes(&wasm_bytes, "existing managed plugin binary")?;
+    Ok((
+        local_wasm_path.to_path_buf(),
+        compute_sha256_hex(&wasm_bytes),
+    ))
+}
+
 /// Validate that a URL string is a well-formed HTTP or HTTPS URL.
 fn validate_url(raw: &str) -> Result<url::Url, ErrorShape> {
     let parsed = url::Url::parse(raw)
@@ -858,66 +923,8 @@ fn handle_plugins_install_inner(
         let (dest, wasm_bytes) = download_plugin_wasm(&parsed_url, plugins_dir, &wasm_file_name)?;
         (Some(dest), Some(compute_sha256_hex(&wasm_bytes)))
     } else {
-        let mut local_wasm = match std::fs::File::open(&local_wasm_path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(error_shape(
-                    ERROR_INVALID_REQUEST,
-                    "url is required unless a matching local WASM already exists in the managed plugins directory",
-                    None,
-                ));
-            }
-            Err(error) => {
-                return Err(error_shape(
-                    ERROR_UNAVAILABLE,
-                    &format!(
-                        "failed to open existing plugin binary at '{}': {}",
-                        local_wasm_path.display(),
-                        error
-                    ),
-                    None,
-                ));
-            }
-        };
-        let wasm_metadata = local_wasm.metadata().map_err(|e| {
-            error_shape(
-                ERROR_UNAVAILABLE,
-                &format!(
-                    "failed to stat existing plugin binary at '{}': {}",
-                    local_wasm_path.display(),
-                    e
-                ),
-                None,
-            )
-        })?;
-        if !wasm_metadata.is_file() {
-            return Err(error_shape(
-                ERROR_INVALID_REQUEST,
-                &format!(
-                    "existing plugin binary at '{}' is not a regular file",
-                    local_wasm_path.display()
-                ),
-                None,
-            ));
-        }
-        validate_plugin_wasm_size(wasm_metadata.len(), "existing managed plugin binary")?;
-        let mut wasm_bytes = Vec::new();
-        local_wasm.read_to_end(&mut wasm_bytes).map_err(|e| {
-            error_shape(
-                ERROR_UNAVAILABLE,
-                &format!(
-                    "failed to read existing plugin binary at '{}': {}",
-                    local_wasm_path.display(),
-                    e
-                ),
-                None,
-            )
-        })?;
-        validate_plugin_wasm_bytes(&wasm_bytes, "existing managed plugin binary")?;
-        (
-            Some(local_wasm_path.clone()),
-            Some(compute_sha256_hex(&wasm_bytes)),
-        )
+        let (path, hash) = adopt_existing_managed_plugin_wasm(&local_wasm_path)?;
+        (Some(path), Some(hash))
     };
 
     // Record metadata in the plugins manifest
@@ -1057,22 +1064,20 @@ fn handle_plugins_update_inner(
         }
     }
 
-    // URL is required to perform an actual update (download new version)
-    let url_str = match url_str {
-        Some(u) => u,
-        None => {
-            return Err(error_shape(
-                ERROR_INVALID_REQUEST,
-                "no update source available: url is required to update a plugin",
-                None,
-            ));
-        }
-    };
-
-    let parsed_url = validate_url(url_str)?;
     let wasm_file_name = format!("{}.wasm", name);
-    let (dest, wasm_bytes) = download_plugin_wasm(&parsed_url, plugins_dir, &wasm_file_name)?;
-    let wasm_hash = compute_sha256_hex(&wasm_bytes);
+    let local_wasm_path = plugins_dir.join(&wasm_file_name);
+    let (dest, wasm_hash, source_url) = if let Some(url_str) = url_str {
+        let parsed_url = validate_url(url_str)?;
+        let (dest, wasm_bytes) = download_plugin_wasm(&parsed_url, plugins_dir, &wasm_file_name)?;
+        (
+            dest,
+            compute_sha256_hex(&wasm_bytes),
+            Some(url_str.to_string()),
+        )
+    } else {
+        let (dest, wasm_hash) = adopt_existing_managed_plugin_wasm(&local_wasm_path)?;
+        (dest, wasm_hash, None)
+    };
     let updated_at = now_ms();
 
     // Update the manifest entry
@@ -1097,7 +1102,9 @@ fn handle_plugins_update_inner(
     if let Some(ref sig) = signature {
         entry_obj.insert("signature".to_string(), Value::String(sig.clone()));
     }
-    entry_obj.insert("url".to_string(), Value::String(url_str.to_string()));
+    if let Some(source_url) = source_url {
+        entry_obj.insert("url".to_string(), Value::String(source_url));
+    }
     write_plugins_manifest(plugins_dir, &manifest)?;
 
     Ok(json!({
@@ -2242,7 +2249,7 @@ mod tests {
     }
 
     #[test]
-    fn test_update_no_url_returns_error() {
+    fn test_update_adopts_existing_local_wasm_without_url() {
         let dir = TempDir::new().unwrap();
         // Pre-create a manifest entry so the plugin is "installed"
         let manifest = json!({
@@ -2253,12 +2260,19 @@ mod tests {
             }
         });
         write_plugins_manifest(dir.path(), &manifest).unwrap();
+        let wasm_bytes = tool_plugin_component_bytes();
+        std::fs::write(dir.path().join("my-plugin.wasm"), &wasm_bytes).unwrap();
 
         let params = json!({ "name": "my-plugin" });
         let result = handle_plugins_update_inner(Some(&params), dir.path());
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.message.contains("no update source available"));
+        assert!(result.is_ok(), "expected local adoption update to succeed");
+        let value = result.unwrap();
+        assert_eq!(value["ok"], Value::Bool(true));
+        assert_eq!(value["name"], Value::String("my-plugin".to_string()));
+        assert_eq!(
+            value["activation"]["state"],
+            Value::String("restart-required".to_string())
+        );
     }
 
     #[test]
@@ -2269,16 +2283,36 @@ mod tests {
         let wasm_bytes = tool_plugin_component_bytes();
         std::fs::write(dir.path().join("disk-plugin.wasm"), &wasm_bytes).unwrap();
 
-        // No URL provided, so it should fail with "no update source" (not "not installed")
+        // No URL provided, but an existing managed binary on disk should be accepted.
         let params = json!({ "name": "disk-plugin" });
+        let result = handle_plugins_update_inner(Some(&params), dir.path());
+        assert!(
+            result.is_ok(),
+            "expected update to adopt the existing local binary"
+        );
+        let value = result.unwrap();
+        assert_eq!(value["ok"], Value::Bool(true));
+        assert_eq!(value["name"], Value::String("disk-plugin".to_string()));
+    }
+
+    #[test]
+    fn test_update_without_url_requires_matching_local_wasm() {
+        let dir = TempDir::new().unwrap();
+        let manifest = json!({
+            "missing-wasm": {
+                "name": "missing-wasm",
+                "installed_at": 1700000000000u64
+            }
+        });
+        write_plugins_manifest(dir.path(), &manifest).unwrap();
+
+        let params = json!({ "name": "missing-wasm" });
         let result = handle_plugins_update_inner(Some(&params), dir.path());
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(
-            err.message.contains("no update source"),
-            "expected 'no update source' but got: {}",
-            err.message
-        );
+        assert!(err
+            .message
+            .contains("url is required unless a matching local WASM already exists"));
     }
 
     #[test]
