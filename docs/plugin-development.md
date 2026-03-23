@@ -101,8 +101,9 @@ your day-to-day dev load path.
 2. Put the built `.wasm` file in a dedicated local plugin directory.
 3. Add that directory to `plugins.load.paths`.
 4. Add any plugin-local config under `plugins.<plugin-id>.*`.
-5. Restart Carapace.
-6. Check `skills.status` and server logs to confirm activation.
+5. Start or restart Carapace.
+6. Check plugin activation in logs first, then verify the structured state with
+   `skills.status`.
 
 Recommended config shape:
 
@@ -123,6 +124,23 @@ Recommended config shape:
 }
 ```
 
+Concrete inner loop:
+
+```sh
+mkdir -p /absolute/path/to/dev-plugins
+cargo component build --release
+cp target/wasm32-wasip2/release/my_plugin.wasm /absolute/path/to/dev-plugins/
+cara start --port 18789
+cara logs -n 200 --port 18789
+```
+
+On each edit/build cycle:
+
+1. rebuild the component
+2. copy the new `.wasm` into your dev plugin directory
+3. restart Carapace
+4. check logs again
+
 Important behavior:
 
 - `plugins.enabled = false` disables both managed skill activation and
@@ -132,6 +150,32 @@ Important behavior:
 - Activation changes require restart.
 - `skills.status` reports activation state, restart requirements, and sanitized
   failure counts. Use server logs for detailed filesystem/runtime diagnostics.
+
+## Verifying activation
+
+Use two checks together:
+
+1. **Fast smoke check via logs**
+
+   ```sh
+   cara logs -n 200 --port 18789
+   ```
+
+   Look for your plugin ID or activation failures in the recent log output.
+
+2. **Structured status via `skills.status`**
+
+   `skills.status` is a WebSocket method, not a dedicated CLI subcommand today.
+   Use the Control UI or another WebSocket client if you need the structured
+   activation state. A successful load should show your plugin entry with:
+
+   - `name`: your configured skill or plugin name
+   - `pluginId`: your plugin manifest ID
+   - `state`: typically `active`
+   - `reason`: `null` when activation succeeded
+
+   If `state` is `failed` or `ignored`, use the paired server logs for the full
+   local diagnostic detail.
 
 ## Managed installs and distribution
 
