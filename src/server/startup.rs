@@ -1045,8 +1045,9 @@ mod tests {
     async fn bootstrap_plugin_runtime_respects_plugins_enabled_false() {
         let temp = tempfile::tempdir().expect("temp dir");
         let cfg = json!({
-            "plugins": { "enabled": false, "load": { "paths": [temp.path().join("dev").to_string_lossy()] } },
-            "skills": {
+            "plugins": {
+                "enabled": false,
+                "load": { "paths": [temp.path().join("dev").to_string_lossy()] },
                 "entries": {
                     "alpha": {
                         "enabled": true,
@@ -1090,10 +1091,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bootstrap_plugin_runtime_reports_missing_manifest_for_managed_skill() {
+    async fn bootstrap_plugin_runtime_reports_missing_manifest_for_managed_plugin() {
         let temp = tempfile::tempdir().expect("temp dir");
         let cfg = json!({
-            "skills": {
+            "plugins": {
                 "entries": {
                     "alpha": { "enabled": true }
                 }
@@ -1109,18 +1110,18 @@ mod tests {
         assert_eq!(alpha.state, PluginActivationState::Failed);
         assert_eq!(
             alpha.reason.as_deref(),
-            Some("missing manifest entry in skills-manifest.json")
+            Some("missing manifest entry in plugins-manifest.json")
         );
     }
 
     #[tokio::test]
     async fn bootstrap_plugin_runtime_reports_invalid_manifest_parse_error() {
         let temp = tempfile::tempdir().expect("temp dir");
-        let managed_dir = temp.path().join("skills");
+        let managed_dir = temp.path().join("plugins");
         std::fs::create_dir_all(&managed_dir).expect("create managed dir");
-        std::fs::write(managed_dir.join("skills-manifest.json"), "{invalid-json").unwrap();
+        std::fs::write(managed_dir.join("plugins-manifest.json"), "{invalid-json").unwrap();
         let cfg = json!({
-            "skills": {
+            "plugins": {
                 "entries": {
                     "alpha": { "enabled": true }
                 }
@@ -1137,14 +1138,14 @@ mod tests {
         assert_eq!(alpha.state, PluginActivationState::Failed);
         assert_eq!(
             alpha.reason.as_deref(),
-            Some("managed skills manifest is invalid; fix skills-manifest.json and restart")
+            Some("managed plugins manifest is invalid; fix plugins-manifest.json and restart")
         );
     }
 
     #[tokio::test]
     async fn bootstrap_plugin_runtime_ignores_stray_managed_wasm_files() {
         let temp = tempfile::tempdir().expect("temp dir");
-        write_minimal_wasm(&temp.path().join("skills"), "rogue");
+        write_minimal_wasm(&temp.path().join("plugins"), "rogue");
 
         let result = bootstrap_plugin_runtime(&json!({}), temp.path()).await;
         let report = result.activation_report;
@@ -1157,7 +1158,7 @@ mod tests {
         assert!(entry
             .reason
             .as_deref()
-            .is_some_and(|reason| reason.contains("not declared in skills.entries")));
+            .is_some_and(|reason| reason.contains("not declared in plugins.entries")));
     }
 
     #[tokio::test]
@@ -1183,10 +1184,10 @@ mod tests {
     #[tokio::test]
     async fn bootstrap_plugin_runtime_skips_unpinned_managed_manifest_entries() {
         let temp = tempfile::tempdir().expect("temp dir");
-        let managed_dir = temp.path().join("skills");
+        let managed_dir = temp.path().join("plugins");
         write_minimal_wasm(&managed_dir, "alpha");
         std::fs::write(
-            managed_dir.join("skills-manifest.json"),
+            managed_dir.join("plugins-manifest.json"),
             json!({
                 "alpha": {
                     "path": managed_dir.join("alpha.wasm").to_string_lossy().to_string()
@@ -1196,7 +1197,7 @@ mod tests {
         )
         .expect("write manifest");
         let cfg = json!({
-            "skills": {
+            "plugins": {
                 "entries": {
                     "alpha": { "enabled": true }
                 }
@@ -1212,19 +1213,19 @@ mod tests {
         assert_eq!(entry.state, PluginActivationState::Failed);
         assert_eq!(
             entry.reason.as_deref(),
-            Some("managed skill is missing a pinned sha256 in skills-manifest.json")
+            Some("managed plugin is missing a pinned sha256 in plugins-manifest.json")
         );
     }
 
     #[tokio::test]
     async fn bootstrap_plugin_runtime_rejects_managed_paths_outside_managed_dir() {
         let temp = tempfile::tempdir().expect("temp dir");
-        let managed_dir = temp.path().join("skills");
+        let managed_dir = temp.path().join("plugins");
         let outside_dir = temp.path().join("outside");
         let outside_path = write_minimal_wasm(&outside_dir, "alpha");
         std::fs::create_dir_all(&managed_dir).expect("create managed dir");
         std::fs::write(
-            managed_dir.join("skills-manifest.json"),
+            managed_dir.join("plugins-manifest.json"),
             json!({
                 "alpha": {
                     "path": outside_path.to_string_lossy().to_string(),
@@ -1235,7 +1236,7 @@ mod tests {
         )
         .expect("write manifest");
         let cfg = json!({
-            "skills": {
+            "plugins": {
                 "entries": {
                     "alpha": { "enabled": true }
                 }
@@ -1258,11 +1259,11 @@ mod tests {
     #[tokio::test]
     async fn bootstrap_plugin_runtime_resolves_relative_manifest_paths_under_managed_dir() {
         let temp = tempfile::tempdir().expect("temp dir");
-        let managed_dir = temp.path().join("skills");
+        let managed_dir = temp.path().join("plugins");
         let component_bytes = tool_plugin_component_bytes();
         let wasm_path = write_wasm_bytes(&managed_dir, "alpha", &component_bytes);
         std::fs::write(
-            managed_dir.join("skills-manifest.json"),
+            managed_dir.join("plugins-manifest.json"),
             json!({
                 "alpha": {
                     "path": "alpha.wasm",
@@ -1273,7 +1274,7 @@ mod tests {
         )
         .expect("write manifest");
         let cfg = json!({
-            "skills": {
+            "plugins": {
                 "signature": {
                     "enabled": false,
                     "requireSignature": false
@@ -1306,13 +1307,13 @@ mod tests {
     #[tokio::test]
     async fn bootstrap_plugin_runtime_activates_valid_managed_tool_component() {
         let temp = tempfile::tempdir().expect("temp dir");
-        let managed_dir = temp.path().join("skills");
+        let managed_dir = temp.path().join("plugins");
         let component_bytes = tool_plugin_component_bytes();
         let wasm_path = write_wasm_bytes(&managed_dir, "alpha", &component_bytes);
         let signing_key = test_signing_key();
         let signature = sign_wasm_bytes(&component_bytes, &signing_key);
         std::fs::write(
-            managed_dir.join("skills-manifest.json"),
+            managed_dir.join("plugins-manifest.json"),
             json!({
                 "alpha": {
                     "path": wasm_path.to_string_lossy().to_string(),
@@ -1338,7 +1339,7 @@ mod tests {
         assert_eq!(loaded.manifest.kind, PluginKind::Tool);
 
         let cfg = json!({
-            "skills": {
+            "plugins": {
                 "sandbox": { "enabled": false },
                 "entries": {
                     "alpha": { "enabled": true }
@@ -1378,11 +1379,11 @@ mod tests {
     #[tokio::test]
     async fn bootstrap_plugin_runtime_reports_managed_sha256_mismatch() {
         let temp = tempfile::tempdir().expect("temp dir");
-        let managed_dir = temp.path().join("skills");
+        let managed_dir = temp.path().join("plugins");
         let component_bytes = tool_plugin_component_bytes();
         let wasm_path = write_wasm_bytes(&managed_dir, "alpha", &component_bytes);
         std::fs::write(
-            managed_dir.join("skills-manifest.json"),
+            managed_dir.join("plugins-manifest.json"),
             json!({
                 "alpha": {
                     "path": wasm_path.to_string_lossy().to_string(),
@@ -1394,7 +1395,7 @@ mod tests {
         .expect("write manifest");
 
         let cfg = json!({
-            "skills": {
+            "plugins": {
                 "sandbox": { "enabled": false },
                 "entries": {
                     "alpha": { "enabled": true }
@@ -1421,7 +1422,7 @@ mod tests {
         assert!(entry
             .reason
             .as_deref()
-            .is_some_and(|reason| reason.contains("Skill hash verification failed")));
+            .is_some_and(|reason| reason.contains("Plugin hash verification failed")));
     }
 
     #[tokio::test]
@@ -1434,9 +1435,7 @@ mod tests {
             "plugins": {
                 "load": {
                     "paths": [config_dir.to_string_lossy().to_string()]
-                }
-            },
-            "skills": {
+                },
                 "signature": {
                     "enabled": false,
                     "requireSignature": false
@@ -1485,9 +1484,7 @@ mod tests {
             "plugins": {
                 "load": {
                     "paths": [config_dir.to_string_lossy().to_string()]
-                }
-            },
-            "skills": {
+                },
                 "signature": {
                     "enabled": false,
                     "requireSignature": false
@@ -1513,12 +1510,12 @@ mod tests {
     #[tokio::test]
     async fn bootstrap_plugin_runtime_ignores_wasm_named_directories_in_managed_dir() {
         let temp = tempfile::tempdir().expect("temp dir");
-        let managed_dir = temp.path().join("skills");
+        let managed_dir = temp.path().join("plugins");
         let component_bytes = tool_plugin_component_bytes();
         let wasm_path = write_wasm_bytes(&managed_dir, "alpha", &component_bytes);
         std::fs::create_dir_all(managed_dir.join("fake.wasm")).expect("create fake wasm directory");
         std::fs::write(
-            managed_dir.join("skills-manifest.json"),
+            managed_dir.join("plugins-manifest.json"),
             json!({
                 "alpha": {
                     "path": wasm_path.to_string_lossy().to_string(),
@@ -1529,7 +1526,7 @@ mod tests {
         )
         .expect("write manifest");
         let cfg = json!({
-            "skills": {
+            "plugins": {
                 "signature": {
                     "enabled": false,
                     "requireSignature": false
@@ -1553,13 +1550,13 @@ mod tests {
     #[test]
     fn load_plugin_candidate_reports_duplicate_plugin_ids_across_sources() {
         let temp = tempfile::tempdir().expect("temp dir");
-        let managed_dir = temp.path().join("skills");
+        let managed_dir = temp.path().join("plugins");
         let config_dir = temp.path().join("config-plugins");
         let managed_bytes = tool_plugin_component_bytes();
         let managed_path = write_wasm_bytes(&managed_dir, "alpha", &managed_bytes);
         let config_path = write_wasm_bytes(&config_dir, "alpha", &managed_bytes);
         std::fs::write(
-            managed_dir.join("skills-manifest.json"),
+            managed_dir.join("plugins-manifest.json"),
             json!({
                 "alpha": {
                     "path": managed_path.to_string_lossy().to_string(),

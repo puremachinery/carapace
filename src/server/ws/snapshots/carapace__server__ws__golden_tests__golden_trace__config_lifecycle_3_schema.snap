@@ -38,7 +38,6 @@ expression: normalized
       "talk",
       "gateway",
       "usage",
-      "skills",
       "plugins",
       "anthropic",
       "sessions",
@@ -160,9 +159,6 @@ expression: normalized
         "type": "object"
       },
       "signal": {
-        "type": "object"
-      },
-      "skills": {
         "type": "object"
       },
       "slack": {

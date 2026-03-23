@@ -124,7 +124,6 @@ For a plain-English guide to the most commonly tuned sections, see
 - `canvasHost` – canvas host server settings
 - `talk` – TTS/voice settings
 - `gateway` – service settings
-- `skills` – skills registry settings
 - `plugins` – plugin load/allowlist/config
 - `filesystem` – root-scoped filesystem tool registration and limits
 - `anthropic` – Anthropic provider settings (apiKey, baseUrl)
@@ -158,7 +157,7 @@ This is a condensed map; refer to the JSON schema for full detail.
 - `browser`
   - `enabled`, `controlUrl`, `cdpUrl`, `profiles` (names must match `/^[a-z0-9-]+$/`)
 - `plugins`
-  - `enabled`, `allow`, `deny`, `load.paths`, `slots`, `entries`, `installs`
+  - `enabled`, `allow`, `deny`, `load.paths`, `entries`, `sandbox`, `signature`, `installs`
 - `filesystem`
   - `enabled`, `roots`, `writeAccess`, `maxReadBytes`, `excludePatterns`
 - `auth`
@@ -192,9 +191,6 @@ This is a condensed map; refer to the JSON schema for full detail.
   - `level`, `format`, `consoleStyle`, `redactSensitive`
 - `cron`
   - `enabled`, `maxConcurrentRuns`, `entries[]`
-- `skills`
-  - `sandbox.enabled`, `sandbox.defaults.{allowHttp,allowCredentials,allowMedia}`
-  - `signature.enabled`, `signature.requireSignature`, `signature.trustedPublishers`
 - `usage`
   - `pricing.default` – fallback pricing (`inputCostPerMTok`, `outputCostPerMTok`)
   - `pricing.overrides[]` – per-model overrides (`match`, `matchType`, `inputCostPerMTok`, `outputCostPerMTok`)

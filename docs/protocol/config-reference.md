@@ -380,8 +380,8 @@ Enable Carapace to listen and respond on external chat platforms.
     - `format`: `"text"` or `"json"`.
     - `consoleStyle`: String. Current default is `"pretty"`.
     - `redactSensitive`: `"tools"` (Default).
-- **`skills.sandbox`** and **`skills.signature`**
-  - *What it does:* Controls sandboxing and signature policy for downloaded skills/plugins.
+- **`plugins.sandbox`** and **`plugins.signature`**
+  - *What it does:* Controls sandboxing and signature policy for downloaded plugins.
   - *Common values:*
     - `sandbox.enabled`: `true` or `false`.
     - `sandbox.defaults.allowHttp`, `allowCredentials`, `allowMedia`: `true` or `false`.
@@ -405,10 +405,10 @@ Enable Carapace to listen and respond on external chat platforms.
     - `enabled`: `true` or `false`.
     - `load.paths`: Array of explicit dev/advanced plugin directories.
   - *Notes:*
-    - Managed skill installs live under `state_dir/skills` and are activated on restart.
-    - Managed skill installs require `skills-manifest.json` entries with pinned `sha256` values.
-    - `plugins.load.paths` is an explicit dev/advanced path and does not use the managed-skill manifest `sha256` pinning flow; treat those directories as trusted local inputs.
-    - `plugins.enabled = false` disables both managed skill activation and configured `load.paths`.
+    - Managed plugin installs live under `state_dir/plugins` and are activated on restart.
+    - Managed plugin installs require `plugins-manifest.json` entries with pinned `sha256` values.
+    - `plugins.load.paths` is an explicit dev/advanced path and does not use the managed plugin manifest `sha256` pinning flow; treat those directories as trusted local inputs.
+    - `plugins.enabled = false` disables both managed plugin activation and configured `load.paths`.
     - Plugin components must target the current WIT package namespace `carapace:plugin@1.0.0`.
 - **`messages`**
   - *What it does:* Messaging behavior defaults.

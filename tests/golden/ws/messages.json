@@ -115,9 +115,9 @@
         "methods": ["channels.status", "channels.logout", "talk.mode"],
         "description": "Messaging channel management"
       },
-      "models_skills": {
-        "methods": ["models.list", "skills.status", "skills.bins", "skills.install", "skills.update"],
-        "description": "Model and skill management"
+      "models_plugins": {
+        "methods": ["models.list", "plugins.status", "plugins.bins", "plugins.install", "plugins.update"],
+        "description": "Model and plugin management"
       },
       "nodes": {
         "methods": ["node.pair.request", "node.pair.list", "node.pair.approve", "node.pair.reject", "node.pair.verify", "node.rename", "node.list", "node.describe", "node.invoke", "node.invoke.result", "node.event"],
@@ -180,10 +180,10 @@
       "talk.mode",
       "models.list",
       "agents.list",
-      "skills.status",
-      "skills.bins",
-      "skills.install",
-      "skills.update",
+      "plugins.status",
+      "plugins.bins",
+      "plugins.install",
+      "plugins.update",
       "update.run",
       "voicewake.get",
       "voicewake.set",

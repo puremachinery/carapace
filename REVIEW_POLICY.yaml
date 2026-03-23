@@ -127,7 +127,7 @@ review_types:
         - "**/signature*"
         - "**/loader*"
         - "**/runtime*"
-        - "**/skills*"
+        - "**/plugins*"
 
     dependencies:
       description: "CVEs in dependencies, supply chain risks, outdated packages"

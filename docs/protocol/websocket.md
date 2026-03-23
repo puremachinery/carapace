@@ -265,18 +265,18 @@ Compatibility aliases:
 - `talk.configure` - Configure talk settings (VAD threshold, silence timeout)
 - `talk.devices` - List available audio devices
 
-### Models & Skills
+### Models & Plugins
 - `models.list` - List available models
 - `agents.list` - List available agents
-- `skills.status` - Get skills status, activation state, restart requirements, and sanitized activation issue counts
-- `skills.bins` - List skill binaries
-- `skills.install` - Install a skill
-- `skills.update` - Update skills
+- `plugins.status` - Get plugin status, activation state, restart requirements, and sanitized activation issue counts
+- `plugins.bins` - List managed plugin binaries
+- `plugins.install` - Install a managed plugin
+- `plugins.update` - Update managed plugins
 
-`skills.status` intentionally avoids returning raw plugin filesystem paths and
+`plugins.status` intentionally avoids returning raw plugin filesystem paths and
 verbatim startup I/O errors. It reports activation state, restart requirements,
-sanitized per-skill reasons, and aggregate counts instead. `activationErrorCount`
-includes both bootstrap-level activation errors and per-skill entries whose
+sanitized per-plugin reasons, and aggregate counts instead. `activationErrorCount`
+includes both bootstrap-level activation errors and per-plugin entries whose
 state is `failed`. Use server logs for detailed local filesystem diagnostics.
 
 ### Updates

@@ -12,8 +12,8 @@ mod exec;
 mod logs;
 mod misc;
 mod node;
+mod plugins;
 pub(crate) mod sessions;
-mod skills;
 mod system;
 mod talk;
 mod tts;
@@ -30,8 +30,8 @@ pub(super) use exec::*;
 use logs::*;
 use misc::*;
 pub(super) use node::*;
+use plugins::*;
 pub(super) use sessions::*;
-use skills::*;
 use system::*;
 pub(super) use talk::*;
 pub(super) use tts::*;
@@ -151,11 +151,12 @@ fn normalize_ws_request<'a>(method: &'a str, params: Option<&Value>) -> (&'a str
 /// These methods can ONLY be called by node connections.
 /// Non-node roles are explicitly blocked from calling these.
 /// This matches Node.js gateway behavior in src/gateway/server-methods.ts.
-pub(super) const NODE_ONLY_METHODS: [&str; 3] = ["node.invoke.result", "node.event", "skills.bins"];
+pub(super) const NODE_ONLY_METHODS: [&str; 3] =
+    ["node.invoke.result", "node.event", "plugins.bins"];
 
 /// Methods that require operator.admin scope for operator role
 ///
-/// Per Node.js gateway: config.*, wizard.*, update.*, skills.install/update,
+/// Per Node.js gateway: config.*, wizard.*, update.*, plugins.install/update,
 /// channels.logout, sessions.*, and cron.* require operator.admin for operators.
 const OPERATOR_ADMIN_REQUIRED_METHODS: [&str; 43] = [
     "config.get",
@@ -196,8 +197,8 @@ const OPERATOR_ADMIN_REQUIRED_METHODS: [&str; 43] = [
     "update.dismiss",
     "update.releaseNotes",
     // Skills
-    "skills.install",
-    "skills.update",
+    "plugins.install",
+    "plugins.update",
     // Cron
     "cron.add",
     "cron.update",
@@ -235,7 +236,7 @@ const READ_METHODS: &[&str] = &[
     "talk.devices",
     "models.list",
     "agents.list",
-    "skills.status",
+    "plugins.status",
     "cron.status",
     "cron.list",
     "cron.runs",
@@ -299,8 +300,8 @@ const WRITE_METHODS: &[&str] = &[
     "talk.start",
     "talk.stop",
     "talk.configure",
-    "skills.install",
-    "skills.update",
+    "plugins.install",
+    "plugins.update",
     "update.run",
     "update.check",
     "update.setChannel",
@@ -507,7 +508,7 @@ pub(super) fn check_method_authorization(
 /// Check operator authorization with scope-based access control
 ///
 /// Per Node.js gateway:
-/// - operator.admin required for: config.*, wizard.*, update.*, skills.install/update, channels.logout
+/// - operator.admin required for: config.*, wizard.*, update.*, plugins.install/update, channels.logout
 /// - operator.pairing allows: device pairing methods (without needing operator.admin)
 /// - operator.approvals allows: exec approval methods (without needing operator.admin)
 /// - operator.write required for write-level methods
@@ -876,13 +877,13 @@ pub(super) async fn dispatch_method(
         "talk.configure" => handle_talk_configure(params),
         "talk.devices" => handle_talk_devices(),
 
-        // Models/agents/skills
+        // Models/agents/plugins
         "models.list" => handle_models_list(),
         "agents.list" => handle_agents_list(),
-        "skills.status" => handle_skills_status(state),
-        "skills.bins" => handle_skills_bins(),
-        "skills.install" => handle_skills_install(params),
-        "skills.update" => handle_skills_update(params),
+        "plugins.status" => handle_plugins_status(state),
+        "plugins.bins" => handle_plugins_bins(),
+        "plugins.install" => handle_plugins_install(params),
+        "plugins.update" => handle_plugins_update(params),
 
         // Update (async)
         "update.run" => handle_update_run(params).await,

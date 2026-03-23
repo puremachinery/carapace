@@ -5,7 +5,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use crate::credentials;
-use crate::plugins::loader::{load_skills_manifest, LoaderError};
+use crate::plugins::loader::{load_plugins_manifest, LoaderError};
 use crate::plugins::permissions::PermissionConfig;
 use crate::plugins::sandbox::SandboxConfig;
 use crate::plugins::signature::SignatureConfig;
@@ -88,7 +88,7 @@ pub(crate) struct PluginBootstrapResult {
 }
 
 #[derive(Debug, Clone)]
-struct ManagedSkillConfigEntry {
+struct ManagedPluginConfigEntry {
     name: String,
     enabled: bool,
     requested_at: Option<u64>,
@@ -130,22 +130,22 @@ pub(crate) fn configured_plugin_paths(cfg: &Value) -> Vec<PathBuf> {
 }
 
 fn plugin_signature_config_from_config(cfg: &Value) -> SignatureConfig {
-    cfg.pointer("/skills/signature")
+    cfg.pointer("/plugins/signature")
         .cloned()
         .and_then(|value| serde_json::from_value(value).ok())
         .unwrap_or_default()
 }
 
 fn plugin_sandbox_config_from_config(cfg: &Value) -> SandboxConfig {
-    cfg.pointer("/skills/sandbox")
+    cfg.pointer("/plugins/sandbox")
         .cloned()
         .and_then(|value| serde_json::from_value(value).ok())
         .unwrap_or_default()
 }
 
-fn managed_skill_config_entries(cfg: &Value) -> Vec<ManagedSkillConfigEntry> {
+fn managed_plugin_config_entries(cfg: &Value) -> Vec<ManagedPluginConfigEntry> {
     let Some(entries) = cfg
-        .pointer("/skills/entries")
+        .pointer("/plugins/entries")
         .and_then(|value| value.as_object())
     else {
         return Vec::new();
@@ -153,7 +153,7 @@ fn managed_skill_config_entries(cfg: &Value) -> Vec<ManagedSkillConfigEntry> {
 
     let mut managed = entries
         .iter()
-        .map(|(name, entry)| ManagedSkillConfigEntry {
+        .map(|(name, entry)| ManagedPluginConfigEntry {
             name: name.clone(),
             enabled: entry
                 .get("enabled")
@@ -185,11 +185,11 @@ fn canonical_prefix(path: &Path) -> Result<PathBuf, String> {
         Ok(canonical) => Ok(canonical),
         // If the managed directory does not exist yet, fail closed by comparing against
         // the raw path. Any candidate under that directory still has to canonicalize
-        // successfully in `resolve_managed_skill_path`, which cannot happen while the
+        // successfully in `resolve_managed_plugin_path`, which cannot happen while the
         // parent directory is absent.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(path.to_path_buf()),
         Err(error) => Err(format!(
-            "failed to resolve managed skills directory {}: {error}",
+            "failed to resolve managed plugin directory {}: {error}",
             path.display()
         )),
     }
@@ -200,36 +200,38 @@ fn canonicalize_existing_path(path: &Path) -> Result<PathBuf, String> {
         .map_err(|error| format!("failed to resolve {}: {error}", path.display()))
 }
 
-fn resolve_managed_skill_path(
+fn resolve_managed_plugin_path(
     managed_dir: &Path,
     manifest: &Value,
-    entry: &ManagedSkillConfigEntry,
+    entry: &ManagedPluginConfigEntry,
 ) -> Result<PathBuf, String> {
     let manifest_entry = manifest
         .get(&entry.name)
-        .ok_or_else(|| "missing manifest entry in skills-manifest.json".to_string())?;
+        .ok_or_else(|| "missing manifest entry in plugins-manifest.json".to_string())?;
 
     if manifest_entry
         .get("sha256")
         .and_then(|value| value.as_str())
         .is_none()
     {
-        return Err("managed skill is missing a pinned sha256 in skills-manifest.json".to_string());
+        return Err(
+            "managed plugin is missing a pinned sha256 in plugins-manifest.json".to_string(),
+        );
     }
 
     let path = manifest_entry_path(manifest_entry, managed_dir, &entry.name);
     let canonical_managed_dir = canonical_prefix(managed_dir)?;
     let canonical_path = canonicalize_existing_path(&path)?;
     if !canonical_path.starts_with(&canonical_managed_dir) {
-        return Err("managed skill path escapes the managed skills directory".to_string());
+        return Err("managed plugin path escapes the managed plugin directory".to_string());
     }
 
     let stem = canonical_path
         .file_stem()
         .and_then(|value| value.to_str())
-        .ok_or_else(|| "managed skill path has no valid UTF-8 file stem".to_string())?;
+        .ok_or_else(|| "managed plugin path has no valid UTF-8 file stem".to_string())?;
     if stem != entry.name {
-        return Err("managed skill artifact name does not match the configured entry".to_string());
+        return Err("managed plugin artifact name does not match the configured entry".to_string());
     }
 
     Ok(canonical_path)
@@ -335,11 +337,11 @@ struct BlockingPluginBootstrapResult {
 }
 
 fn discover_and_load_plugins(cfg: Value, state_dir: PathBuf) -> BlockingPluginBootstrapResult {
-    let managed_dir = state_dir.join("skills");
+    let managed_dir = state_dir.join("plugins");
     let configured_paths = configured_plugin_paths(&cfg);
     let plugins_enabled = plugins_globally_enabled(&cfg);
     let mut report = PluginActivationReport::empty(configured_paths.clone(), plugins_enabled);
-    let managed_entries = managed_skill_config_entries(&cfg);
+    let managed_entries = managed_plugin_config_entries(&cfg);
 
     if !plugins_enabled {
         for entry in managed_entries {
@@ -397,7 +399,7 @@ fn discover_and_load_plugins(cfg: Value, state_dir: PathBuf) -> BlockingPluginBo
         );
     }
 
-    let (manifest, manifest_error) = match load_skills_manifest(&managed_dir) {
+    let (manifest, manifest_error) = match load_plugins_manifest(&managed_dir) {
         Ok(Some(manifest)) => (manifest, None),
         Ok(None) => (Value::Object(Default::default()), None),
         Err(error) => {
@@ -405,7 +407,7 @@ fn discover_and_load_plugins(cfg: Value, state_dir: PathBuf) -> BlockingPluginBo
             (
                 Value::Object(Default::default()),
                 Some(
-                    "managed skills manifest is invalid; fix skills-manifest.json and restart"
+                    "managed plugins manifest is invalid; fix plugins-manifest.json and restart"
                         .to_string(),
                 ),
             )
@@ -432,7 +434,7 @@ fn discover_and_load_plugins(cfg: Value, state_dir: PathBuf) -> BlockingPluginBo
         if !entry.enabled {
             activation_entry.state = PluginActivationState::Disabled;
             activation_entry.reason =
-                Some("managed skill is disabled in skills.entries".to_string());
+                Some("managed plugin is disabled in plugins.entries".to_string());
             report.entries.push(activation_entry);
             continue;
         }
@@ -444,7 +446,7 @@ fn discover_and_load_plugins(cfg: Value, state_dir: PathBuf) -> BlockingPluginBo
             continue;
         }
 
-        let wasm_path = match resolve_managed_skill_path(&managed_dir, &manifest, &entry) {
+        let wasm_path = match resolve_managed_plugin_path(&managed_dir, &manifest, &entry) {
             Ok(path) => path,
             Err(reason) => {
                 activation_entry.state = PluginActivationState::Failed;
@@ -494,7 +496,7 @@ fn discover_and_load_plugins(cfg: Value, state_dir: PathBuf) -> BlockingPluginBo
                 install_id: None,
                 state: PluginActivationState::Ignored,
                 reason: Some(
-                    "WASM file is present in the managed skills directory but not declared in skills.entries"
+                    "WASM file is present in the managed plugin directory but not declared in plugins.entries"
                         .to_string(),
                 ),
             });

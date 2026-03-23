@@ -40,7 +40,7 @@ impl std::fmt::Display for WasmCapability {
     }
 }
 
-/// Per-skill capability policy.
+/// Per-plugin capability policy.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CapabilityPolicy {
     /// Allow HTTP fetch operations.
@@ -61,10 +61,10 @@ pub struct SandboxConfig {
     /// Defaults to `true` so the sandbox is active unless explicitly disabled.
     #[serde(default = "sandbox_enabled_default")]
     pub enabled: bool,
-    /// Default policy for skills without explicit overrides.
+    /// Default policy for plugins without explicit overrides.
     #[serde(default)]
     pub defaults: CapabilityPolicy,
-    /// Per-skill overrides (keyed by skill name).
+    /// Per-plugin overrides (keyed by plugin name).
     #[serde(default)]
     pub overrides: HashMap<String, CapabilityPolicy>,
 }
@@ -187,13 +187,13 @@ pub fn enumerate_capabilities(component: &Component, engine: &Engine) -> Discove
     DiscoveredCapabilities { capabilities }
 }
 
-/// Check whether a skill's discovered capabilities are allowed by the sandbox policy.
+/// Check whether a plugin's discovered capabilities are allowed by the sandbox policy.
 ///
 /// Config and Logging are always allowed.
 /// Returns `Ok(())` if all capabilities are permitted, or `Err(denied)` with
 /// the list of denied capabilities.
 pub fn check_capabilities(
-    skill_name: &str,
+    plugin_name: &str,
     discovered: &DiscoveredCapabilities,
     config: &SandboxConfig,
 ) -> Result<(), Vec<WasmCapability>> {
@@ -201,7 +201,10 @@ pub fn check_capabilities(
         return Ok(());
     }
 
-    let policy = config.overrides.get(skill_name).unwrap_or(&config.defaults);
+    let policy = config
+        .overrides
+        .get(plugin_name)
+        .unwrap_or(&config.defaults);
 
     let mut denied = Vec::new();
 
@@ -303,7 +306,7 @@ mod tests {
         };
         let config = SandboxConfig::default();
 
-        let result = check_capabilities("test-skill", &discovered, &config);
+        let result = check_capabilities("test-plugin", &discovered, &config);
         assert!(result.is_err());
         let denied = result.unwrap_err();
         assert!(denied.contains(&WasmCapability::Http));
@@ -325,7 +328,7 @@ mod tests {
             overrides: HashMap::new(),
         };
 
-        let result = check_capabilities("test-skill", &discovered, &config);
+        let result = check_capabilities("test-plugin", &discovered, &config);
         assert!(result.is_ok());
     }
 
@@ -336,7 +339,7 @@ mod tests {
         };
         let config = SandboxConfig::default();
 
-        let result = check_capabilities("test-skill", &discovered, &config);
+        let result = check_capabilities("test-plugin", &discovered, &config);
         assert!(result.is_ok());
     }
 
@@ -347,18 +350,18 @@ mod tests {
         };
         let config = SandboxConfig::default();
 
-        let result = check_capabilities("test-skill", &discovered, &config);
+        let result = check_capabilities("test-plugin", &discovered, &config);
         assert!(result.is_ok());
     }
 
     #[test]
-    fn test_check_capabilities_per_skill_override() {
+    fn test_check_capabilities_per_plugin_override() {
         let discovered = DiscoveredCapabilities {
             capabilities: vec![WasmCapability::Http],
         };
         let mut overrides = HashMap::new();
         overrides.insert(
-            "my-skill".to_string(),
+            "my-plugin".to_string(),
             CapabilityPolicy {
                 allow_http: true,
                 allow_credentials: false,
@@ -371,10 +374,10 @@ mod tests {
             overrides,
         };
 
-        // my-skill has HTTP allowed
-        assert!(check_capabilities("my-skill", &discovered, &config).is_ok());
-        // other-skill uses defaults (HTTP denied)
-        assert!(check_capabilities("other-skill", &discovered, &config).is_err());
+        // my-plugin has HTTP allowed
+        assert!(check_capabilities("my-plugin", &discovered, &config).is_ok());
+        // other-plugin uses defaults (HTTP denied)
+        assert!(check_capabilities("other-plugin", &discovered, &config).is_err());
     }
 
     // ==================== Disabled Config ====================
@@ -393,7 +396,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = check_capabilities("any-skill", &discovered, &config);
+        let result = check_capabilities("any-plugin", &discovered, &config);
         assert!(result.is_ok());
     }
 
@@ -413,7 +416,7 @@ mod tests {
     fn test_sandbox_config_serde_roundtrip() {
         let mut overrides = HashMap::new();
         overrides.insert(
-            "web-skill".to_string(),
+            "web-plugin".to_string(),
             CapabilityPolicy {
                 allow_http: true,
                 allow_credentials: false,
@@ -433,8 +436,8 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let parsed: SandboxConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.enabled, config.enabled);
-        assert!(parsed.overrides.contains_key("web-skill"));
-        assert!(parsed.overrides["web-skill"].allow_http);
+        assert!(parsed.overrides.contains_key("web-plugin"));
+        assert!(parsed.overrides["web-plugin"].allow_http);
     }
 
     #[test]
@@ -454,7 +457,7 @@ mod tests {
             capabilities: Vec::new(),
         };
         let config = SandboxConfig::default();
-        assert!(check_capabilities("any-skill", &discovered, &config).is_ok());
+        assert!(check_capabilities("any-plugin", &discovered, &config).is_ok());
     }
 
     // ==================== Mixed Allowed/Denied ====================
@@ -478,7 +481,7 @@ mod tests {
             overrides: HashMap::new(),
         };
 
-        let result = check_capabilities("test-skill", &discovered, &config);
+        let result = check_capabilities("test-plugin", &discovered, &config);
         assert!(result.is_err());
         let denied = result.unwrap_err();
         assert_eq!(denied, vec![WasmCapability::Media]);

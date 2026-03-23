@@ -31,17 +31,17 @@ features:
       - "src/server/ws/golden_tests.rs::golden_logs_tail"
       - "src/server/ws/snapshots/carapace__server__ws__golden_tests__golden_trace__golden_logs_tail.snap"
 
-  - feature: "skills.status"
+  - feature: "plugins.status"
     status: "verified_done"
     runtime_wiring:
-      - "src/server/ws/handlers/skills.rs::handle_skills_status"
+      - "src/server/ws/handlers/plugins.rs::handle_plugins_status"
       - "src/server/ws/handlers/mod.rs (dispatch + READ_METHODS)"
       - "src/server/startup.rs::build_ws_state_with_runtime_dependencies (attaches plugin activation report)"
       - "src/server/ws/mod.rs::WsServerState::with_plugin_activation_report"
     tests:
-      - "src/server/ws/handlers/skills.rs::test_handle_skills_status_uses_plugin_activation_report"
-      - "src/server/ws/golden_tests.rs::golden_skills_status"
-      - "src/server/ws/snapshots/carapace__server__ws__golden_tests__golden_trace__golden_skills_status.snap"
+      - "src/server/ws/handlers/plugins.rs::test_handle_plugins_status_uses_plugin_activation_report"
+      - "src/server/ws/golden_tests.rs::golden_plugins_status"
+      - "src/server/ws/snapshots/carapace__server__ws__golden_tests__golden_trace__golden_plugins_status.snap"
 
   - feature: "channels.telegram/discord/slack runtime wiring"
     status: "verified_done"
@@ -686,8 +686,8 @@ features:
       - "src/server/plugin_bootstrap.rs::bootstrap_plugin_runtime"
       - "src/main.rs::run_server (shared startup wiring)"
       - "src/cli/chat.rs::handle_chat_command (embedded startup wiring)"
-      - "src/server/ws/handlers/skills.rs::handle_skills_install_inner (restart-required activation response)"
-      - "src/server/ws/handlers/skills.rs::handle_skills_update_inner (restart-required activation response)"
+      - "src/server/ws/handlers/plugins.rs::handle_plugins_install_inner (restart-required activation response)"
+      - "src/server/ws/handlers/plugins.rs::handle_plugins_update_inner (restart-required activation response)"
     tests:
       - "src/server/startup.rs::bootstrap_plugin_runtime_respects_plugins_enabled_false"
       - "src/server/startup.rs::bootstrap_plugin_runtime_reports_missing_manifest_for_managed_skill"
@@ -697,7 +697,7 @@ features:
       - "src/server/startup.rs::bootstrap_plugin_runtime_activates_valid_config_path_tool_component"
       - "src/server/startup.rs::load_plugin_candidate_reports_duplicate_plugin_ids_across_sources"
       - "src/server/startup.rs::build_ws_state_with_runtime_dependencies_attaches_plugin_activation_report"
-      - "src/server/ws/handlers/skills.rs::test_install_reports_restart_required_activation"
+      - "src/server/ws/handlers/plugins.rs::test_install_reports_restart_required_activation"
 
   - feature: "plugins.credential isolation"
     status: "verified_done"

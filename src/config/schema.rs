@@ -56,7 +56,6 @@ const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "talk",
     "gateway",
     "usage",
-    "skills",
     "plugins",
     "anthropic",
     "sessions",
@@ -116,8 +115,8 @@ pub fn validate_schema(config: &Value) -> Vec<SchemaIssue> {
     validate_cron(obj, &mut issues);
     validate_prompt_guard(obj, &mut issues);
     validate_output_sanitizer(obj, &mut issues);
-    validate_skills_signature(obj, &mut issues);
-    validate_skills_sandbox(obj, &mut issues);
+    validate_plugins_signature(obj, &mut issues);
+    validate_plugins_sandbox(obj, &mut issues);
     validate_plugins(obj, &mut issues);
     validate_session_integrity(obj, &mut issues);
     validate_usage(obj, &mut issues);
@@ -757,9 +756,9 @@ fn validate_output_sanitizer(obj: &serde_json::Map<String, Value>, issues: &mut 
     }
 }
 
-fn validate_skills_signature(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIssue>) {
+fn validate_plugins_signature(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIssue>) {
     let sig = match obj
-        .get("skills")
+        .get("plugins")
         .and_then(|s| s.get("signature"))
         .and_then(|v| v.as_object())
     {
@@ -771,7 +770,7 @@ fn validate_skills_signature(obj: &serde_json::Map<String, Value>, issues: &mut 
         if !enabled.is_boolean() {
             issues.push(SchemaIssue {
                 severity: Severity::Error,
-                path: ".skills.signature.enabled".to_string(),
+                path: ".plugins.signature.enabled".to_string(),
                 message: "enabled must be a boolean".to_string(),
             });
         }
@@ -781,7 +780,7 @@ fn validate_skills_signature(obj: &serde_json::Map<String, Value>, issues: &mut 
         if !require.is_boolean() {
             issues.push(SchemaIssue {
                 severity: Severity::Error,
-                path: ".skills.signature.requireSignature".to_string(),
+                path: ".plugins.signature.requireSignature".to_string(),
                 message: "requireSignature must be a boolean".to_string(),
             });
         }
@@ -791,16 +790,16 @@ fn validate_skills_signature(obj: &serde_json::Map<String, Value>, issues: &mut 
         if !publishers.is_array() {
             issues.push(SchemaIssue {
                 severity: Severity::Warning,
-                path: ".skills.signature.trustedPublishers".to_string(),
+                path: ".plugins.signature.trustedPublishers".to_string(),
                 message: "trustedPublishers must be an array".to_string(),
             });
         }
     }
 }
 
-fn validate_skills_sandbox(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIssue>) {
+fn validate_plugins_sandbox(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIssue>) {
     let sandbox = match obj
-        .get("skills")
+        .get("plugins")
         .and_then(|s| s.get("sandbox"))
         .and_then(|v| v.as_object())
     {
@@ -812,7 +811,7 @@ fn validate_skills_sandbox(obj: &serde_json::Map<String, Value>, issues: &mut Ve
         if !enabled.is_boolean() {
             issues.push(SchemaIssue {
                 severity: Severity::Error,
-                path: ".skills.sandbox.enabled".to_string(),
+                path: ".plugins.sandbox.enabled".to_string(),
                 message: "enabled must be a boolean".to_string(),
             });
         }
@@ -824,7 +823,7 @@ fn validate_skills_sandbox(obj: &serde_json::Map<String, Value>, issues: &mut Ve
                 if !val.is_boolean() {
                     issues.push(SchemaIssue {
                         severity: Severity::Error,
-                        path: format!(".skills.sandbox.defaults.{}", key),
+                        path: format!(".plugins.sandbox.defaults.{}", key),
                         message: format!("{} must be a boolean", key),
                     });
                 }

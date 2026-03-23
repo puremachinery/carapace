@@ -166,13 +166,13 @@ const GATEWAY_METHODS: [&str; 123] = [
     "talk.stop",
     "talk.configure",
     "talk.devices",
-    // Models/agents/skills
+    // Models/agents/plugins
     "models.list",
     "agents.list",
-    "skills.status",
-    "skills.bins",
-    "skills.install",
-    "skills.update",
+    "plugins.status",
+    "plugins.bins",
+    "plugins.install",
+    "plugins.update",
     // Update
     "update.run",
     "update.status",

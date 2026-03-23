@@ -22,7 +22,7 @@ pub const WIZARD_TYPES: [&str; 6] = [
     "channel",
     "agent",
     "provider",
-    "skill",
+    "plugin",
     "migration",
 ];
 
