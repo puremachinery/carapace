@@ -383,8 +383,9 @@ Important behavior:
   `plugins.load.paths`
 - `plugins.load.paths` is trusted local input
 - never place untrusted `.wasm` files in a `plugins.load.paths` directory;
-  plugins loaded from those paths can read plugin-scoped config and credentials
-  and can make outbound HTTP or media requests on your behalf
+  plugins loaded from those paths can always read their plugin-scoped config,
+  while access to credentials and outbound HTTP or media requests depends on
+  `plugins.sandbox.*` and is denied by default unless you enable it
 - there is no hot reload
 - plugin activation changes require restart
 - `cara plugins status --json` is the easiest way to inspect the full structured
