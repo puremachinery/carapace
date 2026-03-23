@@ -13,7 +13,10 @@ and not test(bootstrap_plugin_runtime_activates_valid_config_path_tool_component
 
 [profile.golden]
 inherits = "default"
-default-filter = "test(server::ws::golden_tests::golden_trace)"
+default-filter = '''
+test(server::ws::golden_tests::golden_trace)
++ binary(golden_test)
+'''
 
 [profile.integration]
 inherits = "default"
