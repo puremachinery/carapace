@@ -14,7 +14,7 @@ use hickory_resolver::TokioResolver;
 use super::super::*;
 use super::config::{map_validation_issues, read_config_snapshot, write_config_file};
 use crate::plugins::capabilities::SsrfProtection;
-use crate::plugins::loader::{validate_plugin_component_bytes, LoaderError};
+use crate::plugins::loader::{validate_plugin_component_bytes, LoaderError, PLUGINS_MANIFEST_FILE};
 use crate::runtime_bridge::{run_sync_blocking_send, BridgeError};
 
 /// Maximum download size for a plugin WASM binary (50 MB).
@@ -22,9 +22,6 @@ const MAX_PLUGIN_DOWNLOAD_BYTES: usize = 50 * 1024 * 1024;
 
 /// Default HTTP timeout for plugin downloads (60 seconds).
 const PLUGIN_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// Name of the plugins manifest file stored alongside WASM binaries.
-const PLUGINS_MANIFEST_FILE: &str = "plugins-manifest.json";
 
 enum PluginDnsError {
     InvalidRequest(String),
@@ -504,10 +501,17 @@ fn build_plugins_array(cfg: &Value) -> Vec<Value> {
         .iter()
         .filter_map(|(key, entry)| {
             let entry = entry.as_object()?;
-            if entry
+            let unexpected_fields = entry
                 .keys()
-                .any(|field| !matches!(field.as_str(), "enabled" | "installId" | "requestedAt"))
-            {
+                .filter(|field| !matches!(field.as_str(), "enabled" | "installId" | "requestedAt"))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !unexpected_fields.is_empty() {
+                tracing::warn!(
+                    name = %key,
+                    unexpected_fields = ?unexpected_fields,
+                    "skipping plugins.entries entry with unexpected fields"
+                );
                 return None;
             }
             Some(json!({

@@ -158,10 +158,17 @@ fn managed_plugin_config_entries(cfg: &Value) -> Vec<ManagedPluginConfigEntry> {
                 return None;
             }
             let entry = entry.as_object()?;
-            if entry
+            let unexpected_fields = entry
                 .keys()
-                .any(|field| !matches!(field.as_str(), "enabled" | "installId" | "requestedAt"))
-            {
+                .filter(|field| !matches!(field.as_str(), "enabled" | "installId" | "requestedAt"))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !unexpected_fields.is_empty() {
+                tracing::warn!(
+                    name = %name,
+                    unexpected_fields = ?unexpected_fields,
+                    "skipping plugins.entries entry with unexpected fields"
+                );
                 return None;
             }
             Some(ManagedPluginConfigEntry {

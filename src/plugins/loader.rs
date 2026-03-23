@@ -596,7 +596,7 @@ fn derive_manifest(
 }
 
 /// Name of the plugins manifest file stored alongside WASM binaries.
-const PLUGINS_MANIFEST_FILE: &str = "plugins-manifest.json";
+pub(crate) const PLUGINS_MANIFEST_FILE: &str = "plugins-manifest.json";
 
 /// Compute the SHA-256 hash of the given bytes and return it as a lowercase hex string.
 fn compute_sha256_hex(data: &[u8]) -> String {
