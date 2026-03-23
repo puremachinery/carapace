@@ -47,38 +47,23 @@ pub fn sign_wasm_bytes(wasm_bytes: &[u8], signing_key: &SigningKey) -> Signature
 }
 
 /// Parse a hex-encoded Ed25519 verifying key.
-pub fn parse_verifying_key(hex_key: &str) -> Result<VerifyingKey, LoaderError> {
-    let bytes = hex::decode(hex_key).map_err(|e| LoaderError::SignatureVerificationFailed {
-        plugin_name: String::new(),
-        reason: format!("invalid hex public key: {e}"),
-    })?;
+pub fn parse_verifying_key(hex_key: &str) -> Result<VerifyingKey, String> {
+    let bytes = hex::decode(hex_key).map_err(|e| format!("invalid hex public key: {e}"))?;
 
     if bytes.len() != 32 {
-        return Err(LoaderError::SignatureVerificationFailed {
-            plugin_name: String::new(),
-            reason: format!("public key must be 32 bytes, got {}", bytes.len()),
-        });
+        return Err(format!("public key must be 32 bytes, got {}", bytes.len()));
     }
 
     let key_bytes: [u8; 32] = bytes.try_into().unwrap();
-    VerifyingKey::from_bytes(&key_bytes).map_err(|e| LoaderError::SignatureVerificationFailed {
-        plugin_name: String::new(),
-        reason: format!("invalid Ed25519 public key: {e}"),
-    })
+    VerifyingKey::from_bytes(&key_bytes).map_err(|e| format!("invalid Ed25519 public key: {e}"))
 }
 
 /// Parse a hex-encoded Ed25519 signature.
-fn parse_signature(hex_sig: &str) -> Result<Signature, LoaderError> {
-    let bytes = hex::decode(hex_sig).map_err(|e| LoaderError::SignatureVerificationFailed {
-        plugin_name: String::new(),
-        reason: format!("invalid hex signature: {e}"),
-    })?;
+fn parse_signature(hex_sig: &str) -> Result<Signature, String> {
+    let bytes = hex::decode(hex_sig).map_err(|e| format!("invalid hex signature: {e}"))?;
 
     if bytes.len() != 64 {
-        return Err(LoaderError::SignatureVerificationFailed {
-            plugin_name: String::new(),
-            reason: format!("signature must be 64 bytes, got {}", bytes.len()),
-        });
+        return Err(format!("signature must be 64 bytes, got {}", bytes.len()));
     }
 
     let sig_bytes: [u8; 64] = bytes.try_into().unwrap();
@@ -159,18 +144,19 @@ pub fn verify_plugin_signature(
     };
 
     // Parse key and signature
-    let verifying_key = parse_verifying_key(publisher_key_hex).map_err(|e| {
+    let verifying_key = parse_verifying_key(publisher_key_hex).map_err(|reason| {
         LoaderError::SignatureVerificationFailed {
             plugin_name: plugin_name.to_string(),
-            reason: format!("publisher key parse error: {e}"),
+            reason: format!("publisher key parse error: {reason}"),
         }
     })?;
 
-    let signature =
-        parse_signature(signature_hex).map_err(|e| LoaderError::SignatureVerificationFailed {
+    let signature = parse_signature(signature_hex).map_err(|reason| {
+        LoaderError::SignatureVerificationFailed {
             plugin_name: plugin_name.to_string(),
-            reason: format!("signature parse error: {e}"),
-        })?;
+            reason: format!("signature parse error: {reason}"),
+        }
+    })?;
 
     // Check trusted publishers (case-insensitive hex comparison)
     let publisher_lower = publisher_key_hex.to_ascii_lowercase();

@@ -1117,8 +1117,8 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
                     "plugin capabilities denied by sandbox policy — blocking instantiation"
                 );
                 crate::logging::audit::audit(
-                    crate::logging::audit::AuditEvent::SkillCapabilityDenied {
-                        skill_id: plugin_id.to_string(),
+                    crate::logging::audit::AuditEvent::PluginCapabilityDenied {
+                        plugin_id: plugin_id.to_string(),
                         capabilities: denied_names.clone(),
                     },
                 );

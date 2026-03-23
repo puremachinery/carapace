@@ -665,11 +665,11 @@ features:
   - feature: "plugins.ed25519 signature verification"
     status: "verified_done"
     runtime_wiring:
-      - "src/plugins/signature.rs::verify_skill_signature"
+      - "src/plugins/signature.rs::verify_plugin_signature"
       - "src/plugins/loader.rs (signature verification on load)"
     tests:
-      - "src/plugins/signature.rs::test_verify_skill_signature_success"
-      - "src/plugins/signature.rs::test_verify_skill_signature_tampered"
+      - "src/plugins/signature.rs::test_verify_plugin_signature_success"
+      - "src/plugins/signature.rs::test_verify_plugin_signature_tampered"
 
   - feature: "plugins.plugin loader"
     status: "verified_done"

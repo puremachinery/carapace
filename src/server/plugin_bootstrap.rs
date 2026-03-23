@@ -5,7 +5,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use crate::credentials;
-use crate::plugins::loader::{load_plugins_manifest, LoaderError};
+use crate::plugins::loader::{is_reserved_plugin_id, load_plugins_manifest, LoaderError};
 use crate::plugins::permissions::PermissionConfig;
 use crate::plugins::sandbox::SandboxConfig;
 use crate::plugins::signature::SignatureConfig;
@@ -153,14 +153,26 @@ fn managed_plugin_config_entries(cfg: &Value) -> Vec<ManagedPluginConfigEntry> {
 
     let mut managed = entries
         .iter()
-        .map(|(name, entry)| ManagedPluginConfigEntry {
-            name: name.clone(),
-            enabled: entry
-                .get("enabled")
-                .and_then(|value| value.as_bool())
-                .unwrap_or(true),
-            requested_at: entry.get("requestedAt").and_then(|value| value.as_u64()),
-            install_id: entry.get("installId").cloned(),
+        .filter_map(|(name, entry)| {
+            if is_reserved_plugin_id(name) {
+                return None;
+            }
+            let entry = entry.as_object()?;
+            if entry
+                .keys()
+                .any(|field| !matches!(field.as_str(), "enabled" | "installId" | "requestedAt"))
+            {
+                return None;
+            }
+            Some(ManagedPluginConfigEntry {
+                name: name.clone(),
+                enabled: entry
+                    .get("enabled")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(true),
+                requested_at: entry.get("requestedAt").and_then(|value| value.as_u64()),
+                install_id: entry.get("installId").cloned(),
+            })
         })
         .collect::<Vec<_>>();
     managed.sort_by(|left, right| left.name.cmp(&right.name));

@@ -26,6 +26,13 @@ use thiserror::Error;
 use wasmtime::component::Component as WasmComponent;
 use wasmtime::{Config, Engine};
 
+pub(crate) const RESERVED_PLUGIN_CONFIG_KEYS: &[&str] =
+    &["enabled", "entries", "load", "sandbox", "signature"];
+
+pub(crate) fn is_reserved_plugin_id(id: &str) -> bool {
+    RESERVED_PLUGIN_CONFIG_KEYS.contains(&id)
+}
+
 /// Plugin loading errors
 #[non_exhaustive]
 #[derive(Error, Debug)]
@@ -135,6 +142,16 @@ impl PluginManifest {
             return Err(LoaderError::InvalidManifest {
                 plugin_id: self.id.clone(),
                 message: "ID must contain only lowercase alphanumeric and hyphens".to_string(),
+            });
+        }
+
+        if is_reserved_plugin_id(&self.id) {
+            return Err(LoaderError::InvalidManifest {
+                plugin_id: self.id.clone(),
+                message: format!(
+                    "ID '{}' is reserved for plugin configuration and cannot be used",
+                    self.id
+                ),
             });
         }
 
@@ -952,6 +969,7 @@ impl PluginLoader {
     fn is_valid_plugin_id(id: &str) -> bool {
         !id.is_empty()
             && id.len() <= 32
+            && !is_reserved_plugin_id(id)
             && id
                 .chars()
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
@@ -1021,6 +1039,28 @@ mod tests {
         assert!(!PluginLoader::is_valid_plugin_id("My-Plugin")); // uppercase
         assert!(!PluginLoader::is_valid_plugin_id("plugin_name")); // underscore
         assert!(!PluginLoader::is_valid_plugin_id(&"x".repeat(33))); // too long
+        assert!(!PluginLoader::is_valid_plugin_id("entries")); // reserved config namespace
+        assert!(!PluginLoader::is_valid_plugin_id("load")); // reserved config namespace
+    }
+
+    #[test]
+    fn test_plugin_manifest_rejects_reserved_id() {
+        let manifest = PluginManifest {
+            id: "entries".to_string(),
+            name: "Reserved".to_string(),
+            description: "Reserved ID".to_string(),
+            version: "1.0.0".to_string(),
+            kind: PluginKind::Tool,
+            permissions: Default::default(),
+        };
+
+        let error = manifest
+            .validate()
+            .expect_err("reserved plugin IDs must fail");
+        assert!(matches!(
+            error,
+            LoaderError::InvalidManifest { plugin_id, .. } if plugin_id == "entries"
+        ));
     }
 
     #[test]

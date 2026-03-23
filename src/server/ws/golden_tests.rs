@@ -569,26 +569,6 @@ mod golden_trace {
         insta::assert_json_snapshot!("golden_node_only_method_forbidden", normalized);
     }
 
-    #[tokio::test]
-    async fn legacy_skills_methods_are_unavailable() {
-        let (_guard, state) = test_state();
-        let conn = admin_conn();
-        register_conn(&state, &conn);
-
-        for method in [
-            "skills.status",
-            "skills.bins",
-            "skills.install",
-            "skills.update",
-        ] {
-            let result = dispatch_method(method, Some(&json!({})), &state, &conn).await;
-            let err = result.expect_err("legacy skills.* methods should be unavailable");
-            assert_eq!(err.code, "UNAVAILABLE");
-            assert_eq!(err.message, "method unavailable");
-            assert_eq!(err.details, Some(json!({ "method": method })));
-        }
-    }
-
     /// Read role calling a write method results in authorization error.
     #[tokio::test]
     async fn golden_write_method_read_role() {

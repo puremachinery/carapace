@@ -1115,6 +1115,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bootstrap_plugin_runtime_ignores_invalid_managed_entry_shapes() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let cfg = json!({
+            "plugins": {
+                "entries": {
+                    "alpha": {
+                        "apiKey": "${ALPHA_API_KEY}"
+                    }
+                }
+            }
+        });
+
+        let result = bootstrap_plugin_runtime(&cfg, temp.path()).await;
+        let report = result.activation_report;
+
+        assert!(report.entries.is_empty());
+        assert!(report.errors.is_empty());
+    }
+
+    #[tokio::test]
     async fn bootstrap_plugin_runtime_reports_invalid_manifest_parse_error() {
         let temp = tempfile::tempdir().expect("temp dir");
         let managed_dir = temp.path().join("plugins");

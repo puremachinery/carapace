@@ -114,8 +114,8 @@ pub enum AuditEvent {
         user_id: String,
         session_count: usize,
     },
-    SkillInstalled {
-        skill_id: String,
+    PluginInstalled {
+        plugin_id: String,
         source_url: String,
     },
     ApprovalResolved {
@@ -143,18 +143,18 @@ pub enum AuditEvent {
         reason: String,
         run_id: String,
     },
-    /// Skill signature verified successfully.
-    SkillSignatureVerified {
-        skill_id: String,
+    /// Plugin signature verified successfully.
+    PluginSignatureVerified {
+        plugin_id: String,
     },
-    /// Skill signature verification failed.
-    SkillSignatureFailed {
-        skill_id: String,
+    /// Plugin signature verification failed.
+    PluginSignatureFailed {
+        plugin_id: String,
         reason: String,
     },
-    /// Skill capability denied by sandbox.
-    SkillCapabilityDenied {
-        skill_id: String,
+    /// Plugin capability denied by sandbox.
+    PluginCapabilityDenied {
+        plugin_id: String,
         capabilities: Vec<String>,
     },
     /// Session integrity violation detected.
@@ -195,16 +195,16 @@ impl AuditEvent {
             AuditEvent::SessionDeleted { .. } => "session_deleted",
             AuditEvent::SessionPurged { .. } => "session_purged",
             AuditEvent::DataExported { .. } => "data_exported",
-            AuditEvent::SkillInstalled { .. } => "skill_installed",
+            AuditEvent::PluginInstalled { .. } => "plugin_installed",
             AuditEvent::ApprovalResolved { .. } => "approval_resolved",
             AuditEvent::BackupCreated { .. } => "backup_created",
             AuditEvent::RateLimitHit { .. } => "rate_limit_hit",
             AuditEvent::GatewayConnected { .. } => "gateway_connected",
             AuditEvent::GatewayDisconnected { .. } => "gateway_disconnected",
             AuditEvent::PromptGuardBlocked { .. } => "prompt_guard_blocked",
-            AuditEvent::SkillSignatureVerified { .. } => "skill_signature_verified",
-            AuditEvent::SkillSignatureFailed { .. } => "skill_signature_failed",
-            AuditEvent::SkillCapabilityDenied { .. } => "skill_capability_denied",
+            AuditEvent::PluginSignatureVerified { .. } => "plugin_signature_verified",
+            AuditEvent::PluginSignatureFailed { .. } => "plugin_signature_failed",
+            AuditEvent::PluginCapabilityDenied { .. } => "plugin_capability_denied",
             AuditEvent::SessionIntegrityViolation { .. } => "session_integrity_violation",
             AuditEvent::ClassifierBlocked { .. } => "classifier_blocked",
             AuditEvent::ClassifierWarned { .. } => "classifier_warned",
@@ -498,8 +498,8 @@ mod tests {
                 user_id: "u".into(),
                 session_count: 5,
             },
-            AuditEvent::SkillInstalled {
-                skill_id: "s".into(),
+            AuditEvent::PluginInstalled {
+                plugin_id: "s".into(),
                 source_url: "https://example.com".into(),
             },
             AuditEvent::ApprovalResolved {
@@ -526,15 +526,15 @@ mod tests {
                 reason: "r".into(),
                 run_id: "rid".into(),
             },
-            AuditEvent::SkillSignatureVerified {
-                skill_id: "s".into(),
+            AuditEvent::PluginSignatureVerified {
+                plugin_id: "s".into(),
             },
-            AuditEvent::SkillSignatureFailed {
-                skill_id: "s".into(),
+            AuditEvent::PluginSignatureFailed {
+                plugin_id: "s".into(),
                 reason: "r".into(),
             },
-            AuditEvent::SkillCapabilityDenied {
-                skill_id: "s".into(),
+            AuditEvent::PluginCapabilityDenied {
+                plugin_id: "s".into(),
                 capabilities: vec!["http".into()],
             },
             AuditEvent::SessionIntegrityViolation {
@@ -869,14 +869,14 @@ mod tests {
     }
 
     #[test]
-    fn test_event_name_skill_installed() {
+    fn test_event_name_plugin_installed() {
         assert_eq!(
-            AuditEvent::SkillInstalled {
-                skill_id: "s".into(),
+            AuditEvent::PluginInstalled {
+                plugin_id: "s".into(),
                 source_url: "https://example.com".into()
             }
             .event_name(),
-            "skill_installed"
+            "plugin_installed"
         );
     }
 

@@ -502,13 +502,20 @@ fn build_plugins_array(cfg: &Value) -> Vec<Value> {
 
     entries
         .iter()
-        .map(|(key, entry)| {
-            json!({
+        .filter_map(|(key, entry)| {
+            let entry = entry.as_object()?;
+            if entry
+                .keys()
+                .any(|field| !matches!(field.as_str(), "enabled" | "installId" | "requestedAt"))
+            {
+                return None;
+            }
+            Some(json!({
                 "name": key,
                 "enabled": entry.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true),
                 "installId": entry.get("installId").cloned().unwrap_or(Value::Null),
                 "requestedAt": entry.get("requestedAt").cloned().unwrap_or(Value::Null),
-            })
+            }))
         })
         .collect()
 }
@@ -770,8 +777,12 @@ fn scan_plugins_bins(dir: &std::path::Path) -> Vec<Value> {
             Err(_) => continue,
         };
         let path = entry.path();
-        // Only include files (skip subdirectories)
-        if path.is_file() {
+        // Only include managed plugin artifacts (skip subdirectories and metadata files).
+        if path.is_file()
+            && path
+                .extension()
+                .is_some_and(|extension| extension == "wasm")
+        {
             let name = entry.file_name().to_string_lossy().to_string();
             bins.push(json!({
                 "name": name,
@@ -1199,6 +1210,21 @@ mod tests {
     fn test_build_plugins_array_entries_not_object() {
         // If entries is not an object (e.g. an array), return empty
         let cfg = json!({ "plugins": { "entries": [1, 2, 3] } });
+        let result = build_plugins_array(&cfg);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_build_plugins_array_skips_invalid_managed_entry_shapes() {
+        let cfg = json!({
+            "plugins": {
+                "entries": {
+                    "demo": {
+                        "apiKey": "${DEMO_API_KEY}"
+                    }
+                }
+            }
+        });
         let result = build_plugins_array(&cfg);
         assert!(result.is_empty());
     }
@@ -1752,18 +1778,19 @@ mod tests {
     #[test]
     fn test_scan_plugins_bins_with_files() {
         let dir = TempDir::new().unwrap();
-        // Create some files
-        std::fs::write(dir.path().join("plugin-a"), b"#!/bin/sh\n").unwrap();
-        std::fs::write(dir.path().join("plugin-b"), b"#!/bin/sh\n").unwrap();
-        // Create a subdirectory (should be skipped)
+        std::fs::write(dir.path().join("plugin-a.wasm"), b"wasm").unwrap();
+        std::fs::write(dir.path().join("plugin-b.wasm"), b"wasm").unwrap();
+        std::fs::write(dir.path().join("plugins-manifest.json"), b"{}").unwrap();
+        std::fs::write(dir.path().join("note.txt"), b"ignored").unwrap();
+        std::fs::create_dir(dir.path().join("nested.wasm")).unwrap();
         std::fs::create_dir(dir.path().join("subdir")).unwrap();
 
         let result = scan_plugins_bins(dir.path());
         assert_eq!(result.len(), 2);
 
         let names: Vec<&str> = result.iter().map(|v| v["name"].as_str().unwrap()).collect();
-        assert!(names.contains(&"plugin-a"));
-        assert!(names.contains(&"plugin-b"));
+        assert!(names.contains(&"plugin-a.wasm"));
+        assert!(names.contains(&"plugin-b.wasm"));
 
         // Verify paths are absolute
         for bin in &result {

@@ -2,6 +2,8 @@
 
 use serde_json::Value;
 
+use crate::plugins::loader::{is_reserved_plugin_id, RESERVED_PLUGIN_CONFIG_KEYS};
+
 /// Severity of a schema validation issue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
@@ -855,6 +857,53 @@ fn validate_plugins(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schem
                 path: ".plugins.enabled".to_string(),
                 message: "plugins.enabled must be a boolean".to_string(),
             });
+        }
+    }
+
+    if let Some(entries) = plugins.get("entries") {
+        let Some(entries_obj) = entries.as_object() else {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: ".plugins.entries".to_string(),
+                message: "plugins.entries must be an object".to_string(),
+            });
+            return;
+        };
+
+        for (name, entry) in entries_obj {
+            if is_reserved_plugin_id(name) {
+                issues.push(SchemaIssue {
+                    severity: Severity::Error,
+                    path: format!(".plugins.entries.{name}"),
+                    message: format!(
+                        "managed plugin name '{}' is reserved for plugin configuration",
+                        name
+                    ),
+                });
+            }
+
+            let Some(entry_obj) = entry.as_object() else {
+                issues.push(SchemaIssue {
+                    severity: Severity::Error,
+                    path: format!(".plugins.entries.{name}"),
+                    message: "managed plugin entry must be an object".to_string(),
+                });
+                continue;
+            };
+
+            for field in entry_obj.keys() {
+                if !matches!(field.as_str(), "enabled" | "installId" | "requestedAt") {
+                    issues.push(SchemaIssue {
+                        severity: Severity::Error,
+                        path: format!(".plugins.entries.{name}.{field}"),
+                        message: format!(
+                            "unknown managed plugin field '{}'; plugin runtime config belongs under plugins.<plugin-id>.*, and reserved top-level plugin keys are {}",
+                            field,
+                            RESERVED_PLUGIN_CONFIG_KEYS.join(", ")
+                        ),
+                    });
+                }
+            }
         }
     }
 
@@ -2245,6 +2294,45 @@ mod tests {
             i.severity == Severity::Error
                 && i.path == ".plugins.load.paths"
                 && i.message.contains("entries must be strings")
+        }));
+    }
+
+    #[test]
+    fn test_plugins_entries_must_be_managed_entry_objects() {
+        let config = json!({
+            "plugins": {
+                "entries": {
+                    "demo": {
+                        "apiKey": "${DEMO_API_KEY}"
+                    }
+                }
+            }
+        });
+        let issues = validate_schema(&config);
+        assert!(issues.iter().any(|i| {
+            i.severity == Severity::Error
+                && i.path == ".plugins.entries.demo.apiKey"
+                && i.message
+                    .contains("plugin runtime config belongs under plugins.<plugin-id>.*")
+        }));
+    }
+
+    #[test]
+    fn test_plugins_entries_reject_reserved_names() {
+        let config = json!({
+            "plugins": {
+                "entries": {
+                    "entries": {
+                        "enabled": true
+                    }
+                }
+            }
+        });
+        let issues = validate_schema(&config);
+        assert!(issues.iter().any(|i| {
+            i.severity == Severity::Error
+                && i.path == ".plugins.entries.entries"
+                && i.message.contains("reserved for plugin configuration")
         }));
     }
 
