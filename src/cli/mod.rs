@@ -8376,6 +8376,25 @@ mod tests {
         assert!(!lock.exists());
     }
 
+    #[test]
+    fn test_managed_plugin_file_transaction_drop_releases_lock_only() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let dest = temp.path().join("demo-plugin.wasm");
+        let lock = temp.path().join("demo-plugin.wasm.cli-lock");
+        std::fs::write(&dest, b"restored-plugin-bytes").unwrap();
+        std::fs::write(&lock, b"locked").unwrap();
+
+        drop(ManagedPluginFileTransaction {
+            dest: dest.clone(),
+            backup: None,
+            lock: lock.clone(),
+            drop_action: ManagedPluginFileTransactionDropAction::ReleaseLockOnly,
+        });
+
+        assert_eq!(std::fs::read(&dest).unwrap(), b"restored-plugin-bytes");
+        assert!(!lock.exists());
+    }
+
     #[tokio::test]
     async fn test_acquire_plugin_file_transaction_lock_writes_pid() {
         let temp = tempfile::TempDir::new().unwrap();
