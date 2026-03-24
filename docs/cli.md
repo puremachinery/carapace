@@ -133,6 +133,7 @@ Notes:
 - `--file` is local-only and stages the file into `state_dir/plugins/<name>.wasm` before calling `plugins.install`
 - `--file` is intended for direct loopback targets; SSH port-forwarded remotes are not a supported workflow
 - If the follow-up `plugins.install` request fails, the CLI restores the previous local managed artifact state when possible and reports the recovery action explicitly
+- If a previous local `--file` install/update was interrupted and left `.cli-backup` or `.cli-lock` files under `state_dir/plugins`, the CLI fails closed instead of mutating plugin files again; verify that no other local file-based plugin mutation is still running, restore from the `.cli-backup` file if needed, remove stale `.cli-backup` / `.cli-lock` files, and then retry
 - `--publisher-key` and `--signature` are recorded at install/update time; signature verification happens later at plugin load time according to `plugins.signature` policy
 - managed plugin installs still require a Carapace restart before activation
 - remote hosts use the same TLS/plaintext flags as `cara logs`
@@ -155,7 +156,12 @@ If `--file` is used, the CLI stages the file into `state_dir/plugins/<name>.wasm
 and the server adopts that managed artifact on update. Managed plugin updates
 still require restart before the new artifact becomes active. If the update
 request fails after local staging, the CLI restores the previous local managed
-artifact state when possible and reports the recovery action explicitly.
+artifact state when possible and reports the recovery action explicitly. If a
+previous local `--file` install/update was interrupted and left `.cli-backup`
+or `.cli-lock` files under `state_dir/plugins`, the CLI fails closed instead of
+mutating plugin files again; verify that no other local file-based plugin
+mutation is still running, restore from the `.cli-backup` file if needed,
+remove stale `.cli-backup` / `.cli-lock` files, and then retry.
 
 ### `cara chat`
 Start an interactive chat REPL (`chat.send` over WebSocket).
