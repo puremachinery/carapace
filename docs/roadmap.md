@@ -29,9 +29,10 @@ For what is already shipped and verified, see:
   Control UI, backed by `codex.authProfile` runtime support.
 - Managed and local WASM plugins — startup/runtime loading, `plugins.*` API
   surface, `cara plugins` CLI workflows, and plugin development guidance.
-  Local `cara plugins install|update --file` staging assumes a trusted local
-  state directory; additional hardening is tracked in
-  [#250](https://github.com/puremachinery/carapace/issues/250).
+  Local `cara plugins install/update --file` staging assumes a trusted,
+  single-user state directory. Do not use that workflow where other users can
+  write to the same state directory.
+  Issue: [#250](https://github.com/puremachinery/carapace/issues/250)
 - Filesystem tools — guarded local workspace read/search/stat/list plus opt-in
   write/move within explicit roots, with config-gated registration and
   fail-closed validation.
@@ -41,9 +42,15 @@ For what is already shipped and verified, see:
 ## Next
 
 These items are listed in priority order. The top item is the current focus.
-This replaces the older `Now` bucket: prior near-term items are either
-absorbed into these grouped priorities or no longer reflect the current
-product direction.
+This replaces the older `Now` bucket:
+- subscription onboarding, guided provider onboarding, and migration/import
+  work are absorbed into the onboarding and migration groups below
+- model/provider routing clarity is absorbed into the routing group below
+- provider-status parity remains part of [#185](https://github.com/puremachinery/carapace/issues/185),
+  while broader Control UI depth is not part of the current near-term
+  product-priority list
+- test-infra hardening remains tracked separately in
+  [#190](https://github.com/puremachinery/carapace/issues/190)
 
 - Make onboarding excellent — provider setup should be fast, guided, and
   understandable without requiring users to edit config by hand.
