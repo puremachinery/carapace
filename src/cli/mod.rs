@@ -572,7 +572,7 @@ use crate::channels::telegram::{TelegramChannel, TELEGRAM_DEFAULT_API_BASE_URL};
 use crate::config;
 use crate::credentials;
 use crate::logging::buffer::LogLevel;
-use crate::runtime_bridge::run_sync_blocking_send;
+use crate::runtime_bridge::{run_blocking_cleanup, run_sync_blocking_send};
 use crate::server::bind::DEFAULT_PORT;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
@@ -2324,7 +2324,7 @@ impl Drop for PendingPluginFileTransactionLock {
         let Some(path) = self.path.take() else {
             return;
         };
-        match run_plugin_file_cleanup_in_drop(|| {
+        match run_blocking_cleanup(|| {
             release_plugin_file_transaction_lock_blocking(&path)
         }) {
             Ok(()) => eprintln!(
@@ -2423,7 +2423,7 @@ impl Drop for ManagedPluginFileTransaction {
             self.dest.display()
         );
         eprintln!("Warning: {message}");
-        if let Err(err) = run_plugin_file_cleanup_in_drop(|| {
+        if let Err(err) = run_blocking_cleanup(|| {
             rollback_managed_plugin_file_transaction_blocking(&dest, backup.as_deref(), &lock)
         }) {
             eprintln!("Warning: dropped transaction cleanup failed: {err}");
@@ -2453,22 +2453,6 @@ fn plugin_cli_lock_path(dest: &Path) -> Result<PathBuf, Box<dyn std::error::Erro
     let mut lock_name = file_name.to_os_string();
     lock_name.push(".cli-lock");
     Ok(dest.with_file_name(lock_name))
-}
-
-fn run_plugin_file_cleanup_in_drop<T, F>(cleanup: F) -> T
-where
-    F: FnOnce() -> T,
-{
-    match tokio::runtime::Handle::try_current() {
-        // Drop cannot await, so cancellation cleanup has to use blocking filesystem
-        // calls. When that drop happens on Tokio's multithread runtime, use
-        // `block_in_place` so the scheduler can compensate instead of pinning a
-        // worker thread on the cleanup I/O directly.
-        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-            tokio::task::block_in_place(cleanup)
-        }
-        _ => cleanup(),
-    }
 }
 
 async fn acquire_plugin_file_transaction_lock(

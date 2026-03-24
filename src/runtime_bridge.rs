@@ -75,6 +75,20 @@ where
     run_in_current_thread_runtime(future)
 }
 
+/// Run a blocking cleanup closure from code that may be dropped inside a Tokio runtime.
+///
+/// This is intended for best-effort synchronous cleanup paths where `Drop` cannot `await`.
+/// If running inside a multi-threaded Tokio runtime, uses `block_in_place` so the scheduler
+/// can compensate for the blocking section. Otherwise, runs the closure directly.
+pub fn run_blocking_cleanup<T>(cleanup: impl FnOnce() -> T) -> T {
+    match Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
+            block_in_place(cleanup)
+        }
+        _ => cleanup(),
+    }
+}
+
 fn run_in_spawned_runtime<T, E>(
     future: impl Future<Output = Result<T, E>> + Send + 'static,
 ) -> Result<T, BridgeError<E>>
@@ -116,7 +130,7 @@ fn panic_to_string(payload: Box<dyn Any + Send>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{run_sync_blocking, run_sync_blocking_send, BridgeError};
+    use super::{run_blocking_cleanup, run_sync_blocking, run_sync_blocking_send, BridgeError};
 
     #[test]
     fn run_sync_blocking_outside_runtime() {
@@ -153,6 +167,18 @@ mod tests {
     async fn run_sync_blocking_send_inside_multi_thread_runtime_works() {
         let value = run_sync_blocking_send(async { Ok::<u16, std::io::Error>(33) }).unwrap();
         assert_eq!(value, 33);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_blocking_cleanup_inside_multi_thread_runtime_works() {
+        let value = run_blocking_cleanup(|| 55);
+        assert_eq!(value, 55);
+    }
+
+    #[test]
+    fn run_blocking_cleanup_outside_runtime_works() {
+        let value = run_blocking_cleanup(|| 66);
+        assert_eq!(value, 66);
     }
 
     #[test]
