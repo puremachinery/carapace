@@ -22,7 +22,7 @@ test:
 test-fast:
     ./scripts/run-nextest-guarded.sh --all-targets -P fast
 
-# Run the websocket golden contract lane.
+# Run the full golden lane (WebSocket traces + golden/schema integration checks).
 test-golden:
     ./scripts/run-nextest-guarded.sh --all-targets -P golden
 
@@ -46,7 +46,7 @@ test-verbose:
 test-one NAME:
     ./scripts/run-nextest-guarded.sh --all-targets -P full {{NAME}}
 
-# Run websocket golden snapshot tests.
+# Run the full golden lane.
 test-ws-golden:
     @just test-golden
 

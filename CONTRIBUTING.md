@@ -43,7 +43,7 @@ CARAPACE_DEV=1 cargo run
 3. Run `cargo fmt` before committing.
 4. Run `cargo clippy -- -D warnings` before committing.
 5. Run `just test-fast` for the normal inner loop.
-6. Run `just test-golden` if you changed WebSocket protocol or golden surfaces.
+6. Run `just test-golden` if you changed WebSocket protocol/golden surfaces or any schema/JSON validated by the `golden_test` integration binary (this lane covers both WebSocket traces and golden/schema checks).
 7. Run `just test-full` before broad runtime changes or when you want parity with push-time validation.
 8. If your PR changes workflows or docs, run `just workflow-lint` and/or `just docs-check`.
 9. Push your branch and open a pull request.
