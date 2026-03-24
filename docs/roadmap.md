@@ -31,8 +31,9 @@ For what is already shipped and verified, see:
   surface, `cara plugins` CLI workflows, and plugin development guidance.
   Local `cara plugins install/update --file` staging still has a known
   symlink-swap / TOCTOU hardening gap. Use that workflow only with a trusted,
-  single-user state directory, and do not use it where other users can write
-  to the same state directory.
+  single-user state directory owned by the Carapace user, and do not use it
+  on shared hosts or anywhere other users or services can write to that
+  directory.
   Tracking open issue: [#250](https://github.com/puremachinery/carapace/issues/250)
 - Filesystem tools — guarded local workspace read/search/stat/list plus opt-in
   write/move within explicit roots, with config-gated registration and
