@@ -41,6 +41,9 @@ For what is already shipped and verified, see:
 ## Next
 
 These items are listed in priority order. The top item is the current focus.
+This replaces the older `Now` bucket: prior near-term items are either
+absorbed into these grouped priorities or no longer reflect the current
+product direction.
 
 - Make onboarding excellent — provider setup should be fast, guided, and
   understandable without requiring users to edit config by hand.
