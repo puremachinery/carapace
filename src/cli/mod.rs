@@ -2324,7 +2324,9 @@ impl Drop for PendingPluginFileTransactionLock {
         let Some(path) = self.path.take() else {
             return;
         };
-        match release_plugin_file_transaction_lock_blocking(&path) {
+        match run_plugin_file_cleanup_in_drop(|| {
+            release_plugin_file_transaction_lock_blocking(&path)
+        }) {
             Ok(()) => eprintln!(
                 "Warning: PendingPluginFileTransactionLock dropped before handoff; synchronously removed staging lock '{}' after an interrupted or cancelled run",
                 path.display()
@@ -2421,9 +2423,9 @@ impl Drop for ManagedPluginFileTransaction {
             self.dest.display()
         );
         eprintln!("Warning: {message}");
-        if let Err(err) =
+        if let Err(err) = run_plugin_file_cleanup_in_drop(|| {
             rollback_managed_plugin_file_transaction_blocking(&dest, backup.as_deref(), &lock)
-        {
+        }) {
             eprintln!("Warning: dropped transaction cleanup failed: {err}");
         }
     }
@@ -2451,6 +2453,22 @@ fn plugin_cli_lock_path(dest: &Path) -> Result<PathBuf, Box<dyn std::error::Erro
     let mut lock_name = file_name.to_os_string();
     lock_name.push(".cli-lock");
     Ok(dest.with_file_name(lock_name))
+}
+
+fn run_plugin_file_cleanup_in_drop<T, F>(cleanup: F) -> T
+where
+    F: FnOnce() -> T,
+{
+    match tokio::runtime::Handle::try_current() {
+        // Drop cannot await, so cancellation cleanup has to use blocking filesystem
+        // calls. When that drop happens on Tokio's multithread runtime, use
+        // `block_in_place` so the scheduler can compensate instead of pinning a
+        // worker thread on the cleanup I/O directly.
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(cleanup)
+        }
+        _ => cleanup(),
+    }
 }
 
 async fn acquire_plugin_file_transaction_lock(
@@ -2616,6 +2634,14 @@ async fn restore_previous_plugin_artifact(
     backup: &Path,
     dest: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(test)]
+    if should_fail_restore_previous_plugin_artifact(dest) {
+        return Err(cli_error(format!(
+            "failed to restore previous plugin artifact from '{}' to '{}': injected restore failure",
+            backup.display(),
+            dest.display()
+        )));
+    }
     replace_plugin_artifact_with_backup(backup, dest)
         .await
         .map_err(|err| {
@@ -2752,6 +2778,14 @@ fn should_fail_staged_plugin_cleanup(dest: &Path) -> bool {
         == Some(dest)
 }
 
+#[cfg(test)]
+fn should_fail_restore_previous_plugin_artifact(dest: &Path) -> bool {
+    std::env::var_os("CARAPACE_TEST_FAIL_RESTORE_PLUGIN_DEST")
+        .map(PathBuf::from)
+        .as_deref()
+        == Some(dest)
+}
+
 async fn stage_plugin_file_into_managed_dir(
     connection: &WsConnectionArgs,
     name: &str,
@@ -2801,6 +2835,11 @@ async fn stage_plugin_file_into_managed_dir(
                 ));
             }
         }
+        // This preflight rejects existing symlinks and the `.cli-lock` serializes
+        // concurrent `cara ... --file` mutations, but it intentionally assumes a
+        // trusted local state directory for this loopback-only workflow. We do
+        // not try to defend here against an unrelated local process swapping the
+        // path between this check and the later rename.
         match tokio::fs::symlink_metadata(&backup).await {
             Ok(_) => {
                 return Err(format!(
@@ -8422,6 +8461,47 @@ mod tests {
         assert!(rendered.contains("failed to stage plugin file"));
         assert!(rendered.contains("additionally failed to remove partial staged file"));
         assert!(!plugins_dir.join("demo-plugin.wasm.cli-lock").exists());
+    }
+
+    #[tokio::test]
+    async fn test_stage_plugin_file_into_managed_dir_reports_write_and_restore_failure_and_releases_lock(
+    ) {
+        let mut env_guard = ScopedEnv::new();
+        let temp = tempfile::TempDir::new().unwrap();
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
+
+        let plugins_dir = temp.path().join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+        let existing = plugins_dir.join("demo-plugin.wasm");
+        std::fs::write(&existing, b"old-plugin-bytes").unwrap();
+
+        let plugin_path = temp.path().join("demo-input.wasm");
+        std::fs::write(&plugin_path, tool_plugin_component_bytes()).unwrap();
+        env_guard.set(
+            "CARAPACE_TEST_FAIL_STAGE_PLUGIN_WRITE_DEST",
+            existing.as_os_str(),
+        );
+        env_guard.set(
+            "CARAPACE_TEST_FAIL_RESTORE_PLUGIN_DEST",
+            existing.as_os_str(),
+        );
+        let connection = WsConnectionArgs {
+            port: Some(18789),
+            host: "127.0.0.1".to_string(),
+            tls: false,
+            trust: false,
+            allow_plaintext: false,
+        };
+
+        let err = stage_plugin_file_into_managed_dir(&connection, "demo-plugin", &plugin_path)
+            .await
+            .unwrap_err();
+
+        let rendered = err.to_string();
+        assert!(rendered.contains("failed to stage plugin file"));
+        assert!(rendered.contains("rollback also failed"));
+        assert!(!plugins_dir.join("demo-plugin.wasm.cli-lock").exists());
+        assert!(plugins_dir.join("demo-plugin.wasm.cli-backup").exists());
     }
 
     #[tokio::test]
