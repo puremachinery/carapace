@@ -82,16 +82,20 @@ where
 ///
 /// - If running inside a multi-threaded Tokio runtime, uses `block_in_place` so the scheduler can
 ///   compensate for the blocking section while the cleanup still completes before `Drop` returns.
-/// - If running inside a current-thread Tokio runtime, offloads the cleanup to Tokio's blocking
-///   pool and returns immediately so `Drop` does not stall the single executor thread.
+/// - If running inside a current-thread Tokio runtime, hands the cleanup to a dedicated OS thread
+///   and synchronously waits for it to finish so `Drop` still has deterministic completion
+///   semantics without re-entering Tokio.
 /// - If no runtime exists, runs the cleanup inline.
 pub fn run_blocking_cleanup(cleanup: impl FnOnce() + Send + 'static) {
     match Handle::try_current() {
         Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
             block_in_place(cleanup)
         }
-        Ok(handle) => {
-            drop(handle.spawn_blocking(cleanup));
+        Ok(_) => {
+            let handle = thread::spawn(cleanup);
+            if let Err(payload) = handle.join() {
+                std::panic::resume_unwind(payload);
+            }
         }
         Err(_) => cleanup(),
     }

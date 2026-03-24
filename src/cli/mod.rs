@@ -2832,7 +2832,11 @@ async fn write_staged_plugin_artifact(dest: &Path, bytes: &[u8]) -> std::io::Res
             "injected staged plugin write failure",
         ));
     }
-    let mut file = tokio::fs::File::create(dest).await?;
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dest)
+        .await?;
     file.write_all(bytes).await?;
     file.sync_data().await
 }
