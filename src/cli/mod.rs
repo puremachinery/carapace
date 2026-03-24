@@ -2295,6 +2295,47 @@ struct ManagedPluginFileTransaction {
     completed: bool,
 }
 
+#[derive(Debug)]
+struct PendingPluginFileTransactionLock {
+    path: Option<PathBuf>,
+}
+
+impl PendingPluginFileTransactionLock {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    async fn release_with_context(mut self, message: String) -> String {
+        match self.path.take() {
+            Some(path) => release_plugin_file_transaction_lock_with_context(&path, message).await,
+            None => message,
+        }
+    }
+
+    fn into_path(mut self) -> PathBuf {
+        self.path
+            .take()
+            .expect("pending plugin transaction lock already released")
+    }
+}
+
+impl Drop for PendingPluginFileTransactionLock {
+    fn drop(&mut self) {
+        let Some(path) = self.path.as_ref() else {
+            return;
+        };
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => eprintln!(
+                "Warning: failed to remove staging lock '{}' during pre-transaction cleanup: {}",
+                path.display(),
+                err
+            ),
+        }
+    }
+}
+
 impl ManagedPluginFileTransaction {
     async fn commit(mut self) -> Option<String> {
         self.completed = true;
@@ -2607,104 +2648,92 @@ async fn stage_plugin_file_into_managed_dir(
     let backup = plugin_cli_backup_path(&dest)?;
     let lock = plugin_cli_lock_path(&dest)?;
     acquire_plugin_file_transaction_lock(&lock).await?;
-    let existing_metadata = match tokio::fs::metadata(&dest).await {
-        Ok(metadata) => Some(metadata),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-        Err(err) => {
-            let message = release_plugin_file_transaction_lock_with_context(
-                &lock,
-                format!(
+    let pending_lock = PendingPluginFileTransactionLock::new(lock);
+    let had_existing = match async {
+        let existing_metadata = match tokio::fs::metadata(&dest).await {
+            Ok(metadata) => Some(metadata),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => {
+                return Err(cli_error(format!(
                     "failed to inspect managed plugin destination '{}': {}",
                     dest.display(),
                     err
-                ),
-            )
-            .await;
-            return Err(cli_error(message));
-        }
-    };
-    if let Some(metadata) = existing_metadata.as_ref() {
-        if !metadata.is_file() {
-            let message = release_plugin_file_transaction_lock_with_context(
-                &lock,
-                format!(
+                )));
+            }
+        };
+        if let Some(metadata) = existing_metadata.as_ref() {
+            if !metadata.is_file() {
+                return Err(cli_error(format!(
                     "managed plugin destination '{}' is not a regular file",
                     dest.display()
-                ),
-            )
-            .await;
-            return Err(cli_error(message));
+                )));
+            }
         }
-    }
-    match tokio::fs::metadata(&backup).await {
-        Ok(_) => {
-            let message = release_plugin_file_transaction_lock_with_context(
-                &lock,
-                format!(
+        match tokio::fs::metadata(&backup).await {
+            Ok(_) => {
+                return Err(cli_error(format!(
                     "refusing to stage plugin file because rollback backup '{}' already exists; remove or recover it first",
                     backup.display()
-                ),
-            )
-            .await;
-            return Err(cli_error(message));
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => {
-            let message = release_plugin_file_transaction_lock_with_context(
-                &lock,
-                format!(
+                )));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(cli_error(format!(
                     "failed to inspect staging backup '{}': {}",
                     backup.display(),
                     err
-                ),
-            )
-            .await;
-            return Err(cli_error(message));
+                )));
+            }
         }
-    }
-    let had_existing = existing_metadata.is_some();
-    if had_existing {
-        if let Err(err) = tokio::fs::rename(&dest, &backup).await {
-            let message = format!(
-                "failed to move existing managed plugin artifact '{}' to staging backup '{}': {}",
+        let had_existing = existing_metadata.is_some();
+        if had_existing {
+            tokio::fs::rename(&dest, &backup).await.map_err(|err| {
+                cli_error(format!(
+                    "failed to move existing managed plugin artifact '{}' to staging backup '{}': {}",
+                    dest.display(),
+                    backup.display(),
+                    err
+                ))
+            })?;
+        }
+        if let Err(err) = write_staged_plugin_artifact(&dest, &bytes).await {
+            let write_message = format!(
+                "failed to stage plugin file into '{}': {}",
                 dest.display(),
-                backup.display(),
                 err
             );
-            let message = release_plugin_file_transaction_lock_with_context(&lock, message).await;
+            if had_existing {
+                let restore_result = restore_previous_plugin_artifact(&backup, &dest).await;
+                return Err(cli_error(match restore_result {
+                    Ok(()) => format!(
+                        "{write_message}; restored previous local managed artifact at '{}'",
+                        dest.display()
+                    ),
+                    Err(restore_err) => {
+                        format!("{write_message}; rollback also failed: {}", restore_err)
+                    }
+                }));
+            }
+            let mut message = write_message;
+            if let Err(cleanup_err) = cleanup_partially_staged_plugin_artifact(&dest).await {
+                message = format!(
+                    "{message}; additionally failed to remove partial staged file: {}",
+                    cleanup_err
+                );
+            }
             return Err(cli_error(message));
         }
+        Ok::<bool, Box<dyn std::error::Error>>(had_existing)
     }
-    if let Err(err) = write_staged_plugin_artifact(&dest, &bytes).await {
-        let write_message = format!(
-            "failed to stage plugin file into '{}': {}",
-            dest.display(),
-            err
-        );
-        if had_existing {
-            let restore_result = restore_previous_plugin_artifact(&backup, &dest).await;
-            let mut message = match restore_result {
-                Ok(()) => format!(
-                    "{write_message}; restored previous local managed artifact at '{}'",
-                    dest.display()
-                ),
-                Err(restore_err) => {
-                    format!("{write_message}; rollback also failed: {}", restore_err)
-                }
-            };
-            message = release_plugin_file_transaction_lock_with_context(&lock, message).await;
+    .await
+    {
+        Ok(had_existing) => had_existing,
+        Err(err) => {
+            let message = pending_lock.release_with_context(err.to_string()).await;
             return Err(cli_error(message));
         }
-        let mut message = write_message;
-        if let Err(cleanup_err) = cleanup_partially_staged_plugin_artifact(&dest).await {
-            message = format!(
-                "{message}; additionally failed to remove partial staged file: {}",
-                cleanup_err
-            );
-        }
-        message = release_plugin_file_transaction_lock_with_context(&lock, message).await;
-        return Err(cli_error(message));
-    }
+    };
+    let lock = pending_lock.into_path();
     Ok(ManagedPluginFileTransaction {
         dest,
         backup: had_existing.then_some(backup),
@@ -8008,6 +8037,43 @@ mod tests {
             .to_string()
             .contains("restored previous local managed artifact"));
         assert_eq!(std::fs::read(&existing).unwrap(), b"old-plugin-bytes");
+        assert!(!plugins_dir.join("demo-plugin.wasm.cli-backup").exists());
+        assert!(!plugins_dir.join("demo-plugin.wasm.cli-lock").exists());
+    }
+
+    #[tokio::test]
+    async fn test_stage_plugin_file_into_managed_dir_cleans_new_file_after_write_failure() {
+        let mut env_guard = ScopedEnv::new();
+        let temp = tempfile::TempDir::new().unwrap();
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
+
+        let plugins_dir = temp.path().join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+        let staged_dest = plugins_dir.join("demo-plugin.wasm");
+
+        let plugin_path = temp.path().join("demo-input.wasm");
+        std::fs::write(&plugin_path, tool_plugin_component_bytes()).unwrap();
+        env_guard.set(
+            "CARAPACE_TEST_FAIL_STAGE_PLUGIN_WRITE_DEST",
+            staged_dest.as_os_str(),
+        );
+        let connection = WsConnectionArgs {
+            port: Some(18789),
+            host: "127.0.0.1".to_string(),
+            tls: false,
+            trust: false,
+            allow_plaintext: false,
+        };
+
+        let err = stage_plugin_file_into_managed_dir(&connection, "demo-plugin", &plugin_path)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("failed to stage plugin file"));
+        assert!(!err
+            .to_string()
+            .contains("restored previous local managed artifact"));
+        assert!(!staged_dest.exists());
         assert!(!plugins_dir.join("demo-plugin.wasm.cli-backup").exists());
         assert!(!plugins_dir.join("demo-plugin.wasm.cli-lock").exists());
     }
