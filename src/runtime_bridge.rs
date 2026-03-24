@@ -75,6 +75,37 @@ where
     run_in_current_thread_runtime(future)
 }
 
+/// Run a best-effort drop-time cleanup closure from code that may be dropped inside a Tokio runtime.
+///
+/// This helper is only for `Drop` paths where cleanup cannot `await` and any error handling must
+/// happen inside the closure itself.
+///
+/// - If running inside a multi-threaded Tokio runtime, uses `block_in_place` so the scheduler can
+///   compensate for the blocking section while the cleanup still completes before `Drop` returns.
+/// - If running inside a current-thread Tokio runtime, hands the cleanup to a dedicated OS thread
+///   and synchronously waits for it to finish so `Drop` still has deterministic completion
+///   semantics without re-entering Tokio. If that helper thread panics, we log it instead of
+///   re-raising, because this helper is used from `Drop` paths where propagating a panic could
+///   trigger a process-aborting double panic.
+/// - If no runtime exists, runs the cleanup inline.
+pub fn run_blocking_cleanup(cleanup: impl FnOnce() + Send + 'static) {
+    match Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
+            block_in_place(cleanup)
+        }
+        Ok(_) => {
+            let handle = thread::spawn(cleanup);
+            if let Err(payload) = handle.join() {
+                eprintln!(
+                    "Warning: blocking cleanup helper thread panicked: {}",
+                    panic_to_string(payload)
+                );
+            }
+        }
+        Err(_) => cleanup(),
+    }
+}
+
 fn run_in_spawned_runtime<T, E>(
     future: impl Future<Output = Result<T, E>> + Send + 'static,
 ) -> Result<T, BridgeError<E>>
@@ -116,7 +147,12 @@ fn panic_to_string(payload: Box<dyn Any + Send>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{run_sync_blocking, run_sync_blocking_send, BridgeError};
+    use super::{run_blocking_cleanup, run_sync_blocking, run_sync_blocking_send, BridgeError};
+    use std::sync::{
+        atomic::{AtomicU16, Ordering},
+        Arc,
+    };
+    use std::time::Duration;
 
     #[test]
     fn run_sync_blocking_outside_runtime() {
@@ -153,6 +189,48 @@ mod tests {
     async fn run_sync_blocking_send_inside_multi_thread_runtime_works() {
         let value = run_sync_blocking_send(async { Ok::<u16, std::io::Error>(33) }).unwrap();
         assert_eq!(value, 33);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_blocking_cleanup_inside_multi_thread_runtime_works() {
+        let value = Arc::new(AtomicU16::new(0));
+        let written = value.clone();
+        run_blocking_cleanup(move || {
+            written.store(55, Ordering::SeqCst);
+        });
+        assert_eq!(value.load(Ordering::SeqCst), 55);
+    }
+
+    #[test]
+    fn run_blocking_cleanup_outside_runtime_works() {
+        let value = Arc::new(AtomicU16::new(0));
+        let written = value.clone();
+        run_blocking_cleanup(move || {
+            written.store(66, Ordering::SeqCst);
+        });
+        assert_eq!(value.load(Ordering::SeqCst), 66);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_blocking_cleanup_inside_current_thread_runtime_works() {
+        let caller = std::thread::current().id();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        run_blocking_cleanup(move || {
+            let _ = tx.send(std::thread::current().id());
+        });
+        let cleanup_thread = tokio::time::timeout(Duration::from_secs(1), rx)
+            .await
+            .expect("cleanup should finish promptly")
+            .expect("cleanup thread should report its thread id");
+        assert_ne!(cleanup_thread, caller);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_blocking_cleanup_inside_current_thread_runtime_swallows_cleanup_panic() {
+        let result = std::panic::catch_unwind(|| {
+            run_blocking_cleanup(|| panic!("simulated cleanup panic"));
+        });
+        assert!(result.is_ok());
     }
 
     #[test]

@@ -132,6 +132,9 @@ Options:
 Notes:
 - `--file` is local-only and stages the file into `state_dir/plugins/<name>.wasm` before calling `plugins.install`
 - `--file` is intended for direct loopback targets; SSH port-forwarded remotes are not a supported workflow
+- If the follow-up `plugins.install` request fails, the CLI restores the previous local managed artifact state when possible and reports the recovery action explicitly
+- If `plugins.install` succeeds but the CLI cannot remove its local `.cli-backup` / `.cli-lock` staging files, the command exits nonzero and tells you to recover or remove those files before the next local `--file` mutation
+- If a previous local `--file` install/update was interrupted and left `.cli-backup` or `.cli-lock` files under `state_dir/plugins`, the CLI fails closed instead of mutating plugin files again; verify that no other local file-based plugin mutation is still running, inspect the PID recorded in `.cli-lock` if needed, remember that PID values may have been recycled if the original process crashed, restore from the `.cli-backup` file if needed, remove stale `.cli-backup` / `.cli-lock` files, and then retry
 - `--publisher-key` and `--signature` are recorded at install/update time; signature verification happens later at plugin load time according to `plugins.signature` policy
 - managed plugin installs still require a Carapace restart before activation
 - remote hosts use the same TLS/plaintext flags as `cara logs`
@@ -152,7 +155,19 @@ cara plugins update demo-plugin --file ./target/wasm32-wasip1/release/demo_plugi
 `cara plugins update` accepts the same flags as `cara plugins install`.
 If `--file` is used, the CLI stages the file into `state_dir/plugins/<name>.wasm`
 and the server adopts that managed artifact on update. Managed plugin updates
-still require restart before the new artifact becomes active.
+still require restart before the new artifact becomes active. If the update
+request fails after local staging, the CLI restores the previous local managed
+artifact state when possible and reports the recovery action explicitly. If
+`plugins.update` succeeds but the CLI cannot remove its local `.cli-backup` /
+`.cli-lock` staging files, the command exits nonzero and tells you to recover
+or remove those files before the next local `--file` mutation. If a
+previous local `--file` install/update was interrupted and left `.cli-backup`
+or `.cli-lock` files under `state_dir/plugins`, the CLI fails closed instead of
+mutating plugin files again; verify that no other local file-based plugin
+mutation is still running, inspect the PID recorded in `.cli-lock` if needed,
+remember that PID values may have been recycled if the original process
+crashed, restore from the `.cli-backup` file if needed, remove stale
+`.cli-backup` / `.cli-lock` files, and then retry.
 
 ### `cara chat`
 Start an interactive chat REPL (`chat.send` over WebSocket).
