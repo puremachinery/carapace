@@ -8037,6 +8037,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_finalize_plugin_file_mutation_without_transaction_passthroughs_ok() {
+        let result = finalize_plugin_file_mutation(None, async {
+            Ok::<_, Box<dyn std::error::Error>>("ok".to_string())
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(result, "ok");
+    }
+
+    #[tokio::test]
+    async fn test_finalize_plugin_file_mutation_without_transaction_passthroughs_err() {
+        let err = finalize_plugin_file_mutation(None, async {
+            Err::<(), Box<dyn std::error::Error>>(cli_error(
+                "plugins.update failed: simulated passthrough failure",
+            ))
+        })
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "plugins.update failed: simulated passthrough failure"
+        );
+    }
+
+    #[tokio::test]
     async fn test_cleanup_partially_staged_plugin_artifact_removes_file() {
         let temp = tempfile::TempDir::new().unwrap();
         let dest = temp.path().join("demo-plugin.wasm");
