@@ -309,7 +309,7 @@ jobs:
 
             const blockingSeverities = new Set(['critical', 'high', 'medium']);
             const blocking = inline.filter((f) => blockingSeverities.has(f.severity));
-            const low = inline.filter((f) => !blockingSeverities.has(f.severity));
+            const low = inline.filter((f) => f.severity === 'low');
 
             const comments = [];
             const unplaced = [];
