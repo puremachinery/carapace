@@ -14,33 +14,45 @@ build:
 build-release:
     cargo build --release
 
-# Run all tests with nextest (faster, better output)
+# Run the full local test lane.
 test:
-    ./scripts/run-nextest-guarded.sh --all-targets
+    ./scripts/run-nextest-guarded.sh --all-targets -P full
 
-# Run all tests with standard cargo test
-test-cargo:
-    cargo test
+# Run the fastest broad local Rust test lane.
+test-fast:
+    ./scripts/run-nextest-guarded.sh --all-targets -P fast
+
+# Run the full golden lane (WebSocket traces + golden/schema integration checks).
+test-golden:
+    ./scripts/run-nextest-guarded.sh --all-targets -P golden
+
+# Run the slower integration lane.
+test-integration:
+    ./scripts/run-nextest-guarded.sh --all-targets -P integration
+
+# Run the broad full lane used for push-time validation.
+test-full:
+    ./scripts/run-nextest-guarded.sh --all-targets -P full
 
 # Run library tests only
 test-lib:
-    ./scripts/run-nextest-guarded.sh --lib
+    ./scripts/run-nextest-guarded.sh --lib -P full
 
 # Run tests with verbose output
 test-verbose:
-    ./scripts/run-nextest-guarded.sh --no-capture
+    ./scripts/run-nextest-guarded.sh --all-targets -P full --no-capture
 
 # Run a specific test by name
 test-one NAME:
-    ./scripts/run-nextest-guarded.sh {{NAME}}
+    ./scripts/run-nextest-guarded.sh --all-targets -P full {{NAME}}
 
-# Run websocket golden snapshot tests.
+# Run the full golden lane.
 test-ws-golden:
-    ./scripts/run-nextest-guarded.sh --all-targets server::ws::golden_tests::golden_trace
+    @just test-golden
 
 # Run the fastest websocket golden guard for update/status contract drift.
 test-ws-golden-quick:
-    ./scripts/run-nextest-guarded.sh --all-targets --test cara server::ws::golden_tests::golden_trace::golden_update_status
+    ./scripts/run-nextest-guarded.sh --all-targets -P golden --test cara server::ws::golden_tests::golden_trace::golden_update_status
 
 # Run tests and show coverage summary
 test-coverage:

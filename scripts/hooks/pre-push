@@ -233,20 +233,20 @@ if [ "$needs_script_checks" -eq 1 ]; then
 fi
 
 if [ "$needs_ws_golden" -eq 1 ] && [ "$needs_full_nextest" -eq 0 ]; then
-    echo "WebSocket changes detected. Running websocket golden snapshot checks..."
+    echo "WebSocket/golden changes detected. Running the golden lane (WebSocket traces + golden/schema checks)..."
     ensure_nextest_installed
-    if ! ./scripts/run-nextest-guarded.sh --locked --all-targets server::ws::golden_tests::golden_trace; then
-        echo "Websocket golden snapshot checks failed."
+    if ! ./scripts/run-nextest-guarded.sh --locked --all-targets -P golden; then
+        echo "Golden lane checks failed."
         echo "If output changes are intentional, update snapshots and commit them before pushing."
         exit 1
     fi
 elif [ "$needs_ws_golden" -eq 1 ] && [ "$needs_full_nextest" -eq 1 ]; then
-    echo "WebSocket changes detected, but full cargo nextest is already required."
-    echo "Skipping standalone websocket golden run to avoid duplicate execution."
+    echo "WebSocket/golden changes detected, but the full test lane is already required."
+    echo "Skipping standalone golden-lane run to avoid duplicate execution."
 fi
 
 if [ "$needs_nextest" -eq 1 ] && [ "$needs_full_nextest" -eq 0 ] && [ "$needs_ws_golden" -eq 1 ]; then
-    echo "Only websocket golden-relevant Rust changes detected; skipping full cargo nextest run."
+    echo "Only golden-lane-relevant Rust changes detected; skipping full cargo nextest run."
     echo "All applicable checks passed, pushing..."
     exit 0
 fi
@@ -261,7 +261,7 @@ echo "Rust-impacting changes detected. Running tests before push..."
 
 ensure_nextest_installed
 
-if ! ./scripts/run-nextest-guarded.sh --locked --all-targets; then
+if ! ./scripts/run-nextest-guarded.sh --locked --all-targets -P full; then
     echo "Tests failed. Fix failing tests before pushing."
     exit 1
 fi
