@@ -10,8 +10,6 @@ For what is already shipped and verified, see:
 
 ## Recently shipped
 
-- Stable compatibility policy established for the stable channel, with
-  verified update and release paths now in effect.
 - Cross-platform subprocess sandbox hardening — macOS, Linux, and Windows
   enforce OS-level isolation for sandbox-required paths; unsupported platforms
   fail closed.
@@ -29,38 +27,52 @@ For what is already shipped and verified, see:
   runtime support.
 - Codex onboarding — OpenAI subscription-login setup via `cara setup` and the
   Control UI, backed by `codex.authProfile` runtime support.
+- Managed and local WASM plugins — startup/runtime loading, `plugins.*` API
+  surface, `cara plugins` CLI workflows, and plugin development guidance.
 - Filesystem tools — guarded local workspace read/search/stat/list plus opt-in
   write/move within explicit roots, with config-gated registration and
   fail-closed validation.
 - Multi-page docs site with install/first-run/security/ops plus docs hubs,
   capability matrix, and task-oriented CLI index.
-- Docs architecture polish — tighter day-1/day-2 routing and clearer task-first
-  command ladders across operational docs.
-
-## Now
-
-- Test-infra hardening for env-sensitive flows — reduce order-dependent flake in
-  config/setup/WebSocket test coverage before expanding onboarding further.
-- Subscription onboarding expansion — add Anthropic subscription-oriented
-  flows and shared verification/remediation improvements while keeping
-  provider/auth boundaries explicit.
-- Guided provider onboarding and migration paths — strengthen setup
-  verification/remediation, add Bedrock and Vertex guided onboarding, and make
-  migration/import easier for users coming from adjacent assistants.
-- Control UI depth — richer in-browser runbook/operator workflows and stronger
-  day-2 remediation UX, including onboarding and provider-status parity.
-- Model/provider routing clarity — improve docs for current routing behavior and
-  evaluate clearer route-vs-agent and multimodal routing UX.
 
 ## Next
 
-- Additional channels (WhatsApp, iMessage, Teams, Matrix, WebChat).
-- Companion apps — native macOS, Linux, iOS, and Android clients.
+- Make onboarding excellent — provider setup should be fast, guided, and
+  understandable without requiring users to edit config by hand.
+  Issues: [#185](https://github.com/puremachinery/carapace/issues/185),
+  [#178](https://github.com/puremachinery/carapace/issues/178),
+  [#183](https://github.com/puremachinery/carapace/issues/183),
+  [#184](https://github.com/puremachinery/carapace/issues/184)
+- Add import and migration from tools people already use — reduce switching cost
+  for users coming from adjacent assistants.
+  Issues: [#180](https://github.com/puremachinery/carapace/issues/180),
+  [#181](https://github.com/puremachinery/carapace/issues/181),
+  [#182](https://github.com/puremachinery/carapace/issues/182)
+- Add Matrix / Element — best-fit next channel for privacy-focused,
+  self-hosted users.
+  Issues: [#234](https://github.com/puremachinery/carapace/issues/234)
+- Make model routing explicit, capability-aware, and sane — users should be
+  able to choose cheap/fast, stronger reasoning, or multimodal routes
+  intentionally.
+  Issues: [#203](https://github.com/puremachinery/carapace/issues/203),
+  [#188](https://github.com/puremachinery/carapace/issues/188),
+  [#189](https://github.com/puremachinery/carapace/issues/189),
+  [#207](https://github.com/puremachinery/carapace/issues/207)
+- Make managed plugin install and update writes truly transactional
+  server-side — plugin distribution needs stronger trust and recovery
+  guarantees.
+  Issues: [#243](https://github.com/puremachinery/carapace/issues/243)
 
 ## Later
 
-- Browser control and live canvas / A2UI experiences.
-- Multi-agent routing and automatic model/provider failover.
+- Audit dead-code allowances on plugin and channel entrypoints.
+  Issue: [#241](https://github.com/puremachinery/carapace/issues/241)
+- Harden plugin CLI local staging against local symlink-swap races.
+  Issue: [#250](https://github.com/puremachinery/carapace/issues/250)
+- Evaluate Microsoft Teams as an additional channel.
+  Issue: [#236](https://github.com/puremachinery/carapace/issues/236)
+- Evaluate Session integration feasibility.
+  Issue: [#237](https://github.com/puremachinery/carapace/issues/237)
 
 ## Give feedback
 
