@@ -2324,15 +2324,10 @@ impl Drop for PendingPluginFileTransactionLock {
         let Some(path) = self.path.as_ref() else {
             return;
         };
-        match std::fs::remove_file(path) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => eprintln!(
-                "Warning: failed to remove staging lock '{}' during pre-transaction cleanup: {}",
-                path.display(),
-                err
-            ),
-        }
+        eprintln!(
+            "Warning: PendingPluginFileTransactionLock dropped before handoff; staging lock '{}' may require manual recovery",
+            path.display()
+        );
     }
 }
 
@@ -2474,26 +2469,51 @@ async fn acquire_plugin_file_transaction_lock(
         })?;
     let pid = std::process::id().to_string();
     if let Err(err) = file.write_all(pid.as_bytes()).await {
-        drop(file);
-        let mut message = format!(
-            "failed to record staging lock owner in '{}': {}",
-            lock.display(),
-            err
-        );
-        match tokio::fs::remove_file(lock).await {
-            Ok(()) => {}
-            Err(cleanup_err) if cleanup_err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(cleanup_err) => {
-                message = format!(
-                    "{message}; additionally failed to remove staging lock '{}': {}",
-                    lock.display(),
-                    cleanup_err
-                );
-            }
-        }
-        return Err(cli_error(message));
+        return Err(cleanup_failed_plugin_file_transaction_lock_init(
+            file,
+            lock,
+            format!(
+                "failed to record staging lock owner in '{}': {}",
+                lock.display(),
+                err
+            ),
+        )
+        .await);
+    }
+    if let Err(err) = file.sync_data().await {
+        return Err(cleanup_failed_plugin_file_transaction_lock_init(
+            file,
+            lock,
+            format!(
+                "failed to persist staging lock owner in '{}': {}",
+                lock.display(),
+                err
+            ),
+        )
+        .await);
     }
     Ok(())
+}
+
+async fn cleanup_failed_plugin_file_transaction_lock_init(
+    file: tokio::fs::File,
+    lock: &Path,
+    message: String,
+) -> Box<dyn std::error::Error> {
+    drop(file);
+    let mut message = message;
+    match tokio::fs::remove_file(lock).await {
+        Ok(()) => {}
+        Err(cleanup_err) if cleanup_err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(cleanup_err) => {
+            message = format!(
+                "{message}; additionally failed to remove staging lock '{}': {}",
+                lock.display(),
+                cleanup_err
+            );
+        }
+    }
+    cli_error(message)
 }
 
 async fn release_plugin_file_transaction_lock(lock: &Path) -> std::io::Result<()> {
@@ -2669,7 +2689,7 @@ async fn stage_plugin_file_into_managed_dir(
                 )));
             }
         }
-        match tokio::fs::metadata(&backup).await {
+        match tokio::fs::symlink_metadata(&backup).await {
             Ok(_) => {
                 return Err(cli_error(format!(
                     "refusing to stage plugin file because rollback backup '{}' already exists; remove or recover it first",
@@ -7974,6 +7994,41 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("rollback backup"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_stage_plugin_file_into_managed_dir_rejects_broken_symlink_backup() {
+        use std::os::unix::fs::symlink;
+
+        let mut env_guard = ScopedEnv::new();
+        let temp = tempfile::TempDir::new().unwrap();
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
+
+        let plugins_dir = temp.path().join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+        symlink(
+            temp.path().join("missing-backup-target"),
+            plugins_dir.join("demo-plugin.wasm.cli-backup"),
+        )
+        .unwrap();
+
+        let plugin_path = temp.path().join("demo-input.wasm");
+        std::fs::write(&plugin_path, tool_plugin_component_bytes()).unwrap();
+        let connection = WsConnectionArgs {
+            port: Some(18789),
+            host: "127.0.0.1".to_string(),
+            tls: false,
+            trust: false,
+            allow_plaintext: false,
+        };
+
+        let err = stage_plugin_file_into_managed_dir(&connection, "demo-plugin", &plugin_path)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("rollback backup"));
+        assert!(!plugins_dir.join("demo-plugin.wasm.cli-lock").exists());
     }
 
     #[tokio::test]
