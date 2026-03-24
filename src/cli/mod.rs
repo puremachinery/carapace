@@ -2414,9 +2414,6 @@ impl Drop for ManagedPluginFileTransaction {
             eprintln!("Warning: {message}");
             return;
         }
-        #[cfg(debug_assertions)]
-        panic!("{message}");
-        #[cfg(not(debug_assertions))]
         eprintln!("Warning: {message}");
     }
 }
@@ -2671,7 +2668,7 @@ async fn stage_plugin_file_into_managed_dir(
     acquire_plugin_file_transaction_lock(&lock).await?;
     let pending_lock = PendingPluginFileTransactionLock::new(lock);
     let had_existing = match async {
-        let existing_metadata = match tokio::fs::metadata(&dest).await {
+        let existing_metadata = match tokio::fs::symlink_metadata(&dest).await {
             Ok(metadata) => Some(metadata),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
             Err(err) => {
@@ -7967,9 +7964,8 @@ mod tests {
         assert!(message.contains("failed to remove staging lock"));
     }
 
-    #[cfg(debug_assertions)]
     #[test]
-    fn test_managed_plugin_file_transaction_drop_panics_when_unfinished() {
+    fn test_managed_plugin_file_transaction_drop_warns_when_unfinished() {
         let temp = tempfile::TempDir::new().unwrap();
         let transaction = ManagedPluginFileTransaction {
             dest: temp.path().join("demo-plugin.wasm"),
@@ -7979,7 +7975,7 @@ mod tests {
         };
 
         let result = std::panic::catch_unwind(|| drop(transaction));
-        assert!(result.is_err());
+        assert!(result.is_ok());
     }
 
     #[tokio::test]
@@ -8070,6 +8066,39 @@ mod tests {
 
         let plugins_dir = temp.path().join("plugins");
         std::fs::create_dir_all(plugins_dir.join("demo-plugin.wasm")).unwrap();
+
+        let plugin_path = temp.path().join("demo-input.wasm");
+        std::fs::write(&plugin_path, tool_plugin_component_bytes()).unwrap();
+        let connection = WsConnectionArgs {
+            port: Some(18789),
+            host: "127.0.0.1".to_string(),
+            tls: false,
+            trust: false,
+            allow_plaintext: false,
+        };
+
+        let err = stage_plugin_file_into_managed_dir(&connection, "demo-plugin", &plugin_path)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("not a regular file"));
+        assert!(!plugins_dir.join("demo-plugin.wasm.cli-lock").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_stage_plugin_file_into_managed_dir_rejects_symlink_destination() {
+        use std::os::unix::fs::symlink;
+
+        let mut env_guard = ScopedEnv::new();
+        let temp = tempfile::TempDir::new().unwrap();
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
+
+        let plugins_dir = temp.path().join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+        let real_plugin = temp.path().join("real-plugin.wasm");
+        std::fs::write(&real_plugin, tool_plugin_component_bytes()).unwrap();
+        symlink(&real_plugin, plugins_dir.join("demo-plugin.wasm")).unwrap();
 
         let plugin_path = temp.path().join("demo-input.wasm");
         std::fs::write(&plugin_path, tool_plugin_component_bytes()).unwrap();
