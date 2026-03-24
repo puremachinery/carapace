@@ -8,39 +8,6 @@ For what is already shipped and verified, see:
 - [Feature status](feature-status.yaml)
 - [Feature evidence](feature-evidence.yaml)
 
-## Recently shipped
-
-- Cross-platform subprocess sandbox hardening — macOS, Linux, and Windows
-  enforce OS-level isolation for sandbox-required paths; unsupported platforms
-  fail closed.
-- Control UI foundation — local browser UI for status/channels, safe
-  `gateway.controlUi.*` config patching, device pairing, and task queue
-  operator actions.
-- Long-running assistant MVP — durable task queue with restart recovery,
-  operator task controls (`create/list/get/patch/cancel/retry/resume`),
-  continuation policy budgets, blocked-state handling, and autonomy verification
-  (`cara verify --outcome autonomy`).
-- Outcome-driven setup flow (`cara setup`) with provider credential validation.
-- First-run verifier (`cara verify`) with pass/fail outcome checks.
-- Gemini onboarding — Google sign-in or API-key setup via `cara setup` and the
-  Control UI, backed by shared onboarding flow state and `google.authProfile`
-  runtime support.
-- Codex onboarding — OpenAI subscription-login setup via `cara setup` and the
-  Control UI, backed by `codex.authProfile` runtime support.
-- Managed and local WASM plugins — startup/runtime loading, `plugins.*` API
-  surface, `cara plugins` CLI workflows, and plugin development guidance.
-  Local `cara plugins install/update --file` staging still has a known
-  symlink-swap / TOCTOU hardening gap. Use that workflow only with a trusted,
-  single-user state directory owned by the Carapace user, and do not use it
-  on shared hosts or anywhere other users or services can write to that
-  directory.
-  Tracking open issue: [#250](https://github.com/puremachinery/carapace/issues/250)
-- Filesystem tools — guarded local workspace read/search/stat/list plus opt-in
-  write/move within explicit roots, with config-gated registration and
-  fail-closed validation.
-- Multi-page docs site with install/first-run/security/ops plus docs hubs,
-  capability matrix, and task-oriented CLI index.
-
 ## Next
 
 These items are listed in priority order. The top item is the current focus.
