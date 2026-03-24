@@ -113,7 +113,7 @@ jobs:
 
             Required structured output example:
             {
-              "header": "No in-scope blocking findings.",
+              "header": "Blocking findings present.",
               "summary": "one-paragraph summary",
               "inline_findings": [
                 {
@@ -123,6 +123,14 @@ jobs:
                   "body": "one-paragraph explanation",
                   "path": "repo/relative/path.ext",
                   "line": 123
+                },
+                {
+                  "severity": "low",
+                  "scope": "in-scope",
+                  "title": "short low-severity title",
+                  "body": "one-paragraph explanation",
+                  "path": "repo/relative/path.ext",
+                  "line": 456
                 }
               ],
               "advisory_findings": [
@@ -132,22 +140,17 @@ jobs:
                   "title": "short advisory title",
                   "body": "one-paragraph explanation"
                 }
-              ],
-              "optional_followups": ["non-blocking follow-up item"]
+              ]
             }
 
             Rules:
-            - Allowed header values: "Blocking findings present.", "No in-scope blocking findings.", or "LGTM.".
-            - Allowed severity values: "critical", "high", "medium".
-            - Only in-scope critical/high/medium findings belong in inline_findings.
-            - Never include low/info in inline_findings.
-            - Low-only items go to optional_followups.
-            - If inline_findings is non-empty, header MUST be "Blocking findings present.".
-            - If inline_findings is empty and both advisory_findings and optional_followups are empty, header MUST be "LGTM.".
-            - If inline_findings is empty and any advisory_findings/optional_followups exist, header MUST be "No in-scope blocking findings.".
+            - Allowed severity values: "critical", "high", "medium", "low".
+            - inline_findings contains in-scope findings at any severity level.
+            - advisory_findings contains out-of-scope findings at any severity level.
+            - header is a brief one-line summary of the review.
           claude_args: |
             --allowedTools "Bash(gh pr diff:*),Bash(gh pr view:*),Bash(jq:*)"
-            --json-schema '{"type":"object","additionalProperties":false,"properties":{"header":{"type":"string","enum":["Blocking findings present.","LGTM.","No in-scope blocking findings."]},"summary":{"type":"string","pattern":"\\S"},"inline_findings":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{"severity":{"type":"string","enum":["critical","high","medium"]},"scope":{"type":"string","enum":["in-scope"]},"title":{"type":"string","pattern":"\\S"},"body":{"type":"string","pattern":"\\S"},"path":{"type":"string","pattern":"\\S"},"line":{"type":"integer","minimum":1}},"required":["severity","scope","title","body","path","line"]}},"advisory_findings":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{"severity":{"type":"string","enum":["critical","high","medium"]},"scope":{"type":"string","enum":["out-of-scope"]},"title":{"type":"string","pattern":"\\S"},"body":{"type":"string","pattern":"\\S"}},"required":["severity","scope","title","body"]}},"optional_followups":{"type":"array","items":{"type":"string","pattern":"\\S"}}},"required":["header","summary","inline_findings","advisory_findings","optional_followups"]}'
+            --json-schema '{"type":"object","additionalProperties":false,"properties":{"header":{"type":"string","pattern":"\\S"},"summary":{"type":"string","pattern":"\\S"},"inline_findings":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{"severity":{"type":"string","enum":["critical","high","medium","low"]},"scope":{"type":"string","enum":["in-scope"]},"title":{"type":"string","pattern":"\\S"},"body":{"type":"string","pattern":"\\S"},"path":{"type":"string","pattern":"\\S"},"line":{"type":"integer","minimum":1}},"required":["severity","scope","title","body","path","line"]}},"advisory_findings":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{"severity":{"type":"string","enum":["critical","high","medium","low"]},"scope":{"type":"string","enum":["out-of-scope"]},"title":{"type":"string","pattern":"\\S"},"body":{"type":"string","pattern":"\\S"}},"required":["severity","scope","title","body"]}}},"required":["header","summary","inline_findings","advisory_findings"]}'
 
       - name: Persist structured review output
         id: persist-review-json
@@ -172,18 +175,12 @@ jobs:
           test -f "$REVIEW_JSON_PATH"
           jq -e '
             def nonempty_string: type == "string" and (gsub("^\\s+|\\s+$"; "") | length > 0);
-            def allowed_severity: . as $severity | (["critical","high","medium"] | index($severity)) != null;
+            def allowed_severity: . as $severity | (["critical","high","medium","low"] | index($severity)) != null;
             type == "object" and
-            ((.header == "Blocking findings present.") or
-             (.header == "LGTM.") or
-             (.header == "No in-scope blocking findings.")) and
+            (.header | nonempty_string) and
             (.summary | nonempty_string) and
             (.inline_findings | type == "array") and
             (.advisory_findings | type == "array") and
-            (.optional_followups | type == "array") and
-            (((.inline_findings | length) > 0 and .header == "Blocking findings present.") or
-             ((.inline_findings | length) == 0 and (((.advisory_findings | length) + (.optional_followups | length)) == 0) and .header == "LGTM.") or
-             ((.inline_findings | length) == 0 and (((.advisory_findings | length) + (.optional_followups | length)) > 0) and .header == "No in-scope blocking findings.")) and
             (all(.inline_findings[]?; (.severity | allowed_severity) and
               .scope == "in-scope" and
               (.title | nonempty_string) and
@@ -193,8 +190,7 @@ jobs:
             (all(.advisory_findings[]?; (.severity | allowed_severity) and
               .scope == "out-of-scope" and
               (.title | nonempty_string) and
-              (.body | nonempty_string))) and
-            (all(.optional_followups[]?; nonempty_string))
+              (.body | nonempty_string)))
           ' "$REVIEW_JSON_PATH" >/dev/null
 
       - name: Upload Claude review output
@@ -310,7 +306,10 @@ jobs:
 
             const inline = Array.isArray(review.inline_findings) ? review.inline_findings : [];
             const advisory = Array.isArray(review.advisory_findings) ? review.advisory_findings : [];
-            const followups = Array.isArray(review.optional_followups) ? review.optional_followups : [];
+
+            const blockingSeverities = new Set(['critical', 'high', 'medium']);
+            const blocking = inline.filter((f) => blockingSeverities.has(f.severity));
+            const low = inline.filter((f) => !blockingSeverities.has(f.severity));
 
             const comments = [];
             const unplaced = [];
@@ -334,9 +333,16 @@ jobs:
             let body = `${review.header}\n\n_Generated by Claude; published by workflow._\n\n${String(review.summary || '').trim()}`;
             const reviewMarker = process.env.REVIEW_MARKER || '';
 
-            if (inline.length > 0) {
-              body += '\n\n### Blocking findings (required before merge)\n';
-              for (const f of inline) {
+            if (blocking.length > 0) {
+              body += '\n\n### Blocking findings\n';
+              for (const f of blocking) {
+                const loc = (f.path && f.line) ? ` (${f.path}:${f.line})` : '';
+                body += `\n- [${f.severity}, in-scope] ${f.title}${loc}: ${f.body}`;
+              }
+            }
+            if (low.length > 0) {
+              body += '\n\n### Low-severity findings\n';
+              for (const f of low) {
                 const loc = (f.path && f.line) ? ` (${f.path}:${f.line})` : '';
                 body += `\n- [${f.severity}, in-scope] ${f.title}${loc}: ${f.body}`;
               }
@@ -347,14 +353,8 @@ jobs:
                 body += `\n- [${f.severity}, out-of-scope] ${f.title}: ${f.body}`;
               }
             }
-            if (followups.length > 0) {
-              body += '\n\n### Optional follow-ups (non-blocking)\n';
-              for (const f of followups) {
-                body += `\n- ${f}`;
-              }
-            }
             if (unplaced.length > 0) {
-              body += `\n\nNote: ${unplaced.length} blocking finding(s) could not be placed inline because the requested path/line was not in the current PR diff.`;
+              body += `\n\nNote: ${unplaced.length} finding(s) could not be placed inline because the requested path/line was not in the current PR diff.`;
             }
             if (reviewMarker) {
               body += `\n\n${reviewMarker}`;
