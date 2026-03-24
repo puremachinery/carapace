@@ -79,7 +79,8 @@ where
 ///
 /// This is intended for best-effort synchronous cleanup paths where `Drop` cannot `await`.
 /// If running inside a multi-threaded Tokio runtime, uses `block_in_place` so the scheduler
-/// can compensate for the blocking section. Otherwise, runs the closure directly.
+/// can compensate for the blocking section. Current-thread runtimes have no equivalent
+/// off-ramp for `Drop`, so we run inline there to keep cleanup deterministic.
 pub fn run_blocking_cleanup<T>(cleanup: impl FnOnce() -> T) -> T {
     match Handle::try_current() {
         Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
@@ -179,6 +180,12 @@ mod tests {
     fn run_blocking_cleanup_outside_runtime_works() {
         let value = run_blocking_cleanup(|| 66);
         assert_eq!(value, 66);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_blocking_cleanup_inside_current_thread_runtime_works() {
+        let value = run_blocking_cleanup(|| 77);
+        assert_eq!(value, 77);
     }
 
     #[test]
