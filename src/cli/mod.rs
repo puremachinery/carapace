@@ -2326,13 +2326,13 @@ impl ManagedPluginFileTransaction {
     async fn rollback(mut self) -> Result<String, Box<dyn std::error::Error>> {
         self.completed = true;
         let rollback_result = match self.backup.take() {
-            Some(backup) => {
-                restore_previous_plugin_artifact(&backup, &self.dest).await?;
-                Ok(format!(
+            Some(backup) => match restore_previous_plugin_artifact(&backup, &self.dest).await {
+                Ok(()) => Ok(format!(
                     "restored previous local managed artifact at '{}'",
                     self.dest.display()
-                ))
-            }
+                )),
+                Err(err) => Err(err),
+            },
             None => match tokio::fs::remove_file(&self.dest).await {
                 Ok(()) => Ok(format!(
                     "removed staged local managed artifact at '{}'",
@@ -7647,6 +7647,35 @@ mod tests {
         assert!(rollback_note.contains("restored previous local managed artifact"));
         assert!(!plugins_dir.join("demo-plugin.wasm.cli-backup").exists());
         assert!(!plugins_dir.join("demo-plugin.wasm.cli-lock").exists());
+    }
+
+    #[tokio::test]
+    async fn test_managed_plugin_file_transaction_rollback_releases_lock_on_restore_failure() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let dest = temp.path().join("demo-plugin.wasm");
+        let backup = temp.path().join("demo-plugin.wasm.cli-backup");
+        let lock = temp.path().join("demo-plugin.wasm.cli-lock");
+
+        std::fs::write(&dest, b"new-plugin-bytes").unwrap();
+        std::fs::create_dir_all(&backup).unwrap();
+        std::fs::write(&lock, b"locked").unwrap();
+
+        let err = ManagedPluginFileTransaction {
+            dest: dest.clone(),
+            backup: Some(backup.clone()),
+            lock: lock.clone(),
+            completed: false,
+        }
+        .rollback()
+        .await
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("failed to restore previous plugin artifact"));
+        assert!(!lock.exists());
+        assert!(backup.exists());
+        assert!(dest.exists());
     }
 
     #[tokio::test]
