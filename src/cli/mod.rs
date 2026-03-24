@@ -2374,8 +2374,12 @@ impl Drop for ManagedPluginFileTransaction {
             "ManagedPluginFileTransaction dropped without commit() or rollback(); staged artifact '{}' may require manual recovery",
             self.dest.display()
         );
+        if std::thread::panicking() {
+            eprintln!("Warning: {message}");
+            return;
+        }
         #[cfg(debug_assertions)]
-        debug_assert!(false, "{message}");
+        panic!("{message}");
         #[cfg(not(debug_assertions))]
         eprintln!("Warning: {message}");
     }
@@ -2489,6 +2493,9 @@ fn replace_plugin_artifact_with_backup_windows(backup: &Path, dest: &Path) -> st
         .chain(std::iter::once(0))
         .collect();
     let flags = MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH;
+    // SAFETY: `backup_wide` and `dest_wide` are owned, NUL-terminated UTF-16
+    // buffers that stay alive for the duration of this call, so the pointers are
+    // valid and satisfy `MoveFileExW`'s requirements.
     let result = unsafe { MoveFileExW(backup_wide.as_ptr(), dest_wide.as_ptr(), flags) };
     if result == 0 {
         Err(std::io::Error::last_os_error())
@@ -2665,6 +2672,8 @@ async fn stage_plugin_file_into_managed_dir(
 
 async fn finalize_plugin_file_mutation<T>(
     staged_file: Option<ManagedPluginFileTransaction>,
+    // `result` must already be awaited/evaluated before this helper is called so
+    // the transaction lifetime does not extend across an unpolled future.
     result: Result<T, Box<dyn std::error::Error>>,
 ) -> Result<T, Box<dyn std::error::Error>> {
     match (staged_file, result) {
