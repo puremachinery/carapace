@@ -8,59 +8,46 @@ For what is already shipped and verified, see:
 - [Feature status](feature-status.yaml)
 - [Feature evidence](feature-evidence.yaml)
 
-## Recently shipped
-
-- Stable compatibility policy established for the stable channel, with
-  verified update and release paths now in effect.
-- Cross-platform subprocess sandbox hardening — macOS, Linux, and Windows
-  enforce OS-level isolation for sandbox-required paths; unsupported platforms
-  fail closed.
-- Control UI foundation — local browser UI for status/channels, safe
-  `gateway.controlUi.*` config patching, device pairing, and task queue
-  operator actions.
-- Long-running assistant MVP — durable task queue with restart recovery,
-  operator task controls (`create/list/get/patch/cancel/retry/resume`),
-  continuation policy budgets, blocked-state handling, and autonomy verification
-  (`cara verify --outcome autonomy`).
-- Outcome-driven setup flow (`cara setup`) with provider credential validation.
-- First-run verifier (`cara verify`) with pass/fail outcome checks.
-- Gemini onboarding — Google sign-in or API-key setup via `cara setup` and the
-  Control UI, backed by shared onboarding flow state and `google.authProfile`
-  runtime support.
-- Codex onboarding — OpenAI subscription-login setup via `cara setup` and the
-  Control UI, backed by `codex.authProfile` runtime support.
-- Filesystem tools — guarded local workspace read/search/stat/list plus opt-in
-  write/move within explicit roots, with config-gated registration and
-  fail-closed validation.
-- Multi-page docs site with install/first-run/security/ops plus docs hubs,
-  capability matrix, and task-oriented CLI index.
-- Docs architecture polish — tighter day-1/day-2 routing and clearer task-first
-  command ladders across operational docs.
-
-## Now
-
-- Test-infra hardening for env-sensitive flows — reduce order-dependent flake in
-  config/setup/WebSocket test coverage before expanding onboarding further.
-- Subscription onboarding expansion — add Anthropic subscription-oriented
-  flows and shared verification/remediation improvements while keeping
-  provider/auth boundaries explicit.
-- Guided provider onboarding and migration paths — strengthen setup
-  verification/remediation, add Bedrock and Vertex guided onboarding, and make
-  migration/import easier for users coming from adjacent assistants.
-- Control UI depth — richer in-browser runbook/operator workflows and stronger
-  day-2 remediation UX, including onboarding and provider-status parity.
-- Model/provider routing clarity — improve docs for current routing behavior and
-  evaluate clearer route-vs-agent and multimodal routing UX.
-
 ## Next
 
-- Additional channels (WhatsApp, iMessage, Teams, Matrix, WebChat).
-- Companion apps — native macOS, Linux, iOS, and Android clients.
+These items are listed in priority order. The top item is the current focus.
+
+- Make onboarding excellent — provider setup should be fast, guided, and
+  understandable without requiring users to edit config by hand.
+  Issues: [#185](https://github.com/puremachinery/carapace/issues/185),
+  [#178](https://github.com/puremachinery/carapace/issues/178),
+  [#183](https://github.com/puremachinery/carapace/issues/183),
+  [#184](https://github.com/puremachinery/carapace/issues/184)
+- Add import and migration from tools people already use — reduce switching
+  cost for users coming from adjacent assistants.
+  Issues: [#180](https://github.com/puremachinery/carapace/issues/180),
+  [#181](https://github.com/puremachinery/carapace/issues/181),
+  [#182](https://github.com/puremachinery/carapace/issues/182)
+- Add Matrix / Element — best-fit next channel for privacy-focused,
+  self-hosted users.
+  Issue: [#234](https://github.com/puremachinery/carapace/issues/234)
+- Make model routing explicit, capability-aware, and sane — users should be
+  able to choose cheap/fast, stronger reasoning, or multimodal routes
+  intentionally.
+  Issues: [#203](https://github.com/puremachinery/carapace/issues/203),
+  [#188](https://github.com/puremachinery/carapace/issues/188),
+  [#189](https://github.com/puremachinery/carapace/issues/189),
+  [#207](https://github.com/puremachinery/carapace/issues/207)
+- Make managed plugin install/update operations truly transactional
+  server-side — plugin distribution needs stronger trust and recovery
+  guarantees.
+  Issue: [#243](https://github.com/puremachinery/carapace/issues/243)
 
 ## Later
 
-- Browser control and live canvas / A2UI experiences.
-- Multi-agent routing and automatic model/provider failover.
+- Audit dead-code allowances on plugin and channel entrypoints.
+  Issue: [#241](https://github.com/puremachinery/carapace/issues/241)
+- Harden plugin CLI local staging against local symlink-swap races.
+  Issue: [#250](https://github.com/puremachinery/carapace/issues/250)
+- Evaluate Microsoft Teams as an additional channel.
+  Issue: [#236](https://github.com/puremachinery/carapace/issues/236)
+- Evaluate Session integration feasibility.
+  Issue: [#237](https://github.com/puremachinery/carapace/issues/237)
 
 ## Give feedback
 
