@@ -2551,9 +2551,8 @@ fn append_lock_release_failure(
     lock_err: &dyn std::fmt::Display,
 ) -> String {
     format!(
-        "{message}; additionally failed to remove staging lock '{}': {}",
-        lock.display(),
-        lock_err
+        "{message}; additionally failed to remove staging lock '{}': {}; remove that lock file before the next local `--file` plugin mutation",
+        lock.display(), lock_err
     )
 }
 
@@ -2759,11 +2758,29 @@ fn should_fail_staged_plugin_cleanup(dest: &Path) -> bool {
 }
 
 #[cfg(test)]
+fn should_fail_staged_plugin_rename_dest(dest: &Path) -> bool {
+    std::env::var_os("CARAPACE_TEST_FAIL_STAGE_PLUGIN_RENAME_DEST")
+        .map(PathBuf::from)
+        .as_deref()
+        == Some(dest)
+}
+
+#[cfg(test)]
 fn should_fail_restore_previous_plugin_artifact(dest: &Path) -> bool {
     std::env::var_os("CARAPACE_TEST_FAIL_RESTORE_PLUGIN_DEST")
         .map(PathBuf::from)
         .as_deref()
         == Some(dest)
+}
+
+async fn finalize_staged_plugin_artifact(staged: &Path, dest: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if should_fail_staged_plugin_rename_dest(dest) {
+        return Err(std::io::Error::other(
+            "injected staged plugin rename failure",
+        ));
+    }
+    tokio::fs::rename(staged, dest).await
 }
 
 async fn stage_plugin_file_into_managed_dir(
@@ -2895,7 +2912,7 @@ async fn stage_plugin_file_into_managed_dir(
             }
             return Err(message);
         }
-        if let Err(err) = tokio::fs::rename(&staged, &dest).await {
+        if let Err(err) = finalize_staged_plugin_artifact(&staged, &dest).await {
             let mut message = format!(
                 "failed to finalize staged plugin artifact from '{}' to '{}': {}",
                 staged.display(),
@@ -8076,6 +8093,8 @@ mod tests {
         assert!(rendered.contains("failed to remove staging backup"));
         assert!(rendered.contains("failed to remove staging lock"));
         assert!(rendered.contains("remove or recover that backup"));
+        assert!(rendered
+            .contains("remove that lock file before the next local `--file` plugin mutation"));
         assert!(backup.exists());
         assert!(lock.exists());
     }
@@ -8173,6 +8192,8 @@ mod tests {
 
         assert!(message.contains("base failure"));
         assert!(message.contains("failed to remove staging lock"));
+        assert!(message
+            .contains("remove that lock file before the next local `--file` plugin mutation"));
     }
 
     #[test]
@@ -8457,6 +8478,89 @@ mod tests {
         assert!(!staged_dest.exists());
         assert!(!staged_temp.exists());
         assert!(!plugins_dir.join("demo-plugin.wasm.cli-backup").exists());
+        assert!(!plugins_dir.join("demo-plugin.wasm.cli-lock").exists());
+    }
+
+    #[tokio::test]
+    async fn test_stage_plugin_file_into_managed_dir_cleans_new_file_after_rename_failure() {
+        let mut env_guard = ScopedEnv::new();
+        let temp = tempfile::TempDir::new().unwrap();
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
+
+        let plugins_dir = temp.path().join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+        let staged_dest = plugins_dir.join("demo-plugin.wasm");
+        let staged_temp = plugins_dir.join("demo-plugin.wasm.cli-staged");
+
+        let plugin_path = temp.path().join("demo-input.wasm");
+        std::fs::write(&plugin_path, tool_plugin_component_bytes()).unwrap();
+        env_guard.set(
+            "CARAPACE_TEST_FAIL_STAGE_PLUGIN_RENAME_DEST",
+            staged_dest.as_os_str(),
+        );
+        let connection = WsConnectionArgs {
+            port: Some(18789),
+            host: "127.0.0.1".to_string(),
+            tls: false,
+            trust: false,
+            allow_plaintext: false,
+        };
+
+        let err = stage_plugin_file_into_managed_dir(&connection, "demo-plugin", &plugin_path)
+            .await
+            .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("failed to finalize staged plugin artifact"));
+        assert!(!err
+            .to_string()
+            .contains("restored previous local managed artifact"));
+        assert!(!staged_dest.exists());
+        assert!(!staged_temp.exists());
+        assert!(!plugins_dir.join("demo-plugin.wasm.cli-backup").exists());
+        assert!(!plugins_dir.join("demo-plugin.wasm.cli-lock").exists());
+    }
+
+    #[tokio::test]
+    async fn test_stage_plugin_file_into_managed_dir_restores_backup_after_rename_failure() {
+        let mut env_guard = ScopedEnv::new();
+        let temp = tempfile::TempDir::new().unwrap();
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
+
+        let plugins_dir = temp.path().join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+        let existing = plugins_dir.join("demo-plugin.wasm");
+        let staged = plugins_dir.join("demo-plugin.wasm.cli-staged");
+        std::fs::write(&existing, b"old-plugin-bytes").unwrap();
+
+        let plugin_path = temp.path().join("demo-input.wasm");
+        std::fs::write(&plugin_path, tool_plugin_component_bytes()).unwrap();
+        env_guard.set(
+            "CARAPACE_TEST_FAIL_STAGE_PLUGIN_RENAME_DEST",
+            existing.as_os_str(),
+        );
+        let connection = WsConnectionArgs {
+            port: Some(18789),
+            host: "127.0.0.1".to_string(),
+            tls: false,
+            trust: false,
+            allow_plaintext: false,
+        };
+
+        let err = stage_plugin_file_into_managed_dir(&connection, "demo-plugin", &plugin_path)
+            .await
+            .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("failed to finalize staged plugin artifact"));
+        assert!(err
+            .to_string()
+            .contains("restored previous local managed artifact"));
+        assert_eq!(std::fs::read(&existing).unwrap(), b"old-plugin-bytes");
+        assert!(!plugins_dir.join("demo-plugin.wasm.cli-backup").exists());
+        assert!(!staged.exists());
         assert!(!plugins_dir.join("demo-plugin.wasm.cli-lock").exists());
     }
 
