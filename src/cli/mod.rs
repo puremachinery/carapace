@@ -2303,9 +2303,8 @@ impl ManagedPluginFileTransaction {
             if let Err(err) = tokio::fs::remove_file(&backup).await {
                 if err.kind() != std::io::ErrorKind::NotFound {
                     warnings.push(format!(
-                        "plugin request succeeded, but failed to remove staging backup '{}': {}",
-                        backup.display(),
-                        err
+                        "plugin request succeeded, but failed to remove staging backup '{}': {}; remove or recover that backup before the next local `--file` plugin mutation",
+                        backup.display(), err
                     ));
                 }
             }
@@ -2372,7 +2371,7 @@ impl Drop for ManagedPluginFileTransaction {
             return;
         }
         let message = format!(
-            "ManagedPluginFileTransaction dropped without commit() or rollback(); staged artifact '{}' may require manual recovery",
+            "ManagedPluginFileTransaction dropped without commit() or rollback(); staged artifact '{}' and any matching `.cli-lock` / `.cli-backup` files may require manual recovery after an interrupted or cancelled run",
             self.dest.display()
         );
         if std::thread::panicking() {
@@ -2421,7 +2420,7 @@ async fn acquire_plugin_file_transaction_lock(
         .map_err(|err| {
             if err.kind() == std::io::ErrorKind::AlreadyExists {
                 cli_error(format!(
-                    "refusing to stage plugin file because staging lock '{}' already exists; another local plugin mutation may still be in progress, or the lock may be stale from a previous interrupted run. Verify that no other `cara plugins install --file` or `cara plugins update --file` command is still running, then remove the lock file and retry.",
+                    "refusing to stage plugin file because staging lock '{}' already exists; another local plugin mutation may still be in progress, or the lock may be stale from a previous interrupted run. Verify that no other `cara plugins install --file` or `cara plugins update --file` command is still running, inspect the PID recorded in the lock file if needed, and then remove the lock file and retry. The PID in the lock file may have been recycled if the original process crashed.",
                     lock.display()
                 ))
             } else {
@@ -7793,6 +7792,7 @@ mod tests {
         let rendered = warning.expect("expected warning");
         assert!(rendered.contains("plugin request succeeded"));
         assert!(rendered.contains("failed to remove staging backup"));
+        assert!(rendered.contains("remove or recover that backup"));
         assert!(backup.exists());
     }
 
@@ -7818,6 +7818,7 @@ mod tests {
         let rendered = warning.expect("expected warning");
         assert!(rendered.contains("failed to remove staging backup"));
         assert!(rendered.contains("failed to remove staging lock"));
+        assert!(rendered.contains("remove or recover that backup"));
         assert!(backup.exists());
         assert!(lock.exists());
     }
@@ -8036,6 +8037,9 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("staging lock"));
         assert!(err.to_string().contains("remove the lock file and retry"));
+        assert!(err
+            .to_string()
+            .contains("PID in the lock file may have been recycled"));
     }
 
     #[tokio::test]
