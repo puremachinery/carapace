@@ -1506,6 +1506,104 @@ mod tests {
     }
 
     #[test]
+    fn test_handle_plugins_status_reports_loader_init_failures_per_managed_plugin() {
+        let config_dir = TempDir::new().unwrap();
+        let config_path = config_dir.path().join("carapace.json");
+        std::fs::write(
+            &config_path,
+            json!({
+                "plugins": {
+                    "entries": {
+                        "alpha": {
+                            "enabled": true,
+                            "installId": "install-alpha",
+                            "requestedAt": 1700000001000u64
+                        },
+                        "beta": {
+                            "enabled": false,
+                            "installId": "install-beta",
+                            "requestedAt": 1700000002000u64
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut env = ScopedEnv::new();
+        env.set("CARAPACE_CONFIG_PATH", config_path.as_os_str())
+            .set("CARAPACE_DISABLE_CONFIG_CACHE", "1");
+        crate::config::clear_cache();
+
+        let loader_init_reason =
+            "failed to initialize plugin loader: Wasmtime engine error: forced loader init failure";
+        let state = WsServerState::new(WsServerConfig::default()).with_plugin_activation_report(
+            crate::server::plugin_bootstrap::PluginActivationReport {
+                enabled: true,
+                configured_paths: vec![],
+                restart_required_for_changes: true,
+                errors: vec![loader_init_reason.to_string()],
+                entries: vec![
+                    crate::server::plugin_bootstrap::PluginActivationEntry {
+                        name: "alpha".to_string(),
+                        plugin_id: None,
+                        source: crate::server::plugin_bootstrap::PluginActivationSource::Managed,
+                        enabled: true,
+                        path: None,
+                        requested_at: Some(1700000001000u64),
+                        install_id: Some(json!("install-alpha")),
+                        state: crate::server::plugin_bootstrap::PluginActivationState::Failed,
+                        reason: Some(loader_init_reason.to_string()),
+                    },
+                    crate::server::plugin_bootstrap::PluginActivationEntry {
+                        name: "beta".to_string(),
+                        plugin_id: None,
+                        source: crate::server::plugin_bootstrap::PluginActivationSource::Managed,
+                        enabled: false,
+                        path: None,
+                        requested_at: Some(1700000002000u64),
+                        install_id: Some(json!("install-beta")),
+                        state: crate::server::plugin_bootstrap::PluginActivationState::Disabled,
+                        reason: Some("managed plugin is disabled in plugins.entries".to_string()),
+                    },
+                ],
+            },
+        );
+
+        let result = handle_plugins_status(&state).unwrap();
+        assert_eq!(result["activationErrorCount"], 2);
+
+        let alpha = result["plugins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == "alpha")
+            .unwrap();
+        assert_eq!(alpha["enabled"], true);
+        assert_eq!(alpha["state"], "failed");
+        assert_eq!(alpha["installId"], "install-alpha");
+        assert_eq!(alpha["requestedAt"], 1700000001000u64);
+        assert_eq!(alpha["reason"], loader_init_reason);
+
+        let beta = result["plugins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == "beta")
+            .unwrap();
+        assert_eq!(beta["enabled"], false);
+        assert_eq!(beta["state"], "disabled");
+        assert_eq!(beta["installId"], "install-beta");
+        assert_eq!(beta["requestedAt"], 1700000002000u64);
+        assert_eq!(
+            beta["reason"],
+            "managed plugin is disabled in plugins.entries"
+        );
+
+        crate::config::clear_cache();
+    }
+
+    #[test]
     fn test_handle_plugins_status_sanitizes_path_bearing_reasons() {
         let state = WsServerState::new(WsServerConfig::default()).with_plugin_activation_report(
             crate::server::plugin_bootstrap::PluginActivationReport {

@@ -11,22 +11,26 @@
 # - NEXTEST_LIST_SAMPLE_SECS
 # - NEXTEST_LIST_DIAG_DIR
 
-set -euo pipefail
+ensure_nextest_installed() {
+    if command -v cargo-nextest >/dev/null 2>&1; then
+        return 0
+    fi
 
-if ! command -v cargo-nextest >/dev/null 2>&1; then
     echo "cargo-nextest is required. Install with: cargo install --locked cargo-nextest" >&2
-    exit 1
-fi
+    return 1
+}
 
-LIST_TIMEOUT_SECS="${NEXTEST_LIST_TIMEOUT_SECS:-180}"
-POLL_SECS="${NEXTEST_LIST_WATCHDOG_POLL_SECS:-1}"
-SAMPLE_SECS="${NEXTEST_LIST_SAMPLE_SECS:-5}"
-REPRO_TIMEOUT_SECS="${NEXTEST_LIST_REPRO_TIMEOUT_SECS:-120}"
-STRACE_SECS="${NEXTEST_LIST_STRACE_SECS:-3}"
-TERM_GRACE_SECS="${NEXTEST_TERM_GRACE_SECS:-5}"
-DIAG_DIR="${NEXTEST_LIST_DIAG_DIR:-.local/reports/nextest-list-stalls}"
+initialize_runtime_config() {
+    LIST_TIMEOUT_SECS="${NEXTEST_LIST_TIMEOUT_SECS:-180}"
+    POLL_SECS="${NEXTEST_LIST_WATCHDOG_POLL_SECS:-1}"
+    SAMPLE_SECS="${NEXTEST_LIST_SAMPLE_SECS:-5}"
+    REPRO_TIMEOUT_SECS="${NEXTEST_LIST_REPRO_TIMEOUT_SECS:-120}"
+    STRACE_SECS="${NEXTEST_LIST_STRACE_SECS:-3}"
+    TERM_GRACE_SECS="${NEXTEST_TERM_GRACE_SECS:-5}"
+    DIAG_DIR="${NEXTEST_LIST_DIAG_DIR:-.local/reports/nextest-list-stalls}"
 
-mkdir -p "${DIAG_DIR}"
+    mkdir -p "${DIAG_DIR}"
+}
 
 timestamp() {
     date -u +"%Y%m%dT%H%M%SZ"
@@ -62,7 +66,8 @@ etime_to_seconds() {
         seconds="${a:-0}"
     fi
 
-    echo $((days * 86400 + hours * 3600 + minutes * 60 + seconds))
+    # `ps etime` is zero-padded; force base-10 so values like `08` do not trip bash's octal parsing.
+    echo $((10#${days} * 86400 + 10#${hours} * 3600 + 10#${minutes} * 60 + 10#${seconds}))
 }
 
 record_diag_error() {
@@ -254,6 +259,7 @@ capture_diagnostics() {
             fi
         else
             echo "rg_not_found_falling_back_to_grep"
+            # shellcheck disable=SC2009
             if ! ps -ww -Ao pid=,ppid=,etime=,args= 2>&1 | grep -E "cargo-nextest|--list --format terse|target/debug/deps/" 2>&1; then
                 echo "no_related_processes_matched_snapshot_pattern"
             fi
@@ -333,24 +339,34 @@ list_discovery_pid_etime_and_command() {
         || true
 }
 
-cargo nextest run "$@" &
-nextest_pid=$!
+main() {
+    ensure_nextest_installed || return 1
+    initialize_runtime_config
 
-while kill -0 "${nextest_pid}" >/dev/null 2>&1; do
-    while IFS='|' read -r pid etime cmd; do
-        [ -z "${pid}" ] && continue
-        age_secs="$(etime_to_seconds "${etime}")"
-        if [ "${age_secs}" -lt "${LIST_TIMEOUT_SECS}" ]; then
-            continue
-        fi
+    cargo nextest run "$@" &
+    local nextest_pid=$!
 
-        capture_diagnostics "${pid}" "${nextest_pid}" "${etime}" "${cmd}" "${age_secs}"
-        terminate_pid_bounded "${pid}" "stalled list child" "${DIAG_DIR}/nextest-kill.errors.log" || true
-        terminate_pid_bounded "${nextest_pid}" "nextest parent" "${DIAG_DIR}/nextest-kill.errors.log" || true
-        exit 124
-    done < <(list_discovery_pid_etime_and_command "${nextest_pid}")
+    while kill -0 "${nextest_pid}" >/dev/null 2>&1; do
+        while IFS='|' read -r pid etime cmd; do
+            [ -z "${pid}" ] && continue
+            age_secs="$(etime_to_seconds "${etime}")"
+            if [ "${age_secs}" -lt "${LIST_TIMEOUT_SECS}" ]; then
+                continue
+            fi
 
-    sleep "${POLL_SECS}"
-done
+            capture_diagnostics "${pid}" "${nextest_pid}" "${etime}" "${cmd}" "${age_secs}"
+            terminate_pid_bounded "${pid}" "stalled list child" "${DIAG_DIR}/nextest-kill.errors.log" || true
+            terminate_pid_bounded "${nextest_pid}" "nextest parent" "${DIAG_DIR}/nextest-kill.errors.log" || true
+            return 124
+        done < <(list_discovery_pid_etime_and_command "${nextest_pid}")
 
-wait "${nextest_pid}"
+        sleep "${POLL_SECS}"
+    done
+
+    wait "${nextest_pid}"
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    set -euo pipefail
+    main "$@"
+fi
