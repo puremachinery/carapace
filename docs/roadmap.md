@@ -29,6 +29,9 @@ For what is already shipped and verified, see:
   Control UI, backed by `codex.authProfile` runtime support.
 - Managed and local WASM plugins — startup/runtime loading, `plugins.*` API
   surface, `cara plugins` CLI workflows, and plugin development guidance.
+  Local `cara plugins install|update --file` staging assumes a trusted local
+  state directory; additional hardening is tracked in
+  [#250](https://github.com/puremachinery/carapace/issues/250).
 - Filesystem tools — guarded local workspace read/search/stat/list plus opt-in
   write/move within explicit roots, with config-gated registration and
   fail-closed validation.
@@ -37,20 +40,22 @@ For what is already shipped and verified, see:
 
 ## Next
 
+These items are listed in priority order. The top item is the current focus.
+
 - Make onboarding excellent — provider setup should be fast, guided, and
   understandable without requiring users to edit config by hand.
   Issues: [#185](https://github.com/puremachinery/carapace/issues/185),
   [#178](https://github.com/puremachinery/carapace/issues/178),
   [#183](https://github.com/puremachinery/carapace/issues/183),
   [#184](https://github.com/puremachinery/carapace/issues/184)
-- Add import and migration from tools people already use — reduce switching cost
-  for users coming from adjacent assistants.
+- Add import and migration from tools people already use — reduce switching
+  cost for users coming from adjacent assistants.
   Issues: [#180](https://github.com/puremachinery/carapace/issues/180),
   [#181](https://github.com/puremachinery/carapace/issues/181),
   [#182](https://github.com/puremachinery/carapace/issues/182)
 - Add Matrix / Element — best-fit next channel for privacy-focused,
   self-hosted users.
-  Issues: [#234](https://github.com/puremachinery/carapace/issues/234)
+  Issue: [#234](https://github.com/puremachinery/carapace/issues/234)
 - Make model routing explicit, capability-aware, and sane — users should be
   able to choose cheap/fast, stronger reasoning, or multimodal routes
   intentionally.
@@ -58,10 +63,10 @@ For what is already shipped and verified, see:
   [#188](https://github.com/puremachinery/carapace/issues/188),
   [#189](https://github.com/puremachinery/carapace/issues/189),
   [#207](https://github.com/puremachinery/carapace/issues/207)
-- Make managed plugin install and update writes truly transactional
+- Make managed plugin install/update operations truly transactional
   server-side — plugin distribution needs stronger trust and recovery
   guarantees.
-  Issues: [#243](https://github.com/puremachinery/carapace/issues/243)
+  Issue: [#243](https://github.com/puremachinery/carapace/issues/243)
 
 ## Later
 
