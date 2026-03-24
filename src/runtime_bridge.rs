@@ -75,18 +75,25 @@ where
     run_in_current_thread_runtime(future)
 }
 
-/// Run a blocking cleanup closure from code that may be dropped inside a Tokio runtime.
+/// Run a best-effort drop-time cleanup closure from code that may be dropped inside a Tokio runtime.
 ///
-/// This is intended for best-effort synchronous cleanup paths where `Drop` cannot `await`.
-/// If running inside a multi-threaded Tokio runtime, uses `block_in_place` so the scheduler
-/// can compensate for the blocking section. Current-thread runtimes have no equivalent
-/// off-ramp for `Drop`, so we run inline there to keep cleanup deterministic.
-pub fn run_blocking_cleanup<T>(cleanup: impl FnOnce() -> T) -> T {
+/// This helper is only for `Drop` paths where cleanup cannot `await` and any error handling must
+/// happen inside the closure itself.
+///
+/// - If running inside a multi-threaded Tokio runtime, uses `block_in_place` so the scheduler can
+///   compensate for the blocking section while the cleanup still completes before `Drop` returns.
+/// - If running inside a current-thread Tokio runtime, offloads the cleanup to Tokio's blocking
+///   pool and returns immediately so `Drop` does not stall the single executor thread.
+/// - If no runtime exists, runs the cleanup inline.
+pub fn run_blocking_cleanup(cleanup: impl FnOnce() + Send + 'static) {
     match Handle::try_current() {
         Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
             block_in_place(cleanup)
         }
-        _ => cleanup(),
+        Ok(handle) => {
+            drop(handle.spawn_blocking(cleanup));
+        }
+        Err(_) => cleanup(),
     }
 }
 
@@ -132,6 +139,11 @@ fn panic_to_string(payload: Box<dyn Any + Send>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{run_blocking_cleanup, run_sync_blocking, run_sync_blocking_send, BridgeError};
+    use std::sync::{
+        atomic::{AtomicU16, Ordering},
+        Arc,
+    };
+    use std::time::Duration;
 
     #[test]
     fn run_sync_blocking_outside_runtime() {
@@ -172,20 +184,36 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn run_blocking_cleanup_inside_multi_thread_runtime_works() {
-        let value = run_blocking_cleanup(|| 55);
-        assert_eq!(value, 55);
+        let value = Arc::new(AtomicU16::new(0));
+        let written = value.clone();
+        run_blocking_cleanup(move || {
+            written.store(55, Ordering::SeqCst);
+        });
+        assert_eq!(value.load(Ordering::SeqCst), 55);
     }
 
     #[test]
     fn run_blocking_cleanup_outside_runtime_works() {
-        let value = run_blocking_cleanup(|| 66);
-        assert_eq!(value, 66);
+        let value = Arc::new(AtomicU16::new(0));
+        let written = value.clone();
+        run_blocking_cleanup(move || {
+            written.store(66, Ordering::SeqCst);
+        });
+        assert_eq!(value.load(Ordering::SeqCst), 66);
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn run_blocking_cleanup_inside_current_thread_runtime_works() {
-        let value = run_blocking_cleanup(|| 77);
-        assert_eq!(value, 77);
+        let caller = std::thread::current().id();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        run_blocking_cleanup(move || {
+            let _ = tx.send(std::thread::current().id());
+        });
+        let cleanup_thread = tokio::time::timeout(Duration::from_secs(1), rx)
+            .await
+            .expect("cleanup should finish promptly")
+            .expect("cleanup thread should report its thread id");
+        assert_ne!(cleanup_thread, caller);
     }
 
     #[test]

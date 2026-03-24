@@ -2292,7 +2292,16 @@ struct ManagedPluginFileTransaction {
     dest: PathBuf,
     backup: Option<PathBuf>,
     lock: PathBuf,
-    completed: bool,
+    // Tracks what `Drop` should finish if the future is cancelled mid-commit/rollback.
+    drop_action: ManagedPluginFileTransactionDropAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedPluginFileTransactionDropAction {
+    RollbackArtifact,
+    ReleaseLockOnly,
+    CommitCleanup,
+    Completed,
 }
 
 #[derive(Debug)]
@@ -2324,29 +2333,31 @@ impl Drop for PendingPluginFileTransactionLock {
         let Some(path) = self.path.take() else {
             return;
         };
-        match run_blocking_cleanup(|| {
-            release_plugin_file_transaction_lock_blocking(&path)
-        }) {
-            Ok(()) => eprintln!(
-                "Warning: PendingPluginFileTransactionLock dropped before handoff; synchronously removed staging lock '{}' after an interrupted or cancelled run",
-                path.display()
-            ),
-            Err(err) => eprintln!(
-                "Warning: PendingPluginFileTransactionLock dropped before handoff and failed to remove staging lock '{}': {}",
-                path.display(),
-                err
-            ),
-        }
+        run_blocking_cleanup(move || {
+            match release_plugin_file_transaction_lock_blocking(&path) {
+                Ok(()) => eprintln!(
+                    "Warning: PendingPluginFileTransactionLock dropped before handoff; synchronously removed staging lock '{}' after an interrupted or cancelled run",
+                    path.display()
+                ),
+                Err(err) => eprintln!(
+                    "Warning: PendingPluginFileTransactionLock dropped before handoff and failed to remove staging lock '{}': {}",
+                    path.display(),
+                    err
+                ),
+            }
+        });
     }
 }
 
 impl ManagedPluginFileTransaction {
     async fn commit(mut self) -> Result<(), Box<dyn std::error::Error>> {
-        self.completed = true;
+        self.drop_action = ManagedPluginFileTransactionDropAction::CommitCleanup;
         let mut failures = Vec::new();
-        if let Some(backup) = self.backup.take() {
-            if let Err(err) = tokio::fs::remove_file(&backup).await {
-                if err.kind() != std::io::ErrorKind::NotFound {
+        if let Some(backup) = self.backup.as_deref() {
+            match tokio::fs::remove_file(backup).await {
+                Ok(()) => self.backup = None,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => self.backup = None,
+                Err(err) => {
                     failures.push(format!(
                         "plugin request succeeded, but failed to remove staging backup '{}': {}; remove or recover that backup before the next local `--file` plugin mutation",
                         backup.display(), err
@@ -2361,6 +2372,7 @@ impl ManagedPluginFileTransaction {
                 &err,
             ));
         }
+        self.drop_action = ManagedPluginFileTransactionDropAction::Completed;
         if failures.is_empty() {
             Ok(())
         } else {
@@ -2369,9 +2381,8 @@ impl ManagedPluginFileTransaction {
     }
 
     async fn rollback(mut self) -> Result<String, Box<dyn std::error::Error>> {
-        self.completed = true;
-        let rollback_result = match self.backup.take() {
-            Some(backup) => match restore_previous_plugin_artifact(&backup, &self.dest).await {
+        let rollback_result = match self.backup.as_deref() {
+            Some(backup) => match restore_previous_plugin_artifact(backup, &self.dest).await {
                 Ok(()) => Ok(format!(
                     "restored previous local managed artifact at '{}'",
                     self.dest.display()
@@ -2394,7 +2405,12 @@ impl ManagedPluginFileTransaction {
                 ))),
             },
         };
+        if rollback_result.is_ok() {
+            self.backup = None;
+            self.drop_action = ManagedPluginFileTransactionDropAction::ReleaseLockOnly;
+        }
         let lock_release_result = release_plugin_file_transaction_lock(&self.lock).await;
+        self.drop_action = ManagedPluginFileTransactionDropAction::Completed;
         match (rollback_result, lock_release_result) {
             (Ok(note), Ok(())) => Ok(note),
             (Ok(note), Err(lock_err)) => Err(cli_error(append_lock_release_failure(
@@ -2412,21 +2428,64 @@ impl ManagedPluginFileTransaction {
 
 impl Drop for ManagedPluginFileTransaction {
     fn drop(&mut self) {
-        if self.completed {
+        let drop_action = std::mem::replace(
+            &mut self.drop_action,
+            ManagedPluginFileTransactionDropAction::Completed,
+        );
+        if drop_action == ManagedPluginFileTransactionDropAction::Completed {
             return;
         }
         let dest = self.dest.clone();
         let backup = self.backup.take();
         let lock = self.lock.clone();
-        let message = format!(
-            "ManagedPluginFileTransaction dropped without commit() or rollback(); attempting synchronous cleanup for staged artifact '{}' and any matching `.cli-lock` / `.cli-backup` files after an interrupted or cancelled run",
-            self.dest.display()
-        );
-        eprintln!("Warning: {message}");
-        if let Err(err) = run_blocking_cleanup(|| {
-            rollback_managed_plugin_file_transaction_blocking(&dest, backup.as_deref(), &lock)
-        }) {
-            eprintln!("Warning: dropped transaction cleanup failed: {err}");
+        match drop_action {
+            ManagedPluginFileTransactionDropAction::RollbackArtifact => {
+                let message = format!(
+                    "ManagedPluginFileTransaction dropped before rollback finished; attempting synchronous cleanup for staged artifact '{}' and any matching `.cli-lock` / `.cli-backup` files after an interrupted or cancelled run",
+                    self.dest.display()
+                );
+                eprintln!("Warning: {message}");
+                run_blocking_cleanup(move || {
+                    if let Err(err) = rollback_managed_plugin_file_transaction_blocking(
+                        &dest,
+                        backup.as_deref(),
+                        &lock,
+                    ) {
+                        eprintln!("Warning: dropped transaction cleanup failed: {err}");
+                    }
+                });
+            }
+            ManagedPluginFileTransactionDropAction::ReleaseLockOnly => {
+                let message = format!(
+                    "ManagedPluginFileTransaction dropped after artifact rollback but before staging lock release for '{}'; attempting synchronous lock cleanup after an interrupted or cancelled run",
+                    self.dest.display()
+                );
+                eprintln!("Warning: {message}");
+                run_blocking_cleanup(move || {
+                    if let Err(err) = release_plugin_file_transaction_lock_blocking(&lock) {
+                        eprintln!(
+                            "Warning: dropped transaction cleanup failed to remove staging lock '{}': {}",
+                            lock.display(),
+                            err
+                        );
+                    }
+                });
+            }
+            ManagedPluginFileTransactionDropAction::CommitCleanup => {
+                let message = format!(
+                    "ManagedPluginFileTransaction dropped while commit cleanup was still removing `.cli-backup` / `.cli-lock` sidecars for '{}'; attempting synchronous cleanup after an interrupted or cancelled run",
+                    self.dest.display()
+                );
+                eprintln!("Warning: {message}");
+                run_blocking_cleanup(move || {
+                    if let Err(err) =
+                        finish_managed_plugin_file_commit_cleanup_blocking(backup.as_deref(), &lock)
+                    {
+                        eprintln!("Warning: dropped transaction cleanup failed: {err}");
+                    }
+                });
+            }
+            ManagedPluginFileTransactionDropAction::Completed => {}
         }
     }
 }
@@ -2560,6 +2619,35 @@ async fn release_plugin_file_transaction_lock_with_context(lock: &Path, message:
     match release_plugin_file_transaction_lock(lock).await {
         Ok(()) => message,
         Err(lock_err) => append_lock_release_failure(message, lock, &lock_err),
+    }
+}
+
+fn finish_managed_plugin_file_commit_cleanup_blocking(
+    backup: Option<&Path>,
+    lock: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut failures = Vec::new();
+    if let Some(backup) = backup {
+        match std::fs::remove_file(backup) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => failures.push(format!(
+                "plugin request succeeded, but failed to remove staging backup '{}': {}; remove or recover that backup before the next local `--file` plugin mutation",
+                backup.display(), err
+            )),
+        }
+    }
+    if let Err(err) = release_plugin_file_transaction_lock_blocking(lock) {
+        failures.push(append_lock_release_failure(
+            "plugin request succeeded".to_string(),
+            lock,
+            &err,
+        ));
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(cli_error(failures.join("; ")))
     }
 }
 
@@ -2954,7 +3042,7 @@ async fn stage_plugin_file_into_managed_dir(
         dest,
         backup: had_existing.then_some(backup),
         lock,
-        completed: false,
+        drop_action: ManagedPluginFileTransactionDropAction::RollbackArtifact,
     })
 }
 
@@ -7950,7 +8038,7 @@ mod tests {
             dest: dest.clone(),
             backup: Some(backup.clone()),
             lock: lock.clone(),
-            completed: false,
+            drop_action: ManagedPluginFileTransactionDropAction::RollbackArtifact,
         }
         .rollback()
         .await
@@ -7979,7 +8067,7 @@ mod tests {
             dest: dest.clone(),
             backup: Some(backup.clone()),
             lock: lock.clone(),
-            completed: false,
+            drop_action: ManagedPluginFileTransactionDropAction::RollbackArtifact,
         }
         .rollback()
         .await
@@ -8056,7 +8144,7 @@ mod tests {
             dest,
             backup: Some(backup.clone()),
             lock: temp.path().join("demo-plugin.wasm.cli-lock"),
-            completed: false,
+            drop_action: ManagedPluginFileTransactionDropAction::RollbackArtifact,
         }
         .commit()
         .await
@@ -8083,7 +8171,7 @@ mod tests {
             dest,
             backup: Some(backup.clone()),
             lock: lock.clone(),
-            completed: false,
+            drop_action: ManagedPluginFileTransactionDropAction::RollbackArtifact,
         }
         .commit()
         .await
@@ -8112,7 +8200,7 @@ mod tests {
                 dest,
                 backup: Some(backup.clone()),
                 lock: temp.path().join("demo-plugin.wasm.cli-lock"),
-                completed: false,
+                drop_action: ManagedPluginFileTransactionDropAction::RollbackArtifact,
             }),
             async { Ok::<(), Box<dyn std::error::Error>>(()) },
         )
@@ -8203,7 +8291,7 @@ mod tests {
             dest: temp.path().join("demo-plugin.wasm"),
             backup: None,
             lock: temp.path().join("demo-plugin.wasm.cli-lock"),
-            completed: false,
+            drop_action: ManagedPluginFileTransactionDropAction::RollbackArtifact,
         };
 
         let result = std::panic::catch_unwind(|| drop(transaction));
@@ -8233,7 +8321,7 @@ mod tests {
             dest: dest.clone(),
             backup: None,
             lock: lock.clone(),
-            completed: false,
+            drop_action: ManagedPluginFileTransactionDropAction::RollbackArtifact,
         });
 
         assert!(!dest.exists());
@@ -8254,10 +8342,32 @@ mod tests {
             dest: dest.clone(),
             backup: Some(backup.clone()),
             lock: lock.clone(),
-            completed: false,
+            drop_action: ManagedPluginFileTransactionDropAction::RollbackArtifact,
         });
 
         assert_eq!(std::fs::read(&dest).unwrap(), b"old-plugin-bytes");
+        assert!(!backup.exists());
+        assert!(!lock.exists());
+    }
+
+    #[test]
+    fn test_managed_plugin_file_transaction_drop_finishes_commit_cleanup() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let dest = temp.path().join("demo-plugin.wasm");
+        let backup = temp.path().join("demo-plugin.wasm.cli-backup");
+        let lock = temp.path().join("demo-plugin.wasm.cli-lock");
+        std::fs::write(&dest, b"new-plugin-bytes").unwrap();
+        std::fs::write(&backup, b"old-plugin-bytes").unwrap();
+        std::fs::write(&lock, b"locked").unwrap();
+
+        drop(ManagedPluginFileTransaction {
+            dest: dest.clone(),
+            backup: Some(backup.clone()),
+            lock: lock.clone(),
+            drop_action: ManagedPluginFileTransactionDropAction::CommitCleanup,
+        });
+
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new-plugin-bytes");
         assert!(!backup.exists());
         assert!(!lock.exists());
     }
@@ -8339,6 +8449,44 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("rollback backup"));
+        assert!(!plugins_dir.join("demo-plugin.wasm.cli-lock").exists());
+    }
+
+    #[tokio::test]
+    async fn test_stage_plugin_file_into_managed_dir_removes_stale_staged_artifact() {
+        let mut env_guard = ScopedEnv::new();
+        let temp = tempfile::TempDir::new().unwrap();
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
+
+        let plugins_dir = temp.path().join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+        let staged = plugins_dir.join("demo-plugin.wasm.cli-staged");
+        let dest = plugins_dir.join("demo-plugin.wasm");
+        std::fs::write(&staged, b"stale-staged-bytes").unwrap();
+
+        let new_bytes = tool_plugin_component_bytes();
+        let plugin_path = temp.path().join("demo-input.wasm");
+        std::fs::write(&plugin_path, &new_bytes).unwrap();
+        let connection = WsConnectionArgs {
+            port: Some(18789),
+            host: "127.0.0.1".to_string(),
+            tls: false,
+            trust: false,
+            allow_plaintext: false,
+        };
+
+        let transaction =
+            stage_plugin_file_into_managed_dir(&connection, "demo-plugin", &plugin_path)
+                .await
+                .unwrap();
+
+        assert_eq!(std::fs::read(&dest).unwrap(), new_bytes);
+        assert!(!staged.exists());
+        assert!(plugins_dir.join("demo-plugin.wasm.cli-lock").exists());
+
+        let note = transaction.rollback().await.unwrap();
+        assert!(note.contains("removed staged local managed artifact"));
+        assert!(!dest.exists());
         assert!(!plugins_dir.join("demo-plugin.wasm.cli-lock").exists());
     }
 
@@ -8730,7 +8878,7 @@ mod tests {
                 dest,
                 backup: Some(backup.clone()),
                 lock: lock.clone(),
-                completed: false,
+                drop_action: ManagedPluginFileTransactionDropAction::RollbackArtifact,
             }),
             async {
                 Err::<(), Box<dyn std::error::Error>>(cli_error(
