@@ -322,7 +322,7 @@ jobs:
                 path: p,
                 line: lineNumber,
                 side: 'RIGHT',
-                body: `[${finding.severity}, in-scope] ${finding.title}\n\n${finding.body}`,
+                body: `[${finding.severity}] ${finding.title}\n\n${finding.body}`,
               });
             }
 
