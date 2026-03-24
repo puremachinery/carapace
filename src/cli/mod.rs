@@ -19,6 +19,7 @@ pub mod backup_crypto;
 pub mod chat;
 
 use clap::{Parser, Subcommand};
+use tokio::io::AsyncWriteExt;
 
 /// Carapace gateway server for AI assistants.
 #[derive(Parser, Debug)]
@@ -2412,7 +2413,7 @@ fn plugin_cli_lock_path(dest: &Path) -> Result<PathBuf, Box<dyn std::error::Erro
 async fn acquire_plugin_file_transaction_lock(
     lock: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    tokio::fs::OpenOptions::new()
+    let mut file = tokio::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(lock)
@@ -2431,6 +2432,26 @@ async fn acquire_plugin_file_transaction_lock(
                 ))
             }
         })?;
+    let pid = std::process::id().to_string();
+    if let Err(err) = file.write_all(pid.as_bytes()).await {
+        let mut message = format!(
+            "failed to record staging lock owner in '{}': {}",
+            lock.display(),
+            err
+        );
+        match tokio::fs::remove_file(lock).await {
+            Ok(()) => {}
+            Err(cleanup_err) if cleanup_err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(cleanup_err) => {
+                message = format!(
+                    "{message}; additionally failed to remove staging lock '{}': {}",
+                    lock.display(),
+                    cleanup_err
+                );
+            }
+        }
+        return Err(cli_error(message));
+    }
     Ok(())
 }
 
@@ -7753,6 +7774,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_commit_returns_warning_when_backup_cleanup_and_lock_release_fail() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let dest = temp.path().join("demo-plugin.wasm");
+        let backup = temp.path().join("demo-plugin.wasm.cli-backup");
+        let lock = temp.path().join("demo-plugin.wasm.cli-lock");
+        std::fs::write(&dest, b"new-plugin-bytes").unwrap();
+        std::fs::create_dir_all(&backup).unwrap();
+        std::fs::create_dir_all(&lock).unwrap();
+
+        let warning = ManagedPluginFileTransaction {
+            dest,
+            backup: Some(backup.clone()),
+            lock: lock.clone(),
+            completed: false,
+        }
+        .commit()
+        .await;
+
+        let rendered = warning.expect("expected warning");
+        assert!(rendered.contains("failed to remove staging backup"));
+        assert!(rendered.contains("failed to remove staging lock"));
+        assert!(backup.exists());
+        assert!(lock.exists());
+    }
+
+    #[tokio::test]
     async fn test_cleanup_partially_staged_plugin_artifact_removes_file() {
         let temp = tempfile::TempDir::new().unwrap();
         let dest = temp.path().join("demo-plugin.wasm");
@@ -7810,6 +7857,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_acquire_plugin_file_transaction_lock_writes_pid() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let lock = temp.path().join("demo-plugin.wasm.cli-lock");
+
+        acquire_plugin_file_transaction_lock(&lock).await.unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&lock).unwrap(),
+            std::process::id().to_string()
+        );
+        release_plugin_file_transaction_lock(&lock).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn test_stage_plugin_file_into_managed_dir_rejects_preexisting_backup() {
         let mut env_guard = ScopedEnv::new();
         let temp = tempfile::TempDir::new().unwrap();
@@ -7837,6 +7898,33 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("rollback backup"));
+    }
+
+    #[tokio::test]
+    async fn test_stage_plugin_file_into_managed_dir_rejects_non_regular_destination() {
+        let mut env_guard = ScopedEnv::new();
+        let temp = tempfile::TempDir::new().unwrap();
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
+
+        let plugins_dir = temp.path().join("plugins");
+        std::fs::create_dir_all(plugins_dir.join("demo-plugin.wasm")).unwrap();
+
+        let plugin_path = temp.path().join("demo-input.wasm");
+        std::fs::write(&plugin_path, tool_plugin_component_bytes()).unwrap();
+        let connection = WsConnectionArgs {
+            port: Some(18789),
+            host: "127.0.0.1".to_string(),
+            tls: false,
+            trust: false,
+            allow_plaintext: false,
+        };
+
+        let err = stage_plugin_file_into_managed_dir(&connection, "demo-plugin", &plugin_path)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("not a regular file"));
+        assert!(!plugins_dir.join("demo-plugin.wasm.cli-lock").exists());
     }
 
     #[tokio::test]
