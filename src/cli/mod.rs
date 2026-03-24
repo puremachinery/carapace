@@ -2626,17 +2626,18 @@ fn should_fail_staged_plugin_write(dest: &Path) -> bool {
         == Some(dest)
 }
 
-#[cfg(not(test))]
-fn should_fail_staged_plugin_write(_dest: &Path) -> bool {
-    false
-}
-
+#[cfg(test)]
 async fn write_staged_plugin_artifact(dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if should_fail_staged_plugin_write(dest) {
         return Err(std::io::Error::other(
             "injected staged plugin write failure",
         ));
     }
+    tokio::fs::write(dest, bytes).await
+}
+
+#[cfg(not(test))]
+async fn write_staged_plugin_artifact(dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
     tokio::fs::write(dest, bytes).await
 }
 
@@ -2762,12 +2763,14 @@ async fn stage_plugin_file_into_managed_dir(
     })
 }
 
-async fn finalize_plugin_file_mutation<T>(
+async fn finalize_plugin_file_mutation<T, F>(
     staged_file: Option<ManagedPluginFileTransaction>,
-    // `result` must already be awaited/evaluated before this helper is called so
-    // the transaction lifetime does not extend across an unpolled future.
-    result: Result<T, Box<dyn std::error::Error>>,
-) -> Result<T, Box<dyn std::error::Error>> {
+    result_future: F,
+) -> Result<T, Box<dyn std::error::Error>>
+where
+    F: std::future::Future<Output = Result<T, Box<dyn std::error::Error>>>,
+{
+    let result = result_future.await;
     match (staged_file, result) {
         (Some(transaction), Ok(value)) => {
             if let Some(warning) = transaction.commit().await {
@@ -2900,8 +2903,7 @@ async fn handle_plugins_install_cli(
                 options.publisher_key.as_deref(),
                 options.signature.as_deref(),
             ),
-        )
-        .await,
+        ),
     )
     .await?;
     if options.json {
@@ -2944,8 +2946,7 @@ async fn handle_plugins_update_cli(
                 options.publisher_key.as_deref(),
                 options.signature.as_deref(),
             ),
-        )
-        .await,
+        ),
     )
     .await?;
     if options.json {
@@ -7887,7 +7888,7 @@ mod tests {
                 lock: temp.path().join("demo-plugin.wasm.cli-lock"),
                 completed: false,
             }),
-            Ok::<(), Box<dyn std::error::Error>>(()),
+            async { Ok::<(), Box<dyn std::error::Error>>(()) },
         )
         .await;
 
@@ -8183,10 +8184,11 @@ mod tests {
             stage_plugin_file_into_managed_dir(&connection, "demo-plugin", &plugin_path)
                 .await
                 .unwrap();
-        let err = finalize_plugin_file_mutation::<()>(
-            Some(transaction),
-            Err(cli_error("plugins.install failed: simulated failure")),
-        )
+        let err = finalize_plugin_file_mutation(Some(transaction), async {
+            Err::<(), Box<dyn std::error::Error>>(cli_error(
+                "plugins.install failed: simulated failure",
+            ))
+        })
         .await
         .unwrap_err();
         let rendered = err.to_string();
