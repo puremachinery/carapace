@@ -84,7 +84,9 @@ where
 ///   compensate for the blocking section while the cleanup still completes before `Drop` returns.
 /// - If running inside a current-thread Tokio runtime, hands the cleanup to a dedicated OS thread
 ///   and synchronously waits for it to finish so `Drop` still has deterministic completion
-///   semantics without re-entering Tokio.
+///   semantics without re-entering Tokio. If that helper thread panics, we log it instead of
+///   re-raising, because this helper is used from `Drop` paths where propagating a panic could
+///   trigger a process-aborting double panic.
 /// - If no runtime exists, runs the cleanup inline.
 pub fn run_blocking_cleanup(cleanup: impl FnOnce() + Send + 'static) {
     match Handle::try_current() {
@@ -94,7 +96,10 @@ pub fn run_blocking_cleanup(cleanup: impl FnOnce() + Send + 'static) {
         Ok(_) => {
             let handle = thread::spawn(cleanup);
             if let Err(payload) = handle.join() {
-                std::panic::resume_unwind(payload);
+                eprintln!(
+                    "Warning: blocking cleanup helper thread panicked: {}",
+                    panic_to_string(payload)
+                );
             }
         }
         Err(_) => cleanup(),
@@ -218,6 +223,14 @@ mod tests {
             .expect("cleanup should finish promptly")
             .expect("cleanup thread should report its thread id");
         assert_ne!(cleanup_thread, caller);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_blocking_cleanup_inside_current_thread_runtime_swallows_cleanup_panic() {
+        let result = std::panic::catch_unwind(|| {
+            run_blocking_cleanup(|| panic!("simulated cleanup panic"));
+        });
+        assert!(result.is_ok());
     }
 
     #[test]
