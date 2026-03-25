@@ -11,8 +11,8 @@ use serde_json::Value;
 use tracing::{debug, error, info, warn};
 
 use crate::channels::{ChannelRegistry, ChannelStatus};
+use crate::plugins::{ReadReceiptContext, TypingContext};
 use crate::server::ws::WsServerState;
-use crate::sessions::{get_or_create_scoped_session, SessionMetadata};
 
 /// Interval between receive polls.
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -152,7 +152,7 @@ pub async fn signal_receive_loop(
         .build()
         .expect("failed to build Signal receive HTTP client");
     let receive_url = format!(
-        "{}/v1/receive/{}",
+        "{}/v1/receive/{}?send_read_receipts=false",
         base_url,
         urlencoding::encode(&phone_number)
     );
@@ -293,93 +293,40 @@ async fn process_envelope(envelope: &SignalEnvelope, state: &Arc<WsServerState>)
         "Signal inbound message"
     );
 
-    let cfg = crate::config::load_config_shared()
-        .unwrap_or_else(|_| Arc::new(Value::Object(serde_json::Map::new())));
-    let metadata = SessionMetadata {
-        channel: Some("signal".to_string()),
-        user_id: Some(sender.clone()),
-        chat_id: Some(peer_id.clone()),
+    let options = crate::channels::inbound::InboundDispatchOptions {
+        typing_context: Some(TypingContext {
+            to: peer_id.clone(),
+            ..Default::default()
+        }),
+        read_receipt_context: Some(ReadReceiptContext {
+            recipient: sender.clone(),
+            timestamp: envelope.timestamp.or(data_message.timestamp),
+            ..Default::default()
+        }),
         ..Default::default()
     };
 
-    let session_store = state.session_store();
-    let session = match get_or_create_scoped_session(
-        session_store,
-        cfg.as_ref(),
+    match crate::channels::inbound::dispatch_inbound_text_with_options(
+        state,
         "signal",
-        sender.as_str(),
-        peer_id.as_str(),
-        None,
-        metadata,
-    ) {
-        Ok(session) => session,
-        Err(e) => {
-            error!("Failed to get/create Signal session for {}: {}", sender, e);
-            return;
-        }
-    };
-
-    // Append the user message
-    if let Err(e) = crate::sessions::append_message_blocking(
-        state.session_store().clone(),
-        crate::sessions::ChatMessage::user(session.id.clone(), text),
+        &sender,
+        &peer_id,
+        text,
+        Some(peer_id.clone()),
+        options,
     )
     .await
     {
-        error!("Failed to append Signal message: {}", e);
-        return;
-    }
-
-    // Register and spawn agent run
-    let run_id = uuid::Uuid::new_v4().to_string();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-
-    let cancel_token = tokio_util::sync::CancellationToken::new();
-    let run = crate::server::ws::AgentRun {
-        run_id: run_id.clone(),
-        session_key: session.session_key.clone(),
-        delivery_recipient_id: Some(peer_id.clone()),
-        status: crate::server::ws::AgentRunStatus::Queued,
-        message: text.to_string(),
-        response: String::new(),
-        error: None,
-        created_at: now,
-        started_at: None,
-        completed_at: None,
-        cancel_token: cancel_token.clone(),
-        waiters: Vec::new(),
-    };
-
-    {
-        let mut registry = state.agent_run_registry.lock();
-        registry.register(run);
-    }
-
-    if let Some(provider) = state.llm_provider() {
-        let mut config = crate::agent::AgentConfig::default();
-        crate::agent::apply_agent_config_from_settings(&mut config, &cfg, None);
-        config.deliver = true;
-        crate::agent::spawn_run(
-            run_id.clone(),
-            session.session_key.clone(),
-            config,
-            state.clone(),
-            provider,
-            cancel_token,
-        );
-        debug!(
-            run_id = %run_id,
-            sender = %sender,
-            "Signal agent run dispatched"
-        );
-    } else {
-        debug!(
-            run_id = %run_id,
-            "Signal message queued (no LLM provider)"
-        );
+        Ok(run_id) => {
+            debug!(
+                run_id = %run_id,
+                sender = %sender,
+                "Signal agent run dispatched"
+            );
+        }
+        Err(err) => {
+            error!(sender = %sender, error = %err, "Failed to dispatch Signal message");
+        }
     }
 }
 

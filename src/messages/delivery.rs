@@ -153,19 +153,45 @@ async fn process_channel_messages(
             }),
         );
 
-        handle_delivery_result(pipeline, &message_id, result);
+        handle_delivery_result(
+            pipeline,
+            plugin_registry,
+            channel_id,
+            &message.metadata,
+            &message_id,
+            result,
+        )
+        .await;
     }
 }
 
 /// Handle the result of a message delivery attempt.
-fn handle_delivery_result(
+async fn handle_delivery_result(
     pipeline: &MessagePipeline,
+    plugin_registry: &Arc<PluginRegistry>,
+    channel_id: &str,
+    metadata: &crate::messages::outbound::MessageMetadata,
     message_id: &crate::messages::outbound::MessageId,
     result: Result<plugins::DeliveryResult, plugins::BindingError>,
 ) {
     match result {
         Ok(delivery) if delivery.ok => {
             let _ = pipeline.mark_sent(message_id);
+            if let Some(read_receipt) = metadata.read_receipt.clone() {
+                let cfg = crate::config::load_config_shared()
+                    .unwrap_or_else(|_| Arc::new(serde_json::json!({})));
+                let policy = crate::channels::activity::resolve_channel_activity_policy(
+                    cfg.as_ref(),
+                    channel_id,
+                );
+                crate::channels::activity::maybe_send_read_receipt(
+                    plugin_registry,
+                    channel_id,
+                    &policy,
+                    read_receipt,
+                )
+                .await;
+            }
         }
         Ok(delivery) => {
             let error = delivery
@@ -297,13 +323,19 @@ mod tests {
     };
     use crate::plugins::{
         BindingError, ChannelCapabilities, ChannelPluginInstance, DeliveryResult, OutboundContext,
+        ReadReceiptContext,
     };
+    use std::env;
+    use std::ffi::{OsStr, OsString};
+    use std::fs;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     /// Mock channel plugin that records calls.
     struct MockChannel {
+        caps: ChannelCapabilities,
         send_text_count: AtomicU32,
         send_media_count: AtomicU32,
+        mark_read_count: AtomicU32,
         fail: bool,
         retryable: bool,
     }
@@ -311,8 +343,10 @@ mod tests {
     impl MockChannel {
         fn new() -> Self {
             Self {
+                caps: ChannelCapabilities::default(),
                 send_text_count: AtomicU32::new(0),
                 send_media_count: AtomicU32::new(0),
+                mark_read_count: AtomicU32::new(0),
                 fail: false,
                 retryable: false,
             }
@@ -320,10 +354,26 @@ mod tests {
 
         fn failing(retryable: bool) -> Self {
             Self {
+                caps: ChannelCapabilities::default(),
                 send_text_count: AtomicU32::new(0),
                 send_media_count: AtomicU32::new(0),
+                mark_read_count: AtomicU32::new(0),
                 fail: true,
                 retryable,
+            }
+        }
+
+        fn with_read_receipts() -> Self {
+            Self {
+                caps: ChannelCapabilities {
+                    read_receipts: true,
+                    ..Default::default()
+                },
+                send_text_count: AtomicU32::new(0),
+                send_media_count: AtomicU32::new(0),
+                mark_read_count: AtomicU32::new(0),
+                fail: false,
+                retryable: false,
             }
         }
     }
@@ -341,7 +391,7 @@ mod tests {
         }
 
         fn get_capabilities(&self) -> Result<ChannelCapabilities, BindingError> {
-            Ok(ChannelCapabilities::default())
+            Ok(self.caps.clone())
         }
 
         fn send_text(&self, _ctx: OutboundContext) -> Result<DeliveryResult, BindingError> {
@@ -380,6 +430,50 @@ mod tests {
                 to_jid: None,
                 poll_id: None,
             })
+        }
+
+        fn mark_read(&self, _ctx: ReadReceiptContext) -> Result<(), BindingError> {
+            self.mark_read_count.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    struct ScopedEnv {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl ScopedEnv {
+        fn set_os(key: &'static str, value: &OsStr) -> Self {
+            let previous = env::var_os(key);
+            // SAFETY: tests use scoped env guards to restore process env after each mutation.
+            unsafe {
+                env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+
+        fn set(key: &'static str, value: &str) -> Self {
+            Self::set_os(key, OsStr::new(value))
+        }
+    }
+
+    impl Drop for ScopedEnv {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => {
+                    // SAFETY: tests use scoped env guards to restore process env after each mutation.
+                    unsafe {
+                        env::set_var(self.key, value);
+                    }
+                }
+                None => {
+                    // SAFETY: tests use scoped env guards to restore process env after each mutation.
+                    unsafe {
+                        env::remove_var(self.key);
+                    }
+                }
+            }
         }
     }
 
@@ -665,5 +759,63 @@ mod tests {
             .await
             .expect("delivery loop should exit on shutdown")
             .expect("task should not panic");
+    }
+
+    #[tokio::test]
+    async fn test_delivery_marks_read_after_success_when_enabled() {
+        let mock = Arc::new(MockChannel::with_read_receipts());
+        let (pipeline, plugin_reg, channel_reg) =
+            make_pipeline_and_registries("signal", Some(mock.clone()), true);
+
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("carapace.json5");
+        fs::write(
+            &config_path,
+            r#"{
+                channels: {
+                    signal: {
+                        features: {
+                            readReceipts: {
+                                enabled: true,
+                                mode: "after-response",
+                            },
+                        },
+                    },
+                },
+            }"#,
+        )
+        .unwrap();
+        let _config_path_guard = ScopedEnv::set_os("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+        let _cache_guard = ScopedEnv::set("CARAPACE_DISABLE_CONFIG_CACHE", "1");
+
+        let msg = OutboundMessage::new("signal", MessageContent::text("hello")).with_metadata(
+            crate::messages::outbound::MessageMetadata {
+                recipient_id: Some("+15551234567".to_string()),
+                read_receipt: Some(ReadReceiptContext {
+                    recipient: "+15551234567".to_string(),
+                    timestamp: Some(123),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        pipeline.queue(msg, MsgOutboundContext::new()).unwrap();
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let state = Arc::new(crate::server::ws::WsServerState::new(
+            crate::server::ws::WsServerConfig::default(),
+        ));
+
+        let pl = pipeline.clone();
+        let handle = tokio::spawn(async move {
+            delivery_loop(pl, plugin_reg, channel_reg, state, shutdown_rx).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _ = shutdown_tx.send(true);
+        pipeline.notifier().notify_one();
+        let _ = handle.await;
+
+        assert_eq!(mock.mark_read_count.load(Ordering::Relaxed), 1);
     }
 }

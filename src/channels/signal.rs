@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::plugins::{
     BindingError, ChannelCapabilities, ChannelInfo, ChannelPluginInstance, ChatType,
-    DeliveryResult, OutboundContext,
+    DeliveryResult, OutboundContext, ReadReceiptContext, TypingContext,
 };
 
 /// Maximum media size to fetch and base64-encode (50 MB).
@@ -59,6 +59,22 @@ impl SignalChannel {
         format!("{}/v2/send", self.base_url)
     }
 
+    fn typing_indicator_url(&self) -> String {
+        format!(
+            "{}/v1/typing-indicator/{}",
+            self.base_url,
+            urlencoding::encode(&self.phone_number)
+        )
+    }
+
+    fn receipts_url(&self) -> String {
+        format!(
+            "{}/v1/receipts/{}",
+            self.base_url,
+            urlencoding::encode(&self.phone_number)
+        )
+    }
+
     fn is_loopback_host(parsed: &url::Url) -> bool {
         match parsed.host() {
             Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
@@ -94,6 +110,68 @@ impl SignalChannel {
         }
         Ok(parsed)
     }
+
+    fn update_typing_indicator(&self, ctx: TypingContext, show: bool) -> Result<(), BindingError> {
+        let typing_url = Self::validate_signal_url(
+            &self.typing_indicator_url(),
+            "signal typing indicator",
+            true,
+        )
+        .map_err(BindingError::CallError)?;
+        let body = serde_json::json!({
+            "recipient": ctx.to,
+        });
+        let request = if show {
+            self.client.put(typing_url)
+        } else {
+            self.client.delete(typing_url)
+        };
+
+        match request.json(&body).send() {
+            Ok(resp) if resp.status().is_success() => Ok(()),
+            Ok(resp) => {
+                let status = resp.status();
+                let body_text = resp.text().unwrap_or_default();
+                Err(BindingError::CallError(format!(
+                    "signal typing indicator HTTP {}: {}",
+                    status, body_text
+                )))
+            }
+            Err(err) => Err(BindingError::CallError(format!(
+                "failed to update signal typing indicator: {}",
+                err
+            ))),
+        }
+    }
+
+    fn send_read_receipt(&self, ctx: ReadReceiptContext) -> Result<(), BindingError> {
+        let timestamp = ctx.timestamp.ok_or_else(|| {
+            BindingError::CallError("signal read receipt requires a timestamp".to_string())
+        })?;
+        let receipts_url = Self::validate_signal_url(&self.receipts_url(), "signal receipt", true)
+            .map_err(BindingError::CallError)?;
+        let body = serde_json::json!({
+            "recipient": ctx.recipient,
+            "receipt_type": "read",
+            "timestamp": timestamp,
+        });
+
+        match self.client.post(receipts_url).json(&body).send() {
+            Ok(resp) if resp.status().is_success() => Ok(()),
+            Ok(resp) => {
+                let status = resp.status();
+                let body_text = resp.text().unwrap_or_default();
+                Err(BindingError::CallError(format!(
+                    "signal read receipt HTTP {}: {}",
+                    status, body_text
+                )))
+            }
+            Err(err) => Err(BindingError::CallError(format!(
+                "failed to send signal read receipt: {}",
+                err
+            ))),
+        }
+    }
 }
 
 impl ChannelPluginInstance for SignalChannel {
@@ -113,6 +191,8 @@ impl ChannelPluginInstance for SignalChannel {
             chat_types: vec![ChatType::Dm],
             media: true,
             reactions: true,
+            typing_indicators: true,
+            read_receipts: true,
             ..Default::default()
         })
     }
@@ -220,6 +300,18 @@ impl ChannelPluginInstance for SignalChannel {
 
         self.post_send(&body)
     }
+
+    fn start_typing(&self, ctx: TypingContext) -> Result<(), BindingError> {
+        self.update_typing_indicator(ctx, true)
+    }
+
+    fn stop_typing(&self, ctx: TypingContext) -> Result<(), BindingError> {
+        self.update_typing_indicator(ctx, false)
+    }
+
+    fn mark_read(&self, ctx: ReadReceiptContext) -> Result<(), BindingError> {
+        self.send_read_receipt(ctx)
+    }
 }
 
 impl SignalChannel {
@@ -306,10 +398,38 @@ mod tests {
         let caps = ch.get_capabilities().unwrap();
         assert!(caps.media);
         assert!(caps.reactions);
+        assert!(caps.typing_indicators);
+        assert!(caps.read_receipts);
         assert_eq!(caps.chat_types, vec![ChatType::Dm]);
         assert!(!caps.polls);
         assert!(!caps.edit);
         assert!(!caps.threads);
+    }
+
+    #[test]
+    fn test_signal_mark_read_requires_timestamp() {
+        let ch = test_channel();
+        let err = ch
+            .mark_read(ReadReceiptContext {
+                recipient: "+15559876543".to_string(),
+                ..Default::default()
+            })
+            .expect_err("mark_read without timestamp should fail");
+        assert!(err.to_string().contains("requires a timestamp"));
+    }
+
+    #[test]
+    fn test_signal_start_typing_connection_failure() {
+        let ch = SignalChannel::new("http://127.0.0.1:1".to_string(), "+15551234567".to_string());
+        let err = ch
+            .start_typing(TypingContext {
+                to: "+15559876543".to_string(),
+                ..Default::default()
+            })
+            .expect_err("typing update to unreachable endpoint should fail");
+        assert!(err
+            .to_string()
+            .contains("failed to update signal typing indicator"));
     }
 
     #[test]

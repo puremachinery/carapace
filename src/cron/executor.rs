@@ -349,6 +349,8 @@ fn register_agent_run(
         run_id: run_id.to_string(),
         session_key: session_key.to_string(),
         delivery_recipient_id: None,
+        typing_context: None,
+        read_receipt_context: None,
         status: AgentRunStatus::Queued,
         message: message.to_string(),
         response: String::new(),

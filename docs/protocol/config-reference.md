@@ -366,13 +366,23 @@ Enable Carapace to listen and respond on external chat platforms.
     - `integrity.enabled`: `true` or `false`. (Default: `true`)
     - `integrity.action`: `"warn"` (Default) or `"reject"`.
 - **`session`**
-  - *What it does:* Governs active chat/session scoping behavior.
+  - *What it does:* Governs active chat/session scoping behavior and provides a legacy/global fallback for channel typing.
   - *Common values:*
     - `scope`: `"per-sender"` (Default), `"global"`, or `"per-channel-peer"`.
     - `dmScope`: `"main"` (Default).
-    - `typingMode`: `"thinking"` (Default).
-    - `typingIntervalSeconds`: Integer. Seconds between typing-indicator pulses. (Default: `3`)
+    - `typingMode`: `"thinking"` (Default, legacy/global typing fallback).
+    - `typingIntervalSeconds`: Integer. Seconds between typing-indicator pulses. (Default: `3`, legacy/global typing fallback)
     - `mainKey`: String. Identifier for the main session slot. Always enforced as `"main"` regardless of what you set. (Default: `"main"`)
+- **`channels`**
+  - *What it does:* Applies per-channel override policy, including channel activity features such as typing indicators and read receipts.
+  - *Common values:*
+    - `defaults.features.typing.enabled`: `true` or `false`. (Default: `false`)
+    - `defaults.features.typing.mode`: `"thinking"` (Default)
+    - `defaults.features.typing.intervalSeconds`: Integer. (Default: `3`)
+    - `defaults.features.readReceipts.enabled`: `true` or `false`. (Default: `false`)
+    - `defaults.features.readReceipts.mode`: `"after-response"` (Default)
+    - `<channel>.features.typing.*`: Per-channel override for typing behavior.
+    - `<channel>.features.readReceipts.*`: Per-channel override for read receipts.
 - **`logging`**
   - *What it does:* Dictates what diagnostic events are printed into terminal or backend logs.
   - *Common values:*

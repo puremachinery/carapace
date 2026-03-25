@@ -147,6 +147,9 @@ pub struct MessageMetadata {
     /// User ID of the recipient
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recipient_id: Option<String>,
+    /// Optional read-receipt action to trigger after successful delivery.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_receipt: Option<crate::plugins::ReadReceiptContext>,
     /// Channel-specific extra data
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extra: Option<serde_json::Value>,

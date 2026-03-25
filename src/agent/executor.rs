@@ -1176,100 +1176,157 @@ pub async fn execute_run(
         }
     }
 
-    // 3. Main agentic loop
-    let mut accumulated_text = String::new();
-    let mut total_input_tokens: u64 = 0;
-    let mut total_output_tokens: u64 = 0;
-    let mut final_stop_reason = StopReason::EndTurn;
+    let typing_handle = if let (Some(channel_id), Some(plugin_registry)) =
+        (message_channel.as_deref(), state.plugin_registry())
+    {
+        let cfg =
+            crate::config::load_config_shared().unwrap_or_else(|_| Arc::new(serde_json::json!({})));
+        let policy =
+            crate::channels::activity::resolve_channel_activity_policy(cfg.as_ref(), channel_id);
+        let typing_context = {
+            let registry = state.agent_run_registry.lock();
+            registry
+                .get(&run_id)
+                .and_then(|run| run.typing_context.clone())
+                .or_else(|| {
+                    session
+                        .metadata
+                        .chat_id
+                        .clone()
+                        .map(|to| crate::plugins::TypingContext {
+                            to,
+                            ..Default::default()
+                        })
+                })
+        };
 
-    let mut history = crate::sessions::get_history_blocking(
-        state.session_store().clone(),
-        session.id.clone(),
-        None,
-        None,
-    )
-    .await
-    .map_err(|e| AgentError::SessionStore(e.to_string()))?;
-
-    for _turn in 0..config.max_turns {
-        let should_continue = execute_single_turn(
-            &config,
-            &state,
-            &provider,
-            &cancel_token,
-            &run_id,
-            &session_key,
-            &session.id,
-            message_channel.as_deref(),
-            &seq,
-            &mut history,
-            &mut accumulated_text,
-            &mut total_input_tokens,
-            &mut total_output_tokens,
-            &mut final_stop_reason,
-        )
-        .await?;
-
-        if !should_continue {
-            break;
+        match typing_context {
+            Some(ctx) => {
+                crate::channels::activity::maybe_start_typing_loop(
+                    plugin_registry.clone(),
+                    channel_id,
+                    &policy,
+                    ctx,
+                )
+                .await
+            }
+            None => None,
         }
-    }
-
-    // 4. Broadcast completion and mark run done
-    let delivery_text = if config.deliver {
-        Some(accumulated_text.clone())
     } else {
         None
     };
-    let delivery_recipient_id = {
-        let registry = state.agent_run_registry.lock();
-        registry
-            .get(&run_id)
-            .and_then(|run| run.delivery_recipient_id.clone())
-    };
 
-    finalize_run(
-        &state,
-        &run_id,
-        &session_key,
-        &seq,
-        final_stop_reason,
-        total_input_tokens,
-        total_output_tokens,
-        accumulated_text,
-        &config.output_sanitizer.csp_policy,
-    );
+    let execution_result = async {
+        // 3. Main agentic loop
+        let mut accumulated_text = String::new();
+        let mut total_input_tokens: u64 = 0;
+        let mut total_output_tokens: u64 = 0;
+        let mut final_stop_reason = StopReason::EndTurn;
 
-    // 5. Deliver response to originating channel if requested
-    if let Some(text) = delivery_text {
-        if !text.is_empty() {
-            let recipient_id = delivery_recipient_id.or_else(|| session.metadata.chat_id.clone());
-            if let (Some(channel_id), Some(chat_id)) = (&message_channel, recipient_id) {
-                let metadata = crate::messages::outbound::MessageMetadata {
-                    recipient_id: Some(chat_id),
-                    ..Default::default()
-                };
-                let outbound = crate::messages::outbound::OutboundMessage::new(
-                    channel_id.clone(),
-                    crate::messages::outbound::MessageContent::text(text),
-                )
-                .with_metadata(metadata);
-                let ctx = crate::messages::outbound::OutboundContext::new()
-                    .with_trace_id(&run_id)
-                    .with_source("agent");
-                if let Err(err) = state.message_pipeline().queue(outbound, ctx) {
-                    tracing::warn!(
-                        run_id = %run_id,
-                        channel = %channel_id,
-                        error = %err,
-                        "failed to queue agent response for delivery"
-                    );
+        let mut history = crate::sessions::get_history_blocking(
+            state.session_store().clone(),
+            session.id.clone(),
+            None,
+            None,
+        )
+        .await
+        .map_err(|e| AgentError::SessionStore(e.to_string()))?;
+
+        for _turn in 0..config.max_turns {
+            let should_continue = execute_single_turn(
+                &config,
+                &state,
+                &provider,
+                &cancel_token,
+                &run_id,
+                &session_key,
+                &session.id,
+                message_channel.as_deref(),
+                &seq,
+                &mut history,
+                &mut accumulated_text,
+                &mut total_input_tokens,
+                &mut total_output_tokens,
+                &mut final_stop_reason,
+            )
+            .await?;
+
+            if !should_continue {
+                break;
+            }
+        }
+
+        // 4. Broadcast completion and mark run done
+        let delivery_text = if config.deliver {
+            Some(accumulated_text.clone())
+        } else {
+            None
+        };
+        let (delivery_recipient_id, read_receipt_context) = {
+            let registry = state.agent_run_registry.lock();
+            registry
+                .get(&run_id)
+                .map(|run| {
+                    (
+                        run.delivery_recipient_id.clone(),
+                        run.read_receipt_context.clone(),
+                    )
+                })
+                .unwrap_or((None, None))
+        };
+
+        finalize_run(
+            &state,
+            &run_id,
+            &session_key,
+            &seq,
+            final_stop_reason,
+            total_input_tokens,
+            total_output_tokens,
+            accumulated_text,
+            &config.output_sanitizer.csp_policy,
+        );
+
+        // 5. Deliver response to originating channel if requested
+        if let Some(text) = delivery_text {
+            if !text.is_empty() {
+                let recipient_id =
+                    delivery_recipient_id.or_else(|| session.metadata.chat_id.clone());
+                if let (Some(channel_id), Some(chat_id)) = (&message_channel, recipient_id) {
+                    let metadata = crate::messages::outbound::MessageMetadata {
+                        recipient_id: Some(chat_id),
+                        read_receipt: read_receipt_context,
+                        ..Default::default()
+                    };
+                    let outbound = crate::messages::outbound::OutboundMessage::new(
+                        channel_id.clone(),
+                        crate::messages::outbound::MessageContent::text(text),
+                    )
+                    .with_metadata(metadata);
+                    let ctx = crate::messages::outbound::OutboundContext::new()
+                        .with_trace_id(&run_id)
+                        .with_source("agent");
+                    if let Err(err) = state.message_pipeline().queue(outbound, ctx) {
+                        tracing::warn!(
+                            run_id = %run_id,
+                            channel = %channel_id,
+                            error = %err,
+                            "failed to queue agent response for delivery"
+                        );
+                    }
                 }
             }
         }
+
+        Ok(())
+    }
+    .await;
+
+    if let Some(handle) = typing_handle {
+        handle.stop().await;
     }
 
-    Ok(())
+    execution_result
 }
 
 /// Sanitize a provider error message before sending to clients.
@@ -1781,6 +1838,8 @@ mod tests {
                 run_id: run_id.to_string(),
                 session_key: session_key.to_string(),
                 delivery_recipient_id: None,
+                typing_context: None,
+                read_receipt_context: None,
                 status: AgentRunStatus::Queued,
                 message: "Hello".to_string(),
                 response: String::new(),
@@ -2124,6 +2183,8 @@ mod tests {
                 run_id: run_id.to_string(),
                 session_key: session_key.to_string(),
                 delivery_recipient_id: Some("fresh-peer".to_string()),
+                typing_context: None,
+                read_receipt_context: None,
                 status: AgentRunStatus::Queued,
                 message: "Hello".to_string(),
                 response: String::new(),
@@ -2190,6 +2251,8 @@ mod tests {
                 run_id: run_id.to_string(),
                 session_key: session_key.to_string(),
                 delivery_recipient_id: None,
+                typing_context: None,
+                read_receipt_context: None,
                 status: AgentRunStatus::Queued,
                 message: "Hello".to_string(),
                 response: String::new(),

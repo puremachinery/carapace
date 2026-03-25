@@ -100,6 +100,8 @@ pub struct ChannelCapabilities {
     pub media: bool,
     pub native_commands: bool,
     pub block_streaming: bool,
+    pub typing_indicators: bool,
+    pub read_receipts: bool,
 }
 
 /// Outbound message context
@@ -111,6 +113,32 @@ pub struct OutboundContext {
     pub gif_playback: bool,
     pub reply_to_id: Option<String>,
     pub thread_id: Option<String>,
+    pub account_id: Option<String>,
+}
+
+/// Context for channel typing-indicator operations.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TypingContext {
+    pub to: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+}
+
+/// Context for channel read-receipt operations.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadReceiptContext {
+    pub recipient: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub account_id: Option<String>,
 }
 
@@ -185,6 +213,21 @@ pub trait ChannelPluginInstance: Send + Sync {
 
     /// Send a media message
     fn send_media(&self, ctx: OutboundContext) -> Result<DeliveryResult, BindingError>;
+
+    /// Start or refresh a typing indicator for a channel-specific recipient.
+    fn start_typing(&self, _ctx: TypingContext) -> Result<(), BindingError> {
+        Ok(())
+    }
+
+    /// Stop a typing indicator for a channel-specific recipient.
+    fn stop_typing(&self, _ctx: TypingContext) -> Result<(), BindingError> {
+        Ok(())
+    }
+
+    /// Mark a channel-specific message or conversation as read.
+    fn mark_read(&self, _ctx: ReadReceiptContext) -> Result<(), BindingError> {
+        Ok(())
+    }
 }
 
 /// Plugin instance trait for tool plugins

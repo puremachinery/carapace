@@ -65,6 +65,10 @@ pub struct AgentRun {
     pub session_key: String,
     /// Delivery recipient captured at enqueue time, if any.
     pub delivery_recipient_id: Option<String>,
+    /// Optional channel-specific typing context for inbound activity features.
+    pub typing_context: Option<crate::plugins::TypingContext>,
+    /// Optional channel-specific read-receipt context for inbound activity features.
+    pub read_receipt_context: Option<crate::plugins::ReadReceiptContext>,
     /// Current status
     pub status: AgentRunStatus,
     /// Original message that started this run
@@ -1887,6 +1891,8 @@ fn setup_agent_session(
         run_id: idempotency_key.to_string(),
         session_key: session.session_key.clone(),
         delivery_recipient_id: None,
+        typing_context: None,
+        read_receipt_context: None,
         status: AgentRunStatus::Queued,
         message: message.to_string(),
         response: String::new(),
@@ -2371,6 +2377,8 @@ fn trigger_agent_if_enabled(
         run_id: idempotency_key.to_string(),
         session_key: session_key.to_string(),
         delivery_recipient_id: None,
+        typing_context: None,
+        read_receipt_context: None,
         status: AgentRunStatus::Queued,
         message: message.to_string(),
         response: String::new(),
@@ -2681,6 +2689,8 @@ mod tests {
             run_id: run_id.to_string(),
             session_key: session_key.to_string(),
             delivery_recipient_id: None,
+            typing_context: None,
+            read_receipt_context: None,
             status: AgentRunStatus::Queued,
             message: "test message".to_string(),
             response: String::new(),

@@ -114,6 +114,7 @@ pub fn validate_schema(config: &Value) -> Vec<SchemaIssue> {
     validate_codex(obj, &mut issues);
     validate_agents(obj, &mut issues);
     validate_session(obj, &mut issues);
+    validate_channels(obj, &mut issues);
     validate_cron(obj, &mut issues);
     validate_prompt_guard(obj, &mut issues);
     validate_output_sanitizer(obj, &mut issues);
@@ -291,6 +292,150 @@ fn validate_gateway(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schem
                     message: "basePath must be a string".to_string(),
                 });
             }
+        }
+    }
+}
+
+fn validate_channels(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIssue>) {
+    let Some(channels) = obj.get("channels").and_then(|value| value.as_object()) else {
+        return;
+    };
+
+    for (channel_name, entry) in channels {
+        let Some(entry_obj) = entry.as_object() else {
+            issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: format!(".channels.{}", channel_name),
+                message: format!(
+                    "channel config entry must be an object, got {}",
+                    json_type_label(entry)
+                ),
+            });
+            continue;
+        };
+
+        if let Some(features) = entry_obj.get("features") {
+            validate_channel_features(
+                features,
+                &format!(".channels.{}.features", channel_name),
+                issues,
+            );
+        }
+    }
+}
+
+fn validate_channel_features(features: &Value, path: &str, issues: &mut Vec<SchemaIssue>) {
+    let Some(features_obj) = features.as_object() else {
+        issues.push(SchemaIssue {
+            severity: Severity::Warning,
+            path: path.to_string(),
+            message: format!(
+                "features must be an object, got {}",
+                json_type_label(features)
+            ),
+        });
+        return;
+    };
+
+    if let Some(typing) = features_obj.get("typing") {
+        let typing_path = format!("{}.typing", path);
+        let Some(typing_obj) = typing.as_object() else {
+            issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: typing_path,
+                message: format!(
+                    "typing feature config must be an object, got {}",
+                    json_type_label(typing)
+                ),
+            });
+            return;
+        };
+
+        if let Some(enabled) = typing_obj.get("enabled") {
+            if !enabled.is_boolean() {
+                issues.push(SchemaIssue {
+                    severity: Severity::Warning,
+                    path: format!("{}.enabled", typing_path),
+                    message: "typing enabled must be a boolean".to_string(),
+                });
+            }
+        }
+
+        if let Some(mode) = typing_obj.get("mode").and_then(|value| value.as_str()) {
+            if mode != "thinking" {
+                issues.push(SchemaIssue {
+                    severity: Severity::Warning,
+                    path: format!("{}.mode", typing_path),
+                    message: format!("typing mode should be \"thinking\", got \"{}\"", mode),
+                });
+            }
+        } else if let Some(mode) = typing_obj.get("mode") {
+            issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: format!("{}.mode", typing_path),
+                message: format!(
+                    "typing mode must be a string, got {}",
+                    json_type_label(mode)
+                ),
+            });
+        }
+
+        if let Some(interval) = typing_obj.get("intervalSeconds") {
+            check_positive_integer(
+                interval,
+                &format!("{}.intervalSeconds", typing_path),
+                issues,
+            );
+        }
+    }
+
+    if let Some(read_receipts) = features_obj.get("readReceipts") {
+        let read_receipts_path = format!("{}.readReceipts", path);
+        let Some(read_receipts_obj) = read_receipts.as_object() else {
+            issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: read_receipts_path,
+                message: format!(
+                    "readReceipts feature config must be an object, got {}",
+                    json_type_label(read_receipts)
+                ),
+            });
+            return;
+        };
+
+        if let Some(enabled) = read_receipts_obj.get("enabled") {
+            if !enabled.is_boolean() {
+                issues.push(SchemaIssue {
+                    severity: Severity::Warning,
+                    path: format!("{}.enabled", read_receipts_path),
+                    message: "readReceipts enabled must be a boolean".to_string(),
+                });
+            }
+        }
+
+        if let Some(mode) = read_receipts_obj
+            .get("mode")
+            .and_then(|value| value.as_str())
+        {
+            if mode != "after-response" {
+                issues.push(SchemaIssue {
+                    severity: Severity::Warning,
+                    path: format!("{}.mode", read_receipts_path),
+                    message: format!(
+                        "readReceipts mode should be \"after-response\", got \"{}\"",
+                        mode
+                    ),
+                });
+            }
+        } else if let Some(mode) = read_receipts_obj.get("mode") {
+            issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: format!("{}.mode", read_receipts_path),
+                message: format!(
+                    "readReceipts mode must be a string, got {}",
+                    json_type_label(mode)
+                ),
+            });
         }
     }
 }
@@ -1909,6 +2054,84 @@ mod tests {
         assert!(!issues
             .iter()
             .any(|i| i.path.starts_with(".sessions.retentionDays")));
+    }
+
+    #[test]
+    fn test_channels_features_valid() {
+        let cfg = json!({
+            "channels": {
+                "defaults": {
+                    "features": {
+                        "typing": {
+                            "enabled": true,
+                            "mode": "thinking",
+                            "intervalSeconds": 3
+                        },
+                        "readReceipts": {
+                            "enabled": false,
+                            "mode": "after-response"
+                        }
+                    }
+                },
+                "signal": {
+                    "features": {
+                        "typing": {
+                            "enabled": false,
+                            "intervalSeconds": 7
+                        },
+                        "readReceipts": {
+                            "enabled": true,
+                            "mode": "after-response"
+                        }
+                    }
+                }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(
+            !issues
+                .iter()
+                .any(|issue| issue.path.starts_with(".channels")),
+            "unexpected channel issues: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_channels_features_invalid_values_warn() {
+        let cfg = json!({
+            "channels": {
+                "signal": {
+                    "features": {
+                        "typing": {
+                            "enabled": "yes",
+                            "mode": "forever",
+                            "intervalSeconds": 0
+                        },
+                        "readReceipts": {
+                            "enabled": "yes",
+                            "mode": "on-receive"
+                        }
+                    }
+                }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(issues
+            .iter()
+            .any(|issue| issue.path == ".channels.signal.features.typing.enabled"));
+        assert!(issues
+            .iter()
+            .any(|issue| issue.path == ".channels.signal.features.typing.mode"));
+        assert!(issues
+            .iter()
+            .any(|issue| issue.path == ".channels.signal.features.typing.intervalSeconds"));
+        assert!(issues
+            .iter()
+            .any(|issue| issue.path == ".channels.signal.features.readReceipts.enabled"));
+        assert!(issues
+            .iter()
+            .any(|issue| issue.path == ".channels.signal.features.readReceipts.mode"));
     }
 
     // --- cron ---

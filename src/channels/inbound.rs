@@ -7,8 +7,17 @@ use std::sync::Arc;
 use serde_json::Value;
 use tracing::debug;
 
+use crate::plugins::{ReadReceiptContext, TypingContext};
 use crate::server::ws::{AgentRun, AgentRunStatus, WsServerState};
 use crate::sessions::{get_or_create_scoped_session, ChatMessage, SessionMetadata};
+
+/// Optional per-channel activity context captured from an inbound message.
+#[derive(Debug, Clone, Default)]
+pub struct InboundDispatchOptions {
+    pub delivery_recipient_id: Option<String>,
+    pub typing_context: Option<TypingContext>,
+    pub read_receipt_context: Option<ReadReceiptContext>,
+}
 
 /// Dispatch an inbound text message into the agent pipeline.
 ///
@@ -21,6 +30,28 @@ pub async fn dispatch_inbound_text(
     text: &str,
     chat_id: Option<String>,
 ) -> Result<String, String> {
+    dispatch_inbound_text_with_options(
+        state,
+        channel,
+        sender_id,
+        peer_id,
+        text,
+        chat_id,
+        InboundDispatchOptions::default(),
+    )
+    .await
+}
+
+/// Dispatch an inbound text message with optional channel activity context.
+pub async fn dispatch_inbound_text_with_options(
+    state: &Arc<WsServerState>,
+    channel: &str,
+    sender_id: &str,
+    peer_id: &str,
+    text: &str,
+    chat_id: Option<String>,
+    options: InboundDispatchOptions,
+) -> Result<String, String> {
     let cfg = crate::config::load_config_shared()
         .unwrap_or_else(|_| Arc::new(Value::Object(serde_json::Map::new())));
     let effective_peer_id = if peer_id.is_empty() {
@@ -29,7 +60,7 @@ pub async fn dispatch_inbound_text(
         peer_id
     };
 
-    let delivery_recipient_id = chat_id.clone();
+    let delivery_recipient_id = options.delivery_recipient_id.or_else(|| chat_id.clone());
     let metadata = SessionMetadata {
         channel: Some(channel.to_string()),
         user_id: Some(sender_id.to_string()),
@@ -64,11 +95,22 @@ pub async fn dispatch_inbound_text(
         .unwrap_or_default()
         .as_millis() as u64;
 
+    let typing_context = options.typing_context.or_else(|| {
+        delivery_recipient_id
+            .clone()
+            .or_else(|| session.metadata.chat_id.clone())
+            .map(|to| TypingContext {
+                to,
+                ..Default::default()
+            })
+    });
     let cancel_token = tokio_util::sync::CancellationToken::new();
     let run = AgentRun {
         run_id: run_id.clone(),
         session_key: session.session_key.clone(),
         delivery_recipient_id,
+        typing_context,
+        read_receipt_context: options.read_receipt_context,
         status: AgentRunStatus::Queued,
         message: text.to_string(),
         response: String::new(),
