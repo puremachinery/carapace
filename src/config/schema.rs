@@ -2,10 +2,7 @@
 
 use serde_json::Value;
 
-const KNOWN_CHANNEL_CONFIG_KEYS: &[&str] = &[
-    "defaults", "console", "signal", "telegram", "discord", "slack", "webhook",
-];
-
+use crate::channels::BUILTIN_CHANNEL_IDS;
 use crate::plugins::loader::{is_reserved_plugin_id, RESERVED_PLUGIN_CONFIG_KEYS};
 
 /// Severity of a schema validation issue.
@@ -306,7 +303,7 @@ fn validate_channels(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Sche
     };
 
     for (channel_name, entry) in channels {
-        if !KNOWN_CHANNEL_CONFIG_KEYS.contains(&channel_name.as_str()) {
+        if channel_name != "defaults" && !BUILTIN_CHANNEL_IDS.contains(&channel_name.as_str()) {
             issues.push(SchemaIssue {
                 severity: Severity::Warning,
                 path: format!(".channels.{}", channel_name),
@@ -727,6 +724,26 @@ fn validate_session(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schem
                 });
             }
         }
+    }
+
+    if let Some(typing_mode) = legacy_session.and_then(|s| s.get("typingMode")) {
+        match typing_mode.as_str() {
+            Some(mode) if mode.eq_ignore_ascii_case("thinking") => {}
+            Some(mode) => issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: ".session.typingMode".to_string(),
+                message: format!("typingMode must be \"thinking\", got \"{}\"", mode),
+            }),
+            None => issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: ".session.typingMode".to_string(),
+                message: "typingMode must be a string".to_string(),
+            }),
+        }
+    }
+
+    if let Some(typing_interval) = legacy_session.and_then(|s| s.get("typingIntervalSeconds")) {
+        check_positive_integer(typing_interval, ".session.typingIntervalSeconds", issues);
     }
 }
 
@@ -2160,6 +2177,20 @@ mod tests {
         let issues = validate_schema(&cfg);
         assert!(issues.iter().any(|issue| issue.path == ".channels.singal"
             && issue.message.contains("unknown channel config key")));
+    }
+
+    #[test]
+    fn test_legacy_session_typing_mode_warns_on_unknown_value() {
+        let cfg = json!({
+            "session": {
+                "typingMode": "thinkng"
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(issues
+            .iter()
+            .any(|issue| issue.path == ".session.typingMode"
+                && issue.message.contains("typingMode must be \"thinking\"")));
     }
 
     #[test]

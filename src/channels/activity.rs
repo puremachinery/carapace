@@ -8,12 +8,14 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::runtime::{Handle, RuntimeFlavor};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::plugins::{
     BindingError, ChannelPluginInstance, PluginRegistry, ReadReceiptContext, TypingContext,
 };
+use crate::runtime_bridge::run_sync_blocking_send;
 
 const DEFAULT_TYPING_INTERVAL_SECONDS: u32 = 3;
 
@@ -72,10 +74,20 @@ pub struct ChannelActivityPolicy {
     pub read_receipts: ReadReceiptFeaturePolicy,
 }
 
-#[derive(Debug)]
 pub struct TypingLoopHandle {
     cancel: CancellationToken,
     task: Option<JoinHandle<()>>,
+    plugin: Arc<dyn ChannelPluginInstance>,
+    ctx: TypingContext,
+    channel_id: String,
+}
+
+impl std::fmt::Debug for TypingLoopHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TypingLoopHandle")
+            .field("channel_id", &self.channel_id)
+            .finish_non_exhaustive()
+    }
 }
 
 impl TypingLoopHandle {
@@ -89,7 +101,39 @@ impl TypingLoopHandle {
 
 impl Drop for TypingLoopHandle {
     fn drop(&mut self) {
+        if self.task.is_none() {
+            return;
+        }
         self.cancel.cancel();
+        match Handle::try_current() {
+            Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
+                if let Some(task) = self.task.take() {
+                    if let Err(err) = run_sync_blocking_send(async move {
+                        let _ = task.await;
+                        Ok::<(), String>(())
+                    }) {
+                        eprintln!("Warning: failed to finish typing cleanup after drop: {err}");
+                    }
+                }
+            }
+            _ => {
+                if let Some(task) = self.task.take() {
+                    task.abort();
+                }
+                let plugin = self.plugin.clone();
+                let ctx = self.ctx.clone();
+                let channel_id = self.channel_id.clone();
+                if let Err(err) = run_sync_blocking_send(async move {
+                    invoke_stop_typing(plugin, ctx)
+                        .await
+                        .map_err(|err| err.to_string())
+                }) {
+                    eprintln!(
+                        "Warning: failed to stop typing indicator after drop for {channel_id}: {err}"
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -209,6 +253,9 @@ pub async fn maybe_start_typing_loop(
     let cancel = CancellationToken::new();
     let interval_seconds = policy.typing.interval_seconds.max(1);
     let channel_id = channel_id.to_string();
+    let handle_channel_id = channel_id.clone();
+    let handle_plugin = plugin.clone();
+    let handle_ctx = ctx.clone();
     let task_cancel = cancel.clone();
     let task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(interval_seconds as u64));
@@ -234,6 +281,9 @@ pub async fn maybe_start_typing_loop(
     Some(TypingLoopHandle {
         cancel,
         task: Some(task),
+        plugin: handle_plugin,
+        ctx: handle_ctx,
+        channel_id: handle_channel_id,
     })
 }
 
@@ -307,21 +357,31 @@ mod tests {
 
     use super::*;
     use crate::plugins::{ChannelCapabilities, ChannelInfo, DeliveryResult, OutboundContext};
+    use tokio::sync::Notify;
 
     struct MockChannel {
         caps: ChannelCapabilities,
         start_typing_count: AtomicU32,
         stop_typing_count: AtomicU32,
         mark_read_count: AtomicU32,
+        stop_typing_notify: Option<Arc<Notify>>,
     }
 
     impl MockChannel {
         fn new(caps: ChannelCapabilities) -> Self {
+            Self::with_stop_typing_notify(caps, None)
+        }
+
+        fn with_stop_typing_notify(
+            caps: ChannelCapabilities,
+            stop_typing_notify: Option<Arc<Notify>>,
+        ) -> Self {
             Self {
                 caps,
                 start_typing_count: AtomicU32::new(0),
                 stop_typing_count: AtomicU32::new(0),
                 mark_read_count: AtomicU32::new(0),
+                stop_typing_notify,
             }
         }
     }
@@ -357,6 +417,9 @@ mod tests {
 
         fn stop_typing(&self, _ctx: TypingContext) -> Result<(), BindingError> {
             self.stop_typing_count.fetch_add(1, Ordering::Relaxed);
+            if let Some(notify) = &self.stop_typing_notify {
+                notify.notify_one();
+            }
             Ok(())
         }
 
@@ -493,10 +556,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_maybe_start_typing_loop_drop_cancels_background_task() {
-        let plugin = Arc::new(MockChannel::new(ChannelCapabilities {
-            typing_indicators: true,
-            ..Default::default()
-        }));
+        let stop_typing_notify = Arc::new(Notify::new());
+        let plugin = Arc::new(MockChannel::with_stop_typing_notify(
+            ChannelCapabilities {
+                typing_indicators: true,
+                ..Default::default()
+            },
+            Some(stop_typing_notify.clone()),
+        ));
         let registry = Arc::new(PluginRegistry::new());
         registry.register_channel("signal".to_string(), plugin.clone());
         let policy = ChannelActivityPolicy {
@@ -521,7 +588,9 @@ mod tests {
         .expect("typing loop should start");
 
         drop(handle);
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        tokio::time::timeout(Duration::from_secs(1), stop_typing_notify.notified())
+            .await
+            .expect("drop should stop typing promptly");
 
         assert!(plugin.start_typing_count.load(Ordering::Relaxed) >= 1);
         assert_eq!(plugin.stop_typing_count.load(Ordering::Relaxed), 1);
