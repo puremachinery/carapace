@@ -17,6 +17,42 @@ const MAX_MEDIA_BYTES: u64 = 50 * 1024 * 1024;
 const SIGNAL_HTTP_CONNECT_TIMEOUT_SECS: u64 = 5;
 const SIGNAL_HTTP_TIMEOUT_SECS: u64 = 15;
 
+fn is_loopback_host(parsed: &url::Url) -> bool {
+    match parsed.host() {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
+}
+
+pub(crate) fn validate_signal_url(
+    raw: &str,
+    context: &str,
+    allow_loopback_http: bool,
+) -> Result<url::Url, String> {
+    let parsed = url::Url::parse(raw).map_err(|_| format!("invalid {} URL", context))?;
+    match parsed.scheme() {
+        "https" => {}
+        "http" if allow_loopback_http && is_loopback_host(&parsed) => {}
+        scheme => {
+            let loopback_note = if allow_loopback_http {
+                " (http is only allowed for localhost/loopback endpoints)"
+            } else {
+                ""
+            };
+            return Err(format!(
+                "{} URL must use https{} (got scheme '{}')",
+                context, loopback_note, scheme
+            ));
+        }
+    }
+    if parsed.host_str().is_none() {
+        return Err(format!("{} URL is missing a host", context));
+    }
+    Ok(parsed)
+}
+
 /// A channel plugin that delivers messages via the signal-cli REST API.
 pub struct SignalChannel {
     client: reqwest::blocking::Client,
@@ -33,7 +69,7 @@ impl SignalChannel {
     /// `post_send` and `send_media`.
     pub fn new(base_url: String, phone_number: String) -> Self {
         if let Ok(parsed) = url::Url::parse(&base_url) {
-            if parsed.scheme() == "http" && Self::is_loopback_host(&parsed) {
+            if parsed.scheme() == "http" && is_loopback_host(&parsed) {
                 tracing::warn!(
                     host = parsed.host_str().unwrap_or(""),
                     "signal channel base_url uses http on loopback; use https for non-local deployments"
@@ -83,44 +119,8 @@ impl SignalChannel {
         )
     }
 
-    fn is_loopback_host(parsed: &url::Url) -> bool {
-        match parsed.host() {
-            Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
-            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-            None => false,
-        }
-    }
-
-    fn validate_signal_url(
-        raw: &str,
-        context: &str,
-        allow_loopback_http: bool,
-    ) -> Result<url::Url, String> {
-        let parsed = url::Url::parse(raw).map_err(|_| format!("invalid {} URL", context))?;
-        match parsed.scheme() {
-            "https" => {}
-            "http" if allow_loopback_http && Self::is_loopback_host(&parsed) => {}
-            scheme => {
-                let loopback_note = if allow_loopback_http {
-                    " (http is only allowed for localhost/loopback endpoints)"
-                } else {
-                    ""
-                };
-                return Err(format!(
-                    "{} URL must use https{} (got scheme '{}')",
-                    context, loopback_note, scheme
-                ));
-            }
-        }
-        if parsed.host_str().is_none() {
-            return Err(format!("{} URL is missing a host", context));
-        }
-        Ok(parsed)
-    }
-
     fn update_typing_indicator(&self, ctx: TypingContext, show: bool) -> Result<(), BindingError> {
-        let typing_url = Self::validate_signal_url(
+        let typing_url = validate_signal_url(
             &self.typing_indicator_url(),
             "signal typing indicator",
             true,
@@ -156,7 +156,7 @@ impl SignalChannel {
         let timestamp = ctx.timestamp.ok_or_else(|| {
             BindingError::CallError("signal read receipt requires a timestamp".to_string())
         })?;
-        let receipts_url = Self::validate_signal_url(&self.receipts_url(), "signal receipt", true)
+        let receipts_url = validate_signal_url(&self.receipts_url(), "signal receipt", true)
             .map_err(BindingError::CallError)?;
         let body = serde_json::json!({
             "recipient": ctx.recipient,
@@ -225,7 +225,7 @@ impl ChannelPluginInstance for SignalChannel {
         };
 
         // Fetch media bytes (URL has already been SSRF-validated by the host)
-        let media_request_url = match Self::validate_signal_url(media_url, "signal media", false) {
+        let media_request_url = match validate_signal_url(media_url, "signal media", false) {
             Ok(url) => url,
             Err(e) => {
                 return Ok(DeliveryResult {
@@ -324,7 +324,7 @@ impl ChannelPluginInstance for SignalChannel {
 
 impl SignalChannel {
     fn post_send(&self, body: &serde_json::Value) -> Result<DeliveryResult, BindingError> {
-        let send_url = match Self::validate_signal_url(&self.send_url(), "signal send", true) {
+        let send_url = match validate_signal_url(&self.send_url(), "signal send", true) {
             Ok(url) => url,
             Err(e) => {
                 return Ok(DeliveryResult {
@@ -592,9 +592,8 @@ mod tests {
 
     #[test]
     fn test_signal_url_parse_error_does_not_echo_raw_url() {
-        let err =
-            SignalChannel::validate_signal_url("https://user:pass@/broken", "signal send", true)
-                .expect_err("invalid URL should fail");
+        let err = validate_signal_url("https://user:pass@/broken", "signal send", true)
+            .expect_err("invalid URL should fail");
         assert!(!err.contains("user:pass"));
     }
 

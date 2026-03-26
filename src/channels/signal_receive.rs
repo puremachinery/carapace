@@ -10,6 +10,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use tracing::{debug, error, info, warn};
 
+use crate::channels::signal::validate_signal_url;
 use crate::channels::{ChannelRegistry, ChannelStatus};
 use crate::plugins::{ReadReceiptContext, TypingContext};
 use crate::server::ws::WsServerState;
@@ -163,6 +164,16 @@ pub async fn signal_receive_loop(
     channel_registry: Arc<ChannelRegistry>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
+    let base_url = match validate_signal_url(&base_url, "signal receive", true) {
+        Ok(url) => url.to_string().trim_end_matches('/').to_string(),
+        Err(err) => {
+            error!(phone_number = %phone_number, error = %err, "Signal receive loop configuration is invalid");
+            channel_registry.set_error("signal", err);
+            channel_registry.update_status("signal", ChannelStatus::Error);
+            return;
+        }
+    };
+
     let client = reqwest::Client::builder()
         .timeout(RECEIVE_TIMEOUT)
         .build()
@@ -555,6 +566,13 @@ mod tests {
             build_receive_url("http://localhost:8080", "+15551234567", true),
             "http://localhost:8080/v1/receive/%2B15551234567?send_read_receipts=false"
         );
+    }
+
+    #[test]
+    fn test_validate_signal_receive_url_rejects_non_https_non_loopback_base_url() {
+        let err = validate_signal_url("http://example.com:8080", "signal receive", true)
+            .expect_err("non-loopback receive URL should be rejected");
+        assert!(err.contains("signal receive URL must use https"));
     }
 
     #[test]

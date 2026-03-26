@@ -108,11 +108,29 @@ impl Drop for TypingLoopHandle {
         match Handle::try_current() {
             Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
                 if let Some(task) = self.task.take() {
+                    let plugin = self.plugin.clone();
+                    let ctx = self.ctx.clone();
+                    let channel_id = self.channel_id.clone();
                     if let Err(err) = run_sync_blocking_send(async move {
-                        let _ = task.await;
-                        Ok::<(), String>(())
+                        match task.await {
+                            Ok(()) => Ok::<(), String>(()),
+                            Err(join_err) => {
+                                invoke_stop_typing(plugin, ctx)
+                                    .await
+                                    .map_err(|err| format!(
+                                        "typing task ended unexpectedly ({join_err}); fallback stop_typing also failed: {err}"
+                                    ))?;
+                                Err(format!(
+                                    "typing task ended unexpectedly ({join_err}); sent fallback stop_typing"
+                                ))
+                            }
+                        }
                     }) {
-                        eprintln!("Warning: failed to finish typing cleanup after drop: {err}");
+                        tracing::warn!(
+                            channel = %channel_id,
+                            error = %err,
+                            "failed to finish typing cleanup after drop"
+                        );
                     }
                 }
             }
@@ -128,8 +146,10 @@ impl Drop for TypingLoopHandle {
                         .await
                         .map_err(|err| err.to_string())
                 }) {
-                    eprintln!(
-                        "Warning: failed to stop typing indicator after drop for {channel_id}: {err}"
+                    tracing::warn!(
+                        channel = %channel_id,
+                        error = %err,
+                        "failed to stop typing indicator after drop"
                     );
                 }
             }
