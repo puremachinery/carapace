@@ -390,49 +390,48 @@ fn validate_channel_features(features: &Value, path: &str, issues: &mut Vec<Sche
 
     if let Some(read_receipts) = features_obj.get("readReceipts") {
         let read_receipts_path = format!("{}.readReceipts", path);
-        let Some(read_receipts_obj) = read_receipts.as_object() else {
+        if let Some(read_receipts_obj) = read_receipts.as_object() {
+            if let Some(enabled) = read_receipts_obj.get("enabled") {
+                if !enabled.is_boolean() {
+                    issues.push(SchemaIssue {
+                        severity: Severity::Warning,
+                        path: format!("{}.enabled", read_receipts_path),
+                        message: "readReceipts enabled must be a boolean".to_string(),
+                    });
+                }
+            }
+
+            if let Some(mode) = read_receipts_obj
+                .get("mode")
+                .and_then(|value| value.as_str())
+            {
+                if mode != "after-response" {
+                    issues.push(SchemaIssue {
+                        severity: Severity::Warning,
+                        path: format!("{}.mode", read_receipts_path),
+                        message: format!(
+                            "readReceipts mode should be \"after-response\", got \"{}\"",
+                            mode
+                        ),
+                    });
+                }
+            } else if let Some(mode) = read_receipts_obj.get("mode") {
+                issues.push(SchemaIssue {
+                    severity: Severity::Warning,
+                    path: format!("{}.mode", read_receipts_path),
+                    message: format!(
+                        "readReceipts mode must be a string, got {}",
+                        json_type_label(mode)
+                    ),
+                });
+            }
+        } else {
             issues.push(SchemaIssue {
                 severity: Severity::Warning,
                 path: read_receipts_path,
                 message: format!(
                     "readReceipts feature config must be an object, got {}",
                     json_type_label(read_receipts)
-                ),
-            });
-            return;
-        };
-
-        if let Some(enabled) = read_receipts_obj.get("enabled") {
-            if !enabled.is_boolean() {
-                issues.push(SchemaIssue {
-                    severity: Severity::Warning,
-                    path: format!("{}.enabled", read_receipts_path),
-                    message: "readReceipts enabled must be a boolean".to_string(),
-                });
-            }
-        }
-
-        if let Some(mode) = read_receipts_obj
-            .get("mode")
-            .and_then(|value| value.as_str())
-        {
-            if mode != "after-response" {
-                issues.push(SchemaIssue {
-                    severity: Severity::Warning,
-                    path: format!("{}.mode", read_receipts_path),
-                    message: format!(
-                        "readReceipts mode should be \"after-response\", got \"{}\"",
-                        mode
-                    ),
-                });
-            }
-        } else if let Some(mode) = read_receipts_obj.get("mode") {
-            issues.push(SchemaIssue {
-                severity: Severity::Warning,
-                path: format!("{}.mode", read_receipts_path),
-                message: format!(
-                    "readReceipts mode must be a string, got {}",
-                    json_type_label(mode)
                 ),
             });
         }
