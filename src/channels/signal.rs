@@ -58,6 +58,8 @@ pub struct SignalChannel {
     client: reqwest::blocking::Client,
     base_url: String,
     phone_number: String,
+    typing_indicator_url: Result<url::Url, String>,
+    receipts_url: Result<url::Url, String>,
 }
 
 impl SignalChannel {
@@ -93,6 +95,16 @@ impl SignalChannel {
                 .timeout(std::time::Duration::from_secs(SIGNAL_HTTP_TIMEOUT_SECS))
                 .build()
                 .expect("failed to build Signal HTTP client"),
+            typing_indicator_url: validate_signal_url(
+                &Self::typing_indicator_url_for(&base_url, &phone_number),
+                "signal typing indicator",
+                true,
+            ),
+            receipts_url: validate_signal_url(
+                &Self::receipts_url_for(&base_url, &phone_number),
+                "signal receipt",
+                true,
+            ),
             base_url,
             phone_number,
         }
@@ -103,29 +115,27 @@ impl SignalChannel {
         format!("{}/v2/send", self.base_url)
     }
 
-    fn typing_indicator_url(&self) -> String {
+    fn typing_indicator_url_for(base_url: &str, phone_number: &str) -> String {
         format!(
             "{}/v1/typing-indicator/{}",
-            self.base_url,
-            urlencoding::encode(&self.phone_number)
+            base_url,
+            urlencoding::encode(phone_number)
         )
     }
 
-    fn receipts_url(&self) -> String {
+    fn receipts_url_for(base_url: &str, phone_number: &str) -> String {
         format!(
             "{}/v1/receipts/{}",
-            self.base_url,
-            urlencoding::encode(&self.phone_number)
+            base_url,
+            urlencoding::encode(phone_number)
         )
     }
 
     fn update_typing_indicator(&self, ctx: TypingContext, show: bool) -> Result<(), BindingError> {
-        let typing_url = validate_signal_url(
-            &self.typing_indicator_url(),
-            "signal typing indicator",
-            true,
-        )
-        .map_err(BindingError::CallError)?;
+        let typing_url = self
+            .typing_indicator_url
+            .clone()
+            .map_err(BindingError::CallError)?;
         let body = serde_json::json!({
             "recipient": ctx.to,
         });
@@ -156,8 +166,7 @@ impl SignalChannel {
         let timestamp = ctx.timestamp.ok_or_else(|| {
             BindingError::CallError("signal read receipt requires a timestamp".to_string())
         })?;
-        let receipts_url = validate_signal_url(&self.receipts_url(), "signal receipt", true)
-            .map_err(BindingError::CallError)?;
+        let receipts_url = self.receipts_url.clone().map_err(BindingError::CallError)?;
         let body = serde_json::json!({
             "recipient": ctx.recipient,
             "receipt_type": "read",

@@ -111,6 +111,21 @@ fn signal_group_id(data_message: &SignalDataMessage) -> Option<&str> {
         .filter(|id| !id.is_empty())
 }
 
+fn build_signal_read_receipt_context(
+    envelope: &SignalEnvelope,
+    data_message: &SignalDataMessage,
+    sender: &str,
+) -> Option<ReadReceiptContext> {
+    envelope
+        .timestamp
+        .or(data_message.timestamp)
+        .map(|timestamp| ReadReceiptContext {
+            recipient: sender.to_string(),
+            timestamp: Some(timestamp),
+            ..Default::default()
+        })
+}
+
 fn summarize_signal_receive_response_error(error: &reqwest::Error) -> &'static str {
     if error.is_decode() {
         "invalid Signal receive response body"
@@ -327,11 +342,7 @@ async fn process_envelope(envelope: &SignalEnvelope, state: &Arc<WsServerState>)
             to: peer_id.clone(),
             ..Default::default()
         }),
-        read_receipt_context: Some(ReadReceiptContext {
-            recipient: sender.clone(),
-            timestamp: envelope.timestamp.or(data_message.timestamp),
-            ..Default::default()
-        }),
+        read_receipt_context: build_signal_read_receipt_context(envelope, data_message, &sender),
         ..Default::default()
     };
 
@@ -574,6 +585,50 @@ mod tests {
         let err = validate_signal_url("http://example.com:8080", "signal receive", true)
             .expect_err("non-loopback receive URL should be rejected");
         assert!(err.contains("signal receive URL must use https"));
+    }
+
+    #[test]
+    fn test_build_signal_read_receipt_context_uses_available_timestamp() {
+        let envelope = SignalEnvelope {
+            source_number: Some("+15559876543".to_string()),
+            source: None,
+            timestamp: None,
+            data_message: Some(SignalDataMessage {
+                message: Some("Hello".to_string()),
+                timestamp: Some(1706745600000),
+                group_info: None,
+            }),
+        };
+
+        let ctx = build_signal_read_receipt_context(
+            &envelope,
+            envelope.data_message.as_ref().unwrap(),
+            "+15559876543",
+        )
+        .expect("timestamp should produce read receipt context");
+        assert_eq!(ctx.recipient, "+15559876543");
+        assert_eq!(ctx.timestamp, Some(1706745600000));
+    }
+
+    #[test]
+    fn test_build_signal_read_receipt_context_skips_missing_timestamp() {
+        let envelope = SignalEnvelope {
+            source_number: Some("+15559876543".to_string()),
+            source: None,
+            timestamp: None,
+            data_message: Some(SignalDataMessage {
+                message: Some("Hello".to_string()),
+                timestamp: None,
+                group_info: None,
+            }),
+        };
+
+        let ctx = build_signal_read_receipt_context(
+            &envelope,
+            envelope.data_message.as_ref().unwrap(),
+            "+15559876543",
+        );
+        assert!(ctx.is_none());
     }
 
     #[test]
