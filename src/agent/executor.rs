@@ -1179,7 +1179,8 @@ pub async fn execute_run(
     let typing_handle = if let (Some(channel_id), Some(plugin_registry)) =
         (message_channel.as_deref(), state.plugin_registry())
     {
-        let policy = crate::channels::activity::load_channel_activity_policy(channel_id);
+        let policy =
+            crate::channels::activity::load_channel_activity_policy_async(channel_id).await;
         let typing_context = {
             let registry = state.agent_run_registry.lock();
             registry

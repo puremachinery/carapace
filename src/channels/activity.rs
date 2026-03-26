@@ -186,6 +186,22 @@ pub fn load_channel_activity_policy(channel: &str) -> ChannelActivityPolicy {
     resolve_channel_activity_policy(config.as_ref(), channel)
 }
 
+pub async fn load_channel_activity_policy_async(channel: &str) -> ChannelActivityPolicy {
+    let channel = channel.to_string();
+    let load_channel = channel.clone();
+    match tokio::task::spawn_blocking(move || load_channel_activity_policy(&load_channel)).await {
+        Ok(policy) => policy,
+        Err(err) => {
+            tracing::warn!(
+                channel = %channel,
+                error = %err,
+                "failed to load channel activity policy asynchronously; falling back to defaults"
+            );
+            ChannelActivityPolicy::default()
+        }
+    }
+}
+
 fn apply_legacy_session_typing_fallback(config: &Value, policy: &mut TypingFeaturePolicy) {
     let Some(session) = config.get("session") else {
         return;

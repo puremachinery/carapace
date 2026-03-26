@@ -177,10 +177,12 @@ fn handle_delivery_result(
         Ok(delivery) if delivery.ok => {
             let _ = pipeline.mark_sent(message_id);
             if let Some(read_receipt) = metadata.read_receipt.clone() {
-                let policy = crate::channels::activity::load_channel_activity_policy(channel_id);
                 let plugin_registry = Arc::clone(plugin_registry);
                 let channel_id = channel_id.to_string();
                 tokio::spawn(async move {
+                    let policy =
+                        crate::channels::activity::load_channel_activity_policy_async(&channel_id)
+                            .await;
                     crate::channels::activity::maybe_send_read_receipt(
                         &plugin_registry,
                         &channel_id,
