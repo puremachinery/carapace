@@ -245,11 +245,10 @@ fn sanitize_signal_error_excerpt(body_text: &str) -> String {
 fn redact_sensitive_signal_token(token: &str) -> String {
     let trimmed =
         token.trim_matches(|ch: char| ch.is_ascii_punctuation() && ch != '+' && ch != '-');
-    let numeric = trimmed
+    let phone_like_numeric = trimmed
         .strip_prefix('+')
-        .unwrap_or(trimmed)
-        .chars()
-        .all(|ch| ch.is_ascii_digit());
+        .is_some_and(|digits| digits.chars().all(|ch| ch.is_ascii_digit()));
+    let bare_numeric = !phone_like_numeric && trimmed.chars().all(|ch| ch.is_ascii_digit());
     let digit_count = trimmed.chars().filter(|ch| ch.is_ascii_digit()).count();
     let looks_like_uuid = {
         let parts: Vec<&str> = trimmed.split('-').collect();
@@ -267,7 +266,9 @@ fn redact_sensitive_signal_token(token: &str) -> String {
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '='))
         && trimmed.chars().any(|ch| ch.is_ascii_alphabetic())
         && digit_count >= 4;
-    if (numeric && digit_count >= 4) || looks_like_uuid || looks_like_opaque_token {
+    let sensitive_numeric =
+        (phone_like_numeric && digit_count >= 4) || (bare_numeric && digit_count >= 7);
+    if sensitive_numeric || looks_like_uuid || looks_like_opaque_token {
         "[redacted]".to_string()
     } else {
         token.to_string()
@@ -603,12 +604,12 @@ mod tests {
         let message = signal_http_error_message_with_body_prefix(
             "signal send",
             StatusCode::BAD_REQUEST,
-            "Unregistered user +15551234567 for account 123456",
+            "Unregistered user +15551234567 for account 1234567",
         );
         assert!(message.contains("Unregistered user"));
         assert!(message.contains("[redacted]"));
         assert!(!message.contains("15551234567"));
-        assert!(!message.contains("123456"));
+        assert!(!message.contains("1234567"));
     }
 
     #[test]
@@ -620,6 +621,18 @@ mod tests {
         );
         assert!(message.contains("2024-01-01"));
         assert!(message.contains("ref-1234"));
+    }
+
+    #[test]
+    fn test_signal_http_error_message_preserves_common_short_numeric_diagnostics() {
+        let message = signal_http_error_message_with_body_prefix(
+            "signal send",
+            StatusCode::BAD_REQUEST,
+            "connect 8080 failed after 1024 bytes with code 4000",
+        );
+        assert!(message.contains("8080"));
+        assert!(message.contains("1024"));
+        assert!(message.contains("4000"));
     }
 
     #[test]

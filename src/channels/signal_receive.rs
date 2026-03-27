@@ -299,7 +299,7 @@ pub async fn signal_receive_loop(
             _ = tokio::time::sleep(POLL_INTERVAL) => {}
             changed = config_rx.changed() => {
                 if changed.is_err() {
-                    info!("Signal receive loop config subscription closed");
+                    warn!("Signal receive loop config subscription closed unexpectedly");
                     break;
                 }
                 activity_policy =

@@ -3,6 +3,7 @@
 //! This module handles per-channel activity policy (typing indicators and read
 //! receipts) and the runtime helpers that drive those side effects.
 
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -419,12 +420,18 @@ async fn invoke_stop_typing_with_running_state(
     stop_state: Arc<AtomicU8>,
 ) -> Result<(), BindingError> {
     stop_state.store(STOP_STATE_TASK_RUNNING, Ordering::Release);
-    let stop_task = tokio::task::spawn_blocking(move || plugin.stop_typing(ctx));
+    let stop_task = tokio::task::spawn_blocking(move || {
+        let result = catch_unwind(AssertUnwindSafe(|| plugin.stop_typing(ctx)));
+        mark_stop_completed(stop_state.as_ref());
+        match result {
+            Ok(result) => result,
+            Err(payload) => resume_unwind(payload),
+        }
+    });
     let result = stop_task
         .await
         .map_err(|err| BindingError::CallError(err.to_string()))
         .and_then(|result| result);
-    mark_stop_completed(stop_state.as_ref());
     result
 }
 
@@ -506,6 +513,7 @@ mod tests {
         stop_typing_count: AtomicU32,
         mark_read_count: AtomicU32,
         stop_typing_notify: Option<Arc<Notify>>,
+        stop_typing_delay: Duration,
     }
 
     impl MockChannel {
@@ -523,6 +531,14 @@ mod tests {
                 stop_typing_count: AtomicU32::new(0),
                 mark_read_count: AtomicU32::new(0),
                 stop_typing_notify,
+                stop_typing_delay: Duration::ZERO,
+            }
+        }
+
+        fn with_stop_typing_delay(caps: ChannelCapabilities, stop_typing_delay: Duration) -> Self {
+            Self {
+                stop_typing_delay,
+                ..Self::with_stop_typing_notify(caps, None)
             }
         }
     }
@@ -557,6 +573,9 @@ mod tests {
         }
 
         fn stop_typing(&self, _ctx: TypingContext) -> Result<(), BindingError> {
+            if !self.stop_typing_delay.is_zero() {
+                std::thread::sleep(self.stop_typing_delay);
+            }
             self.stop_typing_count.fetch_add(1, Ordering::Relaxed);
             if let Some(notify) = &self.stop_typing_notify {
                 notify.notify_one();
@@ -909,6 +928,40 @@ mod tests {
         let stop_state = AtomicU8::new(STOP_STATE_TASK_RUNNING);
         assert!(!stop_fallback_needed(&stop_state));
         assert_eq!(stop_state.load(Ordering::Acquire), STOP_STATE_TASK_RUNNING);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_invoke_stop_typing_marks_completed_even_if_waiter_is_aborted() {
+        let plugin = Arc::new(MockChannel::with_stop_typing_delay(
+            ChannelCapabilities {
+                typing_indicators: true,
+                ..Default::default()
+            },
+            Duration::from_millis(50),
+        ));
+        let stop_state = Arc::new(AtomicU8::new(STOP_STATE_TASK_RESERVED));
+        let task = tokio::spawn(invoke_stop_typing_with_running_state(
+            plugin.clone(),
+            TypingContext {
+                to: "+15551234567".to_string(),
+                ..Default::default()
+            },
+            stop_state.clone(),
+        ));
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while stop_state.load(Ordering::Acquire) != STOP_STATE_TASK_RUNNING {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("stop worker should enter TASK_RUNNING");
+
+        task.abort();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(plugin.stop_typing_count.load(Ordering::Relaxed), 1);
+        assert_eq!(stop_state.load(Ordering::Acquire), STOP_STATE_COMPLETED);
     }
 
     #[test]
