@@ -197,6 +197,8 @@ pub async fn signal_receive_loop(
         .build()
         .expect("failed to build Signal receive HTTP client");
     info!(phone_number = %phone_number, "Signal receive loop started");
+    let mut config_rx = crate::config::subscribe_config_changes();
+    let mut activity_policy = crate::channels::activity::load_channel_activity_policy("signal");
 
     // Track consecutive transport and parse errors to avoid spamming logs.
     let mut consecutive_errors: u32 = 0;
@@ -209,11 +211,6 @@ pub async fn signal_receive_loop(
             break;
         }
 
-        // Re-read the activity policy each poll so config reloads can flip
-        // Signal read-receipt ownership promptly. With config caching enabled
-        // this stays cheap in normal runtime paths.
-        let activity_policy =
-            crate::channels::activity::load_channel_activity_policy_async("signal").await;
         let receive_url = build_receive_url(
             &base_url,
             &phone_number,
@@ -299,6 +296,13 @@ pub async fn signal_receive_loop(
         // Wait for poll interval or shutdown
         tokio::select! {
             _ = tokio::time::sleep(POLL_INTERVAL) => {}
+            changed = config_rx.changed() => {
+                if changed.is_err() {
+                    info!("Signal receive loop config subscription closed");
+                    break;
+                }
+                activity_policy = crate::channels::activity::load_channel_activity_policy("signal");
+            }
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
                     info!("Signal receive loop shutting down");

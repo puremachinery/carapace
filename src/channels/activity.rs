@@ -19,6 +19,7 @@ use crate::plugins::{
 use crate::runtime_bridge::{run_blocking_value, run_sync_blocking_send};
 
 const DEFAULT_TYPING_INTERVAL_SECONDS: u32 = 3;
+const MAX_TYPING_REFRESH_BACKOFF_SECONDS: u64 = 30;
 const STOP_STATE_NOT_REQUESTED: u8 = 0;
 const STOP_STATE_TASK_RESERVED: u8 = 1;
 const STOP_STATE_TASK_RUNNING: u8 = 2;
@@ -308,16 +309,33 @@ pub async fn maybe_start_typing_loop(
     let task_cancel = cancel.clone();
     let task_stop_state = stop_state.clone();
     let task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(interval_seconds as u64));
-        interval.tick().await;
+        let base_refresh_delay = Duration::from_secs(interval_seconds as u64);
+        let mut consecutive_refresh_failures = 0_u32;
+        let mut next_refresh_delay = base_refresh_delay;
         loop {
             tokio::select! {
                 _ = task_cancel.cancelled() => {
                     break;
                 }
-                _ = interval.tick() => {
+                _ = tokio::time::sleep(next_refresh_delay) => {
                     if let Err(err) = invoke_start_typing(plugin.clone(), ctx.clone()).await {
-                        tracing::warn!(channel = %channel_id, error = %err, "failed to refresh typing indicator");
+                        consecutive_refresh_failures = consecutive_refresh_failures.saturating_add(1);
+                        next_refresh_delay = typing_refresh_retry_delay(
+                            base_refresh_delay,
+                            consecutive_refresh_failures,
+                        );
+                        if should_log_typing_refresh_failure(consecutive_refresh_failures) {
+                            tracing::warn!(
+                                channel = %channel_id,
+                                error = %err,
+                                failures = consecutive_refresh_failures,
+                                retry_in_ms = next_refresh_delay.as_millis(),
+                                "failed to refresh typing indicator"
+                            );
+                        }
+                    } else {
+                        consecutive_refresh_failures = 0;
+                        next_refresh_delay = base_refresh_delay;
                     }
                 }
             }
@@ -375,6 +393,24 @@ fn stop_fallback_needed(stop_state: &AtomicU8) -> bool {
 
 fn mark_stop_completed(stop_state: &AtomicU8) {
     stop_state.store(STOP_STATE_COMPLETED, Ordering::Release);
+}
+
+fn typing_refresh_retry_delay(base_delay: Duration, consecutive_failures: u32) -> Duration {
+    if consecutive_failures == 0 {
+        return base_delay;
+    }
+    let base_secs = base_delay.as_secs().max(1);
+    let exponent = consecutive_failures.saturating_sub(1).min(4);
+    let multiplier = 1_u64 << exponent;
+    Duration::from_secs(
+        base_secs
+            .saturating_mul(multiplier)
+            .min(MAX_TYPING_REFRESH_BACKOFF_SECONDS),
+    )
+}
+
+fn should_log_typing_refresh_failure(consecutive_failures: u32) -> bool {
+    consecutive_failures <= 3 || consecutive_failures.is_power_of_two()
 }
 
 async fn invoke_stop_typing_with_running_state(
@@ -881,6 +917,29 @@ mod tests {
         let stop_state = AtomicU8::new(STOP_STATE_COMPLETED);
         assert!(!stop_fallback_needed(&stop_state));
         assert_eq!(stop_state.load(Ordering::Acquire), STOP_STATE_COMPLETED);
+    }
+
+    #[test]
+    fn test_typing_refresh_retry_delay_backs_off_and_caps() {
+        let base = Duration::from_secs(2);
+        assert_eq!(typing_refresh_retry_delay(base, 0), Duration::from_secs(2));
+        assert_eq!(typing_refresh_retry_delay(base, 1), Duration::from_secs(2));
+        assert_eq!(typing_refresh_retry_delay(base, 2), Duration::from_secs(4));
+        assert_eq!(typing_refresh_retry_delay(base, 3), Duration::from_secs(8));
+        assert_eq!(
+            typing_refresh_retry_delay(base, 10),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn test_should_log_typing_refresh_failure_throttles_noise() {
+        assert!(should_log_typing_refresh_failure(1));
+        assert!(should_log_typing_refresh_failure(2));
+        assert!(should_log_typing_refresh_failure(3));
+        assert!(should_log_typing_refresh_failure(4));
+        assert!(!should_log_typing_refresh_failure(5));
+        assert!(should_log_typing_refresh_failure(8));
     }
 
     #[tokio::test]

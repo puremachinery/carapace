@@ -906,6 +906,28 @@ fn finalize_run(
     registry.mark_completed(run_id, accumulated_text);
 }
 
+fn delivery_context_from_registry(
+    state: &WsServerState,
+    run_id: &str,
+) -> (Option<String>, Option<crate::plugins::ReadReceiptContext>) {
+    let registry = state.agent_run_registry.lock();
+    registry
+        .get(run_id)
+        .map(|run| {
+            (
+                run.delivery_recipient_id.clone(),
+                run.read_receipt_context.clone(),
+            )
+        })
+        .unwrap_or_else(|| {
+            tracing::warn!(
+                run_id = %run_id,
+                "agent run missing from registry before delivery finalization"
+            );
+            (None, None)
+        })
+}
+
 /// Execute a single LLM turn: call the provider, stream the response,
 /// record usage, persist the assistant message, and optionally execute tools.
 ///
@@ -1260,24 +1282,8 @@ pub async fn execute_run(
         } else {
             None
         };
-        let (delivery_recipient_id, read_receipt_context) = {
-            let registry = state.agent_run_registry.lock();
-            registry
-                .get(&run_id)
-                .map(|run| {
-                    (
-                        run.delivery_recipient_id.clone(),
-                        run.read_receipt_context.clone(),
-                    )
-                })
-                .unwrap_or_else(|| {
-                    tracing::warn!(
-                        run_id = %run_id,
-                        "agent run missing from registry before delivery finalization"
-                    );
-                    (None, None)
-                })
-        };
+        let (delivery_recipient_id, read_receipt_context) =
+            delivery_context_from_registry(&state, &run_id);
 
         finalize_run(
             &state,
@@ -1856,6 +1862,14 @@ mod tests {
             });
         }
         session
+    }
+
+    #[test]
+    fn test_delivery_context_from_registry_returns_none_when_run_missing() {
+        let (state, _tmp) = make_test_state();
+        let (recipient, read_receipt) = delivery_context_from_registry(&state, "missing-run");
+        assert!(recipient.is_none());
+        assert!(read_receipt.is_none());
     }
 
     #[tokio::test]

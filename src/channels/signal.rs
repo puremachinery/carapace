@@ -16,7 +16,8 @@ use crate::plugins::{
 /// Maximum media size to fetch and base64-encode (50 MB).
 const MAX_MEDIA_BYTES: u64 = 50 * 1024 * 1024;
 const SIGNAL_HTTP_CONNECT_TIMEOUT_SECS: u64 = 5;
-const SIGNAL_HTTP_ACTIVITY_TIMEOUT_SECS: u64 = 5;
+const SIGNAL_HTTP_TYPING_TIMEOUT_SECS: u64 = 5;
+const SIGNAL_HTTP_RECEIPT_TIMEOUT_SECS: u64 = 2;
 const SIGNAL_HTTP_SEND_TIMEOUT_SECS: u64 = 15;
 const SIGNAL_HTTP_MEDIA_TIMEOUT_SECS: u64 = 120;
 
@@ -159,7 +160,7 @@ impl SignalChannel {
 
         match request
             .timeout(std::time::Duration::from_secs(
-                SIGNAL_HTTP_ACTIVITY_TIMEOUT_SECS,
+                SIGNAL_HTTP_TYPING_TIMEOUT_SECS,
             ))
             .json(&body)
             .send()
@@ -191,7 +192,7 @@ impl SignalChannel {
             .client
             .post(receipts_url)
             .timeout(std::time::Duration::from_secs(
-                SIGNAL_HTTP_ACTIVITY_TIMEOUT_SECS,
+                SIGNAL_HTTP_RECEIPT_TIMEOUT_SECS,
             ))
             .json(&body)
             .send()
@@ -215,13 +216,37 @@ fn signal_http_error_message_with_body_prefix(
     status: StatusCode,
     body_text: &str,
 ) -> String {
-    let excerpt: String = body_text.trim().chars().take(256).collect();
+    let excerpt = sanitize_signal_error_excerpt(body_text);
     if excerpt.is_empty() {
         format!("{operation} HTTP {status}")
-    } else if body_text.chars().count() > 256 {
-        format!("{operation} HTTP {status}: {excerpt}...")
     } else {
         format!("{operation} HTTP {status}: {excerpt}")
+    }
+}
+
+fn sanitize_signal_error_excerpt(body_text: &str) -> String {
+    let collapsed = body_text
+        .split_whitespace()
+        .map(redact_sensitive_signal_token)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let trimmed = collapsed.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let excerpt: String = trimmed.chars().take(120).collect();
+    if trimmed.chars().count() > 120 {
+        format!("{excerpt}...")
+    } else {
+        excerpt
+    }
+}
+
+fn redact_sensitive_signal_token(token: &str) -> String {
+    if token.chars().filter(|ch| ch.is_ascii_digit()).count() >= 4 {
+        "[redacted]".to_string()
+    } else {
+        token.to_string()
     }
 }
 
@@ -547,6 +572,19 @@ mod tests {
         assert!(message.starts_with("signal send HTTP 400 Bad Request: "));
         assert!(message.ends_with("..."));
         assert!(message.len() < 320);
+    }
+
+    #[test]
+    fn test_signal_http_error_message_redacts_numeric_tokens() {
+        let message = signal_http_error_message_with_body_prefix(
+            "signal send",
+            StatusCode::BAD_REQUEST,
+            "Unregistered user +15551234567 for account 123456",
+        );
+        assert!(message.contains("Unregistered user"));
+        assert!(message.contains("[redacted]"));
+        assert!(!message.contains("15551234567"));
+        assert!(!message.contains("123456"));
     }
 
     #[test]

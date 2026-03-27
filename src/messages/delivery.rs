@@ -178,6 +178,9 @@ async fn handle_delivery_result(
         Ok(delivery) if delivery.ok => {
             let _ = pipeline.mark_sent(message_id);
             if let Some(read_receipt) = metadata.read_receipt.clone() {
+                // Keep read receipts ordered with delivery success and shutdown,
+                // but rely on short per-operation channel timeouts so the queue
+                // impact stays bounded.
                 let policy =
                     crate::channels::activity::load_channel_activity_policy_async(channel_id).await;
                 crate::channels::activity::maybe_send_read_receipt(

@@ -109,6 +109,10 @@ struct CachedConfig {
 
 /// Global config cache
 static CONFIG_CACHE: LazyLock<RwLock<Option<CachedConfig>>> = LazyLock::new(|| RwLock::new(None));
+static CONFIG_CHANGE_TX: LazyLock<tokio::sync::watch::Sender<u64>> = LazyLock::new(|| {
+    let (tx, _rx) = tokio::sync::watch::channel(0_u64);
+    tx
+});
 
 #[derive(Clone, Default)]
 struct InjectedConfigEnvState {
@@ -803,6 +807,7 @@ where
 pub fn clear_cache() {
     let mut cache = CONFIG_CACHE.write();
     *cache = None;
+    broadcast_config_change();
 }
 
 /// Atomically update the config cache with a pre-validated config value.
@@ -816,6 +821,16 @@ pub fn update_cache(raw_value: Value, value: Value) {
         raw_value: Arc::new(raw_value),
         loaded_at: Instant::now(),
     });
+    broadcast_config_change();
+}
+
+pub fn subscribe_config_changes() -> tokio::sync::watch::Receiver<u64> {
+    CONFIG_CHANGE_TX.subscribe()
+}
+
+fn broadcast_config_change() {
+    let next = CONFIG_CHANGE_TX.borrow().wrapping_add(1);
+    let _ = CONFIG_CHANGE_TX.send(next);
 }
 
 /// Reload the config from disk, validate it, and update the cache atomically.
@@ -1299,6 +1314,19 @@ mod tests {
     fn test_clear_cache() {
         // Just verify it doesn't panic
         clear_cache();
+    }
+
+    #[test]
+    fn test_subscribe_config_changes_notified_on_update_cache() {
+        clear_cache();
+        let mut rx = subscribe_config_changes();
+        let before = *rx.borrow_and_update();
+
+        update_cache(serde_json::json!({}), serde_json::json!({}));
+
+        assert!(rx.has_changed().unwrap());
+        let after = *rx.borrow_and_update();
+        assert!(after > before);
     }
 
     #[test]
