@@ -800,6 +800,65 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn test_process_channel_messages_marks_read_after_success_when_enabled() {
+        let mock = Arc::new(MockChannel::with_read_receipts());
+        let (pipeline, plugin_reg, channel_reg) =
+            make_pipeline_and_registries("signal", Some(mock.clone()), true);
+
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("carapace.json5");
+        fs::write(
+            &config_path,
+            r#"{
+                channels: {
+                    signal: {
+                        features: {
+                            readReceipts: {
+                                enabled: true,
+                                mode: "after-response",
+                            },
+                        },
+                    },
+                },
+            }"#,
+        )
+        .unwrap();
+        crate::config::clear_cache();
+        let mut env_guard = crate::test_support::env::ScopedEnv::new();
+        env_guard
+            .set("CARAPACE_CONFIG_PATH", config_path.as_os_str())
+            .set("CARAPACE_DISABLE_CONFIG_CACHE", "1");
+
+        let msg = OutboundMessage::new("signal", MessageContent::text("hello")).with_metadata(
+            crate::messages::outbound::MessageMetadata {
+                recipient_id: Some("+15551234567".to_string()),
+                read_receipt: Some(ReadReceiptContext {
+                    recipient: "+15551234567".to_string(),
+                    timestamp: Some(123),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        let queued = pipeline.queue(msg, MsgOutboundContext::new()).unwrap();
+
+        process_channel_messages(
+            &["signal".to_string()],
+            &pipeline,
+            &plugin_reg,
+            &channel_reg,
+        )
+        .await;
+
+        assert_eq!(mock.send_text_count.load(Ordering::Relaxed), 1);
+        assert_eq!(mock.mark_read_count.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            pipeline.get_status(&queued.message_id),
+            Some(crate::messages::outbound::DeliveryStatus::Sent)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn test_handle_delivery_result_skips_read_receipt_on_delivery_failure() {
         let mock = Arc::new(MockChannel::with_read_receipts());
         let (pipeline, plugin_reg, _channel_reg) =
