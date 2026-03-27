@@ -1203,40 +1203,78 @@ pub async fn execute_run(
     } else {
         None
     };
+    let channel_capabilities = if let (Some(channel_id), Some(plugin_registry)) =
+        (message_channel.as_deref(), state.plugin_registry())
+    {
+        if let Some(plugin) = plugin_registry.get_channel(channel_id) {
+            match tokio::task::spawn_blocking(move || plugin.get_capabilities()).await {
+                Ok(Ok(capabilities)) => Some(capabilities),
+                Ok(Err(err)) => {
+                    tracing::warn!(
+                        run_id = %run_id,
+                        channel = %channel_id,
+                        error = %err,
+                        "failed to load channel capabilities for activity features"
+                    );
+                    None
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        run_id = %run_id,
+                        channel = %channel_id,
+                        error = %err,
+                        "activity capability worker failed"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     let mut typing_handle = if let (Some(channel_id), Some(plugin_registry), Some(policy)) = (
         message_channel.as_deref(),
         state.plugin_registry(),
         channel_activity_policy.as_ref(),
     ) {
-        let typing_context = {
-            let registry = state.agent_run_registry.lock();
-            registry
-                .get(&run_id)
-                .and_then(|run| run.typing_context.clone())
-                .or_else(|| {
-                    session
-                        .metadata
-                        .chat_id
-                        .clone()
-                        .map(|to| crate::plugins::TypingContext {
-                            to,
-                            ..Default::default()
+        if !channel_capabilities
+            .as_ref()
+            .map(|capabilities| capabilities.typing_indicators)
+            .unwrap_or(false)
+        {
+            None
+        } else {
+            let typing_context =
+                {
+                    let registry = state.agent_run_registry.lock();
+                    registry
+                        .get(&run_id)
+                        .and_then(|run| run.typing_context.clone())
+                        .or_else(|| {
+                            session.metadata.chat_id.clone().map(|to| {
+                                crate::plugins::TypingContext {
+                                    to,
+                                    ..Default::default()
+                                }
+                            })
                         })
-                })
-        };
+                };
 
-        match typing_context {
-            Some(ctx) => {
-                crate::channels::activity::maybe_start_typing_loop(
-                    plugin_registry.clone(),
-                    channel_id,
-                    policy,
-                    ctx,
-                )
-                .await
+            match typing_context {
+                Some(ctx) => {
+                    crate::channels::activity::maybe_start_typing_loop(
+                        plugin_registry.clone(),
+                        channel_id,
+                        policy,
+                        ctx,
+                    )
+                    .await
+                }
+                None => None,
             }
-            None => None,
         }
     } else {
         None
@@ -1317,6 +1355,10 @@ pub async fn execute_run(
                         if policy.read_receipts.enabled
                             && policy.read_receipts.mode
                                 == crate::channels::activity::ReadReceiptMode::AfterResponse
+                            && channel_capabilities
+                                .as_ref()
+                                .map(|capabilities| capabilities.read_receipts)
+                                .unwrap_or(false)
                         {
                             read_receipt_context.clone()
                         } else {

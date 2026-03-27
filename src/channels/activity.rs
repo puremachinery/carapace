@@ -438,18 +438,7 @@ async fn invoke_stop_typing_with_running_state(
     ctx: TypingContext,
     stop_state: Arc<AtomicU8>,
 ) -> Result<(), BindingError> {
-    // There are no await points between this store and spawn_blocking, so once
-    // TASK_RUNNING is visible the stop work has already been handed off to the
-    // blocking pool and Drop must not reclaim it with fallback cleanup.
-    stop_state.store(STOP_STATE_TASK_RUNNING, Ordering::Release);
-    let stop_task = tokio::task::spawn_blocking(move || {
-        let result = catch_unwind(AssertUnwindSafe(|| plugin.stop_typing(ctx)));
-        mark_stop_completed(stop_state.as_ref());
-        match result {
-            Ok(result) => result,
-            Err(payload) => resume_unwind(payload),
-        }
-    });
+    let stop_task = spawn_stop_typing_worker(plugin, ctx, stop_state);
     let result = stop_task
         .await
         .map_err(|err| BindingError::CallError(err.to_string()))
@@ -457,48 +446,30 @@ async fn invoke_stop_typing_with_running_state(
     result
 }
 
+fn spawn_stop_typing_worker(
+    plugin: Arc<dyn ChannelPluginInstance>,
+    ctx: TypingContext,
+    stop_state: Arc<AtomicU8>,
+) -> tokio::task::JoinHandle<Result<(), BindingError>> {
+    stop_state.store(STOP_STATE_TASK_RUNNING, Ordering::Release);
+    tokio::task::spawn_blocking(move || {
+        let result = catch_unwind(AssertUnwindSafe(|| plugin.stop_typing(ctx)));
+        mark_stop_completed(stop_state.as_ref());
+        match result {
+            Ok(result) => result,
+            Err(payload) => resume_unwind(payload),
+        }
+    })
+}
+
 pub async fn maybe_send_read_receipt_with_plugin(
     plugin: Arc<dyn ChannelPluginInstance>,
     channel_id: &str,
-    supports_read_receipts: Option<bool>,
     ctx: ReadReceiptContext,
 ) {
-    let supports_read_receipts = match supports_read_receipts {
-        Some(supported) => supported,
-        None => match get_capabilities(plugin.clone()).await {
-            Ok(capabilities) => capabilities.read_receipts,
-            Err(err) => {
-                tracing::warn!(channel = %channel_id, error = %err, "failed to fetch channel capabilities for read receipt");
-                return;
-            }
-        },
-    };
-
-    if !supports_read_receipts {
-        return;
-    }
-
     if let Err(err) = invoke_mark_read(plugin, ctx).await {
         tracing::warn!(channel = %channel_id, error = %err, "failed to send read receipt");
     }
-}
-
-pub async fn maybe_send_read_receipt(
-    plugin_registry: &Arc<PluginRegistry>,
-    channel_id: &str,
-    policy: &ChannelActivityPolicy,
-    ctx: ReadReceiptContext,
-) {
-    if !policy.read_receipts.enabled || policy.read_receipts.mode != ReadReceiptMode::AfterResponse
-    {
-        return;
-    }
-
-    let Some(plugin) = plugin_registry.get_channel(channel_id) else {
-        return;
-    };
-
-    maybe_send_read_receipt_with_plugin(plugin, channel_id, None, ctx).await;
 }
 
 async fn get_capabilities(
@@ -1075,20 +1046,9 @@ mod tests {
             read_receipts: true,
             ..Default::default()
         }));
-        let registry = Arc::new(PluginRegistry::new());
-        registry.register_channel("signal".to_string(), plugin.clone());
-        let policy = ChannelActivityPolicy {
-            read_receipts: ReadReceiptFeaturePolicy {
-                enabled: true,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-
-        maybe_send_read_receipt(
-            &registry,
+        maybe_send_read_receipt_with_plugin(
+            plugin.clone(),
             "signal",
-            &policy,
             ReadReceiptContext {
                 recipient: "+15551234567".to_string(),
                 timestamp: Some(123),

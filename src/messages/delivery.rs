@@ -115,30 +115,6 @@ pub(crate) async fn process_channel_messages(
         };
 
         let metadata = &message.metadata;
-        let read_receipts_supported = if metadata.read_receipt.is_some() {
-            let capability_plugin = plugin.clone();
-            match tokio::task::spawn_blocking(move || capability_plugin.get_capabilities()).await {
-                Ok(Ok(capabilities)) => Some(capabilities.read_receipts),
-                Ok(Err(err)) => {
-                    warn!(
-                        channel = %channel_id,
-                        error = %err,
-                        "failed to fetch channel capabilities for read receipt"
-                    );
-                    None
-                }
-                Err(err) => {
-                    warn!(
-                        channel = %channel_id,
-                        error = %err,
-                        "read receipt capability worker failed"
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
 
         let result = deliver_message(
             &plugin,
@@ -180,7 +156,6 @@ pub(crate) async fn process_channel_messages(
         handle_delivery_result(
             pipeline,
             &plugin,
-            read_receipts_supported,
             channel_id,
             &message.metadata,
             &message_id,
@@ -194,7 +169,6 @@ pub(crate) async fn process_channel_messages(
 async fn handle_delivery_result(
     pipeline: &MessagePipeline,
     plugin: &Arc<dyn plugins::ChannelPluginInstance>,
-    read_receipts_supported: Option<bool>,
     channel_id: &str,
     metadata: &crate::messages::outbound::MessageMetadata,
     message_id: &crate::messages::outbound::MessageId,
@@ -210,7 +184,6 @@ async fn handle_delivery_result(
                 crate::channels::activity::maybe_send_read_receipt_with_plugin(
                     plugin.clone(),
                     channel_id,
-                    read_receipts_supported,
                     read_receipt,
                 )
                 .await;
@@ -802,7 +775,6 @@ mod tests {
         handle_delivery_result(
             &pipeline,
             &plugin,
-            Some(true),
             "signal",
             &message.message.metadata,
             &queued.message_id,
@@ -886,7 +858,6 @@ mod tests {
         handle_delivery_result(
             &pipeline,
             &plugin,
-            Some(true),
             "signal",
             &message.message.metadata,
             &queued.message_id,
@@ -930,7 +901,6 @@ mod tests {
         handle_delivery_result(
             &pipeline,
             &plugin,
-            Some(true),
             "signal",
             &message.message.metadata,
             &queued.message_id,

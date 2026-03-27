@@ -305,7 +305,18 @@ fn validate_gateway(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schem
 }
 
 fn validate_channels(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIssue>) {
-    let Some(channels) = obj.get("channels").and_then(|value| value.as_object()) else {
+    let Some(channels_value) = obj.get("channels") else {
+        return;
+    };
+    let Some(channels) = channels_value.as_object() else {
+        issues.push(SchemaIssue {
+            severity: Severity::Warning,
+            path: ".channels".to_string(),
+            message: format!(
+                "channels must be an object, got {}",
+                json_type_label(channels_value)
+            ),
+        });
         return;
     };
 
@@ -2305,6 +2316,17 @@ mod tests {
         assert!(issues.iter().any(|issue| {
             issue.path == ".channels.signal.feautres"
                 && issue.message.contains("unknown channel config key")
+        }));
+    }
+
+    #[test]
+    fn test_channels_container_type_warns() {
+        let cfg = json!({
+            "channels": []
+        });
+        let issues = validate_schema(&cfg);
+        assert!(issues.iter().any(|issue| {
+            issue.path == ".channels" && issue.message.contains("channels must be an object")
         }));
     }
 
