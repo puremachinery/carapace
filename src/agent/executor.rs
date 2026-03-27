@@ -1388,7 +1388,6 @@ mod tests {
     use crate::agent::provider::{LlmProvider, StopReason, StreamEvent, TokenUsage};
     use crate::agent::vertex::build_gemini_body as build_vertex_gemini_body;
     use crate::agent::AgentConfig;
-    use crate::channels::activity::maybe_send_read_receipt;
     use crate::plugins::{
         BindingError, ChannelCapabilities, ChannelPluginInstance, DeliveryResult, OutboundContext,
         PluginRegistry, ReadReceiptContext, TypingContext,
@@ -2175,6 +2174,10 @@ mod tests {
         let plugin_registry = Arc::new(PluginRegistry::new());
         plugin_registry.register_channel("signal".to_string(), plugin.clone());
         let (state, _tmp) = make_test_state_with_plugin_registry(plugin_registry.clone());
+        state.channel_registry().register(
+            crate::channels::ChannelInfo::new("signal", "Signal")
+                .with_status(crate::channels::ChannelStatus::Connected),
+        );
 
         let run_id = "run-channel-activity";
         let session_key = "test-channel-activity";
@@ -2199,34 +2202,16 @@ mod tests {
         .await;
         assert!(result.is_ok(), "execute_run failed: {:?}", result.err());
 
-        let queued = state
-            .message_pipeline()
-            .next_for_channel("signal")
-            .expect("execute_run should queue a signal delivery");
-        assert_eq!(
-            queued.message.metadata.recipient_id.as_deref(),
-            Some(chat_id)
-        );
-        let read_receipt = queued
-            .message
-            .metadata
-            .read_receipt
-            .clone()
-            .expect("queued delivery should preserve read receipt metadata");
+        let channel_ids = state.message_pipeline().channels_with_messages();
+        assert_eq!(channel_ids, vec!["signal".to_string()]);
 
-        plugin
-            .send_text(OutboundContext {
-                to: chat_id.to_string(),
-                text: "Hello world!".to_string(),
-                media_url: None,
-                gif_playback: false,
-                reply_to_id: None,
-                thread_id: None,
-                account_id: None,
-            })
-            .expect("manual delivery should succeed");
-        let policy = crate::channels::activity::load_channel_activity_policy_async("signal").await;
-        maybe_send_read_receipt(&plugin_registry, "signal", &policy, read_receipt).await;
+        crate::messages::delivery::process_channel_messages(
+            &channel_ids,
+            state.message_pipeline(),
+            &plugin_registry,
+            state.channel_registry(),
+        )
+        .await;
 
         tokio::time::timeout(
             std::time::Duration::from_secs(1),

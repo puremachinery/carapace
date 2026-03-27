@@ -48,7 +48,7 @@ pub async fn delivery_loop(
 }
 
 /// Process pending messages for each connected channel.
-async fn process_channel_messages(
+pub(crate) async fn process_channel_messages(
     channel_ids: &[String],
     pipeline: &MessagePipeline,
     plugin_registry: &Arc<PluginRegistry>,

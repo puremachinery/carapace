@@ -103,7 +103,20 @@ impl TypingLoopHandle {
     pub async fn stop(mut self) {
         self.cancel.cancel();
         if let Some(task) = self.task.take() {
-            let _ = task.await;
+            if let Err(err) = finish_typing_task(
+                task,
+                self.plugin.clone(),
+                self.ctx.clone(),
+                self.stop_state.clone(),
+            )
+            .await
+            {
+                tracing::warn!(
+                    channel = %self.channel_id,
+                    error = %err,
+                    "failed to finish typing cleanup during explicit stop"
+                );
+            }
         }
     }
 }
@@ -121,28 +134,9 @@ impl Drop for TypingLoopHandle {
                     let ctx = self.ctx.clone();
                     let channel_id = self.channel_id.clone();
                     let stop_state = self.stop_state.clone();
-                    if let Err(err) = run_sync_blocking_send(async move {
-                        match task.await {
-                            Ok(()) => Ok::<(), String>(()),
-                            Err(join_err) => {
-                                if stop_fallback_needed(stop_state.as_ref()) {
-                                    invoke_stop_typing(plugin, ctx)
-                                        .await
-                                        .map_err(|err| format!(
-                                            "typing task ended unexpectedly ({join_err}); fallback stop_typing also failed: {err}"
-                                        ))?;
-                                    mark_stop_completed(stop_state.as_ref());
-                                    Err(format!(
-                                        "typing task ended unexpectedly ({join_err}); sent fallback stop_typing"
-                                    ))
-                                } else {
-                                    Err(format!(
-                                        "typing task ended unexpectedly ({join_err}) after typing cleanup already completed"
-                                    ))
-                                }
-                            }
-                        }
-                    }) {
+                    if let Err(err) =
+                        run_sync_blocking_send(finish_typing_task(task, plugin, ctx, stop_state))
+                    {
                         tracing::warn!(
                             channel = %channel_id,
                             error = %err,
@@ -393,6 +387,34 @@ fn mark_stop_completed(stop_state: &AtomicU8) {
     stop_state.store(STOP_STATE_COMPLETED, Ordering::Release);
 }
 
+async fn finish_typing_task(
+    task: JoinHandle<()>,
+    plugin: Arc<dyn ChannelPluginInstance>,
+    ctx: TypingContext,
+    stop_state: Arc<AtomicU8>,
+) -> Result<(), String> {
+    match task.await {
+        Ok(()) => Ok(()),
+        Err(join_err) => {
+            if stop_fallback_needed(stop_state.as_ref()) {
+                invoke_stop_typing(plugin, ctx)
+                    .await
+                    .map_err(|err| format!(
+                        "typing task ended unexpectedly ({join_err}); fallback stop_typing also failed: {err}"
+                    ))?;
+                mark_stop_completed(stop_state.as_ref());
+                Err(format!(
+                    "typing task ended unexpectedly ({join_err}); sent fallback stop_typing"
+                ))
+            } else {
+                Err(format!(
+                    "typing task ended unexpectedly ({join_err}) after typing cleanup already completed"
+                ))
+            }
+        }
+    }
+}
+
 fn typing_refresh_retry_delay(base_delay: Duration, consecutive_failures: u32) -> Duration {
     if consecutive_failures == 0 {
         return base_delay;
@@ -416,6 +438,9 @@ async fn invoke_stop_typing_with_running_state(
     ctx: TypingContext,
     stop_state: Arc<AtomicU8>,
 ) -> Result<(), BindingError> {
+    // There are no await points between this store and spawn_blocking, so once
+    // TASK_RUNNING is visible the stop work has already been handed off to the
+    // blocking pool and Drop must not reclaim it with fallback cleanup.
     stop_state.store(STOP_STATE_TASK_RUNNING, Ordering::Release);
     let stop_task = tokio::task::spawn_blocking(move || {
         let result = catch_unwind(AssertUnwindSafe(|| plugin.stop_typing(ctx)));
@@ -938,6 +963,43 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), stop_typing_notify.notified())
             .await
             .expect("drop should still stop typing when task cleanup was only reserved");
+
+        assert_eq!(plugin.stop_typing_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn test_finish_typing_task_recovers_from_panicked_task() {
+        let stop_typing_notify = Arc::new(Notify::new());
+        let plugin = Arc::new(MockChannel::with_stop_typing_notify(
+            ChannelCapabilities {
+                typing_indicators: true,
+                ..Default::default()
+            },
+            Some(stop_typing_notify.clone()),
+        ));
+        let task = tokio::spawn(async move {
+            panic!("mock typing task panic");
+        });
+
+        let result = finish_typing_task(
+            task,
+            plugin.clone(),
+            TypingContext {
+                to: "+15551234567".to_string(),
+                ..Default::default()
+            },
+            Arc::new(AtomicU8::new(STOP_STATE_NOT_REQUESTED)),
+        )
+        .await;
+
+        let err = result.expect_err("panicked task should report fallback cleanup");
+        assert!(
+            err.contains("sent fallback stop_typing"),
+            "expected fallback stop_typing diagnostic, got: {err}"
+        );
+        tokio::time::timeout(Duration::from_secs(1), stop_typing_notify.notified())
+            .await
+            .expect("panicked task should still trigger fallback stop_typing");
 
         assert_eq!(plugin.stop_typing_count.load(Ordering::Relaxed), 1);
     }
