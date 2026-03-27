@@ -370,8 +370,8 @@ Enable Carapace to listen and respond on external chat platforms.
   - *Common values:*
     - `scope`: `"per-sender"` (Default), `"global"`, or `"per-channel-peer"`.
     - `dmScope`: `"main"` (Default).
-    - `typingMode`: `"thinking"` (Default session value; legacy/global channel-typing fallback only when explicitly set in config).
-    - `typingIntervalSeconds`: Integer. Seconds between typing-indicator pulses. (Default: `3`; legacy/global channel-typing fallback only when explicitly set in config)
+    - `typingMode`: `"thinking"` (Default session value; legacy/global channel-typing fallback only when explicitly set in config, and it applies across all typing-capable channels unless overridden under `channels.*.features.typing`).
+    - `typingIntervalSeconds`: Integer. Seconds between typing-indicator pulses. (Default: `3`; legacy/global channel-typing fallback only when explicitly set in config, and it applies across all typing-capable channels unless overridden under `channels.*.features.typing`)
     - `mainKey`: String. Identifier for the main session slot. Always enforced as `"main"` regardless of what you set. (Default: `"main"`)
 - **`channels`**
   - *What it does:* Applies per-channel override policy, including channel activity features such as typing indicators and read receipts.

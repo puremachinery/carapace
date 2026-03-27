@@ -214,6 +214,10 @@ fn apply_legacy_session_typing_fallback(config: &Value, policy: &mut TypingFeatu
         return;
     };
 
+    // This is intentionally a global legacy fallback: if a user explicitly set
+    // session.typingMode/session.typingIntervalSeconds, those values apply to
+    // every typing-capable channel unless channels.defaults/features or a
+    // per-channel channels.<id>.features.typing override replaces them.
     if let Some(mode) = session.get("typingMode").and_then(|value| value.as_str()) {
         if mode.eq_ignore_ascii_case("thinking") {
             policy.enabled = true;
@@ -471,6 +475,18 @@ pub async fn maybe_send_read_receipt_with_plugin(
     channel_id: &str,
     ctx: ReadReceiptContext,
 ) {
+    #[cfg(debug_assertions)]
+    match get_capabilities(plugin.clone()).await {
+        Ok(capabilities) => debug_assert!(
+            capabilities.read_receipts,
+            "maybe_send_read_receipt_with_plugin called for a channel without read_receipts capability"
+        ),
+        Err(err) => debug_assert!(
+            false,
+            "failed to load channel capabilities for read-receipt assertion: {err}"
+        ),
+    }
+
     if let Err(err) = invoke_mark_read(plugin, ctx).await {
         tracing::warn!(channel = %channel_id, error = %err, "failed to send read receipt");
     }
@@ -1066,5 +1082,24 @@ mod tests {
         .await;
 
         assert_eq!(plugin.mark_read_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    #[should_panic(
+        expected = "maybe_send_read_receipt_with_plugin called for a channel without read_receipts capability"
+    )]
+    async fn test_maybe_send_read_receipt_debug_asserts_without_capability() {
+        let plugin = Arc::new(MockChannel::new(ChannelCapabilities::default()));
+        maybe_send_read_receipt_with_plugin(
+            plugin,
+            "signal",
+            ReadReceiptContext {
+                recipient: "+15551234567".to_string(),
+                timestamp: Some(123),
+                ..Default::default()
+            },
+        )
+        .await;
     }
 }

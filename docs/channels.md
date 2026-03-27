@@ -32,7 +32,9 @@ service HTTP port 18789. Adjust paths/ports for your deployment.
   are added.
 - `session.typingMode` and `session.typingIntervalSeconds` remain as a
   legacy/global fallback for typing only when you explicitly set them in
-  config; prefer `channels.*.features.typing`.
+  config; that fallback applies across all typing-capable channels unless you
+  override it with `channels.defaults.features.typing` or
+  `channels.<channel>.features.typing`. Prefer `channels.*.features.typing`.
 
 ## Signal (signal-cli-rest-api)
 

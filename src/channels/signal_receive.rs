@@ -142,19 +142,24 @@ fn summarize_signal_receive_response_error(error: &reqwest::Error) -> &'static s
 }
 
 fn build_receive_url(
-    base_url: &str,
+    base_url: &url::Url,
     phone_number: &str,
     carapace_manages_read_receipts: bool,
-) -> String {
+) -> url::Url {
+    let mut url = base_url.clone();
     let encoded_phone_number = urlencoding::encode(phone_number);
-    if carapace_manages_read_receipts {
-        format!(
-            "{}/v1/receive/{}?send_read_receipts=false",
-            base_url, encoded_phone_number
-        )
+    let path_prefix = url.path().trim_end_matches('/');
+    let receive_path = if path_prefix.is_empty() {
+        format!("/v1/receive/{}", encoded_phone_number)
     } else {
-        format!("{}/v1/receive/{}", base_url, encoded_phone_number)
+        format!("{}/v1/receive/{}", path_prefix, encoded_phone_number)
+    };
+    url.set_path(&receive_path);
+    if carapace_manages_read_receipts {
+        url.query_pairs_mut()
+            .append_pair("send_read_receipts", "false");
     }
+    url
 }
 
 fn record_signal_parse_failure<E: std::fmt::Display>(
@@ -183,7 +188,7 @@ pub async fn signal_receive_loop(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let base_url = match validate_signal_url(&base_url, "signal receive", true) {
-        Ok(url) => url.to_string().trim_end_matches('/').to_string(),
+        Ok(url) => url,
         Err(err) => {
             error!(phone_number = %phone_number, error = %err, "Signal receive loop configuration is invalid");
             channel_registry.set_error("signal", err);
@@ -219,7 +224,7 @@ pub async fn signal_receive_loop(
             activity_policy.read_receipts.enabled,
         );
 
-        match client.get(&receive_url).send().await {
+        match client.get(receive_url).send().await {
             Ok(resp) if resp.status().is_success() => {
                 if consecutive_errors > 0 {
                     info!(
@@ -594,7 +599,12 @@ mod tests {
     #[test]
     fn test_build_receive_url_preserves_signal_auto_receipts_by_default() {
         assert_eq!(
-            build_receive_url("http://localhost:8080", "+15551234567", false),
+            build_receive_url(
+                &url::Url::parse("http://localhost:8080").unwrap(),
+                "+15551234567",
+                false
+            )
+            .as_str(),
             "http://localhost:8080/v1/receive/%2B15551234567"
         );
     }
@@ -602,8 +612,26 @@ mod tests {
     #[test]
     fn test_build_receive_url_disables_signal_auto_receipts_when_feature_enabled() {
         assert_eq!(
-            build_receive_url("http://localhost:8080", "+15551234567", true),
+            build_receive_url(
+                &url::Url::parse("http://localhost:8080").unwrap(),
+                "+15551234567",
+                true
+            )
+            .as_str(),
             "http://localhost:8080/v1/receive/%2B15551234567?send_read_receipts=false"
+        );
+    }
+
+    #[test]
+    fn test_build_receive_url_preserves_existing_query_parameters() {
+        assert_eq!(
+            build_receive_url(
+                &url::Url::parse("http://localhost:8080?debug=1").unwrap(),
+                "+15551234567",
+                true
+            )
+            .as_str(),
+            "http://localhost:8080/v1/receive/%2B15551234567?debug=1&send_read_receipts=false"
         );
     }
 
