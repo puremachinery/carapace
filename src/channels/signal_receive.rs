@@ -198,6 +198,7 @@ pub async fn signal_receive_loop(
         .expect("failed to build Signal receive HTTP client");
     info!(phone_number = %phone_number, "Signal receive loop started");
     let mut config_rx = crate::config::subscribe_config_changes();
+    config_rx.borrow_and_update();
     let mut activity_policy =
         crate::channels::activity::load_channel_activity_policy_async("signal").await;
 

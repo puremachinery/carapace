@@ -276,6 +276,7 @@ pub async fn maybe_start_typing_loop(
     plugin_registry: Arc<PluginRegistry>,
     channel_id: &str,
     policy: &ChannelActivityPolicy,
+    prefetched_capabilities: Option<crate::plugins::ChannelCapabilities>,
     ctx: TypingContext,
 ) -> Option<TypingLoopHandle> {
     if !policy.typing.enabled {
@@ -283,7 +284,10 @@ pub async fn maybe_start_typing_loop(
     }
 
     let plugin = plugin_registry.get_channel(channel_id)?;
-    let capabilities = get_capabilities(plugin.clone()).await.ok()?;
+    let capabilities = match prefetched_capabilities {
+        Some(capabilities) => capabilities,
+        None => get_capabilities(plugin.clone()).await.ok()?,
+    };
     if !capabilities.typing_indicators {
         return None;
     }
@@ -789,6 +793,7 @@ mod tests {
             registry,
             "signal",
             &policy,
+            None,
             TypingContext {
                 to: "+15551234567".to_string(),
                 ..Default::default()
@@ -829,6 +834,7 @@ mod tests {
             registry,
             "signal",
             &policy,
+            None,
             TypingContext {
                 to: "+15551234567".to_string(),
                 ..Default::default()
@@ -871,6 +877,7 @@ mod tests {
             registry,
             "signal",
             &policy,
+            None,
             TypingContext {
                 to: "+15551234567".to_string(),
                 ..Default::default()
@@ -913,6 +920,7 @@ mod tests {
             registry,
             "signal",
             &policy,
+            None,
             TypingContext {
                 to: "+15551234567".to_string(),
                 ..Default::default()

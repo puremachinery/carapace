@@ -345,13 +345,13 @@ fn validate_channels(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Sche
         }
 
         for key in entry_obj.keys() {
-            if key != "features" {
+            if key != "features" && key != "session" {
                 issues.push(SchemaIssue {
                     severity: Severity::Warning,
                     path: format!(".channels.{}.{}", channel_name, key),
                     message: format!(
-                        "unknown channel config key '{}'; channel activity settings belong under .channels.{}.features",
-                        key, channel_name
+                        "unknown channel config key '{}'; supported keys are .channels.{}.features and .channels.{}.session",
+                        key, channel_name, channel_name
                     ),
                 });
             }
@@ -361,6 +361,14 @@ fn validate_channels(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Sche
             validate_channel_features(
                 features,
                 &format!(".channels.{}.features", channel_name),
+                issues,
+            );
+        }
+
+        if let Some(session) = entry_obj.get("session") {
+            validate_channel_session(
+                session,
+                &format!(".channels.{}.session", channel_name),
                 issues,
             );
         }
@@ -542,6 +550,100 @@ fn validate_channel_features(features: &Value, path: &str, issues: &mut Vec<Sche
                 ),
             });
         }
+    }
+}
+
+fn validate_channel_session(session: &Value, path: &str, issues: &mut Vec<SchemaIssue>) {
+    let Some(session_obj) = session.as_object() else {
+        issues.push(SchemaIssue {
+            severity: Severity::Warning,
+            path: path.to_string(),
+            message: format!(
+                "session must be an object, got {}",
+                json_type_label(session)
+            ),
+        });
+        return;
+    };
+
+    for key in session_obj.keys() {
+        if key != "scope" && key != "reset" {
+            issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: format!("{}.{}", path, key),
+                message: format!(
+                    "unknown channel session key '{}'; supported keys are {}.scope and {}.reset",
+                    key, path, path
+                ),
+            });
+        }
+    }
+
+    if let Some(scope) = session_obj.get("scope") {
+        match scope.as_str() {
+            Some("per-sender" | "global" | "per-channel-peer") => {}
+            Some(other) => issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: format!("{}.scope", path),
+                message: format!(
+                    "scope must be one of per-sender/global/per-channel-peer, got \"{}\"",
+                    other
+                ),
+            }),
+            None => issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: format!("{}.scope", path),
+                message: "scope must be a string".to_string(),
+            }),
+        }
+    }
+
+    if let Some(reset) = session_obj.get("reset") {
+        validate_channel_session_reset(reset, &format!("{}.reset", path), issues);
+    }
+}
+
+fn validate_channel_session_reset(reset: &Value, path: &str, issues: &mut Vec<SchemaIssue>) {
+    let Some(reset_obj) = reset.as_object() else {
+        issues.push(SchemaIssue {
+            severity: Severity::Warning,
+            path: path.to_string(),
+            message: format!("reset must be an object, got {}", json_type_label(reset)),
+        });
+        return;
+    };
+
+    for key in reset_obj.keys() {
+        if key != "mode" && key != "idleMinutes" {
+            issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: format!("{}.{}", path, key),
+                message: format!(
+                    "unknown channel session reset key '{}'; supported keys are {}.mode and {}.idleMinutes",
+                    key, path, path
+                ),
+            });
+        }
+    }
+
+    if let Some(mode) = reset_obj.get("mode") {
+        match mode.as_str() {
+            Some("manual" | "daily" | "idle") => {}
+            Some(other) => issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: format!("{}.mode", path),
+                message: format!("mode must be one of manual/daily/idle, got \"{}\"", other),
+            }),
+            None => issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: format!("{}.mode", path),
+                message: "mode must be a string".to_string(),
+            }),
+        }
+    }
+
+    if let Some(idle_minutes) = reset_obj.get("idleMinutes") {
+        check_positive_integer(idle_minutes, &format!("{}.idleMinutes", path), issues);
     }
 }
 
@@ -2316,6 +2418,49 @@ mod tests {
         assert!(issues.iter().any(|issue| {
             issue.path == ".channels.signal.feautres"
                 && issue.message.contains("unknown channel config key")
+        }));
+    }
+
+    #[test]
+    fn test_channel_session_entry_is_accepted() {
+        let cfg = json!({
+            "channels": {
+                "telegram": {
+                    "session": {
+                        "scope": "per-channel-peer",
+                        "reset": {
+                            "mode": "idle",
+                            "idleMinutes": 30
+                        }
+                    }
+                }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(
+            !issues
+                .iter()
+                .any(|issue| issue.path.starts_with(".channels.telegram.session")),
+            "unexpected session warning for valid per-channel session config: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_channel_session_unknown_key_warns() {
+        let cfg = json!({
+            "channels": {
+                "telegram": {
+                    "session": {
+                        "scpoe": "per-sender"
+                    }
+                }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(issues.iter().any(|issue| {
+            issue.path == ".channels.telegram.session.scpoe"
+                && issue.message.contains("unknown channel session key")
         }));
     }
 

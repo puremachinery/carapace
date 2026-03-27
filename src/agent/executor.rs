@@ -1269,6 +1269,7 @@ pub async fn execute_run(
                         plugin_registry.clone(),
                         channel_id,
                         policy,
+                        channel_capabilities.clone(),
                         ctx,
                     )
                     .await

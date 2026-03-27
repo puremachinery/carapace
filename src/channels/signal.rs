@@ -225,11 +225,18 @@ fn signal_http_error_message_with_body_prefix(
 }
 
 fn sanitize_signal_error_excerpt(body_text: &str) -> String {
+    static EMBEDDED_PHONE_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\+\d(?:[\d().:\-]{5,}\d)").expect("valid embedded phone regex")
+    });
+
     let collapsed = body_text
         .split_whitespace()
         .map(redact_sensitive_signal_token)
         .collect::<Vec<_>>()
         .join(" ");
+    let collapsed = EMBEDDED_PHONE_RE
+        .replace_all(&collapsed, "[redacted]")
+        .into_owned();
     let trimmed = collapsed.trim();
     if trimmed.is_empty() {
         return String::new();
@@ -610,6 +617,17 @@ mod tests {
         assert!(message.contains("[redacted]"));
         assert!(!message.contains("15551234567"));
         assert!(!message.contains("1234567"));
+    }
+
+    #[test]
+    fn test_signal_http_error_message_redacts_embedded_phone_tokens() {
+        let message = signal_http_error_message_with_body_prefix(
+            "signal send",
+            StatusCode::BAD_REQUEST,
+            "recipient:+15551234567 rejected by upstream",
+        );
+        assert!(message.contains("[redacted]"));
+        assert!(!message.contains("15551234567"));
     }
 
     #[test]
