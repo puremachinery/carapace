@@ -2263,12 +2263,14 @@ mod tests {
 
         let channel_ids = state.message_pipeline().channels_with_messages();
         assert_eq!(channel_ids, vec!["signal".to_string()]);
+        let dispatcher = crate::channels::activity::ActivityDispatcher::with_queue_capacity(8);
 
         crate::messages::delivery::process_channel_messages(
             &channel_ids,
             state.message_pipeline(),
             &plugin_registry,
             state.channel_registry(),
+            &dispatcher,
         )
         .await;
 
@@ -2278,6 +2280,7 @@ mod tests {
         )
         .await
         .expect("delivery success should trigger a read receipt");
+        dispatcher.shutdown().await;
 
         assert_eq!(plugin.events(), vec!["start", "stop", "send", "read"]);
         crate::config::clear_cache();

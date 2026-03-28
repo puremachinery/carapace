@@ -267,14 +267,25 @@ fn redact_sensitive_signal_token(token: &str) -> String {
                     part.len() == *len && part.chars().all(|ch| ch.is_ascii_hexdigit())
                 })
     };
+    let looks_like_hex_secret =
+        trimmed.len() >= 32 && trimmed.chars().all(|ch| ch.is_ascii_hexdigit());
+    let has_upper = trimmed.chars().any(|ch| ch.is_ascii_uppercase());
+    let has_lower = trimmed.chars().any(|ch| ch.is_ascii_lowercase());
+    let has_digit = trimmed.chars().any(|ch| ch.is_ascii_digit());
+    let has_symbol = trimmed.chars().any(|ch| matches!(ch, '_' | '-' | '='));
+    let character_class_count = [has_upper, has_lower, has_digit, has_symbol]
+        .into_iter()
+        .filter(|present| *present)
+        .count();
     let looks_like_opaque_token = trimmed.len() >= 24
         && trimmed
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '='))
-        && trimmed.chars().any(|ch| ch.is_ascii_alphabetic());
+        && character_class_count >= 2
+        && (has_digit || has_symbol || (has_upper && has_lower));
     let sensitive_numeric =
         (phone_like_numeric && digit_count >= 4) || (bare_numeric && digit_count >= 7);
-    if sensitive_numeric || looks_like_uuid || looks_like_opaque_token {
+    if sensitive_numeric || looks_like_uuid || looks_like_hex_secret || looks_like_opaque_token {
         "[redacted]".to_string()
     } else {
         token.to_string()

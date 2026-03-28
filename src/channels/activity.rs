@@ -11,6 +11,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::runtime::{Handle, RuntimeFlavor};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -21,6 +22,8 @@ use crate::runtime_bridge::{run_blocking_value, run_sync_blocking_send};
 
 const DEFAULT_TYPING_INTERVAL_SECONDS: u32 = 3;
 const MAX_TYPING_REFRESH_BACKOFF_SECONDS: u64 = 30;
+const READ_RECEIPT_DISPATCH_QUEUE_CAPACITY: usize = 64;
+const READ_RECEIPT_DISPATCH_SHUTDOWN_TIMEOUT_SECONDS: u64 = 10;
 const STOP_STATE_NOT_REQUESTED: u8 = 0;
 const STOP_STATE_TASK_RESERVED: u8 = 1;
 const STOP_STATE_TASK_RUNNING: u8 = 2;
@@ -89,6 +92,99 @@ pub struct TypingLoopHandle {
     ctx: TypingContext,
     channel_id: String,
     stop_state: Arc<AtomicU8>,
+}
+
+struct ReadReceiptDispatchRequest {
+    plugin: Arc<dyn ChannelPluginInstance>,
+    channel_id: String,
+    ctx: ReadReceiptContext,
+}
+
+pub struct ActivityDispatcher {
+    read_receipt_tx: mpsc::Sender<ReadReceiptDispatchRequest>,
+    read_receipt_worker: Option<JoinHandle<()>>,
+}
+
+impl Default for ActivityDispatcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ActivityDispatcher {
+    pub fn new() -> Self {
+        Self::with_queue_capacity(READ_RECEIPT_DISPATCH_QUEUE_CAPACITY)
+    }
+
+    pub(crate) fn with_queue_capacity(capacity: usize) -> Self {
+        let (read_receipt_tx, mut read_receipt_rx) =
+            mpsc::channel::<ReadReceiptDispatchRequest>(capacity);
+        let read_receipt_worker = tokio::spawn(async move {
+            while let Some(request) = read_receipt_rx.recv().await {
+                maybe_send_read_receipt_with_plugin(
+                    request.plugin,
+                    &request.channel_id,
+                    request.ctx,
+                )
+                .await;
+            }
+        });
+
+        Self {
+            read_receipt_tx,
+            read_receipt_worker: Some(read_receipt_worker),
+        }
+    }
+
+    pub fn try_dispatch_read_receipt(
+        &self,
+        plugin: Arc<dyn ChannelPluginInstance>,
+        channel_id: &str,
+        ctx: ReadReceiptContext,
+    ) {
+        let request = ReadReceiptDispatchRequest {
+            plugin,
+            channel_id: channel_id.to_string(),
+            ctx,
+        };
+        match self.read_receipt_tx.try_send(request) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!(
+                    channel = %channel_id,
+                    "read receipt dispatch queue is full; dropping read receipt"
+                );
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::warn!(
+                    channel = %channel_id,
+                    "read receipt dispatcher is shut down; dropping read receipt"
+                );
+            }
+        }
+    }
+
+    pub async fn shutdown(mut self) {
+        drop(self.read_receipt_tx);
+        let Some(mut worker) = self.read_receipt_worker.take() else {
+            return;
+        };
+
+        tokio::select! {
+            result = &mut worker => {
+                if let Err(err) = result {
+                    tracing::warn!(error = %err, "read receipt dispatcher exited unexpectedly");
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_secs(
+                READ_RECEIPT_DISPATCH_SHUTDOWN_TIMEOUT_SECONDS,
+            )) => {
+                worker.abort();
+                let _ = worker.await;
+                tracing::warn!("timed out draining read receipt dispatcher during shutdown");
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for TypingLoopHandle {
@@ -497,16 +593,32 @@ pub async fn maybe_send_read_receipt_with_plugin(
     channel_id: &str,
     ctx: ReadReceiptContext,
 ) {
-    #[cfg(debug_assertions)]
     match get_capabilities(plugin.clone()).await {
-        Ok(capabilities) => debug_assert!(
-            capabilities.read_receipts,
-            "maybe_send_read_receipt_with_plugin called for a channel without read_receipts capability"
-        ),
-        Err(err) => debug_assert!(
-            false,
-            "failed to load channel capabilities for read-receipt assertion: {err}"
-        ),
+        Ok(capabilities) => {
+            debug_assert!(
+                capabilities.read_receipts,
+                "maybe_send_read_receipt_with_plugin called for a channel without read_receipts capability"
+            );
+            if !capabilities.read_receipts {
+                tracing::warn!(
+                    channel = %channel_id,
+                    "skipping read receipt for a channel without read_receipts capability"
+                );
+                return;
+            }
+        }
+        Err(err) => {
+            #[cfg(debug_assertions)]
+            debug_assert!(
+                false,
+                "failed to load channel capabilities for read-receipt assertion: {err}"
+            );
+            tracing::warn!(
+                channel = %channel_id,
+                error = %err,
+                "failed to load channel capabilities before sending read receipt"
+            );
+        }
     }
 
     if let Err(err) = invoke_mark_read(plugin, ctx).await {

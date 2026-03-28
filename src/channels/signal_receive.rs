@@ -129,6 +129,19 @@ fn build_signal_read_receipt_context(
         })
 }
 
+fn read_receipt_context_for_signal_run(
+    envelope: &SignalEnvelope,
+    data_message: &SignalDataMessage,
+    sender: &str,
+    carapace_manages_read_receipts: bool,
+) -> Option<ReadReceiptContext> {
+    if !carapace_manages_read_receipts {
+        return None;
+    }
+
+    build_signal_read_receipt_context(envelope, data_message, sender)
+}
+
 fn summarize_signal_receive_response_error(error: &reqwest::Error) -> &'static str {
     if error.is_decode() {
         "invalid Signal receive response body"
@@ -361,7 +374,12 @@ async fn process_envelope(
         "Signal inbound message"
     );
 
-    let read_receipt_context = build_signal_read_receipt_context(envelope, data_message, &sender);
+    let read_receipt_context = read_receipt_context_for_signal_run(
+        envelope,
+        data_message,
+        &sender,
+        carapace_manages_read_receipts,
+    );
     if carapace_manages_read_receipts && read_receipt_context.is_none() {
         warn!(
             sender = %sender,
@@ -704,6 +722,28 @@ mod tests {
             &envelope,
             envelope.data_message.as_ref().unwrap(),
             "+15559876543",
+        );
+        assert!(ctx.is_none());
+    }
+
+    #[test]
+    fn test_read_receipt_context_for_signal_run_skips_context_when_feature_disabled() {
+        let envelope = SignalEnvelope {
+            source_number: Some("+15559876543".to_string()),
+            source: None,
+            timestamp: Some(1706745600000),
+            data_message: Some(SignalDataMessage {
+                message: Some("Hello".to_string()),
+                timestamp: Some(1706745600000),
+                group_info: None,
+            }),
+        };
+
+        let ctx = read_receipt_context_for_signal_run(
+            &envelope,
+            envelope.data_message.as_ref().unwrap(),
+            "+15559876543",
+            false,
         );
         assert!(ctx.is_none());
     }

@@ -25,6 +25,8 @@ pub async fn delivery_loop(
     _state: Arc<WsServerState>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
+    let activity_dispatcher = crate::channels::activity::ActivityDispatcher::new();
+
     loop {
         // Wait for notification, timeout, or shutdown
         tokio::select! {
@@ -42,9 +44,17 @@ pub async fn delivery_loop(
 
         let channel_ids = pipeline.channels_with_messages();
 
-        process_channel_messages(&channel_ids, &pipeline, &plugin_registry, &channel_registry)
-            .await;
+        process_channel_messages(
+            &channel_ids,
+            &pipeline,
+            &plugin_registry,
+            &channel_registry,
+            &activity_dispatcher,
+        )
+        .await;
     }
+
+    activity_dispatcher.shutdown().await;
 }
 
 /// Process pending messages for each connected channel.
@@ -53,6 +63,7 @@ pub(crate) async fn process_channel_messages(
     pipeline: &MessagePipeline,
     plugin_registry: &Arc<PluginRegistry>,
     channel_registry: &ChannelRegistry,
+    activity_dispatcher: &crate::channels::activity::ActivityDispatcher,
 ) {
     for channel_id in channel_ids {
         if !channel_registry.is_connected(channel_id) {
@@ -160,6 +171,7 @@ pub(crate) async fn process_channel_messages(
             &message.metadata,
             &message_id,
             result,
+            activity_dispatcher,
         )
         .await;
     }
@@ -173,20 +185,19 @@ async fn handle_delivery_result(
     metadata: &crate::messages::outbound::MessageMetadata,
     message_id: &crate::messages::outbound::MessageId,
     result: Result<plugins::DeliveryResult, plugins::BindingError>,
+    activity_dispatcher: &crate::channels::activity::ActivityDispatcher,
 ) {
     match result {
         Ok(delivery) if delivery.ok => {
             let _ = pipeline.mark_sent(message_id);
             if let Some(read_receipt) = metadata.read_receipt.clone() {
-                // Keep read receipts ordered with delivery success and shutdown.
-                // Policy decisions are made before queueing so the delivery loop
-                // does not reload config on its hot path.
-                crate::channels::activity::maybe_send_read_receipt_with_plugin(
+                // Keep delivery success on the hot path and dispatch read
+                // receipts through the owned activity worker.
+                activity_dispatcher.try_dispatch_read_receipt(
                     plugin.clone(),
                     channel_id,
                     read_receipt,
-                )
-                .await;
+                );
             }
         }
         Ok(delivery) => {
@@ -324,6 +335,7 @@ mod tests {
     };
     use std::fs;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
     use tokio::sync::Notify;
 
     /// Mock channel plugin that records calls.
@@ -333,6 +345,7 @@ mod tests {
         send_media_count: AtomicU32,
         mark_read_count: AtomicU32,
         mark_read_notify: Option<Arc<Notify>>,
+        mark_read_delay: Duration,
         fail: bool,
         retryable: bool,
     }
@@ -345,6 +358,7 @@ mod tests {
                 send_media_count: AtomicU32::new(0),
                 mark_read_count: AtomicU32::new(0),
                 mark_read_notify: None,
+                mark_read_delay: Duration::ZERO,
                 fail: false,
                 retryable: false,
             }
@@ -357,6 +371,7 @@ mod tests {
                 send_media_count: AtomicU32::new(0),
                 mark_read_count: AtomicU32::new(0),
                 mark_read_notify: None,
+                mark_read_delay: Duration::ZERO,
                 fail: true,
                 retryable,
             }
@@ -372,8 +387,23 @@ mod tests {
                 send_media_count: AtomicU32::new(0),
                 mark_read_count: AtomicU32::new(0),
                 mark_read_notify: None,
+                mark_read_delay: Duration::ZERO,
                 fail: false,
                 retryable: false,
+            }
+        }
+
+        fn with_read_receipts_notify(mark_read_notify: Arc<Notify>) -> Self {
+            Self {
+                mark_read_notify: Some(mark_read_notify),
+                ..Self::with_read_receipts()
+            }
+        }
+
+        fn with_read_receipts_delay(mark_read_delay: Duration) -> Self {
+            Self {
+                mark_read_delay,
+                ..Self::with_read_receipts()
             }
         }
     }
@@ -433,12 +463,19 @@ mod tests {
         }
 
         fn mark_read(&self, _ctx: ReadReceiptContext) -> Result<(), BindingError> {
+            if !self.mark_read_delay.is_zero() {
+                std::thread::sleep(self.mark_read_delay);
+            }
             self.mark_read_count.fetch_add(1, Ordering::Relaxed);
             if let Some(notify) = &self.mark_read_notify {
                 notify.notify_one();
             }
             Ok(())
         }
+    }
+
+    fn test_activity_dispatcher() -> crate::channels::activity::ActivityDispatcher {
+        crate::channels::activity::ActivityDispatcher::with_queue_capacity(8)
     }
 
     fn make_pipeline_and_registries(
@@ -727,9 +764,13 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_handle_delivery_result_marks_read_after_success_when_enabled() {
-        let mock = Arc::new(MockChannel::with_read_receipts());
+        let mark_read_notify = Arc::new(Notify::new());
+        let mock = Arc::new(MockChannel::with_read_receipts_notify(
+            mark_read_notify.clone(),
+        ));
         let (pipeline, _plugin_reg, _channel_reg) =
             make_pipeline_and_registries("signal", Some(mock.clone()), true);
+        let dispatcher = test_activity_dispatcher();
 
         let temp = tempfile::tempdir().unwrap();
         let config_path = temp.path().join("carapace.json5");
@@ -787,8 +828,14 @@ mod tests {
                 to_jid: None,
                 poll_id: None,
             }),
+            &dispatcher,
         )
         .await;
+
+        tokio::time::timeout(Duration::from_secs(1), mark_read_notify.notified())
+            .await
+            .expect("read receipt should be dispatched asynchronously");
+        dispatcher.shutdown().await;
 
         assert_eq!(
             pipeline.get_status(&queued.message_id),
@@ -799,9 +846,13 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_process_channel_messages_marks_read_after_success_when_enabled() {
-        let mock = Arc::new(MockChannel::with_read_receipts());
+        let mark_read_notify = Arc::new(Notify::new());
+        let mock = Arc::new(MockChannel::with_read_receipts_notify(
+            mark_read_notify.clone(),
+        ));
         let (pipeline, plugin_reg, channel_reg) =
             make_pipeline_and_registries("signal", Some(mock.clone()), true);
+        let dispatcher = test_activity_dispatcher();
 
         let msg = OutboundMessage::new("signal", MessageContent::text("hello")).with_metadata(
             crate::messages::outbound::MessageMetadata {
@@ -821,8 +872,14 @@ mod tests {
             &pipeline,
             &plugin_reg,
             &channel_reg,
+            &dispatcher,
         )
         .await;
+
+        tokio::time::timeout(Duration::from_secs(1), mark_read_notify.notified())
+            .await
+            .expect("read receipt should be dispatched asynchronously");
+        dispatcher.shutdown().await;
 
         assert_eq!(mock.send_text_count.load(Ordering::Relaxed), 1);
         assert_eq!(mock.mark_read_count.load(Ordering::Relaxed), 1);
@@ -837,6 +894,7 @@ mod tests {
         let mock = Arc::new(MockChannel::with_read_receipts());
         let (pipeline, _plugin_reg, _channel_reg) =
             make_pipeline_and_registries("signal", Some(mock.clone()), true);
+        let dispatcher = test_activity_dispatcher();
 
         let msg = OutboundMessage::new("signal", MessageContent::text("hello")).with_metadata(
             crate::messages::outbound::MessageMetadata {
@@ -870,8 +928,10 @@ mod tests {
                 to_jid: None,
                 poll_id: None,
             }),
+            &dispatcher,
         )
         .await;
+        dispatcher.shutdown().await;
 
         assert_eq!(
             pipeline.get_status(&queued.message_id),
@@ -885,6 +945,7 @@ mod tests {
         let mock = Arc::new(MockChannel::with_read_receipts());
         let (pipeline, _plugin_reg, _channel_reg) =
             make_pipeline_and_registries("signal", Some(mock.clone()), true);
+        let dispatcher = test_activity_dispatcher();
 
         let msg = OutboundMessage::new("signal", MessageContent::text("hello")).with_metadata(
             crate::messages::outbound::MessageMetadata {
@@ -913,14 +974,70 @@ mod tests {
                 to_jid: None,
                 poll_id: None,
             }),
+            &dispatcher,
         )
         .await;
+        dispatcher.shutdown().await;
 
         assert_eq!(
             pipeline.get_status(&queued.message_id),
             Some(crate::messages::outbound::DeliveryStatus::Sent)
         );
         assert_eq!(mock.mark_read_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_handle_delivery_result_does_not_block_on_slow_read_receipt_dispatch() {
+        let mock = Arc::new(MockChannel::with_read_receipts_delay(
+            Duration::from_millis(250),
+        ));
+        let (pipeline, _plugin_reg, _channel_reg) =
+            make_pipeline_and_registries("signal", Some(mock.clone()), true);
+        let dispatcher = test_activity_dispatcher();
+
+        let msg = OutboundMessage::new("signal", MessageContent::text("hello")).with_metadata(
+            crate::messages::outbound::MessageMetadata {
+                recipient_id: Some("+15551234567".to_string()),
+                read_receipt: Some(ReadReceiptContext {
+                    recipient: "+15551234567".to_string(),
+                    timestamp: Some(123),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        let queued = pipeline.queue(msg, MsgOutboundContext::new()).unwrap();
+        let message = pipeline
+            .get_message(&queued.message_id)
+            .expect("queued message should be available");
+        let plugin: Arc<dyn ChannelPluginInstance> = mock.clone();
+
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            handle_delivery_result(
+                &pipeline,
+                &plugin,
+                "signal",
+                &message.message.metadata,
+                &queued.message_id,
+                Ok(plugins::DeliveryResult {
+                    ok: true,
+                    message_id: Some("sent-1".to_string()),
+                    error: None,
+                    retryable: false,
+                    conversation_id: None,
+                    to_jid: None,
+                    poll_id: None,
+                }),
+                &dispatcher,
+            ),
+        )
+        .await
+        .expect("delivery result handling should not wait for slow read receipt I/O");
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        dispatcher.shutdown().await;
+        assert_eq!(mock.mark_read_count.load(Ordering::Relaxed), 1);
     }
 
     #[test]
