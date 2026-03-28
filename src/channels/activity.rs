@@ -40,6 +40,13 @@ const DEFAULT_TYPING_INTERVAL_SECONDS: u32 = 3;
 const MAX_TYPING_REFRESH_BACKOFF_SECONDS: u64 = 30;
 const ACTIVITY_DISPATCH_BACKLOG_WARNING_THRESHOLD: usize = 64;
 const ACTIVITY_DISPATCH_SHUTDOWN_GRACE_MS: u64 = 250;
+// Stop-state machine:
+// - NOT_REQUESTED -> TASK_RESERVED -> TASK_RUNNING -> COMPLETED
+// - NOT_REQUESTED -> FALLBACK_RESERVED -> COMPLETED
+// - TASK_RESERVED -> FALLBACK_RESERVED -> COMPLETED
+// TASK_RUNNING means the task-owned stop worker has exclusive ownership of the
+// final stop_typing call. FALLBACK_RESERVED means implicit-drop cleanup won the
+// race before the task handed stop_typing to that worker.
 const STOP_STATE_NOT_REQUESTED: u8 = 0;
 const STOP_STATE_TASK_RESERVED: u8 = 1;
 const STOP_STATE_TASK_RUNNING: u8 = 2;
@@ -978,6 +985,11 @@ pub(crate) fn warn_unsupported_activity_feature(channel_id: &str, feature: &str)
     }
 }
 
+#[cfg(test)]
+fn reset_unsupported_activity_feature_warnings_for_test() {
+    UNSUPPORTED_ACTIVITY_FEATURE_WARNINGS.lock().clear();
+}
+
 fn panic_payload_to_string(payload: Box<dyn Any + Send + 'static>) -> String {
     let payload = payload.as_ref();
     if let Some(message) = payload.downcast_ref::<&str>() {
@@ -1906,5 +1918,17 @@ mod tests {
         dispatcher.shutdown();
 
         assert_eq!(plugin.mark_read_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_reset_unsupported_activity_feature_warnings_for_test_clears_seen_keys() {
+        reset_unsupported_activity_feature_warnings_for_test();
+        warn_unsupported_activity_feature("signal", "typing");
+        assert!(UNSUPPORTED_ACTIVITY_FEATURE_WARNINGS
+            .lock()
+            .contains("signal:typing"));
+
+        reset_unsupported_activity_feature_warnings_for_test();
+        assert!(UNSUPPORTED_ACTIVITY_FEATURE_WARNINGS.lock().is_empty());
     }
 }

@@ -166,9 +166,9 @@ impl SignalChannel {
             .send()
         {
             Ok(resp) if resp.status().is_success() => Ok(()),
-            Ok(resp) => Err(signal_http_call_error(
+            Ok(resp) => Err(signal_http_call_error_from_response(
                 "signal typing indicator",
-                resp.status(),
+                resp,
             )),
             Err(err) => Err(BindingError::CallError(format!(
                 "failed to update signal typing indicator: {}",
@@ -198,7 +198,10 @@ impl SignalChannel {
             .send()
         {
             Ok(resp) if resp.status().is_success() => Ok(()),
-            Ok(resp) => Err(signal_http_call_error("signal read receipt", resp.status())),
+            Ok(resp) => Err(signal_http_call_error_from_response(
+                "signal read receipt",
+                resp,
+            )),
             Err(err) => Err(BindingError::CallError(format!(
                 "failed to send signal read receipt: {}",
                 err
@@ -207,8 +210,15 @@ impl SignalChannel {
     }
 }
 
-fn signal_http_call_error(operation: &str, status: StatusCode) -> BindingError {
-    BindingError::CallError(format!("{operation} HTTP {status}"))
+fn signal_http_call_error_from_response(
+    operation: &str,
+    resp: reqwest::blocking::Response,
+) -> BindingError {
+    let status = resp.status();
+    let body_text = resp.text().unwrap_or_default();
+    BindingError::CallError(signal_http_error_message_with_body_prefix(
+        operation, status, &body_text,
+    ))
 }
 
 fn signal_http_error_message_with_body_prefix(
