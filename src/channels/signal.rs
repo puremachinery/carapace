@@ -228,19 +228,19 @@ fn sanitize_signal_error_excerpt(body_text: &str) -> String {
     static KNOWN_LABELED_PHONE_RE: std::sync::LazyLock<regex::Regex> =
         std::sync::LazyLock::new(|| {
             regex::Regex::new(
-                r"(?i)\b(recipient|source|sender|number)([:=])(\+?\d(?:[\d().:\-]{5,}\d))",
+                r"(?i)\b(recipient|source|sender|number)([:=])(\+?\d(?:[\d().:\-\s]{5,}\d))",
             )
             .expect("valid labeled phone regex")
         });
     static GENERIC_LABELED_PHONE_RE: std::sync::LazyLock<regex::Regex> =
         std::sync::LazyLock::new(|| {
             regex::Regex::new(
-                r"(?i)\b([A-Za-z][A-Za-z0-9_-]{0,31})([:=])(\+?\d(?:[\d().:\-]{8,}\d))",
+                r"(?i)\b([A-Za-z][A-Za-z0-9_-]{0,31})([:=])(\+?\d(?:[\d().:\-\s]{8,}\d))",
             )
             .expect("valid generic labeled phone regex")
         });
     static EMBEDDED_PHONE_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"\+\d(?:[\d().:\-]{5,}\d)").expect("valid embedded phone regex")
+        regex::Regex::new(r"\+\d(?:[\d().:\-\s]{5,}\d)").expect("valid embedded phone regex")
     });
 
     let collapsed = body_text
@@ -675,6 +675,17 @@ mod tests {
         );
         assert!(message.contains("[redacted]"));
         assert!(!message.contains("15551234567"));
+    }
+
+    #[test]
+    fn test_signal_http_error_message_redacts_embedded_spaced_phone_tokens() {
+        let message = signal_http_error_message_with_body_prefix(
+            "signal send",
+            StatusCode::BAD_REQUEST,
+            "+1 555 123 4567 rejected by upstream",
+        );
+        assert!(message.contains("[redacted]"));
+        assert!(!message.contains("555 123 4567"));
     }
 
     #[test]

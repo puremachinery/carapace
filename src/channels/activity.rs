@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use futures_util::FutureExt;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -26,6 +27,7 @@ use crate::runtime_bridge::{run_blocking_value, run_sync_blocking_send};
 const DEFAULT_TYPING_INTERVAL_SECONDS: u32 = 3;
 const MAX_TYPING_REFRESH_BACKOFF_SECONDS: u64 = 30;
 const ACTIVITY_DISPATCH_BACKLOG_WARNING_THRESHOLD: usize = 64;
+const ACTIVITY_DISPATCH_SHUTDOWN_TIMEOUT_SECS: u64 = 5;
 const STOP_STATE_NOT_REQUESTED: u8 = 0;
 const STOP_STATE_TASK_RESERVED: u8 = 1;
 const STOP_STATE_TASK_RUNNING: u8 = 2;
@@ -277,23 +279,19 @@ impl ActivityDispatcher {
         self.stop_typing_tx.lock().take();
 
         if let Some(worker) = self.read_receipt_worker.lock().take() {
-            let result = crate::runtime_bridge::run_blocking_value(move || worker.join());
-            if let Err(payload) = result {
-                tracing::warn!(
-                    error = %panic_payload_to_string(payload),
-                    "read receipt dispatcher thread panicked during shutdown"
-                );
-            }
+            join_activity_worker_with_timeout(
+                worker,
+                "read receipt",
+                Duration::from_secs(ACTIVITY_DISPATCH_SHUTDOWN_TIMEOUT_SECS),
+            );
         }
 
         if let Some(worker) = self.stop_typing_worker.lock().take() {
-            let result = crate::runtime_bridge::run_blocking_value(move || worker.join());
-            if let Err(payload) = result {
-                tracing::warn!(
-                    error = %panic_payload_to_string(payload),
-                    "stop typing dispatcher thread panicked during shutdown"
-                );
-            }
+            join_activity_worker_with_timeout(
+                worker,
+                "stop typing",
+                Duration::from_secs(ACTIVITY_DISPATCH_SHUTDOWN_TIMEOUT_SECS),
+            );
         }
     }
 }
@@ -352,15 +350,10 @@ impl Drop for TypingLoopHandle {
                     }
                 }
             }
-            Ok(handle) => {
+            Ok(_) => {
                 if let Some(task) = self.task.take() {
                     task.abort();
-                    // Drain the aborted task on the same runtime so current-thread
-                    // callers do not leak detached typing tasks, while the actual
-                    // stop_typing side effect is handled by the bounded dispatcher.
-                    drop(handle.spawn(async move {
-                        let _ = task.await;
-                    }));
+                    observe_finished_typing_task_after_abort(task, &self.channel_id);
                     if stop_fallback_needed(self.stop_state.as_ref()) {
                         self.activity_dispatcher.dispatch_stop_typing(
                             self.plugin.clone(),
@@ -374,6 +367,7 @@ impl Drop for TypingLoopHandle {
             Err(_) => {
                 if let Some(task) = self.task.take() {
                     task.abort();
+                    observe_finished_typing_task_after_abort(task, &self.channel_id);
                     if stop_fallback_needed(self.stop_state.as_ref()) {
                         self.activity_dispatcher.dispatch_stop_typing(
                             self.plugin.clone(),
@@ -449,6 +443,10 @@ fn apply_legacy_session_typing_fallback(config: &Value, policy: &mut TypingFeatu
             policy.enabled = true;
             policy.mode = TypingMode::Thinking;
         } else {
+            tracing::warn!(
+                mode = %mode,
+                "unknown legacy session.typingMode value; disabling legacy typing fallback"
+            );
             policy.enabled = false;
         }
     }
@@ -471,6 +469,11 @@ fn apply_channel_activity_overrides(features: Option<&Value>, policy: &mut Chann
             if let Some(mode) = typing.get("mode").and_then(|value| value.as_str()) {
                 if mode.eq_ignore_ascii_case("thinking") {
                     policy.typing.mode = TypingMode::Thinking;
+                } else {
+                    tracing::warn!(
+                        mode = %mode,
+                        "unknown channels.*.features.typing.mode value; ignoring"
+                    );
                 }
             }
             if let Some(interval) = parse_positive_u32_from_value(typing_value, "intervalSeconds") {
@@ -489,6 +492,11 @@ fn apply_channel_activity_overrides(features: Option<&Value>, policy: &mut Chann
         if let Some(mode) = receipts.get("mode").and_then(|value| value.as_str()) {
             if mode.eq_ignore_ascii_case("after-response") {
                 policy.read_receipts.mode = ReadReceiptMode::AfterResponse;
+            } else {
+                tracing::warn!(
+                    mode = %mode,
+                    "unknown channels.*.features.readReceipts.mode value; ignoring"
+                );
             }
         }
     }
@@ -699,6 +707,58 @@ fn log_activity_backlog_if_needed(
             activity,
             "activity dispatcher backlog is growing"
         );
+    }
+}
+
+fn observe_finished_typing_task_after_abort(task: JoinHandle<()>, channel_id: &str) {
+    if task.is_finished() {
+        if let Some(Err(err)) = task.now_or_never() {
+            if err.is_panic() {
+                tracing::warn!(
+                    channel = %channel_id,
+                    error = %panic_payload_to_string(err.into_panic()),
+                    "typing task panicked during implicit drop cleanup"
+                );
+            }
+        }
+    }
+}
+
+fn join_activity_worker_with_timeout(
+    worker: thread::JoinHandle<()>,
+    activity: &'static str,
+    timeout: Duration,
+) {
+    let (done_tx, done_rx) = sync_mpsc::sync_channel::<()>(1);
+    let join_activity = activity.to_string();
+    let _join_helper = thread::Builder::new()
+        .name(format!("carapace-{activity}-join"))
+        .spawn(move || {
+            if let Err(payload) = worker.join() {
+                tracing::warn!(
+                    activity = %join_activity,
+                    error = %panic_payload_to_string(payload),
+                    "activity dispatcher worker panicked during shutdown"
+                );
+            }
+            let _ = done_tx.send(());
+        });
+
+    match done_rx.recv_timeout(timeout) {
+        Ok(()) => {}
+        Err(sync_mpsc::RecvTimeoutError::Timeout) => {
+            tracing::warn!(
+                activity,
+                timeout_ms = timeout.as_millis(),
+                "activity dispatcher worker did not drain before shutdown timeout"
+            );
+        }
+        Err(sync_mpsc::RecvTimeoutError::Disconnected) => {
+            tracing::warn!(
+                activity,
+                "activity dispatcher join helper disconnected during shutdown"
+            );
+        }
     }
 }
 
@@ -1541,6 +1601,21 @@ mod tests {
         assert!(should_log_typing_refresh_failure(4));
         assert!(!should_log_typing_refresh_failure(5));
         assert!(should_log_typing_refresh_failure(8));
+    }
+
+    #[test]
+    fn test_join_activity_worker_with_timeout_returns_promptly_when_worker_stalls() {
+        let worker = thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(50));
+        });
+
+        let started_at = std::time::Instant::now();
+        join_activity_worker_with_timeout(worker, "test", Duration::from_millis(5));
+
+        assert!(
+            started_at.elapsed() < Duration::from_millis(40),
+            "shutdown helper should stay bounded when a worker stalls"
+        );
     }
 
     #[test]
