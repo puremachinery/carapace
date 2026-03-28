@@ -289,7 +289,7 @@ fn should_redact_signal_json_string(label: Option<&str>, value: &str) -> bool {
             return true;
         }
         if preserves_numeric_label(label) {
-            return false;
+            return looks_like_phoneish_value_under_safe_label(value);
         }
     }
     looks_like_phoneish_value(value)
@@ -302,7 +302,7 @@ fn should_redact_signal_json_number(label: Option<&str>, number: &serde_json::Nu
             return true;
         }
         if preserves_numeric_label(label) {
-            return false;
+            return looks_like_phoneish_value_under_safe_label(&rendered);
         }
     }
     looks_like_phoneish_value(&rendered)
@@ -346,7 +346,9 @@ fn sanitize_signal_error_text(body_text: &str) -> String {
     let collapsed = GENERIC_LABELED_PHONE_RE
         .replace_all(&collapsed, |captures: &regex::Captures<'_>| {
             let label = &captures[1];
-            if preserves_numeric_label(label) {
+            let value = &captures[3];
+            if preserves_numeric_label(label) && !looks_like_phoneish_value_under_safe_label(value)
+            {
                 captures[0].to_string()
             } else {
                 format!("{}{}[redacted]", label, &captures[2])
@@ -376,6 +378,15 @@ fn is_secret_numeric_label(label: &str) -> bool {
 fn looks_like_short_secret_numeric(value: &str) -> bool {
     let trimmed = value.trim();
     (4..=8).contains(&trimmed.len()) && trimmed.chars().all(|ch| ch.is_ascii_digit())
+}
+
+fn looks_like_phoneish_value_under_safe_label(value: &str) -> bool {
+    let trimmed = value.trim();
+    let digit_count = trimmed.chars().filter(|ch| ch.is_ascii_digit()).count();
+    digit_count >= 10
+        && trimmed
+            .chars()
+            .all(|ch| ch.is_ascii_digit() || matches!(ch, '+' | '(' | ')' | '.' | ':' | '-' | ' '))
 }
 
 fn looks_like_phoneish_value(value: &str) -> bool {
@@ -842,15 +853,28 @@ mod tests {
     }
 
     #[test]
-    fn test_signal_http_error_message_preserves_non_phone_labeled_numbers() {
+    fn test_signal_http_error_message_preserves_safe_labeled_diagnostics() {
         let message = signal_http_error_message_with_body_prefix(
             "signal send",
             StatusCode::BAD_REQUEST,
-            "ref:1234567890 port:8080 status=4000",
+            "bytes:12345678 port:8080 status=4000",
         );
-        assert!(message.contains("ref:1234567890"));
+        assert!(message.contains("bytes:12345678"));
         assert!(message.contains("port:8080"));
         assert!(message.contains("status=4000"));
+    }
+
+    #[test]
+    fn test_signal_http_error_message_redacts_phone_like_values_under_safe_labels() {
+        let message = signal_http_error_message_with_body_prefix(
+            "signal send",
+            StatusCode::BAD_REQUEST,
+            "bytes:+15551234567 ref:15559876543",
+        );
+        assert!(message.contains("bytes:[redacted]"));
+        assert!(message.contains("ref:[redacted]"));
+        assert!(!message.contains("+15551234567"));
+        assert!(!message.contains("15559876543"));
     }
 
     #[test]
@@ -892,6 +916,19 @@ mod tests {
         assert!(message.contains(r#""bytes":12345678"#));
         assert!(message.contains(r#""count":87654321"#));
         assert!(message.contains(r#""delay":99999999"#));
+    }
+
+    #[test]
+    fn test_signal_http_error_message_redacts_phone_like_json_values_under_safe_labels() {
+        let message = signal_http_error_message_with_body_prefix(
+            "signal send",
+            StatusCode::BAD_REQUEST,
+            r#"{"bytes":"+15551234567","ref":15559876543}"#,
+        );
+        assert!(message.contains(r#""bytes":"[redacted]""#));
+        assert!(message.contains(r#""ref":"[redacted]""#));
+        assert!(!message.contains("+15551234567"));
+        assert!(!message.contains("15559876543"));
     }
 
     #[test]

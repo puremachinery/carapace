@@ -23,7 +23,6 @@ use std::sync::{Arc, LazyLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use futures_util::FutureExt;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -160,6 +159,7 @@ pub struct ChannelActivityPolicy {
 pub struct TypingLoopHandle {
     cancel: CancellationToken,
     task: Option<JoinHandle<()>>,
+    runtime_handle: Handle,
     plugin: Arc<dyn ChannelPluginInstance>,
     ctx: TypingContext,
     channel_id: String,
@@ -461,7 +461,11 @@ impl Drop for TypingLoopHandle {
             Ok(_) => {
                 if let Some(task) = self.task.take() {
                     task.abort();
-                    observe_finished_typing_task_after_abort(task, &self.channel_id);
+                    observe_finished_typing_task_after_abort(
+                        task,
+                        self.runtime_handle.clone(),
+                        &self.channel_id,
+                    );
                     if stop_fallback_needed(self.stop_state.as_ref()) {
                         self.activity_dispatcher.dispatch_stop_typing(
                             self.plugin.clone(),
@@ -475,7 +479,11 @@ impl Drop for TypingLoopHandle {
             Err(_) => {
                 if let Some(task) = self.task.take() {
                     task.abort();
-                    observe_finished_typing_task_after_abort(task, &self.channel_id);
+                    observe_finished_typing_task_after_abort(
+                        task,
+                        self.runtime_handle.clone(),
+                        &self.channel_id,
+                    );
                     if stop_fallback_needed(self.stop_state.as_ref()) {
                         self.activity_dispatcher.dispatch_stop_typing(
                             self.plugin.clone(),
@@ -659,6 +667,7 @@ pub async fn maybe_start_typing_loop(
     let cancel = CancellationToken::new();
     let stop_state = Arc::new(AtomicU8::new(STOP_STATE_NOT_REQUESTED));
     let interval_seconds = policy.typing.interval_seconds.max(1);
+    let runtime_handle = Handle::current();
     let channel_id = channel_id.to_string();
     let handle_channel_id = channel_id.clone();
     let handle_plugin = plugin.clone();
@@ -716,6 +725,7 @@ pub async fn maybe_start_typing_loop(
     Some(TypingLoopHandle {
         cancel,
         task: Some(task),
+        runtime_handle,
         plugin: handle_plugin,
         ctx: handle_ctx,
         channel_id: handle_channel_id,
@@ -866,9 +876,14 @@ fn log_dropped_stop_typing_after_shutdown(channel_id: &str, ctx: &TypingContext)
     );
 }
 
-fn observe_finished_typing_task_after_abort(task: JoinHandle<()>, channel_id: &str) {
-    if task.is_finished() {
-        if let Some(Err(err)) = task.now_or_never() {
+fn observe_finished_typing_task_after_abort(
+    task: JoinHandle<()>,
+    runtime_handle: Handle,
+    channel_id: &str,
+) {
+    let channel_id = channel_id.to_string();
+    runtime_handle.spawn(async move {
+        if let Err(err) = task.await {
             if err.is_panic() {
                 tracing::warn!(
                     channel = %channel_id,
@@ -877,7 +892,7 @@ fn observe_finished_typing_task_after_abort(task: JoinHandle<()>, channel_id: &s
                 );
             }
         }
-    }
+    });
 }
 
 fn join_activity_worker(worker: thread::JoinHandle<()>, activity: &'static str) {
@@ -1109,6 +1124,18 @@ mod tests {
         fn with_stop_typing_delay(caps: ChannelCapabilities, stop_typing_delay: Duration) -> Self {
             Self {
                 stop_typing_delay,
+                ..Self::with_stop_typing_notify(caps, None)
+            }
+        }
+
+        fn with_stop_typing_delay_and_notify(
+            caps: ChannelCapabilities,
+            stop_typing_delay: Duration,
+            stop_typing_notify: Arc<Notify>,
+        ) -> Self {
+            Self {
+                stop_typing_delay,
+                stop_typing_notify: Some(stop_typing_notify),
                 ..Self::with_stop_typing_notify(caps, None)
             }
         }
@@ -1517,12 +1544,14 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_maybe_start_typing_loop_drop_does_not_block_current_thread_runtime() {
-        let plugin = Arc::new(MockChannel::with_stop_typing_delay(
+        let stop_typing_notify = Arc::new(Notify::new());
+        let plugin = Arc::new(MockChannel::with_stop_typing_delay_and_notify(
             ChannelCapabilities {
                 typing_indicators: true,
                 ..Default::default()
             },
             Duration::from_millis(250),
+            stop_typing_notify.clone(),
         ));
         let registry = Arc::new(PluginRegistry::new());
         registry.register_channel("signal".to_string(), plugin.clone());
@@ -1550,14 +1579,15 @@ mod tests {
         .await
         .expect("typing loop should start");
 
-        let started_at = std::time::Instant::now();
         drop(handle);
-        assert!(
-            started_at.elapsed() < Duration::from_millis(150),
-            "drop should not block the current-thread runtime on slow stop_typing"
+        assert_eq!(
+            plugin.stop_typing_count.load(Ordering::Relaxed),
+            0,
+            "drop should return before slow stop_typing completes"
         );
-
-        tokio::time::sleep(Duration::from_millis(350)).await;
+        tokio::time::timeout(Duration::from_secs(1), stop_typing_notify.notified())
+            .await
+            .expect("drop should still schedule stop_typing asynchronously");
         assert_eq!(plugin.stop_typing_count.load(Ordering::Relaxed), 1);
         dispatcher.shutdown();
     }

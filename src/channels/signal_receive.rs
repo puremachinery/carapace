@@ -80,6 +80,7 @@ fn deserialize_signal_envelope_item(item: Value) -> Result<SignalEnvelope, serde
     SignalEnvelope::deserialize(envelope_value)
 }
 
+#[cfg(test)]
 fn resolve_signal_sender_and_peer(
     envelope: &SignalEnvelope,
     data_message: &SignalDataMessage,
@@ -140,6 +141,59 @@ fn read_receipt_context_for_signal_run(
     }
 
     build_signal_read_receipt_context(envelope, data_message, sender)
+}
+
+fn maybe_dispatch_read_receipt_for_ignored_signal_message(
+    state: &Arc<WsServerState>,
+    sender: Option<&str>,
+    read_receipt_context: Option<ReadReceiptContext>,
+    carapace_manages_read_receipts: bool,
+    reason: &str,
+) {
+    if !carapace_manages_read_receipts {
+        return;
+    }
+
+    let Some(sender) = sender else {
+        warn!(
+            ignored_reason = reason,
+            "Signal read receipts are enabled but an ignored message had no sender; Carapace cannot acknowledge it explicitly"
+        );
+        return;
+    };
+
+    let Some(read_receipt_context) = read_receipt_context else {
+        warn!(
+            sender = %sender,
+            ignored_reason = reason,
+            "Signal read receipts are enabled but an ignored message did not include a timestamp; Carapace cannot acknowledge it explicitly"
+        );
+        return;
+    };
+
+    let Some(plugin_registry) = state.plugin_registry() else {
+        warn!(
+            sender = %sender,
+            ignored_reason = reason,
+            "Signal read receipts are enabled but the plugin registry is unavailable; dropping explicit acknowledgment"
+        );
+        return;
+    };
+
+    let Some(plugin) = plugin_registry.get_channel("signal") else {
+        warn!(
+            sender = %sender,
+            ignored_reason = reason,
+            "Signal read receipts are enabled but the Signal channel plugin is unavailable; dropping explicit acknowledgment"
+        );
+        return;
+    };
+
+    state.activity_dispatcher().dispatch_verified_read_receipt(
+        plugin,
+        "signal",
+        read_receipt_context,
+    );
 }
 
 fn summarize_signal_receive_response_error(error: &reqwest::Error) -> &'static str {
@@ -365,35 +419,58 @@ async fn process_envelope(
         None => return, // Not a data message (e.g., receipt, typing indicator)
     };
 
+    let sender = envelope
+        .effective_source_number()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let read_receipt_context = sender.and_then(|sender| {
+        read_receipt_context_for_signal_run(
+            envelope,
+            data_message,
+            sender,
+            carapace_manages_read_receipts,
+        )
+    });
+
     let text = match &data_message.message {
         Some(t) if !t.is_empty() => t,
-        _ => return, // No text content
+        _ => {
+            maybe_dispatch_read_receipt_for_ignored_signal_message(
+                state,
+                sender,
+                read_receipt_context,
+                carapace_manages_read_receipts,
+                "ignored non-text Signal message",
+            );
+            return;
+        } // No text content
     };
 
     if signal_group_id(data_message).is_some() {
+        maybe_dispatch_read_receipt_for_ignored_signal_message(
+            state,
+            sender,
+            read_receipt_context,
+            carapace_manages_read_receipts,
+            "ignored unsupported Signal group message",
+        );
         warn!("Ignoring Signal group message: Signal outbound currently supports direct messages only");
         return;
     }
 
-    let (sender, peer_id) = match resolve_signal_sender_and_peer(envelope, data_message) {
-        Some(ids) => ids,
+    let sender = match sender {
+        Some(sender) => sender.to_string(),
         None => {
             warn!("Ignoring Signal envelope with empty sender ID");
             return;
         }
     };
+    let peer_id = sender.clone();
 
     debug!(
         sender = %sender,
         text_len = text.len(),
         "Signal inbound message"
-    );
-
-    let read_receipt_context = read_receipt_context_for_signal_run(
-        envelope,
-        data_message,
-        &sender,
-        carapace_manages_read_receipts,
     );
     if carapace_manages_read_receipts && read_receipt_context.is_none() {
         warn!(
@@ -438,6 +515,7 @@ async fn process_envelope(
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -445,9 +523,83 @@ mod tests {
     use axum::routing::get;
     use axum::{Json, Router};
     use parking_lot::Mutex;
+    use tokio::sync::Notify;
 
     use super::*;
+    use crate::plugins::{
+        BindingError, ChannelCapabilities, ChannelInfo, ChannelPluginInstance, PluginRegistry,
+    };
     use crate::server::ws::WsServerConfig;
+
+    struct MockSignalReadReceiptChannel {
+        mark_read_count: AtomicU32,
+        mark_read_notify: Arc<Notify>,
+    }
+
+    impl MockSignalReadReceiptChannel {
+        fn new(mark_read_notify: Arc<Notify>) -> Self {
+            Self {
+                mark_read_count: AtomicU32::new(0),
+                mark_read_notify,
+            }
+        }
+    }
+
+    impl ChannelPluginInstance for MockSignalReadReceiptChannel {
+        fn get_info(&self) -> Result<ChannelInfo, BindingError> {
+            Ok(ChannelInfo {
+                id: "signal".to_string(),
+                label: "Signal".to_string(),
+                selection_label: "Signal".to_string(),
+                docs_path: String::new(),
+                blurb: String::new(),
+                order: 0,
+            })
+        }
+
+        fn get_capabilities(&self) -> Result<ChannelCapabilities, BindingError> {
+            Ok(ChannelCapabilities {
+                read_receipts: true,
+                ..Default::default()
+            })
+        }
+
+        fn send_text(
+            &self,
+            _ctx: crate::plugins::OutboundContext,
+        ) -> Result<crate::plugins::DeliveryResult, BindingError> {
+            Ok(crate::plugins::DeliveryResult {
+                ok: true,
+                message_id: None,
+                error: None,
+                retryable: false,
+                conversation_id: None,
+                to_jid: None,
+                poll_id: None,
+            })
+        }
+
+        fn send_media(
+            &self,
+            _ctx: crate::plugins::OutboundContext,
+        ) -> Result<crate::plugins::DeliveryResult, BindingError> {
+            Ok(crate::plugins::DeliveryResult {
+                ok: true,
+                message_id: None,
+                error: None,
+                retryable: false,
+                conversation_id: None,
+                to_jid: None,
+                poll_id: None,
+            })
+        }
+
+        fn mark_read(&self, _ctx: ReadReceiptContext) -> Result<(), BindingError> {
+            self.mark_read_count.fetch_add(1, Ordering::Relaxed);
+            self.mark_read_notify.notify_one();
+            Ok(())
+        }
+    }
 
     #[derive(Clone)]
     struct SignalReceiveTestServerState {
@@ -1119,5 +1271,38 @@ mod tests {
         );
 
         crate::config::clear_cache();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_process_envelope_acknowledges_ignored_non_text_message_when_managed() {
+        let notify = Arc::new(Notify::new());
+        let signal_channel = Arc::new(MockSignalReadReceiptChannel::new(notify.clone()));
+        let plugin_registry = Arc::new(PluginRegistry::new());
+        plugin_registry.register_channel("signal".to_string(), signal_channel.clone());
+        let state = Arc::new(
+            WsServerState::new(WsServerConfig::default()).with_plugin_registry(plugin_registry),
+        );
+        let envelope = SignalEnvelope {
+            source_number: Some("+15559876543".to_string()),
+            source: None,
+            timestamp: Some(1706745600000),
+            data_message: Some(SignalDataMessage {
+                message: None,
+                timestamp: Some(1706745600000),
+                group_info: None,
+            }),
+        };
+
+        process_envelope(&envelope, &state, true).await;
+
+        tokio::time::timeout(Duration::from_secs(1), notify.notified())
+            .await
+            .expect("ignored non-text messages should still be acknowledged");
+        assert_eq!(signal_channel.mark_read_count.load(Ordering::Relaxed), 1);
+        assert!(
+            state.agent_run_registry.lock().snapshot_runs().is_empty(),
+            "ignored non-text messages should not create agent runs"
+        );
+        state.shutdown_activity_service();
     }
 }
