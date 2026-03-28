@@ -749,6 +749,30 @@ mod tests {
     }
 
     #[test]
+    fn test_read_receipt_context_for_signal_run_returns_context_when_feature_enabled() {
+        let envelope = SignalEnvelope {
+            source_number: Some("+15559876543".to_string()),
+            source: None,
+            timestamp: Some(1706745600999),
+            data_message: Some(SignalDataMessage {
+                message: Some("Hello".to_string()),
+                timestamp: Some(1706745600000),
+                group_info: None,
+            }),
+        };
+
+        let ctx = read_receipt_context_for_signal_run(
+            &envelope,
+            envelope.data_message.as_ref().unwrap(),
+            "+15559876543",
+            true,
+        )
+        .expect("enabled path should delegate to receipt-context builder");
+        assert_eq!(ctx.recipient, "+15559876543");
+        assert_eq!(ctx.timestamp, Some(1706745600000));
+    }
+
+    #[test]
     fn test_resolve_sender_and_peer_rejects_empty_sender() {
         let envelope = SignalEnvelope {
             source_number: Some("   ".to_string()),
