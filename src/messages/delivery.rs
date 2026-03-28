@@ -189,7 +189,7 @@ async fn handle_delivery_result(
             if let Some(read_receipt) = metadata.read_receipt.clone() {
                 // Keep delivery success on the hot path and dispatch read
                 // receipts through the owned activity worker.
-                activity_dispatcher.try_dispatch_read_receipt(
+                activity_dispatcher.try_dispatch_verified_read_receipt(
                     plugin.clone(),
                     channel_id,
                     read_receipt,

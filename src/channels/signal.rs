@@ -290,8 +290,7 @@ fn redact_sensitive_signal_token(token: &str) -> String {
         && trimmed
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '='))
-        && character_class_count >= 2
-        && (has_digit || has_symbol || (has_upper && has_lower));
+        && character_class_count >= 2;
     let sensitive_numeric =
         (phone_like_numeric && digit_count >= 4) || (bare_numeric && digit_count >= 7);
     if sensitive_numeric || looks_like_uuid || looks_like_hex_secret || looks_like_opaque_token {

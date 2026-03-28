@@ -96,7 +96,9 @@ pub struct TypingLoopHandle {
     stop_state: Arc<AtomicU8>,
 }
 
-struct ReadReceiptDispatchRequest {
+// Read-receipt requests are only enqueued after policy/capability checks pass
+// on the async path, so the worker can execute mark_read directly.
+struct VerifiedReadReceiptDispatchRequest {
     plugin: Arc<dyn ChannelPluginInstance>,
     channel_id: String,
     ctx: ReadReceiptContext,
@@ -110,7 +112,7 @@ struct StopTypingDispatchRequest {
 }
 
 pub struct ActivityDispatcher {
-    read_receipt_tx: Mutex<Option<sync_mpsc::SyncSender<ReadReceiptDispatchRequest>>>,
+    read_receipt_tx: Mutex<Option<sync_mpsc::SyncSender<VerifiedReadReceiptDispatchRequest>>>,
     read_receipt_worker: Mutex<Option<thread::JoinHandle<()>>>,
     stop_typing_tx: Mutex<Option<sync_mpsc::Sender<StopTypingDispatchRequest>>>,
     stop_typing_worker: Mutex<Option<thread::JoinHandle<()>>>,
@@ -129,7 +131,7 @@ impl ActivityDispatcher {
 
     pub(crate) fn with_queue_capacity(read_receipt_capacity: usize) -> Self {
         let (read_receipt_tx, read_receipt_rx) =
-            sync_mpsc::sync_channel::<ReadReceiptDispatchRequest>(read_receipt_capacity);
+            sync_mpsc::sync_channel::<VerifiedReadReceiptDispatchRequest>(read_receipt_capacity);
         let read_receipt_worker = thread::Builder::new()
             .name("carapace-read-receipts".to_string())
             .spawn(move || {
@@ -166,13 +168,13 @@ impl ActivityDispatcher {
         }
     }
 
-    pub fn try_dispatch_read_receipt(
+    pub fn try_dispatch_verified_read_receipt(
         &self,
         plugin: Arc<dyn ChannelPluginInstance>,
         channel_id: &str,
         ctx: ReadReceiptContext,
     ) {
-        let request = ReadReceiptDispatchRequest {
+        let request = VerifiedReadReceiptDispatchRequest {
             plugin,
             channel_id: channel_id.to_string(),
             ctx,
@@ -697,19 +699,27 @@ fn spawn_stop_typing_worker(
     }))
 }
 
-pub async fn maybe_send_read_receipt_with_plugin(
+#[cfg(test)]
+async fn send_verified_read_receipt_with_plugin(
     plugin: Arc<dyn ChannelPluginInstance>,
     channel_id: &str,
     ctx: ReadReceiptContext,
 ) {
     let channel_id = channel_id.to_string();
+    let worker_channel_id = channel_id.clone();
     match tokio::task::spawn_blocking(move || {
-        send_read_receipt_with_plugin(plugin, &channel_id, ctx);
+        dispatch_read_receipt_blocking(plugin, &worker_channel_id, ctx);
     })
     .await
     {
         Ok(()) => {}
-        Err(err) if err.is_panic() => resume_unwind(err.into_panic()),
+        Err(err) if err.is_panic() => {
+            tracing::warn!(
+                channel = %channel_id,
+                error = %panic_payload_to_string(err.into_panic()),
+                "read receipt worker task panicked"
+            );
+        }
         Err(err) => tracing::warn!(error = %err, "read receipt worker task failed"),
     }
 }
@@ -745,7 +755,20 @@ fn dispatch_read_receipt_blocking(
     channel_id: &str,
     ctx: ReadReceiptContext,
 ) {
-    send_read_receipt_with_plugin(plugin, channel_id, ctx);
+    let result = catch_unwind(AssertUnwindSafe(|| plugin.mark_read(ctx)));
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            tracing::warn!(channel = %channel_id, error = %err, "failed to send read receipt");
+        }
+        Err(payload) => {
+            tracing::warn!(
+                channel = %channel_id,
+                error = %panic_payload_to_string(payload),
+                "read receipt dispatcher panicked"
+            );
+        }
+    }
 }
 
 fn dispatch_stop_typing_blocking(
@@ -775,45 +798,6 @@ fn dispatch_stop_typing_blocking(
     }
 }
 
-fn send_read_receipt_with_plugin(
-    plugin: Arc<dyn ChannelPluginInstance>,
-    channel_id: &str,
-    ctx: ReadReceiptContext,
-) {
-    match plugin.get_capabilities() {
-        Ok(capabilities) => {
-            debug_assert!(
-                capabilities.read_receipts,
-                "maybe_send_read_receipt_with_plugin called for a channel without read_receipts capability"
-            );
-            if !capabilities.read_receipts {
-                tracing::warn!(
-                    channel = %channel_id,
-                    "skipping read receipt for a channel without read_receipts capability"
-                );
-                return;
-            }
-        }
-        Err(err) => {
-            #[cfg(debug_assertions)]
-            debug_assert!(
-                false,
-                "failed to load channel capabilities for read-receipt assertion: {err}"
-            );
-            tracing::warn!(
-                channel = %channel_id,
-                error = %err,
-                "failed to load channel capabilities before sending read receipt"
-            );
-            return;
-        }
-    }
-
-    if let Err(err) = plugin.mark_read(ctx) {
-        tracing::warn!(channel = %channel_id, error = %err, "failed to send read receipt");
-    }
-}
-
 fn panic_payload_to_string(payload: Box<dyn Any + Send + 'static>) -> String {
     let payload = payload.as_ref();
     if let Some(message) = payload.downcast_ref::<&str>() {
@@ -839,8 +823,11 @@ mod tests {
         start_typing_count: AtomicU32,
         stop_typing_count: AtomicU32,
         mark_read_count: AtomicU32,
+        mark_read_notify: Option<Arc<Notify>>,
         stop_typing_notify: Option<Arc<Notify>>,
         stop_typing_delay: Duration,
+        panic_get_capabilities: bool,
+        panic_mark_read_count: AtomicU32,
     }
 
     impl MockChannel {
@@ -857,14 +844,31 @@ mod tests {
                 start_typing_count: AtomicU32::new(0),
                 stop_typing_count: AtomicU32::new(0),
                 mark_read_count: AtomicU32::new(0),
+                mark_read_notify: None,
                 stop_typing_notify,
                 stop_typing_delay: Duration::ZERO,
+                panic_get_capabilities: false,
+                panic_mark_read_count: AtomicU32::new(0),
             }
         }
 
         fn with_stop_typing_delay(caps: ChannelCapabilities, stop_typing_delay: Duration) -> Self {
             Self {
                 stop_typing_delay,
+                ..Self::with_stop_typing_notify(caps, None)
+            }
+        }
+
+        fn with_panicking_capabilities(caps: ChannelCapabilities) -> Self {
+            Self {
+                panic_get_capabilities: true,
+                ..Self::with_stop_typing_notify(caps, None)
+            }
+        }
+
+        fn with_panicking_mark_read(caps: ChannelCapabilities, panic_count: u32) -> Self {
+            Self {
+                panic_mark_read_count: AtomicU32::new(panic_count),
                 ..Self::with_stop_typing_notify(caps, None)
             }
         }
@@ -883,6 +887,7 @@ mod tests {
         }
 
         fn get_capabilities(&self) -> Result<crate::plugins::ChannelCapabilities, BindingError> {
+            assert!(!self.panic_get_capabilities, "mock get_capabilities panic");
             Ok(self.caps.clone())
         }
 
@@ -911,7 +916,14 @@ mod tests {
         }
 
         fn mark_read(&self, _ctx: ReadReceiptContext) -> Result<(), BindingError> {
+            if self.panic_mark_read_count.load(Ordering::Relaxed) > 0 {
+                self.panic_mark_read_count.fetch_sub(1, Ordering::Relaxed);
+                panic!("mock mark_read panic");
+            }
             self.mark_read_count.fetch_add(1, Ordering::Relaxed);
+            if let Some(notify) = &self.mark_read_notify {
+                notify.notify_one();
+            }
             Ok(())
         }
     }
@@ -1495,12 +1507,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_maybe_send_read_receipt_honors_capability() {
+    async fn test_send_verified_read_receipt_marks_read() {
         let plugin = Arc::new(MockChannel::new(ChannelCapabilities {
             read_receipts: true,
             ..Default::default()
         }));
-        maybe_send_read_receipt_with_plugin(
+        send_verified_read_receipt_with_plugin(
             plugin.clone(),
             "signal",
             ReadReceiptContext {
@@ -1514,22 +1526,72 @@ mod tests {
         assert_eq!(plugin.mark_read_count.load(Ordering::Relaxed), 1);
     }
 
-    #[cfg(debug_assertions)]
-    #[tokio::test]
-    #[should_panic(
-        expected = "maybe_send_read_receipt_with_plugin called for a channel without read_receipts capability"
-    )]
-    async fn test_maybe_send_read_receipt_debug_asserts_without_capability() {
-        let plugin = Arc::new(MockChannel::new(ChannelCapabilities::default()));
-        maybe_send_read_receipt_with_plugin(
-            plugin,
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_read_receipt_dispatch_skips_capability_probe() {
+        let notify = Arc::new(Notify::new());
+        let plugin = Arc::new(MockChannel {
+            mark_read_notify: Some(notify.clone()),
+            ..MockChannel::with_panicking_capabilities(ChannelCapabilities::default())
+        });
+        let dispatcher = ActivityDispatcher::with_queue_capacity(8);
+
+        dispatcher.try_dispatch_verified_read_receipt(
+            plugin.clone(),
             "signal",
             ReadReceiptContext {
                 recipient: "+15551234567".to_string(),
                 timestamp: Some(123),
                 ..Default::default()
             },
-        )
-        .await;
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), notify.notified())
+            .await
+            .expect("verified read receipt dispatch should not probe capabilities");
+        dispatcher.shutdown();
+
+        assert_eq!(plugin.mark_read_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_read_receipt_dispatcher_survives_plugin_panic() {
+        let notify = Arc::new(Notify::new());
+        let plugin = Arc::new(MockChannel {
+            mark_read_notify: Some(notify.clone()),
+            ..MockChannel::with_panicking_mark_read(
+                ChannelCapabilities {
+                    read_receipts: true,
+                    ..Default::default()
+                },
+                1,
+            )
+        });
+        let dispatcher = ActivityDispatcher::with_queue_capacity(8);
+
+        dispatcher.try_dispatch_verified_read_receipt(
+            plugin.clone(),
+            "signal",
+            ReadReceiptContext {
+                recipient: "+15551234567".to_string(),
+                timestamp: Some(123),
+                ..Default::default()
+            },
+        );
+        dispatcher.try_dispatch_verified_read_receipt(
+            plugin.clone(),
+            "signal",
+            ReadReceiptContext {
+                recipient: "+15551234567".to_string(),
+                timestamp: Some(124),
+                ..Default::default()
+            },
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), notify.notified())
+            .await
+            .expect("dispatcher should continue after a panicking read receipt");
+        dispatcher.shutdown();
+
+        assert_eq!(plugin.mark_read_count.load(Ordering::Relaxed), 1);
     }
 }
