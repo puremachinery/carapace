@@ -1198,13 +1198,18 @@ pub async fn execute_run(
         }
     }
 
-    let channel_activity_policy = if let Some(channel_id) = message_channel.as_deref() {
+    let delivery_channel_id = if config.deliver {
+        message_channel.as_deref()
+    } else {
+        None
+    };
+    let channel_activity_policy = if let Some(channel_id) = delivery_channel_id {
         Some(crate::channels::activity::load_channel_activity_policy_async(channel_id).await)
     } else {
         None
     };
     let channel_capabilities = if let (Some(channel_id), Some(plugin_registry)) =
-        (message_channel.as_deref(), state.plugin_registry())
+        (delivery_channel_id, state.plugin_registry())
     {
         if let Some(plugin) = plugin_registry.get_channel(channel_id) {
             match tokio::task::spawn_blocking(move || plugin.get_capabilities()).await {
@@ -1236,7 +1241,7 @@ pub async fn execute_run(
     };
 
     let mut typing_handle = if let (Some(channel_id), Some(plugin_registry), Some(policy)) = (
-        message_channel.as_deref(),
+        delivery_channel_id,
         state.plugin_registry(),
         channel_activity_policy.as_ref(),
     ) {
@@ -2331,6 +2336,73 @@ mod tests {
         assert!(
             queued.message.metadata.read_receipt.is_some(),
             "receive-time read receipt context should be preserved even if policy is later disabled"
+        );
+
+        crate::config::clear_cache();
+    }
+
+    #[tokio::test]
+    async fn test_execute_run_skips_channel_activity_when_delivery_disabled() {
+        crate::config::clear_cache();
+        crate::config::update_cache(
+            serde_json::json!({
+                "channels": {
+                    "signal": {
+                        "features": {
+                            "typing": {
+                                "enabled": true,
+                                "intervalSeconds": 30
+                            },
+                            "readReceipts": {
+                                "enabled": true,
+                                "mode": "after-response"
+                            }
+                        }
+                    }
+                }
+            }),
+            serde_json::json!({}),
+        );
+
+        let plugin = Arc::new(ActivityRecordingChannel::new());
+        let plugin_registry = Arc::new(PluginRegistry::new());
+        plugin_registry.register_channel("signal".to_string(), plugin.clone());
+        let (state, _tmp) = make_test_state_with_plugin_registry(plugin_registry);
+        state.channel_registry().register(
+            crate::channels::ChannelInfo::new("signal", "Signal")
+                .with_status(crate::channels::ChannelStatus::Connected),
+        );
+
+        let run_id = "run-channel-activity-no-delivery";
+        let session_key = "test-channel-activity-no-delivery";
+        let chat_id = "+15551234567";
+        setup_session_and_run_with_channel_activity(&state, session_key, run_id, "signal", chat_id);
+
+        let provider = Arc::new(MockProvider::text("Hello world!"));
+        let config = AgentConfig {
+            max_turns: 5,
+            deliver: false,
+            ..Default::default()
+        };
+
+        let result = execute_run(
+            run_id.to_string(),
+            session_key.to_string(),
+            config,
+            state.clone(),
+            provider,
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(result.is_ok(), "execute_run failed: {:?}", result.err());
+
+        assert!(
+            state.message_pipeline().channels_with_messages().is_empty(),
+            "deliver=false should not queue outbound channel messages"
+        );
+        assert!(
+            plugin.events().is_empty(),
+            "deliver=false should not emit typing or read-receipt channel activity"
         );
 
         crate::config::clear_cache();
