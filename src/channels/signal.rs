@@ -16,7 +16,7 @@ use crate::plugins::{
 /// Maximum media size to fetch and base64-encode (50 MB).
 const MAX_MEDIA_BYTES: u64 = 50 * 1024 * 1024;
 const SIGNAL_HTTP_CONNECT_TIMEOUT_SECS: u64 = 5;
-const SIGNAL_HTTP_TYPING_TIMEOUT_SECS: u64 = 5;
+pub(crate) const SIGNAL_HTTP_TYPING_TIMEOUT_SECS: u64 = 5;
 const SIGNAL_HTTP_RECEIPT_TIMEOUT_SECS: u64 = 2;
 const SIGNAL_HTTP_SEND_TIMEOUT_SECS: u64 = 15;
 const SIGNAL_HTTP_MEDIA_TIMEOUT_SECS: u64 = 120;
@@ -235,6 +235,80 @@ fn signal_http_error_message_with_body_prefix(
 }
 
 fn sanitize_signal_error_excerpt(body_text: &str) -> String {
+    let sanitized = sanitize_signal_error_json(body_text)
+        .unwrap_or_else(|| sanitize_signal_error_text(body_text));
+    let trimmed = sanitized.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let excerpt: String = trimmed.chars().take(120).collect();
+    if trimmed.chars().count() > 120 {
+        format!("{excerpt}...")
+    } else {
+        excerpt
+    }
+}
+
+fn sanitize_signal_error_json(body_text: &str) -> Option<String> {
+    let mut value: serde_json::Value = serde_json::from_str(body_text).ok()?;
+    sanitize_signal_error_json_value(&mut value, None);
+    serde_json::to_string(&value).ok()
+}
+
+fn sanitize_signal_error_json_value(value: &mut serde_json::Value, label: Option<&str>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, entry) in map.iter_mut() {
+                sanitize_signal_error_json_value(entry, Some(key.as_str()));
+            }
+        }
+        serde_json::Value::Array(entries) => {
+            for entry in entries {
+                sanitize_signal_error_json_value(entry, label);
+            }
+        }
+        serde_json::Value::String(text) => {
+            if should_redact_signal_json_string(label, text) {
+                *text = "[redacted]".to_string();
+            } else {
+                *text = sanitize_signal_error_text(text);
+            }
+        }
+        serde_json::Value::Number(number) => {
+            if should_redact_signal_json_number(label, number) {
+                *value = serde_json::Value::String("[redacted]".to_string());
+            }
+        }
+        _ => {}
+    }
+}
+
+fn should_redact_signal_json_string(label: Option<&str>, value: &str) -> bool {
+    if let Some(label) = label {
+        if is_secret_numeric_label(label) && looks_like_short_secret_numeric(value) {
+            return true;
+        }
+        if preserves_numeric_label(label) {
+            return false;
+        }
+    }
+    looks_like_phoneish_value(value)
+}
+
+fn should_redact_signal_json_number(label: Option<&str>, number: &serde_json::Number) -> bool {
+    let rendered = number.to_string();
+    if let Some(label) = label {
+        if is_secret_numeric_label(label) && looks_like_short_secret_numeric(&rendered) {
+            return true;
+        }
+        if preserves_numeric_label(label) {
+            return false;
+        }
+    }
+    looks_like_phoneish_value(&rendered)
+}
+
+fn sanitize_signal_error_text(body_text: &str) -> String {
     static SECRET_LABELED_NUMERIC_RE: std::sync::LazyLock<regex::Regex> =
         std::sync::LazyLock::new(|| {
             regex::Regex::new(r"(?i)\b(code|otp|pin|verification|confirmation)([:=])(\d{4,8})\b")
@@ -282,23 +356,35 @@ fn sanitize_signal_error_excerpt(body_text: &str) -> String {
     let collapsed = EMBEDDED_PHONE_RE
         .replace_all(&collapsed, "[redacted]")
         .into_owned();
-    let trimmed = collapsed.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-    let excerpt: String = trimmed.chars().take(120).collect();
-    if trimmed.chars().count() > 120 {
-        format!("{excerpt}...")
-    } else {
-        excerpt
-    }
+    collapsed
 }
 
 fn preserves_numeric_label(label: &str) -> bool {
     matches!(
         label.to_ascii_lowercase().as_str(),
-        "port" | "status" | "ref"
+        "port" | "status" | "ref" | "bytes" | "count" | "size" | "timeout" | "offset" | "delay"
     )
+}
+
+fn is_secret_numeric_label(label: &str) -> bool {
+    matches!(
+        label.to_ascii_lowercase().as_str(),
+        "code" | "otp" | "pin" | "verification" | "confirmation"
+    )
+}
+
+fn looks_like_short_secret_numeric(value: &str) -> bool {
+    let trimmed = value.trim();
+    (4..=8).contains(&trimmed.len()) && trimmed.chars().all(|ch| ch.is_ascii_digit())
+}
+
+fn looks_like_phoneish_value(value: &str) -> bool {
+    let trimmed = value.trim();
+    let digit_count = trimmed.chars().filter(|ch| ch.is_ascii_digit()).count();
+    digit_count >= 8
+        && trimmed
+            .chars()
+            .all(|ch| ch.is_ascii_digit() || matches!(ch, '+' | '(' | ')' | '.' | ':' | '-' | ' '))
 }
 
 fn redact_sensitive_signal_token(token: &str) -> String {
@@ -782,6 +868,30 @@ mod tests {
         assert!(!message.contains("123456"));
         assert!(!message.contains("4321"));
         assert!(!message.contains("9876"));
+    }
+
+    #[test]
+    fn test_signal_http_error_message_redacts_json_phone_fields_without_plus_prefix() {
+        let message = signal_http_error_message_with_body_prefix(
+            "signal send",
+            StatusCode::BAD_REQUEST,
+            r#"{"recipient":"15551234567","detail":"invalid number"}"#,
+        );
+        assert!(message.contains(r#""recipient":"[redacted]""#));
+        assert!(message.contains("invalid number"));
+        assert!(!message.contains("15551234567"));
+    }
+
+    #[test]
+    fn test_signal_http_error_message_preserves_safe_json_numeric_labels() {
+        let message = signal_http_error_message_with_body_prefix(
+            "signal send",
+            StatusCode::BAD_REQUEST,
+            r#"{"bytes":12345678,"count":87654321,"delay":99999999}"#,
+        );
+        assert!(message.contains(r#""bytes":12345678"#));
+        assert!(message.contains(r#""count":87654321"#));
+        assert!(message.contains(r#""delay":99999999"#));
     }
 
     #[test]

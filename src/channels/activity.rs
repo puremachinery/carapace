@@ -15,7 +15,7 @@
 //!   iteration snapshots its activity policy before polling and dispatch.
 
 use std::any::Any;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc as sync_mpsc;
@@ -34,12 +34,17 @@ use tokio_util::sync::CancellationToken;
 use crate::plugins::{
     BindingError, ChannelPluginInstance, PluginRegistry, ReadReceiptContext, TypingContext,
 };
-use crate::runtime_bridge::{run_blocking_value, run_sync_blocking_send};
+use crate::runtime_bridge::run_sync_blocking_send;
 
 const DEFAULT_TYPING_INTERVAL_SECONDS: u32 = 3;
 const MAX_TYPING_REFRESH_BACKOFF_SECONDS: u64 = 30;
 const ACTIVITY_DISPATCH_BACKLOG_WARNING_THRESHOLD: usize = 64;
-const ACTIVITY_DISPATCH_SHUTDOWN_GRACE_MS: u64 = 250;
+// This budget must stay at or above the longest built-in activity operation
+// timeout so graceful shutdown drains already-queued work instead of routinely
+// dropping it. It currently matches Signal's bounded typing timeout.
+const ACTIVITY_DISPATCH_SHUTDOWN_GRACE_MS: u64 =
+    crate::channels::signal::SIGNAL_HTTP_TYPING_TIMEOUT_SECS * 1000;
+const UNSUPPORTED_ACTIVITY_WARNING_COOLDOWN_SECS: u64 = 300;
 // Stop-state machine:
 // - NOT_REQUESTED -> TASK_RESERVED -> TASK_RUNNING -> COMPLETED
 // - NOT_REQUESTED -> FALLBACK_RESERVED -> COMPLETED
@@ -53,8 +58,49 @@ const STOP_STATE_TASK_RUNNING: u8 = 2;
 const STOP_STATE_FALLBACK_RESERVED: u8 = 3;
 const STOP_STATE_COMPLETED: u8 = 4;
 
-static UNSUPPORTED_ACTIVITY_FEATURE_WARNINGS: LazyLock<Mutex<HashSet<String>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
+struct UnsupportedActivityWarningRegistry {
+    seen_at: HashMap<String, Instant>,
+    cooldown: Duration,
+}
+
+impl Default for UnsupportedActivityWarningRegistry {
+    fn default() -> Self {
+        Self {
+            seen_at: HashMap::new(),
+            cooldown: Duration::from_secs(UNSUPPORTED_ACTIVITY_WARNING_COOLDOWN_SECS),
+        }
+    }
+}
+
+impl UnsupportedActivityWarningRegistry {
+    fn should_warn(&mut self, key: &str, now: Instant) -> bool {
+        self.seen_at
+            .retain(|_, last_seen| now.saturating_duration_since(*last_seen) < self.cooldown);
+        match self.seen_at.get(key) {
+            Some(last_seen) if now.saturating_duration_since(*last_seen) < self.cooldown => false,
+            _ => {
+                self.seen_at.insert(key.to_string(), now);
+                true
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn with_cooldown_for_test(cooldown: Duration) -> Self {
+        Self {
+            seen_at: HashMap::new(),
+            cooldown,
+        }
+    }
+
+    #[cfg(test)]
+    fn reset(&mut self) {
+        self.seen_at.clear();
+    }
+}
+
+static UNSUPPORTED_ACTIVITY_FEATURE_WARNINGS: LazyLock<Mutex<UnsupportedActivityWarningRegistry>> =
+    LazyLock::new(|| Mutex::new(UnsupportedActivityWarningRegistry::default()));
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -488,7 +534,18 @@ pub async fn load_channel_activity_policy_async(channel: &str) -> ChannelActivit
     }
 
     let channel = channel.to_string();
-    run_blocking_value(move || load_channel_activity_policy(&channel))
+    let worker_channel = channel.clone();
+    match tokio::task::spawn_blocking(move || load_channel_activity_policy(&worker_channel)).await {
+        Ok(policy) => policy,
+        Err(err) => {
+            tracing::warn!(
+                channel = %channel,
+                error = %err,
+                "failed to load channel activity policy on blocking worker; using disabled defaults"
+            );
+            ChannelActivityPolicy::default()
+        }
+    }
 }
 
 fn apply_legacy_session_typing_fallback(config: &Value, policy: &mut TypingFeaturePolicy) {
@@ -975,8 +1032,11 @@ fn dispatch_stop_typing_blocking(
 
 pub(crate) fn warn_unsupported_activity_feature(channel_id: &str, feature: &str) {
     let key = format!("{channel_id}:{feature}");
-    let mut seen = UNSUPPORTED_ACTIVITY_FEATURE_WARNINGS.lock();
-    if seen.insert(key) {
+    let should_warn = {
+        let mut registry = UNSUPPORTED_ACTIVITY_FEATURE_WARNINGS.lock();
+        registry.should_warn(&key, Instant::now())
+    };
+    if should_warn {
         tracing::warn!(
             channel = %channel_id,
             feature,
@@ -987,7 +1047,7 @@ pub(crate) fn warn_unsupported_activity_feature(channel_id: &str, feature: &str)
 
 #[cfg(test)]
 fn reset_unsupported_activity_feature_warnings_for_test() {
-    UNSUPPORTED_ACTIVITY_FEATURE_WARNINGS.lock().clear();
+    UNSUPPORTED_ACTIVITY_FEATURE_WARNINGS.lock().reset();
 }
 
 fn panic_payload_to_string(payload: Box<dyn Any + Send + 'static>) -> String {
@@ -1926,9 +1986,24 @@ mod tests {
         warn_unsupported_activity_feature("signal", "typing");
         assert!(UNSUPPORTED_ACTIVITY_FEATURE_WARNINGS
             .lock()
-            .contains("signal:typing"));
+            .seen_at
+            .contains_key("signal:typing"));
 
         reset_unsupported_activity_feature_warnings_for_test();
-        assert!(UNSUPPORTED_ACTIVITY_FEATURE_WARNINGS.lock().is_empty());
+        assert!(UNSUPPORTED_ACTIVITY_FEATURE_WARNINGS
+            .lock()
+            .seen_at
+            .is_empty());
+    }
+
+    #[test]
+    fn test_unsupported_activity_warning_registry_rewarns_after_cooldown() {
+        let mut registry =
+            UnsupportedActivityWarningRegistry::with_cooldown_for_test(Duration::from_secs(1));
+        let start = Instant::now();
+
+        assert!(registry.should_warn("signal:typing", start));
+        assert!(!registry.should_warn("signal:typing", start + Duration::from_millis(500)));
+        assert!(registry.should_warn("signal:typing", start + Duration::from_secs(2)));
     }
 }
