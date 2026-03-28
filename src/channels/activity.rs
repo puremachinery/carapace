@@ -39,11 +39,20 @@ const DEFAULT_TYPING_INTERVAL_SECONDS: u32 = 3;
 const MAX_TYPING_REFRESH_BACKOFF_SECONDS: u64 = 30;
 const ACTIVITY_DISPATCH_BACKLOG_WARNING_THRESHOLD: usize = 64;
 const READ_RECEIPT_DISPATCH_QUEUE_CAPACITY: usize = 128;
+const ACTIVITY_BLOCKING_IO_MAX_SECS: u64 = 5;
 // This budget must stay at or above the longest built-in activity operation
 // timeout so graceful shutdown drains already-queued work instead of routinely
-// dropping it. It currently matches Signal's bounded typing timeout.
-const ACTIVITY_DISPATCH_SHUTDOWN_GRACE_MS: u64 =
-    crate::channels::signal::SIGNAL_HTTP_TYPING_TIMEOUT_SECS * 1000;
+// dropping it. Built-in channel activity implementations must keep their own
+// blocking I/O bounded within this shared ceiling.
+const ACTIVITY_DISPATCH_SHUTDOWN_GRACE_MS: u64 = ACTIVITY_BLOCKING_IO_MAX_SECS * 1000;
+const _: () = {
+    assert!(
+        ACTIVITY_BLOCKING_IO_MAX_SECS >= crate::channels::signal::SIGNAL_HTTP_TYPING_TIMEOUT_SECS
+    );
+    assert!(
+        ACTIVITY_BLOCKING_IO_MAX_SECS >= crate::channels::signal::SIGNAL_HTTP_RECEIPT_TIMEOUT_SECS
+    );
+};
 const UNSUPPORTED_ACTIVITY_WARNING_COOLDOWN_SECS: u64 = 300;
 // Stop-state machine:
 // - NOT_REQUESTED -> TASK_RESERVED -> TASK_RUNNING -> COMPLETED
@@ -588,41 +597,27 @@ impl Drop for TypingLoopHandle {
                     }
                 }
             }
-            Ok(_) => {
-                if let Some(task) = self.task.take() {
-                    task.abort();
-                    observe_finished_typing_task_after_abort(
-                        task,
-                        self.runtime_handle.clone(),
-                        &self.channel_id,
-                    );
-                    if stop_fallback_needed(self.stop_state.as_ref()) {
-                        self.activity_dispatcher.dispatch_stop_typing(
-                            self.plugin.clone(),
-                            &self.channel_id,
-                            self.ctx.clone(),
-                            self.stop_state.clone(),
-                        );
-                    }
-                }
-            }
-            Err(_) => {
-                if let Some(task) = self.task.take() {
-                    task.abort();
-                    observe_finished_typing_task_after_abort(
-                        task,
-                        self.runtime_handle.clone(),
-                        &self.channel_id,
-                    );
-                    if stop_fallback_needed(self.stop_state.as_ref()) {
-                        self.activity_dispatcher.dispatch_stop_typing(
-                            self.plugin.clone(),
-                            &self.channel_id,
-                            self.ctx.clone(),
-                            self.stop_state.clone(),
-                        );
-                    }
-                }
+            _ => self.drop_without_multithread_runtime(),
+        }
+    }
+}
+
+impl TypingLoopHandle {
+    fn drop_without_multithread_runtime(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+            observe_finished_typing_task_after_abort(
+                task,
+                self.runtime_handle.clone(),
+                &self.channel_id,
+            );
+            if stop_fallback_needed(self.stop_state.as_ref()) {
+                self.activity_dispatcher.dispatch_stop_typing(
+                    self.plugin.clone(),
+                    &self.channel_id,
+                    self.ctx.clone(),
+                    self.stop_state.clone(),
+                );
             }
         }
     }
