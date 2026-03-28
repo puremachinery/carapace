@@ -7,8 +7,10 @@
 //! - `WsServerState` owns the runtime activity service and is the only runtime
 //!   shutdown entrypoint.
 //! - shutdown closes intake first, then drains already-queued work until a
-//!   deadline using bounded per-operation execution.
+//!   deadline, joining the real worker threads directly.
 //! - work still queued after the deadline is dropped explicitly with logging.
+//! - activity-capable channel implementations must bound their own blocking
+//!   I/O; the dispatcher does not spawn detached per-operation timeout threads.
 //! - config reload only affects future polls/messages because each receive loop
 //!   iteration snapshots its activity policy before polling and dispatch.
 
@@ -37,7 +39,6 @@ use crate::runtime_bridge::{run_blocking_value, run_sync_blocking_send};
 const DEFAULT_TYPING_INTERVAL_SECONDS: u32 = 3;
 const MAX_TYPING_REFRESH_BACKOFF_SECONDS: u64 = 30;
 const ACTIVITY_DISPATCH_BACKLOG_WARNING_THRESHOLD: usize = 64;
-const ACTIVITY_DISPATCH_OPERATION_TIMEOUT_SECS: u64 = 10;
 const ACTIVITY_DISPATCH_SHUTDOWN_GRACE_MS: u64 = 250;
 const STOP_STATE_NOT_REQUESTED: u8 = 0;
 const STOP_STATE_TASK_RESERVED: u8 = 1;
@@ -148,24 +149,15 @@ impl Default for ActivityDispatcher {
 
 impl ActivityDispatcher {
     pub fn new() -> Self {
-        Self::with_options(
-            ACTIVITY_DISPATCH_BACKLOG_WARNING_THRESHOLD,
-            Duration::from_secs(ACTIVITY_DISPATCH_OPERATION_TIMEOUT_SECS),
-        )
+        Self::with_options(ACTIVITY_DISPATCH_BACKLOG_WARNING_THRESHOLD)
     }
 
     #[cfg(test)]
     pub(crate) fn with_backlog_warning_threshold(backlog_warning_threshold: usize) -> Self {
-        Self::with_options(
-            backlog_warning_threshold,
-            Duration::from_secs(ACTIVITY_DISPATCH_OPERATION_TIMEOUT_SECS),
-        )
+        Self::with_options(backlog_warning_threshold)
     }
 
-    pub(crate) fn with_options(
-        backlog_warning_threshold: usize,
-        operation_timeout: Duration,
-    ) -> Self {
+    pub(crate) fn with_options(backlog_warning_threshold: usize) -> Self {
         let read_receipt_backlog = Arc::new(AtomicUsize::new(0));
         let stop_typing_backlog = Arc::new(AtomicUsize::new(0));
         let shutting_down = Arc::new(AtomicBool::new(false));
@@ -180,7 +172,6 @@ impl ActivityDispatcher {
         let read_receipt_backlog_worker = read_receipt_backlog.clone();
         let read_receipt_shutdown = shutting_down.clone();
         let read_receipt_deadline = shutdown_deadline.clone();
-        let read_receipt_timeout = operation_timeout;
         let read_receipt_worker = thread::Builder::new()
             .name("carapace-read-receipts".to_string())
             .spawn(move || {
@@ -197,7 +188,6 @@ impl ActivityDispatcher {
                         request.plugin,
                         &request.channel_id,
                         request.ctx,
-                        read_receipt_timeout,
                     );
                 }
             })
@@ -207,7 +197,6 @@ impl ActivityDispatcher {
         let stop_typing_backlog_worker = stop_typing_backlog.clone();
         let stop_typing_shutdown = shutting_down.clone();
         let stop_typing_deadline = shutdown_deadline.clone();
-        let stop_typing_timeout = operation_timeout;
         let stop_typing_worker = thread::Builder::new()
             .name("carapace-stop-typing".to_string())
             .spawn(move || {
@@ -230,7 +219,6 @@ impl ActivityDispatcher {
                         &request.channel_id,
                         request.ctx,
                         request.stop_state,
-                        stop_typing_timeout,
                     );
                 }
             })
@@ -838,50 +826,6 @@ fn join_activity_worker(worker: thread::JoinHandle<()>, activity: &'static str) 
     }
 }
 
-enum ActivityOperationOutcome {
-    Ok,
-    Error(BindingError),
-    TimedOut,
-    Panicked(String),
-    SpawnFailed(String),
-    Disconnected,
-}
-
-fn run_activity_operation_with_timeout<F>(
-    activity: &'static str,
-    timeout: Duration,
-    operation: F,
-) -> ActivityOperationOutcome
-where
-    F: FnOnce() -> Result<(), BindingError> + Send + 'static,
-{
-    let (done_tx, done_rx) = sync_mpsc::sync_channel(1);
-    // Blocking threads cannot be force-cancelled in-process, so bound the
-    // worker's wait time here and let shutdown join the real worker threads
-    // directly after they drain or skip queued work.
-    match thread::Builder::new()
-        .name(format!("carapace-{activity}-op"))
-        .spawn(move || {
-            let outcome = match catch_unwind(AssertUnwindSafe(operation)) {
-                Ok(Ok(())) => ActivityOperationOutcome::Ok,
-                Ok(Err(err)) => ActivityOperationOutcome::Error(err),
-                Err(payload) => {
-                    ActivityOperationOutcome::Panicked(panic_payload_to_string(payload))
-                }
-            };
-            let _ = done_tx.send(outcome);
-        }) {
-        Ok(_op_thread) => match done_rx.recv_timeout(timeout) {
-            Ok(outcome) => outcome,
-            Err(sync_mpsc::RecvTimeoutError::Timeout) => ActivityOperationOutcome::TimedOut,
-            Err(sync_mpsc::RecvTimeoutError::Disconnected) => {
-                ActivityOperationOutcome::Disconnected
-            }
-        },
-        Err(err) => ActivityOperationOutcome::SpawnFailed(err.to_string()),
-    }
-}
-
 async fn invoke_stop_typing_with_running_state(
     plugin: Arc<dyn ChannelPluginInstance>,
     ctx: TypingContext,
@@ -933,12 +877,7 @@ async fn send_verified_read_receipt_with_plugin(
     let channel_id = channel_id.to_string();
     let worker_channel_id = channel_id.clone();
     match tokio::task::spawn_blocking(move || {
-        dispatch_read_receipt_blocking(
-            plugin,
-            &worker_channel_id,
-            ctx,
-            Duration::from_secs(ACTIVITY_DISPATCH_OPERATION_TIMEOUT_SECS),
-        );
+        dispatch_read_receipt_blocking(plugin, &worker_channel_id, ctx);
     })
     .await
     {
@@ -984,40 +923,17 @@ fn dispatch_read_receipt_blocking(
     plugin: Arc<dyn ChannelPluginInstance>,
     channel_id: &str,
     ctx: ReadReceiptContext,
-    timeout: Duration,
 ) {
-    match run_activity_operation_with_timeout("read-receipt", timeout, move || {
-        plugin.mark_read(ctx)
-    }) {
-        ActivityOperationOutcome::Ok => {}
-        ActivityOperationOutcome::Error(err) => {
+    match catch_unwind(AssertUnwindSafe(|| plugin.mark_read(ctx))) {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
             tracing::warn!(channel = %channel_id, error = %err, "failed to send read receipt");
         }
-        ActivityOperationOutcome::TimedOut => {
+        Err(payload) => {
             tracing::warn!(
                 channel = %channel_id,
-                timeout_ms = timeout.as_millis(),
-                "read receipt timed out in activity dispatcher"
-            );
-        }
-        ActivityOperationOutcome::Panicked(error) => {
-            tracing::warn!(
-                channel = %channel_id,
-                error = %error,
+                error = %panic_payload_to_string(payload),
                 "read receipt dispatcher panicked"
-            );
-        }
-        ActivityOperationOutcome::SpawnFailed(error) => {
-            tracing::warn!(
-                channel = %channel_id,
-                error = %error,
-                "failed to spawn read receipt activity operation"
-            );
-        }
-        ActivityOperationOutcome::Disconnected => {
-            tracing::warn!(
-                channel = %channel_id,
-                "read receipt activity operation disconnected before reporting a result"
             );
         }
     }
@@ -1028,46 +944,23 @@ fn dispatch_stop_typing_blocking(
     channel_id: &str,
     ctx: TypingContext,
     stop_state: Arc<AtomicU8>,
-    timeout: Duration,
 ) {
-    let result = run_activity_operation_with_timeout("stop-typing", timeout, move || {
-        plugin.stop_typing(ctx)
-    });
+    let result = catch_unwind(AssertUnwindSafe(|| plugin.stop_typing(ctx)));
     mark_stop_completed(stop_state.as_ref());
     match result {
-        ActivityOperationOutcome::Ok => {}
-        ActivityOperationOutcome::Error(err) => {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
             tracing::warn!(
                 channel = %channel_id,
                 error = %err,
                 "failed to stop typing indicator after drop"
             );
         }
-        ActivityOperationOutcome::TimedOut => {
+        Err(payload) => {
             tracing::warn!(
                 channel = %channel_id,
-                timeout_ms = timeout.as_millis(),
-                "stop typing activity timed out during cleanup"
-            );
-        }
-        ActivityOperationOutcome::Panicked(error) => {
-            tracing::warn!(
-                channel = %channel_id,
-                error = %error,
+                error = %panic_payload_to_string(payload),
                 "stop typing dispatcher panicked"
-            );
-        }
-        ActivityOperationOutcome::SpawnFailed(error) => {
-            tracing::warn!(
-                channel = %channel_id,
-                error = %error,
-                "failed to spawn stop typing activity operation"
-            );
-        }
-        ActivityOperationOutcome::Disconnected => {
-            tracing::warn!(
-                channel = %channel_id,
-                "stop typing activity operation disconnected before reporting a result"
             );
         }
     }
@@ -1806,17 +1699,17 @@ mod tests {
     }
 
     #[test]
-    fn test_activity_dispatcher_shutdown_returns_promptly_when_worker_operation_stalls() {
-        let dispatcher = ActivityDispatcher::with_options(8, Duration::from_millis(5));
+    fn test_activity_dispatcher_shutdown_waits_for_inflight_bounded_operation() {
+        let dispatcher = ActivityDispatcher::with_options(8);
         let plugin = Arc::new(MockChannel::with_mark_read_delay(
             ChannelCapabilities {
                 read_receipts: true,
                 ..Default::default()
             },
-            Duration::from_millis(250),
+            Duration::from_millis(25),
         ));
         dispatcher.dispatch_verified_read_receipt(
-            plugin,
+            plugin.clone(),
             "signal",
             ReadReceiptContext {
                 recipient: "+15551234567".to_string(),
@@ -1828,14 +1721,15 @@ mod tests {
         dispatcher.shutdown();
 
         assert!(
-            started_at.elapsed() < Duration::from_millis(100),
-            "dispatcher shutdown should stay bounded when an activity operation stalls"
+            started_at.elapsed() >= Duration::from_millis(20),
+            "shutdown should wait for the in-flight bounded activity operation"
         );
+        assert_eq!(plugin.mark_read_count.load(Ordering::Relaxed), 1);
     }
 
     #[test]
     fn test_activity_dispatcher_shutdown_drains_queued_read_receipts_until_deadline() {
-        let dispatcher = ActivityDispatcher::with_options(8, Duration::from_millis(50));
+        let dispatcher = ActivityDispatcher::with_options(8);
         let plugin = Arc::new(MockChannel::with_mark_read_delay(
             ChannelCapabilities {
                 read_receipts: true,

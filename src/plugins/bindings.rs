@@ -215,16 +215,28 @@ pub trait ChannelPluginInstance: Send + Sync {
     fn send_media(&self, ctx: OutboundContext) -> Result<DeliveryResult, BindingError>;
 
     /// Start or refresh a typing indicator for a channel-specific recipient.
+    ///
+    /// Implementations must bound any blocking I/O internally. The activity
+    /// dispatcher joins its real worker threads during shutdown rather than
+    /// spawning detached timeout wrappers around these calls.
     fn start_typing(&self, _ctx: TypingContext) -> Result<(), BindingError> {
         Ok(())
     }
 
     /// Stop a typing indicator for a channel-specific recipient.
+    ///
+    /// Implementations must bound any blocking I/O internally. The activity
+    /// dispatcher joins its real worker threads during shutdown rather than
+    /// spawning detached timeout wrappers around these calls.
     fn stop_typing(&self, _ctx: TypingContext) -> Result<(), BindingError> {
         Ok(())
     }
 
     /// Mark a channel-specific message or conversation as read.
+    ///
+    /// Implementations must bound any blocking I/O internally. The activity
+    /// dispatcher joins its real worker threads during shutdown rather than
+    /// spawning detached timeout wrappers around these calls.
     fn mark_read(&self, _ctx: ReadReceiptContext) -> Result<(), BindingError> {
         Ok(())
     }
