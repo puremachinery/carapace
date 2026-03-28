@@ -225,12 +225,20 @@ fn signal_http_error_message_with_body_prefix(
 }
 
 fn sanitize_signal_error_excerpt(body_text: &str) -> String {
-    static LABELED_PHONE_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(
-            r"(?i)\b(recipient|source|sender|number)([:=])(\+?\d(?:[\d().:\-]{5,}\d))",
-        )
-        .expect("valid labeled phone regex")
-    });
+    static KNOWN_LABELED_PHONE_RE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| {
+            regex::Regex::new(
+                r"(?i)\b(recipient|source|sender|number)([:=])(\+?\d(?:[\d().:\-]{5,}\d))",
+            )
+            .expect("valid labeled phone regex")
+        });
+    static GENERIC_LABELED_PHONE_RE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| {
+            regex::Regex::new(
+                r"(?i)\b([A-Za-z][A-Za-z0-9_-]{0,31})([:=])(\+?\d(?:[\d().:\-]{8,}\d))",
+            )
+            .expect("valid generic labeled phone regex")
+        });
     static EMBEDDED_PHONE_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r"\+\d(?:[\d().:\-]{5,}\d)").expect("valid embedded phone regex")
     });
@@ -240,8 +248,18 @@ fn sanitize_signal_error_excerpt(body_text: &str) -> String {
         .map(redact_sensitive_signal_token)
         .collect::<Vec<_>>()
         .join(" ");
-    let collapsed = LABELED_PHONE_RE
+    let collapsed = KNOWN_LABELED_PHONE_RE
         .replace_all(&collapsed, "$1$2[redacted]")
+        .into_owned();
+    let collapsed = GENERIC_LABELED_PHONE_RE
+        .replace_all(&collapsed, |captures: &regex::Captures<'_>| {
+            let label = &captures[1];
+            if preserves_numeric_label(label) {
+                captures[0].to_string()
+            } else {
+                format!("{}{}[redacted]", label, &captures[2])
+            }
+        })
         .into_owned();
     let collapsed = EMBEDDED_PHONE_RE
         .replace_all(&collapsed, "[redacted]")
@@ -256,6 +274,13 @@ fn sanitize_signal_error_excerpt(body_text: &str) -> String {
     } else {
         excerpt
     }
+}
+
+fn preserves_numeric_label(label: &str) -> bool {
+    matches!(
+        label.to_ascii_lowercase().as_str(),
+        "port" | "code" | "status" | "ref"
+    )
 }
 
 fn redact_sensitive_signal_token(token: &str) -> String {
@@ -663,6 +688,19 @@ mod tests {
         assert!(message.contains("source=[redacted]"));
         assert!(!message.contains("15551234567"));
         assert!(!message.contains("15557654321"));
+    }
+
+    #[test]
+    fn test_signal_http_error_message_redacts_generic_labeled_phone_values() {
+        let message = signal_http_error_message_with_body_prefix(
+            "signal send",
+            StatusCode::BAD_REQUEST,
+            "to:16175550123 account=16175550124 rejected by upstream",
+        );
+        assert!(message.contains("to:[redacted]"));
+        assert!(message.contains("account=[redacted]"));
+        assert!(!message.contains("16175550123"));
+        assert!(!message.contains("16175550124"));
     }
 
     #[test]

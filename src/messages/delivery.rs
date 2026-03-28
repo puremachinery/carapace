@@ -22,7 +22,7 @@ pub async fn delivery_loop(
     pipeline: Arc<MessagePipeline>,
     plugin_registry: Arc<PluginRegistry>,
     channel_registry: Arc<ChannelRegistry>,
-    _state: Arc<WsServerState>,
+    state: Arc<WsServerState>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     loop {
@@ -47,7 +47,7 @@ pub async fn delivery_loop(
             &pipeline,
             &plugin_registry,
             &channel_registry,
-            crate::channels::activity::shared_activity_dispatcher(),
+            state.activity_dispatcher(),
         )
         .await;
     }
@@ -189,7 +189,7 @@ async fn handle_delivery_result(
             if let Some(read_receipt) = metadata.read_receipt.clone() {
                 // Keep delivery success on the hot path and dispatch read
                 // receipts through the owned activity worker.
-                activity_dispatcher.try_dispatch_verified_read_receipt(
+                activity_dispatcher.dispatch_verified_read_receipt(
                     plugin.clone(),
                     channel_id,
                     read_receipt,
@@ -471,7 +471,7 @@ mod tests {
     }
 
     fn test_activity_dispatcher() -> crate::channels::activity::ActivityDispatcher {
-        crate::channels::activity::ActivityDispatcher::with_queue_capacity(8)
+        crate::channels::activity::ActivityDispatcher::with_backlog_warning_threshold(8)
     }
 
     fn make_pipeline_and_registries(

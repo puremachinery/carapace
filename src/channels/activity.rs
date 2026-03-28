@@ -5,9 +5,9 @@
 
 use std::any::Any;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc as sync_mpsc;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -25,7 +25,7 @@ use crate::runtime_bridge::{run_blocking_value, run_sync_blocking_send};
 
 const DEFAULT_TYPING_INTERVAL_SECONDS: u32 = 3;
 const MAX_TYPING_REFRESH_BACKOFF_SECONDS: u64 = 30;
-const READ_RECEIPT_DISPATCH_QUEUE_CAPACITY: usize = 64;
+const ACTIVITY_DISPATCH_BACKLOG_WARNING_THRESHOLD: usize = 64;
 const STOP_STATE_NOT_REQUESTED: u8 = 0;
 const STOP_STATE_TASK_RESERVED: u8 = 1;
 const STOP_STATE_TASK_RUNNING: u8 = 2;
@@ -94,6 +94,7 @@ pub struct TypingLoopHandle {
     ctx: TypingContext,
     channel_id: String,
     stop_state: Arc<AtomicU8>,
+    activity_dispatcher: Arc<ActivityDispatcher>,
 }
 
 // Read-receipt requests are only enqueued after policy/capability checks pass
@@ -112,10 +113,13 @@ struct StopTypingDispatchRequest {
 }
 
 pub struct ActivityDispatcher {
-    read_receipt_tx: Mutex<Option<sync_mpsc::SyncSender<VerifiedReadReceiptDispatchRequest>>>,
+    read_receipt_tx: Mutex<Option<sync_mpsc::Sender<VerifiedReadReceiptDispatchRequest>>>,
     read_receipt_worker: Mutex<Option<thread::JoinHandle<()>>>,
     stop_typing_tx: Mutex<Option<sync_mpsc::Sender<StopTypingDispatchRequest>>>,
     stop_typing_worker: Mutex<Option<thread::JoinHandle<()>>>,
+    read_receipt_backlog: Arc<AtomicUsize>,
+    stop_typing_backlog: Arc<AtomicUsize>,
+    backlog_warning_threshold: usize,
 }
 
 impl Default for ActivityDispatcher {
@@ -126,16 +130,25 @@ impl Default for ActivityDispatcher {
 
 impl ActivityDispatcher {
     pub fn new() -> Self {
-        Self::with_queue_capacity(READ_RECEIPT_DISPATCH_QUEUE_CAPACITY)
+        Self::with_backlog_warning_threshold(ACTIVITY_DISPATCH_BACKLOG_WARNING_THRESHOLD)
     }
 
-    pub(crate) fn with_queue_capacity(read_receipt_capacity: usize) -> Self {
+    pub(crate) fn with_backlog_warning_threshold(backlog_warning_threshold: usize) -> Self {
+        let read_receipt_backlog = Arc::new(AtomicUsize::new(0));
+        let stop_typing_backlog = Arc::new(AtomicUsize::new(0));
+
+        // Once upstream auto-receipts are disabled, Carapace owns explicit
+        // read-receipt delivery for the message. Keep this queue non-lossy so
+        // slow receipt I/O cannot silently drop acknowledgements; observe
+        // backlog growth instead of dropping work.
         let (read_receipt_tx, read_receipt_rx) =
-            sync_mpsc::sync_channel::<VerifiedReadReceiptDispatchRequest>(read_receipt_capacity);
+            sync_mpsc::channel::<VerifiedReadReceiptDispatchRequest>();
+        let read_receipt_backlog_worker = read_receipt_backlog.clone();
         let read_receipt_worker = thread::Builder::new()
             .name("carapace-read-receipts".to_string())
             .spawn(move || {
                 while let Ok(request) = read_receipt_rx.recv() {
+                    read_receipt_backlog_worker.fetch_sub(1, Ordering::AcqRel);
                     dispatch_read_receipt_blocking(
                         request.plugin,
                         &request.channel_id,
@@ -146,14 +159,16 @@ impl ActivityDispatcher {
             .expect("failed to spawn read receipt dispatcher thread");
 
         let (stop_typing_tx, stop_typing_rx) = sync_mpsc::channel::<StopTypingDispatchRequest>();
+        let stop_typing_backlog_worker = stop_typing_backlog.clone();
         let stop_typing_worker = thread::Builder::new()
             .name("carapace-stop-typing".to_string())
             .spawn(move || {
                 // Stop-typing is cleanup, not optional side work. Keep this
-                // queue unbounded so completion bursts cannot drop stop signals;
-                // the queue is still naturally bounded by the number of active
-                // typing loops in the process.
+                // queue non-lossy so completion bursts cannot drop stop
+                // signals; the queue is still naturally bounded by the number
+                // of active typing loops in the runtime.
                 while let Ok(request) = stop_typing_rx.recv() {
+                    stop_typing_backlog_worker.fetch_sub(1, Ordering::AcqRel);
                     dispatch_stop_typing_blocking(
                         request.plugin,
                         &request.channel_id,
@@ -169,10 +184,13 @@ impl ActivityDispatcher {
             read_receipt_worker: Mutex::new(Some(read_receipt_worker)),
             stop_typing_tx: Mutex::new(Some(stop_typing_tx)),
             stop_typing_worker: Mutex::new(Some(stop_typing_worker)),
+            read_receipt_backlog,
+            stop_typing_backlog,
+            backlog_warning_threshold,
         }
     }
 
-    pub fn try_dispatch_verified_read_receipt(
+    pub fn dispatch_verified_read_receipt(
         &self,
         plugin: Arc<dyn ChannelPluginInstance>,
         channel_id: &str,
@@ -191,15 +209,18 @@ impl ActivityDispatcher {
             return;
         };
 
-        match sender.try_send(request) {
+        let backlog = self.read_receipt_backlog.fetch_add(1, Ordering::AcqRel) + 1;
+        log_activity_backlog_if_needed(
+            "read receipt",
+            channel_id,
+            backlog,
+            self.backlog_warning_threshold,
+        );
+
+        match sender.send(request) {
             Ok(()) => {}
-            Err(sync_mpsc::TrySendError::Full(_)) => {
-                tracing::warn!(
-                    channel = %channel_id,
-                    "read receipt dispatch queue is full; dropping read receipt"
-                );
-            }
-            Err(sync_mpsc::TrySendError::Disconnected(_)) => {
+            Err(sync_mpsc::SendError(_)) => {
+                self.read_receipt_backlog.fetch_sub(1, Ordering::AcqRel);
                 tracing::warn!(
                     channel = %channel_id,
                     "read receipt dispatcher is shut down; dropping read receipt"
@@ -208,7 +229,7 @@ impl ActivityDispatcher {
         }
     }
 
-    pub fn try_dispatch_stop_typing(
+    pub fn dispatch_stop_typing(
         &self,
         plugin: Arc<dyn ChannelPluginInstance>,
         channel_id: &str,
@@ -230,9 +251,18 @@ impl ActivityDispatcher {
             return;
         };
 
+        let backlog = self.stop_typing_backlog.fetch_add(1, Ordering::AcqRel) + 1;
+        log_activity_backlog_if_needed(
+            "stop typing",
+            channel_id,
+            backlog,
+            self.backlog_warning_threshold,
+        );
+
         match sender.send(request) {
             Ok(()) => {}
             Err(sync_mpsc::SendError(request)) => {
+                self.stop_typing_backlog.fetch_sub(1, Ordering::AcqRel);
                 mark_stop_completed(request.stop_state.as_ref());
                 tracing::warn!(
                     channel = %channel_id,
@@ -266,13 +296,6 @@ impl ActivityDispatcher {
             }
         }
     }
-}
-
-static SHARED_ACTIVITY_DISPATCHER: LazyLock<ActivityDispatcher> =
-    LazyLock::new(ActivityDispatcher::new);
-
-pub fn shared_activity_dispatcher() -> &'static ActivityDispatcher {
-    &SHARED_ACTIVITY_DISPATCHER
 }
 
 impl std::fmt::Debug for TypingLoopHandle {
@@ -339,7 +362,7 @@ impl Drop for TypingLoopHandle {
                         let _ = task.await;
                     }));
                     if stop_fallback_needed(self.stop_state.as_ref()) {
-                        shared_activity_dispatcher().try_dispatch_stop_typing(
+                        self.activity_dispatcher.dispatch_stop_typing(
                             self.plugin.clone(),
                             &self.channel_id,
                             self.ctx.clone(),
@@ -352,7 +375,7 @@ impl Drop for TypingLoopHandle {
                 if let Some(task) = self.task.take() {
                     task.abort();
                     if stop_fallback_needed(self.stop_state.as_ref()) {
-                        shared_activity_dispatcher().try_dispatch_stop_typing(
+                        self.activity_dispatcher.dispatch_stop_typing(
                             self.plugin.clone(),
                             &self.channel_id,
                             self.ctx.clone(),
@@ -484,6 +507,7 @@ pub async fn maybe_start_typing_loop(
     channel_id: &str,
     policy: &ChannelActivityPolicy,
     prefetched_capabilities: Option<crate::plugins::ChannelCapabilities>,
+    activity_dispatcher: Arc<ActivityDispatcher>,
     ctx: TypingContext,
 ) -> Option<TypingLoopHandle> {
     if !policy.typing.enabled {
@@ -568,6 +592,7 @@ pub async fn maybe_start_typing_loop(
         ctx: handle_ctx,
         channel_id: handle_channel_id,
         stop_state: handle_stop_state,
+        activity_dispatcher,
     })
 }
 
@@ -659,6 +684,22 @@ fn next_typing_refresh_deadline(
 
 fn should_log_typing_refresh_failure(consecutive_failures: u32) -> bool {
     consecutive_failures <= 3 || consecutive_failures.is_power_of_two()
+}
+
+fn log_activity_backlog_if_needed(
+    activity: &str,
+    channel_id: &str,
+    backlog: usize,
+    threshold: usize,
+) {
+    if backlog >= threshold && backlog.is_power_of_two() {
+        tracing::warn!(
+            channel = %channel_id,
+            backlog,
+            activity,
+            "activity dispatcher backlog is growing"
+        );
+    }
 }
 
 async fn invoke_stop_typing_with_running_state(
@@ -829,6 +870,7 @@ mod tests {
         mark_read_count: AtomicU32,
         mark_read_notify: Option<Arc<Notify>>,
         stop_typing_notify: Option<Arc<Notify>>,
+        mark_read_delay: Duration,
         stop_typing_delay: Duration,
         panic_get_capabilities: bool,
         panic_mark_read_count: AtomicU32,
@@ -850,6 +892,7 @@ mod tests {
                 mark_read_count: AtomicU32::new(0),
                 mark_read_notify: None,
                 stop_typing_notify,
+                mark_read_delay: Duration::ZERO,
                 stop_typing_delay: Duration::ZERO,
                 panic_get_capabilities: false,
                 panic_mark_read_count: AtomicU32::new(0),
@@ -873,6 +916,13 @@ mod tests {
         fn with_panicking_mark_read(caps: ChannelCapabilities, panic_count: u32) -> Self {
             Self {
                 panic_mark_read_count: AtomicU32::new(panic_count),
+                ..Self::with_stop_typing_notify(caps, None)
+            }
+        }
+
+        fn with_mark_read_delay(caps: ChannelCapabilities, mark_read_delay: Duration) -> Self {
+            Self {
+                mark_read_delay,
                 ..Self::with_stop_typing_notify(caps, None)
             }
         }
@@ -923,6 +973,9 @@ mod tests {
             if self.panic_mark_read_count.load(Ordering::Relaxed) > 0 {
                 self.panic_mark_read_count.fetch_sub(1, Ordering::Relaxed);
                 panic!("mock mark_read panic");
+            }
+            if !self.mark_read_delay.is_zero() {
+                std::thread::sleep(self.mark_read_delay);
             }
             self.mark_read_count.fetch_add(1, Ordering::Relaxed);
             if let Some(notify) = &self.mark_read_notify {
@@ -1139,11 +1192,13 @@ mod tests {
             ..Default::default()
         };
 
+        let dispatcher = Arc::new(ActivityDispatcher::new());
         let handle = maybe_start_typing_loop(
             registry,
             "signal",
             &policy,
             None,
+            dispatcher.clone(),
             TypingContext {
                 to: "+15551234567".to_string(),
                 ..Default::default()
@@ -1157,6 +1212,7 @@ mod tests {
 
         assert!(plugin.start_typing_count.load(Ordering::Relaxed) >= 1);
         assert_eq!(plugin.stop_typing_count.load(Ordering::Relaxed), 1);
+        dispatcher.shutdown();
     }
 
     #[tokio::test]
@@ -1180,11 +1236,13 @@ mod tests {
             ..Default::default()
         };
 
+        let dispatcher = Arc::new(ActivityDispatcher::new());
         let handle = maybe_start_typing_loop(
             registry,
             "signal",
             &policy,
             None,
+            dispatcher.clone(),
             TypingContext {
                 to: "+15551234567".to_string(),
                 ..Default::default()
@@ -1200,6 +1258,7 @@ mod tests {
 
         assert!(plugin.start_typing_count.load(Ordering::Relaxed) >= 1);
         assert_eq!(plugin.stop_typing_count.load(Ordering::Relaxed), 1);
+        dispatcher.shutdown();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1223,11 +1282,13 @@ mod tests {
             ..Default::default()
         };
 
+        let dispatcher = Arc::new(ActivityDispatcher::new());
         let handle = maybe_start_typing_loop(
             registry,
             "signal",
             &policy,
             None,
+            dispatcher.clone(),
             TypingContext {
                 to: "+15551234567".to_string(),
                 ..Default::default()
@@ -1244,6 +1305,7 @@ mod tests {
 
         assert!(plugin.start_typing_count.load(Ordering::Relaxed) >= 1);
         assert_eq!(plugin.stop_typing_count.load(Ordering::Relaxed), 1);
+        dispatcher.shutdown();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1266,11 +1328,13 @@ mod tests {
             ..Default::default()
         };
 
+        let dispatcher = Arc::new(ActivityDispatcher::new());
         let handle = maybe_start_typing_loop(
             registry,
             "signal",
             &policy,
             None,
+            dispatcher.clone(),
             TypingContext {
                 to: "+15551234567".to_string(),
                 ..Default::default()
@@ -1288,6 +1352,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(350)).await;
         assert_eq!(plugin.stop_typing_count.load(Ordering::Relaxed), 1);
+        dispatcher.shutdown();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1311,11 +1376,13 @@ mod tests {
             ..Default::default()
         };
 
+        let dispatcher = Arc::new(ActivityDispatcher::new());
         let handle = maybe_start_typing_loop(
             registry,
             "signal",
             &policy,
             None,
+            dispatcher.clone(),
             TypingContext {
                 to: "+15551234567".to_string(),
                 ..Default::default()
@@ -1334,6 +1401,7 @@ mod tests {
         tokio::task::yield_now().await;
 
         assert_eq!(plugin.stop_typing_count.load(Ordering::Relaxed), 1);
+        dispatcher.shutdown();
     }
 
     #[tokio::test]
@@ -1477,7 +1545,7 @@ mod tests {
 
     #[test]
     fn test_stop_typing_dispatcher_does_not_drop_bursty_cleanup_requests() {
-        let dispatcher = ActivityDispatcher::with_queue_capacity(1);
+        let dispatcher = ActivityDispatcher::with_backlog_warning_threshold(1);
         let plugin = Arc::new(MockChannel::with_stop_typing_delay(
             ChannelCapabilities {
                 typing_indicators: true,
@@ -1490,7 +1558,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         for stop_state in &stop_states {
-            dispatcher.try_dispatch_stop_typing(
+            dispatcher.dispatch_stop_typing(
                 plugin.clone(),
                 "signal",
                 TypingContext {
@@ -1508,6 +1576,35 @@ mod tests {
         assert!(stop_states
             .iter()
             .all(|state| state.load(Ordering::Acquire) == STOP_STATE_COMPLETED));
+    }
+
+    #[test]
+    fn test_read_receipt_dispatcher_does_not_drop_bursty_requests() {
+        let dispatcher = ActivityDispatcher::with_backlog_warning_threshold(1);
+        let plugin = Arc::new(MockChannel::with_mark_read_delay(
+            ChannelCapabilities {
+                read_receipts: true,
+                ..Default::default()
+            },
+            Duration::from_millis(10),
+        ));
+
+        for timestamp in 0..32_u64 {
+            dispatcher.dispatch_verified_read_receipt(
+                plugin.clone(),
+                "signal",
+                ReadReceiptContext {
+                    recipient: "+15551234567".to_string(),
+                    timestamp: Some(timestamp),
+                    ..Default::default()
+                },
+            );
+        }
+
+        std::thread::sleep(Duration::from_millis(500));
+        dispatcher.shutdown();
+
+        assert_eq!(plugin.mark_read_count.load(Ordering::Relaxed), 32);
     }
 
     #[tokio::test]
@@ -1537,9 +1634,9 @@ mod tests {
             mark_read_notify: Some(notify.clone()),
             ..MockChannel::with_panicking_capabilities(ChannelCapabilities::default())
         });
-        let dispatcher = ActivityDispatcher::with_queue_capacity(8);
+        let dispatcher = ActivityDispatcher::with_backlog_warning_threshold(8);
 
-        dispatcher.try_dispatch_verified_read_receipt(
+        dispatcher.dispatch_verified_read_receipt(
             plugin.clone(),
             "signal",
             ReadReceiptContext {
@@ -1570,9 +1667,9 @@ mod tests {
                 1,
             )
         });
-        let dispatcher = ActivityDispatcher::with_queue_capacity(8);
+        let dispatcher = ActivityDispatcher::with_backlog_warning_threshold(8);
 
-        dispatcher.try_dispatch_verified_read_receipt(
+        dispatcher.dispatch_verified_read_receipt(
             plugin.clone(),
             "signal",
             ReadReceiptContext {
@@ -1581,7 +1678,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        dispatcher.try_dispatch_verified_read_receipt(
+        dispatcher.dispatch_verified_read_receipt(
             plugin.clone(),
             "signal",
             ReadReceiptContext {

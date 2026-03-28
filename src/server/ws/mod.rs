@@ -469,6 +469,8 @@ pub struct WsServerState {
     tools_registry: Option<Arc<plugins::ToolsRegistry>>,
     /// Plugin registry for channel/tool/webhook plugins
     plugin_registry: Option<Arc<plugins::PluginRegistry>>,
+    /// Runtime-owned dispatcher for channel activity side effects.
+    activity_dispatcher: Arc<channels::activity::ActivityDispatcher>,
     /// Retained plugin runtime for instantiated plugin lifetimes and epoch ticker.
     plugin_runtime: Option<Arc<PluginRuntime<credentials::DefaultCredentialBackend>>>,
     /// Startup-time plugin activation report
@@ -494,6 +496,7 @@ impl std::fmt::Debug for WsServerState {
                 "plugin_registry",
                 &self.plugin_registry.as_ref().map(|_| ".."),
             )
+            .field("activity_dispatcher", &"..")
             .field(
                 "plugin_runtime",
                 &self.plugin_runtime.as_ref().map(|_| ".."),
@@ -549,6 +552,7 @@ impl WsServerState {
             llm_provider: parking_lot::RwLock::new(None),
             tools_registry: None,
             plugin_registry: None,
+            activity_dispatcher: Arc::new(channels::activity::ActivityDispatcher::new()),
             plugin_runtime: None,
             plugin_activation_report: None,
             connection_tracker,
@@ -608,6 +612,7 @@ impl WsServerState {
             llm_provider: parking_lot::RwLock::new(None),
             tools_registry: None,
             plugin_registry: None,
+            activity_dispatcher: Arc::new(channels::activity::ActivityDispatcher::new()),
             plugin_runtime: None,
             plugin_activation_report: None,
             connection_tracker,
@@ -766,6 +771,10 @@ impl WsServerState {
     /// Get the plugin registry, if configured.
     pub fn plugin_registry(&self) -> Option<&Arc<plugins::PluginRegistry>> {
         self.plugin_registry.as_ref()
+    }
+
+    pub fn activity_dispatcher(&self) -> &Arc<channels::activity::ActivityDispatcher> {
+        &self.activity_dispatcher
     }
 
     pub(crate) fn plugin_runtime(

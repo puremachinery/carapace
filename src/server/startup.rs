@@ -299,7 +299,7 @@ impl ServerHandle {
         // Brief grace period for in-flight operations
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        crate::channels::activity::shared_activity_dispatcher().shutdown();
+        self.ws_state.activity_dispatcher().shutdown();
 
         // Wait for the server task to finish (with a timeout to avoid hanging)
         match tokio::time::timeout(Duration::from_secs(5), self.server_task).await {
