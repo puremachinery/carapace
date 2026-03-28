@@ -1276,6 +1276,10 @@ pub async fn execute_run(
 
             match typing_context {
                 Some(ctx) => {
+                    // Typing policy is snapshotted for the lifetime of this
+                    // run. Reload only affects future runs; do not re-check the
+                    // policy mid-run and break the receive-time snapshot
+                    // contract for activity side effects.
                     crate::channels::activity::maybe_start_typing_loop(
                         plugin_registry.clone(),
                         channel_id,

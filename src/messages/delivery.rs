@@ -329,7 +329,6 @@ mod tests {
         BindingError, ChannelCapabilities, ChannelPluginInstance, DeliveryResult, OutboundContext,
         ReadReceiptContext,
     };
-    use std::fs;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
     use tokio::sync::Notify;
@@ -846,30 +845,6 @@ mod tests {
         let (pipeline, _plugin_reg, _channel_reg) =
             make_pipeline_and_registries("signal", Some(mock.clone()), true);
         let activity_service = test_activity_service();
-
-        let temp = tempfile::tempdir().unwrap();
-        let config_path = temp.path().join("carapace.json5");
-        fs::write(
-            &config_path,
-            r#"{
-                channels: {
-                    signal: {
-                        features: {
-                            readReceipts: {
-                                enabled: true,
-                                mode: "after-response",
-                            },
-                        },
-                    },
-                },
-            }"#,
-        )
-        .unwrap();
-        crate::config::clear_cache();
-        let mut env_guard = crate::test_support::env::ScopedEnv::new();
-        env_guard
-            .set("CARAPACE_CONFIG_PATH", config_path.as_os_str())
-            .set("CARAPACE_DISABLE_CONFIG_CACHE", "1");
 
         let msg = OutboundMessage::new("signal", MessageContent::text("hello")).with_metadata(
             crate::messages::outbound::MessageMetadata {

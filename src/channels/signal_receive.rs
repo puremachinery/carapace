@@ -220,9 +220,20 @@ fn build_receive_url(
         format!("{}/v1/receive/{}", path_prefix, encoded_phone_number)
     };
     url.set_path(&receive_path);
-    if carapace_manages_read_receipts {
-        url.query_pairs_mut()
-            .append_pair("send_read_receipts", "false");
+    let filtered_query_pairs = url
+        .query_pairs()
+        .into_owned()
+        .filter(|(key, _)| key != "send_read_receipts")
+        .collect::<Vec<_>>();
+    url.set_query(None);
+    {
+        let mut query_pairs = url.query_pairs_mut();
+        for (key, value) in filtered_query_pairs {
+            query_pairs.append_pair(&key, &value);
+        }
+        if carapace_manages_read_receipts {
+            query_pairs.append_pair("send_read_receipts", "false");
+        }
     }
     url
 }
@@ -865,6 +876,19 @@ mod tests {
         assert_eq!(
             build_receive_url(
                 &url::Url::parse("http://localhost:8080?debug=1").unwrap(),
+                "+15551234567",
+                true
+            )
+            .as_str(),
+            "http://localhost:8080/v1/receive/%2B15551234567?debug=1&send_read_receipts=false"
+        );
+    }
+
+    #[test]
+    fn test_build_receive_url_replaces_existing_send_read_receipts_parameter() {
+        assert_eq!(
+            build_receive_url(
+                &url::Url::parse("http://localhost:8080?debug=1&send_read_receipts=true",).unwrap(),
                 "+15551234567",
                 true
             )

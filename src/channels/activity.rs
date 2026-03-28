@@ -192,7 +192,28 @@ struct StopTypingDispatchRequest {
     plugin: Arc<dyn ChannelPluginInstance>,
     channel_id: String,
     ctx: TypingContext,
-    stop_state: Arc<AtomicU8>,
+    stop_states: Vec<Arc<AtomicU8>>,
+    queued: bool,
+    in_flight: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct StopTypingDispatchKey {
+    channel_id: String,
+    recipient: String,
+    thread_id: Option<String>,
+    account_id: Option<String>,
+}
+
+impl StopTypingDispatchKey {
+    fn new(channel_id: &str, ctx: &TypingContext) -> Self {
+        Self {
+            channel_id: channel_id.to_string(),
+            recipient: ctx.to.clone(),
+            thread_id: ctx.thread_id.clone(),
+            account_id: ctx.account_id.clone(),
+        }
+    }
 }
 
 pub struct ActivityService {
@@ -291,8 +312,9 @@ impl ActivityService {
 pub struct ActivityDispatcher {
     read_receipt_tx: Mutex<Option<sync_mpsc::Sender<VerifiedReadReceiptDispatchRequest>>>,
     read_receipt_worker: Mutex<Option<thread::JoinHandle<()>>>,
-    stop_typing_tx: Mutex<Option<sync_mpsc::Sender<StopTypingDispatchRequest>>>,
+    stop_typing_tx: Mutex<Option<sync_mpsc::Sender<StopTypingDispatchKey>>>,
     stop_typing_worker: Mutex<Option<thread::JoinHandle<()>>>,
+    stop_typing_pending: Arc<Mutex<HashMap<StopTypingDispatchKey, StopTypingDispatchRequest>>>,
     read_receipt_backlog: Arc<AtomicUsize>,
     stop_typing_backlog: Arc<AtomicUsize>,
     backlog_warning_threshold: usize,
@@ -352,7 +374,13 @@ impl ActivityDispatcher {
             })
             .expect("failed to spawn read receipt dispatcher thread");
 
-        let (stop_typing_tx, stop_typing_rx) = sync_mpsc::channel::<StopTypingDispatchRequest>();
+        let stop_typing_pending = Arc::new(Mutex::new(HashMap::<
+            StopTypingDispatchKey,
+            StopTypingDispatchRequest,
+        >::new()));
+        let stop_typing_pending_worker = stop_typing_pending.clone();
+        let (stop_typing_tx_raw, stop_typing_rx) = sync_mpsc::channel::<StopTypingDispatchKey>();
+        let stop_typing_tx = Mutex::new(Some(stop_typing_tx_raw));
         let stop_typing_backlog_worker = stop_typing_backlog.clone();
         let stop_typing_shutdown = shutting_down.clone();
         let stop_typing_deadline = shutdown_deadline.clone();
@@ -360,25 +388,104 @@ impl ActivityDispatcher {
             .name("carapace-stop-typing".to_string())
             .spawn(move || {
                 // Stop-typing is cleanup, not optional side work. Keep this
-                // queue non-lossy so completion bursts cannot drop stop
-                // signals; the queue is still naturally bounded by the number
-                // of active typing loops in the runtime.
-                while let Ok(request) = stop_typing_rx.recv() {
+                // path non-lossy, but coalesce requests per channel/recipient
+                // so a stalled stop call cannot grow an unbounded duplicate
+                // queue for the same remote typing state.
+                while let Ok(key) = stop_typing_rx.recv() {
                     stop_typing_backlog_worker.fetch_sub(1, Ordering::AcqRel);
-                    if should_drop_activity_work(
-                        stop_typing_shutdown.as_ref(),
-                        &stop_typing_deadline,
-                    ) {
-                        mark_stop_completed(request.stop_state.as_ref());
-                        log_dropped_stop_typing_after_shutdown(&request.channel_id, &request.ctx);
+                    let maybe_request = {
+                        let mut pending = stop_typing_pending_worker.lock();
+                        let Some(request) = pending.get_mut(&key) else {
+                            continue;
+                        };
+                        if should_drop_activity_work(
+                            stop_typing_shutdown.as_ref(),
+                            &stop_typing_deadline,
+                        ) {
+                            let request =
+                                pending.remove(&key).expect("pending stop typing request");
+                            Some(Err(request))
+                        } else {
+                            request.queued = false;
+                            request.in_flight = true;
+                            Some(Ok((
+                                request.plugin.clone(),
+                                request.channel_id.clone(),
+                                request.ctx.clone(),
+                                std::mem::take(&mut request.stop_states),
+                            )))
+                        }
+                    };
+
+                    let Some(request) = maybe_request else {
                         continue;
+                    };
+
+                    match request {
+                        Err(request) => {
+                            mark_stop_states_completed(&request.stop_states);
+                            log_dropped_stop_typing_after_shutdown(
+                                &request.channel_id,
+                                &request.ctx,
+                            );
+                        }
+                        Ok((mut plugin, mut channel_id, mut ctx, mut stop_states)) => loop {
+                            dispatch_stop_typing_blocking(
+                                plugin,
+                                &channel_id,
+                                ctx.clone(),
+                                &stop_states,
+                            );
+
+                            let next_batch = {
+                                let mut pending = stop_typing_pending_worker.lock();
+                                let Some(request) = pending.get_mut(&key) else {
+                                    break;
+                                };
+                                if should_drop_activity_work(
+                                    stop_typing_shutdown.as_ref(),
+                                    &stop_typing_deadline,
+                                ) {
+                                    let request =
+                                        pending.remove(&key).expect("pending stop typing request");
+                                    Some(Err(request))
+                                } else if request.stop_states.is_empty() {
+                                    pending.remove(&key);
+                                    None
+                                } else {
+                                    Some(Ok((
+                                        request.plugin.clone(),
+                                        request.channel_id.clone(),
+                                        request.ctx.clone(),
+                                        std::mem::take(&mut request.stop_states),
+                                    )))
+                                }
+                            };
+
+                            match next_batch {
+                                None => break,
+                                Some(Err(request)) => {
+                                    mark_stop_states_completed(&request.stop_states);
+                                    log_dropped_stop_typing_after_shutdown(
+                                        &request.channel_id,
+                                        &request.ctx,
+                                    );
+                                    break;
+                                }
+                                Some(Ok((
+                                    next_plugin,
+                                    next_channel_id,
+                                    next_ctx,
+                                    next_stop_states,
+                                ))) => {
+                                    plugin = next_plugin;
+                                    channel_id = next_channel_id;
+                                    ctx = next_ctx;
+                                    stop_states = next_stop_states;
+                                }
+                            }
+                        },
                     }
-                    dispatch_stop_typing_blocking(
-                        request.plugin,
-                        &request.channel_id,
-                        request.ctx,
-                        request.stop_state,
-                    );
                 }
             })
             .expect("failed to spawn stop typing dispatcher thread");
@@ -386,8 +493,9 @@ impl ActivityDispatcher {
         Self {
             read_receipt_tx: Mutex::new(Some(read_receipt_tx)),
             read_receipt_worker: Mutex::new(Some(read_receipt_worker)),
-            stop_typing_tx: Mutex::new(Some(stop_typing_tx)),
+            stop_typing_tx,
             stop_typing_worker: Mutex::new(Some(stop_typing_worker)),
+            stop_typing_pending,
             read_receipt_backlog,
             stop_typing_backlog,
             backlog_warning_threshold,
@@ -415,8 +523,7 @@ impl ActivityDispatcher {
             channel_id: channel_id.to_string(),
             ctx,
         };
-        let sender = self.read_receipt_tx.lock();
-        let Some(sender) = sender.as_ref() else {
+        let Some(sender) = self.read_receipt_tx.lock().as_ref().cloned() else {
             tracing::warn!(
                 channel = %channel_id,
                 "read receipt dispatcher is shut down; dropping read receipt"
@@ -451,14 +558,43 @@ impl ActivityDispatcher {
         ctx: TypingContext,
         stop_state: Arc<AtomicU8>,
     ) {
-        let request = StopTypingDispatchRequest {
-            plugin,
-            channel_id: channel_id.to_string(),
-            ctx,
-            stop_state: stop_state.clone(),
-        };
+        let key = StopTypingDispatchKey::new(channel_id, &ctx);
+        let mut should_enqueue = false;
+        {
+            let mut pending = self.stop_typing_pending.lock();
+            if let Some(request) = pending.get_mut(&key) {
+                request.stop_states.push(stop_state.clone());
+                if !request.queued && !request.in_flight {
+                    request.queued = true;
+                    should_enqueue = true;
+                }
+            } else {
+                pending.insert(
+                    key.clone(),
+                    StopTypingDispatchRequest {
+                        plugin,
+                        channel_id: channel_id.to_string(),
+                        ctx,
+                        stop_states: vec![stop_state.clone()],
+                        queued: true,
+                        in_flight: false,
+                    },
+                );
+                should_enqueue = true;
+            }
+        }
+
+        if !should_enqueue {
+            return;
+        }
+
         let Some(sender) = self.stop_typing_tx.lock().as_ref().cloned() else {
-            mark_stop_completed(stop_state.as_ref());
+            let dropped = self.stop_typing_pending.lock().remove(&key);
+            if let Some(request) = dropped {
+                mark_stop_states_completed(&request.stop_states);
+            } else {
+                mark_stop_completed(stop_state.as_ref());
+            }
             tracing::warn!(
                 channel = %channel_id,
                 "stop typing dispatcher is shut down; dropping implicit stop request"
@@ -474,16 +610,18 @@ impl ActivityDispatcher {
             self.backlog_warning_threshold,
         );
 
-        match sender.send(request) {
-            Ok(()) => {}
-            Err(sync_mpsc::SendError(request)) => {
-                self.stop_typing_backlog.fetch_sub(1, Ordering::AcqRel);
-                mark_stop_completed(request.stop_state.as_ref());
-                tracing::warn!(
-                    channel = %channel_id,
-                    "stop typing dispatcher is shut down; dropping implicit stop request"
-                );
+        if sender.send(key.clone()).is_err() {
+            self.stop_typing_backlog.fetch_sub(1, Ordering::AcqRel);
+            let dropped = self.stop_typing_pending.lock().remove(&key);
+            if let Some(request) = dropped {
+                mark_stop_states_completed(&request.stop_states);
+            } else {
+                mark_stop_completed(stop_state.as_ref());
             }
+            tracing::warn!(
+                channel = %channel_id,
+                "stop typing dispatcher is shut down; dropping implicit stop request"
+            );
         }
     }
 
@@ -911,6 +1049,12 @@ fn mark_stop_completed(stop_state: &AtomicU8) {
     stop_state.store(STOP_STATE_COMPLETED, Ordering::Release);
 }
 
+fn mark_stop_states_completed(stop_states: &[Arc<AtomicU8>]) {
+    for stop_state in stop_states {
+        mark_stop_completed(stop_state.as_ref());
+    }
+}
+
 async fn finish_typing_task(
     task: JoinHandle<()>,
     plugin: Arc<dyn ChannelPluginInstance>,
@@ -1161,10 +1305,10 @@ fn dispatch_stop_typing_blocking(
     plugin: Arc<dyn ChannelPluginInstance>,
     channel_id: &str,
     ctx: TypingContext,
-    stop_state: Arc<AtomicU8>,
+    stop_states: &[Arc<AtomicU8>],
 ) {
     let result = catch_unwind(AssertUnwindSafe(|| plugin.stop_typing(ctx)));
-    mark_stop_completed(stop_state.as_ref());
+    mark_stop_states_completed(stop_states);
     match result {
         Ok(Ok(())) => {}
         Ok(Err(err)) => {
@@ -1211,6 +1355,7 @@ mod tests {
         mark_read_count: AtomicU32,
         mark_read_started_notify: Option<Arc<Notify>>,
         mark_read_notify: Option<Arc<Notify>>,
+        stop_typing_started_notify: Option<Arc<Notify>>,
         stop_typing_notify: Option<Arc<Notify>>,
         mark_read_delay: Duration,
         stop_typing_delay: Duration,
@@ -1234,6 +1379,7 @@ mod tests {
                 mark_read_count: AtomicU32::new(0),
                 mark_read_started_notify: None,
                 mark_read_notify: None,
+                stop_typing_started_notify: None,
                 stop_typing_notify,
                 mark_read_delay: Duration::ZERO,
                 stop_typing_delay: Duration::ZERO,
@@ -1257,6 +1403,18 @@ mod tests {
             Self {
                 stop_typing_delay,
                 stop_typing_notify: Some(stop_typing_notify),
+                ..Self::with_stop_typing_notify(caps, None)
+            }
+        }
+
+        fn with_stop_typing_delay_and_started_notify(
+            caps: ChannelCapabilities,
+            stop_typing_delay: Duration,
+            stop_typing_started_notify: Arc<Notify>,
+        ) -> Self {
+            Self {
+                stop_typing_delay,
+                stop_typing_started_notify: Some(stop_typing_started_notify),
                 ..Self::with_stop_typing_notify(caps, None)
             }
         }
@@ -1326,6 +1484,9 @@ mod tests {
         }
 
         fn stop_typing(&self, _ctx: TypingContext) -> Result<(), BindingError> {
+            if let Some(notify) = &self.stop_typing_started_notify {
+                notify.notify_one();
+            }
             if !self.stop_typing_delay.is_zero() {
                 std::thread::sleep(self.stop_typing_delay);
             }
@@ -2030,7 +2191,7 @@ mod tests {
     }
 
     #[test]
-    fn test_stop_typing_dispatcher_does_not_drop_bursty_cleanup_requests() {
+    fn test_stop_typing_dispatcher_does_not_drop_bursty_distinct_cleanup_requests() {
         let dispatcher = ActivityDispatcher::with_backlog_warning_threshold(1);
         let plugin = Arc::new(MockChannel::with_stop_typing_delay(
             ChannelCapabilities {
@@ -2039,16 +2200,21 @@ mod tests {
             },
             Duration::from_millis(10),
         ));
-        let stop_states = (0..32)
-            .map(|_| Arc::new(AtomicU8::new(STOP_STATE_FALLBACK_RESERVED)))
+        let stop_states = (0..32_u32)
+            .map(|recipient_index| {
+                (
+                    recipient_index,
+                    Arc::new(AtomicU8::new(STOP_STATE_FALLBACK_RESERVED)),
+                )
+            })
             .collect::<Vec<_>>();
 
-        for stop_state in &stop_states {
+        for (recipient_index, stop_state) in &stop_states {
             dispatcher.dispatch_stop_typing(
                 plugin.clone(),
                 "signal",
                 TypingContext {
-                    to: "+15551234567".to_string(),
+                    to: format!("+1555123{recipient_index:04}"),
                     ..Default::default()
                 },
                 stop_state.clone(),
@@ -2060,6 +2226,69 @@ mod tests {
 
         assert_eq!(plugin.stop_typing_count.load(Ordering::Relaxed), 32);
         assert!(stop_states
+            .iter()
+            .all(|(_, state)| state.load(Ordering::Acquire) == STOP_STATE_COMPLETED));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_stop_typing_dispatcher_coalesces_duplicate_recipient_cleanup_requests() {
+        let stop_typing_started_notify = Arc::new(Notify::new());
+        let dispatcher = ActivityDispatcher::with_backlog_warning_threshold(1);
+        let plugin = Arc::new(MockChannel::with_stop_typing_delay_and_started_notify(
+            ChannelCapabilities {
+                typing_indicators: true,
+                ..Default::default()
+            },
+            Duration::from_millis(50),
+            stop_typing_started_notify.clone(),
+        ));
+
+        let first_stop_state = Arc::new(AtomicU8::new(STOP_STATE_FALLBACK_RESERVED));
+        dispatcher.dispatch_stop_typing(
+            plugin.clone(),
+            "signal",
+            TypingContext {
+                to: "+15551234567".to_string(),
+                ..Default::default()
+            },
+            first_stop_state.clone(),
+        );
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            stop_typing_started_notify.notified(),
+        )
+        .await
+        .expect("first stop_typing call should start");
+
+        let additional_stop_states = (0..8)
+            .map(|_| Arc::new(AtomicU8::new(STOP_STATE_FALLBACK_RESERVED)))
+            .collect::<Vec<_>>();
+
+        for stop_state in &additional_stop_states {
+            dispatcher.dispatch_stop_typing(
+                plugin.clone(),
+                "signal",
+                TypingContext {
+                    to: "+15551234567".to_string(),
+                    ..Default::default()
+                },
+                stop_state.clone(),
+            );
+        }
+
+        dispatcher.shutdown();
+
+        assert_eq!(
+            plugin.stop_typing_count.load(Ordering::Relaxed),
+            2,
+            "duplicate recipient cleanup should coalesce into one in-flight call plus one rerun"
+        );
+        assert_eq!(
+            first_stop_state.load(Ordering::Acquire),
+            STOP_STATE_COMPLETED
+        );
+        assert!(additional_stop_states
             .iter()
             .all(|state| state.load(Ordering::Acquire) == STOP_STATE_COMPLETED));
     }
