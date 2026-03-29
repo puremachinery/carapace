@@ -8029,14 +8029,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_managed_plugin_file_transaction_rollback_releases_lock_on_restore_failure() {
+        let mut env_guard = ScopedEnv::new();
         let temp = tempfile::TempDir::new().unwrap();
         let dest = temp.path().join("demo-plugin.wasm");
         let backup = temp.path().join("demo-plugin.wasm.cli-backup");
         let lock = temp.path().join("demo-plugin.wasm.cli-lock");
 
         std::fs::write(&dest, b"new-plugin-bytes").unwrap();
-        std::fs::create_dir_all(&backup).unwrap();
+        std::fs::write(&backup, b"old-plugin-bytes").unwrap();
         std::fs::write(&lock, b"locked").unwrap();
+        env_guard.set("CARAPACE_TEST_FAIL_RESTORE_PLUGIN_DEST", dest.as_os_str());
 
         let err = ManagedPluginFileTransaction {
             dest: dest.clone(),
@@ -8058,14 +8060,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_managed_plugin_file_transaction_rollback_reports_restore_and_lock_failure() {
+        let mut env_guard = ScopedEnv::new();
         let temp = tempfile::TempDir::new().unwrap();
         let dest = temp.path().join("demo-plugin.wasm");
         let backup = temp.path().join("demo-plugin.wasm.cli-backup");
         let lock = temp.path().join("demo-plugin.wasm.cli-lock");
 
         std::fs::write(&dest, b"new-plugin-bytes").unwrap();
-        std::fs::create_dir_all(&backup).unwrap();
+        std::fs::write(&backup, b"old-plugin-bytes").unwrap();
         std::fs::create_dir_all(&lock).unwrap();
+        env_guard.set("CARAPACE_TEST_FAIL_RESTORE_PLUGIN_DEST", dest.as_os_str());
 
         let err = ManagedPluginFileTransaction {
             dest: dest.clone(),
@@ -8887,14 +8891,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_finalize_plugin_file_mutation_reports_original_and_rollback_failure() {
+        let mut env_guard = ScopedEnv::new();
         let temp = tempfile::TempDir::new().unwrap();
         let dest = temp.path().join("demo-plugin.wasm");
         let backup = temp.path().join("demo-plugin.wasm.cli-backup");
         let lock = temp.path().join("demo-plugin.wasm.cli-lock");
 
         std::fs::write(&dest, b"new-plugin-bytes").unwrap();
-        std::fs::create_dir_all(&backup).unwrap();
+        std::fs::write(&backup, b"old-plugin-bytes").unwrap();
         std::fs::create_dir_all(&lock).unwrap();
+        env_guard.set("CARAPACE_TEST_FAIL_RESTORE_PLUGIN_DEST", dest.as_os_str());
 
         let err = finalize_plugin_file_mutation(
             Some(ManagedPluginFileTransaction {
