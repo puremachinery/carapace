@@ -171,27 +171,18 @@ async fn maybe_dispatch_read_receipt_for_ignored_signal_message(
         return;
     };
 
-    let Some(plugin_registry) = state.plugin_registry() else {
-        warn!(
-            sender = %sender,
-            ignored_reason = reason,
-            "Signal read receipts are enabled but the plugin registry is unavailable; dropping explicit acknowledgment"
-        );
-        return;
-    };
-
-    let Some(plugin) = plugin_registry.get_channel("signal") else {
-        warn!(
-            sender = %sender,
-            ignored_reason = reason,
-            "Signal read receipts are enabled but the Signal channel plugin is unavailable; dropping explicit acknowledgment"
-        );
-        return;
-    };
-
-    state
+    if state
         .activity_service()
-        .enqueue_verified_read_receipt(plugin, "signal", read_receipt_context);
+        .enqueue_ready_read_receipt("signal", read_receipt_context)
+        .await
+        .is_none()
+    {
+        warn!(
+            sender = %sender,
+            ignored_reason = reason,
+            "Signal read receipts are enabled but Carapace could not persist the explicit acknowledgment obligation"
+        );
+    }
 }
 
 fn summarize_signal_receive_response_error(error: &reqwest::Error) -> &'static str {
@@ -226,7 +217,7 @@ fn build_receive_url(
         .filter(|(key, _)| key != "send_read_receipts")
         .collect::<Vec<_>>();
     url.set_query(None);
-    {
+    if !filtered_query_pairs.is_empty() || carapace_manages_read_receipts {
         let mut query_pairs = url.query_pairs_mut();
         for (key, value) in filtered_query_pairs {
             query_pairs.append_pair(&key, &value);
@@ -490,12 +481,30 @@ async fn process_envelope(
         );
     }
 
+    let read_receipt_task_id = match read_receipt_context.clone() {
+        Some(ctx) => {
+            let task_id = state
+                .activity_service()
+                .enqueue_after_response_read_receipt("signal", ctx)
+                .await;
+            if task_id.is_none() {
+                warn!(
+                    sender = %sender,
+                    "Signal read receipts are enabled but Carapace could not persist the explicit acknowledgment obligation"
+                );
+            }
+            task_id
+        }
+        None => None,
+    };
+
     let options = crate::channels::inbound::InboundDispatchOptions {
         typing_context: Some(TypingContext {
             to: peer_id.clone(),
             ..Default::default()
         }),
         read_receipt_context,
+        read_receipt_task_id: read_receipt_task_id.clone(),
         ..Default::default()
     };
 
@@ -518,6 +527,15 @@ async fn process_envelope(
             );
         }
         Err(err) => {
+            if let Some(task_id) = read_receipt_task_id.as_deref() {
+                state
+                    .activity_service()
+                    .withhold_read_receipt(
+                        task_id,
+                        crate::channels::activity::READ_RECEIPT_WITHHELD_REASON,
+                    )
+                    .await;
+            }
             error!(sender = %sender, error = %err, "Failed to dispatch Signal message");
         }
     }
@@ -1306,6 +1324,10 @@ mod tests {
         let state = Arc::new(
             WsServerState::new(WsServerConfig::default()).with_plugin_registry(plugin_registry),
         );
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        state
+            .activity_service()
+            .spawn_read_receipt_worker(state.clone(), shutdown_rx);
         let envelope = SignalEnvelope {
             source_number: Some("+15559876543".to_string()),
             source: None,
@@ -1323,10 +1345,24 @@ mod tests {
             .await
             .expect("ignored non-text messages should still be acknowledged");
         assert_eq!(signal_channel.mark_read_count.load(Ordering::Relaxed), 1);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let tasks = state.activity_service().read_receipt_queue().list();
+                if tasks.len() == 1 && tasks[0].state == crate::tasks::TaskState::Done {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("ignored-envelope receipt task should settle to done");
         assert!(
             state.agent_run_registry.lock().snapshot_runs().is_empty(),
             "ignored non-text messages should not create agent runs"
         );
+        shutdown_tx
+            .send(true)
+            .expect("read receipt worker shutdown signal should send");
         state.shutdown_activity_service().await;
     }
 }

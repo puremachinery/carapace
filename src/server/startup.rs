@@ -237,6 +237,7 @@ pub async fn prepare_runtime_environment() -> Result<std::path::PathBuf, Box<dyn
     tokio::fs::create_dir_all(state_dir.join("sessions")).await?;
     tokio::fs::create_dir_all(state_dir.join("cron")).await?;
     tokio::fs::create_dir_all(state_dir.join("tasks")).await?;
+    tokio::fs::create_dir_all(state_dir.join("activity")).await?;
     crate::logging::audit::AuditLog::init(state_dir.clone()).await;
     init_media_store_cleanup().await;
     Ok(state_dir)
@@ -462,6 +463,9 @@ pub fn spawn_background_tasks(
         Duration::from_secs(1),
         shutdown_rx.clone(),
     ));
+    ws_state
+        .activity_service()
+        .spawn_read_receipt_worker(ws_state.clone(), shutdown_rx.clone());
 
     // One-shot updater resume pass for interrupted updates.
     spawn_update_resume_task(shutdown_rx);

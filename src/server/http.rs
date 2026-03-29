@@ -1284,6 +1284,7 @@ async fn dispatch_agent_run(
         delivery_recipient_id: None,
         typing_context: None,
         read_receipt_context: None,
+        read_receipt_task_id: None,
         status: crate::server::ws::AgentRunStatus::Queued,
         message: validated.message.clone(),
         response: String::new(),

@@ -17,6 +17,7 @@ pub struct InboundDispatchOptions {
     pub delivery_recipient_id: Option<String>,
     pub typing_context: Option<TypingContext>,
     pub read_receipt_context: Option<ReadReceiptContext>,
+    pub read_receipt_task_id: Option<String>,
 }
 
 /// Dispatch an inbound text message into the agent pipeline.
@@ -111,6 +112,7 @@ pub async fn dispatch_inbound_text_with_options(
         delivery_recipient_id,
         typing_context,
         read_receipt_context: options.read_receipt_context,
+        read_receipt_task_id: options.read_receipt_task_id,
         status: AgentRunStatus::Queued,
         message: text.to_string(),
         response: String::new(),

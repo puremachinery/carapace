@@ -519,6 +519,7 @@ mod tests {
             delivery_recipient_id: None,
             typing_context: None,
             read_receipt_context: None,
+            read_receipt_task_id: None,
             status: AgentRunStatus::Queued,
             message: "Hello".to_string(),
             response: String::new(),

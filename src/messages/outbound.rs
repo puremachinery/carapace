@@ -133,6 +133,12 @@ impl MessageContent {
 }
 
 /// Metadata for message delivery context
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingReadReceipt {
+    pub task_id: String,
+}
+
+/// Metadata for message delivery context
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MessageMetadata {
     /// ID of message being replied to
@@ -151,7 +157,7 @@ pub struct MessageMetadata {
     ///
     /// This field is intentionally skipped across serialization boundaries.
     #[serde(skip, default)]
-    pub read_receipt: Option<crate::plugins::ReadReceiptContext>,
+    pub read_receipt: Option<PendingReadReceipt>,
     /// Channel-specific extra data
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extra: Option<serde_json::Value>,
@@ -1023,10 +1029,8 @@ mod tests {
     #[test]
     fn test_message_metadata_skips_read_receipt_serialization() {
         let metadata = MessageMetadata {
-            read_receipt: Some(crate::plugins::ReadReceiptContext {
-                recipient: "+15551234567".to_string(),
-                timestamp: Some(1706745600000),
-                ..Default::default()
+            read_receipt: Some(PendingReadReceipt {
+                task_id: "receipt-task-123".to_string(),
             }),
             ..Default::default()
         };

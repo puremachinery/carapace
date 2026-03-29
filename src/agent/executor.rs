@@ -909,7 +909,11 @@ fn finalize_run(
 fn delivery_context_from_registry(
     state: &WsServerState,
     run_id: &str,
-) -> (Option<String>, Option<crate::plugins::ReadReceiptContext>) {
+) -> (
+    Option<String>,
+    Option<crate::plugins::ReadReceiptContext>,
+    Option<String>,
+) {
     let registry = state.agent_run_registry.lock();
     registry
         .get(run_id)
@@ -917,6 +921,7 @@ fn delivery_context_from_registry(
             (
                 run.delivery_recipient_id.clone(),
                 run.read_receipt_context.clone(),
+                run.read_receipt_task_id.clone(),
             )
         })
         .unwrap_or_else(|| {
@@ -924,7 +929,7 @@ fn delivery_context_from_registry(
                 run_id = %run_id,
                 "agent run missing from registry before delivery finalization"
             );
-            (None, None)
+            (None, None, None)
         })
 }
 
@@ -1343,7 +1348,7 @@ pub async fn execute_run(
         } else {
             None
         };
-        let (delivery_recipient_id, read_receipt_context) =
+        let (delivery_recipient_id, read_receipt_context, read_receipt_task_id) =
             delivery_context_from_registry(&state, &run_id);
 
         finalize_run(
@@ -1395,7 +1400,9 @@ pub async fn execute_run(
                         // message. Preserve that context across later config changes
                         // and later capability-probe failures so we do not drop
                         // acknowledgements after auto-receipts were already suppressed upstream.
-                        read_receipt_context.clone()
+                        read_receipt_task_id.clone().map(|task_id| {
+                            crate::messages::outbound::PendingReadReceipt { task_id }
+                        })
                     } else {
                         None
                     };
@@ -1419,9 +1426,42 @@ pub async fn execute_run(
                             error = %err,
                             "failed to queue agent response for delivery"
                         );
+                        if let Some(task_id) = read_receipt_task_id.as_deref() {
+                            state
+                                .activity_service()
+                                .withhold_read_receipt(
+                                    task_id,
+                                    crate::channels::activity::READ_RECEIPT_WITHHELD_REASON,
+                                )
+                                .await;
+                        }
                     }
+                } else if let Some(task_id) = read_receipt_task_id.as_deref() {
+                    state
+                        .activity_service()
+                        .withhold_read_receipt(
+                            task_id,
+                            crate::channels::activity::READ_RECEIPT_WITHHELD_REASON,
+                        )
+                        .await;
                 }
+            } else if let Some(task_id) = read_receipt_task_id.as_deref() {
+                state
+                    .activity_service()
+                    .withhold_read_receipt(
+                        task_id,
+                        crate::channels::activity::READ_RECEIPT_WITHHELD_REASON,
+                    )
+                    .await;
             }
+        } else if let Some(task_id) = read_receipt_task_id.as_deref() {
+            state
+                .activity_service()
+                .withhold_read_receipt(
+                    task_id,
+                    crate::channels::activity::READ_RECEIPT_WITHHELD_REASON,
+                )
+                .await;
         }
 
         Ok(())
@@ -1433,13 +1473,22 @@ pub async fn execute_run(
     }
 
     if execution_result.is_err() {
-        let (_, read_receipt_context) = delivery_context_from_registry(&state, &run_id);
-        if let (Some(channel_id), Some(policy), Some(read_receipt_context)) = (
+        let (_, read_receipt_context, read_receipt_task_id) =
+            delivery_context_from_registry(&state, &run_id);
+        if let (Some(channel_id), Some(policy), Some(read_receipt_context), Some(task_id)) = (
             delivery_channel_id,
             channel_activity_policy.as_ref(),
             read_receipt_context.as_ref(),
+            read_receipt_task_id.as_deref(),
         ) {
-            if config.deliver && policy.read_receipts.enabled {
+            if policy.read_receipts.enabled {
+                state
+                    .activity_service()
+                    .withhold_read_receipt(
+                        task_id,
+                        crate::channels::activity::READ_RECEIPT_WITHHELD_REASON,
+                    )
+                    .await;
                 tracing::warn!(
                     run_id = %run_id,
                     channel = %channel_id,
@@ -2072,6 +2121,7 @@ mod tests {
                 delivery_recipient_id: None,
                 typing_context: None,
                 read_receipt_context: None,
+                read_receipt_task_id: None,
                 status: AgentRunStatus::Queued,
                 message: "Hello".to_string(),
                 response: String::new(),
@@ -2086,13 +2136,13 @@ mod tests {
         session
     }
 
-    fn setup_session_and_run_with_channel_activity(
+    async fn setup_session_and_run_with_channel_activity(
         state: &WsServerState,
         session_key: &str,
         run_id: &str,
         channel: &str,
         chat_id: &str,
-    ) -> sessions::Session {
+    ) -> (sessions::Session, String) {
         let metadata = sessions::SessionMetadata {
             channel: Some(channel.to_string()),
             chat_id: Some(chat_id.to_string()),
@@ -2106,6 +2156,18 @@ mod tests {
             .session_store()
             .append_message(sessions::ChatMessage::user(&session.id, "Hello"))
             .unwrap();
+        let read_receipt_task_id = state
+            .activity_service()
+            .enqueue_after_response_read_receipt(
+                channel,
+                ReadReceiptContext {
+                    recipient: chat_id.to_string(),
+                    timestamp: Some(123),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("channel-activity tests should persist durable read receipt obligations");
         {
             use crate::server::ws::{AgentRun, AgentRunStatus};
             let now = std::time::SystemTime::now()
@@ -2126,6 +2188,7 @@ mod tests {
                     timestamp: Some(123),
                     ..Default::default()
                 }),
+                read_receipt_task_id: Some(read_receipt_task_id.clone()),
                 status: AgentRunStatus::Queued,
                 message: "Hello".to_string(),
                 response: String::new(),
@@ -2137,15 +2200,17 @@ mod tests {
                 waiters: Vec::new(),
             });
         }
-        session
+        (session, read_receipt_task_id)
     }
 
     #[test]
     fn test_delivery_context_from_registry_returns_none_when_run_missing() {
         let (state, _tmp) = make_test_state();
-        let (recipient, read_receipt) = delivery_context_from_registry(&state, "missing-run");
+        let (recipient, read_receipt, read_receipt_task_id) =
+            delivery_context_from_registry(&state, "missing-run");
         assert!(recipient.is_none());
         assert!(read_receipt.is_none());
+        assert!(read_receipt_task_id.is_none());
     }
 
     #[tokio::test]
@@ -2305,7 +2370,14 @@ mod tests {
         let run_id = "run-channel-activity";
         let session_key = "test-channel-activity";
         let chat_id = "+15551234567";
-        setup_session_and_run_with_channel_activity(&state, session_key, run_id, "signal", chat_id);
+        let (_session, read_receipt_task_id) = setup_session_and_run_with_channel_activity(
+            &state,
+            session_key,
+            run_id,
+            "signal",
+            chat_id,
+        )
+        .await;
 
         let provider = Arc::new(MockProvider::text("Hello world!"));
         let config = AgentConfig {
@@ -2327,27 +2399,38 @@ mod tests {
 
         let channel_ids = state.message_pipeline().channels_with_messages();
         assert_eq!(channel_ids, vec!["signal".to_string()]);
-        let activity_service =
-            crate::channels::activity::ActivityService::with_backlog_warning_threshold(8);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        state
+            .activity_service()
+            .spawn_read_receipt_worker(state.clone(), shutdown_rx);
 
         crate::messages::delivery::process_channel_messages(
             &channel_ids,
             state.message_pipeline(),
             &plugin_registry,
             state.channel_registry(),
-            &activity_service,
+            state.activity_service(),
         )
         .await;
 
         tokio::time::timeout(
-            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(2),
             plugin.mark_read_notify.notified(),
         )
         .await
         .expect("delivery success should trigger a read receipt");
-        activity_service.shutdown().await;
+        shutdown_tx
+            .send(true)
+            .expect("read receipt worker shutdown signal should send");
+        state.shutdown_activity_service().await;
 
         assert_eq!(plugin.events(), vec!["start", "stop", "send", "read"]);
+        let completed_task = state
+            .activity_service()
+            .read_receipt_queue()
+            .get(&read_receipt_task_id)
+            .expect("delivery success should preserve the durable receipt task");
+        assert_eq!(completed_task.state, crate::tasks::TaskState::Done);
         crate::config::clear_cache();
     }
 
@@ -2369,7 +2452,14 @@ mod tests {
         let run_id = "run-channel-activity-disabled";
         let session_key = "test-channel-activity-disabled";
         let chat_id = "+15551234567";
-        setup_session_and_run_with_channel_activity(&state, session_key, run_id, "signal", chat_id);
+        let (_session, _read_receipt_task_id) = setup_session_and_run_with_channel_activity(
+            &state,
+            session_key,
+            run_id,
+            "signal",
+            chat_id,
+        )
+        .await;
 
         let provider = Arc::new(MockProvider::text("Hello world!"));
         let config = AgentConfig {
@@ -2421,7 +2511,14 @@ mod tests {
         let run_id = "run-channel-activity-capability-failure";
         let session_key = "test-channel-activity-capability-failure";
         let chat_id = "+15551234567";
-        setup_session_and_run_with_channel_activity(&state, session_key, run_id, "signal", chat_id);
+        let (_session, _read_receipt_task_id) = setup_session_and_run_with_channel_activity(
+            &state,
+            session_key,
+            run_id,
+            "signal",
+            chat_id,
+        )
+        .await;
 
         let provider = Arc::new(MockProvider::text("Hello world!"));
         let config = AgentConfig {
@@ -2488,7 +2585,14 @@ mod tests {
         let run_id = "run-channel-activity-no-delivery";
         let session_key = "test-channel-activity-no-delivery";
         let chat_id = "+15551234567";
-        setup_session_and_run_with_channel_activity(&state, session_key, run_id, "signal", chat_id);
+        let (_session, read_receipt_task_id) = setup_session_and_run_with_channel_activity(
+            &state,
+            session_key,
+            run_id,
+            "signal",
+            chat_id,
+        )
+        .await;
 
         let provider = Arc::new(MockProvider::text("Hello world!"));
         let config = AgentConfig {
@@ -2516,6 +2620,12 @@ mod tests {
             plugin.events().is_empty(),
             "deliver=false should not emit typing or read-receipt channel activity"
         );
+        let withheld_task = state
+            .activity_service()
+            .read_receipt_queue()
+            .get(&read_receipt_task_id)
+            .expect("deliver=false should preserve the durable read receipt task");
+        assert_eq!(withheld_task.state, crate::tasks::TaskState::Cancelled);
 
         crate::config::clear_cache();
     }
@@ -2731,6 +2841,7 @@ mod tests {
                 delivery_recipient_id: Some("fresh-peer".to_string()),
                 typing_context: None,
                 read_receipt_context: None,
+                read_receipt_task_id: None,
                 status: AgentRunStatus::Queued,
                 message: "Hello".to_string(),
                 response: String::new(),
@@ -2799,6 +2910,7 @@ mod tests {
                 delivery_recipient_id: None,
                 typing_context: None,
                 read_receipt_context: None,
+                read_receipt_task_id: None,
                 status: AgentRunStatus::Queued,
                 message: "Hello".to_string(),
                 response: String::new(),

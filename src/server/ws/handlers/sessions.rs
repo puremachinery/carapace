@@ -69,6 +69,8 @@ pub struct AgentRun {
     pub typing_context: Option<crate::plugins::TypingContext>,
     /// Optional channel-specific read-receipt context for inbound activity features.
     pub read_receipt_context: Option<crate::plugins::ReadReceiptContext>,
+    /// Durable task ID for the explicit read-receipt obligation, if any.
+    pub read_receipt_task_id: Option<String>,
     /// Current status
     pub status: AgentRunStatus,
     /// Original message that started this run
@@ -107,6 +109,7 @@ pub struct AgentRunSnapshot {
     pub session_key: String,
     pub message: String,
     pub read_receipt_context: Option<crate::plugins::ReadReceiptContext>,
+    pub read_receipt_task_id: Option<String>,
     pub status: AgentRunStatus,
 }
 
@@ -233,6 +236,7 @@ impl AgentRunRegistry {
                 session_key: run.session_key.clone(),
                 message: run.message.clone(),
                 read_receipt_context: run.read_receipt_context.clone(),
+                read_receipt_task_id: run.read_receipt_task_id.clone(),
                 status: run.status,
             })
             .collect()
@@ -1917,6 +1921,7 @@ fn setup_agent_session(
         delivery_recipient_id: None,
         typing_context: None,
         read_receipt_context: None,
+        read_receipt_task_id: None,
         status: AgentRunStatus::Queued,
         message: message.to_string(),
         response: String::new(),
@@ -2403,6 +2408,7 @@ fn trigger_agent_if_enabled(
         delivery_recipient_id: None,
         typing_context: None,
         read_receipt_context: None,
+        read_receipt_task_id: None,
         status: AgentRunStatus::Queued,
         message: message.to_string(),
         response: String::new(),
@@ -2715,6 +2721,7 @@ mod tests {
             delivery_recipient_id: None,
             typing_context: None,
             read_receipt_context: None,
+            read_receipt_task_id: None,
             status: AgentRunStatus::Queued,
             message: "test message".to_string(),
             response: String::new(),

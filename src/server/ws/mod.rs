@@ -612,7 +612,9 @@ impl WsServerState {
             llm_provider: parking_lot::RwLock::new(None),
             tools_registry: None,
             plugin_registry: None,
-            activity_service: Arc::new(channels::activity::ActivityService::new()),
+            activity_service: Arc::new(channels::activity::ActivityService::new_persistent(
+                state_dir.clone(),
+            )),
             plugin_runtime: None,
             plugin_activation_report: None,
             connection_tracker,
@@ -646,6 +648,12 @@ impl WsServerState {
         })?;
         state
             .task_queue
+            .load_async()
+            .await
+            .map_err(WsConfigError::Runtime)?;
+        state
+            .activity_service
+            .read_receipt_queue()
             .load_async()
             .await
             .map_err(WsConfigError::Runtime)?;
