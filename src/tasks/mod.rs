@@ -403,6 +403,7 @@ impl TaskQueue {
         policy: TaskPolicy,
     ) -> DurableTask {
         let queue = Arc::clone(self);
+        let queue_fallback = Arc::clone(self);
         let payload_fallback = payload.clone();
         let policy_fallback = policy.clone();
         match tokio::task::spawn_blocking(move || {
@@ -414,20 +415,17 @@ impl TaskQueue {
             Err(err) => {
                 let now = now_ms();
                 warn!(error = %err, "enqueue worker failed");
-                DurableTask {
-                    id: Uuid::new_v4().to_string(),
-                    state: TaskState::Failed,
-                    attempts: 0,
+                warn!("falling back to inline task enqueue after enqueue worker failure");
+                let mut task = queue_fallback.enqueue_with_policy(
+                    payload_fallback,
                     next_run_at_ms,
-                    last_error: Some(ENQUEUE_WORKER_FAILED_ERROR.to_string()),
-                    payload: payload_fallback,
-                    created_at_ms: now,
-                    updated_at_ms: now,
-                    run_ids: Vec::new(),
-                    policy: policy_fallback,
-                    blocked_reason: None,
-                    policy_explicit: true,
+                    policy_fallback,
+                );
+                if task.state == TaskState::Failed && task.last_error.is_none() {
+                    task.last_error = Some(ENQUEUE_WORKER_FAILED_ERROR.to_string());
+                    task.updated_at_ms = now;
                 }
+                task
             }
         }
     }
@@ -441,6 +439,7 @@ impl TaskQueue {
         policy: TaskPolicy,
     ) -> DurableTask {
         let queue = Arc::clone(self);
+        let queue_fallback = Arc::clone(self);
         let payload_fallback = payload.clone();
         let reason = reason.into();
         let reason_fallback = reason.clone();
@@ -454,20 +453,18 @@ impl TaskQueue {
             Err(err) => {
                 let now = now_ms();
                 warn!(error = %err, "enqueue worker failed");
-                DurableTask {
-                    id: Uuid::new_v4().to_string(),
-                    state: TaskState::Failed,
-                    attempts: 0,
-                    next_run_at_ms: None,
-                    last_error: Some(format!("{ENQUEUE_WORKER_FAILED_ERROR}: {reason_fallback}")),
-                    payload: payload_fallback,
-                    created_at_ms: now,
-                    updated_at_ms: now,
-                    run_ids: Vec::new(),
-                    policy: policy_fallback,
-                    blocked_reason: Some(category),
-                    policy_explicit: true,
+                warn!("falling back to inline blocked task enqueue after enqueue worker failure");
+                let mut task = queue_fallback.enqueue_blocked_with_policy(
+                    payload_fallback,
+                    reason_fallback,
+                    category,
+                    policy_fallback,
+                );
+                if task.state == TaskState::Failed && task.last_error.is_none() {
+                    task.last_error = Some(ENQUEUE_WORKER_FAILED_ERROR.to_string());
+                    task.updated_at_ms = now;
                 }
+                task
             }
         }
     }

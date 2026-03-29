@@ -589,9 +589,15 @@ impl ActivityDispatcher {
                             stop_typing_shutdown.as_ref(),
                             &stop_typing_deadline,
                         ) {
-                            let request =
-                                pending.remove(&key).expect("pending stop typing request");
-                            Some(Err(request))
+                            match pending.remove(&key) {
+                                Some(request) => Some(Err(request)),
+                                None => {
+                                    tracing::warn!(
+                                        "stop typing dispatcher lost a pending request during shutdown"
+                                    );
+                                    None
+                                }
+                            }
                         } else {
                             request.queued = false;
                             request.in_flight = true;
@@ -633,9 +639,15 @@ impl ActivityDispatcher {
                                     stop_typing_shutdown.as_ref(),
                                     &stop_typing_deadline,
                                 ) {
-                                    let request =
-                                        pending.remove(&key).expect("pending stop typing request");
-                                    Some(Err(request))
+                                    match pending.remove(&key) {
+                                        Some(request) => Some(Err(request)),
+                                        None => {
+                                            tracing::warn!(
+                                                "stop typing dispatcher lost a pending request during shutdown"
+                                            );
+                                            None
+                                        }
+                                    }
                                 } else if request.stop_states.is_empty() {
                                     pending.remove(&key);
                                     None

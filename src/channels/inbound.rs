@@ -20,6 +20,12 @@ pub struct InboundDispatchOptions {
     pub read_receipt_task_id: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboundDispatchResult {
+    pub run_id: String,
+    pub run_spawned: bool,
+}
+
 /// Dispatch an inbound text message into the agent pipeline.
 ///
 /// Returns the run ID if queued successfully.
@@ -41,6 +47,7 @@ pub async fn dispatch_inbound_text(
         InboundDispatchOptions::default(),
     )
     .await
+    .map(|result| result.run_id)
 }
 
 /// Dispatch an inbound text message with optional channel activity context.
@@ -52,7 +59,7 @@ pub async fn dispatch_inbound_text_with_options(
     text: &str,
     chat_id: Option<String>,
     options: InboundDispatchOptions,
-) -> Result<String, String> {
+) -> Result<InboundDispatchResult, String> {
     let cfg = crate::config::load_config_shared()
         .unwrap_or_else(|_| Arc::new(Value::Object(serde_json::Map::new())));
     let effective_peer_id = if peer_id.is_empty() {
@@ -129,7 +136,7 @@ pub async fn dispatch_inbound_text_with_options(
         registry.register(run);
     }
 
-    if let Some(provider) = state.llm_provider() {
+    let run_spawned = if let Some(provider) = state.llm_provider() {
         let mut config = crate::agent::AgentConfig::default();
         crate::agent::apply_agent_config_from_settings(&mut config, cfg.as_ref(), None);
         config.deliver = true;
@@ -147,13 +154,18 @@ pub async fn dispatch_inbound_text_with_options(
             sender = %sender_id,
             "Inbound agent run dispatched"
         );
+        true
     } else {
         debug!(
             run_id = %run_id,
             channel = %channel,
             "Inbound message queued (no LLM provider)"
         );
-    }
+        false
+    };
 
-    Ok(run_id)
+    Ok(InboundDispatchResult {
+        run_id,
+        run_spawned,
+    })
 }
