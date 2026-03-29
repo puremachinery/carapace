@@ -951,7 +951,7 @@ async fn withhold_owned_read_receipt_on_failed_run(
         .activity_service()
         .withhold_read_receipt(
             task_id,
-            crate::channels::activity::READ_RECEIPT_WITHHELD_REASON,
+            crate::channels::activity::READ_RECEIPT_WITHHELD_RUN_FAILED_REASON,
         )
         .await;
 
@@ -1458,7 +1458,7 @@ pub async fn execute_run(
                                     .activity_service()
                                     .withhold_read_receipt(
                                         task_id,
-                                        crate::channels::activity::READ_RECEIPT_WITHHELD_REASON,
+                                        crate::channels::activity::READ_RECEIPT_WITHHELD_RESPONSE_QUEUE_FAILED_REASON,
                                     )
                                     .await;
                             }
@@ -1468,7 +1468,7 @@ pub async fn execute_run(
                             .activity_service()
                             .withhold_read_receipt(
                                 task_id,
-                                crate::channels::activity::READ_RECEIPT_WITHHELD_REASON,
+                                crate::channels::activity::READ_RECEIPT_WITHHELD_NO_DELIVERY_TARGET_REASON,
                             )
                             .await;
                     }
@@ -1477,7 +1477,7 @@ pub async fn execute_run(
                         .activity_service()
                         .withhold_read_receipt(
                             task_id,
-                            crate::channels::activity::READ_RECEIPT_WITHHELD_REASON,
+                            crate::channels::activity::READ_RECEIPT_WITHHELD_EMPTY_RESPONSE_REASON,
                         )
                         .await;
                 }
@@ -1486,7 +1486,7 @@ pub async fn execute_run(
                     .activity_service()
                     .withhold_read_receipt(
                         task_id,
-                        crate::channels::activity::READ_RECEIPT_WITHHELD_REASON,
+                        crate::channels::activity::READ_RECEIPT_WITHHELD_DELIVERY_DISABLED_REASON,
                     )
                     .await;
             }
@@ -2610,6 +2610,10 @@ mod tests {
             .get(&read_receipt_task_id)
             .expect("run error should preserve the durable read receipt task");
         assert_eq!(withheld_task.state, crate::tasks::TaskState::Cancelled);
+        assert_eq!(
+            withheld_task.last_error.as_deref(),
+            Some(crate::channels::activity::READ_RECEIPT_WITHHELD_RUN_FAILED_REASON)
+        );
 
         crate::config::clear_cache();
     }
@@ -2687,6 +2691,10 @@ mod tests {
             .get(&read_receipt_task_id)
             .expect("session lookup failure should preserve the durable read receipt task");
         assert_eq!(withheld_task.state, crate::tasks::TaskState::Cancelled);
+        assert_eq!(
+            withheld_task.last_error.as_deref(),
+            Some(crate::channels::activity::READ_RECEIPT_WITHHELD_RUN_FAILED_REASON)
+        );
     }
 
     #[tokio::test]

@@ -49,8 +49,28 @@ const ACTIVITY_BLOCKING_IO_MAX_SECS: u64 = 5;
 const READ_RECEIPT_RETRY_DELAY_MS: u64 = 5_000;
 const READ_RECEIPT_OWNERSHIP_HIGH_WATERMARK: usize = 10_000;
 const READ_RECEIPT_PENDING_REASON: &str = "waiting for successful response delivery";
-pub(crate) const READ_RECEIPT_WITHHELD_REASON: &str =
-    "withholding explicit read receipt because after-response policy requires a successful response delivery";
+pub(crate) const READ_RECEIPT_WITHHELD_RUN_FAILED_REASON: &str =
+    "withholding explicit read receipt because the agent run did not complete successfully";
+pub(crate) const READ_RECEIPT_WITHHELD_RESPONSE_QUEUE_FAILED_REASON: &str =
+    "withholding explicit read receipt because the agent response could not be queued for delivery";
+pub(crate) const READ_RECEIPT_WITHHELD_NO_DELIVERY_TARGET_REASON: &str =
+    "withholding explicit read receipt because no outbound delivery target was available";
+pub(crate) const READ_RECEIPT_WITHHELD_EMPTY_RESPONSE_REASON: &str =
+    "withholding explicit read receipt because the agent produced no deliverable response text";
+pub(crate) const READ_RECEIPT_WITHHELD_DELIVERY_DISABLED_REASON: &str =
+    "withholding explicit read receipt because outbound delivery was disabled for this run";
+pub(crate) const READ_RECEIPT_WITHHELD_INBOUND_DISPATCH_FAILED_REASON: &str =
+    "withholding explicit read receipt because inbound Signal dispatch failed";
+pub(crate) const READ_RECEIPT_WITHHELD_MESSAGE_EXPIRED_REASON: &str =
+    "withholding explicit read receipt because the queued response expired before delivery";
+pub(crate) const READ_RECEIPT_WITHHELD_HOOK_CANCELLED_REASON: &str =
+    "withholding explicit read receipt because a hook cancelled the queued response before delivery";
+pub(crate) const READ_RECEIPT_WITHHELD_PLUGIN_MISSING_REASON: &str =
+    "withholding explicit read receipt because no channel plugin was available for delivery";
+pub(crate) const READ_RECEIPT_WITHHELD_DELIVERY_FAILED_REASON: &str =
+    "withholding explicit read receipt because response delivery failed";
+pub(crate) const READ_RECEIPT_WITHHELD_DELIVERY_CALL_FAILED_REASON: &str =
+    "withholding explicit read receipt because the channel delivery call failed";
 const READ_RECEIPT_TASK_KIND: &str = "activityReadReceipt";
 // This budget must stay at or above the longest built-in activity operation
 // timeout so graceful shutdown drains already-queued work instead of routinely

@@ -81,7 +81,7 @@ pub(crate) async fn process_channel_messages(
             withhold_pending_read_receipt(
                 activity_service,
                 &expired.message.metadata,
-                crate::channels::activity::READ_RECEIPT_WITHHELD_REASON,
+                crate::channels::activity::READ_RECEIPT_WITHHELD_MESSAGE_EXPIRED_REASON,
             )
             .await;
         }
@@ -116,7 +116,7 @@ pub(crate) async fn process_channel_messages(
                 withhold_pending_read_receipt(
                     activity_service,
                     &message.metadata,
-                    crate::channels::activity::READ_RECEIPT_WITHHELD_REASON,
+                    crate::channels::activity::READ_RECEIPT_WITHHELD_HOOK_CANCELLED_REASON,
                 )
                 .await;
                 continue;
@@ -146,7 +146,7 @@ pub(crate) async fn process_channel_messages(
                 withhold_pending_read_receipt(
                     activity_service,
                     &message.metadata,
-                    crate::channels::activity::READ_RECEIPT_WITHHELD_REASON,
+                    crate::channels::activity::READ_RECEIPT_WITHHELD_PLUGIN_MISSING_REASON,
                 )
                 .await;
                 continue;
@@ -248,7 +248,7 @@ async fn handle_delivery_result(
                 withhold_pending_read_receipt(
                     activity_service,
                     metadata,
-                    crate::channels::activity::READ_RECEIPT_WITHHELD_REASON,
+                    crate::channels::activity::READ_RECEIPT_WITHHELD_DELIVERY_FAILED_REASON,
                 )
                 .await;
             }
@@ -258,7 +258,7 @@ async fn handle_delivery_result(
             withhold_pending_read_receipt(
                 activity_service,
                 metadata,
-                crate::channels::activity::READ_RECEIPT_WITHHELD_REASON,
+                crate::channels::activity::READ_RECEIPT_WITHHELD_DELIVERY_CALL_FAILED_REASON,
             )
             .await;
         }
@@ -1038,6 +1038,10 @@ mod tests {
             .get(&read_receipt.task_id)
             .expect("hook cancellation should preserve the durable read receipt task");
         assert_eq!(withheld_task.state, crate::tasks::TaskState::Cancelled);
+        assert_eq!(
+            withheld_task.last_error.as_deref(),
+            Some(crate::channels::activity::READ_RECEIPT_WITHHELD_HOOK_CANCELLED_REASON)
+        );
         activity_service.shutdown().await;
     }
 
@@ -1081,6 +1085,10 @@ mod tests {
             .get(&read_receipt.task_id)
             .expect("missing plugin should preserve the durable read receipt task");
         assert_eq!(withheld_task.state, crate::tasks::TaskState::Cancelled);
+        assert_eq!(
+            withheld_task.last_error.as_deref(),
+            Some(crate::channels::activity::READ_RECEIPT_WITHHELD_PLUGIN_MISSING_REASON)
+        );
         activity_service.shutdown().await;
     }
 
@@ -1124,6 +1132,10 @@ mod tests {
             .get(&read_receipt.task_id)
             .expect("expired delivery should preserve the durable read receipt task");
         assert_eq!(withheld_task.state, crate::tasks::TaskState::Cancelled);
+        assert_eq!(
+            withheld_task.last_error.as_deref(),
+            Some(crate::channels::activity::READ_RECEIPT_WITHHELD_MESSAGE_EXPIRED_REASON)
+        );
         activity_service.shutdown().await;
     }
 
@@ -1175,6 +1187,10 @@ mod tests {
             .get(&read_receipt.task_id)
             .expect("failed delivery should preserve the durable read receipt task");
         assert_eq!(withheld_task.state, crate::tasks::TaskState::Cancelled);
+        assert_eq!(
+            withheld_task.last_error.as_deref(),
+            Some(crate::channels::activity::READ_RECEIPT_WITHHELD_DELIVERY_FAILED_REASON)
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

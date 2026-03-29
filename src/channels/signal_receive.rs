@@ -81,13 +81,13 @@ fn deserialize_signal_envelope_item(item: Value) -> Result<SignalEnvelope, serde
 }
 
 fn resolve_signal_sender_and_peer(
-    envelope: &SignalEnvelope,
+    sender: &str,
     data_message: &SignalDataMessage,
 ) -> Option<(String, String)> {
-    let sender = envelope
-        .effective_source_number()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())?;
+    let sender = sender.trim();
+    if sender.is_empty() {
+        return None;
+    }
     let group_id = data_message
         .group_info
         .as_ref()
@@ -553,13 +553,15 @@ async fn process_envelope(
         return;
     }
 
-    let (sender, peer_id) = match resolve_signal_sender_and_peer(envelope, data_message) {
-        Some(ids) => ids,
+    let sender = match sender {
+        Some(sender) => sender.to_string(),
         None => {
             warn!("Ignoring Signal envelope with empty sender ID");
             return;
         }
     };
+    let (sender, peer_id) = resolve_signal_sender_and_peer(&sender, data_message)
+        .expect("normalized sender should remain valid after ignored group checks");
     let (read_receipt_context, read_receipt_task_id) = match read_receipt_context {
         Some(ctx) => match acquire_signal_read_receipt_ownership(state, &sender, ctx.clone()).await
         {
@@ -610,11 +612,11 @@ async fn process_envelope(
                         .activity_service()
                         .activate_read_receipt(task_id)
                         .await;
+                    warn!(
+                        sender = %sender,
+                        "Signal read receipts were claimed for this message but no LLM provider was available at dispatch time; sending the explicit receipt immediately"
+                    );
                 }
-                warn!(
-                    sender = %sender,
-                    "Signal read receipts were claimed for this message but no LLM provider was available at dispatch time; sending the explicit receipt immediately"
-                );
             }
             debug!(
                 run_id = %result.run_id,
@@ -628,7 +630,7 @@ async fn process_envelope(
                     .activity_service()
                     .withhold_read_receipt(
                         task_id,
-                        crate::channels::activity::READ_RECEIPT_WITHHELD_REASON,
+                        crate::channels::activity::READ_RECEIPT_WITHHELD_INBOUND_DISPATCH_FAILED_REASON,
                     )
                     .await;
             }
@@ -1346,19 +1348,12 @@ mod tests {
 
     #[test]
     fn test_resolve_sender_and_peer_rejects_empty_sender() {
-        let envelope = SignalEnvelope {
-            source_number: Some("   ".to_string()),
-            source: None,
+        let data_message = SignalDataMessage {
+            message: Some("Hello".to_string()),
             timestamp: None,
-            data_message: Some(SignalDataMessage {
-                message: Some("Hello".to_string()),
-                timestamp: None,
-                group_info: None,
-            }),
+            group_info: None,
         };
-
-        let ids =
-            resolve_signal_sender_and_peer(&envelope, envelope.data_message.as_ref().unwrap());
+        let ids = resolve_signal_sender_and_peer("   ", &data_message);
         assert!(ids.is_none());
     }
 
@@ -1377,8 +1372,10 @@ mod tests {
             }),
         };
 
-        let ids =
-            resolve_signal_sender_and_peer(&envelope, envelope.data_message.as_ref().unwrap());
+        let ids = resolve_signal_sender_and_peer(
+            envelope.effective_source_number().unwrap(),
+            envelope.data_message.as_ref().unwrap(),
+        );
         assert_eq!(
             ids,
             Some(("+15559876543".to_string(), "+15559876543".to_string()))
@@ -1400,8 +1397,10 @@ mod tests {
             }),
         };
 
-        let ids =
-            resolve_signal_sender_and_peer(&envelope, envelope.data_message.as_ref().unwrap());
+        let ids = resolve_signal_sender_and_peer(
+            envelope.effective_source_number().unwrap(),
+            envelope.data_message.as_ref().unwrap(),
+        );
         assert!(ids.is_none());
     }
 
@@ -1420,8 +1419,10 @@ mod tests {
             }),
         };
 
-        let ids =
-            resolve_signal_sender_and_peer(&envelope, envelope.data_message.as_ref().unwrap());
+        let ids = resolve_signal_sender_and_peer(
+            envelope.effective_source_number().unwrap(),
+            envelope.data_message.as_ref().unwrap(),
+        );
         assert!(ids.is_none());
     }
 
