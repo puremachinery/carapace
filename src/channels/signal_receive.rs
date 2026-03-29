@@ -252,18 +252,48 @@ struct SignalReceivePollSnapshot {
     carapace_manages_read_receipts: bool,
 }
 
-fn can_manage_signal_read_receipts(
+async fn can_manage_signal_read_receipts(
     activity_policy: &crate::channels::activity::ChannelActivityPolicy,
     activity_service: &crate::channels::activity::ActivityService,
     state: &WsServerState,
 ) -> bool {
-    activity_policy.read_receipts.enabled
-        && state.llm_provider().is_some()
-        && state
-            .plugin_registry()
-            .and_then(|registry| registry.get_channel("signal"))
-            .is_some()
-        && activity_service.can_accept_read_receipt_ownership("signal")
+    if !activity_policy.read_receipts.enabled
+        || state.llm_provider().is_none()
+        || !activity_service.can_accept_read_receipt_ownership("signal")
+    {
+        return false;
+    }
+
+    let Some(plugin_registry) = state.plugin_registry() else {
+        return false;
+    };
+    let Some(plugin) = plugin_registry.get_channel("signal") else {
+        return false;
+    };
+
+    match tokio::task::spawn_blocking(move || plugin.get_capabilities()).await {
+        Ok(Ok(capabilities)) if capabilities.read_receipts => true,
+        Ok(Ok(_)) => {
+            state
+                .activity_service()
+                .warn_unsupported_feature("signal", "read_receipts");
+            false
+        }
+        Ok(Err(err)) => {
+            warn!(
+                error = %err,
+                "failed to load Signal capabilities while deciding whether to suppress upstream auto-read-receipts"
+            );
+            false
+        }
+        Err(err) => {
+            warn!(
+                error = %err,
+                "Signal capability worker failed while deciding whether to suppress upstream auto-read-receipts"
+            );
+            false
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -319,7 +349,7 @@ async fn acquire_signal_read_receipt_ownership(
     }
 }
 
-fn snapshot_signal_receive_poll(
+async fn snapshot_signal_receive_poll(
     base_url: &url::Url,
     phone_number: &str,
     activity_policy: &crate::channels::activity::ChannelActivityPolicy,
@@ -327,7 +357,7 @@ fn snapshot_signal_receive_poll(
     activity_service: &crate::channels::activity::ActivityService,
 ) -> SignalReceivePollSnapshot {
     let carapace_manages_read_receipts =
-        can_manage_signal_read_receipts(activity_policy, activity_service, state);
+        can_manage_signal_read_receipts(activity_policy, activity_service, state).await;
     SignalReceivePollSnapshot {
         receive_url: build_receive_url(base_url, phone_number, carapace_manages_read_receipts),
         carapace_manages_read_receipts,
@@ -396,7 +426,8 @@ pub async fn signal_receive_loop(
             &activity_policy,
             state.as_ref(),
             state.activity_service(),
-        );
+        )
+        .await;
 
         match client.get(poll_snapshot.receive_url.clone()).send().await {
             Ok(resp) if resp.status().is_success() => {
@@ -769,6 +800,68 @@ mod tests {
         )
     }
 
+    struct MockSignalNoReadReceiptChannel;
+
+    impl ChannelPluginInstance for MockSignalNoReadReceiptChannel {
+        fn get_info(&self) -> Result<ChannelInfo, BindingError> {
+            Ok(ChannelInfo {
+                id: "signal".to_string(),
+                label: "Signal".to_string(),
+                selection_label: "Signal".to_string(),
+                docs_path: String::new(),
+                blurb: String::new(),
+                order: 0,
+            })
+        }
+
+        fn get_capabilities(&self) -> Result<ChannelCapabilities, BindingError> {
+            Ok(ChannelCapabilities::default())
+        }
+
+        fn send_text(
+            &self,
+            _ctx: crate::plugins::OutboundContext,
+        ) -> Result<crate::plugins::DeliveryResult, BindingError> {
+            Ok(crate::plugins::DeliveryResult {
+                ok: true,
+                message_id: None,
+                error: None,
+                retryable: false,
+                conversation_id: None,
+                to_jid: None,
+                poll_id: None,
+            })
+        }
+
+        fn send_media(
+            &self,
+            _ctx: crate::plugins::OutboundContext,
+        ) -> Result<crate::plugins::DeliveryResult, BindingError> {
+            Ok(crate::plugins::DeliveryResult {
+                ok: true,
+                message_id: None,
+                error: None,
+                retryable: false,
+                conversation_id: None,
+                to_jid: None,
+                poll_id: None,
+            })
+        }
+    }
+
+    fn test_state_with_provider_and_signal_plugin_without_receipts() -> Arc<WsServerState> {
+        let plugin_registry = Arc::new(PluginRegistry::new());
+        plugin_registry.register_channel(
+            "signal".to_string(),
+            Arc::new(MockSignalNoReadReceiptChannel),
+        );
+        Arc::new(
+            WsServerState::new(WsServerConfig::default())
+                .with_llm_provider(Arc::new(StaticTestProvider))
+                .with_plugin_registry(plugin_registry),
+        )
+    }
+
     #[derive(Clone)]
     struct SignalReceiveTestServerState {
         requests: Arc<Mutex<Vec<String>>>,
@@ -1094,8 +1187,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_snapshot_signal_receive_poll_leaves_auto_receipts_enabled_without_signal_plugin() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_snapshot_signal_receive_poll_leaves_auto_receipts_enabled_without_signal_plugin()
+    {
         let state = test_state_with_provider(true);
         let activity_service = crate::channels::activity::ActivityService::new();
         let activity_policy = crate::channels::activity::ChannelActivityPolicy {
@@ -1112,7 +1206,8 @@ mod tests {
             &activity_policy,
             state.as_ref(),
             &activity_service,
-        );
+        )
+        .await;
 
         assert!(!snapshot.carapace_manages_read_receipts);
         assert_eq!(
@@ -1134,8 +1229,8 @@ mod tests {
         assert!(!sanitized.contains("send_read_receipts=false"));
     }
 
-    #[test]
-    fn test_snapshot_signal_receive_poll_uses_single_policy_view() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_snapshot_signal_receive_poll_uses_single_policy_view() {
         let activity_service = crate::channels::activity::ActivityService::new();
         let state = test_state_with_provider_and_signal_plugin();
         let activity_policy = crate::channels::activity::ChannelActivityPolicy {
@@ -1152,7 +1247,8 @@ mod tests {
             &activity_policy,
             state.as_ref(),
             &activity_service,
-        );
+        )
+        .await;
 
         assert!(snapshot.carapace_manages_read_receipts);
         assert_eq!(
@@ -1191,7 +1287,8 @@ mod tests {
             &activity_policy,
             state.as_ref(),
             &activity_service,
-        );
+        )
+        .await;
 
         assert!(!snapshot.carapace_manages_read_receipts);
         assert_eq!(
@@ -1200,8 +1297,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_snapshot_signal_receive_poll_leaves_auto_receipts_enabled_without_provider() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_snapshot_signal_receive_poll_leaves_auto_receipts_enabled_without_provider() {
         let activity_service = crate::channels::activity::ActivityService::new();
         let state = test_state_with_provider(false);
         let activity_policy = crate::channels::activity::ChannelActivityPolicy {
@@ -1218,7 +1315,37 @@ mod tests {
             &activity_policy,
             state.as_ref(),
             &activity_service,
+        )
+        .await;
+
+        assert!(!snapshot.carapace_manages_read_receipts);
+        assert_eq!(
+            snapshot.receive_url.as_str(),
+            "http://localhost:8080/api/v1/receive/%2B15551234567?debug=1"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_snapshot_signal_receive_poll_leaves_auto_receipts_enabled_without_receipt_capability(
+    ) {
+        let activity_service = crate::channels::activity::ActivityService::new();
+        let state = test_state_with_provider_and_signal_plugin_without_receipts();
+        let activity_policy = crate::channels::activity::ChannelActivityPolicy {
+            read_receipts: crate::channels::activity::ReadReceiptFeaturePolicy {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let snapshot = snapshot_signal_receive_poll(
+            &url::Url::parse("http://localhost:8080/api?debug=1").unwrap(),
+            "+15551234567",
+            &activity_policy,
+            state.as_ref(),
+            &activity_service,
+        )
+        .await;
 
         assert!(!snapshot.carapace_manages_read_receipts);
         assert_eq!(

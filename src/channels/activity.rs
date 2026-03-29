@@ -140,7 +140,7 @@ impl UnsupportedActivityWarningRegistry {
         self.seen_at
             .retain(|_, last_seen| now.saturating_duration_since(*last_seen) < self.cooldown);
         match self.seen_at.get(key) {
-            Some(last_seen) if now.saturating_duration_since(*last_seen) < self.cooldown => false,
+            Some(_) => false,
             _ => {
                 self.seen_at.insert(key.to_string(), now);
                 true

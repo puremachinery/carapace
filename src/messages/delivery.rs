@@ -62,10 +62,6 @@ pub(crate) async fn process_channel_messages(
     activity_service: &crate::channels::activity::ActivityService,
 ) {
     for channel_id in channel_ids {
-        if !channel_registry.is_connected(channel_id) {
-            continue;
-        }
-
         let work = pipeline.next_delivery_work_for_channel(channel_id);
         for expired in work.expired {
             let expired_message_id = expired.message.id.clone();
@@ -84,6 +80,10 @@ pub(crate) async fn process_channel_messages(
                 crate::channels::activity::READ_RECEIPT_WITHHELD_MESSAGE_EXPIRED_REASON,
             )
             .await;
+        }
+
+        if !channel_registry.is_connected(channel_id) {
+            continue;
         }
 
         let msg = match work.ready {
@@ -1131,6 +1131,52 @@ mod tests {
             .read_receipt_queue()
             .get(&read_receipt.task_id)
             .expect("expired delivery should preserve the durable read receipt task");
+        assert_eq!(withheld_task.state, crate::tasks::TaskState::Cancelled);
+        assert_eq!(
+            withheld_task.last_error.as_deref(),
+            Some(crate::channels::activity::READ_RECEIPT_WITHHELD_MESSAGE_EXPIRED_REASON)
+        );
+        activity_service.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_process_channel_messages_expires_read_receipt_when_channel_is_disconnected() {
+        let mock = Arc::new(MockChannel::with_read_receipts());
+        let (pipeline, plugin_reg, channel_reg) =
+            make_pipeline_and_registries("signal", Some(mock.clone()), false);
+        let activity_service = test_activity_service();
+        let read_receipt =
+            enqueue_after_response_read_receipt_task(&activity_service, "+15551234567", 123).await;
+
+        let mut msg = OutboundMessage::new("signal", MessageContent::text("hello")).with_metadata(
+            crate::messages::outbound::MessageMetadata {
+                recipient_id: Some("+15551234567".to_string()),
+                read_receipt: Some(read_receipt.clone()),
+                ttl_ms: 1,
+                ..Default::default()
+            },
+        );
+        msg.created_at -= 10_000;
+        let queued = pipeline.queue(msg, MsgOutboundContext::new()).unwrap();
+
+        process_channel_messages(
+            &["signal".to_string()],
+            &pipeline,
+            &plugin_reg,
+            &channel_reg,
+            &activity_service,
+        )
+        .await;
+
+        assert_eq!(mock.send_text_count.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            pipeline.get_status(&queued.message_id),
+            Some(crate::messages::outbound::DeliveryStatus::Expired)
+        );
+        let withheld_task = activity_service
+            .read_receipt_queue()
+            .get(&read_receipt.task_id)
+            .expect("expired disconnected delivery should preserve the durable read receipt task");
         assert_eq!(withheld_task.state, crate::tasks::TaskState::Cancelled);
         assert_eq!(
             withheld_task.last_error.as_deref(),

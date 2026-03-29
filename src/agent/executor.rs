@@ -1297,7 +1297,7 @@ pub async fn execute_run(
                 .map(|capabilities| capabilities.typing_indicators)
                 .unwrap_or(false)
             {
-                if policy.typing.enabled {
+                if policy.typing.enabled && !capability_probe_failed {
                     state
                         .activity_service()
                         .warn_unsupported_feature(channel_id, "typing");
