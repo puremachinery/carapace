@@ -47,7 +47,7 @@ pub async fn delivery_loop(
             &pipeline,
             &plugin_registry,
             &channel_registry,
-            state.activity_service(),
+            &state,
         )
         .await;
     }
@@ -59,8 +59,9 @@ pub(crate) async fn process_channel_messages(
     pipeline: &MessagePipeline,
     plugin_registry: &Arc<PluginRegistry>,
     channel_registry: &ChannelRegistry,
-    activity_service: &crate::channels::activity::ActivityService,
+    state: &Arc<WsServerState>,
 ) {
+    let activity_service = state.activity_service();
     for channel_id in channel_ids {
         let work = pipeline.next_delivery_work_for_channel(channel_id);
         for expired in work.expired {
@@ -192,14 +193,7 @@ pub(crate) async fn process_channel_messages(
             }),
         );
 
-        handle_delivery_result(
-            pipeline,
-            &message.metadata,
-            &message_id,
-            result,
-            activity_service,
-        )
-        .await;
+        handle_delivery_result(pipeline, &message.metadata, &message_id, result, state).await;
     }
 }
 
@@ -210,7 +204,7 @@ async fn withhold_pending_read_receipt(
 ) {
     if let Some(read_receipt) = metadata.read_receipt.as_ref() {
         activity_service
-            .withhold_read_receipt(&read_receipt.task_id, reason)
+            .withhold_owned_read_receipt(read_receipt, reason)
             .await;
     }
 }
@@ -221,14 +215,15 @@ async fn handle_delivery_result(
     metadata: &crate::messages::outbound::MessageMetadata,
     message_id: &crate::messages::outbound::MessageId,
     result: Result<plugins::DeliveryResult, plugins::BindingError>,
-    activity_service: &crate::channels::activity::ActivityService,
+    state: &Arc<WsServerState>,
 ) {
+    let activity_service = state.activity_service();
     match result {
         Ok(delivery) if delivery.ok => {
             let _ = pipeline.mark_sent(message_id);
             if let Some(read_receipt) = metadata.read_receipt.clone() {
                 activity_service
-                    .activate_read_receipt(&read_receipt.task_id)
+                    .complete_owned_read_receipt_after_delivery(state.as_ref(), &read_receipt)
                     .await;
             }
         }
@@ -535,8 +530,17 @@ mod tests {
         }
     }
 
-    fn test_activity_service() -> crate::channels::activity::ActivityService {
-        crate::channels::activity::ActivityService::with_backlog_warning_threshold(8)
+    fn test_activity_service() -> Arc<crate::channels::activity::ActivityService> {
+        Arc::new(crate::channels::activity::ActivityService::with_backlog_warning_threshold(8))
+    }
+
+    fn test_state_with_activity_service(
+        activity_service: Arc<crate::channels::activity::ActivityService>,
+    ) -> Arc<crate::server::ws::WsServerState> {
+        Arc::new(
+            crate::server::ws::WsServerState::new(crate::server::ws::WsServerConfig::default())
+                .with_activity_service(activity_service),
+        )
     }
 
     async fn enqueue_after_response_read_receipt_task(
@@ -555,7 +559,15 @@ mod tests {
             )
             .await
             .expect("read receipt task should be persisted");
-        crate::messages::outbound::PendingReadReceipt { task_id }
+        crate::channels::activity::OwnedReadReceipt::Deferred {
+            channel_id: "signal".to_string(),
+            context: ReadReceiptContext {
+                recipient: recipient.to_string(),
+                timestamp: Some(timestamp),
+                ..Default::default()
+            },
+            task_id,
+        }
     }
 
     fn make_pipeline_and_registries(
@@ -732,6 +744,7 @@ mod tests {
         let (pipeline, plugin_reg, channel_reg) =
             make_pipeline_and_registries("signal", Some(mock.clone()), true);
         let activity_service = test_activity_service();
+        let state = test_state_with_activity_service(activity_service.clone());
         let read_receipt =
             enqueue_after_response_read_receipt_task(&activity_service, "+15551234567", 123).await;
 
@@ -751,7 +764,7 @@ mod tests {
             &pipeline,
             &plugin_reg,
             &channel_reg,
-            &activity_service,
+            &state,
         )
         .await;
 
@@ -768,7 +781,11 @@ mod tests {
         );
         let pending_task = activity_service
             .read_receipt_queue()
-            .get(&read_receipt.task_id)
+            .get(
+                read_receipt
+                    .task_id()
+                    .expect("durable test receipt should have a task id"),
+            )
             .expect("read receipt task should still exist after retryable failure");
         assert_eq!(pending_task.state, crate::tasks::TaskState::Blocked);
 
@@ -777,7 +794,7 @@ mod tests {
             &pipeline,
             &plugin_reg,
             &channel_reg,
-            &activity_service,
+            &state,
         )
         .await;
 
@@ -788,7 +805,11 @@ mod tests {
         assert_eq!(mock.send_text_count.load(Ordering::Relaxed), 2);
         let activated_task = activity_service
             .read_receipt_queue()
-            .get(&read_receipt.task_id)
+            .get(
+                read_receipt
+                    .task_id()
+                    .expect("durable test receipt should have a task id"),
+            )
             .expect("successful retry should activate the durable read receipt task");
         assert_eq!(activated_task.state, crate::tasks::TaskState::RetryWait);
         activity_service.shutdown().await;
@@ -916,6 +937,7 @@ mod tests {
         let (pipeline, _plugin_reg, _channel_reg) =
             make_pipeline_and_registries("signal", Some(mock.clone()), true);
         let activity_service = test_activity_service();
+        let state = test_state_with_activity_service(activity_service.clone());
         let read_receipt =
             enqueue_after_response_read_receipt_task(&activity_service, "+15551234567", 123).await;
 
@@ -944,7 +966,7 @@ mod tests {
                 to_jid: None,
                 poll_id: None,
             }),
-            &activity_service,
+            &state,
         )
         .await;
 
@@ -954,7 +976,11 @@ mod tests {
         );
         let activated_task = activity_service
             .read_receipt_queue()
-            .get(&read_receipt.task_id)
+            .get(
+                read_receipt
+                    .task_id()
+                    .expect("durable test receipt should have a task id"),
+            )
             .expect("delivery success should preserve the durable read receipt task");
         assert_eq!(activated_task.state, crate::tasks::TaskState::RetryWait);
         activity_service.shutdown().await;
@@ -966,6 +992,7 @@ mod tests {
         let (pipeline, plugin_reg, channel_reg) =
             make_pipeline_and_registries("signal", Some(mock.clone()), true);
         let activity_service = test_activity_service();
+        let state = test_state_with_activity_service(activity_service.clone());
         let read_receipt =
             enqueue_after_response_read_receipt_task(&activity_service, "+15551234567", 123).await;
 
@@ -983,7 +1010,7 @@ mod tests {
             &pipeline,
             &plugin_reg,
             &channel_reg,
-            &activity_service,
+            &state,
         )
         .await;
 
@@ -994,7 +1021,11 @@ mod tests {
         );
         let activated_task = activity_service
             .read_receipt_queue()
-            .get(&read_receipt.task_id)
+            .get(
+                read_receipt
+                    .task_id()
+                    .expect("durable test receipt should have a task id"),
+            )
             .expect("delivery success should activate the durable read receipt task");
         assert_eq!(activated_task.state, crate::tasks::TaskState::RetryWait);
         activity_service.shutdown().await;
@@ -1007,6 +1038,7 @@ mod tests {
             make_pipeline_and_registries("signal", Some(mock.clone()), true);
         plugin_reg.register_hook("cancel-hook".to_string(), Arc::new(CancellingHook));
         let activity_service = test_activity_service();
+        let state = test_state_with_activity_service(activity_service.clone());
         let read_receipt =
             enqueue_after_response_read_receipt_task(&activity_service, "+15551234567", 123).await;
 
@@ -1024,7 +1056,7 @@ mod tests {
             &pipeline,
             &plugin_reg,
             &channel_reg,
-            &activity_service,
+            &state,
         )
         .await;
 
@@ -1035,7 +1067,11 @@ mod tests {
         );
         let withheld_task = activity_service
             .read_receipt_queue()
-            .get(&read_receipt.task_id)
+            .get(
+                read_receipt
+                    .task_id()
+                    .expect("durable test receipt should have a task id"),
+            )
             .expect("hook cancellation should preserve the durable read receipt task");
         assert_eq!(withheld_task.state, crate::tasks::TaskState::Cancelled);
         assert_eq!(
@@ -1048,6 +1084,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn test_process_channel_messages_withholds_read_receipt_when_plugin_missing() {
         let activity_service = test_activity_service();
+        let state = test_state_with_activity_service(activity_service.clone());
         let read_receipt =
             enqueue_after_response_read_receipt_task(&activity_service, "+15551234567", 123).await;
         let pipeline = Arc::new(MessagePipeline::new());
@@ -1072,7 +1109,7 @@ mod tests {
             &pipeline,
             &plugin_reg,
             &channel_reg,
-            &activity_service,
+            &state,
         )
         .await;
 
@@ -1082,7 +1119,11 @@ mod tests {
         );
         let withheld_task = activity_service
             .read_receipt_queue()
-            .get(&read_receipt.task_id)
+            .get(
+                read_receipt
+                    .task_id()
+                    .expect("durable test receipt should have a task id"),
+            )
             .expect("missing plugin should preserve the durable read receipt task");
         assert_eq!(withheld_task.state, crate::tasks::TaskState::Cancelled);
         assert_eq!(
@@ -1099,6 +1140,7 @@ mod tests {
         let (pipeline, plugin_reg, channel_reg) =
             make_pipeline_and_registries("signal", Some(mock.clone()), true);
         let activity_service = test_activity_service();
+        let state = test_state_with_activity_service(activity_service.clone());
         let read_receipt =
             enqueue_after_response_read_receipt_task(&activity_service, "+15551234567", 123).await;
 
@@ -1118,7 +1160,7 @@ mod tests {
             &pipeline,
             &plugin_reg,
             &channel_reg,
-            &activity_service,
+            &state,
         )
         .await;
 
@@ -1129,7 +1171,11 @@ mod tests {
         );
         let withheld_task = activity_service
             .read_receipt_queue()
-            .get(&read_receipt.task_id)
+            .get(
+                read_receipt
+                    .task_id()
+                    .expect("durable test receipt should have a task id"),
+            )
             .expect("expired delivery should preserve the durable read receipt task");
         assert_eq!(withheld_task.state, crate::tasks::TaskState::Cancelled);
         assert_eq!(
@@ -1145,6 +1191,7 @@ mod tests {
         let (pipeline, plugin_reg, channel_reg) =
             make_pipeline_and_registries("signal", Some(mock.clone()), false);
         let activity_service = test_activity_service();
+        let state = test_state_with_activity_service(activity_service.clone());
         let read_receipt =
             enqueue_after_response_read_receipt_task(&activity_service, "+15551234567", 123).await;
 
@@ -1164,7 +1211,7 @@ mod tests {
             &pipeline,
             &plugin_reg,
             &channel_reg,
-            &activity_service,
+            &state,
         )
         .await;
 
@@ -1175,7 +1222,11 @@ mod tests {
         );
         let withheld_task = activity_service
             .read_receipt_queue()
-            .get(&read_receipt.task_id)
+            .get(
+                read_receipt
+                    .task_id()
+                    .expect("durable test receipt should have a task id"),
+            )
             .expect("expired disconnected delivery should preserve the durable read receipt task");
         assert_eq!(withheld_task.state, crate::tasks::TaskState::Cancelled);
         assert_eq!(
@@ -1191,6 +1242,7 @@ mod tests {
         let (pipeline, _plugin_reg, _channel_reg) =
             make_pipeline_and_registries("signal", Some(mock.clone()), true);
         let activity_service = test_activity_service();
+        let state = test_state_with_activity_service(activity_service.clone());
         let read_receipt =
             enqueue_after_response_read_receipt_task(&activity_service, "+15551234567", 123).await;
 
@@ -1219,7 +1271,7 @@ mod tests {
                 to_jid: None,
                 poll_id: None,
             }),
-            &activity_service,
+            &state,
         )
         .await;
         activity_service.shutdown().await;
@@ -1230,7 +1282,11 @@ mod tests {
         );
         let withheld_task = activity_service
             .read_receipt_queue()
-            .get(&read_receipt.task_id)
+            .get(
+                read_receipt
+                    .task_id()
+                    .expect("durable test receipt should have a task id"),
+            )
             .expect("failed delivery should preserve the durable read receipt task");
         assert_eq!(withheld_task.state, crate::tasks::TaskState::Cancelled);
         assert_eq!(
@@ -1245,6 +1301,7 @@ mod tests {
         let (pipeline, _plugin_reg, _channel_reg) =
             make_pipeline_and_registries("signal", Some(mock.clone()), true);
         let activity_service = test_activity_service();
+        let state = test_state_with_activity_service(activity_service.clone());
 
         let msg = OutboundMessage::new("signal", MessageContent::text("hello")).with_metadata(
             crate::messages::outbound::MessageMetadata {
@@ -1270,7 +1327,7 @@ mod tests {
                 to_jid: None,
                 poll_id: None,
             }),
-            &activity_service,
+            &state,
         )
         .await;
         activity_service.shutdown().await;
@@ -1288,6 +1345,7 @@ mod tests {
         let (pipeline, _plugin_reg, _channel_reg) =
             make_pipeline_and_registries("signal", Some(mock.clone()), true);
         let activity_service = test_activity_service();
+        let state = test_state_with_activity_service(activity_service.clone());
         let read_receipt =
             enqueue_after_response_read_receipt_task(&activity_service, "+15551234567", 123).await;
 
@@ -1317,7 +1375,7 @@ mod tests {
                 to_jid: None,
                 poll_id: None,
             }),
-            &activity_service,
+            &state,
         )
         .await;
         assert!(
@@ -1327,7 +1385,11 @@ mod tests {
         activity_service.shutdown().await;
         let activated_task = activity_service
             .read_receipt_queue()
-            .get(&read_receipt.task_id)
+            .get(
+                read_receipt
+                    .task_id()
+                    .expect("durable test receipt should have a task id"),
+            )
             .expect("delivery success should activate the durable read receipt task");
         assert_eq!(activated_task.state, crate::tasks::TaskState::RetryWait);
     }
@@ -1337,7 +1399,13 @@ mod tests {
         let mut message = OutboundMessage::new("signal", MessageContent::text("hello"));
         message.metadata = crate::messages::outbound::MessageMetadata {
             recipient_id: Some("+15551234567".to_string()),
-            read_receipt: Some(crate::messages::outbound::PendingReadReceipt {
+            read_receipt: Some(crate::channels::activity::OwnedReadReceipt::Deferred {
+                channel_id: "signal".to_string(),
+                context: ReadReceiptContext {
+                    recipient: "+15551234567".to_string(),
+                    timestamp: Some(123),
+                    ..Default::default()
+                },
                 task_id: "receipt-task-123".to_string(),
             }),
             ..Default::default()
@@ -1363,7 +1431,7 @@ mod tests {
                 .metadata
                 .read_receipt
                 .as_ref()
-                .map(|receipt| receipt.task_id.as_str()),
+                .and_then(|receipt| receipt.task_id()),
             Some("receipt-task-123")
         );
     }

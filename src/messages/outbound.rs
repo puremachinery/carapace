@@ -132,11 +132,9 @@ impl MessageContent {
     }
 }
 
-/// Metadata for message delivery context
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PendingReadReceipt {
-    pub task_id: String,
-}
+/// Runtime-only read-receipt ownership carried from inbound receive time
+/// through outbound delivery finalization.
+pub type PendingReadReceipt = crate::channels::activity::OwnedReadReceipt;
 
 /// Metadata for message delivery context
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1075,7 +1073,13 @@ mod tests {
     #[test]
     fn test_message_metadata_skips_read_receipt_serialization() {
         let metadata = MessageMetadata {
-            read_receipt: Some(PendingReadReceipt {
+            read_receipt: Some(crate::channels::activity::OwnedReadReceipt::Deferred {
+                channel_id: "signal".to_string(),
+                context: crate::plugins::ReadReceiptContext {
+                    recipient: "+15551234567".to_string(),
+                    timestamp: Some(123),
+                    ..Default::default()
+                },
                 task_id: "receipt-task-123".to_string(),
             }),
             ..Default::default()

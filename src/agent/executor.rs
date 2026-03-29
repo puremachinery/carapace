@@ -911,25 +911,18 @@ fn delivery_context_from_registry(
     run_id: &str,
 ) -> (
     Option<String>,
-    Option<crate::plugins::ReadReceiptContext>,
-    Option<String>,
+    Option<crate::channels::activity::OwnedReadReceipt>,
 ) {
     let registry = state.agent_run_registry.lock();
     registry
         .get(run_id)
-        .map(|run| {
-            (
-                run.delivery_recipient_id.clone(),
-                run.read_receipt_context.clone(),
-                run.read_receipt_task_id.clone(),
-            )
-        })
+        .map(|run| (run.delivery_recipient_id.clone(), run.read_receipt.clone()))
         .unwrap_or_else(|| {
             tracing::warn!(
                 run_id = %run_id,
                 "agent run missing from registry before delivery finalization"
             );
-            (None, None, None)
+            (None, None)
         })
 }
 
@@ -938,19 +931,15 @@ async fn withhold_owned_read_receipt_on_failed_run(
     run_id: &str,
     channel_id: Option<&str>,
 ) {
-    let (_, read_receipt_context, read_receipt_task_id) =
-        delivery_context_from_registry(state, run_id);
-    let (Some(read_receipt_context), Some(task_id)) = (
-        read_receipt_context.as_ref(),
-        read_receipt_task_id.as_deref(),
-    ) else {
+    let (_, read_receipt) = delivery_context_from_registry(state, run_id);
+    let Some(read_receipt) = read_receipt.as_ref() else {
         return;
     };
 
     state
         .activity_service()
-        .withhold_read_receipt(
-            task_id,
+        .withhold_owned_read_receipt(
+            read_receipt,
             crate::channels::activity::READ_RECEIPT_WITHHELD_RUN_FAILED_REASON,
         )
         .await;
@@ -959,14 +948,14 @@ async fn withhold_owned_read_receipt_on_failed_run(
         Some(channel_id) => tracing::warn!(
             run_id = %run_id,
             channel = %channel_id,
-            recipient = %read_receipt_context.recipient,
-            timestamp = ?read_receipt_context.timestamp,
+            recipient = %read_receipt.context().recipient,
+            timestamp = ?read_receipt.context().timestamp,
             "withholding explicit read receipt because Carapace already owned the receive-time acknowledgement and the response was not delivered successfully"
         ),
         None => tracing::warn!(
             run_id = %run_id,
-            recipient = %read_receipt_context.recipient,
-            timestamp = ?read_receipt_context.timestamp,
+            recipient = %read_receipt.context().recipient,
+            timestamp = ?read_receipt.context().timestamp,
             "withholding explicit read receipt because Carapace already owned the receive-time acknowledgement and the response was not delivered successfully"
         ),
     }
@@ -1091,11 +1080,13 @@ pub async fn execute_run(
     let seq = AtomicU64::new(0);
 
     // 1. Mark run as Running (returns false if already cancelled)
-    {
+    let run_started = {
         let mut registry = state.agent_run_registry.lock();
-        if !registry.mark_started(&run_id) {
-            return Err(AgentError::Cancelled);
-        }
+        registry.mark_started(&run_id)
+    };
+    if !run_started {
+        withhold_owned_read_receipt_on_failed_run(&state, &run_id, None).await;
+        return Err(AgentError::Cancelled);
     }
 
     let mut error_channel_id: Option<String> = None;
@@ -1385,7 +1376,7 @@ pub async fn execute_run(
             } else {
                 None
             };
-            let (delivery_recipient_id, read_receipt_context, read_receipt_task_id) =
+            let (delivery_recipient_id, read_receipt) =
                 delivery_context_from_registry(&state, &run_id);
 
             finalize_run(
@@ -1409,7 +1400,7 @@ pub async fn execute_run(
                             .as_ref()
                             .map(|policy| policy.read_receipts.enabled)
                             .unwrap_or(false)
-                            && read_receipt_context.is_none()
+                            && read_receipt.is_none()
                             && !channel_capabilities
                                 .as_ref()
                                 .map(|capabilities| capabilities.read_receipts)
@@ -1419,7 +1410,9 @@ pub async fn execute_run(
                                 .activity_service()
                                 .warn_unsupported_feature(channel_id, "read_receipts");
                         }
-                        let read_receipt = if read_receipt_context.is_some() {
+                        let pending_read_receipt = if let Some(read_receipt) =
+                            read_receipt.as_ref()
+                        {
                             if capability_probe_failed {
                                 tracing::warn!(
                                     run_id = %run_id,
@@ -1427,15 +1420,13 @@ pub async fn execute_run(
                                     "preserving explicit read receipt after capability probe failure because upstream auto-receipts were already suppressed at receive time"
                                 );
                             }
-                            read_receipt_task_id.clone().map(|task_id| {
-                                crate::messages::outbound::PendingReadReceipt { task_id }
-                            })
+                            Some(read_receipt.clone())
                         } else {
                             None
                         };
                         let metadata = crate::messages::outbound::MessageMetadata {
                             recipient_id: Some(chat_id),
-                            read_receipt,
+                            read_receipt: pending_read_receipt,
                             ..Default::default()
                         };
                         let outbound = crate::messages::outbound::OutboundMessage::new(
@@ -1453,39 +1444,39 @@ pub async fn execute_run(
                                 error = %err,
                                 "failed to queue agent response for delivery"
                             );
-                            if let Some(task_id) = read_receipt_task_id.as_deref() {
+                            if let Some(read_receipt) = read_receipt.as_ref() {
                                 state
                                     .activity_service()
-                                    .withhold_read_receipt(
-                                        task_id,
+                                    .withhold_owned_read_receipt(
+                                        read_receipt,
                                         crate::channels::activity::READ_RECEIPT_WITHHELD_RESPONSE_QUEUE_FAILED_REASON,
                                     )
                                     .await;
                             }
                         }
-                    } else if let Some(task_id) = read_receipt_task_id.as_deref() {
+                    } else if let Some(read_receipt) = read_receipt.as_ref() {
                         state
                             .activity_service()
-                            .withhold_read_receipt(
-                                task_id,
+                            .withhold_owned_read_receipt(
+                                read_receipt,
                                 crate::channels::activity::READ_RECEIPT_WITHHELD_NO_DELIVERY_TARGET_REASON,
                             )
                             .await;
                     }
-                } else if let Some(task_id) = read_receipt_task_id.as_deref() {
+                } else if let Some(read_receipt) = read_receipt.as_ref() {
                     state
                         .activity_service()
-                        .withhold_read_receipt(
-                            task_id,
+                        .withhold_owned_read_receipt(
+                            read_receipt,
                             crate::channels::activity::READ_RECEIPT_WITHHELD_EMPTY_RESPONSE_REASON,
                         )
                         .await;
                 }
-            } else if let Some(task_id) = read_receipt_task_id.as_deref() {
+            } else if let Some(read_receipt) = read_receipt.as_ref() {
                 state
                     .activity_service()
-                    .withhold_read_receipt(
-                        task_id,
+                    .withhold_owned_read_receipt(
+                        read_receipt,
                         crate::channels::activity::READ_RECEIPT_WITHHELD_DELIVERY_DISABLED_REASON,
                     )
                     .await;
@@ -2132,8 +2123,7 @@ mod tests {
                 session_key: session_key.to_string(),
                 delivery_recipient_id: None,
                 typing_context: None,
-                read_receipt_context: None,
-                read_receipt_task_id: None,
+                read_receipt: None,
                 status: AgentRunStatus::Queued,
                 message: "Hello".to_string(),
                 response: String::new(),
@@ -2195,12 +2185,15 @@ mod tests {
                     to: chat_id.to_string(),
                     ..Default::default()
                 }),
-                read_receipt_context: Some(ReadReceiptContext {
-                    recipient: chat_id.to_string(),
-                    timestamp: Some(123),
-                    ..Default::default()
+                read_receipt: Some(crate::channels::activity::OwnedReadReceipt::Deferred {
+                    channel_id: channel.to_string(),
+                    context: ReadReceiptContext {
+                        recipient: chat_id.to_string(),
+                        timestamp: Some(123),
+                        ..Default::default()
+                    },
+                    task_id: read_receipt_task_id.clone(),
                 }),
-                read_receipt_task_id: Some(read_receipt_task_id.clone()),
                 status: AgentRunStatus::Queued,
                 message: "Hello".to_string(),
                 response: String::new(),
@@ -2218,11 +2211,9 @@ mod tests {
     #[test]
     fn test_delivery_context_from_registry_returns_none_when_run_missing() {
         let (state, _tmp) = make_test_state();
-        let (recipient, read_receipt, read_receipt_task_id) =
-            delivery_context_from_registry(&state, "missing-run");
+        let (recipient, read_receipt) = delivery_context_from_registry(&state, "missing-run");
         assert!(recipient.is_none());
         assert!(read_receipt.is_none());
-        assert!(read_receipt_task_id.is_none());
     }
 
     #[tokio::test]
@@ -2421,7 +2412,7 @@ mod tests {
             state.message_pipeline(),
             &plugin_registry,
             state.channel_registry(),
-            state.activity_service(),
+            &state,
         )
         .await;
 
@@ -2652,12 +2643,15 @@ mod tests {
                     to: chat_id.to_string(),
                     ..Default::default()
                 }),
-                read_receipt_context: Some(ReadReceiptContext {
-                    recipient: chat_id.to_string(),
-                    timestamp: Some(123),
-                    ..Default::default()
+                read_receipt: Some(crate::channels::activity::OwnedReadReceipt::Deferred {
+                    channel_id: "signal".to_string(),
+                    context: ReadReceiptContext {
+                        recipient: chat_id.to_string(),
+                        timestamp: Some(123),
+                        ..Default::default()
+                    },
+                    task_id: read_receipt_task_id.clone(),
                 }),
-                read_receipt_task_id: Some(read_receipt_task_id.clone()),
                 status: AgentRunStatus::Queued,
                 message: "Hello".to_string(),
                 response: String::new(),
@@ -2698,7 +2692,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_execute_run_delivers_without_pending_receipt_when_context_exists_but_task_id_is_missing(
+    async fn test_execute_run_preserves_ephemeral_receive_time_receipt_when_durable_task_id_is_missing(
     ) {
         let plugin = Arc::new(ActivityRecordingChannel::new());
         let plugin_registry = Arc::new(PluginRegistry::new());
@@ -2740,12 +2734,16 @@ mod tests {
                     to: chat_id.to_string(),
                     ..Default::default()
                 }),
-                read_receipt_context: Some(ReadReceiptContext {
-                    recipient: chat_id.to_string(),
-                    timestamp: Some(123),
-                    ..Default::default()
-                }),
-                read_receipt_task_id: None,
+                read_receipt: Some(
+                    crate::channels::activity::OwnedReadReceipt::EphemeralAfterResponse {
+                        channel_id: "signal".to_string(),
+                        context: ReadReceiptContext {
+                            recipient: chat_id.to_string(),
+                            timestamp: Some(123),
+                            ..Default::default()
+                        },
+                    },
+                ),
                 status: AgentRunStatus::Queued,
                 message: "Hello".to_string(),
                 response: String::new(),
@@ -2779,9 +2777,15 @@ mod tests {
             queued.message.metadata.recipient_id.as_deref(),
             Some(chat_id)
         );
+        let read_receipt = queued
+            .message
+            .metadata
+            .read_receipt
+            .as_ref()
+            .expect("delivery metadata should preserve an explicit ephemeral receipt obligation when durable persistence failed");
         assert!(
-            queued.message.metadata.read_receipt.is_none(),
-            "delivery metadata should not invent a pending receipt link when no durable task id exists"
+            read_receipt.task_id().is_none(),
+            "ephemeral receive-time ownership should not fabricate a durable task id"
         );
     }
 
@@ -3075,8 +3079,7 @@ mod tests {
                 session_key: session_key.to_string(),
                 delivery_recipient_id: Some("fresh-peer".to_string()),
                 typing_context: None,
-                read_receipt_context: None,
-                read_receipt_task_id: None,
+                read_receipt: None,
                 status: AgentRunStatus::Queued,
                 message: "Hello".to_string(),
                 response: String::new(),
@@ -3144,8 +3147,7 @@ mod tests {
                 session_key: session_key.to_string(),
                 delivery_recipient_id: None,
                 typing_context: None,
-                read_receipt_context: None,
-                read_receipt_task_id: None,
+                read_receipt: None,
                 status: AgentRunStatus::Queued,
                 message: "Hello".to_string(),
                 response: String::new(),

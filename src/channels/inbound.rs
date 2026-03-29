@@ -7,7 +7,7 @@ use std::sync::Arc;
 use serde_json::Value;
 use tracing::debug;
 
-use crate::plugins::{ReadReceiptContext, TypingContext};
+use crate::plugins::TypingContext;
 use crate::server::ws::{AgentRun, AgentRunStatus, WsServerState};
 use crate::sessions::{get_or_create_scoped_session, ChatMessage, SessionMetadata};
 
@@ -16,8 +16,7 @@ use crate::sessions::{get_or_create_scoped_session, ChatMessage, SessionMetadata
 pub struct InboundDispatchOptions {
     pub delivery_recipient_id: Option<String>,
     pub typing_context: Option<TypingContext>,
-    pub read_receipt_context: Option<ReadReceiptContext>,
-    pub read_receipt_task_id: Option<String>,
+    pub read_receipt: Option<crate::channels::activity::OwnedReadReceipt>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,8 +117,7 @@ pub async fn dispatch_inbound_text_with_options(
         session_key: session.session_key.clone(),
         delivery_recipient_id,
         typing_context,
-        read_receipt_context: options.read_receipt_context,
-        read_receipt_task_id: options.read_receipt_task_id,
+        read_receipt: options.read_receipt,
         status: AgentRunStatus::Queued,
         message: text.to_string(),
         response: String::new(),

@@ -4,7 +4,7 @@
 //! 2 seconds and routes inbound messages into the chat pipeline.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -12,7 +12,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::channels::signal::validate_signal_url;
 use crate::channels::{ChannelRegistry, ChannelStatus};
-use crate::plugins::{ReadReceiptContext, TypingContext};
+use crate::plugins::{ChannelPluginInstance, ReadReceiptContext, TypingContext};
 use crate::server::ws::WsServerState;
 
 /// Interval between receive polls.
@@ -20,6 +20,7 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Timeout for each receive HTTP request.
 const RECEIVE_TIMEOUT: Duration = Duration::from_secs(10);
+const SIGNAL_RECEIPT_CAPABILITY_RETRY_BACKOFF: Duration = Duration::from_secs(30);
 
 /// An envelope returned by `GET /v1/receive/{number}`.
 #[derive(Debug, Deserialize)]
@@ -252,10 +253,36 @@ struct SignalReceivePollSnapshot {
     carapace_manages_read_receipts: bool,
 }
 
+#[derive(Debug, Default)]
+struct SignalReadReceiptCapabilityCache {
+    plugin_key: Option<usize>,
+    read_receipts_supported: Option<bool>,
+    retry_after: Option<Instant>,
+}
+
+impl SignalReadReceiptCapabilityCache {
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    fn update_plugin(&mut self, plugin_key: usize) {
+        if self.plugin_key != Some(plugin_key) {
+            self.plugin_key = Some(plugin_key);
+            self.read_receipts_supported = None;
+            self.retry_after = None;
+        }
+    }
+}
+
+fn signal_plugin_cache_key(plugin: &Arc<dyn ChannelPluginInstance>) -> usize {
+    Arc::as_ptr(plugin) as *const () as usize
+}
+
 async fn can_manage_signal_read_receipts(
     activity_policy: &crate::channels::activity::ChannelActivityPolicy,
     activity_service: &crate::channels::activity::ActivityService,
     state: &WsServerState,
+    capability_cache: &mut SignalReadReceiptCapabilityCache,
 ) -> bool {
     if !activity_policy.read_receipts.enabled
         || state.llm_provider().is_none()
@@ -265,21 +292,41 @@ async fn can_manage_signal_read_receipts(
     }
 
     let Some(plugin_registry) = state.plugin_registry() else {
+        capability_cache.clear();
         return false;
     };
     let Some(plugin) = plugin_registry.get_channel("signal") else {
+        capability_cache.clear();
         return false;
     };
+    capability_cache.update_plugin(signal_plugin_cache_key(&plugin));
+
+    if let Some(supported) = capability_cache.read_receipts_supported {
+        return supported;
+    }
+    if capability_cache
+        .retry_after
+        .is_some_and(|retry_after| Instant::now() < retry_after)
+    {
+        return false;
+    }
 
     match tokio::task::spawn_blocking(move || plugin.get_capabilities()).await {
-        Ok(Ok(capabilities)) if capabilities.read_receipts => true,
-        Ok(Ok(_)) => {
-            state
-                .activity_service()
-                .warn_unsupported_feature("signal", "read_receipts");
-            false
+        Ok(Ok(capabilities)) => {
+            capability_cache.read_receipts_supported = Some(capabilities.read_receipts);
+            capability_cache.retry_after = None;
+            if capabilities.read_receipts {
+                true
+            } else {
+                state
+                    .activity_service()
+                    .warn_unsupported_feature("signal", "read_receipts");
+                false
+            }
         }
         Ok(Err(err)) => {
+            capability_cache.retry_after =
+                Some(Instant::now() + SIGNAL_RECEIPT_CAPABILITY_RETRY_BACKOFF);
             warn!(
                 error = %err,
                 "failed to load Signal capabilities while deciding whether to suppress upstream auto-read-receipts"
@@ -287,6 +334,8 @@ async fn can_manage_signal_read_receipts(
             false
         }
         Err(err) => {
+            capability_cache.retry_after =
+                Some(Instant::now() + SIGNAL_RECEIPT_CAPABILITY_RETRY_BACKOFF);
             warn!(
                 error = %err,
                 "Signal capability worker failed while deciding whether to suppress upstream auto-read-receipts"
@@ -296,57 +345,14 @@ async fn can_manage_signal_read_receipts(
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum SignalReadReceiptOwnership {
-    Deferred(String),
-    SentImmediately,
-    Unavailable,
-}
-
 async fn acquire_signal_read_receipt_ownership(
     state: &Arc<WsServerState>,
-    sender: &str,
     ctx: ReadReceiptContext,
-) -> SignalReadReceiptOwnership {
-    if let Some(task_id) = state
+) -> crate::channels::activity::OwnedReadReceipt {
+    state
         .activity_service()
-        .enqueue_after_response_read_receipt("signal", ctx.clone())
+        .claim_after_response_read_receipt("signal", ctx)
         .await
-    {
-        return SignalReadReceiptOwnership::Deferred(task_id);
-    }
-
-    warn!(
-        sender = %sender,
-        "Signal read receipts are enabled but Carapace could not persist the after-response acknowledgment obligation; falling back to an immediate retryable receipt task"
-    );
-
-    if let Some(task_id) = state
-        .activity_service()
-        .enqueue_ready_read_receipt("signal", ctx.clone())
-        .await
-    {
-        return SignalReadReceiptOwnership::Deferred(task_id);
-    }
-
-    warn!(
-        sender = %sender,
-        "Signal read receipts are enabled but Carapace could not persist any durable acknowledgment obligation; attempting direct receipt send"
-    );
-
-    match crate::channels::activity::send_read_receipt_immediately(state.as_ref(), "signal", ctx)
-        .await
-    {
-        Ok(()) => SignalReadReceiptOwnership::SentImmediately,
-        Err(err) => {
-            error!(
-                sender = %sender,
-                error = %err,
-                "Signal read receipts were claimed for this message but Carapace could not persist or send the explicit acknowledgment"
-            );
-            SignalReadReceiptOwnership::Unavailable
-        }
-    }
 }
 
 async fn snapshot_signal_receive_poll(
@@ -355,9 +361,11 @@ async fn snapshot_signal_receive_poll(
     activity_policy: &crate::channels::activity::ChannelActivityPolicy,
     state: &WsServerState,
     activity_service: &crate::channels::activity::ActivityService,
+    capability_cache: &mut SignalReadReceiptCapabilityCache,
 ) -> SignalReceivePollSnapshot {
     let carapace_manages_read_receipts =
-        can_manage_signal_read_receipts(activity_policy, activity_service, state).await;
+        can_manage_signal_read_receipts(activity_policy, activity_service, state, capability_cache)
+            .await;
     SignalReceivePollSnapshot {
         receive_url: build_receive_url(base_url, phone_number, carapace_manages_read_receipts),
         carapace_manages_read_receipts,
@@ -408,6 +416,7 @@ pub async fn signal_receive_loop(
     config_rx.borrow_and_update();
     let mut activity_policy =
         crate::channels::activity::load_channel_activity_policy_async("signal").await;
+    let mut capability_cache = SignalReadReceiptCapabilityCache::default();
 
     // Track consecutive transport and parse errors to avoid spamming logs.
     let mut consecutive_errors: u32 = 0;
@@ -426,6 +435,7 @@ pub async fn signal_receive_loop(
             &activity_policy,
             state.as_ref(),
             state.activity_service(),
+            &mut capability_cache,
         )
         .await;
 
@@ -521,6 +531,7 @@ pub async fn signal_receive_loop(
                 }
                 activity_policy =
                     crate::channels::activity::load_channel_activity_policy_async("signal").await;
+                capability_cache.clear();
             }
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
@@ -593,14 +604,9 @@ async fn process_envelope(
     };
     let (sender, peer_id) = resolve_signal_sender_and_peer(&sender, data_message)
         .expect("normalized sender should remain valid after ignored group checks");
-    let (read_receipt_context, read_receipt_task_id) = match read_receipt_context {
-        Some(ctx) => match acquire_signal_read_receipt_ownership(state, &sender, ctx.clone()).await
-        {
-            SignalReadReceiptOwnership::Deferred(task_id) => (Some(ctx), Some(task_id)),
-            SignalReadReceiptOwnership::SentImmediately => (None, None),
-            SignalReadReceiptOwnership::Unavailable => (None, None),
-        },
-        None => (None, None),
+    let read_receipt = match read_receipt_context {
+        Some(ctx) => Some(acquire_signal_read_receipt_ownership(state, ctx).await),
+        None => None,
     };
 
     debug!(
@@ -608,7 +614,7 @@ async fn process_envelope(
         text_len = text.len(),
         "Signal inbound message"
     );
-    if carapace_manages_read_receipts && read_receipt_context.is_none() {
+    if carapace_manages_read_receipts && read_receipt.is_none() {
         warn!(
             sender = %sender,
             "Signal read receipts are enabled but this message did not include a timestamp; Carapace cannot acknowledge it explicitly"
@@ -620,8 +626,7 @@ async fn process_envelope(
             to: peer_id.clone(),
             ..Default::default()
         }),
-        read_receipt_context,
-        read_receipt_task_id: read_receipt_task_id.clone(),
+        read_receipt: read_receipt.clone(),
         ..Default::default()
     };
 
@@ -638,14 +643,14 @@ async fn process_envelope(
     {
         Ok(result) => {
             if !result.run_spawned {
-                if let Some(task_id) = read_receipt_task_id.as_deref() {
+                if let Some(read_receipt) = read_receipt.as_ref() {
                     state
                         .activity_service()
-                        .activate_read_receipt(task_id)
+                        .complete_owned_read_receipt_without_run(state.as_ref(), read_receipt)
                         .await;
                     warn!(
                         sender = %sender,
-                        "Signal read receipts were claimed for this message but no LLM provider was available at dispatch time; sending the explicit receipt immediately"
+                        "Signal read receipts were claimed for this message but no LLM provider was available at dispatch time; completing the explicit acknowledgment immediately"
                     );
                 }
             }
@@ -656,11 +661,11 @@ async fn process_envelope(
             );
         }
         Err(err) => {
-            if let Some(task_id) = read_receipt_task_id.as_deref() {
+            if let Some(read_receipt) = read_receipt.as_ref() {
                 state
                     .activity_service()
-                    .withhold_read_receipt(
-                        task_id,
+                    .withhold_owned_read_receipt(
+                        read_receipt,
                         crate::channels::activity::READ_RECEIPT_WITHHELD_INBOUND_DISPATCH_FAILED_REASON,
                     )
                     .await;
@@ -1199,6 +1204,7 @@ mod tests {
             },
             ..Default::default()
         };
+        let mut capability_cache = SignalReadReceiptCapabilityCache::default();
 
         let snapshot = snapshot_signal_receive_poll(
             &url::Url::parse("http://localhost:8080").unwrap(),
@@ -1206,6 +1212,7 @@ mod tests {
             &activity_policy,
             state.as_ref(),
             &activity_service,
+            &mut capability_cache,
         )
         .await;
 
@@ -1240,6 +1247,7 @@ mod tests {
             },
             ..Default::default()
         };
+        let mut capability_cache = SignalReadReceiptCapabilityCache::default();
 
         let snapshot = snapshot_signal_receive_poll(
             &url::Url::parse("http://localhost:8080/api?debug=1").unwrap(),
@@ -1247,6 +1255,7 @@ mod tests {
             &activity_policy,
             state.as_ref(),
             &activity_service,
+            &mut capability_cache,
         )
         .await;
 
@@ -1280,6 +1289,7 @@ mod tests {
             },
             ..Default::default()
         };
+        let mut capability_cache = SignalReadReceiptCapabilityCache::default();
 
         let snapshot = snapshot_signal_receive_poll(
             &url::Url::parse("http://localhost:8080/api?debug=1").unwrap(),
@@ -1287,6 +1297,7 @@ mod tests {
             &activity_policy,
             state.as_ref(),
             &activity_service,
+            &mut capability_cache,
         )
         .await;
 
@@ -1308,6 +1319,7 @@ mod tests {
             },
             ..Default::default()
         };
+        let mut capability_cache = SignalReadReceiptCapabilityCache::default();
 
         let snapshot = snapshot_signal_receive_poll(
             &url::Url::parse("http://localhost:8080/api?debug=1").unwrap(),
@@ -1315,6 +1327,7 @@ mod tests {
             &activity_policy,
             state.as_ref(),
             &activity_service,
+            &mut capability_cache,
         )
         .await;
 
@@ -1337,6 +1350,7 @@ mod tests {
             },
             ..Default::default()
         };
+        let mut capability_cache = SignalReadReceiptCapabilityCache::default();
 
         let snapshot = snapshot_signal_receive_poll(
             &url::Url::parse("http://localhost:8080/api?debug=1").unwrap(),
@@ -1344,6 +1358,7 @@ mod tests {
             &activity_policy,
             state.as_ref(),
             &activity_service,
+            &mut capability_cache,
         )
         .await;
 
@@ -1629,7 +1644,7 @@ mod tests {
                 .lock()
                 .snapshot_runs()
                 .iter()
-                .any(|run| run.message == "first" && run.read_receipt_context.is_none())
+                .any(|run| run.message == "first" && run.read_receipt.is_none())
         })
         .await;
 
@@ -1655,9 +1670,9 @@ mod tests {
                 .any(|run| {
                     run.message == "second"
                         && run
-                            .read_receipt_context
+                            .read_receipt
                             .as_ref()
-                            .and_then(|ctx| ctx.timestamp)
+                            .and_then(|receipt| receipt.context().timestamp)
                             == Some(1706745601000_u64)
                 })
         })
@@ -1687,7 +1702,7 @@ mod tests {
             .iter()
             .find(|run| run.message == "first")
             .expect("first inbound run");
-        assert!(first.read_receipt_context.is_none());
+        assert!(first.read_receipt.is_none());
 
         let second = runs
             .iter()
@@ -1695,9 +1710,9 @@ mod tests {
             .expect("second inbound run");
         assert_eq!(
             second
-                .read_receipt_context
+                .read_receipt
                 .as_ref()
-                .and_then(|ctx| ctx.timestamp),
+                .and_then(|receipt| receipt.context().timestamp),
             Some(1706745601000_u64)
         );
 

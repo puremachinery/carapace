@@ -220,6 +220,54 @@ pub struct ChannelActivityPolicy {
     pub read_receipts: ReadReceiptFeaturePolicy,
 }
 
+/// Receipt ownership captured at inbound receive time.
+///
+/// This is the only receipt lifecycle state carried across receive, run, and
+/// delivery. `ActivityService` is the sole owner that may resolve it into
+/// durable activation, withholding, or immediate explicit acknowledgment.
+#[derive(Debug, Clone)]
+pub enum OwnedReadReceipt {
+    /// Carapace durably persisted an after-response obligation at receive time.
+    Deferred {
+        channel_id: String,
+        context: ReadReceiptContext,
+        task_id: String,
+    },
+    /// Carapace claimed receipt ownership for this poll/message, but durable
+    /// after-response persistence was unavailable. This must be resolved
+    /// before the run lifecycle ends; it must never be acknowledged before
+    /// inbound dispatch succeeds.
+    EphemeralAfterResponse {
+        channel_id: String,
+        context: ReadReceiptContext,
+    },
+}
+
+impl OwnedReadReceipt {
+    pub fn channel_id(&self) -> &str {
+        match self {
+            Self::Deferred { channel_id, .. } | Self::EphemeralAfterResponse { channel_id, .. } => {
+                channel_id
+            }
+        }
+    }
+
+    pub fn context(&self) -> &ReadReceiptContext {
+        match self {
+            Self::Deferred { context, .. } | Self::EphemeralAfterResponse { context, .. } => {
+                context
+            }
+        }
+    }
+
+    pub fn task_id(&self) -> Option<&str> {
+        match self {
+            Self::Deferred { task_id, .. } => Some(task_id),
+            Self::EphemeralAfterResponse { .. } => None,
+        }
+    }
+}
+
 pub struct TypingLoopHandle {
     cancel: CancellationToken,
     task: Option<JoinHandle<()>>,
@@ -355,6 +403,34 @@ impl ActivityService {
         }
     }
 
+    pub async fn claim_after_response_read_receipt(
+        &self,
+        channel_id: &str,
+        ctx: ReadReceiptContext,
+    ) -> OwnedReadReceipt {
+        if let Some(task_id) = self
+            .enqueue_after_response_read_receipt(channel_id, ctx.clone())
+            .await
+        {
+            OwnedReadReceipt::Deferred {
+                channel_id: channel_id.to_string(),
+                context: ctx,
+                task_id,
+            }
+        } else {
+            tracing::warn!(
+                channel = %channel_id,
+                recipient = %ctx.recipient,
+                timestamp = ?ctx.timestamp,
+                "failed to durably persist the after-response read receipt obligation at receive time; carrying an ephemeral owned receipt through dispatch and delivery instead"
+            );
+            OwnedReadReceipt::EphemeralAfterResponse {
+                channel_id: channel_id.to_string(),
+                context: ctx,
+            }
+        }
+    }
+
     pub async fn enqueue_ready_read_receipt(
         &self,
         channel_id: &str,
@@ -378,6 +454,29 @@ impl ActivityService {
         } else {
             Some(task.id)
         }
+    }
+
+    pub async fn acknowledge_read_receipt_now(
+        &self,
+        state: &WsServerState,
+        channel_id: &str,
+        ctx: ReadReceiptContext,
+    ) -> Result<(), String> {
+        if self
+            .enqueue_ready_read_receipt(channel_id, ctx.clone())
+            .await
+            .is_some()
+        {
+            return Ok(());
+        }
+
+        tracing::warn!(
+            channel = %channel_id,
+            recipient = %ctx.recipient,
+            timestamp = ?ctx.timestamp,
+            "failed to persist an immediate read receipt obligation; attempting direct explicit receipt send"
+        );
+        send_read_receipt_immediately(state, channel_id, ctx).await
     }
 
     pub async fn activate_read_receipt(&self, task_id: &str) {
@@ -422,6 +521,84 @@ impl ActivityService {
                 error = %err,
                 "read receipt withholding worker failed"
             ),
+        }
+    }
+
+    pub async fn withhold_owned_read_receipt(&self, receipt: &OwnedReadReceipt, reason: &str) {
+        match receipt {
+            OwnedReadReceipt::Deferred { task_id, .. } => {
+                self.withhold_read_receipt(task_id, reason).await;
+            }
+            OwnedReadReceipt::EphemeralAfterResponse {
+                channel_id,
+                context,
+            } => {
+                tracing::warn!(
+                    channel = %channel_id,
+                    recipient = %context.recipient,
+                    timestamp = ?context.timestamp,
+                    reason,
+                    "withholding an ephemeral owned read receipt because the response lifecycle did not complete successfully"
+                );
+            }
+        }
+    }
+
+    pub async fn complete_owned_read_receipt_after_delivery(
+        &self,
+        state: &WsServerState,
+        receipt: &OwnedReadReceipt,
+    ) {
+        match receipt {
+            OwnedReadReceipt::Deferred { task_id, .. } => {
+                self.activate_read_receipt(task_id).await;
+            }
+            OwnedReadReceipt::EphemeralAfterResponse {
+                channel_id,
+                context,
+            } => {
+                if let Err(err) = self
+                    .acknowledge_read_receipt_now(state, channel_id, context.clone())
+                    .await
+                {
+                    tracing::error!(
+                        channel = %channel_id,
+                        recipient = %context.recipient,
+                        timestamp = ?context.timestamp,
+                        error = %err,
+                        "failed to complete an ephemeral owned read receipt after successful delivery"
+                    );
+                }
+            }
+        }
+    }
+
+    pub async fn complete_owned_read_receipt_without_run(
+        &self,
+        state: &WsServerState,
+        receipt: &OwnedReadReceipt,
+    ) {
+        match receipt {
+            OwnedReadReceipt::Deferred { task_id, .. } => {
+                self.activate_read_receipt(task_id).await;
+            }
+            OwnedReadReceipt::EphemeralAfterResponse {
+                channel_id,
+                context,
+            } => {
+                if let Err(err) = self
+                    .acknowledge_read_receipt_now(state, channel_id, context.clone())
+                    .await
+                {
+                    tracing::error!(
+                        channel = %channel_id,
+                        recipient = %context.recipient,
+                        timestamp = ?context.timestamp,
+                        error = %err,
+                        "failed to complete an ephemeral owned read receipt when no run was spawned"
+                    );
+                }
+            }
         }
     }
 
