@@ -927,6 +927,21 @@ mod tests {
     }
 
     #[test]
+    fn test_build_receive_url_strips_existing_send_read_receipts_parameter_when_not_managing_receipts(
+    ) {
+        assert_eq!(
+            build_receive_url(
+                &url::Url::parse("http://localhost:8080?debug=1&send_read_receipts=false")
+                    .unwrap(),
+                "+15551234567",
+                false,
+            )
+            .as_str(),
+            "http://localhost:8080/v1/receive/%2B15551234567?debug=1"
+        );
+    }
+
+    #[test]
     fn test_build_receive_url_preserves_non_root_path_prefix() {
         assert_eq!(
             build_receive_url(
