@@ -31,7 +31,7 @@ fn exec_approvals_path() -> PathBuf {
 /// Compute SHA256 hex digest of a string.
 fn sha256_hex(value: &str) -> String {
     let digest = Sha256::digest(value.as_bytes());
-    format!("{:x}", digest)
+    hex::encode(digest)
 }
 
 /// Snapshot of the exec-approvals file on disk.

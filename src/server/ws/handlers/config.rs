@@ -39,7 +39,7 @@ pub(crate) fn map_validation_issues(issues: Vec<config::ValidationIssue>) -> Vec
 
 pub(crate) fn sha256_hex(value: &str) -> String {
     let digest = Sha256::digest(value.as_bytes());
-    format!("{:x}", digest)
+    hex::encode(digest)
 }
 
 pub(crate) fn read_config_snapshot() -> ConfigSnapshot {

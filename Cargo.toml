@@ -38,6 +38,7 @@ bytes = "1"
 getrandom = "0.4"
 hex = "0.4"
 sha2 = "0.11"
+sha2_10 = { package = "sha2", version = "0.10" }
 hkdf = "0.12"
 hmac = "0.12"
 pbkdf2 = "0.12"

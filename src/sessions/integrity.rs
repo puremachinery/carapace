@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2_10::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
 const HMAC_DIGEST_SIZE: usize = 32;

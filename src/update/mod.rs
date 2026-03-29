@@ -1,7 +1,7 @@
 //! Shared updater pipeline with mandatory Sigstore verification and transaction-based resume.
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2_10::{Digest, Sha256};
 use sigstore::bundle::verify::policy::SingleX509ExtPolicy;
 use std::fmt;
 use std::fs::{self, File};
@@ -378,13 +378,13 @@ pub fn compute_sha256(path: &Path) -> Result<String, UpdateError> {
         }
         hasher.update(&buffer[..n]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hex::encode(hasher.finalize()))
 }
 
 pub fn sha256_bytes(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 /// Verify a staged artifact hash against one checksum entry line from SHA256SUMS.

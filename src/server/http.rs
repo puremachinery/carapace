@@ -58,7 +58,7 @@ pub const DEFAULT_MAX_BODY_BYTES: usize = 262144;
 pub const DEFAULT_HOOKS_PATH: &str = "/hooks";
 const HOOK_SENDER_SCOPE_KDF_TAG: &[u8] = b"hooks-sender-scope-v1";
 const HOOK_SENDER_SCOPE_KDF_FALLBACK_KEY: &str = "carapace-hooks-sender-scope-fallback";
-type HmacSha256 = Hmac<sha2::Sha256>;
+type HmacSha256 = Hmac<sha2_10::Sha256>;
 
 /// HTTP server configuration
 #[non_exhaustive]

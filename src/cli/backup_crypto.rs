@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 use pbkdf2::pbkdf2_hmac;
-use sha2::Sha256;
+use sha2_10::Sha256;
 use zeroize::Zeroize;
 
 /// Magic bytes at the start of every encrypted backup file.
