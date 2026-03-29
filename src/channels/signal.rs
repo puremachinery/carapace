@@ -125,23 +125,39 @@ impl SignalChannel {
 
     /// Build the send endpoint URL.
     fn send_url(&self) -> String {
-        format!("{}/v2/send", self.base_url)
+        Self::api_endpoint_url(&self.base_url, "/v2/send")
     }
 
     fn typing_indicator_url_for(base_url: &str, phone_number: &str) -> String {
-        format!(
-            "{}/v1/typing-indicator/{}",
+        Self::api_endpoint_url(
             base_url,
-            urlencoding::encode(phone_number)
+            &format!("/v1/typing-indicator/{}", urlencoding::encode(phone_number)),
         )
     }
 
     fn receipts_url_for(base_url: &str, phone_number: &str) -> String {
-        format!(
-            "{}/v1/receipts/{}",
+        Self::api_endpoint_url(
             base_url,
-            urlencoding::encode(phone_number)
+            &format!("/v1/receipts/{}", urlencoding::encode(phone_number)),
         )
+    }
+
+    fn api_endpoint_url(base_url: &str, suffix_path: &str) -> String {
+        match url::Url::parse(base_url) {
+            Ok(mut url) => {
+                let path_prefix = url.path().trim_end_matches('/');
+                let full_path = if path_prefix.is_empty() {
+                    suffix_path.to_string()
+                } else {
+                    format!("{path_prefix}{suffix_path}")
+                };
+                url.set_query(None);
+                url.set_fragment(None);
+                url.set_path(&full_path);
+                url.to_string()
+            }
+            Err(_) => format!("{}{}", base_url.trim_end_matches('/'), suffix_path),
+        }
     }
 
     fn update_typing_indicator(&self, ctx: TypingContext, show: bool) -> Result<(), BindingError> {
@@ -761,6 +777,30 @@ mod tests {
             "+15559999999".to_string(),
         );
         assert_eq!(ch2.send_url(), "https://example.com:9090/v2/send");
+    }
+
+    #[test]
+    fn test_signal_endpoint_urls_trim_trailing_slash_from_base_url() {
+        let ch = SignalChannel::new(
+            "https://localhost:8080/api/".to_string(),
+            "+15551234567".to_string(),
+        );
+
+        assert_eq!(ch.send_url(), "https://localhost:8080/api/v2/send");
+        assert_eq!(
+            ch.typing_indicator_url
+                .as_ref()
+                .expect("typing URL should parse")
+                .as_str(),
+            "https://localhost:8080/api/v1/typing-indicator/%2B15551234567"
+        );
+        assert_eq!(
+            ch.receipts_url
+                .as_ref()
+                .expect("receipt URL should parse")
+                .as_str(),
+            "https://localhost:8080/api/v1/receipts/%2B15551234567"
+        );
     }
 
     #[test]

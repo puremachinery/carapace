@@ -712,6 +712,15 @@ impl WsServerState {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_activity_service(
+        mut self,
+        activity_service: Arc<channels::activity::ActivityService>,
+    ) -> Self {
+        self.activity_service = activity_service;
+        self
+    }
+
     pub(crate) fn with_plugin_runtime_opt(
         mut self,
         runtime: Option<Arc<PluginRuntime<credentials::DefaultCredentialBackend>>>,

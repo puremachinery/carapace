@@ -172,15 +172,29 @@ async fn maybe_dispatch_read_receipt_for_ignored_signal_message(
 
     if state
         .activity_service()
-        .enqueue_ready_read_receipt("signal", read_receipt_context)
+        .enqueue_ready_read_receipt("signal", read_receipt_context.clone())
         .await
         .is_none()
     {
         warn!(
             sender = %sender,
             ignored_reason = reason,
-            "Signal read receipts are enabled but Carapace could not persist the explicit acknowledgment obligation"
+            "Signal read receipts are enabled but Carapace could not persist the explicit acknowledgment obligation; attempting direct receipt send"
         );
+        if let Err(err) = crate::channels::activity::send_read_receipt_immediately(
+            state.as_ref(),
+            "signal",
+            read_receipt_context,
+        )
+        .await
+        {
+            error!(
+                sender = %sender,
+                ignored_reason = reason,
+                error = %err,
+                "Signal read receipts are enabled but Carapace could not persist or send the explicit acknowledgment"
+            );
+        }
     }
 }
 
@@ -245,7 +259,64 @@ fn can_manage_signal_read_receipts(
 ) -> bool {
     activity_policy.read_receipts.enabled
         && state.llm_provider().is_some()
+        && state
+            .plugin_registry()
+            .and_then(|registry| registry.get_channel("signal"))
+            .is_some()
         && activity_service.can_accept_read_receipt_ownership("signal")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SignalReadReceiptOwnership {
+    Deferred(String),
+    SentImmediately,
+    Unavailable,
+}
+
+async fn acquire_signal_read_receipt_ownership(
+    state: &Arc<WsServerState>,
+    sender: &str,
+    ctx: ReadReceiptContext,
+) -> SignalReadReceiptOwnership {
+    if let Some(task_id) = state
+        .activity_service()
+        .enqueue_after_response_read_receipt("signal", ctx.clone())
+        .await
+    {
+        return SignalReadReceiptOwnership::Deferred(task_id);
+    }
+
+    warn!(
+        sender = %sender,
+        "Signal read receipts are enabled but Carapace could not persist the after-response acknowledgment obligation; falling back to an immediate retryable receipt task"
+    );
+
+    if let Some(task_id) = state
+        .activity_service()
+        .enqueue_ready_read_receipt("signal", ctx.clone())
+        .await
+    {
+        return SignalReadReceiptOwnership::Deferred(task_id);
+    }
+
+    warn!(
+        sender = %sender,
+        "Signal read receipts are enabled but Carapace could not persist any durable acknowledgment obligation; attempting direct receipt send"
+    );
+
+    match crate::channels::activity::send_read_receipt_immediately(state.as_ref(), "signal", ctx)
+        .await
+    {
+        Ok(()) => SignalReadReceiptOwnership::SentImmediately,
+        Err(err) => {
+            error!(
+                sender = %sender,
+                error = %err,
+                "Signal read receipts were claimed for this message but Carapace could not persist or send the explicit acknowledgment"
+            );
+            SignalReadReceiptOwnership::Unavailable
+        }
+    }
 }
 
 fn snapshot_signal_receive_poll(
@@ -489,21 +560,14 @@ async fn process_envelope(
             return;
         }
     };
-    let read_receipt_task_id = match read_receipt_context.clone() {
-        Some(ctx) => {
-            let task_id = state
-                .activity_service()
-                .enqueue_after_response_read_receipt("signal", ctx)
-                .await;
-            if task_id.is_none() {
-                warn!(
-                    sender = %sender,
-                    "Signal read receipts are enabled but Carapace could not persist the after-response acknowledgment obligation"
-                );
-            }
-            task_id
-        }
-        None => None,
+    let (read_receipt_context, read_receipt_task_id) = match read_receipt_context {
+        Some(ctx) => match acquire_signal_read_receipt_ownership(state, &sender, ctx.clone()).await
+        {
+            SignalReadReceiptOwnership::Deferred(task_id) => (Some(ctx), Some(task_id)),
+            SignalReadReceiptOwnership::SentImmediately => (None, None),
+            SignalReadReceiptOwnership::Unavailable => (None, None),
+        },
+        None => (None, None),
     };
 
     debug!(
@@ -595,6 +659,7 @@ mod tests {
         BindingError, ChannelCapabilities, ChannelInfo, ChannelPluginInstance, PluginRegistry,
     };
     use crate::server::ws::WsServerConfig;
+    use crate::tasks::TaskQueue;
 
     struct StaticTestProvider;
 
@@ -687,6 +752,19 @@ mod tests {
             self.mark_read_notify.notify_one();
             Ok(())
         }
+    }
+
+    fn test_state_with_provider_and_signal_plugin() -> Arc<WsServerState> {
+        let plugin_registry = Arc::new(PluginRegistry::new());
+        plugin_registry.register_channel(
+            "signal".to_string(),
+            Arc::new(MockSignalReadReceiptChannel::new(Arc::new(Notify::new()))),
+        );
+        Arc::new(
+            WsServerState::new(WsServerConfig::default())
+                .with_llm_provider(Arc::new(StaticTestProvider))
+                .with_plugin_registry(plugin_registry),
+        )
     }
 
     #[derive(Clone)]
@@ -1014,6 +1092,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_snapshot_signal_receive_poll_leaves_auto_receipts_enabled_without_signal_plugin() {
+        let state = test_state_with_provider(true);
+        let activity_service = crate::channels::activity::ActivityService::new();
+        let activity_policy = crate::channels::activity::ChannelActivityPolicy {
+            read_receipts: crate::channels::activity::ReadReceiptFeaturePolicy {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let snapshot = snapshot_signal_receive_poll(
+            &url::Url::parse("http://localhost:8080").unwrap(),
+            "+15551234567",
+            &activity_policy,
+            state.as_ref(),
+            &activity_service,
+        );
+
+        assert!(!snapshot.carapace_manages_read_receipts);
+        assert_eq!(
+            snapshot.receive_url.as_str(),
+            "http://localhost:8080/v1/receive/%2B15551234567"
+        );
+    }
+
     #[tokio::test]
     async fn test_sanitize_signal_receive_transport_error_strips_phone_number_from_url() {
         let err = reqwest::Client::new()
@@ -1030,7 +1135,7 @@ mod tests {
     #[test]
     fn test_snapshot_signal_receive_poll_uses_single_policy_view() {
         let activity_service = crate::channels::activity::ActivityService::new();
-        let state = test_state_with_provider(true);
+        let state = test_state_with_provider_and_signal_plugin();
         let activity_policy = crate::channels::activity::ChannelActivityPolicy {
             read_receipts: crate::channels::activity::ReadReceiptFeaturePolicy {
                 enabled: true,
@@ -1058,7 +1163,7 @@ mod tests {
     async fn test_snapshot_signal_receive_poll_leaves_auto_receipts_enabled_when_backlog_is_high() {
         let activity_service =
             crate::channels::activity::ActivityService::with_limits_for_test(8, 1);
-        let state = test_state_with_provider(true);
+        let state = test_state_with_provider_and_signal_plugin();
         activity_service
             .enqueue_after_response_read_receipt(
                 "signal",
@@ -1380,7 +1485,7 @@ mod tests {
             server.await.expect("serve test Signal receive server");
         });
 
-        let state = test_state_with_provider(true);
+        let state = test_state_with_provider_and_signal_plugin();
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let receive_task = tokio::spawn(signal_receive_loop(
             format!("http://127.0.0.1:{}/api", addr.port()),
@@ -1520,5 +1625,48 @@ mod tests {
             .send(true)
             .expect("read receipt worker shutdown signal should send");
         state.shutdown_activity_service().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_process_envelope_sends_immediate_receipt_when_durable_queue_is_unavailable() {
+        let notify = Arc::new(Notify::new());
+        let signal_channel = Arc::new(MockSignalReadReceiptChannel::new(notify.clone()));
+        let plugin_registry = Arc::new(PluginRegistry::new());
+        plugin_registry.register_channel("signal".to_string(), signal_channel.clone());
+        let activity_service = Arc::new(
+            crate::channels::activity::ActivityService::with_read_receipt_queue_for_test(Arc::new(
+                TaskQueue::with_capacity_limit(None, Some(0)),
+            )),
+        );
+        let state = Arc::new(
+            WsServerState::new(WsServerConfig::default())
+                .with_plugin_registry(plugin_registry)
+                .with_activity_service(activity_service),
+        );
+        let envelope = SignalEnvelope {
+            source_number: Some("+15559876543".to_string()),
+            source: None,
+            timestamp: Some(1706745600000),
+            data_message: Some(SignalDataMessage {
+                message: Some("hello".to_string()),
+                timestamp: Some(1706745600000),
+                group_info: None,
+            }),
+        };
+
+        process_envelope(&envelope, &state, true).await;
+
+        tokio::time::timeout(Duration::from_secs(1), notify.notified())
+            .await
+            .expect("failed durable receipt ownership should fall back to an immediate receipt");
+        assert_eq!(signal_channel.mark_read_count.load(Ordering::Relaxed), 1);
+        assert!(
+            state
+                .activity_service()
+                .read_receipt_queue()
+                .list()
+                .is_empty(),
+            "immediate fallback should not leave a synthetic receipt task behind"
+        );
     }
 }

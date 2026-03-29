@@ -273,6 +273,11 @@ impl ActivityService {
     }
 
     #[cfg(test)]
+    pub(crate) fn with_read_receipt_queue_for_test(read_receipt_queue: Arc<TaskQueue>) -> Self {
+        Self::with_read_receipt_queue(read_receipt_queue)
+    }
+
+    #[cfg(test)]
     pub(crate) fn with_backlog_warning_threshold(backlog_warning_threshold: usize) -> Self {
         Self::with_limits_for_test(
             backlog_warning_threshold,
@@ -806,6 +811,62 @@ struct ReadReceiptTaskExecutor {
     state: Arc<WsServerState>,
 }
 
+async fn prepare_read_receipt_dispatch_plugin(
+    state: &WsServerState,
+    channel_id: &str,
+) -> Result<Arc<dyn ChannelPluginInstance>, ReadReceiptDispatchError> {
+    let Some(plugin_registry) = state.plugin_registry().cloned() else {
+        return Err(ReadReceiptDispatchError::Retryable(
+            "plugin registry unavailable for read receipt dispatch".to_string(),
+        ));
+    };
+
+    let Some(plugin) = plugin_registry.get_channel(channel_id) else {
+        return Err(ReadReceiptDispatchError::Retryable(format!(
+            "channel plugin '{}' unavailable for read receipt dispatch",
+            channel_id
+        )));
+    };
+
+    match get_capabilities(plugin.clone()).await {
+        Ok(capabilities) if capabilities.read_receipts => Ok(plugin),
+        Ok(_) => {
+            state
+                .activity_service()
+                .warn_unsupported_feature(channel_id, "read_receipts");
+            Err(ReadReceiptDispatchError::Permanent(format!(
+                "channel '{}' does not support read receipts after activation",
+                channel_id
+            )))
+        }
+        Err(err) => Err(ReadReceiptDispatchError::Retryable(format!(
+            "failed to load channel capabilities for read receipt dispatch: {err}"
+        ))),
+    }
+}
+
+pub(crate) async fn send_read_receipt_immediately(
+    state: &WsServerState,
+    channel_id: &str,
+    ctx: ReadReceiptContext,
+) -> Result<(), String> {
+    let plugin = prepare_read_receipt_dispatch_plugin(state, channel_id)
+        .await
+        .map_err(|err| match err {
+            ReadReceiptDispatchError::Retryable(err) | ReadReceiptDispatchError::Permanent(err) => {
+                err
+            }
+        })?;
+
+    send_verified_read_receipt_with_plugin(plugin, channel_id, ctx)
+        .await
+        .map_err(|err| match err {
+            ReadReceiptDispatchError::Retryable(err) | ReadReceiptDispatchError::Permanent(err) => {
+                err
+            }
+        })
+}
+
 #[async_trait::async_trait]
 impl TaskExecutor for ReadReceiptTaskExecutor {
     async fn execute(&self, task: crate::tasks::DurableTask) -> TaskExecutionOutcome {
@@ -818,45 +879,21 @@ impl TaskExecutor for ReadReceiptTaskExecutor {
             }
         };
 
-        let Some(plugin_registry) = self.state.plugin_registry().cloned() else {
-            return TaskExecutionOutcome::RetryWait {
-                delay_ms: READ_RECEIPT_RETRY_DELAY_MS,
-                error: "plugin registry unavailable for read receipt dispatch".to_string(),
+        let plugin =
+            match prepare_read_receipt_dispatch_plugin(self.state.as_ref(), &payload.channel_id)
+                .await
+            {
+                Ok(plugin) => plugin,
+                Err(ReadReceiptDispatchError::Retryable(err)) => {
+                    return TaskExecutionOutcome::RetryWait {
+                        delay_ms: READ_RECEIPT_RETRY_DELAY_MS,
+                        error: err,
+                    };
+                }
+                Err(ReadReceiptDispatchError::Permanent(err)) => {
+                    return TaskExecutionOutcome::Failed { error: err };
+                }
             };
-        };
-
-        let Some(plugin) = plugin_registry.get_channel(&payload.channel_id) else {
-            return TaskExecutionOutcome::RetryWait {
-                delay_ms: READ_RECEIPT_RETRY_DELAY_MS,
-                error: format!(
-                    "channel plugin '{}' unavailable for read receipt dispatch",
-                    payload.channel_id
-                ),
-            };
-        };
-
-        match get_capabilities(plugin.clone()).await {
-            Ok(capabilities) if capabilities.read_receipts => {}
-            Ok(_) => {
-                self.state
-                    .activity_service()
-                    .warn_unsupported_feature(&payload.channel_id, "read_receipts");
-                return TaskExecutionOutcome::Failed {
-                    error: format!(
-                        "channel '{}' does not support read receipts after activation",
-                        payload.channel_id
-                    ),
-                };
-            }
-            Err(err) => {
-                return TaskExecutionOutcome::RetryWait {
-                    delay_ms: READ_RECEIPT_RETRY_DELAY_MS,
-                    error: format!(
-                        "failed to load channel capabilities for read receipt dispatch: {err}"
-                    ),
-                };
-            }
-        }
 
         match send_verified_read_receipt_with_plugin(plugin, &payload.channel_id, payload.context)
             .await
@@ -2244,6 +2281,65 @@ mod tests {
             stop_state.load(Ordering::Acquire),
             STOP_STATE_FALLBACK_RESERVED
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_reserved_stop_state_race_has_single_owner() {
+        let plugin = Arc::new(MockChannel::new(ChannelCapabilities {
+            typing_indicators: true,
+            ..Default::default()
+        }));
+        let stop_state = Arc::new(AtomicU8::new(STOP_STATE_TASK_RESERVED));
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+        let worker_state = stop_state.clone();
+        let worker_barrier = barrier.clone();
+        let worker_plugin = plugin.clone();
+        let worker = tokio::spawn(async move {
+            worker_barrier.wait().await;
+            spawn_stop_typing_worker(
+                worker_plugin,
+                TypingContext {
+                    to: "+15551234567".to_string(),
+                    ..Default::default()
+                },
+                worker_state,
+            )
+        });
+
+        let fallback_state = stop_state.clone();
+        let fallback_barrier = barrier.clone();
+        let fallback = tokio::spawn(async move {
+            fallback_barrier.wait().await;
+            stop_fallback_needed(fallback_state.as_ref())
+        });
+
+        let maybe_worker = worker.await.expect("worker claimant should return");
+        let fallback_claimed = fallback.await.expect("fallback claimant should return");
+
+        match maybe_worker {
+            Some(worker) => {
+                assert!(
+                    !fallback_claimed,
+                    "fallback path must not win once the task worker owns cleanup"
+                );
+                worker
+                    .await
+                    .expect("stop worker should complete")
+                    .expect("stop worker should succeed");
+                assert_eq!(stop_state.load(Ordering::Acquire), STOP_STATE_COMPLETED);
+            }
+            None => {
+                assert!(
+                    fallback_claimed,
+                    "fallback path must own cleanup if the task worker loses the race"
+                );
+                assert_eq!(
+                    stop_state.load(Ordering::Acquire),
+                    STOP_STATE_FALLBACK_RESERVED
+                );
+            }
+        }
     }
 
     #[test]
