@@ -895,6 +895,12 @@ pub async fn task_worker_loop(
     task_worker_loop_with_wakeup(queue, executor, interval, shutdown, None).await;
 }
 
+/// Run a durable task worker with an optional best-effort wake signal.
+///
+/// The worker still polls on `interval`, but `wake` can short-circuit that delay
+/// when callers know tasks may have become immediately runnable. Wakeups are
+/// allowed to coalesce: one notification is sufficient because each wake or tick
+/// claims the full batch of tasks that are currently due.
 pub async fn task_worker_loop_with_wakeup(
     queue: Arc<TaskQueue>,
     executor: Arc<dyn TaskExecutor>,
@@ -1580,20 +1586,20 @@ mod tests {
             Some(wake.clone()),
         ));
 
+        // Allow the worker to consume the interval's initial immediate tick
+        // while the queue is still empty so the task below must run via `wake`.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
         queue.enqueue(serde_json::json!({"kind":"wake-demo"}), None);
         wake.notify_one();
 
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                let notified = executor.notify.notified();
-                tokio::pin!(notified);
-                notified.as_mut().enable();
-                if executor.calls.load(Ordering::Relaxed) >= 1 {
-                    break;
-                }
-                notified.await;
-            }
-        })
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_task_condition(
+                || executor.calls.load(Ordering::Relaxed) >= 1,
+                "worker did not execute woke task promptly",
+            ),
+        )
         .await
         .expect("worker did not execute woke task promptly");
         wait_for_task_condition(

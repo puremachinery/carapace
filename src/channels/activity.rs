@@ -623,6 +623,9 @@ impl ActivityService {
             );
             None
         } else {
+            // Any persisted non-failed enqueue may have made work runnable.
+            // Spurious wakes are harmless and simpler than coupling this path
+            // to specific task states.
             self.read_receipt_wake.notify_one();
             Some(task.id)
         }
