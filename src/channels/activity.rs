@@ -93,17 +93,20 @@ const _: () = {
 };
 const UNSUPPORTED_ACTIVITY_WARNING_COOLDOWN_SECS: u64 = 300;
 // Stop-state machine:
-// - NOT_REQUESTED -> TASK_RESERVED -> TASK_RUNNING -> COMPLETED
+// - NOT_REQUESTED -> TASK_RESERVED -> TASK_SPAWNING -> TASK_RUNNING -> COMPLETED
 // - NOT_REQUESTED -> FALLBACK_RESERVED -> COMPLETED
 // - TASK_RESERVED -> FALLBACK_RESERVED -> COMPLETED
-// TASK_RUNNING means the task-owned stop worker has exclusive ownership of the
-// final stop_typing call. FALLBACK_RESERVED means implicit-drop cleanup won the
-// race before the task handed stop_typing to that worker.
+// - TASK_SPAWNING -> FALLBACK_RESERVED -> COMPLETED
+// TASK_SPAWNING means the typing task is detaching a stop worker, but fallback
+// cleanup may still steal ownership if the outer task is aborted before that
+// worker starts running. TASK_RUNNING means the detached stop worker has
+// durably claimed exclusive ownership of the final stop_typing call.
 const STOP_STATE_NOT_REQUESTED: u8 = 0;
 const STOP_STATE_TASK_RESERVED: u8 = 1;
-const STOP_STATE_TASK_RUNNING: u8 = 2;
-const STOP_STATE_FALLBACK_RESERVED: u8 = 3;
-const STOP_STATE_COMPLETED: u8 = 4;
+const STOP_STATE_TASK_SPAWNING: u8 = 2;
+const STOP_STATE_TASK_RUNNING: u8 = 3;
+const STOP_STATE_FALLBACK_RESERVED: u8 = 4;
+const STOP_STATE_COMPLETED: u8 = 5;
 
 struct UnsupportedActivityWarningRegistry {
     seen_at: HashMap<String, Instant>,
@@ -1615,7 +1618,7 @@ fn stop_fallback_needed(stop_state: &AtomicU8) -> bool {
     let mut current = stop_state.load(Ordering::Acquire);
     loop {
         match current {
-            STOP_STATE_NOT_REQUESTED | STOP_STATE_TASK_RESERVED => {
+            STOP_STATE_NOT_REQUESTED | STOP_STATE_TASK_RESERVED | STOP_STATE_TASK_SPAWNING => {
                 match stop_state.compare_exchange(
                     current,
                     STOP_STATE_FALLBACK_RESERVED,
@@ -1632,6 +1635,28 @@ fn stop_fallback_needed(stop_state: &AtomicU8) -> bool {
             _ => return false,
         }
     }
+}
+
+fn reserve_task_stop_worker_handoff(stop_state: &AtomicU8) -> bool {
+    stop_state
+        .compare_exchange(
+            STOP_STATE_TASK_RESERVED,
+            STOP_STATE_TASK_SPAWNING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+}
+
+fn claim_task_stop_worker_ownership(stop_state: &AtomicU8) -> bool {
+    stop_state
+        .compare_exchange(
+            STOP_STATE_TASK_SPAWNING,
+            STOP_STATE_TASK_RUNNING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
 }
 
 fn mark_stop_completed(stop_state: &AtomicU8) {
@@ -1788,19 +1813,14 @@ fn spawn_stop_typing_worker(
     ctx: TypingContext,
     stop_state: Arc<AtomicU8>,
 ) -> Option<tokio::task::JoinHandle<Result<(), BindingError>>> {
-    if stop_state
-        .compare_exchange(
-            STOP_STATE_TASK_RESERVED,
-            STOP_STATE_TASK_RUNNING,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        )
-        .is_err()
-    {
+    if !reserve_task_stop_worker_handoff(stop_state.as_ref()) {
         return None;
     }
 
     Some(tokio::task::spawn_blocking(move || {
+        if !claim_task_stop_worker_ownership(stop_state.as_ref()) {
+            return Ok(());
+        }
         let result = catch_unwind(AssertUnwindSafe(|| plugin.stop_typing(ctx)));
         mark_stop_completed(stop_state.as_ref());
         match result {
@@ -2556,12 +2576,14 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_invoke_stop_typing_marks_completed_even_if_waiter_is_aborted() {
-        let plugin = Arc::new(MockChannel::with_stop_typing_delay(
+        let stop_typing_notify = Arc::new(Notify::new());
+        let plugin = Arc::new(MockChannel::with_stop_typing_delay_and_notify(
             ChannelCapabilities {
                 typing_indicators: true,
                 ..Default::default()
             },
             Duration::from_millis(50),
+            stop_typing_notify.clone(),
         ));
         let stop_state = Arc::new(AtomicU8::new(STOP_STATE_TASK_RESERVED));
         let task = tokio::spawn(invoke_stop_typing_with_running_state(
@@ -2582,7 +2604,9 @@ mod tests {
         .expect("stop worker should enter TASK_RUNNING");
 
         task.abort();
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::timeout(Duration::from_secs(1), stop_typing_notify.notified())
+            .await
+            .expect("aborting the waiter should not cancel a committed stop worker");
 
         assert_eq!(plugin.stop_typing_count.load(Ordering::Relaxed), 1);
         assert_eq!(stop_state.load(Ordering::Acquire), STOP_STATE_COMPLETED);
@@ -2625,6 +2649,16 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_stop_fallback_needed_claims_task_spawning_state() {
+        let stop_state = AtomicU8::new(STOP_STATE_TASK_SPAWNING);
+        assert!(stop_fallback_needed(&stop_state));
+        assert_eq!(
+            stop_state.load(Ordering::Acquire),
+            STOP_STATE_FALLBACK_RESERVED
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_reserved_stop_state_race_has_single_owner() {
         let plugin = Arc::new(MockChannel::new(ChannelCapabilities {
@@ -2659,27 +2693,38 @@ mod tests {
         let maybe_worker = worker.await.expect("worker claimant should return");
         let fallback_claimed = fallback.await.expect("fallback claimant should return");
 
-        match maybe_worker {
-            Some(worker) => {
-                assert!(
-                    !fallback_claimed,
-                    "fallback path must not win once the task worker owns cleanup"
-                );
+        match (maybe_worker, fallback_claimed) {
+            (Some(worker), false) => {
                 worker
                     .await
                     .expect("stop worker should complete")
                     .expect("stop worker should succeed");
+                assert_eq!(plugin.stop_typing_count.load(Ordering::Relaxed), 1);
                 assert_eq!(stop_state.load(Ordering::Acquire), STOP_STATE_COMPLETED);
             }
-            None => {
-                assert!(
-                    fallback_claimed,
-                    "fallback path must own cleanup if the task worker loses the race"
+            (Some(worker), true) => {
+                worker
+                    .await
+                    .expect("detached stop worker should still join cleanly")
+                    .expect("worker should no-op cleanly when fallback steals ownership");
+                assert_eq!(
+                    plugin.stop_typing_count.load(Ordering::Relaxed),
+                    0,
+                    "fallback ownership should prevent the detached worker from double-sending"
                 );
                 assert_eq!(
                     stop_state.load(Ordering::Acquire),
                     STOP_STATE_FALLBACK_RESERVED
                 );
+            }
+            (None, true) => {
+                assert_eq!(
+                    stop_state.load(Ordering::Acquire),
+                    STOP_STATE_FALLBACK_RESERVED
+                );
+            }
+            (None, false) => {
+                panic!("either the detached worker or fallback cleanup must claim ownership");
             }
         }
     }
