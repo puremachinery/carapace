@@ -599,8 +599,24 @@ async fn process_envelope(
             return;
         }
     };
-    let (sender, peer_id) = resolve_signal_sender_and_peer(&sender, data_message)
-        .expect("normalized sender should remain valid after ignored group checks");
+    let Some((sender, peer_id)) = resolve_signal_sender_and_peer(&sender, data_message) else {
+        if signal_group_id(data_message).is_some() {
+            maybe_dispatch_read_receipt_for_ignored_signal_message(
+                state,
+                Some(sender.as_str()),
+                read_receipt_context.clone(),
+                carapace_manages_read_receipts,
+                "ignored unsupported Signal group message",
+            )
+            .await;
+            warn!(
+                "Ignoring Signal group message: Signal outbound currently supports direct messages only"
+            );
+        } else {
+            warn!("Ignoring Signal envelope because sender normalization failed");
+        }
+        return;
+    };
     let read_receipt =
         read_receipt_context.map(|ctx| acquire_signal_read_receipt_ownership(state, ctx));
 
@@ -1757,6 +1773,59 @@ mod tests {
         assert!(
             state.agent_run_registry.lock().snapshot_runs().is_empty(),
             "ignored non-text messages should not create agent runs"
+        );
+        shutdown_tx
+            .send(true)
+            .expect("read receipt worker shutdown signal should send");
+        state.shutdown_activity_service().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_process_envelope_acknowledges_ignored_group_message_when_managed() {
+        let notify = Arc::new(Notify::new());
+        let signal_channel = Arc::new(MockSignalReadReceiptChannel::new(notify.clone()));
+        let plugin_registry = Arc::new(PluginRegistry::new());
+        plugin_registry.register_channel("signal".to_string(), signal_channel.clone());
+        let state = Arc::new(
+            WsServerState::new(WsServerConfig::default()).with_plugin_registry(plugin_registry),
+        );
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        state
+            .activity_service()
+            .spawn_read_receipt_worker(state.clone(), shutdown_rx);
+        let envelope = SignalEnvelope {
+            source_number: Some("+15559876543".to_string()),
+            source: None,
+            timestamp: Some(1706745600000),
+            data_message: Some(SignalDataMessage {
+                message: Some("hello".to_string()),
+                timestamp: Some(1706745600000),
+                group_info: Some(SignalGroupInfo {
+                    group_id: Some("dGVzdGdyb3VwaWQ=".to_string()),
+                }),
+            }),
+        };
+
+        process_envelope(&envelope, &state, true).await;
+
+        tokio::time::timeout(Duration::from_secs(1), notify.notified())
+            .await
+            .expect("ignored group messages should still be acknowledged");
+        assert_eq!(signal_channel.mark_read_count.load(Ordering::Relaxed), 1);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let tasks = state.activity_service().read_receipt_queue().list();
+                if tasks.len() == 1 && tasks[0].state == crate::tasks::TaskState::Done {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("ignored-group receipt task should settle to done");
+        assert!(
+            state.agent_run_registry.lock().snapshot_runs().is_empty(),
+            "ignored group messages should not create agent runs"
         );
         shutdown_tx
             .send(true)
