@@ -75,6 +75,27 @@ where
     run_in_current_thread_runtime(future)
 }
 
+#[cfg(test)]
+/// Run a synchronous blocking operation from code that may be inside a Tokio runtime.
+///
+/// - If running inside a multi-threaded Tokio runtime, uses `block_in_place`.
+/// - If running inside a current-thread Tokio runtime, hands the work to a
+///   dedicated OS thread and synchronously waits for it to finish.
+/// - If no runtime exists, runs the work inline.
+pub fn run_blocking_value<T>(work: impl FnOnce() -> T + Send + 'static) -> T
+where
+    T: Send + 'static,
+{
+    match Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => block_in_place(work),
+        Ok(_) => match thread::spawn(work).join() {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        },
+        Err(_) => work(),
+    }
+}
+
 /// Run a best-effort drop-time cleanup closure from code that may be dropped inside a Tokio runtime.
 ///
 /// This helper is only for `Drop` paths where cleanup cannot `await` and any error handling must
@@ -147,7 +168,10 @@ fn panic_to_string(payload: Box<dyn Any + Send>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{run_blocking_cleanup, run_sync_blocking, run_sync_blocking_send, BridgeError};
+    use super::{
+        run_blocking_cleanup, run_blocking_value, run_sync_blocking, run_sync_blocking_send,
+        BridgeError,
+    };
     use std::sync::{
         atomic::{AtomicU16, Ordering},
         Arc,
@@ -223,6 +247,32 @@ mod tests {
             .expect("cleanup should finish promptly")
             .expect("cleanup thread should report its thread id");
         assert_ne!(cleanup_thread, caller);
+    }
+
+    #[test]
+    fn run_blocking_value_outside_runtime_works() {
+        assert_eq!(run_blocking_value(|| 77_u16), 77);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_blocking_value_inside_multi_thread_runtime_works() {
+        assert_eq!(run_blocking_value(|| 88_u16), 88);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_blocking_value_inside_current_thread_runtime_works() {
+        let caller = std::thread::current().id();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let value = run_blocking_value(move || {
+            let _ = tx.send(std::thread::current().id());
+            99_u16
+        });
+        let worker = tokio::time::timeout(Duration::from_secs(1), rx)
+            .await
+            .expect("blocking helper should finish promptly")
+            .expect("blocking helper should report its thread id");
+        assert_eq!(value, 99);
+        assert_ne!(worker, caller);
     }
 
     #[tokio::test(flavor = "current_thread")]

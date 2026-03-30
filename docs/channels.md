@@ -24,6 +24,17 @@ service HTTP port 18789. Adjust paths/ports for your deployment.
 - Channel tools (agent actions) are available when `session.metadata.channel`
   is set for the conversation.
 - Signal’s REST API defaults to port 8080; this is separate from the Carapace port.
+- Channel activity features are configured under `channels.defaults.features.*`
+  and `channels.<channel>.features.*`.
+- Today those channel-specific activity settings are implemented for built-in
+  native channels; external/plugin channel entries are accepted for forward
+  compatibility but may be ignored until plugin channel activity capabilities
+  are added.
+- `session.typingMode` and `session.typingIntervalSeconds` remain as a
+  legacy/global fallback for typing only when you explicitly set them in
+  config; that fallback applies across all typing-capable channels unless you
+  override it with `channels.defaults.features.typing` or
+  `channels.<channel>.features.typing`. Prefer `channels.*.features.typing`.
 
 ## Signal (signal-cli-rest-api)
 
@@ -44,12 +55,28 @@ docker run -d -p 8080:8080 -v $HOME/.local/share/signal-api:/home/.local/share/s
   "signal": {
     "baseUrl": "http://localhost:8080",
     "phoneNumber": "+15551234567"
+  },
+  "channels": {
+    "signal": {
+      "features": {
+        "typing": {
+          "enabled": true
+        },
+        "readReceipts": {
+          "enabled": true
+        }
+      }
+    }
   }
 }
 ```
 
 For non-loopback Signal deployments, set `signal.baseUrl` to `https://...`.
 Carapace rejects non-HTTPS non-loopback Signal URLs.
+When `channels.signal.features.readReceipts.enabled` is true, Carapace polls
+Signal with `send_read_receipts=false` and only sends a read receipt after a
+successful assistant response is delivered. When the feature is disabled,
+Signal keeps its normal auto-read-receipt behavior.
 
 ## Telegram (Bot API + Webhook or Polling)
 

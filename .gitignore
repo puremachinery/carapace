@@ -26,3 +26,6 @@ fuzz/artifacts
 .direnv/
 flake.nix
 flake.lock
+
+# Local repo automation helpers
+scripts/cargo-serial

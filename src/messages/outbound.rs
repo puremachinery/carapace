@@ -132,6 +132,10 @@ impl MessageContent {
     }
 }
 
+/// Runtime-only read-receipt ownership carried from inbound receive time
+/// through outbound delivery finalization.
+pub type PendingReadReceipt = crate::channels::activity::OwnedReadReceipt;
+
 /// Metadata for message delivery context
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MessageMetadata {
@@ -147,6 +151,11 @@ pub struct MessageMetadata {
     /// User ID of the recipient
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recipient_id: Option<String>,
+    /// Optional runtime-only read-receipt action to trigger after successful delivery.
+    ///
+    /// This field is intentionally skipped across serialization boundaries.
+    #[serde(skip, default)]
+    pub read_receipt: Option<PendingReadReceipt>,
     /// Channel-specific extra data
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extra: Option<serde_json::Value>,
@@ -156,6 +165,16 @@ pub struct MessageMetadata {
     /// Time-to-live in milliseconds (0 = no expiry)
     #[serde(default)]
     pub ttl_ms: u64,
+}
+
+impl MessageMetadata {
+    /// Restore runtime-only metadata after deserializing hook overrides.
+    ///
+    /// `read_receipt` is intentionally skipped across serialization boundaries,
+    /// so hook output can never preserve it on its own.
+    pub fn restore_runtime_only_fields_from(&mut self, previous: &Self) {
+        self.read_receipt = previous.read_receipt.clone();
+    }
 }
 
 /// An outbound message to be delivered
@@ -318,6 +337,13 @@ impl QueuedMessage {
         self.updated_at = now_millis();
     }
 
+    /// Mark the message as expired before delivery.
+    pub fn mark_expired(&mut self, reason: impl Into<String>) {
+        self.status = DeliveryStatus::Expired;
+        self.last_error = Some(reason.into());
+        self.updated_at = now_millis();
+    }
+
     /// Mark the message as cancelled
     pub fn mark_cancelled(&mut self) {
         self.status = DeliveryStatus::Cancelled;
@@ -338,6 +364,12 @@ impl QueuedMessage {
     pub fn can_retry(&self) -> bool {
         self.context.retry_enabled && self.attempts < self.context.max_retries
     }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct NextChannelDeliveryWork {
+    pub ready: Option<QueuedMessage>,
+    pub expired: Vec<QueuedMessage>,
 }
 
 /// Delivery result fields returned from channel plugins (re-exported for convenience)
@@ -683,16 +715,28 @@ impl MessagePipeline {
     ///
     /// This is used by delivery workers to get messages to send.
     pub fn next_for_channel(&self, channel_id: &str) -> Option<QueuedMessage> {
+        self.next_delivery_work_for_channel(channel_id).ready
+    }
+
+    /// Get the next ready message plus any queued messages that have expired.
+    pub fn next_delivery_work_for_channel(&self, channel_id: &str) -> NextChannelDeliveryWork {
         let queues = self.queues.read();
+        let mut work = NextChannelDeliveryWork::default();
         if let Some(queue) = queues.get(channel_id) {
-            // Find first non-cancelled, non-expired message
             for msg in queue.iter() {
-                if msg.status == DeliveryStatus::Queued && !msg.message.is_expired() {
-                    return Some(msg.clone());
+                if msg.status != DeliveryStatus::Queued {
+                    continue;
+                }
+                if msg.message.is_expired() {
+                    work.expired.push(msg.clone());
+                    continue;
+                }
+                if work.ready.is_none() {
+                    work.ready = Some(msg.clone());
                 }
             }
         }
-        None
+        work
     }
 
     /// Mark a message as being sent
@@ -801,6 +845,27 @@ impl MessagePipeline {
         self.remove_from_queue(message_id);
 
         // Clean up old completed messages to prevent memory leak
+        self.maybe_cleanup_completed();
+
+        Ok(())
+    }
+
+    /// Mark a message as expired before delivery.
+    pub fn mark_expired(
+        &self,
+        message_id: &MessageId,
+        reason: impl Into<String>,
+    ) -> Result<(), PipelineError> {
+        {
+            let mut messages = self.messages.write();
+            if let Some(queued) = messages.get_mut(&message_id.0) {
+                queued.mark_expired(reason);
+            } else {
+                return Err(PipelineError::MessageNotFound(message_id.0.clone()));
+            }
+        }
+
+        self.remove_from_queue(message_id);
         self.maybe_cleanup_completed();
 
         Ok(())
@@ -1003,6 +1068,26 @@ mod tests {
         msg.created_at = now_millis() - 2000; // Created 2 seconds ago
 
         assert!(msg.is_expired());
+    }
+
+    #[test]
+    fn test_message_metadata_skips_read_receipt_serialization() {
+        let metadata = MessageMetadata {
+            read_receipt: Some(crate::channels::activity::OwnedReadReceipt::new(
+                "signal",
+                crate::plugins::ReadReceiptContext {
+                    recipient: "+15551234567".to_string(),
+                    timestamp: Some(123),
+                    ..Default::default()
+                },
+                "receipt-task-123",
+            )),
+            ..Default::default()
+        };
+
+        let value = serde_json::to_value(&metadata).unwrap();
+        assert!(value.get("read_receipt").is_none());
+        assert!(value.get("readReceipt").is_none());
     }
 
     #[test]
@@ -1226,6 +1311,25 @@ mod tests {
     }
 
     #[test]
+    fn test_pipeline_mark_expired() {
+        let pipeline = MessagePipeline::new();
+        let msg = OutboundMessage::new("telegram", MessageContent::text("Hello"));
+        let result = pipeline.queue(msg, OutboundContext::new()).unwrap();
+
+        pipeline
+            .mark_expired(&result.message_id, "message expired before delivery")
+            .unwrap();
+
+        let queued = pipeline.get_message(&result.message_id).unwrap();
+        assert_eq!(queued.status, DeliveryStatus::Expired);
+        assert_eq!(
+            queued.last_error,
+            Some("message expired before delivery".into())
+        );
+        assert_eq!(pipeline.queue_size("telegram"), 0);
+    }
+
+    #[test]
     fn test_pipeline_next_for_channel() {
         let pipeline = MessagePipeline::new();
         let msg1 = OutboundMessage::new("telegram", MessageContent::text("First"));
@@ -1237,6 +1341,30 @@ mod tests {
         let next = pipeline.next_for_channel("telegram").unwrap();
         match &next.message.content {
             MessageContent::Text { text } => assert_eq!(text, "First"),
+            _ => panic!("Expected text content"),
+        }
+    }
+
+    #[test]
+    fn test_pipeline_next_delivery_work_surfaces_expired_messages() {
+        let pipeline = MessagePipeline::new();
+        let mut expired = OutboundMessage::new("telegram", MessageContent::text("Expired"));
+        expired.metadata.ttl_ms = 1;
+        expired.created_at -= 10_000;
+        let ready = OutboundMessage::new("telegram", MessageContent::text("Ready"));
+
+        pipeline.queue(expired, OutboundContext::new()).unwrap();
+        pipeline.queue(ready, OutboundContext::new()).unwrap();
+
+        let work = pipeline.next_delivery_work_for_channel("telegram");
+        assert_eq!(work.expired.len(), 1);
+        match &work.expired[0].message.content {
+            MessageContent::Text { text } => assert_eq!(text, "Expired"),
+            _ => panic!("Expected text content"),
+        }
+        let ready = work.ready.expect("ready message should still be returned");
+        match &ready.message.content {
+            MessageContent::Text { text } => assert_eq!(text, "Ready"),
             _ => panic!("Expected text content"),
         }
     }

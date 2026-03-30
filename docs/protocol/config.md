@@ -114,12 +114,12 @@ For a plain-English guide to the most commonly tuned sections, see
 - `messages` – messaging behavior defaults
 - `commands` – command policy/config
 - `approvals` – exec approval settings
-- `session` – legacy/global session defaults (`scope`, `dmScope`, `typingMode`, `typingIntervalSeconds`, `mainKey`)
+- `session` – session defaults plus legacy/global typing fallback (`scope`, `dmScope`, `typingMode`, `typingIntervalSeconds`, `mainKey`)
 - `sessions` – session behavior (retention, cleanup)
 - `usage` – usage tracking configuration (pricing overrides)
 - `cron` – cron scheduler settings
 - `web` – web provider settings (WhatsApp Web)
-- `channels` – per-channel configs
+- `channels` – per-channel overrides and activity feature policy
 - `discovery` – service discovery settings
 - `canvasHost` – canvas host server settings
 - `talk` – TTS/voice settings
@@ -183,6 +183,10 @@ This is a condensed map; refer to the JSON schema for full detail.
   - `enabled`, `mode` (`off` | `warn` | `block`), `model`, `blockThreshold`
 - `session`
   - `scope`, `dmScope`, `typingMode`, `typingIntervalSeconds`, `mainKey`
+  - `typingMode` / `typingIntervalSeconds` are legacy/global fallback for channel typing only when you explicitly set them in config; prefer `channels.defaults.features.typing` and `channels.<channel>.features.typing`
+- `channels`
+  - `defaults.features.typing`, `defaults.features.readReceipts`
+  - `<channel>.features.typing`, `<channel>.features.readReceipts`
 - `sessions`
   - `retention.enabled`, `retention.days`, `retention.intervalHours`
   - `integrity.enabled` (default `true`), `integrity.action` (`warn` | `reject`, default `warn`)
@@ -349,9 +353,11 @@ Defaults are applied during config loading before validation. Key defaults inclu
 - `agents.defaults.compaction.mode`: `"safeguard"`
 - `session.scope`: `"per-sender"`
 - `session.dmScope`: `"main"`
-- `session.typingMode`: `"thinking"`
-- `session.typingIntervalSeconds`: `3`
+- `session.typingMode`: `"thinking"` (defaulted session value; legacy/global channel-typing fallback only when explicitly set in config, and applies across all typing-capable channels unless overridden under `channels.*.features.typing`)
+- `session.typingIntervalSeconds`: `3` (defaulted session value; legacy/global channel-typing fallback only when explicitly set in config, and applies across all typing-capable channels unless overridden under `channels.*.features.typing`)
 - `session.mainKey`: `"main"` (enforced even if another value is supplied)
+- Channel typing activity defaults: typing is disabled by default; when enabled by `channels.defaults.features.typing` or `channels.<channel>.features.typing`, the default mode is `"thinking"` with a `3`-second interval.
+- Channel read-receipt activity defaults: read receipts are disabled by default; when enabled by `channels.defaults.features.readReceipts` or `channels.<channel>.features.readReceipts`, the default mode is `"after-response"`.
 - `cron.maxConcurrentRuns`: `2`
 - `gateway.port`: `18789`
 - `gateway.bind`: `"loopback"`
@@ -382,7 +388,8 @@ Defaults are applied during config loading before validation. Key defaults inclu
 - Duplicate agent directories are rejected.
 - `agents.list[].identity.avatar` must be workspace‑relative or http(s)/data URI.
 - `plugins.entries.<plugin-id>` may only contain `enabled`, `installId`, and `requestedAt`.
-- `channels` keys must map to known channel IDs.
+- `channels.*.features.typing.mode` currently supports `"thinking"`.
+- `channels.*.features.readReceipts.mode` currently supports `"after-response"`.
 - `browser.profiles` names must be `^[a-z0-9-]+$` and must set `cdpPort` or `cdpUrl`.
 
 ## Errors

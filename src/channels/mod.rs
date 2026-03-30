@@ -3,6 +3,7 @@
 //! Provides channel registry for tracking active messaging channels
 //! and their connection states.
 
+pub mod activity;
 pub mod console;
 pub mod discord;
 pub mod discord_gateway;

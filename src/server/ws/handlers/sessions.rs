@@ -65,6 +65,10 @@ pub struct AgentRun {
     pub session_key: String,
     /// Delivery recipient captured at enqueue time, if any.
     pub delivery_recipient_id: Option<String>,
+    /// Optional channel-specific typing context for inbound activity features.
+    pub typing_context: Option<crate::plugins::TypingContext>,
+    /// Receive-time read-receipt ownership captured before run dispatch.
+    pub read_receipt: Option<crate::channels::activity::ClaimedReadReceipt>,
     /// Current status
     pub status: AgentRunStatus,
     /// Original message that started this run
@@ -94,6 +98,16 @@ pub struct AgentRunResult {
     pub error: Option<String>,
     pub started_at: Option<u64>,
     pub completed_at: Option<u64>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub struct AgentRunSnapshot {
+    pub run_id: String,
+    pub session_key: String,
+    pub message: String,
+    pub read_receipt: Option<crate::channels::activity::ClaimedReadReceipt>,
+    pub status: AgentRunStatus,
 }
 
 /// Registry for tracking active agent runs
@@ -208,6 +222,20 @@ impl AgentRunRegistry {
         } else {
             None
         }
+    }
+
+    #[cfg(test)]
+    pub fn snapshot_runs(&self) -> Vec<AgentRunSnapshot> {
+        self.runs
+            .values()
+            .map(|run| AgentRunSnapshot {
+                run_id: run.run_id.clone(),
+                session_key: run.session_key.clone(),
+                message: run.message.clone(),
+                read_receipt: run.read_receipt.clone(),
+                status: run.status,
+            })
+            .collect()
     }
 
     /// Mark a run as started.
@@ -1887,6 +1915,8 @@ fn setup_agent_session(
         run_id: idempotency_key.to_string(),
         session_key: session.session_key.clone(),
         delivery_recipient_id: None,
+        typing_context: None,
+        read_receipt: None,
         status: AgentRunStatus::Queued,
         message: message.to_string(),
         response: String::new(),
@@ -2371,6 +2401,8 @@ fn trigger_agent_if_enabled(
         run_id: idempotency_key.to_string(),
         session_key: session_key.to_string(),
         delivery_recipient_id: None,
+        typing_context: None,
+        read_receipt: None,
         status: AgentRunStatus::Queued,
         message: message.to_string(),
         response: String::new(),
@@ -2681,6 +2713,8 @@ mod tests {
             run_id: run_id.to_string(),
             session_key: session_key.to_string(),
             delivery_recipient_id: None,
+            typing_context: None,
+            read_receipt: None,
             status: AgentRunStatus::Queued,
             message: "test message".to_string(),
             response: String::new(),

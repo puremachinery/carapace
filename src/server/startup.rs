@@ -237,6 +237,7 @@ pub async fn prepare_runtime_environment() -> Result<std::path::PathBuf, Box<dyn
     tokio::fs::create_dir_all(state_dir.join("sessions")).await?;
     tokio::fs::create_dir_all(state_dir.join("cron")).await?;
     tokio::fs::create_dir_all(state_dir.join("tasks")).await?;
+    tokio::fs::create_dir_all(state_dir.join("activity")).await?;
     crate::logging::audit::AuditLog::init(state_dir.clone()).await;
     init_media_store_cleanup().await;
     Ok(state_dir)
@@ -298,6 +299,8 @@ impl ServerHandle {
 
         // Brief grace period for in-flight operations
         tokio::time::sleep(Duration::from_millis(100)).await;
+
+        self.ws_state.shutdown_activity_service().await;
 
         // Wait for the server task to finish (with a timeout to avoid hanging)
         match tokio::time::timeout(Duration::from_secs(5), self.server_task).await {
@@ -460,6 +463,9 @@ pub fn spawn_background_tasks(
         Duration::from_secs(1),
         shutdown_rx.clone(),
     ));
+    ws_state
+        .activity_service()
+        .spawn_read_receipt_worker(ws_state.clone(), shutdown_rx.clone());
 
     // One-shot updater resume pass for interrupted updates.
     spawn_update_resume_task(shutdown_rx);
@@ -492,6 +498,7 @@ pub fn spawn_background_tasks(
 
     // Bridge config watcher events to WS broadcasts + provider hot-swap
     spawn_config_watcher_bridge(&config_watcher, ws_state, raw_config, shutdown_rx);
+    spawn_activity_feature_support_warnings(ws_state, shutdown_rx);
 
     // SIGHUP handler for manual config reload (Unix only)
     #[cfg(unix)]
@@ -499,6 +506,44 @@ pub fn spawn_background_tasks(
 
     // Resource monitor and session retention cleanup
     spawn_monitoring_and_retention(ws_state, raw_config, shutdown_rx);
+}
+
+fn spawn_activity_feature_support_warnings(
+    ws_state: &Arc<WsServerState>,
+    shutdown_rx: &watch::Receiver<bool>,
+) {
+    let Some(plugin_registry) = ws_state.plugin_registry().cloned() else {
+        return;
+    };
+    let activity_service = ws_state.activity_service().clone();
+    let mut config_rx = crate::config::subscribe_config_changes();
+    config_rx.borrow_and_update();
+    let mut shutdown_rx = shutdown_rx.clone();
+    tokio::spawn(async move {
+        activity_service
+            .warn_configured_unsupported_features_for_registered_channels(plugin_registry.clone())
+            .await;
+
+        loop {
+            tokio::select! {
+                changed = config_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    activity_service
+                        .warn_configured_unsupported_features_for_registered_channels(
+                            plugin_registry.clone(),
+                        )
+                        .await;
+                }
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// Spawn a task that bridges config watcher reload events to WebSocket broadcasts

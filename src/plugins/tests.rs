@@ -41,6 +41,8 @@ mod integration_tests {
                     media: true,
                     native_commands: false,
                     block_streaming: false,
+                    typing_indicators: false,
+                    read_receipts: false,
                 },
             }
         }
