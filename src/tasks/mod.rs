@@ -890,13 +890,30 @@ pub async fn task_worker_loop(
     queue: Arc<TaskQueue>,
     executor: Arc<dyn TaskExecutor>,
     interval: Duration,
+    shutdown: watch::Receiver<bool>,
+) {
+    task_worker_loop_with_wakeup(queue, executor, interval, shutdown, None).await;
+}
+
+pub async fn task_worker_loop_with_wakeup(
+    queue: Arc<TaskQueue>,
+    executor: Arc<dyn TaskExecutor>,
+    interval: Duration,
     mut shutdown: watch::Receiver<bool>,
+    wake: Option<Arc<tokio::sync::Notify>>,
 ) {
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             _ = ticker.tick() => {}
+            _ = async {
+                if let Some(wake) = wake.as_ref() {
+                    wake.notified().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {}
             _ = shutdown.changed() => {
                 tracing::info!("durable task worker received shutdown signal");
                 break;
@@ -1543,6 +1560,49 @@ mod tests {
         let stats = queue.stats();
         assert_eq!(stats.done, 2);
         assert_eq!(stats.running, 0);
+    }
+
+    #[tokio::test]
+    async fn test_task_worker_loop_with_wakeup_processes_due_tasks_without_waiting_for_tick() {
+        let queue = Arc::new(TaskQueue::in_memory());
+        let executor = Arc::new(NotifyingOutcomeExecutor {
+            outcome: TaskExecutionOutcome::Done { run_id: None },
+            calls: AtomicUsize::new(0),
+            notify: tokio::sync::Notify::new(),
+        });
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let worker = tokio::spawn(task_worker_loop_with_wakeup(
+            queue.clone(),
+            executor.clone(),
+            Duration::from_secs(3600),
+            shutdown_rx,
+            Some(wake.clone()),
+        ));
+
+        queue.enqueue(serde_json::json!({"kind":"wake-demo"}), None);
+        wake.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let notified = executor.notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if executor.calls.load(Ordering::Relaxed) >= 1 {
+                    break;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .expect("worker did not execute woke task promptly");
+        wait_for_task_condition(
+            || queue.stats().done == 1,
+            "woken task did not transition to done state",
+        )
+        .await;
+        let _ = shutdown_tx.send(true);
+        let _ = worker.await;
     }
 
     #[tokio::test]
