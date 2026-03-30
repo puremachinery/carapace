@@ -4,6 +4,8 @@ use serde_json::Value;
 
 use crate::plugins::loader::{is_reserved_plugin_id, RESERVED_PLUGIN_CONFIG_KEYS};
 
+const MAX_REASONABLE_TYPING_INTERVAL_SECONDS: u64 = 3600;
+
 /// Severity of a schema validation issue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
@@ -76,6 +78,14 @@ const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "filesystem",
 ];
 
+/// Built-in channel IDs that currently accept `channels.<id>.features.*`.
+///
+/// Unknown channel IDs remain allowed for forward compatibility, but we use
+/// this set to catch obvious typos in built-in names.
+const BUILTIN_CHANNEL_CONFIG_IDS: &[&str] = &[
+    "console", "signal", "telegram", "discord", "slack", "webhook",
+];
+
 /// Validate a config value against the full schema.
 ///
 /// Returns a (possibly empty) list of issues. Callers should inspect each
@@ -114,6 +124,7 @@ pub fn validate_schema(config: &Value) -> Vec<SchemaIssue> {
     validate_codex(obj, &mut issues);
     validate_agents(obj, &mut issues);
     validate_session(obj, &mut issues);
+    validate_channels(obj, &mut issues);
     validate_cron(obj, &mut issues);
     validate_prompt_guard(obj, &mut issues);
     validate_output_sanitizer(obj, &mut issues);
@@ -292,6 +303,407 @@ fn validate_gateway(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schem
                 });
             }
         }
+    }
+}
+
+fn validate_channels(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIssue>) {
+    let Some(channels_value) = obj.get("channels") else {
+        return;
+    };
+    let Some(channels) = channels_value.as_object() else {
+        issues.push(SchemaIssue {
+            severity: Severity::Warning,
+            path: ".channels".to_string(),
+            message: format!(
+                "channels must be an object, got {}",
+                json_type_label(channels_value)
+            ),
+        });
+        return;
+    };
+
+    for (channel_name, entry) in channels {
+        if channel_name == "defaults" {
+            validate_channel_defaults(entry, issues);
+            continue;
+        }
+
+        let Some(entry_obj) = entry.as_object() else {
+            issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: format!(".channels.{}", channel_name),
+                message: format!(
+                    "channel config entry must be an object, got {}",
+                    json_type_label(entry)
+                ),
+            });
+            continue;
+        };
+
+        if let Some(suggested) = suggest_reserved_channel_defaults_key(channel_name) {
+            issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: format!(".channels.{}", channel_name),
+                message: format!(
+                    "'{}' is not a channel id; did you mean the reserved global defaults key '{}'?",
+                    channel_name, suggested
+                ),
+            });
+        }
+
+        if let Some(suggested) = suggest_builtin_channel_id(channel_name) {
+            issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: format!(".channels.{}", channel_name),
+                message: format!(
+                    "unknown built-in channel id '{}'; did you mean '{}'?",
+                    channel_name, suggested
+                ),
+            });
+        }
+
+        for key in entry_obj.keys() {
+            if key != "features" && key != "session" {
+                issues.push(SchemaIssue {
+                    severity: Severity::Warning,
+                    path: format!(".channels.{}.{}", channel_name, key),
+                    message: format!(
+                        "unknown channel config key '{}'; supported keys are .channels.{}.features and .channels.{}.session",
+                        key, channel_name, channel_name
+                    ),
+                });
+            }
+        }
+
+        if let Some(features) = entry_obj.get("features") {
+            validate_channel_features(
+                features,
+                &format!(".channels.{}.features", channel_name),
+                issues,
+            );
+        }
+
+        if let Some(session) = entry_obj.get("session") {
+            validate_channel_session(
+                session,
+                &format!(".channels.{}.session", channel_name),
+                issues,
+            );
+        }
+    }
+}
+
+fn validate_channel_defaults(entry: &Value, issues: &mut Vec<SchemaIssue>) {
+    let Some(entry_obj) = entry.as_object() else {
+        issues.push(SchemaIssue {
+            severity: Severity::Warning,
+            path: ".channels.defaults".to_string(),
+            message: format!(
+                "defaults entry must be an object, got {}",
+                json_type_label(entry)
+            ),
+        });
+        return;
+    };
+
+    for key in entry_obj.keys() {
+        if key != "features" {
+            issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: format!(".channels.defaults.{}", key),
+                message:
+                    "unknown defaults config key; supported key is .channels.defaults.features"
+                        .to_string(),
+            });
+        }
+    }
+
+    if let Some(features) = entry_obj.get("features") {
+        validate_channel_features(features, ".channels.defaults.features", issues);
+    }
+}
+
+fn suggest_reserved_channel_defaults_key(channel_name: &str) -> Option<&'static str> {
+    if channel_name == "defaults" {
+        return None;
+    }
+
+    if bounded_levenshtein(channel_name, "defaults", 2) <= 2 {
+        Some("defaults")
+    } else {
+        None
+    }
+}
+
+fn suggest_builtin_channel_id(channel_name: &str) -> Option<&'static str> {
+    BUILTIN_CHANNEL_CONFIG_IDS.iter().copied().find(|builtin| {
+        *builtin != channel_name && bounded_levenshtein(channel_name, builtin, 2) <= 2
+    })
+}
+
+fn bounded_levenshtein(a: &str, b: &str, max_distance: usize) -> usize {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    if a == b {
+        return 0;
+    }
+    if a.len().abs_diff(b.len()) > max_distance {
+        return max_distance + 1;
+    }
+
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut curr = vec![0; b.len() + 1];
+
+    for (i, a_byte) in a.iter().enumerate() {
+        curr[0] = i + 1;
+        let mut row_min = curr[0];
+        for (j, b_byte) in b.iter().enumerate() {
+            let cost = usize::from(a_byte != b_byte);
+            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
+            row_min = row_min.min(curr[j + 1]);
+        }
+        if row_min > max_distance {
+            return max_distance + 1;
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+
+    prev[b.len()]
+}
+
+fn validate_channel_features(features: &Value, path: &str, issues: &mut Vec<SchemaIssue>) {
+    let Some(features_obj) = features.as_object() else {
+        issues.push(SchemaIssue {
+            severity: Severity::Warning,
+            path: path.to_string(),
+            message: format!(
+                "features must be an object, got {}",
+                json_type_label(features)
+            ),
+        });
+        return;
+    };
+
+    for key in features_obj.keys() {
+        if !matches!(key.as_str(), "typing" | "readReceipts") {
+            issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: format!("{}.{}", path, key),
+                message: format!("unknown channel feature '{}'", key),
+            });
+        }
+    }
+
+    if let Some(typing) = features_obj.get("typing") {
+        let typing_path = format!("{}.typing", path);
+        if let Some(typing_obj) = typing.as_object() {
+            for key in typing_obj.keys() {
+                if !matches!(key.as_str(), "enabled" | "mode" | "intervalSeconds") {
+                    issues.push(SchemaIssue {
+                        severity: Severity::Warning,
+                        path: format!("{}.{}", typing_path, key),
+                        message: format!("unknown typing feature key '{}'", key),
+                    });
+                }
+            }
+            if let Some(enabled) = typing_obj.get("enabled") {
+                if !enabled.is_boolean() {
+                    issues.push(SchemaIssue {
+                        severity: Severity::Warning,
+                        path: format!("{}.enabled", typing_path),
+                        message: "typing enabled must be a boolean".to_string(),
+                    });
+                }
+            }
+
+            if let Some(mode) = typing_obj.get("mode").and_then(|value| value.as_str()) {
+                if mode != "thinking" {
+                    issues.push(SchemaIssue {
+                        severity: Severity::Warning,
+                        path: format!("{}.mode", typing_path),
+                        message: format!("typing mode should be \"thinking\", got \"{}\"", mode),
+                    });
+                }
+            } else if let Some(mode) = typing_obj.get("mode") {
+                issues.push(SchemaIssue {
+                    severity: Severity::Warning,
+                    path: format!("{}.mode", typing_path),
+                    message: format!(
+                        "typing mode must be a string, got {}",
+                        json_type_label(mode)
+                    ),
+                });
+            }
+
+            if let Some(interval) = typing_obj.get("intervalSeconds") {
+                check_typing_interval_seconds(
+                    interval,
+                    &format!("{}.intervalSeconds", typing_path),
+                    issues,
+                );
+            }
+        } else {
+            issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: typing_path,
+                message: format!(
+                    "typing feature config must be an object, got {}",
+                    json_type_label(typing)
+                ),
+            });
+        }
+    }
+
+    if let Some(read_receipts) = features_obj.get("readReceipts") {
+        let read_receipts_path = format!("{}.readReceipts", path);
+        if let Some(read_receipts_obj) = read_receipts.as_object() {
+            for key in read_receipts_obj.keys() {
+                if !matches!(key.as_str(), "enabled" | "mode") {
+                    issues.push(SchemaIssue {
+                        severity: Severity::Warning,
+                        path: format!("{}.{}", read_receipts_path, key),
+                        message: format!("unknown readReceipts feature key '{}'", key),
+                    });
+                }
+            }
+            if let Some(enabled) = read_receipts_obj.get("enabled") {
+                if !enabled.is_boolean() {
+                    issues.push(SchemaIssue {
+                        severity: Severity::Warning,
+                        path: format!("{}.enabled", read_receipts_path),
+                        message: "readReceipts enabled must be a boolean".to_string(),
+                    });
+                }
+            }
+
+            if let Some(mode) = read_receipts_obj
+                .get("mode")
+                .and_then(|value| value.as_str())
+            {
+                if mode != "after-response" {
+                    issues.push(SchemaIssue {
+                        severity: Severity::Warning,
+                        path: format!("{}.mode", read_receipts_path),
+                        message: format!(
+                            "readReceipts mode should be \"after-response\", got \"{}\"",
+                            mode
+                        ),
+                    });
+                }
+            } else if let Some(mode) = read_receipts_obj.get("mode") {
+                issues.push(SchemaIssue {
+                    severity: Severity::Warning,
+                    path: format!("{}.mode", read_receipts_path),
+                    message: format!(
+                        "readReceipts mode must be a string, got {}",
+                        json_type_label(mode)
+                    ),
+                });
+            }
+        } else {
+            issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: read_receipts_path,
+                message: format!(
+                    "readReceipts feature config must be an object, got {}",
+                    json_type_label(read_receipts)
+                ),
+            });
+        }
+    }
+}
+
+fn validate_channel_session(session: &Value, path: &str, issues: &mut Vec<SchemaIssue>) {
+    let Some(session_obj) = session.as_object() else {
+        issues.push(SchemaIssue {
+            severity: Severity::Warning,
+            path: path.to_string(),
+            message: format!(
+                "session must be an object, got {}",
+                json_type_label(session)
+            ),
+        });
+        return;
+    };
+
+    for key in session_obj.keys() {
+        if key != "scope" && key != "reset" {
+            issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: format!("{}.{}", path, key),
+                message: format!(
+                    "unknown channel session key '{}'; supported keys are {}.scope and {}.reset",
+                    key, path, path
+                ),
+            });
+        }
+    }
+
+    if let Some(scope) = session_obj.get("scope") {
+        match scope.as_str() {
+            Some("per-sender" | "global" | "per-channel-peer") => {}
+            Some(other) => issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: format!("{}.scope", path),
+                message: format!(
+                    "scope must be one of per-sender/global/per-channel-peer, got \"{}\"",
+                    other
+                ),
+            }),
+            None => issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: format!("{}.scope", path),
+                message: "scope must be a string".to_string(),
+            }),
+        }
+    }
+
+    if let Some(reset) = session_obj.get("reset") {
+        validate_channel_session_reset(reset, &format!("{}.reset", path), issues);
+    }
+}
+
+fn validate_channel_session_reset(reset: &Value, path: &str, issues: &mut Vec<SchemaIssue>) {
+    let Some(reset_obj) = reset.as_object() else {
+        issues.push(SchemaIssue {
+            severity: Severity::Warning,
+            path: path.to_string(),
+            message: format!("reset must be an object, got {}", json_type_label(reset)),
+        });
+        return;
+    };
+
+    for key in reset_obj.keys() {
+        if key != "mode" && key != "idleMinutes" {
+            issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: format!("{}.{}", path, key),
+                message: format!(
+                    "unknown channel session reset key '{}'; supported keys are {}.mode and {}.idleMinutes",
+                    key, path, path
+                ),
+            });
+        }
+    }
+
+    if let Some(mode) = reset_obj.get("mode") {
+        match mode.as_str() {
+            Some("manual" | "daily" | "idle") => {}
+            Some(other) => issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: format!("{}.mode", path),
+                message: format!("mode must be one of manual/daily/idle, got \"{}\"", other),
+            }),
+            None => issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: format!("{}.mode", path),
+                message: "mode must be a string".to_string(),
+            }),
+        }
+    }
+
+    if let Some(idle_minutes) = reset_obj.get("idleMinutes") {
+        check_positive_integer(idle_minutes, &format!("{}.idleMinutes", path), issues);
     }
 }
 
@@ -572,6 +984,26 @@ fn validate_session(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schem
                 });
             }
         }
+    }
+
+    if let Some(typing_mode) = legacy_session.and_then(|s| s.get("typingMode")) {
+        match typing_mode.as_str() {
+            Some(mode) if mode.eq_ignore_ascii_case("thinking") => {}
+            Some(mode) => issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: ".session.typingMode".to_string(),
+                message: format!("typingMode must be \"thinking\", got \"{}\"", mode),
+            }),
+            None => issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: ".session.typingMode".to_string(),
+                message: "typingMode must be a string".to_string(),
+            }),
+        }
+    }
+
+    if let Some(typing_interval) = legacy_session.and_then(|s| s.get("typingIntervalSeconds")) {
+        check_typing_interval_seconds(typing_interval, ".session.typingIntervalSeconds", issues);
     }
 }
 
@@ -1340,6 +1772,22 @@ fn check_positive_integer(value: &Value, path: &str, issues: &mut Vec<SchemaIssu
     }
 }
 
+fn check_typing_interval_seconds(value: &Value, path: &str, issues: &mut Vec<SchemaIssue>) {
+    check_positive_integer(value, path, issues);
+    if let Some(n) = value.as_u64() {
+        if n > MAX_REASONABLE_TYPING_INTERVAL_SECONDS {
+            issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: path.to_string(),
+                message: format!(
+                    "typing interval above {} seconds is unusually large and may delay or suppress visible typing feedback",
+                    MAX_REASONABLE_TYPING_INTERVAL_SECONDS
+                ),
+            });
+        }
+    }
+}
+
 /// Check that a value is a positive number (> 0).
 fn check_positive_number(value: &Value, path: &str, issues: &mut Vec<SchemaIssue>) {
     match value.as_f64() {
@@ -1909,6 +2357,359 @@ mod tests {
         assert!(!issues
             .iter()
             .any(|i| i.path.starts_with(".sessions.retentionDays")));
+    }
+
+    #[test]
+    fn test_channels_features_valid() {
+        let cfg = json!({
+            "channels": {
+                "defaults": {
+                    "features": {
+                        "typing": {
+                            "enabled": true,
+                            "mode": "thinking",
+                            "intervalSeconds": 3
+                        },
+                        "readReceipts": {
+                            "enabled": false,
+                            "mode": "after-response"
+                        }
+                    }
+                },
+                "signal": {
+                    "features": {
+                        "typing": {
+                            "enabled": false,
+                            "intervalSeconds": 7
+                        },
+                        "readReceipts": {
+                            "enabled": true,
+                            "mode": "after-response"
+                        }
+                    }
+                }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(
+            !issues
+                .iter()
+                .any(|issue| issue.path.starts_with(".channels")),
+            "unexpected channel issues: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_channels_features_invalid_values_warn() {
+        let cfg = json!({
+            "channels": {
+                "signal": {
+                    "features": {
+                        "typing": {
+                            "enabled": "yes",
+                            "mode": "forever",
+                            "intervalSeconds": 0
+                        },
+                        "readReceipts": {
+                            "enabled": "yes",
+                            "mode": "on-receive"
+                        }
+                    }
+                }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(issues
+            .iter()
+            .any(|issue| issue.path == ".channels.signal.features.typing.enabled"));
+        assert!(issues
+            .iter()
+            .any(|issue| issue.path == ".channels.signal.features.typing.mode"));
+        assert!(issues
+            .iter()
+            .any(|issue| issue.path == ".channels.signal.features.typing.intervalSeconds"));
+        assert!(issues
+            .iter()
+            .any(|issue| issue.path == ".channels.signal.features.readReceipts.enabled"));
+        assert!(issues
+            .iter()
+            .any(|issue| issue.path == ".channels.signal.features.readReceipts.mode"));
+    }
+
+    #[test]
+    fn test_channels_features_typing_interval_warns_when_unusually_large() {
+        let cfg = json!({
+            "channels": {
+                "signal": {
+                    "features": {
+                        "typing": {
+                            "enabled": true,
+                            "intervalSeconds": 9999999
+                        }
+                    }
+                }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(issues.iter().any(|issue| {
+            issue.path == ".channels.signal.features.typing.intervalSeconds"
+                && issue
+                    .message
+                    .contains("typing interval above 3600 seconds is unusually large")
+        }));
+    }
+
+    #[test]
+    fn test_unknown_channel_config_entry_is_accepted_for_forward_compatibility() {
+        let cfg = json!({
+            "channels": {
+                "matrix": {
+                    "features": {
+                        "typing": {
+                            "enabled": true
+                        }
+                    }
+                }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(
+            !issues.iter().any(|issue| issue.path == ".channels.matrix"),
+            "unexpected channel-id warning for forward-compatible entry: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_builtin_channel_typo_warns_with_suggestion() {
+        let cfg = json!({
+            "channels": {
+                "singal": {
+                    "features": {
+                        "typing": {
+                            "enabled": true
+                        }
+                    }
+                }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(issues.iter().any(|issue| {
+            issue.path == ".channels.singal" && issue.message.contains("did you mean 'signal'?")
+        }));
+    }
+
+    #[test]
+    fn test_unknown_channel_entry_key_warns() {
+        let cfg = json!({
+            "channels": {
+                "signal": {
+                    "feautres": {
+                        "typing": {
+                            "enabled": true
+                        }
+                    }
+                }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(issues.iter().any(|issue| {
+            issue.path == ".channels.signal.feautres"
+                && issue.message.contains("unknown channel config key")
+        }));
+    }
+
+    #[test]
+    fn test_channel_session_entry_is_accepted() {
+        let cfg = json!({
+            "channels": {
+                "telegram": {
+                    "session": {
+                        "scope": "per-channel-peer",
+                        "reset": {
+                            "mode": "idle",
+                            "idleMinutes": 30
+                        }
+                    }
+                }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(
+            !issues
+                .iter()
+                .any(|issue| issue.path.starts_with(".channels.telegram.session")),
+            "unexpected session warning for valid per-channel session config: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_channel_session_unknown_key_warns() {
+        let cfg = json!({
+            "channels": {
+                "telegram": {
+                    "session": {
+                        "scpoe": "per-sender"
+                    }
+                }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(issues.iter().any(|issue| {
+            issue.path == ".channels.telegram.session.scpoe"
+                && issue.message.contains("unknown channel session key")
+        }));
+    }
+
+    #[test]
+    fn test_channels_container_type_warns() {
+        let cfg = json!({
+            "channels": []
+        });
+        let issues = validate_schema(&cfg);
+        assert!(issues.iter().any(|issue| {
+            issue.path == ".channels" && issue.message.contains("channels must be an object")
+        }));
+    }
+
+    #[test]
+    fn test_legacy_session_typing_mode_warns_on_unknown_value() {
+        let cfg = json!({
+            "session": {
+                "typingMode": "thinkng"
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(issues
+            .iter()
+            .any(|issue| issue.path == ".session.typingMode"
+                && issue.message.contains("typingMode must be \"thinking\"")));
+    }
+
+    #[test]
+    fn test_legacy_session_typing_interval_warns_when_unusually_large() {
+        let cfg = json!({
+            "session": {
+                "typingIntervalSeconds": 9999999
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(issues.iter().any(|issue| {
+            issue.path == ".session.typingIntervalSeconds"
+                && issue
+                    .message
+                    .contains("typing interval above 3600 seconds is unusually large")
+        }));
+    }
+
+    #[test]
+    fn test_channels_features_invalid_typing_shape_still_validates_read_receipts() {
+        let cfg = json!({
+            "channels": {
+                "signal": {
+                    "features": {
+                        "typing": true,
+                        "readReceipts": {
+                            "enabled": "yes",
+                            "mode": "on-receive"
+                        }
+                    }
+                }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(issues
+            .iter()
+            .any(|issue| issue.path == ".channels.signal.features.typing"));
+        assert!(issues
+            .iter()
+            .any(|issue| issue.path == ".channels.signal.features.readReceipts.enabled"));
+        assert!(issues
+            .iter()
+            .any(|issue| issue.path == ".channels.signal.features.readReceipts.mode"));
+    }
+
+    #[test]
+    fn test_channels_features_unknown_keys_warn() {
+        let cfg = json!({
+            "channels": {
+                "signal": {
+                    "features": {
+                        "readReceipt": {
+                            "enabled": true
+                        },
+                        "typing": {
+                            "enabled": true,
+                            "intervalSecond": 5
+                        },
+                        "readReceipts": {
+                            "enabled": true,
+                            "extra": true
+                        }
+                    }
+                }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(issues.iter().any(
+            |issue| issue.path == ".channels.signal.features.readReceipt"
+                && issue.message.contains("unknown channel feature")
+        ));
+        assert!(issues.iter().any(|issue| issue.path
+            == ".channels.signal.features.typing.intervalSecond"
+            && issue.message.contains("unknown typing feature key")));
+        assert!(issues.iter().any(|issue| issue.path
+            == ".channels.signal.features.readReceipts.extra"
+            && issue.message.contains("unknown readReceipts feature key")));
+    }
+
+    #[test]
+    fn test_channels_default_typo_warns_for_reserved_defaults_key() {
+        let cfg = json!({
+            "channels": {
+                "default": {
+                    "features": {
+                        "typing": {
+                            "enabled": true
+                        }
+                    }
+                }
+            }
+        });
+
+        let issues = validate_schema(&cfg);
+        assert!(issues.iter().any(|issue| {
+            issue.path == ".channels.default"
+                && issue
+                    .message
+                    .contains("reserved global defaults key 'defaults'")
+        }));
+    }
+
+    #[test]
+    fn test_channels_defaults_rejects_channel_only_keys() {
+        let cfg = json!({
+            "channels": {
+                "defaults": {
+                    "features": {
+                        "typing": {
+                            "enabled": true
+                        }
+                    },
+                    "session": {
+                        "scope": "dm"
+                    }
+                }
+            }
+        });
+
+        let issues = validate_schema(&cfg);
+        assert!(issues.iter().any(|issue| {
+            issue.path == ".channels.defaults.session"
+                && issue.message.contains(".channels.defaults.features")
+        }));
     }
 
     // --- cron ---

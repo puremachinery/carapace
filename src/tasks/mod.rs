@@ -11,12 +11,15 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::thread;
 use std::time::Duration;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use tracing::warn;
 use uuid::Uuid;
 
-const MAX_TASKS: usize = 10_000;
+const DEFAULT_MAX_TASKS: usize = 10_000;
+#[cfg(test)]
+const MAX_TASKS: usize = DEFAULT_MAX_TASKS;
 const TASK_QUEUE_FULL_NO_EVICTION_ERROR: &str =
     "task queue full: no terminal tasks available for eviction";
 const ENQUEUE_WORKER_FAILED_ERROR: &str = "task queue enqueue worker failed";
@@ -154,21 +157,47 @@ pub struct TaskQueue {
     tasks: RwLock<Vec<DurableTask>>,
     persist_path: Option<PathBuf>,
     dir_ensured: AtomicBool,
+    max_tasks: Option<usize>,
+}
+
+struct BuildTaskParams {
+    state: TaskState,
+    next_run_at_ms: Option<u64>,
+    last_error: Option<String>,
+    policy: TaskPolicy,
+    blocked_reason: Option<TaskBlockedReason>,
+    now: u64,
 }
 
 impl TaskQueue {
     /// Create a queue. If `persist_path` is set, mutations flush to disk.
     pub fn new(persist_path: Option<PathBuf>) -> Self {
+        Self::with_capacity_limit(persist_path, Some(DEFAULT_MAX_TASKS))
+    }
+
+    /// Create a queue with an explicit capacity limit. `None` means unbounded.
+    pub fn with_capacity_limit(persist_path: Option<PathBuf>, max_tasks: Option<usize>) -> Self {
         Self {
             tasks: RwLock::new(Vec::new()),
             persist_path,
             dir_ensured: AtomicBool::new(false),
+            max_tasks,
         }
     }
 
     /// In-memory queue for tests.
     pub fn in_memory() -> Self {
         Self::new(None)
+    }
+
+    /// In-memory queue without an item cap.
+    pub fn in_memory_unbounded() -> Self {
+        Self::with_capacity_limit(None, None)
+    }
+
+    /// Persisted queue without an item cap.
+    pub fn new_unbounded(persist_path: Option<PathBuf>) -> Self {
+        Self::with_capacity_limit(persist_path, None)
     }
 
     /// Load tasks from disk and recover stale `running` entries.
@@ -257,52 +286,148 @@ impl TaskQueue {
         policy: TaskPolicy,
     ) -> DurableTask {
         let now = now_ms();
-        let mut task = DurableTask {
-            id: Uuid::new_v4().to_string(),
-            state: TaskState::Queued,
-            attempts: 0,
-            next_run_at_ms,
-            last_error: None,
+        let mut task = self.build_task(
             payload,
-            created_at_ms: now,
-            updated_at_ms: now,
-            run_ids: Vec::new(),
-            policy,
-            blocked_reason: None,
-            policy_explicit: true,
-        };
+            BuildTaskParams {
+                state: TaskState::Queued,
+                next_run_at_ms,
+                last_error: None,
+                policy,
+                blocked_reason: None,
+                now,
+            },
+        );
 
+        self.insert_task(&mut task, now);
+        task
+    }
+
+    /// Add a new task that starts in `blocked` state.
+    pub fn enqueue_blocked_with_policy(
+        &self,
+        payload: Value,
+        reason: impl Into<String>,
+        category: TaskBlockedReason,
+        policy: TaskPolicy,
+    ) -> DurableTask {
+        let now = now_ms();
+        let mut task = self.build_task(
+            payload,
+            BuildTaskParams {
+                state: TaskState::Blocked,
+                next_run_at_ms: None,
+                last_error: Some(reason.into()),
+                policy,
+                blocked_reason: Some(category),
+                now,
+            },
+        );
+
+        self.insert_task(&mut task, now);
+        task
+    }
+
+    fn build_task(&self, payload: Value, params: BuildTaskParams) -> DurableTask {
+        DurableTask {
+            id: Uuid::new_v4().to_string(),
+            state: params.state,
+            attempts: 0,
+            next_run_at_ms: params.next_run_at_ms,
+            last_error: params.last_error,
+            payload,
+            created_at_ms: params.now,
+            updated_at_ms: params.now,
+            run_ids: Vec::new(),
+            policy: params.policy,
+            blocked_reason: params.blocked_reason,
+            policy_explicit: true,
+        }
+    }
+
+    fn insert_task(&self, task: &mut DurableTask, now: u64) {
         {
             let mut tasks = self.tasks.write();
-            if tasks.len() >= MAX_TASKS {
-                // Evict oldest terminal task first.
-                if let Some((idx, _)) = tasks
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, t)| {
-                        matches!(
-                            t.state,
-                            TaskState::Done | TaskState::Failed | TaskState::Cancelled
-                        )
-                    })
-                    .min_by_key(|(_, t)| t.updated_at_ms)
-                {
-                    tasks.remove(idx);
-                } else {
-                    task.state = TaskState::Failed;
-                    task.last_error = Some(TASK_QUEUE_FULL_NO_EVICTION_ERROR.to_string());
-                    task.updated_at_ms = now;
-                    warn!(
-                        max_tasks = MAX_TASKS,
-                        "task queue full with no terminal tasks; dropping enqueue request"
-                    );
-                    return task;
+            if let Some(max_tasks) = self.max_tasks {
+                if tasks.len() >= max_tasks {
+                    // Evict oldest terminal task first.
+                    if let Some((idx, _)) = tasks
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, t)| {
+                            matches!(
+                                t.state,
+                                TaskState::Done | TaskState::Failed | TaskState::Cancelled
+                            )
+                        })
+                        .min_by_key(|(_, t)| t.updated_at_ms)
+                    {
+                        tasks.remove(idx);
+                    } else {
+                        task.state = TaskState::Failed;
+                        task.last_error = Some(TASK_QUEUE_FULL_NO_EVICTION_ERROR.to_string());
+                        task.updated_at_ms = now;
+                        warn!(
+                            max_tasks,
+                            "task queue full with no terminal tasks; dropping enqueue request"
+                        );
+                        return;
+                    }
                 }
-            }
+            };
             tasks.push(task.clone());
         }
         self.flush_to_disk();
-        task
+    }
+
+    fn build_failed_enqueue_task(
+        &self,
+        payload: Value,
+        policy: TaskPolicy,
+        blocked_reason: Option<TaskBlockedReason>,
+    ) -> DurableTask {
+        let now = now_ms();
+        self.build_task(
+            payload,
+            BuildTaskParams {
+                state: TaskState::Failed,
+                next_run_at_ms: None,
+                last_error: Some(ENQUEUE_WORKER_FAILED_ERROR.to_string()),
+                policy,
+                blocked_reason,
+                now,
+            },
+        )
+    }
+
+    async fn enqueue_via_dedicated_thread(
+        self: &Arc<Self>,
+        worker_name: &'static str,
+        enqueue: impl FnOnce(Arc<Self>) -> DurableTask + Send + 'static,
+        fallback_task: DurableTask,
+    ) -> DurableTask {
+        let queue = Arc::clone(self);
+        let (tx, rx) = oneshot::channel();
+        match thread::Builder::new()
+            .name(worker_name.to_string())
+            .spawn(move || {
+                let task = enqueue(queue);
+                let _ = tx.send(task);
+            }) {
+            Ok(_) => match rx.await {
+                Ok(task) => task,
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        "enqueue fallback thread exited before returning a task"
+                    );
+                    fallback_task
+                }
+            },
+            Err(err) => {
+                warn!(error = %err, "failed to spawn dedicated enqueue fallback thread");
+                fallback_task
+            }
+        }
     }
 
     /// Async-safe enqueue wrapper for Tokio call sites.
@@ -339,22 +464,71 @@ impl TaskQueue {
         {
             Ok(task) => task,
             Err(err) => {
-                let now = now_ms();
                 warn!(error = %err, "enqueue worker failed");
-                DurableTask {
-                    id: Uuid::new_v4().to_string(),
-                    state: TaskState::Failed,
-                    attempts: 0,
-                    next_run_at_ms,
-                    last_error: Some(ENQUEUE_WORKER_FAILED_ERROR.to_string()),
-                    payload: payload_fallback,
-                    created_at_ms: now,
-                    updated_at_ms: now,
-                    run_ids: Vec::new(),
-                    policy: policy_fallback,
-                    blocked_reason: None,
-                    policy_explicit: true,
-                }
+                warn!("falling back to a dedicated enqueue thread after enqueue worker failure");
+                let fallback_task = self.build_failed_enqueue_task(
+                    payload_fallback.clone(),
+                    policy_fallback.clone(),
+                    None,
+                );
+                self.enqueue_via_dedicated_thread(
+                    "task-queue-enqueue-fallback",
+                    move |queue_fallback| {
+                        queue_fallback.enqueue_with_policy(
+                            payload_fallback,
+                            next_run_at_ms,
+                            policy_fallback,
+                        )
+                    },
+                    fallback_task,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Async-safe enqueue wrapper that starts the task in `blocked` state.
+    pub async fn enqueue_blocked_async_with_policy(
+        self: &Arc<Self>,
+        payload: Value,
+        reason: impl Into<String>,
+        category: TaskBlockedReason,
+        policy: TaskPolicy,
+    ) -> DurableTask {
+        let queue = Arc::clone(self);
+        let payload_fallback = payload.clone();
+        let reason = reason.into();
+        let reason_fallback = reason.clone();
+        let policy_fallback = policy.clone();
+        match tokio::task::spawn_blocking(move || {
+            queue.enqueue_blocked_with_policy(payload, reason, category, policy)
+        })
+        .await
+        {
+            Ok(task) => task,
+            Err(err) => {
+                warn!(error = %err, "enqueue worker failed");
+                warn!(
+                    "falling back to a dedicated blocked-task enqueue thread after enqueue worker failure"
+                );
+                let fallback_task = self.build_failed_enqueue_task(
+                    payload_fallback.clone(),
+                    policy_fallback.clone(),
+                    Some(category),
+                );
+                self.enqueue_via_dedicated_thread(
+                    "task-queue-blocked-enqueue-fallback",
+                    move |queue_fallback| {
+                        queue_fallback.enqueue_blocked_with_policy(
+                            payload_fallback,
+                            reason_fallback,
+                            category,
+                            policy_fallback,
+                        )
+                    },
+                    fallback_task,
+                )
+                .await
             }
         }
     }
@@ -1186,6 +1360,67 @@ mod tests {
             Some(TASK_QUEUE_FULL_NO_EVICTION_ERROR)
         );
         assert!(queue.get(&dropped.id).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_via_dedicated_thread_persists_task() {
+        let queue = Arc::new(TaskQueue::in_memory());
+        let fallback_task = queue.build_failed_enqueue_task(
+            serde_json::json!({"kind":"fallback"}),
+            TaskPolicy::default(),
+            None,
+        );
+
+        let task = queue
+            .enqueue_via_dedicated_thread(
+                "task-queue-test-fallback",
+                move |queue| {
+                    queue.enqueue_with_policy(
+                        serde_json::json!({"kind":"fallback-thread"}),
+                        None,
+                        TaskPolicy::default(),
+                    )
+                },
+                fallback_task,
+            )
+            .await;
+
+        assert_eq!(task.state, TaskState::Queued);
+        let persisted = queue
+            .get(&task.id)
+            .expect("dedicated fallback thread should persist the queued task");
+        assert_eq!(
+            persisted.payload,
+            serde_json::json!({"kind":"fallback-thread"})
+        );
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_via_dedicated_thread_returns_failed_task_when_worker_panics() {
+        let queue = Arc::new(TaskQueue::in_memory());
+        let fallback_task = queue.build_failed_enqueue_task(
+            serde_json::json!({"kind":"fallback"}),
+            TaskPolicy::default(),
+            None,
+        );
+
+        let task = queue
+            .enqueue_via_dedicated_thread(
+                "task-queue-test-fallback-panic",
+                move |_queue| -> DurableTask {
+                    panic!("boom");
+                },
+                fallback_task.clone(),
+            )
+            .await;
+
+        assert_eq!(task.state, TaskState::Failed);
+        assert_eq!(
+            task.last_error.as_deref(),
+            Some(ENQUEUE_WORKER_FAILED_ERROR)
+        );
+        assert_eq!(task.id, fallback_task.id);
+        assert!(queue.list().is_empty());
     }
 
     struct NotifyingOutcomeExecutor {

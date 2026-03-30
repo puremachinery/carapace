@@ -962,6 +962,7 @@ async fn shutdown_signal(
 
     // Brief grace period for in-flight operations to complete
     tokio::time::sleep(Duration::from_millis(250)).await;
+    ws_state.shutdown_activity_service().await;
     info!("Graceful shutdown complete");
 }
 

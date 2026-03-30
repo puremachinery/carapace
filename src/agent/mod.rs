@@ -71,6 +71,9 @@ pub enum AgentError {
     #[error("streaming error: {0}")]
     Stream(String),
 
+    #[error("delivery error: {0}")]
+    Delivery(String),
+
     #[error("classifier blocked message ({0}): {1}")]
     ClassifierBlocked(String, String),
 }
@@ -517,6 +520,8 @@ mod tests {
             run_id: run_id.to_string(),
             session_key: session_key.to_string(),
             delivery_recipient_id: None,
+            typing_context: None,
+            read_receipt: None,
             status: AgentRunStatus::Queued,
             message: "Hello".to_string(),
             response: String::new(),

@@ -103,11 +103,16 @@ pub enum ConfigError {
 /// Cached configuration entry
 struct CachedConfig {
     value: Arc<Value>,
+    raw_value: Arc<Value>,
     loaded_at: Instant,
 }
 
 /// Global config cache
 static CONFIG_CACHE: LazyLock<RwLock<Option<CachedConfig>>> = LazyLock::new(|| RwLock::new(None));
+static CONFIG_CHANGE_TX: LazyLock<tokio::sync::watch::Sender<u64>> = LazyLock::new(|| {
+    let (tx, _rx) = tokio::sync::watch::channel(0_u64);
+    tx
+});
 
 #[derive(Clone, Default)]
 struct InjectedConfigEnvState {
@@ -227,20 +232,48 @@ pub fn load_config_shared() -> Result<Arc<Value>, ConfigError> {
         }
     }
 
-    // Load fresh config
-    let config = load_config_uncached(&path)?;
-    let shared = Arc::new(config);
+    let cached = load_cached_config_uncached(&path)?;
+    let shared = Arc::clone(&cached.value);
+    maybe_store_cached_config(cached);
+    Ok(shared)
+}
 
-    // Update cache if caching is enabled
-    if get_cache_ttl().is_some() {
-        let mut cache = CONFIG_CACHE.write();
-        *cache = Some(CachedConfig {
-            value: Arc::clone(&shared),
-            loaded_at: Instant::now(),
-        });
+/// Load the explicit user config without applying defaults, returning a shared value.
+///
+/// The returned value still has includes resolved, env substitution applied,
+/// and encrypted secrets decrypted. Missing files return an empty object `{}`.
+pub(crate) fn load_raw_config_shared() -> Result<Arc<Value>, ConfigError> {
+    let path = get_config_path();
+
+    if let Some(ttl) = get_cache_ttl() {
+        let cache = CONFIG_CACHE.read();
+        if let Some(cached) = cache.as_ref() {
+            if cached.loaded_at.elapsed() < ttl {
+                return Ok(Arc::clone(&cached.raw_value));
+            }
+        }
     }
 
+    let cached = load_cached_config_uncached(&path)?;
+    let shared = Arc::clone(&cached.raw_value);
+    maybe_store_cached_config(cached);
     Ok(shared)
+}
+
+/// Return the currently cached explicit user config if the cache entry is still fresh.
+///
+/// Unlike `load_raw_config_shared`, this never forces a disk reload. Callers can
+/// use it on hot async paths to avoid unnecessary blocking work, while still
+/// honoring the configured cache TTL.
+pub(crate) fn peek_fresh_raw_config_shared() -> Option<Arc<Value>> {
+    let ttl = get_cache_ttl()?;
+    let cache = CONFIG_CACHE.read();
+    let cached = cache.as_ref()?;
+    if cached.loaded_at.elapsed() < ttl {
+        Some(Arc::clone(&cached.raw_value))
+    } else {
+        None
+    }
 }
 
 /// Load config without using the cache.
@@ -248,17 +281,16 @@ pub fn load_config_shared() -> Result<Arc<Value>, ConfigError> {
 /// After parsing, include resolution, and env var substitution, this applies
 /// config defaults so that missing sections/fields have sensible values.
 pub fn load_config_uncached(path: &Path) -> Result<Value, ConfigError> {
-    // Return empty object with defaults if file doesn't exist
+    Ok(load_cached_config_uncached(path)?.value.as_ref().clone())
+}
+
+fn load_raw_config_uncached(path: &Path) -> Result<Value, ConfigError> {
+    // Return empty object if file doesn't exist.
     if !path.exists() {
         let mut env_state = CONFIG_ENV_STATE.lock();
         let empty_env_state = InjectedConfigEnvState::default();
         restore_config_env_state(&empty_env_state, &mut env_state);
-        drop(env_state);
-
-        let mut empty = Value::Object(serde_json::Map::new());
-        defaults::apply_defaults(&mut empty);
-        crate::usage::update_pricing_from_config(&empty);
-        return Ok(empty);
+        return Ok(Value::Object(serde_json::Map::new()));
     }
 
     // Read and parse the config file
@@ -293,15 +325,29 @@ pub fn load_config_uncached(path: &Path) -> Result<Value, ConfigError> {
     }
     drop(env_state);
 
-    // Apply config defaults so missing sections and fields get production-ready values.
-    defaults::apply_defaults(&mut value);
-
     // Resolve encrypted secrets if configured.
     resolve_config_secrets(&mut value);
 
-    crate::usage::update_pricing_from_config(&value);
-
     Ok(value)
+}
+
+fn load_cached_config_uncached(path: &Path) -> Result<CachedConfig, ConfigError> {
+    let raw_value = load_raw_config_uncached(path)?;
+    let mut value = raw_value.clone();
+    defaults::apply_defaults(&mut value);
+    crate::usage::update_pricing_from_config(&value);
+    Ok(CachedConfig {
+        value: Arc::new(value),
+        raw_value: Arc::new(raw_value),
+        loaded_at: Instant::now(),
+    })
+}
+
+fn maybe_store_cached_config(cached: CachedConfig) {
+    if get_cache_ttl().is_some() {
+        let mut cache = CONFIG_CACHE.write();
+        *cache = Some(cached);
+    }
 }
 
 fn collect_config_env_vars(value: &Value) -> Result<Vec<(String, String)>, ConfigError> {
@@ -761,19 +807,41 @@ where
 pub fn clear_cache() {
     let mut cache = CONFIG_CACHE.write();
     *cache = None;
+    broadcast_config_change();
 }
 
 /// Atomically update the config cache with a pre-validated config value.
 ///
 /// This is used by the config watcher and reload mechanism to install a new
-/// config without going through file I/O again (the caller has already parsed
-/// and validated the new config).
-pub fn update_cache(value: Value) {
+/// raw + normalized config pair without going through file I/O again.
+pub fn update_cache(raw_value: Value, value: Value) {
     let mut cache = CONFIG_CACHE.write();
     *cache = Some(CachedConfig {
         value: Arc::new(value),
+        raw_value: Arc::new(raw_value),
         loaded_at: Instant::now(),
     });
+    broadcast_config_change();
+}
+
+#[cfg(test)]
+pub(crate) fn update_cache_for_test_with_age(raw_value: Value, value: Value, age: Duration) {
+    let mut cache = CONFIG_CACHE.write();
+    *cache = Some(CachedConfig {
+        value: Arc::new(value),
+        raw_value: Arc::new(raw_value),
+        loaded_at: Instant::now().checked_sub(age).unwrap_or_else(Instant::now),
+    });
+    broadcast_config_change();
+}
+
+pub fn subscribe_config_changes() -> tokio::sync::watch::Receiver<u64> {
+    CONFIG_CHANGE_TX.subscribe()
+}
+
+fn broadcast_config_change() {
+    let next = CONFIG_CHANGE_TX.borrow().wrapping_add(1);
+    let _ = CONFIG_CHANGE_TX.send(next);
 }
 
 /// Reload the config from disk, validate it, and update the cache atomically.
@@ -783,10 +851,11 @@ pub fn update_cache(value: Value) {
 /// hard parse/read errors cause an `Err`.
 pub fn reload_config() -> Result<(Value, Vec<ValidationIssue>), ConfigError> {
     let path = get_config_path();
-    let new_config = load_config_uncached(&path)?;
+    let cached = load_cached_config_uncached(&path)?;
+    let new_config = cached.value.as_ref().clone();
     let issues = validate_config(&new_config);
     // Update the cache with the freshly loaded config
-    update_cache(new_config.clone());
+    update_cache(cached.raw_value.as_ref().clone(), new_config.clone());
     Ok((new_config, issues))
 }
 
@@ -1255,6 +1324,76 @@ mod tests {
     #[test]
     fn test_clear_cache() {
         // Just verify it doesn't panic
+        clear_cache();
+    }
+
+    #[test]
+    fn test_subscribe_config_changes_notified_on_update_cache() {
+        clear_cache();
+        let mut rx = subscribe_config_changes();
+        let before = *rx.borrow_and_update();
+
+        update_cache(serde_json::json!({}), serde_json::json!({}));
+
+        assert!(rx.has_changed().unwrap());
+        let after = *rx.borrow_and_update();
+        assert!(after > before);
+    }
+
+    #[test]
+    fn test_raw_and_normalized_cache_share_one_file_snapshot() {
+        clear_cache();
+        let mut env_guard = ScopedEnv::new();
+        env_guard
+            .unset("CARAPACE_DISABLE_CONFIG_CACHE")
+            .set("CARAPACE_CONFIG_CACHE_MS", "60000");
+
+        let dir = TempDir::new().unwrap();
+        let config_path = create_temp_config(
+            &dir,
+            "config.json5",
+            r#"{
+                "channels": {
+                    "signal": {
+                        "features": {
+                            "typing": {
+                                "enabled": true
+                            }
+                        }
+                    }
+                }
+            }"#,
+        );
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+
+        let normalized = load_config_shared().unwrap();
+        assert_eq!(
+            normalized["session"]["typingMode"],
+            Value::String("thinking".to_string())
+        );
+
+        std::fs::write(
+            &config_path,
+            r#"{
+                "channels": {
+                    "signal": {
+                        "features": {
+                            "typing": {
+                                "enabled": false
+                            }
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let raw = load_raw_config_shared().unwrap();
+        assert_eq!(
+            raw["channels"]["signal"]["features"]["typing"]["enabled"],
+            Value::Bool(true)
+        );
+
         clear_cache();
     }
 

@@ -433,6 +433,8 @@ impl From<WitChannelCapabilities> for ChannelCapabilities {
             media: wit.media,
             native_commands: wit.native_commands,
             block_streaming: wit.block_streaming,
+            typing_indicators: false,
+            read_receipts: false,
         }
     }
 }
@@ -1908,6 +1910,8 @@ mod tests {
         assert!(caps.reply);
         assert!(!caps.effects);
         assert!(caps.group_management);
+        assert!(!caps.typing_indicators);
+        assert!(!caps.read_receipts);
         assert!(caps.threads);
         assert!(caps.media);
         assert!(!caps.native_commands);
