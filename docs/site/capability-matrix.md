@@ -11,7 +11,7 @@ See what works today across channels, providers, and platforms, including caveat
 | Telegram | Verified | Webhook mode + long-polling fallback supported. |
 | Discord | Verified | Gateway + outbound flows supported. |
 | Slack | Implemented (smoke pending) | Runtime wiring present; live smoke evidence pending. |
-| Signal | Implemented (smoke pending) | Runtime wiring present; live smoke evidence pending. |
+| Signal | Implemented (smoke pending) | Inbound polling, typing indicators, and after-response read receipts are implemented; live smoke evidence pending. |
 | Hooks (automation) | Verified | Token-authenticated wake/agent/mapping endpoints. |
 
 ## Providers

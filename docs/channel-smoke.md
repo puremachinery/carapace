@@ -37,6 +37,8 @@ A channel smoke run is considered **pass** when all are true:
 2. Channel registration succeeds at startup (no repeated auth/signature errors).
 3. One inbound message is received and produces an agent run.
 4. One outbound reply is delivered back to the same channel.
+5. If optional channel-activity features are enabled for the target channel,
+   those behaviors also match the configured policy.
 
 If any step fails, capture the first failing step and logs.
 
@@ -52,6 +54,12 @@ Assumes `signal-cli-rest-api` is running and configured in `carapace.json5`
 3. Confirm logs show inbound parsing + agent run dispatch from
    `signal_receive`.
 4. Confirm reply is delivered in Signal.
+5. If `channels.signal.features.typing.enabled` is true, confirm the sending
+   device/account sees a typing indicator while Carapace is generating the
+   reply.
+6. If `channels.signal.features.readReceipts.enabled` is true, confirm the
+   inbound message stays unread until the assistant reply is delivered, then
+   transitions to read shortly after delivery.
 
 Common failure indicators:
 

@@ -2,7 +2,7 @@
 # Keep this focused on audited entries in docs/feature-status.yaml.
 
 version: "1.0"
-updated_at: "2026-03-19"
+updated_at: "2026-03-29"
 
 features:
   - feature: "filesystem tools"
@@ -62,15 +62,33 @@ features:
       - "src/channels/slack.rs::test_slack_get_info"
       - "src/channels/slack_inbound.rs::test_verify_slack_signature"
 
+  - feature: "channels.activity framework"
+    status: "verified_done"
+    runtime_wiring:
+      - "src/channels/activity.rs (per-channel activity policy, dispatcher, shutdown, and durable read-receipt obligations)"
+      - "src/channels/inbound.rs (inbound typing/read-receipt context capture)"
+      - "src/agent/executor.rs (typing lifecycle + receive-time read receipt preservation)"
+      - "src/messages/delivery.rs (after-response receipt activation/withhold behavior)"
+    tests:
+      - "src/channels/activity.rs::test_maybe_start_typing_loop_drives_start_and_stop"
+      - "src/channels/activity.rs::test_send_verified_read_receipt_marks_read"
+      - "src/channels/activity.rs::test_read_receipt_task_executor_respects_max_attempts_budget"
+      - "src/agent/executor.rs::test_execute_run_channel_activity_lifecycle_orders_stop_before_delivery_and_marks_read"
+      - "src/messages/delivery.rs::test_retryable_delivery_failure_preserves_read_receipt_until_success"
+
   - feature: "channels.signal runtime wiring"
     status: "verified_done"
     runtime_wiring:
-      - "src/channels/signal.rs (SignalChannel send_text/send_media)"
+      - "src/channels/signal.rs (SignalChannel send_text/send_media/start_typing/stop_typing/mark_read)"
       - "src/channels/signal_receive.rs (signal-cli receive polling + inbound dispatch)"
       - "src/main.rs (register_signal_channel_if_configured)"
       - "src/main.rs (spawn_signal_receive_loop_if_configured)"
     tests:
       - "src/channels/signal.rs::test_signal_get_info"
+      - "src/channels/signal.rs::test_signal_get_capabilities"
+      - "src/channels/signal.rs::test_signal_start_typing_connection_failure"
+      - "src/channels/signal.rs::test_signal_mark_read_requires_timestamp"
+      - "src/channels/signal.rs::test_signal_mark_read_connection_failure_strips_phone_number_from_error"
       - "src/channels/signal.rs::test_signal_send_text_connection_failure"
       - "src/channels/signal_receive.rs::test_parse_inbound_message"
       - "src/channels/signal_receive.rs::test_parse_group_message"
@@ -79,7 +97,7 @@ features:
     status: "partial"
     notes:
       - "Evidence artifacts: docs/channel-smoke.md; .github/ISSUE_TEMPLATE/channel-smoke-report.yml"
-      - "Pending published pass/fail evidence from a live signal-cli-rest-api deployment."
+      - "Pending published pass/fail evidence from a live signal-cli-rest-api deployment, including typing/read-receipt checks when those features are enabled."
 
   - feature: "channels.slack live smoke"
     status: "partial"

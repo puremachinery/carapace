@@ -54,12 +54,14 @@ body:
     id: checks
     attributes:
       label: Smoke checks completed
-      description: Mark each completed check. For a PASS report, all four checks must be completed.
+      description: Mark each completed check. For a PASS report, complete the four core checks and any enabled Signal activity checks below.
       options:
         - label: `cara status` reported healthy
         - label: Channel registration was successful (no repeated auth/signature errors)
         - label: One inbound message triggered an agent run
         - label: One outbound reply was delivered
+        - label: If Signal typing was enabled, the typing indicator appeared while Carapace was generating the reply
+        - label: If Signal read receipts were enabled, the inbound message stayed unread until reply delivery and then became read
     validations:
       required: true
 

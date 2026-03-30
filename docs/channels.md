@@ -73,6 +73,9 @@ docker run -d -p 8080:8080 -v $HOME/.local/share/signal-api:/home/.local/share/s
 
 For non-loopback Signal deployments, set `signal.baseUrl` to `https://...`.
 Carapace rejects non-HTTPS non-loopback Signal URLs.
+When `channels.signal.features.typing.enabled` is true, Carapace refreshes the
+Signal typing indicator while the assistant is generating a reply and clears it
+before outbound delivery.
 When `channels.signal.features.readReceipts.enabled` is true, Carapace polls
 Signal with `send_read_receipts=false` and only sends a read receipt after a
 successful assistant response is delivered. When the feature is disabled,

@@ -10,6 +10,7 @@ A hardened alternative to openclaw / clawdbot — for when your assistant needs 
 
 - **Multi-provider LLM engine** — Anthropic, OpenAI API key, Codex subscription login, Ollama, Google Gemini, Vertex AI, AWS Bedrock, and Venice AI with streaming, tool dispatch, and cancellation
 - **Multi-channel messaging** — Signal, Telegram, Discord, Slack, console, and webhooks
+- **Channel activity framework** — per-channel typing indicators and after-response read receipts, with Signal as the first activity-enabled built-in channel
 - **Tooling and local workspace access** — built-in agent tools, guarded filesystem tools for explicit roots, and channel-specific tool schemas
 - **Signed plugin runtime** — plugins are signature-verified and run with strict permissions and resource limits
 - **Secure defaults** — local-first binding, locked-down auth behavior, encrypted secret storage, guarded tool execution, root-scoped filesystem access, and OS-level subprocess sandboxing for protected paths
@@ -90,7 +91,8 @@ routine use, while partial and in-progress areas remain explicitly documented.
 - Working now: setup wizard, local chat (`cara chat`), token auth enforcement,
   health/control endpoints (including durable task controls), control UI
   frontend foundation (status/channels/redacted config editor), Codex
-  subscription onboarding, and OpenAI-compatible HTTP endpoints.
+  subscription onboarding, per-channel activity config with Signal
+  typing/read-receipt flows, and OpenAI-compatible HTTP endpoints.
 - In progress: advanced Control UI flows (pairing/workflow UX), broader
   channel smoke evidence, and hardened internet-facing deployment guidance.
 
@@ -108,7 +110,9 @@ of truth.
   (`cara setup`), first-run verifier (`cara verify`), Gemini onboarding
   (Google sign-in or API key via CLI and Control UI), Codex onboarding
   (OpenAI subscription login via CLI and Control UI), Vertex AI provider
-  support, and guarded filesystem tools for explicit workspace roots
+  support, per-channel activity features with Signal typing indicators and
+  after-response read receipts, and guarded filesystem tools for explicit
+  workspace roots
 
 ## Docs
 
