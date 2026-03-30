@@ -890,13 +890,48 @@ pub async fn task_worker_loop(
     queue: Arc<TaskQueue>,
     executor: Arc<dyn TaskExecutor>,
     interval: Duration,
+    shutdown: watch::Receiver<bool>,
+) {
+    task_worker_loop_with_wakeup_inner(queue, executor, interval, shutdown, None, None).await;
+}
+
+/// Run a durable task worker with an optional best-effort wake signal.
+///
+/// The worker still polls on `interval`, but `wake` can short-circuit that delay
+/// when callers know tasks may have become immediately runnable. Wakeups are
+/// allowed to coalesce: one notification is sufficient because each wake or tick
+/// claims the full batch of tasks that are currently due.
+pub async fn task_worker_loop_with_wakeup(
+    queue: Arc<TaskQueue>,
+    executor: Arc<dyn TaskExecutor>,
+    interval: Duration,
+    shutdown: watch::Receiver<bool>,
+    wake: Option<Arc<tokio::sync::Notify>>,
+) {
+    task_worker_loop_with_wakeup_inner(queue, executor, interval, shutdown, wake, None).await;
+}
+
+async fn task_worker_loop_with_wakeup_inner(
+    queue: Arc<TaskQueue>,
+    executor: Arc<dyn TaskExecutor>,
+    interval: Duration,
     mut shutdown: watch::Receiver<bool>,
+    wake: Option<Arc<tokio::sync::Notify>>,
+    startup_cycle_complete: Option<oneshot::Sender<()>>,
 ) {
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut startup_cycle_complete = startup_cycle_complete;
     loop {
         tokio::select! {
             _ = ticker.tick() => {}
+            _ = async {
+                if let Some(wake) = wake.as_ref() {
+                    wake.notified().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {}
             _ = shutdown.changed() => {
                 tracing::info!("durable task worker received shutdown signal");
                 break;
@@ -921,6 +956,9 @@ pub async fn task_worker_loop(
                 continue;
             }
         };
+        if let Some(tx) = startup_cycle_complete.take() {
+            let _ = tx.send(());
+        }
         // Intentionally sequential for now: each tick claims at most 32 tasks.
         // Future work may add bounded parallelism once dispatch paths are
         // validated under concurrent execution.
@@ -1543,6 +1581,57 @@ mod tests {
         let stats = queue.stats();
         assert_eq!(stats.done, 2);
         assert_eq!(stats.running, 0);
+    }
+
+    #[tokio::test]
+    async fn test_task_worker_loop_with_wakeup_processes_due_tasks_without_waiting_for_tick() {
+        let queue = Arc::new(TaskQueue::in_memory());
+        let executor = Arc::new(NotifyingOutcomeExecutor {
+            outcome: TaskExecutionOutcome::Done { run_id: None },
+            calls: AtomicUsize::new(0),
+            notify: tokio::sync::Notify::new(),
+        });
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (startup_tx, startup_rx) = oneshot::channel();
+        let worker = tokio::spawn(task_worker_loop_with_wakeup_inner(
+            queue.clone(),
+            executor.clone(),
+            Duration::from_secs(3600),
+            shutdown_rx,
+            Some(wake.clone()),
+            Some(startup_tx),
+        ));
+
+        tokio::time::timeout(Duration::from_secs(1), startup_rx)
+            .await
+            .expect("worker did not complete its startup poll")
+            .expect("worker dropped the startup signal");
+        assert_eq!(
+            executor.calls.load(Ordering::Relaxed),
+            0,
+            "empty startup poll should not execute tasks",
+        );
+
+        queue.enqueue(serde_json::json!({"kind":"wake-demo"}), None);
+        wake.notify_one();
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_task_condition(
+                || executor.calls.load(Ordering::Relaxed) >= 1,
+                "worker did not execute woke task promptly",
+            ),
+        )
+        .await
+        .expect("worker did not execute woke task promptly");
+        wait_for_task_condition(
+            || queue.stats().done == 1,
+            "woken task did not transition to done state",
+        )
+        .await;
+        let _ = shutdown_tx.send(true);
+        let _ = worker.await;
     }
 
     #[tokio::test]

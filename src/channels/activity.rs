@@ -406,6 +406,7 @@ impl StopTypingDispatchKey {
 pub struct ActivityService {
     dispatcher: Arc<ActivityDispatcher>,
     read_receipt_queue: Arc<TaskQueue>,
+    read_receipt_wake: Arc<tokio::sync::Notify>,
     reserved_read_receipt_ownership: Arc<Mutex<HashSet<String>>>,
     unsupported_feature_warnings: Mutex<UnsupportedActivityWarningRegistry>,
     read_receipt_ownership_high_watermark: usize,
@@ -436,6 +437,7 @@ impl ActivityService {
         Self {
             dispatcher: Arc::new(ActivityDispatcher::new()),
             read_receipt_queue,
+            read_receipt_wake: Arc::new(tokio::sync::Notify::new()),
             reserved_read_receipt_ownership: Arc::new(Mutex::new(HashSet::new())),
             unsupported_feature_warnings: Mutex::new(UnsupportedActivityWarningRegistry::default()),
             read_receipt_ownership_high_watermark: READ_RECEIPT_OWNERSHIP_HIGH_WATERMARK,
@@ -468,6 +470,7 @@ impl ActivityService {
                 None,
                 Some(read_receipt_ownership_high_watermark),
             )),
+            read_receipt_wake: Arc::new(tokio::sync::Notify::new()),
             reserved_read_receipt_ownership: Arc::new(Mutex::new(HashSet::new())),
             unsupported_feature_warnings: Mutex::new(UnsupportedActivityWarningRegistry::default()),
             read_receipt_ownership_high_watermark,
@@ -620,6 +623,10 @@ impl ActivityService {
             );
             None
         } else {
+            // Any persisted non-failed enqueue may have made work runnable.
+            // Spurious wakes are harmless and simpler than coupling this path
+            // to specific task states.
+            self.read_receipt_wake.notify_one();
             Some(task.id)
         }
     }
@@ -654,7 +661,9 @@ impl ActivityService {
         })
         .await
         {
-            Ok(true) => {}
+            Ok(true) => {
+                self.read_receipt_wake.notify_one();
+            }
             Ok(false) => tracing::warn!(
                 task_id = %task_id_for_log,
                 "failed to activate read receipt obligation after successful delivery"
@@ -850,11 +859,13 @@ impl ActivityService {
     ) {
         let queue = self.read_receipt_queue.clone();
         let executor = Arc::new(ReadReceiptTaskExecutor { state });
-        tokio::spawn(crate::tasks::task_worker_loop(
+        let wake = self.read_receipt_wake.clone();
+        tokio::spawn(crate::tasks::task_worker_loop_with_wakeup(
             queue,
             executor,
             Duration::from_secs(1),
             shutdown,
+            Some(wake),
         ));
     }
 }
