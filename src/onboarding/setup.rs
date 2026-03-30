@@ -1,3 +1,31 @@
+//! Shared provider onboarding contract for `cara setup` and future Control UI
+//! parity work.
+//!
+//! Owning abstraction:
+//! - provider-specific setup flows write provider-owned config/auth-profile
+//!   state and return live observations through [`SetupFlowResult`]
+//! - [`assess_provider_setup`] is the only layer that converts persisted config
+//!   plus observed checks into final ready/partial/invalid status
+//! - remediation text must be a concrete next step an operator can take without
+//!   reverse-engineering the code path
+//!
+//! Write targets that upcoming guided-provider work must preserve:
+//! - Bedrock: `bedrock.region`, `bedrock.accessKeyId`,
+//!   `bedrock.secretAccessKey`, optional `bedrock.sessionToken`, and
+//!   `agents.defaults.model`
+//! - Vertex: `vertex.projectId`, `vertex.location`, optional `vertex.model`,
+//!   and `agents.defaults.model`
+//!
+//! Status contract:
+//! - "written" means the flow persisted its config/auth-profile changes and can
+//!   hand them to [`assess_provider_setup`]
+//! - [`SetupAssessmentStatus::Ready`] requires no failing checks and at least
+//!   one validation pass
+//! - [`SetupAssessmentStatus::Partial`] means config was written but live
+//!   validation was skipped or unavailable
+//! - [`SetupAssessmentStatus::Invalid`] means any requirement or validation
+//!   failed and remediation must be surfaced directly
+
 use std::path::Path;
 
 use serde_json::Value;
@@ -12,6 +40,7 @@ pub enum SetupProvider {
     OpenAi,
     Ollama,
     Gemini,
+    Vertex,
     Venice,
     Bedrock,
 }
@@ -24,6 +53,7 @@ impl SetupProvider {
             Self::OpenAi => "OpenAI",
             Self::Ollama => "Ollama",
             Self::Gemini => "Gemini",
+            Self::Vertex => "Vertex",
             Self::Venice => "Venice",
             Self::Bedrock => "Bedrock",
         }
@@ -36,6 +66,7 @@ impl SetupProvider {
             Self::OpenAi => "openai",
             Self::Ollama => "ollama",
             Self::Gemini => "gemini",
+            Self::Vertex => "vertex",
             Self::Venice => "venice",
             Self::Bedrock => "bedrock",
         }
@@ -48,6 +79,7 @@ impl SetupProvider {
             Self::OpenAi => "gpt-4o",
             Self::Ollama => "ollama:llama3",
             Self::Gemini => "gemini-2.0-flash",
+            Self::Vertex => "vertex:default",
             Self::Venice => "venice:llama-3.3-70b",
             Self::Bedrock => "bedrock:anthropic.claude-3-5-sonnet-20240620-v1:0",
         }
@@ -182,6 +214,25 @@ impl SetupCheck {
             detail: detail.into(),
             remediation: Some(remediation.into()),
         }
+    }
+}
+
+/// Provider-specific setup flow output that cannot be reconstructed purely
+/// from persisted config.
+///
+/// Setup flows should record live/provider-side observations here, such as
+/// auth exchange success, model access verification, or provider-specific input
+/// validation that happened before config was written. Static config presence,
+/// env-placeholder resolution, and final status classification belong in
+/// [`assess_provider_setup`].
+#[derive(Debug, Clone, Default)]
+pub struct SetupFlowResult {
+    pub observed_checks: Vec<SetupCheck>,
+}
+
+impl SetupFlowResult {
+    pub fn push(&mut self, check: SetupCheck) {
+        self.observed_checks.push(check);
     }
 }
 
@@ -376,6 +427,25 @@ pub fn assess_provider_setup(
                 }
             }
         },
+        SetupProvider::Vertex => {
+            checks.push(configured_value_check(
+                cfg,
+                &["vertex", "projectId"],
+                "Vertex project ID",
+                &rerun_command,
+            ));
+            checks.push(configured_value_check(
+                cfg,
+                &["vertex", "location"],
+                "Vertex location",
+                &rerun_command,
+            ));
+            checks.push(optional_configured_value_check(
+                cfg,
+                &["vertex", "model"],
+                "Vertex default model",
+            ));
+        }
         SetupProvider::Venice => {
             checks.push(configured_value_check(
                 cfg,
@@ -492,6 +562,7 @@ fn detect_auth_mode(cfg: &Value, provider: SetupProvider) -> Option<SetupAuthMod
                 None
             }
         }
+        SetupProvider::Vertex => None,
         SetupProvider::Bedrock => Some(SetupAuthMode::StaticCredentials),
     }
 }
@@ -809,6 +880,8 @@ fn model_provider_for_local_chat(model: &str) -> Option<SetupProvider> {
         Some(SetupProvider::Venice)
     } else if agent::gemini::is_gemini_model(model) {
         Some(SetupProvider::Gemini)
+    } else if agent::vertex::is_vertex_model(model) {
+        Some(SetupProvider::Vertex)
     } else if agent::codex::is_codex_model(model) {
         Some(SetupProvider::Codex)
     } else if agent::openai::is_openai_model(model) {
@@ -985,6 +1058,50 @@ mod tests {
         assert_eq!(assessment.status, SetupAssessmentStatus::Ready);
         assert_eq!(assessment.profile_name.as_deref(), Some("Sample Profile"));
         assert_eq!(assessment.email.as_deref(), Some("user@example.com"));
+    }
+
+    #[test]
+    fn test_assess_provider_setup_vertex_requires_explicit_project_and_location() {
+        let temp = TempDir::new().unwrap();
+        let cfg = json!({
+            "agents": { "defaults": { "model": "vertex:default" } },
+            "vertex": { "projectId": "my-project" }
+        });
+
+        let assessment = assess_provider_setup(&cfg, temp.path(), SetupProvider::Vertex, vec![]);
+
+        assert_eq!(assessment.status, SetupAssessmentStatus::Invalid);
+        assert!(assessment.checks.iter().any(|check| {
+            check.name == "Vertex location" && check.status == SetupCheckStatus::Fail
+        }));
+    }
+
+    #[test]
+    fn test_assess_provider_setup_vertex_ready_with_validation_pass() {
+        let temp = TempDir::new().unwrap();
+        let cfg = json!({
+            "agents": { "defaults": { "model": "vertex:default" } },
+            "vertex": {
+                "projectId": "my-project",
+                "location": "us-central1",
+                "model": "gemini-2.5-flash"
+            }
+        });
+
+        let assessment = assess_provider_setup(
+            &cfg,
+            temp.path(),
+            SetupProvider::Vertex,
+            vec![SetupCheck::validation_pass(
+                "Vertex model access",
+                "validated access to `gemini-2.5-flash`",
+            )],
+        );
+
+        assert_eq!(assessment.status, SetupAssessmentStatus::Ready);
+        assert!(assessment.checks.iter().any(|check| {
+            check.name == "Vertex model access" && check.status == SetupCheckStatus::Pass
+        }));
     }
 
     #[test]
