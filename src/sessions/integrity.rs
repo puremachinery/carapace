@@ -9,9 +9,10 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use hkdf::Hkdf;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
-use sha2_10::Sha256;
+use sha2::Sha256;
+use sha2_10::Sha256 as Sha256Legacy;
 
 type HmacSha256 = Hmac<Sha256>;
 const HMAC_DIGEST_SIZE: usize = 32;
@@ -75,7 +76,7 @@ pub enum IntegrityError {
 ///
 /// Uses `KEY_DERIVATION_TAG` as the salt and `b"hmac-key"` as the info parameter.
 pub fn derive_hmac_key(server_secret: &[u8]) -> [u8; 32] {
-    let hk = Hkdf::<Sha256>::new(Some(KEY_DERIVATION_TAG), server_secret);
+    let hk = Hkdf::<Sha256Legacy>::new(Some(KEY_DERIVATION_TAG), server_secret);
     let mut key: [u8; 32] = Default::default();
     hk.expand(b"hmac-key", &mut key)
         .expect("32-byte output is valid for HKDF-SHA256");

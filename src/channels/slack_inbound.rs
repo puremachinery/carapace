@@ -1,8 +1,8 @@
 //! Slack inbound Events API helpers.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde_json::Value;
-use sha2_10::Sha256;
+use sha2::Sha256;
 
 /// Slack signature version prefix.
 pub const SLACK_SIGNATURE_VERSION: &str = "v0";

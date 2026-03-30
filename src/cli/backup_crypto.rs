@@ -198,7 +198,8 @@ pub fn decrypt_backup(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
+    use sha2::Sha256 as HmacSha256Digest;
     use tempfile::TempDir;
 
     fn random_bytes<const N: usize>() -> [u8; N] {
@@ -226,7 +227,7 @@ mod tests {
         salt: &[u8],
         iterations: u32,
     ) -> [u8; KEY_LEN] {
-        type HmacSha256 = Hmac<Sha256>;
+        type HmacSha256 = Hmac<HmacSha256Digest>;
 
         // This reference path derives exactly one PBKDF2 block. It is valid
         // because KEY_LEN is fixed to the SHA-256 output size (32 bytes).
@@ -237,14 +238,13 @@ mod tests {
         first_block_input.extend_from_slice(salt);
         first_block_input.extend_from_slice(&1u32.to_be_bytes());
 
-        let mut mac = <HmacSha256 as Mac>::new_from_slice(passphrase).expect("HMAC key creation");
+        let mut mac = HmacSha256::new_from_slice(passphrase).expect("HMAC key creation");
         mac.update(&first_block_input);
         let mut u_prev: [u8; KEY_LEN] = mac.finalize().into_bytes().into();
         let mut out = u_prev;
 
         for _ in 1..iterations {
-            let mut iter_mac =
-                <HmacSha256 as Mac>::new_from_slice(passphrase).expect("HMAC key creation");
+            let mut iter_mac = HmacSha256::new_from_slice(passphrase).expect("HMAC key creation");
             iter_mac.update(&u_prev);
             u_prev = iter_mac.finalize().into_bytes().into();
             for (dst, src) in out.iter_mut().zip(u_prev.iter()) {

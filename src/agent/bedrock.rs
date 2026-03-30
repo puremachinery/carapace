@@ -8,10 +8,9 @@
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use sha2_10::Sha256 as Sha256Legacy;
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -19,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 use crate::agent::provider::*;
 use crate::agent::AgentError;
 
-type HmacSha256 = Hmac<Sha256Legacy>;
+type HmacSha256 = Hmac<Sha256>;
 
 /// AWS Bedrock Converse API provider.
 pub struct BedrockProvider {
