@@ -971,6 +971,23 @@ struct ReadReceiptTaskExecutor {
     state: Arc<WsServerState>,
 }
 
+fn read_receipt_policy_violation_error(task: &crate::tasks::DurableTask) -> Option<String> {
+    if !task.policy_explicit {
+        return None;
+    }
+
+    if task.policy.max_attempts == 0 {
+        Some("objective policy violation: maxAttempts must be greater than 0".to_string())
+    } else if task.attempts > task.policy.max_attempts {
+        Some(format!(
+            "objective policy violation: attempts {} exceeded maxAttempts {}",
+            task.attempts, task.policy.max_attempts
+        ))
+    } else {
+        None
+    }
+}
+
 async fn prepare_read_receipt_dispatch_plugin(
     state: &WsServerState,
     channel_id: &str,
@@ -1030,6 +1047,10 @@ pub(crate) async fn send_read_receipt_immediately(
 #[async_trait::async_trait]
 impl TaskExecutor for ReadReceiptTaskExecutor {
     async fn execute(&self, task: crate::tasks::DurableTask) -> TaskExecutionOutcome {
+        if let Some(error) = read_receipt_policy_violation_error(&task) {
+            return TaskExecutionOutcome::Failed { error };
+        }
+
         let payload = match ReadReceiptTaskPayload::from_value(task.payload) {
             Ok(payload) => payload,
             Err(err) => {
@@ -2766,6 +2787,72 @@ mod tests {
             }
             other => panic!("expected terminal failure, got {other:?}"),
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_read_receipt_task_executor_respects_max_attempts_budget() {
+        let state = Arc::new(crate::server::ws::WsServerState::new(
+            crate::server::ws::WsServerConfig::default(),
+        ));
+        let executor = ReadReceiptTaskExecutor {
+            state: state.clone(),
+        };
+
+        let task = state
+            .activity_service()
+            .read_receipt_queue()
+            .enqueue_async_with_policy(
+                serde_json::to_value(ReadReceiptTaskPayload::new(
+                    "signal",
+                    ReadReceiptContext {
+                        recipient: "+15551234567".to_string(),
+                        timestamp: Some(123),
+                        ..Default::default()
+                    },
+                ))
+                .expect("read receipt payload should serialize"),
+                None,
+                crate::tasks::TaskPolicy {
+                    max_attempts: 1,
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        let first_claimed = state
+            .activity_service()
+            .read_receipt_queue()
+            .claim_due(crate::time::unix_now_ms_u64(), 1);
+        assert_eq!(first_claimed.len(), 1);
+        assert_eq!(first_claimed[0].id, task.id);
+        assert_eq!(first_claimed[0].attempts, 1);
+
+        let first_error = match executor.execute(first_claimed[0].clone()).await {
+            TaskExecutionOutcome::RetryWait { delay_ms, error } => {
+                assert_eq!(delay_ms, READ_RECEIPT_RETRY_DELAY_MS);
+                error
+            }
+            other => panic!("expected retryable first attempt, got {other:?}"),
+        };
+        assert!(state
+            .activity_service()
+            .read_receipt_queue()
+            .mark_retry_wait(&task.id, 0, &first_error));
+
+        let second_claimed = state
+            .activity_service()
+            .read_receipt_queue()
+            .claim_due(crate::time::unix_now_ms_u64(), 1);
+        assert_eq!(second_claimed.len(), 1);
+        assert_eq!(second_claimed[0].id, task.id);
+        assert_eq!(second_claimed[0].attempts, 2);
+
+        assert_eq!(
+            executor.execute(second_claimed[0].clone()).await,
+            TaskExecutionOutcome::Failed {
+                error: "objective policy violation: attempts 2 exceeded maxAttempts 1".to_string(),
+            }
+        );
     }
 
     #[test]
