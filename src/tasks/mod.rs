@@ -892,7 +892,7 @@ pub async fn task_worker_loop(
     interval: Duration,
     shutdown: watch::Receiver<bool>,
 ) {
-    task_worker_loop_with_wakeup(queue, executor, interval, shutdown, None).await;
+    task_worker_loop_with_wakeup_inner(queue, executor, interval, shutdown, None, None).await;
 }
 
 /// Run a durable task worker with an optional best-effort wake signal.
@@ -905,11 +905,23 @@ pub async fn task_worker_loop_with_wakeup(
     queue: Arc<TaskQueue>,
     executor: Arc<dyn TaskExecutor>,
     interval: Duration,
+    shutdown: watch::Receiver<bool>,
+    wake: Option<Arc<tokio::sync::Notify>>,
+) {
+    task_worker_loop_with_wakeup_inner(queue, executor, interval, shutdown, wake, None).await;
+}
+
+async fn task_worker_loop_with_wakeup_inner(
+    queue: Arc<TaskQueue>,
+    executor: Arc<dyn TaskExecutor>,
+    interval: Duration,
     mut shutdown: watch::Receiver<bool>,
     wake: Option<Arc<tokio::sync::Notify>>,
+    startup_cycle_complete: Option<oneshot::Sender<()>>,
 ) {
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut startup_cycle_complete = startup_cycle_complete;
     loop {
         tokio::select! {
             _ = ticker.tick() => {}
@@ -944,6 +956,9 @@ pub async fn task_worker_loop_with_wakeup(
                 continue;
             }
         };
+        if let Some(tx) = startup_cycle_complete.take() {
+            let _ = tx.send(());
+        }
         // Intentionally sequential for now: each tick claims at most 32 tasks.
         // Future work may add bounded parallelism once dispatch paths are
         // validated under concurrent execution.
@@ -1578,17 +1593,25 @@ mod tests {
         });
         let wake = Arc::new(tokio::sync::Notify::new());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let worker = tokio::spawn(task_worker_loop_with_wakeup(
+        let (startup_tx, startup_rx) = oneshot::channel();
+        let worker = tokio::spawn(task_worker_loop_with_wakeup_inner(
             queue.clone(),
             executor.clone(),
             Duration::from_secs(3600),
             shutdown_rx,
             Some(wake.clone()),
+            Some(startup_tx),
         ));
 
-        // Allow the worker to consume the interval's initial immediate tick
-        // while the queue is still empty so the task below must run via `wake`.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::timeout(Duration::from_secs(1), startup_rx)
+            .await
+            .expect("worker did not complete its startup poll")
+            .expect("worker dropped the startup signal");
+        assert_eq!(
+            executor.calls.load(Ordering::Relaxed),
+            0,
+            "empty startup poll should not execute tasks",
+        );
 
         queue.enqueue(serde_json::json!({"kind":"wake-demo"}), None);
         wake.notify_one();
