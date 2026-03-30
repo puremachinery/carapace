@@ -218,7 +218,7 @@ fn sanitize_signal_receive_transport_error(error: reqwest::Error) -> String {
 fn build_receive_url(
     base_url: &url::Url,
     phone_number: &str,
-    carapace_manages_read_receipts: bool,
+    managed_read_receipt_capacity: usize,
 ) -> url::Url {
     let mut url = base_url.clone();
     let encoded_phone_number = urlencoding::encode(phone_number);
@@ -232,15 +232,16 @@ fn build_receive_url(
     let filtered_query_pairs = url
         .query_pairs()
         .into_owned()
-        .filter(|(key, _)| key != "send_read_receipts")
+        .filter(|(key, _)| key != "send_read_receipts" && key != "max_messages")
         .collect::<Vec<_>>();
     url.set_query(None);
-    if !filtered_query_pairs.is_empty() || carapace_manages_read_receipts {
+    if !filtered_query_pairs.is_empty() || managed_read_receipt_capacity > 0 {
         let mut query_pairs = url.query_pairs_mut();
         for (key, value) in filtered_query_pairs {
             query_pairs.append_pair(&key, &value);
         }
-        if carapace_manages_read_receipts {
+        if managed_read_receipt_capacity > 0 {
+            query_pairs.append_pair("max_messages", &managed_read_receipt_capacity.to_string());
             query_pairs.append_pair("send_read_receipts", "false");
         }
     }
@@ -283,32 +284,33 @@ async fn can_manage_signal_read_receipts(
     activity_service: &crate::channels::activity::ActivityService,
     state: &WsServerState,
     capability_cache: &mut SignalReadReceiptCapabilityCache,
-) -> bool {
-    if !activity_policy.read_receipts.enabled
-        || state.llm_provider().is_none()
-        || !activity_service.can_accept_read_receipt_ownership("signal")
-    {
-        return false;
+) -> usize {
+    if !activity_policy.read_receipts.enabled || state.llm_provider().is_none() {
+        return 0;
     }
 
     let Some(plugin_registry) = state.plugin_registry() else {
         capability_cache.clear();
-        return false;
+        return 0;
     };
     let Some(plugin) = plugin_registry.get_channel("signal") else {
         capability_cache.clear();
-        return false;
+        return 0;
     };
     capability_cache.update_plugin(signal_plugin_cache_key(&plugin));
 
     if let Some(supported) = capability_cache.read_receipts_supported {
-        return supported;
+        return if supported {
+            activity_service.available_read_receipt_ownership_capacity("signal")
+        } else {
+            0
+        };
     }
     if capability_cache
         .retry_after
         .is_some_and(|retry_after| Instant::now() < retry_after)
     {
-        return false;
+        return 0;
     }
 
     match tokio::task::spawn_blocking(move || plugin.get_capabilities()).await {
@@ -316,12 +318,12 @@ async fn can_manage_signal_read_receipts(
             capability_cache.read_receipts_supported = Some(capabilities.read_receipts);
             capability_cache.retry_after = None;
             if capabilities.read_receipts {
-                true
+                activity_service.available_read_receipt_ownership_capacity("signal")
             } else {
                 state
                     .activity_service()
                     .warn_unsupported_feature("signal", "read_receipts");
-                false
+                0
             }
         }
         Ok(Err(err)) => {
@@ -331,7 +333,7 @@ async fn can_manage_signal_read_receipts(
                 error = %err,
                 "failed to load Signal capabilities while deciding whether to suppress upstream auto-read-receipts"
             );
-            false
+            0
         }
         Err(err) => {
             capability_cache.retry_after =
@@ -340,7 +342,7 @@ async fn can_manage_signal_read_receipts(
                 error = %err,
                 "Signal capability worker failed while deciding whether to suppress upstream auto-read-receipts"
             );
-            false
+            0
         }
     }
 }
@@ -348,8 +350,10 @@ async fn can_manage_signal_read_receipts(
 fn acquire_signal_read_receipt_ownership(
     state: &Arc<WsServerState>,
     ctx: ReadReceiptContext,
-) -> crate::channels::activity::ClaimedReadReceipt {
-    state.activity_service().claim_read_receipt("signal", ctx)
+) -> Option<crate::channels::activity::ClaimedReadReceipt> {
+    state
+        .activity_service()
+        .try_claim_read_receipt("signal", ctx)
 }
 
 async fn snapshot_signal_receive_poll(
@@ -360,12 +364,12 @@ async fn snapshot_signal_receive_poll(
     activity_service: &crate::channels::activity::ActivityService,
     capability_cache: &mut SignalReadReceiptCapabilityCache,
 ) -> SignalReceivePollSnapshot {
-    let carapace_manages_read_receipts =
+    let managed_read_receipt_capacity =
         can_manage_signal_read_receipts(activity_policy, activity_service, state, capability_cache)
             .await;
     SignalReceivePollSnapshot {
-        receive_url: build_receive_url(base_url, phone_number, carapace_manages_read_receipts),
-        carapace_manages_read_receipts,
+        receive_url: build_receive_url(base_url, phone_number, managed_read_receipt_capacity),
+        carapace_manages_read_receipts: managed_read_receipt_capacity > 0,
     }
 }
 
@@ -603,18 +607,24 @@ async fn process_envelope(
         warn!("Ignoring Signal envelope because sender normalization failed");
         return;
     };
+    let had_read_receipt_context = read_receipt_context.is_some();
     let read_receipt =
-        read_receipt_context.map(|ctx| acquire_signal_read_receipt_ownership(state, ctx));
+        read_receipt_context.and_then(|ctx| acquire_signal_read_receipt_ownership(state, ctx));
 
     debug!(
         sender = %sender,
         text_len = text.len(),
         "Signal inbound message"
     );
-    if carapace_manages_read_receipts && read_receipt.is_none() {
+    if carapace_manages_read_receipts && !had_read_receipt_context {
         warn!(
             sender = %sender,
             "Signal read receipts are enabled but this message did not include a timestamp; Carapace cannot acknowledge it explicitly"
+        );
+    } else if carapace_manages_read_receipts && read_receipt.is_none() {
+        warn!(
+            sender = %sender,
+            "Signal read receipts are enabled but Carapace could not claim bounded receipt ownership for this message; leaving it unread"
         );
     }
 
@@ -659,6 +669,10 @@ async fn process_envelope(
         }
         Err(err) => {
             if let Some(read_receipt) = read_receipt.as_ref() {
+                state.activity_service().withhold_claimed_read_receipt(
+                    read_receipt,
+                    crate::channels::activity::READ_RECEIPT_WITHHELD_INBOUND_DISPATCH_FAILED_REASON,
+                );
                 warn!(
                     sender = %sender,
                     channel = %read_receipt.channel_id(),
@@ -1102,7 +1116,7 @@ mod tests {
             build_receive_url(
                 &url::Url::parse("http://localhost:8080").unwrap(),
                 "+15551234567",
-                false
+                0
             )
             .as_str(),
             "http://localhost:8080/v1/receive/%2B15551234567"
@@ -1115,10 +1129,10 @@ mod tests {
             build_receive_url(
                 &url::Url::parse("http://localhost:8080").unwrap(),
                 "+15551234567",
-                true
+                7
             )
             .as_str(),
-            "http://localhost:8080/v1/receive/%2B15551234567?send_read_receipts=false"
+            "http://localhost:8080/v1/receive/%2B15551234567?max_messages=7&send_read_receipts=false"
         );
     }
 
@@ -1128,34 +1142,40 @@ mod tests {
             build_receive_url(
                 &url::Url::parse("http://localhost:8080?debug=1").unwrap(),
                 "+15551234567",
-                true
+                7
             )
             .as_str(),
-            "http://localhost:8080/v1/receive/%2B15551234567?debug=1&send_read_receipts=false"
+            "http://localhost:8080/v1/receive/%2B15551234567?debug=1&max_messages=7&send_read_receipts=false"
         );
     }
 
     #[test]
-    fn test_build_receive_url_replaces_existing_send_read_receipts_parameter() {
+    fn test_build_receive_url_replaces_existing_receipt_control_parameters() {
         assert_eq!(
             build_receive_url(
-                &url::Url::parse("http://localhost:8080?debug=1&send_read_receipts=true",).unwrap(),
+                &url::Url::parse(
+                    "http://localhost:8080?debug=1&max_messages=99&send_read_receipts=true",
+                )
+                .unwrap(),
                 "+15551234567",
-                true
+                7
             )
             .as_str(),
-            "http://localhost:8080/v1/receive/%2B15551234567?debug=1&send_read_receipts=false"
+            "http://localhost:8080/v1/receive/%2B15551234567?debug=1&max_messages=7&send_read_receipts=false"
         );
     }
 
     #[test]
-    fn test_build_receive_url_strips_existing_send_read_receipts_parameter_when_not_managing_receipts(
+    fn test_build_receive_url_strips_existing_receipt_control_parameters_when_not_managing_receipts(
     ) {
         assert_eq!(
             build_receive_url(
-                &url::Url::parse("http://localhost:8080?debug=1&send_read_receipts=false").unwrap(),
+                &url::Url::parse(
+                    "http://localhost:8080?debug=1&max_messages=99&send_read_receipts=false",
+                )
+                .unwrap(),
                 "+15551234567",
-                false,
+                0,
             )
             .as_str(),
             "http://localhost:8080/v1/receive/%2B15551234567?debug=1"
@@ -1168,7 +1188,7 @@ mod tests {
             build_receive_url(
                 &url::Url::parse("http://localhost:8080/api").unwrap(),
                 "+15551234567",
-                false
+                0
             )
             .as_str(),
             "http://localhost:8080/api/v1/receive/%2B15551234567"
@@ -1181,10 +1201,10 @@ mod tests {
             build_receive_url(
                 &url::Url::parse("http://localhost:8080/api?debug=1").unwrap(),
                 "+15551234567",
-                true
+                7
             )
             .as_str(),
-            "http://localhost:8080/api/v1/receive/%2B15551234567?debug=1&send_read_receipts=false"
+            "http://localhost:8080/api/v1/receive/%2B15551234567?debug=1&max_messages=7&send_read_receipts=false"
         );
     }
 
@@ -1222,7 +1242,9 @@ mod tests {
     #[tokio::test]
     async fn test_sanitize_signal_receive_transport_error_strips_phone_number_from_url() {
         let err = reqwest::Client::new()
-            .get("http://127.0.0.1:1/v1/receive/%2B15551234567?send_read_receipts=false")
+            .get(
+                "http://127.0.0.1:1/v1/receive/%2B15551234567?max_messages=7&send_read_receipts=false",
+            )
             .send()
             .await
             .expect_err("transport request should fail against unreachable port");
@@ -1234,7 +1256,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_snapshot_signal_receive_poll_uses_single_policy_view() {
-        let activity_service = crate::channels::activity::ActivityService::new();
+        let activity_service =
+            crate::channels::activity::ActivityService::with_limits_for_test(8, 3);
         let state = test_state_with_provider_and_signal_plugin();
         let activity_policy = crate::channels::activity::ChannelActivityPolicy {
             read_receipts: crate::channels::activity::ReadReceiptFeaturePolicy {
@@ -1258,7 +1281,7 @@ mod tests {
         assert!(snapshot.carapace_manages_read_receipts);
         assert_eq!(
             snapshot.receive_url.as_str(),
-            "http://localhost:8080/api/v1/receive/%2B15551234567?debug=1&send_read_receipts=false"
+            "http://localhost:8080/api/v1/receive/%2B15551234567?debug=1&max_messages=3&send_read_receipts=false"
         );
     }
 
@@ -1820,6 +1843,54 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn test_process_envelope_rechecks_bounded_receipt_ownership_per_message() {
+        let activity_service =
+            Arc::new(crate::channels::activity::ActivityService::with_limits_for_test(8, 1));
+        let state = Arc::new(
+            WsServerState::new(WsServerConfig::default())
+                .with_llm_provider(Arc::new(StaticTestProvider))
+                .with_activity_service(activity_service.clone()),
+        );
+        let reserved_claim = activity_service
+            .try_claim_read_receipt(
+                "signal",
+                ReadReceiptContext {
+                    recipient: "+15551230000".to_string(),
+                    timestamp: Some(1),
+                    ..Default::default()
+                },
+            )
+            .expect("test should reserve the only available read receipt slot");
+        let envelope = SignalEnvelope {
+            source_number: Some("+15559876543".to_string()),
+            source: None,
+            timestamp: Some(1706745600000),
+            data_message: Some(SignalDataMessage {
+                message: Some("hello".to_string()),
+                timestamp: Some(1706745600000),
+                group_info: None,
+            }),
+        };
+
+        process_envelope(&envelope, &state, true).await;
+
+        let runs = state.agent_run_registry.lock().snapshot_runs();
+        let run = runs
+            .iter()
+            .find(|run| run.message == "hello")
+            .expect("bounded-capacity path should still dispatch the inbound run");
+        assert!(
+            run.read_receipt.is_none(),
+            "process_envelope should leave the message unclaimed once bounded receipt capacity is exhausted"
+        );
+
+        activity_service.withhold_claimed_read_receipt(
+            &reserved_claim,
+            "test cleanup after bounded receipt ownership assertion",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn test_process_envelope_sends_immediate_receipt_when_durable_queue_is_unavailable() {
         let notify = Arc::new(Notify::new());
         let signal_channel = Arc::new(MockSignalReadReceiptChannel::new(notify.clone()));
@@ -1881,7 +1952,7 @@ mod tests {
             ..Default::default()
         };
         let mut capability_cache = SignalReadReceiptCapabilityCache::default();
-        let carapace_manages_read_receipts = can_manage_signal_read_receipts(
+        let managed_read_receipt_capacity = can_manage_signal_read_receipts(
             &activity_policy,
             state.activity_service(),
             state.as_ref(),
@@ -1889,7 +1960,7 @@ mod tests {
         )
         .await;
         assert!(
-            carapace_manages_read_receipts,
+            managed_read_receipt_capacity > 0,
             "provider should be available at poll time so Carapace claims the receipt"
         );
 
@@ -1910,7 +1981,7 @@ mod tests {
             }),
         };
 
-        process_envelope(&envelope, &state, carapace_manages_read_receipts).await;
+        process_envelope(&envelope, &state, managed_read_receipt_capacity > 0).await;
 
         tokio::time::timeout(Duration::from_secs(1), notify.notified())
             .await

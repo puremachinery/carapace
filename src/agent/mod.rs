@@ -71,6 +71,9 @@ pub enum AgentError {
     #[error("streaming error: {0}")]
     Stream(String),
 
+    #[error("delivery error: {0}")]
+    Delivery(String),
+
     #[error("classifier blocked message ({0}): {1}")]
     ClassifierBlocked(String, String),
 }

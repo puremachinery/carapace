@@ -22,7 +22,7 @@
 //!   config reload evaluates channel capabilities against policy.
 
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
@@ -37,6 +37,7 @@ use serde_json::Value;
 use tokio::runtime::{Handle, RuntimeFlavor};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use crate::plugins::{
     BindingError, ChannelPluginInstance, PluginRegistry, ReadReceiptContext, TypingContext,
@@ -228,13 +229,15 @@ pub struct ChannelActivityPolicy {
 /// Receive-time explicit read-receipt ownership claim.
 ///
 /// Signal receive decides whether Carapace owns the receipt for this inbound
-/// message. The claim is carried through dispatch/run evaluation, but it does
-/// not become a durable after-response obligation until delivery is actually
-/// queued.
+/// message. The claim is carried through dispatch/run evaluation and, when the
+/// activity service issued it, also reserves bounded receipt ownership
+/// capacity until it is released or promoted into a durable after-response
+/// obligation.
 #[derive(Debug, Clone)]
 pub struct ClaimedReadReceipt {
     channel_id: String,
     context: ReadReceiptContext,
+    reservation_id: Option<String>,
 }
 
 impl ClaimedReadReceipt {
@@ -242,6 +245,19 @@ impl ClaimedReadReceipt {
         Self {
             channel_id: channel_id.into(),
             context,
+            reservation_id: None,
+        }
+    }
+
+    fn tracked(
+        channel_id: impl Into<String>,
+        context: ReadReceiptContext,
+        reservation_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            channel_id: channel_id.into(),
+            context,
+            reservation_id: Some(reservation_id.into()),
         }
     }
 
@@ -251,6 +267,10 @@ impl ClaimedReadReceipt {
 
     pub fn context(&self) -> &ReadReceiptContext {
         &self.context
+    }
+
+    fn reservation_id(&self) -> Option<&str> {
+        self.reservation_id.as_deref()
     }
 }
 
@@ -330,6 +350,7 @@ impl StopTypingDispatchKey {
 pub struct ActivityService {
     dispatcher: Arc<ActivityDispatcher>,
     read_receipt_queue: Arc<TaskQueue>,
+    claimed_read_receipts: Mutex<HashSet<String>>,
     unsupported_feature_warnings: Mutex<UnsupportedActivityWarningRegistry>,
     read_receipt_ownership_high_watermark: usize,
 }
@@ -342,19 +363,24 @@ impl Default for ActivityService {
 
 impl ActivityService {
     pub fn new() -> Self {
-        Self::with_read_receipt_queue(Arc::new(TaskQueue::in_memory_unbounded()))
+        Self::with_read_receipt_queue(Arc::new(TaskQueue::with_capacity_limit(
+            None,
+            Some(READ_RECEIPT_OWNERSHIP_HIGH_WATERMARK),
+        )))
     }
 
     pub fn new_persistent(state_dir: PathBuf) -> Self {
-        Self::with_read_receipt_queue(Arc::new(TaskQueue::new_unbounded(Some(
-            state_dir.join("activity").join("read_receipts.json"),
-        ))))
+        Self::with_read_receipt_queue(Arc::new(TaskQueue::with_capacity_limit(
+            Some(state_dir.join("activity").join("read_receipts.json")),
+            Some(READ_RECEIPT_OWNERSHIP_HIGH_WATERMARK),
+        )))
     }
 
     fn with_read_receipt_queue(read_receipt_queue: Arc<TaskQueue>) -> Self {
         Self {
             dispatcher: Arc::new(ActivityDispatcher::new()),
             read_receipt_queue,
+            claimed_read_receipts: Mutex::new(HashSet::new()),
             unsupported_feature_warnings: Mutex::new(UnsupportedActivityWarningRegistry::default()),
             read_receipt_ownership_high_watermark: READ_RECEIPT_OWNERSHIP_HIGH_WATERMARK,
         }
@@ -382,7 +408,11 @@ impl ActivityService {
             dispatcher: Arc::new(ActivityDispatcher::with_backlog_warning_threshold(
                 backlog_warning_threshold,
             )),
-            read_receipt_queue: Arc::new(TaskQueue::in_memory_unbounded()),
+            read_receipt_queue: Arc::new(TaskQueue::with_capacity_limit(
+                None,
+                Some(read_receipt_ownership_high_watermark),
+            )),
+            claimed_read_receipts: Mutex::new(HashSet::new()),
             unsupported_feature_warnings: Mutex::new(UnsupportedActivityWarningRegistry::default()),
             read_receipt_ownership_high_watermark,
         }
@@ -423,12 +453,35 @@ impl ActivityService {
         }
     }
 
-    pub fn claim_read_receipt(
+    pub fn try_claim_read_receipt(
         &self,
         channel_id: &str,
         ctx: ReadReceiptContext,
-    ) -> ClaimedReadReceipt {
-        ClaimedReadReceipt::new(channel_id, ctx)
+    ) -> Option<ClaimedReadReceipt> {
+        let outstanding_queue = self.read_receipt_queue_outstanding_count();
+        let mut claimed_read_receipts = self.claimed_read_receipts.lock();
+        let outstanding = outstanding_queue + claimed_read_receipts.len();
+        if outstanding >= self.read_receipt_ownership_high_watermark {
+            drop(claimed_read_receipts);
+            self.maybe_warn_read_receipt_backpressure(channel_id, outstanding);
+            return None;
+        }
+
+        let reservation_id = Uuid::new_v4().to_string();
+        claimed_read_receipts.insert(reservation_id.clone());
+        Some(ClaimedReadReceipt::tracked(channel_id, ctx, reservation_id))
+    }
+
+    fn release_claimed_read_receipt_reservation(&self, claim: &ClaimedReadReceipt) -> bool {
+        let Some(reservation_id) = claim.reservation_id() else {
+            return false;
+        };
+        self.claimed_read_receipts.lock().remove(reservation_id)
+    }
+
+    pub fn withhold_claimed_read_receipt(&self, claim: &ClaimedReadReceipt, reason: &str) -> bool {
+        let _ = reason;
+        self.release_claimed_read_receipt_reservation(claim)
     }
 
     pub async fn prepare_after_response_read_receipt(
@@ -441,11 +494,17 @@ impl ActivityService {
             .enqueue_after_response_read_receipt(&channel_id, context.clone())
             .await
         {
-            Some(task_id) => Ok(OwnedReadReceipt::new(channel_id, context, task_id)),
-            None => Err(
-                "failed to durably persist the after-response read receipt obligation before delivery queueing"
-                    .to_string(),
-            ),
+            Some(task_id) => {
+                let _ = self.release_claimed_read_receipt_reservation(claim);
+                Ok(OwnedReadReceipt::new(channel_id, context, task_id))
+            }
+            None => {
+                let _ = self.release_claimed_read_receipt_reservation(claim);
+                Err(
+                    "failed to durably persist the after-response read receipt obligation before delivery queueing"
+                        .to_string(),
+                )
+            }
         }
     }
 
@@ -553,6 +612,7 @@ impl ActivityService {
         state: &WsServerState,
         claim: &ClaimedReadReceipt,
     ) {
+        let _ = self.release_claimed_read_receipt_reservation(claim);
         if let Err(err) = self
             .acknowledge_read_receipt_now(state, claim.channel_id(), claim.context().clone())
             .await
@@ -629,17 +689,16 @@ impl ActivityService {
         }
     }
 
-    fn read_receipt_obligation_count(&self) -> usize {
+    fn read_receipt_queue_outstanding_count(&self) -> usize {
         let stats = self.read_receipt_queue.stats();
         stats.queued + stats.running + stats.blocked + stats.retry_wait
     }
 
-    pub fn can_accept_read_receipt_ownership(&self, channel_id: &str) -> bool {
-        let outstanding = self.read_receipt_obligation_count();
-        if outstanding < self.read_receipt_ownership_high_watermark {
-            return true;
-        }
+    fn read_receipt_obligation_count(&self) -> usize {
+        self.read_receipt_queue_outstanding_count() + self.claimed_read_receipts.lock().len()
+    }
 
+    fn maybe_warn_read_receipt_backpressure(&self, channel_id: &str, outstanding: usize) {
         let key = format!("{channel_id}:read_receipts_backpressure");
         let should_warn = {
             let mut registry = self.unsupported_feature_warnings.lock();
@@ -653,7 +712,20 @@ impl ActivityService {
                 "read receipt backlog reached the high-water mark; leaving upstream auto-receipts enabled for new messages until the durable queue drains"
             );
         }
-        false
+    }
+
+    pub fn available_read_receipt_ownership_capacity(&self, channel_id: &str) -> usize {
+        let outstanding = self.read_receipt_obligation_count();
+        if outstanding < self.read_receipt_ownership_high_watermark {
+            return self.read_receipt_ownership_high_watermark - outstanding;
+        }
+
+        self.maybe_warn_read_receipt_backpressure(channel_id, outstanding);
+        0
+    }
+
+    pub fn can_accept_read_receipt_ownership(&self, channel_id: &str) -> bool {
+        self.available_read_receipt_ownership_capacity(channel_id) > 0
     }
 
     pub async fn shutdown(&self) {
@@ -2956,6 +3028,34 @@ mod tests {
         assert!(
             !service.can_accept_read_receipt_ownership("signal"),
             "new ownership should stop once the durable backlog reaches the high-water mark"
+        );
+    }
+
+    #[test]
+    fn test_try_claim_read_receipt_counts_and_releases_receive_time_reservations() {
+        let service = ActivityService::with_limits_for_test(8, 1);
+        let claim = service
+            .try_claim_read_receipt(
+                "signal",
+                ReadReceiptContext {
+                    recipient: "+15551230001".to_string(),
+                    timestamp: Some(1),
+                    ..Default::default()
+                },
+            )
+            .expect("first claim should reserve the only available receipt slot");
+        assert!(
+            !service.can_accept_read_receipt_ownership("signal"),
+            "tracked receive-time claims should count against the ownership high-water mark"
+        );
+
+        assert!(service.withhold_claimed_read_receipt(
+            &claim,
+            "test should release claimed receipt ownership",
+        ));
+        assert!(
+            service.can_accept_read_receipt_ownership("signal"),
+            "withholding a tracked claim should release its ownership reservation"
         );
     }
 
