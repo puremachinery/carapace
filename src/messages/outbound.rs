@@ -1073,15 +1073,15 @@ mod tests {
     #[test]
     fn test_message_metadata_skips_read_receipt_serialization() {
         let metadata = MessageMetadata {
-            read_receipt: Some(crate::channels::activity::OwnedReadReceipt::Deferred {
-                channel_id: "signal".to_string(),
-                context: crate::plugins::ReadReceiptContext {
+            read_receipt: Some(crate::channels::activity::OwnedReadReceipt::new(
+                "signal",
+                crate::plugins::ReadReceiptContext {
                     recipient: "+15551234567".to_string(),
                     timestamp: Some(123),
                     ..Default::default()
                 },
-                task_id: "receipt-task-123".to_string(),
-            }),
+                "receipt-task-123",
+            )),
             ..Default::default()
         };
 

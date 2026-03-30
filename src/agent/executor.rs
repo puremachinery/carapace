@@ -911,7 +911,7 @@ fn delivery_context_from_registry(
     run_id: &str,
 ) -> (
     Option<String>,
-    Option<crate::channels::activity::OwnedReadReceipt>,
+    Option<crate::channels::activity::ClaimedReadReceipt>,
 ) {
     let registry = state.agent_run_registry.lock();
     registry
@@ -931,18 +931,10 @@ async fn withhold_owned_read_receipt_on_failed_run(
     run_id: &str,
     channel_id: Option<&str>,
 ) {
-    let (_, read_receipt) = delivery_context_from_registry(state, run_id);
-    let Some(read_receipt) = read_receipt.as_ref() else {
+    let (_, claimed_read_receipt) = delivery_context_from_registry(state, run_id);
+    let Some(_claimed_read_receipt) = claimed_read_receipt.as_ref() else {
         return;
     };
-
-    state
-        .activity_service()
-        .withhold_owned_read_receipt(
-            read_receipt,
-            crate::channels::activity::READ_RECEIPT_WITHHELD_RUN_FAILED_REASON,
-        )
-        .await;
 
     match channel_id {
         Some(channel_id) => tracing::warn!(
@@ -1387,6 +1379,10 @@ pub async fn execute_run(
                 &config.output_sanitizer.csp_policy,
             );
 
+            if let Some(handle) = typing_handle.take() {
+                handle.stop().await;
+            }
+
             if let Some(text) = delivery_text {
                 if !text.is_empty() {
                     let recipient_id =
@@ -1406,8 +1402,7 @@ pub async fn execute_run(
                                 .activity_service()
                                 .warn_unsupported_feature(channel_id, "read_receipts");
                         }
-                        let pending_read_receipt = if let Some(read_receipt) =
-                            read_receipt.as_ref()
+                        let pending_read_receipt = if let Some(read_receipt) = read_receipt.as_ref()
                         {
                             if capability_probe_failed {
                                 tracing::warn!(
@@ -1416,13 +1411,31 @@ pub async fn execute_run(
                                     "preserving explicit read receipt after capability probe failure because upstream auto-receipts were already suppressed at receive time"
                                 );
                             }
-                            Some(read_receipt.clone())
+                            match state
+                                .activity_service()
+                                .prepare_after_response_read_receipt(read_receipt)
+                                .await
+                            {
+                                Ok(receipt) => Some(receipt),
+                                Err(err) => {
+                                    tracing::warn!(
+                                        run_id = %run_id,
+                                        channel = %channel_id,
+                                        error = %err,
+                                        "failed to persist after-response read receipt before delivery queueing; skipping outbound delivery to preserve explicit acknowledgment ordering"
+                                    );
+                                    None
+                                }
+                            }
                         } else {
                             None
                         };
+                        if read_receipt.is_some() && pending_read_receipt.is_none() {
+                            return Ok(());
+                        }
                         let metadata = crate::messages::outbound::MessageMetadata {
                             recipient_id: Some(chat_id),
-                            read_receipt: pending_read_receipt,
+                            read_receipt: pending_read_receipt.clone(),
                             ..Default::default()
                         };
                         let outbound = crate::messages::outbound::OutboundMessage::new(
@@ -1440,7 +1453,7 @@ pub async fn execute_run(
                                 error = %err,
                                 "failed to queue agent response for delivery"
                             );
-                            if let Some(read_receipt) = read_receipt.as_ref() {
+                            if let Some(read_receipt) = pending_read_receipt.as_ref() {
                                 state
                                     .activity_service()
                                     .withhold_owned_read_receipt(
@@ -1450,36 +1463,23 @@ pub async fn execute_run(
                                     .await;
                             }
                         }
-                    } else if let Some(read_receipt) = read_receipt.as_ref() {
-                        state
-                            .activity_service()
-                            .withhold_owned_read_receipt(
-                                read_receipt,
-                                crate::channels::activity::READ_RECEIPT_WITHHELD_NO_DELIVERY_TARGET_REASON,
-                            )
-                            .await;
+                    } else if read_receipt.is_some() {
+                        tracing::warn!(
+                            run_id = %run_id,
+                            "withholding explicit read receipt because no outbound delivery target was available"
+                        );
                     }
-                } else if let Some(read_receipt) = read_receipt.as_ref() {
-                    state
-                        .activity_service()
-                        .withhold_owned_read_receipt(
-                            read_receipt,
-                            crate::channels::activity::READ_RECEIPT_WITHHELD_EMPTY_RESPONSE_REASON,
-                        )
-                        .await;
+                } else if read_receipt.is_some() {
+                    tracing::warn!(
+                        run_id = %run_id,
+                        "withholding explicit read receipt because the agent produced no deliverable response text"
+                    );
                 }
-            } else if let Some(read_receipt) = read_receipt.as_ref() {
-                state
-                    .activity_service()
-                    .withhold_owned_read_receipt(
-                        read_receipt,
-                        crate::channels::activity::READ_RECEIPT_WITHHELD_DELIVERY_DISABLED_REASON,
-                    )
-                    .await;
-            }
-
-            if let Some(handle) = typing_handle.take() {
-                handle.stop().await;
+            } else if read_receipt.is_some() {
+                tracing::warn!(
+                    run_id = %run_id,
+                    "withholding explicit read receipt because outbound delivery was disabled for this run"
+                );
             }
 
             Ok(())
@@ -2140,7 +2140,7 @@ mod tests {
         run_id: &str,
         channel: &str,
         chat_id: &str,
-    ) -> (sessions::Session, String) {
+    ) -> (sessions::Session, crate::channels::activity::ClaimedReadReceipt) {
         let metadata = sessions::SessionMetadata {
             channel: Some(channel.to_string()),
             chat_id: Some(chat_id.to_string()),
@@ -2154,18 +2154,14 @@ mod tests {
             .session_store()
             .append_message(sessions::ChatMessage::user(&session.id, "Hello"))
             .unwrap();
-        let read_receipt_task_id = state
-            .activity_service()
-            .enqueue_after_response_read_receipt(
-                channel,
-                ReadReceiptContext {
-                    recipient: chat_id.to_string(),
-                    timestamp: Some(123),
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("channel-activity tests should persist durable read receipt obligations");
+        let claimed_read_receipt = crate::channels::activity::ClaimedReadReceipt::new(
+            channel,
+            ReadReceiptContext {
+                recipient: chat_id.to_string(),
+                timestamp: Some(123),
+                ..Default::default()
+            },
+        );
         {
             use crate::server::ws::{AgentRun, AgentRunStatus};
             let now = std::time::SystemTime::now()
@@ -2181,15 +2177,7 @@ mod tests {
                     to: chat_id.to_string(),
                     ..Default::default()
                 }),
-                read_receipt: Some(crate::channels::activity::OwnedReadReceipt::Deferred {
-                    channel_id: channel.to_string(),
-                    context: ReadReceiptContext {
-                        recipient: chat_id.to_string(),
-                        timestamp: Some(123),
-                        ..Default::default()
-                    },
-                    task_id: read_receipt_task_id.clone(),
-                }),
+                read_receipt: Some(claimed_read_receipt.clone()),
                 status: AgentRunStatus::Queued,
                 message: "Hello".to_string(),
                 response: String::new(),
@@ -2201,7 +2189,7 @@ mod tests {
                 waiters: Vec::new(),
             });
         }
-        (session, read_receipt_task_id)
+        (session, claimed_read_receipt)
     }
 
     #[test]
@@ -2369,7 +2357,7 @@ mod tests {
         let run_id = "run-channel-activity";
         let session_key = "test-channel-activity";
         let chat_id = "+15551234567";
-        let (_session, read_receipt_task_id) = setup_session_and_run_with_channel_activity(
+        let (_session, _claimed_read_receipt) = setup_session_and_run_with_channel_activity(
             &state,
             session_key,
             run_id,
@@ -2384,6 +2372,19 @@ mod tests {
             deliver: true,
             ..Default::default()
         };
+        let (delivery_shutdown_tx, delivery_shutdown_rx) = tokio::sync::watch::channel(false);
+        let delivery_handle = tokio::spawn(crate::messages::delivery::delivery_loop(
+            state.message_pipeline().clone(),
+            plugin_registry.clone(),
+            state.channel_registry().clone(),
+            state.clone(),
+            delivery_shutdown_rx,
+        ));
+        let (read_receipt_shutdown_tx, read_receipt_shutdown_rx) =
+            tokio::sync::watch::channel(false);
+        state
+            .activity_service()
+            .spawn_read_receipt_worker(state.clone(), read_receipt_shutdown_rx);
 
         let result = execute_run(
             run_id.to_string(),
@@ -2396,40 +2397,29 @@ mod tests {
         .await;
         assert!(result.is_ok(), "execute_run failed: {:?}", result.err());
 
-        let channel_ids = state.message_pipeline().channels_with_messages();
-        assert_eq!(channel_ids, vec!["signal".to_string()]);
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        state
-            .activity_service()
-            .spawn_read_receipt_worker(state.clone(), shutdown_rx);
-
-        crate::messages::delivery::process_channel_messages(
-            &channel_ids,
-            state.message_pipeline(),
-            &plugin_registry,
-            state.channel_registry(),
-            &state,
-        )
-        .await;
-
         tokio::time::timeout(
             std::time::Duration::from_secs(2),
             plugin.mark_read_notify.notified(),
         )
         .await
         .expect("delivery success should trigger a read receipt");
-        shutdown_tx
+        read_receipt_shutdown_tx
             .send(true)
             .expect("read receipt worker shutdown signal should send");
+        delivery_shutdown_tx
+            .send(true)
+            .expect("delivery loop shutdown signal should send");
+        state.message_pipeline().notifier().notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(2), delivery_handle)
+            .await
+            .expect("delivery loop should exit")
+            .expect("delivery loop task should succeed");
         state.shutdown_activity_service().await;
 
         assert_eq!(plugin.events(), vec!["start", "stop", "send", "read"]);
-        let completed_task = state
-            .activity_service()
-            .read_receipt_queue()
-            .get(&read_receipt_task_id)
-            .expect("delivery success should preserve the durable receipt task");
-        assert_eq!(completed_task.state, crate::tasks::TaskState::Done);
+        let receipt_tasks = state.activity_service().read_receipt_queue().list();
+        assert_eq!(receipt_tasks.len(), 1);
+        assert_eq!(receipt_tasks[0].state, crate::tasks::TaskState::Done);
         crate::config::clear_cache();
     }
 
@@ -2559,7 +2549,7 @@ mod tests {
         let run_id = "run-channel-activity-error-disabled";
         let session_key = "test-channel-activity-error-disabled";
         let chat_id = "+15551234567";
-        let (_session, read_receipt_task_id) = setup_session_and_run_with_channel_activity(
+        let (_session, _claimed_read_receipt) = setup_session_and_run_with_channel_activity(
             &state,
             session_key,
             run_id,
@@ -2591,15 +2581,9 @@ mod tests {
             "execute_run should surface provider failure"
         );
 
-        let withheld_task = state
-            .activity_service()
-            .read_receipt_queue()
-            .get(&read_receipt_task_id)
-            .expect("run error should preserve the durable read receipt task");
-        assert_eq!(withheld_task.state, crate::tasks::TaskState::Cancelled);
-        assert_eq!(
-            withheld_task.last_error.as_deref(),
-            Some(crate::channels::activity::READ_RECEIPT_WITHHELD_RUN_FAILED_REASON)
+        assert!(
+            state.activity_service().read_receipt_queue().list().is_empty(),
+            "run errors before delivery should not persist a durable read receipt task"
         );
 
         crate::config::clear_cache();
@@ -2611,19 +2595,6 @@ mod tests {
         let run_id = "run-channel-activity-missing-session";
         let session_key = "missing-session-for-activity";
         let chat_id = "+15551234567";
-        let read_receipt_task_id = state
-            .activity_service()
-            .enqueue_after_response_read_receipt(
-                "signal",
-                ReadReceiptContext {
-                    recipient: chat_id.to_string(),
-                    timestamp: Some(123),
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("test should persist a durable read receipt obligation");
-
         {
             use crate::server::ws::{AgentRun, AgentRunStatus};
             let now = std::time::SystemTime::now()
@@ -2639,15 +2610,14 @@ mod tests {
                     to: chat_id.to_string(),
                     ..Default::default()
                 }),
-                read_receipt: Some(crate::channels::activity::OwnedReadReceipt::Deferred {
-                    channel_id: "signal".to_string(),
-                    context: ReadReceiptContext {
+                read_receipt: Some(crate::channels::activity::ClaimedReadReceipt::new(
+                    "signal",
+                    ReadReceiptContext {
                         recipient: chat_id.to_string(),
                         timestamp: Some(123),
                         ..Default::default()
                     },
-                    task_id: read_receipt_task_id.clone(),
-                }),
+                )),
                 status: AgentRunStatus::Queued,
                 message: "Hello".to_string(),
                 response: String::new(),
@@ -2675,25 +2645,28 @@ mod tests {
             result
         );
 
-        let withheld_task = state
-            .activity_service()
-            .read_receipt_queue()
-            .get(&read_receipt_task_id)
-            .expect("session lookup failure should preserve the durable read receipt task");
-        assert_eq!(withheld_task.state, crate::tasks::TaskState::Cancelled);
-        assert_eq!(
-            withheld_task.last_error.as_deref(),
-            Some(crate::channels::activity::READ_RECEIPT_WITHHELD_RUN_FAILED_REASON)
+        assert!(
+            state.activity_service().read_receipt_queue().list().is_empty(),
+            "session lookup failure should not persist a durable read receipt task"
         );
     }
 
     #[tokio::test]
-    async fn test_execute_run_preserves_ephemeral_receive_time_receipt_when_durable_task_id_is_missing(
+    async fn test_execute_run_skips_delivery_when_after_response_receipt_cannot_be_persisted(
     ) {
         let plugin = Arc::new(ActivityRecordingChannel::new());
         let plugin_registry = Arc::new(PluginRegistry::new());
         plugin_registry.register_channel("signal".to_string(), plugin);
-        let (state, _tmp) = make_test_state_with_plugin_registry(plugin_registry);
+        let activity_service = Arc::new(
+            crate::channels::activity::ActivityService::with_read_receipt_queue_for_test(
+                Arc::new(crate::tasks::TaskQueue::with_capacity_limit(None, Some(0))),
+            ),
+        );
+        let state = Arc::new(
+            crate::server::ws::WsServerState::new(crate::server::ws::WsServerConfig::default())
+                .with_plugin_registry(plugin_registry)
+                .with_activity_service(activity_service),
+        );
         state.channel_registry().register(
             crate::channels::ChannelInfo::new("signal", "Signal")
                 .with_status(crate::channels::ChannelStatus::Connected),
@@ -2730,16 +2703,14 @@ mod tests {
                     to: chat_id.to_string(),
                     ..Default::default()
                 }),
-                read_receipt: Some(
-                    crate::channels::activity::OwnedReadReceipt::EphemeralAfterResponse {
-                        channel_id: "signal".to_string(),
-                        context: ReadReceiptContext {
-                            recipient: chat_id.to_string(),
-                            timestamp: Some(123),
-                            ..Default::default()
-                        },
+                read_receipt: Some(crate::channels::activity::ClaimedReadReceipt::new(
+                    "signal",
+                    ReadReceiptContext {
+                        recipient: chat_id.to_string(),
+                        timestamp: Some(123),
+                        ..Default::default()
                     },
-                ),
+                )),
                 status: AgentRunStatus::Queued,
                 message: "Hello".to_string(),
                 response: String::new(),
@@ -2766,22 +2737,13 @@ mod tests {
         .await;
         assert!(result.is_ok(), "execute_run failed: {:?}", result.err());
 
-        let queued = state.message_pipeline().next_for_channel("signal").expect(
-            "execute_run should still queue delivery when receipt persistence previously failed",
-        );
-        assert_eq!(
-            queued.message.metadata.recipient_id.as_deref(),
-            Some(chat_id)
-        );
-        let read_receipt = queued
-            .message
-            .metadata
-            .read_receipt
-            .as_ref()
-            .expect("delivery metadata should preserve an explicit ephemeral receipt obligation when durable persistence failed");
         assert!(
-            read_receipt.task_id().is_none(),
-            "ephemeral receive-time ownership should not fabricate a durable task id"
+            state.message_pipeline().channels_with_messages().is_empty(),
+            "delivery should be skipped when the after-response receipt cannot be persisted durably"
+        );
+        assert!(
+            state.activity_service().read_receipt_queue().list().is_empty(),
+            "failed receipt preparation should not leave a durable receipt task behind"
         );
     }
 
@@ -2820,7 +2782,7 @@ mod tests {
         let run_id = "run-channel-activity-no-delivery";
         let session_key = "test-channel-activity-no-delivery";
         let chat_id = "+15551234567";
-        let (_session, read_receipt_task_id) = setup_session_and_run_with_channel_activity(
+        let (_session, _claimed_read_receipt) = setup_session_and_run_with_channel_activity(
             &state,
             session_key,
             run_id,
@@ -2855,12 +2817,10 @@ mod tests {
             plugin.events().is_empty(),
             "deliver=false should not emit typing or read-receipt channel activity"
         );
-        let withheld_task = state
-            .activity_service()
-            .read_receipt_queue()
-            .get(&read_receipt_task_id)
-            .expect("deliver=false should preserve the durable read receipt task");
-        assert_eq!(withheld_task.state, crate::tasks::TaskState::Cancelled);
+        assert!(
+            state.activity_service().read_receipt_queue().list().is_empty(),
+            "deliver=false should not persist a durable read receipt task"
+        );
 
         crate::config::clear_cache();
     }

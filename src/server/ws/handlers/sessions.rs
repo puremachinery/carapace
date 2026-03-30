@@ -67,8 +67,8 @@ pub struct AgentRun {
     pub delivery_recipient_id: Option<String>,
     /// Optional channel-specific typing context for inbound activity features.
     pub typing_context: Option<crate::plugins::TypingContext>,
-    /// Owned read-receipt lifecycle captured at inbound receive time.
-    pub read_receipt: Option<crate::channels::activity::OwnedReadReceipt>,
+    /// Receive-time read-receipt ownership captured before run dispatch.
+    pub read_receipt: Option<crate::channels::activity::ClaimedReadReceipt>,
     /// Current status
     pub status: AgentRunStatus,
     /// Original message that started this run
@@ -106,7 +106,7 @@ pub struct AgentRunSnapshot {
     pub run_id: String,
     pub session_key: String,
     pub message: String,
-    pub read_receipt: Option<crate::channels::activity::OwnedReadReceipt>,
+    pub read_receipt: Option<crate::channels::activity::ClaimedReadReceipt>,
     pub status: AgentRunStatus,
 }
 

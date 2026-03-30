@@ -370,7 +370,9 @@ fn sanitize_signal_error_text(body_text: &str) -> String {
         .replace_all(&collapsed, |captures: &regex::Captures<'_>| {
             let label = &captures[1];
             let value = &captures[3];
-            if preserves_numeric_label(label) && !looks_like_phoneish_value_under_safe_label(value)
+            if looks_like_ipv4_address(value)
+                || (preserves_numeric_label(label)
+                    && !looks_like_phoneish_value_under_safe_label(value))
             {
                 captures[0].to_string()
             } else {
@@ -410,6 +412,18 @@ fn looks_like_phoneish_value_under_safe_label(value: &str) -> bool {
         && trimmed
             .chars()
             .all(|ch| ch.is_ascii_digit() || matches!(ch, '+' | '(' | ')' | '.' | ':' | '-' | ' '))
+}
+
+fn looks_like_ipv4_address(value: &str) -> bool {
+    let trimmed = value.trim();
+    let octets = trimmed.split('.').collect::<Vec<_>>();
+    octets.len() == 4
+        && octets.iter().all(|octet| {
+            !octet.is_empty()
+                && octet.len() <= 3
+                && octet.chars().all(|ch| ch.is_ascii_digit())
+                && octet.parse::<u8>().is_ok()
+        })
 }
 
 fn looks_like_phoneish_value(value: &str) -> bool {
@@ -914,6 +928,17 @@ mod tests {
         assert!(message.contains("account=[redacted]"));
         assert!(!message.contains("16175550123"));
         assert!(!message.contains("16175550124"));
+    }
+
+    #[test]
+    fn test_signal_http_error_message_preserves_labeled_ipv4_diagnostics() {
+        let message = signal_http_error_message_with_body_prefix(
+            "signal send",
+            StatusCode::BAD_REQUEST,
+            "endpoint:10.0.0.1 upstream=192.168.1.100 rejected by upstream",
+        );
+        assert!(message.contains("endpoint:10.0.0.1"));
+        assert!(message.contains("upstream=192.168.1.100"));
     }
 
     #[test]

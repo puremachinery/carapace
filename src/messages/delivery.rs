@@ -223,7 +223,7 @@ async fn handle_delivery_result(
             let _ = pipeline.mark_sent(message_id);
             if let Some(read_receipt) = metadata.read_receipt.clone() {
                 activity_service
-                    .complete_owned_read_receipt_after_delivery(state.as_ref(), &read_receipt)
+                    .complete_owned_read_receipt_after_delivery(&read_receipt)
                     .await;
             }
         }
@@ -559,15 +559,15 @@ mod tests {
             )
             .await
             .expect("read receipt task should be persisted");
-        crate::channels::activity::OwnedReadReceipt::Deferred {
-            channel_id: "signal".to_string(),
-            context: ReadReceiptContext {
+        crate::channels::activity::OwnedReadReceipt::new(
+            "signal",
+            ReadReceiptContext {
                 recipient: recipient.to_string(),
                 timestamp: Some(timestamp),
                 ..Default::default()
             },
             task_id,
-        }
+        )
     }
 
     fn make_pipeline_and_registries(
@@ -781,11 +781,7 @@ mod tests {
         );
         let pending_task = activity_service
             .read_receipt_queue()
-            .get(
-                read_receipt
-                    .task_id()
-                    .expect("durable test receipt should have a task id"),
-            )
+            .get(read_receipt.task_id())
             .expect("read receipt task should still exist after retryable failure");
         assert_eq!(pending_task.state, crate::tasks::TaskState::Blocked);
 
@@ -805,11 +801,7 @@ mod tests {
         assert_eq!(mock.send_text_count.load(Ordering::Relaxed), 2);
         let activated_task = activity_service
             .read_receipt_queue()
-            .get(
-                read_receipt
-                    .task_id()
-                    .expect("durable test receipt should have a task id"),
-            )
+            .get(read_receipt.task_id())
             .expect("successful retry should activate the durable read receipt task");
         assert_eq!(activated_task.state, crate::tasks::TaskState::RetryWait);
         activity_service.shutdown().await;
@@ -976,11 +968,7 @@ mod tests {
         );
         let activated_task = activity_service
             .read_receipt_queue()
-            .get(
-                read_receipt
-                    .task_id()
-                    .expect("durable test receipt should have a task id"),
-            )
+            .get(read_receipt.task_id())
             .expect("delivery success should preserve the durable read receipt task");
         assert_eq!(activated_task.state, crate::tasks::TaskState::RetryWait);
         activity_service.shutdown().await;
@@ -1021,11 +1009,7 @@ mod tests {
         );
         let activated_task = activity_service
             .read_receipt_queue()
-            .get(
-                read_receipt
-                    .task_id()
-                    .expect("durable test receipt should have a task id"),
-            )
+            .get(read_receipt.task_id())
             .expect("delivery success should activate the durable read receipt task");
         assert_eq!(activated_task.state, crate::tasks::TaskState::RetryWait);
         activity_service.shutdown().await;
@@ -1067,11 +1051,7 @@ mod tests {
         );
         let withheld_task = activity_service
             .read_receipt_queue()
-            .get(
-                read_receipt
-                    .task_id()
-                    .expect("durable test receipt should have a task id"),
-            )
+            .get(read_receipt.task_id())
             .expect("hook cancellation should preserve the durable read receipt task");
         assert_eq!(withheld_task.state, crate::tasks::TaskState::Cancelled);
         assert_eq!(
@@ -1119,11 +1099,7 @@ mod tests {
         );
         let withheld_task = activity_service
             .read_receipt_queue()
-            .get(
-                read_receipt
-                    .task_id()
-                    .expect("durable test receipt should have a task id"),
-            )
+            .get(read_receipt.task_id())
             .expect("missing plugin should preserve the durable read receipt task");
         assert_eq!(withheld_task.state, crate::tasks::TaskState::Cancelled);
         assert_eq!(
@@ -1171,11 +1147,7 @@ mod tests {
         );
         let withheld_task = activity_service
             .read_receipt_queue()
-            .get(
-                read_receipt
-                    .task_id()
-                    .expect("durable test receipt should have a task id"),
-            )
+            .get(read_receipt.task_id())
             .expect("expired delivery should preserve the durable read receipt task");
         assert_eq!(withheld_task.state, crate::tasks::TaskState::Cancelled);
         assert_eq!(
@@ -1222,11 +1194,7 @@ mod tests {
         );
         let withheld_task = activity_service
             .read_receipt_queue()
-            .get(
-                read_receipt
-                    .task_id()
-                    .expect("durable test receipt should have a task id"),
-            )
+            .get(read_receipt.task_id())
             .expect("expired disconnected delivery should preserve the durable read receipt task");
         assert_eq!(withheld_task.state, crate::tasks::TaskState::Cancelled);
         assert_eq!(
@@ -1282,11 +1250,7 @@ mod tests {
         );
         let withheld_task = activity_service
             .read_receipt_queue()
-            .get(
-                read_receipt
-                    .task_id()
-                    .expect("durable test receipt should have a task id"),
-            )
+            .get(read_receipt.task_id())
             .expect("failed delivery should preserve the durable read receipt task");
         assert_eq!(withheld_task.state, crate::tasks::TaskState::Cancelled);
         assert_eq!(
@@ -1385,11 +1349,7 @@ mod tests {
         activity_service.shutdown().await;
         let activated_task = activity_service
             .read_receipt_queue()
-            .get(
-                read_receipt
-                    .task_id()
-                    .expect("durable test receipt should have a task id"),
-            )
+            .get(read_receipt.task_id())
             .expect("delivery success should activate the durable read receipt task");
         assert_eq!(activated_task.state, crate::tasks::TaskState::RetryWait);
     }
@@ -1399,15 +1359,15 @@ mod tests {
         let mut message = OutboundMessage::new("signal", MessageContent::text("hello"));
         message.metadata = crate::messages::outbound::MessageMetadata {
             recipient_id: Some("+15551234567".to_string()),
-            read_receipt: Some(crate::channels::activity::OwnedReadReceipt::Deferred {
-                channel_id: "signal".to_string(),
-                context: ReadReceiptContext {
+            read_receipt: Some(crate::channels::activity::OwnedReadReceipt::new(
+                "signal",
+                ReadReceiptContext {
                     recipient: "+15551234567".to_string(),
                     timestamp: Some(123),
                     ..Default::default()
                 },
-                task_id: "receipt-task-123".to_string(),
-            }),
+                "receipt-task-123",
+            )),
             ..Default::default()
         };
 
@@ -1431,7 +1391,7 @@ mod tests {
                 .metadata
                 .read_receipt
                 .as_ref()
-                .and_then(|receipt| receipt.task_id()),
+                .map(|receipt| receipt.task_id()),
             Some("receipt-task-123")
         );
     }

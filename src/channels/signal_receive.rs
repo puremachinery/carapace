@@ -345,14 +345,11 @@ async fn can_manage_signal_read_receipts(
     }
 }
 
-async fn acquire_signal_read_receipt_ownership(
+fn acquire_signal_read_receipt_ownership(
     state: &Arc<WsServerState>,
     ctx: ReadReceiptContext,
-) -> crate::channels::activity::OwnedReadReceipt {
-    state
-        .activity_service()
-        .claim_after_response_read_receipt("signal", ctx)
-        .await
+) -> crate::channels::activity::ClaimedReadReceipt {
+    state.activity_service().claim_read_receipt("signal", ctx)
 }
 
 async fn snapshot_signal_receive_poll(
@@ -604,10 +601,7 @@ async fn process_envelope(
     };
     let (sender, peer_id) = resolve_signal_sender_and_peer(&sender, data_message)
         .expect("normalized sender should remain valid after ignored group checks");
-    let read_receipt = match read_receipt_context {
-        Some(ctx) => Some(acquire_signal_read_receipt_ownership(state, ctx).await),
-        None => None,
-    };
+    let read_receipt = read_receipt_context.map(|ctx| acquire_signal_read_receipt_ownership(state, ctx));
 
     debug!(
         sender = %sender,
@@ -646,7 +640,7 @@ async fn process_envelope(
                 if let Some(read_receipt) = read_receipt.as_ref() {
                     state
                         .activity_service()
-                        .complete_owned_read_receipt_without_run(state.as_ref(), read_receipt)
+                        .complete_claimed_read_receipt_without_run(state.as_ref(), read_receipt)
                         .await;
                     warn!(
                         sender = %sender,
@@ -662,13 +656,12 @@ async fn process_envelope(
         }
         Err(err) => {
             if let Some(read_receipt) = read_receipt.as_ref() {
-                state
-                    .activity_service()
-                    .withhold_owned_read_receipt(
-                        read_receipt,
-                        crate::channels::activity::READ_RECEIPT_WITHHELD_INBOUND_DISPATCH_FAILED_REASON,
-                    )
-                    .await;
+                warn!(
+                    sender = %sender,
+                    channel = %read_receipt.channel_id(),
+                    reason = crate::channels::activity::READ_RECEIPT_WITHHELD_INBOUND_DISPATCH_FAILED_REASON,
+                    "leaving Signal message unread because inbound dispatch failed before a durable after-response receipt obligation was created"
+                );
             }
             error!(sender = %sender, error = %err, "Failed to dispatch Signal message");
         }
@@ -1811,5 +1804,91 @@ mod tests {
                 .is_empty(),
             "immediate fallback should not leave a synthetic receipt task behind"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_process_envelope_completes_claimed_receipt_when_provider_disappears_after_poll()
+    {
+        let notify = Arc::new(Notify::new());
+        let signal_channel = Arc::new(MockSignalReadReceiptChannel::new(notify.clone()));
+        let plugin_registry = Arc::new(PluginRegistry::new());
+        plugin_registry.register_channel("signal".to_string(), signal_channel.clone());
+        let state = Arc::new(
+            WsServerState::new(WsServerConfig::default())
+                .with_llm_provider(Arc::new(StaticTestProvider))
+                .with_plugin_registry(plugin_registry),
+        );
+        let activity_policy = crate::channels::activity::ChannelActivityPolicy {
+            read_receipts: crate::channels::activity::ReadReceiptFeaturePolicy {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut capability_cache = SignalReadReceiptCapabilityCache::default();
+        let carapace_manages_read_receipts = can_manage_signal_read_receipts(
+            &activity_policy,
+            state.activity_service(),
+            state.as_ref(),
+            &mut capability_cache,
+        )
+        .await;
+        assert!(
+            carapace_manages_read_receipts,
+            "provider should be available at poll time so Carapace claims the receipt"
+        );
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        state
+            .activity_service()
+            .spawn_read_receipt_worker(state.clone(), shutdown_rx);
+        state.set_llm_provider(None);
+
+        let envelope = SignalEnvelope {
+            source_number: Some("+15559876543".to_string()),
+            source: None,
+            timestamp: Some(1706745600000),
+            data_message: Some(SignalDataMessage {
+                message: Some("hello".to_string()),
+                timestamp: Some(1706745600000),
+                group_info: None,
+            }),
+        };
+
+        process_envelope(&envelope, &state, carapace_manages_read_receipts).await;
+
+        tokio::time::timeout(Duration::from_secs(1), notify.notified())
+            .await
+            .expect(
+                "claimed receipts should be completed when the provider disappears before dispatch",
+            );
+        assert_eq!(signal_channel.mark_read_count.load(Ordering::Relaxed), 1);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let tasks = state.activity_service().read_receipt_queue().list();
+                if tasks.len() == 1 && tasks[0].state == crate::tasks::TaskState::Done {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("immediate no-run receipt task should settle to done");
+
+        let runs = state.agent_run_registry.lock().snapshot_runs();
+        let run = runs
+            .iter()
+            .find(|run| run.message == "hello")
+            .expect("dispatch should still register the inbound run context");
+        assert_eq!(
+            run.read_receipt
+                .as_ref()
+                .and_then(|receipt| receipt.context().timestamp),
+            Some(1706745600000)
+        );
+        shutdown_tx
+            .send(true)
+            .expect("read receipt worker shutdown signal should send");
+        state.shutdown_activity_service().await;
     }
 }

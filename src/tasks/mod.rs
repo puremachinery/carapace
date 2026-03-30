@@ -11,8 +11,9 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::thread;
 use std::time::Duration;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -378,6 +379,57 @@ impl TaskQueue {
         self.flush_to_disk();
     }
 
+    fn build_failed_enqueue_task(
+        &self,
+        payload: Value,
+        policy: TaskPolicy,
+        blocked_reason: Option<TaskBlockedReason>,
+    ) -> DurableTask {
+        let now = now_ms();
+        self.build_task(
+            payload,
+            BuildTaskParams {
+                state: TaskState::Failed,
+                next_run_at_ms: None,
+                last_error: Some(ENQUEUE_WORKER_FAILED_ERROR.to_string()),
+                policy,
+                blocked_reason,
+                now,
+            },
+        )
+    }
+
+    async fn enqueue_via_dedicated_thread(
+        self: &Arc<Self>,
+        worker_name: &'static str,
+        enqueue: impl FnOnce(Arc<Self>) -> DurableTask + Send + 'static,
+        fallback_task: DurableTask,
+    ) -> DurableTask {
+        let queue = Arc::clone(self);
+        let (tx, rx) = oneshot::channel();
+        match thread::Builder::new()
+            .name(worker_name.to_string())
+            .spawn(move || {
+                let task = enqueue(queue);
+                let _ = tx.send(task);
+            }) {
+            Ok(_) => match rx.await {
+                Ok(task) => task,
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        "enqueue fallback thread exited before returning a task"
+                    );
+                    fallback_task
+                }
+            },
+            Err(err) => {
+                warn!(error = %err, "failed to spawn dedicated enqueue fallback thread");
+                fallback_task
+            }
+        }
+    }
+
     /// Async-safe enqueue wrapper for Tokio call sites.
     ///
     /// This offloads sync queue mutation and fsync persistence to a blocking
@@ -403,7 +455,6 @@ impl TaskQueue {
         policy: TaskPolicy,
     ) -> DurableTask {
         let queue = Arc::clone(self);
-        let queue_fallback = Arc::clone(self);
         let payload_fallback = payload.clone();
         let policy_fallback = policy.clone();
         match tokio::task::spawn_blocking(move || {
@@ -413,19 +464,22 @@ impl TaskQueue {
         {
             Ok(task) => task,
             Err(err) => {
-                let now = now_ms();
                 warn!(error = %err, "enqueue worker failed");
-                warn!("falling back to inline task enqueue after enqueue worker failure");
-                let mut task = queue_fallback.enqueue_with_policy(
-                    payload_fallback,
-                    next_run_at_ms,
-                    policy_fallback,
-                );
-                if task.state == TaskState::Failed && task.last_error.is_none() {
-                    task.last_error = Some(ENQUEUE_WORKER_FAILED_ERROR.to_string());
-                    task.updated_at_ms = now;
-                }
-                task
+                warn!("falling back to a dedicated enqueue thread after enqueue worker failure");
+                let fallback_task =
+                    self.build_failed_enqueue_task(payload_fallback.clone(), policy_fallback.clone(), None);
+                self.enqueue_via_dedicated_thread(
+                    "task-queue-enqueue-fallback",
+                    move |queue_fallback| {
+                        queue_fallback.enqueue_with_policy(
+                            payload_fallback,
+                            next_run_at_ms,
+                            policy_fallback,
+                        )
+                    },
+                    fallback_task,
+                )
+                .await
             }
         }
     }
@@ -439,7 +493,6 @@ impl TaskQueue {
         policy: TaskPolicy,
     ) -> DurableTask {
         let queue = Arc::clone(self);
-        let queue_fallback = Arc::clone(self);
         let payload_fallback = payload.clone();
         let reason = reason.into();
         let reason_fallback = reason.clone();
@@ -451,20 +504,28 @@ impl TaskQueue {
         {
             Ok(task) => task,
             Err(err) => {
-                let now = now_ms();
                 warn!(error = %err, "enqueue worker failed");
-                warn!("falling back to inline blocked task enqueue after enqueue worker failure");
-                let mut task = queue_fallback.enqueue_blocked_with_policy(
-                    payload_fallback,
-                    reason_fallback,
-                    category,
-                    policy_fallback,
+                warn!(
+                    "falling back to a dedicated blocked-task enqueue thread after enqueue worker failure"
                 );
-                if task.state == TaskState::Failed && task.last_error.is_none() {
-                    task.last_error = Some(ENQUEUE_WORKER_FAILED_ERROR.to_string());
-                    task.updated_at_ms = now;
-                }
-                task
+                let fallback_task = self.build_failed_enqueue_task(
+                    payload_fallback.clone(),
+                    policy_fallback.clone(),
+                    Some(category),
+                );
+                self.enqueue_via_dedicated_thread(
+                    "task-queue-blocked-enqueue-fallback",
+                    move |queue_fallback| {
+                        queue_fallback.enqueue_blocked_with_policy(
+                            payload_fallback,
+                            reason_fallback,
+                            category,
+                            policy_fallback,
+                        )
+                    },
+                    fallback_task,
+                )
+                .await
             }
         }
     }
@@ -1296,6 +1357,67 @@ mod tests {
             Some(TASK_QUEUE_FULL_NO_EVICTION_ERROR)
         );
         assert!(queue.get(&dropped.id).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_via_dedicated_thread_persists_task() {
+        let queue = Arc::new(TaskQueue::in_memory());
+        let fallback_task = queue.build_failed_enqueue_task(
+            serde_json::json!({"kind":"fallback"}),
+            TaskPolicy::default(),
+            None,
+        );
+
+        let task = queue
+            .enqueue_via_dedicated_thread(
+                "task-queue-test-fallback",
+                move |queue| {
+                    queue.enqueue_with_policy(
+                        serde_json::json!({"kind":"fallback-thread"}),
+                        None,
+                        TaskPolicy::default(),
+                    )
+                },
+                fallback_task,
+            )
+            .await;
+
+        assert_eq!(task.state, TaskState::Queued);
+        let persisted = queue
+            .get(&task.id)
+            .expect("dedicated fallback thread should persist the queued task");
+        assert_eq!(
+            persisted.payload,
+            serde_json::json!({"kind":"fallback-thread"})
+        );
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_via_dedicated_thread_returns_failed_task_when_worker_panics() {
+        let queue = Arc::new(TaskQueue::in_memory());
+        let fallback_task = queue.build_failed_enqueue_task(
+            serde_json::json!({"kind":"fallback"}),
+            TaskPolicy::default(),
+            None,
+        );
+
+        let task = queue
+            .enqueue_via_dedicated_thread(
+                "task-queue-test-fallback-panic",
+                move |_queue| -> DurableTask {
+                    panic!("boom");
+                },
+                fallback_task.clone(),
+            )
+            .await;
+
+        assert_eq!(task.state, TaskState::Failed);
+        assert_eq!(
+            task.last_error.as_deref(),
+            Some(ENQUEUE_WORKER_FAILED_ERROR)
+        );
+        assert_eq!(task.id, fallback_task.id);
+        assert!(queue.list().is_empty());
     }
 
     struct NotifyingOutcomeExecutor {

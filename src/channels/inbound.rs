@@ -16,7 +16,7 @@ use crate::sessions::{get_or_create_scoped_session, ChatMessage, SessionMetadata
 pub struct InboundDispatchOptions {
     pub delivery_recipient_id: Option<String>,
     pub typing_context: Option<TypingContext>,
-    pub read_receipt: Option<crate::channels::activity::OwnedReadReceipt>,
+    pub read_receipt: Option<crate::channels::activity::ClaimedReadReceipt>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

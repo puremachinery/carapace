@@ -9,6 +9,9 @@
 //! - shutdown closes intake first, then drains already-queued work until a
 //!   deadline, joining the real worker threads directly.
 //! - work still queued after the deadline is dropped explicitly with logging.
+//! - receive time claims and delivery-time durable obligations are separate
+//!   typed states owned by `ActivityService`; outbound delivery only ever
+//!   carries a durable read-receipt task.
 //! - read receipts are committed as non-lossy in-process obligations so
 //!   successful delivery never waits on receipt-worker capacity.
 //! - activity-capable channel implementations must bound their own blocking
@@ -50,16 +53,8 @@ const ACTIVITY_DISPATCH_SHUTDOWN_HEADROOM_MS: u64 = 500;
 const READ_RECEIPT_RETRY_DELAY_MS: u64 = 5_000;
 const READ_RECEIPT_OWNERSHIP_HIGH_WATERMARK: usize = 10_000;
 const READ_RECEIPT_PENDING_REASON: &str = "waiting for successful response delivery";
-pub(crate) const READ_RECEIPT_WITHHELD_RUN_FAILED_REASON: &str =
-    "withholding explicit read receipt because the agent run did not complete successfully";
 pub(crate) const READ_RECEIPT_WITHHELD_RESPONSE_QUEUE_FAILED_REASON: &str =
     "withholding explicit read receipt because the agent response could not be queued for delivery";
-pub(crate) const READ_RECEIPT_WITHHELD_NO_DELIVERY_TARGET_REASON: &str =
-    "withholding explicit read receipt because no outbound delivery target was available";
-pub(crate) const READ_RECEIPT_WITHHELD_EMPTY_RESPONSE_REASON: &str =
-    "withholding explicit read receipt because the agent produced no deliverable response text";
-pub(crate) const READ_RECEIPT_WITHHELD_DELIVERY_DISABLED_REASON: &str =
-    "withholding explicit read receipt because outbound delivery was disabled for this run";
 pub(crate) const READ_RECEIPT_WITHHELD_INBOUND_DISPATCH_FAILED_REASON: &str =
     "withholding explicit read receipt because inbound Signal dispatch failed";
 pub(crate) const READ_RECEIPT_WITHHELD_MESSAGE_EXPIRED_REASON: &str =
@@ -230,51 +225,66 @@ pub struct ChannelActivityPolicy {
     pub read_receipts: ReadReceiptFeaturePolicy,
 }
 
-/// Receipt ownership captured at inbound receive time.
+/// Receive-time explicit read-receipt ownership claim.
 ///
-/// This is the only receipt lifecycle state carried across receive, run, and
-/// delivery. `ActivityService` is the sole owner that may resolve it into
-/// durable activation, withholding, or immediate explicit acknowledgment.
+/// Signal receive decides whether Carapace owns the receipt for this inbound
+/// message. The claim is carried through dispatch/run evaluation, but it does
+/// not become a durable after-response obligation until delivery is actually
+/// queued.
 #[derive(Debug, Clone)]
-pub enum OwnedReadReceipt {
-    /// Carapace durably persisted an after-response obligation at receive time.
-    Deferred {
-        channel_id: String,
-        context: ReadReceiptContext,
-        task_id: String,
-    },
-    /// Carapace claimed receipt ownership for this poll/message, but durable
-    /// after-response persistence was unavailable. This must be resolved
-    /// before the run lifecycle ends; it must never be acknowledged before
-    /// inbound dispatch succeeds.
-    EphemeralAfterResponse {
-        channel_id: String,
-        context: ReadReceiptContext,
-    },
+pub struct ClaimedReadReceipt {
+    channel_id: String,
+    context: ReadReceiptContext,
 }
 
-impl OwnedReadReceipt {
-    pub fn channel_id(&self) -> &str {
-        match self {
-            Self::Deferred { channel_id, .. } | Self::EphemeralAfterResponse { channel_id, .. } => {
-                channel_id
-            }
+impl ClaimedReadReceipt {
+    pub fn new(channel_id: impl Into<String>, context: ReadReceiptContext) -> Self {
+        Self {
+            channel_id: channel_id.into(),
+            context,
         }
+    }
+
+    pub fn channel_id(&self) -> &str {
+        &self.channel_id
     }
 
     pub fn context(&self) -> &ReadReceiptContext {
-        match self {
-            Self::Deferred { context, .. } | Self::EphemeralAfterResponse { context, .. } => {
-                context
-            }
+        &self.context
+    }
+}
+
+/// Durable after-response read-receipt obligation attached to queued delivery.
+#[derive(Debug, Clone)]
+pub struct OwnedReadReceipt {
+    channel_id: String,
+    context: ReadReceiptContext,
+    task_id: String,
+}
+
+impl OwnedReadReceipt {
+    pub fn new(
+        channel_id: impl Into<String>,
+        context: ReadReceiptContext,
+        task_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            channel_id: channel_id.into(),
+            context,
+            task_id: task_id.into(),
         }
     }
 
-    pub fn task_id(&self) -> Option<&str> {
-        match self {
-            Self::Deferred { task_id, .. } => Some(task_id),
-            Self::EphemeralAfterResponse { .. } => None,
-        }
+    pub fn channel_id(&self) -> &str {
+        &self.channel_id
+    }
+
+    pub fn context(&self) -> &ReadReceiptContext {
+        &self.context
+    }
+
+    pub fn task_id(&self) -> &str {
+        &self.task_id
     }
 }
 
@@ -413,29 +423,29 @@ impl ActivityService {
         }
     }
 
-    pub async fn claim_after_response_read_receipt(
+    pub fn claim_read_receipt(
         &self,
         channel_id: &str,
         ctx: ReadReceiptContext,
-    ) -> OwnedReadReceipt {
-        if let Some(task_id) = self
-            .enqueue_after_response_read_receipt(channel_id, ctx.clone())
+    ) -> ClaimedReadReceipt {
+        ClaimedReadReceipt::new(channel_id, ctx)
+    }
+
+    pub async fn prepare_after_response_read_receipt(
+        &self,
+        claim: &ClaimedReadReceipt,
+    ) -> Result<OwnedReadReceipt, String> {
+        let channel_id = claim.channel_id().to_string();
+        let context = claim.context().clone();
+        match self
+            .enqueue_after_response_read_receipt(&channel_id, context.clone())
             .await
         {
-            OwnedReadReceipt::Deferred {
-                channel_id: channel_id.to_string(),
-                context: ctx,
-                task_id,
-            }
-        } else {
-            tracing::warn!(
-                channel = %channel_id,
-                "failed to durably persist the after-response read receipt obligation at receive time; carrying an ephemeral owned receipt through dispatch and delivery instead"
-            );
-            OwnedReadReceipt::EphemeralAfterResponse {
-                channel_id: channel_id.to_string(),
-                context: ctx,
-            }
+            Some(task_id) => Ok(OwnedReadReceipt::new(channel_id, context, task_id)),
+            None => Err(
+                "failed to durably persist the after-response read receipt obligation before delivery queueing"
+                    .to_string(),
+            ),
         }
     }
 
@@ -531,74 +541,34 @@ impl ActivityService {
     }
 
     pub async fn withhold_owned_read_receipt(&self, receipt: &OwnedReadReceipt, reason: &str) {
-        match receipt {
-            OwnedReadReceipt::Deferred { task_id, .. } => {
-                self.withhold_read_receipt(task_id, reason).await;
-            }
-            OwnedReadReceipt::EphemeralAfterResponse {
-                channel_id,
-                context: _,
-            } => {
-                tracing::warn!(
-                    channel = %channel_id,
-                    reason,
-                    "withholding an ephemeral owned read receipt because the response lifecycle did not complete successfully"
-                );
-            }
-        }
+        self.withhold_read_receipt(receipt.task_id(), reason).await;
     }
 
     pub async fn complete_owned_read_receipt_after_delivery(
         &self,
-        state: &WsServerState,
         receipt: &OwnedReadReceipt,
     ) {
-        match receipt {
-            OwnedReadReceipt::Deferred { task_id, .. } => {
-                self.activate_read_receipt(task_id).await;
-            }
-            OwnedReadReceipt::EphemeralAfterResponse {
-                channel_id,
-                context,
-            } => {
-                if let Err(err) = self
-                    .acknowledge_read_receipt_now(state, channel_id, context.clone())
-                    .await
-                {
-                    tracing::error!(
-                        channel = %channel_id,
-                        error = %err,
-                        "failed to complete an ephemeral owned read receipt after successful delivery"
-                    );
-                }
-            }
-        }
+        self.activate_read_receipt(receipt.task_id()).await;
     }
 
-    pub async fn complete_owned_read_receipt_without_run(
+    pub async fn complete_claimed_read_receipt_without_run(
         &self,
         state: &WsServerState,
-        receipt: &OwnedReadReceipt,
+        claim: &ClaimedReadReceipt,
     ) {
-        match receipt {
-            OwnedReadReceipt::Deferred { task_id, .. } => {
-                self.activate_read_receipt(task_id).await;
-            }
-            OwnedReadReceipt::EphemeralAfterResponse {
-                channel_id,
-                context,
-            } => {
-                if let Err(err) = self
-                    .acknowledge_read_receipt_now(state, channel_id, context.clone())
-                    .await
-                {
-                    tracing::error!(
-                        channel = %channel_id,
-                        error = %err,
-                        "failed to complete an ephemeral owned read receipt when no run was spawned"
-                    );
-                }
-            }
+        if let Err(err) = self
+            .acknowledge_read_receipt_now(
+                state,
+                claim.channel_id(),
+                claim.context().clone(),
+            )
+            .await
+        {
+            tracing::error!(
+                channel = %claim.channel_id(),
+                error = %err,
+                "failed to complete a claimed read receipt when no run was spawned"
+            );
         }
     }
 
