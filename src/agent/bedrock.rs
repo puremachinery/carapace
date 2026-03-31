@@ -758,6 +758,10 @@ pub(crate) struct AwsCredentials<'a> {
 }
 
 /// Sign an AWS request using Signature Version 4 for the `bedrock` service.
+///
+/// The signing service name is hardcoded to `bedrock`. Do not reuse this
+/// function for non-Bedrock AWS services (e.g. STS, S3) — they require a
+/// different service name in the credential scope.
 pub(crate) fn sign_aws_v4_request(
     creds: &AwsCredentials<'_>,
     host: &str,

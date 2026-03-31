@@ -5,6 +5,10 @@ use crate::agent::bedrock::{sign_aws_v4_request, AwsCredentials};
 use crate::onboarding::setup::SetupCheck;
 
 /// AWS regions known to support Bedrock at time of writing.
+///
+/// This list is used only for an advisory check (Skip, not Fail) so unlisted
+/// regions do not block setup. Refresh periodically from:
+/// https://docs.aws.amazon.com/general/latest/gr/bedrock.html
 const BEDROCK_REGIONS: &[&str] = &[
     "ap-northeast-1",
     "ap-northeast-2",
@@ -23,10 +27,19 @@ const BEDROCK_REGIONS: &[&str] = &[
 ];
 
 /// Where a credential value was found.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CredentialSource {
     pub value: String,
     pub source: &'static str,
+}
+
+impl std::fmt::Debug for CredentialSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CredentialSource")
+            .field("value", &"[REDACTED]")
+            .field("source", &self.source)
+            .finish()
+    }
 }
 
 /// Detected Bedrock credential sources from the environment.
@@ -207,6 +220,26 @@ pub async fn validate_bedrock_credentials(
         }
     } else {
         let body_text = response.text().await.unwrap_or_default();
+        // AccessDeniedException means credentials are valid but lack
+        // bedrock:ListFoundationModels. The runtime path only needs
+        // bedrock:InvokeModel, so this is not a setup failure.
+        if status.as_u16() == 403 && body_text.contains("AccessDeniedException") {
+            return (
+                SetupCheck::validation_skip(
+                    "Bedrock credentials",
+                    "AWS credentials are valid but lack `bedrock:ListFoundationModels` \
+                     permission; cannot verify model access during setup"
+                        .to_string(),
+                    Some(
+                        "Run `cara verify` after setup to confirm the runtime model path works. \
+                         To enable full setup validation, attach `AmazonBedrockReadOnly` to \
+                         your IAM user/role."
+                            .to_string(),
+                    ),
+                ),
+                None,
+            );
+        }
         let (detail, remediation) = classify_api_error(status.as_u16(), &body_text, region);
         (
             SetupCheck::validation_fail("Bedrock credentials", detail, remediation),

@@ -6783,17 +6783,19 @@ fn configure_provider_noninteractive(
             // Run live validation if actual credential values are available.
             let sources = crate::onboarding::bedrock::detect_credential_sources();
             let mut result = ProviderSetupResult::default();
-            if let Some(ref region_src) = sources.region {
-                result
-                    .observed_checks
-                    .push(crate::onboarding::bedrock::validate_region(
-                        &region_src.value,
-                    ));
-            }
-            if let (Some(region_src), Some(access_src), Some(secret_src)) =
-                (&sources.region, &sources.access_key, &sources.secret_key)
+            let effective_region = sources
+                .region
+                .as_ref()
+                .map(|s| s.value.clone())
+                .unwrap_or_else(|| "us-east-1".to_string());
+            result
+                .observed_checks
+                .push(crate::onboarding::bedrock::validate_region(
+                    &effective_region,
+                ));
+            if let (Some(access_src), Some(secret_src)) = (&sources.access_key, &sources.secret_key)
             {
-                let r = region_src.value.clone();
+                let r = effective_region.clone();
                 let a = access_src.value.clone();
                 let s = secret_src.value.clone();
                 let t = sources.session_token.as_ref().map(|v| v.value.clone());
