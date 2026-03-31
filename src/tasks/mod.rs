@@ -892,7 +892,14 @@ pub async fn task_worker_loop(
     interval: Duration,
     shutdown: watch::Receiver<bool>,
 ) {
-    task_worker_loop_with_wakeup_inner(queue, executor, interval, shutdown, None, None).await;
+    task_worker_loop_inner(
+        queue,
+        executor,
+        task_worker_ticker(interval),
+        shutdown,
+        None,
+    )
+    .await;
 }
 
 /// Run a durable task worker with an optional best-effort wake signal.
@@ -908,34 +915,148 @@ pub async fn task_worker_loop_with_wakeup(
     shutdown: watch::Receiver<bool>,
     wake: Option<Arc<tokio::sync::Notify>>,
 ) {
-    task_worker_loop_with_wakeup_inner(queue, executor, interval, shutdown, wake, None).await;
+    task_worker_loop_inner(
+        queue,
+        executor,
+        task_worker_ticker(interval),
+        shutdown,
+        wake,
+    )
+    .await;
 }
 
-async fn task_worker_loop_with_wakeup_inner(
-    queue: Arc<TaskQueue>,
-    executor: Arc<dyn TaskExecutor>,
-    interval: Duration,
-    mut shutdown: watch::Receiver<bool>,
-    wake: Option<Arc<tokio::sync::Notify>>,
-    startup_cycle_complete: Option<oneshot::Sender<()>>,
-) {
+fn task_worker_ticker(interval: Duration) -> tokio::time::Interval {
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut startup_cycle_complete = startup_cycle_complete;
-    loop {
-        tokio::select! {
-            _ = ticker.tick() => {}
-            _ = async {
-                if let Some(wake) = wake.as_ref() {
-                    wake.notified().await;
-                } else {
-                    std::future::pending::<()>().await;
-                }
-            } => {}
-            _ = shutdown.changed() => {
-                tracing::info!("durable task worker received shutdown signal");
-                break;
+    ticker
+}
+
+async fn wait_for_wake_signal(wake: &tokio::sync::Notify) {
+    let notified = wake.notified();
+    tokio::pin!(notified);
+    // Register the waiter before awaiting so a racing notify becomes a stored
+    // permit for this loop iteration instead of relying on implicit select
+    // timing. Wakeups may still coalesce by design; one wake is enough because
+    // each iteration claims the full batch of currently due tasks.
+    notified.as_mut().enable();
+    notified.await;
+}
+
+async fn wait_for_task_worker_trigger(
+    ticker: &mut tokio::time::Interval,
+    shutdown: &mut watch::Receiver<bool>,
+    wake: Option<&tokio::sync::Notify>,
+) -> bool {
+    tokio::select! {
+        _ = ticker.tick() => true,
+        _ = async {
+            if let Some(wake) = wake {
+                wait_for_wake_signal(wake).await;
+            } else {
+                std::future::pending::<()>().await;
             }
+        } => true,
+        _ = shutdown.changed() => {
+            tracing::info!("durable task worker received shutdown signal");
+            false
+        }
+    }
+}
+
+async fn run_task_worker_cycle(queue: Arc<TaskQueue>, executor: Arc<dyn TaskExecutor>) {
+    let now = now_ms();
+    let due = match tokio::task::spawn_blocking({
+        let queue = queue.clone();
+        move || queue.claim_due(now, 32)
+    })
+    .await
+    {
+        Ok(due) => due,
+        Err(err) => {
+            warn!(error = %err, "failed to claim due tasks in worker");
+            return;
+        }
+    };
+
+    // Intentionally sequential for now: each tick claims at most 32 tasks.
+    // Future work may add bounded parallelism once dispatch paths are
+    // validated under concurrent execution.
+    for task in due {
+        let outcome = executor.execute(task.clone()).await;
+        let task_id = task.id.clone();
+        let (state_name, update_result) = match outcome {
+            TaskExecutionOutcome::Done { run_id } => (
+                "done",
+                tokio::task::spawn_blocking({
+                    let queue = queue.clone();
+                    let task_id = task_id.clone();
+                    move || queue.mark_done(&task_id, run_id.as_deref())
+                })
+                .await,
+            ),
+            TaskExecutionOutcome::RetryWait { delay_ms, error } => (
+                "retry_wait",
+                tokio::task::spawn_blocking({
+                    let queue = queue.clone();
+                    let task_id = task_id.clone();
+                    move || queue.mark_retry_wait(&task_id, delay_ms, &error)
+                })
+                .await,
+            ),
+            TaskExecutionOutcome::Blocked { reason, category } => (
+                "blocked",
+                tokio::task::spawn_blocking({
+                    let queue = queue.clone();
+                    let task_id = task_id.clone();
+                    move || queue.mark_blocked(&task_id, &reason, category)
+                })
+                .await,
+            ),
+            TaskExecutionOutcome::Failed { error } => (
+                "failed",
+                tokio::task::spawn_blocking({
+                    let queue = queue.clone();
+                    let task_id = task_id.clone();
+                    move || queue.mark_failed(&task_id, &error)
+                })
+                .await,
+            ),
+            TaskExecutionOutcome::Cancelled { reason } => (
+                "cancelled",
+                tokio::task::spawn_blocking({
+                    let queue = queue.clone();
+                    let task_id = task_id.clone();
+                    move || queue.mark_cancelled(&task_id, reason.as_deref())
+                })
+                .await,
+            ),
+        };
+
+        match update_result {
+            Ok(true) => {}
+            Ok(false) => {
+                warn!(task_id = %task_id, state = state_name, "failed to update task state")
+            }
+            Err(err) => warn!(
+                task_id = %task_id,
+                state = state_name,
+                error = %err,
+                "task state update worker failed"
+            ),
+        }
+    }
+}
+
+async fn task_worker_loop_inner(
+    queue: Arc<TaskQueue>,
+    executor: Arc<dyn TaskExecutor>,
+    mut ticker: tokio::time::Interval,
+    mut shutdown: watch::Receiver<bool>,
+    wake: Option<Arc<tokio::sync::Notify>>,
+) {
+    loop {
+        if !wait_for_task_worker_trigger(&mut ticker, &mut shutdown, wake.as_deref()).await {
+            break;
         }
 
         if *shutdown.borrow() {
@@ -943,92 +1064,28 @@ async fn task_worker_loop_with_wakeup_inner(
             break;
         }
 
-        let now = now_ms();
-        let due = match tokio::task::spawn_blocking({
-            let queue = queue.clone();
-            move || queue.claim_due(now, 32)
-        })
-        .await
-        {
-            Ok(due) => due,
-            Err(err) => {
-                warn!(error = %err, "failed to claim due tasks in worker");
-                continue;
-            }
-        };
-        if let Some(tx) = startup_cycle_complete.take() {
-            let _ = tx.send(());
-        }
-        // Intentionally sequential for now: each tick claims at most 32 tasks.
-        // Future work may add bounded parallelism once dispatch paths are
-        // validated under concurrent execution.
-        for task in due {
-            let outcome = executor.execute(task.clone()).await;
-            let task_id = task.id.clone();
-            let (state_name, update_result) = match outcome {
-                TaskExecutionOutcome::Done { run_id } => (
-                    "done",
-                    tokio::task::spawn_blocking({
-                        let queue = queue.clone();
-                        let task_id = task_id.clone();
-                        move || queue.mark_done(&task_id, run_id.as_deref())
-                    })
-                    .await,
-                ),
-                TaskExecutionOutcome::RetryWait { delay_ms, error } => (
-                    "retry_wait",
-                    tokio::task::spawn_blocking({
-                        let queue = queue.clone();
-                        let task_id = task_id.clone();
-                        let error = error.clone();
-                        move || queue.mark_retry_wait(&task_id, delay_ms, &error)
-                    })
-                    .await,
-                ),
-                TaskExecutionOutcome::Blocked { reason, category } => (
-                    "blocked",
-                    tokio::task::spawn_blocking({
-                        let queue = queue.clone();
-                        let task_id = task_id.clone();
-                        let reason = reason.clone();
-                        move || queue.mark_blocked(&task_id, &reason, category)
-                    })
-                    .await,
-                ),
-                TaskExecutionOutcome::Failed { error } => (
-                    "failed",
-                    tokio::task::spawn_blocking({
-                        let queue = queue.clone();
-                        let task_id = task_id.clone();
-                        let error = error.clone();
-                        move || queue.mark_failed(&task_id, &error)
-                    })
-                    .await,
-                ),
-                TaskExecutionOutcome::Cancelled { reason } => (
-                    "cancelled",
-                    tokio::task::spawn_blocking({
-                        let queue = queue.clone();
-                        let task_id = task_id.clone();
-                        move || queue.mark_cancelled(&task_id, reason.as_deref())
-                    })
-                    .await,
-                ),
-            };
-            match update_result {
-                Ok(true) => {}
-                Ok(false) => {
-                    warn!(task_id = %task_id, state = state_name, "failed to update task state")
-                }
-                Err(err) => warn!(
-                    task_id = %task_id,
-                    state = state_name,
-                    error = %err,
-                    "task state update worker failed"
-                ),
-            }
-        }
+        run_task_worker_cycle(queue.clone(), executor.clone()).await;
     }
+}
+
+#[cfg(test)]
+async fn task_worker_loop_with_wakeup_after_startup_cycle_for_test(
+    queue: Arc<TaskQueue>,
+    executor: Arc<dyn TaskExecutor>,
+    interval: Duration,
+    mut shutdown: watch::Receiver<bool>,
+    wake: Option<Arc<tokio::sync::Notify>>,
+    startup_cycle_complete: oneshot::Sender<()>,
+) {
+    let mut ticker = task_worker_ticker(interval);
+    if wait_for_task_worker_trigger(&mut ticker, &mut shutdown, wake.as_deref()).await
+        && !*shutdown.borrow()
+    {
+        run_task_worker_cycle(queue.clone(), executor.clone()).await;
+        let _ = startup_cycle_complete.send(());
+    }
+
+    task_worker_loop_inner(queue, executor, ticker, shutdown, wake).await;
 }
 
 #[cfg(test)]
@@ -1594,13 +1651,13 @@ mod tests {
         let wake = Arc::new(tokio::sync::Notify::new());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (startup_tx, startup_rx) = oneshot::channel();
-        let worker = tokio::spawn(task_worker_loop_with_wakeup_inner(
+        let worker = tokio::spawn(task_worker_loop_with_wakeup_after_startup_cycle_for_test(
             queue.clone(),
             executor.clone(),
             Duration::from_secs(3600),
             shutdown_rx,
             Some(wake.clone()),
-            Some(startup_tx),
+            startup_tx,
         ));
 
         tokio::time::timeout(Duration::from_secs(1), startup_rx)
