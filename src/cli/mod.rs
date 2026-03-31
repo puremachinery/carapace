@@ -4977,6 +4977,9 @@ fn validate_bedrock_credentials_interactive(
         )]);
     }
 
+    let mut checks = Vec::new();
+    checks.push(crate::onboarding::bedrock::validate_region(region));
+
     let region = region.to_string();
     let access_key = access_key.to_string();
     let secret_key = secret_key.to_string();
@@ -4996,8 +4999,6 @@ fn validate_bedrock_credentials_interactive(
         )
     })
     .map_err(|err| format!("credential validation runtime failed: {err}"))?;
-
-    let mut checks = Vec::new();
 
     match cred_check.status {
         crate::onboarding::setup::SetupCheckStatus::Pass => {
@@ -6660,17 +6661,7 @@ fn configure_provider_interactive(
                 None
             };
 
-            // Region validation (offline, always runs).
-            result
-                .observed_checks
-                .push(crate::onboarding::bedrock::validate_region(
-                    region
-                        .effective_value
-                        .as_deref()
-                        .unwrap_or(&region.config_value),
-                ));
-
-            // Live credential + model validation.
+            // Live credential + model validation (includes region check).
             if let (Some(eff_region), Some(eff_access), Some(eff_secret)) = (
                 region.effective_value.clone(),
                 access_key.effective_value.clone(),
@@ -6808,7 +6799,7 @@ fn configure_provider_noninteractive(
                 let t = sources.session_token.as_ref().map(|v| v.value.clone());
                 let default_model = provider.default_model().to_string();
 
-                if let Ok((cred_check, models_json)) = run_sync_blocking_send(async move {
+                match run_sync_blocking_send(async move {
                     Ok::<_, String>(
                         crate::onboarding::bedrock::validate_bedrock_credentials(
                             &r,
@@ -6819,10 +6810,24 @@ fn configure_provider_noninteractive(
                         .await,
                     )
                 }) {
-                    result.observed_checks.push(cred_check);
-                    if let Some(ref models) = models_json {
+                    Ok((cred_check, models_json)) => {
+                        result.observed_checks.push(cred_check);
+                        if let Some(ref models) = models_json {
+                            result.observed_checks.push(
+                                crate::onboarding::bedrock::check_model_access(
+                                    &default_model,
+                                    models,
+                                ),
+                            );
+                        }
+                    }
+                    Err(err) => {
                         result.observed_checks.push(
-                            crate::onboarding::bedrock::check_model_access(&default_model, models),
+                            crate::onboarding::setup::SetupCheck::validation_fail(
+                                "Live Bedrock validation",
+                                format!("Credential validation runtime failed: {err}"),
+                                "run `cara verify` after setup to exercise the configured provider path".to_string(),
+                            ),
                         );
                     }
                 }

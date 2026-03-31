@@ -99,17 +99,17 @@ pub fn validate_region(region: &str) -> SetupCheck {
             format!("Region `{region}` supports Bedrock"),
         )
     } else {
-        SetupCheck::validation_fail(
+        SetupCheck::validation_skip(
             "Bedrock region",
             format!(
                 "Region `{region}` is not in the known Bedrock region list; \
                  it may work if recently launched"
             ),
-            format!(
+            Some(format!(
                 "Known Bedrock regions: {}. \
-                 If `{region}` was recently added, this warning is safe to ignore.",
+                 If `{region}` was recently added, this is safe to ignore.",
                 BEDROCK_REGIONS.join(", ")
-            ),
+            )),
         )
     }
 }
@@ -217,12 +217,7 @@ pub async fn validate_bedrock_credentials(
 
 /// Check whether a specific model is accessible in the ListFoundationModels response.
 pub fn check_model_access(model_id: &str, foundation_models: &serde_json::Value) -> SetupCheck {
-    let bare_model = model_id
-        .strip_prefix("bedrock:")
-        .or_else(|| model_id.strip_prefix("bedrock/"))
-        .or_else(|| model_id.strip_prefix("Bedrock:"))
-        .or_else(|| model_id.strip_prefix("Bedrock/"))
-        .unwrap_or(model_id);
+    let bare_model = crate::agent::bedrock::strip_bedrock_prefix(model_id);
 
     let models = match foundation_models.get("modelSummaries") {
         Some(serde_json::Value::Array(arr)) => arr,
@@ -344,17 +339,16 @@ fn classify_api_error(status: u16, body: &str, region: &str) -> (String, String)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::env::ScopedEnv;
     use serde_json::json;
 
     #[test]
     fn detect_sources_finds_env_vars() {
-        // Set up test env vars with unique prefix to avoid conflicts
-        let guard = EnvGuard::new(&[
-            ("AWS_REGION", Some("us-west-2")),
-            ("AWS_ACCESS_KEY_ID", Some("AKIATEST")),
-            ("AWS_SECRET_ACCESS_KEY", Some("secret123")),
-            ("AWS_SESSION_TOKEN", Some("token456")),
-        ]);
+        let mut env = ScopedEnv::new();
+        env.set("AWS_REGION", "us-west-2")
+            .set("AWS_ACCESS_KEY_ID", "AKIATEST")
+            .set("AWS_SECRET_ACCESS_KEY", "secret123")
+            .set("AWS_SESSION_TOKEN", "token456");
 
         let sources = detect_credential_sources();
         assert_eq!(sources.region.as_ref().unwrap().value, "us-west-2");
@@ -371,19 +365,16 @@ mod tests {
             sources.session_token.as_ref().unwrap().source,
             "AWS_SESSION_TOKEN"
         );
-
-        drop(guard);
     }
 
     #[test]
     fn detect_sources_falls_back_to_default_region() {
-        let guard = EnvGuard::new(&[
-            ("AWS_REGION", None),
-            ("AWS_DEFAULT_REGION", Some("eu-west-1")),
-            ("AWS_ACCESS_KEY_ID", None),
-            ("AWS_SECRET_ACCESS_KEY", None),
-            ("AWS_SESSION_TOKEN", None),
-        ]);
+        let mut env = ScopedEnv::new();
+        env.unset("AWS_REGION")
+            .set("AWS_DEFAULT_REGION", "eu-west-1")
+            .unset("AWS_ACCESS_KEY_ID")
+            .unset("AWS_SECRET_ACCESS_KEY")
+            .unset("AWS_SESSION_TOKEN");
 
         let sources = detect_credential_sources();
         assert_eq!(sources.region.as_ref().unwrap().value, "eu-west-1");
@@ -392,27 +383,23 @@ mod tests {
             "AWS_DEFAULT_REGION"
         );
         assert!(sources.access_key.is_none());
-
-        drop(guard);
     }
 
     #[test]
     fn detect_sources_empty_when_unset() {
-        let guard = EnvGuard::new(&[
-            ("AWS_REGION", None),
-            ("AWS_DEFAULT_REGION", None),
-            ("AWS_ACCESS_KEY_ID", None),
-            ("AWS_SECRET_ACCESS_KEY", None),
-            ("AWS_SESSION_TOKEN", None),
-        ]);
+        let mut env = ScopedEnv::new();
+        env.unset("AWS_REGION")
+            .unset("AWS_DEFAULT_REGION")
+            .unset("AWS_ACCESS_KEY_ID")
+            .unset("AWS_SECRET_ACCESS_KEY")
+            .unset("AWS_SESSION_TOKEN");
 
         let sources = detect_credential_sources();
         assert!(sources.region.is_none());
         assert!(sources.access_key.is_none());
         assert!(sources.secret_key.is_none());
         assert!(sources.session_token.is_none());
-
-        drop(guard);
+        drop(env);
     }
 
     #[test]
@@ -429,7 +416,7 @@ mod tests {
         let check = validate_region("mars-west-1");
         assert_eq!(
             check.status,
-            crate::onboarding::setup::SetupCheckStatus::Fail
+            crate::onboarding::setup::SetupCheckStatus::Skip
         );
     }
 
@@ -516,35 +503,5 @@ mod tests {
     fn classify_error_region_404() {
         let (detail, _) = classify_api_error(404, "", "mars-west-1");
         assert!(detail.contains("mars-west-1"));
-    }
-
-    /// RAII guard that sets env vars for test scope and restores originals on drop.
-    struct EnvGuard {
-        originals: Vec<(String, Option<String>)>,
-    }
-
-    impl EnvGuard {
-        fn new(vars: &[(&str, Option<&str>)]) -> Self {
-            let mut originals = Vec::new();
-            for (key, value) in vars {
-                originals.push((key.to_string(), env::var(key).ok()));
-                match value {
-                    Some(v) => env::set_var(key, v),
-                    None => env::remove_var(key),
-                }
-            }
-            Self { originals }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (key, original) in &self.originals {
-                match original {
-                    Some(v) => env::set_var(key, v),
-                    None => env::remove_var(key),
-                }
-            }
-        }
     }
 }
