@@ -999,7 +999,6 @@ async fn run_task_worker_cycle(queue: Arc<TaskQueue>, executor: Arc<dyn TaskExec
                 tokio::task::spawn_blocking({
                     let queue = queue.clone();
                     let task_id = task_id.clone();
-                    let error = error.clone();
                     move || queue.mark_retry_wait(&task_id, delay_ms, &error)
                 })
                 .await,
@@ -1009,7 +1008,6 @@ async fn run_task_worker_cycle(queue: Arc<TaskQueue>, executor: Arc<dyn TaskExec
                 tokio::task::spawn_blocking({
                     let queue = queue.clone();
                     let task_id = task_id.clone();
-                    let reason = reason.clone();
                     move || queue.mark_blocked(&task_id, &reason, category)
                 })
                 .await,
@@ -1019,7 +1017,6 @@ async fn run_task_worker_cycle(queue: Arc<TaskQueue>, executor: Arc<dyn TaskExec
                 tokio::task::spawn_blocking({
                     let queue = queue.clone();
                     let task_id = task_id.clone();
-                    let error = error.clone();
                     move || queue.mark_failed(&task_id, &error)
                 })
                 .await,
