@@ -576,26 +576,54 @@ fn detect_auth_mode(cfg: &Value, provider: SetupProvider) -> Option<SetupAuthMod
 
 const LOCAL_CHAT_VERIFY_COMMAND: &str = "cara verify --outcome local-chat";
 
-fn setup_follow_up(
-    setup_command: Option<&str>,
-    rerun_action: impl AsRef<str>,
-    manual_action: impl AsRef<str>,
-) -> String {
+enum SetupFollowUp<'a> {
+    Rerun { command: &'a str, action: String },
+    Manual { action: String },
+}
+
+fn provider_setup_follow_up<'a>(
+    setup_command: Option<&'a str>,
+    rerun_action: impl Into<String>,
+    manual_action: impl Into<String>,
+) -> SetupFollowUp<'a> {
     match setup_command {
-        Some(command) => format!("rerun `{command}` {}", rerun_action.as_ref()),
-        None => format!(
-            "{}, then rerun `{LOCAL_CHAT_VERIFY_COMMAND}`",
-            manual_action.as_ref()
-        ),
+        Some(command) => SetupFollowUp::Rerun {
+            command,
+            action: rerun_action.into(),
+        },
+        None => SetupFollowUp::Manual {
+            action: manual_action.into(),
+        },
     }
 }
 
-fn vertex_route_remediation() -> String {
-    setup_follow_up(
-        None,
-        "",
-        "set `agents.defaults.model` to `vertex:default` plus `vertex.model`, or to an explicit Vertex model such as `vertex:gemini-2.5-flash`",
-    )
+fn setup_follow_up(follow_up: SetupFollowUp<'_>) -> String {
+    match follow_up {
+        SetupFollowUp::Rerun { command, action } => format!("rerun `{command}` {action}"),
+        SetupFollowUp::Manual { action } => {
+            format!("{action}, then rerun `{LOCAL_CHAT_VERIFY_COMMAND}`")
+        }
+    }
+}
+
+fn default_model_route_follow_up(provider: SetupProvider, setup_command: Option<&str>) -> String {
+    let follow_up = match provider {
+        SetupProvider::Vertex => SetupFollowUp::Manual {
+            action: "set `agents.defaults.model` to `vertex:default` plus `vertex.model`, or to an explicit Vertex model such as `vertex:gemini-2.5-flash`".to_string(),
+        },
+        _ => provider_setup_follow_up(
+            setup_command,
+            format!(
+                "to set `agents.defaults.model` to `{}`",
+                provider.default_model()
+            ),
+            format!(
+                "set `agents.defaults.model` to `{}`",
+                provider.default_model()
+            ),
+        ),
+    };
+    setup_follow_up(follow_up)
 }
 
 fn vertex_route_requires_default_model(cfg: &Value) -> bool {
@@ -603,7 +631,7 @@ fn vertex_route_requires_default_model(cfg: &Value) -> bool {
         config_string(cfg, &["agents", "defaults", "model"])
             .unwrap_or_else(|| SetupProvider::Vertex.default_model().to_string())
             .as_str(),
-        "vertex:default" | "vertex/default"
+        "vertex:default"
     )
 }
 
@@ -662,40 +690,12 @@ fn model_route_check(
                 actual_provider.label(),
                 provider.label()
             ),
-            if provider == SetupProvider::Vertex {
-                vertex_route_remediation()
-            } else {
-                setup_follow_up(
-                    setup_command,
-                    format!(
-                        "to set `agents.defaults.model` to `{}`",
-                        provider.default_model()
-                    ),
-                    format!(
-                        "set `agents.defaults.model` to `{}`",
-                        provider.default_model()
-                    ),
-                )
-            },
+            default_model_route_follow_up(provider, setup_command),
         ),
         None => SetupCheck::fail(
             "Default model route",
             format!("`agents.defaults.model` uses an unrecognized provider route: `{model}`"),
-            if provider == SetupProvider::Vertex {
-                vertex_route_remediation()
-            } else {
-                setup_follow_up(
-                    setup_command,
-                    format!(
-                        "to set `agents.defaults.model` to `{}`",
-                        provider.default_model()
-                    ),
-                    format!(
-                        "set `agents.defaults.model` to `{}`",
-                        provider.default_model()
-                    ),
-                )
-            },
+            default_model_route_follow_up(provider, setup_command),
         ),
     }
 }
@@ -711,11 +711,11 @@ fn auth_profiles_enabled_check(cfg: &Value, setup_command: Option<&str>) -> Setu
         SetupCheck::fail(
             "Auth profiles",
             "`auth.profiles.enabled` is false",
-            setup_follow_up(
+            setup_follow_up(provider_setup_follow_up(
                 setup_command,
                 "to enable auth profiles",
                 "enable `auth.profiles.enabled` in config",
-            ),
+            )),
         )
     }
 }
@@ -733,11 +733,11 @@ fn oauth_profile_id_check(
         None => SetupCheck::fail(
             label,
             format!("{label} is not configured"),
-            setup_follow_up(
+            setup_follow_up(provider_setup_follow_up(
                 setup_command,
                 "to store a sign-in profile",
                 format!("write {label} into config"),
-            ),
+            )),
         ),
     }
 }
@@ -782,11 +782,11 @@ fn auth_profile_summary_check(
                             "stored profile `{profile_id}` belongs to {}, not {}",
                             summary.provider, expected_provider
                         ),
-                        setup_follow_up(
+                        setup_follow_up(provider_setup_follow_up(
                             setup_command,
                             "to store the correct auth profile",
                             format!("write the correct {label} into config"),
-                        ),
+                        )),
                     ),
                     None,
                 )
@@ -802,11 +802,11 @@ fn auth_profile_summary_check(
             SetupCheck::fail(
                 label,
                 format!("stored profile `{profile_id}` was not found in the profile store"),
-                setup_follow_up(
+                setup_follow_up(provider_setup_follow_up(
                     setup_command,
                     "to store a fresh auth profile",
                     format!("write a fresh {label} into config"),
-                ),
+                )),
             ),
             None,
         ),
@@ -864,11 +864,11 @@ fn configured_value_check(
         None => SetupCheck::fail(
             label,
             format!("{label} is not configured"),
-            setup_follow_up(
+            setup_follow_up(provider_setup_follow_up(
                 setup_command,
                 format!("to configure {label}"),
                 format!("write {label} into config"),
-            ),
+            )),
         ),
     }
 }
@@ -936,11 +936,11 @@ where
         Err(err) => SetupCheck::fail(
             label,
             format!("{label} failed local validation: {err}"),
-            setup_follow_up(
+            setup_follow_up(provider_setup_follow_up(
                 setup_command,
                 "and correct the base URL",
                 format!("write a valid {label} into config"),
-            ),
+            )),
         ),
     }
 }
