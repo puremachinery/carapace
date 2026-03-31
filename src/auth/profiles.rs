@@ -337,7 +337,7 @@ impl OAuthProvider {
     ) -> OAuthProviderConfig {
         match self {
             OAuthProvider::Anthropic => {
-                panic!("Anthropic auth profiles do not use OAuth provider config")
+                unreachable!("Anthropic auth profiles do not use OAuth provider config")
             }
             OAuthProvider::Google => OAuthProviderConfig {
                 client_id: client_id.to_string(),

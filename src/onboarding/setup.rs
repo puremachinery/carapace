@@ -905,6 +905,21 @@ fn auth_profile_summary_check(
                     ),
                     None,
                 )
+            } else if summary.credential_kind == AuthProfileCredentialKind::Token
+                && !summary.token_valid
+            {
+                (
+                    SetupCheck::fail(
+                        label,
+                        format!("stored profile `{profile_id}` has no usable token"),
+                        setup_follow_up(provider_setup_follow_up(
+                            setup_command,
+                            "to store a fresh auth profile token",
+                            format!("write a fresh {label} into config"),
+                        )),
+                    ),
+                    None,
+                )
             } else {
                 let detail = match summary.email.as_deref() {
                     Some(email) => format!("loaded `{}` ({email})", summary.name),
@@ -1246,6 +1261,47 @@ mod tests {
             assessment.profile_name.as_deref(),
             Some("Anthropic setup token")
         );
+    }
+
+    #[test]
+    fn test_assess_provider_setup_rejects_anthropic_token_profile_without_token() {
+        let temp = TempDir::new().unwrap();
+        let store = ProfileStore::new(temp.path().to_path_buf());
+        store
+            .add(AuthProfile {
+                id: "anthropic:default".to_string(),
+                name: "Anthropic setup token".to_string(),
+                provider: OAuthProvider::Anthropic,
+                user_id: None,
+                email: None,
+                display_name: None,
+                avatar_url: None,
+                created_at_ms: 1,
+                last_used_ms: Some(1),
+                credential_kind: AuthProfileCredentialKind::Token,
+                tokens: None,
+                token: Some("   ".to_string()),
+                oauth_provider_config: None,
+            })
+            .unwrap();
+
+        let cfg = json!({
+            "agents": { "defaults": { "model": "claude-sonnet-4-20250514" } },
+            "auth": { "profiles": { "enabled": true } },
+            "anthropic": { "authProfile": "anthropic:default" }
+        });
+        let mut env = ScopedEnv::new();
+        env.set("CARAPACE_CONFIG_PASSWORD", "test-password");
+
+        let assessment = assess_provider_setup(&cfg, temp.path(), SetupProvider::Anthropic, vec![]);
+
+        assert_eq!(assessment.status, SetupAssessmentStatus::Invalid);
+        assert!(assessment
+            .checks
+            .iter()
+            .any(|check| check.name == "Anthropic auth profile"
+                && check.status == SetupCheckStatus::Fail
+                && check.detail.contains("has no usable token")));
     }
 
     #[test]

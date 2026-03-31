@@ -260,7 +260,6 @@ fn build_codex_provider(
 }
 
 fn build_anthropic_provider(
-    _cfg: &Value,
     anthropic_api_key: Option<String>,
     anthropic_auth_profile: Option<String>,
     anthropic_base_url: Option<String>,
@@ -300,18 +299,25 @@ fn build_anthropic_provider(
         return Ok(None);
     };
     if profile.provider != OAuthProvider::Anthropic {
-        warn!(
+        return Err(std::io::Error::other(format!(
             "Anthropic auth profile \"{}\" belongs to {}, not anthropic",
             profile_id, profile.provider
-        );
-        return Ok(None);
+        ))
+        .into());
     }
     if profile.credential_kind != AuthProfileCredentialKind::Token {
-        warn!(
+        return Err(std::io::Error::other(format!(
             "Anthropic auth profile \"{}\" is not token-backed",
             profile_id
-        );
-        return Ok(None);
+        ))
+        .into());
+    }
+    if profile.provider_token().is_none() {
+        return Err(std::io::Error::other(format!(
+            "Anthropic auth profile \"{}\" has no usable token",
+            profile_id
+        ))
+        .into());
     }
 
     let mut provider = agent::anthropic::AnthropicProvider::with_auth_profile_token(
@@ -536,7 +542,6 @@ pub fn build_providers(cfg: &Value) -> Result<Option<MultiProvider>, Box<dyn std
             .map(|s| s.to_string())
     });
     let anthropic_provider = build_anthropic_provider(
-        cfg,
         anthropic_api_key,
         anthropic_auth_profile,
         anthropic_base_url,
@@ -1473,6 +1478,78 @@ mod tests {
                 providers.is_some(),
                 "Anthropic auth profile should build a usable provider set"
             );
+        });
+    }
+
+    #[test]
+    fn test_build_providers_rejects_anthropic_auth_profile_without_token() {
+        with_clean_provider_env(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let _password = set_env_var_scoped("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+            let _state_dir = set_env_var_scoped(
+                "CARAPACE_STATE_DIR",
+                temp.path().to_str().expect("state dir path"),
+            );
+
+            let profile = crate::auth::profiles::AuthProfile {
+                id: "anthropic:default".to_string(),
+                name: "Anthropic setup token".to_string(),
+                provider: OAuthProvider::Anthropic,
+                user_id: None,
+                email: None,
+                display_name: None,
+                avatar_url: None,
+                created_at_ms: 0,
+                last_used_ms: None,
+                credential_kind: AuthProfileCredentialKind::Token,
+                tokens: None,
+                token: Some("   ".to_string()),
+                oauth_provider_config: None,
+            };
+            let store = ProfileStore::from_env(temp.path().to_path_buf()).expect("profile store");
+            store.add(profile).expect("store profile");
+
+            let cfg = json!({
+                "anthropic": { "authProfile": "anthropic:default" }
+            });
+            let err = build_providers(&cfg).expect_err("missing token should fail fast");
+            assert!(err.to_string().contains("has no usable token"));
+        });
+    }
+
+    #[test]
+    fn test_build_providers_rejects_anthropic_auth_profile_with_wrong_provider() {
+        with_clean_provider_env(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let _password = set_env_var_scoped("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+            let _state_dir = set_env_var_scoped(
+                "CARAPACE_STATE_DIR",
+                temp.path().to_str().expect("state dir path"),
+            );
+
+            let profile = crate::auth::profiles::AuthProfile {
+                id: "anthropic:default".to_string(),
+                name: "Wrong profile".to_string(),
+                provider: OAuthProvider::Google,
+                user_id: Some("user-123".to_string()),
+                email: Some("user@example.com".to_string()),
+                display_name: Some("Example User".to_string()),
+                avatar_url: None,
+                created_at_ms: 0,
+                last_used_ms: None,
+                credential_kind: AuthProfileCredentialKind::Token,
+                tokens: None,
+                token: Some("sk-ant-oat01-test-token".to_string()),
+                oauth_provider_config: None,
+            };
+            let store = ProfileStore::from_env(temp.path().to_path_buf()).expect("profile store");
+            store.add(profile).expect("store profile");
+
+            let cfg = json!({
+                "anthropic": { "authProfile": "anthropic:default" }
+            });
+            let err = build_providers(&cfg).expect_err("wrong provider should fail fast");
+            assert!(err.to_string().contains("belongs to google, not anthropic"));
         });
     }
 

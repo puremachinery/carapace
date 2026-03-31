@@ -4335,6 +4335,26 @@ fn provider_api_key_guidance(cfg: &Value, provider: SetupProvider, config_path: 
 }
 
 fn anthropic_provider_guidance(cfg: &Value) -> String {
+    if let Some(env_var) = unresolved_placeholder_env_var(cfg, &["anthropic", "apiKey"]) {
+        return missing_placeholder_guidance(&env_var);
+    }
+
+    let api_key_configured = SetupProvider::Anthropic
+        .api_key_env_var_name()
+        .map(env_var_present)
+        .unwrap_or(false)
+        || config_path_has_usable_value(cfg, &["anthropic", "apiKey"]);
+    if api_key_configured {
+        let mut guidance =
+            provider_api_key_guidance(cfg, SetupProvider::Anthropic, &["anthropic", "apiKey"]);
+        if config_path_has_usable_value(cfg, &["anthropic", "authProfile"]) {
+            guidance.push_str(
+                " Note: both `anthropic.apiKey` and `anthropic.authProfile` are configured; the API key configuration will be used.",
+            );
+        }
+        return guidance;
+    }
+
     if config_path_has_usable_value(cfg, &["anthropic", "authProfile"]) {
         if env_var_present("CARAPACE_CONFIG_PASSWORD") {
             return "check Anthropic auth profile/model and retry `cara verify --outcome local-chat`"
@@ -11021,6 +11041,49 @@ mod tests {
         assert_eq!(
             local_chat_verify_next_step(&cfg),
             "the selected model currently routes to Anthropic; configure Anthropic or switch `agents.defaults.model` to one of the other usable providers (OpenAI), then retry `cara verify --outcome local-chat`"
+        );
+    }
+
+    #[test]
+    fn test_local_chat_verify_next_step_prefers_anthropic_api_key_guidance_when_both_paths_exist() {
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("ANTHROPIC_API_KEY");
+        env_guard.unset("CARAPACE_CONFIG_PASSWORD");
+        env_guard.unset("VERTEX_PROJECT_ID");
+        env_guard.unset("VERTEX_LOCATION");
+        env_guard.unset("VERTEX_MODEL");
+        let cfg = serde_json::json!({
+            "anthropic": {
+                "apiKey": "sk-ant-inline",
+                "authProfile": "anthropic:default"
+            }
+        });
+
+        assert_eq!(
+            local_chat_verify_next_step(&cfg),
+            "check Anthropic API key/model and retry `cara verify --outcome local-chat` Note: both `anthropic.apiKey` and `anthropic.authProfile` are configured; the API key configuration will be used."
+        );
+    }
+
+    #[test]
+    fn test_local_chat_verify_next_step_flags_missing_anthropic_api_key_placeholder_before_auth_profile(
+    ) {
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("ANTHROPIC_API_KEY");
+        env_guard.set("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+        env_guard.unset("VERTEX_PROJECT_ID");
+        env_guard.unset("VERTEX_LOCATION");
+        env_guard.unset("VERTEX_MODEL");
+        let cfg = serde_json::json!({
+            "anthropic": {
+                "apiKey": "${ANTHROPIC_API_KEY}",
+                "authProfile": "anthropic:default"
+            }
+        });
+
+        assert_eq!(
+            local_chat_verify_next_step(&cfg),
+            "set `$ANTHROPIC_API_KEY` in the same shell you use for `cara start` and `cara verify`, or rerun `cara setup --force` to write the key into config, then retry `cara verify --outcome local-chat`"
         );
     }
 
