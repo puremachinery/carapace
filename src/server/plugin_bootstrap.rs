@@ -166,7 +166,17 @@ fn plugin_runtime_init_error_is_fatal(error: &RuntimeError) -> bool {
         RuntimeError::ThreadSpawn { .. } => true,
         // All other runtime init failures intentionally degrade into a report-only
         // bootstrap result so startup can continue without plugin execution.
-        _ => false,
+        RuntimeError::PluginNotFound(_)
+        | RuntimeError::InstantiationError(_)
+        | RuntimeError::CallError(_)
+        | RuntimeError::ExecutionTimeout
+        | RuntimeError::MemoryLimitExceeded
+        | RuntimeError::HostError(_)
+        | RuntimeError::LoaderError(_)
+        | RuntimeError::WasmtimeError(_)
+        | RuntimeError::PluginError { .. }
+        | RuntimeError::FuelExhausted { .. }
+        | RuntimeError::CapabilityDenied { .. } => false,
     }
 }
 

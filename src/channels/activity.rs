@@ -121,7 +121,7 @@ impl std::fmt::Display for ThreadSpawnContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "failed to spawn stop typing dispatcher thread '{}': {}",
+            "failed to spawn background thread '{}': {}",
             self.thread_name, self.source
         )
     }
@@ -2858,7 +2858,7 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::Other);
         assert!(err
             .to_string()
-            .contains("failed to spawn stop typing dispatcher thread"));
+            .contains("failed to spawn background thread"));
     }
 
     #[test]
