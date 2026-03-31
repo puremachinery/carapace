@@ -185,77 +185,14 @@ impl BedrockProvider {
         body: &[u8],
         datetime: &str,
     ) -> Vec<(String, String)> {
-        let date = &datetime[..8]; // YYYYMMDD
         let host = format!("bedrock-runtime.{}.amazonaws.com", self.region);
-        let payload_hash = hex_sha256(body);
-
-        // Determine signed headers and canonical headers
-        let mut signed_header_names = vec!["host", "x-amz-content-sha256", "x-amz-date"];
-        let mut canonical_headers = format!(
-            "host:{}\nx-amz-content-sha256:{}\nx-amz-date:{}\n",
-            host, payload_hash, datetime
-        );
-
-        if self.session_token.is_some() {
-            signed_header_names.push("x-amz-security-token");
-        }
-        signed_header_names.sort();
-
-        // Rebuild canonical headers in sorted order
-        canonical_headers = String::new();
-        for name in &signed_header_names {
-            let value = match *name {
-                "host" => host.clone(),
-                "x-amz-content-sha256" => payload_hash.clone(),
-                "x-amz-date" => datetime.to_string(),
-                "x-amz-security-token" => self.session_token.as_deref().unwrap_or("").to_string(),
-                _ => String::new(),
-            };
-            canonical_headers.push_str(&format!("{}:{}\n", name, value));
-        }
-
-        let signed_headers = signed_header_names.join(";");
-
-        // Canonical request
-        let canonical_request = format!(
-            "{}\n{}\n\n{}\n{}\n{}",
-            method, uri_path, canonical_headers, signed_headers, payload_hash
-        );
-
-        let credential_scope = format!("{}/{}/bedrock/aws4_request", date, self.region);
-
-        // String to sign
-        let string_to_sign = format!(
-            "AWS4-HMAC-SHA256\n{}\n{}\n{}",
-            datetime,
-            credential_scope,
-            hex_sha256(canonical_request.as_bytes())
-        );
-
-        // Signing key
-        let signing_key = derive_signing_key(&self.secret_access_key, date, &self.region);
-
-        // Signature
-        let signature = hex::encode(hmac_sha256(&signing_key, string_to_sign.as_bytes()));
-
-        // Authorization header
-        let authorization = format!(
-            "AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={}, Signature={}",
-            self.access_key_id, credential_scope, signed_headers, signature
-        );
-
-        let mut headers = vec![
-            ("host".to_string(), host),
-            ("x-amz-date".to_string(), datetime.to_string()),
-            ("x-amz-content-sha256".to_string(), payload_hash),
-            ("authorization".to_string(), authorization),
-        ];
-
-        if let Some(ref token) = self.session_token {
-            headers.push(("x-amz-security-token".to_string(), token.clone()));
-        }
-
-        headers
+        let creds = AwsCredentials {
+            region: &self.region,
+            access_key_id: &self.access_key_id,
+            secret_access_key: &self.secret_access_key,
+            session_token: self.session_token.as_deref(),
+        };
+        sign_aws_v4_request(&creds, &host, method, uri_path, body, datetime)
     }
 }
 
@@ -812,25 +749,102 @@ pub fn strip_bedrock_prefix(model: &str) -> &str {
 
 // ==================== AWS SigV4 helpers ====================
 
-/// Compute the hex-encoded SHA-256 digest of `data`.
+/// AWS credentials for SigV4 signing.
+pub(crate) struct AwsCredentials<'a> {
+    pub region: &'a str,
+    pub access_key_id: &'a str,
+    pub secret_access_key: &'a str,
+    pub session_token: Option<&'a str>,
+}
+
+/// Sign an AWS request using Signature Version 4 for the `bedrock` service.
+///
+/// The signing service name is hardcoded to `bedrock`. Do not reuse this
+/// function for non-Bedrock AWS services (e.g. STS, S3) — they require a
+/// different service name in the credential scope.
+pub(crate) fn sign_aws_v4_request(
+    creds: &AwsCredentials<'_>,
+    host: &str,
+    method: &str,
+    uri_path: &str,
+    body: &[u8],
+    datetime: &str,
+) -> Vec<(String, String)> {
+    debug_assert!(
+        datetime.len() >= 16,
+        "datetime must be a full SigV4 timestamp (YYYYMMDDTHHMMSSZ), got {datetime:?}"
+    );
+    let date = &datetime[..8]; // YYYYMMDD
+    let payload_hash = hex_sha256(body);
+
+    let mut signed_header_names = vec!["host", "x-amz-content-sha256", "x-amz-date"];
+    if creds.session_token.is_some() {
+        signed_header_names.push("x-amz-security-token");
+    }
+    signed_header_names.sort();
+
+    let mut canonical_headers = String::new();
+    for name in &signed_header_names {
+        let value = match *name {
+            "host" => host.to_string(),
+            "x-amz-content-sha256" => payload_hash.clone(),
+            "x-amz-date" => datetime.to_string(),
+            "x-amz-security-token" => creds.session_token.unwrap_or("").to_string(),
+            _ => String::new(),
+        };
+        canonical_headers.push_str(&format!("{}:{}\n", name, value));
+    }
+
+    let signed_headers = signed_header_names.join(";");
+
+    let canonical_request = format!(
+        "{}\n{}\n\n{}\n{}\n{}",
+        method, uri_path, canonical_headers, signed_headers, payload_hash
+    );
+
+    let credential_scope = format!("{}/{}/bedrock/aws4_request", date, creds.region);
+
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{}\n{}\n{}",
+        datetime,
+        credential_scope,
+        hex_sha256(canonical_request.as_bytes())
+    );
+
+    let signing_key = derive_signing_key(creds.secret_access_key, date, creds.region);
+    let signature = hex::encode(hmac_sha256(&signing_key, string_to_sign.as_bytes()));
+
+    let authorization = format!(
+        "AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={}, Signature={}",
+        creds.access_key_id, credential_scope, signed_headers, signature
+    );
+
+    let mut headers = vec![
+        ("host".to_string(), host.to_string()),
+        ("x-amz-date".to_string(), datetime.to_string()),
+        ("x-amz-content-sha256".to_string(), payload_hash),
+        ("authorization".to_string(), authorization),
+    ];
+
+    if let Some(token) = creds.session_token {
+        headers.push(("x-amz-security-token".to_string(), token.to_string()));
+    }
+
+    headers
+}
+
 fn hex_sha256(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
     hex::encode(hasher.finalize())
 }
 
-/// Compute HMAC-SHA256 of `data` with the given `key`.
 fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC-SHA256 accepts any key length");
     mac.update(data);
     mac.finalize().into_bytes().to_vec()
 }
 
-/// Derive the SigV4 signing key:
-///   kDate    = HMAC("AWS4" + secret, date)
-///   kRegion  = HMAC(kDate, region)
-///   kService = HMAC(kRegion, "bedrock")
-///   kSigning = HMAC(kService, "aws4_request")
 fn derive_signing_key(secret_access_key: &str, date: &str, region: &str) -> Vec<u8> {
     let k_secret = format!("AWS4{}", secret_access_key);
     let k_date = hmac_sha256(k_secret.as_bytes(), date.as_bytes());
