@@ -20,6 +20,7 @@
 //! - Execution timeout (30s per call)
 
 use std::collections::HashMap;
+use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
@@ -30,6 +31,7 @@ use wasmtime::component::{Component, ComponentType, Lift, Linker, Lower};
 use wasmtime::{Config, Engine, ResourceLimiter, Store, StoreContextMut};
 
 use crate::credentials::{CredentialBackend, CredentialStore};
+use crate::thread_util::{spawn_named_thread, NamedThreadSpawner};
 
 use super::bindings::{
     BindingError, ChannelCapabilities, ChannelInfo, ChannelPluginInstance, ChatType,
@@ -66,6 +68,7 @@ pub const DEFAULT_FUEL_BUDGET: u64 = 1_000_000_000;
 
 /// Bounded queue depth for per-plugin worker requests.
 const PLUGIN_WORKER_QUEUE_CAPACITY: usize = 64;
+const EPOCH_TICKER_THREAD_NAME: &str = "plugin-epoch-ticker";
 
 fn compute_epoch_deadline_ticks(timeout: Duration) -> u64 {
     let interval_ms = DEFAULT_EPOCH_TICK_INTERVAL.as_millis().max(1);
@@ -80,23 +83,40 @@ struct EpochTicker {
 }
 
 impl EpochTicker {
-    fn start(engine: Engine, interval: Duration) -> Self {
+    fn start(engine: Engine, interval: Duration) -> io::Result<Self> {
+        Self::start_with_spawner(engine, interval, spawn_named_thread)
+    }
+
+    #[cfg(test)]
+    fn start_with_spawner_for_test(
+        engine: Engine,
+        interval: Duration,
+        spawner: NamedThreadSpawner,
+    ) -> io::Result<Self> {
+        Self::start_with_spawner(engine, interval, spawner)
+    }
+
+    fn start_with_spawner(
+        engine: Engine,
+        interval: Duration,
+        spawner: NamedThreadSpawner,
+    ) -> io::Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = stop.clone();
-        let handle = std::thread::Builder::new()
-            .name("plugin-epoch-ticker".to_string())
-            .spawn(move || {
+        let handle = spawner(
+            std::thread::Builder::new().name(EPOCH_TICKER_THREAD_NAME.to_string()),
+            Box::new(move || {
                 while !stop_clone.load(Ordering::SeqCst) {
                     std::thread::sleep(interval);
                     engine.increment_epoch();
                 }
-            })
-            .expect("failed to spawn plugin epoch ticker thread");
+            }),
+        )?;
 
-        Self {
+        Ok(Self {
             stop,
             handle: Some(handle),
-        }
+        })
     }
 }
 
@@ -579,6 +599,13 @@ pub enum RuntimeError {
         plugin_id: String,
         capabilities: Vec<String>,
     },
+
+    #[error("Failed to spawn startup thread '{thread_name}': {source}")]
+    ThreadSpawn {
+        thread_name: String,
+        #[source]
+        source: io::Error,
+    },
 }
 
 /// State held in each plugin's wasmtime store
@@ -1046,6 +1073,34 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
         sandbox_config: super::sandbox::SandboxConfig,
         permission_config: PermissionConfig,
     ) -> Result<Self, RuntimeError> {
+        Self::with_permissions_config_and_epoch_ticker_factory(
+            loader,
+            credential_store,
+            rate_limiters,
+            ssrf_config,
+            sandbox_config,
+            permission_config,
+            |engine, interval| {
+                EpochTicker::start(engine, interval).map_err(|source| RuntimeError::ThreadSpawn {
+                    thread_name: EPOCH_TICKER_THREAD_NAME.to_string(),
+                    source,
+                })
+            },
+        )
+    }
+
+    fn with_permissions_config_and_epoch_ticker_factory<F>(
+        loader: Arc<PluginLoader>,
+        credential_store: Arc<CredentialStore<B>>,
+        rate_limiters: Arc<RateLimiterRegistry>,
+        ssrf_config: SsrfConfig,
+        sandbox_config: super::sandbox::SandboxConfig,
+        permission_config: PermissionConfig,
+        epoch_ticker_factory: F,
+    ) -> Result<Self, RuntimeError>
+    where
+        F: FnOnce(Engine, Duration) -> Result<EpochTicker, RuntimeError>,
+    {
         // Configure wasmtime engine
         let mut config = Config::new();
         config.wasm_component_model(true);
@@ -1057,7 +1112,7 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
             Engine::new(&config).map_err(|e| RuntimeError::WasmtimeError(e.to_string()))?;
 
         let epoch_deadline_ticks = compute_epoch_deadline_ticks(DEFAULT_EXECUTION_TIMEOUT);
-        let epoch_ticker = EpochTicker::start(engine.clone(), DEFAULT_EPOCH_TICK_INTERVAL);
+        let epoch_ticker = epoch_ticker_factory(engine.clone(), DEFAULT_EPOCH_TICK_INTERVAL)?;
 
         Ok(Self {
             engine,
@@ -1781,10 +1836,75 @@ mod tests {
         PluginRuntime::new(loader, credential_store).unwrap()
     }
 
+    #[test]
+    fn test_epoch_ticker_start_reports_thread_spawn_error() {
+        fn fail_spawner(
+            _builder: std::thread::Builder,
+            routine: crate::thread_util::NamedThreadRoutine,
+        ) -> io::Result<std::thread::JoinHandle<()>> {
+            drop(routine);
+            Err(io::Error::other("simulated epoch ticker thread exhaustion"))
+        }
+
+        let engine = Engine::default();
+        let err = match EpochTicker::start_with_spawner_for_test(
+            engine,
+            DEFAULT_EPOCH_TICK_INTERVAL,
+            fail_spawner,
+        ) {
+            Ok(_) => panic!("epoch ticker startup should report thread spawn failure"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert!(err
+            .to_string()
+            .contains("simulated epoch ticker thread exhaustion"));
+    }
+
     #[tokio::test]
     async fn test_runtime_creation() {
         let runtime = create_test_runtime().await;
         assert!(runtime.list_plugins().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_runtime_creation_reports_epoch_ticker_spawn_error() {
+        let temp_dir = tempdir().unwrap();
+        let plugins_dir = temp_dir.path().join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+
+        let loader = Arc::new(PluginLoader::new(plugins_dir).unwrap());
+        let backend = MockCredentialBackend::new(true);
+        let credential_store = Arc::new(
+            CredentialStore::new(backend, temp_dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+
+        let err = match PluginRuntime::with_permissions_config_and_epoch_ticker_factory(
+            loader,
+            credential_store,
+            Arc::new(RateLimiterRegistry::new()),
+            SsrfConfig::default(),
+            crate::plugins::sandbox::SandboxConfig::default(),
+            PermissionConfig::default(),
+            |_engine, _interval| {
+                Err(RuntimeError::ThreadSpawn {
+                    thread_name: EPOCH_TICKER_THREAD_NAME.to_string(),
+                    source: io::Error::other("simulated epoch ticker thread exhaustion"),
+                })
+            },
+        ) {
+            Ok(_) => panic!("runtime startup should propagate epoch ticker spawn failure"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(
+            err,
+            RuntimeError::ThreadSpawn { ref thread_name, .. }
+                if thread_name == EPOCH_TICKER_THREAD_NAME
+        ));
     }
 
     #[tokio::test]
