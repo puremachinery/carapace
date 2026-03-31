@@ -339,15 +339,8 @@ fn classify_api_error(status: u16, body: &str, region: &str) -> (String, String)
                      Verify it in the IAM console."
                         .to_string(),
                 )
-            } else if body.contains("AccessDeniedException") {
-                (
-                    "Access denied (HTTP 403).".to_string(),
-                    "Your credentials are valid but lack the \
-                     `bedrock:ListFoundationModels` permission. \
-                     Attach the `AmazonBedrockReadOnly` managed policy \
-                     (or a policy granting `bedrock:*`) to your IAM user/role."
-                        .to_string(),
-                )
+            // AccessDeniedException is intercepted in validate_bedrock_credentials
+            // before classify_api_error is called, so it does not need a branch here.
             } else if body.contains("ExpiredTokenException") || body.contains("ExpiredToken") {
                 (
                     "AWS session token expired (HTTP 403).".to_string(),
@@ -539,10 +532,12 @@ mod tests {
     }
 
     #[test]
-    fn classify_error_access_denied() {
-        let (detail, remediation) = classify_api_error(403, "AccessDeniedException", "us-east-1");
-        assert!(detail.contains("Access denied"));
-        assert!(remediation.contains("ListFoundationModels"));
+    fn classify_error_access_denied_falls_through() {
+        // AccessDeniedException is intercepted in validate_bedrock_credentials
+        // before classify_api_error is called. If it somehow reaches here,
+        // it falls through to the generic 403 branch.
+        let (detail, _) = classify_api_error(403, "AccessDeniedException", "us-east-1");
+        assert!(detail.contains("403"));
     }
 
     #[test]

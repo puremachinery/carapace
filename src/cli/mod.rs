@@ -6788,11 +6788,13 @@ fn configure_provider_noninteractive(
                 .as_ref()
                 .map(|s| s.value.clone())
                 .unwrap_or_else(|| "us-east-1".to_string());
-            result
-                .observed_checks
-                .push(crate::onboarding::bedrock::validate_region(
-                    &effective_region,
-                ));
+            if sources.region.is_some() {
+                result
+                    .observed_checks
+                    .push(crate::onboarding::bedrock::validate_region(
+                        &effective_region,
+                    ));
+            }
             if let (Some(access_src), Some(secret_src)) = (&sources.access_key, &sources.secret_key)
             {
                 let r = effective_region.clone();
