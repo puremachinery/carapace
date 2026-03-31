@@ -215,9 +215,26 @@ pub enum Command {
         telegram_to: Option<String>,
     },
 
+    /// Import configuration from another tool.
+    Import {
+        /// Source tool to import from.
+        #[arg(value_enum)]
+        source: ImportSource,
+
+        /// Overwrite existing Carapace configuration if it already exists.
+        #[arg(long)]
+        force: bool,
+    },
+
     /// Manage mTLS certificates for gateway-to-gateway communication.
     #[command(subcommand)]
     Tls(TlsCommand),
+}
+
+#[derive(clap::ValueEnum, Clone, Debug)]
+pub enum ImportSource {
+    /// Import from OpenClaw (~/.openclaw/ or ~/.clawdbot/).
+    Openclaw,
 }
 
 #[derive(Subcommand, Debug)]
@@ -7280,6 +7297,137 @@ fn configure_provider_noninteractive(
         }
     }
     Ok(ProviderSetupResult::default())
+}
+
+/// Run the `import openclaw` subcommand.
+pub fn handle_import_openclaw(force: bool) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::migration::openclaw;
+
+    // Check for existing config.
+    let config_path = config::get_config_path();
+    if config_path.exists() && !force {
+        eprintln!(
+            "Carapace config already exists at {}.",
+            config_path.display()
+        );
+        eprintln!("Use --force to overwrite, or edit the existing config manually.");
+        return Err("existing config found; use --force to overwrite".into());
+    }
+
+    // Discover OpenClaw installation.
+    let discovery = match openclaw::discover() {
+        Some(d) => d,
+        None => {
+            eprintln!("No OpenClaw installation found.");
+            eprintln!(
+                "Checked: ~/.openclaw/, ~/.clawdbot/, $OPENCLAW_CONFIG_PATH, $OPENCLAW_STATE_DIR"
+            );
+            return Err("no OpenClaw config found".into());
+        }
+    };
+
+    println!("Found OpenClaw config: {}", discovery.config_path.display());
+    if let Some(ref env) = discovery.env_path {
+        println!("Found .env file: {}", env.display());
+    }
+    if let Some(ref creds) = discovery.credentials_path {
+        println!("Found credentials: {}", creds.display());
+    }
+    println!();
+
+    // Plan the import.
+    let plan = openclaw::plan_import(&discovery);
+
+    for warning in &plan.warnings {
+        eprintln!("Warning: {warning}");
+    }
+
+    if plan.is_empty() && plan.skipped.is_empty() {
+        println!("No importable configuration found in the OpenClaw config.");
+        return Ok(());
+    }
+
+    // Show what will be imported.
+    if !plan.mappings.is_empty() {
+        println!("The following fields will be imported:\n");
+        println!("  {:<45} {:<30} Value", "OpenClaw source", "Carapace key");
+        println!(
+            "  {:<45} {:<30} {}",
+            "-".repeat(44),
+            "-".repeat(29),
+            "-".repeat(20)
+        );
+        for mapping in &plan.mappings {
+            let display_value = if mapping.sensitive {
+                "[REDACTED]".to_string()
+            } else {
+                mapping
+                    .value
+                    .as_str()
+                    .map(|s| truncate_display(s, 40))
+                    .unwrap_or_else(|| mapping.value.to_string())
+            };
+            println!(
+                "  {:<45} {:<30} {}",
+                truncate_display(&mapping.openclaw_path, 44),
+                mapping.carapace_key,
+                display_value
+            );
+        }
+        println!();
+    }
+
+    // Show what was skipped.
+    if !plan.skipped.is_empty() {
+        println!("Skipped (no Carapace mapping):\n");
+        for skipped in &plan.skipped {
+            println!("  {} — {}", skipped.openclaw_path, skipped.reason);
+        }
+        println!();
+    }
+
+    if plan.is_empty() {
+        println!("No importable fields found after scanning.");
+        return Ok(());
+    }
+
+    // Confirm.
+    if !prompt_yes_no(
+        &format!(
+            "Write {} field(s) to {}?",
+            plan.mappings.len(),
+            config_path.display()
+        ),
+        true,
+    )? {
+        println!("Import cancelled.");
+        return Ok(());
+    }
+
+    // Build and write config.
+    let config = plan.build_carapace_config();
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let content = json5::to_string(&config)?;
+    std::fs::write(&config_path, &content)?;
+
+    println!("\nConfig written to {}", config_path.display());
+    println!();
+    println!("Next steps:");
+    println!("  cara verify    — validate that imported providers work");
+    println!("  cara status    — check gateway health after starting");
+    println!("  cara setup     — reconfigure or add providers interactively");
+
+    Ok(())
+}
+
+fn truncate_display(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", &s[..max - 1])
+    }
 }
 
 /// Run the `setup` subcommand -- interactive first-run wizard.
