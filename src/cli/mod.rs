@@ -3986,10 +3986,7 @@ impl From<GeminiSetupAuthMode> for crate::onboarding::setup::SetupAuthMode {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-struct ProviderSetupResult {
-    observed_provider_checks: Vec<crate::onboarding::setup::SetupCheck>,
-}
+type ProviderSetupResult = crate::onboarding::setup::SetupFlowResult;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ModelProviderRoute {
@@ -4904,6 +4901,15 @@ async fn validate_channel_credentials_owned(channel: String, token: String) -> R
     validate_channel_credentials(&channel, &token).await
 }
 
+fn setup_rerun_command(
+    provider: SetupProvider,
+    requested_auth_mode: Option<GeminiSetupAuthMode>,
+) -> String {
+    crate::onboarding::setup::SetupProvider::from(provider)
+        .setup_command(setup_provider_auth_mode_hint(provider, requested_auth_mode))
+        .unwrap_or_else(|| crate::onboarding::setup::LOCAL_CHAT_VERIFY_COMMAND.to_string())
+}
+
 fn validate_provider_credentials_interactive(
     provider: SetupProvider,
     api_key: &str,
@@ -4936,8 +4942,7 @@ fn validate_provider_credentials_interactive(
         Err(err) => {
             eprintln!("Credential check failed: {}", err);
             if prompt_yes_no("Continue setup and write config anyway?", false)? {
-                let rerun_command = crate::onboarding::setup::SetupProvider::from(provider)
-                    .rerun_command(setup_provider_auth_mode_hint(provider, None));
+                let rerun_command = setup_rerun_command(provider, None);
                 Ok(crate::onboarding::setup::SetupCheck::validation_fail(
                     "Live provider validation",
                     err,
@@ -6231,13 +6236,11 @@ fn configure_gemini_provider_interactive(
                         .and_then(|value| value.effective_value.as_deref()),
                 );
                 if let Err(err) = validation {
-                    result
-                        .observed_provider_checks
-                        .push(handle_setup_validation_failure(
-                            SetupProvider::Gemini,
-                            Some(GeminiSetupAuthMode::ApiKey),
-                            err,
-                        )?);
+                    result.observed_checks.push(handle_setup_validation_failure(
+                        SetupProvider::Gemini,
+                        Some(GeminiSetupAuthMode::ApiKey),
+                        err,
+                    )?);
                 }
             }
 
@@ -6266,13 +6269,11 @@ fn configure_gemini_provider_interactive(
                 if let Err(err) =
                     crate::onboarding::gemini::validate_gemini_base_url_input(Some(url))
                 {
-                    result
-                        .observed_provider_checks
-                        .push(handle_setup_validation_failure(
-                            SetupProvider::Gemini,
-                            Some(GeminiSetupAuthMode::OAuth),
-                            err,
-                        )?);
+                    result.observed_checks.push(handle_setup_validation_failure(
+                        SetupProvider::Gemini,
+                        Some(GeminiSetupAuthMode::OAuth),
+                        err,
+                    )?);
                 }
             }
 
@@ -6292,12 +6293,12 @@ fn configure_gemini_provider_interactive(
                 None => "stored Gemini auth profile".to_string(),
             };
             crate::onboarding::gemini::persist_cli_google_oauth(state_dir, config, completion)?;
-            result.observed_provider_checks.push(
-                crate::onboarding::setup::SetupCheck::validation_pass(
+            result
+                .observed_checks
+                .push(crate::onboarding::setup::SetupCheck::validation_pass(
                     "Live provider validation",
                     profile_detail,
-                ),
-            );
+                ));
 
             if let Some(base_url) = base_url {
                 config["google"]["baseUrl"] = serde_json::json!(base_url.config_value);
@@ -6341,7 +6342,7 @@ fn configure_codex_provider_interactive(
     crate::onboarding::codex::persist_cli_openai_oauth(state_dir, config, completion)?;
 
     Ok(ProviderSetupResult {
-        observed_provider_checks: vec![crate::onboarding::setup::SetupCheck::validation_pass(
+        observed_checks: vec![crate::onboarding::setup::SetupCheck::validation_pass(
             "Live provider validation",
             profile_detail,
         )],
@@ -6354,8 +6355,7 @@ fn handle_setup_validation_failure(
     err: crate::agent::AgentError,
 ) -> Result<crate::onboarding::setup::SetupCheck, Box<dyn std::error::Error>> {
     eprintln!("{}", render_setup_validation_failure(&err));
-    let rerun = crate::onboarding::setup::SetupProvider::from(provider)
-        .rerun_command(setup_provider_auth_mode_hint(provider, requested_auth_mode));
+    let rerun = setup_rerun_command(provider, requested_auth_mode);
     eprintln!("Next step: fix the value and rerun `{rerun}`.");
     if prompt_yes_no("Continue setup and write config anyway?", false)? {
         Ok(crate::onboarding::setup::SetupCheck::validation_fail(
@@ -6390,7 +6390,7 @@ fn configure_provider_interactive(
             )?;
             if let Some(key) = api_key.effective_value.as_deref() {
                 result
-                    .observed_provider_checks
+                    .observed_checks
                     .push(validate_provider_credentials_interactive(provider, key)?);
             } else {
                 print_missing_setup_value_notice("ANTHROPIC_API_KEY", "API key");
@@ -6408,7 +6408,7 @@ fn configure_provider_interactive(
             )?;
             if let Some(key) = api_key.effective_value.as_deref() {
                 result
-                    .observed_provider_checks
+                    .observed_checks
                     .push(validate_provider_credentials_interactive(provider, key)?);
             } else {
                 print_missing_setup_value_notice("OPENAI_API_KEY", "API key");
@@ -6455,7 +6455,7 @@ fn configure_provider_interactive(
                 }) {
                 Ok(_) => {}
                 Err(err) => result
-                    .observed_provider_checks
+                    .observed_checks
                     .push(handle_setup_validation_failure(provider, None, err)?),
             }
 
@@ -6510,7 +6510,7 @@ fn configure_provider_interactive(
                     });
                 if let Err(err) = validation {
                     result
-                        .observed_provider_checks
+                        .observed_checks
                         .push(handle_setup_validation_failure(provider, None, err)?);
                 }
             }
@@ -6601,7 +6601,7 @@ fn configure_provider_interactive(
                         });
                 if let Err(err) = validation {
                     result
-                        .observed_provider_checks
+                        .observed_checks
                         .push(handle_setup_validation_failure(provider, None, err)?);
                 }
             }
@@ -6914,7 +6914,7 @@ pub fn handle_setup(
         &config,
         &resolve_state_dir(),
         configured_provider.into(),
-        provider_setup_result.observed_provider_checks,
+        provider_setup_result.observed_checks,
     );
     print_setup_assessment_summary(&setup_assessment);
     if let Some(remediation) = setup_assessment.recommended_remediation() {

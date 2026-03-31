@@ -250,6 +250,32 @@ sequenceDiagram
 | Classifier | `src/agent/classifier.rs` | Inbound message classifier (prompt injection, social engineering) |
 | Logging | `src/logging/mod.rs` | tracing setup, ring buffer, log tail streaming |
 
+## Shared Provider Onboarding Contract
+
+`src/onboarding/setup.rs` owns the shared onboarding contract for `cara setup`
+and the future Control UI parity work. Provider-specific onboarding flows should
+not invent their own status or remediation shape.
+
+- provider-specific flows write provider-owned config/auth-profile state
+- provider-specific flows return only live/provider-side observations through
+  `SetupFlowResult.observed_checks`
+- `assess_provider_setup(...)` is the only layer that converts persisted config
+  plus observed checks into final `ready` / `partial` / `invalid` status
+- remediation text must be a concrete next step, not a generic failure summary
+
+Current/frozen write targets for the next guided-provider work:
+
+| Provider | Persisted targets | Route target |
+|-----------|-------------------|--------------|
+| Bedrock | `bedrock.region`, `bedrock.accessKeyId`, `bedrock.secretAccessKey`, optional `bedrock.sessionToken` | `agents.defaults.model` routes to Bedrock |
+| Vertex | `vertex.projectId`, `vertex.location`, `vertex.model` (required for `vertex:default`; optional for explicit Vertex models) | `agents.defaults.model` routes to `vertex:default` (using `vertex.model`) or to the chosen explicit Vertex model |
+
+Status semantics are intentionally shared:
+
+- `ready`: at least one validation pass and no failures
+- `partial`: config/auth-profile state was written, but live validation was skipped or unavailable
+- `invalid`: any requirement or validation failed, and remediation must be surfaced directly
+
 ## Design Decisions
 
 - **Async runtime**: tokio
