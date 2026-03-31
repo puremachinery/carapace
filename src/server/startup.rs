@@ -214,7 +214,7 @@ pub async fn build_ws_state_with_runtime_dependencies(
         }
     };
 
-    let plugin_bootstrap = bootstrap_plugin_runtime(cfg, state_dir).await;
+    let plugin_bootstrap = bootstrap_plugin_runtime(cfg, state_dir).await?;
     tools_registry.set_plugin_registry(plugin_bootstrap.registry.clone());
     Ok(Arc::new(
         ws_state
@@ -1106,7 +1106,9 @@ mod tests {
             }
         });
 
-        let result = bootstrap_plugin_runtime(&cfg, temp.path()).await;
+        let result = bootstrap_plugin_runtime(&cfg, temp.path())
+            .await
+            .expect("plugin bootstrap should not fatally fail");
         let report = result.activation_report;
 
         assert!(!report.enabled);
@@ -1146,7 +1148,9 @@ mod tests {
             }
         });
 
-        let result = bootstrap_plugin_runtime(&cfg, temp.path()).await;
+        let result = bootstrap_plugin_runtime(&cfg, temp.path())
+            .await
+            .expect("plugin bootstrap should not fatally fail");
         let report = result.activation_report;
 
         assert_eq!(report.entries.len(), 1);
@@ -1172,7 +1176,9 @@ mod tests {
             }
         });
 
-        let result = bootstrap_plugin_runtime(&cfg, temp.path()).await;
+        let result = bootstrap_plugin_runtime(&cfg, temp.path())
+            .await
+            .expect("plugin bootstrap should not fatally fail");
         let report = result.activation_report;
 
         assert!(report.entries.is_empty());
@@ -1193,7 +1199,9 @@ mod tests {
             }
         });
 
-        let result = bootstrap_plugin_runtime(&cfg, temp.path()).await;
+        let result = bootstrap_plugin_runtime(&cfg, temp.path())
+            .await
+            .expect("plugin bootstrap should not fatally fail");
         let report = result.activation_report;
 
         assert_eq!(report.entries.len(), 1);
@@ -1232,7 +1240,9 @@ mod tests {
             }
         });
 
-        let result = bootstrap_plugin_runtime(&cfg, temp.path()).await;
+        let result = bootstrap_plugin_runtime(&cfg, temp.path())
+            .await
+            .expect("plugin bootstrap should not fatally fail");
         let report = result.activation_report;
 
         assert!(result.runtime.is_none());
@@ -1279,7 +1289,9 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir");
         write_minimal_wasm(&temp.path().join("plugins"), "rogue");
 
-        let result = bootstrap_plugin_runtime(&json!({}), temp.path()).await;
+        let result = bootstrap_plugin_runtime(&json!({}), temp.path())
+            .await
+            .expect("plugin bootstrap should not fatally fail");
         let report = result.activation_report;
 
         assert_eq!(report.entries.len(), 1);
@@ -1305,7 +1317,9 @@ mod tests {
             }
         });
 
-        let result = bootstrap_plugin_runtime(&cfg, temp.path()).await;
+        let result = bootstrap_plugin_runtime(&cfg, temp.path())
+            .await
+            .expect("plugin bootstrap should not fatally fail");
         let report = result.activation_report;
 
         assert_eq!(report.entries.len(), 0);
@@ -1336,7 +1350,9 @@ mod tests {
             }
         });
 
-        let result = bootstrap_plugin_runtime(&cfg, temp.path()).await;
+        let result = bootstrap_plugin_runtime(&cfg, temp.path())
+            .await
+            .expect("plugin bootstrap should not fatally fail");
         let report = result.activation_report;
 
         assert_eq!(report.entries.len(), 1);
@@ -1375,7 +1391,9 @@ mod tests {
             }
         });
 
-        let result = bootstrap_plugin_runtime(&cfg, temp.path()).await;
+        let result = bootstrap_plugin_runtime(&cfg, temp.path())
+            .await
+            .expect("plugin bootstrap should not fatally fail");
         let report = result.activation_report;
 
         assert_eq!(report.entries.len(), 1);
@@ -1418,7 +1436,9 @@ mod tests {
             }
         });
 
-        let result = bootstrap_plugin_runtime(&cfg, temp.path()).await;
+        let result = bootstrap_plugin_runtime(&cfg, temp.path())
+            .await
+            .expect("plugin bootstrap should not fatally fail");
         let report = result.activation_report;
         let expected_path = std::fs::canonicalize(&wasm_path).expect("canonicalize wasm path");
 
@@ -1479,7 +1499,9 @@ mod tests {
             }
         });
 
-        let result = bootstrap_plugin_runtime(&cfg, temp.path()).await;
+        let result = bootstrap_plugin_runtime(&cfg, temp.path())
+            .await
+            .expect("plugin bootstrap should not fatally fail");
         let report = result.activation_report;
         let expected_path = std::fs::canonicalize(&wasm_path).expect("canonicalize wasm path");
 
@@ -1535,7 +1557,9 @@ mod tests {
             }
         });
 
-        let result = bootstrap_plugin_runtime(&cfg, temp.path()).await;
+        let result = bootstrap_plugin_runtime(&cfg, temp.path())
+            .await
+            .expect("plugin bootstrap should not fatally fail");
         let report = result.activation_report;
 
         assert!(
@@ -1576,7 +1600,9 @@ mod tests {
             }
         });
 
-        let result = bootstrap_plugin_runtime(&cfg, temp.path()).await;
+        let result = bootstrap_plugin_runtime(&cfg, temp.path())
+            .await
+            .expect("plugin bootstrap should not fatally fail");
         let report = result.activation_report;
         let expected_path = std::fs::canonicalize(&wasm_path).expect("canonicalize wasm path");
 
@@ -1625,7 +1651,9 @@ mod tests {
             }
         });
 
-        let result = bootstrap_plugin_runtime(&cfg, temp.path()).await;
+        let result = bootstrap_plugin_runtime(&cfg, temp.path())
+            .await
+            .expect("plugin bootstrap should not fatally fail");
         let report = result.activation_report;
 
         assert!(result.runtime.is_some(), "activation report: {report:#?}");
@@ -1670,7 +1698,9 @@ mod tests {
             }
         });
 
-        let result = bootstrap_plugin_runtime(&cfg, temp.path()).await;
+        let result = bootstrap_plugin_runtime(&cfg, temp.path())
+            .await
+            .expect("plugin bootstrap should not fatally fail");
         let report = result.activation_report;
 
         assert!(result.runtime.is_some(), "activation report: {report:#?}");

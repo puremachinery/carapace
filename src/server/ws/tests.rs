@@ -1,6 +1,27 @@
 use super::*;
 
 #[test]
+fn test_try_new_reports_activity_service_startup_error() {
+    let err = WsServerState::try_new_with_activity_service_factory_for_test(
+        WsServerConfig::default(),
+        || {
+            Err(std::io::Error::other(
+                "simulated activity thread exhaustion",
+            ))
+        },
+    )
+    .expect_err("startup should report activity service initialization failure");
+
+    match err {
+        WsConfigError::Runtime(message) => {
+            assert!(message.contains("failed to initialize activity service"));
+            assert!(message.contains("simulated activity thread exhaustion"));
+        }
+        other => panic!("expected runtime startup error, got {other:?}"),
+    }
+}
+
+#[test]
 fn test_error_shape() {
     let err = error_shape(ERROR_INVALID_REQUEST, "test error", None);
     assert_eq!(err.code, "INVALID_REQUEST");

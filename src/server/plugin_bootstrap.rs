@@ -9,7 +9,7 @@ use crate::plugins::loader::{is_reserved_plugin_id, load_plugins_manifest, Loade
 use crate::plugins::permissions::PermissionConfig;
 use crate::plugins::sandbox::SandboxConfig;
 use crate::plugins::signature::SignatureConfig;
-use crate::plugins::{PluginLoader, PluginRegistry, PluginRuntime};
+use crate::plugins::{PluginLoader, PluginRegistry, PluginRuntime, RuntimeError};
 use crate::server::ws::WsServerState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,6 +158,28 @@ fn managed_plugin_activation_entry(entry: &ManagedPluginConfigEntry) -> PluginAc
         install_id: entry.install_id.clone(),
         state: PluginActivationState::Ignored,
         reason: None,
+    }
+}
+
+fn plugin_runtime_init_error_is_fatal(error: &RuntimeError) -> bool {
+    error.is_startup_thread_spawn()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_plugin_runtime_thread_spawn_errors_are_fatal() {
+        assert!(plugin_runtime_init_error_is_fatal(
+            &RuntimeError::ThreadSpawn {
+                thread_name: "plugin-epoch-ticker".to_string(),
+                source: std::io::Error::other("simulated thread exhaustion"),
+            }
+        ));
+        assert!(!plugin_runtime_init_error_is_fatal(
+            &RuntimeError::InstantiationError("component load failed".to_string(),)
+        ));
     }
 }
 
@@ -615,7 +637,7 @@ fn discover_and_load_plugins(cfg: Value, state_dir: PathBuf) -> BlockingPluginBo
 pub(crate) async fn bootstrap_plugin_runtime(
     cfg: &Value,
     state_dir: &Path,
-) -> PluginBootstrapResult {
+) -> Result<PluginBootstrapResult, RuntimeError> {
     let registry = Arc::new(PluginRegistry::new());
     let fallback_report =
         PluginActivationReport::empty(configured_plugin_paths(cfg), plugins_globally_enabled(cfg));
@@ -632,11 +654,11 @@ pub(crate) async fn bootstrap_plugin_runtime(
             report
                 .errors
                 .push(format!("plugin bootstrap worker failed: {error}"));
-            return PluginBootstrapResult {
+            return Ok(PluginBootstrapResult {
                 registry,
                 runtime: None,
                 activation_report: report,
-            };
+            });
         }
     };
 
@@ -650,19 +672,19 @@ pub(crate) async fn bootstrap_plugin_runtime(
     } = blocking;
 
     let Some(loader) = loader else {
-        return PluginBootstrapResult {
+        return Ok(PluginBootstrapResult {
             registry,
             runtime: None,
             activation_report: report,
-        };
+        });
     };
 
     if loaded_plugin_ids.is_empty() {
-        return PluginBootstrapResult {
+        return Ok(PluginBootstrapResult {
             registry,
             runtime: None,
             activation_report: report,
-        };
+        });
     }
 
     let credential_store = match credentials::create_default_store(state_dir.to_path_buf()).await {
@@ -678,11 +700,11 @@ pub(crate) async fn bootstrap_plugin_runtime(
                         Some(format!("plugin runtime unavailable: {error}"));
                 }
             }
-            return PluginBootstrapResult {
+            return Ok(PluginBootstrapResult {
                 registry,
                 runtime: None,
                 activation_report: report,
-            };
+            });
         }
     };
 
@@ -696,6 +718,9 @@ pub(crate) async fn bootstrap_plugin_runtime(
     ) {
         Ok(runtime) => Arc::new(runtime),
         Err(error) => {
+            if plugin_runtime_init_error_is_fatal(&error) {
+                return Err(error);
+            }
             report
                 .errors
                 .push(format!("failed to initialize plugin runtime: {error}"));
@@ -706,11 +731,11 @@ pub(crate) async fn bootstrap_plugin_runtime(
                         Some(format!("plugin runtime unavailable: {error}"));
                 }
             }
-            return PluginBootstrapResult {
+            return Ok(PluginBootstrapResult {
                 registry,
                 runtime: None,
                 activation_report: report,
-            };
+            });
         }
     };
     let shared_registry = runtime.registry();
@@ -747,11 +772,11 @@ pub(crate) async fn bootstrap_plugin_runtime(
         runtime.unload_plugin(&plugin_id).ok();
     }
 
-    PluginBootstrapResult {
+    Ok(PluginBootstrapResult {
         registry: shared_registry,
         runtime: Some(runtime),
         activation_report: report,
-    }
+    })
 }
 
 pub(crate) fn stop_plugin_services(ws_state: &WsServerState) {
