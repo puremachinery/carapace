@@ -162,24 +162,11 @@ fn managed_plugin_activation_entry(entry: &ManagedPluginConfigEntry) -> PluginAc
 }
 
 fn plugin_runtime_init_error_is_fatal(error: &RuntimeError) -> bool {
-    error.is_startup_thread_spawn()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_plugin_runtime_thread_spawn_errors_are_fatal() {
-        assert!(plugin_runtime_init_error_is_fatal(
-            &RuntimeError::ThreadSpawn {
-                thread_name: "plugin-epoch-ticker".to_string(),
-                source: std::io::Error::other("simulated thread exhaustion"),
-            }
-        ));
-        assert!(!plugin_runtime_init_error_is_fatal(
-            &RuntimeError::InstantiationError("component load failed".to_string(),)
-        ));
+    match error {
+        RuntimeError::ThreadSpawn { .. } => true,
+        // All other runtime init failures intentionally degrade into a report-only
+        // bootstrap result so startup can continue without plugin execution.
+        _ => false,
     }
 }
 
@@ -798,5 +785,23 @@ pub(crate) fn stop_plugin_services(ws_state: &WsServerState) {
                 tracing::warn!(plugin_id = %plugin_id, error = %error, "failed to unload service plugin");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_plugin_runtime_thread_spawn_errors_are_fatal() {
+        assert!(plugin_runtime_init_error_is_fatal(
+            &RuntimeError::ThreadSpawn {
+                thread_name: "plugin-epoch-ticker".to_string(),
+                source: std::io::Error::other("simulated thread exhaustion"),
+            }
+        ));
+        assert!(!plugin_runtime_init_error_is_fatal(
+            &RuntimeError::InstantiationError("component load failed".to_string(),)
+        ));
     }
 }

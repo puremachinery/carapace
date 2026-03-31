@@ -46,6 +46,7 @@ use crate::plugins::{
 use crate::runtime_bridge::run_sync_blocking_send;
 use crate::server::ws::WsServerState;
 use crate::tasks::{TaskBlockedReason, TaskExecutionOutcome, TaskExecutor, TaskQueue};
+use crate::thread_util::{spawn_named_thread, NamedThreadSpawner};
 
 const DEFAULT_TYPING_INTERVAL_SECONDS: u32 = 3;
 const MAX_TYPING_REFRESH_BACKOFF_SECONDS: u64 = 30;
@@ -110,21 +111,35 @@ const STOP_STATE_TASK_RUNNING: u8 = 3;
 const STOP_STATE_FALLBACK_RESERVED: u8 = 4;
 const STOP_STATE_COMPLETED: u8 = 5;
 
-type NamedThreadRoutine = Box<dyn FnOnce() + Send + 'static>;
-type NamedThreadSpawner =
-    fn(thread::Builder, NamedThreadRoutine) -> io::Result<thread::JoinHandle<()>>;
+#[derive(Debug)]
+struct ThreadSpawnContext {
+    thread_name: &'static str,
+    source: io::Error,
+}
 
-fn spawn_named_thread(
-    builder: thread::Builder,
-    routine: NamedThreadRoutine,
-) -> io::Result<thread::JoinHandle<()>> {
-    builder.spawn(move || routine())
+impl std::fmt::Display for ThreadSpawnContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "failed to spawn stop typing dispatcher thread '{}': {}",
+            self.thread_name, self.source
+        )
+    }
+}
+
+impl std::error::Error for ThreadSpawnContext {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
 }
 
 fn stop_typing_thread_spawn_error(err: io::Error) -> io::Error {
     io::Error::new(
         err.kind(),
-        format!("failed to spawn stop typing dispatcher thread: {err}"),
+        ThreadSpawnContext {
+            thread_name: STOP_TYPING_THREAD_NAME,
+            source: err,
+        },
     )
 }
 
@@ -2829,7 +2844,7 @@ mod tests {
     fn test_activity_dispatcher_try_with_options_reports_thread_spawn_error() {
         fn fail_spawner(
             _builder: thread::Builder,
-            routine: NamedThreadRoutine,
+            routine: crate::thread_util::NamedThreadRoutine,
         ) -> io::Result<thread::JoinHandle<()>> {
             drop(routine);
             Err(io::Error::other("simulated stop typing thread exhaustion"))
@@ -2844,6 +2859,19 @@ mod tests {
         assert!(err
             .to_string()
             .contains("failed to spawn stop typing dispatcher thread"));
+    }
+
+    #[test]
+    fn test_stop_typing_thread_spawn_error_preserves_source_error() {
+        let err = stop_typing_thread_spawn_error(io::Error::from_raw_os_error(11));
+        let context = err
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<ThreadSpawnContext>())
+            .expect("thread spawn context should be preserved as the io::Error source");
+
+        assert_eq!(err.kind(), context.source.kind());
+        assert_eq!(context.thread_name, STOP_TYPING_THREAD_NAME);
+        assert_eq!(context.source.raw_os_error(), Some(11));
     }
 
     #[test]

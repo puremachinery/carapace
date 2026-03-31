@@ -593,10 +593,18 @@ impl WsServerState {
         Self::build_in_memory_with_activity_service_factory(config, activity_service_factory)
     }
 
-    fn new_persistent_unloaded(
+    fn build_persistent_unloaded_with_activity_service_factory<F>(
         config: WsServerConfig,
         state_dir: PathBuf,
-    ) -> Result<Self, WsConfigError> {
+        activity_service_factory: F,
+    ) -> Result<Self, WsConfigError>
+    where
+        F: FnOnce(PathBuf) -> io::Result<channels::activity::ActivityService>,
+    {
+        let activity_state_dir = state_dir.clone();
+        let activity_service = activity_service_factory(activity_state_dir)
+            .map_err(Self::map_activity_service_startup_error)?;
+
         let node_pairing = nodes::create_registry(state_dir.clone())?;
         let device_registry = devices::create_registry(state_dir.clone())?;
         let connection_tracker = limits::ConnectionTracker::with_limits(
@@ -646,14 +654,38 @@ impl WsServerState {
             llm_provider: parking_lot::RwLock::new(None),
             tools_registry: None,
             plugin_registry: None,
-            activity_service: Arc::new(
-                channels::activity::ActivityService::try_new_persistent(state_dir.clone())
-                    .map_err(Self::map_activity_service_startup_error)?,
-            ),
+            activity_service: Arc::new(activity_service),
             plugin_runtime: None,
             plugin_activation_report: None,
             connection_tracker,
         })
+    }
+
+    fn new_persistent_unloaded(
+        config: WsServerConfig,
+        state_dir: PathBuf,
+    ) -> Result<Self, WsConfigError> {
+        Self::build_persistent_unloaded_with_activity_service_factory(
+            config,
+            state_dir,
+            channels::activity::ActivityService::try_new_persistent,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_new_persistent_unloaded_with_activity_service_factory_for_test<F>(
+        config: WsServerConfig,
+        state_dir: PathBuf,
+        activity_service_factory: F,
+    ) -> Result<Self, WsConfigError>
+    where
+        F: FnOnce(PathBuf) -> io::Result<channels::activity::ActivityService>,
+    {
+        Self::build_persistent_unloaded_with_activity_service_factory(
+            config,
+            state_dir,
+            activity_service_factory,
+        )
     }
 
     /// Construct persistent WS server state, including async-safe task queue

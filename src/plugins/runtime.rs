@@ -31,6 +31,7 @@ use wasmtime::component::{Component, ComponentType, Lift, Linker, Lower};
 use wasmtime::{Config, Engine, ResourceLimiter, Store, StoreContextMut};
 
 use crate::credentials::{CredentialBackend, CredentialStore};
+use crate::thread_util::{spawn_named_thread, NamedThreadSpawner};
 
 use super::bindings::{
     BindingError, ChannelCapabilities, ChannelInfo, ChannelPluginInstance, ChatType,
@@ -68,17 +69,6 @@ pub const DEFAULT_FUEL_BUDGET: u64 = 1_000_000_000;
 /// Bounded queue depth for per-plugin worker requests.
 const PLUGIN_WORKER_QUEUE_CAPACITY: usize = 64;
 const EPOCH_TICKER_THREAD_NAME: &str = "plugin-epoch-ticker";
-
-type NamedThreadRoutine = Box<dyn FnOnce() + Send + 'static>;
-type NamedThreadSpawner =
-    fn(std::thread::Builder, NamedThreadRoutine) -> io::Result<std::thread::JoinHandle<()>>;
-
-fn spawn_named_thread(
-    builder: std::thread::Builder,
-    routine: NamedThreadRoutine,
-) -> io::Result<std::thread::JoinHandle<()>> {
-    builder.spawn(move || routine())
-}
 
 fn compute_epoch_deadline_ticks(timeout: Duration) -> u64 {
     let interval_ms = DEFAULT_EPOCH_TICK_INTERVAL.as_millis().max(1);
@@ -616,12 +606,6 @@ pub enum RuntimeError {
         #[source]
         source: io::Error,
     },
-}
-
-impl RuntimeError {
-    pub(crate) fn is_startup_thread_spawn(&self) -> bool {
-        matches!(self, Self::ThreadSpawn { .. })
-    }
 }
 
 /// State held in each plugin's wasmtime store
@@ -1856,7 +1840,7 @@ mod tests {
     fn test_epoch_ticker_start_reports_thread_spawn_error() {
         fn fail_spawner(
             _builder: std::thread::Builder,
-            routine: NamedThreadRoutine,
+            routine: crate::thread_util::NamedThreadRoutine,
         ) -> io::Result<std::thread::JoinHandle<()>> {
             drop(routine);
             Err(io::Error::other("simulated epoch ticker thread exhaustion"))

@@ -31,6 +31,7 @@ pub mod tailscale;
 pub mod tasks;
 #[cfg(test)]
 pub(crate) mod test_support;
+pub(crate) mod thread_util;
 pub(crate) mod time;
 pub mod tls;
 pub mod update;

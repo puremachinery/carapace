@@ -1,4 +1,5 @@
 use super::*;
+use tempfile::tempdir;
 
 #[test]
 fn test_try_new_reports_activity_service_startup_error() {
@@ -16,6 +17,29 @@ fn test_try_new_reports_activity_service_startup_error() {
         WsConfigError::Runtime(message) => {
             assert!(message.contains("failed to initialize activity service"));
             assert!(message.contains("simulated activity thread exhaustion"));
+        }
+        other => panic!("expected runtime startup error, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_try_new_persistent_unloaded_reports_activity_service_startup_error() {
+    let temp = tempdir().expect("tempdir");
+    let err = WsServerState::try_new_persistent_unloaded_with_activity_service_factory_for_test(
+        WsServerConfig::default(),
+        temp.path().to_path_buf(),
+        |_state_dir| {
+            Err(std::io::Error::other(
+                "simulated persistent activity thread exhaustion",
+            ))
+        },
+    )
+    .expect_err("persistent startup should report activity service initialization failure");
+
+    match err {
+        WsConfigError::Runtime(message) => {
+            assert!(message.contains("failed to initialize activity service"));
+            assert!(message.contains("simulated persistent activity thread exhaustion"));
         }
         other => panic!("expected runtime startup error, got {other:?}"),
     }
