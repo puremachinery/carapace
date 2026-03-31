@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::env;
+use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -511,13 +512,33 @@ impl std::fmt::Debug for WsServerState {
 
 impl WsServerState {
     pub fn new(config: WsServerConfig) -> Self {
+        Self::try_new(config).expect("failed to initialize in-memory websocket server state")
+    }
+
+    pub fn try_new(config: WsServerConfig) -> Result<Self, WsConfigError> {
+        Self::build_in_memory_with_activity_service_factory(config, || {
+            channels::activity::ActivityService::try_new()
+        })
+    }
+
+    fn map_activity_service_startup_error(err: io::Error) -> WsConfigError {
+        WsConfigError::Runtime(format!("failed to initialize activity service: {err}"))
+    }
+
+    fn build_in_memory_with_activity_service_factory<F>(
+        config: WsServerConfig,
+        activity_service_factory: F,
+    ) -> Result<Self, WsConfigError>
+    where
+        F: FnOnce() -> io::Result<channels::activity::ActivityService>,
+    {
         let connection_tracker = limits::ConnectionTracker::with_limits(
             config
                 .max_ws_connections
                 .unwrap_or(limits::DEFAULT_MAX_CONNECTIONS),
             config.max_ws_per_ip.unwrap_or(limits::DEFAULT_MAX_PER_IP),
         );
-        Self {
+        Ok(Self {
             config,
             start_time: Instant::now(),
             device_registry: Arc::new(devices::DevicePairingRegistry::in_memory()),
@@ -552,17 +573,34 @@ impl WsServerState {
             llm_provider: parking_lot::RwLock::new(None),
             tools_registry: None,
             plugin_registry: None,
-            activity_service: Arc::new(channels::activity::ActivityService::new()),
+            activity_service: Arc::new(
+                activity_service_factory().map_err(Self::map_activity_service_startup_error)?,
+            ),
             plugin_runtime: None,
             plugin_activation_report: None,
             connection_tracker,
-        }
+        })
     }
 
-    fn new_persistent_unloaded(
+    #[cfg(test)]
+    pub(crate) fn try_new_with_activity_service_factory_for_test<F>(
+        config: WsServerConfig,
+        activity_service_factory: F,
+    ) -> Result<Self, WsConfigError>
+    where
+        F: FnOnce() -> io::Result<channels::activity::ActivityService>,
+    {
+        Self::build_in_memory_with_activity_service_factory(config, activity_service_factory)
+    }
+
+    fn build_persistent_unloaded_with_activity_service_factory<F>(
         config: WsServerConfig,
         state_dir: PathBuf,
-    ) -> Result<Self, WsConfigError> {
+        activity_service_factory: F,
+    ) -> Result<Self, WsConfigError>
+    where
+        F: FnOnce(PathBuf) -> io::Result<channels::activity::ActivityService>,
+    {
         let node_pairing = nodes::create_registry(state_dir.clone())?;
         let device_registry = devices::create_registry(state_dir.clone())?;
         let connection_tracker = limits::ConnectionTracker::with_limits(
@@ -571,6 +609,9 @@ impl WsServerState {
                 .unwrap_or(limits::DEFAULT_MAX_CONNECTIONS),
             config.max_ws_per_ip.unwrap_or(limits::DEFAULT_MAX_PER_IP),
         );
+        let activity_state_dir = state_dir.clone();
+        let activity_service = activity_service_factory(activity_state_dir)
+            .map_err(Self::map_activity_service_startup_error)?;
         Ok(Self {
             config,
             start_time: Instant::now(),
@@ -612,13 +653,38 @@ impl WsServerState {
             llm_provider: parking_lot::RwLock::new(None),
             tools_registry: None,
             plugin_registry: None,
-            activity_service: Arc::new(channels::activity::ActivityService::new_persistent(
-                state_dir.clone(),
-            )),
+            activity_service: Arc::new(activity_service),
             plugin_runtime: None,
             plugin_activation_report: None,
             connection_tracker,
         })
+    }
+
+    fn new_persistent_unloaded(
+        config: WsServerConfig,
+        state_dir: PathBuf,
+    ) -> Result<Self, WsConfigError> {
+        Self::build_persistent_unloaded_with_activity_service_factory(
+            config,
+            state_dir,
+            channels::activity::ActivityService::try_new_persistent,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_new_persistent_unloaded_with_activity_service_factory_for_test<F>(
+        config: WsServerConfig,
+        state_dir: PathBuf,
+        activity_service_factory: F,
+    ) -> Result<Self, WsConfigError>
+    where
+        F: FnOnce(PathBuf) -> io::Result<channels::activity::ActivityService>,
+    {
+        Self::build_persistent_unloaded_with_activity_service_factory(
+            config,
+            state_dir,
+            activity_service_factory,
+        )
     }
 
     /// Construct persistent WS server state, including async-safe task queue
