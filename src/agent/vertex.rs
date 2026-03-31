@@ -626,13 +626,21 @@ pub async fn validate_vertex_setup(
         .await
         .map_err(|_| VertexSetupValidationError::Transport)?;
 
-    match response.status() {
+    classify_vertex_validation_probe_status(response.status())
+}
+
+fn classify_vertex_validation_probe_status(
+    status: StatusCode,
+) -> Result<(), VertexSetupValidationError> {
+    match status {
         status if status.is_success() => Ok(()),
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
             Err(VertexSetupValidationError::AccessDenied)
         }
         StatusCode::BAD_REQUEST => Err(VertexSetupValidationError::ProbeRejected),
         StatusCode::NOT_FOUND => Err(VertexSetupValidationError::Unavailable),
+        StatusCode::TOO_MANY_REQUESTS => Err(VertexSetupValidationError::Transport),
+        status if status.is_server_error() => Err(VertexSetupValidationError::Transport),
         _ => Err(VertexSetupValidationError::Rejected),
     }
 }
@@ -1158,6 +1166,30 @@ mod tests {
             err.to_string()
                 .contains("supports Google Gemini models only"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_classify_vertex_validation_probe_status() {
+        assert_eq!(
+            classify_vertex_validation_probe_status(StatusCode::TOO_MANY_REQUESTS),
+            Err(VertexSetupValidationError::Transport)
+        );
+        assert_eq!(
+            classify_vertex_validation_probe_status(StatusCode::SERVICE_UNAVAILABLE),
+            Err(VertexSetupValidationError::Transport)
+        );
+        assert_eq!(
+            classify_vertex_validation_probe_status(StatusCode::BAD_REQUEST),
+            Err(VertexSetupValidationError::ProbeRejected)
+        );
+        assert_eq!(
+            classify_vertex_validation_probe_status(StatusCode::NOT_FOUND),
+            Err(VertexSetupValidationError::Unavailable)
+        );
+        assert_eq!(
+            classify_vertex_validation_probe_status(StatusCode::UNPROCESSABLE_ENTITY),
+            Err(VertexSetupValidationError::Rejected)
         );
     }
 

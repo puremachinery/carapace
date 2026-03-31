@@ -5145,7 +5145,7 @@ fn vertex_validation_failure_remediation(
                 .to_string()
         }
         crate::agent::vertex::VertexSetupValidationError::Transport => {
-            "check network connectivity to Vertex AI and rerun `cara setup --force --provider vertex`"
+            "retry if Vertex AI is temporarily unavailable or rate limited; otherwise check network connectivity and rerun `cara setup --force --provider vertex`"
                 .to_string()
         }
     }
@@ -6742,14 +6742,14 @@ fn configure_vertex_provider_interactive(
             if configured.effective_value.is_none() {
                 print_missing_setup_value_notice("VERTEX_MODEL", "Vertex default model");
             }
-            Some(configured)
+            configured
         }
         crate::onboarding::vertex::VertexModelRoute::Explicit => {
             let explicit_model = prompt_vertex_explicit_model_id()?;
-            Some(SetupConfigValue {
+            SetupConfigValue {
                 config_value: explicit_model.clone(),
                 effective_value: Some(explicit_model),
-            })
+            }
         }
     };
 
@@ -6761,13 +6761,11 @@ fn configure_vertex_provider_interactive(
         project_id: project_id.config_value.clone(),
         location: location.config_value.clone(),
         route,
-        model: model.as_ref().map(|value| value.config_value.clone()),
+        model: Some(model.config_value.clone()),
     };
 
     let mut result = ProviderSetupResult::default();
-    let effective_model = model
-        .as_ref()
-        .and_then(|value| value.effective_value.clone());
+    let effective_model = model.effective_value.clone();
     let mut deferred_env_vars = Vec::new();
     if project_id.effective_value.is_none() {
         deferred_env_vars.push("`VERTEX_PROJECT_ID`");
@@ -6779,15 +6777,18 @@ fn configure_vertex_provider_interactive(
     }
 
     if deferred_env_vars.is_empty() {
+        // The location prompt defaults to `us-central1`, so setup always has a
+        // concrete location by the time live validation runs.
+        let effective_location = location
+            .effective_value
+            .clone()
+            .expect("Vertex location prompt should always resolve before validation");
         let validation_input = crate::onboarding::vertex::VertexSetupInput {
             project_id: project_id
                 .effective_value
                 .clone()
                 .expect("deferred Vertex project should be skipped before validation"),
-            location: location
-                .effective_value
-                .clone()
-                .expect("deferred Vertex location should be skipped before validation"),
+            location: effective_location,
             route,
             model: effective_model.clone(),
         };
