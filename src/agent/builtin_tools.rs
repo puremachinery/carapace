@@ -406,26 +406,9 @@ fn resolve_anthropic_media_key(cfg: &Value) -> Result<Option<String>, String> {
     store
         .load()
         .map_err(|err| format!("failed to load Anthropic auth profile store: {err}"))?;
-    let profile = store.get(profile_id).ok_or_else(|| {
-        format!("configured Anthropic auth profile \"{profile_id}\" was not found")
-    })?;
-    if profile.provider != crate::auth::profiles::OAuthProvider::Anthropic {
-        return Err(format!(
-            "configured Anthropic auth profile \"{profile_id}\" belongs to {}",
-            profile.provider
-        ));
-    }
-    if profile.credential_kind != crate::auth::profiles::AuthProfileCredentialKind::Token {
-        return Err(format!(
-            "configured Anthropic auth profile \"{profile_id}\" is not token-backed"
-        ));
-    }
-
-    profile.provider_token().map(|token| Some(token.to_string())).ok_or_else(|| {
-        format!(
-            "configured Anthropic auth profile \"{profile_id}\" has no usable token; check CARAPACE_CONFIG_PASSWORD and the stored profile"
-        )
-    })
+    crate::auth::profiles::resolve_anthropic_profile_token(&store, profile_id)
+        .map(Some)
+        .map_err(|err| format!("{err}; check CARAPACE_CONFIG_PASSWORD and the stored profile"))
 }
 
 fn resolve_anthropic_base_url(cfg: &Value) -> Option<String> {
@@ -1579,8 +1562,13 @@ mod tests {
             temp.path().to_str().expect("state dir path"),
         );
 
-        let store = ProfileStore::with_encryption(temp.path().to_path_buf(), b"correct-password")
-            .expect("encrypted profile store");
+        let correct_password = format!(
+            "builtin-tools-test-password-{}",
+            crate::time::unix_now_ms_u64()
+        );
+        let store =
+            ProfileStore::with_encryption(temp.path().to_path_buf(), correct_password.as_bytes())
+                .expect("encrypted profile store");
         store
             .add(AuthProfile {
                 id: "anthropic:default".to_string(),
@@ -1599,7 +1587,11 @@ mod tests {
             })
             .expect("store profile");
 
-        let _password = set_env_var_scoped("CARAPACE_CONFIG_PASSWORD", "wrong-password");
+        let wrong_password = format!(
+            "builtin-tools-test-wrong-password-{}",
+            crate::time::unix_now_ms_u64()
+        );
+        let _password = set_env_var_scoped("CARAPACE_CONFIG_PASSWORD", &wrong_password);
         let cfg = json!({
             "anthropic": { "authProfile": "anthropic:default" }
         });

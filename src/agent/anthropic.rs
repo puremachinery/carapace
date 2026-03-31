@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::provider::*;
 use crate::agent::AgentError;
-use crate::auth::profiles::{AuthProfileCredentialKind, OAuthProvider, ProfileStore};
+use crate::auth::profiles::{resolve_anthropic_profile_token, ProfileStore};
 
 enum AnthropicAuth {
     ApiKey(String),
@@ -193,29 +193,10 @@ impl AnthropicProvider {
                 profile_store,
                 profile_id,
             } => {
-                let profile = profile_store.get(profile_id).ok_or_else(|| {
-                    AgentError::Provider(format!(
-                        "configured Anthropic auth profile \"{profile_id}\" was not found"
-                    ))
-                })?;
-                if profile.provider != OAuthProvider::Anthropic {
-                    return Err(AgentError::Provider(format!(
-                        "configured Anthropic auth profile \"{profile_id}\" belongs to {}",
-                        profile.provider
-                    )));
-                }
-                if profile.credential_kind != AuthProfileCredentialKind::Token {
-                    return Err(AgentError::Provider(format!(
-                        "configured Anthropic auth profile \"{profile_id}\" is not token-backed"
-                    )));
-                }
-                let token = profile.provider_token().ok_or_else(|| {
-                    AgentError::Provider(format!(
-                        "configured Anthropic auth profile \"{profile_id}\" has no usable token"
-                    ))
-                })?;
+                let token = resolve_anthropic_profile_token(profile_store, profile_id)
+                    .map_err(AgentError::Provider)?;
                 profile_store.update_last_used(profile_id);
-                Ok(token.to_string())
+                Ok(token)
             }
         }
     }

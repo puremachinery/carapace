@@ -1248,6 +1248,29 @@ pub fn profile_store_encryption_enabled_from_env() -> bool {
         .unwrap_or(false)
 }
 
+pub fn resolve_anthropic_profile_token(
+    profile_store: &ProfileStore,
+    profile_id: &str,
+) -> Result<String, String> {
+    let profile = profile_store.get(profile_id).ok_or_else(|| {
+        format!("configured Anthropic auth profile \"{profile_id}\" was not found")
+    })?;
+    if profile.provider != OAuthProvider::Anthropic {
+        return Err(format!(
+            "configured Anthropic auth profile \"{profile_id}\" belongs to {}",
+            profile.provider
+        ));
+    }
+    if profile.credential_kind != AuthProfileCredentialKind::Token {
+        return Err(format!(
+            "configured Anthropic auth profile \"{profile_id}\" is not token-backed"
+        ));
+    }
+    profile.provider_token().map(str::to_string).ok_or_else(|| {
+        format!("configured Anthropic auth profile \"{profile_id}\" has no usable token")
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Config integration
 // ---------------------------------------------------------------------------

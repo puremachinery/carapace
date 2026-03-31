@@ -13,8 +13,8 @@ use tracing::{info, warn};
 use crate::agent;
 use crate::agent::provider::MultiProvider;
 use crate::auth::profiles::{
-    profile_store_encryption_enabled_from_env, AuthProfileCredentialKind, OAuthProvider,
-    ProfileStore,
+    profile_store_encryption_enabled_from_env, resolve_anthropic_profile_token,
+    AuthProfileCredentialKind, OAuthProvider, ProfileStore,
 };
 
 fn resolve_anthropic_auth_profile_id(cfg: &Value) -> Option<String> {
@@ -284,41 +284,16 @@ fn build_anthropic_provider(
     };
 
     if !profile_store_encryption_enabled_from_env() {
-        warn!(
-            "Anthropic auth profile requires CARAPACE_CONFIG_PASSWORD so setup-token credentials stay encrypted at rest"
-        );
-        return Ok(None);
+        return Err(std::io::Error::other(
+            "Anthropic auth profile requires CARAPACE_CONFIG_PASSWORD so setup-token credentials stay encrypted at rest",
+        )
+        .into());
     }
 
     let state_dir = crate::paths::resolve_state_dir();
     let profile_store = ProfileStore::from_env(state_dir)?;
     profile_store.load()?;
-    let profile = profile_store.get(&profile_id);
-    let Some(profile) = profile else {
-        warn!("Anthropic auth profile \"{}\" was not found", profile_id);
-        return Ok(None);
-    };
-    if profile.provider != OAuthProvider::Anthropic {
-        return Err(std::io::Error::other(format!(
-            "Anthropic auth profile \"{}\" belongs to {}, not anthropic",
-            profile_id, profile.provider
-        ))
-        .into());
-    }
-    if profile.credential_kind != AuthProfileCredentialKind::Token {
-        return Err(std::io::Error::other(format!(
-            "Anthropic auth profile \"{}\" is not token-backed",
-            profile_id
-        ))
-        .into());
-    }
-    if profile.provider_token().is_none() {
-        return Err(std::io::Error::other(format!(
-            "Anthropic auth profile \"{}\" has no usable token",
-            profile_id
-        ))
-        .into());
-    }
+    resolve_anthropic_profile_token(&profile_store, &profile_id).map_err(std::io::Error::other)?;
 
     let mut provider = agent::anthropic::AnthropicProvider::with_auth_profile_token(
         Arc::new(profile_store),
@@ -1514,6 +1489,41 @@ mod tests {
             });
             let err = build_providers(&cfg).expect_err("missing token should fail fast");
             assert!(err.to_string().contains("has no usable token"));
+        });
+    }
+
+    #[test]
+    fn test_build_providers_rejects_anthropic_auth_profile_without_password() {
+        with_clean_provider_env(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let _state_dir = set_env_var_scoped(
+                "CARAPACE_STATE_DIR",
+                temp.path().to_str().expect("state dir path"),
+            );
+
+            let profile = crate::auth::profiles::AuthProfile {
+                id: "anthropic:default".to_string(),
+                name: "Anthropic setup token".to_string(),
+                provider: OAuthProvider::Anthropic,
+                user_id: None,
+                email: None,
+                display_name: None,
+                avatar_url: None,
+                created_at_ms: 0,
+                last_used_ms: None,
+                credential_kind: AuthProfileCredentialKind::Token,
+                tokens: None,
+                token: Some("sk-ant-oat01-test-token".to_string()),
+                oauth_provider_config: None,
+            };
+            let store = ProfileStore::new(temp.path().to_path_buf());
+            store.add(profile).expect("store profile");
+
+            let cfg = json!({
+                "anthropic": { "authProfile": "anthropic:default" }
+            });
+            let err = build_providers(&cfg).expect_err("missing password should fail fast");
+            assert!(err.to_string().contains("CARAPACE_CONFIG_PASSWORD"));
         });
     }
 
