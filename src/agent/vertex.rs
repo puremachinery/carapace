@@ -630,7 +630,9 @@ pub async fn validate_vertex_setup(
         .await
         .map_err(|_| VertexSetupValidationError::Transport)?;
     let status = response.status();
-    let _ = response.bytes().await;
+    if let Err(err) = response.bytes().await {
+        debug!("failed to drain Vertex validation probe response body: {err}");
+    }
 
     classify_vertex_validation_probe_status(status)
 }

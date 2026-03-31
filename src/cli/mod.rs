@@ -10808,6 +10808,21 @@ mod tests {
     }
 
     #[test]
+    fn test_local_chat_verify_next_step_for_vertex_explicit_route() {
+        let cfg = serde_json::json!({
+            "vertex": {
+                "projectId": "my-project",
+                "location": "us-central1"
+            },
+            "agents": { "defaults": { "model": "vertex:gemini-2.5-flash" } }
+        });
+        assert_eq!(
+            local_chat_verify_next_step(&cfg),
+            "check Vertex auth, project, location, and selected model, then retry `cara verify --outcome local-chat`"
+        );
+    }
+
+    #[test]
     fn test_local_chat_verify_next_step_for_vertex_default_alias_missing_model() {
         let mut env_guard = ScopedEnv::new();
         env_guard.unset("VERTEX_MODEL");
@@ -10940,6 +10955,27 @@ mod tests {
         });
 
         assert_eq!(usable_provider_labels(&cfg), vec!["OpenAI"]);
+    }
+
+    #[test]
+    fn test_usable_provider_labels_include_vertex_for_explicit_route() {
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("VERTEX_PROJECT_ID");
+        env_guard.unset("VERTEX_LOCATION");
+        env_guard.unset("VERTEX_MODEL");
+        let cfg = serde_json::json!({
+            "vertex": {
+                "projectId": "my-project",
+                "location": "us-central1"
+            },
+            "agents": {
+                "defaults": {
+                    "model": "vertex:gemini-2.5-flash"
+                }
+            }
+        });
+
+        assert_eq!(usable_provider_labels(&cfg), vec!["Vertex"]);
     }
 
     #[test]
