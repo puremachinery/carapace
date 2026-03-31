@@ -30,6 +30,7 @@ pub enum VertexSetupValidationError {
     ProbeRejected,
     Unavailable,
     Rejected,
+    RateLimited,
     Transport,
 }
 
@@ -60,6 +61,7 @@ impl std::fmt::Display for VertexSetupValidationError {
                 "Vertex could not find the configured project, location, or model."
             }
             Self::Rejected => "Vertex rejected the configuration.",
+            Self::RateLimited => "Vertex validation is being rate limited.",
             Self::Transport => "Vertex validation could not reach the provider.",
         };
         write!(f, "{message}")
@@ -639,7 +641,7 @@ fn classify_vertex_validation_probe_status(
         }
         StatusCode::BAD_REQUEST => Err(VertexSetupValidationError::ProbeRejected),
         StatusCode::NOT_FOUND => Err(VertexSetupValidationError::Unavailable),
-        StatusCode::TOO_MANY_REQUESTS => Err(VertexSetupValidationError::Transport),
+        StatusCode::TOO_MANY_REQUESTS => Err(VertexSetupValidationError::RateLimited),
         status if status.is_server_error() => Err(VertexSetupValidationError::Transport),
         _ => Err(VertexSetupValidationError::Rejected),
     }
@@ -1173,7 +1175,7 @@ mod tests {
     fn test_classify_vertex_validation_probe_status() {
         assert_eq!(
             classify_vertex_validation_probe_status(StatusCode::TOO_MANY_REQUESTS),
-            Err(VertexSetupValidationError::Transport)
+            Err(VertexSetupValidationError::RateLimited)
         );
         assert_eq!(
             classify_vertex_validation_probe_status(StatusCode::SERVICE_UNAVAILABLE),

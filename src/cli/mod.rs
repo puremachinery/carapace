@@ -5144,8 +5144,12 @@ fn vertex_validation_failure_remediation(
             "check the Vertex project, location, model, and provider access, then rerun `cara setup --force --provider vertex`"
                 .to_string()
         }
+        crate::agent::vertex::VertexSetupValidationError::RateLimited => {
+            "retry after the current Vertex AI rate limit window, then rerun `cara setup --force --provider vertex`"
+                .to_string()
+        }
         crate::agent::vertex::VertexSetupValidationError::Transport => {
-            "retry if Vertex AI is temporarily unavailable or rate limited; otherwise check network connectivity and rerun `cara setup --force --provider vertex`"
+            "retry if Vertex AI is temporarily unavailable; otherwise check network connectivity and rerun `cara setup --force --provider vertex`"
                 .to_string()
         }
     }
@@ -6777,12 +6781,13 @@ fn configure_vertex_provider_interactive(
     }
 
     if deferred_env_vars.is_empty() {
-        // The location prompt defaults to `us-central1`, so setup always has a
-        // concrete location by the time live validation runs.
-        let effective_location = location
-            .effective_value
-            .clone()
-            .expect("Vertex location prompt should always resolve before validation");
+        // The location prompt defaults to `us-central1`, so setup should always
+        // have a concrete location before live validation runs.
+        let effective_location = location.effective_value.clone().ok_or_else(|| {
+            std::io::Error::other(
+                "Vertex location prompt must produce a concrete value before validation",
+            )
+        })?;
         let validation_input = crate::onboarding::vertex::VertexSetupInput {
             project_id: project_id
                 .effective_value
@@ -11623,6 +11628,16 @@ mod tests {
                 &crate::agent::vertex::VertexSetupValidationError::ProbeRejected
             ),
             "check the Vertex project, location, and model values; if they look correct, this may indicate a malformed Vertex validation request in Carapace"
+        );
+    }
+
+    #[test]
+    fn test_vertex_validation_failure_remediation_mentions_retry_for_rate_limited() {
+        assert_eq!(
+            vertex_validation_failure_remediation(
+                &crate::agent::vertex::VertexSetupValidationError::RateLimited
+            ),
+            "retry after the current Vertex AI rate limit window, then rerun `cara setup --force --provider vertex`"
         );
     }
 
