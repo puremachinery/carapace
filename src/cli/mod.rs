@@ -5132,6 +5132,10 @@ fn vertex_validation_failure_remediation(
             "check Vertex IAM/API access for the configured project, location, and model, then rerun `cara setup --force --provider vertex`"
                 .to_string()
         }
+        crate::agent::vertex::VertexSetupValidationError::ProbeRejected => {
+            "check the Vertex project, location, and model values; if they look correct, this may indicate a malformed Vertex validation request in Carapace"
+                .to_string()
+        }
         crate::agent::vertex::VertexSetupValidationError::Unavailable => {
             "check the Vertex project ID, location, and model name, then rerun `cara setup --force --provider vertex`"
                 .to_string()
@@ -6768,9 +6772,6 @@ fn configure_vertex_provider_interactive(
     if project_id.effective_value.is_none() {
         deferred_env_vars.push("`VERTEX_PROJECT_ID`");
     }
-    if location.effective_value.is_none() {
-        deferred_env_vars.push("`VERTEX_LOCATION`");
-    }
     if matches!(route, crate::onboarding::vertex::VertexModelRoute::Default)
         && effective_model.is_none()
     {
@@ -7095,7 +7096,7 @@ fn configure_provider_interactive(
         }
     }
 
-    if !matches!(provider, SetupProvider::Gemini | SetupProvider::Vertex) {
+    if provider != SetupProvider::Vertex {
         config["agents"]["defaults"]["model"] = serde_json::json!(provider.default_model());
     }
 
@@ -11612,6 +11613,43 @@ mod tests {
         );
         assert!(!rendered.contains("secret"));
         assert!(!rendered.contains("example.com"));
+    }
+
+    #[test]
+    fn test_vertex_validation_failure_remediation_mentions_validation_request_for_probe_rejected() {
+        assert_eq!(
+            vertex_validation_failure_remediation(
+                &crate::agent::vertex::VertexSetupValidationError::ProbeRejected
+            ),
+            "check the Vertex project, location, and model values; if they look correct, this may indicate a malformed Vertex validation request in Carapace"
+        );
+    }
+
+    #[test]
+    fn test_configure_provider_interactive_gemini_api_key_sets_default_model() {
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset("GOOGLE_API_KEY");
+        env_guard.unset("GOOGLE_API_BASE_URL");
+        let _guard = install_setup_interactive_harness(SetupInteractiveTestHarness {
+            visible_inputs: VecDeque::from(vec!["n".to_string(), "AIza-test-key".to_string()]),
+            ..Default::default()
+        });
+        let mut config = serde_json::json!({});
+
+        let result = configure_provider_interactive(
+            &mut config,
+            SetupProvider::Gemini,
+            false,
+            Some(GeminiSetupAuthMode::ApiKey),
+        )
+        .expect("interactive Gemini setup");
+
+        assert!(result.observed_checks.is_empty());
+        assert_eq!(config["google"]["apiKey"], "AIza-test-key");
+        assert_eq!(config["agents"]["defaults"]["model"], "gemini-2.0-flash");
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.provider_validation_calls, 0);
+        assert!(state.visible_inputs.is_empty());
     }
 
     #[test]

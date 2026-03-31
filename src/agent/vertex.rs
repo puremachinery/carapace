@@ -27,6 +27,7 @@ pub enum VertexSetupValidationError {
     ClientInit,
     AuthUnavailable,
     AccessDenied,
+    ProbeRejected,
     Unavailable,
     Rejected,
     Transport,
@@ -51,6 +52,9 @@ impl std::fmt::Display for VertexSetupValidationError {
             }
             Self::AccessDenied => {
                 "Vertex rejected access to the configured project, location, or model."
+            }
+            Self::ProbeRejected => {
+                "Vertex rejected the validation request before model lookup completed."
             }
             Self::Unavailable => {
                 "Vertex could not find the configured project, location, or model."
@@ -627,9 +631,8 @@ pub async fn validate_vertex_setup(
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
             Err(VertexSetupValidationError::AccessDenied)
         }
-        StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND => {
-            Err(VertexSetupValidationError::Unavailable)
-        }
+        StatusCode::BAD_REQUEST => Err(VertexSetupValidationError::ProbeRejected),
+        StatusCode::NOT_FOUND => Err(VertexSetupValidationError::Unavailable),
         _ => Err(VertexSetupValidationError::Rejected),
     }
 }
