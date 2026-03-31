@@ -1,4 +1,6 @@
 use super::*;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tempfile::tempdir;
 
 #[test]
@@ -43,6 +45,41 @@ fn test_try_new_persistent_unloaded_reports_activity_service_startup_error() {
         }
         other => panic!("expected runtime startup error, got {other:?}"),
     }
+}
+
+#[test]
+fn test_try_new_persistent_unloaded_builds_registries_before_activity_service() {
+    let temp = tempdir().expect("tempdir");
+    let invalid_state_dir = temp.path().join("state");
+    std::fs::create_dir_all(&invalid_state_dir).expect("create state dir");
+    std::fs::write(
+        invalid_state_dir.join("node-pairing.json"),
+        "{not valid json",
+    )
+    .expect("write invalid node pairing state");
+    let activity_factory_called = Arc::new(AtomicBool::new(false));
+    let activity_factory_called_for_closure = Arc::clone(&activity_factory_called);
+
+    let err = WsServerState::try_new_persistent_unloaded_with_activity_service_factory_for_test(
+        WsServerConfig::default(),
+        invalid_state_dir,
+        move |_state_dir| {
+            activity_factory_called_for_closure.store(true, Ordering::SeqCst);
+            Err(std::io::Error::other(
+                "activity service factory should not run before registry setup",
+            ))
+        },
+    )
+    .expect_err("persistent startup should fail on registry initialization first");
+
+    assert!(
+        matches!(err, WsConfigError::Nodes(_)),
+        "expected node registry initialization failure, got {err:?}"
+    );
+    assert!(
+        !activity_factory_called.load(Ordering::SeqCst),
+        "activity service factory should not run when persistent registry initialization fails"
+    );
 }
 
 #[test]

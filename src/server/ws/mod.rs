@@ -601,10 +601,6 @@ impl WsServerState {
     where
         F: FnOnce(PathBuf) -> io::Result<channels::activity::ActivityService>,
     {
-        let activity_state_dir = state_dir.clone();
-        let activity_service = activity_service_factory(activity_state_dir)
-            .map_err(Self::map_activity_service_startup_error)?;
-
         let node_pairing = nodes::create_registry(state_dir.clone())?;
         let device_registry = devices::create_registry(state_dir.clone())?;
         let connection_tracker = limits::ConnectionTracker::with_limits(
@@ -613,6 +609,9 @@ impl WsServerState {
                 .unwrap_or(limits::DEFAULT_MAX_CONNECTIONS),
             config.max_ws_per_ip.unwrap_or(limits::DEFAULT_MAX_PER_IP),
         );
+        let activity_state_dir = state_dir.clone();
+        let activity_service = activity_service_factory(activity_state_dir)
+            .map_err(Self::map_activity_service_startup_error)?;
         Ok(Self {
             config,
             start_time: Instant::now(),
