@@ -62,8 +62,8 @@ impl CodexProvider {
         })?;
         let now_ms = current_time_ms();
         if profile
-            .tokens
-            .expires_at_ms
+            .oauth_tokens()
+            .and_then(|tokens| tokens.expires_at_ms)
             .is_some_and(|expires_at| expires_at <= now_ms + TOKEN_REFRESH_MARGIN_MS)
         {
             let _refresh_guard = self.refresh_lock.lock().await;
@@ -75,16 +75,15 @@ impl CodexProvider {
             })?;
             let now_ms_after_lock = current_time_ms();
             if locked_profile
-                .tokens
-                .expires_at_ms
+                .oauth_tokens()
+                .and_then(|tokens| tokens.expires_at_ms)
                 .is_none_or(|expires_at| expires_at > now_ms_after_lock + TOKEN_REFRESH_MARGIN_MS)
             {
                 profile = locked_profile;
             } else {
                 let refresh_token_value = locked_profile
-                    .tokens
-                    .refresh_token
-                    .clone()
+                    .oauth_tokens()
+                    .and_then(|tokens| tokens.refresh_token.clone())
                     .filter(|token| !token.trim().is_empty())
                     .ok_or_else(|| {
                         AgentError::Provider(format!(
@@ -113,11 +112,14 @@ impl CodexProvider {
                 // `last_used_ms` by ID afterwards, so there is no need to
                 // re-fetch unrelated profile fields here.
                 profile = locked_profile;
-                profile.tokens = refreshed;
+                profile.tokens = Some(refreshed);
             }
         }
 
-        let access_token = profile.tokens.access_token.trim();
+        let access_token = profile
+            .oauth_tokens()
+            .map(|tokens| tokens.access_token.trim())
+            .unwrap_or("");
         if access_token.is_empty() {
             return Err(AgentError::Provider(format!(
                 "Codex auth profile \"{}\" has no usable access token",
@@ -179,7 +181,8 @@ fn current_time_ms() -> u64 {
 mod tests {
     use super::*;
     use crate::auth::profiles::{
-        AuthProfile, OAuthProvider, OAuthTokens, StoredOAuthProviderConfig,
+        AuthProfile, AuthProfileCredentialKind, OAuthProvider, OAuthTokens,
+        StoredOAuthProviderConfig,
     };
 
     fn sample_tokens() -> OAuthTokens {
@@ -208,7 +211,9 @@ mod tests {
             avatar_url: None,
             created_at_ms: current_time_ms(),
             last_used_ms: Some(current_time_ms()),
-            tokens: sample_tokens(),
+            credential_kind: AuthProfileCredentialKind::OAuth,
+            tokens: Some(sample_tokens()),
+            token: None,
             oauth_provider_config: Some(StoredOAuthProviderConfig::from(&provider_config)),
         }
     }
@@ -281,10 +286,10 @@ mod tests {
             "http://127.0.0.1:3000/auth/callback",
         );
         let profile = AuthProfile {
-            tokens: OAuthTokens {
+            tokens: Some(OAuthTokens {
                 access_token: "   ".to_string(),
                 ..sample_tokens()
-            },
+            }),
             ..sample_profile("openai-empty-token")
         };
         let store = Arc::new(ProfileStore::from_env(temp.path().to_path_buf()).expect("store"));

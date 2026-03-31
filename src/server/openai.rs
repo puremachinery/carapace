@@ -638,7 +638,7 @@ pub async fn chat_completions_handler(
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(OpenAiError::api_error(
-                    "No LLM provider configured. Set ANTHROPIC_API_KEY to enable.",
+                    "No LLM provider configured. Set ANTHROPIC_API_KEY or anthropic.authProfile to enable.",
                 )),
             )
                 .into_response();
@@ -997,7 +997,7 @@ pub async fn responses_handler(
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(OpenAiError::api_error(
-                    "No LLM provider configured. Set ANTHROPIC_API_KEY to enable.",
+                    "No LLM provider configured. Set ANTHROPIC_API_KEY or anthropic.authProfile to enable.",
                 )),
             )
                 .into_response();

@@ -6,18 +6,48 @@
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::provider::*;
 use crate::agent::AgentError;
+use crate::auth::profiles::{AuthProfileCredentialKind, OAuthProvider, ProfileStore};
+
+enum AnthropicAuth {
+    ApiKey(String),
+    AuthProfileToken {
+        profile_store: Arc<ProfileStore>,
+        profile_id: String,
+    },
+}
+
+impl std::fmt::Debug for AnthropicAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ApiKey(_) => f.debug_tuple("ApiKey").field(&"<redacted>").finish(),
+            Self::AuthProfileToken { profile_id, .. } => f
+                .debug_struct("AuthProfileToken")
+                .field("profile_id", profile_id)
+                .finish_non_exhaustive(),
+        }
+    }
+}
 
 /// Anthropic Messages API provider.
-#[derive(Debug)]
 pub struct AnthropicProvider {
     client: reqwest::Client,
-    api_key: String,
+    auth: AnthropicAuth,
     base_url: String,
+}
+
+impl std::fmt::Debug for AnthropicProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AnthropicProvider")
+            .field("auth", &self.auth)
+            .field("base_url", &self.base_url)
+            .finish()
+    }
 }
 
 impl AnthropicProvider {
@@ -34,7 +64,31 @@ impl AnthropicProvider {
             .map_err(|e| AgentError::Provider(format!("failed to build HTTP client: {e}")))?;
         Ok(Self {
             client,
-            api_key,
+            auth: AnthropicAuth::ApiKey(api_key),
+            base_url: "https://api.anthropic.com".to_string(),
+        })
+    }
+
+    pub fn with_auth_profile_token(
+        profile_store: Arc<ProfileStore>,
+        profile_id: String,
+    ) -> Result<Self, AgentError> {
+        if profile_id.trim().is_empty() {
+            return Err(AgentError::Provider(
+                "Anthropic auth profile ID must not be empty".to_string(),
+            ));
+        }
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(300))
+            .build()
+            .map_err(|e| AgentError::Provider(format!("failed to build HTTP client: {e}")))?;
+        Ok(Self {
+            client,
+            auth: AnthropicAuth::AuthProfileToken {
+                profile_store,
+                profile_id,
+            },
             base_url: "https://api.anthropic.com".to_string(),
         })
     }
@@ -131,6 +185,40 @@ impl AnthropicProvider {
 
         body
     }
+
+    async fn api_key(&self) -> Result<String, AgentError> {
+        match &self.auth {
+            AnthropicAuth::ApiKey(api_key) => Ok(api_key.clone()),
+            AnthropicAuth::AuthProfileToken {
+                profile_store,
+                profile_id,
+            } => {
+                let profile = profile_store.get(profile_id).ok_or_else(|| {
+                    AgentError::Provider(format!(
+                        "configured Anthropic auth profile \"{profile_id}\" was not found"
+                    ))
+                })?;
+                if profile.provider != OAuthProvider::Anthropic {
+                    return Err(AgentError::Provider(format!(
+                        "configured Anthropic auth profile \"{profile_id}\" belongs to {}",
+                        profile.provider
+                    )));
+                }
+                if profile.credential_kind != AuthProfileCredentialKind::Token {
+                    return Err(AgentError::Provider(format!(
+                        "configured Anthropic auth profile \"{profile_id}\" is not token-backed"
+                    )));
+                }
+                let token = profile.provider_token().ok_or_else(|| {
+                    AgentError::Provider(format!(
+                        "configured Anthropic auth profile \"{profile_id}\" has no usable token"
+                    ))
+                })?;
+                profile_store.update_last_used(profile_id);
+                Ok(token.to_string())
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -145,6 +233,7 @@ impl LlmProvider for AnthropicProvider {
         }
         let body = self.build_body(&request);
         let url = format!("{}/v1/messages", self.base_url);
+        let api_key = self.api_key().await?;
 
         let response = tokio::select! {
             _ = cancel_token.cancelled() => {
@@ -153,7 +242,7 @@ impl LlmProvider for AnthropicProvider {
             response = self
                 .client
                 .post(&url)
-                .header("x-api-key", &self.api_key)
+                .header("x-api-key", api_key)
                 .header("anthropic-version", "2023-06-01")
                 .header("content-type", "application/json")
                 .header("accept", "text/event-stream")
@@ -410,6 +499,10 @@ fn handle_content_block_stop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::profiles::{
+        AuthProfile, AuthProfileCredentialKind, OAuthProvider, ProfileStore,
+    };
+    use std::sync::Arc;
 
     #[test]
     fn test_build_body_basic() {
@@ -616,6 +709,76 @@ mod tests {
     fn test_new_accepts_valid_api_key() {
         let result = AnthropicProvider::new("sk-ant-valid-key".to_string());
         assert!(result.is_ok(), "expected valid API key to pass");
+    }
+
+    #[tokio::test]
+    async fn test_with_auth_profile_token_uses_stored_token() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ProfileStore::new(temp.path().to_path_buf());
+        store
+            .add(AuthProfile {
+                id: "anthropic:default".to_string(),
+                name: "Anthropic setup token".to_string(),
+                provider: OAuthProvider::Anthropic,
+                user_id: None,
+                email: None,
+                display_name: None,
+                avatar_url: None,
+                created_at_ms: 1,
+                last_used_ms: None,
+                credential_kind: AuthProfileCredentialKind::Token,
+                tokens: None,
+                token: Some("sk-ant-oat01-test-token".to_string()),
+                oauth_provider_config: None,
+            })
+            .expect("store profile");
+
+        let provider = AnthropicProvider::with_auth_profile_token(
+            Arc::new(store),
+            "anthropic:default".to_string(),
+        )
+        .expect("provider");
+
+        let token = provider.api_key().await.expect("token");
+        assert_eq!(token, "sk-ant-oat01-test-token");
+    }
+
+    #[tokio::test]
+    async fn test_with_auth_profile_token_rejects_wrong_credential_kind() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ProfileStore::new(temp.path().to_path_buf());
+        store
+            .add(AuthProfile {
+                id: "anthropic:default".to_string(),
+                name: "Wrong profile".to_string(),
+                provider: OAuthProvider::Anthropic,
+                user_id: None,
+                email: None,
+                display_name: None,
+                avatar_url: None,
+                created_at_ms: 1,
+                last_used_ms: None,
+                credential_kind: AuthProfileCredentialKind::OAuth,
+                tokens: Some(crate::auth::profiles::OAuthTokens {
+                    access_token: "oauth-access".to_string(),
+                    refresh_token: None,
+                    token_type: "Bearer".to_string(),
+                    expires_at_ms: None,
+                    scope: None,
+                }),
+                token: None,
+                oauth_provider_config: None,
+            })
+            .expect("store profile");
+
+        let provider = AnthropicProvider::with_auth_profile_token(
+            Arc::new(store),
+            "anthropic:default".to_string(),
+        )
+        .expect("provider");
+
+        let err = provider.api_key().await.expect_err("wrong credential kind");
+        assert!(err.to_string().contains("not token-backed"));
     }
 
     #[test]

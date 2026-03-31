@@ -1,8 +1,8 @@
-//! OAuth2 authentication profiles
+//! Auth profile storage and OAuth helpers.
 //!
-//! Multi-provider OAuth2 authentication supporting Google, GitHub, and Discord.
-//! Each profile stores OAuth2 tokens, supports token refresh, and can be managed
-//! via WS methods. Profiles are persisted to disk as JSON.
+//! Auth profiles persist provider credentials for runtime use. Some providers
+//! are OAuth-backed and store refreshable token sets plus provider config;
+//! others store direct provider tokens. Profiles are persisted to disk as JSON.
 
 use base64::Engine as _;
 use parking_lot::RwLock;
@@ -42,6 +42,7 @@ pub enum AuthProfileError {
     TokenExchangeFailed(String),
     TokenRefreshFailed(String),
     UserInfoFailed(String),
+    CredentialTypeMismatch(String),
     ProfileNotFound,
     MaxProfilesExceeded,
     IoError(String),
@@ -58,6 +59,7 @@ impl fmt::Display for AuthProfileError {
             Self::TokenExchangeFailed(msg) => write!(f, "Token exchange failed: {}", msg),
             Self::TokenRefreshFailed(msg) => write!(f, "Token refresh failed: {}", msg),
             Self::UserInfoFailed(msg) => write!(f, "User info fetch failed: {}", msg),
+            Self::CredentialTypeMismatch(msg) => write!(f, "Credential type mismatch: {}", msg),
             Self::ProfileNotFound => write!(f, "Profile not found"),
             Self::MaxProfilesExceeded => {
                 write!(f, "Maximum number of profiles ({}) exceeded", MAX_PROFILES)
@@ -77,10 +79,11 @@ impl std::error::Error for AuthProfileError {}
 // Data structures
 // ---------------------------------------------------------------------------
 
-/// Supported OAuth providers.
+/// Supported auth-profile providers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OAuthProvider {
+    Anthropic,
     Google,
     GitHub,
     Discord,
@@ -90,10 +93,29 @@ pub enum OAuthProvider {
 impl fmt::Display for OAuthProvider {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Anthropic => write!(f, "anthropic"),
             Self::Google => write!(f, "google"),
             Self::GitHub => write!(f, "github"),
             Self::Discord => write!(f, "discord"),
             Self::OpenAI => write!(f, "openai"),
+        }
+    }
+}
+
+/// Stored credential kind for an auth profile.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AuthProfileCredentialKind {
+    #[default]
+    OAuth,
+    Token,
+}
+
+impl fmt::Display for AuthProfileCredentialKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OAuth => write!(f, "oauth"),
+            Self::Token => write!(f, "token"),
         }
     }
 }
@@ -164,7 +186,12 @@ pub struct AuthProfile {
     pub avatar_url: Option<String>,
     pub created_at_ms: u64,
     pub last_used_ms: Option<u64>,
-    pub tokens: OAuthTokens,
+    #[serde(default)]
+    pub credential_kind: AuthProfileCredentialKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<OAuthTokens>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth_provider_config: Option<StoredOAuthProviderConfig>,
 }
@@ -175,6 +202,7 @@ pub struct AuthProfileSummary {
     pub id: String,
     pub name: String,
     pub provider: OAuthProvider,
+    pub credential_kind: AuthProfileCredentialKind,
     pub email: Option<String>,
     pub display_name: Option<String>,
     pub avatar_url: Option<String>,
@@ -191,21 +219,71 @@ impl AuthProfile {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
 
-        let token_valid = match self.tokens.expires_at_ms {
-            Some(expires) => now_ms < expires,
-            None => true, // No expiry means we assume valid
-        };
+        let token_valid = self.token_valid_at(now_ms);
 
         AuthProfileSummary {
             id: self.id.clone(),
             name: self.name.clone(),
             provider: self.provider,
+            credential_kind: self.credential_kind,
             email: self.email.clone(),
             display_name: self.display_name.clone(),
             avatar_url: self.avatar_url.clone(),
             created_at_ms: self.created_at_ms,
             last_used_ms: self.last_used_ms,
             token_valid,
+        }
+    }
+
+    pub fn token_valid(&self) -> bool {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        self.token_valid_at(now_ms)
+    }
+
+    fn token_valid_at(&self, now_ms: u64) -> bool {
+        match self.credential_kind {
+            AuthProfileCredentialKind::OAuth => self
+                .tokens
+                .as_ref()
+                .filter(|tokens| !tokens.access_token.trim().is_empty())
+                .map(|tokens| match tokens.expires_at_ms {
+                    Some(expires) => now_ms < expires,
+                    None => true,
+                })
+                .unwrap_or(false),
+            AuthProfileCredentialKind::Token => self
+                .token
+                .as_ref()
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false),
+        }
+    }
+
+    pub fn oauth_tokens(&self) -> Option<&OAuthTokens> {
+        match self.credential_kind {
+            AuthProfileCredentialKind::OAuth => self.tokens.as_ref(),
+            AuthProfileCredentialKind::Token => None,
+        }
+    }
+
+    pub fn oauth_tokens_mut(&mut self) -> Option<&mut OAuthTokens> {
+        match self.credential_kind {
+            AuthProfileCredentialKind::OAuth => self.tokens.as_mut(),
+            AuthProfileCredentialKind::Token => None,
+        }
+    }
+
+    pub fn provider_token(&self) -> Option<&str> {
+        match self.credential_kind {
+            AuthProfileCredentialKind::OAuth => None,
+            AuthProfileCredentialKind::Token => self
+                .token
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty()),
         }
     }
 }
@@ -258,6 +336,9 @@ impl OAuthProvider {
         redirect_uri: &str,
     ) -> OAuthProviderConfig {
         match self {
+            OAuthProvider::Anthropic => {
+                panic!("Anthropic auth profiles do not use OAuth provider config")
+            }
             OAuthProvider::Google => OAuthProviderConfig {
                 client_id: client_id.to_string(),
                 client_secret: client_secret.to_string(),
@@ -592,6 +673,9 @@ pub async fn fetch_user_info(
         .map_err(|e| AuthProfileError::UserInfoFailed(e.to_string()))?;
 
     match provider {
+        OAuthProvider::Anthropic => Err(AuthProfileError::UserInfoFailed(
+            "Anthropic setup-token profiles do not support OAuth user-info fetch".to_string(),
+        )),
         OAuthProvider::Google => Ok(UserInfo {
             user_id: body
                 .get("sub")
@@ -818,12 +902,7 @@ impl ProfileStore {
                 .map(|v| v.as_slice())
                 .unwrap_or(&[]);
             for profile in profiles.iter_mut() {
-                Self::decrypt_tokens(&mut profile.tokens, store, password);
-                Self::decrypt_provider_config_secret(
-                    &mut profile.oauth_provider_config,
-                    store,
-                    password,
-                );
+                Self::decrypt_profile_credential(profile, store, password);
             }
         }
 
@@ -855,8 +934,7 @@ impl ProfileStore {
         // Encrypt token fields if we have a SecretStore
         if let Some(ref store) = self.secret_store {
             for profile in to_save.iter_mut() {
-                Self::encrypt_tokens(&mut profile.tokens, store);
-                Self::encrypt_provider_config_secret(&mut profile.oauth_provider_config, store);
+                Self::encrypt_profile_credential(profile, store);
             }
         }
 
@@ -910,6 +988,32 @@ impl ProfileStore {
         }
     }
 
+    fn encrypt_profile_credential(profile: &mut AuthProfile, store: &SecretStore) {
+        match profile.credential_kind {
+            AuthProfileCredentialKind::OAuth => {
+                if let Some(tokens) = profile.tokens.as_mut() {
+                    Self::encrypt_tokens(tokens, store);
+                }
+                Self::encrypt_provider_config_secret(&mut profile.oauth_provider_config, store);
+            }
+            AuthProfileCredentialKind::Token => {
+                if let Some(token) = profile.token.as_mut() {
+                    if !is_encrypted(token) {
+                        match store.encrypt(token) {
+                            Ok(encrypted) => *token = encrypted,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to encrypt token credential for profile: {}",
+                                    e
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn encrypt_provider_config_secret(
         provider_config: &mut Option<StoredOAuthProviderConfig>,
         store: &SecretStore,
@@ -953,6 +1057,37 @@ impl ProfileStore {
                     Err(e) => {
                         tracing::warn!("Failed to decrypt refresh_token for profile: {}; clearing token to prevent opaque downstream errors", e);
                         tokens.refresh_token = Some(String::new());
+                    }
+                }
+            }
+        }
+    }
+
+    fn decrypt_profile_credential(profile: &mut AuthProfile, store: &SecretStore, password: &[u8]) {
+        match profile.credential_kind {
+            AuthProfileCredentialKind::OAuth => {
+                if let Some(tokens) = profile.tokens.as_mut() {
+                    Self::decrypt_tokens(tokens, store, password);
+                }
+                Self::decrypt_provider_config_secret(
+                    &mut profile.oauth_provider_config,
+                    store,
+                    password,
+                );
+            }
+            AuthProfileCredentialKind::Token => {
+                if let Some(token) = profile.token.as_mut() {
+                    if is_encrypted(token) {
+                        match store.decrypt_rekey(token, password) {
+                            Ok(plaintext) => *token = plaintext,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to decrypt token credential for profile: {}; clearing token to prevent opaque downstream errors",
+                                    e
+                                );
+                                token.clear();
+                            }
+                        }
                     }
                 }
             }
@@ -1057,7 +1192,12 @@ impl ProfileStore {
             .iter_mut()
             .find(|p| p.id == id)
             .ok_or(AuthProfileError::ProfileNotFound)?;
-        profile.tokens = tokens;
+        if profile.credential_kind != AuthProfileCredentialKind::OAuth {
+            return Err(AuthProfileError::CredentialTypeMismatch(format!(
+                "profile \"{id}\" is not OAuth-backed"
+            )));
+        }
+        profile.tokens = Some(tokens);
         self.save_profiles(&guard)
     }
 
@@ -1228,9 +1368,21 @@ mod tests {
             avatar_url: Some("https://example.com/avatar.png".to_string()),
             created_at_ms: now_ms,
             last_used_ms: None,
-            tokens: sample_tokens(),
+            credential_kind: AuthProfileCredentialKind::OAuth,
+            tokens: Some(sample_tokens()),
+            token: None,
             oauth_provider_config: None,
         }
+    }
+
+    fn oauth_tokens(profile: &AuthProfile) -> &OAuthTokens {
+        profile.oauth_tokens().expect("oauth-backed sample profile")
+    }
+
+    fn oauth_tokens_mut(profile: &mut AuthProfile) -> &mut OAuthTokens {
+        profile
+            .oauth_tokens_mut()
+            .expect("oauth-backed sample profile")
     }
 
     fn google_config() -> OAuthProviderConfig {
@@ -1428,8 +1580,8 @@ mod tests {
         assert_eq!(deserialized.created_at_ms, profile.created_at_ms);
         assert_eq!(deserialized.last_used_ms, profile.last_used_ms);
         assert_eq!(
-            deserialized.tokens.access_token,
-            profile.tokens.access_token
+            oauth_tokens(&deserialized).access_token,
+            oauth_tokens(&profile).access_token
         );
     }
 
@@ -1460,7 +1612,7 @@ mod tests {
             + 3_600_000; // +1 hour
 
         let mut profile = sample_profile("valid");
-        profile.tokens.expires_at_ms = Some(far_future_ms);
+        oauth_tokens_mut(&mut profile).expires_at_ms = Some(far_future_ms);
         let summary = profile.to_summary();
         assert!(
             summary.token_valid,
@@ -1471,7 +1623,7 @@ mod tests {
     #[test]
     fn test_profile_summary_token_expired() {
         let mut profile = sample_profile("expired");
-        profile.tokens.expires_at_ms = Some(1000); // far in the past
+        oauth_tokens_mut(&mut profile).expires_at_ms = Some(1000); // far in the past
         let summary = profile.to_summary();
         assert!(
             !summary.token_valid,
@@ -1594,9 +1746,9 @@ mod tests {
         store.update_tokens("upd", new_tokens).unwrap();
 
         let profile = store.get("upd").unwrap();
-        assert!(profile.tokens.access_token == "new-access");
+        assert!(oauth_tokens(&profile).access_token == "new-access");
         assert_eq!(
-            profile.tokens.refresh_token,
+            oauth_tokens(&profile).refresh_token,
             Some("new-refresh".to_string())
         );
     }
@@ -1974,11 +2126,12 @@ mod tests {
 
         let profile = store2.get("enc-1").unwrap();
         assert_eq!(
-            profile.tokens.access_token, "access-123",
+            oauth_tokens(&profile).access_token,
+            "access-123",
             "access_token should be decrypted correctly"
         );
         assert_eq!(
-            profile.tokens.refresh_token,
+            oauth_tokens(&profile).refresh_token,
             Some("refresh-456".to_string()),
             "refresh_token should be decrypted correctly"
         );
@@ -2010,11 +2163,12 @@ mod tests {
 
         let profile = store2.get("plain-1").unwrap();
         assert_eq!(
-            profile.tokens.access_token, "access-123",
+            oauth_tokens(&profile).access_token,
+            "access-123",
             "plaintext access_token should load correctly in encrypted store"
         );
         assert_eq!(
-            profile.tokens.refresh_token,
+            oauth_tokens(&profile).refresh_token,
             Some("refresh-456".to_string()),
             "plaintext refresh_token should load correctly in encrypted store"
         );
@@ -2072,7 +2226,7 @@ mod tests {
 
         // In-memory tokens should be plaintext
         let profile = store2.get("de-1").unwrap();
-        assert!(profile.tokens.access_token == "access-123");
+        assert!(oauth_tokens(&profile).access_token == "access-123");
 
         // Force a re-save
         store2.update_last_used("de-1");
@@ -2083,11 +2237,12 @@ mod tests {
 
         let profile2 = store3.get("de-1").unwrap();
         assert_eq!(
-            profile2.tokens.access_token, "access-123",
+            oauth_tokens(&profile2).access_token,
+            "access-123",
             "tokens should survive multiple save/load cycles"
         );
         assert_eq!(
-            profile2.tokens.refresh_token,
+            oauth_tokens(&profile2).refresh_token,
             Some("refresh-456".to_string()),
         );
     }
@@ -2099,7 +2254,7 @@ mod tests {
 
         // Create a profile without a refresh token
         let mut profile = sample_profile("nrt-1");
-        profile.tokens.refresh_token = None;
+        oauth_tokens_mut(&mut profile).refresh_token = None;
 
         let store = ProfileStore::with_encryption(dir.path().to_path_buf(), &password).unwrap();
         store.add(profile).unwrap();
@@ -2109,7 +2264,7 @@ mod tests {
         store2.load().unwrap();
 
         let loaded = store2.get("nrt-1").unwrap();
-        assert!(loaded.tokens.access_token == "access-123");
-        assert!(loaded.tokens.refresh_token.is_none());
+        assert!(oauth_tokens(&loaded).access_token == "access-123");
+        assert!(oauth_tokens(&loaded).refresh_token.is_none());
     }
 }

@@ -45,6 +45,20 @@ export OPENAI_API_KEY='...'
 cara setup --provider openai
 ```
 
+Anthropic also supports a setup-token-backed auth profile:
+
+```bash
+export CARAPACE_CONFIG_PASSWORD='...'
+export ANTHROPIC_SETUP_TOKEN='...'
+cara setup --provider anthropic --auth-mode setup-token
+```
+
+Notes:
+
+- This keeps the Anthropic setup-token out of config and stores it in the encrypted auth-profile store.
+- The resulting config uses `anthropic.authProfile`.
+- `cara setup --provider anthropic --auth-mode api-key` keeps the existing direct API-key path.
+
 ### Codex (OpenAI subscription login)
 
 ```bash

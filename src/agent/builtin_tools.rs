@@ -298,7 +298,7 @@ fn handle_media_analyze(args: Value) -> ToolInvokeResult {
                     return Err("Anthropic does not support audio transcription".into());
                 }
                 let key = anthropic_key.ok_or_else(|| {
-                    "Anthropic API key not configured; set ANTHROPIC_API_KEY or anthropic.apiKey"
+                    "Anthropic credential not configured; set ANTHROPIC_API_KEY, anthropic.apiKey, or anthropic.authProfile"
                         .to_string()
                 })?;
                 let mut analyzer = AnthropicMediaAnalyzer::new(key).map_err(|e| e.to_string())?;
@@ -376,6 +376,28 @@ fn resolve_anthropic_media_key(cfg: &Value) -> Option<String> {
                 .and_then(|v| v.as_str())
                 .filter(|k| !k.is_empty())
                 .map(|k| k.to_string())
+        })
+        .or_else(|| {
+            let profile_id = cfg
+                .get("anthropic")
+                .and_then(|v| v.get("authProfile"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?;
+            if !crate::auth::profiles::profile_store_encryption_enabled_from_env() {
+                return None;
+            }
+            let state_dir = crate::paths::resolve_state_dir();
+            let store = crate::auth::profiles::ProfileStore::from_env(state_dir).ok()?;
+            store.load().ok()?;
+            let profile = store.get(profile_id)?;
+            if profile.provider != crate::auth::profiles::OAuthProvider::Anthropic
+                || profile.credential_kind
+                    != crate::auth::profiles::AuthProfileCredentialKind::Token
+            {
+                return None;
+            }
+            profile.provider_token().map(|token| token.to_string())
         })
 }
 

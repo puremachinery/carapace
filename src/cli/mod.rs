@@ -151,7 +151,7 @@ pub enum Command {
         #[arg(long, value_enum)]
         provider: Option<SetupProvider>,
 
-        /// Gemini auth mode (required for non-interactive Gemini setup).
+        /// Provider auth mode. Required for non-interactive Gemini and Anthropic setup.
         #[arg(long, value_enum)]
         auth_mode: Option<GeminiSetupAuthMode>,
     },
@@ -3966,12 +3966,16 @@ impl SetupProvider {
 }
 
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GeminiSetupAuthMode {
+pub enum SetupAuthModeSelection {
     #[value(name = "oauth")]
     OAuth,
     #[value(name = "api-key")]
     ApiKey,
+    #[value(name = "setup-token")]
+    SetupToken,
 }
+
+type GeminiSetupAuthMode = SetupAuthModeSelection;
 
 impl From<SetupProvider> for crate::onboarding::setup::SetupProvider {
     fn from(value: SetupProvider) -> Self {
@@ -3993,6 +3997,7 @@ impl From<GeminiSetupAuthMode> for crate::onboarding::setup::SetupAuthMode {
         match value {
             GeminiSetupAuthMode::OAuth => Self::OAuth,
             GeminiSetupAuthMode::ApiKey => Self::ApiKey,
+            GeminiSetupAuthMode::SetupToken => Self::SetupToken,
         }
     }
 }
@@ -4029,7 +4034,9 @@ fn env_var_value(key: &str) -> Option<String> {
 fn detect_setup_provider_env_hints() -> Vec<SetupProvider> {
     let mut providers = Vec::new();
 
-    if env_var_present("ANTHROPIC_API_KEY") {
+    if env_var_present("ANTHROPIC_API_KEY")
+        || (env_var_present("ANTHROPIC_SETUP_TOKEN") && env_var_present("CARAPACE_CONFIG_PASSWORD"))
+    {
         providers.push(SetupProvider::Anthropic);
     }
     if env_var_present("OPENAI_API_KEY") {
@@ -4067,7 +4074,9 @@ fn detect_setup_provider_env_hints() -> Vec<SetupProvider> {
 fn detect_setup_provider_choice_env_hints() -> Vec<SetupProviderChoice> {
     let mut choices = Vec::new();
 
-    if env_var_present("ANTHROPIC_API_KEY") {
+    if env_var_present("ANTHROPIC_API_KEY")
+        || (env_var_present("ANTHROPIC_SETUP_TOKEN") && env_var_present("CARAPACE_CONFIG_PASSWORD"))
+    {
         choices.push(SetupProviderChoice::Anthropic);
     }
     if env_var_present("OPENAI_API_KEY")
@@ -4170,6 +4179,8 @@ fn usable_provider_labels(cfg: &Value) -> Vec<&'static str> {
     let mut labels = Vec::new();
     if env_var_present("ANTHROPIC_API_KEY")
         || config_path_has_usable_value(cfg, &["anthropic", "apiKey"])
+        || (config_path_has_usable_value(cfg, &["anthropic", "authProfile"])
+            && env_var_present("CARAPACE_CONFIG_PASSWORD"))
     {
         labels.push("Anthropic");
     }
@@ -4323,6 +4334,18 @@ fn provider_api_key_guidance(cfg: &Value, provider: SetupProvider, config_path: 
     )
 }
 
+fn anthropic_provider_guidance(cfg: &Value) -> String {
+    if config_path_has_usable_value(cfg, &["anthropic", "authProfile"]) {
+        if env_var_present("CARAPACE_CONFIG_PASSWORD") {
+            return "check Anthropic auth profile/model and retry `cara verify --outcome local-chat`"
+                .to_string();
+        }
+        return "set `CARAPACE_CONFIG_PASSWORD` in the same shell you use for `cara start` and `cara verify`, then retry `cara verify --outcome local-chat`".to_string();
+    }
+
+    provider_api_key_guidance(cfg, SetupProvider::Anthropic, &["anthropic", "apiKey"])
+}
+
 fn bedrock_provider_guidance(cfg: &Value) -> String {
     let region = env_var_present("AWS_REGION")
         || env_var_present("AWS_DEFAULT_REGION")
@@ -4405,9 +4428,7 @@ fn codex_provider_guidance(cfg: &Value) -> String {
 fn local_chat_verify_next_step(cfg: &Value) -> String {
     let model = local_chat_model(cfg);
     match local_chat_provider_route(&model) {
-        ModelProviderRoute::Anthropic => {
-            provider_api_key_guidance(cfg, SetupProvider::Anthropic, &["anthropic", "apiKey"])
-        }
+        ModelProviderRoute::Anthropic => anthropic_provider_guidance(cfg),
         ModelProviderRoute::Codex => codex_provider_guidance(cfg),
         ModelProviderRoute::OpenAi => {
             provider_api_key_guidance(cfg, SetupProvider::OpenAi, &["openai", "apiKey"])
@@ -4982,6 +5003,7 @@ fn setup_rerun_command(
 
 fn validate_provider_credentials_interactive(
     provider: SetupProvider,
+    requested_auth_mode: Option<GeminiSetupAuthMode>,
     api_key: &str,
 ) -> Result<crate::onboarding::setup::SetupCheck, Box<dyn std::error::Error>> {
     let validate_now = prompt_yes_no("Validate provider credentials now?", true)?;
@@ -5012,7 +5034,7 @@ fn validate_provider_credentials_interactive(
         Err(err) => {
             eprintln!("Credential check failed: {}", err);
             if prompt_yes_no("Continue setup and write config anyway?", false)? {
-                let rerun_command = setup_rerun_command(provider, None);
+                let rerun_command = setup_rerun_command(provider, requested_auth_mode);
                 Ok(crate::onboarding::setup::SetupCheck::validation_fail(
                     "Live provider validation",
                     err,
@@ -6300,9 +6322,9 @@ fn setup_provider_auth_mode_hint(
     requested_auth_mode: Option<GeminiSetupAuthMode>,
 ) -> Option<crate::onboarding::setup::SetupAuthMode> {
     match provider {
-        SetupProvider::Gemini => requested_auth_mode.map(Into::into),
+        SetupProvider::Anthropic | SetupProvider::Gemini => requested_auth_mode.map(Into::into),
         SetupProvider::Codex => Some(crate::onboarding::setup::SetupAuthMode::OAuth),
-        SetupProvider::Anthropic | SetupProvider::OpenAi | SetupProvider::Venice => {
+        SetupProvider::OpenAi | SetupProvider::Venice => {
             Some(crate::onboarding::setup::SetupAuthMode::ApiKey)
         }
         SetupProvider::Ollama => Some(crate::onboarding::setup::SetupAuthMode::BaseUrl),
@@ -6315,6 +6337,11 @@ fn prompt_gemini_setup_auth_mode(
     requested_mode: Option<GeminiSetupAuthMode>,
 ) -> Result<GeminiSetupAuthMode, Box<dyn std::error::Error>> {
     if let Some(mode) = requested_mode {
+        if mode == GeminiSetupAuthMode::SetupToken {
+            return Err(
+                "`--auth-mode setup-token` is only valid with `--provider anthropic`.".into(),
+            );
+        }
         return Ok(mode);
     }
 
@@ -6330,6 +6357,32 @@ fn prompt_gemini_setup_auth_mode(
             _ => {
                 eprintln!("Please choose either `oauth` or `api-key`.");
             }
+        }
+    }
+}
+
+fn prompt_anthropic_setup_auth_mode(
+    requested_mode: Option<GeminiSetupAuthMode>,
+) -> Result<GeminiSetupAuthMode, Box<dyn std::error::Error>> {
+    if let Some(mode) = requested_mode {
+        return match mode {
+            GeminiSetupAuthMode::ApiKey | GeminiSetupAuthMode::SetupToken => Ok(mode),
+            GeminiSetupAuthMode::OAuth => {
+                Err("`--auth-mode oauth` is only valid with `--provider gemini`.".into())
+            }
+        };
+    }
+
+    loop {
+        let selection = prompt_choice(
+            "How should Anthropic authenticate? (api-key/setup-token)",
+            "api-key",
+            &["api-key", "setup-token"],
+        )?;
+        match selection.as_str() {
+            "api-key" => return Ok(GeminiSetupAuthMode::ApiKey),
+            "setup-token" => return Ok(GeminiSetupAuthMode::SetupToken),
+            _ => eprintln!("Please choose either `api-key` or `setup-token`."),
         }
     }
 }
@@ -6453,6 +6506,27 @@ fn prompt_required_secret_config_value(
             config_value: entered.clone(),
             effective_value: Some(entered),
         })
+    }
+}
+
+fn prompt_required_secret_value_from_env(
+    env_var: &'static str,
+    label: &str,
+    hide_sensitive_input: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if let Some((env_name, env_value)) = first_present_env_var(&[env_var]) {
+        if prompt_yes_no(&format!("Use {label} from ${env_name}?"), true)? {
+            return Ok(env_value);
+        }
+    }
+
+    loop {
+        let entered = prompt_sensitive_line(label, hide_sensitive_input, false)?;
+        let trimmed = entered.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+        eprintln!("{label} is required.");
     }
 }
 
@@ -6681,6 +6755,11 @@ fn configure_gemini_provider_interactive(
                 config["google"]["baseUrl"] = serde_json::json!(base_url.config_value);
             }
         }
+        GeminiSetupAuthMode::SetupToken => {
+            return Err(
+                "`--auth-mode setup-token` is only valid with `--provider anthropic`.".into(),
+            );
+        }
     }
 
     Ok(result)
@@ -6872,27 +6951,66 @@ fn configure_provider_interactive(
     hide_sensitive_input: bool,
     requested_auth_mode: Option<GeminiSetupAuthMode>,
 ) -> Result<ProviderSetupResult, Box<dyn std::error::Error>> {
-    if provider != SetupProvider::Gemini && requested_auth_mode.is_some() {
-        return Err("`--auth-mode` is currently only valid with `--provider gemini`.".into());
+    if !matches!(provider, SetupProvider::Anthropic | SetupProvider::Gemini)
+        && requested_auth_mode.is_some()
+    {
+        return Err("`--auth-mode` is only valid with `--provider anthropic|gemini`.".into());
     }
 
     let mut result = ProviderSetupResult::default();
 
     match provider {
         SetupProvider::Anthropic => {
-            let api_key = prompt_required_secret_config_value(
-                "ANTHROPIC_API_KEY",
-                "API key",
-                hide_sensitive_input,
-            )?;
-            if let Some(key) = api_key.effective_value.as_deref() {
-                result
-                    .observed_checks
-                    .push(validate_provider_credentials_interactive(provider, key)?);
-            } else {
-                print_missing_setup_value_notice("ANTHROPIC_API_KEY", "API key");
+            let auth_mode = prompt_anthropic_setup_auth_mode(requested_auth_mode)?;
+            match auth_mode {
+                GeminiSetupAuthMode::ApiKey => {
+                    let api_key = prompt_required_secret_config_value(
+                        "ANTHROPIC_API_KEY",
+                        "Anthropic API key",
+                        hide_sensitive_input,
+                    )?;
+                    if let Some(key) = api_key.effective_value.as_deref() {
+                        result
+                            .observed_checks
+                            .push(validate_provider_credentials_interactive(
+                                provider,
+                                Some(GeminiSetupAuthMode::ApiKey),
+                                key,
+                            )?);
+                    } else {
+                        print_missing_setup_value_notice("ANTHROPIC_API_KEY", "Anthropic API key");
+                    }
+                    config["anthropic"] = serde_json::json!({ "apiKey": api_key.config_value });
+                }
+                GeminiSetupAuthMode::SetupToken => {
+                    let token = prompt_required_secret_value_from_env(
+                        "ANTHROPIC_SETUP_TOKEN",
+                        "Anthropic setup-token",
+                        hide_sensitive_input,
+                    )?;
+                    let token =
+                        crate::onboarding::anthropic::validate_anthropic_setup_token_input(&token)
+                            .map_err(std::io::Error::other)?;
+                    result
+                        .observed_checks
+                        .push(validate_provider_credentials_interactive(
+                            provider,
+                            Some(GeminiSetupAuthMode::SetupToken),
+                            &token,
+                        )?);
+                    let state_dir = resolve_state_dir();
+                    std::fs::create_dir_all(&state_dir)?;
+                    crate::onboarding::anthropic::persist_cli_anthropic_setup_token(
+                        state_dir, config, &token,
+                    )
+                    .map_err(std::io::Error::other)?;
+                }
+                GeminiSetupAuthMode::OAuth => {
+                    return Err(
+                        "`--auth-mode oauth` is only valid with `--provider gemini`.".into(),
+                    );
+                }
             }
-            config["anthropic"] = serde_json::json!({ "apiKey": api_key.config_value });
         }
         SetupProvider::Codex => {
             result = configure_codex_provider_interactive(config, hide_sensitive_input)?;
@@ -6906,7 +7024,9 @@ fn configure_provider_interactive(
             if let Some(key) = api_key.effective_value.as_deref() {
                 result
                     .observed_checks
-                    .push(validate_provider_credentials_interactive(provider, key)?);
+                    .push(validate_provider_credentials_interactive(
+                        provider, None, key,
+                    )?);
             } else {
                 print_missing_setup_value_notice("OPENAI_API_KEY", "API key");
             }
@@ -7123,16 +7243,42 @@ fn configure_provider_noninteractive(
     provider: SetupProvider,
     requested_auth_mode: Option<GeminiSetupAuthMode>,
 ) -> Result<ProviderSetupResult, Box<dyn std::error::Error>> {
-    if provider != SetupProvider::Gemini && requested_auth_mode.is_some() {
-        return Err("`--auth-mode` is currently only valid with `--provider gemini`.".into());
+    if !matches!(provider, SetupProvider::Anthropic | SetupProvider::Gemini)
+        && requested_auth_mode.is_some()
+    {
+        return Err("`--auth-mode` is only valid with `--provider anthropic|gemini`.".into());
     }
     config["agents"]["defaults"]["model"] = serde_json::json!(provider.default_model());
 
     match provider {
-        SetupProvider::Anthropic => {
-            config["anthropic"] =
-                serde_json::json!({ "apiKey": env_placeholder("ANTHROPIC_API_KEY") });
-        }
+        SetupProvider::Anthropic => match requested_auth_mode {
+            Some(GeminiSetupAuthMode::SetupToken) => {
+                let token = env_var_value("ANTHROPIC_SETUP_TOKEN").ok_or_else(|| {
+                        std::io::Error::other(
+                            "non-interactive Anthropic setup-token mode requires ANTHROPIC_SETUP_TOKEN.",
+                        )
+                    })?;
+                let token =
+                    crate::onboarding::anthropic::validate_anthropic_setup_token_input(&token)
+                        .map_err(std::io::Error::other)?;
+                let state_dir = resolve_state_dir();
+                std::fs::create_dir_all(&state_dir)?;
+                crate::onboarding::anthropic::persist_cli_anthropic_setup_token(
+                    state_dir, config, &token,
+                )
+                .map_err(std::io::Error::other)?;
+            }
+            Some(GeminiSetupAuthMode::OAuth) => {
+                return Err(
+                        "non-interactive Anthropic setup does not support `--auth-mode oauth`; use `api-key` or `setup-token`."
+                            .into(),
+                    );
+            }
+            _ => {
+                config["anthropic"] =
+                    serde_json::json!({ "apiKey": env_placeholder("ANTHROPIC_API_KEY") });
+            }
+        },
         SetupProvider::Codex => {
             return Err(
                 "non-interactive Codex sign-in is not supported; rerun interactively.".into(),
@@ -7172,6 +7318,12 @@ fn configure_provider_noninteractive(
                         "non-interactive Gemini Google sign-in is not supported; rerun interactively or use `--auth-mode api-key`."
                             .into(),
                     );
+            }
+            Some(GeminiSetupAuthMode::SetupToken) => {
+                return Err(
+                    "non-interactive Gemini setup does not support `--auth-mode setup-token`; use `oauth` or `api-key`."
+                        .into(),
+                );
             }
             None => {
                 return Err(

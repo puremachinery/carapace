@@ -408,7 +408,7 @@ impl MultiProvider {
                 Ok(provider)
             } else {
                 Err(AgentError::Provider(format!(
-                    "model \"{model}\" requires Anthropic provider, but no ANTHROPIC_API_KEY is configured"
+                    "model \"{model}\" requires Anthropic provider, but neither ANTHROPIC_API_KEY nor anthropic.authProfile is configured"
                 )))
             }
         }

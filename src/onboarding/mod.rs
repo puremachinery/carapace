@@ -1,3 +1,4 @@
+pub mod anthropic;
 pub mod bedrock;
 pub mod codex;
 pub mod gemini;

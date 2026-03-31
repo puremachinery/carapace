@@ -236,8 +236,8 @@ impl GeminiProvider {
                 })?;
                 let now_ms = current_time_ms();
                 if profile
-                    .tokens
-                    .expires_at_ms
+                    .oauth_tokens()
+                    .and_then(|tokens| tokens.expires_at_ms)
                     .is_some_and(|expires_at| expires_at <= now_ms + TOKEN_REFRESH_MARGIN_MS)
                 {
                     let _refresh_guard = refresh_lock.lock().await;
@@ -248,8 +248,8 @@ impl GeminiProvider {
                     })?;
                     let now_ms_after_lock = current_time_ms();
                     if refreshed_profile
-                        .tokens
-                        .expires_at_ms
+                        .oauth_tokens()
+                        .and_then(|tokens| tokens.expires_at_ms)
                         .is_none_or(|expires_at| {
                             expires_at > now_ms_after_lock + TOKEN_REFRESH_MARGIN_MS
                         })
@@ -257,9 +257,8 @@ impl GeminiProvider {
                         profile = refreshed_profile;
                     } else {
                         let refresh_token_value = refreshed_profile
-                            .tokens
-                            .refresh_token
-                            .clone()
+                            .oauth_tokens()
+                            .and_then(|tokens| tokens.refresh_token.clone())
                             .filter(|token| !token.trim().is_empty())
                             .ok_or_else(|| {
                                 AgentError::Provider(format!(
@@ -281,20 +280,21 @@ impl GeminiProvider {
                                 ))
                             })?;
                         profile = refreshed_profile;
-                        profile.tokens = refreshed;
+                        profile.tokens = Some(refreshed);
                     }
                 }
 
-                if profile.tokens.access_token.trim().is_empty() {
+                let access_token = profile
+                    .oauth_tokens()
+                    .map(|tokens| tokens.access_token.trim())
+                    .unwrap_or("");
+                if access_token.is_empty() {
                     return Err(AgentError::Provider(format!(
                         "Gemini auth profile \"{profile_id}\" has no usable access token"
                     )));
                 }
                 profile_store.update_last_used(profile_id);
-                Ok(vec![(
-                    "authorization",
-                    format!("Bearer {}", profile.tokens.access_token),
-                )])
+                Ok(vec![("authorization", format!("Bearer {access_token}"))])
             }
         }
     }
@@ -663,7 +663,9 @@ pub fn strip_gemini_prefix(model: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::profiles::{AuthProfile, OAuthProvider, OAuthTokens, ProfileStore};
+    use crate::auth::profiles::{
+        AuthProfile, AuthProfileCredentialKind, OAuthProvider, OAuthTokens, ProfileStore,
+    };
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -711,13 +713,15 @@ mod tests {
                 avatar_url: None,
                 created_at_ms: now_ms,
                 last_used_ms: None,
-                tokens: OAuthTokens {
+                credential_kind: AuthProfileCredentialKind::OAuth,
+                tokens: Some(OAuthTokens {
                     access_token: "access-token-123".to_string(),
                     refresh_token: None,
                     token_type: "Bearer".to_string(),
                     expires_at_ms: Some(now_ms + 3_600_000),
                     scope: Some("openid email profile".to_string()),
-                },
+                }),
+                token: None,
                 oauth_provider_config: None,
             })
             .expect("store profile");
@@ -783,13 +787,15 @@ mod tests {
                 avatar_url: None,
                 created_at_ms: now_ms,
                 last_used_ms: None,
-                tokens: OAuthTokens {
+                credential_kind: AuthProfileCredentialKind::OAuth,
+                tokens: Some(OAuthTokens {
                     access_token: "   ".to_string(),
                     refresh_token: None,
                     token_type: "Bearer".to_string(),
                     expires_at_ms: Some(now_ms + 3_600_000),
                     scope: Some("openid email profile".to_string()),
-                },
+                }),
+                token: None,
                 oauth_provider_config: None,
             })
             .expect("store profile");
