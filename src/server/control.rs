@@ -295,6 +295,24 @@ pub struct ControlSetupCheck {
     pub remediation: Option<String>,
 }
 
+fn control_setup_summary(
+    provider: onboarding::setup::SetupProvider,
+    status: onboarding::setup::SetupAssessmentStatus,
+) -> String {
+    match status {
+        onboarding::setup::SetupAssessmentStatus::Ready => {
+            format!("{} setup looks ready for verification.", provider.label())
+        }
+        onboarding::setup::SetupAssessmentStatus::Partial => format!(
+            "{} setup is written, but some live validation was skipped or not available.",
+            provider.label()
+        ),
+        onboarding::setup::SetupAssessmentStatus::Invalid => {
+            format!("{} setup is incomplete or invalid.", provider.label())
+        }
+    }
+}
+
 fn sanitize_control_setup_check(check: onboarding::setup::SetupCheck) -> ControlSetupCheck {
     let onboarding::setup::SetupCheck {
         name,
@@ -304,26 +322,31 @@ fn sanitize_control_setup_check(check: onboarding::setup::SetupCheck) -> Control
         remediation,
     } = check;
 
-    let detail = if name.ends_with("auth profile") {
-        if detail.contains("configured profile id:") {
-            format!("{name} is configured")
-        } else if detail.contains("belongs to") {
-            format!("{name} belongs to a different provider")
-        } else if detail.contains("uses") && detail.contains("credentials") {
-            format!("{name} uses the wrong credential type")
-        } else if detail.contains("could not decrypt the stored token") {
-            format!("{name} token could not be decrypted; check CARAPACE_CONFIG_PASSWORD")
-        } else if detail.contains("has no usable token") {
-            format!("{name} has no usable token")
-        } else if detail.contains("was not found in the profile store") {
-            format!("{name} was not found in the encrypted profile store")
-        } else if detail.contains("failed to read the profile store") {
-            "failed to read the encrypted profile store".to_string()
-        } else if detail.starts_with("loaded `") {
-            format!("{name} loaded from encrypted profile store")
-        } else {
-            format!("{name} requires attention")
-        }
+    let detail = if detail.contains("configured profile id:") {
+        format!("{name} is configured")
+    } else if detail.contains("stored profile `") && detail.contains("belongs to") {
+        format!("{name} belongs to a different provider")
+    } else if detail.contains("stored profile `")
+        && detail.contains("uses")
+        && detail.contains("credentials")
+    {
+        format!("{name} uses the wrong credential type")
+    } else if detail.contains("stored profile `")
+        && detail.contains("could not decrypt the stored token")
+    {
+        format!("{name} token could not be decrypted; check CARAPACE_CONFIG_PASSWORD")
+    } else if detail.contains("stored profile `") && detail.contains("has no usable token") {
+        format!("{name} has no usable token")
+    } else if detail.contains("stored profile `")
+        && detail.contains("was not found in the profile store")
+    {
+        format!("{name} was not found in the encrypted profile store")
+    } else if detail.contains("failed to read the profile store") {
+        "failed to read the encrypted profile store".to_string()
+    } else if detail.starts_with("loaded `") {
+        format!("{name} loaded from encrypted profile store")
+    } else if detail.contains("stored profile `") {
+        format!("{name} requires attention")
     } else {
         detail
     };
@@ -343,10 +366,7 @@ impl From<onboarding::setup::SetupAssessment> for ControlSetupAssessment {
             provider: value.provider,
             auth_mode: value.auth_mode,
             status: value.status,
-            // `SetupAssessment::summary` remains browser-visible here. The
-            // setup layer must keep it limited to static provider guidance and
-            // avoid embedding auth-profile identity or server-local details.
-            summary: value.summary,
+            summary: control_setup_summary(value.provider, value.status),
             checks: value
                 .checks
                 .into_iter()
@@ -2319,20 +2339,20 @@ mod tests {
             provider: onboarding::setup::SetupProvider::Gemini,
             auth_mode: Some(onboarding::setup::SetupAuthMode::OAuth),
             status: onboarding::setup::SetupAssessmentStatus::Ready,
-            summary: "Gemini setup looks ready for verification.".to_string(),
+            summary: "loaded `Google Profile` (user@example.com)".to_string(),
             checks: vec![
                 onboarding::setup::SetupCheck::pass(
                     "Gemini auth profile",
                     "configured profile id: `google-123`",
                 ),
                 onboarding::setup::SetupCheck::validation_pass(
-                    "Gemini auth profile",
+                    "Gemini account identity",
                     "loaded `Google Profile` (user@example.com)",
                 ),
                 onboarding::setup::SetupCheck::validation_fail(
-                    "Gemini auth profile",
-                    "future auth profile detail with `internal-profile-id`",
-                    "Re-run setup for Gemini auth profile.",
+                    "Gemini credential validation",
+                    "stored profile `google-123` future auth detail with `internal-profile-id`",
+                    "Re-run setup for Gemini credential validation.",
                 ),
             ],
             profile_name: Some("Google Profile".to_string()),
@@ -2347,12 +2367,16 @@ mod tests {
             "Gemini auth profile is configured"
         );
         assert_eq!(
+            json["summary"],
+            "Gemini setup looks ready for verification."
+        );
+        assert_eq!(
             json["checks"][1]["detail"],
-            "Gemini auth profile loaded from encrypted profile store"
+            "Gemini account identity loaded from encrypted profile store"
         );
         assert_eq!(
             json["checks"][2]["detail"],
-            "Gemini auth profile requires attention"
+            "Gemini credential validation requires attention"
         );
         assert!(!json.to_string().contains("google-123"));
         assert!(!json.to_string().contains("Google Profile"));
