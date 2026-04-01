@@ -9,13 +9,13 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-#[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -34,7 +34,9 @@ static OAUTH_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
 });
 
 #[cfg(test)]
-static FORCE_SECRET_ENCRYPTION_FAILURE: AtomicBool = AtomicBool::new(false);
+std::thread_local! {
+    static FORCE_SECRET_ENCRYPTION_FAILURE: Cell<bool> = const { Cell::new(false) };
+}
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -981,7 +983,7 @@ impl ProfileStore {
         store: &SecretStore,
     ) -> Result<String, AuthProfileError> {
         #[cfg(test)]
-        if FORCE_SECRET_ENCRYPTION_FAILURE.load(Ordering::Relaxed) {
+        if FORCE_SECRET_ENCRYPTION_FAILURE.with(|flag| flag.get()) {
             return Err(AuthProfileError::SecretStorageError(format!(
                 "failed to encrypt {field_name}: simulated test failure"
             )));
@@ -1391,12 +1393,12 @@ mod tests {
 
     impl Drop for SecretEncryptionFailureGuard {
         fn drop(&mut self) {
-            FORCE_SECRET_ENCRYPTION_FAILURE.store(false, Ordering::Relaxed);
+            FORCE_SECRET_ENCRYPTION_FAILURE.with(|flag| flag.set(false));
         }
     }
 
     fn force_secret_encryption_failure_for_tests() -> SecretEncryptionFailureGuard {
-        FORCE_SECRET_ENCRYPTION_FAILURE.store(true, Ordering::Relaxed);
+        FORCE_SECRET_ENCRYPTION_FAILURE.with(|flag| flag.set(true));
         SecretEncryptionFailureGuard
     }
 
@@ -2066,6 +2068,9 @@ mod tests {
 
         let err = AuthProfileError::SecretStorageError("encrypt failed".to_string());
         assert!(err.to_string().contains("Secret storage error"));
+
+        let err = AuthProfileError::CredentialTypeMismatch("expected oauth".to_string());
+        assert!(err.to_string().contains("Credential type mismatch"));
 
         let err = AuthProfileError::ProfileNotFound;
         assert!(err.to_string().contains("Profile not found"));
