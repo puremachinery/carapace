@@ -20,6 +20,7 @@ pub mod links;
 pub mod logging;
 pub mod media;
 pub mod messages;
+pub mod migration;
 pub mod nodes;
 pub mod onboarding;
 pub mod paths;
