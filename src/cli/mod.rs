@@ -12175,11 +12175,7 @@ mod tests {
             result.observed_checks[0].kind,
             crate::onboarding::setup::SetupCheckKind::Validation
         );
-        assert!(
-            result.observed_checks[0].detail.contains("setup-token"),
-            "unexpected validation skip detail: {}",
-            result.observed_checks[0].detail
-        );
+        assert!(result.observed_checks[0].detail.contains("setup-token"));
         assert_eq!(
             result.observed_checks[0].remediation.as_deref(),
             Some(
