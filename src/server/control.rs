@@ -343,6 +343,8 @@ fn sanitize_control_setup_check(check: onboarding::setup::SetupCheck) -> Control
         format!("{name} was not found in the encrypted profile store")
     } else if detail.contains("failed to read the profile store") {
         "failed to read the encrypted profile store".to_string()
+    } else if detail.contains("failed local validation:") {
+        format!("{name} failed local validation")
     } else if detail.starts_with("loaded `") {
         format!("{name} loaded from encrypted profile store")
     } else if detail.contains("stored profile `") {
@@ -2354,6 +2356,11 @@ mod tests {
                     "stored profile `google-123` future auth detail with `internal-profile-id`",
                     "Re-run setup for Gemini credential validation.",
                 ),
+                onboarding::setup::SetupCheck::fail(
+                    "Gemini base URL validation",
+                    "Gemini base URL validation failed local validation: invalid URL \"https://user:secret@proxy.example.com/\": invalid port number",
+                    "Write a valid Gemini base URL into config.",
+                ),
             ],
             profile_name: Some("Google Profile".to_string()),
             email: Some("user@example.com".to_string()),
@@ -2378,10 +2385,15 @@ mod tests {
             json["checks"][2]["detail"],
             "Gemini credential validation requires attention"
         );
+        assert_eq!(
+            json["checks"][3]["detail"],
+            "Gemini base URL validation failed local validation"
+        );
         assert!(!json.to_string().contains("google-123"));
         assert!(!json.to_string().contains("Google Profile"));
         assert!(!json.to_string().contains("user@example.com"));
         assert!(!json.to_string().contains("internal-profile-id"));
+        assert!(!json.to_string().contains("user:secret@proxy.example.com"));
     }
 
     #[test]
@@ -2400,6 +2412,32 @@ mod tests {
         assert!(status.assessment.is_none());
         assert_eq!(status.provider, onboarding::setup::SetupProvider::Anthropic);
         assert_eq!(status.available_entrypoints.len(), 2);
+        assert_eq!(
+            status.available_entrypoints[0].kind,
+            ControlOnboardingEntrypointKind::Cli
+        );
+        assert_eq!(
+            status.available_entrypoints[0].auth_mode,
+            Some(onboarding::setup::SetupAuthMode::ApiKey)
+        );
+        assert_eq!(status.available_entrypoints[0].path, None);
+        assert_eq!(
+            status.available_entrypoints[0].command.as_deref(),
+            Some("cara setup --force --provider anthropic --auth-mode api-key")
+        );
+        assert_eq!(
+            status.available_entrypoints[1].kind,
+            ControlOnboardingEntrypointKind::Cli
+        );
+        assert_eq!(
+            status.available_entrypoints[1].auth_mode,
+            Some(onboarding::setup::SetupAuthMode::SetupToken)
+        );
+        assert_eq!(status.available_entrypoints[1].path, None);
+        assert_eq!(
+            status.available_entrypoints[1].command.as_deref(),
+            Some("cara setup --force --provider anthropic --auth-mode setup-token")
+        );
     }
 
     #[test]
