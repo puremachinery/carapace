@@ -11,9 +11,7 @@ use tokio_util::sync::CancellationToken;
 use crate::agent::openai::OpenAiProvider;
 use crate::agent::provider::*;
 use crate::agent::AgentError;
-use crate::auth::profiles::{
-    refresh_token, AuthProfile, AuthProfileCredentialKind, OAuthProviderConfig, ProfileStore,
-};
+use crate::auth::profiles::{refresh_token, OAuthProviderConfig, ProfileStore};
 
 const TOKEN_REFRESH_MARGIN_MS: u64 = 60_000;
 pub const DEFAULT_CODEX_MODEL: &str = "gpt-5.4";
@@ -62,7 +60,7 @@ impl CodexProvider {
                 self.profile_id
             ))
         })?;
-        ensure_oauth_profile_kind(&profile, &self.profile_id)?;
+        ensure_oauth_profile_kind(&profile, &self.profile_id, "Codex")?;
         let now_ms = current_time_ms();
         if profile
             .oauth_tokens()
@@ -76,7 +74,7 @@ impl CodexProvider {
                     self.profile_id
                 ))
             })?;
-            ensure_oauth_profile_kind(&locked_profile, &self.profile_id)?;
+            ensure_oauth_profile_kind(&locked_profile, &self.profile_id, "Codex")?;
             let now_ms_after_lock = current_time_ms();
             if locked_profile
                 .oauth_tokens()
@@ -141,16 +139,6 @@ impl CodexProvider {
             model
         }
     }
-}
-
-fn ensure_oauth_profile_kind(profile: &AuthProfile, profile_id: &str) -> Result<(), AgentError> {
-    if profile.credential_kind != AuthProfileCredentialKind::OAuth {
-        return Err(AgentError::Provider(format!(
-            "Codex auth profile \"{profile_id}\" uses {} credentials, not oauth",
-            profile.credential_kind
-        )));
-    }
-    Ok(())
 }
 
 #[async_trait]

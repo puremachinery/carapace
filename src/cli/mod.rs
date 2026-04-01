@@ -7345,9 +7345,6 @@ fn configure_provider_noninteractive(
                             "non-interactive Anthropic setup-token mode requires ANTHROPIC_SETUP_TOKEN.",
                         )
                     })?;
-                let token =
-                    crate::onboarding::anthropic::validate_anthropic_setup_token_input(&token)
-                        .map_err(std::io::Error::other)?;
                 let state_dir = resolve_state_dir();
                 std::fs::create_dir_all(&state_dir)?;
                 crate::onboarding::anthropic::persist_cli_anthropic_setup_token(

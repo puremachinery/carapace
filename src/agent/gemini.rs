@@ -12,9 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::provider::*;
 use crate::agent::AgentError;
-use crate::auth::profiles::{
-    refresh_token, AuthProfile, AuthProfileCredentialKind, OAuthProviderConfig, ProfileStore,
-};
+use crate::auth::profiles::{refresh_token, OAuthProviderConfig, ProfileStore};
 
 const TOKEN_REFRESH_MARGIN_MS: u64 = 60_000;
 
@@ -236,7 +234,7 @@ impl GeminiProvider {
                         "configured Gemini auth profile \"{profile_id}\" was not found"
                     ))
                 })?;
-                ensure_oauth_profile_kind(&profile, profile_id)?;
+                ensure_oauth_profile_kind(&profile, profile_id, "Gemini")?;
                 let now_ms = current_time_ms();
                 if profile
                     .oauth_tokens()
@@ -249,7 +247,7 @@ impl GeminiProvider {
                             "configured Gemini auth profile \"{profile_id}\" was not found"
                         ))
                     })?;
-                    ensure_oauth_profile_kind(&refreshed_profile, profile_id)?;
+                    ensure_oauth_profile_kind(&refreshed_profile, profile_id, "Gemini")?;
                     let now_ms_after_lock = current_time_ms();
                     if refreshed_profile
                         .oauth_tokens()
@@ -302,16 +300,6 @@ impl GeminiProvider {
             }
         }
     }
-}
-
-fn ensure_oauth_profile_kind(profile: &AuthProfile, profile_id: &str) -> Result<(), AgentError> {
-    if profile.credential_kind != AuthProfileCredentialKind::OAuth {
-        return Err(AgentError::Provider(format!(
-            "Gemini auth profile \"{profile_id}\" uses {} credentials, not oauth",
-            profile.credential_kind
-        )));
-    }
-    Ok(())
 }
 
 /// Find the tool name that corresponds to a ToolResult block by searching

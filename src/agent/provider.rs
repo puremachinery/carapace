@@ -8,6 +8,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::AgentError;
+use crate::auth::profiles::{AuthProfile, AuthProfileCredentialKind};
 
 /// A streaming event from the LLM.
 #[derive(Debug, Clone)]
@@ -116,6 +117,20 @@ pub struct GeminiPartMetadata {
 }
 
 const MAX_GEMINI_THOUGHT_SIGNATURE_BYTES: usize = 64 * 1024;
+
+pub(crate) fn ensure_oauth_profile_kind(
+    profile: &AuthProfile,
+    profile_id: &str,
+    provider_name: &str,
+) -> Result<(), AgentError> {
+    if profile.credential_kind != AuthProfileCredentialKind::OAuth {
+        return Err(AgentError::Provider(format!(
+            "{provider_name} auth profile \"{profile_id}\" uses {} credentials, not oauth",
+            profile.credential_kind
+        )));
+    }
+    Ok(())
+}
 
 impl ContentBlockMetadata {
     pub fn with_gemini_thought_signature(thought_signature: Option<String>) -> Option<Self> {

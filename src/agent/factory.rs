@@ -1536,6 +1536,29 @@ mod tests {
     }
 
     #[test]
+    fn test_build_providers_rejects_missing_anthropic_auth_profile() {
+        with_clean_provider_env(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let _password = set_env_var_scoped("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+            let _state_dir = set_env_var_scoped(
+                "CARAPACE_STATE_DIR",
+                temp.path().to_str().expect("state dir path"),
+            );
+
+            let store = ProfileStore::from_env(temp.path().to_path_buf()).expect("profile store");
+            store.load().expect("load empty profile store");
+
+            let cfg = json!({
+                "anthropic": { "authProfile": "anthropic:missing" }
+            });
+            let err = build_providers(&cfg).expect_err("missing profile should fail fast");
+            assert!(err
+                .to_string()
+                .contains("configured Anthropic auth profile \"anthropic:missing\" was not found"));
+        });
+    }
+
+    #[test]
     fn test_build_providers_rejects_anthropic_auth_profile_without_password() {
         with_clean_provider_env(|| {
             let temp = tempfile::tempdir().expect("tempdir");
