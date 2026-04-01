@@ -383,13 +383,41 @@ impl From<onboarding::setup::SetupAssessment> for ControlSetupAssessment {
 #[serde(rename_all = "camelCase")]
 pub struct ControlOnboardingApplyResponse {
     pub ok: bool,
-    /// Provider-owned apply payload. Current onboarding handlers return small
-    /// JSON objects such as `{"mode": "apiKey"}` or
-    /// `{"profileId": "...", "mode": "oauth"}`.
-    pub applied: Value,
+    /// Control-owned browser-visible apply payload. This intentionally exposes
+    /// only the applied auth path instead of forwarding provider-internal
+    /// onboarding details.
+    pub applied: ControlOnboardingApplied,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
     pub provider_status: ControlProviderOnboardingStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum ControlOnboardingAppliedMode {
+    #[serde(rename = "apiKey")]
+    ApiKey,
+    #[serde(rename = "oauth")]
+    OAuth,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControlOnboardingApplied {
+    pub mode: ControlOnboardingAppliedMode,
+}
+
+impl ControlOnboardingApplied {
+    fn api_key() -> Self {
+        Self {
+            mode: ControlOnboardingAppliedMode::ApiKey,
+        }
+    }
+
+    fn oauth() -> Self {
+        Self {
+            mode: ControlOnboardingAppliedMode::OAuth,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -1213,7 +1241,7 @@ pub async fn gemini_oauth_apply_handler(
 
     let state_dir = crate::server::ws::resolve_state_dir();
     match onboarding::gemini::apply_control_google_oauth(flow_id.trim(), state_dir.clone()) {
-        Ok(applied) => {
+        Ok(_) => {
             let snapshot = read_config_snapshot();
             let hash = snapshot.hash;
             let provider_status = match build_control_provider_onboarding_status_async(
@@ -1237,7 +1265,7 @@ pub async fn gemini_oauth_apply_handler(
                 StatusCode::OK,
                 Json(ControlOnboardingApplyResponse {
                     ok: true,
-                    applied,
+                    applied: ControlOnboardingApplied::oauth(),
                     hash,
                     provider_status,
                 }),
@@ -1350,7 +1378,7 @@ pub async fn codex_oauth_apply_handler(
 
     let state_dir = crate::server::ws::resolve_state_dir();
     match onboarding::codex::apply_control_openai_oauth(flow_id.trim(), state_dir.clone()) {
-        Ok(applied) => {
+        Ok(_) => {
             let snapshot = read_config_snapshot();
             let hash = snapshot.hash;
             let provider_status = match build_control_provider_onboarding_status_async(
@@ -1374,7 +1402,7 @@ pub async fn codex_oauth_apply_handler(
                 StatusCode::OK,
                 Json(ControlOnboardingApplyResponse {
                     ok: true,
-                    applied,
+                    applied: ControlOnboardingApplied::oauth(),
                     hash,
                     provider_status,
                 }),
@@ -1470,7 +1498,7 @@ pub async fn gemini_api_key_handler(
         api_key: req.api_key,
         base_url: req.base_url,
     }) {
-        Ok(applied) => {
+        Ok(_) => {
             let snapshot = read_config_snapshot();
             let hash = snapshot.hash;
             let provider_status = match build_control_provider_onboarding_status_async(
@@ -1494,7 +1522,7 @@ pub async fn gemini_api_key_handler(
                 StatusCode::OK,
                 Json(ControlOnboardingApplyResponse {
                     ok: true,
-                    applied,
+                    applied: ControlOnboardingApplied::api_key(),
                     hash,
                     provider_status,
                 }),
@@ -2333,6 +2361,33 @@ mod tests {
             .get("profileName")
             .is_none());
         assert!(json["providers"][0]["assessment"].get("email").is_none());
+    }
+
+    #[test]
+    fn test_control_onboarding_apply_response_serialization() {
+        let response = ControlOnboardingApplyResponse {
+            ok: true,
+            applied: ControlOnboardingApplied::oauth(),
+            hash: Some("deadbeef".to_string()),
+            provider_status: ControlProviderOnboardingStatus {
+                provider: onboarding::setup::SetupProvider::Codex,
+                label: "Codex".to_string(),
+                configured: true,
+                supported_auth_modes: vec![onboarding::setup::SetupAuthMode::OAuth],
+                available_entrypoints: vec![],
+                cli_setup_command: Some("cara setup --force --provider codex".to_string()),
+                assessment: None,
+            },
+        };
+
+        let json = serde_json::to_value(&response).expect("apply response should serialize");
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["applied"]["mode"], "oauth");
+        assert_eq!(json["providerStatus"]["provider"], "codex");
+        assert!(json["applied"]["profileId"].is_null());
+        assert!(json["applied"]["authProfile"].is_null());
+        assert!(json["applied"]["provider"].is_null());
+        assert!(json["applied"]["model"].is_null());
     }
 
     #[test]
