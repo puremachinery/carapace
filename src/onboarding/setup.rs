@@ -29,6 +29,7 @@
 
 use std::path::Path;
 
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::agent;
@@ -37,19 +38,41 @@ use crate::auth::profiles::{
 };
 use crate::config::secrets::is_encrypted;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum SetupProvider {
+    #[serde(rename = "anthropic")]
     Anthropic,
+    #[serde(rename = "codex")]
     Codex,
+    #[serde(rename = "openai")]
     OpenAi,
+    #[serde(rename = "ollama")]
     Ollama,
+    #[serde(rename = "gemini")]
     Gemini,
+    #[serde(rename = "vertex")]
     Vertex,
+    #[serde(rename = "venice")]
     Venice,
+    #[serde(rename = "bedrock")]
     Bedrock,
 }
 
 impl SetupProvider {
+    pub fn all() -> &'static [Self] {
+        const PROVIDERS: [SetupProvider; 8] = [
+            SetupProvider::Anthropic,
+            SetupProvider::Codex,
+            SetupProvider::OpenAi,
+            SetupProvider::Ollama,
+            SetupProvider::Gemini,
+            SetupProvider::Vertex,
+            SetupProvider::Venice,
+            SetupProvider::Bedrock,
+        ];
+        &PROVIDERS
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Anthropic => "Anthropic",
@@ -109,14 +132,80 @@ impl SetupProvider {
             )),
         }
     }
+
+    pub fn supported_auth_modes(self) -> &'static [SetupAuthMode] {
+        const NO_AUTH_MODES: [SetupAuthMode; 0] = [];
+        const ANTHROPIC_AUTH_MODES: [SetupAuthMode; 2] =
+            [SetupAuthMode::ApiKey, SetupAuthMode::SetupToken];
+        const CODEX_AUTH_MODES: [SetupAuthMode; 1] = [SetupAuthMode::OAuth];
+        const OPENAI_AUTH_MODES: [SetupAuthMode; 1] = [SetupAuthMode::ApiKey];
+        const OLLAMA_AUTH_MODES: [SetupAuthMode; 1] = [SetupAuthMode::BaseUrl];
+        const GEMINI_AUTH_MODES: [SetupAuthMode; 2] = [SetupAuthMode::OAuth, SetupAuthMode::ApiKey];
+        const BEDROCK_AUTH_MODES: [SetupAuthMode; 1] = [SetupAuthMode::StaticCredentials];
+
+        match self {
+            Self::Anthropic => &ANTHROPIC_AUTH_MODES,
+            Self::Codex => &CODEX_AUTH_MODES,
+            Self::OpenAi => &OPENAI_AUTH_MODES,
+            Self::Ollama => &OLLAMA_AUTH_MODES,
+            Self::Gemini => &GEMINI_AUTH_MODES,
+            Self::Vertex => &NO_AUTH_MODES,
+            Self::Venice => &OPENAI_AUTH_MODES,
+            Self::Bedrock => &BEDROCK_AUTH_MODES,
+        }
+    }
+
+    pub fn is_configured(self, cfg: &Value) -> bool {
+        match self {
+            Self::Anthropic => {
+                config_string(cfg, &["anthropic", "apiKey"]).is_some()
+                    || config_string(cfg, &["anthropic", "authProfile"]).is_some()
+                    || config_string(cfg, &["anthropic", "baseUrl"]).is_some()
+            }
+            Self::Codex => config_string(cfg, &["codex", "authProfile"]).is_some(),
+            Self::OpenAi => {
+                config_string(cfg, &["openai", "apiKey"]).is_some()
+                    || config_string(cfg, &["openai", "baseUrl"]).is_some()
+            }
+            Self::Ollama => {
+                config_string(cfg, &["providers", "ollama", "baseUrl"]).is_some()
+                    || config_string(cfg, &["providers", "ollama", "apiKey"]).is_some()
+            }
+            Self::Gemini => {
+                config_string(cfg, &["google", "authProfile"]).is_some()
+                    || config_string(cfg, &["google", "apiKey"]).is_some()
+                    || config_string(cfg, &["google", "baseUrl"]).is_some()
+            }
+            Self::Vertex => {
+                config_string(cfg, &["vertex", "projectId"]).is_some()
+                    || config_string(cfg, &["vertex", "location"]).is_some()
+                    || config_string(cfg, &["vertex", "model"]).is_some()
+            }
+            Self::Venice => {
+                config_string(cfg, &["venice", "apiKey"]).is_some()
+                    || config_string(cfg, &["venice", "baseUrl"]).is_some()
+            }
+            Self::Bedrock => {
+                config_string(cfg, &["bedrock", "region"]).is_some()
+                    || config_string(cfg, &["bedrock", "accessKeyId"]).is_some()
+                    || config_string(cfg, &["bedrock", "secretAccessKey"]).is_some()
+                    || config_string(cfg, &["bedrock", "sessionToken"]).is_some()
+            }
+        }
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum SetupAuthMode {
+    #[serde(rename = "apiKey")]
     ApiKey,
+    #[serde(rename = "setupToken")]
     SetupToken,
+    #[serde(rename = "oauth")]
     OAuth,
+    #[serde(rename = "staticCredentials")]
     StaticCredentials,
+    #[serde(rename = "baseUrl")]
     BaseUrl,
 }
 
@@ -132,20 +221,23 @@ impl SetupAuthMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub enum SetupCheckStatus {
     Pass,
     Fail,
     Skip,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub enum SetupCheckKind {
     Requirement,
     Validation,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SetupCheck {
     pub name: String,
     pub status: SetupCheckStatus,
@@ -245,7 +337,8 @@ pub struct SetupFlowResult {
     pub observed_checks: Vec<SetupCheck>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub enum SetupAssessmentStatus {
     Ready,
     Partial,
@@ -262,7 +355,8 @@ impl SetupAssessmentStatus {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SetupAssessment {
     pub provider: SetupProvider,
     pub auth_mode: Option<SetupAuthMode>,
@@ -1786,5 +1880,45 @@ mod tests {
                 && check.status == SetupCheckStatus::Fail
                 && check.detail.contains("unrecognized provider route")
         }));
+    }
+
+    #[test]
+    fn test_setup_assessment_serializes_with_control_facing_field_names() {
+        let assessment = SetupAssessment {
+            provider: SetupProvider::Gemini,
+            auth_mode: Some(SetupAuthMode::ApiKey),
+            status: SetupAssessmentStatus::Partial,
+            summary: "Gemini setup is written, but live validation was skipped.".to_string(),
+            checks: vec![SetupCheck::validation_skip(
+                "Live provider validation",
+                "setup completed without a live provider-side validation step",
+                Some("run `cara verify --outcome local-chat`".to_string()),
+            )],
+            profile_name: Some("Google Profile".to_string()),
+            email: Some("user@example.com".to_string()),
+        };
+
+        let value = serde_json::to_value(&assessment).expect("assessment should serialize");
+
+        assert_eq!(value["provider"], "gemini");
+        assert_eq!(value["authMode"], "apiKey");
+        assert_eq!(value["status"], "partial");
+        assert_eq!(value["checks"][0]["status"], "skip");
+        assert_eq!(value["checks"][0]["kind"], "validation");
+        assert_eq!(value["profileName"], "Google Profile");
+    }
+
+    #[test]
+    fn test_setup_provider_is_configured_tracks_provider_owned_state() {
+        let cfg = json!({
+            "anthropic": { "baseUrl": "https://anthropic-proxy.example.com" },
+            "providers": { "ollama": { "baseUrl": "http://127.0.0.1:11434" } },
+            "vertex": { "projectId": "test-project" },
+        });
+
+        assert!(SetupProvider::Anthropic.is_configured(&cfg));
+        assert!(SetupProvider::Ollama.is_configured(&cfg));
+        assert!(SetupProvider::Vertex.is_configured(&cfg));
+        assert!(!SetupProvider::Codex.is_configured(&cfg));
     }
 }

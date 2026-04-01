@@ -913,11 +913,15 @@ features:
   - feature: "server.control api"
     status: "verified_done"
     runtime_wiring:
-      - "src/server/control.rs (status/channels/config + task create/list/get/patch/cancel/retry/resume handlers + Gemini onboarding handlers)"
-      - "src/server/http.rs (control routes including /control/tasks* and /control/onboarding/gemini/*)"
+      - "src/server/control.rs (status/channels/config + task create/list/get/patch/cancel/retry/resume handlers + aggregate provider onboarding status + Gemini/Codex onboarding handlers)"
+      - "src/server/http.rs (control routes including /control/tasks*, /control/onboarding/status, /control/onboarding/gemini/*, and /control/onboarding/codex/*)"
       - "src/tasks/mod.rs (durable queue primitives used by control handlers)"
     tests:
       - "src/server/control.rs::test_gateway_status_response_serialization"
+      - "src/server/control.rs::test_control_onboarding_status_response_serialization"
+      - "src/server/control.rs::test_build_control_provider_onboarding_status_omits_assessment_when_unconfigured"
+      - "src/server/http.rs::test_control_onboarding_status_lists_all_providers"
+      - "src/server/http.rs::test_control_onboarding_status_reports_configured_provider_assessment"
       - "src/server/http.rs::test_control_tasks_create_list_and_get"
       - "src/server/http.rs::test_control_tasks_patch_not_found_returns_404"
       - "src/server/http.rs::test_control_tasks_resume_not_found_returns_404"

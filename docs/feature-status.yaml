@@ -229,7 +229,7 @@ feature_inventory_markdown: |
   - [x] **Rate limiting** — per-IP quotas
   - [x] **Resource monitoring** — CPU/memory tracking
   - [x] **Content Security Policy** — CSP headers
-  - [x] **Control API** — status/channels/config plus task endpoints (`/control/tasks` create/list/get/patch/cancel/retry/resume) and Gemini onboarding endpoints
+  - [x] **Control API** — status/channels/config plus task endpoints (`/control/tasks` create/list/get/patch/cancel/retry/resume), shared provider onboarding status (`/control/onboarding/status`), and Gemini/Codex onboarding endpoints
   - [x] **Graceful shutdown** — 30s drain period
 
   #### WebSocket Handlers

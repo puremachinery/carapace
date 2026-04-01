@@ -4,6 +4,7 @@
 //! - GET /control/status - Gateway status
 //! - GET /control/channels - Channel status
 //! - GET /control/config - Redacted config snapshot + optimistic concurrency hash
+//! - GET /control/onboarding/status - Shared provider onboarding/status snapshot
 //! - PATCH /control/config - Safe config updates (controlUi subtree)
 //! - POST /control/config - Legacy broader config updates
 //! - POST /control/tasks - Create objective task
@@ -23,6 +24,7 @@ use axum::{
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::net::SocketAddr;
+use std::path::Path as FsPath;
 use std::sync::Arc;
 
 use crate::auth;
@@ -217,6 +219,60 @@ pub struct ConfigReadResponse {
     /// SHA256 hash of current config file (if present)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
+}
+
+/// Shared Control API onboarding status response.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControlOnboardingStatusResponse {
+    pub ok: bool,
+    pub providers: Vec<ControlProviderOnboardingStatus>,
+}
+
+/// Control-facing onboarding status for a single provider.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControlProviderOnboardingStatus {
+    pub provider: String,
+    pub label: String,
+    pub configured: bool,
+    pub supported_auth_modes: Vec<onboarding::setup::SetupAuthMode>,
+    pub available_entrypoints: Vec<ControlOnboardingEntrypoint>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cli_setup_command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assessment: Option<onboarding::setup::SetupAssessment>,
+}
+
+/// A browser or CLI entrypoint the Control UI can surface for onboarding.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControlOnboardingEntrypoint {
+    pub kind: ControlOnboardingEntrypointKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_mode: Option<onboarding::setup::SetupAuthMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ControlOnboardingEntrypointKind {
+    Browser,
+    Cli,
+}
+
+/// Shared shape returned by onboarding apply/save handlers.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControlOnboardingApplyResponse {
+    pub ok: bool,
+    pub applied: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
+    pub provider_status: ControlProviderOnboardingStatus,
 }
 
 #[derive(Default)]
@@ -756,6 +812,131 @@ pub async fn config_read_handler(
         .into_response()
 }
 
+fn browser_onboarding_entrypoints(
+    provider: onboarding::setup::SetupProvider,
+) -> Vec<ControlOnboardingEntrypoint> {
+    use onboarding::setup::{SetupAuthMode, SetupProvider};
+
+    match provider {
+        SetupProvider::Gemini => vec![
+            ControlOnboardingEntrypoint {
+                kind: ControlOnboardingEntrypointKind::Browser,
+                auth_mode: Some(SetupAuthMode::OAuth),
+                path: Some("/control/onboarding/gemini/oauth/start".to_string()),
+                command: None,
+            },
+            ControlOnboardingEntrypoint {
+                kind: ControlOnboardingEntrypointKind::Browser,
+                auth_mode: Some(SetupAuthMode::ApiKey),
+                path: Some("/control/onboarding/gemini/api-key".to_string()),
+                command: None,
+            },
+        ],
+        SetupProvider::Codex => vec![ControlOnboardingEntrypoint {
+            kind: ControlOnboardingEntrypointKind::Browser,
+            auth_mode: Some(SetupAuthMode::OAuth),
+            path: Some("/control/onboarding/codex/oauth/start".to_string()),
+            command: None,
+        }],
+        _ => Vec::new(),
+    }
+}
+
+fn cli_onboarding_entrypoints(
+    provider: onboarding::setup::SetupProvider,
+) -> Vec<ControlOnboardingEntrypoint> {
+    let supported_auth_modes = provider.supported_auth_modes();
+    if supported_auth_modes.is_empty() {
+        return provider
+            .setup_command(None)
+            .into_iter()
+            .map(|command| ControlOnboardingEntrypoint {
+                kind: ControlOnboardingEntrypointKind::Cli,
+                auth_mode: None,
+                path: None,
+                command: Some(command),
+            })
+            .collect();
+    }
+
+    supported_auth_modes
+        .iter()
+        .filter_map(|auth_mode| {
+            provider
+                .setup_command(Some(*auth_mode))
+                .map(|command| ControlOnboardingEntrypoint {
+                    kind: ControlOnboardingEntrypointKind::Cli,
+                    auth_mode: Some(*auth_mode),
+                    path: None,
+                    command: Some(command),
+                })
+        })
+        .collect()
+}
+
+fn control_onboarding_entrypoints(
+    provider: onboarding::setup::SetupProvider,
+) -> Vec<ControlOnboardingEntrypoint> {
+    let mut entrypoints = browser_onboarding_entrypoints(provider);
+    entrypoints.extend(cli_onboarding_entrypoints(provider));
+    entrypoints
+}
+
+fn build_control_provider_onboarding_status(
+    cfg: &Value,
+    state_dir: &FsPath,
+    provider: onboarding::setup::SetupProvider,
+) -> ControlProviderOnboardingStatus {
+    let configured = provider.is_configured(cfg);
+    let assessment = configured
+        .then(|| onboarding::setup::assess_provider_setup(cfg, state_dir, provider, vec![]));
+    let cli_setup_command = provider.setup_command(assessment.as_ref().and_then(|it| it.auth_mode));
+
+    ControlProviderOnboardingStatus {
+        provider: provider.prompt_key().to_string(),
+        label: provider.label().to_string(),
+        configured,
+        supported_auth_modes: provider.supported_auth_modes().to_vec(),
+        available_entrypoints: control_onboarding_entrypoints(provider),
+        cli_setup_command,
+        assessment,
+    }
+}
+
+fn build_control_onboarding_statuses(
+    cfg: &Value,
+    state_dir: &FsPath,
+) -> Vec<ControlProviderOnboardingStatus> {
+    onboarding::setup::SetupProvider::all()
+        .iter()
+        .copied()
+        .map(|provider| build_control_provider_onboarding_status(cfg, state_dir, provider))
+        .collect()
+}
+
+/// GET /control/onboarding/status - Shared provider onboarding/status snapshot.
+pub async fn onboarding_status_handler(
+    State(state): State<ControlState>,
+    connect_info: MaybeConnectInfo,
+    headers: HeaderMap,
+) -> Response {
+    let remote_addr = connect_info.0;
+    if let Some(err) = check_control_auth(&state, &headers, remote_addr) {
+        return err;
+    }
+
+    let snapshot = read_config_snapshot();
+    let state_dir = crate::server::ws::resolve_state_dir();
+    (
+        StatusCode::OK,
+        Json(ControlOnboardingStatusResponse {
+            ok: true,
+            providers: build_control_onboarding_statuses(&snapshot.config, &state_dir),
+        }),
+    )
+        .into_response()
+}
+
 /// POST /control/onboarding/gemini/oauth/start - Begin Gemini Google sign-in.
 pub async fn gemini_oauth_start_handler(
     State(state): State<ControlState>,
@@ -856,19 +1037,23 @@ pub async fn gemini_oauth_apply_handler(
         return err;
     }
 
-    match onboarding::gemini::apply_control_google_oauth(
-        flow_id.trim(),
-        crate::server::ws::resolve_state_dir(),
-    ) {
+    let state_dir = crate::server::ws::resolve_state_dir();
+    match onboarding::gemini::apply_control_google_oauth(flow_id.trim(), state_dir.clone()) {
         Ok(applied) => {
             let snapshot = read_config_snapshot();
+            let provider_status = build_control_provider_onboarding_status(
+                &snapshot.config,
+                &state_dir,
+                onboarding::setup::SetupProvider::Gemini,
+            );
             (
                 StatusCode::OK,
-                Json(json!({
-                    "ok": true,
-                    "applied": applied,
-                    "hash": snapshot.hash,
-                })),
+                Json(ControlOnboardingApplyResponse {
+                    ok: true,
+                    applied,
+                    hash: snapshot.hash,
+                    provider_status,
+                }),
             )
                 .into_response()
         }
@@ -976,19 +1161,23 @@ pub async fn codex_oauth_apply_handler(
         return err;
     }
 
-    match onboarding::codex::apply_control_openai_oauth(
-        flow_id.trim(),
-        crate::server::ws::resolve_state_dir(),
-    ) {
+    let state_dir = crate::server::ws::resolve_state_dir();
+    match onboarding::codex::apply_control_openai_oauth(flow_id.trim(), state_dir.clone()) {
         Ok(applied) => {
             let snapshot = read_config_snapshot();
+            let provider_status = build_control_provider_onboarding_status(
+                &snapshot.config,
+                &state_dir,
+                onboarding::setup::SetupProvider::Codex,
+            );
             (
                 StatusCode::OK,
-                Json(json!({
-                    "ok": true,
-                    "applied": applied,
-                    "hash": snapshot.hash,
-                })),
+                Json(ControlOnboardingApplyResponse {
+                    ok: true,
+                    applied,
+                    hash: snapshot.hash,
+                    provider_status,
+                }),
             )
                 .into_response()
         }
@@ -1083,13 +1272,20 @@ pub async fn gemini_api_key_handler(
     }) {
         Ok(applied) => {
             let snapshot = read_config_snapshot();
+            let state_dir = crate::server::ws::resolve_state_dir();
+            let provider_status = build_control_provider_onboarding_status(
+                &snapshot.config,
+                &state_dir,
+                onboarding::setup::SetupProvider::Gemini,
+            );
             (
                 StatusCode::OK,
-                Json(json!({
-                    "ok": true,
-                    "applied": applied,
-                    "hash": snapshot.hash,
-                })),
+                Json(ControlOnboardingApplyResponse {
+                    ok: true,
+                    applied,
+                    hash: snapshot.hash,
+                    provider_status,
+                }),
             )
                 .into_response()
         }
@@ -1776,6 +1972,7 @@ fn check_control_auth(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn test_gateway_status_response_serialization() {
@@ -1872,6 +2069,70 @@ mod tests {
         assert!(json_str.contains("\"ok\":true"));
         assert!(!json_str.contains("\"hash\""));
         assert!(!json_str.contains("\"applied\""));
+    }
+
+    #[test]
+    fn test_control_onboarding_status_response_serialization() {
+        let response = ControlOnboardingStatusResponse {
+            ok: true,
+            providers: vec![ControlProviderOnboardingStatus {
+                provider: "gemini".to_string(),
+                label: "Gemini".to_string(),
+                configured: true,
+                supported_auth_modes: vec![
+                    onboarding::setup::SetupAuthMode::OAuth,
+                    onboarding::setup::SetupAuthMode::ApiKey,
+                ],
+                available_entrypoints: vec![ControlOnboardingEntrypoint {
+                    kind: ControlOnboardingEntrypointKind::Browser,
+                    auth_mode: Some(onboarding::setup::SetupAuthMode::OAuth),
+                    path: Some("/control/onboarding/gemini/oauth/start".to_string()),
+                    command: None,
+                }],
+                cli_setup_command: Some(
+                    "cara setup --force --provider gemini --auth-mode oauth".to_string(),
+                ),
+                assessment: Some(onboarding::setup::SetupAssessment {
+                    provider: onboarding::setup::SetupProvider::Gemini,
+                    auth_mode: Some(onboarding::setup::SetupAuthMode::OAuth),
+                    status: onboarding::setup::SetupAssessmentStatus::Partial,
+                    summary: "Gemini setup is written, but validation was skipped.".to_string(),
+                    checks: vec![onboarding::setup::SetupCheck::validation_skip(
+                        "Live provider validation",
+                        "setup completed without a live provider-side validation step",
+                        None,
+                    )],
+                    profile_name: Some("Google Profile".to_string()),
+                    email: Some("user@example.com".to_string()),
+                }),
+            }],
+        };
+
+        let json = serde_json::to_value(&response).expect("status response should serialize");
+        assert_eq!(json["providers"][0]["provider"], "gemini");
+        assert_eq!(json["providers"][0]["supportedAuthModes"][0], "oauth");
+        assert_eq!(
+            json["providers"][0]["availableEntrypoints"][0]["kind"],
+            "browser"
+        );
+        assert_eq!(json["providers"][0]["assessment"]["status"], "partial");
+    }
+
+    #[test]
+    fn test_build_control_provider_onboarding_status_omits_assessment_when_unconfigured() {
+        let temp = TempDir::new().unwrap();
+        let cfg = json!({});
+
+        let status = build_control_provider_onboarding_status(
+            &cfg,
+            temp.path(),
+            onboarding::setup::SetupProvider::Anthropic,
+        );
+
+        assert!(!status.configured);
+        assert!(status.assessment.is_none());
+        assert_eq!(status.provider, "anthropic");
+        assert_eq!(status.available_entrypoints.len(), 2);
     }
 
     #[test]
