@@ -82,26 +82,21 @@ pub(crate) fn read_config_snapshot() -> ConfigSnapshot {
 
     let hash = Some(sha256_hex(&raw));
     let parsed = json5::from_str::<Value>(&raw).unwrap_or(Value::Null);
-    let raw_config = match config::load_raw_config_shared() {
-        Ok(cfg) => cfg.as_ref().clone(),
-        Err(_) => parsed.clone(),
-    };
-
-    let (config_value, mut issues, valid) = match config::load_config_shared() {
-        Ok(cfg) => {
-            let cfg = cfg.as_ref().clone();
-            let issues = map_validation_issues(config::validate_config(&cfg));
-            let valid = issues.is_empty();
-            (cfg, issues, valid)
-        }
-        Err(err) => {
-            let issues = vec![ConfigIssue {
-                path: "".to_string(),
-                message: err.to_string(),
-            }];
-            (raw_config.clone(), issues, false)
-        }
-    };
+    let (raw_config, config_value, mut issues, valid) =
+        match config::load_config_pair_uncached(&path) {
+            Ok((raw_cfg, cfg)) => {
+                let issues = map_validation_issues(config::validate_config(&cfg));
+                let valid = issues.is_empty();
+                (raw_cfg, cfg, issues, valid)
+            }
+            Err(err) => {
+                let issues = vec![ConfigIssue {
+                    path: "".to_string(),
+                    message: err.to_string(),
+                }];
+                (parsed.clone(), parsed.clone(), issues, false)
+            }
+        };
 
     if !valid && issues.is_empty() {
         issues.push(ConfigIssue {

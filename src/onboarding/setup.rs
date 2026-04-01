@@ -31,6 +31,7 @@ use std::path::Path;
 
 use serde::Serialize;
 use serde_json::Value;
+use strum::IntoEnumIterator;
 
 use crate::agent;
 use crate::auth::profiles::{
@@ -38,7 +39,7 @@ use crate::auth::profiles::{
 };
 use crate::config::secrets::is_encrypted;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, strum::EnumIter)]
 pub enum SetupProvider {
     #[serde(rename = "anthropic")]
     Anthropic,
@@ -60,17 +61,9 @@ pub enum SetupProvider {
 
 impl SetupProvider {
     pub fn all() -> &'static [Self] {
-        const PROVIDERS: [SetupProvider; 8] = [
-            SetupProvider::Anthropic,
-            SetupProvider::Codex,
-            SetupProvider::OpenAi,
-            SetupProvider::Ollama,
-            SetupProvider::Gemini,
-            SetupProvider::Vertex,
-            SetupProvider::Venice,
-            SetupProvider::Bedrock,
-        ];
-        &PROVIDERS
+        static PROVIDERS: std::sync::LazyLock<Vec<SetupProvider>> =
+            std::sync::LazyLock::new(|| SetupProvider::iter().collect());
+        PROVIDERS.as_slice()
     }
 
     pub fn label(self) -> &'static str {
@@ -138,7 +131,7 @@ impl SetupProvider {
         const ANTHROPIC_AUTH_MODES: [SetupAuthMode; 2] =
             [SetupAuthMode::ApiKey, SetupAuthMode::SetupToken];
         const CODEX_AUTH_MODES: [SetupAuthMode; 1] = [SetupAuthMode::OAuth];
-        const OPENAI_AUTH_MODES: [SetupAuthMode; 1] = [SetupAuthMode::ApiKey];
+        const API_KEY_AUTH_MODES: [SetupAuthMode; 1] = [SetupAuthMode::ApiKey];
         const OLLAMA_AUTH_MODES: [SetupAuthMode; 1] = [SetupAuthMode::BaseUrl];
         const GEMINI_AUTH_MODES: [SetupAuthMode; 2] = [SetupAuthMode::OAuth, SetupAuthMode::ApiKey];
         const BEDROCK_AUTH_MODES: [SetupAuthMode; 1] = [SetupAuthMode::StaticCredentials];
@@ -146,11 +139,14 @@ impl SetupProvider {
         match self {
             Self::Anthropic => &ANTHROPIC_AUTH_MODES,
             Self::Codex => &CODEX_AUTH_MODES,
-            Self::OpenAi => &OPENAI_AUTH_MODES,
+            Self::OpenAi => &API_KEY_AUTH_MODES,
             Self::Ollama => &OLLAMA_AUTH_MODES,
             Self::Gemini => &GEMINI_AUTH_MODES,
+            // Vertex setup is currently CLI-first and credential-source-agnostic
+            // (ADC vs service account), so the shared status API exposes guidance
+            // via CLI entrypoints rather than a misleading auth-mode enum value.
             Self::Vertex => &NO_AUTH_MODES,
-            Self::Venice => &OPENAI_AUTH_MODES,
+            Self::Venice => &API_KEY_AUTH_MODES,
             Self::Bedrock => &BEDROCK_AUTH_MODES,
         }
     }

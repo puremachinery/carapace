@@ -233,7 +233,7 @@ pub struct ControlOnboardingStatusResponse {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ControlProviderOnboardingStatus {
-    pub provider: String,
+    pub provider: onboarding::setup::SetupProvider,
     pub label: String,
     pub configured: bool,
     pub supported_auth_modes: Vec<onboarding::setup::SetupAuthMode>,
@@ -269,6 +269,9 @@ pub enum ControlOnboardingEntrypointKind {
 #[serde(rename_all = "camelCase")]
 pub struct ControlOnboardingApplyResponse {
     pub ok: bool,
+    /// Provider-owned apply payload. Current onboarding handlers return small
+    /// JSON objects such as `{"mode": "apiKey"}` or
+    /// `{"profileId": "...", "mode": "oauth"}`.
     pub applied: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
@@ -896,7 +899,7 @@ fn build_control_provider_onboarding_status(
     let cli_setup_command = provider.setup_command(assessment.as_ref().and_then(|it| it.auth_mode));
 
     ControlProviderOnboardingStatus {
-        provider: provider.prompt_key().to_string(),
+        provider,
         label: provider.label().to_string(),
         configured,
         supported_auth_modes: provider.supported_auth_modes().to_vec(),
@@ -2171,7 +2174,7 @@ mod tests {
         let response = ControlOnboardingStatusResponse {
             ok: true,
             providers: vec![ControlProviderOnboardingStatus {
-                provider: "gemini".to_string(),
+                provider: onboarding::setup::SetupProvider::Gemini,
                 label: "Gemini".to_string(),
                 configured: true,
                 supported_auth_modes: vec![
@@ -2227,7 +2230,7 @@ mod tests {
 
         assert!(!status.configured);
         assert!(status.assessment.is_none());
-        assert_eq!(status.provider, "anthropic");
+        assert_eq!(status.provider, onboarding::setup::SetupProvider::Anthropic);
         assert_eq!(status.available_entrypoints.len(), 2);
     }
 

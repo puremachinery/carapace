@@ -284,6 +284,14 @@ pub fn load_config_uncached(path: &Path) -> Result<Value, ConfigError> {
     Ok(load_cached_config_uncached(path)?.value.as_ref().clone())
 }
 
+pub(crate) fn load_config_pair_uncached(path: &Path) -> Result<(Value, Value), ConfigError> {
+    let cached = load_cached_config_uncached(path)?;
+    Ok((
+        cached.raw_value.as_ref().clone(),
+        cached.value.as_ref().clone(),
+    ))
+}
+
 fn load_raw_config_uncached(path: &Path) -> Result<Value, ConfigError> {
     // Return empty object if file doesn't exist.
     if !path.exists() {
@@ -1392,6 +1400,63 @@ mod tests {
         assert_eq!(
             raw["channels"]["signal"]["features"]["typing"]["enabled"],
             Value::Bool(true)
+        );
+
+        clear_cache();
+    }
+
+    #[test]
+    fn test_load_config_pair_uncached_bypasses_stale_cache() {
+        clear_cache();
+        let mut env_guard = ScopedEnv::new();
+        env_guard
+            .unset("CARAPACE_DISABLE_CONFIG_CACHE")
+            .set("CARAPACE_CONFIG_CACHE_MS", "60000");
+
+        let dir = TempDir::new().unwrap();
+        let config_path = create_temp_config(
+            &dir,
+            "config.json5",
+            r#"{
+                "channels": {
+                    "signal": {
+                        "features": {
+                            "typing": {
+                                "enabled": true
+                            }
+                        }
+                    }
+                }
+            }"#,
+        );
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
+
+        let _stale = load_config_shared().unwrap();
+
+        std::fs::write(
+            &config_path,
+            r#"{
+                "channels": {
+                    "signal": {
+                        "features": {
+                            "typing": {
+                                "enabled": false
+                            }
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let (raw, normalized) = load_config_pair_uncached(&config_path).unwrap();
+        assert_eq!(
+            raw["channels"]["signal"]["features"]["typing"]["enabled"],
+            Value::Bool(false)
+        );
+        assert_eq!(
+            normalized["channels"]["signal"]["features"]["typing"]["enabled"],
+            Value::Bool(false)
         );
 
         clear_cache();
