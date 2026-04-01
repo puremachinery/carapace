@@ -126,7 +126,7 @@ For a plain-English guide to the most commonly tuned sections, see
 - `gateway` – service settings
 - `plugins` – plugin load/allowlist/config
 - `filesystem` – root-scoped filesystem tool registration and limits
-- `anthropic` – Anthropic provider settings (apiKey, baseUrl)
+- `anthropic` – Anthropic provider settings (apiKey, authProfile, baseUrl)
 - `openai` – OpenAI provider settings (apiKey, baseUrl, httpReferer, title)
 - `codex` – Codex/OpenAI subscription settings (`authProfile`)
 - `google` – Google Gemini provider settings (`apiKey`, `authProfile`, `baseUrl`)
@@ -164,7 +164,7 @@ This is a condensed map; refer to the JSON schema for full detail.
   - `profiles.enabled`, `profiles.redirectBaseUrl`
   - `profiles.providers.{google,github,discord,openai}.{clientId,clientSecret,redirectUri}`
 - `anthropic`
-  - `apiKey`, `baseUrl`
+  - `apiKey`, `authProfile`, `baseUrl`
 - `openai`
   - `apiKey`, `baseUrl`, `httpReferer`, `title`
 - `codex`
@@ -206,6 +206,49 @@ This is a condensed map; refer to the JSON schema for full detail.
   - `gatewayUrl` (override Discord Gateway URL)
 - `slack`
   - `signingSecret` (validates Events API signatures)
+
+### Anthropic credential modes
+
+Anthropic can authenticate in either of these ways:
+
+- `anthropic.apiKey` or `ANTHROPIC_API_KEY`
+- `anthropic.authProfile` pointing at a stored Anthropic setup-token profile under `auth.profiles`
+
+If both are present, runtime prefers the API-key path and setup assessment
+surfaces that dual configuration explicitly.
+
+Example API-key config:
+
+```json5
+{
+  "anthropic": {
+    "apiKey": "${ANTHROPIC_API_KEY}"
+  }
+}
+```
+
+Example setup-token config:
+
+```json5
+{
+  "auth": {
+    "profiles": {
+      "enabled": true
+    }
+  },
+  "anthropic": {
+    "authProfile": "anthropic:default"
+  }
+}
+```
+
+Notes:
+
+- `cara setup --provider anthropic --auth-mode setup-token` writes this shape.
+- Anthropic setup-token mode requires `CARAPACE_CONFIG_PASSWORD` because the
+  stored token is kept in the encrypted auth-profile store instead of config.
+- `cara setup --provider anthropic --auth-mode api-key` keeps the existing
+  direct API-key path.
 
 ### Gemini credential modes
 

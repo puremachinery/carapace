@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use crate::auth::profiles::{
     exchange_code, fetch_user_info, generate_auth_url, profile_store_encryption_enabled_from_env,
-    AuthProfile, OAuthProvider, OAuthProviderConfig, OAuthTokens, ProfileStore,
-    StoredOAuthProviderConfig,
+    AuthProfile, AuthProfileCredentialKind, OAuthProvider, OAuthProviderConfig, OAuthTokens,
+    ProfileStore, StoredOAuthProviderConfig,
 };
 use crate::server::ws::{map_validation_issues, persist_config_file, read_config_snapshot};
 
@@ -530,7 +530,9 @@ fn build_google_auth_profile(
         avatar_url: userinfo.avatar_url,
         created_at_ms: now_ms,
         last_used_ms: Some(now_ms),
-        tokens,
+        credential_kind: AuthProfileCredentialKind::OAuth,
+        tokens: Some(tokens),
+        token: None,
         oauth_provider_config: Some(StoredOAuthProviderConfig::from(provider_config)),
     }
 }
@@ -1212,13 +1214,15 @@ mod tests {
                         avatar_url: None,
                         created_at_ms: now_ms(),
                         last_used_ms: Some(now_ms()),
-                        tokens: OAuthTokens {
+                        credential_kind: AuthProfileCredentialKind::OAuth,
+                        tokens: Some(OAuthTokens {
                             access_token: "access-token".to_string(),
                             refresh_token: Some("refresh-token".to_string()),
                             token_type: "Bearer".to_string(),
                             expires_at_ms: Some(now_ms() + 3_600_000),
                             scope: Some("openid email profile".to_string()),
-                        },
+                        }),
+                        token: None,
                         oauth_provider_config: Some(StoredOAuthProviderConfig::from(
                             &OAuthProvider::Google.default_config(
                                 "client-id",

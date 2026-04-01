@@ -242,6 +242,13 @@ These are the most commonly used provider sections for first-run setup and day-1
   - *Common values:*
     - `apiKey`: Secret credential string, often sourced from an environment variable like `"${OPENAI_API_KEY}"`.
     - `baseUrl`: String. Useful if passing through an enterprise proxy or alternate endpoint.
+- **`anthropic`**
+  - *Additional values:*
+    - `authProfile`: String. Name of a stored Anthropic setup-token profile under `auth.profiles` (alternative to `apiKey`).
+  - *Behavior notes:*
+    - `cara setup --provider anthropic --auth-mode setup-token` writes `anthropic.authProfile`.
+    - Anthropic setup-token mode requires `CARAPACE_CONFIG_PASSWORD` so the stored token stays encrypted at rest.
+    - If both `anthropic.apiKey` and `anthropic.authProfile` are present, runtime prefers `apiKey`.
 - **`openai`**
   - *Additional values:*
     - `httpReferer`: String. Sends the `HTTP-Referer` header to OpenAI-compatible backends that use it for app identification or routing.

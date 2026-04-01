@@ -60,10 +60,11 @@ impl CodexProvider {
                 self.profile_id
             ))
         })?;
+        ensure_oauth_profile_kind(&profile, &self.profile_id, "Codex")?;
         let now_ms = current_time_ms();
         if profile
-            .tokens
-            .expires_at_ms
+            .oauth_tokens()
+            .and_then(|tokens| tokens.expires_at_ms)
             .is_some_and(|expires_at| expires_at <= now_ms + TOKEN_REFRESH_MARGIN_MS)
         {
             let _refresh_guard = self.refresh_lock.lock().await;
@@ -73,18 +74,18 @@ impl CodexProvider {
                     self.profile_id
                 ))
             })?;
+            ensure_oauth_profile_kind(&locked_profile, &self.profile_id, "Codex")?;
             let now_ms_after_lock = current_time_ms();
             if locked_profile
-                .tokens
-                .expires_at_ms
+                .oauth_tokens()
+                .and_then(|tokens| tokens.expires_at_ms)
                 .is_none_or(|expires_at| expires_at > now_ms_after_lock + TOKEN_REFRESH_MARGIN_MS)
             {
                 profile = locked_profile;
             } else {
                 let refresh_token_value = locked_profile
-                    .tokens
-                    .refresh_token
-                    .clone()
+                    .oauth_tokens()
+                    .and_then(|tokens| tokens.refresh_token.clone())
                     .filter(|token| !token.trim().is_empty())
                     .ok_or_else(|| {
                         AgentError::Provider(format!(
@@ -113,11 +114,14 @@ impl CodexProvider {
                 // `last_used_ms` by ID afterwards, so there is no need to
                 // re-fetch unrelated profile fields here.
                 profile = locked_profile;
-                profile.tokens = refreshed;
+                profile.tokens = Some(refreshed);
             }
         }
 
-        let access_token = profile.tokens.access_token.trim();
+        let access_token = profile
+            .oauth_tokens()
+            .map(|tokens| tokens.access_token.trim())
+            .unwrap_or("");
         if access_token.is_empty() {
             return Err(AgentError::Provider(format!(
                 "Codex auth profile \"{}\" has no usable access token",
@@ -179,7 +183,8 @@ fn current_time_ms() -> u64 {
 mod tests {
     use super::*;
     use crate::auth::profiles::{
-        AuthProfile, OAuthProvider, OAuthTokens, StoredOAuthProviderConfig,
+        AuthProfile, AuthProfileCredentialKind, OAuthProvider, OAuthTokens,
+        StoredOAuthProviderConfig,
     };
 
     fn sample_tokens() -> OAuthTokens {
@@ -208,7 +213,9 @@ mod tests {
             avatar_url: None,
             created_at_ms: current_time_ms(),
             last_used_ms: Some(current_time_ms()),
-            tokens: sample_tokens(),
+            credential_kind: AuthProfileCredentialKind::OAuth,
+            tokens: Some(sample_tokens()),
+            token: None,
             oauth_provider_config: Some(StoredOAuthProviderConfig::from(&provider_config)),
         }
     }
@@ -281,10 +288,10 @@ mod tests {
             "http://127.0.0.1:3000/auth/callback",
         );
         let profile = AuthProfile {
-            tokens: OAuthTokens {
+            tokens: Some(OAuthTokens {
                 access_token: "   ".to_string(),
                 ..sample_tokens()
-            },
+            }),
             ..sample_profile("openai-empty-token")
         };
         let store = Arc::new(ProfileStore::from_env(temp.path().to_path_buf()).expect("store"));
@@ -303,6 +310,37 @@ mod tests {
         assert!(err
             .to_string()
             .contains("Codex auth profile \"openai-empty-token\" has no usable access token"));
+    }
+
+    #[tokio::test]
+    async fn test_codex_provider_wrong_credential_kind_errors() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let provider_config = OAuthProvider::OpenAI.default_config(
+            "client-id",
+            "client-secret",
+            "http://127.0.0.1:3000/auth/callback",
+        );
+        let mut profile = sample_profile("openai-token-kind");
+        profile.credential_kind = AuthProfileCredentialKind::Token;
+        profile.tokens = None;
+        profile.token = Some("sk-ant-oat01-token".to_string());
+
+        let store = Arc::new(ProfileStore::from_env(temp.path().to_path_buf()).expect("store"));
+        store.add(profile).expect("store profile");
+        let provider = CodexProvider::with_oauth_profile(
+            store,
+            "openai-token-kind".to_string(),
+            provider_config,
+        )
+        .expect("provider");
+
+        let err = provider
+            .access_token()
+            .await
+            .expect_err("wrong credential kind should fail");
+        assert!(err.to_string().contains(
+            "Codex auth profile \"openai-token-kind\" uses token credentials, not oauth"
+        ));
     }
 
     #[tokio::test]

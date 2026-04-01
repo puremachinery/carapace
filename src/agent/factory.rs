@@ -13,8 +13,30 @@ use tracing::{info, warn};
 use crate::agent;
 use crate::agent::provider::MultiProvider;
 use crate::auth::profiles::{
-    profile_store_encryption_enabled_from_env, OAuthProvider, ProfileStore,
+    profile_store_encryption_enabled_from_env, resolve_anthropic_profile_token,
+    AuthProfileCredentialKind, OAuthProvider, ProfileStore,
 };
+
+fn resolve_anthropic_auth_profile_id(cfg: &Value) -> Option<String> {
+    cfg.get("anthropic")
+        .and_then(|v| v.get("authProfile"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn resolve_anthropic_api_key(cfg: &Value) -> Option<String> {
+    std::env::var("ANTHROPIC_API_KEY")
+        .ok()
+        .or_else(|| {
+            cfg.get("anthropic")
+                .and_then(|v| v.get("apiKey"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
 
 fn resolve_google_auth_profile_id(cfg: &Value) -> Option<String> {
     cfg.get("google")
@@ -40,7 +62,9 @@ fn resolve_google_oauth_runtime_config(
     let profile_store = ProfileStore::from_env(state_dir.to_path_buf()).ok()?;
     profile_store.load().ok()?;
     let profile = profile_store.get(profile_id)?;
-    if profile.provider != OAuthProvider::Google {
+    if profile.provider != OAuthProvider::Google
+        || profile.credential_kind != AuthProfileCredentialKind::OAuth
+    {
         return None;
     }
     if let Some(stored) = profile.oauth_provider_config {
@@ -64,6 +88,27 @@ fn resolve_google_oauth_runtime_config(
     None
 }
 
+fn resolve_anthropic_auth_profile_fingerprint(cfg: &Value) -> Option<String> {
+    let profile_id = resolve_anthropic_auth_profile_id(cfg)?;
+    let state_dir = crate::paths::resolve_state_dir();
+    let profile_store = ProfileStore::from_env(state_dir).ok()?;
+    profile_store.load().ok()?;
+    let profile = profile_store.get(&profile_id)?;
+    if profile.provider != OAuthProvider::Anthropic
+        || profile.credential_kind != AuthProfileCredentialKind::Token
+    {
+        return None;
+    }
+
+    let material =
+        serde_json::to_string(&(&profile_id, &profile.credential_kind, &profile.token)).ok()?;
+    Some(format!(
+        "auth-profile:{}:{}",
+        profile_id,
+        hash_key_prefix(&material)
+    ))
+}
+
 fn resolve_openai_oauth_runtime_config(
     cfg: &Value,
     state_dir: &Path,
@@ -72,7 +117,9 @@ fn resolve_openai_oauth_runtime_config(
     let profile_store = ProfileStore::from_env(state_dir.to_path_buf()).ok()?;
     profile_store.load().ok()?;
     let profile = profile_store.get(profile_id)?;
-    if profile.provider != OAuthProvider::OpenAI {
+    if profile.provider != OAuthProvider::OpenAI
+        || profile.credential_kind != AuthProfileCredentialKind::OAuth
+    {
         return None;
     }
     if let Some(stored) = profile.oauth_provider_config {
@@ -102,7 +149,9 @@ fn resolve_google_auth_profile_fingerprint(cfg: &Value) -> Option<String> {
     let profile_store = ProfileStore::from_env(state_dir).ok()?;
     profile_store.load().ok()?;
     let profile = profile_store.get(&profile_id)?;
-    if profile.provider != OAuthProvider::Google {
+    if profile.provider != OAuthProvider::Google
+        || profile.credential_kind != AuthProfileCredentialKind::OAuth
+    {
         return None;
     }
 
@@ -122,7 +171,9 @@ fn resolve_openai_auth_profile_fingerprint(cfg: &Value) -> Option<String> {
     let profile_store = ProfileStore::from_env(state_dir).ok()?;
     profile_store.load().ok()?;
     let profile = profile_store.get(&profile_id)?;
-    if profile.provider != OAuthProvider::OpenAI {
+    if profile.provider != OAuthProvider::OpenAI
+        || profile.credential_kind != AuthProfileCredentialKind::OAuth
+    {
         return None;
     }
 
@@ -219,6 +270,53 @@ fn build_codex_provider(
         );
         Ok(None)
     }
+}
+
+fn build_anthropic_provider(
+    anthropic_api_key: Option<String>,
+    anthropic_auth_profile: Option<String>,
+    anthropic_base_url: Option<String>,
+) -> Result<Option<Arc<dyn agent::LlmProvider>>, Box<dyn std::error::Error>> {
+    if let Some(api_key) = anthropic_api_key {
+        if anthropic_auth_profile.is_some() {
+            warn!(
+                "Both anthropic.apiKey and anthropic.authProfile are configured; preferring the direct API key path"
+            );
+        }
+        return try_build_provider(
+            Some(api_key),
+            anthropic_base_url,
+            "Anthropic",
+            agent::anthropic::AnthropicProvider::new,
+            |p, url| p.with_base_url(url),
+        );
+    }
+
+    let Some(profile_id) = anthropic_auth_profile else {
+        return Ok(None);
+    };
+
+    if !profile_store_encryption_enabled_from_env() {
+        return Err(std::io::Error::other(
+            "Anthropic auth profile requires CARAPACE_CONFIG_PASSWORD so setup-token credentials stay encrypted at rest",
+        )
+        .into());
+    }
+
+    let state_dir = crate::paths::resolve_state_dir();
+    let profile_store = ProfileStore::from_env(state_dir)?;
+    profile_store.load()?;
+    resolve_anthropic_profile_token(&profile_store, &profile_id).map_err(std::io::Error::other)?;
+
+    let mut provider = agent::anthropic::AnthropicProvider::with_auth_profile_token(
+        Arc::new(profile_store),
+        profile_id,
+    )?;
+    if let Some(url) = anthropic_base_url {
+        provider = provider.with_base_url(url)?;
+    }
+    info!("LLM provider configured: Anthropic (auth profile)");
+    Ok(Some(Arc::new(provider) as Arc<dyn agent::LlmProvider>))
 }
 
 /// Try to build a provider from an API key + optional base URL.
@@ -418,24 +516,18 @@ fn try_build_ollama_provider(
 /// Returns `None` if no providers are configured.
 pub fn build_providers(cfg: &Value) -> Result<Option<MultiProvider>, Box<dyn std::error::Error>> {
     // Anthropic
-    let anthropic_api_key = std::env::var("ANTHROPIC_API_KEY").ok().or_else(|| {
-        cfg.get("anthropic")
-            .and_then(|v| v.get("apiKey"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    });
+    let anthropic_api_key = resolve_anthropic_api_key(cfg);
+    let anthropic_auth_profile = resolve_anthropic_auth_profile_id(cfg);
     let anthropic_base_url = std::env::var("ANTHROPIC_BASE_URL").ok().or_else(|| {
         cfg.get("anthropic")
             .and_then(|v| v.get("baseUrl"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
     });
-    let anthropic_provider = try_build_provider(
+    let anthropic_provider = build_anthropic_provider(
         anthropic_api_key,
+        anthropic_auth_profile,
         anthropic_base_url,
-        "Anthropic",
-        agent::anthropic::AnthropicProvider::new,
-        |p, url| p.with_base_url(url),
     )?;
 
     // OpenAI
@@ -635,12 +727,8 @@ pub struct ProviderFingerprint {
 
 /// Compute a fingerprint of the provider configuration from config + env vars.
 pub fn fingerprint_providers(cfg: &Value) -> ProviderFingerprint {
-    let anthropic_key = std::env::var("ANTHROPIC_API_KEY").ok().or_else(|| {
-        cfg.get("anthropic")
-            .and_then(|v| v.get("apiKey"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    });
+    let anthropic_key = resolve_anthropic_api_key(cfg);
+    let anthropic_auth_profile_fingerprint = resolve_anthropic_auth_profile_fingerprint(cfg);
     let anthropic_url = std::env::var("ANTHROPIC_BASE_URL").ok().or_else(|| {
         cfg.get("anthropic")
             .and_then(|v| v.get("baseUrl"))
@@ -719,7 +807,16 @@ pub fn fingerprint_providers(cfg: &Value) -> ProviderFingerprint {
     });
 
     ProviderFingerprint {
-        anthropic: anthropic_key.map(|k| (hash_key_prefix(&k), anthropic_url)),
+        anthropic: anthropic_key
+            .map(|k| {
+                (
+                    format!("api-key:{}", hash_key_prefix(&k)),
+                    anthropic_url.clone(),
+                )
+            })
+            .or_else(|| {
+                anthropic_auth_profile_fingerprint.map(|fingerprint| (fingerprint, anthropic_url))
+            }),
         openai: openai_api_key.as_ref().map(|api_key| {
             let api_key_hash = if openai_http_referer.is_none() && openai_title.is_none() {
                 hash_key_prefix(api_key)
@@ -915,13 +1012,15 @@ mod tests {
                 avatar_url: None,
                 created_at_ms: 0,
                 last_used_ms: None,
-                tokens: crate::auth::profiles::OAuthTokens {
+                credential_kind: AuthProfileCredentialKind::OAuth,
+                tokens: Some(crate::auth::profiles::OAuthTokens {
                     access_token: "access-token".to_string(),
                     refresh_token: Some("refresh-token".to_string()),
                     token_type: "Bearer".to_string(),
                     expires_at_ms: Some(u64::MAX),
                     scope: Some("openid email profile".to_string()),
-                },
+                }),
+                token: None,
                 oauth_provider_config: Some(
                     crate::auth::profiles::StoredOAuthProviderConfig::from(&provider_config),
                 ),
@@ -934,6 +1033,42 @@ mod tests {
             let fp = fingerprint_providers(&cfg);
             let fingerprint = fp.gemini.expect("gemini fingerprint");
             assert!(fingerprint.0.starts_with("auth-profile:google-abc123:"));
+            assert_eq!(fingerprint.1, None);
+        });
+    }
+
+    #[test]
+    fn test_fingerprint_with_anthropic_auth_profile() {
+        with_clean_provider_env(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let _password = set_env_var_scoped("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+            let _state_dir = set_env_var_scoped(
+                "CARAPACE_STATE_DIR",
+                temp.path().to_str().expect("state dir path"),
+            );
+            let profile = crate::auth::profiles::AuthProfile {
+                id: "anthropic:default".to_string(),
+                name: "Anthropic setup token".to_string(),
+                provider: OAuthProvider::Anthropic,
+                user_id: None,
+                email: None,
+                display_name: None,
+                avatar_url: None,
+                created_at_ms: 0,
+                last_used_ms: None,
+                credential_kind: AuthProfileCredentialKind::Token,
+                tokens: None,
+                token: Some("sk-ant-oat01-test-token".to_string()),
+                oauth_provider_config: None,
+            };
+            let store = ProfileStore::from_env(temp.path().to_path_buf()).expect("profile store");
+            store.add(profile).expect("store profile");
+            let cfg = json!({
+                "anthropic": { "authProfile": "anthropic:default" }
+            });
+            let fp = fingerprint_providers(&cfg);
+            let fingerprint = fp.anthropic.expect("anthropic fingerprint");
+            assert!(fingerprint.0.starts_with("auth-profile:anthropic:default:"));
             assert_eq!(fingerprint.1, None);
         });
     }
@@ -961,13 +1096,15 @@ mod tests {
                 avatar_url: None,
                 created_at_ms: 0,
                 last_used_ms: None,
-                tokens: crate::auth::profiles::OAuthTokens {
+                credential_kind: AuthProfileCredentialKind::OAuth,
+                tokens: Some(crate::auth::profiles::OAuthTokens {
                     access_token: "access-token".to_string(),
                     refresh_token: Some("refresh-token".to_string()),
                     token_type: "Bearer".to_string(),
                     expires_at_ms: Some(u64::MAX),
                     scope: Some("openid email profile offline_access".to_string()),
-                },
+                }),
+                token: None,
                 oauth_provider_config: Some(
                     crate::auth::profiles::StoredOAuthProviderConfig::from(&provider_config),
                 ),
@@ -1007,13 +1144,15 @@ mod tests {
                 avatar_url: None,
                 created_at_ms: 0,
                 last_used_ms: None,
-                tokens: crate::auth::profiles::OAuthTokens {
+                credential_kind: AuthProfileCredentialKind::OAuth,
+                tokens: Some(crate::auth::profiles::OAuthTokens {
                     access_token: "access-token".to_string(),
                     refresh_token: Some("refresh-token".to_string()),
                     token_type: "Bearer".to_string(),
                     expires_at_ms: Some(u64::MAX),
                     scope: Some("openid email profile".to_string()),
-                },
+                }),
+                token: None,
                 oauth_provider_config: Some(
                     crate::auth::profiles::StoredOAuthProviderConfig::from(&provider_config),
                 ),
@@ -1137,13 +1276,15 @@ mod tests {
                 avatar_url: None,
                 created_at_ms: 0,
                 last_used_ms: None,
-                tokens: crate::auth::profiles::OAuthTokens {
+                credential_kind: AuthProfileCredentialKind::OAuth,
+                tokens: Some(crate::auth::profiles::OAuthTokens {
                     access_token: "access-token-a".to_string(),
                     refresh_token: Some("refresh-token-a".to_string()),
                     token_type: "Bearer".to_string(),
                     expires_at_ms: Some(1_000),
                     scope: Some("openid email profile".to_string()),
-                },
+                }),
+                token: None,
                 oauth_provider_config: Some(
                     crate::auth::profiles::StoredOAuthProviderConfig::from(&provider_config),
                 ),
@@ -1200,13 +1341,15 @@ mod tests {
                 avatar_url: None,
                 created_at_ms: 0,
                 last_used_ms: None,
-                tokens: crate::auth::profiles::OAuthTokens {
+                credential_kind: AuthProfileCredentialKind::OAuth,
+                tokens: Some(crate::auth::profiles::OAuthTokens {
                     access_token: "access-token".to_string(),
                     refresh_token: Some("refresh-token".to_string()),
                     token_type: "Bearer".to_string(),
                     expires_at_ms: Some(u64::MAX),
                     scope: Some("openid email profile".to_string()),
-                },
+                }),
+                token: None,
                 oauth_provider_config: Some(
                     crate::auth::profiles::StoredOAuthProviderConfig::from(&provider_config),
                 ),
@@ -1250,13 +1393,15 @@ mod tests {
                 avatar_url: None,
                 created_at_ms: 0,
                 last_used_ms: None,
-                tokens: crate::auth::profiles::OAuthTokens {
+                credential_kind: AuthProfileCredentialKind::OAuth,
+                tokens: Some(crate::auth::profiles::OAuthTokens {
                     access_token: "access-token".to_string(),
                     refresh_token: Some("refresh-token".to_string()),
                     token_type: "Bearer".to_string(),
                     expires_at_ms: Some(u64::MAX),
                     scope: Some("openid email profile offline_access".to_string()),
-                },
+                }),
+                token: None,
                 oauth_provider_config: Some(
                     crate::auth::profiles::StoredOAuthProviderConfig::from(&provider_config),
                 ),
@@ -1272,6 +1417,257 @@ mod tests {
                 providers.is_some(),
                 "Codex auth profile should build a usable provider set"
             );
+        });
+    }
+
+    #[test]
+    fn test_build_providers_with_anthropic_auth_profile() {
+        with_clean_provider_env(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let _password = set_env_var_scoped("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+            let _state_dir = set_env_var_scoped(
+                "CARAPACE_STATE_DIR",
+                temp.path().to_str().expect("state dir path"),
+            );
+
+            let profile = crate::auth::profiles::AuthProfile {
+                id: "anthropic:default".to_string(),
+                name: "Anthropic setup token".to_string(),
+                provider: OAuthProvider::Anthropic,
+                user_id: None,
+                email: None,
+                display_name: None,
+                avatar_url: None,
+                created_at_ms: 0,
+                last_used_ms: None,
+                credential_kind: AuthProfileCredentialKind::Token,
+                tokens: None,
+                token: Some("sk-ant-oat01-test-token".to_string()),
+                oauth_provider_config: None,
+            };
+            let store = ProfileStore::from_env(temp.path().to_path_buf()).expect("profile store");
+            store.add(profile).expect("store profile");
+
+            let cfg = json!({
+                "anthropic": { "authProfile": "anthropic:default" }
+            });
+            let providers = build_providers(&cfg).expect("build providers");
+            assert!(
+                providers.is_some(),
+                "Anthropic auth profile should build a usable provider set"
+            );
+        });
+    }
+
+    #[test]
+    fn test_build_providers_ignores_blank_anthropic_api_key_when_auth_profile_present() {
+        with_clean_provider_env(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let _password = set_env_var_scoped("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+            let _state_dir = set_env_var_scoped(
+                "CARAPACE_STATE_DIR",
+                temp.path().to_str().expect("state dir path"),
+            );
+            let _blank_key = set_env_var_scoped("ANTHROPIC_API_KEY", "   ");
+
+            let profile = crate::auth::profiles::AuthProfile {
+                id: "anthropic:default".to_string(),
+                name: "Anthropic setup token".to_string(),
+                provider: OAuthProvider::Anthropic,
+                user_id: None,
+                email: None,
+                display_name: None,
+                avatar_url: None,
+                created_at_ms: 0,
+                last_used_ms: None,
+                credential_kind: AuthProfileCredentialKind::Token,
+                tokens: None,
+                token: Some("sk-ant-oat01-test-token".to_string()),
+                oauth_provider_config: None,
+            };
+            let store = ProfileStore::from_env(temp.path().to_path_buf()).expect("profile store");
+            store.add(profile).expect("store profile");
+
+            let cfg = json!({
+                "anthropic": { "authProfile": "anthropic:default" }
+            });
+            let providers = build_providers(&cfg).expect("build providers");
+            assert!(
+                providers.is_some(),
+                "blank ANTHROPIC_API_KEY should not mask auth-profile Anthropic setup"
+            );
+        });
+    }
+
+    #[test]
+    fn test_build_providers_rejects_anthropic_auth_profile_without_token() {
+        with_clean_provider_env(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let _password = set_env_var_scoped("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+            let _state_dir = set_env_var_scoped(
+                "CARAPACE_STATE_DIR",
+                temp.path().to_str().expect("state dir path"),
+            );
+
+            let profile = crate::auth::profiles::AuthProfile {
+                id: "anthropic:default".to_string(),
+                name: "Anthropic setup token".to_string(),
+                provider: OAuthProvider::Anthropic,
+                user_id: None,
+                email: None,
+                display_name: None,
+                avatar_url: None,
+                created_at_ms: 0,
+                last_used_ms: None,
+                credential_kind: AuthProfileCredentialKind::Token,
+                tokens: None,
+                token: Some("   ".to_string()),
+                oauth_provider_config: None,
+            };
+            let store = ProfileStore::from_env(temp.path().to_path_buf()).expect("profile store");
+            store.add(profile).expect("store profile");
+
+            let cfg = json!({
+                "anthropic": { "authProfile": "anthropic:default" }
+            });
+            let err = build_providers(&cfg).expect_err("missing token should fail fast");
+            assert!(err.to_string().contains("has no usable token"));
+        });
+    }
+
+    #[test]
+    fn test_build_providers_rejects_missing_anthropic_auth_profile() {
+        with_clean_provider_env(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let _password = set_env_var_scoped("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+            let _state_dir = set_env_var_scoped(
+                "CARAPACE_STATE_DIR",
+                temp.path().to_str().expect("state dir path"),
+            );
+
+            let store = ProfileStore::from_env(temp.path().to_path_buf()).expect("profile store");
+            store.load().expect("load empty profile store");
+
+            let cfg = json!({
+                "anthropic": { "authProfile": "anthropic:missing" }
+            });
+            let err = build_providers(&cfg).expect_err("missing profile should fail fast");
+            assert!(err
+                .to_string()
+                .contains("configured Anthropic auth profile \"anthropic:missing\" was not found"));
+        });
+    }
+
+    #[test]
+    fn test_build_providers_rejects_anthropic_auth_profile_without_password() {
+        with_clean_provider_env(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let _state_dir = set_env_var_scoped(
+                "CARAPACE_STATE_DIR",
+                temp.path().to_str().expect("state dir path"),
+            );
+
+            let profile = crate::auth::profiles::AuthProfile {
+                id: "anthropic:default".to_string(),
+                name: "Anthropic setup token".to_string(),
+                provider: OAuthProvider::Anthropic,
+                user_id: None,
+                email: None,
+                display_name: None,
+                avatar_url: None,
+                created_at_ms: 0,
+                last_used_ms: None,
+                credential_kind: AuthProfileCredentialKind::Token,
+                tokens: None,
+                token: Some("sk-ant-oat01-test-token".to_string()),
+                oauth_provider_config: None,
+            };
+            let store = ProfileStore::new(temp.path().to_path_buf());
+            store.add(profile).expect("store profile");
+
+            let cfg = json!({
+                "anthropic": { "authProfile": "anthropic:default" }
+            });
+            let err = build_providers(&cfg).expect_err("missing password should fail fast");
+            assert!(err.to_string().contains("CARAPACE_CONFIG_PASSWORD"));
+        });
+    }
+
+    #[test]
+    fn test_build_providers_rejects_anthropic_auth_profile_with_wrong_provider() {
+        with_clean_provider_env(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let _password = set_env_var_scoped("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+            let _state_dir = set_env_var_scoped(
+                "CARAPACE_STATE_DIR",
+                temp.path().to_str().expect("state dir path"),
+            );
+
+            let profile = crate::auth::profiles::AuthProfile {
+                id: "anthropic:default".to_string(),
+                name: "Wrong profile".to_string(),
+                provider: OAuthProvider::Google,
+                user_id: Some("user-123".to_string()),
+                email: Some("user@example.com".to_string()),
+                display_name: Some("Example User".to_string()),
+                avatar_url: None,
+                created_at_ms: 0,
+                last_used_ms: None,
+                credential_kind: AuthProfileCredentialKind::Token,
+                tokens: None,
+                token: Some("sk-ant-oat01-test-token".to_string()),
+                oauth_provider_config: None,
+            };
+            let store = ProfileStore::from_env(temp.path().to_path_buf()).expect("profile store");
+            store.add(profile).expect("store profile");
+
+            let cfg = json!({
+                "anthropic": { "authProfile": "anthropic:default" }
+            });
+            let err = build_providers(&cfg).expect_err("wrong provider should fail fast");
+            assert!(err.to_string().contains("belongs to google, not anthropic"));
+        });
+    }
+
+    #[test]
+    fn test_build_providers_rejects_anthropic_auth_profile_with_oauth_credential_kind() {
+        with_clean_provider_env(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let _password = set_env_var_scoped("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+            let _state_dir = set_env_var_scoped(
+                "CARAPACE_STATE_DIR",
+                temp.path().to_str().expect("state dir path"),
+            );
+
+            let profile = crate::auth::profiles::AuthProfile {
+                id: "anthropic:default".to_string(),
+                name: "Anthropic oauth profile".to_string(),
+                provider: OAuthProvider::Anthropic,
+                user_id: Some("user-123".to_string()),
+                email: Some("user@example.com".to_string()),
+                display_name: Some("Example User".to_string()),
+                avatar_url: None,
+                created_at_ms: 0,
+                last_used_ms: None,
+                credential_kind: AuthProfileCredentialKind::OAuth,
+                tokens: Some(crate::auth::profiles::OAuthTokens {
+                    access_token: "access-token".to_string(),
+                    refresh_token: Some("refresh-token".to_string()),
+                    token_type: "Bearer".to_string(),
+                    expires_at_ms: Some(u64::MAX),
+                    scope: None,
+                }),
+                token: None,
+                oauth_provider_config: None,
+            };
+            let store = ProfileStore::from_env(temp.path().to_path_buf()).expect("profile store");
+            store.add(profile).expect("store profile");
+
+            let cfg = json!({
+                "anthropic": { "authProfile": "anthropic:default" }
+            });
+            let err = build_providers(&cfg).expect_err("oauth-backed profile should fail fast");
+            assert!(err.to_string().contains("is not token-backed"));
         });
     }
 
@@ -1294,13 +1690,15 @@ mod tests {
                 avatar_url: None,
                 created_at_ms: 0,
                 last_used_ms: None,
-                tokens: crate::auth::profiles::OAuthTokens {
+                credential_kind: AuthProfileCredentialKind::OAuth,
+                tokens: Some(crate::auth::profiles::OAuthTokens {
                     access_token: "access-token".to_string(),
                     refresh_token: Some("refresh-token".to_string()),
                     token_type: "Bearer".to_string(),
                     expires_at_ms: Some(u64::MAX),
                     scope: Some("openid email profile".to_string()),
-                },
+                }),
+                token: None,
                 oauth_provider_config: Some(
                     crate::auth::profiles::StoredOAuthProviderConfig::from(&provider_config),
                 ),

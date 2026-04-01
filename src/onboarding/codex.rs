@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use crate::auth::profiles::{
     exchange_code, fetch_user_info, generate_auth_url, profile_store_encryption_enabled_from_env,
-    AuthProfile, OAuthProvider, OAuthProviderConfig, OAuthTokens, ProfileStore,
-    StoredOAuthProviderConfig,
+    AuthProfile, AuthProfileCredentialKind, OAuthProvider, OAuthProviderConfig, OAuthTokens,
+    ProfileStore, StoredOAuthProviderConfig,
 };
 use crate::server::ws::{map_validation_issues, persist_config_file, read_config_snapshot};
 
@@ -507,7 +507,9 @@ fn build_openai_auth_profile(
         avatar_url: userinfo.avatar_url,
         created_at_ms: now_ms,
         last_used_ms: Some(now_ms),
-        tokens,
+        credential_kind: AuthProfileCredentialKind::OAuth,
+        tokens: Some(tokens),
+        token: None,
         oauth_provider_config: Some(StoredOAuthProviderConfig::from(provider_config)),
     }
 }
