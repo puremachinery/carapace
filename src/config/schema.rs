@@ -120,6 +120,7 @@ pub fn validate_schema(config: &Value) -> Vec<SchemaIssue> {
     validate_hooks(obj, &mut issues);
     validate_logging(obj, &mut issues);
     validate_auth(obj, &mut issues);
+    validate_anthropic(obj, &mut issues);
     validate_google(obj, &mut issues);
     validate_codex(obj, &mut issues);
     validate_agents(obj, &mut issues);
@@ -804,6 +805,65 @@ fn validate_auth(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIs
                     });
                 }
             }
+        }
+    }
+}
+
+fn validate_anthropic(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIssue>) {
+    let anthropic = match obj.get("anthropic").and_then(|v| v.as_object()) {
+        Some(a) => a,
+        None => return,
+    };
+
+    for (field, path) in [
+        ("apiKey", ".anthropic.apiKey"),
+        ("baseUrl", ".anthropic.baseUrl"),
+        ("authProfile", ".anthropic.authProfile"),
+    ] {
+        if let Some(value) = anthropic.get(field) {
+            if !value.is_string() {
+                issues.push(SchemaIssue {
+                    severity: Severity::Warning,
+                    path: path.to_string(),
+                    message: format!("{field} must be a string"),
+                });
+            }
+        }
+    }
+
+    let api_key = anthropic
+        .get("apiKey")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    let auth_profile = anthropic
+        .get("authProfile")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+
+    if api_key.is_some() && auth_profile.is_some() {
+        issues.push(SchemaIssue {
+            severity: Severity::Warning,
+            path: ".anthropic".to_string(),
+            message: "configure either anthropic.apiKey or anthropic.authProfile, not both"
+                .to_string(),
+        });
+    }
+
+    if auth_profile.is_some() {
+        let auth_profiles_enabled = obj
+            .get("auth")
+            .and_then(|v| v.get("profiles"))
+            .and_then(|v| v.get("enabled"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if !auth_profiles_enabled {
+            issues.push(SchemaIssue {
+                severity: Severity::Warning,
+                path: ".anthropic.authProfile".to_string(),
+                message: "anthropic.authProfile requires auth.profiles.enabled = true".to_string(),
+            });
         }
     }
 }
@@ -2014,6 +2074,43 @@ mod tests {
         let cfg = json!({ "vertex": { "model": 123 } });
         let issues = validate_schema(&cfg);
         assert!(issues.iter().any(|i| i.path == ".vertex.model"));
+    }
+
+    #[test]
+    fn test_anthropic_auth_profile_requires_auth_profiles_enabled() {
+        let cfg = json!({
+            "anthropic": { "authProfile": "anthropic:default" },
+            "auth": { "profiles": { "enabled": false } }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(issues
+            .iter()
+            .any(|i| i.path == ".anthropic.authProfile"
+                && i.message.contains("auth.profiles.enabled")));
+    }
+
+    #[test]
+    fn test_anthropic_api_key_and_auth_profile_warn() {
+        let cfg = json!({
+            "anthropic": {
+                "apiKey": "${ANTHROPIC_API_KEY}",
+                "authProfile": "anthropic:default"
+            },
+            "auth": { "profiles": { "enabled": true } }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(issues.iter().any(|i| i.path == ".anthropic"
+            && i.message
+                .contains("either anthropic.apiKey or anthropic.authProfile")));
+    }
+
+    #[test]
+    fn test_anthropic_auth_profile_must_be_string() {
+        let cfg = json!({
+            "anthropic": { "authProfile": 123 }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(issues.iter().any(|i| i.path == ".anthropic.authProfile"));
     }
 
     #[test]

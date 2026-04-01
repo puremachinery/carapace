@@ -32,7 +32,10 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::agent;
-use crate::auth::profiles::{AuthProfileSummary, OAuthProvider, ProfileStore};
+use crate::auth::profiles::{
+    AuthProfileCredentialKind, AuthProfileSummary, OAuthProvider, ProfileStore,
+};
+use crate::config::secrets::is_encrypted;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetupProvider {
@@ -88,6 +91,12 @@ impl SetupProvider {
 
     pub fn setup_command(self, auth_mode: Option<SetupAuthMode>) -> Option<String> {
         match (self, auth_mode) {
+            (Self::Anthropic, Some(SetupAuthMode::SetupToken)) => {
+                Some("cara setup --force --provider anthropic --auth-mode setup-token".to_string())
+            }
+            (Self::Anthropic, Some(SetupAuthMode::ApiKey)) => {
+                Some("cara setup --force --provider anthropic --auth-mode api-key".to_string())
+            }
             (Self::Gemini, Some(SetupAuthMode::OAuth)) => {
                 Some("cara setup --force --provider gemini --auth-mode oauth".to_string())
             }
@@ -105,6 +114,7 @@ impl SetupProvider {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetupAuthMode {
     ApiKey,
+    SetupToken,
     OAuth,
     StaticCredentials,
     BaseUrl,
@@ -114,6 +124,7 @@ impl SetupAuthMode {
     pub fn label(self) -> &'static str {
         match self {
             Self::ApiKey => "API key",
+            Self::SetupToken => "setup token",
             Self::OAuth => "OAuth sign-in",
             Self::StaticCredentials => "static credentials",
             Self::BaseUrl => "base URL",
@@ -293,16 +304,88 @@ pub fn assess_provider_setup(
 
     match provider {
         SetupProvider::Anthropic => {
-            checks.push(configured_value_check(
-                cfg,
-                &["anthropic", "apiKey"],
-                "Anthropic API key",
-                setup_command.as_deref(),
-            ));
+            let api_key = config_string(cfg, &["anthropic", "apiKey"]);
+            let profile_id = config_string(cfg, &["anthropic", "authProfile"]);
+            match (api_key, profile_id) {
+                (Some(_), Some(profile_id)) => {
+                    checks.push(SetupCheck::skip(
+                        "Anthropic auth path",
+                        format!(
+                            "both `anthropic.apiKey` and `anthropic.authProfile` (`{profile_id}`) are configured; runtime will prefer `anthropic.apiKey`"
+                        ),
+                        Some(
+                            "remove one of `anthropic.apiKey` or `anthropic.authProfile` to keep the Anthropic auth path explicit"
+                                .to_string(),
+                        ),
+                    ));
+                    checks.push(configured_value_check(
+                        cfg,
+                        &["anthropic", "apiKey"],
+                        "Anthropic API key",
+                        provider
+                            .setup_command(Some(SetupAuthMode::ApiKey))
+                            .as_deref(),
+                    ));
+                }
+                (Some(_), None) => {
+                    checks.push(configured_value_check(
+                        cfg,
+                        &["anthropic", "apiKey"],
+                        "Anthropic API key",
+                        provider
+                            .setup_command(Some(SetupAuthMode::ApiKey))
+                            .as_deref(),
+                    ));
+                }
+                (None, Some(profile_id)) => {
+                    checks.push(auth_profiles_enabled_check(cfg, setup_command.as_deref()));
+                    checks.push(auth_profile_id_check(
+                        cfg,
+                        &["anthropic", "authProfile"],
+                        "Anthropic auth profile",
+                        provider
+                            .setup_command(Some(SetupAuthMode::SetupToken))
+                            .as_deref(),
+                    ));
+                    let password_present = profile_store_password_present();
+                    checks.push(config_password_check(
+                        provider
+                            .setup_command(Some(SetupAuthMode::SetupToken))
+                            .as_deref(),
+                    ));
+                    if password_present {
+                        let (check, summary) = auth_profile_summary_check(
+                            state_dir,
+                            &profile_id,
+                            OAuthProvider::Anthropic,
+                            AuthProfileCredentialKind::Token,
+                            "Anthropic auth profile",
+                            provider
+                                .setup_command(Some(SetupAuthMode::SetupToken))
+                                .as_deref(),
+                        );
+                        if let Some(summary) = summary {
+                            profile_name = Some(summary.name.clone());
+                            email = summary.email.clone();
+                        }
+                        checks.push(check);
+                    }
+                }
+                (None, None) => checks.push(SetupCheck::fail(
+                    "Anthropic credential",
+                    "Neither `anthropic.apiKey` nor `anthropic.authProfile` is configured",
+                    setup_follow_up(provider_setup_follow_up(
+                        setup_command.as_deref(),
+                        "to choose Anthropic API-key or setup-token auth".to_string(),
+                        "write `anthropic.apiKey` or `anthropic.authProfile` into config"
+                            .to_string(),
+                    )),
+                )),
+            }
         }
         SetupProvider::Codex => {
             checks.push(auth_profiles_enabled_check(cfg, setup_command.as_deref()));
-            let profile_check = oauth_profile_id_check(
+            let profile_check = auth_profile_id_check(
                 cfg,
                 &["codex", "authProfile"],
                 "OpenAI auth profile",
@@ -318,6 +401,7 @@ pub fn assess_provider_setup(
                         state_dir,
                         &profile_id,
                         OAuthProvider::OpenAI,
+                        AuthProfileCredentialKind::OAuth,
                         "OpenAI auth profile",
                         setup_command.as_deref(),
                     );
@@ -365,7 +449,7 @@ pub fn assess_provider_setup(
         SetupProvider::Gemini => match auth_mode {
             Some(SetupAuthMode::OAuth) => {
                 checks.push(auth_profiles_enabled_check(cfg, setup_command.as_deref()));
-                let profile_check = oauth_profile_id_check(
+                let profile_check = auth_profile_id_check(
                     cfg,
                     &["google", "authProfile"],
                     "Gemini auth profile",
@@ -381,6 +465,7 @@ pub fn assess_provider_setup(
                             state_dir,
                             &profile_id,
                             OAuthProvider::Google,
+                            AuthProfileCredentialKind::OAuth,
                             "Gemini auth profile",
                             setup_command.as_deref(),
                         );
@@ -554,9 +639,16 @@ pub fn assess_provider_setup(
 
 fn detect_auth_mode(cfg: &Value, provider: SetupProvider) -> Option<SetupAuthMode> {
     match provider {
-        SetupProvider::Anthropic | SetupProvider::OpenAi | SetupProvider::Venice => {
-            Some(SetupAuthMode::ApiKey)
+        SetupProvider::Anthropic => {
+            let has_api_key = config_string(cfg, &["anthropic", "apiKey"]).is_some();
+            let has_auth_profile = config_string(cfg, &["anthropic", "authProfile"]).is_some();
+            match (has_api_key, has_auth_profile) {
+                (true, false) | (true, true) => Some(SetupAuthMode::ApiKey),
+                (false, true) => Some(SetupAuthMode::SetupToken),
+                _ => None,
+            }
         }
+        SetupProvider::OpenAi | SetupProvider::Venice => Some(SetupAuthMode::ApiKey),
         SetupProvider::Codex => Some(SetupAuthMode::OAuth),
         SetupProvider::Ollama => Some(SetupAuthMode::BaseUrl),
         SetupProvider::Gemini => {
@@ -727,7 +819,7 @@ fn auth_profiles_enabled_check(cfg: &Value, setup_command: Option<&str>) -> Setu
     }
 }
 
-fn oauth_profile_id_check(
+fn auth_profile_id_check(
     cfg: &Value,
     path: &[&str],
     label: &str,
@@ -776,18 +868,19 @@ fn auth_profile_summary_check(
     state_dir: &Path,
     profile_id: &str,
     expected_provider: OAuthProvider,
+    expected_credential_kind: AuthProfileCredentialKind,
     label: &str,
     setup_command: Option<&str>,
 ) -> (SetupCheck, Option<AuthProfileSummary>) {
     match load_profile_summary(state_dir, profile_id) {
-        Ok(Some(summary)) => {
-            if summary.provider != expected_provider {
+        Ok(Some(loaded)) => {
+            if loaded.summary.provider != expected_provider {
                 (
                     SetupCheck::fail(
                         label,
                         format!(
                             "stored profile `{profile_id}` belongs to {}, not {}",
-                            summary.provider, expected_provider
+                            loaded.summary.provider, expected_provider
                         ),
                         setup_follow_up(provider_setup_follow_up(
                             setup_command,
@@ -797,12 +890,53 @@ fn auth_profile_summary_check(
                     ),
                     None,
                 )
-            } else {
-                let detail = match summary.email.as_deref() {
-                    Some(email) => format!("loaded `{}` ({email})", summary.name),
-                    None => format!("loaded `{}`", summary.name),
+            } else if loaded.summary.credential_kind != expected_credential_kind {
+                (
+                    SetupCheck::fail(
+                        label,
+                        format!(
+                            "stored profile `{profile_id}` uses {} credentials, not {}",
+                            loaded.summary.credential_kind, expected_credential_kind
+                        ),
+                        setup_follow_up(provider_setup_follow_up(
+                            setup_command,
+                            "to store the correct auth profile credential type",
+                            format!("write the correct {label} into config"),
+                        )),
+                    ),
+                    None,
+                )
+            } else if loaded.summary.credential_kind == AuthProfileCredentialKind::Token
+                && !loaded.summary.token_valid
+            {
+                let detail = if loaded.token_still_encrypted && profile_store_password_present() {
+                    format!(
+                        "stored profile `{profile_id}` could not decrypt the stored token; check CARAPACE_CONFIG_PASSWORD"
+                    )
+                } else {
+                    format!("stored profile `{profile_id}` has no usable token")
                 };
-                (SetupCheck::validation_pass(label, detail), Some(summary))
+                (
+                    SetupCheck::fail(
+                        label,
+                        detail,
+                        setup_follow_up(provider_setup_follow_up(
+                            setup_command,
+                            "to store a fresh auth profile token",
+                            format!("write a fresh {label} into config"),
+                        )),
+                    ),
+                    None,
+                )
+            } else {
+                let detail = match loaded.summary.email.as_deref() {
+                    Some(email) => format!("loaded `{}` ({email})", loaded.summary.name),
+                    None => format!("loaded `{}`", loaded.summary.name),
+                };
+                (
+                    SetupCheck::validation_pass(label, detail),
+                    Some(loaded.summary),
+                )
             }
         }
         Ok(None) => (
@@ -832,6 +966,11 @@ fn auth_profile_summary_check(
             )
         }
     }
+}
+
+struct LoadedProfileSummary {
+    summary: AuthProfileSummary,
+    token_still_encrypted: bool,
 }
 
 fn configured_value_check(
@@ -955,14 +1094,22 @@ where
 fn load_profile_summary(
     state_dir: &Path,
     profile_id: &str,
-) -> Result<Option<AuthProfileSummary>, String> {
+) -> Result<Option<LoadedProfileSummary>, String> {
     let store = if profile_store_password_present() {
         ProfileStore::from_env(state_dir.to_path_buf()).map_err(|err| err.to_string())?
     } else {
         ProfileStore::new(state_dir.to_path_buf())
     };
     store.load().map_err(|err| err.to_string())?;
-    Ok(store.get(profile_id).map(|profile| profile.to_summary()))
+    Ok(store.get(profile_id).map(|profile| LoadedProfileSummary {
+        token_still_encrypted: profile
+            .token
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_some_and(is_encrypted),
+        summary: profile.to_summary(),
+    }))
 }
 
 fn profile_store_password_present() -> bool {
@@ -1053,7 +1200,7 @@ fn model_provider_for_local_chat(model: &str) -> Option<SetupProvider> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::profiles::{AuthProfile, OAuthTokens};
+    use crate::auth::profiles::{AuthProfile, AuthProfileCredentialKind, OAuthTokens};
     use crate::test_support::env::ScopedEnv;
     use serde_json::json;
     use tempfile::TempDir;
@@ -1069,13 +1216,15 @@ mod tests {
             avatar_url: None,
             created_at_ms: 1,
             last_used_ms: Some(1),
-            tokens: OAuthTokens {
+            credential_kind: AuthProfileCredentialKind::OAuth,
+            tokens: Some(OAuthTokens {
                 access_token: "token".to_string(),
                 refresh_token: Some("refresh".to_string()),
                 token_type: "Bearer".to_string(),
                 expires_at_ms: None,
                 scope: None,
-            },
+            }),
+            token: None,
             oauth_provider_config: None,
         }
     }
@@ -1097,6 +1246,174 @@ mod tests {
             .recommended_remediation()
             .expect("remediation")
             .contains("ANTHROPIC_API_KEY"));
+    }
+
+    #[test]
+    fn test_assess_provider_setup_loads_anthropic_token_profile_summary() {
+        let temp = TempDir::new().unwrap();
+        let store = ProfileStore::new(temp.path().to_path_buf());
+        store
+            .add(AuthProfile {
+                id: "anthropic:default".to_string(),
+                name: "Anthropic setup token".to_string(),
+                provider: OAuthProvider::Anthropic,
+                user_id: None,
+                email: None,
+                display_name: None,
+                avatar_url: None,
+                created_at_ms: 1,
+                last_used_ms: Some(1),
+                credential_kind: AuthProfileCredentialKind::Token,
+                tokens: None,
+                token: Some("sk-ant-oat01-token".to_string()),
+                oauth_provider_config: None,
+            })
+            .unwrap();
+
+        let cfg = json!({
+            "agents": { "defaults": { "model": "claude-sonnet-4-20250514" } },
+            "auth": { "profiles": { "enabled": true } },
+            "anthropic": { "authProfile": "anthropic:default" }
+        });
+        let mut env = ScopedEnv::new();
+        env.set("CARAPACE_CONFIG_PASSWORD", "test-password");
+
+        let assessment = assess_provider_setup(&cfg, temp.path(), SetupProvider::Anthropic, vec![]);
+
+        assert_eq!(assessment.status, SetupAssessmentStatus::Ready);
+        assert_eq!(
+            assessment.profile_name.as_deref(),
+            Some("Anthropic setup token")
+        );
+    }
+
+    #[test]
+    fn test_assess_provider_setup_rejects_anthropic_token_profile_without_token() {
+        let temp = TempDir::new().unwrap();
+        let store = ProfileStore::new(temp.path().to_path_buf());
+        store
+            .add(AuthProfile {
+                id: "anthropic:default".to_string(),
+                name: "Anthropic setup token".to_string(),
+                provider: OAuthProvider::Anthropic,
+                user_id: None,
+                email: None,
+                display_name: None,
+                avatar_url: None,
+                created_at_ms: 1,
+                last_used_ms: Some(1),
+                credential_kind: AuthProfileCredentialKind::Token,
+                tokens: None,
+                token: Some("   ".to_string()),
+                oauth_provider_config: None,
+            })
+            .unwrap();
+
+        let cfg = json!({
+            "agents": { "defaults": { "model": "claude-sonnet-4-20250514" } },
+            "auth": { "profiles": { "enabled": true } },
+            "anthropic": { "authProfile": "anthropic:default" }
+        });
+        let mut env = ScopedEnv::new();
+        env.set("CARAPACE_CONFIG_PASSWORD", "test-password");
+
+        let assessment = assess_provider_setup(&cfg, temp.path(), SetupProvider::Anthropic, vec![]);
+
+        assert_eq!(assessment.status, SetupAssessmentStatus::Invalid);
+        assert!(assessment
+            .checks
+            .iter()
+            .any(|check| check.name == "Anthropic auth profile"
+                && check.status == SetupCheckStatus::Fail
+                && check.detail.contains("has no usable token")));
+    }
+
+    #[test]
+    fn test_assess_provider_setup_surfaces_wrong_password_for_anthropic_token_profile() {
+        let temp = TempDir::new().unwrap();
+        let mut env = ScopedEnv::new();
+        env.set("CARAPACE_CONFIG_PASSWORD", "correct-password");
+
+        {
+            let store = ProfileStore::from_env(temp.path().to_path_buf()).unwrap();
+            store
+                .add(AuthProfile {
+                    id: "anthropic:default".to_string(),
+                    name: "Anthropic setup token".to_string(),
+                    provider: OAuthProvider::Anthropic,
+                    user_id: None,
+                    email: None,
+                    display_name: None,
+                    avatar_url: None,
+                    created_at_ms: 1,
+                    last_used_ms: Some(1),
+                    credential_kind: AuthProfileCredentialKind::Token,
+                    tokens: None,
+                    token: Some("sk-ant-oat01-token".to_string()),
+                    oauth_provider_config: None,
+                })
+                .unwrap();
+        }
+
+        env.set("CARAPACE_CONFIG_PASSWORD", "wrong-password");
+
+        let cfg = json!({
+            "agents": { "defaults": { "model": "claude-sonnet-4-20250514" } },
+            "auth": { "profiles": { "enabled": true } },
+            "anthropic": { "authProfile": "anthropic:default" }
+        });
+
+        let assessment = assess_provider_setup(&cfg, temp.path(), SetupProvider::Anthropic, vec![]);
+
+        assert_eq!(assessment.status, SetupAssessmentStatus::Invalid);
+        assert!(assessment
+            .checks
+            .iter()
+            .any(|check| check.name == "Anthropic auth profile"
+                && check.status == SetupCheckStatus::Fail
+                && check.detail.contains("could not decrypt the stored token")
+                && check.detail.contains("CARAPACE_CONFIG_PASSWORD")));
+    }
+
+    #[test]
+    fn test_assess_provider_setup_surfaces_dual_anthropic_auth_paths() {
+        let temp = TempDir::new().unwrap();
+        let cfg = json!({
+            "agents": { "defaults": { "model": "claude-sonnet-4-20250514" } },
+            "auth": { "profiles": { "enabled": true } },
+            "anthropic": {
+                "apiKey": "${ANTHROPIC_API_KEY}",
+                "authProfile": "anthropic:default"
+            }
+        });
+        let mut env = ScopedEnv::new();
+        env.set("ANTHROPIC_API_KEY", "sk-ant-test");
+
+        let assessment = assess_provider_setup(&cfg, temp.path(), SetupProvider::Anthropic, vec![]);
+
+        assert!(assessment
+            .checks
+            .iter()
+            .any(|check| check.name == "Anthropic auth path"
+                && check.status == SetupCheckStatus::Skip
+                && check
+                    .detail
+                    .contains("runtime will prefer `anthropic.apiKey`")));
+    }
+
+    #[test]
+    fn test_detect_auth_mode_prefers_anthropic_api_key_when_both_paths_configured() {
+        let cfg = json!({
+            "anthropic": {
+                "apiKey": "${ANTHROPIC_API_KEY}",
+                "authProfile": "anthropic:default"
+            }
+        });
+
+        assert_eq!(
+            detect_auth_mode(&cfg, SetupProvider::Anthropic),
+            Some(SetupAuthMode::ApiKey)
+        );
     }
 
     #[test]
