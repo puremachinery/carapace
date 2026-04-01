@@ -22,6 +22,7 @@ A security-focused, open-source personal AI assistant.
 - [Channel Setup](channels.md) — Signal, Telegram, Discord, Slack, webhooks
 - [Channel Smoke Validation](channel-smoke.md) — reproducible live channel checks + evidence capture
 - [CLI Guide](cli.md) — subcommands, flags, and device identity
+- [Migrating from another tool](getting-started.md#migrating-from-another-tool) — import config from OpenClaw, OpenCode, Aider, or NemoClaw
 - [Security Policy](../SECURITY.md) — vulnerability reporting and response expectations
 
 ## Architecture & Security
