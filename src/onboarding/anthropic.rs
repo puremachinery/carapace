@@ -7,7 +7,7 @@ use crate::auth::profiles::{
 };
 
 pub const ANTHROPIC_SETUP_TOKEN_PREFIX: &str = "sk-ant-oat01-";
-pub const ANTHROPIC_SETUP_TOKEN_MIN_LENGTH: usize = 80;
+pub const ANTHROPIC_SETUP_TOKEN_MIN_TOTAL_LENGTH: usize = 80;
 pub const DEFAULT_ANTHROPIC_AUTH_PROFILE_ID: &str = "anthropic:default";
 
 pub fn require_encrypted_profile_store_for_anthropic_setup_token() -> Result<(), String> {
@@ -31,7 +31,7 @@ pub fn validate_anthropic_setup_token_input(raw: &str) -> Result<String, String>
             "Anthropic setup-token must start with `{ANTHROPIC_SETUP_TOKEN_PREFIX}`."
         ));
     }
-    if trimmed.len() < ANTHROPIC_SETUP_TOKEN_MIN_LENGTH {
+    if trimmed.len() < ANTHROPIC_SETUP_TOKEN_MIN_TOTAL_LENGTH {
         return Err("Anthropic setup-token looks too short; paste the full token.".to_string());
     }
     Ok(trimmed.to_string())
@@ -111,7 +111,13 @@ mod tests {
 
     #[test]
     fn test_validate_anthropic_setup_token_input_accepts_expected_shape() {
-        let token = format!("{}{}", ANTHROPIC_SETUP_TOKEN_PREFIX, "a".repeat(80));
+        let payload_len =
+            ANTHROPIC_SETUP_TOKEN_MIN_TOTAL_LENGTH - ANTHROPIC_SETUP_TOKEN_PREFIX.len();
+        let token = format!(
+            "{}{}",
+            ANTHROPIC_SETUP_TOKEN_PREFIX,
+            "a".repeat(payload_len)
+        );
         let validated = validate_anthropic_setup_token_input(&token).unwrap();
         assert_eq!(validated, token);
     }
@@ -124,7 +130,13 @@ mod tests {
 
     #[test]
     fn test_validate_anthropic_setup_token_input_rejects_too_short_token() {
-        let token = format!("{}{}", ANTHROPIC_SETUP_TOKEN_PREFIX, "a".repeat(66));
+        let payload_len =
+            ANTHROPIC_SETUP_TOKEN_MIN_TOTAL_LENGTH - ANTHROPIC_SETUP_TOKEN_PREFIX.len() - 1;
+        let token = format!(
+            "{}{}",
+            ANTHROPIC_SETUP_TOKEN_PREFIX,
+            "a".repeat(payload_len)
+        );
         let err = validate_anthropic_setup_token_input(&token).unwrap_err();
         assert!(err.contains("looks too short"));
     }
@@ -152,7 +164,13 @@ mod tests {
         let mut env = ScopedEnv::new();
         env.set("CARAPACE_CONFIG_PASSWORD", "test-password");
 
-        let token = format!("{}{}", ANTHROPIC_SETUP_TOKEN_PREFIX, "a".repeat(80));
+        let payload_len =
+            ANTHROPIC_SETUP_TOKEN_MIN_TOTAL_LENGTH - ANTHROPIC_SETUP_TOKEN_PREFIX.len();
+        let token = format!(
+            "{}{}",
+            ANTHROPIC_SETUP_TOKEN_PREFIX,
+            "a".repeat(payload_len)
+        );
         let mut config = json!({});
         let profile_id =
             persist_cli_anthropic_setup_token(temp.path().to_path_buf(), &mut config, &token)
