@@ -98,34 +98,33 @@ pub fn plan_import(discovery: &OpenClawDiscovery) -> ImportPlan {
         ..Default::default()
     };
 
-    let content = match std::fs::read_to_string(&discovery.config_path) {
-        Ok(c) => c,
+    let config: Option<Value> = match std::fs::read_to_string(&discovery.config_path) {
+        Ok(content) => match json5::from_str(&content) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                plan.warnings
+                    .push(format!("Failed to parse config as JSON5: {e}"));
+                None
+            }
+        },
         Err(e) => {
             plan.warnings.push(format!("Failed to read config: {e}"));
-            return plan;
+            None
         }
     };
 
-    let config: Value = match json5::from_str(&content) {
-        Ok(v) => v,
-        Err(e) => {
-            plan.warnings
-                .push(format!("Failed to parse config as JSON5: {e}"));
-            return plan;
-        }
-    };
-
-    extract_provider_keys(&config, &mut plan);
-    extract_agent_defaults(&config, &mut plan);
-    extract_channel_tokens(&config, &mut plan);
-    extract_gateway_auth(&config, &mut plan);
-    extract_env_block(&config, &mut plan);
+    if let Some(ref config) = config {
+        extract_provider_keys(config, &mut plan);
+        extract_agent_defaults(config, &mut plan);
+        extract_channel_tokens(config, &mut plan);
+        extract_gateway_auth(config, &mut plan);
+        extract_env_block(config, &mut plan);
+        note_skipped_surfaces(config, &mut plan);
+    }
 
     if let Some(ref env_path) = discovery.env_path {
         extract_dotenv_keys(env_path, &mut plan);
     }
-
-    note_skipped_surfaces(&config, &mut plan);
 
     plan
 }
