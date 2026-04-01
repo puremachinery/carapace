@@ -279,7 +279,62 @@ pub struct ControlSetupAssessment {
     pub auth_mode: Option<onboarding::setup::SetupAuthMode>,
     pub status: onboarding::setup::SetupAssessmentStatus,
     pub summary: String,
-    pub checks: Vec<onboarding::setup::SetupCheck>,
+    pub checks: Vec<ControlSetupCheck>,
+}
+
+/// Control-facing setup check. This strips auth-profile identifiers and loaded
+/// identity strings before browser serialization.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControlSetupCheck {
+    pub name: String,
+    pub status: onboarding::setup::SetupCheckStatus,
+    pub kind: onboarding::setup::SetupCheckKind,
+    pub detail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remediation: Option<String>,
+}
+
+fn sanitize_control_setup_check(check: onboarding::setup::SetupCheck) -> ControlSetupCheck {
+    let onboarding::setup::SetupCheck {
+        name,
+        status,
+        kind,
+        detail,
+        remediation,
+    } = check;
+
+    let detail = if name.ends_with("auth profile") {
+        if detail.contains("configured profile id:") {
+            format!("{name} is configured")
+        } else if detail.contains("belongs to") {
+            format!("{name} belongs to a different provider")
+        } else if detail.contains("uses") && detail.contains("credentials") {
+            format!("{name} uses the wrong credential type")
+        } else if detail.contains("could not decrypt the stored token") {
+            format!("{name} token could not be decrypted; check CARAPACE_CONFIG_PASSWORD")
+        } else if detail.contains("has no usable token") {
+            format!("{name} has no usable token")
+        } else if detail.contains("was not found in the profile store") {
+            format!("{name} was not found in the encrypted profile store")
+        } else if detail.contains("failed to read the profile store") {
+            "failed to read the encrypted profile store".to_string()
+        } else if detail.starts_with("loaded `") {
+            format!("{name} loaded from encrypted profile store")
+        } else {
+            detail
+        }
+    } else {
+        detail
+    };
+
+    ControlSetupCheck {
+        name,
+        status,
+        kind,
+        detail,
+        remediation,
+    }
 }
 
 impl From<onboarding::setup::SetupAssessment> for ControlSetupAssessment {
@@ -289,7 +344,11 @@ impl From<onboarding::setup::SetupAssessment> for ControlSetupAssessment {
             auth_mode: value.auth_mode,
             status: value.status,
             summary: value.summary,
-            checks: value.checks,
+            checks: value
+                .checks
+                .into_iter()
+                .map(sanitize_control_setup_check)
+                .collect(),
         }
     }
 }
@@ -2225,11 +2284,14 @@ mod tests {
                     auth_mode: Some(onboarding::setup::SetupAuthMode::OAuth),
                     status: onboarding::setup::SetupAssessmentStatus::Partial,
                     summary: "Gemini setup is written, but validation was skipped.".to_string(),
-                    checks: vec![onboarding::setup::SetupCheck::validation_skip(
-                        "Live provider validation",
-                        "setup completed without a live provider-side validation step",
-                        None,
-                    )],
+                    checks: vec![ControlSetupCheck {
+                        name: "Live provider validation".to_string(),
+                        status: onboarding::setup::SetupCheckStatus::Skip,
+                        kind: onboarding::setup::SetupCheckKind::Validation,
+                        detail: "setup completed without a live provider-side validation step"
+                            .to_string(),
+                        remediation: None,
+                    }],
                 }),
             }],
         };
@@ -2246,6 +2308,43 @@ mod tests {
             .get("profileName")
             .is_none());
         assert!(json["providers"][0]["assessment"].get("email").is_none());
+    }
+
+    #[test]
+    fn test_control_setup_assessment_sanitizes_auth_profile_check_details() {
+        let assessment = onboarding::setup::SetupAssessment {
+            provider: onboarding::setup::SetupProvider::Gemini,
+            auth_mode: Some(onboarding::setup::SetupAuthMode::OAuth),
+            status: onboarding::setup::SetupAssessmentStatus::Ready,
+            summary: "Gemini setup looks ready for verification.".to_string(),
+            checks: vec![
+                onboarding::setup::SetupCheck::pass(
+                    "Gemini auth profile",
+                    "configured profile id: `google-123`",
+                ),
+                onboarding::setup::SetupCheck::validation_pass(
+                    "Gemini auth profile",
+                    "loaded `Google Profile` (user@example.com)",
+                ),
+            ],
+            profile_name: Some("Google Profile".to_string()),
+            email: Some("user@example.com".to_string()),
+        };
+
+        let control = ControlSetupAssessment::from(assessment);
+        let json = serde_json::to_value(&control).expect("control assessment should serialize");
+
+        assert_eq!(
+            json["checks"][0]["detail"],
+            "Gemini auth profile is configured"
+        );
+        assert_eq!(
+            json["checks"][1]["detail"],
+            "Gemini auth profile loaded from encrypted profile store"
+        );
+        assert!(!json.to_string().contains("google-123"));
+        assert!(!json.to_string().contains("Google Profile"));
+        assert!(!json.to_string().contains("user@example.com"));
     }
 
     #[test]
