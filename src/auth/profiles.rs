@@ -14,6 +14,8 @@ use std::fmt;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -31,6 +33,9 @@ static OAUTH_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .unwrap_or_else(|_| reqwest::Client::new())
 });
 
+#[cfg(test)]
+static FORCE_SECRET_ENCRYPTION_FAILURE: AtomicBool = AtomicBool::new(false);
+
 // ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------
@@ -42,6 +47,7 @@ pub enum AuthProfileError {
     TokenExchangeFailed(String),
     TokenRefreshFailed(String),
     UserInfoFailed(String),
+    SecretStorageError(String),
     CredentialTypeMismatch(String),
     ProfileNotFound,
     MaxProfilesExceeded,
@@ -59,6 +65,7 @@ impl fmt::Display for AuthProfileError {
             Self::TokenExchangeFailed(msg) => write!(f, "Token exchange failed: {}", msg),
             Self::TokenRefreshFailed(msg) => write!(f, "Token refresh failed: {}", msg),
             Self::UserInfoFailed(msg) => write!(f, "User info fetch failed: {}", msg),
+            Self::SecretStorageError(msg) => write!(f, "Secret storage error: {}", msg),
             Self::CredentialTypeMismatch(msg) => write!(f, "Credential type mismatch: {}", msg),
             Self::ProfileNotFound => write!(f, "Profile not found"),
             Self::MaxProfilesExceeded => {
@@ -937,7 +944,7 @@ impl ProfileStore {
         // Encrypt token fields if we have a SecretStore
         if let Some(ref store) = self.secret_store {
             for profile in to_save.iter_mut() {
-                Self::encrypt_profile_credential(profile, store);
+                Self::encrypt_profile_credential(profile, store)?;
             }
         }
 
@@ -968,73 +975,79 @@ impl ProfileStore {
 
     // -- private helpers for token encryption/decryption --
 
+    fn encrypt_secret_value(
+        field_name: &str,
+        plaintext: &str,
+        store: &SecretStore,
+    ) -> Result<String, AuthProfileError> {
+        #[cfg(test)]
+        if FORCE_SECRET_ENCRYPTION_FAILURE.load(Ordering::Relaxed) {
+            return Err(AuthProfileError::SecretStorageError(format!(
+                "failed to encrypt {field_name}: simulated test failure"
+            )));
+        }
+
+        store.encrypt(plaintext).map_err(|e| {
+            AuthProfileError::SecretStorageError(format!("failed to encrypt {field_name}: {e}"))
+        })
+    }
+
     /// Encrypt sensitive token fields in-place.  Already-encrypted values
     /// (prefixed with `enc:v1:`) are skipped to avoid double-encryption.
-    fn encrypt_tokens(tokens: &mut OAuthTokens, store: &SecretStore) {
+    fn encrypt_tokens(
+        tokens: &mut OAuthTokens,
+        store: &SecretStore,
+    ) -> Result<(), AuthProfileError> {
         if !is_encrypted(&tokens.access_token) {
-            match store.encrypt(&tokens.access_token) {
-                Ok(encrypted) => tokens.access_token = encrypted,
-                Err(e) => {
-                    tracing::warn!("Failed to encrypt access_token for profile: {}", e);
-                }
-            }
+            tokens.access_token =
+                Self::encrypt_secret_value("access_token", &tokens.access_token, store)?;
         }
         if let Some(ref rt) = tokens.refresh_token {
             if !is_encrypted(rt) {
-                match store.encrypt(rt) {
-                    Ok(encrypted) => tokens.refresh_token = Some(encrypted),
-                    Err(e) => {
-                        tracing::warn!("Failed to encrypt refresh_token for profile: {}", e);
-                    }
-                }
+                tokens.refresh_token =
+                    Some(Self::encrypt_secret_value("refresh_token", rt, store)?);
             }
         }
+        Ok(())
     }
 
-    fn encrypt_profile_credential(profile: &mut AuthProfile, store: &SecretStore) {
+    fn encrypt_profile_credential(
+        profile: &mut AuthProfile,
+        store: &SecretStore,
+    ) -> Result<(), AuthProfileError> {
         match profile.credential_kind {
             AuthProfileCredentialKind::OAuth => {
                 if let Some(tokens) = profile.tokens.as_mut() {
-                    Self::encrypt_tokens(tokens, store);
+                    Self::encrypt_tokens(tokens, store)?;
                 }
-                Self::encrypt_provider_config_secret(&mut profile.oauth_provider_config, store);
+                Self::encrypt_provider_config_secret(&mut profile.oauth_provider_config, store)?;
             }
             AuthProfileCredentialKind::Token => {
                 if let Some(token) = profile.token.as_mut() {
                     if !is_encrypted(token) {
-                        match store.encrypt(token) {
-                            Ok(encrypted) => *token = encrypted,
-                            Err(e) => {
-                                tracing::warn!(
-                                    "Failed to encrypt token credential for profile: {}",
-                                    e
-                                );
-                            }
-                        }
+                        *token = Self::encrypt_secret_value("token credential", token, store)?;
                     }
                 }
             }
         }
+        Ok(())
     }
 
     fn encrypt_provider_config_secret(
         provider_config: &mut Option<StoredOAuthProviderConfig>,
         store: &SecretStore,
-    ) {
+    ) -> Result<(), AuthProfileError> {
         let Some(provider_config) = provider_config.as_mut() else {
-            return;
+            return Ok(());
         };
         if !is_encrypted(&provider_config.client_secret) {
-            match store.encrypt(&provider_config.client_secret) {
-                Ok(encrypted) => provider_config.client_secret = encrypted,
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to encrypt oauth provider client_secret for profile: {}",
-                        e
-                    );
-                }
-            }
+            provider_config.client_secret = Self::encrypt_secret_value(
+                "oauth provider client_secret",
+                &provider_config.client_secret,
+                store,
+            )?;
         }
+        Ok(())
     }
 
     /// Decrypt sensitive token fields in-place.  Plaintext values (no
@@ -1373,6 +1386,19 @@ pub fn build_auth_profiles_config(cfg: &Value) -> AuthProfilesConfig {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    struct SecretEncryptionFailureGuard;
+
+    impl Drop for SecretEncryptionFailureGuard {
+        fn drop(&mut self) {
+            FORCE_SECRET_ENCRYPTION_FAILURE.store(false, Ordering::Relaxed);
+        }
+    }
+
+    fn force_secret_encryption_failure_for_tests() -> SecretEncryptionFailureGuard {
+        FORCE_SECRET_ENCRYPTION_FAILURE.store(true, Ordering::Relaxed);
+        SecretEncryptionFailureGuard
+    }
 
     // -----------------------------------------------------------------------
     // Helper builders
@@ -2038,6 +2064,9 @@ mod tests {
         let err = AuthProfileError::UserInfoFailed("403".to_string());
         assert!(err.to_string().contains("User info fetch failed"));
 
+        let err = AuthProfileError::SecretStorageError("encrypt failed".to_string());
+        assert!(err.to_string().contains("Secret storage error"));
+
         let err = AuthProfileError::ProfileNotFound;
         assert!(err.to_string().contains("Profile not found"));
 
@@ -2372,5 +2401,41 @@ mod tests {
         let saved_after: serde_json::Value = serde_json::from_str(&raw_after).unwrap();
         let ciphertext_after = saved_after[0]["token"].as_str().unwrap();
         assert_eq!(ciphertext_after, ciphertext_before);
+    }
+
+    #[test]
+    fn test_encrypted_store_save_fails_closed_when_secret_encryption_fails() {
+        let dir = tempdir().unwrap();
+        let password = random_password();
+        let store = ProfileStore::with_encryption(dir.path().to_path_buf(), &password).unwrap();
+
+        store
+            .add(sample_token_profile(
+                "anthropic:default",
+                OAuthProvider::Anthropic,
+                "token-before",
+            ))
+            .unwrap();
+
+        let state_path = dir.path().join("auth_profiles.json");
+        let raw_before = std::fs::read_to_string(&state_path).unwrap();
+        assert!(!raw_before.contains("token-before"));
+
+        let _guard = force_secret_encryption_failure_for_tests();
+        let err = store
+            .upsert(sample_token_profile(
+                "anthropic:default",
+                OAuthProvider::Anthropic,
+                "token-after",
+            ))
+            .unwrap_err();
+        assert!(
+            matches!(err, AuthProfileError::SecretStorageError(ref msg) if msg.contains("token credential")),
+            "unexpected error: {err}"
+        );
+
+        let raw_after = std::fs::read_to_string(&state_path).unwrap();
+        assert_eq!(raw_after, raw_before);
+        assert!(!raw_after.contains("token-after"));
     }
 }

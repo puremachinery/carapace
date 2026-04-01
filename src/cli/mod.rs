@@ -5041,6 +5041,20 @@ fn validate_provider_credentials_interactive(
     requested_auth_mode: Option<SetupAuthModeSelection>,
     api_key: &str,
 ) -> Result<crate::onboarding::setup::SetupCheck, Box<dyn std::error::Error>> {
+    if provider == SetupProvider::Anthropic
+        && requested_auth_mode == Some(SetupAuthModeSelection::SetupToken)
+    {
+        return Ok(crate::onboarding::setup::SetupCheck::validation_skip(
+            "Live provider validation",
+            "Anthropic setup-token live validation was skipped because setup-tokens do not use the API-key validation probe."
+                .to_string(),
+            Some(
+                "run `cara verify --outcome local-chat` after setup to exercise the configured Anthropic setup-token path"
+                    .to_string(),
+            ),
+        ));
+    }
+
     let validate_now = prompt_yes_no("Validate provider credentials now?", true)?;
     if !validate_now {
         return Ok(crate::onboarding::setup::SetupCheck::validation_skip(
@@ -12121,6 +12135,75 @@ mod tests {
         let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
         assert_eq!(state.provider_validation_calls, 0);
         assert!(state.visible_inputs.is_empty());
+    }
+
+    #[test]
+    fn test_configure_provider_interactive_anthropic_setup_token_skips_live_validation() {
+        let mut env_guard = ScopedEnv::new();
+        let state_dir = tempfile::TempDir::new().unwrap();
+        env_guard.unset("ANTHROPIC_SETUP_TOKEN");
+        env_guard.set("CARAPACE_STATE_DIR", state_dir.path().as_os_str());
+        env_guard.set("CARAPACE_CONFIG_PASSWORD", "test-password");
+
+        let payload_len = crate::onboarding::anthropic::ANTHROPIC_SETUP_TOKEN_MIN_TOTAL_LENGTH
+            - crate::onboarding::anthropic::ANTHROPIC_SETUP_TOKEN_PREFIX.len();
+        let token = format!(
+            "{}{}",
+            crate::onboarding::anthropic::ANTHROPIC_SETUP_TOKEN_PREFIX,
+            "a".repeat(payload_len)
+        );
+        let _guard = install_setup_interactive_harness(SetupInteractiveTestHarness {
+            hidden_inputs: VecDeque::from(vec![token.clone()]),
+            ..Default::default()
+        });
+        let mut config = serde_json::json!({});
+
+        let result = configure_provider_interactive(
+            &mut config,
+            SetupProvider::Anthropic,
+            true,
+            Some(SetupAuthModeSelection::SetupToken),
+        )
+        .expect("interactive Anthropic setup-token setup");
+
+        assert_eq!(result.observed_checks.len(), 1);
+        assert_eq!(
+            result.observed_checks[0].status,
+            crate::onboarding::setup::SetupCheckStatus::Skip
+        );
+        assert_eq!(
+            result.observed_checks[0].kind,
+            crate::onboarding::setup::SetupCheckKind::Validation
+        );
+        assert!(
+            result.observed_checks[0].detail.contains("setup-token"),
+            "unexpected validation skip detail: {}",
+            result.observed_checks[0].detail
+        );
+        assert_eq!(
+            result.observed_checks[0].remediation.as_deref(),
+            Some(
+                "run `cara verify --outcome local-chat` after setup to exercise the configured Anthropic setup-token path"
+            )
+        );
+
+        assert_eq!(
+            config["anthropic"]["authProfile"],
+            crate::onboarding::anthropic::DEFAULT_ANTHROPIC_AUTH_PROFILE_ID
+        );
+        assert_eq!(
+            config["auth"]["profiles"]["enabled"],
+            serde_json::json!(true)
+        );
+
+        let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
+        assert_eq!(state.provider_validation_calls, 0);
+        assert_eq!(state.hidden_prompt_count, 1);
+        assert!(state.hidden_inputs.is_empty());
+
+        let raw = std::fs::read_to_string(state_dir.path().join("auth_profiles.json")).unwrap();
+        assert!(raw.contains("enc:v1:"));
+        assert!(!raw.contains(&token));
     }
 
     #[test]
