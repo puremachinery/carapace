@@ -2,54 +2,14 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+use super::{push_mapping, ImportPlan, SkippedField};
+
 /// Known OpenClaw config locations, checked in priority order.
 const OPENCLAW_STATE_DIRS: &[&str] = &["~/.openclaw", "~/.clawdbot"];
 const OPENCLAW_CONFIG_NAMES: &[&str] = &["openclaw.json", "clawdbot.json"];
 const OPENCLAW_ENV_FILE: &str = ".env";
 const OPENCLAW_CREDENTIALS_DIR: &str = "credentials";
 const OPENCLAW_OAUTH_FILE: &str = "oauth.json";
-
-/// A field that was successfully mapped from OpenClaw to Carapace config.
-#[derive(Debug, Clone)]
-pub struct ImportMapping {
-    pub openclaw_path: String,
-    pub carapace_key: String,
-    pub value: Value,
-    pub sensitive: bool,
-}
-
-/// A field that was found but could not be mapped.
-#[derive(Debug, Clone)]
-pub struct SkippedField {
-    pub openclaw_path: String,
-    pub reason: &'static str,
-}
-
-/// Result of scanning and mapping an OpenClaw config.
-#[derive(Debug, Default)]
-pub struct ImportPlan {
-    pub source_path: Option<PathBuf>,
-    pub env_path: Option<PathBuf>,
-    pub credentials_path: Option<PathBuf>,
-    pub mappings: Vec<ImportMapping>,
-    pub skipped: Vec<SkippedField>,
-    pub warnings: Vec<String>,
-}
-
-impl ImportPlan {
-    pub fn is_empty(&self) -> bool {
-        self.mappings.is_empty()
-    }
-
-    /// Build a Carapace config Value from the mapped fields.
-    pub fn build_carapace_config(&self) -> Value {
-        let mut config = serde_json::json!({});
-        for mapping in &self.mappings {
-            set_nested(&mut config, &mapping.carapace_key, mapping.value.clone());
-        }
-        config
-    }
-}
 
 /// Discovered OpenClaw installation on disk.
 #[derive(Debug)]
@@ -92,9 +52,8 @@ pub fn discover() -> Option<OpenClawDiscovery> {
 /// Parse an OpenClaw config file and produce an import plan.
 pub fn plan_import(discovery: &OpenClawDiscovery) -> ImportPlan {
     let mut plan = ImportPlan {
-        source_path: Some(discovery.config_path.clone()),
-        env_path: discovery.env_path.clone(),
-        credentials_path: discovery.credentials_path.clone(),
+        source_name: "OpenClaw",
+        config_path: Some(discovery.config_path.clone()),
         ..Default::default()
     };
 
@@ -192,7 +151,7 @@ fn extract_provider_keys(config: &Value, plan: &mut ImportPlan) {
             }
             ProviderMapping::Bedrock => {
                 plan.skipped.push(SkippedField {
-                    openclaw_path: format!("models.providers.{name}"),
+                    source_path: format!("models.providers.{name}"),
                     reason: "Bedrock credentials use env vars or cara setup; cannot import from OpenClaw provider config",
                 });
             }
@@ -229,7 +188,7 @@ fn extract_provider_keys(config: &Value, plan: &mut ImportPlan) {
             }
             ProviderMapping::Unknown => {
                 plan.skipped.push(SkippedField {
-                    openclaw_path: format!("models.providers.{name}"),
+                    source_path: format!("models.providers.{name}"),
                     reason: "Custom provider; no automatic Carapace mapping",
                 });
             }
@@ -383,7 +342,7 @@ fn note_skipped_surfaces(config: &Value, plan: &mut ImportPlan) {
     for (key, reason) in skippable {
         if config.get(key).is_some() {
             plan.skipped.push(SkippedField {
-                openclaw_path: key.to_string(),
+                source_path: key.to_string(),
                 reason,
             });
         }
@@ -551,43 +510,10 @@ fn try_map_secret(config: &Value, json_path: &[&str], carapace_key: &str, plan: 
     }
 }
 
-fn push_mapping(
-    plan: &mut ImportPlan,
-    openclaw_path: String,
-    carapace_key: &str,
-    value: Value,
-    sensitive: bool,
-) {
-    // Deduplicate: if we already have a mapping for this carapace key, skip.
-    if plan.mappings.iter().any(|m| m.carapace_key == carapace_key) {
-        return;
-    }
-    plan.mappings.push(ImportMapping {
-        openclaw_path,
-        carapace_key: carapace_key.to_string(),
-        value,
-        sensitive,
-    });
-}
-
-fn set_nested(config: &mut Value, dotted_key: &str, value: Value) {
-    let segments: Vec<&str> = dotted_key.split('.').collect();
-    let mut current = config;
-    for (i, segment) in segments.iter().enumerate() {
-        if i == segments.len() - 1 {
-            current[*segment] = value;
-            return;
-        }
-        if !current.get(*segment).is_some_and(|v| v.is_object()) {
-            current[*segment] = serde_json::json!({});
-        }
-        current = current.get_mut(*segment).unwrap();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::migration::ImportMapping;
     use serde_json::json;
 
     #[test]
@@ -717,7 +643,7 @@ mod tests {
         let skipped_paths: Vec<&str> = plan
             .skipped
             .iter()
-            .map(|s| s.openclaw_path.as_str())
+            .map(|s| s.source_path.as_str())
             .collect();
         assert!(skipped_paths.contains(&"acp"));
         assert!(skipped_paths.contains(&"skills"));
@@ -847,7 +773,7 @@ mod tests {
         assert!(plan
             .skipped
             .iter()
-            .any(|s| s.openclaw_path.contains("my-bedrock")));
+            .any(|s| s.source_path.contains("my-bedrock")));
     }
 
     #[test]
@@ -855,13 +781,13 @@ mod tests {
         let plan = ImportPlan {
             mappings: vec![
                 ImportMapping {
-                    openclaw_path: "test".to_string(),
+                    source_path: "test".to_string(),
                     carapace_key: "anthropic.apiKey".to_string(),
                     value: json!("sk-test"),
                     sensitive: true,
                 },
                 ImportMapping {
-                    openclaw_path: "test".to_string(),
+                    source_path: "test".to_string(),
                     carapace_key: "agents.defaults.model".to_string(),
                     value: json!("claude-sonnet-4-20250514"),
                     sensitive: false,
@@ -880,6 +806,7 @@ mod tests {
 
     #[test]
     fn set_nested_creates_intermediate_objects() {
+        use crate::migration::set_nested;
         let mut config = json!({});
         set_nested(&mut config, "a.b.c", json!("deep"));
         assert_eq!(config["a"]["b"]["c"], "deep");

@@ -235,6 +235,12 @@ pub enum Command {
 pub enum ImportSource {
     /// Import from OpenClaw (~/.openclaw/ or ~/.clawdbot/).
     Openclaw,
+    /// Import from OpenCode (~/.opencode.json).
+    Opencode,
+    /// Import from Aider (~/.aider.conf.yml and .env).
+    Aider,
+    /// Import from NemoClaw (~/.nemoclaw/config.json).
+    Nemoclaw,
 }
 
 #[derive(Subcommand, Debug)]
@@ -7522,18 +7528,6 @@ fn configure_provider_noninteractive(
 pub fn handle_import_openclaw(force: bool) -> Result<(), Box<dyn std::error::Error>> {
     use crate::migration::openclaw;
 
-    // Check for existing config.
-    let config_path = config::get_config_path();
-    if config_path.exists() && !force {
-        eprintln!(
-            "Carapace config already exists at {}.",
-            config_path.display()
-        );
-        eprintln!("Use --force to overwrite, or edit the existing config manually.");
-        return Err("existing config found; use --force to overwrite".into());
-    }
-
-    // Discover OpenClaw installation.
     let discovery = match openclaw::discover() {
         Some(d) => d,
         None => {
@@ -7554,22 +7548,111 @@ pub fn handle_import_openclaw(force: bool) -> Result<(), Box<dyn std::error::Err
     }
     println!();
 
-    // Plan the import.
     let plan = openclaw::plan_import(&discovery);
+    execute_import_plan(plan, force)
+}
+
+/// Run the `import opencode` subcommand.
+pub fn handle_import_opencode(force: bool) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::migration::opencode;
+
+    let discovery = match opencode::discover() {
+        Some(d) => d,
+        None => {
+            eprintln!("No OpenCode installation found.");
+            eprintln!(
+                "Checked: ./.opencode.json, ~/.opencode.json, $XDG_CONFIG_HOME/opencode/, ~/.config/opencode/"
+            );
+            return Err("no OpenCode config found".into());
+        }
+    };
+
+    println!("Found OpenCode config: {}", discovery.config_path.display());
+    println!();
+
+    let plan = opencode::plan_import(&discovery);
+    execute_import_plan(plan, force)
+}
+
+/// Run the `import aider` subcommand.
+pub fn handle_import_aider(force: bool) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::migration::aider;
+
+    let discovery = match aider::discover() {
+        Some(d) => d,
+        None => {
+            eprintln!("No Aider installation found.");
+            eprintln!("Checked: ./.aider.conf.yml, ~/.aider.conf.yml, ./.env");
+            return Err("no Aider config found".into());
+        }
+    };
+
+    if let Some(ref config) = discovery.config_path {
+        println!("Found Aider config: {}", config.display());
+    }
+    if let Some(ref env) = discovery.env_path {
+        println!("Found .env file: {}", env.display());
+    }
+    println!();
+
+    let plan = aider::plan_import(&discovery);
+    execute_import_plan(plan, force)
+}
+
+/// Run the `import nemoclaw` subcommand.
+pub fn handle_import_nemoclaw(force: bool) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::migration::nemoclaw;
+
+    let discovery = match nemoclaw::discover() {
+        Some(d) => d,
+        None => {
+            eprintln!("No NemoClaw installation found.");
+            eprintln!("Checked: ~/.nemoclaw/config.json");
+            return Err("no NemoClaw config found".into());
+        }
+    };
+
+    println!("Found NemoClaw config: {}", discovery.config_path.display());
+    println!();
+
+    let plan = nemoclaw::plan_import(&discovery);
+    execute_import_plan(plan, force)
+}
+
+fn execute_import_plan(
+    plan: crate::migration::ImportPlan,
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config_path = config::get_config_path();
+    if config_path.exists() && !force {
+        eprintln!(
+            "Carapace config already exists at {}.",
+            config_path.display()
+        );
+        eprintln!("Use --force to overwrite, or edit the existing config manually.");
+        return Err("existing config found; use --force to overwrite".into());
+    }
 
     for warning in &plan.warnings {
         eprintln!("Warning: {warning}");
     }
 
     if plan.is_empty() && plan.skipped.is_empty() {
-        println!("No importable configuration found in the OpenClaw config.");
+        println!(
+            "No importable configuration found in the {} config.",
+            plan.source_name
+        );
         return Ok(());
     }
 
     // Show what will be imported.
     if !plan.mappings.is_empty() {
         println!("The following fields will be imported:\n");
-        println!("  {:<45} {:<30} Value", "OpenClaw source", "Carapace key");
+        println!(
+            "  {:<45} {:<30} Value",
+            format!("{} source", plan.source_name),
+            "Carapace key"
+        );
         println!(
             "  {:<45} {:<30} {}",
             "-".repeat(44),
@@ -7588,7 +7671,7 @@ pub fn handle_import_openclaw(force: bool) -> Result<(), Box<dyn std::error::Err
             };
             println!(
                 "  {:<45} {:<30} {}",
-                truncate_display(&mapping.openclaw_path, 44),
+                truncate_display(&mapping.source_path, 44),
                 mapping.carapace_key,
                 display_value
             );
@@ -7600,7 +7683,7 @@ pub fn handle_import_openclaw(force: bool) -> Result<(), Box<dyn std::error::Err
     if !plan.skipped.is_empty() {
         println!("Skipped (no Carapace mapping):\n");
         for skipped in &plan.skipped {
-            println!("  {} — {}", skipped.openclaw_path, skipped.reason);
+            println!("  {} — {}", skipped.source_path, skipped.reason);
         }
         println!();
     }
