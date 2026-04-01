@@ -49,6 +49,15 @@ pub fn persist_cli_anthropic_setup_token(
     Ok(profile_id)
 }
 
+pub fn anthropic_setup_token_would_replace_api_key(config: &Value) -> bool {
+    config
+        .get("anthropic")
+        .and_then(|anthropic| anthropic.get("apiKey"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+}
+
 fn upsert_anthropic_setup_token_profile(state_dir: &Path, token: &str) -> Result<String, String> {
     let store = ProfileStore::from_env(state_dir.to_path_buf()).map_err(|err| err.to_string())?;
     store.load().map_err(|err| err.to_string())?;
@@ -156,6 +165,23 @@ mod tests {
             DEFAULT_ANTHROPIC_AUTH_PROFILE_ID
         );
         assert_eq!(config["auth"]["profiles"]["enabled"], json!(true));
+    }
+
+    #[test]
+    fn test_anthropic_setup_token_would_replace_api_key_detects_existing_value() {
+        let config = json!({
+            "anthropic": {
+                "apiKey": "${ANTHROPIC_API_KEY}"
+            }
+        });
+        assert!(anthropic_setup_token_would_replace_api_key(&config));
+
+        let blank = json!({
+            "anthropic": {
+                "apiKey": "   "
+            }
+        });
+        assert!(!anthropic_setup_token_would_replace_api_key(&blank));
     }
 
     #[test]
