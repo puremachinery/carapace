@@ -239,6 +239,8 @@ pub enum ImportSource {
     Opencode,
     /// Import from Aider (~/.aider.conf.yml and .env).
     Aider,
+    /// Import from NemoClaw (~/.nemoclaw/config.json).
+    Nemoclaw,
 }
 
 #[derive(Subcommand, Debug)]
@@ -7373,6 +7375,26 @@ pub fn handle_import_aider(force: bool) -> Result<(), Box<dyn std::error::Error>
     println!();
 
     let plan = aider::plan_import(&discovery);
+    execute_import_plan(plan, force)
+}
+
+/// Run the `import nemoclaw` subcommand.
+pub fn handle_import_nemoclaw(force: bool) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::migration::nemoclaw;
+
+    let discovery = match nemoclaw::discover() {
+        Some(d) => d,
+        None => {
+            eprintln!("No NemoClaw installation found.");
+            eprintln!("Checked: ~/.nemoclaw/config.json");
+            return Err("no NemoClaw config found".into());
+        }
+    };
+
+    println!("Found NemoClaw config: {}", discovery.config_path.display());
+    println!();
+
+    let plan = nemoclaw::plan_import(&discovery);
     execute_import_plan(plan, force)
 }
 

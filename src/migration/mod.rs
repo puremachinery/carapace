@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use serde_json::Value;
 
 pub mod aider;
+pub mod nemoclaw;
 pub mod openclaw;
 pub mod opencode;
 
