@@ -3101,6 +3101,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_control_onboarding_status_requires_auth() {
+        let (_temp, _guard) = set_temp_config_path();
+        let router = test_router(test_config());
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/control/onboarding/status")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
     async fn test_control_onboarding_status_reports_configured_provider_assessment() {
         let (temp, _guard) = set_temp_config_path();
         let config_path = temp.path().join("carapace-test-config.json5");

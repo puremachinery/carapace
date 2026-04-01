@@ -1951,4 +1951,27 @@ mod tests {
         assert_eq!(SetupProvider::Codex.label(), "Codex");
         assert_eq!(SetupProvider::OpenAi.label(), "OpenAI");
     }
+
+    #[test]
+    fn test_setup_provider_all_lists_expected_variants() {
+        let providers = SetupProvider::all();
+        assert_eq!(providers.len(), 8);
+        let keys: Vec<&str> = providers
+            .iter()
+            .map(|provider| provider.prompt_key())
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                "anthropic",
+                "codex",
+                "openai",
+                "ollama",
+                "gemini",
+                "vertex",
+                "venice",
+                "bedrock",
+            ]
+        );
+    }
 }
