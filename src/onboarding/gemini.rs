@@ -655,6 +655,44 @@ fn insert_google_oauth_flow(flow: PendingGeminiOAuthFlow) -> Result<(), String> 
     Ok(())
 }
 
+#[cfg(test)]
+pub(crate) fn insert_completed_control_google_oauth_flow_for_test() -> String {
+    let flow_id = format!("gemini-test-flow-{}", uuid::Uuid::new_v4());
+    let provider_config = OAuthProvider::Google.default_config(
+        "google-client-id",
+        "google-client-secret",
+        "https://gateway.example.com/control/onboarding/gemini/callback",
+    );
+    let tokens = OAuthTokens {
+        access_token: "google-access-token".to_string(),
+        refresh_token: Some("google-refresh-token".to_string()),
+        token_type: "Bearer".to_string(),
+        expires_at_ms: Some(now_ms() + 3_600_000),
+        scope: Some("openid email profile".to_string()),
+    };
+    let userinfo = crate::auth::profiles::UserInfo {
+        user_id: "user-123".to_string(),
+        email: Some("user@example.com".to_string()),
+        display_name: Some("Example User".to_string()),
+        avatar_url: None,
+    };
+    GEMINI_OAUTH_FLOWS.write().insert(
+        flow_id.clone(),
+        PendingGeminiOAuthFlow {
+            id: flow_id.clone(),
+            state: format!("state-{flow_id}"),
+            code_verifier: "verifier".to_string(),
+            provider_config: provider_config.clone(),
+            created_at_ms: now_ms(),
+            flow_state: GeminiOAuthFlowState::Completed(Box::new(GeminiOAuthCompletion {
+                client_id: "google-client-id".to_string(),
+                auth_profile: build_google_auth_profile(&provider_config, tokens, userinfo),
+            })),
+        },
+    );
+    flow_id
+}
+
 fn require_encrypted_profile_store_for_google_oauth() -> Result<(), String> {
     if profile_store_encryption_enabled_from_env() {
         return Ok(());

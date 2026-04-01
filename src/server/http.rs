@@ -650,7 +650,7 @@ fn apply_http_middleware_layers(
     stateless_router
 }
 
-/// Register control session endpoints (status, channels, config).
+/// Register control session endpoints (status, channels, config, onboarding).
 fn register_session_routes(
     router: Router<AppState>,
     config: &HttpConfig,
@@ -675,6 +675,7 @@ fn register_session_routes(
     let control_state_config_read = control_state.clone();
     let control_state_config_post = control_state.clone();
     let control_state_config_patch = control_state.clone();
+    let control_state_onboarding_status = control_state.clone();
     let control_state_gemini_oauth_start = control_state.clone();
     let control_state_gemini_oauth_status = control_state.clone();
     let control_state_gemini_oauth_apply = control_state.clone();
@@ -728,6 +729,15 @@ fn register_session_routes(
                     }
                 },
             ),
+        )
+        .route(
+            "/control/onboarding/status",
+            get(move |connect_info: MaybeConnectInfo, headers: HeaderMap| {
+                let state = control_state_onboarding_status.clone();
+                async move {
+                    control::onboarding_status_handler(State(state), connect_info, headers).await
+                }
+            }),
         )
         .route(
             "/control/onboarding/gemini/oauth/start",
@@ -3050,6 +3060,138 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_control_onboarding_status_lists_all_providers() {
+        let (_temp, _guard) = set_temp_config_path();
+        let router = test_router(test_config());
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/control/onboarding/status")
+            .header("authorization", "Bearer test-gateway-token")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ok"], true);
+        let providers = json["providers"]
+            .as_array()
+            .expect("providers should be an array");
+        assert_eq!(
+            providers.len(),
+            crate::onboarding::setup::SetupProvider::all().len()
+        );
+        let anthropic = providers
+            .iter()
+            .find(|provider| provider["provider"] == "anthropic")
+            .expect("anthropic status should be present");
+        assert_eq!(anthropic["configured"], false);
+        assert!(anthropic["assessment"].is_null());
+        assert_eq!(anthropic["supportedAuthModes"][0], "apiKey");
+        assert_eq!(anthropic["supportedAuthModes"][1], "setupToken");
+        let codex = providers
+            .iter()
+            .find(|provider| provider["provider"] == "codex")
+            .expect("codex status should be present");
+        assert_eq!(codex["label"], "Codex");
+    }
+
+    #[tokio::test]
+    async fn test_control_onboarding_status_requires_auth() {
+        let (_temp, _guard) = set_temp_config_path();
+        let router = test_router(test_config());
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/control/onboarding/status")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_control_onboarding_status_reports_configured_provider_assessment() {
+        let (temp, _guard) = set_temp_config_path();
+        let config_path = temp.path().join("carapace-test-config.json5");
+        std::fs::write(
+            &config_path,
+            r#"{
+                agents: { defaults: { model: "gemini-2.0-flash" } },
+                google: { apiKey: "AIza-test-key", baseUrl: "https://proxy.example.com" }
+            }"#,
+        )
+        .unwrap();
+
+        let router = test_router(test_config());
+        let req = Request::builder()
+            .method("GET")
+            .uri("/control/onboarding/status")
+            .header("authorization", "Bearer test-gateway-token")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let providers = json["providers"]
+            .as_array()
+            .expect("providers should be an array");
+        let gemini = providers
+            .iter()
+            .find(|provider| provider["provider"] == "gemini")
+            .expect("gemini status should be present");
+        assert_eq!(gemini["configured"], true);
+        assert_eq!(gemini["assessment"]["provider"], "gemini");
+        assert_eq!(gemini["assessment"]["status"], "partial");
+        assert_eq!(gemini["assessment"]["authMode"], "apiKey");
+    }
+
+    #[tokio::test]
+    async fn test_control_onboarding_status_ignores_defaulted_vertex_location() {
+        let (temp, _guard) = set_temp_config_path();
+        let config_path = temp.path().join("carapace-test-config.json5");
+        std::fs::write(
+            &config_path,
+            r#"{
+                agents: { defaults: { model: "gpt-4o" } }
+            }"#,
+        )
+        .unwrap();
+
+        let router = test_router(test_config());
+        let req = Request::builder()
+            .method("GET")
+            .uri("/control/onboarding/status")
+            .header("authorization", "Bearer test-gateway-token")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let providers = json["providers"]
+            .as_array()
+            .expect("providers should be an array");
+        let vertex = providers
+            .iter()
+            .find(|provider| provider["provider"] == "vertex")
+            .expect("vertex status should be present");
+        assert_eq!(vertex["configured"], false);
+        assert!(vertex["assessment"].is_null());
+    }
+
+    #[tokio::test]
     async fn test_control_gemini_api_key_writes_config() {
         let (temp, _guard) = set_temp_config_path();
         let config_path = temp.path().join("carapace-test-config.json5");
@@ -3073,12 +3215,53 @@ mod tests {
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["ok"], true);
         assert_eq!(json["applied"]["mode"], "apiKey");
+        assert_eq!(json["providerStatus"]["provider"], "gemini");
+        assert_eq!(json["providerStatus"]["configured"], true);
+        assert_eq!(json["providerStatus"]["assessment"]["status"], "partial");
+        assert!(json["providerStatus"]["assessment"]
+            .get("profileName")
+            .is_none());
+        assert!(json["providerStatus"]["assessment"].get("email").is_none());
 
         let content = std::fs::read_to_string(config_path).expect("written config");
         let parsed: Value = json5::from_str(&content).expect("valid json5 config");
         assert_eq!(parsed["google"]["apiKey"], "AIza-test-key");
         assert_eq!(parsed["google"]["baseUrl"], "https://proxy.example.com");
         assert!(parsed["google"].get("authProfile").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_control_gemini_oauth_apply_returns_provider_status() {
+        let (temp, mut env_guard) = set_temp_config_path();
+        env_guard.set("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
+        let flow_id =
+            crate::onboarding::gemini::insert_completed_control_google_oauth_flow_for_test();
+        let router = test_router(test_config());
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/control/onboarding/gemini/oauth/{flow_id}/apply"))
+            .header("authorization", "Bearer test-gateway-token")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["applied"]["mode"], "oauth");
+        assert_eq!(json["providerStatus"]["provider"], "gemini");
+        assert_eq!(json["providerStatus"]["configured"], true);
+        assert_eq!(json["providerStatus"]["assessment"]["provider"], "gemini");
+        assert_eq!(json["providerStatus"]["assessment"]["authMode"], "oauth");
+        assert!(json["providerStatus"]["assessment"]
+            .get("profileName")
+            .is_none());
+        assert!(json["providerStatus"]["assessment"].get("email").is_none());
     }
 
     #[tokio::test]
@@ -3113,6 +3296,39 @@ mod tests {
             json["redirectUri"],
             "https://gateway.example.com/control/onboarding/codex/callback"
         );
+    }
+
+    #[tokio::test]
+    async fn test_control_codex_oauth_apply_returns_provider_status() {
+        let (temp, mut env_guard) = set_temp_config_path();
+        env_guard.set("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+        env_guard.set("CARAPACE_STATE_DIR", temp.path().as_os_str());
+        let flow_id =
+            crate::onboarding::codex::insert_completed_control_openai_oauth_flow_for_test();
+        let router = test_router(test_config());
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/control/onboarding/codex/oauth/{flow_id}/apply"))
+            .header("authorization", "Bearer test-gateway-token")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["providerStatus"]["provider"], "codex");
+        assert_eq!(json["providerStatus"]["configured"], true);
+        assert_eq!(json["providerStatus"]["assessment"]["provider"], "codex");
+        assert_eq!(json["providerStatus"]["assessment"]["authMode"], "oauth");
+        assert!(json["providerStatus"]["assessment"]
+            .get("profileName")
+            .is_none());
+        assert!(json["providerStatus"]["assessment"].get("email").is_none());
     }
 
     #[tokio::test]

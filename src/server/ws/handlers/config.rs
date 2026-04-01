@@ -21,6 +21,7 @@ pub(crate) struct ConfigSnapshot {
     pub(crate) exists: bool,
     pub(crate) raw: Option<String>,
     pub(crate) parsed: Value,
+    pub(crate) raw_config: Value,
     pub(crate) valid: bool,
     pub(crate) config: Value,
     pub(crate) hash: Option<String>,
@@ -51,6 +52,7 @@ pub(crate) fn read_config_snapshot() -> ConfigSnapshot {
             exists: false,
             raw: None,
             parsed: Value::Object(serde_json::Map::new()),
+            raw_config: Value::Object(serde_json::Map::new()),
             valid: true,
             config: Value::Object(serde_json::Map::new()),
             hash: None,
@@ -66,6 +68,7 @@ pub(crate) fn read_config_snapshot() -> ConfigSnapshot {
                 exists: true,
                 raw: None,
                 parsed: Value::Object(serde_json::Map::new()),
+                raw_config: Value::Object(serde_json::Map::new()),
                 valid: false,
                 config: Value::Object(serde_json::Map::new()),
                 hash: None,
@@ -79,21 +82,21 @@ pub(crate) fn read_config_snapshot() -> ConfigSnapshot {
 
     let hash = Some(sha256_hex(&raw));
     let parsed = json5::from_str::<Value>(&raw).unwrap_or(Value::Null);
-
-    let (config_value, mut issues, valid) = match config::load_config_uncached(&path) {
-        Ok(cfg) => {
-            let issues = map_validation_issues(config::validate_config(&cfg));
-            let valid = issues.is_empty();
-            (cfg, issues, valid)
-        }
-        Err(err) => {
-            let issues = vec![ConfigIssue {
-                path: "".to_string(),
-                message: err.to_string(),
-            }];
-            (parsed.clone(), issues, false)
-        }
-    };
+    let (raw_config, config_value, mut issues, valid) =
+        match config::load_config_pair_uncached(&path) {
+            Ok((raw_cfg, cfg)) => {
+                let issues = map_validation_issues(config::validate_config(&cfg));
+                let valid = issues.is_empty();
+                (raw_cfg, cfg, issues, valid)
+            }
+            Err(err) => {
+                let issues = vec![ConfigIssue {
+                    path: "".to_string(),
+                    message: err.to_string(),
+                }];
+                (parsed.clone(), parsed.clone(), issues, false)
+            }
+        };
 
     if !valid && issues.is_empty() {
         issues.push(ConfigIssue {
@@ -107,6 +110,7 @@ pub(crate) fn read_config_snapshot() -> ConfigSnapshot {
         exists: true,
         raw: Some(raw),
         parsed,
+        raw_config,
         valid,
         config: config_value,
         hash,

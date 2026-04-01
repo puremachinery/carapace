@@ -631,6 +631,44 @@ fn insert_openai_oauth_flow(flow: PendingCodexOAuthFlow) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(test)]
+pub(crate) fn insert_completed_control_openai_oauth_flow_for_test() -> String {
+    let flow_id = format!("codex-test-flow-{}", uuid::Uuid::new_v4());
+    let provider_config = OAuthProvider::OpenAI.default_config(
+        "openai-client-id",
+        "openai-client-secret",
+        "https://gateway.example.com/control/onboarding/codex/callback",
+    );
+    let tokens = OAuthTokens {
+        access_token: "header.eyJzdWIiOiJ1c2VyLTEyMyJ9.sig".to_string(),
+        refresh_token: Some("refresh-token".to_string()),
+        token_type: "Bearer".to_string(),
+        expires_at_ms: Some(now_ms() + 3_600_000),
+        scope: Some("openid profile email offline_access".to_string()),
+    };
+    let userinfo = crate::auth::profiles::UserInfo {
+        user_id: "user-123".to_string(),
+        email: Some("user@example.com".to_string()),
+        display_name: Some("Example User".to_string()),
+        avatar_url: None,
+    };
+    CODEX_OAUTH_FLOWS.write().insert(
+        flow_id.clone(),
+        PendingCodexOAuthFlow {
+            id: flow_id.clone(),
+            state: format!("state-{flow_id}"),
+            code_verifier: "verifier".to_string(),
+            provider_config: provider_config.clone(),
+            created_at_ms: now_ms(),
+            flow_state: CodexOAuthFlowState::Completed(Box::new(CodexOAuthCompletion {
+                client_id: "openai-client-id".to_string(),
+                auth_profile: build_openai_auth_profile(&provider_config, tokens, userinfo),
+            })),
+        },
+    );
+    flow_id
+}
+
 fn require_encrypted_profile_store_for_openai_oauth() -> Result<(), String> {
     if profile_store_encryption_enabled_from_env() {
         return Ok(());
