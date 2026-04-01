@@ -72,6 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::Import { source, force }) => match source {
             cli::ImportSource::Openclaw => cli::handle_import_openclaw(force),
             cli::ImportSource::Opencode => cli::handle_import_opencode(force),
+            cli::ImportSource::Aider => cli::handle_import_aider(force),
         },
 
         Some(Command::Pair { url, name, trust }) => {

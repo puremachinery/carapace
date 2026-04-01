@@ -237,6 +237,8 @@ pub enum ImportSource {
     Openclaw,
     /// Import from OpenCode (~/.opencode.json).
     Opencode,
+    /// Import from Aider (~/.aider.conf.yml and .env).
+    Aider,
 }
 
 #[derive(Subcommand, Debug)]
@@ -7346,6 +7348,31 @@ pub fn handle_import_opencode(force: bool) -> Result<(), Box<dyn std::error::Err
     println!();
 
     let plan = opencode::plan_import(&discovery);
+    execute_import_plan(plan, force)
+}
+
+/// Run the `import aider` subcommand.
+pub fn handle_import_aider(force: bool) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::migration::aider;
+
+    let discovery = match aider::discover() {
+        Some(d) => d,
+        None => {
+            eprintln!("No Aider installation found.");
+            eprintln!("Checked: ./.aider.conf.yml, ~/.aider.conf.yml, ./.env");
+            return Err("no Aider config found".into());
+        }
+    };
+
+    if let Some(ref config) = discovery.config_path {
+        println!("Found Aider config: {}", config.display());
+    }
+    if let Some(ref env) = discovery.env_path {
+        println!("Found .env file: {}", env.display());
+    }
+    println!();
+
+    let plan = aider::plan_import(&discovery);
     execute_import_plan(plan, force)
 }
 
