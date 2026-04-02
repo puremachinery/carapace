@@ -72,6 +72,7 @@ rappct = "0.13.3"
 self-replace = "1.5"
 
 [dev-dependencies]
+filetime = "0.2"
 insta = { version = "1", features = ["json"] }
 tokio-test = "0.4"
 tempfile = "3"

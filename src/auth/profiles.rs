@@ -1019,6 +1019,10 @@ pub struct ProfileStore {
     last_used_worker: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
+pub(crate) fn profile_store_state_path(state_dir: &std::path::Path) -> PathBuf {
+    state_dir.join("auth_profiles.json")
+}
+
 impl ProfileStore {
     /// Open the profile store for the given state directory.
     ///
@@ -1039,7 +1043,7 @@ impl ProfileStore {
     /// Token fields are stored as plaintext.  Use [`with_encryption`](Self::with_encryption)
     /// to enable at-rest encryption.
     pub fn new(state_dir: PathBuf) -> Self {
-        let state_path = state_dir.join("auth_profiles.json");
+        let state_path = profile_store_state_path(&state_dir);
         let shared = Arc::new(ProfileStoreShared::new(state_path, None, None));
         Self {
             last_used_worker: Mutex::new(Self::start_last_used_worker(&shared)),
@@ -1058,7 +1062,7 @@ impl ProfileStore {
     /// salt (e.g. from a previous run) can still be decrypted via key
     /// re-derivation.
     pub fn with_encryption(state_dir: PathBuf, password: &[u8]) -> Result<Self, AuthProfileError> {
-        let state_path = state_dir.join("auth_profiles.json");
+        let state_path = profile_store_state_path(&state_dir);
         let secret_store = SecretStore::new(password)
             .map_err(|e| AuthProfileError::IoError(format!("encryption init failed: {e}")))?;
         let shared = Arc::new(ProfileStoreShared::new(
@@ -1307,7 +1311,6 @@ impl ProfileStore {
 
         let content = fs::read_to_string(&self.shared.state_path)
             .map_err(|e| AuthProfileError::IoError(e.to_string()))?;
-
         let loaded = parse_store_file(&content)?;
         let mut profiles = loaded.profiles;
 

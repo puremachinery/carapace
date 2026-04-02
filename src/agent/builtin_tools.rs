@@ -1594,7 +1594,7 @@ mod tests {
             "builtin-tools-test-wrong-password-{}",
             crate::time::unix_now_ms_u64()
         );
-        let _password = set_env_var_scoped("CARAPACE_CONFIG_PASSWORD", &wrong_password);
+        let _password_guard = set_env_var_scoped("CARAPACE_CONFIG_PASSWORD", &wrong_password);
         let cfg = json!({
             "anthropic": { "authProfile": "anthropic:default" }
         });
@@ -1638,7 +1638,7 @@ mod tests {
             })
             .expect("store profile");
 
-        let _password = set_env_var_scoped("CARAPACE_CONFIG_PASSWORD", &password);
+        let _password_guard = set_env_var_scoped("CARAPACE_CONFIG_PASSWORD", &password);
         let _blank_key = set_env_var_scoped("ANTHROPIC_API_KEY", "   ");
         let cfg = json!({
             "anthropic": { "authProfile": "anthropic:default" }
@@ -1682,7 +1682,7 @@ mod tests {
             })
             .expect("store profile");
 
-        let _password = set_env_var_scoped("CARAPACE_CONFIG_PASSWORD", &password);
+        let _password_guard = set_env_var_scoped("CARAPACE_CONFIG_PASSWORD", &password);
         let cfg = json!({
             "anthropic": { "authProfile": "anthropic:default" }
         });
