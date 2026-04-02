@@ -2641,7 +2641,7 @@ mod tests {
                     "stored profile `google-123` future auth detail with `internal-profile-id`",
                     "Re-run setup for Gemini credential validation.",
                 ),
-                onboarding::setup::SetupCheck::fail_code(
+                onboarding::setup::SetupCheck::validation_fail_code(
                     "Gemini base URL validation",
                     "opaque invalid URL detail with https://user:secret@proxy.example.com/",
                     "Write a valid Gemini base URL into config.",

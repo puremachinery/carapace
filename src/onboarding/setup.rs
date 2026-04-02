@@ -401,6 +401,22 @@ impl SetupCheck {
         )
     }
 
+    pub fn skip_code(
+        name: impl Into<String>,
+        detail: impl Into<String>,
+        remediation: Option<String>,
+        code: SetupCheckCode,
+    ) -> Self {
+        Self::new(
+            name,
+            SetupCheckStatus::Skip,
+            SetupCheckKind::Requirement,
+            detail,
+            remediation,
+            SetupCheckProjection::Code(code),
+        )
+    }
+
     pub fn validation_skip_generic(
         name: impl Into<String>,
         detail: impl Into<String>,
@@ -413,6 +429,22 @@ impl SetupCheck {
             detail,
             remediation,
             SetupCheckProjection::GenericStatus,
+        )
+    }
+
+    pub fn validation_skip_code(
+        name: impl Into<String>,
+        detail: impl Into<String>,
+        remediation: Option<String>,
+        code: SetupCheckCode,
+    ) -> Self {
+        Self::new(
+            name,
+            SetupCheckStatus::Skip,
+            SetupCheckKind::Validation,
+            detail,
+            remediation,
+            SetupCheckProjection::Code(code),
         )
     }
 
@@ -431,7 +463,24 @@ impl SetupCheck {
         )
     }
 
-    pub fn code(&self) -> Option<SetupCheckCode> {
+    pub fn validation_fail_code(
+        name: impl Into<String>,
+        detail: impl Into<String>,
+        remediation: impl Into<String>,
+        code: SetupCheckCode,
+    ) -> Self {
+        Self::new(
+            name,
+            SetupCheckStatus::Fail,
+            SetupCheckKind::Validation,
+            detail,
+            Some(remediation.into()),
+            SetupCheckProjection::Code(code),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn code(&self) -> Option<SetupCheckCode> {
         match self.projection {
             SetupCheckProjection::GenericStatus => None,
             SetupCheckProjection::Code(code) => Some(code),
@@ -1306,7 +1355,7 @@ where
     let effective = effective_config_value(&value).unwrap_or_else(|| value.clone());
     match validator(&effective) {
         Ok(()) => SetupCheck::pass_generic(label, format!("{label} passed local validation")),
-        Err(err) => SetupCheck::fail_code(
+        Err(err) => SetupCheck::validation_fail_code(
             label,
             format!("{label} failed local validation: {err}"),
             setup_follow_up(provider_setup_follow_up(
@@ -1719,7 +1768,50 @@ mod tests {
         );
 
         assert_eq!(check.status, SetupCheckStatus::Fail);
+        assert_eq!(check.kind, SetupCheckKind::Validation);
         assert_eq!(check.code(), Some(SetupCheckCode::LocalValidationFailed));
+    }
+
+    #[test]
+    fn test_setup_check_code_constructors_preserve_kind_and_code() {
+        let requirement_skip = SetupCheck::skip_code(
+            "Req skip",
+            "detail",
+            Some("fix it".to_string()),
+            SetupCheckCode::AuthProfileMissing,
+        );
+        assert_eq!(requirement_skip.status, SetupCheckStatus::Skip);
+        assert_eq!(requirement_skip.kind, SetupCheckKind::Requirement);
+        assert_eq!(
+            requirement_skip.code(),
+            Some(SetupCheckCode::AuthProfileMissing)
+        );
+
+        let validation_skip = SetupCheck::validation_skip_code(
+            "Val skip",
+            "detail",
+            Some("fix it".to_string()),
+            SetupCheckCode::AuthProfileStoreReadFailed,
+        );
+        assert_eq!(validation_skip.status, SetupCheckStatus::Skip);
+        assert_eq!(validation_skip.kind, SetupCheckKind::Validation);
+        assert_eq!(
+            validation_skip.code(),
+            Some(SetupCheckCode::AuthProfileStoreReadFailed)
+        );
+
+        let validation_fail = SetupCheck::validation_fail_code(
+            "Val fail",
+            "detail",
+            "fix it",
+            SetupCheckCode::LocalValidationFailed,
+        );
+        assert_eq!(validation_fail.status, SetupCheckStatus::Fail);
+        assert_eq!(validation_fail.kind, SetupCheckKind::Validation);
+        assert_eq!(
+            validation_fail.code(),
+            Some(SetupCheckCode::LocalValidationFailed)
+        );
     }
 
     #[test]
