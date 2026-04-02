@@ -170,6 +170,12 @@ impl AuthProfileRuntimeResolver {
         let resolved = Self::resolve_cached_anthropic_token(&store, profile_id);
 
         let mut state = self.state.write();
+        // Cache the successfully loaded store even if profile/token resolution
+        // itself fails. Stable configuration errors (for example, a missing
+        // profile id) should not force another disk load on the next identical
+        // snapshot. Password changes are part of the snapshot identity, so a
+        // later correctly-keyed call naturally reloads under the new
+        // fingerprint instead of reusing the wrong-password snapshot.
         state.anthropic_store = Some(CachedAnthropicProfileStore {
             snapshot: inputs.snapshot,
             store,
