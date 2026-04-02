@@ -66,7 +66,6 @@ impl ProfileStoreMetadataStamp {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AnthropicProfileStoreSnapshot {
     state_dir: PathBuf,
-    state_path: PathBuf,
     password_fingerprint: [u8; 32],
     file_stamp: ProfileStoreMetadataStamp,
 }
@@ -78,16 +77,13 @@ impl AnthropicProfileStoreSnapshot {
         let file_stamp = ProfileStoreMetadataStamp::read(&state_path);
         Self {
             state_dir,
-            state_path,
             password_fingerprint,
             file_stamp,
         }
     }
 
     fn cache_key_matches(&self, other: &Self) -> bool {
-        self.state_dir == other.state_dir
-            && self.state_path == other.state_path
-            && self.password_fingerprint == other.password_fingerprint
+        self.state_dir == other.state_dir && self.password_fingerprint == other.password_fingerprint
     }
 }
 
@@ -422,6 +418,56 @@ mod tests {
                 .resolve_anthropic_token(inputs, profile_id)
                 .expect("reload resolve"),
             "sk-ant-oat01-fresh-token"
+        );
+        assert_eq!(resolver.anthropic_load_attempts_for_tests(), 2);
+    }
+
+    #[test]
+    fn test_resolve_anthropic_profile_token_reloads_after_state_dir_change() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let password = test_password();
+        let profile_id = "anthropic:default";
+
+        let first_store =
+            ProfileStore::with_encryption(first.path().to_path_buf(), password.as_bytes())
+                .expect("first encrypted profile store");
+        first_store
+            .add(anthropic_token_profile(
+                profile_id,
+                "sk-ant-oat01-first-token",
+            ))
+            .expect("store first profile");
+
+        let second_store =
+            ProfileStore::with_encryption(second.path().to_path_buf(), password.as_bytes())
+                .expect("second encrypted profile store");
+        second_store
+            .add(anthropic_token_profile(
+                profile_id,
+                "sk-ant-oat01-second-token",
+            ))
+            .expect("store second profile");
+
+        let resolver = AuthProfileRuntimeResolver::new();
+        resolver.set_now_ms_for_tests(15_000);
+
+        let first_inputs =
+            AnthropicProfileRuntimeInputs::new(first.path().to_path_buf(), password.clone());
+        assert_eq!(
+            resolver
+                .resolve_anthropic_token(first_inputs, profile_id)
+                .expect("first state dir resolve"),
+            "sk-ant-oat01-first-token"
+        );
+
+        let second_inputs =
+            AnthropicProfileRuntimeInputs::new(second.path().to_path_buf(), password);
+        assert_eq!(
+            resolver
+                .resolve_anthropic_token(second_inputs, profile_id)
+                .expect("second state dir resolve"),
+            "sk-ant-oat01-second-token"
         );
         assert_eq!(resolver.anthropic_load_attempts_for_tests(), 2);
     }
