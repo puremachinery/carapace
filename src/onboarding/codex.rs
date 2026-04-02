@@ -284,6 +284,7 @@ pub fn apply_control_openai_oauth(flow_id: &str, state_dir: PathBuf) -> Result<V
 
     Ok(json!({
         "authProfile": profile_id,
+        "mode": "oauth",
         "provider": "codex",
         "model": crate::agent::codex::DEFAULT_CODEX_MODEL,
     }))

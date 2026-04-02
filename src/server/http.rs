@@ -3215,6 +3215,7 @@ mod tests {
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["ok"], true);
         assert_eq!(json["applied"]["mode"], "apiKey");
+        assert_eq!(json["applied"].as_object().map(|it| it.len()), Some(1));
         assert_eq!(json["providerStatus"]["provider"], "gemini");
         assert_eq!(json["providerStatus"]["configured"], true);
         assert_eq!(json["providerStatus"]["assessment"]["status"], "partial");
@@ -3254,6 +3255,7 @@ mod tests {
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["ok"], true);
         assert_eq!(json["applied"]["mode"], "oauth");
+        assert_eq!(json["applied"].as_object().map(|it| it.len()), Some(1));
         assert_eq!(json["providerStatus"]["provider"], "gemini");
         assert_eq!(json["providerStatus"]["configured"], true);
         assert_eq!(json["providerStatus"]["assessment"]["provider"], "gemini");
@@ -3321,6 +3323,8 @@ mod tests {
             .unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["ok"], true);
+        assert_eq!(json["applied"]["mode"], "oauth");
+        assert_eq!(json["applied"].as_object().map(|it| it.len()), Some(1));
         assert_eq!(json["providerStatus"]["provider"], "codex");
         assert_eq!(json["providerStatus"]["configured"], true);
         assert_eq!(json["providerStatus"]["assessment"]["provider"], "codex");
