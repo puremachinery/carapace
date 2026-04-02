@@ -112,9 +112,6 @@ struct AuthProfileStoreEnvelope {
 #[derive(Debug, Clone)]
 struct SkippedProfile {
     raw: Value,
-    /// Deserialization error message, retained for diagnostics.
-    #[allow(dead_code)]
-    error: String,
 }
 
 /// Result of loading the profile store: successfully parsed profiles plus
@@ -131,6 +128,13 @@ fn parse_store_file(content: &str) -> Result<LoadedProfiles, AuthProfileError> {
         Ok(Value::Object(map)) => {
             let envelope: AuthProfileStoreEnvelope = serde_json::from_value(Value::Object(map))
                 .map_err(|e| AuthProfileError::SerializationError(e.to_string()))?;
+            if envelope.version > CURRENT_STORE_VERSION {
+                return Err(AuthProfileError::SerializationError(format!(
+                    "auth profile store version {} is newer than supported version {}; \
+                     upgrade Carapace or restore from a backup",
+                    envelope.version, CURRENT_STORE_VERSION
+                )));
+            }
             envelope.profiles
         }
         Ok(_) => {
@@ -154,10 +158,7 @@ fn parse_store_file(content: &str) -> Result<LoadedProfiles, AuthProfileError> {
                     error = %e,
                     "skipping unrecognized auth profile during load (preserved for round-trip)"
                 );
-                skipped.push(SkippedProfile {
-                    raw,
-                    error: e.to_string(),
-                });
+                skipped.push(SkippedProfile { raw });
             }
         }
     }
@@ -930,7 +931,9 @@ fn decode_jwt_payload(token: &str) -> Option<Value> {
 
 /// Persistent store for auth profiles.
 ///
-/// Profiles are stored as a JSON array in `{state_dir}/auth_profiles.json`.
+/// Profiles are stored in `{state_dir}/auth_profiles.json` using a versioned
+/// envelope format: `{ "version": 2, "profiles": [...] }`. Legacy bare-array
+/// files (version 1) are auto-detected on load and upgraded on save.
 /// Uses `parking_lot::RwLock` for synchronous interior mutability.
 ///
 /// When a `SecretStore` is provided, sensitive token fields (`access_token`,
@@ -2752,5 +2755,33 @@ mod tests {
             Some("sk-ant-oat01-test-token")
         );
         assert!(profiles[0].tokens.is_none());
+    }
+
+    #[test]
+    fn future_version_rejected() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("auth_profiles.json");
+
+        let envelope = serde_json::json!({
+            "version": 99,
+            "profiles": []
+        });
+        std::fs::write(
+            &state_path,
+            serde_json::to_string_pretty(&envelope).unwrap(),
+        )
+        .unwrap();
+
+        let store = ProfileStore::new(dir.path().to_path_buf());
+        let err = store.load().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("99"),
+            "error should mention the version: {msg}"
+        );
+        assert!(
+            msg.contains("upgrade"),
+            "error should suggest upgrade: {msg}"
+        );
     }
 }
