@@ -412,11 +412,10 @@ impl ControlOnboardingAppliedMode {
     }
 }
 
-fn serialize_control_onboarding_applied_mode(mode: ControlOnboardingAppliedMode) -> String {
+fn serialize_control_onboarding_applied_mode(mode: ControlOnboardingAppliedMode) -> Option<String> {
     serde_json::to_value(mode)
         .ok()
         .and_then(|value| value.as_str().map(ToOwned::to_owned))
-        .expect("control onboarding applied mode should serialize to a string")
 }
 
 fn invalid_control_onboarding_apply_result_message() -> String {
@@ -427,7 +426,8 @@ fn validate_control_onboarding_applied_mode(
     applied: &Value,
     expected_mode: ControlOnboardingAppliedMode,
 ) -> Result<ControlOnboardingApplied, String> {
-    let expected_mode_name = serialize_control_onboarding_applied_mode(expected_mode);
+    let expected_mode_name = serialize_control_onboarding_applied_mode(expected_mode)
+        .unwrap_or_else(|| "<unknown expected mode>".to_string());
     let reported_mode_value = applied.get("mode").cloned().ok_or_else(|| {
         let applied_keys = applied
             .as_object()
@@ -452,7 +452,8 @@ fn validate_control_onboarding_applied_mode(
             })?;
 
     if reported_mode != expected_mode {
-        let reported_mode_name = serialize_control_onboarding_applied_mode(reported_mode);
+        let reported_mode_name = serialize_control_onboarding_applied_mode(reported_mode)
+            .unwrap_or_else(|| "<unknown reported mode>".to_string());
         tracing::warn!(
             expected_mode = %expected_mode_name,
             reported_mode = %reported_mode_name,
@@ -2495,12 +2496,14 @@ mod tests {
     #[test]
     fn test_serialize_control_onboarding_applied_mode_uses_serde_wire_names() {
         assert_eq!(
-            serialize_control_onboarding_applied_mode(ControlOnboardingAppliedMode::ApiKey),
-            "apiKey"
+            serialize_control_onboarding_applied_mode(ControlOnboardingAppliedMode::ApiKey)
+                .as_deref(),
+            Some("apiKey")
         );
         assert_eq!(
-            serialize_control_onboarding_applied_mode(ControlOnboardingAppliedMode::OAuth),
-            "oauth"
+            serialize_control_onboarding_applied_mode(ControlOnboardingAppliedMode::OAuth)
+                .as_deref(),
+            Some("oauth")
         );
     }
 
