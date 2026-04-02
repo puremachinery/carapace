@@ -655,11 +655,13 @@ mod tests {
         let provider = crate::agent::codex::CodexProvider::with_oauth_profile(
             profile_store,
             "openai-abc123".to_string(),
-            crate::auth::profiles::OAuthProvider::OpenAI.default_config(
-                "client-id",
-                "client-secret",
-                "http://127.0.0.1:3000/auth/callback",
-            ),
+            crate::auth::profiles::OAuthProvider::OpenAI
+                .default_config(
+                    "client-id",
+                    "client-secret",
+                    "http://127.0.0.1:3000/auth/callback",
+                )
+                .unwrap(),
         )
         .unwrap();
         let multi = MultiProvider::new(None, None).with_codex(Some(std::sync::Arc::new(provider)));

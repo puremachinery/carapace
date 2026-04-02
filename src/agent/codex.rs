@@ -198,11 +198,13 @@ mod tests {
     }
 
     fn sample_profile(id: &str) -> AuthProfile {
-        let provider_config = OAuthProvider::OpenAI.default_config(
-            "client-id",
-            "client-secret",
-            "http://127.0.0.1:3000/auth/callback",
-        );
+        let provider_config = OAuthProvider::OpenAI
+            .default_config(
+                "client-id",
+                "client-secret",
+                "http://127.0.0.1:3000/auth/callback",
+            )
+            .unwrap();
         AuthProfile {
             id: id.to_string(),
             name: "Codex (user@example.com)".to_string(),
@@ -262,11 +264,13 @@ mod tests {
         let provider = CodexProvider::with_oauth_profile(
             store,
             "missing-profile".to_string(),
-            OAuthProvider::OpenAI.default_config(
-                "client-id",
-                "client-secret",
-                "http://127.0.0.1:3000/auth/callback",
-            ),
+            OAuthProvider::OpenAI
+                .default_config(
+                    "client-id",
+                    "client-secret",
+                    "http://127.0.0.1:3000/auth/callback",
+                )
+                .unwrap(),
         )
         .expect("provider");
 
@@ -282,11 +286,13 @@ mod tests {
     #[tokio::test]
     async fn test_codex_provider_empty_token_errors() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let provider_config = OAuthProvider::OpenAI.default_config(
-            "client-id",
-            "client-secret",
-            "http://127.0.0.1:3000/auth/callback",
-        );
+        let provider_config = OAuthProvider::OpenAI
+            .default_config(
+                "client-id",
+                "client-secret",
+                "http://127.0.0.1:3000/auth/callback",
+            )
+            .unwrap();
         let profile = AuthProfile {
             tokens: Some(OAuthTokens {
                 access_token: "   ".to_string(),
@@ -315,11 +321,13 @@ mod tests {
     #[tokio::test]
     async fn test_codex_provider_wrong_credential_kind_errors() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let provider_config = OAuthProvider::OpenAI.default_config(
-            "client-id",
-            "client-secret",
-            "http://127.0.0.1:3000/auth/callback",
-        );
+        let provider_config = OAuthProvider::OpenAI
+            .default_config(
+                "client-id",
+                "client-secret",
+                "http://127.0.0.1:3000/auth/callback",
+            )
+            .unwrap();
         let mut profile = sample_profile("openai-token-kind");
         profile.credential_kind = AuthProfileCredentialKind::Token;
         profile.tokens = None;
@@ -346,11 +354,13 @@ mod tests {
     #[tokio::test]
     async fn test_codex_provider_updates_last_used_after_access() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let provider_config = OAuthProvider::OpenAI.default_config(
-            "client-id",
-            "client-secret",
-            "http://127.0.0.1:3000/auth/callback",
-        );
+        let provider_config = OAuthProvider::OpenAI
+            .default_config(
+                "client-id",
+                "client-secret",
+                "http://127.0.0.1:3000/auth/callback",
+            )
+            .unwrap();
         let mut profile = sample_profile("openai-last-used");
         profile.last_used_ms = None;
         let store = Arc::new(ProfileStore::from_env(temp.path().to_path_buf()).expect("store"));

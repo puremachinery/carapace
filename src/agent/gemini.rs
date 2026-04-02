@@ -731,11 +731,13 @@ mod tests {
         let provider = GeminiProvider::with_oauth_profile(
             Arc::new(store),
             "google-test".to_string(),
-            OAuthProvider::Google.default_config(
-                "client-id",
-                "client-secret",
-                "http://127.0.0.1:3000/auth/callback",
-            ),
+            OAuthProvider::Google
+                .default_config(
+                    "client-id",
+                    "client-secret",
+                    "http://127.0.0.1:3000/auth/callback",
+                )
+                .unwrap(),
         )
         .expect("oauth-backed provider");
 
@@ -753,11 +755,13 @@ mod tests {
         let provider = GeminiProvider::with_oauth_profile(
             Arc::new(store),
             "missing-profile".to_string(),
-            OAuthProvider::Google.default_config(
-                "client-id",
-                "client-secret",
-                "http://127.0.0.1:3000/auth/callback",
-            ),
+            OAuthProvider::Google
+                .default_config(
+                    "client-id",
+                    "client-secret",
+                    "http://127.0.0.1:3000/auth/callback",
+                )
+                .unwrap(),
         )
         .expect("oauth-backed provider");
 
@@ -805,11 +809,13 @@ mod tests {
         let provider = GeminiProvider::with_oauth_profile(
             Arc::new(store),
             "google-empty-token".to_string(),
-            OAuthProvider::Google.default_config(
-                "client-id",
-                "client-secret",
-                "http://127.0.0.1:3000/auth/callback",
-            ),
+            OAuthProvider::Google
+                .default_config(
+                    "client-id",
+                    "client-secret",
+                    "http://127.0.0.1:3000/auth/callback",
+                )
+                .unwrap(),
         )
         .expect("oauth-backed provider");
 
@@ -851,11 +857,13 @@ mod tests {
         let provider = GeminiProvider::with_oauth_profile(
             Arc::new(store),
             "google-token-kind".to_string(),
-            OAuthProvider::Google.default_config(
-                "client-id",
-                "client-secret",
-                "http://127.0.0.1:3000/auth/callback",
-            ),
+            OAuthProvider::Google
+                .default_config(
+                    "client-id",
+                    "client-secret",
+                    "http://127.0.0.1:3000/auth/callback",
+                )
+                .unwrap(),
         )
         .expect("oauth-backed provider");
 

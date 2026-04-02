@@ -1027,11 +1027,13 @@ mod tests {
                 "CARAPACE_STATE_DIR",
                 temp.path().to_str().expect("state dir path"),
             );
-            let provider_config = OAuthProvider::Google.default_config(
-                "google-client-id",
-                "google-client-secret",
-                "https://gateway.example.com/control/onboarding/gemini/callback",
-            );
+            let provider_config = OAuthProvider::Google
+                .default_config(
+                    "google-client-id",
+                    "google-client-secret",
+                    "https://gateway.example.com/control/onboarding/gemini/callback",
+                )
+                .unwrap();
             let profile = crate::auth::profiles::AuthProfile {
                 id: "google-abc123".to_string(),
                 name: "Google user@example.com".to_string(),
@@ -1111,11 +1113,13 @@ mod tests {
                 "CARAPACE_STATE_DIR",
                 temp.path().to_str().expect("state dir path"),
             );
-            let provider_config = OAuthProvider::OpenAI.default_config(
-                "openai-client-id",
-                "openai-client-secret",
-                "https://gateway.example.com/control/onboarding/codex/callback",
-            );
+            let provider_config = OAuthProvider::OpenAI
+                .default_config(
+                    "openai-client-id",
+                    "openai-client-secret",
+                    "https://gateway.example.com/control/onboarding/codex/callback",
+                )
+                .unwrap();
             let profile = crate::auth::profiles::AuthProfile {
                 id: "openai-abc123".to_string(),
                 name: "Codex user@example.com".to_string(),
@@ -1159,11 +1163,13 @@ mod tests {
                 temp.path().to_str().expect("state dir path"),
             );
             let _blank_key = set_env_var_scoped("GOOGLE_API_KEY", "   ");
-            let provider_config = OAuthProvider::Google.default_config(
-                "google-client-id",
-                "google-client-secret",
-                "https://gateway.example.com/control/onboarding/gemini/callback",
-            );
+            let provider_config = OAuthProvider::Google
+                .default_config(
+                    "google-client-id",
+                    "google-client-secret",
+                    "https://gateway.example.com/control/onboarding/gemini/callback",
+                )
+                .unwrap();
             let profile = crate::auth::profiles::AuthProfile {
                 id: "google-abc123".to_string(),
                 name: "Google user@example.com".to_string(),
@@ -1291,11 +1297,13 @@ mod tests {
                 "CARAPACE_STATE_DIR",
                 temp.path().to_str().expect("state dir path"),
             );
-            let provider_config = OAuthProvider::Google.default_config(
-                "google-client-id",
-                "google-client-secret",
-                "https://gateway.example.com/control/onboarding/gemini/callback",
-            );
+            let provider_config = OAuthProvider::Google
+                .default_config(
+                    "google-client-id",
+                    "google-client-secret",
+                    "https://gateway.example.com/control/onboarding/gemini/callback",
+                )
+                .unwrap();
             let profile = crate::auth::profiles::AuthProfile {
                 id: "google-abc123".to_string(),
                 name: "Google user@example.com".to_string(),
@@ -1356,11 +1364,13 @@ mod tests {
             );
             let _blank_key = set_env_var_scoped("GOOGLE_API_KEY", "   ");
 
-            let provider_config = OAuthProvider::Google.default_config(
-                "google-client-id",
-                "google-client-secret",
-                "https://gateway.example.com/control/onboarding/gemini/callback",
-            );
+            let provider_config = OAuthProvider::Google
+                .default_config(
+                    "google-client-id",
+                    "google-client-secret",
+                    "https://gateway.example.com/control/onboarding/gemini/callback",
+                )
+                .unwrap();
             let profile = crate::auth::profiles::AuthProfile {
                 id: "google-abc123".to_string(),
                 name: "Google user@example.com".to_string(),
@@ -1408,11 +1418,13 @@ mod tests {
                 temp.path().to_str().expect("state dir path"),
             );
 
-            let provider_config = OAuthProvider::OpenAI.default_config(
-                "openai-client-id",
-                "openai-client-secret",
-                "https://gateway.example.com/control/onboarding/codex/callback",
-            );
+            let provider_config = OAuthProvider::OpenAI
+                .default_config(
+                    "openai-client-id",
+                    "openai-client-secret",
+                    "https://gateway.example.com/control/onboarding/codex/callback",
+                )
+                .unwrap();
             let profile = crate::auth::profiles::AuthProfile {
                 id: "openai-abc123".to_string(),
                 name: "Codex user@example.com".to_string(),
@@ -1705,11 +1717,13 @@ mod tests {
     fn test_resolve_google_oauth_runtime_config_uses_stored_redirect_uri_when_missing() {
         with_clean_provider_env(|| {
             let temp = tempfile::tempdir().expect("tempdir");
-            let provider_config = OAuthProvider::Google.default_config(
-                "google-client-id",
-                "google-client-secret",
-                "https://gateway.example.com/control/onboarding/gemini/callback",
-            );
+            let provider_config = OAuthProvider::Google
+                .default_config(
+                    "google-client-id",
+                    "google-client-secret",
+                    "https://gateway.example.com/control/onboarding/gemini/callback",
+                )
+                .unwrap();
             let profile = crate::auth::profiles::AuthProfile {
                 id: "google-abc123".to_string(),
                 name: "Google user@example.com".to_string(),

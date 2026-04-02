@@ -113,8 +113,9 @@ pub fn resolve_openai_oauth_provider_config(
         return Err("Codex sign-in requires OpenAI OAuth clientId and clientSecret.".to_string());
     }
 
-    let mut provider_config =
-        OAuthProvider::OpenAI.default_config(client_id.trim(), client_secret.trim(), &redirect_uri);
+    let mut provider_config = OAuthProvider::OpenAI
+        .default_config(client_id.trim(), client_secret.trim(), &redirect_uri)
+        .expect("OpenAI is an OAuth provider");
     if let Some(stored) = stored_provider_config {
         provider_config.auth_url = stored.auth_url;
         provider_config.token_url = stored.token_url;
@@ -635,11 +636,13 @@ fn insert_openai_oauth_flow(flow: PendingCodexOAuthFlow) -> Result<(), String> {
 #[cfg(test)]
 pub(crate) fn insert_completed_control_openai_oauth_flow_for_test() -> String {
     let flow_id = format!("codex-test-flow-{}", uuid::Uuid::new_v4());
-    let provider_config = OAuthProvider::OpenAI.default_config(
-        "openai-client-id",
-        "openai-client-secret",
-        "https://gateway.example.com/control/onboarding/codex/callback",
-    );
+    let provider_config = OAuthProvider::OpenAI
+        .default_config(
+            "openai-client-id",
+            "openai-client-secret",
+            "https://gateway.example.com/control/onboarding/codex/callback",
+        )
+        .unwrap();
     let tokens = OAuthTokens {
         access_token: "header.eyJzdWIiOiJ1c2VyLTEyMyJ9.sig".to_string(),
         refresh_token: Some("refresh-token".to_string()),
@@ -858,11 +861,13 @@ mod tests {
         let completion = CodexOAuthCompletion {
             client_id: "openai-client-id".to_string(),
             auth_profile: build_openai_auth_profile(
-                &OAuthProvider::OpenAI.default_config(
-                    "openai-client-id",
-                    "openai-client-secret",
-                    "http://127.0.0.1:3000/auth/callback",
-                ),
+                &OAuthProvider::OpenAI
+                    .default_config(
+                        "openai-client-id",
+                        "openai-client-secret",
+                        "http://127.0.0.1:3000/auth/callback",
+                    )
+                    .unwrap(),
                 sample_tokens(),
                 sample_user_info(),
             ),
@@ -970,20 +975,24 @@ mod tests {
                 id: flow_id.clone(),
                 state: "codex-state-completed".to_string(),
                 code_verifier: "verifier".to_string(),
-                provider_config: OAuthProvider::OpenAI.default_config(
-                    "client-id",
-                    "client-secret",
-                    "https://gateway.example.com/control/onboarding/codex/callback",
-                ),
+                provider_config: OAuthProvider::OpenAI
+                    .default_config(
+                        "client-id",
+                        "client-secret",
+                        "https://gateway.example.com/control/onboarding/codex/callback",
+                    )
+                    .unwrap(),
                 created_at_ms: now_ms(),
                 flow_state: CodexOAuthFlowState::Completed(Box::new(CodexOAuthCompletion {
                     client_id: "client-id".to_string(),
                     auth_profile: build_openai_auth_profile(
-                        &OAuthProvider::OpenAI.default_config(
-                            "client-id",
-                            "client-secret",
-                            "https://gateway.example.com/control/onboarding/codex/callback",
-                        ),
+                        &OAuthProvider::OpenAI
+                            .default_config(
+                                "client-id",
+                                "client-secret",
+                                "https://gateway.example.com/control/onboarding/codex/callback",
+                            )
+                            .unwrap(),
                         sample_tokens(),
                         sample_user_info(),
                     ),
@@ -1010,11 +1019,13 @@ mod tests {
                 id: flow_id.clone(),
                 state: state.clone(),
                 code_verifier: "verifier".to_string(),
-                provider_config: OAuthProvider::OpenAI.default_config(
-                    "client-id",
-                    "client-secret",
-                    "https://gateway.example.com/control/onboarding/codex/callback",
-                ),
+                provider_config: OAuthProvider::OpenAI
+                    .default_config(
+                        "client-id",
+                        "client-secret",
+                        "https://gateway.example.com/control/onboarding/codex/callback",
+                    )
+                    .unwrap(),
                 created_at_ms: now_ms(),
                 flow_state: CodexOAuthFlowState::InProgress,
             },
@@ -1042,11 +1053,13 @@ mod tests {
                 id: flow_id.clone(),
                 state: "codex-stale-state".to_string(),
                 code_verifier: "verifier".to_string(),
-                provider_config: OAuthProvider::OpenAI.default_config(
-                    "client-id",
-                    "client-secret",
-                    "https://gateway.example.com/control/onboarding/codex/callback",
-                ),
+                provider_config: OAuthProvider::OpenAI
+                    .default_config(
+                        "client-id",
+                        "client-secret",
+                        "https://gateway.example.com/control/onboarding/codex/callback",
+                    )
+                    .unwrap(),
                 created_at_ms: now_ms() - FLOW_TTL.as_millis() as u64 - 1,
                 flow_state: CodexOAuthFlowState::InProgress,
             },
@@ -1080,11 +1093,13 @@ mod tests {
                     id: id.clone(),
                     state: format!("codex-state-{i}"),
                     code_verifier: "verifier".to_string(),
-                    provider_config: OAuthProvider::OpenAI.default_config(
-                        "client-id",
-                        "client-secret",
-                        "https://gateway.example.com/control/onboarding/codex/callback",
-                    ),
+                    provider_config: OAuthProvider::OpenAI
+                        .default_config(
+                            "client-id",
+                            "client-secret",
+                            "https://gateway.example.com/control/onboarding/codex/callback",
+                        )
+                        .unwrap(),
                     created_at_ms: now_ms(),
                     flow_state: CodexOAuthFlowState::Pending,
                 },

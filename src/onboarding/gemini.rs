@@ -123,8 +123,9 @@ pub fn resolve_google_oauth_provider_config(
         );
     }
 
-    let mut provider_config =
-        OAuthProvider::Google.default_config(client_id.trim(), client_secret.trim(), &redirect_uri);
+    let mut provider_config = OAuthProvider::Google
+        .default_config(client_id.trim(), client_secret.trim(), &redirect_uri)
+        .expect("Google is an OAuth provider");
     if let Some(stored) = stored_provider_config {
         provider_config.auth_url = stored.auth_url;
         provider_config.token_url = stored.token_url;
@@ -658,11 +659,13 @@ fn insert_google_oauth_flow(flow: PendingGeminiOAuthFlow) -> Result<(), String> 
 #[cfg(test)]
 pub(crate) fn insert_completed_control_google_oauth_flow_for_test() -> String {
     let flow_id = format!("gemini-test-flow-{}", uuid::Uuid::new_v4());
-    let provider_config = OAuthProvider::Google.default_config(
-        "google-client-id",
-        "google-client-secret",
-        "https://gateway.example.com/control/onboarding/gemini/callback",
-    );
+    let provider_config = OAuthProvider::Google
+        .default_config(
+            "google-client-id",
+            "google-client-secret",
+            "https://gateway.example.com/control/onboarding/gemini/callback",
+        )
+        .unwrap();
     let tokens = OAuthTokens {
         access_token: "google-access-token".to_string(),
         refresh_token: Some("google-refresh-token".to_string()),
@@ -962,11 +965,13 @@ mod tests {
         let state_dir = temp.path().to_path_buf();
         let _password_guard = set_temp_env_var("CARAPACE_CONFIG_PASSWORD", "test-config-password");
         let profile = build_google_auth_profile(
-            &OAuthProvider::Google.default_config(
-                "stored-client-id",
-                "stored-client-secret",
-                "http://127.0.0.1:3000/auth/callback",
-            ),
+            &OAuthProvider::Google
+                .default_config(
+                    "stored-client-id",
+                    "stored-client-secret",
+                    "http://127.0.0.1:3000/auth/callback",
+                )
+                .unwrap(),
             sample_tokens(),
             sample_user_info(),
         );
@@ -1000,11 +1005,13 @@ mod tests {
         let state_dir = temp.path().to_path_buf();
         let _password_guard = set_temp_env_var("CARAPACE_CONFIG_PASSWORD", "test-config-password");
         let profile = build_google_auth_profile(
-            &OAuthProvider::Google.default_config(
-                "stored-client-id",
-                "stored-client-secret",
-                "http://127.0.0.1:3000/auth/callback",
-            ),
+            &OAuthProvider::Google
+                .default_config(
+                    "stored-client-id",
+                    "stored-client-secret",
+                    "http://127.0.0.1:3000/auth/callback",
+                )
+                .unwrap(),
             sample_tokens(),
             sample_user_info(),
         );
@@ -1089,11 +1096,13 @@ mod tests {
         let completion = GeminiOAuthCompletion {
             client_id: "google-client-id".to_string(),
             auth_profile: build_google_auth_profile(
-                &OAuthProvider::Google.default_config(
-                    "google-client-id",
-                    "google-client-secret",
-                    "http://127.0.0.1:3000/auth/callback",
-                ),
+                &OAuthProvider::Google
+                    .default_config(
+                        "google-client-id",
+                        "google-client-secret",
+                        "http://127.0.0.1:3000/auth/callback",
+                    )
+                    .unwrap(),
                 sample_tokens(),
                 sample_user_info(),
             ),
@@ -1234,11 +1243,13 @@ mod tests {
                 id: flow_id.clone(),
                 state: "state-completed".to_string(),
                 code_verifier: "verifier".to_string(),
-                provider_config: OAuthProvider::Google.default_config(
-                    "client-id",
-                    "client-secret",
-                    "https://gateway.example.com/control/onboarding/gemini/callback",
-                ),
+                provider_config: OAuthProvider::Google
+                    .default_config(
+                        "client-id",
+                        "client-secret",
+                        "https://gateway.example.com/control/onboarding/gemini/callback",
+                    )
+                    .unwrap(),
                 created_at_ms: now_ms(),
                 flow_state: GeminiOAuthFlowState::Completed(Box::new(GeminiOAuthCompletion {
                     client_id: "client-id".to_string(),
@@ -1262,11 +1273,13 @@ mod tests {
                         }),
                         token: None,
                         oauth_provider_config: Some(StoredOAuthProviderConfig::from(
-                            &OAuthProvider::Google.default_config(
-                                "client-id",
-                                "client-secret",
-                                "https://gateway.example.com/control/onboarding/gemini/callback",
-                            ),
+                            &OAuthProvider::Google
+                                .default_config(
+                                    "client-id",
+                                    "client-secret",
+                                    "https://gateway.example.com/control/onboarding/gemini/callback",
+                                )
+                                .unwrap(),
                         )),
                     },
                 })),
@@ -1297,11 +1310,13 @@ mod tests {
                 id: flow_id.clone(),
                 state: "state-failure".to_string(),
                 code_verifier: "verifier".to_string(),
-                provider_config: OAuthProvider::Google.default_config(
-                    "client-id",
-                    "client-secret",
-                    "http://127.0.0.1:3000/auth/callback",
-                ),
+                provider_config: OAuthProvider::Google
+                    .default_config(
+                        "client-id",
+                        "client-secret",
+                        "http://127.0.0.1:3000/auth/callback",
+                    )
+                    .unwrap(),
                 created_at_ms: now_ms(),
                 flow_state: GeminiOAuthFlowState::Pending,
             },
@@ -1327,20 +1342,24 @@ mod tests {
                 id: flow_id.clone(),
                 state: "state-preserve-completed".to_string(),
                 code_verifier: "verifier".to_string(),
-                provider_config: OAuthProvider::Google.default_config(
-                    "client-id",
-                    "client-secret",
-                    "http://127.0.0.1:3000/auth/callback",
-                ),
+                provider_config: OAuthProvider::Google
+                    .default_config(
+                        "client-id",
+                        "client-secret",
+                        "http://127.0.0.1:3000/auth/callback",
+                    )
+                    .unwrap(),
                 created_at_ms: now_ms(),
                 flow_state: GeminiOAuthFlowState::Completed(Box::new(GeminiOAuthCompletion {
                     client_id: "client-id".to_string(),
                     auth_profile: build_google_auth_profile(
-                        &OAuthProvider::Google.default_config(
-                            "client-id",
-                            "client-secret",
-                            "http://127.0.0.1:3000/auth/callback",
-                        ),
+                        &OAuthProvider::Google
+                            .default_config(
+                                "client-id",
+                                "client-secret",
+                                "http://127.0.0.1:3000/auth/callback",
+                            )
+                            .unwrap(),
                         sample_tokens(),
                         sample_user_info(),
                     ),
@@ -1367,11 +1386,13 @@ mod tests {
                 id: flow_id.clone(),
                 state: state.clone(),
                 code_verifier: "verifier".to_string(),
-                provider_config: OAuthProvider::Google.default_config(
-                    "client-id",
-                    "client-secret",
-                    "https://gateway.example.com/control/onboarding/gemini/callback",
-                ),
+                provider_config: OAuthProvider::Google
+                    .default_config(
+                        "client-id",
+                        "client-secret",
+                        "https://gateway.example.com/control/onboarding/gemini/callback",
+                    )
+                    .unwrap(),
                 created_at_ms: now_ms(),
                 flow_state: GeminiOAuthFlowState::InProgress,
             },
@@ -1398,11 +1419,13 @@ mod tests {
                 id: flow_id.clone(),
                 state: "gemini-stale-state".to_string(),
                 code_verifier: "verifier".to_string(),
-                provider_config: OAuthProvider::Google.default_config(
-                    "client-id",
-                    "client-secret",
-                    "https://gateway.example.com/control/onboarding/gemini/callback",
-                ),
+                provider_config: OAuthProvider::Google
+                    .default_config(
+                        "client-id",
+                        "client-secret",
+                        "https://gateway.example.com/control/onboarding/gemini/callback",
+                    )
+                    .unwrap(),
                 created_at_ms: now_ms() - FLOW_TTL.as_millis() as u64 - 1,
                 flow_state: GeminiOAuthFlowState::InProgress,
             },
@@ -1432,11 +1455,13 @@ mod tests {
                 id: flow_id.clone(),
                 state: state.clone(),
                 code_verifier: "verifier".to_string(),
-                provider_config: OAuthProvider::Google.default_config(
-                    "client-id",
-                    "client-secret",
-                    "https://gateway.example.com/control/onboarding/gemini/callback",
-                ),
+                provider_config: OAuthProvider::Google
+                    .default_config(
+                        "client-id",
+                        "client-secret",
+                        "https://gateway.example.com/control/onboarding/gemini/callback",
+                    )
+                    .unwrap(),
                 created_at_ms: now_ms() - FLOW_TTL.as_millis() as u64 - 1,
                 flow_state: GeminiOAuthFlowState::Pending,
             },
@@ -1462,11 +1487,13 @@ mod tests {
                     id: id.clone(),
                     state: format!("state-{i}"),
                     code_verifier: "verifier".to_string(),
-                    provider_config: OAuthProvider::Google.default_config(
-                        "client-id",
-                        "client-secret",
-                        "https://gateway.example.com/control/onboarding/gemini/callback",
-                    ),
+                    provider_config: OAuthProvider::Google
+                        .default_config(
+                            "client-id",
+                            "client-secret",
+                            "https://gateway.example.com/control/onboarding/gemini/callback",
+                        )
+                        .unwrap(),
                     created_at_ms: now_ms(),
                     flow_state: GeminiOAuthFlowState::Pending,
                 },
@@ -1496,20 +1523,24 @@ mod tests {
                 id: flow_id.clone(),
                 state: "expired-apply-state".to_string(),
                 code_verifier: "verifier".to_string(),
-                provider_config: OAuthProvider::Google.default_config(
-                    "client-id",
-                    "client-secret",
-                    "https://gateway.example.com/control/onboarding/gemini/callback",
-                ),
+                provider_config: OAuthProvider::Google
+                    .default_config(
+                        "client-id",
+                        "client-secret",
+                        "https://gateway.example.com/control/onboarding/gemini/callback",
+                    )
+                    .unwrap(),
                 created_at_ms: now_ms() - FLOW_TTL.as_millis() as u64 - 1,
                 flow_state: GeminiOAuthFlowState::Completed(Box::new(GeminiOAuthCompletion {
                     client_id: "client-id".to_string(),
                     auth_profile: build_google_auth_profile(
-                        &OAuthProvider::Google.default_config(
-                            "client-id",
-                            "client-secret",
-                            "https://gateway.example.com/control/onboarding/gemini/callback",
-                        ),
+                        &OAuthProvider::Google
+                            .default_config(
+                                "client-id",
+                                "client-secret",
+                                "https://gateway.example.com/control/onboarding/gemini/callback",
+                            )
+                            .unwrap(),
                         sample_tokens(),
                         sample_user_info(),
                     ),

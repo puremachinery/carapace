@@ -449,17 +449,18 @@ impl fmt::Debug for OAuthProviderConfig {
 
 impl OAuthProvider {
     /// Build a provider config with default endpoints for this provider.
+    ///
+    /// Returns `None` for providers that do not use OAuth (e.g., Anthropic
+    /// uses direct token-backed auth profiles instead of OAuth flows).
     pub fn default_config(
         &self,
         client_id: &str,
         client_secret: &str,
         redirect_uri: &str,
-    ) -> OAuthProviderConfig {
+    ) -> Option<OAuthProviderConfig> {
         match self {
-            OAuthProvider::Anthropic => {
-                unreachable!("Anthropic auth profiles do not use OAuth provider config")
-            }
-            OAuthProvider::Google => OAuthProviderConfig {
+            OAuthProvider::Anthropic => None,
+            OAuthProvider::Google => Some(OAuthProviderConfig {
                 client_id: client_id.to_string(),
                 client_secret: client_secret.to_string(),
                 redirect_uri: redirect_uri.to_string(),
@@ -471,8 +472,8 @@ impl OAuthProvider {
                     "email".to_string(),
                     "profile".to_string(),
                 ],
-            },
-            OAuthProvider::GitHub => OAuthProviderConfig {
+            }),
+            OAuthProvider::GitHub => Some(OAuthProviderConfig {
                 client_id: client_id.to_string(),
                 client_secret: client_secret.to_string(),
                 redirect_uri: redirect_uri.to_string(),
@@ -480,8 +481,8 @@ impl OAuthProvider {
                 token_url: "https://github.com/login/oauth/access_token".to_string(),
                 userinfo_url: "https://api.github.com/user".to_string(),
                 scopes: vec!["read:user".to_string(), "user:email".to_string()],
-            },
-            OAuthProvider::Discord => OAuthProviderConfig {
+            }),
+            OAuthProvider::Discord => Some(OAuthProviderConfig {
                 client_id: client_id.to_string(),
                 client_secret: client_secret.to_string(),
                 redirect_uri: redirect_uri.to_string(),
@@ -489,8 +490,8 @@ impl OAuthProvider {
                 token_url: "https://discord.com/api/oauth2/token".to_string(),
                 userinfo_url: "https://discord.com/api/users/@me".to_string(),
                 scopes: vec!["identify".to_string(), "email".to_string()],
-            },
-            OAuthProvider::OpenAI => OAuthProviderConfig {
+            }),
+            OAuthProvider::OpenAI => Some(OAuthProviderConfig {
                 client_id: client_id.to_string(),
                 client_secret: client_secret.to_string(),
                 redirect_uri: redirect_uri.to_string(),
@@ -503,7 +504,7 @@ impl OAuthProvider {
                     "email".to_string(),
                     "offline_access".to_string(),
                 ],
-            },
+            }),
         }
     }
 }
@@ -1479,10 +1480,11 @@ pub fn build_auth_profiles_config(cfg: &Value) -> AuthProfilesConfig {
                     .unwrap_or_else(|| default_redirect.clone());
 
                 if !client_id.is_empty() && !client_secret.is_empty() {
-                    providers.insert(
-                        provider,
-                        provider.default_config(&client_id, &client_secret, &redirect_uri),
-                    );
+                    if let Some(config) =
+                        provider.default_config(&client_id, &client_secret, &redirect_uri)
+                    {
+                        providers.insert(provider, config);
+                    }
                 }
             }
         }
@@ -1588,19 +1590,27 @@ mod tests {
     }
 
     fn google_config() -> OAuthProviderConfig {
-        OAuthProvider::Google.default_config("cid", "csecret", "https://example.com/cb")
+        OAuthProvider::Google
+            .default_config("cid", "csecret", "https://example.com/cb")
+            .unwrap()
     }
 
     fn github_config() -> OAuthProviderConfig {
-        OAuthProvider::GitHub.default_config("cid", "csecret", "https://example.com/cb")
+        OAuthProvider::GitHub
+            .default_config("cid", "csecret", "https://example.com/cb")
+            .unwrap()
     }
 
     fn discord_config() -> OAuthProviderConfig {
-        OAuthProvider::Discord.default_config("cid", "csecret", "https://example.com/cb")
+        OAuthProvider::Discord
+            .default_config("cid", "csecret", "https://example.com/cb")
+            .unwrap()
     }
 
     fn openai_config() -> OAuthProviderConfig {
-        OAuthProvider::OpenAI.default_config("cid", "csecret", "https://example.com/cb")
+        OAuthProvider::OpenAI
+            .default_config("cid", "csecret", "https://example.com/cb")
+            .unwrap()
     }
 
     fn random_password() -> Vec<u8> {
@@ -1629,6 +1639,16 @@ mod tests {
         assert!(gh.client_secret == "csecret");
         assert_eq!(d.redirect_uri, "https://example.com/cb");
         assert_eq!(o.redirect_uri, "https://example.com/cb");
+    }
+
+    #[test]
+    fn test_anthropic_default_config_returns_none() {
+        assert!(
+            OAuthProvider::Anthropic
+                .default_config("cid", "csecret", "https://example.com/cb")
+                .is_none(),
+            "Anthropic does not use OAuth; default_config should return None"
+        );
     }
 
     #[test]
@@ -2111,11 +2131,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_user_info_openai_uses_token_claims_without_http_request() {
-        let mut provider_config = OAuthProvider::OpenAI.default_config(
-            "client-id",
-            "client-secret",
-            "http://127.0.0.1:3000/auth/callback",
-        );
+        let mut provider_config = OAuthProvider::OpenAI
+            .default_config(
+                "client-id",
+                "client-secret",
+                "http://127.0.0.1:3000/auth/callback",
+            )
+            .unwrap();
         let payload = serde_json::json!({
             "sub": "user-123",
             "https://api.openai.com/profile": {
