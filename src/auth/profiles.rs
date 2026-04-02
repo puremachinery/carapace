@@ -130,7 +130,6 @@ struct LastUsedPersistence {
 
 struct LastUsedPersistenceState {
     dirty_generation: u64,
-    scheduled_generation: u64,
     flushed_generation: u64,
     shutdown: bool,
     auto_flush_enabled: bool,
@@ -183,7 +182,6 @@ impl LastUsedPersistenceState {
     fn new() -> Self {
         Self {
             dirty_generation: 0,
-            scheduled_generation: 0,
             flushed_generation: 0,
             shutdown: false,
             auto_flush_enabled: true,
@@ -192,7 +190,6 @@ impl LastUsedPersistenceState {
 
     fn reset_generations(&mut self) {
         self.dirty_generation = 0;
-        self.scheduled_generation = 0;
         self.flushed_generation = 0;
     }
 }
@@ -1140,7 +1137,7 @@ impl ProfileStore {
             if state.shutdown {
                 return (state.dirty_generation > state.flushed_generation).then_some(true);
             }
-            if state.auto_flush_enabled && state.dirty_generation > state.scheduled_generation {
+            if state.auto_flush_enabled && state.dirty_generation > state.flushed_generation {
                 return Some(false);
             }
             state = shared
@@ -1158,7 +1155,6 @@ impl ProfileStore {
     fn mark_last_used_persisted(&self, generation: u64) {
         let mut state = self.lock_last_used_state();
         state.flushed_generation = state.flushed_generation.max(generation);
-        state.scheduled_generation = state.scheduled_generation.max(generation);
         self.shared.last_used_persistence.condvar.notify_all();
     }
 
@@ -1215,7 +1211,6 @@ impl ProfileStore {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.flushed_generation = state.flushed_generation.max(target_generation);
-        state.scheduled_generation = state.scheduled_generation.max(target_generation);
         shared.last_used_persistence.condvar.notify_all();
         Ok(true)
     }
@@ -2334,7 +2329,10 @@ mod tests {
         let raw_before = std::fs::read_to_string(&state_path).unwrap();
 
         store.update_last_used("lu-auto");
-        store.wait_for_last_used_flush_for_tests().unwrap();
+        assert!(
+            store.wait_for_last_used_flush_for_tests().is_ok(),
+            "background worker should flush last_used metadata within the test deadline"
+        );
 
         let raw_after = std::fs::read_to_string(&state_path).unwrap();
         assert_ne!(raw_after, raw_before);
