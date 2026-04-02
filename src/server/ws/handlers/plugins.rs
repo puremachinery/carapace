@@ -933,8 +933,8 @@ impl PluginWriteTransaction {
         let name = &self.plugin_name;
         let artifact = self.plugins_dir.join(format!("{name}.wasm"));
         if let Some(ref backup) = self.artifact_backup {
-            // Restore from backup (update case).
-            let _ = std::fs::remove_file(&artifact);
+            // Restore from backup (update case). rename atomically replaces
+            // the destination on Unix — no need to remove_file first.
             if let Err(e) = std::fs::rename(backup, &artifact) {
                 tracing::warn!(
                     error = %e,
