@@ -230,6 +230,20 @@ pub enum SetupCheckKind {
     Validation,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetupCheckCode {
+    AuthProfileConfigured,
+    AuthProfileLoaded,
+    AuthProfileWrongProvider,
+    AuthProfileWrongCredentialType,
+    AuthProfileTokenDecryptFailed,
+    AuthProfileTokenMissing,
+    AuthProfileMissing,
+    AuthProfileStoreReadFailed,
+    AuthProfileNeedsAttention,
+    LocalValidationFailed,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetupCheck {
@@ -238,6 +252,8 @@ pub struct SetupCheck {
     pub kind: SetupCheckKind,
     pub detail: String,
     pub remediation: Option<String>,
+    #[serde(skip)]
+    pub code: Option<SetupCheckCode>,
 }
 
 impl SetupCheck {
@@ -248,6 +264,7 @@ impl SetupCheck {
             kind: SetupCheckKind::Requirement,
             detail: detail.into(),
             remediation: None,
+            code: None,
         }
     }
 
@@ -258,6 +275,7 @@ impl SetupCheck {
             kind: SetupCheckKind::Validation,
             detail: detail.into(),
             remediation: None,
+            code: None,
         }
     }
 
@@ -272,6 +290,7 @@ impl SetupCheck {
             kind: SetupCheckKind::Requirement,
             detail: detail.into(),
             remediation: Some(remediation.into()),
+            code: None,
         }
     }
 
@@ -286,6 +305,7 @@ impl SetupCheck {
             kind: SetupCheckKind::Requirement,
             detail: detail.into(),
             remediation,
+            code: None,
         }
     }
 
@@ -300,6 +320,7 @@ impl SetupCheck {
             kind: SetupCheckKind::Validation,
             detail: detail.into(),
             remediation,
+            code: None,
         }
     }
 
@@ -314,7 +335,13 @@ impl SetupCheck {
             kind: SetupCheckKind::Validation,
             detail: detail.into(),
             remediation: Some(remediation.into()),
+            code: None,
         }
+    }
+
+    pub fn with_code(mut self, code: SetupCheckCode) -> Self {
+        self.code = Some(code);
+        self
     }
 }
 
@@ -915,6 +942,7 @@ fn auth_profile_id_check(
     match config_string(cfg, path) {
         Some(profile_id) => {
             SetupCheck::pass(label, format!("configured profile id: `{profile_id}`"))
+                .with_code(SetupCheckCode::AuthProfileConfigured)
         }
         None => SetupCheck::fail(
             label,
@@ -974,7 +1002,8 @@ fn auth_profile_summary_check(
                             "to store the correct auth profile",
                             format!("write the correct {label} into config"),
                         )),
-                    ),
+                    )
+                    .with_code(SetupCheckCode::AuthProfileWrongProvider),
                     None,
                 )
             } else if loaded.summary.credential_kind != expected_credential_kind {
@@ -990,7 +1019,8 @@ fn auth_profile_summary_check(
                             "to store the correct auth profile credential type",
                             format!("write the correct {label} into config"),
                         )),
-                    ),
+                    )
+                    .with_code(SetupCheckCode::AuthProfileWrongCredentialType),
                     None,
                 )
             } else if loaded.summary.credential_kind == AuthProfileCredentialKind::Token
@@ -1012,6 +1042,13 @@ fn auth_profile_summary_check(
                             "to store a fresh auth profile token",
                             format!("write a fresh {label} into config"),
                         )),
+                    )
+                    .with_code(
+                        if loaded.token_still_encrypted && profile_store_password_present() {
+                            SetupCheckCode::AuthProfileTokenDecryptFailed
+                        } else {
+                            SetupCheckCode::AuthProfileTokenMissing
+                        },
                     ),
                     None,
                 )
@@ -1021,7 +1058,8 @@ fn auth_profile_summary_check(
                     None => format!("loaded `{}`", loaded.summary.name),
                 };
                 (
-                    SetupCheck::validation_pass(label, detail),
+                    SetupCheck::validation_pass(label, detail)
+                        .with_code(SetupCheckCode::AuthProfileLoaded),
                     Some(loaded.summary),
                 )
             }
@@ -1035,7 +1073,8 @@ fn auth_profile_summary_check(
                     "to store a fresh auth profile",
                     format!("write a fresh {label} into config"),
                 )),
-            ),
+            )
+            .with_code(SetupCheckCode::AuthProfileMissing),
             None,
         ),
         Err(err) => {
@@ -1048,7 +1087,8 @@ fn auth_profile_summary_check(
                     label,
                     format!("failed to read the profile store: {err}"),
                     remediation,
-                ),
+                )
+                .with_code(SetupCheckCode::AuthProfileStoreReadFailed),
                 None,
             )
         }
@@ -1174,7 +1214,8 @@ where
                 "and correct the base URL",
                 format!("write a valid {label} into config"),
             )),
-        ),
+        )
+        .with_code(SetupCheckCode::LocalValidationFailed),
     }
 }
 
@@ -1546,6 +1587,41 @@ mod tests {
     }
 
     #[test]
+    fn test_base_url_validation_check_sets_local_validation_failed_code() {
+        let cfg = json!({
+            "venice": { "baseUrl": "https://proxy.example.com/v1" }
+        });
+
+        let check = base_url_validation_check(
+            &cfg,
+            &["venice", "baseUrl"],
+            "Venice base URL validation",
+            Some("cara setup --provider venice"),
+            |_| Err("invalid URL with embedded credentials".to_string()),
+        );
+
+        assert_eq!(check.status, SetupCheckStatus::Fail);
+        assert_eq!(check.code, Some(SetupCheckCode::LocalValidationFailed));
+    }
+
+    #[test]
+    fn test_auth_profile_id_check_sets_auth_profile_configured_code() {
+        let cfg = json!({
+            "google": { "authProfile": "google-123" }
+        });
+
+        let check = auth_profile_id_check(
+            &cfg,
+            &["google", "authProfile"],
+            "Gemini auth profile",
+            Some("cara setup --provider gemini --auth-mode oauth"),
+        );
+
+        assert_eq!(check.status, SetupCheckStatus::Pass);
+        assert_eq!(check.code, Some(SetupCheckCode::AuthProfileConfigured));
+    }
+
+    #[test]
     fn test_assess_provider_setup_requires_config_password_for_codex() {
         let temp = TempDir::new().unwrap();
         let cfg = json!({
@@ -1617,6 +1693,14 @@ mod tests {
         assert_eq!(assessment.status, SetupAssessmentStatus::Ready);
         assert_eq!(assessment.profile_name.as_deref(), Some("Sample Profile"));
         assert_eq!(assessment.email.as_deref(), Some("user@example.com"));
+        assert!(assessment.checks.iter().any(|check| {
+            check.name == "Gemini auth profile"
+                && check.code == Some(SetupCheckCode::AuthProfileConfigured)
+        }));
+        assert!(assessment.checks.iter().any(|check| {
+            check.name == "Gemini auth profile"
+                && check.code == Some(SetupCheckCode::AuthProfileLoaded)
+        }));
     }
 
     #[test]

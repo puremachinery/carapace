@@ -320,37 +320,41 @@ fn sanitize_control_setup_check(check: onboarding::setup::SetupCheck) -> Control
         kind,
         detail,
         remediation,
+        code,
     } = check;
 
-    let detail = if detail.contains("configured profile id:") {
-        format!("{name} is configured")
-    } else if detail.contains("stored profile `") && detail.contains("belongs to") {
-        format!("{name} belongs to a different provider")
-    } else if detail.contains("stored profile `")
-        && detail.contains("uses")
-        && detail.contains("credentials")
-    {
-        format!("{name} uses the wrong credential type")
-    } else if detail.contains("stored profile `")
-        && detail.contains("could not decrypt the stored token")
-    {
-        format!("{name} token could not be decrypted; check CARAPACE_CONFIG_PASSWORD")
-    } else if detail.contains("stored profile `") && detail.contains("has no usable token") {
-        format!("{name} has no usable token")
-    } else if detail.contains("stored profile `")
-        && detail.contains("was not found in the profile store")
-    {
-        format!("{name} was not found in the encrypted profile store")
-    } else if detail.contains("failed to read the profile store") {
-        "failed to read the encrypted profile store".to_string()
-    } else if detail.contains("failed local validation:") {
-        format!("{name} failed local validation")
-    } else if detail.starts_with("loaded `") {
-        format!("{name} loaded from encrypted profile store")
-    } else if detail.contains("stored profile `") {
-        format!("{name} requires attention")
-    } else {
-        detail
+    let detail = match code {
+        Some(onboarding::setup::SetupCheckCode::AuthProfileConfigured) => {
+            format!("{name} is configured")
+        }
+        Some(onboarding::setup::SetupCheckCode::AuthProfileLoaded) => {
+            format!("{name} loaded from encrypted profile store")
+        }
+        Some(onboarding::setup::SetupCheckCode::AuthProfileWrongProvider) => {
+            format!("{name} belongs to a different provider")
+        }
+        Some(onboarding::setup::SetupCheckCode::AuthProfileWrongCredentialType) => {
+            format!("{name} uses the wrong credential type")
+        }
+        Some(onboarding::setup::SetupCheckCode::AuthProfileTokenDecryptFailed) => {
+            format!("{name} token could not be decrypted; check CARAPACE_CONFIG_PASSWORD")
+        }
+        Some(onboarding::setup::SetupCheckCode::AuthProfileTokenMissing) => {
+            format!("{name} has no usable token")
+        }
+        Some(onboarding::setup::SetupCheckCode::AuthProfileMissing) => {
+            format!("{name} was not found in the encrypted profile store")
+        }
+        Some(onboarding::setup::SetupCheckCode::AuthProfileStoreReadFailed) => {
+            "failed to read the encrypted profile store".to_string()
+        }
+        Some(onboarding::setup::SetupCheckCode::AuthProfileNeedsAttention) => {
+            format!("{name} requires attention")
+        }
+        Some(onboarding::setup::SetupCheckCode::LocalValidationFailed) => {
+            format!("{name} failed local validation")
+        }
+        None => detail,
     };
 
     ControlSetupCheck {
@@ -2567,22 +2571,26 @@ mod tests {
             checks: vec![
                 onboarding::setup::SetupCheck::pass(
                     "Gemini auth profile",
-                    "configured profile id: `google-123`",
-                ),
+                    "opaque internal configured profile detail",
+                )
+                .with_code(onboarding::setup::SetupCheckCode::AuthProfileConfigured),
                 onboarding::setup::SetupCheck::validation_pass(
                     "Gemini account identity",
-                    "loaded `Google Profile` (user@example.com)",
-                ),
+                    "opaque internal loaded profile detail",
+                )
+                .with_code(onboarding::setup::SetupCheckCode::AuthProfileLoaded),
                 onboarding::setup::SetupCheck::validation_fail(
                     "Gemini credential validation",
                     "stored profile `google-123` future auth detail with `internal-profile-id`",
                     "Re-run setup for Gemini credential validation.",
-                ),
+                )
+                .with_code(onboarding::setup::SetupCheckCode::AuthProfileNeedsAttention),
                 onboarding::setup::SetupCheck::fail(
                     "Gemini base URL validation",
-                    "Gemini base URL validation failed local validation: invalid URL \"https://user:secret@proxy.example.com/\": invalid port number",
+                    "opaque invalid URL detail with https://user:secret@proxy.example.com/",
                     "Write a valid Gemini base URL into config.",
-                ),
+                )
+                .with_code(onboarding::setup::SetupCheckCode::LocalValidationFailed),
             ],
             profile_name: Some("Google Profile".to_string()),
             email: Some("user@example.com".to_string()),
