@@ -394,22 +394,8 @@ fn resolve_anthropic_media_key(cfg: &Value) -> Result<Option<String>, String> {
         return Ok(None);
     };
 
-    if !crate::auth::profiles::profile_store_encryption_enabled_from_env() {
-        return Err(
-            "Anthropic auth profile is configured, but CARAPACE_CONFIG_PASSWORD is not set."
-                .to_string(),
-        );
-    }
-
-    let state_dir = crate::paths::resolve_state_dir();
-    let store = crate::auth::profiles::ProfileStore::from_env(state_dir)
-        .map_err(|err| format!("failed to open Anthropic auth profile store: {err}"))?;
-    store
-        .load()
-        .map_err(|err| format!("failed to load Anthropic auth profile store: {err}"))?;
-    crate::auth::profiles::resolve_anthropic_profile_token(&store, profile_id)
+    crate::auth::profile_runtime::resolve_anthropic_profile_token_from_env_cached(profile_id)
         .map(Some)
-        .map_err(|err| format!("{err}; check CARAPACE_CONFIG_PASSWORD and the stored profile"))
 }
 
 fn resolve_anthropic_base_url(cfg: &Value) -> Option<String> {
@@ -1557,6 +1543,7 @@ mod tests {
     #[test]
     fn test_resolve_anthropic_media_key_surfaces_unusable_auth_profile() {
         let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        crate::auth::profile_runtime::reset_auth_profile_runtime_for_tests();
         let temp = tempfile::tempdir().unwrap();
         let _state_dir = set_env_var_scoped(
             "CARAPACE_STATE_DIR",
@@ -1600,11 +1587,13 @@ mod tests {
         let err = resolve_anthropic_media_key(&cfg).expect_err("wrong password should surface");
         assert!(err.contains("could not decrypt the stored token"));
         assert!(err.contains("CARAPACE_CONFIG_PASSWORD"));
+        crate::auth::profile_runtime::reset_auth_profile_runtime_for_tests();
     }
 
     #[test]
     fn test_resolve_anthropic_media_key_ignores_blank_api_key_when_auth_profile_present() {
         let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        crate::auth::profile_runtime::reset_auth_profile_runtime_for_tests();
         let temp = tempfile::tempdir().unwrap();
         let _state_dir = set_env_var_scoped(
             "CARAPACE_STATE_DIR",
@@ -1643,6 +1632,57 @@ mod tests {
 
         let key = resolve_anthropic_media_key(&cfg).expect("resolved key");
         assert_eq!(key.as_deref(), Some("sk-ant-oat01-test-token"));
+        crate::auth::profile_runtime::reset_auth_profile_runtime_for_tests();
+    }
+
+    #[test]
+    fn test_resolve_anthropic_media_key_reuses_cached_auth_profile_store() {
+        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        crate::auth::profile_runtime::reset_auth_profile_runtime_for_tests();
+        let temp = tempfile::tempdir().unwrap();
+        let _state_dir = set_env_var_scoped(
+            "CARAPACE_STATE_DIR",
+            temp.path().to_str().expect("state dir path"),
+        );
+
+        let password = format!(
+            "builtin-tools-runtime-cache-password-{}",
+            crate::time::unix_now_ms_u64()
+        );
+        let store = ProfileStore::with_encryption(temp.path().to_path_buf(), password.as_bytes())
+            .expect("encrypted profile store");
+        store
+            .add(AuthProfile {
+                id: "anthropic:default".to_string(),
+                name: "Anthropic setup token".to_string(),
+                provider: OAuthProvider::Anthropic,
+                user_id: None,
+                email: None,
+                display_name: None,
+                avatar_url: None,
+                created_at_ms: 1,
+                last_used_ms: None,
+                credential_kind: AuthProfileCredentialKind::Token,
+                tokens: None,
+                token: Some("sk-ant-oat01-runtime-cache-token".to_string()),
+                oauth_provider_config: None,
+            })
+            .expect("store profile");
+
+        let _password = set_env_var_scoped("CARAPACE_CONFIG_PASSWORD", &password);
+        let cfg = json!({
+            "anthropic": { "authProfile": "anthropic:default" }
+        });
+
+        let first = resolve_anthropic_media_key(&cfg).expect("first resolve");
+        let second = resolve_anthropic_media_key(&cfg).expect("second resolve");
+        assert_eq!(first.as_deref(), Some("sk-ant-oat01-runtime-cache-token"));
+        assert_eq!(second.as_deref(), Some("sk-ant-oat01-runtime-cache-token"));
+        assert_eq!(
+            crate::auth::profile_runtime::anthropic_profile_runtime_load_attempts_for_tests(),
+            1
+        );
+        crate::auth::profile_runtime::reset_auth_profile_runtime_for_tests();
     }
 
     #[test]
