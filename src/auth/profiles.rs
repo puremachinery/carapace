@@ -17,7 +17,9 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
-use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(test)]
+use std::time::Instant;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::config::secrets::{is_encrypted, SecretStore};
 
@@ -148,6 +150,51 @@ struct ProfileStoreShared {
     /// `last_used_ms` flushes cannot race newer synchronous profile saves.
     persist_lock: Mutex<()>,
     last_used_persistence: LastUsedPersistence,
+}
+
+impl ProfileStoreShared {
+    fn new(
+        state_path: PathBuf,
+        secret_store: Option<Arc<SecretStore>>,
+        encryption_password: Option<Arc<zeroize::Zeroizing<Vec<u8>>>>,
+    ) -> Self {
+        Self {
+            profiles: RwLock::new(Vec::new()),
+            skipped_profiles: RwLock::new(Vec::new()),
+            state_path,
+            secret_store,
+            encryption_password,
+            persist_lock: Mutex::new(()),
+            last_used_persistence: LastUsedPersistence::new(),
+        }
+    }
+}
+
+impl LastUsedPersistence {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(LastUsedPersistenceState::new()),
+            condvar: Condvar::new(),
+        }
+    }
+}
+
+impl LastUsedPersistenceState {
+    fn new() -> Self {
+        Self {
+            dirty_generation: 0,
+            scheduled_generation: 0,
+            flushed_generation: 0,
+            shutdown: false,
+            auto_flush_enabled: true,
+        }
+    }
+
+    fn reset_generations(&mut self) {
+        self.dirty_generation = 0;
+        self.scheduled_generation = 0;
+        self.flushed_generation = 0;
+    }
 }
 
 /// Parse a store file, auto-detecting bare-array (v1) vs envelope (v2) format.
@@ -995,24 +1042,7 @@ impl ProfileStore {
     /// to enable at-rest encryption.
     pub fn new(state_dir: PathBuf) -> Self {
         let state_path = state_dir.join("auth_profiles.json");
-        let shared = Arc::new(ProfileStoreShared {
-            profiles: RwLock::new(Vec::new()),
-            skipped_profiles: RwLock::new(Vec::new()),
-            state_path,
-            secret_store: None,
-            encryption_password: None,
-            persist_lock: Mutex::new(()),
-            last_used_persistence: LastUsedPersistence {
-                state: Mutex::new(LastUsedPersistenceState {
-                    dirty_generation: 0,
-                    scheduled_generation: 0,
-                    flushed_generation: 0,
-                    shutdown: false,
-                    auto_flush_enabled: true,
-                }),
-                condvar: Condvar::new(),
-            },
-        });
+        let shared = Arc::new(ProfileStoreShared::new(state_path, None, None));
         Self {
             last_used_worker: Mutex::new(Self::start_last_used_worker(&shared)),
             shared,
@@ -1033,24 +1063,11 @@ impl ProfileStore {
         let state_path = state_dir.join("auth_profiles.json");
         let secret_store = SecretStore::new(password)
             .map_err(|e| AuthProfileError::IoError(format!("encryption init failed: {e}")))?;
-        let shared = Arc::new(ProfileStoreShared {
-            profiles: RwLock::new(Vec::new()),
-            skipped_profiles: RwLock::new(Vec::new()),
+        let shared = Arc::new(ProfileStoreShared::new(
             state_path,
-            secret_store: Some(Arc::new(secret_store)),
-            encryption_password: Some(Arc::new(zeroize::Zeroizing::new(password.to_vec()))),
-            persist_lock: Mutex::new(()),
-            last_used_persistence: LastUsedPersistence {
-                state: Mutex::new(LastUsedPersistenceState {
-                    dirty_generation: 0,
-                    scheduled_generation: 0,
-                    flushed_generation: 0,
-                    shutdown: false,
-                    auto_flush_enabled: true,
-                }),
-                condvar: Condvar::new(),
-            },
-        });
+            Some(Arc::new(secret_store)),
+            Some(Arc::new(zeroize::Zeroizing::new(password.to_vec()))),
+        ));
         Ok(Self {
             last_used_worker: Mutex::new(Self::start_last_used_worker(&shared)),
             shared,
@@ -1105,6 +1122,7 @@ impl ProfileStore {
                     error = %err,
                     "failed to persist auth profile last_used metadata"
                 );
+                std::thread::sleep(Duration::from_millis(250));
             }
             if shutdown_flush {
                 return;
@@ -1123,7 +1141,6 @@ impl ProfileStore {
                 return (state.dirty_generation > state.flushed_generation).then_some(true);
             }
             if state.auto_flush_enabled && state.dirty_generation > state.scheduled_generation {
-                state.scheduled_generation = state.dirty_generation;
                 return Some(false);
             }
             state = shared
@@ -1154,12 +1171,7 @@ impl ProfileStore {
     fn flush_pending_last_used_once_shared(
         shared: &ProfileStoreShared,
     ) -> Result<bool, AuthProfileError> {
-        let _persist_guard = shared
-            .persist_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let profiles = shared.profiles.read();
-        let target_generation = {
+        {
             let state = shared
                 .last_used_persistence
                 .state
@@ -1168,9 +1180,35 @@ impl ProfileStore {
             if state.dirty_generation <= state.flushed_generation {
                 return Ok(false);
             }
-            state.dirty_generation
+        }
+
+        let _persist_guard = shared
+            .persist_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        {
+            let state = shared
+                .last_used_persistence
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.dirty_generation <= state.flushed_generation {
+                return Ok(false);
+            }
+        }
+        let (profiles_to_save, target_generation) = {
+            let profiles = shared.profiles.read();
+            let state = shared
+                .last_used_persistence
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.dirty_generation <= state.flushed_generation {
+                return Ok(false);
+            }
+            (profiles.to_vec(), state.dirty_generation)
         };
-        Self::save_profiles_shared(shared, &profiles)?;
+        Self::save_profiles_shared(shared, &profiles_to_save)?;
         let mut state = shared
             .last_used_persistence
             .state
@@ -1196,6 +1234,30 @@ impl ProfileStore {
     #[cfg(test)]
     fn flush_pending_last_used_for_tests(&self) -> Result<bool, AuthProfileError> {
         self.flush_pending_last_used_once()
+    }
+
+    #[cfg(test)]
+    fn wait_for_last_used_flush_for_tests(&self) -> Result<(), &'static str> {
+        let timeout = Duration::from_secs(5);
+        let deadline = Instant::now() + timeout;
+        let mut state = self.lock_last_used_state();
+        while state.dirty_generation > state.flushed_generation {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err("timed out waiting for background last_used flush");
+            }
+            let (next_state, wait_result) = self
+                .shared
+                .last_used_persistence
+                .condvar
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state = next_state;
+            if wait_result.timed_out() && state.dirty_generation > state.flushed_generation {
+                return Err("timed out waiting for background last_used flush");
+            }
+        }
+        Ok(())
     }
 
     fn shutdown_last_used_worker(&self) {
@@ -1254,12 +1316,12 @@ impl ProfileStore {
             }
         }
 
-        *self.shared.profiles.write() = profiles;
-        *self.shared.skipped_profiles.write() = loaded.skipped;
+        let mut profiles_guard = self.shared.profiles.write();
+        let mut skipped_guard = self.shared.skipped_profiles.write();
         let mut state = self.lock_last_used_state();
-        state.dirty_generation = 0;
-        state.scheduled_generation = 0;
-        state.flushed_generation = 0;
+        *profiles_guard = profiles;
+        *skipped_guard = loaded.skipped;
+        state.reset_generations();
         self.shared.last_used_persistence.condvar.notify_all();
         Ok(())
     }
@@ -1271,9 +1333,12 @@ impl ProfileStore {
     /// in plaintext so that callers never see encrypted values.
     pub fn save(&self) -> Result<(), AuthProfileError> {
         let _persist_guard = self.lock_persist();
-        let guard = self.shared.profiles.read();
-        let persisted_generation = self.capture_dirty_generation();
-        self.save_profiles(&guard)?;
+        let (profiles_to_save, persisted_generation) = {
+            let guard = self.shared.profiles.read();
+            let persisted_generation = self.capture_dirty_generation();
+            (guard.to_vec(), persisted_generation)
+        };
+        self.save_profiles(&profiles_to_save)?;
         self.mark_last_used_persisted(persisted_generation);
         Ok(())
     }
@@ -1302,8 +1367,10 @@ impl ProfileStore {
             }
         }
 
-        let skipped = shared.skipped_profiles.read();
-        let content = serialize_store(&to_save, &skipped)?;
+        let content = {
+            let skipped = shared.skipped_profiles.read();
+            serialize_store(&to_save, &skipped)?
+        };
 
         // Ensure parent directory exists
         if let Some(parent) = shared.state_path.parent() {
@@ -1600,10 +1667,10 @@ impl ProfileStore {
                 should_schedule_flush = true;
             }
         }
-        drop(guard);
         if should_schedule_flush {
             self.note_last_used_dirty();
         }
+        drop(guard);
     }
 
     /// Insert or replace a full profile by ID.
@@ -2254,6 +2321,24 @@ mod tests {
         let raw_after_flush = std::fs::read_to_string(&state_path).unwrap();
         assert_ne!(raw_after_flush, raw_before);
         let saved: serde_json::Value = serde_json::from_str(&raw_after_flush).unwrap();
+        assert!(saved["profiles"][0]["last_used_ms"].as_u64().is_some());
+    }
+
+    #[test]
+    fn test_profile_store_auto_flush_persists_last_used_in_background() {
+        let dir = tempdir().unwrap();
+        let store = ProfileStore::new(dir.path().to_path_buf());
+        store.add(sample_profile("lu-auto")).unwrap();
+
+        let state_path = dir.path().join("auth_profiles.json");
+        let raw_before = std::fs::read_to_string(&state_path).unwrap();
+
+        store.update_last_used("lu-auto");
+        store.wait_for_last_used_flush_for_tests().unwrap();
+
+        let raw_after = std::fs::read_to_string(&state_path).unwrap();
+        assert_ne!(raw_after, raw_before);
+        let saved: serde_json::Value = serde_json::from_str(&raw_after).unwrap();
         assert!(saved["profiles"][0]["last_used_ms"].as_u64().is_some());
     }
 
