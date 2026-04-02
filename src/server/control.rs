@@ -383,13 +383,86 @@ impl From<onboarding::setup::SetupAssessment> for ControlSetupAssessment {
 #[serde(rename_all = "camelCase")]
 pub struct ControlOnboardingApplyResponse {
     pub ok: bool,
-    /// Provider-owned apply payload. Current onboarding handlers return small
-    /// JSON objects such as `{"mode": "apiKey"}` or
-    /// `{"profileId": "...", "mode": "oauth"}`.
-    pub applied: Value,
+    /// Control-owned browser-visible apply payload. This intentionally exposes
+    /// only the applied auth path instead of forwarding provider-internal
+    /// onboarding details.
+    pub applied: ControlOnboardingApplied,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
     pub provider_status: ControlProviderOnboardingStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ControlOnboardingAppliedMode {
+    #[serde(rename = "apiKey")]
+    ApiKey,
+    #[serde(rename = "oauth")]
+    OAuth,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControlOnboardingApplied {
+    pub mode: ControlOnboardingAppliedMode,
+}
+
+impl ControlOnboardingAppliedMode {
+    fn applied(self) -> ControlOnboardingApplied {
+        ControlOnboardingApplied { mode: self }
+    }
+}
+
+fn serialize_control_onboarding_applied_mode(mode: ControlOnboardingAppliedMode) -> Option<String> {
+    serde_json::to_value(mode)
+        .ok()
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+}
+
+fn invalid_control_onboarding_apply_result_message() -> String {
+    "Provider onboarding apply result was invalid; check server logs.".to_string()
+}
+
+fn validate_control_onboarding_applied_mode(
+    applied: &Value,
+    expected_mode: ControlOnboardingAppliedMode,
+) -> Result<ControlOnboardingApplied, String> {
+    let expected_mode_name = serialize_control_onboarding_applied_mode(expected_mode)
+        .unwrap_or_else(|| "<unknown expected mode>".to_string());
+    let reported_mode_value = applied.get("mode").cloned().ok_or_else(|| {
+        let applied_keys = applied
+            .as_object()
+            .map(|entries| entries.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        tracing::warn!(
+            expected_mode = %expected_mode_name,
+            applied_keys = ?applied_keys,
+            "control onboarding apply result missing mode"
+        );
+        invalid_control_onboarding_apply_result_message()
+    })?;
+    let reported_mode =
+        serde_json::from_value::<ControlOnboardingAppliedMode>(reported_mode_value.clone())
+            .map_err(|_| {
+                tracing::warn!(
+                    expected_mode = %expected_mode_name,
+                    reported_mode = ?reported_mode_value,
+                    "control onboarding apply result reported invalid mode"
+                );
+                invalid_control_onboarding_apply_result_message()
+            })?;
+
+    if reported_mode != expected_mode {
+        let reported_mode_name = serialize_control_onboarding_applied_mode(reported_mode)
+            .unwrap_or_else(|| "<unknown reported mode>".to_string());
+        tracing::warn!(
+            expected_mode = %expected_mode_name,
+            reported_mode = %reported_mode_name,
+            "control onboarding apply result reported unexpected mode"
+        );
+        return Err(invalid_control_onboarding_apply_result_message());
+    }
+
+    Ok(expected_mode.applied())
 }
 
 #[derive(Default)]
@@ -1214,6 +1287,19 @@ pub async fn gemini_oauth_apply_handler(
     let state_dir = crate::server::ws::resolve_state_dir();
     match onboarding::gemini::apply_control_google_oauth(flow_id.trim(), state_dir.clone()) {
         Ok(applied) => {
+            let applied = match validate_control_onboarding_applied_mode(
+                &applied,
+                ControlOnboardingAppliedMode::OAuth,
+            ) {
+                Ok(applied) => applied,
+                Err(err) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ControlError::new(err)),
+                    )
+                        .into_response();
+                }
+            };
             let snapshot = read_config_snapshot();
             let hash = snapshot.hash;
             let provider_status = match build_control_provider_onboarding_status_async(
@@ -1351,6 +1437,19 @@ pub async fn codex_oauth_apply_handler(
     let state_dir = crate::server::ws::resolve_state_dir();
     match onboarding::codex::apply_control_openai_oauth(flow_id.trim(), state_dir.clone()) {
         Ok(applied) => {
+            let applied = match validate_control_onboarding_applied_mode(
+                &applied,
+                ControlOnboardingAppliedMode::OAuth,
+            ) {
+                Ok(applied) => applied,
+                Err(err) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ControlError::new(err)),
+                    )
+                        .into_response();
+                }
+            };
             let snapshot = read_config_snapshot();
             let hash = snapshot.hash;
             let provider_status = match build_control_provider_onboarding_status_async(
@@ -1471,6 +1570,19 @@ pub async fn gemini_api_key_handler(
         base_url: req.base_url,
     }) {
         Ok(applied) => {
+            let applied = match validate_control_onboarding_applied_mode(
+                &applied,
+                ControlOnboardingAppliedMode::ApiKey,
+            ) {
+                Ok(applied) => applied,
+                Err(err) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ControlError::new(err)),
+                    )
+                        .into_response();
+                }
+            };
             let snapshot = read_config_snapshot();
             let hash = snapshot.hash;
             let provider_status = match build_control_provider_onboarding_status_async(
@@ -2333,6 +2445,116 @@ mod tests {
             .get("profileName")
             .is_none());
         assert!(json["providers"][0]["assessment"].get("email").is_none());
+    }
+
+    #[test]
+    fn test_control_onboarding_apply_response_serialization() {
+        let response = ControlOnboardingApplyResponse {
+            ok: true,
+            applied: ControlOnboardingAppliedMode::OAuth.applied(),
+            hash: Some("deadbeef".to_string()),
+            provider_status: ControlProviderOnboardingStatus {
+                provider: onboarding::setup::SetupProvider::Codex,
+                label: "Codex".to_string(),
+                configured: true,
+                supported_auth_modes: vec![onboarding::setup::SetupAuthMode::OAuth],
+                available_entrypoints: vec![],
+                cli_setup_command: Some("cara setup --force --provider codex".to_string()),
+                assessment: None,
+            },
+        };
+
+        let json = serde_json::to_value(&response).expect("apply response should serialize");
+        assert_eq!(json["ok"], true);
+        let applied = json
+            .get("applied")
+            .and_then(|value| value.as_object())
+            .expect("applied should be an object");
+        assert_eq!(applied.get("mode"), Some(&serde_json::json!("oauth")));
+        // The applied wire shape should be narrowed to only { mode: ... }.
+        assert_eq!(
+            applied.len(),
+            1,
+            "applied should only contain the `mode` key"
+        );
+        assert_eq!(json["providerStatus"]["provider"], "codex");
+        assert!(applied.get("profileId").is_none());
+        assert!(applied.get("authProfile").is_none());
+        assert!(applied.get("provider").is_none());
+        assert!(applied.get("model").is_none());
+    }
+
+    #[test]
+    fn test_control_onboarding_applied_round_trips() {
+        let applied = ControlOnboardingAppliedMode::ApiKey.applied();
+        let json = serde_json::to_string(&applied).expect("applied payload should serialize");
+        let round_trip: ControlOnboardingApplied =
+            serde_json::from_str(&json).expect("applied payload should deserialize");
+        assert_eq!(round_trip.mode, ControlOnboardingAppliedMode::ApiKey);
+    }
+
+    #[test]
+    fn test_serialize_control_onboarding_applied_mode_uses_serde_wire_names() {
+        assert_eq!(
+            serialize_control_onboarding_applied_mode(ControlOnboardingAppliedMode::ApiKey)
+                .as_deref(),
+            Some("apiKey")
+        );
+        assert_eq!(
+            serialize_control_onboarding_applied_mode(ControlOnboardingAppliedMode::OAuth)
+                .as_deref(),
+            Some("oauth")
+        );
+    }
+
+    #[test]
+    fn test_validate_control_onboarding_applied_mode_accepts_expected_mode() {
+        let applied = json!({ "mode": "oauth", "profileId": "google-123" });
+        let projected =
+            validate_control_onboarding_applied_mode(&applied, ControlOnboardingAppliedMode::OAuth)
+                .expect("matching mode should be accepted");
+        assert_eq!(projected, ControlOnboardingAppliedMode::OAuth.applied());
+    }
+
+    #[test]
+    fn test_validate_control_onboarding_applied_mode_rejects_missing_mode() {
+        let err = validate_control_onboarding_applied_mode(
+            &json!({"authProfile": "openai-123"}),
+            ControlOnboardingAppliedMode::OAuth,
+        )
+        .expect_err("missing mode should be rejected");
+        assert_eq!(
+            err,
+            "Provider onboarding apply result was invalid; check server logs."
+        );
+    }
+
+    #[test]
+    fn test_validate_control_onboarding_applied_mode_rejects_invalid_non_string_mode() {
+        let err = validate_control_onboarding_applied_mode(
+            &json!({"mode": {"kind": "oauth"}}),
+            ControlOnboardingAppliedMode::OAuth,
+        )
+        .expect_err("non-string mode should be rejected");
+        assert_eq!(
+            err,
+            "Provider onboarding apply result was invalid; check server logs."
+        );
+    }
+
+    #[test]
+    fn test_validate_control_onboarding_applied_mode_rejects_unexpected_mode() {
+        let err = validate_control_onboarding_applied_mode(
+            &json!({"mode": "apiKey"}),
+            ControlOnboardingAppliedMode::OAuth,
+        )
+        .expect_err("unexpected mode should be rejected");
+        assert_eq!(
+            err,
+            "Provider onboarding apply result was invalid; check server logs."
+        );
+        assert!(!err.contains("apiKey"));
+        assert!(!err.contains("oauth"));
     }
 
     #[test]
