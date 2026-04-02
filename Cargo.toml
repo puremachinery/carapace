@@ -18,7 +18,7 @@ url = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 json5 = "1"
-strum = { version = "0.27", features = ["derive"] }
+strum = { version = "0.28", features = ["derive"] }
 regex = "1"
 glob = "0.3"
 dirs = "6"
@@ -76,8 +76,8 @@ insta = { version = "1", features = ["json"] }
 tokio-test = "0.4"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
-wit-component = { version = "0.245.1", features = ["dummy-module"] }
-wit-parser = "0.245.1"
+wit-component = { version = "0.246.1", features = ["dummy-module"] }
+wit-parser = "0.246.1"
 
 [features]
 gateway = []
