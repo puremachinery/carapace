@@ -3,6 +3,7 @@
 //! Implements timing-safe comparisons, Tailscale header verification,
 //! local-direct detection, and gateway token/password authorization.
 
+pub(crate) mod profile_runtime;
 pub mod profiles;
 
 use axum::http::HeaderMap;

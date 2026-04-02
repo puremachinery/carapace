@@ -515,6 +515,7 @@ dependencies = [
  "crc32fast",
  "dirs",
  "ed25519-dalek",
+ "filetime",
  "flate2",
  "futures-util",
  "getrandom 0.4.2",
