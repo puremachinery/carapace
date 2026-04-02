@@ -230,17 +230,32 @@ pub enum SetupCheckKind {
     Validation,
 }
 
+/// Internal setup-to-control diagnostic code.
+///
+/// These codes are stamped at the source when a setup check's browser-visible
+/// projection needs an explicit control-owned message instead of relying on
+/// generic status/kind fallback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetupCheckCode {
+    /// Config points at an auth profile ID for this provider.
     AuthProfileConfigured,
+    /// Config does not contain an auth profile ID for this provider.
     AuthProfileNotConfigured,
+    /// The referenced auth profile loaded successfully from the profile store.
     AuthProfileLoaded,
+    /// The referenced auth profile belongs to a different provider.
     AuthProfileWrongProvider,
+    /// The referenced auth profile uses the wrong credential kind.
     AuthProfileWrongCredentialType,
+    /// The referenced token profile stayed encrypted even though a password is present.
     AuthProfileTokenDecryptFailed,
+    /// The referenced token profile has no usable token material.
     AuthProfileTokenMissing,
+    /// Config references an auth profile ID that is not present in the store.
     AuthProfileMissing,
+    /// The encrypted profile store could not be read.
     AuthProfileStoreReadFailed,
+    /// A provider-specific local validation check failed.
     LocalValidationFailed,
 }
 
@@ -252,6 +267,10 @@ pub struct SetupCheck {
     pub kind: SetupCheckKind,
     pub detail: String,
     pub remediation: Option<String>,
+    /// Internal setup-to-control projection code.
+    ///
+    /// This is deliberately omitted from `SetupCheck` JSON because browser-
+    /// visible responses are emitted through control-owned DTOs instead.
     #[serde(skip)]
     pub code: Option<SetupCheckCode>,
 }
@@ -1358,6 +1377,24 @@ mod tests {
         }
     }
 
+    fn sample_token_profile(id: &str, provider: OAuthProvider, token: &str) -> AuthProfile {
+        AuthProfile {
+            id: id.to_string(),
+            name: "Sample Token Profile".to_string(),
+            provider,
+            user_id: None,
+            email: None,
+            display_name: None,
+            avatar_url: None,
+            created_at_ms: 1,
+            last_used_ms: Some(1),
+            credential_kind: AuthProfileCredentialKind::Token,
+            tokens: None,
+            token: Some(token.to_string()),
+            oauth_provider_config: None,
+        }
+    }
+
     #[test]
     fn test_assess_provider_setup_flags_missing_placeholder() {
         let temp = TempDir::new().unwrap();
@@ -1637,6 +1674,156 @@ mod tests {
 
         assert_eq!(check.status, SetupCheckStatus::Fail);
         assert_eq!(check.code, Some(SetupCheckCode::AuthProfileNotConfigured));
+    }
+
+    #[test]
+    fn test_auth_profile_summary_check_sets_wrong_provider_code() {
+        let temp = TempDir::new().unwrap();
+        let store = ProfileStore::new(temp.path().to_path_buf());
+        store
+            .add(sample_profile("google-123", OAuthProvider::Google))
+            .unwrap();
+
+        let (check, summary) = auth_profile_summary_check(
+            temp.path(),
+            "google-123",
+            OAuthProvider::OpenAI,
+            AuthProfileCredentialKind::OAuth,
+            "Codex auth profile",
+            Some("cara setup --provider codex"),
+        );
+
+        assert_eq!(check.status, SetupCheckStatus::Fail);
+        assert_eq!(check.code, Some(SetupCheckCode::AuthProfileWrongProvider));
+        assert!(summary.is_none());
+    }
+
+    #[test]
+    fn test_auth_profile_summary_check_sets_wrong_credential_type_code() {
+        let temp = TempDir::new().unwrap();
+        let store = ProfileStore::new(temp.path().to_path_buf());
+        store
+            .add(sample_token_profile(
+                "anthropic:default",
+                OAuthProvider::Anthropic,
+                "sk-ant-oat01-token",
+            ))
+            .unwrap();
+
+        let (check, summary) = auth_profile_summary_check(
+            temp.path(),
+            "anthropic:default",
+            OAuthProvider::Anthropic,
+            AuthProfileCredentialKind::OAuth,
+            "Anthropic auth profile",
+            Some("cara setup --provider anthropic --auth-mode setup-token"),
+        );
+
+        assert_eq!(check.status, SetupCheckStatus::Fail);
+        assert_eq!(
+            check.code,
+            Some(SetupCheckCode::AuthProfileWrongCredentialType)
+        );
+        assert!(summary.is_none());
+    }
+
+    #[test]
+    fn test_auth_profile_summary_check_sets_auth_profile_missing_code() {
+        let temp = TempDir::new().unwrap();
+
+        let (check, summary) = auth_profile_summary_check(
+            temp.path(),
+            "missing-profile",
+            OAuthProvider::Google,
+            AuthProfileCredentialKind::OAuth,
+            "Gemini auth profile",
+            Some("cara setup --provider gemini --auth-mode oauth"),
+        );
+
+        assert_eq!(check.status, SetupCheckStatus::Fail);
+        assert_eq!(check.code, Some(SetupCheckCode::AuthProfileMissing));
+        assert!(summary.is_none());
+    }
+
+    #[test]
+    fn test_auth_profile_summary_check_sets_auth_profile_store_read_failed_code() {
+        let temp = TempDir::new().unwrap();
+        std::fs::write(temp.path().join("auth_profiles.json"), "not valid json").unwrap();
+
+        let (check, summary) = auth_profile_summary_check(
+            temp.path(),
+            "google-123",
+            OAuthProvider::Google,
+            AuthProfileCredentialKind::OAuth,
+            "Gemini auth profile",
+            Some("cara setup --provider gemini --auth-mode oauth"),
+        );
+
+        assert_eq!(check.status, SetupCheckStatus::Fail);
+        assert_eq!(check.code, Some(SetupCheckCode::AuthProfileStoreReadFailed));
+        assert!(summary.is_none());
+    }
+
+    #[test]
+    fn test_auth_profile_summary_check_sets_token_missing_code() {
+        let temp = TempDir::new().unwrap();
+        let store = ProfileStore::new(temp.path().to_path_buf());
+        store
+            .add(sample_token_profile(
+                "anthropic:default",
+                OAuthProvider::Anthropic,
+                "   ",
+            ))
+            .unwrap();
+
+        let (check, summary) = auth_profile_summary_check(
+            temp.path(),
+            "anthropic:default",
+            OAuthProvider::Anthropic,
+            AuthProfileCredentialKind::Token,
+            "Anthropic auth profile",
+            Some("cara setup --provider anthropic --auth-mode setup-token"),
+        );
+
+        assert_eq!(check.status, SetupCheckStatus::Fail);
+        assert_eq!(check.code, Some(SetupCheckCode::AuthProfileTokenMissing));
+        assert!(summary.is_none());
+    }
+
+    #[test]
+    fn test_auth_profile_summary_check_sets_token_decrypt_failed_code() {
+        let temp = TempDir::new().unwrap();
+        let mut env = ScopedEnv::new();
+        env.set("CARAPACE_CONFIG_PASSWORD", "correct-password");
+
+        {
+            let store = ProfileStore::from_env(temp.path().to_path_buf()).unwrap();
+            store
+                .add(sample_token_profile(
+                    "anthropic:default",
+                    OAuthProvider::Anthropic,
+                    "sk-ant-oat01-token",
+                ))
+                .unwrap();
+        }
+
+        env.set("CARAPACE_CONFIG_PASSWORD", "wrong-password");
+
+        let (check, summary) = auth_profile_summary_check(
+            temp.path(),
+            "anthropic:default",
+            OAuthProvider::Anthropic,
+            AuthProfileCredentialKind::Token,
+            "Anthropic auth profile",
+            Some("cara setup --provider anthropic --auth-mode setup-token"),
+        );
+
+        assert_eq!(check.status, SetupCheckStatus::Fail);
+        assert_eq!(
+            check.code,
+            Some(SetupCheckCode::AuthProfileTokenDecryptFailed)
+        );
+        assert!(summary.is_none());
     }
 
     #[test]
