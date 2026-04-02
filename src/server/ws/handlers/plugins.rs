@@ -837,6 +837,104 @@ fn scan_plugins_bins(dir: &std::path::Path) -> Vec<Value> {
     bins
 }
 
+// ---------------------------------------------------------------------------
+// Transactional write support for managed plugin install/update
+// ---------------------------------------------------------------------------
+
+/// Backup and rollback support for the multi-file write sequence in managed
+/// plugin install/update operations.
+///
+/// Write order: artifact → manifest → config. If any write fails after a
+/// previous one committed, the earlier writes are rolled back from backups.
+struct PluginWriteTransaction {
+    plugins_dir: PathBuf,
+    artifact_backup: Option<PathBuf>,
+    manifest_backup: Option<PathBuf>,
+}
+
+impl PluginWriteTransaction {
+    fn new(plugins_dir: PathBuf) -> Self {
+        Self {
+            plugins_dir,
+            artifact_backup: None,
+            manifest_backup: None,
+        }
+    }
+
+    /// Back up the existing artifact before overwriting it.
+    fn backup_artifact(&mut self, name: &str) -> Result<(), ErrorShape> {
+        let artifact = self.plugins_dir.join(format!("{name}.wasm"));
+        if artifact.is_file() {
+            let backup = self.plugins_dir.join(format!("{name}.wasm.txn-bak"));
+            std::fs::copy(&artifact, &backup).map_err(|e| {
+                error_shape(
+                    ERROR_UNAVAILABLE,
+                    &format!("failed to back up plugin artifact: {e}"),
+                    None,
+                )
+            })?;
+            self.artifact_backup = Some(backup);
+        }
+        Ok(())
+    }
+
+    /// Back up the existing manifest before overwriting it.
+    fn backup_manifest(&mut self) -> Result<(), ErrorShape> {
+        let manifest = self.plugins_dir.join(PLUGINS_MANIFEST_FILE);
+        if manifest.is_file() {
+            let backup = self
+                .plugins_dir
+                .join(format!("{PLUGINS_MANIFEST_FILE}.txn-bak"));
+            std::fs::copy(&manifest, &backup).map_err(|e| {
+                error_shape(
+                    ERROR_UNAVAILABLE,
+                    &format!("failed to back up plugins manifest: {e}"),
+                    None,
+                )
+            })?;
+            self.manifest_backup = Some(backup);
+        }
+        Ok(())
+    }
+
+    /// Roll back the manifest to its pre-transaction state.
+    fn rollback_manifest(&self) {
+        if let Some(ref backup) = self.manifest_backup {
+            let manifest = self.plugins_dir.join(PLUGINS_MANIFEST_FILE);
+            if let Err(e) = std::fs::rename(backup, &manifest) {
+                tracing::warn!(
+                    error = %e,
+                    "failed to roll back plugins manifest from backup"
+                );
+            }
+        }
+    }
+
+    /// Roll back the artifact to its pre-transaction state.
+    fn rollback_artifact(&self, name: &str) {
+        let artifact = self.plugins_dir.join(format!("{name}.wasm"));
+        if let Some(ref backup) = self.artifact_backup {
+            if let Err(e) = std::fs::rename(backup, &artifact) {
+                tracing::warn!(
+                    error = %e,
+                    plugin = name,
+                    "failed to roll back plugin artifact from backup"
+                );
+            }
+        }
+    }
+
+    /// Remove backup files after a successful transaction.
+    fn cleanup_backups(&self) {
+        if let Some(ref backup) = self.artifact_backup {
+            let _ = std::fs::remove_file(backup);
+        }
+        if let Some(ref backup) = self.manifest_backup {
+            let _ = std::fs::remove_file(backup);
+        }
+    }
+}
+
 pub(super) fn handle_plugins_install(params: Option<&Value>) -> Result<Value, ErrorShape> {
     handle_plugins_install_inner(params, &resolve_plugins_dir())
 }
@@ -880,17 +978,20 @@ fn handle_plugins_install_inner(
     let local_wasm_path = plugins_dir.join(&wasm_file_name);
     let installed_at = now_ms();
 
-    // Either download the managed plugin artifact or adopt an existing local one.
-    let (wasm_path, wasm_hash) = if let Some(raw_url) = url_str {
+    // --- Phase 1: Prepare all payloads and validate config BEFORE any writes ---
+
+    // Resolve the artifact bytes (download or read existing).
+    let (wasm_bytes_for_write, wasm_hash) = if let Some(raw_url) = url_str {
         let parsed_url = validate_url(raw_url)?;
-        let (dest, wasm_bytes) = download_plugin_wasm(&parsed_url, plugins_dir, &wasm_file_name)?;
-        (Some(dest), Some(compute_sha256_hex(&wasm_bytes)))
+        let (_dest, wasm_bytes) = download_plugin_wasm(&parsed_url, plugins_dir, &wasm_file_name)?;
+        let hash = compute_sha256_hex(&wasm_bytes);
+        (Some(wasm_bytes), hash)
     } else {
-        let (path, hash) = adopt_existing_managed_plugin_wasm(&local_wasm_path)?;
-        (Some(path), Some(hash))
+        let (_path, hash) = adopt_existing_managed_plugin_wasm(&local_wasm_path)?;
+        (None, hash) // None = no write needed, artifact already in place
     };
 
-    // Record metadata in the plugins manifest
+    // Prepare manifest payload.
     let mut manifest = read_plugins_manifest(plugins_dir);
     let manifest_obj = ensure_object(&mut manifest)?;
     let entry = manifest_obj
@@ -905,15 +1006,11 @@ fn handle_plugins_install_inner(
         "installed_at".to_string(),
         Value::Number(installed_at.into()),
     );
-    if let Some(ref p) = wasm_path {
-        entry_obj.insert(
-            "path".to_string(),
-            Value::String(p.to_string_lossy().to_string()),
-        );
-    }
-    if let Some(ref hash) = wasm_hash {
-        entry_obj.insert("sha256".to_string(), Value::String(hash.clone()));
-    }
+    entry_obj.insert(
+        "path".to_string(),
+        Value::String(local_wasm_path.to_string_lossy().to_string()),
+    );
+    entry_obj.insert("sha256".to_string(), Value::String(wasm_hash));
     if let Some(ref pk) = publisher_key {
         entry_obj.insert("publisher_key".to_string(), Value::String(pk.clone()));
     }
@@ -923,9 +1020,8 @@ fn handle_plugins_install_inner(
     if let Some(raw_url) = url_str {
         entry_obj.insert("url".to_string(), Value::String(raw_url.to_string()));
     }
-    write_plugins_manifest(plugins_dir, &manifest)?;
 
-    // Also record the plugin in the main config (preserving existing behaviour)
+    // Prepare config payload and validate BEFORE writing anything.
     let mut config_value = read_config_snapshot().config;
     let root = ensure_object(&mut config_value)?;
     let plugins = root.entry("plugins").or_insert_with(|| json!({}));
@@ -950,7 +1046,36 @@ fn handle_plugins_install_inner(
             Some(json!({ "issues": issues })),
         ));
     }
-    write_config_file(&config::get_config_path(), &config_value)?;
+
+    // --- Phase 2: Commit all writes with backup-based rollback ---
+
+    let mut txn = PluginWriteTransaction::new(plugins_dir.to_path_buf());
+
+    // Write 1: artifact (if download path).
+    if let Some(ref bytes) = wasm_bytes_for_write {
+        txn.backup_artifact(name)?;
+        if let Err(e) = atomic_write_plugin_file(plugins_dir, &wasm_file_name, bytes) {
+            txn.rollback_artifact(name);
+            return Err(e);
+        }
+    }
+
+    // Write 2: manifest.
+    txn.backup_manifest()?;
+    if let Err(e) = write_plugins_manifest(plugins_dir, &manifest) {
+        txn.rollback_manifest();
+        txn.rollback_artifact(name);
+        return Err(e);
+    }
+
+    // Write 3: config.
+    if let Err(e) = write_config_file(&config::get_config_path(), &config_value) {
+        txn.rollback_manifest();
+        txn.rollback_artifact(name);
+        return Err(e);
+    }
+
+    txn.cleanup_backups();
 
     Ok(json!({
         "ok": true,
@@ -1027,21 +1152,21 @@ fn handle_plugins_update_inner(
 
     let wasm_file_name = format!("{}.wasm", name);
     let local_wasm_path = plugins_dir.join(&wasm_file_name);
-    let (dest, wasm_hash, source_url) = if let Some(url_str) = url_str {
+
+    // --- Phase 1: Prepare all payloads and validate config BEFORE any writes ---
+
+    let (wasm_bytes_for_write, wasm_hash, source_url) = if let Some(url_str) = url_str {
         let parsed_url = validate_url(url_str)?;
-        let (dest, wasm_bytes) = download_plugin_wasm(&parsed_url, plugins_dir, &wasm_file_name)?;
-        (
-            dest,
-            compute_sha256_hex(&wasm_bytes),
-            Some(url_str.to_string()),
-        )
+        let (_dest, wasm_bytes) = download_plugin_wasm(&parsed_url, plugins_dir, &wasm_file_name)?;
+        let hash = compute_sha256_hex(&wasm_bytes);
+        (Some(wasm_bytes), hash, Some(url_str.to_string()))
     } else {
-        let (dest, wasm_hash) = adopt_existing_managed_plugin_wasm(&local_wasm_path)?;
-        (dest, wasm_hash, None)
+        let (_path, wasm_hash) = adopt_existing_managed_plugin_wasm(&local_wasm_path)?;
+        (None, wasm_hash, None)
     };
     let updated_at = now_ms();
 
-    // Update the manifest entry
+    // Prepare manifest payload.
     let manifest_obj = ensure_object(&mut manifest)?;
     let entry = manifest_obj
         .entry(name.to_string())
@@ -1054,7 +1179,7 @@ fn handle_plugins_update_inner(
     entry_obj.insert("updated_at".to_string(), Value::Number(updated_at.into()));
     entry_obj.insert(
         "path".to_string(),
-        Value::String(dest.to_string_lossy().to_string()),
+        Value::String(local_wasm_path.to_string_lossy().to_string()),
     );
     entry_obj.insert("sha256".to_string(), Value::String(wasm_hash));
     if let Some(ref pk) = publisher_key {
@@ -1063,13 +1188,13 @@ fn handle_plugins_update_inner(
     if let Some(ref sig) = signature {
         entry_obj.insert("signature".to_string(), Value::String(sig.clone()));
     }
-    if let Some(source_url) = source_url {
-        entry_obj.insert("url".to_string(), Value::String(source_url));
+    if let Some(ref source_url) = source_url {
+        entry_obj.insert("url".to_string(), Value::String(source_url.clone()));
     } else {
         entry_obj.remove("url");
     }
-    write_plugins_manifest(plugins_dir, &manifest)?;
 
+    // Prepare config payload and validate BEFORE writing anything.
     let mut config_value = read_config_snapshot().config;
     let root = ensure_object(&mut config_value)?;
     let plugins = root.entry("plugins").or_insert_with(|| json!({}));
@@ -1093,7 +1218,36 @@ fn handle_plugins_update_inner(
             Some(json!({ "issues": issues })),
         ));
     }
-    write_config_file(&config::get_config_path(), &config_value)?;
+
+    // --- Phase 2: Commit all writes with backup-based rollback ---
+
+    let mut txn = PluginWriteTransaction::new(plugins_dir.to_path_buf());
+
+    // Write 1: artifact (if download path).
+    if let Some(ref bytes) = wasm_bytes_for_write {
+        txn.backup_artifact(name)?;
+        if let Err(e) = atomic_write_plugin_file(plugins_dir, &wasm_file_name, bytes) {
+            txn.rollback_artifact(name);
+            return Err(e);
+        }
+    }
+
+    // Write 2: manifest.
+    txn.backup_manifest()?;
+    if let Err(e) = write_plugins_manifest(plugins_dir, &manifest) {
+        txn.rollback_manifest();
+        txn.rollback_artifact(name);
+        return Err(e);
+    }
+
+    // Write 3: config.
+    if let Err(e) = write_config_file(&config::get_config_path(), &config_value) {
+        txn.rollback_manifest();
+        txn.rollback_artifact(name);
+        return Err(e);
+    }
+
+    txn.cleanup_backups();
 
     Ok(json!({
         "ok": true,
