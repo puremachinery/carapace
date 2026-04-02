@@ -2545,7 +2545,6 @@ async fn acquire_plugin_file_transaction_lock(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let lock_owned = lock.to_path_buf();
     let std_file = tokio::task::spawn_blocking({
-        let lock_owned = lock_owned.clone();
         move || {
             let mut options = std::fs::OpenOptions::new();
             options.write(true).create_new(true);
@@ -2869,7 +2868,12 @@ fn reject_if_symlink(path: &Path, label: &str) -> Result<(), String> {
             "{label} '{}' is a symlink; refusing to proceed",
             path.display()
         )),
-        _ => Ok(()),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!(
+            "failed to verify {label} '{}' is not a symlink: {e}",
+            path.display()
+        )),
     }
 }
 
