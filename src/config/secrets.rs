@@ -118,7 +118,7 @@ enum SecretStoreMode {
     DecryptOnly,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum SecretStoreAccess {
     Ready {
         key: Zeroizing<[u8; PASSWORD_DERIVED_KEY_LEN]>,
