@@ -725,32 +725,24 @@ pub fn build_providers(cfg: &Value) -> Result<Option<MultiProvider>, Box<dyn std
     };
 
     // Claude CLI backend — enabled via claudeCli.enabled config or CLAUDE_CLI_ENABLED env.
-    let claude_cli_provider = {
-        let enabled = cfg
-            .pointer("/claudeCli/enabled")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-            || std::env::var("CLAUDE_CLI_ENABLED")
-                .ok()
-                .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
-        if enabled {
-            let path = cfg
-                .pointer("/claudeCli/path")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let max_turns = cfg
-                .pointer("/claudeCli/maxTurns")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(10) as u32;
-            let provider = agent::claude_cli::ClaudeCliProvider::new()
-                .with_binary_path(path)
-                .with_max_turns(max_turns);
-            info!("LLM provider configured: Claude CLI");
-            Some(Arc::new(provider) as Arc<dyn agent::LlmProvider>)
-        } else {
-            None
-        }
+    let claude_cli_provider = if agent::claude_cli::is_enabled(cfg) {
+        let path = cfg
+            .pointer("/claudeCli/path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let max_turns = cfg
+            .pointer("/claudeCli/maxTurns")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(10)
+            .min(u32::MAX as u64) as u32;
+        let provider = agent::claude_cli::ClaudeCliProvider::new()
+            .with_binary_path(path)
+            .with_max_turns(max_turns);
+        info!("LLM provider configured: Claude CLI");
+        Some(Arc::new(provider) as Arc<dyn agent::LlmProvider>)
+    } else {
+        None
     };
 
     // Build multi-provider dispatcher
@@ -783,7 +775,7 @@ pub struct ProviderFingerprint {
     pub venice: Option<(String, Option<String>)>,
     pub bedrock: Option<String>,
     pub vertex: Option<(String, String, Option<String>)>,
-    pub claude_cli: Option<bool>,
+    pub claude_cli: Option<String>,
 }
 
 /// Compute a fingerprint of the provider configuration from config + env vars.
@@ -936,19 +928,18 @@ pub fn fingerprint_providers(cfg: &Value) -> ProviderFingerprint {
                 vertex_config.model,
             )
         }),
-        claude_cli: {
-            let enabled = cfg
-                .pointer("/claudeCli/enabled")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-                || std::env::var("CLAUDE_CLI_ENABLED")
-                    .ok()
-                    .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
-            if enabled {
-                Some(true)
-            } else {
-                None
-            }
+        claude_cli: if agent::claude_cli::is_enabled(cfg) {
+            let path = cfg
+                .pointer("/claudeCli/path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("claude");
+            let max_turns = cfg
+                .pointer("/claudeCli/maxTurns")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(10);
+            Some(hash_key_prefix(&format!("{path}:{max_turns}")))
+        } else {
+            None
         },
     }
 }

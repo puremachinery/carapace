@@ -385,7 +385,7 @@ impl MultiProvider {
             self.claude_cli.as_deref().ok_or_else(|| {
                 AgentError::Provider(format!(
                     "model \"{model}\" requires Claude CLI backend, but it is not configured; \
-                     set claudeCli.enabled: true in config or use cara setup --provider claude-cli"
+                     set claudeCli.enabled: true in config or CLAUDE_CLI_ENABLED=1 in env"
                 ))
             })
         } else if crate::agent::ollama::is_ollama_model(model) {

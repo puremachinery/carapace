@@ -90,6 +90,16 @@ impl ClaudeCliProvider {
     }
 }
 
+/// Check whether the Claude CLI provider is enabled via config or env.
+pub fn is_enabled(cfg: &serde_json::Value) -> bool {
+    cfg.pointer("/claudeCli/enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        || std::env::var("CLAUDE_CLI_ENABLED")
+            .ok()
+            .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
 /// Check whether a model ID should be routed to the Claude CLI provider.
 pub fn is_claude_cli_model(model: &str) -> bool {
     model.starts_with("claude-cli:") || model.starts_with("claude-cli/") || model == "claude-cli"
@@ -126,10 +136,12 @@ impl LlmProvider for ClaudeCliProvider {
         // Build the prompt from the messages.
         let prompt = build_prompt_from_messages(&request);
 
+        // Pipe the prompt via stdin to avoid exposing conversation content
+        // in process arguments (visible via /proc/pid/cmdline on Linux).
         let mut cmd = tokio::process::Command::new(&self.binary_path);
         cmd.arg("--bare")
             .arg("-p")
-            .arg(&prompt)
+            .arg("-") // read prompt from stdin
             .arg("--output-format")
             .arg("stream-json")
             .arg("--verbose")
@@ -153,8 +165,8 @@ impl LlmProvider for ClaudeCliProvider {
         cmd.env("DISABLE_NONESSENTIAL_TRAFFIC", "1");
 
         cmd.stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .stdin(std::process::Stdio::null());
+            .stderr(std::process::Stdio::null()) // prevent stderr pipe buffer from blocking
+            .stdin(std::process::Stdio::piped());
 
         let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
@@ -167,6 +179,18 @@ impl LlmProvider for ClaudeCliProvider {
             }
         })?;
 
+        // Write prompt to stdin and close it so the CLI starts processing.
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            if let Err(e) = stdin.write_all(prompt.as_bytes()).await {
+                let _ = child.kill().await;
+                return Err(AgentError::Provider(format!(
+                    "failed to write prompt to Claude CLI stdin: {e}"
+                )));
+            }
+            // Drop stdin to signal EOF.
+        }
+
         let stdout = child
             .stdout
             .take()
@@ -178,14 +202,13 @@ impl LlmProvider for ClaudeCliProvider {
         tokio::spawn(async move {
             let reader = tokio::io::BufReader::new(stdout);
             let mut lines = reader.lines();
+            let mut cancelled = false;
 
             loop {
                 tokio::select! {
                     _ = cancel_token.cancelled() => {
                         let _ = child.kill().await;
-                        let _ = tx.send(StreamEvent::Error {
-                            message: "cancelled".to_string(),
-                        }).await;
+                        cancelled = true;
                         break;
                     }
                     line_result = lines.next_line() => {
@@ -213,32 +236,34 @@ impl LlmProvider for ClaudeCliProvider {
                 }
             }
 
-            // Wait for the process to finish and check exit code.
-            match child.wait().await {
-                Ok(status) if !status.success() => {
-                    let _ = tx
-                        .send(StreamEvent::Error {
-                            message: format!("Claude CLI exited with status {status}"),
-                        })
-                        .await;
+            if !cancelled {
+                // Wait for the process to finish and check exit code.
+                match child.wait().await {
+                    Ok(status) if !status.success() => {
+                        let _ = tx
+                            .send(StreamEvent::Error {
+                                message: format!("Claude CLI exited with status {status}"),
+                            })
+                            .await;
+                    }
+                    Err(e) => {
+                        let _ = tx
+                            .send(StreamEvent::Error {
+                                message: format!("failed to wait for Claude CLI: {e}"),
+                            })
+                            .await;
+                    }
+                    _ => {}
                 }
-                Err(e) => {
-                    let _ = tx
-                        .send(StreamEvent::Error {
-                            message: format!("failed to wait for Claude CLI: {e}"),
-                        })
-                        .await;
-                }
-                _ => {}
-            }
 
-            // Send stop event if the channel is still open.
-            let _ = tx
-                .send(StreamEvent::Stop {
-                    reason: StopReason::EndTurn,
-                    usage: TokenUsage::default(),
-                })
-                .await;
+                // Send stop event only on normal completion.
+                let _ = tx
+                    .send(StreamEvent::Stop {
+                        reason: StopReason::EndTurn,
+                        usage: TokenUsage::default(),
+                    })
+                    .await;
+            }
         });
 
         Ok(rx)
