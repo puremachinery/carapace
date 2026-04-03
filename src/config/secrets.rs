@@ -110,6 +110,14 @@ pub struct SecretStore {
     salt: [u8; SALT_LEN],
     /// The envelope version used for new writes.
     write_version: SecretEnvelopeVersion,
+    /// Whether this store may use its in-memory key for direct encrypt/decrypt.
+    mode: SecretStoreMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecretStoreMode {
+    Full,
+    DecryptOnly,
 }
 
 impl SecretStore {
@@ -127,6 +135,7 @@ impl SecretStore {
             key,
             salt,
             write_version,
+            mode: SecretStoreMode::Full,
         })
     }
 
@@ -145,6 +154,7 @@ impl SecretStore {
             key,
             salt: *salt,
             write_version,
+            mode: SecretStoreMode::Full,
         })
     }
 
@@ -159,15 +169,23 @@ impl SecretStore {
             // `for_decrypt` exists to support `decrypt_rekey` fallback paths.
             // Avoid paying the full current KDF cost or risking an allocation
             // failure here because this placeholder key is never used for
-            // actual ciphertext decryption.
+            // actual ciphertext decryption. `mode` guards the direct
+            // encrypt/decrypt methods so this placeholder key cannot be used.
             key: Zeroizing::new([0u8; PASSWORD_DERIVED_KEY_LEN]),
             salt: sentinel_salt,
             write_version: SecretEnvelopeVersion::current(),
+            mode: SecretStoreMode::DecryptOnly,
         }
     }
 
     /// Encrypt a plaintext string, returning the current `enc:v2:...` format.
     pub fn encrypt(&self, plaintext: &str) -> Result<String, SecretError> {
+        if self.mode == SecretStoreMode::DecryptOnly {
+            return Err(SecretError::EncryptionFailed(
+                "decrypt-only secret store cannot encrypt".to_string(),
+            ));
+        }
+
         let mut nonce_bytes = [0u8; NONCE_LEN];
         getrandom::fill(&mut nonce_bytes).map_err(|e| SecretError::RandomFailure(e.to_string()))?;
         let nonce = Nonce::from_slice(&nonce_bytes);
@@ -193,6 +211,10 @@ impl SecretStore {
     /// Decrypt a supported `enc:v1:` or `enc:v2:` string back to plaintext
     /// when it matches this store's current salt and write version.
     pub fn decrypt(&self, encrypted: &str) -> Result<String, SecretError> {
+        if self.mode == SecretStoreMode::DecryptOnly {
+            return Err(SecretError::DecryptionFailed);
+        }
+
         let parts = parse_encrypted(encrypted)?;
 
         if parts.version == self.write_version && parts.salt == self.salt {
@@ -567,6 +589,27 @@ mod tests {
         )
     }
 
+    fn encrypt_with_raw_key_and_salt(
+        version: SecretEnvelopeVersion,
+        key: &[u8; PASSWORD_DERIVED_KEY_LEN],
+        salt: &[u8; SALT_LEN],
+        plaintext: &str,
+    ) -> String {
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        getrandom::fill(&mut nonce_bytes).expect("random nonce");
+        let cipher = Aes256Gcm::new(key.into());
+        let ciphertext = cipher
+            .encrypt(Nonce::from_slice(&nonce_bytes), plaintext.as_bytes())
+            .expect("test encryption should succeed");
+        format!(
+            "{}{}:{}:{}",
+            version.prefix(),
+            BASE64.encode(nonce_bytes),
+            BASE64.encode(ciphertext),
+            BASE64.encode(salt)
+        )
+    }
+
     #[test]
     fn test_derive_key_deterministic() {
         let password = random_password();
@@ -721,6 +764,41 @@ mod tests {
         let encrypted = encrypt_with_version(SecretEnvelopeVersion::V1, &password, "hello-v1");
         let decrypted = store.decrypt_rekey(&encrypted, &password).unwrap();
         assert_eq!(decrypted, "hello-v1");
+    }
+
+    #[test]
+    fn test_for_decrypt_store_rejects_direct_encrypt_and_decrypt() {
+        let password = random_password();
+        let store = SecretStore::for_decrypt(&password);
+
+        let direct_encrypt = store.encrypt("hello");
+        assert!(matches!(
+            direct_encrypt,
+            Err(SecretError::EncryptionFailed(message))
+                if message.contains("decrypt-only")
+        ));
+
+        let crafted = encrypt_with_raw_key_and_salt(
+            SecretEnvelopeVersion::current(),
+            &[0u8; PASSWORD_DERIVED_KEY_LEN],
+            &store.salt,
+            "crafted",
+        );
+        assert_eq!(store.decrypt(&crafted), Err(SecretError::DecryptionFailed));
+    }
+
+    #[test]
+    fn test_decrypt_rejects_legacy_v1_on_current_v2_store_even_with_matching_salt() {
+        let password = random_password();
+        let encrypted = encrypt_with_version(SecretEnvelopeVersion::V1, &password, "hello-v1");
+        let parts = parse_encrypted(&encrypted).expect("parse v1 envelope");
+        let current_store =
+            SecretStore::from_password_and_salt(&password, &parts.salt).expect("current store");
+
+        assert_eq!(
+            current_store.decrypt(&encrypted),
+            Err(SecretError::DecryptionFailed)
+        );
     }
 
     #[test]
