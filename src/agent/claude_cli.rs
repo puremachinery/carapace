@@ -160,10 +160,16 @@ impl LlmProvider for ClaudeCliProvider {
         }
 
         // Write system prompt to a temp file to avoid exposing it in process
-        // arguments. The file is cleaned up after the process spawns.
+        // arguments. Uses a random suffix to prevent predictable-path attacks.
+        // Cleaned up after the child process exits (not after spawn, since the
+        // CLI needs time to read it).
         let system_prompt_path = if let Some(ref system) = request.system {
-            let path =
-                std::env::temp_dir().join(format!("carapace-sysprompt-{}.txt", std::process::id()));
+            let mut rng_bytes = [0u8; 8];
+            getrandom::fill(&mut rng_bytes).map_err(|e| {
+                AgentError::Provider(format!("failed to generate random temp file name: {e}"))
+            })?;
+            let path = std::env::temp_dir()
+                .join(format!("carapace-sysprompt-{}.txt", hex::encode(rng_bytes)));
             std::fs::write(&path, system.as_bytes()).map_err(|e| {
                 AgentError::Provider(format!("failed to write system prompt temp file: {e}"))
             })?;
@@ -190,11 +196,6 @@ impl LlmProvider for ClaudeCliProvider {
                 AgentError::Provider(format!("failed to spawn Claude CLI: {e}"))
             }
         })?;
-
-        // Clean up the system prompt temp file now that the CLI has read it.
-        if let Some(ref path) = system_prompt_path {
-            let _ = std::fs::remove_file(path);
-        }
 
         // Write prompt to stdin and close it so the CLI starts processing.
         if let Some(mut stdin) = child.stdin.take() {
@@ -280,6 +281,11 @@ impl LlmProvider for ClaudeCliProvider {
                         usage: TokenUsage::default(),
                     })
                     .await;
+            }
+
+            // Clean up system prompt temp file after the process exits.
+            if let Some(ref path) = system_prompt_path {
+                let _ = std::fs::remove_file(path);
             }
         });
 
