@@ -104,23 +104,27 @@ impl SecretEnvelopeVersion {
 ///
 /// The key is zeroized on drop to prevent leaking sensitive material.
 pub struct SecretStore {
-    /// The derived AES-256 key (32 bytes), wrapped in Zeroizing for secure cleanup
-    key: Zeroizing<[u8; PASSWORD_DERIVED_KEY_LEN]>,
+    /// Direct encrypt/decrypt access state for the current write key.
+    access: SecretStoreAccess,
     /// The salt used to derive the key (stored so encrypt can embed it)
     salt: [u8; SALT_LEN],
     /// The envelope version used for new writes.
     write_version: SecretEnvelopeVersion,
-    /// Whether this store may use its in-memory key for direct encrypt/decrypt.
-    mode: SecretStoreMode,
-    /// Deferred constructor error retained only for compatibility-preserving
-    /// infallible constructors.
-    init_error: Option<SecretError>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SecretStoreMode {
     Full,
     DecryptOnly,
+}
+
+#[derive(Debug, Clone)]
+enum SecretStoreAccess {
+    Ready {
+        key: Zeroizing<[u8; PASSWORD_DERIVED_KEY_LEN]>,
+        mode: SecretStoreMode,
+    },
+    InitFailed(SecretError),
 }
 
 impl SecretStore {
@@ -135,11 +139,12 @@ impl SecretStore {
                 .map_err(map_kdf_error)?,
         );
         Ok(Self {
-            key,
+            access: SecretStoreAccess::Ready {
+                key,
+                mode: SecretStoreMode::Full,
+            },
             salt,
             write_version,
-            mode: SecretStoreMode::Full,
-            init_error: None,
         })
     }
 
@@ -153,11 +158,9 @@ impl SecretStore {
         match Self::try_from_password_and_salt(password, salt) {
             Ok(store) => store,
             Err(err) => Self {
-                key: Zeroizing::new([0u8; PASSWORD_DERIVED_KEY_LEN]),
+                access: SecretStoreAccess::InitFailed(err),
                 salt: *salt,
                 write_version: SecretEnvelopeVersion::current(),
-                mode: SecretStoreMode::Full,
-                init_error: Some(err),
             },
         }
     }
@@ -175,11 +178,12 @@ impl SecretStore {
                 .map_err(map_kdf_error)?,
         );
         Ok(Self {
-            key,
+            access: SecretStoreAccess::Ready {
+                key,
+                mode: SecretStoreMode::Full,
+            },
             salt: *salt,
             write_version,
-            mode: SecretStoreMode::Full,
-            init_error: None,
         })
     }
 
@@ -196,30 +200,38 @@ impl SecretStore {
             // failure here because this placeholder key is never used for
             // actual ciphertext decryption. `mode` guards the direct
             // encrypt/decrypt methods so this placeholder key cannot be used.
-            key: Zeroizing::new([0u8; PASSWORD_DERIVED_KEY_LEN]),
+            access: SecretStoreAccess::Ready {
+                key: Zeroizing::new([0u8; PASSWORD_DERIVED_KEY_LEN]),
+                mode: SecretStoreMode::DecryptOnly,
+            },
             salt: sentinel_salt,
             write_version: SecretEnvelopeVersion::current(),
-            mode: SecretStoreMode::DecryptOnly,
-            init_error: None,
         }
     }
 
     /// Encrypt a plaintext string, returning the current `enc:v2:...` format.
     pub fn encrypt(&self, plaintext: &str) -> Result<String, SecretError> {
-        if let Some(err) = &self.init_error {
-            return Err(err.clone());
-        }
-        if self.mode == SecretStoreMode::DecryptOnly {
-            return Err(SecretError::EncryptionFailed(
-                "decrypt-only secret store cannot encrypt".to_string(),
-            ));
-        }
+        let key = match &self.access {
+            SecretStoreAccess::Ready {
+                key,
+                mode: SecretStoreMode::Full,
+            } => key,
+            SecretStoreAccess::Ready {
+                mode: SecretStoreMode::DecryptOnly,
+                ..
+            } => {
+                return Err(SecretError::EncryptionFailed(
+                    "decrypt-only secret store cannot encrypt".to_string(),
+                ));
+            }
+            SecretStoreAccess::InitFailed(err) => return Err(err.clone()),
+        };
 
         let mut nonce_bytes = [0u8; NONCE_LEN];
         getrandom::fill(&mut nonce_bytes).map_err(|e| SecretError::RandomFailure(e.to_string()))?;
         let nonce = Nonce::from_slice(&nonce_bytes);
 
-        let cipher = Aes256Gcm::new(self.key.as_ref().into());
+        let cipher = Aes256Gcm::new(key.as_ref().into());
         let ciphertext = cipher
             .encrypt(nonce, plaintext.as_bytes())
             .map_err(|e| SecretError::EncryptionFailed(e.to_string()))?;
@@ -239,18 +251,27 @@ impl SecretStore {
 
     /// Decrypt a supported `enc:v1:` or `enc:v2:` string back to plaintext
     /// when it matches this store's current salt and write version.
+    ///
+    /// This direct path fails closed with `DecryptionFailed` for version or
+    /// salt mismatches as well as wrong-password/corrupt-data cases; use
+    /// `decrypt_rekey()` for general-purpose mixed-version decryption.
     pub fn decrypt(&self, encrypted: &str) -> Result<String, SecretError> {
-        if let Some(err) = &self.init_error {
-            return Err(err.clone());
-        }
-        if self.mode == SecretStoreMode::DecryptOnly {
-            return Err(SecretError::DecryptionFailed);
-        }
+        let key = match &self.access {
+            SecretStoreAccess::Ready {
+                key,
+                mode: SecretStoreMode::Full,
+            } => key,
+            SecretStoreAccess::Ready {
+                mode: SecretStoreMode::DecryptOnly,
+                ..
+            } => return Err(SecretError::DecryptionFailed),
+            SecretStoreAccess::InitFailed(err) => return Err(err.clone()),
+        };
 
         let parts = parse_encrypted(encrypted)?;
 
         if parts.version == self.write_version && parts.salt == self.salt {
-            decrypt_with_key(&self.key, &parts.nonce, &parts.ciphertext)
+            decrypt_with_key(key, &parts.nonce, &parts.ciphertext)
         } else {
             Err(SecretError::DecryptionFailed)
         }
@@ -1224,6 +1245,23 @@ mod tests {
         let encrypted = store.encrypt("hello").unwrap();
         let decrypted = store.decrypt(&encrypted).unwrap();
         assert_eq!(decrypted, "hello");
+    }
+
+    #[test]
+    fn test_init_failed_store_surfaces_error_without_direct_key_state() {
+        let password = random_password();
+        let salt = random_salt();
+        let error = SecretError::KeyDerivationFailed("simulated init failure".to_string());
+        let store = SecretStore {
+            access: SecretStoreAccess::InitFailed(error.clone()),
+            salt,
+            write_version: SecretEnvelopeVersion::current(),
+        };
+
+        assert_eq!(store.encrypt("hello"), Err(error.clone()));
+
+        let encrypted = encrypt_with_version(SecretEnvelopeVersion::current(), &password, "hello");
+        assert_eq!(store.decrypt(&encrypted), Err(error));
     }
 
     #[test]
