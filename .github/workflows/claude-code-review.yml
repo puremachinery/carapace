@@ -67,7 +67,7 @@ jobs:
         id: claude-review
         if: steps.workflow-change.outputs.changed != 'true'
         continue-on-error: true
-        uses: anthropics/claude-code-action@58dbe8ed6879f0d3b02ac295b20d5fdfe7733e0c # v1
+        uses: anthropics/claude-code-action@0432df8bfe0572278dd19bca33be32cdc8061ebb # v1
         env:
           GH_TOKEN: ${{ github.token }}
         with:
