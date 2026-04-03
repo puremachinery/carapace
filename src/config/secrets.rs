@@ -151,22 +151,22 @@ impl SecretStore {
     /// Create a store for rekey-based decryption without random salt generation.
     ///
     /// Note: `decrypt()` will always fail for real ciphertexts because the
-    /// stored salt is a deterministic sentinel; use `decrypt_rekey()` for
-    /// actual decryption.
+    /// stored salt is a deterministic sentinel and the key is a dummy
+    /// placeholder; use `decrypt_rekey()` for actual decryption.
     pub fn for_decrypt(password: &[u8]) -> Self {
         let sentinel_salt = derive_decrypt_sentinel_salt(password);
         Self {
-            key: Zeroizing::new(
-                SecretEnvelopeVersion::current()
-                    .derive_key(password, &sentinel_salt)
-                    .expect("current secret envelope parameters must stay valid"),
-            ),
+            // `for_decrypt` exists to support `decrypt_rekey` fallback paths.
+            // Avoid paying the full current KDF cost or risking an allocation
+            // failure here because this placeholder key is never used for
+            // actual ciphertext decryption.
+            key: Zeroizing::new([0u8; PASSWORD_DERIVED_KEY_LEN]),
             salt: sentinel_salt,
             write_version: SecretEnvelopeVersion::current(),
         }
     }
 
-    /// Encrypt a plaintext string, returning the current `enc:vN:...` format.
+    /// Encrypt a plaintext string, returning the current `enc:v2:...` format.
     pub fn encrypt(&self, plaintext: &str) -> Result<String, SecretError> {
         let mut nonce_bytes = [0u8; NONCE_LEN];
         getrandom::fill(&mut nonce_bytes).map_err(|e| SecretError::RandomFailure(e.to_string()))?;
@@ -190,8 +190,8 @@ impl SecretStore {
         ))
     }
 
-    /// Decrypt an `enc:vN:...` formatted string back to plaintext when it
-    /// matches this store's current salt and write version.
+    /// Decrypt a supported `enc:v1:` or `enc:v2:` string back to plaintext
+    /// when it matches this store's current salt and write version.
     pub fn decrypt(&self, encrypted: &str) -> Result<String, SecretError> {
         let parts = parse_encrypted(encrypted)?;
 
@@ -228,20 +228,24 @@ pub(crate) struct EncryptedParts {
     pub(crate) salt: [u8; SALT_LEN],
 }
 
-/// Parse an `enc:vN:NONCE:CIPHERTEXT:SALT` string into its components.
+/// Parse a supported `enc:v1:NONCE:CIPHERTEXT:SALT` or
+/// `enc:v2:NONCE:CIPHERTEXT:SALT` string into its components.
 pub(crate) fn parse_encrypted(encrypted: &str) -> Result<EncryptedParts, SecretError> {
     let Some(version) = SecretEnvelopeVersion::parse_prefix(encrypted) else {
         let preview: String = encrypted.chars().take(10).collect();
-        return Err(SecretError::BadFormat(format!(
-            "expected versioned enc:vN prefix, got '{}'",
-            preview
-        )));
+        let message = if encrypted.starts_with("enc:v") {
+            format!(
+                "unsupported enc version; expected enc:v1 or enc:v2, got '{}'",
+                preview
+            )
+        } else {
+            format!("expected enc:v1 or enc:v2 prefix, got '{}'", preview)
+        };
+        return Err(SecretError::BadFormat(message));
     };
 
-    let rest = encrypted.strip_prefix(version.prefix()).ok_or_else(|| {
-        let preview: String = encrypted.chars().take(10).collect();
-        SecretError::BadFormat(format!("expected prefix, got '{}'", preview))
-    })?;
+    let prefix = version.prefix();
+    let rest = &encrypted[prefix.len()..];
 
     let segments: Vec<&str> = rest.splitn(3, ':').collect();
     if segments.len() != 3 {
@@ -414,7 +418,8 @@ fn scrub_encrypted_inner(config: &mut Value, depth: usize) {
     }
 }
 
-/// Walk a JSON value tree and decrypt all `enc:vN:` strings in-place.
+/// Walk a JSON value tree and decrypt all supported `enc:v1:` / `enc:v2:`
+/// strings in-place.
 ///
 /// Uses the password to re-derive keys from embedded salts so that values
 /// encrypted with different salts can all be resolved.
@@ -768,10 +773,14 @@ mod tests {
     }
 
     #[test]
-    fn test_bad_format_wrong_prefix() {
+    fn test_bad_format_unsupported_version() {
         let store = new_test_store();
         let result = store.decrypt("enc:v3:aaa:bbb:ccc");
-        assert!(matches!(result, Err(SecretError::BadFormat(_))));
+        assert!(matches!(
+            result,
+            Err(SecretError::BadFormat(message))
+                if message.contains("unsupported enc version")
+        ));
     }
 
     #[test]
@@ -1133,12 +1142,15 @@ mod tests {
 
     #[test]
     fn test_pbkdf2_known_vector() {
-        let key = derive_key_pbkdf2_sha256(b"password", b"salt");
+        let passphrase = sha2::Sha256::digest(b"carapace-secret-v1-kat-passphrase");
+        let salt = sha2::Sha256::digest(b"carapace-secret-v1-kat-salt");
         // Expected output generated independently via Python hashlib.pbkdf2_hmac:
-        // python3 -c 'import hashlib; print(hashlib.pbkdf2_hmac("sha256", b"password", b"salt", 600000, 32).hex())'
-        let expected = "669cfe52482116fda1aa2cbe409b2f56c8e4563752b7a28f6eaab614ee005178";
+        // python3 -c 'import hashlib; p=hashlib.sha256(b"carapace-secret-v1-kat-passphrase").digest(); s=hashlib.sha256(b"carapace-secret-v1-kat-salt").digest()[:16]; print(hashlib.pbkdf2_hmac("sha256", p, s, 600000, 32).hex())'
+        let expected = "fba539b769b63cfb5a65da14de9267f70c7fa022345df609c146231d5668f5a6";
+        let salt_bytes: &[u8; SALT_LEN] = (&salt[..SALT_LEN]).try_into().unwrap();
+        let key = derive_key_pbkdf2_sha256(passphrase.as_slice(), salt_bytes);
         assert_eq!(hex::encode(key), expected);
-        let key2 = derive_key_pbkdf2_sha256(b"password", b"salt");
+        let key2 = derive_key_pbkdf2_sha256(passphrase.as_slice(), salt_bytes);
         assert_eq!(key, key2, "PBKDF2 must be deterministic");
     }
 

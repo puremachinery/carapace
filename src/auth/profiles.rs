@@ -1300,9 +1300,9 @@ impl ProfileStore {
 
     /// Load profiles from disk. Replaces any in-memory data.
     ///
-    /// If a `SecretStore` is configured, encrypted token fields are decrypted
-    /// transparently. Plaintext values (no `enc:vN:` prefix) are left as-is
-    /// for backward compatibility.
+    /// If a `SecretStore` is configured, encrypted token fields using
+    /// supported `enc:v1:` / `enc:v2:` envelopes are decrypted transparently.
+    /// Plaintext values are left as-is for backward compatibility.
     pub fn load(&self) -> Result<(), AuthProfileError> {
         let _persist_guard = self.lock_persist();
         if !self.shared.state_path.exists() {
@@ -1424,8 +1424,9 @@ impl ProfileStore {
         })
     }
 
-    /// Encrypt sensitive token fields in-place.  Already-encrypted values
-    /// (prefixed with `enc:vN:`) are skipped to avoid double-encryption.
+    /// Encrypt sensitive token fields in-place. Already-encrypted values
+    /// using supported `enc:v1:` / `enc:v2:` envelopes are skipped to avoid
+    /// double-encryption.
     fn encrypt_tokens(
         tokens: &mut OAuthTokens,
         store: &SecretStore,
@@ -1483,7 +1484,8 @@ impl ProfileStore {
     }
 
     /// Decrypt sensitive token fields in-place. Plaintext values (no
-    /// `enc:vN:` prefix) are left as-is for backward compatibility.
+    /// supported `enc:v1:` / `enc:v2:` prefix) are left as-is for backward
+    /// compatibility.
     ///
     /// Uses `decrypt_rekey` so that values encrypted with a different salt
     /// (e.g. from a previous `SecretStore` instance) are still decryptable
