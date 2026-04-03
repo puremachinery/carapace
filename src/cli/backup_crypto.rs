@@ -121,9 +121,7 @@ pub fn encrypt_backup(
 
     let mut key = derive_key(FORMAT_VERSION, passphrase.as_bytes(), &salt)?;
 
-    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| {
-        BackupCryptoError::KeyDerivationFailed(format!("invalid AES-256 key: {}", e))
-    })?;
+    let cipher = Aes256Gcm::new((&key).into());
     let nonce = Nonce::from_slice(&nonce_bytes);
     let ciphertext = cipher
         .encrypt(nonce, plaintext.as_ref())
@@ -184,9 +182,7 @@ pub fn decrypt_backup(
 
     let mut key = derive_key(version, passphrase.as_bytes(), salt)?;
 
-    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| {
-        BackupCryptoError::KeyDerivationFailed(format!("invalid AES-256 key: {}", e))
-    })?;
+    let cipher = Aes256Gcm::new((&key).into());
     let nonce = Nonce::from_slice(nonce_bytes);
     let plaintext = cipher
         .decrypt(nonce, ciphertext)
@@ -290,9 +286,7 @@ mod tests {
             &salt,
             crate::crypto::LEGACY_PBKDF2_ITERATIONS,
         );
-        let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| {
-            BackupCryptoError::KeyDerivationFailed(format!("invalid AES-256 key: {}", e))
-        })?;
+        let cipher = Aes256Gcm::new((&key).into());
         let nonce = Nonce::from_slice(&nonce_bytes);
         let ciphertext = cipher
             .encrypt(nonce, plaintext)

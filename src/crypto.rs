@@ -16,11 +16,14 @@ pub(crate) const LEGACY_PBKDF2_ITERATIONS: u32 = 600_000;
 pub(crate) const ARGON2ID_V2_MEMORY_KIB: u32 = 64 * 1024;
 pub(crate) const ARGON2ID_V2_ITERATIONS: u32 = 3;
 pub(crate) const ARGON2ID_V2_LANES: u32 = 1;
+const ARGON2ID_MIN_SALT_LEN: usize = 8;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub(crate) enum PasswordKdfError {
     #[error("invalid Argon2 parameters: {0}")]
     InvalidParams(String),
+    #[error("invalid Argon2 salt length: expected at least {minimum}, got {got}")]
+    InvalidSaltLength { minimum: usize, got: usize },
     #[error("Argon2 derivation failed: {0}")]
     DerivationFailed(String),
 }
@@ -45,6 +48,13 @@ pub(crate) fn derive_key_argon2id(
     password: &[u8],
     salt: &[u8],
 ) -> Result<[u8; PASSWORD_DERIVED_KEY_LEN], PasswordKdfError> {
+    if salt.len() < ARGON2ID_MIN_SALT_LEN {
+        return Err(PasswordKdfError::InvalidSaltLength {
+            minimum: ARGON2ID_MIN_SALT_LEN,
+            got: salt.len(),
+        });
+    }
+
     let params = Params::new(
         ARGON2ID_V2_MEMORY_KIB,
         ARGON2ID_V2_ITERATIONS,
@@ -59,4 +69,21 @@ pub(crate) fn derive_key_argon2id(
         .hash_password_into(password, salt, &mut out)
         .map_err(|e| PasswordKdfError::DerivationFailed(e.to_string()))?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_derive_key_argon2id_rejects_short_salt() {
+        let err = derive_key_argon2id(b"password", b"short").unwrap_err();
+        assert_eq!(
+            err,
+            PasswordKdfError::InvalidSaltLength {
+                minimum: ARGON2ID_MIN_SALT_LEN,
+                got: 5,
+            }
+        );
+    }
 }

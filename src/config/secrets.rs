@@ -30,7 +30,7 @@ const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 12;
 
 /// Errors that can occur during secret encryption/decryption.
-#[derive(Error, Debug, PartialEq)]
+#[derive(Error, Debug, Clone, PartialEq)]
 pub enum SecretError {
     #[error("Invalid encrypted format: {0}")]
     BadFormat(String),
@@ -112,6 +112,9 @@ pub struct SecretStore {
     write_version: SecretEnvelopeVersion,
     /// Whether this store may use its in-memory key for direct encrypt/decrypt.
     mode: SecretStoreMode,
+    /// Deferred constructor error retained only for compatibility-preserving
+    /// infallible constructors.
+    init_error: Option<SecretError>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,11 +139,32 @@ impl SecretStore {
             salt,
             write_version,
             mode: SecretStoreMode::Full,
+            init_error: None,
         })
     }
 
     /// Create a `SecretStore` from an existing password and salt.
-    pub fn from_password_and_salt(
+    ///
+    /// This compatibility-preserving constructor never panics and never
+    /// returns `Result`. If current-key derivation fails, the returned store
+    /// retains the initialization error and surfaces it from `encrypt()` /
+    /// `decrypt()` rather than silently using a bogus key.
+    pub fn from_password_and_salt(password: &[u8], salt: &[u8; SALT_LEN]) -> Self {
+        match Self::try_from_password_and_salt(password, salt) {
+            Ok(store) => store,
+            Err(err) => Self {
+                key: Zeroizing::new([0u8; PASSWORD_DERIVED_KEY_LEN]),
+                salt: *salt,
+                write_version: SecretEnvelopeVersion::current(),
+                mode: SecretStoreMode::Full,
+                init_error: Some(err),
+            },
+        }
+    }
+
+    /// Create a `SecretStore` from an existing password and salt, returning
+    /// any current-key derivation failure eagerly.
+    pub fn try_from_password_and_salt(
         password: &[u8],
         salt: &[u8; SALT_LEN],
     ) -> Result<Self, SecretError> {
@@ -155,6 +179,7 @@ impl SecretStore {
             salt: *salt,
             write_version,
             mode: SecretStoreMode::Full,
+            init_error: None,
         })
     }
 
@@ -175,11 +200,15 @@ impl SecretStore {
             salt: sentinel_salt,
             write_version: SecretEnvelopeVersion::current(),
             mode: SecretStoreMode::DecryptOnly,
+            init_error: None,
         }
     }
 
     /// Encrypt a plaintext string, returning the current `enc:v2:...` format.
     pub fn encrypt(&self, plaintext: &str) -> Result<String, SecretError> {
+        if let Some(err) = &self.init_error {
+            return Err(err.clone());
+        }
         if self.mode == SecretStoreMode::DecryptOnly {
             return Err(SecretError::EncryptionFailed(
                 "decrypt-only secret store cannot encrypt".to_string(),
@@ -211,6 +240,9 @@ impl SecretStore {
     /// Decrypt a supported `enc:v1:` or `enc:v2:` string back to plaintext
     /// when it matches this store's current salt and write version.
     pub fn decrypt(&self, encrypted: &str) -> Result<String, SecretError> {
+        if let Some(err) = &self.init_error {
+            return Err(err.clone());
+        }
         if self.mode == SecretStoreMode::DecryptOnly {
             return Err(SecretError::DecryptionFailed);
         }
@@ -793,7 +825,7 @@ mod tests {
         let encrypted = encrypt_with_version(SecretEnvelopeVersion::V1, &password, "hello-v1");
         let parts = parse_encrypted(&encrypted).expect("parse v1 envelope");
         let current_store =
-            SecretStore::from_password_and_salt(&password, &parts.salt).expect("current store");
+            SecretStore::try_from_password_and_salt(&password, &parts.salt).expect("current store");
 
         assert_eq!(
             current_store.decrypt(&encrypted),
@@ -1178,7 +1210,17 @@ mod tests {
     fn test_from_password_and_salt() {
         let password = random_password();
         let salt = random_salt();
-        let store = SecretStore::from_password_and_salt(&password, &salt).unwrap();
+        let store = SecretStore::from_password_and_salt(&password, &salt);
+        let encrypted = store.encrypt("hello").unwrap();
+        let decrypted = store.decrypt(&encrypted).unwrap();
+        assert_eq!(decrypted, "hello");
+    }
+
+    #[test]
+    fn test_try_from_password_and_salt() {
+        let password = random_password();
+        let salt = random_salt();
+        let store = SecretStore::try_from_password_and_salt(&password, &salt).unwrap();
         let encrypted = store.encrypt("hello").unwrap();
         let decrypted = store.decrypt(&encrypted).unwrap();
         assert_eq!(decrypted, "hello");

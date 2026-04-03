@@ -28,7 +28,7 @@ Carapace is a Rust rewrite of OpenClaw built from the ground up to address these
 
 **Carapace:**
 - **OS credential stores.** Secrets are stored in macOS Keychain, Linux Secret Service, or Windows Credential Manager — not in filesystem-accessible files.
-- **AES-256-GCM fallback.** When OS keychains are unavailable (containers, CI), secrets are encrypted with AES-256-GCM using Argon2id for new writes (64 MiB, 3 iterations, 1 lane), while legacy PBKDF2-HMAC-SHA256 values remain decryptable for compatibility. Each value has its own random salt and nonce.
+- **AES-256-GCM fallback.** When OS keychains are unavailable (containers, CI), secrets are encrypted with AES-256-GCM using Argon2id for new writes (64 MiB, 3 iterations, 1 lane), while legacy PBKDF2-HMAC-SHA256 values remain decryptable for compatibility. Encrypted values include the store instance's random salt and a fresh random nonce per value.
 - **Zeroization.** Encryption keys and auth secrets are zeroized in memory after use via the `zeroize` crate.
 - An infostealer reading Carapace's state directory gets ciphertext and keychain references, not credentials.
 
