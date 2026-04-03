@@ -170,9 +170,21 @@ impl LlmProvider for ClaudeCliProvider {
             })?;
             let path = std::env::temp_dir()
                 .join(format!("carapace-sysprompt-{}.txt", hex::encode(rng_bytes)));
-            std::fs::write(&path, system.as_bytes()).map_err(|e| {
-                AgentError::Provider(format!("failed to write system prompt temp file: {e}"))
-            })?;
+            {
+                let mut options = std::fs::OpenOptions::new();
+                options.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600);
+                }
+                let mut file = options.open(&path).map_err(|e| {
+                    AgentError::Provider(format!("failed to create system prompt temp file: {e}"))
+                })?;
+                std::io::Write::write_all(&mut file, system.as_bytes()).map_err(|e| {
+                    AgentError::Provider(format!("failed to write system prompt temp file: {e}"))
+                })?;
+            }
             cmd.arg("--system-prompt-file").arg(&path);
             Some(path)
         } else {
