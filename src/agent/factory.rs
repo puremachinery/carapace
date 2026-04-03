@@ -724,6 +724,35 @@ pub fn build_providers(cfg: &Value) -> Result<Option<MultiProvider>, Box<dyn std
         None
     };
 
+    // Claude CLI backend — enabled via claudeCli.enabled config or CLAUDE_CLI_ENABLED env.
+    let claude_cli_provider = {
+        let enabled = cfg
+            .pointer("/claudeCli/enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+            || std::env::var("CLAUDE_CLI_ENABLED")
+                .ok()
+                .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+        if enabled {
+            let path = cfg
+                .pointer("/claudeCli/path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let max_turns = cfg
+                .pointer("/claudeCli/maxTurns")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(10) as u32;
+            let provider = agent::claude_cli::ClaudeCliProvider::new()
+                .with_binary_path(path)
+                .with_max_turns(max_turns);
+            info!("LLM provider configured: Claude CLI");
+            Some(Arc::new(provider) as Arc<dyn agent::LlmProvider>)
+        } else {
+            None
+        }
+    };
+
     // Build multi-provider dispatcher
     let multi_provider = MultiProvider::new(anthropic_provider, openai_provider)
         .with_codex(codex_provider)
@@ -731,7 +760,8 @@ pub fn build_providers(cfg: &Value) -> Result<Option<MultiProvider>, Box<dyn std
         .with_gemini(gemini_provider)
         .with_venice(venice_provider)
         .with_bedrock(bedrock)
-        .with_vertex(vertex_provider);
+        .with_vertex(vertex_provider)
+        .with_claude_cli(claude_cli_provider);
 
     if multi_provider.has_any_provider() {
         Ok(Some(multi_provider))
@@ -753,6 +783,7 @@ pub struct ProviderFingerprint {
     pub venice: Option<(String, Option<String>)>,
     pub bedrock: Option<String>,
     pub vertex: Option<(String, String, Option<String>)>,
+    pub claude_cli: Option<bool>,
 }
 
 /// Compute a fingerprint of the provider configuration from config + env vars.
@@ -905,6 +936,20 @@ pub fn fingerprint_providers(cfg: &Value) -> ProviderFingerprint {
                 vertex_config.model,
             )
         }),
+        claude_cli: {
+            let enabled = cfg
+                .pointer("/claudeCli/enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+                || std::env::var("CLAUDE_CLI_ENABLED")
+                    .ok()
+                    .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+            if enabled {
+                Some(true)
+            } else {
+                None
+            }
+        },
     }
 }
 

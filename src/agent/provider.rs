@@ -261,6 +261,7 @@ pub struct MultiProvider {
     bedrock: Option<std::sync::Arc<dyn LlmProvider>>,
     venice: Option<std::sync::Arc<dyn LlmProvider>>,
     vertex: Option<std::sync::Arc<dyn LlmProvider>>,
+    claude_cli: Option<std::sync::Arc<dyn LlmProvider>>,
 }
 
 impl std::fmt::Debug for MultiProvider {
@@ -274,6 +275,7 @@ impl std::fmt::Debug for MultiProvider {
             .field("bedrock", &self.bedrock.is_some())
             .field("venice", &self.venice.is_some())
             .field("vertex", &self.vertex.is_some())
+            .field("claude_cli", &self.claude_cli.is_some())
             .finish()
     }
 }
@@ -296,6 +298,7 @@ impl MultiProvider {
             bedrock: None,
             venice: None,
             vertex: None,
+            claude_cli: None,
         }
     }
 
@@ -335,6 +338,12 @@ impl MultiProvider {
         self
     }
 
+    /// Set the Claude CLI backend provider for local CLI-based inference.
+    pub fn with_claude_cli(mut self, claude_cli: Option<std::sync::Arc<dyn LlmProvider>>) -> Self {
+        self.claude_cli = claude_cli;
+        self
+    }
+
     /// Returns `true` if at least one provider is configured.
     pub fn has_any_provider(&self) -> bool {
         self.anthropic.is_some()
@@ -345,6 +354,7 @@ impl MultiProvider {
             || self.bedrock.is_some()
             || self.venice.is_some()
             || self.vertex.is_some()
+            || self.claude_cli.is_some()
     }
 
     fn normalize_model_for_routing<'a>(&self, model: &'a str) -> Cow<'a, str> {
@@ -371,7 +381,14 @@ impl MultiProvider {
         let normalized_model = self.normalize_model_for_routing(model);
         let model = normalized_model.as_ref();
 
-        if crate::agent::ollama::is_ollama_model(model) {
+        if crate::agent::claude_cli::is_claude_cli_model(model) {
+            self.claude_cli.as_deref().ok_or_else(|| {
+                AgentError::Provider(format!(
+                    "model \"{model}\" requires Claude CLI backend, but it is not configured; \
+                     set claudeCli.enabled: true in config or use cara setup --provider claude-cli"
+                ))
+            })
+        } else if crate::agent::ollama::is_ollama_model(model) {
             self.ollama.as_deref().ok_or_else(|| {
                 AgentError::Provider(format!(
                     "model \"{model}\" requires Ollama provider, but Ollama is not configured"
@@ -441,6 +458,12 @@ impl LlmProvider for MultiProvider {
             .normalize_model_for_routing(&request.model)
             .into_owned();
         let provider = self.select_provider(&request.model)?;
+
+        // Strip the claude-cli: or claude-cli/ prefix before forwarding.
+        if crate::agent::claude_cli::is_claude_cli_model(&request.model) {
+            request.model =
+                crate::agent::claude_cli::strip_claude_cli_prefix(&request.model).to_string();
+        }
 
         // Strip the ollama: or ollama/ prefix before forwarding to the provider,
         // so the Ollama server receives the bare model name (e.g. "llama3").
