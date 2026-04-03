@@ -58,7 +58,8 @@ pub enum BackupCryptoError {
     UnsupportedVersion(u8),
     DecryptionFailed,
     IoError(String),
-    KeyDerivationFailed,
+    RandomFailure(String),
+    KeyDerivationFailed(String),
 }
 
 impl fmt::Display for BackupCryptoError {
@@ -70,7 +71,8 @@ impl fmt::Display for BackupCryptoError {
                 write!(f, "decryption failed: wrong passphrase or corrupted data")
             }
             Self::IoError(msg) => write!(f, "I/O error: {}", msg),
-            Self::KeyDerivationFailed => write!(f, "key derivation failed"),
+            Self::RandomFailure(msg) => write!(f, "random number generation failed: {}", msg),
+            Self::KeyDerivationFailed(msg) => write!(f, "key derivation failed: {}", msg),
         }
     }
 }
@@ -93,7 +95,7 @@ fn derive_key(
     match version {
         FORMAT_VERSION_V1 => Ok(derive_key_pbkdf2_sha256(passphrase, salt)),
         FORMAT_VERSION_V2 => derive_key_argon2id(passphrase, salt)
-            .map_err(|_| BackupCryptoError::KeyDerivationFailed),
+            .map_err(|e| BackupCryptoError::KeyDerivationFailed(e.to_string())),
         other => Err(BackupCryptoError::UnsupportedVersion(other)),
     }
 }
@@ -113,13 +115,15 @@ pub fn encrypt_backup(
 
     let mut salt = [0u8; SALT_LEN];
     let mut nonce_bytes = [0u8; NONCE_LEN];
-    getrandom::fill(&mut salt).map_err(|_| BackupCryptoError::KeyDerivationFailed)?;
-    getrandom::fill(&mut nonce_bytes).map_err(|_| BackupCryptoError::KeyDerivationFailed)?;
+    getrandom::fill(&mut salt).map_err(|e| BackupCryptoError::RandomFailure(e.to_string()))?;
+    getrandom::fill(&mut nonce_bytes)
+        .map_err(|e| BackupCryptoError::RandomFailure(e.to_string()))?;
 
     let mut key = derive_key(FORMAT_VERSION, passphrase.as_bytes(), &salt)?;
 
-    let cipher =
-        Aes256Gcm::new_from_slice(&key).map_err(|_| BackupCryptoError::KeyDerivationFailed)?;
+    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| {
+        BackupCryptoError::KeyDerivationFailed(format!("invalid AES-256 key: {}", e))
+    })?;
     let nonce = Nonce::from_slice(&nonce_bytes);
     let ciphertext = cipher
         .encrypt(nonce, plaintext.as_ref())
@@ -180,8 +184,9 @@ pub fn decrypt_backup(
 
     let mut key = derive_key(version, passphrase.as_bytes(), salt)?;
 
-    let cipher =
-        Aes256Gcm::new_from_slice(&key).map_err(|_| BackupCryptoError::KeyDerivationFailed)?;
+    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| {
+        BackupCryptoError::KeyDerivationFailed(format!("invalid AES-256 key: {}", e))
+    })?;
     let nonce = Nonce::from_slice(nonce_bytes);
     let plaintext = cipher
         .decrypt(nonce, ciphertext)
@@ -280,12 +285,14 @@ mod tests {
 
         let mut salt = [0u8; SALT_LEN];
         let mut nonce_bytes = [0u8; NONCE_LEN];
-        getrandom::fill(&mut salt).map_err(|_| BackupCryptoError::KeyDerivationFailed)?;
-        getrandom::fill(&mut nonce_bytes).map_err(|_| BackupCryptoError::KeyDerivationFailed)?;
+        getrandom::fill(&mut salt).map_err(|e| BackupCryptoError::RandomFailure(e.to_string()))?;
+        getrandom::fill(&mut nonce_bytes)
+            .map_err(|e| BackupCryptoError::RandomFailure(e.to_string()))?;
 
         let mut key = derive_key(version, passphrase.as_bytes(), &salt)?;
-        let cipher =
-            Aes256Gcm::new_from_slice(&key).map_err(|_| BackupCryptoError::KeyDerivationFailed)?;
+        let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| {
+            BackupCryptoError::KeyDerivationFailed(format!("invalid AES-256 key: {}", e))
+        })?;
         let nonce = Nonce::from_slice(&nonce_bytes);
         let ciphertext = cipher
             .encrypt(nonce, plaintext.as_ref())
@@ -656,8 +663,12 @@ mod tests {
             "I/O error: disk full"
         );
         assert_eq!(
-            BackupCryptoError::KeyDerivationFailed.to_string(),
-            "key derivation failed"
+            BackupCryptoError::RandomFailure("rng".to_string()).to_string(),
+            "random number generation failed: rng"
+        );
+        assert_eq!(
+            BackupCryptoError::KeyDerivationFailed("oom".to_string()).to_string(),
+            "key derivation failed: oom"
         );
     }
 
