@@ -1002,17 +1002,31 @@ fn validate_agents(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schema
     }
 
     // Validate model uses provider:model syntax.
-    if let Some(model) = defaults.get("model").and_then(|v| v.as_str()) {
-        check_model_has_provider_prefix(model, ".agents.defaults.model", issues);
+    if let Some(model) = defaults.get("model") {
+        check_model_field(model, ".agents.defaults.model", issues);
     }
 
     // Validate per-agent models.
     if let Some(list) = agents.get("list").and_then(|v| v.as_array()) {
         for (i, entry) in list.iter().enumerate() {
-            if let Some(model) = entry.get("model").and_then(|v| v.as_str()) {
-                check_model_has_provider_prefix(model, &format!(".agents.list[{i}].model"), issues);
+            if let Some(model) = entry.get("model") {
+                check_model_field(model, &format!(".agents.list[{i}].model"), issues);
             }
         }
+    }
+}
+
+fn check_model_field(value: &Value, path: &str, issues: &mut Vec<SchemaIssue>) {
+    match value.as_str() {
+        Some(model) => check_model_has_provider_prefix(model, path, issues),
+        None => issues.push(SchemaIssue {
+            severity: Severity::Error,
+            path: path.to_string(),
+            message: format!(
+                "`{path}` must be a string using the provider:model format \
+                 (e.g. `anthropic:claude-sonnet-4-20250514`)"
+            ),
+        }),
     }
 }
 

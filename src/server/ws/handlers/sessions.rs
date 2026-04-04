@@ -2021,6 +2021,13 @@ pub(super) fn handle_agent(
         if let Some(m) = model {
             config.model = m.to_string();
         }
+        if config.model.trim().is_empty() {
+            return Err(error_shape(
+                ERROR_UNAVAILABLE,
+                "no model configured; set `agents.defaults.model` in config or provide a `model` parameter",
+                None,
+            ));
+        }
         config.system = params
             .and_then(|v| v.get("system"))
             .and_then(|v| v.as_str())

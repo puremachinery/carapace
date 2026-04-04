@@ -31,8 +31,8 @@ pub(crate) fn prefix_bare_model(model: &str) -> String {
             "codex" => return format!("codex:{rest}"),
             "venice" => return format!("venice:{rest}"),
             "claude-cli" => return format!("claude-cli:{rest}"),
-            "models" if lower.starts_with("models/gemini-") => {
-                return format!("gemini:{}", &model[7..]);
+            "models" if rest.to_ascii_lowercase().starts_with("gemini-") => {
+                return format!("gemini:{rest}");
             }
             _ => {} // Not a known provider/ form, fall through to bare-name checks
         }

@@ -1319,6 +1319,15 @@ async fn dispatch_agent_run(
         if let Some(m) = validated.model.clone() {
             config.model = m;
         }
+        if config.model.trim().is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(AgentResponse::error(
+                    "no model configured; set `agents.defaults.model` in config or provide a model in the request",
+                )),
+            )
+                .into_response());
+        }
         config.deliver = validated.deliver;
         config.extra = validated.venice_parameters.clone();
         crate::agent::spawn_run(
