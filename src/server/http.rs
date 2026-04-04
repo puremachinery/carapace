@@ -1287,6 +1287,23 @@ async fn dispatch_agent_run(
             .into_response()
     })?;
 
+    // Validate model before registering the run to avoid orphan entries.
+    let cfg = crate::config::load_config().unwrap_or(Value::Object(serde_json::Map::new()));
+    let mut config = crate::agent::AgentConfig::default();
+    crate::agent::apply_agent_config_from_settings(&mut config, &cfg, None);
+    if let Some(m) = validated.model.clone() {
+        config.model = m;
+    }
+    if config.model.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(AgentResponse::error(
+                "no model configured; set `agents.defaults.model` in config or provide a model in the request",
+            )),
+        )
+            .into_response());
+    }
+
     // Register the agent run
     let cancel_token = tokio_util::sync::CancellationToken::new();
     let run = crate::server::ws::AgentRun {
@@ -1313,21 +1330,6 @@ async fn dispatch_agent_run(
 
     // Spawn agent executor if LLM provider is configured
     if let Some(provider) = ws.llm_provider() {
-        let cfg = crate::config::load_config().unwrap_or(Value::Object(serde_json::Map::new()));
-        let mut config = crate::agent::AgentConfig::default();
-        crate::agent::apply_agent_config_from_settings(&mut config, &cfg, None);
-        if let Some(m) = validated.model.clone() {
-            config.model = m;
-        }
-        if config.model.trim().is_empty() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(AgentResponse::error(
-                    "no model configured; set `agents.defaults.model` in config or provide a model in the request",
-                )),
-            )
-                .into_response());
-        }
         config.deliver = validated.deliver;
         config.extra = validated.venice_parameters.clone();
         crate::agent::spawn_run(
@@ -2743,6 +2745,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_hooks_mapping_agent_dispatches_real_run() {
+        let (temp, _guard) = set_temp_config_path();
+        std::fs::write(
+            temp.path().join("carapace-test-config.json5"),
+            r#"{ agents: { defaults: { model: "anthropic:test-model" } } }"#,
+        )
+        .unwrap();
         let (ws_state, _tmp) = make_test_ws_state();
         let hook_registry = Arc::new(HookRegistry::new());
         let mut mapping = HookMapping::new("agent-map")

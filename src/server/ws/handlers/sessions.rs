@@ -2003,6 +2003,24 @@ pub(super) fn handle_agent(
             None,
         )
     })?;
+    // Validate model before creating the session/run to avoid orphan registrations.
+    let model_param = params.and_then(|v| v.get("model")).and_then(|v| v.as_str());
+    let mut config = crate::agent::AgentConfig::default();
+    let agent_id = params
+        .and_then(|v| v.get("agentId"))
+        .and_then(|v| v.as_str());
+    crate::agent::apply_agent_config_from_settings(&mut config, &cfg, agent_id);
+    if let Some(m) = model_param {
+        config.model = m.to_string();
+    }
+    if config.model.trim().is_empty() {
+        return Err(error_shape(
+            ERROR_UNAVAILABLE,
+            "no model configured; set `agents.defaults.model` in config or provide a `model` parameter",
+            None,
+        ));
+    }
+
     let (run_id, session_key_out, cancel_token) = setup_agent_session(
         &state,
         session,
@@ -2012,22 +2030,6 @@ pub(super) fn handle_agent(
 
     // Spawn the agent executor if an LLM provider is configured
     let status = if let Some(provider) = state.llm_provider() {
-        let model = params.and_then(|v| v.get("model")).and_then(|v| v.as_str());
-        let mut config = crate::agent::AgentConfig::default();
-        let agent_id = params
-            .and_then(|v| v.get("agentId"))
-            .and_then(|v| v.as_str());
-        crate::agent::apply_agent_config_from_settings(&mut config, &cfg, agent_id);
-        if let Some(m) = model {
-            config.model = m.to_string();
-        }
-        if config.model.trim().is_empty() {
-            return Err(error_shape(
-                ERROR_UNAVAILABLE,
-                "no model configured; set `agents.defaults.model` in config or provide a `model` parameter",
-                None,
-            ));
-        }
         config.system = params
             .and_then(|v| v.get("system"))
             .and_then(|v| v.as_str())

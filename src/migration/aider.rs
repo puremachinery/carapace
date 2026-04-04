@@ -269,11 +269,13 @@ mod tests {
     }
 
     #[test]
-    fn remap_model_bare_o1_o3() {
+    fn remap_model_bare_o_families() {
         assert_eq!(remap_model_id("o1"), "openai:o1");
         assert_eq!(remap_model_id("o1-preview"), "openai:o1-preview");
         assert_eq!(remap_model_id("o3"), "openai:o3");
         assert_eq!(remap_model_id("o3-mini"), "openai:o3-mini");
+        assert_eq!(remap_model_id("o4"), "openai:o4");
+        assert_eq!(remap_model_id("o4-mini"), "openai:o4-mini");
     }
 
     #[test]
