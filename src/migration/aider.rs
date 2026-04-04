@@ -277,6 +277,14 @@ mod tests {
     }
 
     #[test]
+    fn remap_model_google_canonical_form() {
+        assert_eq!(
+            remap_model_id("models/gemini-2.0-flash"),
+            "gemini:gemini-2.0-flash"
+        );
+    }
+
+    #[test]
     fn remap_model_bedrock() {
         assert_eq!(
             remap_model_id("bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0"),

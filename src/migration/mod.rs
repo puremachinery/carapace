@@ -12,7 +12,7 @@ pub mod opencode;
 /// All well-known model families get the appropriate prefix:
 /// - `claude-*` → `anthropic:`
 /// - `gpt-*`, `o1*`, `o3*`, `o4*`, `chatgpt-*` → `openai:`
-/// - `gemini-*` → `gemini:`
+/// - `gemini-*`, `models/gemini-*` → `gemini:`
 ///
 /// Unrecognized models pass through unchanged.
 pub(crate) fn prefix_bare_model(model: &str) -> String {
@@ -31,6 +31,9 @@ pub(crate) fn prefix_bare_model(model: &str) -> String {
         format!("openai:{model}")
     } else if lower.starts_with("gemini-") {
         format!("gemini:{model}")
+    } else if lower.starts_with("models/gemini-") {
+        // Google canonical API form: models/gemini-2.0-flash → gemini:gemini-2.0-flash
+        format!("gemini:{}", &model[7..])
     } else {
         model.to_string()
     }
