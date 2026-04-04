@@ -13,6 +13,7 @@ pub mod opencode;
 /// - `claude-*` → `anthropic:`
 /// - `gpt-*`, `o1*`, `o3*`, `o4*`, `chatgpt-*` → `openai:`
 /// - `gemini-*`, `models/gemini-*` → `gemini:`
+/// - `anthropic.claude-*`, `amazon.titan-*`, `meta.llama*` → `bedrock:`
 ///
 /// Unrecognized models pass through unchanged.
 pub(crate) fn prefix_bare_model(model: &str) -> String {
@@ -34,6 +35,12 @@ pub(crate) fn prefix_bare_model(model: &str) -> String {
     } else if lower.starts_with("models/gemini-") {
         // Google canonical API form: models/gemini-2.0-flash → gemini:gemini-2.0-flash
         format!("gemini:{}", &model[7..])
+    } else if lower.starts_with("anthropic.claude-")
+        || lower.starts_with("amazon.titan-")
+        || lower.starts_with("meta.llama")
+    {
+        // Bedrock native model IDs
+        format!("bedrock:{model}")
     } else {
         model.to_string()
     }

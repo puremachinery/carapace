@@ -470,10 +470,20 @@ impl MultiProvider {
                          ollama:, codex:, venice:, claude-cli:"
                     )
                 }
-                _ => format!(
-                    "model \"{model}\" is missing a provider prefix; \
-                     use the provider:model format (e.g. `anthropic:{model}`)"
-                ),
+                _ => {
+                    let suggestion = crate::migration::prefix_bare_model(model);
+                    if suggestion != model {
+                        format!(
+                            "model \"{model}\" is missing a provider prefix; \
+                             use `{suggestion}` instead"
+                        )
+                    } else {
+                        format!(
+                            "model \"{model}\" is missing a provider prefix; \
+                             use the provider:model format (e.g. `anthropic:{model}`)"
+                        )
+                    }
+                }
             };
             Err(AgentError::Provider(hint))
         }
@@ -711,10 +721,14 @@ mod tests {
             Ok(_) => panic!("expected error"),
         };
         // The colon is embedded in the version suffix, not a provider prefix.
-        // Error should suggest adding a provider prefix, not claim unrecognized prefix.
+        // Error should suggest bedrock: prefix, not anthropic:.
         assert!(
             msg.contains("missing a provider prefix"),
             "Bedrock native ID should get missing-prefix hint: {msg}"
+        );
+        assert!(
+            msg.contains("bedrock:"),
+            "hint should suggest bedrock: prefix: {msg}"
         );
     }
 
