@@ -1956,7 +1956,7 @@ features:
     runtime_wiring:
       - "src/agent/codex.rs::complete (OpenAI-compatible streaming with stored OpenAI auth-profile tokens)"
       - "src/agent/codex.rs::with_oauth_profile (OpenAI auth-profile runtime auth)"
-      - "src/agent/provider.rs (explicit codex: / codex/ routing + prefix stripping)"
+      - "src/agent/provider.rs (explicit codex: routing + prefix stripping)"
       - "src/agent/factory.rs (Codex auth-profile resolution + MultiProvider wiring)"
     tests:
       - "src/agent/codex.rs::test_is_codex_model"

@@ -717,31 +717,20 @@ fn parse_stop_reason(reason: &str) -> StopReason {
 
 /// Determine whether a model identifier should route to the Bedrock provider.
 ///
-/// Matches models with the `bedrock:` or `bedrock/` prefix, as well as native
-/// Bedrock model ID patterns like `anthropic.claude-*`, `amazon.titan-*`, and
-/// `meta.llama*`.
+/// Requires the canonical `bedrock:` prefix (e.g. `bedrock:anthropic.claude-3-sonnet`).
 pub fn is_bedrock_model(model: &str) -> bool {
-    let lower = model.to_lowercase();
-    lower.starts_with("bedrock:")
-        || lower.starts_with("bedrock/")
-        || lower.starts_with("anthropic.claude-")
-        || lower.starts_with("amazon.titan-")
-        || lower.starts_with("meta.llama")
+    model.len() > 8
+        && model.as_bytes()[..7].eq_ignore_ascii_case(b"bedrock")
+        && model.as_bytes()[7] == b':'
 }
 
-/// Strip the `bedrock:` or `bedrock/` prefix from a model identifier.
+/// Strip the `bedrock:` prefix from a model identifier.
 ///
-/// Returns the bare model ID suitable for passing to the Bedrock API.
-/// If the model doesn't have the prefix, it is returned unchanged.
+/// Returns the bare model ID suitable for passing to the Bedrock API
+/// (e.g. `anthropic.claude-3-sonnet-20240229-v1:0`).
 pub fn strip_bedrock_prefix(model: &str) -> &str {
-    if let Some(rest) = model.strip_prefix("bedrock:") {
-        rest
-    } else if let Some(rest) = model.strip_prefix("bedrock/") {
-        rest
-    } else if let Some(rest) = model.strip_prefix("Bedrock:") {
-        rest
-    } else if let Some(rest) = model.strip_prefix("Bedrock/") {
-        rest
+    if is_bedrock_model(model) {
+        &model[8..]
     } else {
         model
     }
@@ -1490,36 +1479,27 @@ mod tests {
     }
 
     #[test]
-    fn test_is_bedrock_model_slash_prefix() {
-        assert!(is_bedrock_model("bedrock/anthropic.claude-3-sonnet"));
-        assert!(is_bedrock_model("bedrock/meta.llama3-70b-instruct-v1:0"));
+    fn test_is_bedrock_model_slash_prefix_no_longer_accepted() {
+        assert!(!is_bedrock_model("bedrock/anthropic.claude-3-sonnet"));
+        assert!(!is_bedrock_model("bedrock/meta.llama3-70b-instruct-v1:0"));
     }
 
     #[test]
-    fn test_is_bedrock_model_anthropic_pattern() {
-        assert!(is_bedrock_model("anthropic.claude-3-sonnet-20240229-v1:0"));
-        assert!(is_bedrock_model("anthropic.claude-3-haiku-20240307-v1:0"));
-        assert!(is_bedrock_model("anthropic.claude-v2"));
-    }
-
-    #[test]
-    fn test_is_bedrock_model_amazon_titan_pattern() {
-        assert!(is_bedrock_model("amazon.titan-text-express-v1"));
-        assert!(is_bedrock_model("amazon.titan-text-lite-v1"));
-    }
-
-    #[test]
-    fn test_is_bedrock_model_meta_llama_pattern() {
-        assert!(is_bedrock_model("meta.llama3-70b-instruct-v1:0"));
-        assert!(is_bedrock_model("meta.llama2-13b-chat-v1"));
+    fn test_is_bedrock_model_colon_prefix_case_insensitive() {
+        assert!(is_bedrock_model("bedrock:anthropic.claude-3-sonnet"));
+        assert!(is_bedrock_model("Bedrock:anthropic.claude-3-sonnet"));
+        assert!(is_bedrock_model("BEDROCK:amazon.titan-text-express-v1"));
     }
 
     #[test]
     fn test_is_not_bedrock_model() {
+        assert!(!is_bedrock_model("anthropic.claude-3-sonnet-20240229-v1:0")); // bare native ID no longer matches
+        assert!(!is_bedrock_model("amazon.titan-text-express-v1")); // bare native ID no longer matches
+        assert!(!is_bedrock_model("meta.llama3-70b-instruct-v1:0")); // bare native ID no longer matches
+        assert!(!is_bedrock_model("bedrock/anthropic.claude-3-sonnet")); // slash no longer accepted
         assert!(!is_bedrock_model("gpt-4o"));
         assert!(!is_bedrock_model("claude-sonnet-4-20250514"));
         assert!(!is_bedrock_model("ollama:llama3"));
-        assert!(!is_bedrock_model("o1-preview"));
     }
 
     #[test]
@@ -1531,23 +1511,12 @@ mod tests {
     }
 
     #[test]
-    fn test_strip_bedrock_prefix_slash() {
-        assert_eq!(
-            strip_bedrock_prefix("bedrock/anthropic.claude-3-sonnet"),
-            "anthropic.claude-3-sonnet"
-        );
-    }
-
-    #[test]
     fn test_strip_bedrock_prefix_case_variants() {
         assert_eq!(
             strip_bedrock_prefix("Bedrock:anthropic.claude-3-sonnet"),
             "anthropic.claude-3-sonnet"
         );
-        assert_eq!(
-            strip_bedrock_prefix("Bedrock/anthropic.claude-3-sonnet"),
-            "anthropic.claude-3-sonnet"
-        );
+        assert_eq!(strip_bedrock_prefix("BEDROCK:meta.llama3"), "meta.llama3");
     }
 
     #[test]

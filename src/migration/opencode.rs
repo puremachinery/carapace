@@ -203,8 +203,8 @@ pub fn remap_model_id(opencode_model: &str) -> String {
         return format!("bedrock:{rest}");
     }
 
-    // Most OpenCode model IDs are bare and match Carapace's format directly.
-    opencode_model.to_string()
+    // Bare well-known model families need a provider prefix for Carapace routing.
+    crate::migration::prefix_bare_model(opencode_model)
 }
 
 #[cfg(test)]
@@ -230,14 +230,14 @@ mod tests {
 
     #[test]
     fn remap_model_gpt() {
-        assert_eq!(remap_model_id("gpt-4o"), "gpt-4o");
+        assert_eq!(remap_model_id("gpt-4o"), "openai:gpt-4o");
     }
 
     #[test]
     fn remap_model_gemini() {
         assert_eq!(
             remap_model_id("gemini-2.5-pro-preview"),
-            "gemini-2.5-pro-preview"
+            "gemini:gemini-2.5-pro-preview"
         );
     }
 

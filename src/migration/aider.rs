@@ -246,8 +246,8 @@ pub fn remap_model_id(aider_model: &str) -> String {
         return format!("ollama:{rest}");
     }
     // openrouter/, azure/, groq/ prefixes have no Carapace equivalent — pass through.
-    // Bare model names (claude-*, gpt-*, gemini-*) work as-is.
-    aider_model.to_string()
+    // Bare well-known model families need a provider prefix for Carapace routing.
+    crate::migration::prefix_bare_model(aider_model)
 }
 
 #[cfg(test)]
@@ -265,7 +265,7 @@ mod tests {
 
     #[test]
     fn remap_model_bare_gpt() {
-        assert_eq!(remap_model_id("gpt-4o"), "gpt-4o");
+        assert_eq!(remap_model_id("gpt-4o"), "openai:gpt-4o");
     }
 
     #[test]

@@ -398,13 +398,13 @@ fn map_provider_name(name: &str, base_url: &str, auth: &str) -> ProviderMapping 
 
 /// Remap an OpenClaw model ID (provider/model format) to Carapace's prefix:model format.
 pub fn remap_model_id(openclaw_model: &str) -> String {
-    // OpenClaw uses "provider/model" format.
+    // OpenClaw uses "provider/model" format; Carapace uses "provider:model".
     if let Some((provider, model)) = openclaw_model.split_once('/') {
         let provider_lower = provider.to_lowercase();
         match provider_lower.as_str() {
-            "anthropic" => model.to_string(), // Anthropic models are bare in Carapace
-            "openai" => model.to_string(),    // OpenAI models are bare
-            "google" | "gemini" => model.to_string(), // Gemini models are bare
+            "anthropic" => model.to_string(), // Anthropic is the default — bare is fine
+            "openai" => format!("openai:{model}"),
+            "google" | "gemini" => format!("gemini:{model}"),
             "bedrock" => format!("bedrock:{model}"),
             "vertex" => format!("vertex:{model}"),
             "ollama" => format!("ollama:{model}"),
@@ -412,7 +412,7 @@ pub fn remap_model_id(openclaw_model: &str) -> String {
             _ => openclaw_model.to_string(), // Unknown provider, keep as-is
         }
     } else {
-        // No provider prefix — pass through as-is (already bare).
+        // No provider prefix — pass through as-is (bare Anthropic models).
         openclaw_model.to_string()
     }
 }
@@ -526,7 +526,19 @@ mod tests {
 
     #[test]
     fn remap_model_openai() {
-        assert_eq!(remap_model_id("openai/gpt-4o"), "gpt-4o");
+        assert_eq!(remap_model_id("openai/gpt-4o"), "openai:gpt-4o");
+    }
+
+    #[test]
+    fn remap_model_gemini() {
+        assert_eq!(
+            remap_model_id("gemini/gemini-2.0-flash"),
+            "gemini:gemini-2.0-flash"
+        );
+        assert_eq!(
+            remap_model_id("google/gemini-2.5-pro"),
+            "gemini:gemini-2.5-pro"
+        );
     }
 
     #[test]

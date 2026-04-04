@@ -153,13 +153,9 @@ This block shapes how smart your AI behaves and what limits apply during executi
     - `identity.description`: String. Short summary shown in UIs or listings.
     - `identity.avatar`: String. Workspace-relative path or `http(s)` / `data:` URI used as the agent avatar.
     - `model`: String. The exact LLM name used by this agent, determining both the underlying model and the provider.
-      - **Provider Routing:** Explicit routing syntax is provider-specific, not universal. Current examples include `vertex:model` and `vertex/model`, `bedrock:model` and `bedrock/model`, `ollama:model` and `ollama/model`, `codex:model` and `codex/model`, `venice:model`, plus Gemini-specific forms like `gemini/model` and `models/gemini-*`. OpenAI and Anthropic currently route via bare model-name matching rather than explicit `openai:` or `anthropic:` prefixes.
-      - **Implicit Fallbacks:** If no explicit prefix is present, the system routes based on the model name:
-        - `gemini-*` routes to Gemini (or Vertex AI if Gemini is not configured).
-        - `gpt-*`, `o1`, `o1-*`, `o3`, `o3-*`, and `chatgpt-*` route to OpenAI.
-        - `anthropic.claude-*`, `amazon.titan-*`, `meta.llama*` route to Bedrock.
-        - `claude-*` and all unrecognized models default to Anthropic.
-        - If the exact system default model (`claude-sonnet-4-20250514`) is requested and Anthropic is not configured, it will fall back to Vertex AI (`vertex:default`).
+      - **Provider Routing:** All providers use canonical `provider:model` colon syntax: `anthropic:model`, `openai:model`, `gemini:model`, `vertex:model`, `bedrock:model`, `ollama:model`, `codex:model`, `venice:model`, `claude-cli:model`.
+      - **Anthropic Default:** Models without a recognized provider prefix default to Anthropic. Bare `claude-sonnet-4-20250514` routes to Anthropic without requiring the `anthropic:` prefix.
+        - If the system default model is requested and Anthropic is not configured, it falls back to Vertex AI (`vertex:default`).
     - `system`: String. The system prompt or core identity instructions for this agent.
     - `maxTurns`: Integer. Maximum LLM round-trips allowed per single user request. (Default: `25`)
     - `maxTokens`: Integer. Maximum output tokens the LLM is permitted to generate in one response. (Default: `8192`)

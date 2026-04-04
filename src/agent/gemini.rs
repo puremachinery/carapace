@@ -335,7 +335,6 @@ impl LlmProvider for GeminiProvider {
         }
         let body = self.build_body(&request);
 
-        // Strip any prefix (gemini/, models/) to get the bare model name for the URL
         let model_name = strip_gemini_prefix(&request.model);
         let url = format!(
             "{}/v1beta/models/{}:streamGenerateContent?alt=sse",
@@ -638,25 +637,21 @@ fn collect_gemini_part_events(parts: &[Value]) -> Vec<StreamEvent> {
 }
 
 /// Determine whether a model identifier should route to the Gemini provider.
+///
+/// Requires the canonical `gemini:` prefix (e.g. `gemini:gemini-2.0-flash`).
 pub fn is_gemini_model(model: &str) -> bool {
-    let lower = model.to_lowercase();
-    lower.starts_with("gemini-")
-        || lower.starts_with("gemini/")
-        || lower.starts_with("models/gemini-")
+    model.len() > 7
+        && model.as_bytes()[..6].eq_ignore_ascii_case(b"gemini")
+        && model.as_bytes()[6] == b':'
 }
 
-/// Strip the `gemini/` or `models/gemini-` prefix from a model name.
+/// Strip the `gemini:` prefix from a model name.
 ///
-/// Returns the bare model name suitable for passing to the Gemini API.
-/// The API expects model names like `gemini-2.0-flash` (without `models/` prefix).
-/// If the model doesn't have a prefix, it is returned unchanged.
+/// Returns the bare model name suitable for passing to the Gemini API
+/// (e.g. `gemini-2.0-flash`).
 pub fn strip_gemini_prefix(model: &str) -> &str {
-    if let Some(rest) = model.strip_prefix("gemini/") {
-        rest
-    } else if let Some(rest) = model.strip_prefix("Gemini/") {
-        rest
-    } else if let Some(rest) = model.strip_prefix("models/") {
-        rest
+    if is_gemini_model(model) {
+        &model[7..]
     } else {
         model
     }
@@ -1513,35 +1508,25 @@ mod tests {
 
     #[test]
     fn test_is_gemini_model() {
-        assert!(is_gemini_model("gemini-2.0-flash"));
-        assert!(is_gemini_model("gemini-1.5-pro"));
-        assert!(is_gemini_model("gemini-1.5-flash"));
-        assert!(is_gemini_model("Gemini-2.0-flash")); // case insensitive
-        assert!(is_gemini_model("GEMINI-2.0-FLASH")); // case insensitive
+        assert!(is_gemini_model("gemini:gemini-2.0-flash"));
+        assert!(is_gemini_model("gemini:gemini-1.5-pro"));
+        assert!(is_gemini_model("Gemini:gemini-2.0-flash")); // case insensitive
+        assert!(is_gemini_model("GEMINI:gemini-2.0-flash")); // case insensitive
 
-        assert!(is_gemini_model("gemini/gemini-2.0-flash"));
-        assert!(is_gemini_model("models/gemini-2.0-flash"));
-
+        assert!(!is_gemini_model("gemini-2.0-flash")); // bare name no longer matches
+        assert!(!is_gemini_model("gemini/gemini-2.0-flash")); // slash no longer accepted
+        assert!(!is_gemini_model("models/gemini-2.0-flash")); // models/ no longer accepted
         assert!(!is_gemini_model("gpt-4o"));
         assert!(!is_gemini_model("claude-sonnet-4-20250514"));
-        assert!(!is_gemini_model("some-other-model"));
         assert!(!is_gemini_model("ollama:llama3"));
     }
 
     // ==================== strip_gemini_prefix tests ====================
 
     #[test]
-    fn test_strip_gemini_slash_prefix() {
+    fn test_strip_gemini_colon_prefix() {
         assert_eq!(
-            strip_gemini_prefix("gemini/gemini-2.0-flash"),
-            "gemini-2.0-flash"
-        );
-    }
-
-    #[test]
-    fn test_strip_models_prefix() {
-        assert_eq!(
-            strip_gemini_prefix("models/gemini-2.0-flash"),
+            strip_gemini_prefix("gemini:gemini-2.0-flash"),
             "gemini-2.0-flash"
         );
     }
@@ -1554,7 +1539,7 @@ mod tests {
     #[test]
     fn test_strip_case_variant() {
         assert_eq!(
-            strip_gemini_prefix("Gemini/gemini-2.0-flash"),
+            strip_gemini_prefix("Gemini:gemini-2.0-flash"),
             "gemini-2.0-flash"
         );
     }

@@ -155,23 +155,23 @@ impl LlmProvider for CodexProvider {
     }
 }
 
+/// Determine whether a model identifier should route to the Codex provider.
+///
+/// Requires the canonical `codex:` prefix (e.g. `codex:gpt-5.4`).
 pub fn is_codex_model(model: &str) -> bool {
-    codex_model_suffix(model).is_some()
+    model.len() > 6
+        && model.as_bytes()[..5].eq_ignore_ascii_case(b"codex")
+        && model.as_bytes()[5] == b':'
 }
 
+/// Strip the `codex:` prefix from a model identifier.
+///
+/// Returns the bare model name for the underlying provider (e.g. `gpt-5.4`).
 pub fn strip_codex_prefix(model: &str) -> &str {
-    codex_model_suffix(model).unwrap_or(model)
-}
-
-fn codex_model_suffix(model: &str) -> Option<&str> {
-    let bytes = model.as_bytes();
-    if bytes.len() <= 6 {
-        return None;
-    }
-    if bytes[..5].eq_ignore_ascii_case(b"codex") && matches!(bytes[5], b':' | b'/') {
-        Some(&model[6..])
+    if is_codex_model(model) {
+        &model[6..]
     } else {
-        None
+        model
     }
 }
 
@@ -225,9 +225,10 @@ mod tests {
     #[test]
     fn test_is_codex_model() {
         assert!(is_codex_model("codex:gpt-5.4"));
-        assert!(is_codex_model("codex/default"));
+        assert!(is_codex_model("codex:default"));
         assert!(is_codex_model("Codex:gpt-5.4"));
-        assert!(is_codex_model("CODEX/GPT-5.4"));
+        assert!(is_codex_model("CODEX:GPT-5.4"));
+        assert!(!is_codex_model("codex/default")); // slash no longer accepted
         assert!(!is_codex_model("gpt-5.4"));
         assert!(!is_codex_model("openai:gpt-5.4"));
     }
@@ -235,9 +236,9 @@ mod tests {
     #[test]
     fn test_strip_codex_prefix() {
         assert_eq!(strip_codex_prefix("codex:gpt-5.4"), "gpt-5.4");
-        assert_eq!(strip_codex_prefix("codex/default"), "default");
+        assert_eq!(strip_codex_prefix("codex:default"), "default");
         assert_eq!(strip_codex_prefix("Codex:gpt-5.4"), "gpt-5.4");
-        assert_eq!(strip_codex_prefix("CODEX/GPT-5.4"), "GPT-5.4");
+        assert_eq!(strip_codex_prefix("CODEX:GPT-5.4"), "GPT-5.4");
         assert_eq!(strip_codex_prefix("gpt-5.4"), "gpt-5.4");
     }
 

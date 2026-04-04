@@ -124,7 +124,7 @@ mod tests {
                 project_id: "my-project".to_string(),
                 location: "us-central1".to_string(),
                 route: VertexModelRoute::Explicit,
-                model: Some("vertex/google/gemini-1.5-pro".to_string()),
+                model: Some("vertex:google/gemini-1.5-pro".to_string()),
             },
         )
         .expect("explicit Vertex route should serialize");
@@ -172,7 +172,7 @@ mod tests {
             "gemini-2.5-flash"
         );
         assert_eq!(
-            normalize_vertex_model_id("vertex/google/gemini-1.5-pro"),
+            normalize_vertex_model_id("vertex:google/gemini-1.5-pro"),
             "google/gemini-1.5-pro"
         );
         assert_eq!(

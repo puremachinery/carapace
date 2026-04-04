@@ -3121,7 +3121,7 @@ mod tests {
         std::fs::write(
             &config_path,
             r#"{
-                agents: { defaults: { model: "gemini-2.0-flash" } },
+                agents: { defaults: { model: "gemini:gemini-2.0-flash" } },
                 google: { apiKey: "AIza-test-key", baseUrl: "https://proxy.example.com" }
             }"#,
         )

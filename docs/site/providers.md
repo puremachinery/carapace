@@ -148,13 +148,9 @@ Supported env vars:
 
 Carapace automatically routes your requests to the correct AI provider based on the `model` string configured in your agent (see [agent.model](../protocol/config-reference.md)).
 
-- **Explicit Provider Prefixes**: You can force routing to a specific provider by using the explicit forms that provider currently supports. Examples: `vertex:gemini-2.5-pro` and `vertex/gemini-2.5-flash`, `bedrock:anthropic.claude-3-sonnet` and `bedrock/anthropic.claude-3-sonnet`, `ollama:llama3` and `ollama/llama3`, `codex:gpt-5.4` and `codex/gpt-5.4`, `venice:llama-3.3-70b`, plus Gemini-specific forms like `gemini/gemini-2.5-flash` and `models/gemini-2.5-flash`. OpenAI and Anthropic currently do not have explicit provider prefixes; they route via bare model-name matching and fallback behavior.
-- **Implicit Fallbacks**: If you don't use a prefix, Carapace maps the bare model name:
-  - `gemini-*` routes to Gemini (or Vertex AI if Gemini is not configured).
-  - `gpt-*`, `o1`, `o1-*`, `o3`, `o3-*`, and `chatgpt-*` route to OpenAI.
-  - `anthropic.claude-*`, `amazon.titan-*`, `meta.llama*` route to Bedrock.
-  - `claude-*` and all other unrecognized models default to Anthropic.
-  - If the exact system default model (`claude-sonnet-4-20250514`) is requested and Anthropic is not configured, it will fall back to Vertex AI (`vertex:default`).
+- **Canonical Provider Prefix**: All providers use the same `provider:model` colon syntax: `anthropic:claude-sonnet-4-20250514`, `openai:gpt-4o`, `gemini:gemini-2.0-flash`, `vertex:gemini-2.5-flash`, `bedrock:anthropic.claude-3-sonnet`, `ollama:llama3`, `codex:gpt-5.4`, `venice:llama-3.3-70b`, `claude-cli:opus`.
+- **Anthropic Default**: Models without any recognized provider prefix default to Anthropic. Bare `claude-sonnet-4-20250514` routes to Anthropic without needing the `anthropic:` prefix.
+  - If the system default model is requested and Anthropic is not configured, it will fall back to Vertex AI (`vertex:default`).
 
 Here is an example `carapace.json5` snippet locking agents onto specific providers using prefixes:
 

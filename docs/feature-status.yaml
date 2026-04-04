@@ -20,7 +20,7 @@ feature_inventory_markdown: |
 
   - [x] **Anthropic provider** — streaming, tool use, cancellation (`anthropic.rs`)
   - [x] **OpenAI provider** — streaming, tool use, cancellation (`openai.rs`)
-  - [x] **Codex provider** — OpenAI auth-profile runtime via explicit `codex:` / `codex/` routing (`codex.rs`)
+  - [x] **Codex provider** — OpenAI auth-profile runtime via explicit `codex:` routing (`codex.rs`)
   - [x] **Ollama provider** — streaming, tool use, cancellation (`ollama.rs`)
   - [x] **Gemini provider** — streaming, tool use, cancellation, API key or Google auth-profile runtime (`gemini.rs`)
   - [x] **Bedrock provider** — SigV4 signing, tool use, streaming via emitted events (`bedrock.rs`) wired via `factory.rs`

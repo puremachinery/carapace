@@ -96,9 +96,9 @@ impl SetupProvider {
         match self {
             Self::Anthropic => "claude-sonnet-4-20250514",
             Self::Codex => "codex:default",
-            Self::OpenAi => "gpt-4o",
+            Self::OpenAi => "openai:gpt-4o",
             Self::Ollama => "ollama:llama3",
-            Self::Gemini => "gemini-2.0-flash",
+            Self::Gemini => "gemini:gemini-2.0-flash",
             Self::Vertex => "vertex:default",
             Self::Venice => "venice:llama-3.3-70b",
             Self::Bedrock => "bedrock:anthropic.claude-3-5-sonnet-20240620-v1:0",
@@ -1467,10 +1467,9 @@ fn model_provider_for_local_chat(model: &str) -> Option<SetupProvider> {
         Some(SetupProvider::OpenAi)
     } else if agent::bedrock::is_bedrock_model(model) {
         Some(SetupProvider::Bedrock)
-    } else if model.trim_start().starts_with("claude") {
-        Some(SetupProvider::Anthropic)
     } else {
-        None
+        // Anthropic is the default — explicit `anthropic:` prefix or bare model IDs.
+        Some(SetupProvider::Anthropic)
     }
 }
 
@@ -2061,7 +2060,7 @@ mod tests {
             .unwrap();
 
         let cfg = json!({
-            "agents": { "defaults": { "model": "gemini-2.0-flash" } },
+            "agents": { "defaults": { "model": "gemini:gemini-2.0-flash" } },
             "auth": { "profiles": { "enabled": true } },
             "google": { "authProfile": "google-123" }
         });
@@ -2219,7 +2218,7 @@ mod tests {
     fn test_assess_provider_setup_marks_skipped_live_validation_as_partial() {
         let temp = TempDir::new().unwrap();
         let cfg = json!({
-            "agents": { "defaults": { "model": "gpt-4o" } },
+            "agents": { "defaults": { "model": "openai:gpt-4o" } },
             "openai": { "apiKey": "sk-test-value" }
         });
 
@@ -2235,7 +2234,7 @@ mod tests {
     fn test_assess_provider_setup_keeps_failed_validation_invalid() {
         let temp = TempDir::new().unwrap();
         let cfg = json!({
-            "agents": { "defaults": { "model": "gpt-4o" } },
+            "agents": { "defaults": { "model": "openai:gpt-4o" } },
             "openai": { "apiKey": "sk-test-value" }
         });
 
@@ -2265,7 +2264,7 @@ mod tests {
     fn test_assess_provider_setup_does_not_duplicate_skipped_validation() {
         let temp = TempDir::new().unwrap();
         let cfg = json!({
-            "agents": { "defaults": { "model": "gpt-4o" } },
+            "agents": { "defaults": { "model": "openai:gpt-4o" } },
             "openai": { "apiKey": "sk-test-value" }
         });
 
@@ -2322,7 +2321,7 @@ mod tests {
     }
 
     #[test]
-    fn test_assess_provider_setup_reports_unknown_model_route() {
+    fn test_assess_provider_setup_reports_mismatched_model_route() {
         let temp = TempDir::new().unwrap();
         let cfg = json!({
             "agents": { "defaults": { "model": "mistral:mixtral" } },
@@ -2335,7 +2334,7 @@ mod tests {
         assert!(assessment.checks.iter().any(|check| {
             check.name == "Default model route"
                 && check.status == SetupCheckStatus::Fail
-                && check.detail.contains("unrecognized provider route")
+                && check.detail.contains("routes to Anthropic")
         }));
     }
 

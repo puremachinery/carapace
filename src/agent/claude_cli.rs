@@ -104,11 +104,13 @@ pub fn is_enabled(cfg: &serde_json::Value) -> bool {
 }
 
 /// Check whether a model ID should be routed to the Claude CLI provider.
+///
+/// Matches `claude-cli` (bare, uses CLI default) or `claude-cli:model`.
 pub fn is_claude_cli_model(model: &str) -> bool {
-    model.starts_with("claude-cli:") || model.starts_with("claude-cli/") || model == "claude-cli"
+    model == "claude-cli" || model.starts_with("claude-cli:")
 }
 
-/// Strip the `claude-cli:` or `claude-cli/` prefix from a model ID.
+/// Strip the `claude-cli:` prefix from a model ID.
 ///
 /// If the model is bare `claude-cli` or `claude-cli:default`, returns an
 /// empty string to let the CLI use its own default model.
@@ -117,8 +119,6 @@ pub fn strip_claude_cli_prefix(model: &str) -> &str {
         return "";
     }
     if let Some(rest) = model.strip_prefix("claude-cli:") {
-        rest
-    } else if let Some(rest) = model.strip_prefix("claude-cli/") {
         rest
     } else {
         model
@@ -367,14 +367,13 @@ mod tests {
     fn is_claude_cli_model_matches() {
         assert!(is_claude_cli_model("claude-cli:default"));
         assert!(is_claude_cli_model("claude-cli:opus"));
-        assert!(is_claude_cli_model("claude-cli/sonnet"));
         assert!(is_claude_cli_model("claude-cli"));
     }
 
     #[test]
     fn is_claude_cli_model_rejects() {
         assert!(!is_claude_cli_model("claude-sonnet-4-20250514"));
-        assert!(!is_claude_cli_model("anthropic/claude-3"));
+        assert!(!is_claude_cli_model("claude-cli/sonnet")); // slash no longer accepted
         assert!(!is_claude_cli_model("ollama:llama3"));
     }
 
@@ -387,7 +386,6 @@ mod tests {
     #[test]
     fn strip_prefix_specific_model() {
         assert_eq!(strip_claude_cli_prefix("claude-cli:opus"), "opus");
-        assert_eq!(strip_claude_cli_prefix("claude-cli/sonnet"), "sonnet");
         assert_eq!(
             strip_claude_cli_prefix("claude-cli:claude-sonnet-4-20250514"),
             "claude-sonnet-4-20250514"

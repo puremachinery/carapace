@@ -606,14 +606,23 @@ async fn flush_tool_calls_and_stop(
 }
 
 /// Determine whether a model identifier should route to the OpenAI provider.
+///
+/// Requires the canonical `openai:` prefix (e.g. `openai:gpt-4o`).
 pub fn is_openai_model(model: &str) -> bool {
-    let lower = model.to_lowercase();
-    lower.starts_with("gpt-")
-        || lower.starts_with("o1-")
-        || lower.starts_with("o3-")
-        || lower.starts_with("o1")
-        || lower.starts_with("o3")
-        || lower.starts_with("chatgpt-")
+    model.len() > 7
+        && model.as_bytes()[..7].eq_ignore_ascii_case(b"openai:")
+        && model.as_bytes()[6] == b':'
+}
+
+/// Strip the `openai:` prefix from a model identifier.
+///
+/// Returns the bare model name for the OpenAI API (e.g. `gpt-4o`).
+pub fn strip_openai_prefix(model: &str) -> &str {
+    if is_openai_model(model) {
+        &model[7..]
+    } else {
+        model
+    }
 }
 
 #[cfg(test)]
@@ -1258,17 +1267,22 @@ mod tests {
 
     #[test]
     fn test_is_openai_model() {
-        assert!(is_openai_model("gpt-4o"));
-        assert!(is_openai_model("gpt-4-turbo"));
-        assert!(is_openai_model("gpt-3.5-turbo"));
-        assert!(is_openai_model("GPT-4o")); // case insensitive
-        assert!(is_openai_model("o1-preview"));
-        assert!(is_openai_model("o1-mini"));
-        assert!(is_openai_model("o3-mini"));
-        assert!(is_openai_model("chatgpt-4o-latest"));
+        assert!(is_openai_model("openai:gpt-4o"));
+        assert!(is_openai_model("openai:gpt-4-turbo"));
+        assert!(is_openai_model("openai:o1-preview"));
+        assert!(is_openai_model("OpenAI:gpt-4o")); // case insensitive
+        assert!(is_openai_model("OPENAI:chatgpt-4o-latest"));
 
+        assert!(!is_openai_model("gpt-4o")); // bare model names no longer match
+        assert!(!is_openai_model("o1-preview"));
         assert!(!is_openai_model("claude-sonnet-4-20250514"));
-        assert!(!is_openai_model("claude-3-opus"));
         assert!(!is_openai_model("some-other-model"));
+    }
+
+    #[test]
+    fn test_strip_openai_prefix() {
+        assert_eq!(strip_openai_prefix("openai:gpt-4o"), "gpt-4o");
+        assert_eq!(strip_openai_prefix("OpenAI:o1-preview"), "o1-preview");
+        assert_eq!(strip_openai_prefix("gpt-4o"), "gpt-4o"); // no prefix
     }
 }

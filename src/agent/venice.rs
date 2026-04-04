@@ -62,20 +62,19 @@ impl LlmProvider for VeniceProvider {
 
 /// Determine whether a model identifier should route to the Venice provider.
 ///
-/// Venice models use the `venice:` prefix (e.g. `venice:llama-3.3-70b`).
+/// Requires the canonical `venice:` prefix (e.g. `venice:llama-3.3-70b`).
 pub fn is_venice_model(model: &str) -> bool {
-    let lower = model.to_lowercase();
-    lower.starts_with("venice:")
+    model.len() > 7
+        && model.as_bytes()[..6].eq_ignore_ascii_case(b"venice")
+        && model.as_bytes()[6] == b':'
 }
 
 /// Strip the `venice:` prefix from a model identifier.
 ///
 /// Returns the bare model name for the Venice API (e.g. `llama-3.3-70b`).
 pub fn strip_venice_prefix(model: &str) -> &str {
-    if let Some(rest) = model.strip_prefix("venice:") {
-        rest
-    } else if let Some(rest) = model.strip_prefix("Venice:") {
-        rest
+    if is_venice_model(model) {
+        &model[7..]
     } else {
         model
     }
@@ -129,6 +128,12 @@ mod tests {
         assert!(!is_venice_model("gpt-4o"));
         assert!(!is_venice_model("claude-sonnet-4-20250514"));
         assert!(!is_venice_model("ollama:llama3"));
+    }
+
+    #[test]
+    fn test_is_venice_model_case_insensitive() {
+        assert!(is_venice_model("Venice:llama-3.3-70b"));
+        assert!(is_venice_model("VENICE:deepseek-r1"));
     }
 
     #[test]

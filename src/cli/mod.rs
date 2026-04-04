@@ -4027,9 +4027,9 @@ impl SetupProvider {
         match self {
             Self::Anthropic => "claude-sonnet-4-20250514",
             Self::Codex => "codex:default",
-            Self::OpenAi => "gpt-4o",
+            Self::OpenAi => "openai:gpt-4o",
             Self::Ollama => "ollama:llama3",
-            Self::Gemini => "gemini-2.0-flash",
+            Self::Gemini => "gemini:gemini-2.0-flash",
             Self::Vertex => "vertex:default",
             Self::Venice => "venice:llama-3.3-70b",
             Self::Bedrock => "bedrock:anthropic.claude-3-5-sonnet-20240620-v1:0",
@@ -4382,6 +4382,7 @@ fn local_chat_provider_route(model: &str) -> ModelProviderRoute {
     } else if crate::agent::bedrock::is_bedrock_model(model) {
         ModelProviderRoute::Bedrock
     } else {
+        // Anthropic is the default — handles `anthropic:model` and bare model IDs.
         ModelProviderRoute::Anthropic
     }
 }
@@ -11263,7 +11264,7 @@ mod tests {
     fn test_local_chat_verify_next_step_for_configured_provider() {
         let cfg = serde_json::json!({
             "openai": { "apiKey": "sk-openai-inline" },
-            "agents": { "defaults": { "model": "gpt-4o" } }
+            "agents": { "defaults": { "model": "openai:gpt-4o" } }
         });
         assert_eq!(
             local_chat_verify_next_step(&cfg),
@@ -11277,7 +11278,7 @@ mod tests {
         env_guard.set("OPENAI_API_KEY", "sk-openai-env");
         env_guard.unset("ANTHROPIC_API_KEY");
         let cfg = serde_json::json!({
-            "agents": { "defaults": { "model": "gpt-4o" } }
+            "agents": { "defaults": { "model": "openai:gpt-4o" } }
         });
         assert_eq!(
             local_chat_verify_next_step(&cfg),
@@ -11290,7 +11291,7 @@ mod tests {
         let cfg = serde_json::json!({
             "anthropic": { "apiKey": "sk-anthropic-inline" },
             "openai": { "apiKey": "sk-openai-inline" },
-            "agents": { "defaults": { "model": "gpt-4o" } }
+            "agents": { "defaults": { "model": "openai:gpt-4o" } }
         });
         assert_eq!(
             local_chat_verify_next_step(&cfg),
@@ -11319,7 +11320,7 @@ mod tests {
         env_guard.unset("VERTEX_LOCATION");
         env_guard.unset("VERTEX_MODEL");
         let cfg = serde_json::json!({
-            "agents": { "defaults": { "model": "gemini-2.0-flash" } }
+            "agents": { "defaults": { "model": "gemini:gemini-2.0-flash" } }
         });
         assert_eq!(
             local_chat_verify_next_step(&cfg),
@@ -11333,7 +11334,7 @@ mod tests {
         env_guard.unset("GOOGLE_API_KEY");
         let cfg = serde_json::json!({
             "google": { "apiKey": "${GOOGLE_API_KEY}" },
-            "agents": { "defaults": { "model": "gemini-2.0-flash" } }
+            "agents": { "defaults": { "model": "gemini:gemini-2.0-flash" } }
         });
         assert_eq!(
             local_chat_verify_next_step(&cfg),
@@ -11381,7 +11382,7 @@ mod tests {
                 "projectId": "my-project",
                 "location": "us-central1"
             },
-            "agents": { "defaults": { "model": "vertex/default" } }
+            "agents": { "defaults": { "model": "vertex:default" } }
         });
         assert_eq!(
             local_chat_verify_next_step(&cfg),
@@ -12119,7 +12120,10 @@ mod tests {
         let content = std::fs::read_to_string(&config_path).unwrap();
         let parsed: serde_json::Value = json5::from_str(&content).unwrap();
         assert_eq!(parsed["google"]["apiKey"], "${GOOGLE_API_KEY}");
-        assert_eq!(parsed["agents"]["defaults"]["model"], "gemini-2.0-flash");
+        assert_eq!(
+            parsed["agents"]["defaults"]["model"],
+            "gemini:gemini-2.0-flash"
+        );
     }
 
     #[test]
@@ -12317,7 +12321,10 @@ mod tests {
 
         assert!(result.observed_checks.is_empty());
         assert_eq!(config["google"]["apiKey"], "AIza-test-key");
-        assert_eq!(config["agents"]["defaults"]["model"], "gemini-2.0-flash");
+        assert_eq!(
+            config["agents"]["defaults"]["model"],
+            "gemini:gemini-2.0-flash"
+        );
         let state = setup_interactive_test_harness_snapshot().expect("harness snapshot");
         assert_eq!(state.provider_validation_calls, 0);
         assert!(state.visible_inputs.is_empty());
@@ -12619,7 +12626,7 @@ mod tests {
                 "my-project".to_string(),
                 "us-central1".to_string(),
                 "explicit-model".to_string(),
-                "vertex/google/gemini-1.5-pro".to_string(),
+                "vertex:google/gemini-1.5-pro".to_string(),
                 "n".to_string(),
             ]),
             ..Default::default()

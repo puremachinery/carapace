@@ -367,25 +367,20 @@ impl LlmProvider for OllamaProvider {
 
 /// Determine whether a model identifier should route to the Ollama provider.
 ///
-/// Models starting with `ollama:` or `ollama/` are routed to Ollama.
+/// Requires the canonical `ollama:` prefix (e.g. `ollama:llama3`).
 pub fn is_ollama_model(model: &str) -> bool {
-    let lower = model.to_lowercase();
-    lower.starts_with("ollama:") || lower.starts_with("ollama/")
+    model.len() > 7
+        && model.as_bytes()[..6].eq_ignore_ascii_case(b"ollama")
+        && model.as_bytes()[6] == b':'
 }
 
-/// Strip the `ollama:` or `ollama/` prefix from a model name.
+/// Strip the `ollama:` prefix from a model name.
 ///
-/// Returns the bare model name suitable for passing to the Ollama API.
-/// If the model doesn't have the prefix, it is returned unchanged.
+/// Returns the bare model name suitable for passing to the Ollama API
+/// (e.g. `llama3`).
 pub fn strip_ollama_prefix(model: &str) -> &str {
-    if let Some(rest) = model.strip_prefix("ollama:") {
-        rest
-    } else if let Some(rest) = model.strip_prefix("ollama/") {
-        rest
-    } else if let Some(rest) = model.strip_prefix("Ollama:") {
-        rest
-    } else if let Some(rest) = model.strip_prefix("Ollama/") {
-        rest
+    if is_ollama_model(model) {
+        &model[7..]
     } else {
         model
     }
@@ -407,18 +402,9 @@ mod tests {
     }
 
     #[test]
-    fn test_is_ollama_model_with_slash_prefix() {
-        assert!(is_ollama_model("ollama/llama3"));
-        assert!(is_ollama_model("ollama/codellama"));
-        assert!(is_ollama_model("ollama/mixtral:8x7b"));
-    }
-
-    #[test]
     fn test_is_ollama_model_case_insensitive() {
         assert!(is_ollama_model("Ollama:llama3"));
         assert!(is_ollama_model("OLLAMA:llama3"));
-        assert!(is_ollama_model("Ollama/llama3"));
-        assert!(is_ollama_model("OLLAMA/llama3"));
     }
 
     #[test]
@@ -427,6 +413,7 @@ mod tests {
         assert!(!is_ollama_model("claude-sonnet-4-20250514"));
         assert!(!is_ollama_model("llama3"));
         assert!(!is_ollama_model("mistral"));
+        assert!(!is_ollama_model("ollama/llama3")); // slash no longer accepted
     }
 
     // ==================== strip_ollama_prefix tests ====================
@@ -438,15 +425,9 @@ mod tests {
     }
 
     #[test]
-    fn test_strip_slash_prefix() {
-        assert_eq!(strip_ollama_prefix("ollama/llama3"), "llama3");
-        assert_eq!(strip_ollama_prefix("ollama/mixtral:8x7b"), "mixtral:8x7b");
-    }
-
-    #[test]
     fn test_strip_case_variants() {
         assert_eq!(strip_ollama_prefix("Ollama:llama3"), "llama3");
-        assert_eq!(strip_ollama_prefix("Ollama/llama3"), "llama3");
+        assert_eq!(strip_ollama_prefix("OLLAMA:llama3"), "llama3");
     }
 
     #[test]

@@ -477,6 +477,30 @@ fn handle_content_block_stop(
     }
 }
 
+/// Determine whether a model identifier should route to the Anthropic provider
+/// via explicit prefix.
+///
+/// Requires the canonical `anthropic:` prefix (e.g. `anthropic:claude-sonnet-4-20250514`).
+/// Models without any recognized provider prefix still fall through to Anthropic
+/// as the default in `MultiProvider::select_provider`.
+pub fn is_anthropic_model(model: &str) -> bool {
+    model.len() > 10
+        && model.as_bytes()[..9].eq_ignore_ascii_case(b"anthropic")
+        && model.as_bytes()[9] == b':'
+}
+
+/// Strip the `anthropic:` prefix from a model identifier.
+///
+/// Returns the bare model name for the Anthropic API
+/// (e.g. `claude-sonnet-4-20250514`).
+pub fn strip_anthropic_prefix(model: &str) -> &str {
+    if is_anthropic_model(model) {
+        &model[10..]
+    } else {
+        model
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
