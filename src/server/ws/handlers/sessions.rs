@@ -2401,7 +2401,21 @@ fn trigger_agent_if_enabled(
         return (None, "sent");
     }
 
-    // Create the agent run
+    // Check provider and model before creating the run to avoid orphan registrations.
+    let provider = match state.llm_provider() {
+        Some(p) => p,
+        None => return (None, "queued"),
+    };
+    let cfg = config::load_config().unwrap_or(Value::Object(serde_json::Map::new()));
+    let mut config = crate::agent::AgentConfig::default();
+    crate::agent::apply_agent_config_from_settings(&mut config, &cfg, None);
+    if config.model.trim().is_empty() {
+        tracing::warn!("agent auto-reply skipped: no model configured");
+        return (None, "queued");
+    }
+    config.deliver = true;
+
+    // Create and register the agent run
     let cancel_token = CancellationToken::new();
     let run = AgentRun {
         run_id: idempotency_key.to_string(),
@@ -2421,38 +2435,23 @@ fn trigger_agent_if_enabled(
     };
 
     let run_id = run.run_id.clone();
-
-    // Register the run in the agent_run_registry
     {
         let mut registry = state.agent_run_registry.lock();
         registry.register(run);
     }
 
-    // Spawn the agent executor if an LLM provider is configured
-    let status = if let Some(provider) = state.llm_provider() {
-        let cfg = config::load_config().unwrap_or(Value::Object(serde_json::Map::new()));
-        let mut config = crate::agent::AgentConfig::default();
-        crate::agent::apply_agent_config_from_settings(&mut config, &cfg, None);
-        if config.model.trim().is_empty() {
-            return (None, "queued");
-        }
-        config.deliver = true;
-        config.extra = extra;
-        crate::agent::spawn_run(
-            run_id.clone(),
-            session_key.to_string(),
-            config,
-            state.clone(),
-            provider,
-            cancel_token,
-        );
-        "accepted"
-    } else {
-        // No provider configured — run stays queued
-        "queued"
-    };
+    // Spawn the agent executor
+    config.extra = extra;
+    crate::agent::spawn_run(
+        run_id.clone(),
+        session_key.to_string(),
+        config,
+        state.clone(),
+        provider,
+        cancel_token,
+    );
 
-    (Some(run_id), status)
+    (Some(run_id), "accepted")
 }
 
 pub(super) fn handle_chat_send(

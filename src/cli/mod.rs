@@ -4519,11 +4519,25 @@ fn codex_provider_guidance(cfg: &Value) -> String {
 fn local_chat_verify_next_step(cfg: &Value) -> String {
     let model = local_chat_model(cfg);
     let Some(route) = local_chat_provider_route(&model) else {
-        return provider_route_fallback_guidance(
-            cfg,
-            &model,
-            Some("use the `provider:model` format (e.g. `anthropic:claude-sonnet-4-20250514`)"),
-        );
+        if model.is_empty() {
+            return "set `agents.defaults.model` to a provider:model value \
+                    (e.g. `anthropic:claude-sonnet-4-20250514`), then retry \
+                    `cara verify --outcome local-chat`"
+                .to_string();
+        }
+        let suggestion = crate::migration::prefix_bare_model(&model);
+        return if suggestion != model {
+            format!(
+                "`agents.defaults.model` = \"{model}\" needs a provider prefix; \
+                 use `{suggestion}` instead, then retry `cara verify --outcome local-chat`"
+            )
+        } else {
+            format!(
+                "`agents.defaults.model` = \"{model}\" uses an unrecognized provider; \
+                 configure a provider for the selected model, or rerun `cara setup --force`, \
+                 then retry `cara verify --outcome local-chat`"
+            )
+        };
     };
     match route {
         ModelProviderRoute::Anthropic => anthropic_provider_guidance(cfg),
@@ -11248,9 +11262,9 @@ mod tests {
         env_guard.unset("VERTEX_LOCATION");
         env_guard.unset("VERTEX_MODEL");
         let cfg = serde_json::json!({});
-        assert_eq!(
-            local_chat_verify_next_step(&cfg),
-            "configure a provider for the selected model, or rerun `cara setup --force`, then retry `cara verify --outcome local-chat`"
+        assert!(
+            local_chat_verify_next_step(&cfg).contains("set `agents.defaults.model`"),
+            "empty config should tell user to set agents.defaults.model"
         );
     }
 
