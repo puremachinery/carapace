@@ -459,18 +459,21 @@ impl MultiProvider {
                 ))
             })
         } else {
-            let hint = if !model.contains(':') {
-                format!(
-                    "model \"{model}\" is missing a provider prefix; \
-                     use the provider:model format (e.g. `anthropic:{model}`)"
-                )
-            } else {
-                let prefix = model.split_once(':').map(|(p, _)| p).unwrap_or(model);
-                format!(
+            // Longest known provider prefix is "claude-cli" (10 chars).
+            // If the part before the colon is longer than that, the colon is
+            // likely embedded in the model ID (e.g. Bedrock version suffix
+            // `anthropic.claude-3-sonnet-v1:0`) rather than a provider prefix.
+            const MAX_PROVIDER_LEN: usize = 10;
+            let hint = match model.split_once(':') {
+                Some((prefix, _)) if prefix.len() <= MAX_PROVIDER_LEN => format!(
                     "model \"{model}\" uses unrecognized provider prefix \"{prefix}:\"; \
                      known prefixes are anthropic:, openai:, gemini:, vertex:, bedrock:, \
                      ollama:, codex:, venice:, claude-cli:"
-                )
+                ),
+                _ => format!(
+                    "model \"{model}\" is missing a provider prefix; \
+                     use the provider:model format (e.g. `anthropic:{model}`)"
+                ),
             };
             Err(AgentError::Provider(hint))
         }
@@ -699,7 +702,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bare_bedrock_native_id_rejected_as_unrecognized_prefix() {
+    fn test_bare_bedrock_native_id_gets_missing_prefix_hint() {
         let provider = MultiProvider::new(None, None);
         let err = provider.select_provider("anthropic.claude-3-sonnet-20240229-v1:0");
         assert!(err.is_err());
@@ -707,9 +710,11 @@ mod tests {
             Err(e) => e.to_string(),
             Ok(_) => panic!("expected error"),
         };
+        // The colon is embedded in the version suffix, not a provider prefix.
+        // Error should suggest adding a provider prefix, not claim unrecognized prefix.
         assert!(
-            msg.contains("unrecognized provider prefix"),
-            "Bedrock native ID with colon should be rejected: {msg}"
+            msg.contains("missing a provider prefix"),
+            "Bedrock native ID should get missing-prefix hint: {msg}"
         );
     }
 

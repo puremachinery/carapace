@@ -1000,6 +1000,55 @@ fn validate_agents(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schema
     if let Some(v) = defaults.get("contextTokens") {
         check_positive_integer(v, ".agents.defaults.contextTokens", issues);
     }
+
+    // Validate model uses provider:model syntax.
+    if let Some(model) = defaults.get("model").and_then(|v| v.as_str()) {
+        check_model_has_provider_prefix(model, ".agents.defaults.model", issues);
+    }
+
+    // Validate per-agent models.
+    if let Some(list) = agents.get("list").and_then(|v| v.as_array()) {
+        for (i, entry) in list.iter().enumerate() {
+            if let Some(model) = entry.get("model").and_then(|v| v.as_str()) {
+                check_model_has_provider_prefix(model, &format!(".agents.list[{i}].model"), issues);
+            }
+        }
+    }
+}
+
+fn check_model_has_provider_prefix(model: &str, path: &str, issues: &mut Vec<SchemaIssue>) {
+    let model = model.trim();
+    if model.is_empty() {
+        return;
+    }
+    let has_known_prefix = crate::agent::anthropic::is_anthropic_model(model)
+        || crate::agent::openai::is_openai_model(model)
+        || crate::agent::gemini::is_gemini_model(model)
+        || crate::agent::vertex::is_vertex_model(model)
+        || crate::agent::bedrock::is_bedrock_model(model)
+        || crate::agent::ollama::is_ollama_model(model)
+        || crate::agent::codex::is_codex_model(model)
+        || crate::agent::venice::is_venice_model(model)
+        || crate::agent::claude_cli::is_claude_cli_model(model);
+    if !has_known_prefix {
+        let suggestion = crate::migration::prefix_bare_model(model);
+        let hint = if suggestion != model {
+            format!(
+                "`{path}` = \"{model}\" is missing a provider prefix; \
+                 use `{suggestion}` instead"
+            )
+        } else {
+            format!(
+                "`{path}` = \"{model}\" is missing a provider prefix; \
+                 use the provider:model format (e.g. `anthropic:{model}`)"
+            )
+        };
+        issues.push(SchemaIssue {
+            severity: Severity::Error,
+            path: path.to_string(),
+            message: hint,
+        });
+    }
 }
 
 fn validate_session(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIssue>) {
