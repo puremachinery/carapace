@@ -1031,6 +1031,16 @@ fn check_model_field(value: &Value, path: &str, issues: &mut Vec<SchemaIssue>) {
 }
 
 fn check_model_has_provider_prefix(model: &str, path: &str, issues: &mut Vec<SchemaIssue>) {
+    if model != model.trim() {
+        issues.push(SchemaIssue {
+            severity: Severity::Warning,
+            path: path.to_string(),
+            message: format!(
+                "`{path}` has leading or trailing whitespace; \
+                 remove whitespace to avoid routing errors"
+            ),
+        });
+    }
     let model = model.trim();
     if model.is_empty() {
         issues.push(SchemaIssue {
@@ -1074,8 +1084,7 @@ fn check_model_has_provider_prefix(model: &str, path: &str, issues: &mut Vec<Sch
                 "`{path}` = \"{model}\" is missing a provider prefix; \
                  use `{suggestion}` instead"
             )
-        } else if model.contains(':') && !model.split_once(':').unwrap().0.contains('.') {
-            let prefix = model.split_once(':').unwrap().0;
+        } else if let Some((prefix, _)) = model.split_once(':').filter(|(p, _)| !p.contains('.')) {
             format!(
                 "`{path}` = \"{model}\" uses unrecognized provider prefix \"{prefix}:\"; \
                  known prefixes are anthropic:, openai:, gemini:, vertex:, bedrock:, \

@@ -235,7 +235,8 @@ fn resolve_configured_model() -> String {
         .and_then(|cfg| {
             cfg.pointer("/agents/defaults/model")
                 .and_then(|v| v.as_str())
-                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
                 .map(|s| s.to_string())
         })
         .unwrap_or_default()
