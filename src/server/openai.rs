@@ -230,7 +230,7 @@ pub struct OpenAiState {
 /// Returns an empty string if no model is configured — `select_provider`
 /// will produce a clear "no model configured" error downstream.
 fn resolve_configured_model() -> String {
-    crate::config::load_config()
+    crate::config::load_config_shared()
         .ok()
         .and_then(|cfg| {
             cfg.pointer("/agents/defaults/model")

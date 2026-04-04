@@ -1030,6 +1030,21 @@ fn check_model_has_provider_prefix(model: &str, path: &str, issues: &mut Vec<Sch
         || crate::agent::codex::is_codex_model(model)
         || crate::agent::venice::is_venice_model(model)
         || crate::agent::claude_cli::is_claude_cli_model(model);
+    // Check for provider prefix with empty model name (e.g. "openai:" or "anthropic:")
+    if let Some((prefix, suffix)) = model.split_once(':') {
+        if suffix.is_empty() && !prefix.contains('.') {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: path.to_string(),
+                message: format!(
+                    "`{path}` = \"{model}\" has a provider prefix but no model name; \
+                     specify the model after the colon (e.g. `{prefix}:your-model`)"
+                ),
+            });
+            return;
+        }
+    }
+
     if !has_known_prefix {
         let suggestion = crate::migration::prefix_bare_model(model);
         let hint = if suggestion != model {

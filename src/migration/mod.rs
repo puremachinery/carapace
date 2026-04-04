@@ -34,7 +34,7 @@ pub(crate) fn prefix_bare_model(model: &str) -> String {
         format!("gemini:{model}")
     } else if lower.starts_with("models/gemini-") {
         // Google canonical API form: models/gemini-2.0-flash → gemini:gemini-2.0-flash
-        format!("gemini:{}", &model[7..])
+        format!("gemini:{}", &lower[7..])
     } else if lower.starts_with("anthropic.claude-")
         || lower.starts_with("amazon.titan-")
         || lower.starts_with("meta.llama")

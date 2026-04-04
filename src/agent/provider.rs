@@ -249,7 +249,7 @@ pub(crate) fn summarize_http_failure_body(body: &str) -> String {
 /// Strip the canonical `provider:` prefix from a model identifier.
 ///
 /// Checks each known provider prefix in turn and returns the bare model name.
-/// If no prefix matches, returns the input unchanged (Anthropic fallback models).
+/// If no known prefix matches, returns the input unchanged.
 pub(crate) fn strip_provider_prefix(model: &str) -> &str {
     if crate::agent::claude_cli::is_claude_cli_model(model) {
         crate::agent::claude_cli::strip_claude_cli_prefix(model)
@@ -395,6 +395,16 @@ impl MultiProvider {
                  (e.g. `anthropic:claude-sonnet-4-20250514`)"
                     .to_string(),
             ));
+        }
+
+        // Check for provider prefix with empty model name (e.g. "openai:" or "anthropic:")
+        if let Some((prefix, suffix)) = model.split_once(':') {
+            if suffix.is_empty() && !prefix.contains('.') {
+                return Err(AgentError::Provider(format!(
+                    "model \"{model}\" has a provider prefix but no model name; \
+                     specify the model after the colon (e.g. `{prefix}:your-model`)"
+                )));
+            }
         }
 
         if crate::agent::claude_cli::is_claude_cli_model(model) {
