@@ -9,15 +9,35 @@ pub mod opencode;
 
 /// Add a canonical provider prefix to a bare model name for Carapace routing.
 ///
-/// All well-known model families get the appropriate prefix:
-/// - `claude-*` → `anthropic:`
-/// - `gpt-*`, `o1*`, `o3*`, `o4*`, `chatgpt-*` → `openai:`
-/// - `gemini-*`, `models/gemini-*` → `gemini:`
-/// - `anthropic.claude-*`, `amazon.titan-*`, `meta.llama*` → `bedrock:`
+/// Handles:
+/// - Well-known model families: `claude-*` → `anthropic:`, `gpt-*`/`o1*`/`o3*`/`o4*`/`chatgpt-*` → `openai:`,
+///   `gemini-*`/`models/gemini-*` → `gemini:`, `anthropic.claude-*`/`amazon.titan-*`/`meta.llama*` → `bedrock:`
+/// - Deprecated slash forms: `provider/model` → `provider:model` for known providers
 ///
 /// Unrecognized models pass through unchanged.
 pub(crate) fn prefix_bare_model(model: &str) -> String {
     let lower = model.to_ascii_lowercase();
+
+    // Deprecated provider/model slash forms → provider:model
+    if let Some((provider, rest)) = model.split_once('/') {
+        let provider_lower = provider.to_lowercase();
+        match provider_lower.as_str() {
+            "anthropic" => return format!("anthropic:{rest}"),
+            "openai" => return format!("openai:{rest}"),
+            "gemini" | "google" => return format!("gemini:{rest}"),
+            "bedrock" => return format!("bedrock:{rest}"),
+            "vertex" => return format!("vertex:{rest}"),
+            "ollama" => return format!("ollama:{rest}"),
+            "codex" => return format!("codex:{rest}"),
+            "venice" => return format!("venice:{rest}"),
+            "models" if lower.starts_with("models/gemini-") => {
+                return format!("gemini:{}", &model[7..]);
+            }
+            _ => {} // Not a known provider/ form, fall through to bare-name checks
+        }
+    }
+
+    // Well-known bare model families
     if lower.starts_with("claude-") {
         format!("anthropic:{model}")
     } else if lower.starts_with("gpt-")
@@ -32,14 +52,10 @@ pub(crate) fn prefix_bare_model(model: &str) -> String {
         format!("openai:{model}")
     } else if lower.starts_with("gemini-") {
         format!("gemini:{model}")
-    } else if lower.starts_with("models/gemini-") {
-        // Google canonical API form: models/gemini-2.0-flash → gemini:gemini-2.0-flash
-        format!("gemini:{}", &lower[7..])
     } else if lower.starts_with("anthropic.claude-")
         || lower.starts_with("amazon.titan-")
         || lower.starts_with("meta.llama")
     {
-        // Bedrock native model IDs
         format!("bedrock:{model}")
     } else {
         model.to_string()

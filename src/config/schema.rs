@@ -1019,6 +1019,14 @@ fn validate_agents(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schema
 fn check_model_has_provider_prefix(model: &str, path: &str, issues: &mut Vec<SchemaIssue>) {
     let model = model.trim();
     if model.is_empty() {
+        issues.push(SchemaIssue {
+            severity: Severity::Error,
+            path: path.to_string(),
+            message: format!(
+                "`{path}` must not be empty; specify a model using the provider:model format \
+                 (e.g. `anthropic:claude-sonnet-4-20250514`)"
+            ),
+        });
         return;
     }
     let has_known_prefix = crate::agent::anthropic::is_anthropic_model(model)
