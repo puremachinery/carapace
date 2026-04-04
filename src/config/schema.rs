@@ -1080,10 +1080,12 @@ fn check_model_has_provider_prefix(model: &str, path: &str, issues: &mut Vec<Sch
     if !has_known_prefix {
         let suggestion = crate::migration::prefix_bare_model(model);
         let hint = if suggestion != model {
-            format!(
-                "`{path}` = \"{model}\" is missing a provider prefix; \
-                 use `{suggestion}` instead"
-            )
+            let verb = if model.contains('/') {
+                "uses deprecated slash syntax"
+            } else {
+                "is missing a provider prefix"
+            };
+            format!("`{path}` = \"{model}\" {verb}; use `{suggestion}` instead")
         } else if let Some((prefix, _)) = model.split_once(':').filter(|(p, _)| !p.contains('.')) {
             format!(
                 "`{path}` = \"{model}\" uses unrecognized provider prefix \"{prefix}:\"; \

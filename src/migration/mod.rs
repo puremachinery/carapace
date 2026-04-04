@@ -38,11 +38,18 @@ pub(crate) fn prefix_bare_model(model: &str) -> String {
         }
     }
 
+    // If it already has a provider:model colon form (no dots in prefix), don't double-prefix.
+    // Bedrock native IDs like anthropic.claude-v1:0 have dots before the colon and still
+    // need to be prefixed with bedrock:.
+    if let Some((prefix, _)) = model.split_once(':') {
+        if !prefix.contains('.') {
+            return model.to_string();
+        }
+    }
+
     // Well-known bare model families (claude-cli before claude- to avoid mismatch)
     if lower == "claude-cli" {
         "claude-cli:default".to_string()
-    } else if lower.starts_with("claude-cli:") {
-        model.to_string() // already prefixed
     } else if lower.starts_with("claude-") {
         format!("anthropic:{model}")
     } else if lower.starts_with("gpt-")

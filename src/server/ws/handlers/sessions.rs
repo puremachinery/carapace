@@ -2433,6 +2433,9 @@ fn trigger_agent_if_enabled(
         let cfg = config::load_config().unwrap_or(Value::Object(serde_json::Map::new()));
         let mut config = crate::agent::AgentConfig::default();
         crate::agent::apply_agent_config_from_settings(&mut config, &cfg, None);
+        if config.model.trim().is_empty() {
+            return (None, "queued");
+        }
         config.deliver = true;
         config.extra = extra;
         crate::agent::spawn_run(

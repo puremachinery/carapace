@@ -483,10 +483,12 @@ impl MultiProvider {
                 _ => {
                     let suggestion = crate::migration::prefix_bare_model(model);
                     if suggestion != model {
-                        format!(
-                            "model \"{model}\" is missing a provider prefix; \
-                             use `{suggestion}` instead"
-                        )
+                        let verb = if model.contains('/') {
+                            "uses deprecated slash syntax"
+                        } else {
+                            "is missing a provider prefix"
+                        };
+                        format!("model \"{model}\" {verb}; use `{suggestion}` instead")
                     } else {
                         format!(
                             "model \"{model}\" is missing a provider prefix; \
@@ -622,8 +624,8 @@ mod tests {
             Ok(_) => panic!("expected error"),
         };
         assert!(
-            msg.contains("missing a provider prefix"),
-            "slash form should be rejected as bare model: {msg}"
+            msg.contains("deprecated slash syntax"),
+            "slash form should mention deprecated syntax: {msg}"
         );
     }
 
