@@ -19,6 +19,7 @@ pub mod filesystem_tools;
 pub mod gemini;
 pub mod ollama;
 pub mod openai;
+pub mod openai_wire;
 pub mod output_sanitizer;
 pub mod prompt_guard;
 pub mod provider;
