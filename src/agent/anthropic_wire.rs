@@ -13,7 +13,7 @@ use crate::agent::provider::*;
 
 /// Maximum SSE line buffer size (1 MB). If a single SSE line exceeds this,
 /// the stream is treated as corrupted to prevent unbounded memory growth.
-const MAX_SSE_BUFFER_BYTES: usize = 1_048_576;
+pub(crate) const MAX_SSE_BUFFER_BYTES: usize = 1_048_576;
 
 /// Build the common Anthropic Messages API body.
 ///

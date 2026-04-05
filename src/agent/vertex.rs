@@ -45,8 +45,8 @@ impl std::fmt::Display for VertexSetupValidationError {
             ),
             Self::UnsupportedModel => write!(
                 f,
-                "Unsupported Vertex model. Use a Gemini model (e.g. gemini-2.0-flash) \
-                 or publishers/anthropic/models/<model-id> for Anthropic models."
+                "Unsupported Vertex model. Use vertex:gemini-2.0-flash for Gemini \
+                 or vertex:publishers/anthropic/models/<model-id> for Anthropic models."
             ),
             Self::ClientInit(detail) => {
                 if detail.is_empty() {
@@ -695,6 +695,18 @@ pub async fn validate_vertex_setup(
     let provider = VertexProvider::try_new(project_id, location, default_model)
         .map_err(VertexSetupValidationError::from)?;
     let target = provider.resolve_model_target(&route_model)?;
+
+    // fetchPublisherModelConfig is a Google-specific v1beta1 endpoint that may not
+    // exist for third-party publishers (Anthropic uses v1/streamRawPredict).
+    // For non-Google publishers, we validate the model target and auth only.
+    if target.publisher != VertexPublisher::Google {
+        provider
+            .get_token()
+            .await
+            .map_err(|_| VertexSetupValidationError::AuthUnavailable)?;
+        return Ok(());
+    }
+
     let token = provider
         .get_token()
         .await
@@ -925,10 +937,10 @@ impl LlmProvider for VertexProvider {
             return Err(AgentError::Cancelled);
         }
 
-        let token = self.get_token().await?;
         let resolved = self
             .resolve_model_target(&request.model)
             .map_err(|err| AgentError::Provider(err.to_string()))?;
+        let token = self.get_token().await?;
         let url = resolved.streaming_url(&self.project_id);
 
         match resolved.publisher {
@@ -944,9 +956,7 @@ impl LlmProvider for VertexProvider {
     }
 }
 
-/// Maximum SSE line buffer size (1 MB). If a single SSE line exceeds this,
-/// the stream is treated as corrupted to prevent unbounded memory growth.
-const MAX_SSE_BUFFER_BYTES: usize = 1_048_576;
+use crate::agent::anthropic_wire::MAX_SSE_BUFFER_BYTES;
 
 /// Process a Vertex SSE byte stream into StreamEvents.
 async fn process_vertex_sse_stream<S>(
