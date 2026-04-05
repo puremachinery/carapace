@@ -50,7 +50,10 @@ impl std::fmt::Display for VertexSetupValidationError {
             ),
             Self::ClientInit(detail) => {
                 if detail.is_empty() {
-                    write!(f, "Vertex validation could not initialize the local HTTP client.")
+                    write!(
+                        f,
+                        "Vertex validation could not initialize the local HTTP client."
+                    )
                 } else {
                     write!(
                         f,
@@ -645,8 +648,13 @@ impl VertexProvider {
 }
 
 /// SSRF / Path Traversal validation for model IDs embedded in URLs.
+///
+/// Requires the first character to be alphanumeric to reject dot-segment
+/// sequences (`.`, `..`) that RFC 3986 normalization could resolve as
+/// parent-directory references in the URL path.
 fn validate_model_id(model_id: &str) -> Result<(), VertexSetupValidationError> {
     if model_id.is_empty()
+        || !model_id.as_bytes()[0].is_ascii_alphanumeric()
         || !model_id
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
@@ -866,6 +874,7 @@ impl VertexProvider {
                 .post(&url)
                 .header("Authorization", format!("Bearer {}", token))
                 .header("content-type", "application/json")
+                .header("accept", "text/event-stream")
                 .json(&body)
                 .send() => {
                     response.map_err(|e| AgentError::Provider(format!("HTTP request failed: {e}")))?
@@ -924,7 +933,8 @@ impl LlmProvider for VertexProvider {
 
         match resolved.publisher {
             VertexPublisher::Google => {
-                self.complete_gemini(request, token, url, cancel_token).await
+                self.complete_gemini(request, token, url, cancel_token)
+                    .await
             }
             VertexPublisher::Anthropic => {
                 self.complete_anthropic(request, token, url, cancel_token)
@@ -1580,9 +1590,7 @@ mod tests {
     fn test_gemini_streaming_url_uses_generate_content() {
         let provider =
             VertexProvider::new("my-project".to_string(), "us-central1".to_string(), None).unwrap();
-        let url = provider
-            .resolve_request_config("gemini-2.0-flash")
-            .unwrap();
+        let url = provider.resolve_request_config("gemini-2.0-flash").unwrap();
         assert!(
             url.contains("streamGenerateContent"),
             "Google publisher should use streamGenerateContent: {url}"
@@ -1615,6 +1623,30 @@ mod tests {
             .resolve_model_target("publishers/openai/models/gpt-4o")
             .expect_err("unknown publisher should fail");
         assert_eq!(err, VertexSetupValidationError::UnsupportedModel);
+    }
+
+    #[test]
+    fn test_reject_dot_segment_model_ids() {
+        let provider =
+            VertexProvider::new("my-project".to_string(), "us-central1".to_string(), None).unwrap();
+        // Dot-only sequences are path traversal vectors (RFC 3986 dot-segment normalization)
+        assert!(provider
+            .resolve_model_target("publishers/anthropic/models/..")
+            .is_err());
+        assert!(provider
+            .resolve_model_target("publishers/anthropic/models/.")
+            .is_err());
+        assert!(provider
+            .resolve_model_target("publishers/anthropic/models/...")
+            .is_err());
+        // Leading dot rejected even with trailing alphanumeric
+        assert!(provider
+            .resolve_model_target("publishers/anthropic/models/.hidden")
+            .is_err());
+        // Dots in the middle are fine (e.g. version separators)
+        assert!(provider
+            .resolve_model_target("publishers/anthropic/models/claude-3.5-sonnet")
+            .is_ok());
     }
 
     #[test]

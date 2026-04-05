@@ -137,9 +137,7 @@ where
         let mut consumed = 0;
         while let Some(rel_pos) = buffer[consumed..].find('\n') {
             let newline_pos = consumed + rel_pos;
-            let line = buffer[consumed..newline_pos]
-                .trim_end_matches('\r')
-                .to_string();
+            let line = buffer[consumed..newline_pos].trim_end_matches('\r');
             consumed = newline_pos + 1;
 
             if let Some(evt) = line.strip_prefix("event: ") {
