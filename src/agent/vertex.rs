@@ -46,7 +46,8 @@ impl std::fmt::Display for VertexSetupValidationError {
             Self::UnsupportedModel => write!(
                 f,
                 "Unsupported Vertex model. Use vertex:gemini-2.0-flash for Gemini \
-                 or vertex:publishers/anthropic/models/<model-id> for Anthropic models."
+                 or vertex:publishers/<publisher>/models/<model-id> for third-party models \
+                 (supported publishers: anthropic, meta, mistral, nvidia)."
             ),
             Self::ClientInit(detail) => {
                 if detail.is_empty() {
@@ -407,6 +408,9 @@ pub struct VertexProvider {
 enum VertexPublisher {
     Google,
     Anthropic,
+    Meta,
+    Mistral,
+    Nvidia,
 }
 
 impl VertexPublisher {
@@ -414,6 +418,9 @@ impl VertexPublisher {
         match self {
             Self::Google => "google",
             Self::Anthropic => "anthropic",
+            Self::Meta => "meta",
+            Self::Mistral => "mistral",
+            Self::Nvidia => "nvidia",
         }
     }
 }
@@ -461,7 +468,11 @@ impl ResolvedVertexModel {
     fn streaming_url(&self, project_id: &str) -> String {
         match self.publisher {
             VertexPublisher::Google => self.stream_generate_url(project_id),
-            VertexPublisher::Anthropic => self.stream_raw_predict_url(project_id),
+            // All third-party publishers use streamRawPredict.
+            VertexPublisher::Anthropic
+            | VertexPublisher::Meta
+            | VertexPublisher::Mistral
+            | VertexPublisher::Nvidia => self.stream_raw_predict_url(project_id),
         }
     }
 
@@ -627,6 +638,9 @@ impl VertexProvider {
 
         let publisher = match publisher_str {
             "anthropic" => VertexPublisher::Anthropic,
+            "meta" => VertexPublisher::Meta,
+            "mistral" => VertexPublisher::Mistral,
+            "nvidia" => VertexPublisher::Nvidia,
             _ => return Err(VertexSetupValidationError::UnsupportedModel),
         };
 
@@ -927,6 +941,66 @@ impl VertexProvider {
 
         Ok(rx)
     }
+
+    async fn complete_openai_compat(
+        &self,
+        request: CompletionRequest,
+        resolved: &ResolvedVertexModel,
+        token: String,
+        url: String,
+        cancel_token: CancellationToken,
+    ) -> Result<mpsc::Receiver<StreamEvent>, AgentError> {
+        let mut body = crate::agent::openai_wire::build_openai_messages_body(&request);
+        body["model"] = json!(resolved.model_id);
+        body["max_tokens"] = json!(request.max_tokens);
+        body["stream_options"] = json!({ "include_usage": true });
+
+        let response = tokio::select! {
+            _ = cancel_token.cancelled() => {
+                return Err(AgentError::Cancelled);
+            }
+            response = self
+                .client
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", token))
+                .header("content-type", "application/json")
+                .header("accept", "text/event-stream")
+                .json(&body)
+                .send() => {
+                    response.map_err(|e| AgentError::Provider(format!("HTTP request failed: {e}")))?
+                }
+        };
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<unreadable>".to_string());
+            let safe_body = summarize_http_failure_body(&body);
+            return Err(AgentError::Provider(format!(
+                "Vertex API returned {status}: {safe_body}"
+            )));
+        }
+
+        let (tx, rx) = mpsc::channel(64);
+        let stream = response.bytes_stream();
+        let cancel = cancel_token.clone();
+
+        tokio::spawn(async move {
+            if let Err(e) =
+                crate::agent::openai_wire::process_openai_sse_stream(stream, &tx, &cancel).await
+            {
+                let _ = tx
+                    .send(StreamEvent::Error {
+                        message: e.to_string(),
+                    })
+                    .await;
+            }
+        });
+
+        Ok(rx)
+    }
 }
 
 #[async_trait]
@@ -955,11 +1029,15 @@ impl LlmProvider for VertexProvider {
                 self.complete_anthropic(request, token, url, cancel_token)
                     .await
             }
+            VertexPublisher::Meta | VertexPublisher::Mistral | VertexPublisher::Nvidia => {
+                self.complete_openai_compat(request, &resolved, token, url, cancel_token)
+                    .await
+            }
         }
     }
 }
 
-use crate::agent::anthropic_wire::MAX_SSE_BUFFER_BYTES;
+use crate::agent::provider::MAX_SSE_BUFFER_BYTES;
 
 /// Process a Vertex SSE byte stream into StreamEvents.
 async fn process_vertex_sse_stream<S>(
@@ -1715,5 +1793,101 @@ mod tests {
     fn test_vertex_publisher_as_str() {
         assert_eq!(VertexPublisher::Google.as_str(), "google");
         assert_eq!(VertexPublisher::Anthropic.as_str(), "anthropic");
+        assert_eq!(VertexPublisher::Meta.as_str(), "meta");
+        assert_eq!(VertexPublisher::Mistral.as_str(), "mistral");
+        assert_eq!(VertexPublisher::Nvidia.as_str(), "nvidia");
+    }
+
+    // ==================== OpenAI-compat publishers (Meta/Mistral/Nvidia) ====================
+
+    #[test]
+    fn test_resolve_meta_publisher_model() {
+        let provider =
+            VertexProvider::new("my-project".to_string(), "us-central1".to_string(), None).unwrap();
+        let target = provider
+            .resolve_model_target("publishers/meta/models/llama-3.1-405b-instruct-maas")
+            .expect("meta model target");
+        assert_eq!(target.publisher, VertexPublisher::Meta);
+        assert_eq!(target.model_id, "llama-3.1-405b-instruct-maas");
+        assert_eq!(target.endpoint_location, "us-central1");
+    }
+
+    #[test]
+    fn test_resolve_mistral_publisher_model() {
+        let provider =
+            VertexProvider::new("my-project".to_string(), "us-central1".to_string(), None).unwrap();
+        let target = provider
+            .resolve_model_target("publishers/mistral/models/mistral-large-2411")
+            .expect("mistral model target");
+        assert_eq!(target.publisher, VertexPublisher::Mistral);
+        assert_eq!(target.model_id, "mistral-large-2411");
+    }
+
+    #[test]
+    fn test_resolve_nvidia_publisher_model() {
+        let provider =
+            VertexProvider::new("my-project".to_string(), "us-central1".to_string(), None).unwrap();
+        let target = provider
+            .resolve_model_target("publishers/nvidia/models/llama-3.1-nemotron-70b-instruct")
+            .expect("nvidia model target");
+        assert_eq!(target.publisher, VertexPublisher::Nvidia);
+        assert_eq!(target.model_id, "llama-3.1-nemotron-70b-instruct");
+    }
+
+    #[test]
+    fn test_openai_compat_publishers_use_stream_raw_predict() {
+        let provider =
+            VertexProvider::new("my-project".to_string(), "us-central1".to_string(), None).unwrap();
+        for path in [
+            "publishers/meta/models/llama-3.1-405b-instruct-maas",
+            "publishers/mistral/models/mistral-large-2411",
+            "publishers/nvidia/models/llama-3.1-nemotron-70b-instruct",
+        ] {
+            let url = provider.resolve_request_config(path).unwrap();
+            assert!(
+                url.contains("streamRawPredict"),
+                "third-party publisher should use streamRawPredict: {url}"
+            );
+            assert!(
+                !url.contains("streamGenerateContent"),
+                "third-party publisher should not use streamGenerateContent: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_openai_compat_body_has_model_and_max_tokens() {
+        let request = CompletionRequest {
+            model: "publishers/meta/models/llama-3.1-405b-instruct-maas".to_string(),
+            messages: vec![LlmMessage {
+                role: LlmRole::User,
+                content: vec![ContentBlock::Text {
+                    text: "Hello".to_string(),
+                    metadata: None,
+                }],
+            }],
+            system: Some("You are helpful.".to_string()),
+            tools: vec![],
+            max_tokens: 2048,
+            temperature: Some(0.7),
+            extra: None,
+        };
+
+        let mut body = crate::agent::openai_wire::build_openai_messages_body(&request);
+        body["model"] = json!("llama-3.1-405b-instruct-maas");
+        body["max_tokens"] = json!(request.max_tokens);
+
+        body["stream_options"] = json!({ "include_usage": true });
+
+        assert_eq!(body["model"], "llama-3.1-405b-instruct-maas");
+        assert_eq!(body["max_tokens"], 2048);
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["temperature"], 0.7);
+        assert_eq!(
+            body["stream_options"]["include_usage"], true,
+            "stream_options should request usage data"
+        );
+        // No max_completion_tokens (OpenAI-specific field name)
+        assert!(body.get("max_completion_tokens").is_none());
     }
 }

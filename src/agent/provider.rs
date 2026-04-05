@@ -115,6 +115,11 @@ pub struct GeminiPartMetadata {
     pub thought_signature: Option<String>,
 }
 
+/// Maximum SSE line buffer size (1 MB). If a single SSE line exceeds this,
+/// the stream is treated as corrupted to prevent unbounded memory growth.
+/// Shared across all SSE parsers (Anthropic, OpenAI, Vertex Gemini).
+pub(crate) const MAX_SSE_BUFFER_BYTES: usize = 1_048_576;
+
 const MAX_GEMINI_THOUGHT_SIGNATURE_BYTES: usize = 64 * 1024;
 
 pub(crate) fn ensure_oauth_profile_kind(
