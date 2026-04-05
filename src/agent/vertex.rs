@@ -45,11 +45,15 @@ impl std::fmt::Display for VertexSetupValidationError {
             ),
             Self::UnsupportedModel => write!(
                 f,
-                "Unsupported Vertex model. This provider currently supports Google Gemini models only."
+                "Unsupported Vertex model. Use vertex:gemini-2.0-flash for Gemini \
+                 or vertex:publishers/anthropic/models/<model-id> for Anthropic models."
             ),
             Self::ClientInit(detail) => {
                 if detail.is_empty() {
-                    write!(f, "Vertex validation could not initialize the local HTTP client.")
+                    write!(
+                        f,
+                        "Vertex validation could not initialize the local HTTP client."
+                    )
                 } else {
                     write!(
                         f,
@@ -399,10 +403,25 @@ pub struct VertexProvider {
     default_model: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VertexPublisher {
+    Google,
+    Anthropic,
+}
+
+impl VertexPublisher {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Google => "google",
+            Self::Anthropic => "anthropic",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedVertexModel {
     endpoint_location: String,
-    publisher: &'static str,
+    publisher: VertexPublisher,
     model_id: String,
 }
 
@@ -420,13 +439,30 @@ impl ResolvedVertexModel {
 
     fn stream_generate_url(&self, project_id: &str) -> String {
         format!(
-            "{}/v1beta1/projects/{}/locations/{}/publishers/{}/models/{}:streamGenerateContent?alt=sse",
+            "{}/v1beta1/projects/{}/locations/{}/publishers/google/models/{}:streamGenerateContent?alt=sse",
             self.service_endpoint(),
             project_id,
             self.endpoint_location,
-            self.publisher,
             self.model_id
         )
+    }
+
+    fn stream_raw_predict_url(&self, project_id: &str) -> String {
+        format!(
+            "{}/v1/projects/{}/locations/{}/publishers/{}/models/{}:streamRawPredict",
+            self.service_endpoint(),
+            project_id,
+            self.endpoint_location,
+            self.publisher.as_str(),
+            self.model_id
+        )
+    }
+
+    fn streaming_url(&self, project_id: &str) -> String {
+        match self.publisher {
+            VertexPublisher::Google => self.stream_generate_url(project_id),
+            VertexPublisher::Anthropic => self.stream_raw_predict_url(project_id),
+        }
     }
 
     fn publisher_model_config_url(&self, project_id: &str) -> String {
@@ -435,7 +471,7 @@ impl ResolvedVertexModel {
             self.service_endpoint(),
             project_id,
             self.endpoint_location,
-            self.publisher,
+            self.publisher.as_str(),
             self.model_id
         )
     }
@@ -517,13 +553,13 @@ impl VertexProvider {
         Ok(token)
     }
 
-    /// Resolves the Google-published Gemini model target on Vertex AI.
+    /// Resolves a Vertex AI model target to a typed publisher + model ID.
     ///
     /// Rules:
     /// - `vertex:gemini-1.5-pro` -> Google publisher, gemini-1.5-pro
     /// - `vertex:google/gemini-1.5-pro` -> Google publisher, gemini-1.5-pro
+    /// - `vertex:publishers/anthropic/models/claude-sonnet-4-20250514` -> Anthropic publisher
     /// - `vertex:default` -> use `default_model`
-    /// - non-Gemini model IDs and other publisher namespaces are rejected in this scoped implementation
     fn resolve_model_target(
         &self,
         model_name: &str,
@@ -541,37 +577,60 @@ impl VertexProvider {
             clean_model
         };
 
-        let (publisher, model_id): (&str, &str) =
-            if let Some(model_id) = effective_model.strip_prefix("google/") {
-                if !model_id.starts_with("gemini-") {
-                    return Err(VertexSetupValidationError::UnsupportedModel);
-                }
-                ("google", model_id)
-            } else if effective_model.contains('/') || !effective_model.starts_with("gemini-") {
-                return Err(VertexSetupValidationError::UnsupportedModel);
-            } else {
-                // Bare Gemini model IDs are treated as Google-published models on Vertex AI.
-                ("google", effective_model)
-            };
-        // SSRF / Path Traversal Validation
-        if model_id.is_empty()
-            || !model_id
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
-        {
-            return Err(VertexSetupValidationError::UnsupportedModel);
+        // Explicit publisher path: publishers/<publisher>/models/<model_id>
+        if let Some(rest) = effective_model.strip_prefix("publishers/") {
+            return self.resolve_publisher_model(rest);
         }
 
-        // Global endpoints for Gemini 3 and Experimental
-        // These models are automatically routed to the global endpoint `aiplatform.googleapis.com`
-        // unless overridden.
+        // Google Gemini shorthand
+        let model_id: &str = if let Some(model_id) = effective_model.strip_prefix("google/") {
+            if !model_id.starts_with("gemini-") {
+                return Err(VertexSetupValidationError::UnsupportedModel);
+            }
+            model_id
+        } else if effective_model.contains('/') || !effective_model.starts_with("gemini-") {
+            return Err(VertexSetupValidationError::UnsupportedModel);
+        } else {
+            // Bare Gemini model IDs are treated as Google-published models on Vertex AI.
+            effective_model
+        };
+
+        validate_model_id(model_id)?;
+
+        // Global endpoints for Gemini 3
         if model_id.starts_with("gemini-3") {
             return Ok(ResolvedVertexModel {
                 endpoint_location: "global".to_string(),
-                publisher,
+                publisher: VertexPublisher::Google,
                 model_id: model_id.to_string(),
             });
         }
+
+        Ok(ResolvedVertexModel {
+            endpoint_location: self.location.clone(),
+            publisher: VertexPublisher::Google,
+            model_id: model_id.to_string(),
+        })
+    }
+
+    /// Resolve an explicit `publishers/<publisher>/models/<model_id>` path.
+    fn resolve_publisher_model(
+        &self,
+        path: &str,
+    ) -> Result<ResolvedVertexModel, VertexSetupValidationError> {
+        let (publisher_str, rest) = path
+            .split_once('/')
+            .ok_or(VertexSetupValidationError::UnsupportedModel)?;
+        let model_id = rest
+            .strip_prefix("models/")
+            .ok_or(VertexSetupValidationError::UnsupportedModel)?;
+
+        let publisher = match publisher_str {
+            "anthropic" => VertexPublisher::Anthropic,
+            _ => return Err(VertexSetupValidationError::UnsupportedModel),
+        };
+
+        validate_model_id(model_id)?;
 
         Ok(ResolvedVertexModel {
             endpoint_location: self.location.clone(),
@@ -580,11 +639,29 @@ impl VertexProvider {
         })
     }
 
+    #[cfg(test)]
     fn resolve_request_config(&self, model_name: &str) -> Result<String, AgentError> {
         self.resolve_model_target(model_name)
-            .map(|resolved| resolved.stream_generate_url(&self.project_id))
+            .map(|resolved| resolved.streaming_url(&self.project_id))
             .map_err(|err| AgentError::Provider(err.to_string()))
     }
+}
+
+/// SSRF / Path Traversal validation for model IDs embedded in URLs.
+///
+/// Requires the first character to be alphanumeric to reject dot-segment
+/// sequences (`.`, `..`) that RFC 3986 normalization could resolve as
+/// parent-directory references in the URL path.
+fn validate_model_id(model_id: &str) -> Result<(), VertexSetupValidationError> {
+    if model_id.is_empty()
+        || !model_id.as_bytes()[0].is_ascii_alphanumeric()
+        || !model_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return Err(VertexSetupValidationError::UnsupportedModel);
+    }
+    Ok(())
 }
 
 fn validate_project_id(project_id: &str) -> Result<(), VertexSetupValidationError> {
@@ -618,6 +695,21 @@ pub async fn validate_vertex_setup(
     let provider = VertexProvider::try_new(project_id, location, default_model)
         .map_err(VertexSetupValidationError::from)?;
     let target = provider.resolve_model_target(&route_model)?;
+
+    // For non-Google publishers, validation only confirms that the model target
+    // parses/resolves and that a local access token can be acquired. It does NOT
+    // verify that the token has IAM permissions for the requested publisher/model
+    // or that the model exists in Vertex; those failures surface at first request.
+    // fetchPublisherModelConfig is a Google-specific v1beta1 endpoint that does
+    // not exist for third-party publishers (Anthropic uses v1/streamRawPredict).
+    if target.publisher != VertexPublisher::Google {
+        provider
+            .get_token()
+            .await
+            .map_err(|_| VertexSetupValidationError::AuthUnavailable)?;
+        return Ok(());
+    }
+
     let token = provider
         .get_token()
         .await
@@ -724,19 +816,14 @@ pub fn is_vertex_model(model: &str) -> bool {
         && model.as_bytes()[6] == b':'
 }
 
-#[async_trait]
-impl LlmProvider for VertexProvider {
-    async fn complete(
+impl VertexProvider {
+    async fn complete_gemini(
         &self,
         request: CompletionRequest,
+        token: String,
+        url: String,
         cancel_token: CancellationToken,
     ) -> Result<mpsc::Receiver<StreamEvent>, AgentError> {
-        if cancel_token.is_cancelled() {
-            return Err(AgentError::Cancelled);
-        }
-
-        let token = self.get_token().await?;
-        let url = self.resolve_request_config(&request.model)?;
         let body = build_gemini_body(&request);
 
         let response = tokio::select! {
@@ -782,11 +869,97 @@ impl LlmProvider for VertexProvider {
 
         Ok(rx)
     }
+
+    async fn complete_anthropic(
+        &self,
+        request: CompletionRequest,
+        token: String,
+        url: String,
+        cancel_token: CancellationToken,
+    ) -> Result<mpsc::Receiver<StreamEvent>, AgentError> {
+        let mut body = crate::agent::anthropic_wire::build_messages_body(&request);
+        body["anthropic_version"] = json!("vertex-2023-10-16");
+
+        let response = tokio::select! {
+            _ = cancel_token.cancelled() => {
+                return Err(AgentError::Cancelled);
+            }
+            response = self
+                .client
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", token))
+                .header("content-type", "application/json")
+                .header("accept", "text/event-stream")
+                .json(&body)
+                .send() => {
+                    response.map_err(|e| AgentError::Provider(format!("HTTP request failed: {e}")))?
+                }
+        };
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<unreadable>".to_string());
+            let safe_body = summarize_http_failure_body(&body);
+            return Err(AgentError::Provider(format!(
+                "Vertex API returned {status}: {safe_body}"
+            )));
+        }
+
+        let (tx, rx) = mpsc::channel(64);
+        let stream = response.bytes_stream();
+        let cancel = cancel_token.clone();
+
+        tokio::spawn(async move {
+            if let Err(e) =
+                crate::agent::anthropic_wire::process_anthropic_sse_stream(stream, &tx, &cancel)
+                    .await
+            {
+                let _ = tx
+                    .send(StreamEvent::Error {
+                        message: e.to_string(),
+                    })
+                    .await;
+            }
+        });
+
+        Ok(rx)
+    }
 }
 
-/// Maximum SSE line buffer size (1 MB). If a single SSE line exceeds this,
-/// the stream is treated as corrupted to prevent unbounded memory growth.
-const MAX_SSE_BUFFER_BYTES: usize = 1_048_576;
+#[async_trait]
+impl LlmProvider for VertexProvider {
+    async fn complete(
+        &self,
+        request: CompletionRequest,
+        cancel_token: CancellationToken,
+    ) -> Result<mpsc::Receiver<StreamEvent>, AgentError> {
+        if cancel_token.is_cancelled() {
+            return Err(AgentError::Cancelled);
+        }
+
+        let resolved = self
+            .resolve_model_target(&request.model)
+            .map_err(|err| AgentError::Provider(err.to_string()))?;
+        let token = self.get_token().await?;
+        let url = resolved.streaming_url(&self.project_id);
+
+        match resolved.publisher {
+            VertexPublisher::Google => {
+                self.complete_gemini(request, token, url, cancel_token)
+                    .await
+            }
+            VertexPublisher::Anthropic => {
+                self.complete_anthropic(request, token, url, cancel_token)
+                    .await
+            }
+        }
+    }
+}
+
+use crate::agent::anthropic_wire::MAX_SSE_BUFFER_BYTES;
 
 /// Process a Vertex SSE byte stream into StreamEvents.
 async fn process_vertex_sse_stream<S>(
@@ -1179,8 +1352,7 @@ mod tests {
             .resolve_request_config("anthropic/claude-3-opus")
             .expect_err("unsupported publisher namespace should fail");
         assert!(
-            err.to_string()
-                .contains("supports Google Gemini models only"),
+            err.to_string().contains("Unsupported Vertex model"),
             "unexpected error: {err}"
         );
     }
@@ -1193,8 +1365,7 @@ mod tests {
             .resolve_request_config("claude-3-opus")
             .expect_err("unsupported bare model should fail");
         assert!(
-            err.to_string()
-                .contains("supports Google Gemini models only"),
+            err.to_string().contains("Unsupported Vertex model"),
             "unexpected error: {err}"
         );
     }
@@ -1371,5 +1542,178 @@ mod tests {
         assert!(events.iter().any(|e| matches!(e, StreamEvent::Stop { .. })));
         assert_eq!(usage.input_tokens, 10);
         assert_eq!(usage.output_tokens, 20);
+    }
+
+    // ==================== Anthropic-on-Vertex tests ====================
+
+    #[test]
+    fn test_resolve_anthropic_publisher_model() {
+        let provider =
+            VertexProvider::new("my-project".to_string(), "us-central1".to_string(), None).unwrap();
+        let target = provider
+            .resolve_model_target("publishers/anthropic/models/claude-sonnet-4-20250514")
+            .expect("anthropic model target");
+        assert_eq!(target.publisher, VertexPublisher::Anthropic);
+        assert_eq!(target.model_id, "claude-sonnet-4-20250514");
+        assert_eq!(target.endpoint_location, "us-central1");
+    }
+
+    #[test]
+    fn test_resolve_anthropic_publisher_model_with_vertex_prefix() {
+        let provider =
+            VertexProvider::new("my-project".to_string(), "us-central1".to_string(), None).unwrap();
+        let target = provider
+            .resolve_model_target("vertex:publishers/anthropic/models/claude-sonnet-4-20250514")
+            .expect("anthropic model target with vertex prefix");
+        assert_eq!(target.publisher, VertexPublisher::Anthropic);
+        assert_eq!(target.model_id, "claude-sonnet-4-20250514");
+    }
+
+    #[test]
+    fn test_anthropic_stream_raw_predict_url() {
+        let provider =
+            VertexProvider::new("my-project".to_string(), "us-central1".to_string(), None).unwrap();
+        let target = provider
+            .resolve_model_target("publishers/anthropic/models/claude-sonnet-4-20250514")
+            .unwrap();
+        assert_eq!(
+            target.stream_raw_predict_url("my-project"),
+            "https://us-central1-aiplatform.googleapis.com/v1/projects/my-project/locations/us-central1/publishers/anthropic/models/claude-sonnet-4-20250514:streamRawPredict"
+        );
+    }
+
+    #[test]
+    fn test_anthropic_streaming_url_uses_raw_predict() {
+        let provider =
+            VertexProvider::new("my-project".to_string(), "us-central1".to_string(), None).unwrap();
+        let url = provider
+            .resolve_request_config("publishers/anthropic/models/claude-sonnet-4-20250514")
+            .unwrap();
+        assert!(
+            url.contains("streamRawPredict"),
+            "Anthropic publisher should use streamRawPredict: {url}"
+        );
+        assert!(
+            !url.contains("streamGenerateContent"),
+            "Anthropic publisher should not use streamGenerateContent: {url}"
+        );
+    }
+
+    #[test]
+    fn test_gemini_streaming_url_uses_generate_content() {
+        let provider =
+            VertexProvider::new("my-project".to_string(), "us-central1".to_string(), None).unwrap();
+        let url = provider.resolve_request_config("gemini-2.0-flash").unwrap();
+        assert!(
+            url.contains("streamGenerateContent"),
+            "Google publisher should use streamGenerateContent: {url}"
+        );
+    }
+
+    #[test]
+    fn test_anthropic_publisher_model_config_url() {
+        let provider =
+            VertexProvider::new("my-project".to_string(), "us-central1".to_string(), None).unwrap();
+        let target = provider
+            .resolve_model_target("publishers/anthropic/models/claude-sonnet-4-20250514")
+            .unwrap();
+        let config_url = target.publisher_model_config_url("my-project");
+        assert!(
+            config_url.contains("publishers/anthropic/"),
+            "config URL should reference anthropic publisher: {config_url}"
+        );
+        assert!(
+            config_url.contains("fetchPublisherModelConfig"),
+            "config URL should use fetchPublisherModelConfig: {config_url}"
+        );
+    }
+
+    #[test]
+    fn test_reject_unknown_publisher() {
+        let provider =
+            VertexProvider::new("my-project".to_string(), "us-central1".to_string(), None).unwrap();
+        let err = provider
+            .resolve_model_target("publishers/openai/models/gpt-4o")
+            .expect_err("unknown publisher should fail");
+        assert_eq!(err, VertexSetupValidationError::UnsupportedModel);
+    }
+
+    #[test]
+    fn test_reject_dot_segment_model_ids() {
+        let provider =
+            VertexProvider::new("my-project".to_string(), "us-central1".to_string(), None).unwrap();
+        // Dot-only sequences are path traversal vectors (RFC 3986 dot-segment normalization)
+        assert!(provider
+            .resolve_model_target("publishers/anthropic/models/..")
+            .is_err());
+        assert!(provider
+            .resolve_model_target("publishers/anthropic/models/.")
+            .is_err());
+        assert!(provider
+            .resolve_model_target("publishers/anthropic/models/...")
+            .is_err());
+        // Leading dot rejected even with trailing alphanumeric
+        assert!(provider
+            .resolve_model_target("publishers/anthropic/models/.hidden")
+            .is_err());
+        // Dots in the middle are fine (e.g. version separators)
+        assert!(provider
+            .resolve_model_target("publishers/anthropic/models/claude-3.5-sonnet")
+            .is_ok());
+    }
+
+    #[test]
+    fn test_reject_malformed_publisher_path() {
+        let provider =
+            VertexProvider::new("my-project".to_string(), "us-central1".to_string(), None).unwrap();
+        // Missing models/ segment
+        assert!(provider
+            .resolve_model_target("publishers/anthropic/claude-3")
+            .is_err());
+        // Empty model ID
+        assert!(provider
+            .resolve_model_target("publishers/anthropic/models/")
+            .is_err());
+        // Path traversal in model ID
+        assert!(provider
+            .resolve_model_target("publishers/anthropic/models/../../etc/passwd")
+            .is_err());
+    }
+
+    #[test]
+    fn test_anthropic_body_has_anthropic_version_no_model() {
+        let request = CompletionRequest {
+            model: "publishers/anthropic/models/claude-sonnet-4-20250514".to_string(),
+            messages: vec![LlmMessage {
+                role: LlmRole::User,
+                content: vec![ContentBlock::Text {
+                    text: "Hello".to_string(),
+                    metadata: None,
+                }],
+            }],
+            system: Some("You are helpful.".to_string()),
+            tools: vec![],
+            max_tokens: 1024,
+            temperature: Some(0.7),
+            extra: None,
+        };
+
+        let mut body = crate::agent::anthropic_wire::build_messages_body(&request);
+        body["anthropic_version"] = json!("vertex-2023-10-16");
+
+        assert_eq!(body["anthropic_version"], "vertex-2023-10-16");
+        assert!(
+            body.get("model").is_none(),
+            "Vertex Anthropic body should not include model field"
+        );
+        assert_eq!(body["max_tokens"], 1024);
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["system"], "You are helpful.");
+    }
+
+    #[test]
+    fn test_vertex_publisher_as_str() {
+        assert_eq!(VertexPublisher::Google.as_str(), "google");
+        assert_eq!(VertexPublisher::Anthropic.as_str(), "anthropic");
     }
 }

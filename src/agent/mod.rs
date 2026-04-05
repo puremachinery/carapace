@@ -4,6 +4,7 @@
 //! and the core agent run loop that ties everything together.
 
 pub mod anthropic;
+pub mod anthropic_wire;
 pub mod bedrock;
 pub mod builtin_tools;
 pub mod channel_tools;
