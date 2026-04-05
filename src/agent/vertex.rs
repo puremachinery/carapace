@@ -696,9 +696,12 @@ pub async fn validate_vertex_setup(
         .map_err(VertexSetupValidationError::from)?;
     let target = provider.resolve_model_target(&route_model)?;
 
-    // fetchPublisherModelConfig is a Google-specific v1beta1 endpoint that may not
-    // exist for third-party publishers (Anthropic uses v1/streamRawPredict).
-    // For non-Google publishers, we validate the model target and auth only.
+    // For non-Google publishers, validation only confirms that the model target
+    // parses/resolves and that a local access token can be acquired. It does NOT
+    // verify that the token has IAM permissions for the requested publisher/model
+    // or that the model exists in Vertex; those failures surface at first request.
+    // fetchPublisherModelConfig is a Google-specific v1beta1 endpoint that does
+    // not exist for third-party publishers (Anthropic uses v1/streamRawPredict).
     if target.publisher != VertexPublisher::Google {
         provider
             .get_token()
