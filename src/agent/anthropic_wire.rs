@@ -11,9 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::provider::*;
 
-/// Maximum SSE line buffer size (1 MB). If a single SSE line exceeds this,
-/// the stream is treated as corrupted to prevent unbounded memory growth.
-pub(crate) const MAX_SSE_BUFFER_BYTES: usize = 1_048_576;
+use crate::agent::provider::MAX_SSE_BUFFER_BYTES;
 
 /// Build the common Anthropic Messages API body.
 ///

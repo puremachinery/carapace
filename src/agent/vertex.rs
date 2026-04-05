@@ -953,6 +953,7 @@ impl VertexProvider {
         let mut body = crate::agent::openai_wire::build_openai_messages_body(&request);
         body["model"] = json!(resolved.model_id);
         body["max_tokens"] = json!(request.max_tokens);
+        body["stream_options"] = json!({ "include_usage": true });
 
         let response = tokio::select! {
             _ = cancel_token.cancelled() => {
@@ -1036,7 +1037,7 @@ impl LlmProvider for VertexProvider {
     }
 }
 
-use crate::agent::anthropic_wire::MAX_SSE_BUFFER_BYTES;
+use crate::agent::provider::MAX_SSE_BUFFER_BYTES;
 
 /// Process a Vertex SSE byte stream into StreamEvents.
 async fn process_vertex_sse_stream<S>(
@@ -1876,12 +1877,16 @@ mod tests {
         body["model"] = json!("llama-3.1-405b-instruct-maas");
         body["max_tokens"] = json!(request.max_tokens);
 
+        body["stream_options"] = json!({ "include_usage": true });
+
         assert_eq!(body["model"], "llama-3.1-405b-instruct-maas");
         assert_eq!(body["max_tokens"], 2048);
         assert_eq!(body["stream"], true);
         assert_eq!(body["temperature"], 0.7);
-        // No stream_options (Vertex third-party APIs may not support it)
-        assert!(body.get("stream_options").is_none());
+        assert_eq!(
+            body["stream_options"]["include_usage"], true,
+            "stream_options should request usage data"
+        );
         // No max_completion_tokens (OpenAI-specific field name)
         assert!(body.get("max_completion_tokens").is_none());
     }

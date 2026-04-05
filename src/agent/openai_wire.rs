@@ -9,7 +9,6 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::anthropic_wire::MAX_SSE_BUFFER_BYTES;
 use crate::agent::provider::*;
 
 /// Build the common OpenAI Chat Completions body.
@@ -612,6 +611,48 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[tokio::test]
+    async fn test_complete_tool_call_stream() {
+        let sse_data = concat!(
+            "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"index\":0,\"id\":\"call_abc\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"city\\\":\\\"SF\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: {\"id\":\"chatcmpl-1\",\"choices\":[],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":10,\"total_tokens\":30}}\n\n",
+            "data: [DONE]\n\n",
+        );
+
+        let stream = mock_sse_stream(vec![sse_data]);
+        let (tx, mut rx) = mpsc::channel(64);
+
+        let result = process_openai_sse_stream(stream, &tx, &CancellationToken::new()).await;
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result);
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                StreamEvent::ToolUse { id, name, .. }
+                if id == "call_abc" && name == "get_weather"
+            )),
+            "expected ToolUse for get_weather, got: {:?}",
+            events,
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                StreamEvent::Stop {
+                    reason: StopReason::ToolUse,
+                    ..
+                }
+            )),
+            "expected Stop with ToolUse, got: {:?}",
+            events,
+        );
     }
 
     #[tokio::test]
