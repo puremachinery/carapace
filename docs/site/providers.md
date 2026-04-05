@@ -93,15 +93,19 @@ Vertex AI supports Google Gemini models and third-party models from
 Anthropic, Meta, Mistral, and Nvidia. Authentication uses `gcloud` CLI
 credentials or the GCE metadata server.
 
+Prerequisite: authenticate with `gcloud auth application-default login` so
+Carapace can obtain access tokens.
+
 ```bash
 export VERTEX_PROJECT_ID='my-gcp-project'
 export VERTEX_LOCATION='us-central1'   # optional, defaults to us-central1
 cara setup --provider vertex
 ```
 
-Gemini models use the short form:
+Gemini models use the short form in agent config:
 
 ```json5
+// agents.defaults.model or agents.list[].model
 { "model": "vertex:gemini-2.5-flash" }
 ```
 
