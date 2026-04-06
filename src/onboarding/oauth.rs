@@ -374,7 +374,6 @@ pub(crate) async fn complete_oauth_callback(
             }
             OAuthFlowState::Pending => {
                 flow.flow_state = OAuthFlowState::InProgress;
-                flow.created_at_ms = now_ms();
                 (
                     flow.id.clone(),
                     flow.provider_config.clone(),
@@ -451,10 +450,14 @@ fn finish_oauth_flow(
 }
 
 /// Poll the status of an OAuth flow by its flow ID.
-pub(crate) fn oauth_flow_status(flow_id: &str) -> OAuthStatusResult {
+/// Only returns results for flows matching the given spec (prevents cross-provider leaks).
+pub(crate) fn oauth_flow_status(
+    spec: &'static OAuthOnboardingSpec,
+    flow_id: &str,
+) -> OAuthStatusResult {
     cleanup_expired_flows();
     let flows = OAUTH_FLOWS.read();
-    match flows.get(flow_id) {
+    match flows.get(flow_id).filter(|f| std::ptr::eq(f.spec, spec)) {
         None => OAuthStatusResult::NotFound,
         Some(flow) => match &flow.flow_state {
             OAuthFlowState::Pending | OAuthFlowState::InProgress => OAuthStatusResult::InProgress,
@@ -470,11 +473,15 @@ pub(crate) fn oauth_flow_status(flow_id: &str) -> OAuthStatusResult {
 /// Apply a completed OAuth flow: persist the profile, update config, and
 /// remove the flow from the in-memory store.
 pub(crate) fn apply_oauth_flow(
+    spec: &'static OAuthOnboardingSpec,
     flow_id: &str,
     state_dir: &Path,
     cfg: &mut Value,
 ) -> Result<OAuthApplyResult, String> {
-    let flow = get_flow(flow_id).ok_or_else(|| "Unknown or expired OAuth flow".to_string())?;
+    cleanup_expired_flows();
+    let flow = get_flow(flow_id)
+        .filter(|f| std::ptr::eq(f.spec, spec))
+        .ok_or_else(|| "Unknown or expired OAuth flow".to_string())?;
 
     let completion = match &flow.flow_state {
         OAuthFlowState::Completed(completion) => completion.as_ref().clone(),

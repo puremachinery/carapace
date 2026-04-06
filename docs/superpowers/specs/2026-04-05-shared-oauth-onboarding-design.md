@@ -123,8 +123,7 @@ pub(crate) struct OAuthStartResult {
 }
 
 pub(crate) enum OAuthStatusResult {
-    Pending,
-    InProgress,
+    InProgress,  // Pending and InProgress are collapsed — callers see "pending" for both
     Completed {
         profile_name: String,
         email: Option<String>,
@@ -135,7 +134,6 @@ pub(crate) enum OAuthStatusResult {
 
 pub(crate) struct OAuthApplyResult {
     pub profile_id: String,
-    pub client_id: String,
 }
 ```
 

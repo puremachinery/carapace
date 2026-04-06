@@ -233,7 +233,7 @@ pub async fn complete_control_google_oauth_callback(
 }
 
 pub fn control_google_oauth_status(flow_id: &str) -> Result<GeminiOAuthStatus, String> {
-    match oauth::oauth_flow_status(flow_id) {
+    match oauth::oauth_flow_status(&GEMINI_SPEC, flow_id) {
         OAuthStatusResult::InProgress => Ok(GeminiOAuthStatus {
             flow_id: flow_id.to_string(),
             status: "pending",
@@ -265,7 +265,7 @@ pub fn control_google_oauth_status(flow_id: &str) -> Result<GeminiOAuthStatus, S
 pub fn apply_control_google_oauth(flow_id: &str, state_dir: PathBuf) -> Result<Value, String> {
     oauth::require_encrypted_profile_store(&GEMINI_SPEC)?;
     let mut snapshot = read_config_snapshot();
-    let result = oauth::apply_oauth_flow(flow_id, &state_dir, &mut snapshot.config)?;
+    let result = oauth::apply_oauth_flow(&GEMINI_SPEC, flow_id, &state_dir, &mut snapshot.config)?;
 
     Ok(json!({
         "profileId": result.profile_id,
@@ -714,17 +714,15 @@ mod tests {
     }
 
     #[test]
-    fn test_finish_control_google_oauth_flow_preserves_completed_flow() {
+    fn test_completed_gemini_oauth_flow_is_readable_after_insert() {
         let flow_id = insert_completed_control_google_oauth_flow_for_test();
-
-        // Attempt to overwrite with a failure -- completed flow should be preserved.
-        oauth::update_flow_state(&flow_id, OAuthFlowState::Failed("late failure".to_string()));
-        // update_flow_state does a naive overwrite; the shared engine's
-        // finish_oauth_flow is what preserves terminal states. For this test we
-        // just verify the completed flow was inserted and is readable.
-        let flow = oauth::get_flow(&flow_id);
-        // Flow existed (may now be Failed due to update_flow_state's naive write).
-        assert!(flow.is_some());
+        let flow = oauth::get_flow(&flow_id).expect("completed flow should exist");
+        assert!(
+            matches!(flow.flow_state, OAuthFlowState::Completed(_)),
+            "flow should be in Completed state"
+        );
+        let status = control_google_oauth_status(&flow_id).expect("status");
+        assert_eq!(status.status, "completed");
     }
 
     #[tokio::test]
