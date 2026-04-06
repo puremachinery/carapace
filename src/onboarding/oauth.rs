@@ -281,6 +281,12 @@ fn remove_flow(flow_id: &str) {
     OAUTH_FLOWS.write().remove(flow_id);
 }
 
+/// Remove a flow from the shared store by ID (test-only).
+#[cfg(test)]
+pub(crate) fn remove_flow_for_test(flow_id: &str) {
+    remove_flow(flow_id);
+}
+
 // ---------------------------------------------------------------------------
 // Flow engine — Control-facing functions
 // ---------------------------------------------------------------------------
