@@ -10,12 +10,18 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::LazyLock;
+use std::time::Duration;
 
 use crate::auth::profiles::{
     exchange_code, fetch_user_info, generate_auth_url, profile_store_encryption_enabled_from_env,
     AuthProfile, OAuthProvider, OAuthProviderConfig, OAuthTokens, ProfileStore, UserInfo,
 };
 use crate::server::ws::{map_validation_issues, persist_config_file};
+
+/// Oneshot sender used by the CLI OAuth callback server to deliver the result.
+type CliOAuthSender = std::sync::Arc<
+    std::sync::Mutex<Option<tokio::sync::oneshot::Sender<Result<OAuthCompletion, String>>>>,
+>;
 
 // ---------------------------------------------------------------------------
 // Provider spec
@@ -512,4 +518,263 @@ pub(crate) fn apply_oauth_flow(
         profile_id,
         client_id: completion.client_id,
     })
+}
+
+// ---------------------------------------------------------------------------
+// CLI OAuth flow
+// ---------------------------------------------------------------------------
+
+/// Persist a CLI OAuth completion: upsert the profile, write provider config,
+/// validate and save.  Returns the profile ID on success.
+pub(crate) fn persist_cli_oauth(
+    spec: &'static OAuthOnboardingSpec,
+    completion: OAuthCompletion,
+    state_dir: &Path,
+    config: &mut Value,
+) -> Result<String, String> {
+    let profile_id = upsert_oauth_profile(state_dir, completion.auth_profile)?;
+    (spec.write_provider_config)(config, &profile_id, &completion.client_id);
+    validate_and_persist_config(config)?;
+    Ok(profile_id)
+}
+
+/// Run the CLI OAuth flow with the default 300-second timeout.
+pub(crate) async fn run_cli_oauth(
+    spec: &'static OAuthOnboardingSpec,
+    cfg: &Value,
+    client_id_override: Option<String>,
+    client_secret_override: Option<String>,
+) -> Result<OAuthCompletion, String> {
+    run_cli_oauth_with_timeout(
+        spec,
+        cfg,
+        client_id_override,
+        client_secret_override,
+        Duration::from_secs(300),
+    )
+    .await
+}
+
+/// Core CLI OAuth flow: binds a local listener, prints the auth URL, waits
+/// for the identity-provider callback, exchanges the code, and returns the
+/// completion.
+async fn run_cli_oauth_with_timeout(
+    spec: &'static OAuthOnboardingSpec,
+    cfg: &Value,
+    client_id_override: Option<String>,
+    client_secret_override: Option<String>,
+    timeout: Duration,
+) -> Result<OAuthCompletion, String> {
+    require_encrypted_profile_store(spec)?;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(|err| format!("failed to bind local OAuth callback listener: {err}"))?;
+    let bind_addr = listener
+        .local_addr()
+        .map_err(|err| format!("failed to determine local OAuth callback port: {err}"))?;
+    let redirect_uri = format!("http://127.0.0.1:{}/auth/callback", bind_addr.port());
+
+    let provider_config = (spec.resolve_provider_config)(
+        cfg,
+        client_id_override,
+        client_secret_override,
+        redirect_uri.clone(),
+        &crate::paths::resolve_state_dir(),
+    )?;
+
+    let parsed_redirect = url::Url::parse(&provider_config.redirect_uri)
+        .map_err(|err| format!("invalid {} OAuth redirect URI: {err}", spec.idp_display_name))?;
+    let host = parsed_redirect.host_str().unwrap_or_default();
+    if host != "127.0.0.1" && host != "localhost" {
+        return Err(format!(
+            "CLI {} sign-in requires a loopback redirect URI; use Control UI sign-in.",
+            spec.idp_display_name,
+        ));
+    }
+
+    let path = parsed_redirect.path().to_string();
+    let state = format!("{}-cli-{}", spec.provider_label, uuid::Uuid::new_v4());
+    let (auth_url, verifier) =
+        generate_auth_url(&provider_config, &state).map_err(|err| err.to_string())?;
+
+    println!();
+    println!(
+        "Open this URL to sign in with {} for {}:",
+        spec.idp_display_name, spec.display_name
+    );
+    println!("{auth_url}");
+    println!();
+    println!("Waiting for OAuth callback on {}{} ...", bind_addr, path);
+
+    let provider_config_for_server = provider_config.clone();
+    let state_for_server = state.clone();
+    let verifier_for_server = verifier.clone();
+    let path_for_server = path.clone();
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    let result_tx: CliOAuthSender = std::sync::Arc::new(std::sync::Mutex::new(Some(result_tx)));
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let shutdown_tx_for_server = shutdown_tx.clone();
+
+    let server_task = tokio::spawn(async move {
+        use axum::extract::{Query, State};
+        use axum::response::Html;
+        use axum::routing::get;
+        use axum::Router;
+
+        #[derive(Clone)]
+        struct CliOAuthState {
+            expected_state: String,
+            code_verifier: String,
+            provider_config: OAuthProviderConfig,
+            sender: CliOAuthSender,
+            shutdown_tx: tokio::sync::watch::Sender<bool>,
+            spec: &'static OAuthOnboardingSpec,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct CallbackQuery {
+            code: Option<String>,
+            state: Option<String>,
+            error: Option<String>,
+            error_description: Option<String>,
+        }
+
+        async fn callback_handler(
+            State(state): State<CliOAuthState>,
+            Query(query): Query<CallbackQuery>,
+        ) -> Html<String> {
+            if !cli_oauth_callback_matches_expected_state(
+                &state.expected_state,
+                query.state.as_deref(),
+            ) {
+                return Html(callback_html(
+                    &format!("Still waiting for {} sign-in", state.spec.display_name),
+                    "Ignored an unrelated OAuth callback. Return to the active sign-in flow and continue.",
+                ));
+            }
+
+            let result = match query.error.filter(|value| !value.trim().is_empty()) {
+                Some(err) => Err(format_oauth_provider_error(
+                    &err,
+                    query.error_description.as_deref(),
+                )),
+                None => {
+                    complete_cli_oauth_callback(
+                        state.spec,
+                        &state.provider_config,
+                        &state.code_verifier,
+                        query.code.as_deref(),
+                    )
+                    .await
+                }
+            };
+
+            if let Some(sender) = state
+                .sender
+                .lock()
+                .expect("CLI OAuth sender mutex poisoned")
+                .take()
+            {
+                let _ = sender.send(result.clone());
+            }
+            let _ = state.shutdown_tx.send(true);
+
+            match result {
+                Ok(_) => Html(callback_html(
+                    &format!("{} sign-in complete", state.spec.display_name),
+                    "You can return to Carapace and finish setup.",
+                )),
+                Err(err) => Html(callback_html(
+                    &format!("{} sign-in failed", state.spec.display_name),
+                    &err,
+                )),
+            }
+        }
+
+        let app = Router::new()
+            .route(&path_for_server, get(callback_handler))
+            .with_state(CliOAuthState {
+                expected_state: state_for_server,
+                code_verifier: verifier_for_server,
+                provider_config: provider_config_for_server,
+                sender: result_tx.clone(),
+                shutdown_tx: shutdown_tx_for_server,
+                spec,
+            });
+
+        let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+            let mut shutdown_rx = shutdown_rx;
+            let _ = shutdown_rx.changed().await;
+        });
+
+        if let Err(err) = server.await {
+            if let Some(sender) = result_tx
+                .lock()
+                .expect("CLI OAuth sender mutex poisoned")
+                .take()
+            {
+                let _ = sender.send(Err(format!("OAuth callback server error: {err}")));
+            }
+        }
+    });
+
+    let result = match tokio::time::timeout(timeout, result_rx).await {
+        Ok(Ok(Ok(completion))) => Ok(completion),
+        Ok(Ok(Err(err))) => Err(err),
+        Ok(Err(_)) => Err(format!(
+            "{} OAuth callback channel closed unexpectedly",
+            spec.display_name,
+        )),
+        Err(_) => Err(format!(
+            "Timed out waiting for {} sign-in callback",
+            spec.display_name,
+        )),
+    };
+
+    let _ = shutdown_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(5), server_task).await;
+
+    result
+}
+
+/// Complete a CLI OAuth callback: exchange the authorization code for tokens,
+/// fetch user info, and build the completion via the spec's profile builder.
+async fn complete_cli_oauth_callback(
+    spec: &'static OAuthOnboardingSpec,
+    provider_config: &OAuthProviderConfig,
+    code_verifier: &str,
+    code: Option<&str>,
+) -> Result<OAuthCompletion, String> {
+    let code = code.unwrap_or_default();
+    if code.trim().is_empty() {
+        return Err("OAuth callback missing authorization code".to_string());
+    }
+
+    let tokens = exchange_code(provider_config, code.trim(), code_verifier)
+        .await
+        .map_err(|err| err.to_string())?;
+    let userinfo = fetch_user_info(
+        spec.oauth_provider,
+        provider_config,
+        &tokens.access_token,
+    )
+    .await
+    .map_err(|err| err.to_string())?;
+
+    Ok(OAuthCompletion {
+        client_id: provider_config.client_id.clone(),
+        auth_profile: (spec.build_auth_profile)(tokens, provider_config, userinfo),
+    })
+}
+
+/// Returns `true` if the returned OAuth state parameter matches the expected value.
+pub(crate) fn cli_oauth_callback_matches_expected_state(
+    expected_state: &str,
+    returned_state: Option<&str>,
+) -> bool {
+    returned_state
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        == Some(expected_state)
 }
