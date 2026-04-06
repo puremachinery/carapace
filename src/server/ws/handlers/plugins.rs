@@ -232,12 +232,7 @@ fn write_plugins_manifest(plugins_dir: &Path, manifest: &Value) -> Result<(), Er
     })?;
     let mut bytes = content.into_bytes();
     bytes.push(b'\n');
-    write_atomic_plugins_file(
-        &tmp_path,
-        &manifest_path,
-        &bytes,
-        "plugins manifest",
-    )?;
+    write_atomic_plugins_file(&tmp_path, &manifest_path, &bytes, "plugins manifest")?;
     Ok(())
 }
 
@@ -476,12 +471,7 @@ fn atomic_write_plugin_file(
     let dest_path = plugins_dir.join(file_name);
     let tmp_path = unique_plugins_tmp_path(plugins_dir, file_name);
 
-    write_atomic_plugins_file(
-        &tmp_path,
-        &dest_path,
-        bytes,
-        "plugin binary",
-    )?;
+    write_atomic_plugins_file(&tmp_path, &dest_path, bytes, "plugin binary")?;
 
     Ok(dest_path)
 }
@@ -2336,13 +2326,9 @@ mod tests {
         std::fs::write(&redirected_target, b"existing-target").unwrap();
         symlink(&redirected_target, &tmp_path).unwrap();
 
-        let err = write_atomic_plugins_file(
-            &tmp_path,
-            &dest_path,
-            b"new-plugin-bytes",
-            "plugin binary",
-        )
-        .unwrap_err();
+        let err =
+            write_atomic_plugins_file(&tmp_path, &dest_path, b"new-plugin-bytes", "plugin binary")
+                .unwrap_err();
 
         assert_eq!(err.code, ERROR_UNAVAILABLE);
         assert!(
