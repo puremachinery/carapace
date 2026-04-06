@@ -285,14 +285,14 @@ fn write_atomic_plugins_file(
         return Err(err);
     }
 
-    std::fs::rename(tmp_path, dest_path).map_err(|e| {
+    if let Err(e) = std::fs::rename(tmp_path, dest_path) {
         log_plugins_tmp_cleanup_failure(tmp_path, label);
-        error_shape(
+        return Err(error_shape(
             ERROR_UNAVAILABLE,
             &format!("failed to replace {label}: {e}"),
             None,
-        )
-    })?;
+        ));
+    }
     Ok(())
 }
 
