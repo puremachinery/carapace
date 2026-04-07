@@ -46,7 +46,7 @@ sha2_10 = { package = "sha2", version = "0.10" }
 hkdf = "0.13"
 hmac = "0.13"
 pbkdf2 = "0.12"
-mdns-sd = "0.18"
+mdns-sd = "0.19"
 rcgen = "0.14"
 x509-parser = "0.18"
 tokio-rustls = "0.26"
@@ -78,8 +78,8 @@ insta = { version = "1", features = ["json"] }
 tokio-test = "0.4"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
-wit-component = { version = "0.246.1", features = ["dummy-module"] }
-wit-parser = "0.246.1"
+wit-component = { version = "0.246.2", features = ["dummy-module"] }
+wit-parser = "0.246.2"
 
 [features]
 gateway = []
