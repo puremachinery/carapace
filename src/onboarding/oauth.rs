@@ -388,7 +388,6 @@ pub(crate) async fn complete_oauth_callback(
     if let Some(err) = error.filter(|value| !value.trim().is_empty()) {
         return finish_oauth_flow(
             &flow_id,
-            &provider_config,
             Err(format_oauth_provider_error(err, error_description)),
         );
     }
@@ -399,7 +398,6 @@ pub(crate) async fn complete_oauth_callback(
         None => {
             return finish_oauth_flow(
                 &flow_id,
-                &provider_config,
                 Err("Missing OAuth authorization code".to_string()),
             );
         }
@@ -420,7 +418,7 @@ pub(crate) async fn complete_oauth_callback(
     }
     .await;
 
-    finish_oauth_flow(&flow_id, &provider_config, result)
+    finish_oauth_flow(&flow_id, result)
 }
 
 /// Transition a flow to its terminal state (Completed or Failed).
@@ -430,7 +428,6 @@ pub(crate) async fn complete_oauth_callback(
 /// terminal state, that state is returned without modification.
 fn finish_oauth_flow(
     flow_id: &str,
-    _provider_config: &OAuthProviderConfig,
     result: Result<OAuthCompletion, String>,
 ) -> Result<(), String> {
     let mut flows = OAUTH_FLOWS.write();
