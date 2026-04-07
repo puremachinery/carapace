@@ -2,6 +2,7 @@
 
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -10,6 +11,9 @@ use std::time::Duration;
 use hickory_resolver::config::ResolverConfig;
 use hickory_resolver::name_server::TokioConnectionProvider;
 use hickory_resolver::TokioResolver;
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 use super::super::*;
 use super::config::{map_validation_issues, read_config_snapshot, write_config_file};
@@ -217,7 +221,7 @@ fn write_plugins_manifest(plugins_dir: &Path, manifest: &Value) -> Result<(), Er
     })?;
 
     let manifest_path = plugins_dir.join(PLUGINS_MANIFEST_FILE);
-    let tmp_path = plugins_dir.join(format!("{}.tmp", PLUGINS_MANIFEST_FILE));
+    let tmp_path = unique_plugins_tmp_path(plugins_dir, PLUGINS_MANIFEST_FILE);
 
     let content = serde_json::to_string_pretty(manifest).map_err(|e| {
         error_shape(
@@ -226,44 +230,84 @@ fn write_plugins_manifest(plugins_dir: &Path, manifest: &Value) -> Result<(), Er
             None,
         )
     })?;
+    let mut bytes = content.into_bytes();
+    bytes.push(b'\n');
+    write_atomic_plugins_file(&tmp_path, &manifest_path, &bytes, "plugins manifest")?;
+    Ok(())
+}
+
+fn unique_plugins_tmp_path(plugins_dir: &Path, file_name: &str) -> PathBuf {
+    plugins_dir.join(format!(".{}.{}.tmp", file_name, uuid::Uuid::new_v4()))
+}
+
+fn open_plugins_tmp_file(tmp_path: &Path, file_label: &str) -> Result<std::fs::File, ErrorShape> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
     {
-        let mut file = std::fs::File::create(&tmp_path).map_err(|e| {
+        options.mode(0o600);
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(tmp_path).map_err(|e| {
+        error_shape(
+            ERROR_UNAVAILABLE,
+            &format!("failed to write {file_label}: {e}"),
+            None,
+        )
+    })
+}
+
+fn write_atomic_plugins_file(
+    tmp_path: &Path,
+    dest_path: &Path,
+    bytes: &[u8],
+    label: &str,
+) -> Result<(), ErrorShape> {
+    let mut file = open_plugins_tmp_file(tmp_path, label)?;
+    if let Err(err) = (|| {
+        file.write_all(bytes).map_err(|e| {
             error_shape(
                 ERROR_UNAVAILABLE,
-                &format!("failed to write plugins manifest: {}", e),
-                None,
-            )
-        })?;
-        file.write_all(content.as_bytes()).map_err(|e| {
-            error_shape(
-                ERROR_UNAVAILABLE,
-                &format!("failed to write plugins manifest: {}", e),
-                None,
-            )
-        })?;
-        file.write_all(b"\n").map_err(|e| {
-            error_shape(
-                ERROR_UNAVAILABLE,
-                &format!("failed to write plugins manifest: {}", e),
+                &format!("failed to write {label}: {e}"),
                 None,
             )
         })?;
         file.sync_all().map_err(|e| {
             error_shape(
                 ERROR_UNAVAILABLE,
-                &format!("failed to sync plugins manifest: {}", e),
+                &format!("failed to sync {label}: {e}"),
                 None,
             )
         })?;
+        Ok::<(), ErrorShape>(())
+    })() {
+        log_plugins_tmp_cleanup_failure(tmp_path, label);
+        return Err(err);
     }
-    std::fs::rename(&tmp_path, &manifest_path).map_err(|e| {
-        error_shape(
+
+    if let Err(e) = std::fs::rename(tmp_path, dest_path) {
+        log_plugins_tmp_cleanup_failure(tmp_path, label);
+        return Err(error_shape(
             ERROR_UNAVAILABLE,
-            &format!("failed to replace plugins manifest: {}", e),
+            &format!("failed to replace {label}: {e}"),
             None,
-        )
-    })?;
+        ));
+    }
     Ok(())
+}
+
+fn log_plugins_tmp_cleanup_failure(tmp_path: &Path, label: &str) {
+    if let Err(cleanup_error) = std::fs::remove_file(tmp_path) {
+        if cleanup_error.kind() == std::io::ErrorKind::NotFound {
+            return;
+        }
+        tracing::warn!(
+            path = %tmp_path.display(),
+            %label,
+            %cleanup_error,
+            "failed to clean up temporary plugin file"
+        );
+    }
 }
 
 /// Compute the SHA-256 hash of the given bytes and return it as a lowercase hex string.
@@ -426,38 +470,9 @@ fn atomic_write_plugin_file(
     bytes: &[u8],
 ) -> Result<PathBuf, ErrorShape> {
     let dest_path = plugins_dir.join(file_name);
-    let tmp_path = plugins_dir.join(format!("{}.tmp", file_name));
+    let tmp_path = unique_plugins_tmp_path(plugins_dir, file_name);
 
-    {
-        let mut file = std::fs::File::create(&tmp_path).map_err(|e| {
-            error_shape(
-                ERROR_UNAVAILABLE,
-                &format!("failed to write plugin binary: {}", e),
-                None,
-            )
-        })?;
-        file.write_all(bytes).map_err(|e| {
-            error_shape(
-                ERROR_UNAVAILABLE,
-                &format!("failed to write plugin binary: {}", e),
-                None,
-            )
-        })?;
-        file.sync_all().map_err(|e| {
-            error_shape(
-                ERROR_UNAVAILABLE,
-                &format!("failed to sync plugin binary: {}", e),
-                None,
-            )
-        })?;
-    }
-    std::fs::rename(&tmp_path, &dest_path).map_err(|e| {
-        error_shape(
-            ERROR_UNAVAILABLE,
-            &format!("failed to replace plugin binary: {}", e),
-            None,
-        )
-    })?;
+    write_atomic_plugins_file(&tmp_path, &dest_path, bytes, "plugin binary")?;
 
     Ok(dest_path)
 }
@@ -2297,6 +2312,37 @@ mod tests {
         let manifest = json!({ "test": {} });
         write_plugins_manifest(&nested, &manifest).unwrap();
         assert!(nested.join(PLUGINS_MANIFEST_FILE).is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_write_atomic_plugins_file_rejects_symlinked_tmp_path() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let dest_path = dir.path().join("plugin.wasm");
+        let tmp_path = dir.path().join("plugin.wasm.tmp");
+        let redirected_target = dir.path().join("redirected-target");
+
+        std::fs::write(&redirected_target, b"existing-target").unwrap();
+        symlink(&redirected_target, &tmp_path).unwrap();
+
+        let err =
+            write_atomic_plugins_file(&tmp_path, &dest_path, b"new-plugin-bytes", "plugin binary")
+                .unwrap_err();
+
+        assert_eq!(err.code, ERROR_UNAVAILABLE);
+        assert!(
+            err.message.contains("failed to write plugin binary"),
+            "unexpected error: {}",
+            err.message
+        );
+        assert_eq!(
+            std::fs::read(&redirected_target).unwrap(),
+            b"existing-target",
+            "symlink target must not be overwritten"
+        );
+        assert!(!dest_path.exists(), "destination should not be created");
     }
 
     #[test]
