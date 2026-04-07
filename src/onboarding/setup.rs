@@ -1213,12 +1213,21 @@ fn resolve_config_value(cfg: &Value, path: &[&str], label: &str) -> ConfigValueR
             env_vars: format_env_var_list(&missing),
         };
     }
-    let detail = if !references.is_empty() {
-        format!("{label} resolves from {}", format_env_var_list(&references))
+    // Env vars are already confirmed present — substitute directly instead of
+    // calling effective_config_value (which would re-parse references).
+    let (detail, effective) = if !references.is_empty() {
+        let resolved = crate::config::substitute_env_in_string(&value)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(value);
+        (
+            format!("{label} resolves from {}", format_env_var_list(&references)),
+            resolved,
+        )
     } else {
-        format!("{label} is written in config")
+        (format!("{label} is written in config"), value)
     };
-    let effective = effective_config_value(&value).unwrap_or(value);
     ConfigValueResolution::Resolved {
         detail,
         effective_value: effective,
@@ -1370,23 +1379,6 @@ fn config_string(cfg: &Value, path: &[&str]) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
-}
-
-fn effective_config_value(value: &str) -> Option<String> {
-    let references = env_var_references(value);
-    if references.is_empty() {
-        let trimmed = value.trim();
-        return (!trimmed.is_empty()).then(|| trimmed.to_string());
-    }
-
-    if missing_env_var_references(&references).is_empty() {
-        crate::config::substitute_env_in_string(value)
-            .ok()
-            .map(|resolved| resolved.trim().to_string())
-            .filter(|resolved| !resolved.is_empty())
-    } else {
-        None
-    }
 }
 
 fn env_var_references(value: &str) -> Vec<String> {
