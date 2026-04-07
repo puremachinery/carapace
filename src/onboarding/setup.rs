@@ -284,6 +284,13 @@ pub struct SetupCheck {
     pub projection: SetupCheckProjection,
 }
 
+fn projection_from(code: Option<SetupCheckCode>) -> SetupCheckProjection {
+    match code {
+        Some(c) => SetupCheckProjection::Code(c),
+        None => SetupCheckProjection::GenericStatus,
+    }
+}
+
 impl SetupCheck {
     fn new(
         name: impl Into<String>,
@@ -303,21 +310,10 @@ impl SetupCheck {
         }
     }
 
-    pub fn pass_generic(name: impl Into<String>, detail: impl Into<String>) -> Self {
-        Self::new(
-            name,
-            SetupCheckStatus::Pass,
-            SetupCheckKind::Requirement,
-            detail,
-            None,
-            SetupCheckProjection::GenericStatus,
-        )
-    }
-
-    pub fn pass_code(
+    pub fn pass(
         name: impl Into<String>,
         detail: impl Into<String>,
-        code: SetupCheckCode,
+        code: Option<SetupCheckCode>,
     ) -> Self {
         Self::new(
             name,
@@ -325,25 +321,14 @@ impl SetupCheck {
             SetupCheckKind::Requirement,
             detail,
             None,
-            SetupCheckProjection::Code(code),
+            projection_from(code),
         )
     }
 
-    pub fn validation_pass_generic(name: impl Into<String>, detail: impl Into<String>) -> Self {
-        Self::new(
-            name,
-            SetupCheckStatus::Pass,
-            SetupCheckKind::Validation,
-            detail,
-            None,
-            SetupCheckProjection::GenericStatus,
-        )
-    }
-
-    pub fn validation_pass_code(
+    pub fn validation_pass(
         name: impl Into<String>,
         detail: impl Into<String>,
-        code: SetupCheckCode,
+        code: Option<SetupCheckCode>,
     ) -> Self {
         Self::new(
             name,
@@ -351,14 +336,15 @@ impl SetupCheck {
             SetupCheckKind::Validation,
             detail,
             None,
-            SetupCheckProjection::Code(code),
+            projection_from(code),
         )
     }
 
-    pub fn fail_generic(
+    pub fn fail(
         name: impl Into<String>,
         detail: impl Into<String>,
         remediation: impl Into<String>,
+        code: Option<SetupCheckCode>,
     ) -> Self {
         Self::new(
             name,
@@ -366,30 +352,15 @@ impl SetupCheck {
             SetupCheckKind::Requirement,
             detail,
             Some(remediation.into()),
-            SetupCheckProjection::GenericStatus,
+            projection_from(code),
         )
     }
 
-    pub fn fail_code(
-        name: impl Into<String>,
-        detail: impl Into<String>,
-        remediation: impl Into<String>,
-        code: SetupCheckCode,
-    ) -> Self {
-        Self::new(
-            name,
-            SetupCheckStatus::Fail,
-            SetupCheckKind::Requirement,
-            detail,
-            Some(remediation.into()),
-            SetupCheckProjection::Code(code),
-        )
-    }
-
-    pub fn skip_generic(
+    pub fn skip(
         name: impl Into<String>,
         detail: impl Into<String>,
         remediation: Option<String>,
+        code: Option<SetupCheckCode>,
     ) -> Self {
         Self::new(
             name,
@@ -397,30 +368,15 @@ impl SetupCheck {
             SetupCheckKind::Requirement,
             detail,
             remediation,
-            SetupCheckProjection::GenericStatus,
+            projection_from(code),
         )
     }
 
-    pub fn skip_code(
+    pub fn validation_skip(
         name: impl Into<String>,
         detail: impl Into<String>,
         remediation: Option<String>,
-        code: SetupCheckCode,
-    ) -> Self {
-        Self::new(
-            name,
-            SetupCheckStatus::Skip,
-            SetupCheckKind::Requirement,
-            detail,
-            remediation,
-            SetupCheckProjection::Code(code),
-        )
-    }
-
-    pub fn validation_skip_generic(
-        name: impl Into<String>,
-        detail: impl Into<String>,
-        remediation: Option<String>,
+        code: Option<SetupCheckCode>,
     ) -> Self {
         Self::new(
             name,
@@ -428,30 +384,15 @@ impl SetupCheck {
             SetupCheckKind::Validation,
             detail,
             remediation,
-            SetupCheckProjection::GenericStatus,
+            projection_from(code),
         )
     }
 
-    pub fn validation_skip_code(
-        name: impl Into<String>,
-        detail: impl Into<String>,
-        remediation: Option<String>,
-        code: SetupCheckCode,
-    ) -> Self {
-        Self::new(
-            name,
-            SetupCheckStatus::Skip,
-            SetupCheckKind::Validation,
-            detail,
-            remediation,
-            SetupCheckProjection::Code(code),
-        )
-    }
-
-    pub fn validation_fail_generic(
+    pub fn validation_fail(
         name: impl Into<String>,
         detail: impl Into<String>,
         remediation: impl Into<String>,
+        code: Option<SetupCheckCode>,
     ) -> Self {
         Self::new(
             name,
@@ -459,23 +400,7 @@ impl SetupCheck {
             SetupCheckKind::Validation,
             detail,
             Some(remediation.into()),
-            SetupCheckProjection::GenericStatus,
-        )
-    }
-
-    pub fn validation_fail_code(
-        name: impl Into<String>,
-        detail: impl Into<String>,
-        remediation: impl Into<String>,
-        code: SetupCheckCode,
-    ) -> Self {
-        Self::new(
-            name,
-            SetupCheckStatus::Fail,
-            SetupCheckKind::Validation,
-            detail,
-            Some(remediation.into()),
-            SetupCheckProjection::Code(code),
+            projection_from(code),
         )
     }
 
@@ -565,7 +490,7 @@ pub fn assess_provider_setup(
             let profile_id = config_string(cfg, &["anthropic", "authProfile"]);
             match (api_key, profile_id) {
                 (Some(_), Some(profile_id)) => {
-                    checks.push(SetupCheck::skip_generic(
+                    checks.push(SetupCheck::skip(
                         "Anthropic auth path",
                         format!(
                             "both `anthropic.apiKey` and `anthropic.authProfile` (`{profile_id}`) are configured; runtime will prefer `anthropic.apiKey`"
@@ -574,6 +499,7 @@ pub fn assess_provider_setup(
                             "remove one of `anthropic.apiKey` or `anthropic.authProfile` to keep the Anthropic auth path explicit"
                                 .to_string(),
                         ),
+                        None,
                     ));
                     checks.push(configured_value_check(
                         cfg,
@@ -628,7 +554,7 @@ pub fn assess_provider_setup(
                         checks.push(check);
                     }
                 }
-                (None, None) => checks.push(SetupCheck::fail_generic(
+                (None, None) => checks.push(SetupCheck::fail(
                     "Anthropic credential",
                     "Neither `anthropic.apiKey` nor `anthropic.authProfile` is configured",
                     setup_follow_up(provider_setup_follow_up(
@@ -637,6 +563,7 @@ pub fn assess_provider_setup(
                         "write `anthropic.apiKey` or `anthropic.authProfile` into config"
                             .to_string(),
                     )),
+                    None,
                 )),
             }
         }
@@ -855,9 +782,10 @@ pub fn assess_provider_setup(
         check.status == SetupCheckStatus::Pass && check.kind == SetupCheckKind::Validation
     });
     if !has_fail && !has_validation_check {
-        checks.push(SetupCheck::validation_skip_generic(
+        checks.push(SetupCheck::validation_skip(
             "Live provider validation",
             "setup completed without a live provider-side validation step",
+            None,
             None,
         ));
     }
@@ -987,7 +915,7 @@ fn vertex_default_model_check(cfg: &Value, setup_command: Option<&str>) -> Setup
             let missing = missing_env_var_references(&references);
             if !missing.is_empty() {
                 let env_vars = format_env_var_list(&missing);
-                SetupCheck::fail_generic(
+                SetupCheck::fail(
                     "Vertex default model",
                     format!("Vertex default model references {env_vars}, but they are not set"),
                     setup_follow_up(provider_setup_follow_up(
@@ -995,23 +923,26 @@ fn vertex_default_model_check(cfg: &Value, setup_command: Option<&str>) -> Setup
                         format!("after setting {env_vars} or rewriting `vertex.model`"),
                         format!("set {env_vars} in the same shell or write `vertex.model` into config"),
                     )),
+                    None,
                 )
             } else if !references.is_empty() {
-                SetupCheck::pass_generic(
+                SetupCheck::pass(
                     "Vertex default model",
                     format!(
                         "Vertex default model resolves from {}",
                         format_env_var_list(&references)
                     ),
+                    None,
                 )
             } else {
-                SetupCheck::pass_generic(
+                SetupCheck::pass(
                     "Vertex default model",
                     "Vertex default model is written in config",
+                    None,
                 )
             }
         }
-        None => SetupCheck::fail_generic(
+        None => SetupCheck::fail(
             "Vertex default model",
             "`agents.defaults.model` routes to `vertex:default`, but `vertex.model` is not configured",
             setup_follow_up(provider_setup_follow_up(
@@ -1019,6 +950,7 @@ fn vertex_default_model_check(cfg: &Value, setup_command: Option<&str>) -> Setup
                 "after setting `vertex.model` or choosing an explicit Vertex model route".to_string(),
                 "set `vertex.model`, or switch `agents.defaults.model` to an explicit Vertex model such as `vertex:gemini-2.5-flash`".to_string(),
             )),
+            None,
         ),
     }
 }
@@ -1029,18 +961,20 @@ fn model_route_check(
     setup_command: Option<&str>,
 ) -> SetupCheck {
     let Some(model) = config_string(cfg, &["agents", "defaults", "model"]) else {
-        return SetupCheck::fail_generic(
+        return SetupCheck::fail(
             "Default model route",
             "`agents.defaults.model` is not configured".to_string(),
             default_model_route_follow_up(provider, setup_command),
+            None,
         );
     };
     match model_provider_for_local_chat(&model) {
-        Some(actual_provider) if actual_provider == provider => SetupCheck::pass_generic(
+        Some(actual_provider) if actual_provider == provider => SetupCheck::pass(
             "Default model route",
             format!("`agents.defaults.model` routes to {}", provider.label()),
+            None,
         ),
-        Some(actual_provider) => SetupCheck::fail_generic(
+        Some(actual_provider) => SetupCheck::fail(
             "Default model route",
             format!(
                 "`agents.defaults.model` currently routes to {}, not {}",
@@ -1048,11 +982,13 @@ fn model_route_check(
                 provider.label()
             ),
             default_model_route_follow_up(provider, setup_command),
+            None,
         ),
-        None => SetupCheck::fail_generic(
+        None => SetupCheck::fail(
             "Default model route",
             format!("`agents.defaults.model` uses an unrecognized provider route: `{model}`"),
             default_model_route_follow_up(provider, setup_command),
+            None,
         ),
     }
 }
@@ -1063,9 +999,9 @@ fn auth_profiles_enabled_check(cfg: &Value, setup_command: Option<&str>) -> Setu
         .and_then(Value::as_bool)
         .unwrap_or(false);
     if enabled {
-        SetupCheck::pass_generic("Auth profiles", "`auth.profiles.enabled` is true")
+        SetupCheck::pass("Auth profiles", "`auth.profiles.enabled` is true", None)
     } else {
-        SetupCheck::fail_generic(
+        SetupCheck::fail(
             "Auth profiles",
             "`auth.profiles.enabled` is false",
             setup_follow_up(provider_setup_follow_up(
@@ -1073,6 +1009,7 @@ fn auth_profiles_enabled_check(cfg: &Value, setup_command: Option<&str>) -> Setu
                 "to enable auth profiles",
                 "enable `auth.profiles.enabled` in config",
             )),
+            None,
         )
     }
 }
@@ -1084,12 +1021,12 @@ fn auth_profile_id_check(
     setup_command: Option<&str>,
 ) -> SetupCheck {
     match config_string(cfg, path) {
-        Some(profile_id) => SetupCheck::pass_code(
+        Some(profile_id) => SetupCheck::pass(
             label,
             format!("configured profile id: `{profile_id}`"),
-            SetupCheckCode::AuthProfileConfigured,
+            Some(SetupCheckCode::AuthProfileConfigured),
         ),
-        None => SetupCheck::fail_code(
+        None => SetupCheck::fail(
             label,
             format!("{label} is not configured"),
             setup_follow_up(provider_setup_follow_up(
@@ -1097,16 +1034,17 @@ fn auth_profile_id_check(
                 "to store a sign-in profile",
                 format!("write {label} into config"),
             )),
-            SetupCheckCode::AuthProfileNotConfigured,
+            Some(SetupCheckCode::AuthProfileNotConfigured),
         ),
     }
 }
 
 fn config_password_check(setup_command: Option<&str>) -> SetupCheck {
     if env_var_present("CARAPACE_CONFIG_PASSWORD") {
-        SetupCheck::pass_generic(
+        SetupCheck::pass(
             "Encrypted profile store",
             "`CARAPACE_CONFIG_PASSWORD` is set in the current shell",
+            None,
         )
     } else {
         let remediation = match setup_command {
@@ -1117,10 +1055,11 @@ fn config_password_check(setup_command: Option<&str>) -> SetupCheck {
                 "set `CARAPACE_CONFIG_PASSWORD` before running Carapace, then rerun `{LOCAL_CHAT_VERIFY_COMMAND}`"
             ),
         };
-        SetupCheck::fail_generic(
+        SetupCheck::fail(
             "Encrypted profile store",
             "`CARAPACE_CONFIG_PASSWORD` is not set in the current shell",
             remediation,
+            None,
         )
     }
 }
@@ -1137,7 +1076,7 @@ fn auth_profile_summary_check(
         Ok(Some(loaded)) => {
             if loaded.summary.provider != expected_provider {
                 (
-                    SetupCheck::fail_code(
+                    SetupCheck::fail(
                         label,
                         format!(
                             "stored profile `{profile_id}` belongs to {}, not {}",
@@ -1148,13 +1087,13 @@ fn auth_profile_summary_check(
                             "to store the correct auth profile",
                             format!("write the correct {label} into config"),
                         )),
-                        SetupCheckCode::AuthProfileWrongProvider,
+                        Some(SetupCheckCode::AuthProfileWrongProvider),
                     ),
                     None,
                 )
             } else if loaded.summary.credential_kind != expected_credential_kind {
                 (
-                    SetupCheck::fail_code(
+                    SetupCheck::fail(
                         label,
                         format!(
                             "stored profile `{profile_id}` uses {} credentials, not {}",
@@ -1165,7 +1104,7 @@ fn auth_profile_summary_check(
                             "to store the correct auth profile credential type",
                             format!("write the correct {label} into config"),
                         )),
-                        SetupCheckCode::AuthProfileWrongCredentialType,
+                        Some(SetupCheckCode::AuthProfileWrongCredentialType),
                     ),
                     None,
                 )
@@ -1180,7 +1119,7 @@ fn auth_profile_summary_check(
                     format!("stored profile `{profile_id}` has no usable token")
                 };
                 (
-                    SetupCheck::fail_code(
+                    SetupCheck::fail(
                         label,
                         detail,
                         setup_follow_up(provider_setup_follow_up(
@@ -1188,11 +1127,13 @@ fn auth_profile_summary_check(
                             "to store a fresh auth profile token",
                             format!("write a fresh {label} into config"),
                         )),
-                        if loaded.token_still_encrypted && profile_store_password_present() {
-                            SetupCheckCode::AuthProfileTokenDecryptFailed
-                        } else {
-                            SetupCheckCode::AuthProfileTokenMissing
-                        },
+                        Some(
+                            if loaded.token_still_encrypted && profile_store_password_present() {
+                                SetupCheckCode::AuthProfileTokenDecryptFailed
+                            } else {
+                                SetupCheckCode::AuthProfileTokenMissing
+                            },
+                        ),
                     ),
                     None,
                 )
@@ -1202,17 +1143,17 @@ fn auth_profile_summary_check(
                     None => format!("loaded `{}`", loaded.summary.name),
                 };
                 (
-                    SetupCheck::validation_pass_code(
+                    SetupCheck::validation_pass(
                         label,
                         detail,
-                        SetupCheckCode::AuthProfileLoaded,
+                        Some(SetupCheckCode::AuthProfileLoaded),
                     ),
                     Some(loaded.summary),
                 )
             }
         }
         Ok(None) => (
-            SetupCheck::fail_code(
+            SetupCheck::fail(
                 label,
                 format!("stored profile `{profile_id}` was not found in the profile store"),
                 setup_follow_up(provider_setup_follow_up(
@@ -1220,7 +1161,7 @@ fn auth_profile_summary_check(
                     "to store a fresh auth profile",
                     format!("write a fresh {label} into config"),
                 )),
-                SetupCheckCode::AuthProfileMissing,
+                Some(SetupCheckCode::AuthProfileMissing),
             ),
             None,
         ),
@@ -1230,11 +1171,11 @@ fn auth_profile_summary_check(
                 None => format!("check the profile store and rerun `{LOCAL_CHAT_VERIFY_COMMAND}`"),
             };
             (
-                SetupCheck::fail_code(
+                SetupCheck::fail(
                     label,
                     format!("failed to read the profile store: {err}"),
                     remediation,
-                    SetupCheckCode::AuthProfileStoreReadFailed,
+                    Some(SetupCheckCode::AuthProfileStoreReadFailed),
                 ),
                 None,
             )
@@ -1267,21 +1208,23 @@ fn configured_value_check(
                         "set {env_vars} in the same shell or write {label} into config, then rerun `{LOCAL_CHAT_VERIFY_COMMAND}`"
                     ),
                 };
-                SetupCheck::fail_generic(
+                SetupCheck::fail(
                     label,
                     format!("{label} references {env_vars}, but they are not set"),
                     remediation,
+                    None,
                 )
             } else if !references.is_empty() {
-                SetupCheck::pass_generic(
+                SetupCheck::pass(
                     label,
                     format!("{label} resolves from {}", format_env_var_list(&references)),
+                    None,
                 )
             } else {
-                SetupCheck::pass_generic(label, format!("{label} is written in config"))
+                SetupCheck::pass(label, format!("{label} is written in config"), None)
             }
         }
-        None => SetupCheck::fail_generic(
+        None => SetupCheck::fail(
             label,
             format!("{label} is not configured"),
             setup_follow_up(provider_setup_follow_up(
@@ -1289,6 +1232,7 @@ fn configured_value_check(
                 format!("to configure {label}"),
                 format!("write {label} into config"),
             )),
+            None,
         ),
     }
 }
@@ -1300,21 +1244,23 @@ fn optional_configured_value_check(cfg: &Value, path: &[&str], label: &str) -> S
             let missing = missing_env_var_references(&references);
             if !missing.is_empty() {
                 let env_vars = format_env_var_list(&missing);
-                SetupCheck::fail_generic(
+                SetupCheck::fail(
                     label,
                     format!("{label} references {env_vars}, but they are not set"),
                     format!("set {env_vars} before starting Carapace"),
+                    None,
                 )
             } else if !references.is_empty() {
-                SetupCheck::pass_generic(
+                SetupCheck::pass(
                     label,
                     format!("{label} resolves from {}", format_env_var_list(&references)),
+                    None,
                 )
             } else {
-                SetupCheck::pass_generic(label, format!("{label} is written in config"))
+                SetupCheck::pass(label, format!("{label} is written in config"), None)
             }
         }
-        None => SetupCheck::skip_generic(label, format!("{label} is not configured"), None),
+        None => SetupCheck::skip(label, format!("{label} is not configured"), None, None),
     }
 }
 
@@ -1329,7 +1275,7 @@ where
     F: FnOnce(&str) -> Result<(), String>,
 {
     let Some(value) = config_string(cfg, path) else {
-        return SetupCheck::skip_generic(label, "no custom base URL configured", None);
+        return SetupCheck::skip(label, "no custom base URL configured", None, None);
     };
     let references = env_var_references(&value);
     let missing = missing_env_var_references(&references);
@@ -1343,17 +1289,18 @@ where
                 "set {env_vars} in the same shell or write a valid {label} into config, then rerun `{LOCAL_CHAT_VERIFY_COMMAND}`"
             ),
         };
-        return SetupCheck::fail_generic(
+        return SetupCheck::fail(
             label,
             format!("{label} references {env_vars}, but they are not set"),
             remediation,
+            None,
         );
     }
 
     let effective = effective_config_value(&value).unwrap_or_else(|| value.clone());
     match validator(&effective) {
-        Ok(()) => SetupCheck::pass_generic(label, format!("{label} passed local validation")),
-        Err(err) => SetupCheck::validation_fail_code(
+        Ok(()) => SetupCheck::pass(label, format!("{label} passed local validation"), None),
+        Err(err) => SetupCheck::validation_fail(
             label,
             format!("{label} failed local validation: {err}"),
             setup_follow_up(provider_setup_follow_up(
@@ -1361,7 +1308,7 @@ where
                 "and correct the base URL",
                 format!("write a valid {label} into config"),
             )),
-            SetupCheckCode::LocalValidationFailed,
+            Some(SetupCheckCode::LocalValidationFailed),
         ),
     }
 }
@@ -1773,11 +1720,11 @@ mod tests {
 
     #[test]
     fn test_setup_check_code_constructors_preserve_kind_and_code() {
-        let requirement_skip = SetupCheck::skip_code(
+        let requirement_skip = SetupCheck::skip(
             "Req skip",
             "detail",
             Some("fix it".to_string()),
-            SetupCheckCode::AuthProfileMissing,
+            Some(SetupCheckCode::AuthProfileMissing),
         );
         assert_eq!(requirement_skip.status, SetupCheckStatus::Skip);
         assert_eq!(requirement_skip.kind, SetupCheckKind::Requirement);
@@ -1786,11 +1733,11 @@ mod tests {
             Some(SetupCheckCode::AuthProfileMissing)
         );
 
-        let validation_skip = SetupCheck::validation_skip_code(
+        let validation_skip = SetupCheck::validation_skip(
             "Val skip",
             "detail",
             Some("fix it".to_string()),
-            SetupCheckCode::AuthProfileStoreReadFailed,
+            Some(SetupCheckCode::AuthProfileStoreReadFailed),
         );
         assert_eq!(validation_skip.status, SetupCheckStatus::Skip);
         assert_eq!(validation_skip.kind, SetupCheckKind::Validation);
@@ -1799,11 +1746,11 @@ mod tests {
             Some(SetupCheckCode::AuthProfileStoreReadFailed)
         );
 
-        let validation_fail = SetupCheck::validation_fail_code(
+        let validation_fail = SetupCheck::validation_fail(
             "Val fail",
             "detail",
             "fix it",
-            SetupCheckCode::LocalValidationFailed,
+            Some(SetupCheckCode::LocalValidationFailed),
         );
         assert_eq!(validation_fail.status, SetupCheckStatus::Fail);
         assert_eq!(validation_fail.kind, SetupCheckKind::Validation);
@@ -2180,9 +2127,10 @@ mod tests {
             &cfg,
             temp.path(),
             SetupProvider::Vertex,
-            vec![SetupCheck::validation_pass_generic(
+            vec![SetupCheck::validation_pass(
                 "Vertex model access",
                 "validated access to `gemini-2.5-flash`",
+                None,
             )],
         );
 
@@ -2242,10 +2190,11 @@ mod tests {
             &cfg,
             temp.path(),
             SetupProvider::OpenAi,
-            vec![SetupCheck::validation_fail_generic(
+            vec![SetupCheck::validation_fail(
                 "Provider configuration validation",
                 "provider config failed local validation",
                 "fix the value and rerun setup",
+                None,
             )],
         );
 
@@ -2272,10 +2221,11 @@ mod tests {
             &cfg,
             temp.path(),
             SetupProvider::OpenAi,
-            vec![SetupCheck::validation_skip_generic(
+            vec![SetupCheck::validation_skip(
                 "Live provider validation",
                 "OpenAI credential validation was skipped",
                 Some("run `cara verify` after setup".to_string()),
+                None,
             )],
         );
 
@@ -2340,10 +2290,11 @@ mod tests {
 
     #[test]
     fn test_setup_check_serializes_with_control_facing_field_names() {
-        let check = SetupCheck::validation_skip_generic(
+        let check = SetupCheck::validation_skip(
             "Live provider validation",
             "setup completed without a live provider-side validation step",
             Some("run `cara verify --outcome local-chat`".to_string()),
+            None,
         );
 
         let value = serde_json::to_value(&check).expect("check should serialize");

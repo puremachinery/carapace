@@ -109,12 +109,13 @@ pub fn detect_credential_sources() -> BedrockCredentialSources {
 /// Validate that a region is known to support Bedrock.
 pub fn validate_region(region: &str) -> SetupCheck {
     if BEDROCK_REGIONS.contains(&region) {
-        SetupCheck::validation_pass_generic(
+        SetupCheck::validation_pass(
             "Bedrock region",
             format!("Region `{region}` supports Bedrock"),
+            None,
         )
     } else {
-        SetupCheck::validation_skip_generic(
+        SetupCheck::validation_skip(
             "Bedrock region",
             format!(
                 "Region `{region}` is not in the known Bedrock region list; \
@@ -125,6 +126,7 @@ pub fn validate_region(region: &str) -> SetupCheck {
                  If `{region}` was recently added, this is safe to ignore.",
                 BEDROCK_REGIONS.join(", ")
             )),
+            None,
         )
     }
 }
@@ -159,10 +161,11 @@ pub async fn validate_bedrock_credentials(
         Ok(c) => c,
         Err(e) => {
             return (
-                SetupCheck::validation_fail_generic(
+                SetupCheck::validation_fail(
                     "Bedrock credentials",
                     format!("Failed to build HTTP client: {e}"),
                     "This is unexpected. Check your system TLS/network configuration.".to_string(),
+                    None,
                 ),
                 None,
             );
@@ -194,10 +197,11 @@ pub async fn validate_bedrock_credentials(
                 )
             };
             return (
-                SetupCheck::validation_fail_generic(
+                SetupCheck::validation_fail(
                     "Bedrock credentials",
                     format!("{e}"),
                     remediation,
+                    None,
                 ),
                 None,
             );
@@ -208,19 +212,21 @@ pub async fn validate_bedrock_credentials(
     if status.is_success() {
         match response.json::<serde_json::Value>().await {
             Ok(body) => (
-                SetupCheck::validation_pass_generic(
+                SetupCheck::validation_pass(
                     "Bedrock credentials",
                     format!("AWS credentials are valid and authorized for Bedrock in `{region}`"),
+                    None,
                 ),
                 Some(body),
             ),
             Err(e) => (
-                SetupCheck::validation_skip_generic(
+                SetupCheck::validation_skip(
                     "Bedrock credentials",
                     format!(
                         "AWS credentials are valid (HTTP 200) but response parsing failed: {e}"
                     ),
                     Some("Run `cara verify` after setup to confirm model access.".to_string()),
+                    None,
                 ),
                 None,
             ),
@@ -232,7 +238,7 @@ pub async fn validate_bedrock_credentials(
         // bedrock:InvokeModel, so this is not a setup failure.
         if status.as_u16() == 403 && body_text.contains("AccessDeniedException") {
             return (
-                SetupCheck::validation_skip_generic(
+                SetupCheck::validation_skip(
                     "Bedrock credentials",
                     "AWS credentials are valid but lack `bedrock:ListFoundationModels` \
                      permission; cannot verify model access during setup"
@@ -243,13 +249,14 @@ pub async fn validate_bedrock_credentials(
                          your IAM user/role."
                             .to_string(),
                     ),
+                    None,
                 ),
                 None,
             );
         }
         let (detail, remediation) = classify_api_error(status.as_u16(), &body_text, region);
         (
-            SetupCheck::validation_fail_generic("Bedrock credentials", detail, remediation),
+            SetupCheck::validation_fail("Bedrock credentials", detail, remediation, None),
             None,
         )
     }
@@ -262,10 +269,11 @@ pub fn check_model_access(model_id: &str, foundation_models: &serde_json::Value)
     let models = match foundation_models.get("modelSummaries") {
         Some(serde_json::Value::Array(arr)) => arr,
         _ => {
-            return SetupCheck::validation_skip_generic(
+            return SetupCheck::validation_skip(
                 "Model access",
                 "Could not parse model list from ListFoundationModels response".to_string(),
                 Some("Run `cara verify` after setup to confirm model access.".to_string()),
+                None,
             );
         }
     };
@@ -279,12 +287,13 @@ pub fn check_model_access(model_id: &str, foundation_models: &serde_json::Value)
                 .and_then(|v| v.as_str())
                 .unwrap_or("UNKNOWN");
             if status != "ACTIVE" {
-                return SetupCheck::validation_fail_generic(
+                return SetupCheck::validation_fail(
                     "Model access",
                     format!("Model `{bare_model}` found but lifecycle status is `{status}`"),
                     "The model may be deprecated or not yet available. \
                      Check the AWS console for model status in your region."
                         .to_string(),
+                    None,
                 );
             }
 
@@ -294,7 +303,7 @@ pub fn check_model_access(model_id: &str, foundation_models: &serde_json::Value)
                 .is_some_and(|arr| arr.iter().any(|v| v.as_str() == Some("ON_DEMAND")));
 
             if !supports_on_demand {
-                return SetupCheck::validation_fail_generic(
+                return SetupCheck::validation_fail(
                     "Model access",
                     format!(
                         "Model `{bare_model}` is active but does not support on-demand inference"
@@ -303,17 +312,19 @@ pub fn check_model_access(model_id: &str, foundation_models: &serde_json::Value)
                      that supports on-demand inference, or provision throughput \
                      in the AWS console."
                         .to_string(),
+                    None,
                 );
             }
 
-            return SetupCheck::validation_pass_generic(
+            return SetupCheck::validation_pass(
                 "Model access",
                 format!("Model `{bare_model}` is active and supports on-demand inference"),
+                None,
             );
         }
     }
 
-    SetupCheck::validation_fail_generic(
+    SetupCheck::validation_fail(
         "Model access",
         format!(
             "Model `{bare_model}` not found in the ListFoundationModels response for this region"
@@ -323,6 +334,7 @@ pub fn check_model_access(model_id: &str, foundation_models: &serde_json::Value)
              you have requested access in the AWS console \
              (Bedrock → Model access → Request access)."
         ),
+        None,
     )
 }
 

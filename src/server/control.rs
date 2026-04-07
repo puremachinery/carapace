@@ -2626,26 +2626,27 @@ mod tests {
             status: onboarding::setup::SetupAssessmentStatus::Ready,
             summary: "loaded `Google Profile` (user@example.com)".to_string(),
             checks: vec![
-                onboarding::setup::SetupCheck::pass_code(
+                onboarding::setup::SetupCheck::pass(
                     "Gemini auth profile",
                     "opaque internal configured profile detail",
-                    onboarding::setup::SetupCheckCode::AuthProfileConfigured,
+                    Some(onboarding::setup::SetupCheckCode::AuthProfileConfigured),
                 ),
-                onboarding::setup::SetupCheck::validation_pass_code(
+                onboarding::setup::SetupCheck::validation_pass(
                     "Gemini account identity",
                     "opaque internal loaded profile detail",
-                    onboarding::setup::SetupCheckCode::AuthProfileLoaded,
+                    Some(onboarding::setup::SetupCheckCode::AuthProfileLoaded),
                 ),
-                onboarding::setup::SetupCheck::validation_fail_generic(
+                onboarding::setup::SetupCheck::validation_fail(
                     "Gemini credential validation",
                     "stored profile `google-123` future auth detail with `internal-profile-id`",
                     "Re-run setup for Gemini credential validation.",
+                    None,
                 ),
-                onboarding::setup::SetupCheck::validation_fail_code(
+                onboarding::setup::SetupCheck::validation_fail(
                     "Gemini base URL validation",
                     "opaque invalid URL detail with https://user:secret@proxy.example.com/",
                     "Write a valid Gemini base URL into config.",
-                    onboarding::setup::SetupCheckCode::LocalValidationFailed,
+                    Some(onboarding::setup::SetupCheckCode::LocalValidationFailed),
                 ),
             ],
             profile_name: Some("Google Profile".to_string()),
@@ -2689,10 +2690,11 @@ mod tests {
             auth_mode: Some(onboarding::setup::SetupAuthMode::OAuth),
             status: onboarding::setup::SetupAssessmentStatus::Invalid,
             summary: "opaque setup summary".to_string(),
-            checks: vec![onboarding::setup::SetupCheck::fail_generic(
+            checks: vec![onboarding::setup::SetupCheck::fail(
                 "Gemini auth profile",
                 "stored profile `google-123` future sensitive detail",
                 "Re-run setup for Gemini.",
+                None,
             )],
             profile_name: None,
             email: None,

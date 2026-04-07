@@ -5121,7 +5121,7 @@ fn validate_provider_credentials_interactive(
     if provider == SetupProvider::Anthropic
         && requested_auth_mode == Some(SetupAuthModeSelection::SetupToken)
     {
-        return Ok(crate::onboarding::setup::SetupCheck::validation_skip_generic(
+        return Ok(crate::onboarding::setup::SetupCheck::validation_skip(
             "Live provider validation",
             "Anthropic setup-token live validation was skipped because setup-tokens do not use the API-key validation probe."
                 .to_string(),
@@ -5129,21 +5129,21 @@ fn validate_provider_credentials_interactive(
                 "run `cara verify --outcome local-chat` after setup to exercise the configured Anthropic setup-token path"
                     .to_string(),
             ),
+            None,
         ));
     }
 
     let validate_now = prompt_yes_no("Validate provider credentials now?", true)?;
     if !validate_now {
-        return Ok(
-            crate::onboarding::setup::SetupCheck::validation_skip_generic(
-                "Live provider validation",
-                format!("{} credential validation was skipped", provider.label()),
-                Some(
-                    "run `cara verify` after setup to exercise the configured provider path"
-                        .to_string(),
-                ),
+        return Ok(crate::onboarding::setup::SetupCheck::validation_skip(
+            "Live provider validation",
+            format!("{} credential validation was skipped", provider.label()),
+            Some(
+                "run `cara verify` after setup to exercise the configured provider path"
+                    .to_string(),
             ),
-        );
+            None,
+        ));
     }
 
     let provider_key = provider.prompt_key().to_string();
@@ -5154,24 +5154,24 @@ fn validate_provider_credentials_interactive(
     {
         Ok(()) => {
             println!("Credential check succeeded.");
-            Ok(
-                crate::onboarding::setup::SetupCheck::validation_pass_generic(
-                    "Live provider validation",
-                    format!("{} credential validation succeeded", provider.label()),
-                ),
-            )
+            Ok(crate::onboarding::setup::SetupCheck::validation_pass(
+                "Live provider validation",
+                format!("{} credential validation succeeded", provider.label()),
+                None,
+            ))
         }
         Err(err) => {
             eprintln!("Credential check failed: {}", err);
             if prompt_yes_no("Continue setup and write config anyway?", false)? {
                 let rerun_command = setup_rerun_command(provider, requested_auth_mode);
-                Ok(crate::onboarding::setup::SetupCheck::validation_fail_generic(
+                Ok(crate::onboarding::setup::SetupCheck::validation_fail(
                     "Live provider validation",
                     err,
                     format!(
                         "fix the credential and rerun `{}` or run `cara verify` after updating config",
                         rerun_command
                     ),
+                    None,
                 ))
             } else {
                 Err("setup aborted after credential validation failure".into())
@@ -5189,16 +5189,15 @@ fn validate_bedrock_credentials_interactive(
 ) -> Result<Vec<crate::onboarding::setup::SetupCheck>, Box<dyn std::error::Error>> {
     let validate_now = prompt_yes_no("Validate Bedrock credentials now?", true)?;
     if !validate_now {
-        return Ok(vec![
-            crate::onboarding::setup::SetupCheck::validation_skip_generic(
-                "Live Bedrock validation",
-                "Bedrock credential validation was skipped".to_string(),
-                Some(
-                    "run `cara verify` after setup to exercise the configured provider path"
-                        .to_string(),
-                ),
+        return Ok(vec![crate::onboarding::setup::SetupCheck::validation_skip(
+            "Live Bedrock validation",
+            "Bedrock credential validation was skipped".to_string(),
+            Some(
+                "run `cara verify` after setup to exercise the configured provider path"
+                    .to_string(),
             ),
-        ]);
+            None,
+        )]);
     }
 
     let mut checks = Vec::new();
@@ -5321,34 +5320,32 @@ fn validate_vertex_provider_interactive(
 ) -> Result<crate::onboarding::setup::SetupCheck, Box<dyn std::error::Error>> {
     let validate_now = prompt_yes_no("Validate Vertex configuration now?", true)?;
     if !validate_now {
-        return Ok(
-            crate::onboarding::setup::SetupCheck::validation_skip_generic(
-                "Live provider validation",
-                "Vertex live validation was skipped",
-                Some(
-                    "run `cara verify` after setup to exercise the configured Vertex path"
-                        .to_string(),
-                ),
+        return Ok(crate::onboarding::setup::SetupCheck::validation_skip(
+            "Live provider validation",
+            "Vertex live validation was skipped",
+            Some(
+                "run `cara verify` after setup to exercise the configured Vertex path".to_string(),
             ),
-        );
+            None,
+        ));
     }
 
     #[cfg(test)]
     if let Some(result) = setup_interactive_test_harness_take_provider_validation_result() {
         return match result {
-            Ok(()) => Ok(
-                crate::onboarding::setup::SetupCheck::validation_pass_generic(
-                    "Live provider validation",
-                    "Vertex auth, project, location, and model access validated",
-                ),
-            ),
+            Ok(()) => Ok(crate::onboarding::setup::SetupCheck::validation_pass(
+                "Live provider validation",
+                "Vertex auth, project, location, and model access validated",
+                None,
+            )),
             Err(detail) => {
                 eprintln!("Credential check failed: {detail}");
                 if prompt_yes_no("Continue setup and write config anyway?", false)? {
-                    Ok(crate::onboarding::setup::SetupCheck::validation_fail_generic(
+                    Ok(crate::onboarding::setup::SetupCheck::validation_fail(
                         "Live provider validation",
                         detail,
                         "check Vertex auth, project, location, and model access, then rerun `cara setup --force --provider vertex`".to_string(),
+                        None,
                     ))
                 } else {
                     Err("setup aborted after provider configuration validation failure".into())
@@ -5367,24 +5364,22 @@ fn validate_vertex_provider_interactive(
     )) {
         Ok(()) => {
             println!("Credential check succeeded.");
-            Ok(
-                crate::onboarding::setup::SetupCheck::validation_pass_generic(
-                    "Live provider validation",
-                    "Vertex auth, project, location, and model access validated",
-                ),
-            )
+            Ok(crate::onboarding::setup::SetupCheck::validation_pass(
+                "Live provider validation",
+                "Vertex auth, project, location, and model access validated",
+                None,
+            ))
         }
         Err(crate::runtime_bridge::BridgeError::Inner(err)) => {
             let detail = err.to_string();
             eprintln!("Credential check failed: {detail}");
             if prompt_yes_no("Continue setup and write config anyway?", false)? {
-                Ok(
-                    crate::onboarding::setup::SetupCheck::validation_fail_generic(
-                        "Live provider validation",
-                        detail,
-                        vertex_validation_failure_remediation(&err),
-                    ),
-                )
+                Ok(crate::onboarding::setup::SetupCheck::validation_fail(
+                    "Live provider validation",
+                    detail,
+                    vertex_validation_failure_remediation(&err),
+                    None,
+                ))
             } else {
                 Err("setup aborted after provider configuration validation failure".into())
             }
@@ -5393,11 +5388,12 @@ fn validate_vertex_provider_interactive(
             let detail = format!("Vertex validation runtime failed: {err}");
             eprintln!("Credential check failed: {detail}");
             if prompt_yes_no("Continue setup and write config anyway?", false)? {
-                Ok(crate::onboarding::setup::SetupCheck::validation_fail_generic(
+                Ok(crate::onboarding::setup::SetupCheck::validation_fail(
                     "Live provider validation",
                     detail,
                     "check local runtime availability and rerun `cara setup --force --provider vertex`"
                         .to_string(),
+                    None,
                 ))
             } else {
                 Err("setup aborted after provider configuration validation failure".into())
@@ -6885,12 +6881,13 @@ fn configure_gemini_provider_interactive(
                 None => "stored Gemini auth profile".to_string(),
             };
             crate::onboarding::gemini::persist_cli_google_oauth(state_dir, config, completion)?;
-            result.observed_checks.push(
-                crate::onboarding::setup::SetupCheck::validation_pass_generic(
+            result
+                .observed_checks
+                .push(crate::onboarding::setup::SetupCheck::validation_pass(
                     "Live provider validation",
                     profile_detail,
-                ),
-            );
+                    None,
+                ));
 
             if let Some(base_url) = base_url {
                 config["google"]["baseUrl"] = serde_json::json!(base_url.config_value);
@@ -6939,12 +6936,11 @@ fn configure_codex_provider_interactive(
     crate::onboarding::codex::persist_cli_openai_oauth(state_dir, config, completion)?;
 
     Ok(ProviderSetupResult {
-        observed_checks: vec![
-            crate::onboarding::setup::SetupCheck::validation_pass_generic(
-                "Live provider validation",
-                profile_detail,
-            ),
-        ],
+        observed_checks: vec![crate::onboarding::setup::SetupCheck::validation_pass(
+            "Live provider validation",
+            profile_detail,
+            None,
+        )],
     })
 }
 
@@ -7056,13 +7052,14 @@ fn configure_vertex_provider_interactive(
                 ),
             ),
         };
-        result.observed_checks.push(
-            crate::onboarding::setup::SetupCheck::validation_skip_generic(
+        result
+            .observed_checks
+            .push(crate::onboarding::setup::SetupCheck::validation_skip(
                 "Live provider validation",
                 detail,
                 Some(remediation),
-            ),
-        );
+                None,
+            ));
     }
 
     crate::onboarding::vertex::write_vertex_config(config, &config_input)?;
@@ -7078,13 +7075,12 @@ fn handle_setup_validation_failure(
     let rerun = setup_rerun_command(provider, requested_auth_mode);
     eprintln!("Next step: fix the value and rerun `{rerun}`.");
     if prompt_yes_no("Continue setup and write config anyway?", false)? {
-        Ok(
-            crate::onboarding::setup::SetupCheck::validation_fail_generic(
-                "Provider configuration validation",
-                render_setup_validation_failure(&err),
-                format!("fix the value and rerun `{rerun}`"),
-            ),
-        )
+        Ok(crate::onboarding::setup::SetupCheck::validation_fail(
+            "Provider configuration validation",
+            render_setup_validation_failure(&err),
+            format!("fix the value and rerun `{rerun}`"),
+            None,
+        ))
     } else {
         Err("setup aborted after provider configuration validation failure".into())
     }
@@ -7599,10 +7595,11 @@ fn configure_provider_noninteractive(
                     }
                     Err(err) => {
                         result.observed_checks.push(
-                            crate::onboarding::setup::SetupCheck::validation_fail_generic(
+                            crate::onboarding::setup::SetupCheck::validation_fail(
                                 "Live Bedrock validation",
                                 format!("Credential validation runtime failed: {err}"),
                                 "run `cara verify` after setup to exercise the configured provider path".to_string(),
+                                None,
                             ),
                         );
                     }
