@@ -1569,7 +1569,7 @@ pub async fn gemini_oauth_callback_handler(
 
     (
         status,
-        axum::response::Html(onboarding::gemini::callback_html(title, &message)),
+        axum::response::Html(onboarding::oauth::callback_html(title, &message)),
     )
         .into_response()
 }
@@ -1598,7 +1598,7 @@ pub async fn codex_oauth_callback_handler(
 
     (
         status,
-        axum::response::Html(onboarding::codex::callback_html(title, &message)),
+        axum::response::Html(onboarding::oauth::callback_html(title, &message)),
     )
         .into_response()
 }

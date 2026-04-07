@@ -12,6 +12,9 @@ CLAUDE.md
 GEMINI.md
 .claude/
 
+# Superpowers skill artifacts (specs, plans)
+docs/superpowers/
+
 # AI Review System
 .review_state.yaml
 .review_history/
