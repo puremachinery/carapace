@@ -24,6 +24,12 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_STABLE_TOOLCHAIN: 1.94.1
+  RUST_MSRV_TOOLCHAIN: 1.93.0
+  CARGO_NEXTEST_VERSION: 0.9.132
+  CARGO_AUDIT_VERSION: 0.22.1
+  CARGO_DENY_VERSION: 0.19.0
+  CARGO_GEIGER_VERSION: 0.13.0
   RUST_BACKTRACE: 1
 
 jobs:
@@ -79,7 +85,7 @@ jobs:
               workflow=true
             fi
 
-            if [[ "$path" == src/* || "$path" == tests/* || "$path" == fuzz/* || "$path" == wit/* || "$path" == ".cargo/"* || "$path" == ".config/nextest.toml" || "$path" == "Cargo.toml" || "$path" == "Cargo.lock" || "$path" == "build.rs" || "$path" == "deny.toml" || "$path" == "config.example.json5" ]]; then
+            if [[ "$path" == src/* || "$path" == tests/* || "$path" == fuzz/* || "$path" == wit/* || "$path" == ".cargo/"* || "$path" == ".config/nextest.toml" || "$path" == "Cargo.toml" || "$path" == "Cargo.lock" || "$path" == "build.rs" || "$path" == "deny.toml" || "$path" == "config.example.json5" || "$path" == "rust-toolchain.toml" || "$path" == "rust-toolchain" ]]; then
               rust_runtime=true
             fi
 
@@ -118,6 +124,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
+          toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
           components: rustfmt
       - run: cargo fmt --all --check
 
@@ -130,6 +137,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
+          toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
           components: clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
       - run: cargo clippy --all-targets --all-features -- -D warnings
@@ -152,8 +160,12 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
       - uses: taiki-e/install-action@602dc500e2b7e0e2486b4ce53909ba048de44e08 # nextest
+        with:
+          tool: nextest@${{ env.CARGO_NEXTEST_VERSION }}
       - name: Run nextest (golden lane)
         run: ./scripts/run-nextest-guarded.sh --all-targets -P golden
       - name: Upload nextest stall diagnostics (ws-golden)
@@ -173,6 +185,8 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
       - run: cargo build --all-targets
 
@@ -184,8 +198,12 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
       - uses: taiki-e/install-action@602dc500e2b7e0e2486b4ce53909ba048de44e08 # nextest
+        with:
+          tool: nextest@${{ env.CARGO_NEXTEST_VERSION }}
       - name: Run nextest (fast lane)
         run: ./scripts/run-nextest-guarded.sh --all-targets -P fast
       - name: Upload nextest stall diagnostics (test-pr)
@@ -209,8 +227,12 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
       - uses: taiki-e/install-action@602dc500e2b7e0e2486b4ce53909ba048de44e08 # nextest
+        with:
+          tool: nextest@${{ env.CARGO_NEXTEST_VERSION }}
       - name: Run nextest (full lane)
         if: runner.os != 'Windows'
         run: ./scripts/run-nextest-guarded.sh --all-targets -P full
@@ -234,8 +256,12 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
       - uses: taiki-e/install-action@602dc500e2b7e0e2486b4ce53909ba048de44e08 # nextest
+        with:
+          tool: nextest@${{ env.CARGO_NEXTEST_VERSION }}
       - name: Run nextest (fast lane)
         run: cargo nextest run --all-targets -P fast
 
@@ -247,6 +273,8 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # 1.93.0
+        with:
+          toolchain: ${{ env.RUST_MSRV_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
       - run: cargo check --all-targets
 
@@ -257,7 +285,12 @@ jobs:
     if: needs.changes.outputs.rust_runtime == 'true'
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
       - uses: taiki-e/install-action@468f60710537884ebb9b0e713dad1957996a55f2 # cargo-audit
+        with:
+          tool: cargo-audit@${{ env.CARGO_AUDIT_VERSION }}
       - run: cargo audit
 
   deny:
@@ -267,7 +300,12 @@ jobs:
     if: needs.changes.outputs.rust_runtime == 'true'
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
       - uses: taiki-e/install-action@f63130e3904c76fd4045473e61389a5266ee4cc0 # cargo-deny
+        with:
+          tool: cargo-deny@${{ env.CARGO_DENY_VERSION }}
       - name: Run cargo deny with transient-network retries
         run: |
           set -euo pipefail
@@ -354,9 +392,12 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
-      - name: Install cargo-geiger
-        run: cargo install cargo-geiger
+      - uses: taiki-e/install-action@602dc500e2b7e0e2486b4ce53909ba048de44e08 # cargo-geiger
+        with:
+          tool: cargo-geiger@${{ env.CARGO_GEIGER_VERSION }}
       - name: Report unsafe usage
         run: cargo geiger --all-targets --output-format ascii 2>&1 | tee geiger-report.txt
       - name: Upload geiger report
@@ -411,8 +452,12 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
       - uses: taiki-e/install-action@602dc500e2b7e0e2486b4ce53909ba048de44e08 # nextest
+        with:
+          tool: nextest@${{ env.CARGO_NEXTEST_VERSION }}
       - name: Run nextest (integration lane)
         run: ./scripts/run-nextest-guarded.sh --all-targets -P integration
       - name: Upload nextest stall diagnostics (manual integration)
@@ -435,8 +480,12 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
       - uses: taiki-e/install-action@602dc500e2b7e0e2486b4ce53909ba048de44e08 # nextest
+        with:
+          tool: nextest@${{ env.CARGO_NEXTEST_VERSION }}
       - name: Run nextest (full lane)
         if: runner.os != 'Windows'
         run: ./scripts/run-nextest-guarded.sh --all-targets -P full
