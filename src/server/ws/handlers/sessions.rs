@@ -2009,10 +2009,18 @@ pub(super) fn handle_agent(
     let agent_id = params
         .and_then(|v| v.get("agentId"))
         .and_then(|v| v.as_str());
-    crate::agent::apply_agent_config_from_settings(&mut config, &cfg, agent_id);
-    if let Some(m) = model_param {
-        config.model = m.trim().to_string();
+    // Resolve model through route resolver; request-level model param
+    // takes highest precedence.
+    if let Err(e) = crate::agent::resolve_agent_model(
+        &mut config,
+        &cfg,
+        agent_id,
+        None,
+        model_param,
+    ) {
+        return Err(error_shape(ERROR_UNAVAILABLE, &e.to_string(), None));
     }
+    crate::agent::apply_agent_config_from_settings(&mut config, &cfg, agent_id);
     if config.model.trim().is_empty() {
         return Err(error_shape(
             ERROR_UNAVAILABLE,
@@ -2410,6 +2418,10 @@ fn trigger_agent_if_enabled(
     };
     let cfg = config::load_config().unwrap_or(Value::Object(serde_json::Map::new()));
     let mut config = crate::agent::AgentConfig::default();
+    if let Err(e) = crate::agent::resolve_agent_model(&mut config, &cfg, None, None, None) {
+        tracing::warn!(error = %e, "agent auto-reply skipped: model resolution failed");
+        return (None, "queued");
+    }
     crate::agent::apply_agent_config_from_settings(&mut config, &cfg, None);
     if config.model.trim().is_empty() {
         tracing::warn!("agent auto-reply skipped: no model configured");

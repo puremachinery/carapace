@@ -235,12 +235,56 @@ fn select_agent_entry<'a>(
     None
 }
 
+/// Resolve the agent's model from the route/model precedence chain.
+///
+/// Extracts route/model selectors from config (defaults + agent entry)
+/// and resolves them through the route resolver. Request-level selectors
+/// can be passed for per-request overrides.
+pub fn resolve_agent_model(
+    config: &mut AgentConfig,
+    settings: &Value,
+    agent_id: Option<&str>,
+    request_route: Option<&str>,
+    request_model: Option<&str>,
+) -> Result<(), AgentError> {
+    let routes = crate::config::routes::load_routes(settings);
+
+    let agents = settings.get("agents").and_then(|v| v.as_object());
+
+    // Extract selectors from defaults
+    let defaults = agents.and_then(|a| a.get("defaults").and_then(|v| v.as_object()));
+    let defaults_route = defaults.and_then(|d| d.get("route").and_then(|v| v.as_str()));
+    let defaults_model = defaults.and_then(|d| d.get("model").and_then(|v| v.as_str()));
+
+    // Extract selectors from agent entry
+    let agent_entry = agents.and_then(|a| select_agent_entry(a, agent_id));
+    let agent_route = agent_entry.and_then(|e| e.get("route").and_then(|v| v.as_str()));
+    let agent_model = agent_entry.and_then(|e| e.get("model").and_then(|v| v.as_str()));
+
+    let inputs = crate::config::routes::RouteResolutionInputs {
+        request: crate::config::routes::SelectorLevel {
+            route: request_route,
+            model: request_model,
+        },
+        session: crate::config::routes::SelectorLevel::default(),
+        agent: crate::config::routes::SelectorLevel {
+            route: agent_route,
+            model: agent_model,
+        },
+        defaults: crate::config::routes::SelectorLevel {
+            route: defaults_route,
+            model: defaults_model,
+        },
+    };
+
+    let resolved = crate::config::routes::resolve_execution_target(&routes, &inputs)?;
+    config.model = resolved.model;
+    Ok(())
+}
+
 fn apply_agent_overrides(config: &mut AgentConfig, agent_obj: &serde_json::Map<String, Value>) {
-    if let Some(model) = agent_obj.get("model").and_then(|v| v.as_str()) {
-        if !model.trim().is_empty() {
-            config.model = model.to_string();
-        }
-    }
+    // Model resolution is handled separately by resolve_agent_model;
+    // skip the model field here.
 
     if let Some(system) = agent_obj.get("system").and_then(|v| v.as_str()) {
         if !system.trim().is_empty() {
@@ -655,5 +699,93 @@ mod tests {
             AgentRunStatus::Queued,
             "run must not be stuck in Queued after panic"
         );
+    }
+
+    // ── resolve_agent_model tests ──────────────────────────────────
+
+    #[test]
+    fn resolve_agent_model_named_route_in_defaults() {
+        let settings = serde_json::json!({
+            "routes": {
+                "fast": { "model": "anthropic:claude-sonnet-4-20250514" }
+            },
+            "agents": {
+                "defaults": { "route": "fast" }
+            }
+        });
+        let mut config = AgentConfig::default();
+        resolve_agent_model(&mut config, &settings, None, None, None).unwrap();
+        assert_eq!(config.model, "anthropic:claude-sonnet-4-20250514");
+    }
+
+    #[test]
+    fn resolve_agent_model_named_route_on_agent_entry() {
+        let settings = serde_json::json!({
+            "routes": {
+                "smart": { "model": "anthropic:claude-opus-4-20250514" }
+            },
+            "agents": {
+                "list": [
+                    { "id": "helper", "route": "smart" }
+                ]
+            }
+        });
+        let mut config = AgentConfig::default();
+        resolve_agent_model(&mut config, &settings, Some("helper"), None, None).unwrap();
+        assert_eq!(config.model, "anthropic:claude-opus-4-20250514");
+    }
+
+    #[test]
+    fn resolve_agent_model_legacy_model_no_routes() {
+        let settings = serde_json::json!({
+            "agents": {
+                "defaults": { "model": "openai:gpt-4o" }
+            }
+        });
+        let mut config = AgentConfig::default();
+        resolve_agent_model(&mut config, &settings, None, None, None).unwrap();
+        assert_eq!(config.model, "openai:gpt-4o");
+    }
+
+    #[test]
+    fn resolve_agent_model_agent_route_overrides_defaults_model() {
+        let settings = serde_json::json!({
+            "routes": {
+                "smart": { "model": "anthropic:claude-opus-4-20250514" }
+            },
+            "agents": {
+                "defaults": { "model": "openai:gpt-4o" },
+                "list": [
+                    { "id": "thinker", "route": "smart" }
+                ]
+            }
+        });
+        let mut config = AgentConfig::default();
+        resolve_agent_model(&mut config, &settings, Some("thinker"), None, None).unwrap();
+        assert_eq!(config.model, "anthropic:claude-opus-4-20250514");
+    }
+
+    #[test]
+    fn resolve_agent_model_request_model_overrides_agent_route() {
+        let settings = serde_json::json!({
+            "routes": {
+                "smart": { "model": "anthropic:claude-opus-4-20250514" }
+            },
+            "agents": {
+                "list": [
+                    { "id": "thinker", "route": "smart" }
+                ]
+            }
+        });
+        let mut config = AgentConfig::default();
+        resolve_agent_model(
+            &mut config,
+            &settings,
+            Some("thinker"),
+            None,
+            Some("openai:gpt-4o"),
+        )
+        .unwrap();
+        assert_eq!(config.model, "openai:gpt-4o");
     }
 }

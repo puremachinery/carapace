@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use serde_json::Value;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::plugins::TypingContext;
 use crate::server::ws::{AgentRun, AgentRunStatus, WsServerState};
@@ -136,6 +136,13 @@ pub async fn dispatch_inbound_text_with_options(
 
     let run_spawned = if let Some(provider) = state.llm_provider() {
         let mut config = crate::agent::AgentConfig::default();
+        if let Err(e) = crate::agent::resolve_agent_model(&mut config, cfg.as_ref(), None, None, None) {
+            warn!(error = %e, "inbound agent run skipped: model resolution failed");
+            return Ok(InboundDispatchResult {
+                run_id,
+                run_spawned: false,
+            });
+        }
         crate::agent::apply_agent_config_from_settings(&mut config, cfg.as_ref(), None);
         config.deliver = true;
         crate::agent::spawn_run(

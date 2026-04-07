@@ -319,12 +319,18 @@ fn build_agent_config(
 ) -> crate::agent::AgentConfig {
     let cfg = crate::config::load_config().unwrap_or(Value::Object(serde_json::Map::new()));
     let mut config = crate::agent::AgentConfig::default();
-    crate::agent::apply_agent_config_from_settings(&mut config, &cfg, None);
-    if let Some(m) = model.clone() {
-        config.model = m;
+    // Resolve model through route resolver; cron-level model override is
+    // passed as request_model so it takes highest precedence.
+    if let Err(e) = crate::agent::resolve_agent_model(
+        &mut config,
+        &cfg,
+        None,
+        None,
+        model.as_deref(),
+    ) {
+        tracing::warn!(error = %e, "cron agent config: model resolution failed");
     }
-    // config.model is set from agents.defaults.model via apply_agent_config_from_settings;
-    // the cron-level model override takes precedence if provided.
+    crate::agent::apply_agent_config_from_settings(&mut config, &cfg, None);
     if let Some(allow) = allow_unsafe_external_content {
         config.exfiltration_guard = !allow;
     }
