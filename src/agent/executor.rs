@@ -79,7 +79,15 @@ fn apply_agent_hook_overrides(
             "cannot set both `route` and `model` in before_agent_start hook response".to_string(),
         ));
     } else if let Some(route) = hook_route {
-        crate::agent::resolve_agent_model(config, settings, None, Some(route), None)?;
+        crate::agent::resolve_agent_model(
+            config,
+            settings,
+            None,
+            &crate::agent::ModelResolutionOverrides {
+                request_route: Some(route),
+                ..Default::default()
+            },
+        )?;
     } else if let Some(model) = hook_model {
         config.model = model.to_string();
     }

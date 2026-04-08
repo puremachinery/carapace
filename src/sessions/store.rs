@@ -214,6 +214,9 @@ pub struct SessionMetadata {
     /// User ID of the session owner
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_id: Option<String>,
+    /// Named route for this session
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route: Option<String>,
     /// Model being used for this session
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -867,6 +870,9 @@ impl SessionStore {
         }
         if updates.user_id.is_some() {
             session.metadata.user_id = updates.user_id;
+        }
+        if updates.route.is_some() {
+            session.metadata.route = updates.route;
         }
         if updates.model.is_some() {
             session.metadata.model = updates.model;

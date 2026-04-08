@@ -235,17 +235,27 @@ fn select_agent_entry<'a>(
     None
 }
 
+/// Per-request and per-session overrides for model resolution.
+/// Passed by callers to provide request-level and session-level selectors.
+#[derive(Debug, Default)]
+pub struct ModelResolutionOverrides<'a> {
+    pub request_route: Option<&'a str>,
+    pub request_model: Option<&'a str>,
+    pub session_route: Option<&'a str>,
+    pub session_model: Option<&'a str>,
+}
+
 /// Resolve the agent's model from the route/model precedence chain.
 ///
-/// Extracts route/model selectors from config (defaults + agent entry)
-/// and resolves them through the route resolver. Request-level selectors
-/// can be passed for per-request overrides.
+/// Checks scopes in order: request → session → agent → defaults.
+/// Within each scope, `route` is checked before `model`.
+/// Request-level and session-level selectors can be passed for
+/// per-request and per-session overrides.
 pub fn resolve_agent_model(
     config: &mut AgentConfig,
     settings: &Value,
     agent_id: Option<&str>,
-    request_route: Option<&str>,
-    request_model: Option<&str>,
+    overrides: &ModelResolutionOverrides<'_>,
 ) -> Result<(), AgentError> {
     let routes = crate::config::routes::load_routes(settings);
 
@@ -263,10 +273,13 @@ pub fn resolve_agent_model(
 
     let inputs = crate::config::routes::RouteResolutionInputs {
         request: crate::config::routes::SelectorLevel {
-            route: request_route,
-            model: request_model,
+            route: overrides.request_route,
+            model: overrides.request_model,
         },
-        session: crate::config::routes::SelectorLevel::default(),
+        session: crate::config::routes::SelectorLevel {
+            route: overrides.session_route,
+            model: overrides.session_model,
+        },
         agent: crate::config::routes::SelectorLevel {
             route: agent_route,
             model: agent_model,
@@ -714,7 +727,13 @@ mod tests {
             }
         });
         let mut config = AgentConfig::default();
-        resolve_agent_model(&mut config, &settings, None, None, None).unwrap();
+        resolve_agent_model(
+            &mut config,
+            &settings,
+            None,
+            &ModelResolutionOverrides::default(),
+        )
+        .unwrap();
         assert_eq!(config.model, "anthropic:claude-sonnet-4-20250514");
     }
 
@@ -731,7 +750,13 @@ mod tests {
             }
         });
         let mut config = AgentConfig::default();
-        resolve_agent_model(&mut config, &settings, Some("helper"), None, None).unwrap();
+        resolve_agent_model(
+            &mut config,
+            &settings,
+            Some("helper"),
+            &ModelResolutionOverrides::default(),
+        )
+        .unwrap();
         assert_eq!(config.model, "anthropic:claude-opus-4-20250514");
     }
 
@@ -743,7 +768,13 @@ mod tests {
             }
         });
         let mut config = AgentConfig::default();
-        resolve_agent_model(&mut config, &settings, None, None, None).unwrap();
+        resolve_agent_model(
+            &mut config,
+            &settings,
+            None,
+            &ModelResolutionOverrides::default(),
+        )
+        .unwrap();
         assert_eq!(config.model, "openai:gpt-4o");
     }
 
@@ -761,7 +792,13 @@ mod tests {
             }
         });
         let mut config = AgentConfig::default();
-        resolve_agent_model(&mut config, &settings, Some("thinker"), None, None).unwrap();
+        resolve_agent_model(
+            &mut config,
+            &settings,
+            Some("thinker"),
+            &ModelResolutionOverrides::default(),
+        )
+        .unwrap();
         assert_eq!(config.model, "anthropic:claude-opus-4-20250514");
     }
 
@@ -782,10 +819,109 @@ mod tests {
             &mut config,
             &settings,
             Some("thinker"),
-            None,
-            Some("openai:gpt-4o"),
+            &ModelResolutionOverrides {
+                request_model: Some("openai:gpt-4o"),
+                ..Default::default()
+            },
         )
         .unwrap();
         assert_eq!(config.model, "openai:gpt-4o");
+    }
+
+    // ── session-level route/model tests ──────────────────────────────
+
+    #[test]
+    fn resolve_agent_model_session_route_overrides_defaults_model() {
+        let settings = serde_json::json!({
+            "routes": {
+                "smart": { "model": "anthropic:claude-opus-4-20250514" }
+            },
+            "agents": {
+                "defaults": { "model": "openai:gpt-4o" }
+            }
+        });
+        let mut config = AgentConfig::default();
+        resolve_agent_model(
+            &mut config,
+            &settings,
+            None,
+            &ModelResolutionOverrides {
+                session_route: Some("smart"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(config.model, "anthropic:claude-opus-4-20250514");
+    }
+
+    #[test]
+    fn resolve_agent_model_session_model_overrides_defaults_model() {
+        let settings = serde_json::json!({
+            "agents": {
+                "defaults": { "model": "openai:gpt-4o" }
+            }
+        });
+        let mut config = AgentConfig::default();
+        resolve_agent_model(
+            &mut config,
+            &settings,
+            None,
+            &ModelResolutionOverrides {
+                session_model: Some("anthropic:claude-sonnet-4-20250514"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(config.model, "anthropic:claude-sonnet-4-20250514");
+    }
+
+    #[test]
+    fn resolve_agent_model_request_route_overrides_session_route() {
+        let settings = serde_json::json!({
+            "routes": {
+                "fast": { "model": "anthropic:claude-sonnet-4-20250514" },
+                "smart": { "model": "anthropic:claude-opus-4-20250514" }
+            }
+        });
+        let mut config = AgentConfig::default();
+        resolve_agent_model(
+            &mut config,
+            &settings,
+            None,
+            &ModelResolutionOverrides {
+                request_route: Some("fast"),
+                session_route: Some("smart"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(config.model, "anthropic:claude-sonnet-4-20250514");
+    }
+
+    #[test]
+    fn resolve_agent_model_session_route_overrides_agent_route() {
+        let settings = serde_json::json!({
+            "routes": {
+                "fast": { "model": "anthropic:claude-sonnet-4-20250514" },
+                "smart": { "model": "anthropic:claude-opus-4-20250514" }
+            },
+            "agents": {
+                "list": [
+                    { "id": "helper", "route": "fast" }
+                ]
+            }
+        });
+        let mut config = AgentConfig::default();
+        resolve_agent_model(
+            &mut config,
+            &settings,
+            Some("helper"),
+            &ModelResolutionOverrides {
+                session_route: Some("smart"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(config.model, "anthropic:claude-opus-4-20250514");
     }
 }

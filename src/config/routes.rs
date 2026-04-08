@@ -241,6 +241,63 @@ mod tests {
     }
 
     #[test]
+    fn session_route_wins_over_agent_model() {
+        let routes = make_routes();
+        let inputs = RouteResolutionInputs {
+            session: SelectorLevel {
+                route: Some("smart"),
+                ..Default::default()
+            },
+            agent: SelectorLevel {
+                model: Some("openai:gpt-4o"),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let resolved = resolve_execution_target(&routes, &inputs).unwrap();
+        assert_eq!(resolved.model, "anthropic:claude-opus-4-20250514");
+        assert_eq!(resolved.source, RouteSource::SessionRoute);
+    }
+
+    #[test]
+    fn session_model_wins_over_agent_route() {
+        let routes = make_routes();
+        let inputs = RouteResolutionInputs {
+            session: SelectorLevel {
+                model: Some("openai:gpt-4o"),
+                ..Default::default()
+            },
+            agent: SelectorLevel {
+                route: Some("fast"),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let resolved = resolve_execution_target(&routes, &inputs).unwrap();
+        assert_eq!(resolved.model, "openai:gpt-4o");
+        assert_eq!(resolved.source, RouteSource::SessionModel);
+    }
+
+    #[test]
+    fn request_model_wins_over_session_route() {
+        let routes = make_routes();
+        let inputs = RouteResolutionInputs {
+            request: SelectorLevel {
+                model: Some("openai:gpt-4o"),
+                ..Default::default()
+            },
+            session: SelectorLevel {
+                route: Some("smart"),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let resolved = resolve_execution_target(&routes, &inputs).unwrap();
+        assert_eq!(resolved.model, "openai:gpt-4o");
+        assert_eq!(resolved.source, RouteSource::RequestModel);
+    }
+
+    #[test]
     fn unknown_route_is_hard_error() {
         let routes = make_routes();
         let inputs = RouteResolutionInputs {
@@ -325,5 +382,33 @@ mod tests {
         let cfg = json!({"agents": {}});
         let routes = load_routes(&cfg);
         assert!(routes.is_empty());
+    }
+
+    #[test]
+    fn request_route_overrides_session_model() {
+        let mut routes = HashMap::new();
+        routes.insert(
+            "fast".to_string(),
+            RouteConfig {
+                model: "gemini:gemini-2.0-flash".to_string(),
+                label: None,
+            },
+        );
+
+        let inputs = RouteResolutionInputs {
+            request: SelectorLevel {
+                route: Some("fast"),
+                model: None,
+            },
+            session: SelectorLevel {
+                route: None,
+                model: Some("anthropic:claude-sonnet-4-20250514"),
+            },
+            ..Default::default()
+        };
+
+        let result = resolve_execution_target(&routes, &inputs).unwrap();
+        assert_eq!(result.model, "gemini:gemini-2.0-flash");
+        assert_eq!(result.source, RouteSource::RequestRoute);
     }
 }

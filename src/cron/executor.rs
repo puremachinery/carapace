@@ -336,8 +336,11 @@ fn build_agent_config(
         &mut config,
         &cfg,
         None,
-        route.as_deref(),
-        model.as_deref(),
+        &crate::agent::ModelResolutionOverrides {
+            request_route: route.as_deref(),
+            request_model: model.as_deref(),
+            ..Default::default()
+        },
     ) {
         tracing::warn!(error = %e, "cron agent config: model resolution failed");
     }

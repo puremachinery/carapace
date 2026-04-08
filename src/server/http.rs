@@ -1291,13 +1291,17 @@ async fn dispatch_agent_run(
     // Validate model before registering the run to avoid orphan entries.
     let mut config = crate::agent::AgentConfig::default();
     // Resolve model through route resolver; request-level model/route param
-    // takes highest precedence.
+    // takes highest precedence, then session-level route/model.
     if let Err(e) = crate::agent::resolve_agent_model(
         &mut config,
         &cfg,
         None,
-        validated.route.as_deref(),
-        validated.model.as_deref(),
+        &crate::agent::ModelResolutionOverrides {
+            request_route: validated.route.as_deref(),
+            request_model: validated.model.as_deref(),
+            session_route: session.metadata.route.as_deref(),
+            session_model: session.metadata.model.as_deref(),
+        },
     ) {
         return Err((
             StatusCode::BAD_REQUEST,

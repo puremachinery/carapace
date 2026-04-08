@@ -886,8 +886,16 @@ fn build_session_metadata(
     if let Some(user_id) = read_string_param(params, "userId") {
         meta.user_id = Some(user_id);
     }
-    if let Some(model) = read_string_param(params, "model") {
-        meta.model = Some(model);
+    let session_route = read_string_param(params, "route");
+    let session_model = read_string_param(params, "model");
+    // If both route and model are set on session metadata, route wins and
+    // model is dropped — consistent with config-level both-set behavior.
+    if session_route.is_some() && session_model.is_some() {
+        tracing::warn!("session metadata has both `route` and `model`; `route` takes precedence");
+    }
+    meta.route = session_route;
+    if meta.route.is_none() {
+        meta.model = session_model;
     }
     if let Some(thinking_level) = read_string_param(params, "thinkingLevel") {
         meta.thinking_level = Some(thinking_level);
@@ -916,6 +924,7 @@ fn has_metadata_updates(meta: &sessions::SessionMetadata) -> bool {
         || meta.agent_id.is_some()
         || meta.channel.is_some()
         || meta.user_id.is_some()
+        || meta.route.is_some()
         || meta.model.is_some()
         || meta.thinking_level.is_some()
         || !meta.tags.is_empty()
@@ -943,6 +952,9 @@ fn apply_metadata_updates(
     }
     if updates.user_id.is_some() {
         target.user_id = updates.user_id.clone();
+    }
+    if updates.route.is_some() {
+        target.route = updates.route.clone();
     }
     if updates.model.is_some() {
         target.model = updates.model.clone();
@@ -2018,10 +2030,18 @@ pub(super) fn handle_agent(
         .and_then(|v| v.get("agentId"))
         .and_then(|v| v.as_str());
     // Resolve model through route resolver; request-level model/route param
-    // takes highest precedence.
-    if let Err(e) =
-        crate::agent::resolve_agent_model(&mut config, &cfg, agent_id, route_param, model_param)
-    {
+    // takes highest precedence, then session-level route/model.
+    if let Err(e) = crate::agent::resolve_agent_model(
+        &mut config,
+        &cfg,
+        agent_id,
+        &crate::agent::ModelResolutionOverrides {
+            request_route: route_param,
+            request_model: model_param,
+            session_route: session.metadata.route.as_deref(),
+            session_model: session.metadata.model.as_deref(),
+        },
+    ) {
         return Err(error_shape(ERROR_UNAVAILABLE, &e.to_string(), None));
     }
     crate::agent::apply_agent_config_from_settings(&mut config, &cfg, agent_id);
@@ -2408,7 +2428,7 @@ fn trigger_agent_if_enabled(
     trigger_agent: bool,
     idempotency_key: &str,
     message: &str,
-    session_key: &str,
+    session: &sessions::Session,
     extra: Option<serde_json::Value>,
 ) -> (Option<String>, &'static str) {
     if !trigger_agent {
@@ -2422,7 +2442,16 @@ fn trigger_agent_if_enabled(
     };
     let cfg = config::load_config().unwrap_or(Value::Object(serde_json::Map::new()));
     let mut config = crate::agent::AgentConfig::default();
-    if let Err(e) = crate::agent::resolve_agent_model(&mut config, &cfg, None, None, None) {
+    if let Err(e) = crate::agent::resolve_agent_model(
+        &mut config,
+        &cfg,
+        None,
+        &crate::agent::ModelResolutionOverrides {
+            session_route: session.metadata.route.as_deref(),
+            session_model: session.metadata.model.as_deref(),
+            ..Default::default()
+        },
+    ) {
         tracing::warn!(error = %e, "agent auto-reply skipped: model resolution failed");
         return (None, "queued");
     }
@@ -2437,7 +2466,7 @@ fn trigger_agent_if_enabled(
     let cancel_token = CancellationToken::new();
     let run = AgentRun {
         run_id: idempotency_key.to_string(),
-        session_key: session_key.to_string(),
+        session_key: session.session_key.clone(),
         delivery_recipient_id: None,
         typing_context: None,
         read_receipt: None,
@@ -2462,7 +2491,7 @@ fn trigger_agent_if_enabled(
     config.extra = extra;
     crate::agent::spawn_run(
         run_id.clone(),
-        session_key.to_string(),
+        session.session_key.clone(),
         config,
         state.clone(),
         provider,
@@ -2604,7 +2633,7 @@ pub(super) fn handle_chat_send(
         chat_params.trigger_agent,
         chat_params.idempotency_key,
         chat_params.message,
-        &session.session_key,
+        &session,
         params
             .and_then(|v| v.get("venice_parameters"))
             .filter(|v| v.is_object())
