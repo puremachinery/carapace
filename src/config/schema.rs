@@ -1228,7 +1228,7 @@ fn validate_cron(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIs
             }
         }
 
-        // Validate payload is an object
+        // Validate payload is an object, then check route/model fields
         if let Some(payload) = entry_obj.get("payload") {
             if !payload.is_object() {
                 issues.push(SchemaIssue {
@@ -1236,6 +1236,64 @@ fn validate_cron(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIs
                     path: format!(".cron.entries[{}].payload", i),
                     message: "payload must be an object".to_string(),
                 });
+            } else if let Some(payload_obj) = payload.as_object() {
+                let has_route = payload_obj.get("route").and_then(|v| v.as_str());
+                let has_model = payload_obj.get("model").and_then(|v| v.as_str());
+
+                // Validate route references a defined route
+                if let Some(route_str) = has_route {
+                    let route_str = route_str.trim();
+                    if !route_str.is_empty() {
+                        let routes_map = obj.get("routes").and_then(|v| v.as_object());
+                        match routes_map {
+                            None => {
+                                issues.push(SchemaIssue {
+                                    severity: Severity::Error,
+                                    path: format!(".cron.entries[{}].payload.route", i),
+                                    message: format!(
+                                        "references route \"{route_str}\" but no `routes` map is defined; \
+                                         add a top-level `routes` section"
+                                    ),
+                                });
+                            }
+                            Some(map) if !map.contains_key(route_str) => {
+                                let available: Vec<&String> = map.keys().collect();
+                                issues.push(SchemaIssue {
+                                    severity: Severity::Error,
+                                    path: format!(".cron.entries[{}].payload.route", i),
+                                    message: format!(
+                                        "references unknown route \"{route_str}\"; \
+                                         defined routes are: {available:?}"
+                                    ),
+                                });
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
+                // Warn if both route and model are set
+                if has_route.is_some() && has_model.is_some() {
+                    issues.push(SchemaIssue {
+                        severity: Severity::Warning,
+                        path: format!(".cron.entries[{}].payload", i),
+                        message: "both `route` and `model` are set; \
+                                  the cron executor will reject this at runtime"
+                            .to_string(),
+                    });
+                }
+
+                // Validate model has a provider prefix
+                if let Some(model) = has_model {
+                    let model = model.trim();
+                    if !model.is_empty() {
+                        check_model_has_provider_prefix(
+                            model,
+                            &format!(".cron.entries[{}].payload.model", i),
+                            issues,
+                        );
+                    }
+                }
             }
         }
     }
@@ -2023,7 +2081,9 @@ fn validate_routes_map(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Sc
         None => return,
     };
 
-    let id_re = regex::Regex::new(r"^[a-z][a-z0-9-]*$").expect("route id regex");
+    static ROUTE_ID_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let id_re = ROUTE_ID_RE
+        .get_or_init(|| regex::Regex::new(r"^[a-z][a-z0-9-]*$").expect("route id regex"));
 
     for (key, entry) in routes {
         let path_prefix = format!(".routes.{key}");

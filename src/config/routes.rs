@@ -132,11 +132,19 @@ pub fn load_routes(cfg: &Value) -> HashMap<String, RouteConfig> {
     };
     routes_obj
         .iter()
-        .filter_map(|(key, value)| {
-            serde_json::from_value::<RouteConfig>(value.clone())
-                .ok()
-                .map(|config| (key.clone(), config))
-        })
+        .filter_map(
+            |(key, value)| match serde_json::from_value::<RouteConfig>(value.clone()) {
+                Ok(config) => Some((key.clone(), config)),
+                Err(e) => {
+                    tracing::warn!(
+                        route = %key,
+                        error = %e,
+                        "skipping malformed route entry"
+                    );
+                    None
+                }
+            },
+        )
         .collect()
 }
 
@@ -239,7 +247,6 @@ mod tests {
             agent: SelectorLevel {
                 route: Some("nonexistent"),
                 model: Some("openai:gpt-4o"), // must NOT fall through
-                ..Default::default()
             },
             ..Default::default()
         };
@@ -256,7 +263,6 @@ mod tests {
             request: SelectorLevel {
                 route: Some("  "),
                 model: Some(""),
-                ..Default::default()
             },
             agent: SelectorLevel {
                 model: Some("openai:gpt-4o"),

@@ -54,9 +54,13 @@ fn parse_hook_payload(result: &HookDispatchResult, hook_name: &str) -> Option<Va
     hook_utils::parse_hook_payload(result, hook_name)
 }
 
-fn apply_agent_hook_overrides(config: &mut AgentConfig, payload: &Value) {
+fn apply_agent_hook_overrides(
+    config: &mut AgentConfig,
+    payload: &Value,
+    settings: &Value,
+) -> Result<(), AgentError> {
     let Some(obj) = payload.as_object() else {
-        return;
+        return Ok(());
     };
 
     if let Some(system) = obj.get("system") {
@@ -71,17 +75,11 @@ fn apply_agent_hook_overrides(config: &mut AgentConfig, payload: &Value) {
     let hook_route = obj.get("route").and_then(|v| v.as_str());
 
     if hook_route.is_some() && hook_model.is_some() {
-        tracing::warn!("before_agent_start hook returned both `route` and `model`; ignoring both");
+        return Err(AgentError::Provider(
+            "cannot set both `route` and `model` in before_agent_start hook response".to_string(),
+        ));
     } else if let Some(route) = hook_route {
-        // Resolve model from route via config
-        let cfg = crate::config::load_config().unwrap_or(Value::Object(serde_json::Map::new()));
-        if let Err(e) = crate::agent::resolve_agent_model(config, &cfg, None, Some(route), None) {
-            tracing::warn!(
-                error = %e,
-                route = %route,
-                "before_agent_start hook route override failed"
-            );
-        }
+        crate::agent::resolve_agent_model(config, settings, None, Some(route), None)?;
     } else if let Some(model) = hook_model {
         config.model = model.to_string();
     }
@@ -101,6 +99,8 @@ fn apply_agent_hook_overrides(config: &mut AgentConfig, payload: &Value) {
             config.extra = Some(extra.clone());
         }
     }
+
+    Ok(())
 }
 
 fn apply_tool_input_override(tool_input: &mut Value, payload: &Value) {
@@ -1151,7 +1151,9 @@ pub async fn execute_run(
                 return Err(AgentError::Cancelled);
             }
             if let Some(payload) = parse_hook_payload(&result, "before_agent_start") {
-                apply_agent_hook_overrides(&mut config, &payload);
+                let cfg = crate::config::load_config()
+                    .unwrap_or(Value::Object(serde_json::Map::new()));
+                apply_agent_hook_overrides(&mut config, &payload, &cfg)?;
             }
         }
 

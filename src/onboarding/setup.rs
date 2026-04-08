@@ -908,17 +908,17 @@ fn default_model_route_follow_up(provider: SetupProvider, setup_command: Option<
 ///
 /// Checks `agents.defaults.route` first — if present, resolves it through
 /// the `routes` map to get the concrete model string.  Falls back to
-/// `agents.defaults.model` when no route is set or the route name is
-/// missing from the map (the downstream check will report the mismatch).
+/// `agents.defaults.model` only when no route is set at all.
+///
+/// Fail-closed: if a route is set but not found in the routes map, returns
+/// `None` rather than falling back to `agents.defaults.model`. This matches
+/// the runtime resolver's fail-closed semantics — a dangling route reference
+/// must surface as an error, not silently degrade to a different model.
 fn effective_default_model(cfg: &Value) -> Option<String> {
     if let Some(route_name) = config_string(cfg, &["agents", "defaults", "route"]) {
         let routes = crate::config::routes::load_routes(cfg);
-        if let Some(route_cfg) = routes.get(&route_name) {
-            return Some(route_cfg.model.clone());
-        }
-        // Route name present but not in map — fall through to `model` so the
-        // downstream provider check reports a clear mismatch instead of
-        // "not configured".
+        // Route set but missing from map → None (fail-closed).
+        return routes.get(&route_name).map(|rc| rc.model.clone());
     }
     config_string(cfg, &["agents", "defaults", "model"])
 }
