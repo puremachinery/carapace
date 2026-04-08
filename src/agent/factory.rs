@@ -955,12 +955,8 @@ fn hash_key_prefix(key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::env::ScopedEnv;
     use serde_json::json;
-    use std::ffi::OsString;
-    use std::sync::{LazyLock, Mutex};
-
-    // Serializes env-var touching tests in this module.
-    static ENV_VAR_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     const PROVIDER_ENV_KEYS: &[&str] = &[
         "ANTHROPIC_API_KEY",
@@ -987,940 +983,842 @@ mod tests {
         "VERTEX_MODEL",
     ];
 
-    struct EnvVarGuard {
-        key: &'static str,
-        previous: Option<OsString>,
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match self.previous.take() {
-                Some(value) => std::env::set_var(self.key, value),
-                None => std::env::remove_var(self.key),
-            }
+    fn clean_provider_env() -> ScopedEnv {
+        let mut env = ScopedEnv::new();
+        for key in PROVIDER_ENV_KEYS {
+            env.unset(key);
         }
-    }
-
-    fn unset_env_var_scoped(key: &'static str) -> EnvVarGuard {
-        let previous = std::env::var_os(key);
-        std::env::remove_var(key);
-        EnvVarGuard { key, previous }
-    }
-
-    fn set_env_var_scoped(key: &'static str, value: &str) -> EnvVarGuard {
-        let previous = std::env::var_os(key);
-        std::env::set_var(key, value);
-        EnvVarGuard { key, previous }
-    }
-
-    fn with_clean_provider_env<T>(f: impl FnOnce() -> T) -> T {
-        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
-        let _guards: Vec<EnvVarGuard> = PROVIDER_ENV_KEYS
-            .iter()
-            .map(|key| unset_env_var_scoped(key))
-            .collect();
-        f()
+        env
     }
 
     #[test]
     fn test_fingerprint_empty_config() {
-        with_clean_provider_env(|| {
-            // With no env vars and no config, all providers should be None
-            let cfg = json!({});
-            let fp = fingerprint_providers(&cfg);
-            assert!(fp.anthropic.is_none());
-            assert!(fp.openai.is_none());
-            assert!(fp.codex.is_none());
-            assert!(fp.ollama.is_none());
-            assert!(fp.gemini.is_none());
-            assert!(fp.venice.is_none());
-            assert!(fp.bedrock.is_none());
-            assert!(fp.vertex.is_none());
-        });
+        let _env = clean_provider_env();
+        // With no env vars and no config, all providers should be None
+        let cfg = json!({});
+        let fp = fingerprint_providers(&cfg);
+        assert!(fp.anthropic.is_none());
+        assert!(fp.openai.is_none());
+        assert!(fp.codex.is_none());
+        assert!(fp.ollama.is_none());
+        assert!(fp.gemini.is_none());
+        assert!(fp.venice.is_none());
+        assert!(fp.bedrock.is_none());
+        assert!(fp.vertex.is_none());
     }
 
     #[test]
     fn test_fingerprint_with_config_keys() {
-        with_clean_provider_env(|| {
-            let cfg = json!({
-                "anthropic": { "apiKey": "sk-ant-test123" },
-                "openai": { "apiKey": "sk-openai-test456" },
-                "google": { "apiKey": "AIza-test789" }
-            });
-            let fp = fingerprint_providers(&cfg);
-            assert!(fp.anthropic.is_some());
-            assert!(fp.openai.is_some());
-            assert!(fp.gemini.is_some());
-            assert!(fp.ollama.is_none());
+        let _env = clean_provider_env();
+        let cfg = json!({
+            "anthropic": { "apiKey": "sk-ant-test123" },
+            "openai": { "apiKey": "sk-openai-test456" },
+            "google": { "apiKey": "AIza-test789" }
         });
+        let fp = fingerprint_providers(&cfg);
+        assert!(fp.anthropic.is_some());
+        assert!(fp.openai.is_some());
+        assert!(fp.gemini.is_some());
+        assert!(fp.ollama.is_none());
     }
 
     #[test]
     fn test_fingerprint_with_gemini_auth_profile() {
-        with_clean_provider_env(|| {
-            let temp = tempfile::tempdir().expect("tempdir");
-            let _state_dir = set_env_var_scoped(
-                "CARAPACE_STATE_DIR",
-                temp.path().to_str().expect("state dir path"),
-            );
-            let provider_config = OAuthProvider::Google
-                .default_config(
-                    "google-client-id",
-                    "google-client-secret",
-                    "https://gateway.example.com/control/onboarding/gemini/callback",
-                )
-                .unwrap();
-            let profile = crate::auth::profiles::AuthProfile {
-                id: "google-abc123".to_string(),
-                name: "Google user@example.com".to_string(),
-                provider: OAuthProvider::Google,
-                user_id: Some("user-123".to_string()),
-                email: Some("user@example.com".to_string()),
-                display_name: Some("Example User".to_string()),
-                avatar_url: None,
-                created_at_ms: 0,
-                last_used_ms: None,
-                credential_kind: AuthProfileCredentialKind::OAuth,
-                tokens: Some(crate::auth::profiles::OAuthTokens {
-                    access_token: "access-token".to_string(),
-                    refresh_token: Some("refresh-token".to_string()),
-                    token_type: "Bearer".to_string(),
-                    expires_at_ms: Some(u64::MAX),
-                    scope: Some("openid email profile".to_string()),
-                }),
-                token: None,
-                oauth_provider_config: Some(
-                    crate::auth::profiles::StoredOAuthProviderConfig::from(&provider_config),
-                ),
-            };
-            let store = ProfileStore::from_env(temp.path().to_path_buf()).expect("profile store");
-            store.add(profile).expect("store profile");
-            let cfg = json!({
-                "google": { "authProfile": "google-abc123" }
-            });
-            let fp = fingerprint_providers(&cfg);
-            let fingerprint = fp.gemini.expect("gemini fingerprint");
-            assert!(fingerprint.0.starts_with("auth-profile:google-abc123:"));
-            assert_eq!(fingerprint.1, None);
+        let mut env = clean_provider_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        env.set("CARAPACE_STATE_DIR", temp.path());
+        let provider_config = OAuthProvider::Google
+            .default_config(
+                "google-client-id",
+                "google-client-secret",
+                "https://gateway.example.com/control/onboarding/gemini/callback",
+            )
+            .unwrap();
+        let profile = crate::auth::profiles::AuthProfile {
+            id: "google-abc123".to_string(),
+            name: "Google user@example.com".to_string(),
+            provider: OAuthProvider::Google,
+            user_id: Some("user-123".to_string()),
+            email: Some("user@example.com".to_string()),
+            display_name: Some("Example User".to_string()),
+            avatar_url: None,
+            created_at_ms: 0,
+            last_used_ms: None,
+            credential_kind: AuthProfileCredentialKind::OAuth,
+            tokens: Some(crate::auth::profiles::OAuthTokens {
+                access_token: "access-token".to_string(),
+                refresh_token: Some("refresh-token".to_string()),
+                token_type: "Bearer".to_string(),
+                expires_at_ms: Some(u64::MAX),
+                scope: Some("openid email profile".to_string()),
+            }),
+            token: None,
+            oauth_provider_config: Some(crate::auth::profiles::StoredOAuthProviderConfig::from(
+                &provider_config,
+            )),
+        };
+        let store = ProfileStore::from_env(temp.path().to_path_buf()).expect("profile store");
+        store.add(profile).expect("store profile");
+        let cfg = json!({
+            "google": { "authProfile": "google-abc123" }
         });
+        let fp = fingerprint_providers(&cfg);
+        let fingerprint = fp.gemini.expect("gemini fingerprint");
+        assert!(fingerprint.0.starts_with("auth-profile:google-abc123:"));
+        assert_eq!(fingerprint.1, None);
     }
 
     #[test]
     fn test_fingerprint_with_anthropic_auth_profile() {
-        with_clean_provider_env(|| {
-            let temp = tempfile::tempdir().expect("tempdir");
-            let _password = set_env_var_scoped("CARAPACE_CONFIG_PASSWORD", "test-config-password");
-            let _state_dir = set_env_var_scoped(
-                "CARAPACE_STATE_DIR",
-                temp.path().to_str().expect("state dir path"),
-            );
-            let profile = crate::auth::profiles::AuthProfile {
-                id: "anthropic:default".to_string(),
-                name: "Anthropic setup token".to_string(),
-                provider: OAuthProvider::Anthropic,
-                user_id: None,
-                email: None,
-                display_name: None,
-                avatar_url: None,
-                created_at_ms: 0,
-                last_used_ms: None,
-                credential_kind: AuthProfileCredentialKind::Token,
-                tokens: None,
-                token: Some("sk-ant-oat01-test-token".to_string()),
-                oauth_provider_config: None,
-            };
-            let store = ProfileStore::from_env(temp.path().to_path_buf()).expect("profile store");
-            store.add(profile).expect("store profile");
-            let cfg = json!({
-                "anthropic": { "authProfile": "anthropic:default" }
-            });
-            let fp = fingerprint_providers(&cfg);
-            let fingerprint = fp.anthropic.expect("anthropic fingerprint");
-            assert!(fingerprint.0.starts_with("auth-profile:anthropic:default:"));
-            assert_eq!(fingerprint.1, None);
+        let mut env = clean_provider_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        env.set("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+        env.set("CARAPACE_STATE_DIR", temp.path());
+        let profile = crate::auth::profiles::AuthProfile {
+            id: "anthropic:default".to_string(),
+            name: "Anthropic setup token".to_string(),
+            provider: OAuthProvider::Anthropic,
+            user_id: None,
+            email: None,
+            display_name: None,
+            avatar_url: None,
+            created_at_ms: 0,
+            last_used_ms: None,
+            credential_kind: AuthProfileCredentialKind::Token,
+            tokens: None,
+            token: Some("sk-ant-oat01-test-token".to_string()),
+            oauth_provider_config: None,
+        };
+        let store = ProfileStore::from_env(temp.path().to_path_buf()).expect("profile store");
+        store.add(profile).expect("store profile");
+        let cfg = json!({
+            "anthropic": { "authProfile": "anthropic:default" }
         });
+        let fp = fingerprint_providers(&cfg);
+        let fingerprint = fp.anthropic.expect("anthropic fingerprint");
+        assert!(fingerprint.0.starts_with("auth-profile:anthropic:default:"));
+        assert_eq!(fingerprint.1, None);
     }
 
     #[test]
     fn test_fingerprint_with_codex_auth_profile() {
-        with_clean_provider_env(|| {
-            let temp = tempfile::tempdir().expect("tempdir");
-            let _state_dir = set_env_var_scoped(
-                "CARAPACE_STATE_DIR",
-                temp.path().to_str().expect("state dir path"),
-            );
-            let provider_config = OAuthProvider::OpenAI
-                .default_config(
-                    "openai-client-id",
-                    "openai-client-secret",
-                    "https://gateway.example.com/control/onboarding/codex/callback",
-                )
-                .unwrap();
-            let profile = crate::auth::profiles::AuthProfile {
-                id: "openai-abc123".to_string(),
-                name: "Codex user@example.com".to_string(),
-                provider: OAuthProvider::OpenAI,
-                user_id: Some("user-123".to_string()),
-                email: Some("user@example.com".to_string()),
-                display_name: Some("Example User".to_string()),
-                avatar_url: None,
-                created_at_ms: 0,
-                last_used_ms: None,
-                credential_kind: AuthProfileCredentialKind::OAuth,
-                tokens: Some(crate::auth::profiles::OAuthTokens {
-                    access_token: "access-token".to_string(),
-                    refresh_token: Some("refresh-token".to_string()),
-                    token_type: "Bearer".to_string(),
-                    expires_at_ms: Some(u64::MAX),
-                    scope: Some("openid email profile offline_access".to_string()),
-                }),
-                token: None,
-                oauth_provider_config: Some(
-                    crate::auth::profiles::StoredOAuthProviderConfig::from(&provider_config),
-                ),
-            };
-            let store = ProfileStore::from_env(temp.path().to_path_buf()).expect("profile store");
-            store.add(profile).expect("store profile");
-            let cfg = json!({
-                "codex": { "authProfile": "openai-abc123" }
-            });
-            let fp = fingerprint_providers(&cfg);
-            let fingerprint = fp.codex.expect("codex fingerprint");
-            assert!(fingerprint.starts_with("auth-profile:openai-abc123:"));
+        let mut env = clean_provider_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        env.set("CARAPACE_STATE_DIR", temp.path());
+        let provider_config = OAuthProvider::OpenAI
+            .default_config(
+                "openai-client-id",
+                "openai-client-secret",
+                "https://gateway.example.com/control/onboarding/codex/callback",
+            )
+            .unwrap();
+        let profile = crate::auth::profiles::AuthProfile {
+            id: "openai-abc123".to_string(),
+            name: "Codex user@example.com".to_string(),
+            provider: OAuthProvider::OpenAI,
+            user_id: Some("user-123".to_string()),
+            email: Some("user@example.com".to_string()),
+            display_name: Some("Example User".to_string()),
+            avatar_url: None,
+            created_at_ms: 0,
+            last_used_ms: None,
+            credential_kind: AuthProfileCredentialKind::OAuth,
+            tokens: Some(crate::auth::profiles::OAuthTokens {
+                access_token: "access-token".to_string(),
+                refresh_token: Some("refresh-token".to_string()),
+                token_type: "Bearer".to_string(),
+                expires_at_ms: Some(u64::MAX),
+                scope: Some("openid email profile offline_access".to_string()),
+            }),
+            token: None,
+            oauth_provider_config: Some(crate::auth::profiles::StoredOAuthProviderConfig::from(
+                &provider_config,
+            )),
+        };
+        let store = ProfileStore::from_env(temp.path().to_path_buf()).expect("profile store");
+        store.add(profile).expect("store profile");
+        let cfg = json!({
+            "codex": { "authProfile": "openai-abc123" }
         });
+        let fp = fingerprint_providers(&cfg);
+        let fingerprint = fp.codex.expect("codex fingerprint");
+        assert!(fingerprint.starts_with("auth-profile:openai-abc123:"));
     }
 
     #[test]
     fn test_fingerprint_ignores_blank_gemini_api_key_when_auth_profile_present() {
-        with_clean_provider_env(|| {
-            let temp = tempfile::tempdir().expect("tempdir");
-            let _state_dir = set_env_var_scoped(
-                "CARAPACE_STATE_DIR",
-                temp.path().to_str().expect("state dir path"),
-            );
-            let _blank_key = set_env_var_scoped("GOOGLE_API_KEY", "   ");
-            let provider_config = OAuthProvider::Google
-                .default_config(
-                    "google-client-id",
-                    "google-client-secret",
-                    "https://gateway.example.com/control/onboarding/gemini/callback",
-                )
-                .unwrap();
-            let profile = crate::auth::profiles::AuthProfile {
-                id: "google-abc123".to_string(),
-                name: "Google user@example.com".to_string(),
-                provider: OAuthProvider::Google,
-                user_id: Some("user-123".to_string()),
-                email: Some("user@example.com".to_string()),
-                display_name: Some("Example User".to_string()),
-                avatar_url: None,
-                created_at_ms: 0,
-                last_used_ms: None,
-                credential_kind: AuthProfileCredentialKind::OAuth,
-                tokens: Some(crate::auth::profiles::OAuthTokens {
-                    access_token: "access-token".to_string(),
-                    refresh_token: Some("refresh-token".to_string()),
-                    token_type: "Bearer".to_string(),
-                    expires_at_ms: Some(u64::MAX),
-                    scope: Some("openid email profile".to_string()),
-                }),
-                token: None,
-                oauth_provider_config: Some(
-                    crate::auth::profiles::StoredOAuthProviderConfig::from(&provider_config),
-                ),
-            };
-            let store = ProfileStore::from_env(temp.path().to_path_buf()).expect("profile store");
-            store.add(profile).expect("store profile");
-            let cfg = json!({
-                "google": { "authProfile": "google-abc123" }
-            });
-            let fp = fingerprint_providers(&cfg);
-            let fingerprint = fp.gemini.expect("gemini fingerprint");
-            assert!(fingerprint.0.starts_with("auth-profile:google-abc123:"));
-            assert_eq!(fingerprint.1, None);
+        let mut env = clean_provider_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        env.set("CARAPACE_STATE_DIR", temp.path());
+        env.set("GOOGLE_API_KEY", "   ");
+        let provider_config = OAuthProvider::Google
+            .default_config(
+                "google-client-id",
+                "google-client-secret",
+                "https://gateway.example.com/control/onboarding/gemini/callback",
+            )
+            .unwrap();
+        let profile = crate::auth::profiles::AuthProfile {
+            id: "google-abc123".to_string(),
+            name: "Google user@example.com".to_string(),
+            provider: OAuthProvider::Google,
+            user_id: Some("user-123".to_string()),
+            email: Some("user@example.com".to_string()),
+            display_name: Some("Example User".to_string()),
+            avatar_url: None,
+            created_at_ms: 0,
+            last_used_ms: None,
+            credential_kind: AuthProfileCredentialKind::OAuth,
+            tokens: Some(crate::auth::profiles::OAuthTokens {
+                access_token: "access-token".to_string(),
+                refresh_token: Some("refresh-token".to_string()),
+                token_type: "Bearer".to_string(),
+                expires_at_ms: Some(u64::MAX),
+                scope: Some("openid email profile".to_string()),
+            }),
+            token: None,
+            oauth_provider_config: Some(crate::auth::profiles::StoredOAuthProviderConfig::from(
+                &provider_config,
+            )),
+        };
+        let store = ProfileStore::from_env(temp.path().to_path_buf()).expect("profile store");
+        store.add(profile).expect("store profile");
+        let cfg = json!({
+            "google": { "authProfile": "google-abc123" }
         });
+        let fp = fingerprint_providers(&cfg);
+        let fingerprint = fp.gemini.expect("gemini fingerprint");
+        assert!(fingerprint.0.starts_with("auth-profile:google-abc123:"));
+        assert_eq!(fingerprint.1, None);
     }
 
     #[test]
     fn test_fingerprint_ignores_blank_gemini_auth_profile() {
-        with_clean_provider_env(|| {
-            let cfg = json!({
-                "google": { "authProfile": "   " }
-            });
-            let fp = fingerprint_providers(&cfg);
-            assert!(fp.gemini.is_none());
+        let _env = clean_provider_env();
+        let cfg = json!({
+            "google": { "authProfile": "   " }
         });
+        let fp = fingerprint_providers(&cfg);
+        assert!(fp.gemini.is_none());
     }
 
     #[test]
     fn test_openai_fingerprint_changes_when_extra_headers_change() {
-        with_clean_provider_env(|| {
-            let cfg_a = json!({
-                "openai": {
-                    "apiKey": "sk-openai-test456",
-                    "httpReferer": "https://example.com/app-a",
-                    "title": "Carapace A"
-                }
-            });
-            let cfg_b = json!({
-                "openai": {
-                    "apiKey": "sk-openai-test456",
-                    "httpReferer": "https://example.com/app-b",
-                    "title": "Carapace B"
-                }
-            });
-
-            let fp_a = fingerprint_providers(&cfg_a);
-            let fp_b = fingerprint_providers(&cfg_b);
-
-            assert_ne!(fp_a.openai, fp_b.openai);
+        let _env = clean_provider_env();
+        let cfg_a = json!({
+            "openai": {
+                "apiKey": "sk-openai-test456",
+                "httpReferer": "https://example.com/app-a",
+                "title": "Carapace A"
+            }
         });
+        let cfg_b = json!({
+            "openai": {
+                "apiKey": "sk-openai-test456",
+                "httpReferer": "https://example.com/app-b",
+                "title": "Carapace B"
+            }
+        });
+
+        let fp_a = fingerprint_providers(&cfg_a);
+        let fp_b = fingerprint_providers(&cfg_b);
+
+        assert_ne!(fp_a.openai, fp_b.openai);
     }
 
     #[test]
     fn test_openai_fingerprint_normalizes_header_whitespace() {
-        with_clean_provider_env(|| {
-            let cfg_a = json!({
-                "openai": {
-                    "apiKey": "sk-openai-test456",
-                    "httpReferer": "https://example.com/app",
-                    "title": "Carapace"
-                }
-            });
-            let cfg_b = json!({
-                "openai": {
-                    "apiKey": "sk-openai-test456",
-                    "httpReferer": "  https://example.com/app  ",
-                    "title": "  Carapace  "
-                }
-            });
-
-            let fp_a = fingerprint_providers(&cfg_a);
-            let fp_b = fingerprint_providers(&cfg_b);
-
-            assert_eq!(fp_a.openai, fp_b.openai);
+        let _env = clean_provider_env();
+        let cfg_a = json!({
+            "openai": {
+                "apiKey": "sk-openai-test456",
+                "httpReferer": "https://example.com/app",
+                "title": "Carapace"
+            }
         });
+        let cfg_b = json!({
+            "openai": {
+                "apiKey": "sk-openai-test456",
+                "httpReferer": "  https://example.com/app  ",
+                "title": "  Carapace  "
+            }
+        });
+
+        let fp_a = fingerprint_providers(&cfg_a);
+        let fp_b = fingerprint_providers(&cfg_b);
+
+        assert_eq!(fp_a.openai, fp_b.openai);
     }
 
     #[test]
     fn test_openai_fingerprint_normalizes_base_url_trailing_slash() {
-        with_clean_provider_env(|| {
-            let cfg_a = json!({
-                "openai": {
-                    "apiKey": "sk-openai-test456",
-                    "baseUrl": "https://proxy.example.com/v1"
-                }
-            });
-            let cfg_b = json!({
-                "openai": {
-                    "apiKey": "sk-openai-test456",
-                    "baseUrl": "https://proxy.example.com/v1/"
-                }
-            });
-
-            let fp_a = fingerprint_providers(&cfg_a);
-            let fp_b = fingerprint_providers(&cfg_b);
-
-            assert_eq!(fp_a.openai, fp_b.openai);
+        let _env = clean_provider_env();
+        let cfg_a = json!({
+            "openai": {
+                "apiKey": "sk-openai-test456",
+                "baseUrl": "https://proxy.example.com/v1"
+            }
         });
+        let cfg_b = json!({
+            "openai": {
+                "apiKey": "sk-openai-test456",
+                "baseUrl": "https://proxy.example.com/v1/"
+            }
+        });
+
+        let fp_a = fingerprint_providers(&cfg_a);
+        let fp_b = fingerprint_providers(&cfg_b);
+
+        assert_eq!(fp_a.openai, fp_b.openai);
     }
 
     #[test]
     fn test_fingerprint_changes_when_gemini_auth_profile_tokens_change() {
-        with_clean_provider_env(|| {
-            let temp = tempfile::tempdir().expect("tempdir");
-            let _state_dir = set_env_var_scoped(
-                "CARAPACE_STATE_DIR",
-                temp.path().to_str().expect("state dir path"),
-            );
-            let provider_config = OAuthProvider::Google
-                .default_config(
-                    "google-client-id",
-                    "google-client-secret",
-                    "https://gateway.example.com/control/onboarding/gemini/callback",
-                )
-                .unwrap();
-            let profile = crate::auth::profiles::AuthProfile {
-                id: "google-abc123".to_string(),
-                name: "Google user@example.com".to_string(),
-                provider: OAuthProvider::Google,
-                user_id: Some("user-123".to_string()),
-                email: Some("user@example.com".to_string()),
-                display_name: Some("Example User".to_string()),
-                avatar_url: None,
-                created_at_ms: 0,
-                last_used_ms: None,
-                credential_kind: AuthProfileCredentialKind::OAuth,
-                tokens: Some(crate::auth::profiles::OAuthTokens {
-                    access_token: "access-token-a".to_string(),
-                    refresh_token: Some("refresh-token-a".to_string()),
-                    token_type: "Bearer".to_string(),
-                    expires_at_ms: Some(1_000),
-                    scope: Some("openid email profile".to_string()),
-                }),
-                token: None,
-                oauth_provider_config: Some(
-                    crate::auth::profiles::StoredOAuthProviderConfig::from(&provider_config),
-                ),
-            };
-            let store = ProfileStore::from_env(temp.path().to_path_buf()).expect("profile store");
-            store.add(profile).expect("store profile");
+        let mut env = clean_provider_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        env.set("CARAPACE_STATE_DIR", temp.path());
+        let provider_config = OAuthProvider::Google
+            .default_config(
+                "google-client-id",
+                "google-client-secret",
+                "https://gateway.example.com/control/onboarding/gemini/callback",
+            )
+            .unwrap();
+        let profile = crate::auth::profiles::AuthProfile {
+            id: "google-abc123".to_string(),
+            name: "Google user@example.com".to_string(),
+            provider: OAuthProvider::Google,
+            user_id: Some("user-123".to_string()),
+            email: Some("user@example.com".to_string()),
+            display_name: Some("Example User".to_string()),
+            avatar_url: None,
+            created_at_ms: 0,
+            last_used_ms: None,
+            credential_kind: AuthProfileCredentialKind::OAuth,
+            tokens: Some(crate::auth::profiles::OAuthTokens {
+                access_token: "access-token-a".to_string(),
+                refresh_token: Some("refresh-token-a".to_string()),
+                token_type: "Bearer".to_string(),
+                expires_at_ms: Some(1_000),
+                scope: Some("openid email profile".to_string()),
+            }),
+            token: None,
+            oauth_provider_config: Some(crate::auth::profiles::StoredOAuthProviderConfig::from(
+                &provider_config,
+            )),
+        };
+        let store = ProfileStore::from_env(temp.path().to_path_buf()).expect("profile store");
+        store.add(profile).expect("store profile");
 
-            let cfg = json!({
-                "google": { "authProfile": "google-abc123" }
-            });
-            let fp1 = fingerprint_providers(&cfg);
-
-            store
-                .update_tokens(
-                    "google-abc123",
-                    crate::auth::profiles::OAuthTokens {
-                        access_token: "access-token-b".to_string(),
-                        refresh_token: Some("refresh-token-b".to_string()),
-                        token_type: "Bearer".to_string(),
-                        expires_at_ms: Some(2_000),
-                        scope: Some("openid email profile".to_string()),
-                    },
-                )
-                .expect("update tokens");
-
-            let fp2 = fingerprint_providers(&cfg);
-            assert_ne!(fp1.gemini, fp2.gemini);
+        let cfg = json!({
+            "google": { "authProfile": "google-abc123" }
         });
+        let fp1 = fingerprint_providers(&cfg);
+
+        store
+            .update_tokens(
+                "google-abc123",
+                crate::auth::profiles::OAuthTokens {
+                    access_token: "access-token-b".to_string(),
+                    refresh_token: Some("refresh-token-b".to_string()),
+                    token_type: "Bearer".to_string(),
+                    expires_at_ms: Some(2_000),
+                    scope: Some("openid email profile".to_string()),
+                },
+            )
+            .expect("update tokens");
+
+        let fp2 = fingerprint_providers(&cfg);
+        assert_ne!(fp1.gemini, fp2.gemini);
     }
 
     #[test]
     fn test_build_providers_ignores_blank_gemini_api_key_when_auth_profile_present() {
-        with_clean_provider_env(|| {
-            let temp = tempfile::tempdir().expect("tempdir");
-            let _password = set_env_var_scoped("CARAPACE_CONFIG_PASSWORD", "test-config-password");
-            let _state_dir = set_env_var_scoped(
-                "CARAPACE_STATE_DIR",
-                temp.path().to_str().expect("state dir path"),
-            );
-            let _blank_key = set_env_var_scoped("GOOGLE_API_KEY", "   ");
+        let mut env = clean_provider_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        env.set("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+        env.set("CARAPACE_STATE_DIR", temp.path());
+        env.set("GOOGLE_API_KEY", "   ");
 
-            let provider_config = OAuthProvider::Google
-                .default_config(
-                    "google-client-id",
-                    "google-client-secret",
-                    "https://gateway.example.com/control/onboarding/gemini/callback",
-                )
-                .unwrap();
-            let profile = crate::auth::profiles::AuthProfile {
-                id: "google-abc123".to_string(),
-                name: "Google user@example.com".to_string(),
-                provider: OAuthProvider::Google,
-                user_id: Some("user-123".to_string()),
-                email: Some("user@example.com".to_string()),
-                display_name: Some("Example User".to_string()),
-                avatar_url: None,
-                created_at_ms: 0,
-                last_used_ms: None,
-                credential_kind: AuthProfileCredentialKind::OAuth,
-                tokens: Some(crate::auth::profiles::OAuthTokens {
-                    access_token: "access-token".to_string(),
-                    refresh_token: Some("refresh-token".to_string()),
-                    token_type: "Bearer".to_string(),
-                    expires_at_ms: Some(u64::MAX),
-                    scope: Some("openid email profile".to_string()),
-                }),
-                token: None,
-                oauth_provider_config: Some(
-                    crate::auth::profiles::StoredOAuthProviderConfig::from(&provider_config),
-                ),
-            };
-            let store = ProfileStore::from_env(temp.path().to_path_buf()).expect("profile store");
-            store.add(profile).expect("store profile");
+        let provider_config = OAuthProvider::Google
+            .default_config(
+                "google-client-id",
+                "google-client-secret",
+                "https://gateway.example.com/control/onboarding/gemini/callback",
+            )
+            .unwrap();
+        let profile = crate::auth::profiles::AuthProfile {
+            id: "google-abc123".to_string(),
+            name: "Google user@example.com".to_string(),
+            provider: OAuthProvider::Google,
+            user_id: Some("user-123".to_string()),
+            email: Some("user@example.com".to_string()),
+            display_name: Some("Example User".to_string()),
+            avatar_url: None,
+            created_at_ms: 0,
+            last_used_ms: None,
+            credential_kind: AuthProfileCredentialKind::OAuth,
+            tokens: Some(crate::auth::profiles::OAuthTokens {
+                access_token: "access-token".to_string(),
+                refresh_token: Some("refresh-token".to_string()),
+                token_type: "Bearer".to_string(),
+                expires_at_ms: Some(u64::MAX),
+                scope: Some("openid email profile".to_string()),
+            }),
+            token: None,
+            oauth_provider_config: Some(crate::auth::profiles::StoredOAuthProviderConfig::from(
+                &provider_config,
+            )),
+        };
+        let store = ProfileStore::from_env(temp.path().to_path_buf()).expect("profile store");
+        store.add(profile).expect("store profile");
 
-            let cfg = json!({
-                "google": { "authProfile": "google-abc123" }
-            });
-            let providers = build_providers(&cfg).expect("build providers");
-            assert!(
-                providers.is_some(),
-                "blank GOOGLE_API_KEY should not mask auth-profile Gemini setup"
-            );
+        let cfg = json!({
+            "google": { "authProfile": "google-abc123" }
         });
+        let providers = build_providers(&cfg).expect("build providers");
+        assert!(
+            providers.is_some(),
+            "blank GOOGLE_API_KEY should not mask auth-profile Gemini setup"
+        );
     }
 
     #[test]
     fn test_build_providers_with_codex_auth_profile() {
-        with_clean_provider_env(|| {
-            let temp = tempfile::tempdir().expect("tempdir");
-            let _password = set_env_var_scoped("CARAPACE_CONFIG_PASSWORD", "test-config-password");
-            let _state_dir = set_env_var_scoped(
-                "CARAPACE_STATE_DIR",
-                temp.path().to_str().expect("state dir path"),
-            );
+        let mut env = clean_provider_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        env.set("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+        env.set("CARAPACE_STATE_DIR", temp.path());
 
-            let provider_config = OAuthProvider::OpenAI
-                .default_config(
-                    "openai-client-id",
-                    "openai-client-secret",
-                    "https://gateway.example.com/control/onboarding/codex/callback",
-                )
-                .unwrap();
-            let profile = crate::auth::profiles::AuthProfile {
-                id: "openai-abc123".to_string(),
-                name: "Codex user@example.com".to_string(),
-                provider: OAuthProvider::OpenAI,
-                user_id: Some("user-123".to_string()),
-                email: Some("user@example.com".to_string()),
-                display_name: Some("Example User".to_string()),
-                avatar_url: None,
-                created_at_ms: 0,
-                last_used_ms: None,
-                credential_kind: AuthProfileCredentialKind::OAuth,
-                tokens: Some(crate::auth::profiles::OAuthTokens {
-                    access_token: "access-token".to_string(),
-                    refresh_token: Some("refresh-token".to_string()),
-                    token_type: "Bearer".to_string(),
-                    expires_at_ms: Some(u64::MAX),
-                    scope: Some("openid email profile offline_access".to_string()),
-                }),
-                token: None,
-                oauth_provider_config: Some(
-                    crate::auth::profiles::StoredOAuthProviderConfig::from(&provider_config),
-                ),
-            };
-            let store = ProfileStore::from_env(temp.path().to_path_buf()).expect("profile store");
-            store.add(profile).expect("store profile");
+        let provider_config = OAuthProvider::OpenAI
+            .default_config(
+                "openai-client-id",
+                "openai-client-secret",
+                "https://gateway.example.com/control/onboarding/codex/callback",
+            )
+            .unwrap();
+        let profile = crate::auth::profiles::AuthProfile {
+            id: "openai-abc123".to_string(),
+            name: "Codex user@example.com".to_string(),
+            provider: OAuthProvider::OpenAI,
+            user_id: Some("user-123".to_string()),
+            email: Some("user@example.com".to_string()),
+            display_name: Some("Example User".to_string()),
+            avatar_url: None,
+            created_at_ms: 0,
+            last_used_ms: None,
+            credential_kind: AuthProfileCredentialKind::OAuth,
+            tokens: Some(crate::auth::profiles::OAuthTokens {
+                access_token: "access-token".to_string(),
+                refresh_token: Some("refresh-token".to_string()),
+                token_type: "Bearer".to_string(),
+                expires_at_ms: Some(u64::MAX),
+                scope: Some("openid email profile offline_access".to_string()),
+            }),
+            token: None,
+            oauth_provider_config: Some(crate::auth::profiles::StoredOAuthProviderConfig::from(
+                &provider_config,
+            )),
+        };
+        let store = ProfileStore::from_env(temp.path().to_path_buf()).expect("profile store");
+        store.add(profile).expect("store profile");
 
-            let cfg = json!({
-                "codex": { "authProfile": "openai-abc123" }
-            });
-            let providers = build_providers(&cfg).expect("build providers");
-            assert!(
-                providers.is_some(),
-                "Codex auth profile should build a usable provider set"
-            );
+        let cfg = json!({
+            "codex": { "authProfile": "openai-abc123" }
         });
+        let providers = build_providers(&cfg).expect("build providers");
+        assert!(
+            providers.is_some(),
+            "Codex auth profile should build a usable provider set"
+        );
     }
 
     #[test]
     fn test_build_providers_with_anthropic_auth_profile() {
-        with_clean_provider_env(|| {
-            let temp = tempfile::tempdir().expect("tempdir");
-            let _password = set_env_var_scoped("CARAPACE_CONFIG_PASSWORD", "test-config-password");
-            let _state_dir = set_env_var_scoped(
-                "CARAPACE_STATE_DIR",
-                temp.path().to_str().expect("state dir path"),
-            );
+        let mut env = clean_provider_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        env.set("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+        env.set("CARAPACE_STATE_DIR", temp.path());
 
-            let profile = crate::auth::profiles::AuthProfile {
-                id: "anthropic:default".to_string(),
-                name: "Anthropic setup token".to_string(),
-                provider: OAuthProvider::Anthropic,
-                user_id: None,
-                email: None,
-                display_name: None,
-                avatar_url: None,
-                created_at_ms: 0,
-                last_used_ms: None,
-                credential_kind: AuthProfileCredentialKind::Token,
-                tokens: None,
-                token: Some("sk-ant-oat01-test-token".to_string()),
-                oauth_provider_config: None,
-            };
-            let store = ProfileStore::from_env(temp.path().to_path_buf()).expect("profile store");
-            store.add(profile).expect("store profile");
+        let profile = crate::auth::profiles::AuthProfile {
+            id: "anthropic:default".to_string(),
+            name: "Anthropic setup token".to_string(),
+            provider: OAuthProvider::Anthropic,
+            user_id: None,
+            email: None,
+            display_name: None,
+            avatar_url: None,
+            created_at_ms: 0,
+            last_used_ms: None,
+            credential_kind: AuthProfileCredentialKind::Token,
+            tokens: None,
+            token: Some("sk-ant-oat01-test-token".to_string()),
+            oauth_provider_config: None,
+        };
+        let store = ProfileStore::from_env(temp.path().to_path_buf()).expect("profile store");
+        store.add(profile).expect("store profile");
 
-            let cfg = json!({
-                "anthropic": { "authProfile": "anthropic:default" }
-            });
-            let providers = build_providers(&cfg).expect("build providers");
-            assert!(
-                providers.is_some(),
-                "Anthropic auth profile should build a usable provider set"
-            );
+        let cfg = json!({
+            "anthropic": { "authProfile": "anthropic:default" }
         });
+        let providers = build_providers(&cfg).expect("build providers");
+        assert!(
+            providers.is_some(),
+            "Anthropic auth profile should build a usable provider set"
+        );
     }
 
     #[test]
     fn test_build_providers_ignores_blank_anthropic_api_key_when_auth_profile_present() {
-        with_clean_provider_env(|| {
-            let temp = tempfile::tempdir().expect("tempdir");
-            let _password = set_env_var_scoped("CARAPACE_CONFIG_PASSWORD", "test-config-password");
-            let _state_dir = set_env_var_scoped(
-                "CARAPACE_STATE_DIR",
-                temp.path().to_str().expect("state dir path"),
-            );
-            let _blank_key = set_env_var_scoped("ANTHROPIC_API_KEY", "   ");
+        let mut env = clean_provider_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        env.set("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+        env.set("CARAPACE_STATE_DIR", temp.path());
+        env.set("ANTHROPIC_API_KEY", "   ");
 
-            let profile = crate::auth::profiles::AuthProfile {
-                id: "anthropic:default".to_string(),
-                name: "Anthropic setup token".to_string(),
-                provider: OAuthProvider::Anthropic,
-                user_id: None,
-                email: None,
-                display_name: None,
-                avatar_url: None,
-                created_at_ms: 0,
-                last_used_ms: None,
-                credential_kind: AuthProfileCredentialKind::Token,
-                tokens: None,
-                token: Some("sk-ant-oat01-test-token".to_string()),
-                oauth_provider_config: None,
-            };
-            let store = ProfileStore::from_env(temp.path().to_path_buf()).expect("profile store");
-            store.add(profile).expect("store profile");
+        let profile = crate::auth::profiles::AuthProfile {
+            id: "anthropic:default".to_string(),
+            name: "Anthropic setup token".to_string(),
+            provider: OAuthProvider::Anthropic,
+            user_id: None,
+            email: None,
+            display_name: None,
+            avatar_url: None,
+            created_at_ms: 0,
+            last_used_ms: None,
+            credential_kind: AuthProfileCredentialKind::Token,
+            tokens: None,
+            token: Some("sk-ant-oat01-test-token".to_string()),
+            oauth_provider_config: None,
+        };
+        let store = ProfileStore::from_env(temp.path().to_path_buf()).expect("profile store");
+        store.add(profile).expect("store profile");
 
-            let cfg = json!({
-                "anthropic": { "authProfile": "anthropic:default" }
-            });
-            let providers = build_providers(&cfg).expect("build providers");
-            assert!(
-                providers.is_some(),
-                "blank ANTHROPIC_API_KEY should not mask auth-profile Anthropic setup"
-            );
+        let cfg = json!({
+            "anthropic": { "authProfile": "anthropic:default" }
         });
+        let providers = build_providers(&cfg).expect("build providers");
+        assert!(
+            providers.is_some(),
+            "blank ANTHROPIC_API_KEY should not mask auth-profile Anthropic setup"
+        );
     }
 
     #[test]
     fn test_build_providers_rejects_anthropic_auth_profile_without_token() {
-        with_clean_provider_env(|| {
-            let temp = tempfile::tempdir().expect("tempdir");
-            let _password = set_env_var_scoped("CARAPACE_CONFIG_PASSWORD", "test-config-password");
-            let _state_dir = set_env_var_scoped(
-                "CARAPACE_STATE_DIR",
-                temp.path().to_str().expect("state dir path"),
-            );
+        let mut env = clean_provider_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        env.set("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+        env.set("CARAPACE_STATE_DIR", temp.path());
 
-            let profile = crate::auth::profiles::AuthProfile {
-                id: "anthropic:default".to_string(),
-                name: "Anthropic setup token".to_string(),
-                provider: OAuthProvider::Anthropic,
-                user_id: None,
-                email: None,
-                display_name: None,
-                avatar_url: None,
-                created_at_ms: 0,
-                last_used_ms: None,
-                credential_kind: AuthProfileCredentialKind::Token,
-                tokens: None,
-                token: Some("   ".to_string()),
-                oauth_provider_config: None,
-            };
-            let store = ProfileStore::from_env(temp.path().to_path_buf()).expect("profile store");
-            store.add(profile).expect("store profile");
+        let profile = crate::auth::profiles::AuthProfile {
+            id: "anthropic:default".to_string(),
+            name: "Anthropic setup token".to_string(),
+            provider: OAuthProvider::Anthropic,
+            user_id: None,
+            email: None,
+            display_name: None,
+            avatar_url: None,
+            created_at_ms: 0,
+            last_used_ms: None,
+            credential_kind: AuthProfileCredentialKind::Token,
+            tokens: None,
+            token: Some("   ".to_string()),
+            oauth_provider_config: None,
+        };
+        let store = ProfileStore::from_env(temp.path().to_path_buf()).expect("profile store");
+        store.add(profile).expect("store profile");
 
-            let cfg = json!({
-                "anthropic": { "authProfile": "anthropic:default" }
-            });
-            let err = build_providers(&cfg).expect_err("missing token should fail fast");
-            assert!(err.to_string().contains("has no usable token"));
+        let cfg = json!({
+            "anthropic": { "authProfile": "anthropic:default" }
         });
+        let err = build_providers(&cfg).expect_err("missing token should fail fast");
+        assert!(err.to_string().contains("has no usable token"));
     }
 
     #[test]
     fn test_build_providers_rejects_missing_anthropic_auth_profile() {
-        with_clean_provider_env(|| {
-            let temp = tempfile::tempdir().expect("tempdir");
-            let _password = set_env_var_scoped("CARAPACE_CONFIG_PASSWORD", "test-config-password");
-            let _state_dir = set_env_var_scoped(
-                "CARAPACE_STATE_DIR",
-                temp.path().to_str().expect("state dir path"),
-            );
+        let mut env = clean_provider_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        env.set("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+        env.set("CARAPACE_STATE_DIR", temp.path());
 
-            let store = ProfileStore::from_env(temp.path().to_path_buf()).expect("profile store");
-            store.load().expect("load empty profile store");
+        let store = ProfileStore::from_env(temp.path().to_path_buf()).expect("profile store");
+        store.load().expect("load empty profile store");
 
-            let cfg = json!({
-                "anthropic": { "authProfile": "anthropic:missing" }
-            });
-            let err = build_providers(&cfg).expect_err("missing profile should fail fast");
-            assert!(err
-                .to_string()
-                .contains("configured Anthropic auth profile \"anthropic:missing\" was not found"));
+        let cfg = json!({
+            "anthropic": { "authProfile": "anthropic:missing" }
         });
+        let err = build_providers(&cfg).expect_err("missing profile should fail fast");
+        assert!(err
+            .to_string()
+            .contains("configured Anthropic auth profile \"anthropic:missing\" was not found"));
     }
 
     #[test]
     fn test_build_providers_rejects_anthropic_auth_profile_without_password() {
-        with_clean_provider_env(|| {
-            let temp = tempfile::tempdir().expect("tempdir");
-            let _state_dir = set_env_var_scoped(
-                "CARAPACE_STATE_DIR",
-                temp.path().to_str().expect("state dir path"),
-            );
+        let mut env = clean_provider_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        env.set("CARAPACE_STATE_DIR", temp.path());
 
-            let profile = crate::auth::profiles::AuthProfile {
-                id: "anthropic:default".to_string(),
-                name: "Anthropic setup token".to_string(),
-                provider: OAuthProvider::Anthropic,
-                user_id: None,
-                email: None,
-                display_name: None,
-                avatar_url: None,
-                created_at_ms: 0,
-                last_used_ms: None,
-                credential_kind: AuthProfileCredentialKind::Token,
-                tokens: None,
-                token: Some("sk-ant-oat01-test-token".to_string()),
-                oauth_provider_config: None,
-            };
-            let store = ProfileStore::new(temp.path().to_path_buf());
-            store.add(profile).expect("store profile");
+        let profile = crate::auth::profiles::AuthProfile {
+            id: "anthropic:default".to_string(),
+            name: "Anthropic setup token".to_string(),
+            provider: OAuthProvider::Anthropic,
+            user_id: None,
+            email: None,
+            display_name: None,
+            avatar_url: None,
+            created_at_ms: 0,
+            last_used_ms: None,
+            credential_kind: AuthProfileCredentialKind::Token,
+            tokens: None,
+            token: Some("sk-ant-oat01-test-token".to_string()),
+            oauth_provider_config: None,
+        };
+        let store = ProfileStore::new(temp.path().to_path_buf());
+        store.add(profile).expect("store profile");
 
-            let cfg = json!({
-                "anthropic": { "authProfile": "anthropic:default" }
-            });
-            let err = build_providers(&cfg).expect_err("missing password should fail fast");
-            assert!(err.to_string().contains("CARAPACE_CONFIG_PASSWORD"));
+        let cfg = json!({
+            "anthropic": { "authProfile": "anthropic:default" }
         });
+        let err = build_providers(&cfg).expect_err("missing password should fail fast");
+        assert!(err.to_string().contains("CARAPACE_CONFIG_PASSWORD"));
     }
 
     #[test]
     fn test_build_providers_rejects_anthropic_auth_profile_with_wrong_provider() {
-        with_clean_provider_env(|| {
-            let temp = tempfile::tempdir().expect("tempdir");
-            let _password = set_env_var_scoped("CARAPACE_CONFIG_PASSWORD", "test-config-password");
-            let _state_dir = set_env_var_scoped(
-                "CARAPACE_STATE_DIR",
-                temp.path().to_str().expect("state dir path"),
-            );
+        let mut env = clean_provider_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        env.set("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+        env.set("CARAPACE_STATE_DIR", temp.path());
 
-            let profile = crate::auth::profiles::AuthProfile {
-                id: "anthropic:default".to_string(),
-                name: "Wrong profile".to_string(),
-                provider: OAuthProvider::Google,
-                user_id: Some("user-123".to_string()),
-                email: Some("user@example.com".to_string()),
-                display_name: Some("Example User".to_string()),
-                avatar_url: None,
-                created_at_ms: 0,
-                last_used_ms: None,
-                credential_kind: AuthProfileCredentialKind::Token,
-                tokens: None,
-                token: Some("sk-ant-oat01-test-token".to_string()),
-                oauth_provider_config: None,
-            };
-            let store = ProfileStore::from_env(temp.path().to_path_buf()).expect("profile store");
-            store.add(profile).expect("store profile");
+        let profile = crate::auth::profiles::AuthProfile {
+            id: "anthropic:default".to_string(),
+            name: "Wrong profile".to_string(),
+            provider: OAuthProvider::Google,
+            user_id: Some("user-123".to_string()),
+            email: Some("user@example.com".to_string()),
+            display_name: Some("Example User".to_string()),
+            avatar_url: None,
+            created_at_ms: 0,
+            last_used_ms: None,
+            credential_kind: AuthProfileCredentialKind::Token,
+            tokens: None,
+            token: Some("sk-ant-oat01-test-token".to_string()),
+            oauth_provider_config: None,
+        };
+        let store = ProfileStore::from_env(temp.path().to_path_buf()).expect("profile store");
+        store.add(profile).expect("store profile");
 
-            let cfg = json!({
-                "anthropic": { "authProfile": "anthropic:default" }
-            });
-            let err = build_providers(&cfg).expect_err("wrong provider should fail fast");
-            assert!(err.to_string().contains("belongs to google, not anthropic"));
+        let cfg = json!({
+            "anthropic": { "authProfile": "anthropic:default" }
         });
+        let err = build_providers(&cfg).expect_err("wrong provider should fail fast");
+        assert!(err.to_string().contains("belongs to google, not anthropic"));
     }
 
     #[test]
     fn test_build_providers_rejects_anthropic_auth_profile_with_oauth_credential_kind() {
-        with_clean_provider_env(|| {
-            let temp = tempfile::tempdir().expect("tempdir");
-            let _password = set_env_var_scoped("CARAPACE_CONFIG_PASSWORD", "test-config-password");
-            let _state_dir = set_env_var_scoped(
-                "CARAPACE_STATE_DIR",
-                temp.path().to_str().expect("state dir path"),
-            );
+        let mut env = clean_provider_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        env.set("CARAPACE_CONFIG_PASSWORD", "test-config-password");
+        env.set("CARAPACE_STATE_DIR", temp.path());
 
-            let profile = crate::auth::profiles::AuthProfile {
-                id: "anthropic:default".to_string(),
-                name: "Anthropic oauth profile".to_string(),
-                provider: OAuthProvider::Anthropic,
-                user_id: Some("user-123".to_string()),
-                email: Some("user@example.com".to_string()),
-                display_name: Some("Example User".to_string()),
-                avatar_url: None,
-                created_at_ms: 0,
-                last_used_ms: None,
-                credential_kind: AuthProfileCredentialKind::OAuth,
-                tokens: Some(crate::auth::profiles::OAuthTokens {
-                    access_token: "access-token".to_string(),
-                    refresh_token: Some("refresh-token".to_string()),
-                    token_type: "Bearer".to_string(),
-                    expires_at_ms: Some(u64::MAX),
-                    scope: None,
-                }),
-                token: None,
-                oauth_provider_config: None,
-            };
-            let store = ProfileStore::from_env(temp.path().to_path_buf()).expect("profile store");
-            store.add(profile).expect("store profile");
+        let profile = crate::auth::profiles::AuthProfile {
+            id: "anthropic:default".to_string(),
+            name: "Anthropic oauth profile".to_string(),
+            provider: OAuthProvider::Anthropic,
+            user_id: Some("user-123".to_string()),
+            email: Some("user@example.com".to_string()),
+            display_name: Some("Example User".to_string()),
+            avatar_url: None,
+            created_at_ms: 0,
+            last_used_ms: None,
+            credential_kind: AuthProfileCredentialKind::OAuth,
+            tokens: Some(crate::auth::profiles::OAuthTokens {
+                access_token: "access-token".to_string(),
+                refresh_token: Some("refresh-token".to_string()),
+                token_type: "Bearer".to_string(),
+                expires_at_ms: Some(u64::MAX),
+                scope: None,
+            }),
+            token: None,
+            oauth_provider_config: None,
+        };
+        let store = ProfileStore::from_env(temp.path().to_path_buf()).expect("profile store");
+        store.add(profile).expect("store profile");
 
-            let cfg = json!({
-                "anthropic": { "authProfile": "anthropic:default" }
-            });
-            let err = build_providers(&cfg).expect_err("oauth-backed profile should fail fast");
-            assert!(err.to_string().contains("is not token-backed"));
+        let cfg = json!({
+            "anthropic": { "authProfile": "anthropic:default" }
         });
+        let err = build_providers(&cfg).expect_err("oauth-backed profile should fail fast");
+        assert!(err.to_string().contains("is not token-backed"));
     }
 
     #[test]
     fn test_resolve_google_oauth_runtime_config_uses_stored_redirect_uri_when_missing() {
-        with_clean_provider_env(|| {
-            let temp = tempfile::tempdir().expect("tempdir");
-            let provider_config = OAuthProvider::Google
-                .default_config(
-                    "google-client-id",
-                    "google-client-secret",
-                    "https://gateway.example.com/control/onboarding/gemini/callback",
-                )
-                .unwrap();
-            let profile = crate::auth::profiles::AuthProfile {
-                id: "google-abc123".to_string(),
-                name: "Google user@example.com".to_string(),
-                provider: OAuthProvider::Google,
-                user_id: Some("user-123".to_string()),
-                email: Some("user@example.com".to_string()),
-                display_name: Some("Example User".to_string()),
-                avatar_url: None,
-                created_at_ms: 0,
-                last_used_ms: None,
-                credential_kind: AuthProfileCredentialKind::OAuth,
-                tokens: Some(crate::auth::profiles::OAuthTokens {
-                    access_token: "access-token".to_string(),
-                    refresh_token: Some("refresh-token".to_string()),
-                    token_type: "Bearer".to_string(),
-                    expires_at_ms: Some(u64::MAX),
-                    scope: Some("openid email profile".to_string()),
-                }),
-                token: None,
-                oauth_provider_config: Some(
-                    crate::auth::profiles::StoredOAuthProviderConfig::from(&provider_config),
-                ),
-            };
-            let store = ProfileStore::from_env(temp.path().to_path_buf()).expect("profile store");
-            store.add(profile).expect("store profile");
+        let _env = clean_provider_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let provider_config = OAuthProvider::Google
+            .default_config(
+                "google-client-id",
+                "google-client-secret",
+                "https://gateway.example.com/control/onboarding/gemini/callback",
+            )
+            .unwrap();
+        let profile = crate::auth::profiles::AuthProfile {
+            id: "google-abc123".to_string(),
+            name: "Google user@example.com".to_string(),
+            provider: OAuthProvider::Google,
+            user_id: Some("user-123".to_string()),
+            email: Some("user@example.com".to_string()),
+            display_name: Some("Example User".to_string()),
+            avatar_url: None,
+            created_at_ms: 0,
+            last_used_ms: None,
+            credential_kind: AuthProfileCredentialKind::OAuth,
+            tokens: Some(crate::auth::profiles::OAuthTokens {
+                access_token: "access-token".to_string(),
+                refresh_token: Some("refresh-token".to_string()),
+                token_type: "Bearer".to_string(),
+                expires_at_ms: Some(u64::MAX),
+                scope: Some("openid email profile".to_string()),
+            }),
+            token: None,
+            oauth_provider_config: Some(crate::auth::profiles::StoredOAuthProviderConfig::from(
+                &provider_config,
+            )),
+        };
+        let store = ProfileStore::from_env(temp.path().to_path_buf()).expect("profile store");
+        store.add(profile).expect("store profile");
 
-            let cfg = json!({
-                "google": { "authProfile": "google-abc123" }
-            });
-            let resolved = resolve_google_oauth_runtime_config(&cfg, temp.path(), "google-abc123")
-                .expect("runtime config");
-
-            assert_eq!(
-                resolved.redirect_uri,
-                "https://gateway.example.com/control/onboarding/gemini/callback"
-            );
+        let cfg = json!({
+            "google": { "authProfile": "google-abc123" }
         });
+        let resolved = resolve_google_oauth_runtime_config(&cfg, temp.path(), "google-abc123")
+            .expect("runtime config");
+
+        assert_eq!(
+            resolved.redirect_uri,
+            "https://gateway.example.com/control/onboarding/gemini/callback"
+        );
     }
 
     #[test]
     fn test_fingerprint_detects_key_change() {
-        with_clean_provider_env(|| {
-            let cfg1 = json!({ "anthropic": { "apiKey": "key-a" } });
-            let cfg2 = json!({ "anthropic": { "apiKey": "key-b" } });
-            let fp1 = fingerprint_providers(&cfg1);
-            let fp2 = fingerprint_providers(&cfg2);
-            assert_ne!(fp1, fp2);
-        });
+        let _env = clean_provider_env();
+        let cfg1 = json!({ "anthropic": { "apiKey": "key-a" } });
+        let cfg2 = json!({ "anthropic": { "apiKey": "key-b" } });
+        let fp1 = fingerprint_providers(&cfg1);
+        let fp2 = fingerprint_providers(&cfg2);
+        assert_ne!(fp1, fp2);
     }
 
     #[test]
     fn test_fingerprint_same_key_same_hash() {
-        with_clean_provider_env(|| {
-            let cfg = json!({ "anthropic": { "apiKey": "key-same" } });
-            let fp1 = fingerprint_providers(&cfg);
-            let fp2 = fingerprint_providers(&cfg);
-            assert_eq!(fp1, fp2);
-        });
+        let _env = clean_provider_env();
+        let cfg = json!({ "anthropic": { "apiKey": "key-same" } });
+        let fp1 = fingerprint_providers(&cfg);
+        let fp2 = fingerprint_providers(&cfg);
+        assert_eq!(fp1, fp2);
     }
 
     #[test]
     fn test_fingerprint_ollama_configured() {
-        with_clean_provider_env(|| {
-            let cfg = json!({ "providers": { "ollama": { "baseUrl": "http://localhost:11434" } } });
-            let fp = fingerprint_providers(&cfg);
-            assert!(fp.ollama.is_some());
-            let (configured, url) = fp.ollama.unwrap();
-            assert!(configured);
-            assert_eq!(url.as_deref(), Some("http://localhost:11434"));
-        });
+        let _env = clean_provider_env();
+        let cfg = json!({ "providers": { "ollama": { "baseUrl": "http://localhost:11434" } } });
+        let fp = fingerprint_providers(&cfg);
+        assert!(fp.ollama.is_some());
+        let (configured, url) = fp.ollama.unwrap();
+        assert!(configured);
+        assert_eq!(url.as_deref(), Some("http://localhost:11434"));
     }
 
     #[test]
     fn test_fingerprint_bedrock_configured() {
-        with_clean_provider_env(|| {
-            let cfg = json!({
-                "bedrock": {
-                    "region": "us-east-1",
-                    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
-                    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
-                }
-            });
-            let fp = fingerprint_providers(&cfg);
-            assert!(fp.bedrock.is_some());
-            let combined = format!("{}{}", "us-east-1", "AKIAIOSFODNN7EXAMPLE");
-            let expected_hash = hash_key_prefix(&combined);
-            assert_eq!(fp.bedrock, Some(expected_hash));
+        let _env = clean_provider_env();
+        let cfg = json!({
+            "bedrock": {
+                "region": "us-east-1",
+                "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+                "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+            }
         });
+        let fp = fingerprint_providers(&cfg);
+        assert!(fp.bedrock.is_some());
+        let combined = format!("{}{}", "us-east-1", "AKIAIOSFODNN7EXAMPLE");
+        let expected_hash = hash_key_prefix(&combined);
+        assert_eq!(fp.bedrock, Some(expected_hash));
     }
 
     #[test]
     fn test_fingerprint_bedrock_detects_change() {
-        with_clean_provider_env(|| {
-            let cfg1 = json!({
-                "bedrock": {
-                    "region": "us-east-1",
-                    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
-                    "secretAccessKey": "secret1"
-                }
-            });
-            let cfg2 = json!({
-                "bedrock": {
-                    "region": "us-west-2",
-                    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
-                    "secretAccessKey": "secret1"
-                }
-            });
-            let fp1 = fingerprint_providers(&cfg1);
-            let fp2 = fingerprint_providers(&cfg2);
-            assert_ne!(fp1.bedrock, fp2.bedrock);
+        let _env = clean_provider_env();
+        let cfg1 = json!({
+            "bedrock": {
+                "region": "us-east-1",
+                "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+                "secretAccessKey": "secret1"
+            }
         });
+        let cfg2 = json!({
+            "bedrock": {
+                "region": "us-west-2",
+                "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+                "secretAccessKey": "secret1"
+            }
+        });
+        let fp1 = fingerprint_providers(&cfg1);
+        let fp2 = fingerprint_providers(&cfg2);
+        assert_ne!(fp1.bedrock, fp2.bedrock);
     }
 
     #[test]
     fn test_fingerprint_bedrock_disabled() {
-        with_clean_provider_env(|| {
-            let cfg = json!({
-                "bedrock": {
-                    "region": "us-east-1",
-                    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
-                    "secretAccessKey": "secret",
-                    "enabled": false
-                }
-            });
-            let fp = fingerprint_providers(&cfg);
-            assert!(fp.bedrock.is_none());
+        let _env = clean_provider_env();
+        let cfg = json!({
+            "bedrock": {
+                "region": "us-east-1",
+                "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+                "secretAccessKey": "secret",
+                "enabled": false
+            }
         });
+        let fp = fingerprint_providers(&cfg);
+        assert!(fp.bedrock.is_none());
     }
 
     #[test]
     fn test_fingerprint_bedrock_partial_creds() {
-        with_clean_provider_env(|| {
-            // Only region, missing access key — should be None
-            let cfg = json!({
-                "bedrock": { "region": "us-east-1" }
-            });
-            let fp = fingerprint_providers(&cfg);
-            assert!(fp.bedrock.is_none());
+        let _env = clean_provider_env();
+        // Only region, missing access key — should be None
+        let cfg = json!({
+            "bedrock": { "region": "us-east-1" }
         });
+        let fp = fingerprint_providers(&cfg);
+        assert!(fp.bedrock.is_none());
     }
 
     #[test]
     fn test_fingerprint_vertex_hashes_project_id() {
-        with_clean_provider_env(|| {
-            let cfg = json!({
-                "vertex": {
-                    "projectId": "my-project",
-                    "location": "us-central1",
-                    "model": "gemini-2.0-flash"
-                }
-            });
-            let fp = fingerprint_providers(&cfg);
-            assert_eq!(
-                fp.vertex,
-                Some((
-                    hash_key_prefix("my-project"),
-                    "us-central1".to_string(),
-                    Some("gemini-2.0-flash".to_string())
-                ))
-            );
+        let _env = clean_provider_env();
+        let cfg = json!({
+            "vertex": {
+                "projectId": "my-project",
+                "location": "us-central1",
+                "model": "gemini-2.0-flash"
+            }
         });
+        let fp = fingerprint_providers(&cfg);
+        assert_eq!(
+            fp.vertex,
+            Some((
+                hash_key_prefix("my-project"),
+                "us-central1".to_string(),
+                Some("gemini-2.0-flash".to_string())
+            ))
+        );
     }
 
     #[test]
@@ -1964,70 +1862,63 @@ mod tests {
 
     #[test]
     fn anthropic_auth_profile_fingerprint_with_correct_password() {
-        with_clean_provider_env(|| {
-            let dir = tempfile::tempdir().unwrap();
-            let password = random_test_password();
-            let _pw = set_env_var_scoped("CARAPACE_CONFIG_PASSWORD", &password);
-            let _sd = set_env_var_scoped("CARAPACE_STATE_DIR", dir.path().to_str().unwrap());
+        let mut env = clean_provider_env();
+        let dir = tempfile::tempdir().unwrap();
+        let password = random_test_password();
+        env.set("CARAPACE_CONFIG_PASSWORD", &password);
+        env.set("CARAPACE_STATE_DIR", dir.path());
 
-            let store =
-                ProfileStore::with_encryption(dir.path().to_path_buf(), password.as_bytes())
-                    .unwrap();
-            store.add(sample_anthropic_token_profile()).unwrap();
+        let store =
+            ProfileStore::with_encryption(dir.path().to_path_buf(), password.as_bytes()).unwrap();
+        store.add(sample_anthropic_token_profile()).unwrap();
 
-            let cfg = json!({ "anthropic": { "authProfile": "anthropic:default" } });
-            let fp = resolve_anthropic_auth_profile_fingerprint(&cfg);
+        let cfg = json!({ "anthropic": { "authProfile": "anthropic:default" } });
+        let fp = resolve_anthropic_auth_profile_fingerprint(&cfg);
 
-            assert!(
-                fp.is_some(),
-                "fingerprint should resolve with correct password"
-            );
-            assert!(fp.unwrap().starts_with("auth-profile:anthropic:default:"));
-        });
+        assert!(
+            fp.is_some(),
+            "fingerprint should resolve with correct password"
+        );
+        assert!(fp.unwrap().starts_with("auth-profile:anthropic:default:"));
     }
 
     #[test]
     fn anthropic_auth_profile_fingerprint_differs_with_wrong_password() {
-        with_clean_provider_env(|| {
-            let dir = tempfile::tempdir().unwrap();
-            let password = random_test_password();
-            let wrong_password = random_test_password();
+        let mut env = clean_provider_env();
+        let dir = tempfile::tempdir().unwrap();
+        let password = random_test_password();
+        let wrong_password = random_test_password();
 
-            let store =
-                ProfileStore::with_encryption(dir.path().to_path_buf(), password.as_bytes())
-                    .unwrap();
-            store.add(sample_anthropic_token_profile()).unwrap();
+        let store =
+            ProfileStore::with_encryption(dir.path().to_path_buf(), password.as_bytes()).unwrap();
+        store.add(sample_anthropic_token_profile()).unwrap();
 
-            let cfg = json!({ "anthropic": { "authProfile": "anthropic:default" } });
+        let cfg = json!({ "anthropic": { "authProfile": "anthropic:default" } });
 
-            // Fingerprint with correct password.
-            let _pw = set_env_var_scoped("CARAPACE_CONFIG_PASSWORD", &password);
-            let _sd = set_env_var_scoped("CARAPACE_STATE_DIR", dir.path().to_str().unwrap());
-            let fp_correct = resolve_anthropic_auth_profile_fingerprint(&cfg);
-            drop(_pw);
-            drop(_sd);
+        // Fingerprint with correct password.
+        env.set("CARAPACE_CONFIG_PASSWORD", &password);
+        env.set("CARAPACE_STATE_DIR", dir.path());
+        let fp_correct = resolve_anthropic_auth_profile_fingerprint(&cfg);
 
-            // Fingerprint with wrong password — store loads but token stays
-            // encrypted, producing a different fingerprint hash.
-            let _pw2 = set_env_var_scoped("CARAPACE_CONFIG_PASSWORD", &wrong_password);
-            let _sd2 = set_env_var_scoped("CARAPACE_STATE_DIR", dir.path().to_str().unwrap());
-            let fp_wrong = resolve_anthropic_auth_profile_fingerprint(&cfg);
+        // Fingerprint with wrong password — store loads but token stays
+        // encrypted, producing a different fingerprint hash.
+        env.set("CARAPACE_CONFIG_PASSWORD", &wrong_password);
+        env.set("CARAPACE_STATE_DIR", dir.path());
+        let fp_wrong = resolve_anthropic_auth_profile_fingerprint(&cfg);
 
-            assert!(fp_correct.is_some());
-            assert!(fp_wrong.is_some());
-            assert_ne!(
-                fp_correct, fp_wrong,
-                "fingerprint should differ when password is wrong (token stays encrypted)"
-            );
-        });
+        assert!(fp_correct.is_some());
+        assert!(fp_wrong.is_some());
+        assert_ne!(
+            fp_correct, fp_wrong,
+            "fingerprint should differ when password is wrong (token stays encrypted)"
+        );
     }
 
     #[test]
     fn anthropic_auth_profile_fingerprint_no_profile_configured() {
-        with_clean_provider_env(|| {
-            let cfg = json!({ "anthropic": { "apiKey": "sk-ant-test" } });
-            let fp = resolve_anthropic_auth_profile_fingerprint(&cfg);
-            assert!(fp.is_none());
-        });
+        let _env = clean_provider_env();
+        let cfg = json!({ "anthropic": { "apiKey": "sk-ant-test" } });
+        let fp = resolve_anthropic_auth_profile_fingerprint(&cfg);
+        assert!(fp.is_none());
     }
 }

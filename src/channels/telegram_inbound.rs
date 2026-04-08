@@ -123,35 +123,7 @@ fn normalize_secret(secret: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{LazyLock, Mutex};
-
-    static ENV_VAR_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-
-    struct EnvVarGuard {
-        key: &'static str,
-        previous: Option<String>,
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match &self.previous {
-                Some(value) => std::env::set_var(self.key, value),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
-
-    fn set_env_var_scoped(key: &'static str, value: &str) -> EnvVarGuard {
-        let previous = std::env::var(key).ok();
-        std::env::set_var(key, value);
-        EnvVarGuard { key, previous }
-    }
-
-    fn unset_env_var_scoped(key: &'static str) -> EnvVarGuard {
-        let previous = std::env::var(key).ok();
-        std::env::remove_var(key);
-        EnvVarGuard { key, previous }
-    }
+    use crate::test_support::env::ScopedEnv;
 
     #[test]
     fn test_extract_inbound_message() {
@@ -200,8 +172,8 @@ mod tests {
 
     #[test]
     fn test_resolve_webhook_secret_from_config() {
-        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
-        let _env_guard = unset_env_var_scoped("TELEGRAM_WEBHOOK_SECRET");
+        let mut env = ScopedEnv::new();
+        env.unset("TELEGRAM_WEBHOOK_SECRET");
         let cfg = serde_json::json!({
             "telegram": {
                 "webhookSecret": "secret-value"
@@ -215,16 +187,16 @@ mod tests {
 
     #[test]
     fn test_resolve_webhook_secret_falls_back_to_env() {
-        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
-        let _env_guard = set_env_var_scoped("TELEGRAM_WEBHOOK_SECRET", "env-secret");
+        let mut env = ScopedEnv::new();
+        env.set("TELEGRAM_WEBHOOK_SECRET", "env-secret");
         let cfg = serde_json::json!({});
         assert_eq!(resolve_webhook_secret(&cfg), Some("env-secret".to_string()));
     }
 
     #[test]
     fn test_resolve_webhook_secret_config_precedence_over_env() {
-        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
-        let _env_guard = set_env_var_scoped("TELEGRAM_WEBHOOK_SECRET", "env-secret");
+        let mut env = ScopedEnv::new();
+        env.set("TELEGRAM_WEBHOOK_SECRET", "env-secret");
         let cfg = serde_json::json!({
             "telegram": {
                 "webhookSecret": "config-secret"
@@ -238,16 +210,16 @@ mod tests {
 
     #[test]
     fn test_resolve_webhook_secret_returns_none_when_missing() {
-        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
-        let _env_guard = unset_env_var_scoped("TELEGRAM_WEBHOOK_SECRET");
+        let mut env = ScopedEnv::new();
+        env.unset("TELEGRAM_WEBHOOK_SECRET");
         let cfg = serde_json::json!({});
         assert_eq!(resolve_webhook_secret(&cfg), None);
     }
 
     #[test]
     fn test_resolve_webhook_secret_rejects_whitespace_values() {
-        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
-        let _env_guard = unset_env_var_scoped("TELEGRAM_WEBHOOK_SECRET");
+        let mut env = ScopedEnv::new();
+        env.unset("TELEGRAM_WEBHOOK_SECRET");
         let cfg = serde_json::json!({
             "telegram": {
                 "webhookSecret": "   "
@@ -255,7 +227,7 @@ mod tests {
         });
         assert_eq!(resolve_webhook_secret(&cfg), None);
 
-        let _env_guard = set_env_var_scoped("TELEGRAM_WEBHOOK_SECRET", "   ");
+        env.set("TELEGRAM_WEBHOOK_SECRET", "   ");
         let cfg = serde_json::json!({});
         assert_eq!(resolve_webhook_secret(&cfg), None);
     }

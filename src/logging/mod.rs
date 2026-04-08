@@ -365,11 +365,8 @@ pub mod targets {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use crate::test_support::env::ScopedEnv;
     use tempfile::NamedTempFile;
-
-    /// Mutex to serialize tests that modify global state (env vars).
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_log_config_defaults() {
@@ -397,10 +394,9 @@ mod tests {
 
     #[test]
     fn test_env_filter_default() {
-        let _lock = TEST_LOCK.lock().unwrap();
-        // Clear env vars for this test
-        std::env::remove_var("CARAPACE_LOG");
-        std::env::remove_var("RUST_LOG");
+        let mut env = ScopedEnv::new();
+        env.unset("CARAPACE_LOG");
+        env.unset("RUST_LOG");
 
         // Filter should be created successfully with default level
         let filter = build_env_filter(Level::INFO);
@@ -412,51 +408,46 @@ mod tests {
 
     #[test]
     fn test_env_filter_carapace_log() {
-        let _lock = TEST_LOCK.lock().unwrap();
-        std::env::set_var("CARAPACE_LOG", "debug");
+        let mut env = ScopedEnv::new();
+        env.set("CARAPACE_LOG", "debug");
         let filter = build_env_filter(Level::INFO);
         assert!(filter.is_ok(), "Should create filter from CARAPACE_LOG");
-        std::env::remove_var("CARAPACE_LOG");
     }
 
     #[test]
     fn test_env_filter_rust_log_fallback() {
-        let _lock = TEST_LOCK.lock().unwrap();
-        std::env::remove_var("CARAPACE_LOG");
-        std::env::set_var("RUST_LOG", "warn");
+        let mut env = ScopedEnv::new();
+        env.unset("CARAPACE_LOG");
+        env.set("RUST_LOG", "warn");
         let filter = build_env_filter(Level::INFO);
         assert!(
             filter.is_ok(),
             "Should create filter from RUST_LOG fallback"
         );
-        std::env::remove_var("RUST_LOG");
     }
 
     #[test]
     fn test_env_filter_carapace_takes_precedence() {
-        let _lock = TEST_LOCK.lock().unwrap();
-        std::env::set_var("CARAPACE_LOG", "error");
-        std::env::set_var("RUST_LOG", "debug");
+        let mut env = ScopedEnv::new();
+        env.set("CARAPACE_LOG", "error");
+        env.set("RUST_LOG", "debug");
         // CARAPACE_LOG should take precedence (both are valid, so just verify creation)
         let filter = build_env_filter(Level::INFO);
         assert!(
             filter.is_ok(),
             "Should create filter with CARAPACE_LOG taking precedence"
         );
-        std::env::remove_var("CARAPACE_LOG");
-        std::env::remove_var("RUST_LOG");
     }
 
     #[test]
     fn test_env_filter_complex_directive() {
-        let _lock = TEST_LOCK.lock().unwrap();
-        std::env::set_var("CARAPACE_LOG", "gateway=debug,ws=info,http=warn");
+        let mut env = ScopedEnv::new();
+        env.set("CARAPACE_LOG", "gateway=debug,ws=info,http=warn");
         let filter = build_env_filter(Level::INFO);
         assert!(
             filter.is_ok(),
             "Should parse complex directive from CARAPACE_LOG"
         );
-        std::env::remove_var("CARAPACE_LOG");
     }
 
     #[test]
