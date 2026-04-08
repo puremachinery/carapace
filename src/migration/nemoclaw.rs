@@ -170,6 +170,7 @@ fn extract_inference_config(config: &Value, plan: &mut ImportPlan) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::env::ScopedEnv;
     use serde_json::json;
 
     #[test]
@@ -188,7 +189,8 @@ mod tests {
         .unwrap();
 
         // Set the env var so the credential resolves.
-        let _guard = EnvGuard::set("ANTHROPIC_API_KEY", "sk-ant-test");
+        let mut env = ScopedEnv::new();
+        env.set("ANTHROPIC_API_KEY", "sk-ant-test");
 
         let discovery = NemoClawDiscovery { config_path };
         let plan = plan_import(&discovery);
@@ -218,7 +220,8 @@ mod tests {
         )
         .unwrap();
 
-        let _guard = EnvGuard::set("OPENAI_API_KEY", "sk-test");
+        let mut env = ScopedEnv::new();
+        env.set("OPENAI_API_KEY", "sk-test");
 
         let discovery = NemoClawDiscovery { config_path };
         let plan = plan_import(&discovery);
@@ -328,31 +331,5 @@ mod tests {
         let discovery = NemoClawDiscovery { config_path };
         let plan = plan_import(&discovery);
         assert!(plan.is_empty());
-    }
-
-    /// Simple env var guard for tests.
-    struct EnvGuard {
-        key: String,
-        original: Option<String>,
-    }
-
-    impl EnvGuard {
-        fn set(key: &str, value: &str) -> Self {
-            let original = std::env::var(key).ok();
-            std::env::set_var(key, value);
-            Self {
-                key: key.to_string(),
-                original,
-            }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match &self.original {
-                Some(v) => std::env::set_var(&self.key, v),
-                None => std::env::remove_var(&self.key),
-            }
-        }
     }
 }

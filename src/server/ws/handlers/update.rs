@@ -417,46 +417,21 @@ pub(super) fn handle_update_release_notes() -> Result<Value, ErrorShape> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::env::ScopedEnv;
     use std::sync::Mutex;
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 
-    struct EnvVarGuard {
-        key: &'static str,
-        prev: Option<String>,
-    }
-
-    impl EnvVarGuard {
-        #[allow(unused_unsafe)]
-        fn set(key: &'static str, value: &str) -> Self {
-            let prev = std::env::var(key).ok();
-            // SAFETY: tests in this module scope env var writes with a guard and TEST_LOCK.
-            unsafe { std::env::set_var(key, value) };
-            Self { key, prev }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        #[allow(unused_unsafe)]
-        fn drop(&mut self) {
-            match &self.prev {
-                // SAFETY: restoring test-scoped env var state.
-                Some(value) => unsafe { std::env::set_var(self.key, value) },
-                // SAFETY: restoring test-scoped env var state.
-                None => unsafe { std::env::remove_var(self.key) },
-            }
-        }
-    }
-
-    fn set_temp_state_dir() -> (tempfile::TempDir, EnvVarGuard) {
+    fn set_temp_state_dir() -> (tempfile::TempDir, ScopedEnv) {
         let temp = tempfile::tempdir().expect("tempdir for update handler tests");
-        let guard = EnvVarGuard::set(
+        let mut env = ScopedEnv::new();
+        env.set(
             "CARAPACE_STATE_DIR",
             temp.path()
                 .to_str()
                 .expect("temp state dir should be utf-8 for tests"),
         );
-        (temp, guard)
+        (temp, env)
     }
 
     fn reset_state() {

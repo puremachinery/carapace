@@ -1143,32 +1143,8 @@ mod tests {
         AuthProfile, AuthProfileCredentialKind, OAuthProvider, ProfileStore,
     };
     use crate::plugins::tools::ToolInvokeContext;
+    use crate::test_support::env::ScopedEnv;
     use serde_json::json;
-    use std::ffi::OsString;
-    use std::sync::{LazyLock, Mutex};
-
-    // Serializes env-var touching tests in this module.
-    static ENV_VAR_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-
-    struct EnvVarGuard {
-        key: &'static str,
-        previous: Option<OsString>,
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match self.previous.take() {
-                Some(value) => std::env::set_var(self.key, value),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
-
-    fn set_env_var_scoped(key: &'static str, value: &str) -> EnvVarGuard {
-        let previous = std::env::var_os(key);
-        std::env::set_var(key, value);
-        EnvVarGuard { key, previous }
-    }
 
     struct AuthProfileRuntimeResetGuard;
 
@@ -1334,13 +1310,12 @@ mod tests {
 
     #[test]
     fn test_config_read_missing_key() {
-        let _lock = ENV_VAR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = ScopedEnv::new();
         let temp_dir = tempfile::tempdir().expect("temp config dir");
         let config_path = temp_dir.path().join("carapace-test-config.json5");
         std::fs::write(&config_path, "{}").expect("write isolated config");
-        let _config_path_guard =
-            set_env_var_scoped("CARAPACE_CONFIG_PATH", config_path.to_str().unwrap());
-        let _disable_cache_guard = set_env_var_scoped("CARAPACE_DISABLE_CONFIG_CACHE", "1");
+        env.set("CARAPACE_CONFIG_PATH", config_path);
+        env.set("CARAPACE_DISABLE_CONFIG_CACHE", "1");
         crate::config::clear_cache();
 
         let tool = config_read_tool();
@@ -1557,13 +1532,10 @@ mod tests {
 
     #[test]
     fn test_resolve_anthropic_media_key_surfaces_unusable_auth_profile() {
-        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let mut env = ScopedEnv::new();
         let _runtime_guard = AuthProfileRuntimeResetGuard::new();
         let temp = tempfile::tempdir().unwrap();
-        let _state_dir = set_env_var_scoped(
-            "CARAPACE_STATE_DIR",
-            temp.path().to_str().expect("state dir path"),
-        );
+        env.set("CARAPACE_STATE_DIR", temp.path());
 
         let correct_password = format!(
             "builtin-tools-test-password-{}",
@@ -1594,7 +1566,7 @@ mod tests {
             "builtin-tools-test-wrong-password-{}",
             crate::time::unix_now_ms_u64()
         );
-        let _password_guard = set_env_var_scoped("CARAPACE_CONFIG_PASSWORD", &wrong_password);
+        env.set("CARAPACE_CONFIG_PASSWORD", &wrong_password);
         let cfg = json!({
             "anthropic": { "authProfile": "anthropic:default" }
         });
@@ -1606,13 +1578,10 @@ mod tests {
 
     #[test]
     fn test_resolve_anthropic_media_key_ignores_blank_api_key_when_auth_profile_present() {
-        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let mut env = ScopedEnv::new();
         let _runtime_guard = AuthProfileRuntimeResetGuard::new();
         let temp = tempfile::tempdir().unwrap();
-        let _state_dir = set_env_var_scoped(
-            "CARAPACE_STATE_DIR",
-            temp.path().to_str().expect("state dir path"),
-        );
+        env.set("CARAPACE_STATE_DIR", temp.path());
 
         let password = format!(
             "builtin-tools-test-password-{}",
@@ -1638,8 +1607,8 @@ mod tests {
             })
             .expect("store profile");
 
-        let _password_guard = set_env_var_scoped("CARAPACE_CONFIG_PASSWORD", &password);
-        let _blank_key = set_env_var_scoped("ANTHROPIC_API_KEY", "   ");
+        env.set("CARAPACE_CONFIG_PASSWORD", &password);
+        env.set("ANTHROPIC_API_KEY", "   ");
         let cfg = json!({
             "anthropic": { "authProfile": "anthropic:default" }
         });
@@ -1650,13 +1619,10 @@ mod tests {
 
     #[test]
     fn test_resolve_anthropic_media_key_reuses_cached_auth_profile_store() {
-        let _lock = ENV_VAR_TEST_LOCK.lock().expect("env var test lock");
+        let mut env = ScopedEnv::new();
         let _runtime_guard = AuthProfileRuntimeResetGuard::new();
         let temp = tempfile::tempdir().unwrap();
-        let _state_dir = set_env_var_scoped(
-            "CARAPACE_STATE_DIR",
-            temp.path().to_str().expect("state dir path"),
-        );
+        env.set("CARAPACE_STATE_DIR", temp.path());
 
         let password = format!(
             "builtin-tools-runtime-cache-password-{}",
@@ -1682,7 +1648,7 @@ mod tests {
             })
             .expect("store profile");
 
-        let _password_guard = set_env_var_scoped("CARAPACE_CONFIG_PASSWORD", &password);
+        env.set("CARAPACE_CONFIG_PASSWORD", &password);
         let cfg = json!({
             "anthropic": { "authProfile": "anthropic:default" }
         });

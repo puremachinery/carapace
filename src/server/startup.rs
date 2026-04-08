@@ -700,52 +700,18 @@ mod tests {
     use serde_json::json;
     use sha2::{Digest, Sha256};
     use std::collections::HashMap;
-    use std::ffi::OsString;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{LazyLock, Mutex, MutexGuard};
 
-    static TEST_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-
-    struct EnvVarGuard {
-        key: &'static str,
-        prev: Option<OsString>,
-        _lock: MutexGuard<'static, ()>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: &std::ffi::OsStr) -> Self {
-            let lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let prev = std::env::var_os(key);
-            // SAFETY: env mutation in this test module is serialized by TEST_ENV_LOCK.
-            unsafe { std::env::set_var(key, value) };
-            Self {
-                key,
-                prev,
-                _lock: lock,
-            }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match &self.prev {
-                // SAFETY: restoring test-scoped env var state.
-                Some(value) => unsafe { std::env::set_var(self.key, value) },
-                // SAFETY: restoring test-scoped env var state.
-                None => unsafe { std::env::remove_var(self.key) },
-            }
-        }
-    }
-
-    fn runtime_task_executor_with_temp_state(
-    ) -> (tempfile::TempDir, EnvVarGuard, RuntimeTaskExecutor) {
+    fn runtime_task_executor_with_temp_state() -> (tempfile::TempDir, ScopedEnv, RuntimeTaskExecutor)
+    {
         let temp = tempfile::tempdir().expect("create temp dir");
         let state_dir = temp.path().join("state");
-        let guard = EnvVarGuard::set("CARAPACE_STATE_DIR", state_dir.as_os_str());
+        let mut env = ScopedEnv::new();
+        env.set("CARAPACE_STATE_DIR", state_dir);
         let state = Arc::new(WsServerState::new(WsServerConfig::default()));
         let executor = RuntimeTaskExecutor { state };
-        (temp, guard, executor)
+        (temp, env, executor)
     }
 
     fn durable_task_with_payload(payload: serde_json::Value, attempts: u32) -> DurableTask {
