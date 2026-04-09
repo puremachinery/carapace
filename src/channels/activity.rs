@@ -23,6 +23,7 @@
 
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
+#[cfg(test)]
 use std::io;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
@@ -35,6 +36,7 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use thiserror::Error;
 use tokio::runtime::{Handle, RuntimeFlavor};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -46,7 +48,8 @@ use crate::plugins::{
 use crate::runtime_bridge::run_sync_blocking_send;
 use crate::server::ws::WsServerState;
 use crate::tasks::{TaskBlockedReason, TaskExecutionOutcome, TaskExecutor, TaskQueue};
-use crate::thread_util::{spawn_named_thread, NamedThreadSpawner};
+use crate::thread_util::{spawn_startup_named_thread_with_spawner, NamedThreadSpawner};
+use crate::StartupThreadSpawnError;
 
 const DEFAULT_TYPING_INTERVAL_SECONDS: u32 = 3;
 const MAX_TYPING_REFRESH_BACKOFF_SECONDS: u64 = 30;
@@ -111,36 +114,19 @@ const STOP_STATE_TASK_RUNNING: u8 = 3;
 const STOP_STATE_FALLBACK_RESERVED: u8 = 4;
 const STOP_STATE_COMPLETED: u8 = 5;
 
-#[derive(Debug)]
-struct ThreadSpawnContext {
-    thread_name: &'static str,
-    source: io::Error,
+#[derive(Debug, Error)]
+pub enum ActivityStartupError {
+    #[error("{source}")]
+    ThreadSpawn {
+        #[source]
+        source: StartupThreadSpawnError,
+    },
 }
 
-impl std::fmt::Display for ThreadSpawnContext {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "failed to spawn background thread '{}': {}",
-            self.thread_name, self.source
-        )
+impl From<StartupThreadSpawnError> for ActivityStartupError {
+    fn from(source: StartupThreadSpawnError) -> Self {
+        Self::ThreadSpawn { source }
     }
-}
-
-impl std::error::Error for ThreadSpawnContext {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
-    }
-}
-
-fn stop_typing_thread_spawn_error(err: io::Error) -> io::Error {
-    io::Error::new(
-        err.kind(),
-        ThreadSpawnContext {
-            thread_name: STOP_TYPING_THREAD_NAME,
-            source: err,
-        },
-    )
 }
 
 struct UnsupportedActivityWarningRegistry {
@@ -458,7 +444,7 @@ impl ActivityService {
         Self::try_new().expect("failed to initialize in-memory activity service startup helpers")
     }
 
-    pub fn try_new() -> io::Result<Self> {
+    pub fn try_new() -> Result<Self, ActivityStartupError> {
         Self::try_with_read_receipt_queue(Arc::new(TaskQueue::with_capacity_limit(
             None,
             Some(READ_RECEIPT_OWNERSHIP_HIGH_WATERMARK),
@@ -470,14 +456,16 @@ impl ActivityService {
             .expect("failed to initialize persistent activity service startup helpers")
     }
 
-    pub fn try_new_persistent(state_dir: PathBuf) -> io::Result<Self> {
+    pub fn try_new_persistent(state_dir: PathBuf) -> Result<Self, ActivityStartupError> {
         Self::try_with_read_receipt_queue(Arc::new(TaskQueue::with_capacity_limit(
             Some(state_dir.join("activity").join("read_receipts.json")),
             Some(READ_RECEIPT_OWNERSHIP_HIGH_WATERMARK),
         )))
     }
 
-    fn try_with_read_receipt_queue(read_receipt_queue: Arc<TaskQueue>) -> io::Result<Self> {
+    fn try_with_read_receipt_queue(
+        read_receipt_queue: Arc<TaskQueue>,
+    ) -> Result<Self, ActivityStartupError> {
         Ok(Self {
             dispatcher: Arc::new(ActivityDispatcher::try_new()?),
             read_receipt_queue,
@@ -936,7 +924,7 @@ impl ActivityDispatcher {
         Self::try_new().expect("failed to initialize activity dispatcher startup thread")
     }
 
-    pub fn try_new() -> io::Result<Self> {
+    pub fn try_new() -> Result<Self, ActivityStartupError> {
         Self::try_with_options(ACTIVITY_DISPATCH_BACKLOG_WARNING_THRESHOLD)
     }
 
@@ -950,18 +938,19 @@ impl ActivityDispatcher {
     pub(crate) fn try_with_options_and_spawner_for_test(
         backlog_warning_threshold: usize,
         spawner: NamedThreadSpawner,
-    ) -> io::Result<Self> {
+    ) -> Result<Self, ActivityStartupError> {
         Self::try_with_options_and_spawner(backlog_warning_threshold, spawner)
     }
 
-    fn try_with_options(backlog_warning_threshold: usize) -> io::Result<Self> {
-        Self::try_with_options_and_spawner(backlog_warning_threshold, spawn_named_thread)
+    fn try_with_options(backlog_warning_threshold: usize) -> Result<Self, ActivityStartupError> {
+        let spawn_default: NamedThreadSpawner = crate::thread_util::spawn_named_thread;
+        Self::try_with_options_and_spawner(backlog_warning_threshold, spawn_default)
     }
 
     fn try_with_options_and_spawner(
         backlog_warning_threshold: usize,
         spawner: NamedThreadSpawner,
-    ) -> io::Result<Self> {
+    ) -> Result<Self, ActivityStartupError> {
         let stop_typing_backlog = Arc::new(AtomicUsize::new(0));
         let shutting_down = Arc::new(AtomicBool::new(false));
         let shutdown_deadline = Arc::new(Mutex::new(None));
@@ -976,8 +965,8 @@ impl ActivityDispatcher {
         let stop_typing_backlog_worker = stop_typing_backlog.clone();
         let stop_typing_shutdown = shutting_down.clone();
         let stop_typing_deadline = shutdown_deadline.clone();
-        let stop_typing_worker = spawner(
-            thread::Builder::new().name(STOP_TYPING_THREAD_NAME.to_string()),
+        let stop_typing_worker = spawn_startup_named_thread_with_spawner(
+            STOP_TYPING_THREAD_NAME,
             Box::new(move || {
                 // Stop-typing is cleanup, not optional side work. Keep this
                 // path non-lossy, but coalesce requests per channel/recipient
@@ -1092,8 +1081,8 @@ impl ActivityDispatcher {
                     }
                 }
             }),
-        )
-        .map_err(stop_typing_thread_spawn_error)?;
+            spawner,
+        )?;
 
         Ok(Self {
             stop_typing_tx,
@@ -2019,6 +2008,7 @@ fn panic_payload_to_string(payload: Box<dyn Any + Send + 'static>) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error as _;
     use std::fs;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -2859,23 +2849,31 @@ mod tests {
             Err(err) => err,
         };
 
-        assert_eq!(err.kind(), io::ErrorKind::Other);
-        assert!(err
-            .to_string()
-            .contains("failed to spawn background thread"));
+        let ActivityStartupError::ThreadSpawn { source: err } = err;
+        let io_source = err
+            .source()
+            .expect("thread spawn error should preserve the original io::Error source");
+        let io_error = io_source
+            .downcast_ref::<io::Error>()
+            .expect("thread spawn error source should remain an io::Error");
+        assert_eq!(io_error.kind(), io::ErrorKind::Other);
+        assert!(err.to_string().contains("failed to spawn startup thread"));
     }
 
     #[test]
     fn test_stop_typing_thread_spawn_error_preserves_source_error() {
-        let err = stop_typing_thread_spawn_error(io::Error::from_raw_os_error(11));
-        let context = err
-            .get_ref()
-            .and_then(|source| source.downcast_ref::<ThreadSpawnContext>())
-            .expect("thread spawn context should be preserved as the io::Error source");
+        let err =
+            StartupThreadSpawnError::new(STOP_TYPING_THREAD_NAME, io::Error::from_raw_os_error(11));
 
-        assert_eq!(err.kind(), context.source.kind());
-        assert_eq!(context.thread_name, STOP_TYPING_THREAD_NAME);
-        assert_eq!(context.source.raw_os_error(), Some(11));
+        let io_source = err
+            .source()
+            .expect("thread spawn error should preserve the original io::Error source");
+        let io_error = io_source
+            .downcast_ref::<io::Error>()
+            .expect("thread spawn error source should remain an io::Error");
+
+        assert_eq!(err.thread_name(), STOP_TYPING_THREAD_NAME);
+        assert_eq!(io_error.raw_os_error(), Some(11));
     }
 
     #[test]

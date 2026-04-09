@@ -15,7 +15,6 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::env;
-use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -521,16 +520,15 @@ impl WsServerState {
         })
     }
 
-    fn map_activity_service_startup_error(err: io::Error) -> WsConfigError {
-        WsConfigError::Runtime(format!("failed to initialize activity service: {err}"))
-    }
-
     fn build_in_memory_with_activity_service_factory<F>(
         config: WsServerConfig,
         activity_service_factory: F,
     ) -> Result<Self, WsConfigError>
     where
-        F: FnOnce() -> io::Result<channels::activity::ActivityService>,
+        F: FnOnce() -> Result<
+            channels::activity::ActivityService,
+            channels::activity::ActivityStartupError,
+        >,
     {
         let connection_tracker = limits::ConnectionTracker::with_limits(
             config
@@ -573,9 +571,7 @@ impl WsServerState {
             llm_provider: parking_lot::RwLock::new(None),
             tools_registry: None,
             plugin_registry: None,
-            activity_service: Arc::new(
-                activity_service_factory().map_err(Self::map_activity_service_startup_error)?,
-            ),
+            activity_service: Arc::new(activity_service_factory()?),
             plugin_runtime: None,
             plugin_activation_report: None,
             connection_tracker,
@@ -588,7 +584,10 @@ impl WsServerState {
         activity_service_factory: F,
     ) -> Result<Self, WsConfigError>
     where
-        F: FnOnce() -> io::Result<channels::activity::ActivityService>,
+        F: FnOnce() -> Result<
+            channels::activity::ActivityService,
+            channels::activity::ActivityStartupError,
+        >,
     {
         Self::build_in_memory_with_activity_service_factory(config, activity_service_factory)
     }
@@ -599,7 +598,12 @@ impl WsServerState {
         activity_service_factory: F,
     ) -> Result<Self, WsConfigError>
     where
-        F: FnOnce(PathBuf) -> io::Result<channels::activity::ActivityService>,
+        F: FnOnce(
+            PathBuf,
+        ) -> Result<
+            channels::activity::ActivityService,
+            channels::activity::ActivityStartupError,
+        >,
     {
         let node_pairing = nodes::create_registry(state_dir.clone())?;
         let device_registry = devices::create_registry(state_dir.clone())?;
@@ -610,8 +614,7 @@ impl WsServerState {
             config.max_ws_per_ip.unwrap_or(limits::DEFAULT_MAX_PER_IP),
         );
         let activity_state_dir = state_dir.clone();
-        let activity_service = activity_service_factory(activity_state_dir)
-            .map_err(Self::map_activity_service_startup_error)?;
+        let activity_service = activity_service_factory(activity_state_dir)?;
         Ok(Self {
             config,
             start_time: Instant::now(),
@@ -678,7 +681,12 @@ impl WsServerState {
         activity_service_factory: F,
     ) -> Result<Self, WsConfigError>
     where
-        F: FnOnce(PathBuf) -> io::Result<channels::activity::ActivityService>,
+        F: FnOnce(
+            PathBuf,
+        ) -> Result<
+            channels::activity::ActivityService,
+            channels::activity::ActivityStartupError,
+        >,
     {
         Self::build_persistent_unloaded_with_activity_service_factory(
             config,
@@ -1177,6 +1185,8 @@ pub enum WsConfigError {
     Nodes(#[from] nodes::NodePairingError),
     #[error(transparent)]
     Devices(#[from] devices::DevicePairingError),
+    #[error("failed to initialize activity service: {0}")]
+    ActivityStartup(#[from] channels::activity::ActivityStartupError),
     #[error("{0}")]
     Runtime(String),
 }

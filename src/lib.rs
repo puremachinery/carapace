@@ -37,3 +37,4 @@ pub(crate) mod time;
 pub mod tls;
 pub mod update;
 pub mod usage;
+pub use crate::thread_util::StartupThreadSpawnError;

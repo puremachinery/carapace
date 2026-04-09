@@ -806,8 +806,10 @@ mod tests {
     fn test_plugin_runtime_thread_spawn_errors_are_fatal() {
         assert!(plugin_runtime_init_error_is_fatal(
             &RuntimeError::ThreadSpawn {
-                thread_name: "plugin-epoch-ticker".to_string(),
-                source: std::io::Error::other("simulated thread exhaustion"),
+                source: crate::StartupThreadSpawnError::new(
+                    "plugin-epoch-ticker",
+                    std::io::Error::other("simulated thread exhaustion"),
+                ),
             }
         ));
         assert!(!plugin_runtime_init_error_is_fatal(
