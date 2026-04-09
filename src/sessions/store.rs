@@ -1014,6 +1014,17 @@ impl SessionStore {
             && self.locked_session_count() > 0
     }
 
+    fn locked_filter_error(&self) -> SessionStoreError {
+        if self.crypto.is_none() && self.encryption_mode.uses_encryption() {
+            return Self::lock_message(
+                "encrypted sessions are present; provide the config password to apply metadata-based session filters",
+            );
+        }
+        Self::lock_message(
+            "unavailable sessions are present; repair or unlock them to apply metadata-based session filters",
+        )
+    }
+
     fn rewrite_history_file_from_messages(
         &self,
         history_path: &Path,
@@ -1387,16 +1398,11 @@ impl SessionStore {
         };
 
         let mut locked = Vec::new();
-        if self.crypto.is_none() && self.encryption_mode.uses_encryption() {
+        if self.locked_session_count() > 0 {
             if filter.requires_decrypted_metadata() {
-                if self.locked_session_count() > 0 {
-                    return Err(Self::lock_message(
-                        "encrypted sessions are present; provide the config password to apply metadata-based session filters",
-                    ));
-                }
-            } else {
-                locked.extend(self.locked_session_entries_snapshot());
+                return Err(self.locked_filter_error());
             }
+            locked.extend(self.locked_session_entries_snapshot());
         }
 
         available.extend(locked);
@@ -2320,6 +2326,15 @@ impl SessionStore {
                 }
                 return Err(SessionStoreError::Locked(message));
             }
+            Err(err @ SessionStoreError::Crypto(_)) if meta_was_encrypted => {
+                if update_locked_scan_state {
+                    self.record_locked_session_entry(
+                        session_id.to_string(),
+                        Self::file_updated_at(&meta_path),
+                    );
+                }
+                return Err(err);
+            }
             Err(err) => return Err(err),
         };
 
@@ -2383,10 +2398,22 @@ impl SessionStore {
                             );
                         }
                         Err(err @ SessionStoreError::DecryptionFailed(_))
-                        | Err(err @ SessionStoreError::Crypto(_))
                             if self.crypto.is_some() =>
                         {
                             return Err(err);
+                        }
+                        Err(err @ SessionStoreError::Crypto(_)) if self.crypto.is_some() => {
+                            locked_session_entries.insert(
+                                stem.to_string(),
+                                SessionListEntry::locked(
+                                    stem.to_string(),
+                                    Self::file_updated_at(&path),
+                                ),
+                            );
+                            tracing::warn!(
+                                error_kind = session_store_error_kind(&err),
+                                "skipping unreadable encrypted session metadata during scan"
+                            );
                         }
                         Err(err) => {
                             tracing::warn!(
@@ -3214,6 +3241,83 @@ mod tests {
             .list_session_entries(SessionFilter::default())
             .unwrap_err();
         assert!(matches!(err, SessionStoreError::DecryptionFailed(_)));
+    }
+
+    #[test]
+    fn test_list_sessions_isolates_corrupt_encrypted_metadata_to_locked_stub() {
+        let key_material = test_key_material();
+        let (store, temp_dir) = create_encrypted_store(&key_material);
+        let healthy = store
+            .create_session(
+                "agent-1",
+                SessionMetadata {
+                    channel: Some("channel-a".into()),
+                    chat_id: Some("chat-a".into()),
+                    user_id: Some("user-a".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let corrupt = store
+            .create_session(
+                "agent-1",
+                SessionMetadata {
+                    channel: Some("channel-b".into()),
+                    chat_id: Some("chat-b".into()),
+                    user_id: Some("user-b".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store
+            .append_message(ChatMessage::user(&healthy.id, "still-readable"))
+            .unwrap();
+        store
+            .append_message(ChatMessage::user(&corrupt.id, "will-corrupt"))
+            .unwrap();
+
+        let corrupt_meta_path = store.session_meta_path(&corrupt.id).unwrap();
+        let malformed = br#"{"format":"session-enc-v1"}"#;
+        fs::write(&corrupt_meta_path, malformed).unwrap();
+        integrity::write_hmac_file(
+            store.hmac_key.as_ref().unwrap(),
+            malformed,
+            &corrupt_meta_path,
+        )
+        .unwrap();
+
+        let reopened = reopen_store_with_encryption(
+            temp_dir.path(),
+            Some(&key_material),
+            EncryptionMode::IfPassword,
+        );
+        let entries = reopened
+            .list_session_entries(SessionFilter::default())
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+
+        let healthy_entry = entries
+            .iter()
+            .find(|entry| entry.session_id() == healthy.id)
+            .unwrap();
+        assert_eq!(healthy_entry.access(), SessionAccessState::Available);
+
+        let corrupt_entry = entries
+            .iter()
+            .find(|entry| entry.session_id() == corrupt.id)
+            .unwrap();
+        assert_eq!(corrupt_entry.access(), SessionAccessState::Locked);
+
+        let loaded_healthy = reopened.get_session(&healthy.id).unwrap();
+        assert_eq!(loaded_healthy.id, healthy.id);
+
+        let err = reopened.get_session(&corrupt.id).unwrap_err();
+        assert!(matches!(err, SessionStoreError::Crypto(_)));
+
+        let err = reopened
+            .list_session_entries(SessionFilter::new().with_user_id("user-a"))
+            .unwrap_err();
+        assert!(matches!(err, SessionStoreError::Locked(_)));
     }
 
     #[test]
