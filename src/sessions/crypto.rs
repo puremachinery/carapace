@@ -17,6 +17,7 @@ use base64::Engine;
 use hkdf::Hkdf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::Sha256;
 use thiserror::Error;
 use zeroize::Zeroizing;
@@ -27,7 +28,6 @@ const CRYPTO_MANIFEST_PATH: &str = ".crypto-manifest";
 const CRYPTO_MANIFEST_VERSION: u32 = 1;
 const CRYPTO_KDF_ID: &str = "argon2id-v2";
 const SESSION_ENCRYPTED_FORMAT_V1: &str = "session-enc-v1";
-const SESSION_ENCRYPTED_PREFIX_V1: &[u8] = br#"{"format":"session-enc-v1""#;
 const SESSION_ENCRYPTION_ROOT_TAG: &[u8] = b"carapace:session-encryption-root:v1";
 const SESSION_ENCRYPTION_INFO_PREFIX: &[u8] = b"carapace:session-encryption-key:v1:";
 const SESSION_INTEGRITY_INFO: &[u8] = b"carapace:session-integrity-hmac:v2";
@@ -113,17 +113,6 @@ fn map_kdf_error(err: PasswordKdfError) -> SessionCryptoError {
 
 fn manifest_path(base_path: &Path) -> PathBuf {
     base_path.join(CRYPTO_MANIFEST_PATH)
-}
-
-fn trim_ascii_start(mut data: &[u8]) -> &[u8] {
-    while let Some((first, rest)) = data.split_first() {
-        if first.is_ascii_whitespace() {
-            data = rest;
-        } else {
-            break;
-        }
-    }
-    data
 }
 
 fn create_private_file(path: &Path) -> Result<File, SessionCryptoError> {
@@ -367,7 +356,16 @@ impl SessionCryptoContext {
 }
 
 pub fn looks_like_encrypted_payload(data: &[u8]) -> bool {
-    trim_ascii_start(data).starts_with(SESSION_ENCRYPTED_PREFIX_V1)
+    serde_json::from_slice::<Value>(data)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("format")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .as_deref()
+        == Some(SESSION_ENCRYPTED_FORMAT_V1)
 }
 
 pub fn encrypted_payload(data: &[u8]) -> bool {

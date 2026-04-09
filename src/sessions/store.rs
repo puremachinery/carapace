@@ -642,6 +642,8 @@ pub struct SessionStore {
     compact_threshold: usize,
     /// Optional HMAC key for session integrity verification.
     hmac_key: Option<Zeroizing<[u8; 32]>>,
+    /// Optional legacy HMAC key for pre-encryption session artifacts.
+    legacy_hmac_key: Option<Zeroizing<[u8; 32]>>,
     /// Action to take when integrity verification fails.
     integrity_action: super::integrity::IntegrityAction,
     /// Session encryption mode.
@@ -650,6 +652,8 @@ pub struct SessionStore {
     crypto: Option<Arc<super::crypto::SessionCryptoContext>>,
     /// Count of encrypted session metadata files discovered without an unlock key.
     locked_session_count: AtomicUsize,
+    /// Locked-session stubs discovered during the store-owned disk scan.
+    locked_session_entries: RwLock<HashMap<String, SessionListEntry>>,
 }
 
 impl Default for SessionStore {
@@ -675,10 +679,12 @@ impl SessionStore {
             key_to_id: RwLock::new(HashMap::new()),
             compact_threshold: DEFAULT_COMPACT_THRESHOLD,
             hmac_key: None,
+            legacy_hmac_key: None,
             integrity_action: super::integrity::IntegrityAction::Warn,
             encryption_mode: super::crypto::EncryptionMode::Off,
             crypto: None,
             locked_session_count: AtomicUsize::new(0),
+            locked_session_entries: RwLock::new(HashMap::new()),
         }
     }
 
@@ -691,6 +697,12 @@ impl SessionStore {
     /// Set the HMAC key for session integrity verification.
     pub fn with_hmac_key(mut self, key: Zeroizing<[u8; 32]>) -> Self {
         self.hmac_key = Some(key);
+        self
+    }
+
+    /// Set the legacy HMAC key used for pre-encryption session artifacts.
+    pub fn with_legacy_hmac_key(mut self, key: Zeroizing<[u8; 32]>) -> Self {
+        self.legacy_hmac_key = Some(key);
         self
     }
 
@@ -729,10 +741,8 @@ impl SessionStore {
     }
 
     fn session_locked_without_password(session_id: &str) -> SessionStoreError {
-        Self::lock_message(format!(
-            "session {} is encrypted; set CARAPACE_CONFIG_PASSWORD to unlock it",
-            session_id
-        ))
+        let _ = session_id;
+        Self::lock_message("session is encrypted and unavailable without the config password")
     }
 
     fn ensure_required_encryption_available(&self) -> Result<(), SessionStoreError> {
@@ -742,7 +752,7 @@ impl SessionStore {
         ) && self.crypto.is_none()
         {
             return Err(Self::lock_message(
-                "session encryption is required; set CARAPACE_CONFIG_PASSWORD to access sessions",
+                "session encryption is required; provide the config password to access sessions",
             ));
         }
         Ok(())
@@ -839,8 +849,120 @@ impl SessionStore {
         self.locked_session_count.store(count, Ordering::Release);
     }
 
+    fn replace_locked_session_entries(&self, entries: HashMap<String, SessionListEntry>) {
+        *self.locked_session_entries.write() = entries;
+    }
+
     fn locked_session_count(&self) -> usize {
         self.locked_session_count.load(Ordering::Acquire)
+    }
+
+    fn locked_session_entries_snapshot(&self) -> Vec<SessionListEntry> {
+        self.locked_session_entries
+            .read()
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    fn verify_integrity_path_with_compat(&self, file_path: &Path) -> Result<(), SessionStoreError> {
+        let Some(ref key) = self.hmac_key else {
+            return Ok(());
+        };
+        let integrity_config = super::integrity::IntegrityConfig {
+            enabled: true,
+            action: self.integrity_action,
+        };
+        match super::integrity::verify_hmac_path(key, file_path, &integrity_config) {
+            Ok(()) => Ok(()),
+            Err(super::integrity::IntegrityError::Rejected { .. }) => {
+                let Some(ref legacy_key) = self.legacy_hmac_key else {
+                    return Err(SessionStoreError::Io(format!(
+                        "session integrity verification failed for {}",
+                        file_path.display()
+                    )));
+                };
+                super::integrity::verify_hmac_path(legacy_key, file_path, &integrity_config)
+                    .map_err(|err| match err {
+                        super::integrity::IntegrityError::Rejected { file } => {
+                            SessionStoreError::Io(format!(
+                                "session integrity verification failed for {}",
+                                file
+                            ))
+                        }
+                        other => {
+                            tracing::warn!(
+                                error_kind = integrity_error_kind(&other),
+                                "session integrity verification issue"
+                            );
+                            SessionStoreError::Io(format!(
+                                "session integrity verification failed for {}",
+                                file_path.display()
+                            ))
+                        }
+                    })
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error_kind = integrity_error_kind(&err),
+                    "session integrity verification issue"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    fn verify_integrity_bytes_with_compat(
+        &self,
+        content: &[u8],
+        file_path: &Path,
+    ) -> Result<(), SessionStoreError> {
+        let Some(ref key) = self.hmac_key else {
+            return Ok(());
+        };
+        let integrity_config = super::integrity::IntegrityConfig {
+            enabled: true,
+            action: self.integrity_action,
+        };
+        match super::integrity::verify_hmac_file(key, content, file_path, &integrity_config) {
+            Ok(()) => Ok(()),
+            Err(super::integrity::IntegrityError::Rejected { .. }) => {
+                let Some(ref legacy_key) = self.legacy_hmac_key else {
+                    return Err(SessionStoreError::Io(format!(
+                        "session integrity verification failed for {}",
+                        file_path.display()
+                    )));
+                };
+                super::integrity::verify_hmac_file(
+                    legacy_key,
+                    content,
+                    file_path,
+                    &integrity_config,
+                )
+                .map_err(|err| match err {
+                    super::integrity::IntegrityError::Rejected { file } => SessionStoreError::Io(
+                        format!("session integrity verification failed for {}", file),
+                    ),
+                    other => {
+                        tracing::warn!(
+                            error_kind = integrity_error_kind(&other),
+                            "session integrity verification issue"
+                        );
+                        SessionStoreError::Io(format!(
+                            "session integrity verification failed for {}",
+                            file_path.display()
+                        ))
+                    }
+                })
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error_kind = integrity_error_kind(&err),
+                    "session integrity verification issue"
+                );
+                Ok(())
+            }
+        }
     }
 
     fn should_block_unknown_session_key_without_crypto(&self) -> bool {
@@ -978,7 +1100,7 @@ impl SessionStore {
 
         if self.should_block_unknown_session_key_without_crypto() {
             return Err(Self::lock_message(
-                "encrypted sessions are present; set CARAPACE_CONFIG_PASSWORD before creating or resolving sessions by key",
+                "encrypted sessions are present; provide the config password before creating or resolving sessions by key",
             ));
         }
 
@@ -990,28 +1112,7 @@ impl SessionStore {
         history_path: &Path,
         _session_id: &str,
     ) -> Result<(), SessionStoreError> {
-        if let Some(ref key) = self.hmac_key {
-            let integrity_config = super::integrity::IntegrityConfig {
-                enabled: true,
-                action: self.integrity_action,
-            };
-            match super::integrity::verify_hmac_path(key, history_path, &integrity_config) {
-                Ok(()) => {}
-                Err(super::integrity::IntegrityError::Rejected { file }) => {
-                    return Err(SessionStoreError::Io(format!(
-                        "session history integrity verification failed for {}",
-                        file
-                    )));
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error_kind = integrity_error_kind(&e),
-                        "session history integrity verification issue"
-                    );
-                }
-            }
-        }
-        Ok(())
+        self.verify_integrity_path_with_compat(history_path)
     }
 
     fn write_history_hmac(
@@ -1118,7 +1219,7 @@ impl SessionStore {
             drop(key_map);
             if self.should_block_unknown_session_key_without_crypto() {
                 Err(Self::lock_message(
-                    "encrypted sessions are present; set CARAPACE_CONFIG_PASSWORD before resolving sessions by key",
+                    "encrypted sessions are present; provide the config password before resolving sessions by key",
                 ))
             } else {
                 Err(SessionStoreError::NotFound(session_key.to_string()))
@@ -1188,37 +1289,15 @@ impl SessionStore {
         };
 
         let mut locked = Vec::new();
-        if self.crypto.is_none()
-            && self.encryption_mode.uses_encryption()
-            && self.base_path.exists()
-        {
+        if self.crypto.is_none() && self.encryption_mode.uses_encryption() {
             if filter.requires_decrypted_metadata() {
                 if self.locked_session_count() > 0 {
                     return Err(Self::lock_message(
-                        "encrypted sessions are present; set CARAPACE_CONFIG_PASSWORD to apply metadata-based session filters",
+                        "encrypted sessions are present; provide the config password to apply metadata-based session filters",
                     ));
                 }
             } else {
-                for entry in fs::read_dir(&self.base_path)? {
-                    let entry = entry?;
-                    let path = entry.path();
-                    if path.extension().and_then(|s| s.to_str()) != Some("json") {
-                        continue;
-                    }
-                    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-                        continue;
-                    };
-                    if self.sessions.read().contains_key(stem) {
-                        continue;
-                    }
-                    let content = fs::read(&path)?;
-                    if super::crypto::encrypted_payload(&content) {
-                        locked.push(SessionListEntry::locked(
-                            stem.to_string(),
-                            Self::file_updated_at(&path),
-                        ));
-                    }
-                }
+                locked.extend(self.locked_session_entries_snapshot());
             }
         }
 
@@ -2137,27 +2216,7 @@ impl SessionStore {
         let content = fs::read(&meta_path)?;
 
         // Verify session integrity if HMAC key is configured
-        if let Some(ref key) = self.hmac_key {
-            let integrity_config = super::integrity::IntegrityConfig {
-                enabled: true,
-                action: self.integrity_action,
-            };
-            match super::integrity::verify_hmac_file(key, &content, &meta_path, &integrity_config) {
-                Ok(()) => {}
-                Err(super::integrity::IntegrityError::Rejected { file }) => {
-                    return Err(SessionStoreError::Io(format!(
-                        "session integrity verification failed for {}",
-                        file
-                    )));
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error_kind = integrity_error_kind(&e),
-                        "session integrity verification issue"
-                    );
-                }
-            }
-        }
+        self.verify_integrity_bytes_with_compat(&content, &meta_path)?;
 
         let session = match self.decode_session_metadata(session_id, &content) {
             Ok(session) => session,
@@ -2191,11 +2250,14 @@ impl SessionStore {
     fn load_sessions_from_disk(&self) -> Result<(), SessionStoreError> {
         self.ensure_required_encryption_available()?;
         if !self.base_path.exists() {
+            self.note_locked_session_count(0);
+            self.replace_locked_session_entries(HashMap::new());
             return Ok(());
         }
 
         let entries = fs::read_dir(&self.base_path)?;
         let mut locked_session_count = 0usize;
+        let mut locked_session_entries = HashMap::new();
 
         for entry in entries {
             let entry = entry?;
@@ -2215,6 +2277,13 @@ impl SessionStore {
                         Ok(_) => {}
                         Err(SessionStoreError::Locked(_)) => {
                             locked_session_count += 1;
+                            locked_session_entries.insert(
+                                stem.to_string(),
+                                SessionListEntry::locked(
+                                    stem.to_string(),
+                                    Self::file_updated_at(&path),
+                                ),
+                            );
                         }
                         Err(err) => {
                             tracing::warn!(
@@ -2229,6 +2298,7 @@ impl SessionStore {
         }
 
         self.note_locked_session_count(locked_session_count);
+        self.replace_locked_session_entries(locked_session_entries);
         Ok(())
     }
 
@@ -2399,12 +2469,15 @@ mod tests {
     }
 
     fn create_encrypted_store(password: &[u8]) -> (SessionStore, TempDir) {
+        create_encrypted_store_with_mode(password, EncryptionMode::IfPassword)
+    }
+
+    fn create_encrypted_store_with_mode(
+        password: &[u8],
+        mode: EncryptionMode,
+    ) -> (SessionStore, TempDir) {
         let temp_dir = TempDir::new().unwrap();
-        let store = reopen_store_with_encryption(
-            temp_dir.path(),
-            Some(password),
-            EncryptionMode::IfPassword,
-        );
+        let store = reopen_store_with_encryption(temp_dir.path(), Some(password), mode);
         (store, temp_dir)
     }
 
@@ -2434,6 +2507,19 @@ mod tests {
             store = store
                 .with_crypto_context(Arc::new(crypto))
                 .with_hmac_key(hmac_key);
+        }
+        store
+    }
+
+    fn reopen_store_with_encryption_and_legacy_hmac(
+        base_path: &Path,
+        password: Option<&[u8]>,
+        mode: EncryptionMode,
+        legacy_secret: Option<&[u8]>,
+    ) -> SessionStore {
+        let mut store = reopen_store_with_encryption(base_path, password, mode);
+        if let Some(secret) = legacy_secret {
+            store = store.with_legacy_hmac_key(Zeroizing::new(integrity::derive_hmac_key(secret)));
         }
         store
     }
@@ -2705,6 +2791,97 @@ mod tests {
             .list_session_entries(SessionFilter::default())
             .unwrap_err();
         assert!(matches!(err, SessionStoreError::Locked(_)));
+    }
+
+    #[test]
+    fn test_required_mode_with_password_round_trip() {
+        let key_material = test_key_material();
+        let (store, temp_dir) =
+            create_encrypted_store_with_mode(&key_material, EncryptionMode::Required);
+
+        let session = store
+            .create_session("agent-1", SessionMetadata::default())
+            .unwrap();
+        store
+            .append_message(ChatMessage::user(&session.id, "hello"))
+            .unwrap();
+
+        let history = store.get_history(&session.id, None, None).unwrap();
+        assert_eq!(history.len(), 1);
+
+        let entries = store
+            .list_session_entries(SessionFilter::default())
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].session_id(), session.id);
+        assert_eq!(entries[0].access(), SessionAccessState::Available);
+
+        let archived = store.archive_session(&session.id, false).unwrap();
+        let restored = store.restore_session(&archived.session_id).unwrap();
+        let restored_history = store.get_history(&restored.session_id, None, None).unwrap();
+        assert_eq!(restored_history.len(), 1);
+
+        let reopened = reopen_store_with_encryption(
+            temp_dir.path(),
+            Some(&key_material),
+            EncryptionMode::Required,
+        );
+        let reopened_history = reopened.get_history(&session.id, None, None).unwrap();
+        assert_eq!(reopened_history.len(), 1);
+    }
+
+    #[test]
+    fn test_reject_mode_migrates_legacy_integrity_sidecars_when_encryption_enabled() {
+        let temp_dir = TempDir::new().unwrap();
+        let key_material = test_key_material();
+        let legacy_secret = test_key_material();
+        let legacy_hmac_key = Zeroizing::new(integrity::derive_hmac_key(&legacy_secret));
+
+        let plaintext_store = SessionStore::with_base_path(temp_dir.path().to_path_buf())
+            .with_hmac_key(legacy_hmac_key)
+            .with_integrity_action(integrity::IntegrityAction::Reject);
+        let session = plaintext_store
+            .create_session("agent-1", SessionMetadata::default())
+            .unwrap();
+        plaintext_store
+            .append_message(ChatMessage::user(&session.id, "before"))
+            .unwrap();
+
+        let encrypted_store = reopen_store_with_encryption_and_legacy_hmac(
+            temp_dir.path(),
+            Some(&key_material),
+            EncryptionMode::IfPassword,
+            Some(&legacy_secret),
+        )
+        .with_integrity_action(integrity::IntegrityAction::Reject);
+
+        encrypted_store
+            .append_message(ChatMessage::user(&session.id, "after"))
+            .unwrap();
+
+        let history = encrypted_store
+            .get_history(&session.id, None, None)
+            .unwrap();
+        assert_eq!(history.len(), 2);
+
+        let meta_raw = fs::read(encrypted_store.session_meta_path(&session.id).unwrap()).unwrap();
+        assert!(crypto::encrypted_payload(&meta_raw));
+        let history_raw =
+            fs::read_to_string(encrypted_store.session_history_path(&session.id).unwrap()).unwrap();
+        let first_line = history_raw
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap();
+        assert!(crypto::encrypted_payload(first_line.as_bytes()));
+
+        let reopened = reopen_store_with_encryption(
+            temp_dir.path(),
+            Some(&key_material),
+            EncryptionMode::IfPassword,
+        )
+        .with_integrity_action(integrity::IntegrityAction::Reject);
+        let reopened_history = reopened.get_history(&session.id, None, None).unwrap();
+        assert_eq!(reopened_history.len(), 2);
     }
 
     #[test]
