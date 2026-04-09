@@ -116,6 +116,28 @@ fn session_store_error_kind(err: &SessionStoreError) -> &'static str {
     }
 }
 
+fn session_store_error_export_warning(err: &SessionStoreError) -> &'static str {
+    match err {
+        SessionStoreError::NotFound(_) => "session data was not found on disk",
+        SessionStoreError::AlreadyExists(_) => "session data already exists on disk",
+        SessionStoreError::Io(_) => "session data could not be read from disk",
+        SessionStoreError::Serialization(_) => "session data is malformed",
+        SessionStoreError::InvalidSessionKey(_) => "session data uses an invalid session key",
+        SessionStoreError::CompactionInProgress(_) => {
+            "session data is being compacted and is temporarily unavailable"
+        }
+        SessionStoreError::AlreadyArchived(_) => "session data is already archived",
+        SessionStoreError::NotArchived(_) => "session data is not archived",
+        SessionStoreError::ArchiveNotFound(_) => "session archive was not found on disk",
+        SessionStoreError::InvalidUserId(_) => "session data is associated with an invalid user ID",
+        SessionStoreError::Locked(_) => {
+            "encrypted session data is unavailable without the config password"
+        }
+        SessionStoreError::DecryptionFailed(_) => "encrypted session data could not be decrypted",
+        SessionStoreError::Crypto(_) => "encrypted session data is unreadable or corrupted",
+    }
+}
+
 fn integrity_error_kind(err: &super::integrity::IntegrityError) -> &'static str {
     match err {
         super::integrity::IntegrityError::Io(_) => "io",
@@ -879,12 +901,10 @@ impl SessionStore {
 
         #[cfg(unix)]
         {
-            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            use std::os::unix::fs::OpenOptionsExt;
 
             options.mode(0o600);
-            let file = options.open(path)?;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-            Ok(file)
+            Ok(options.open(path)?)
         }
 
         #[cfg(not(unix))]
@@ -1081,9 +1101,7 @@ impl SessionStore {
             return Ok(());
         };
 
-        if super::crypto::looks_like_encrypted_payload(line.trim().as_bytes())
-            && super::crypto::has_encrypted_payload_prefix(line.trim().as_bytes())
-        {
+        if super::crypto::has_encrypted_payload_prefix(line.trim().as_bytes()) {
             return Ok(());
         }
 
@@ -1104,9 +1122,7 @@ impl SessionStore {
         let _lock =
             FileLock::acquire(&archive_path).map_err(|e| SessionStoreError::Io(e.to_string()))?;
         let archive_content = fs::read(&archive_path)?;
-        if super::crypto::looks_like_encrypted_payload(&archive_content)
-            && super::crypto::has_encrypted_payload_prefix(&archive_content)
-        {
+        if super::crypto::has_encrypted_payload_prefix(&archive_content) {
             return Ok(());
         }
 
@@ -1580,7 +1596,7 @@ impl SessionStore {
                     warnings.push(format!(
                         "failed to export session {}: {}",
                         session.id,
-                        session_store_error_kind(&e)
+                        session_store_error_export_warning(&e)
                     ));
                 }
             }
@@ -4496,7 +4512,7 @@ mod tests {
         assert_eq!(warnings.len(), 1);
         let warning = warnings[0].as_str().unwrap();
         assert!(warning.contains("failed to export session"));
-        assert!(warning.ends_with(": io"));
+        assert!(warning.ends_with(": session data could not be read from disk"));
         assert!(!warning.contains("Session store is locked"));
         assert!(!warning.contains("history-secret"));
     }
