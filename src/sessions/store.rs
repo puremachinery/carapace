@@ -794,7 +794,7 @@ impl SessionStore {
         session_id: &str,
         content: &[u8],
     ) -> Result<Session, SessionStoreError> {
-        if super::crypto::looks_like_encrypted_payload(content) {
+        if super::crypto::has_encrypted_payload_prefix(content) {
             let Some(crypto) = self.crypto.as_ref() else {
                 return Err(Self::session_locked_without_password());
             };
@@ -849,7 +849,7 @@ impl SessionStore {
         session_id: &str,
         content: &[u8],
     ) -> Result<ArchivedSession, SessionStoreError> {
-        if super::crypto::looks_like_encrypted_payload(content) {
+        if super::crypto::has_encrypted_payload_prefix(content) {
             let Some(crypto) = self.crypto.as_ref() else {
                 return Err(Self::session_locked_without_password());
             };
@@ -1791,7 +1791,7 @@ impl SessionStore {
                 continue;
             }
             let line_bytes = line.as_bytes();
-            let encrypted_line = super::crypto::looks_like_encrypted_payload(line_bytes);
+            let encrypted_line = super::crypto::has_encrypted_payload_prefix(line_bytes);
 
             let msg = match self.decode_history_message(session_id, line_bytes, encrypted_line) {
                 Ok(m) => m,
@@ -2141,7 +2141,7 @@ impl SessionStore {
         }
 
         let archive_content = fs::read(&archive_path)?;
-        let archive_was_plaintext = !super::crypto::looks_like_encrypted_payload(&archive_content);
+        let archive_was_plaintext = !super::crypto::has_encrypted_payload_prefix(&archive_content);
         let archived = self.decode_archive(session_id, &archive_content)?;
 
         // Restore messages to history file
@@ -2335,9 +2335,8 @@ impl SessionStore {
         }
 
         let content = fs::read(&meta_path)?;
-        let meta_was_encrypted = super::crypto::looks_like_encrypted_payload(&content);
-        let meta_needs_migration =
-            !meta_was_encrypted || !super::crypto::has_encrypted_payload_prefix(&content);
+        let meta_was_encrypted = super::crypto::has_encrypted_payload_prefix(&content);
+        let meta_needs_migration = !meta_was_encrypted;
 
         // Verify session integrity if HMAC key is configured
         self.verify_integrity_bytes_with_compat(&content, &meta_path)?;
@@ -3272,7 +3271,7 @@ mod tests {
     }
 
     #[test]
-    fn test_list_sessions_isolates_corrupt_encrypted_metadata_to_locked_stub() {
+    fn test_list_sessions_isolates_malformed_prefixed_encrypted_metadata_to_locked_stub() {
         let key_material = test_key_material();
         let (store, temp_dir) = create_encrypted_store(&key_material);
         let healthy = store
@@ -3305,7 +3304,7 @@ mod tests {
             .unwrap();
 
         let corrupt_meta_path = store.session_meta_path(&corrupt.id).unwrap();
-        let malformed = br#"{"format":"session-enc-v1"}"#;
+        let malformed = b"cse1:{\"format\":\"session-enc-v1\"}";
         fs::write(&corrupt_meta_path, malformed).unwrap();
         integrity::write_hmac_file(
             store.hmac_key.as_ref().unwrap(),
@@ -3675,7 +3674,7 @@ mod tests {
         let history_path = store.session_history_path(&session.id).unwrap();
         fs::write(
             &history_path,
-            b"{\"format\":\"session-enc-v1\",\"n\":\"%%%\",\"c\":\"bad\"}\n",
+            b"cse1:{\"format\":\"session-enc-v1\",\"n\":\"%%%\",\"c\":\"bad\"}\n",
         )
         .unwrap();
 
@@ -3685,6 +3684,31 @@ mod tests {
             SessionStoreError::Crypto(ref message)
                 if message.contains("invalid encrypted session history line")
         ));
+    }
+
+    #[test]
+    fn test_get_history_ignores_plaintext_format_field_matching_encryption_format() {
+        let (store, _temp) = create_test_store();
+        let session = store
+            .create_session("agent-1", SessionMetadata::default())
+            .unwrap();
+
+        let mut message = serde_json::to_value(ChatMessage::user(&session.id, "hello")).unwrap();
+        message.as_object_mut().unwrap().insert(
+            "format".to_string(),
+            serde_json::Value::String("session-enc-v1".to_string()),
+        );
+
+        let history_path = store.session_history_path(&session.id).unwrap();
+        fs::write(
+            &history_path,
+            format!("{}\n", serde_json::to_string(&message).unwrap()),
+        )
+        .unwrap();
+
+        let history = store.get_history(&session.id, None, None).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].content, "hello");
     }
 
     #[test]

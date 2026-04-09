@@ -18,7 +18,6 @@ use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit as _, Mac};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use sha2::Sha256;
 use thiserror::Error;
 use zeroize::Zeroizing;
@@ -445,24 +444,8 @@ pub fn has_encrypted_payload_prefix(data: &[u8]) -> bool {
     has_prefix(data)
 }
 
-pub fn looks_like_encrypted_payload(data: &[u8]) -> bool {
-    if has_prefix(data) {
-        return true;
-    }
-    serde_json::from_slice::<Value>(data)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("format")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-        .as_deref()
-        == Some(SESSION_ENCRYPTED_FORMAT_V1)
-}
-
 pub fn is_encrypted_payload(data: &[u8]) -> bool {
-    if !looks_like_encrypted_payload(data) {
+    if !has_encrypted_payload_prefix(data) {
         return false;
     }
     serde_json::from_slice::<EncryptedEnvelope>(strip_prefix(data))
@@ -473,6 +456,7 @@ pub fn is_encrypted_payload(data: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
 
     fn test_key_material() -> Vec<u8> {
         format!("fixture-{}", uuid::Uuid::new_v4()).into_bytes()
@@ -558,12 +542,20 @@ mod tests {
             .unwrap();
         let truncated = encrypted[..SESSION_ENCRYPTED_PREFIX_V1.len() + 8].to_vec();
 
-        assert!(looks_like_encrypted_payload(&truncated));
+        assert!(has_encrypted_payload_prefix(&truncated));
         assert!(!is_encrypted_payload(&truncated));
         assert!(matches!(
             ctx.decrypt_bytes("session-1", "history", &truncated),
             Err(SessionCryptoError::BadFormat(_))
         ));
+    }
+
+    #[test]
+    fn test_is_encrypted_payload_rejects_unprefixed_envelope_like_json() {
+        let unprefixed = br#"{"format":"session-enc-v1","n":"abc","c":"def"}"#;
+
+        assert!(!has_encrypted_payload_prefix(unprefixed));
+        assert!(!is_encrypted_payload(unprefixed));
     }
 
     #[cfg(unix)]
