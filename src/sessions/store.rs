@@ -11,7 +11,6 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tracing::warn;
 use uuid::Uuid;
@@ -650,9 +649,7 @@ pub struct SessionStore {
     encryption_mode: super::crypto::EncryptionMode,
     /// Optional session crypto context for encrypted session artifacts.
     crypto: Option<Arc<super::crypto::SessionCryptoContext>>,
-    /// Count of encrypted session metadata files discovered without an unlock key.
-    locked_session_count: AtomicUsize,
-    /// Locked-session stubs discovered during the store-owned disk scan.
+    /// Locked-session stubs discovered by the store-owned disk scan.
     locked_session_entries: RwLock<HashMap<String, SessionListEntry>>,
 }
 
@@ -683,7 +680,6 @@ impl SessionStore {
             integrity_action: super::integrity::IntegrityAction::Warn,
             encryption_mode: super::crypto::EncryptionMode::Off,
             crypto: None,
-            locked_session_count: AtomicUsize::new(0),
             locked_session_entries: RwLock::new(HashMap::new()),
         }
     }
@@ -845,8 +841,15 @@ impl SessionStore {
             .map(|dur| dur.as_millis() as i64)
     }
 
-    fn note_locked_session_count(&self, count: usize) {
-        self.locked_session_count.store(count, Ordering::Release);
+    fn record_locked_session_entry(&self, session_id: String, updated_at: Option<i64>) {
+        self.locked_session_entries.write().insert(
+            session_id.clone(),
+            SessionListEntry::locked(session_id, updated_at),
+        );
+    }
+
+    fn clear_locked_session_entry(&self, session_id: &str) {
+        self.locked_session_entries.write().remove(session_id);
     }
 
     fn replace_locked_session_entries(&self, entries: HashMap<String, SessionListEntry>) {
@@ -854,7 +857,7 @@ impl SessionStore {
     }
 
     fn locked_session_count(&self) -> usize {
-        self.locked_session_count.load(Ordering::Acquire)
+        self.locked_session_entries.read().len()
     }
 
     fn locked_session_entries_snapshot(&self) -> Vec<SessionListEntry> {
@@ -863,6 +866,46 @@ impl SessionStore {
             .values()
             .cloned()
             .collect()
+    }
+
+    fn create_private_output_file(path: &Path) -> Result<File, SessionStoreError> {
+        let mut options = OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+            options.mode(0o600);
+            let file = options.open(path)?;
+            fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+            Ok(file)
+        }
+
+        #[cfg(not(unix))]
+        {
+            Ok(options.open(path)?)
+        }
+    }
+
+    fn open_private_append_file(path: &Path) -> Result<File, SessionStoreError> {
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+            options.mode(0o600);
+            let file = options.open(path)?;
+            fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+            Ok(file)
+        }
+
+        #[cfg(not(unix))]
+        {
+            Ok(options.open(path)?)
+        }
     }
 
     fn verify_integrity_path_with_compat(&self, file_path: &Path) -> Result<(), SessionStoreError> {
@@ -979,7 +1022,7 @@ impl SessionStore {
     ) -> Result<(), SessionStoreError> {
         let temp_path = history_path.with_extension("jsonl.tmp");
         {
-            let file = File::create(&temp_path)?;
+            let file = Self::create_private_output_file(&temp_path)?;
             let mut writer = BufWriter::new(file);
             for message in messages {
                 let encoded = self.encode_history_message(message)?;
@@ -1564,10 +1607,7 @@ impl SessionStore {
         let _lock =
             FileLock::acquire(&history_path).map_err(|e| SessionStoreError::Io(e.to_string()))?;
         self.migrate_history_file_if_needed(&history_path, &session_id)?;
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&history_path)?;
+        let file = Self::open_private_append_file(&history_path)?;
         let mut writer = BufWriter::new(file);
         let encoded = self.encode_history_message(&message)?;
         writer.write_all(&encoded)?;
@@ -1612,10 +1652,7 @@ impl SessionStore {
         let _lock =
             FileLock::acquire(&history_path).map_err(|e| SessionStoreError::Io(e.to_string()))?;
         self.migrate_history_file_if_needed(&history_path, session_id)?;
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&history_path)?;
+        let file = Self::open_private_append_file(&history_path)?;
         let mut writer = BufWriter::new(file);
 
         for msg in messages {
@@ -1796,7 +1833,7 @@ impl SessionStore {
         let temp_path = history_path.with_extension("jsonl.tmp");
 
         {
-            let file = File::create(&temp_path)?;
+            let file = Self::create_private_output_file(&temp_path)?;
             let mut writer = BufWriter::new(file);
 
             // Write summary as system message
@@ -1942,7 +1979,7 @@ impl SessionStore {
         let temp_path = archive_path.with_extension("tmp");
 
         {
-            let file = File::create(&temp_path)?;
+            let file = Self::create_private_output_file(&temp_path)?;
             let mut writer = BufWriter::new(file);
             let encoded = self.encode_archive(session_id, &archived)?;
             writer.write_all(&encoded)?;
@@ -2026,7 +2063,7 @@ impl SessionStore {
         // Restore messages to history file
         let history_path = self.session_history_path(session_id)?;
         {
-            let file = File::create(&history_path)?;
+            let file = Self::create_private_output_file(&history_path)?;
             let mut writer = BufWriter::new(file);
             for msg in &archived.messages {
                 let encoded = self.encode_history_message(msg)?;
@@ -2046,7 +2083,7 @@ impl SessionStore {
             let temp_path = archive_path.with_extension("tmp");
             let encoded = self.encode_archive(session_id, &archived)?;
             {
-                let file = File::create(&temp_path)?;
+                let file = Self::create_private_output_file(&temp_path)?;
                 let mut writer = BufWriter::new(file);
                 writer.write_all(&encoded)?;
                 writer.flush()?;
@@ -2222,12 +2259,19 @@ impl SessionStore {
             Ok(session) => session,
             Err(SessionStoreError::Locked(message)) => {
                 if update_locked_scan_state {
-                    self.note_locked_session_count(1);
+                    self.record_locked_session_entry(
+                        session_id.to_string(),
+                        Self::file_updated_at(&meta_path),
+                    );
                 }
                 return Err(SessionStoreError::Locked(message));
             }
             Err(err) => return Err(err),
         };
+
+        if update_locked_scan_state {
+            self.clear_locked_session_entry(session_id);
+        }
 
         // Update caches
         {
@@ -2250,13 +2294,11 @@ impl SessionStore {
     fn load_sessions_from_disk(&self) -> Result<(), SessionStoreError> {
         self.ensure_required_encryption_available()?;
         if !self.base_path.exists() {
-            self.note_locked_session_count(0);
             self.replace_locked_session_entries(HashMap::new());
             return Ok(());
         }
 
         let entries = fs::read_dir(&self.base_path)?;
-        let mut locked_session_count = 0usize;
         let mut locked_session_entries = HashMap::new();
 
         for entry in entries {
@@ -2276,7 +2318,6 @@ impl SessionStore {
                     match self.load_session_with_locked_tracking(stem, false) {
                         Ok(_) => {}
                         Err(SessionStoreError::Locked(_)) => {
-                            locked_session_count += 1;
                             locked_session_entries.insert(
                                 stem.to_string(),
                                 SessionListEntry::locked(
@@ -2297,7 +2338,6 @@ impl SessionStore {
             }
         }
 
-        self.note_locked_session_count(locked_session_count);
         self.replace_locked_session_entries(locked_session_entries);
         Ok(())
     }
@@ -2318,7 +2358,7 @@ impl SessionStore {
 
         // Write to temp file first, then sync
         {
-            let file = File::create(&temp_path)?;
+            let file = Self::create_private_output_file(&temp_path)?;
             let mut writer = BufWriter::new(file);
             writer.write_all(&serialized)?;
             writer.flush()?;
@@ -2461,6 +2501,14 @@ mod tests {
     use crate::sessions::crypto::{self, EncryptionMode, SessionCryptoContext};
     use crate::sessions::integrity;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    fn assert_private_mode(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "expected {} to be mode 0600", path.display());
+    }
 
     fn create_test_store() -> (SessionStore, TempDir) {
         let temp_dir = TempDir::new().unwrap();
@@ -2733,24 +2781,32 @@ mod tests {
             .append_message(ChatMessage::user(&session.id, "top secret"))
             .unwrap();
 
-        let meta_raw = fs::read(store.session_meta_path(&session.id).unwrap()).unwrap();
+        let meta_path = store.session_meta_path(&session.id).unwrap();
+        let meta_raw = fs::read(&meta_path).unwrap();
         assert!(crypto::encrypted_payload(&meta_raw));
+        #[cfg(unix)]
+        assert_private_mode(&meta_path);
 
-        let history_raw =
-            fs::read_to_string(store.session_history_path(&session.id).unwrap()).unwrap();
+        let history_path = store.session_history_path(&session.id).unwrap();
+        let history_raw = fs::read_to_string(&history_path).unwrap();
         let first_line = history_raw
             .lines()
             .find(|line| !line.trim().is_empty())
             .unwrap();
         assert!(crypto::encrypted_payload(first_line.as_bytes()));
+        #[cfg(unix)]
+        assert_private_mode(&history_path);
 
         let history = store.get_history(&session.id, None, None).unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].content, "top secret");
 
         let archived = store.archive_session(&session.id, false).unwrap();
-        let archive_raw = fs::read(archived.archive_path).unwrap();
+        let archive_path = PathBuf::from(&archived.archive_path);
+        let archive_raw = fs::read(&archive_path).unwrap();
         assert!(crypto::encrypted_payload(&archive_raw));
+        #[cfg(unix)]
+        assert_private_mode(&archive_path);
     }
 
     #[test]
@@ -2988,6 +3044,8 @@ mod tests {
 
         let archive_raw = fs::read(&archive_path).unwrap();
         assert!(crypto::encrypted_payload(&archive_raw));
+        #[cfg(unix)]
+        assert_private_mode(&archive_path);
 
         let history_path = encrypted_store.session_history_path(&session.id).unwrap();
         let history_raw = fs::read_to_string(&history_path).unwrap();
@@ -2995,6 +3053,8 @@ mod tests {
             .lines()
             .filter(|line| !line.trim().is_empty())
             .all(|line| crypto::encrypted_payload(line.as_bytes())));
+        #[cfg(unix)]
+        assert_private_mode(&history_path);
     }
 
     #[test]
