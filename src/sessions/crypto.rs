@@ -6,7 +6,8 @@
 //! - session archive files
 
 use std::fmt;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
@@ -52,18 +53,10 @@ impl EncryptionMode {
 }
 
 /// Configurable session encryption settings.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EncryptionConfig {
     #[serde(default)]
     pub mode: EncryptionMode,
-}
-
-impl Default for EncryptionConfig {
-    fn default() -> Self {
-        Self {
-            mode: EncryptionMode::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,6 +114,30 @@ fn manifest_path(base_path: &Path) -> PathBuf {
     base_path.join(CRYPTO_MANIFEST_PATH)
 }
 
+fn create_private_file(path: &Path) -> Result<File, SessionCryptoError> {
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path).map_err(Into::into)
+}
+
+fn write_manifest_atomic(path: &Path, manifest: &CryptoManifest) -> Result<(), SessionCryptoError> {
+    let temp_path = path.with_extension("tmp");
+    let serialized = serde_json::to_vec_pretty(manifest)
+        .map_err(|err| SessionCryptoError::Manifest(err.to_string()))?;
+    {
+        let mut file = create_private_file(&temp_path)?;
+        file.write_all(&serialized)?;
+        file.sync_all()?;
+    }
+    fs::rename(&temp_path, path)?;
+    Ok(())
+}
+
 fn decode_b64<const N: usize>(
     field: &'static str,
     value: &str,
@@ -142,12 +159,12 @@ fn decode_b64<const N: usize>(
 fn expand_hkdf(
     master_key: &[u8],
     info: &[u8],
-) -> Result<[u8; PASSWORD_DERIVED_KEY_LEN], SessionCryptoError> {
+) -> Result<Zeroizing<[u8; PASSWORD_DERIVED_KEY_LEN]>, SessionCryptoError> {
     let hk = Hkdf::<Sha256>::new(Some(SESSION_ENCRYPTION_ROOT_TAG), master_key);
     let mut out = [0u8; PASSWORD_DERIVED_KEY_LEN];
     hk.expand(info, &mut out)
         .map_err(|err| SessionCryptoError::KeyDerivation(err.to_string()))?;
-    Ok(out)
+    Ok(Zeroizing::new(out))
 }
 
 fn aad_bytes(session_id: &str, purpose: &str) -> Vec<u8> {
@@ -157,7 +174,7 @@ fn aad_bytes(session_id: &str, purpose: &str) -> Vec<u8> {
 /// Root session-crypto context derived from the config password.
 pub struct SessionCryptoContext {
     master_key: Zeroizing<[u8; PASSWORD_DERIVED_KEY_LEN]>,
-    integrity_hmac_key: [u8; 32],
+    integrity_hmac_key: Zeroizing<[u8; 32]>,
 }
 
 impl fmt::Debug for SessionCryptoContext {
@@ -207,11 +224,7 @@ impl SessionCryptoContext {
                 kdf: CRYPTO_KDF_ID.to_string(),
                 root_salt: BASE64.encode(salt),
             };
-            let temp_path = manifest_path.with_extension("tmp");
-            let serialized = serde_json::to_vec_pretty(&manifest)
-                .map_err(|err| SessionCryptoError::Manifest(err.to_string()))?;
-            fs::write(&temp_path, serialized)?;
-            fs::rename(&temp_path, &manifest_path)?;
+            write_manifest_atomic(&manifest_path, &manifest)?;
             manifest
         };
 
@@ -231,7 +244,7 @@ impl SessionCryptoContext {
         &self,
         session_id: &str,
         purpose: &str,
-    ) -> Result<[u8; PASSWORD_DERIVED_KEY_LEN], SessionCryptoError> {
+    ) -> Result<Zeroizing<[u8; PASSWORD_DERIVED_KEY_LEN]>, SessionCryptoError> {
         let mut info = Vec::with_capacity(
             SESSION_ENCRYPTION_INFO_PREFIX.len() + session_id.len() + purpose.len() + 1,
         );
@@ -244,7 +257,9 @@ impl SessionCryptoContext {
 
     /// Derive the session-store-wide HMAC key rooted in the encryption master key.
     pub fn integrity_hmac_key(&self) -> [u8; 32] {
-        self.integrity_hmac_key
+        let mut out = [0u8; 32];
+        out.copy_from_slice(self.integrity_hmac_key.as_ref());
+        out
     }
 
     pub fn encrypt_bytes(
@@ -254,7 +269,7 @@ impl SessionCryptoContext {
         plaintext: &[u8],
     ) -> Result<Vec<u8>, SessionCryptoError> {
         let key = self.derive_session_key(session_id, purpose)?;
-        let cipher = Aes256Gcm::new((&key).into());
+        let cipher = Aes256Gcm::new((&*key).into());
 
         let mut nonce_bytes = [0u8; NONCE_LEN];
         getrandom::fill(&mut nonce_bytes)
@@ -302,7 +317,7 @@ impl SessionCryptoContext {
                     message: err.to_string(),
                 })?;
         let key = self.derive_session_key(session_id, purpose)?;
-        let cipher = Aes256Gcm::new((&key).into());
+        let cipher = Aes256Gcm::new((&*key).into());
         let aad = aad_bytes(session_id, purpose);
         cipher
             .decrypt(
@@ -346,10 +361,15 @@ pub fn encrypted_payload(data: &[u8]) -> bool {
 mod tests {
     use super::*;
 
+    fn test_key_material() -> Vec<u8> {
+        format!("fixture-{}", uuid::Uuid::new_v4()).into_bytes()
+    }
+
     #[test]
     fn test_crypto_context_round_trip() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx = SessionCryptoContext::load_or_create(dir.path(), b"test-password").unwrap();
+        let key_material = test_key_material();
+        let ctx = SessionCryptoContext::load_or_create(dir.path(), &key_material).unwrap();
         let plaintext = br#"{"hello":"world"}"#;
         let encrypted = ctx
             .encrypt_bytes("session-1", "metadata", plaintext)
@@ -364,22 +384,42 @@ mod tests {
     #[test]
     fn test_crypto_context_reuses_manifest_salt() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx1 = SessionCryptoContext::load_or_create(dir.path(), b"test-password").unwrap();
-        let ctx2 = SessionCryptoContext::load_or_create(dir.path(), b"test-password").unwrap();
+        let key_material = test_key_material();
+        let ctx1 = SessionCryptoContext::load_or_create(dir.path(), &key_material).unwrap();
+        let ctx2 = SessionCryptoContext::load_or_create(dir.path(), &key_material).unwrap();
         assert_eq!(ctx1.integrity_hmac_key(), ctx2.integrity_hmac_key());
     }
 
     #[test]
     fn test_crypto_context_detects_wrong_password() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx = SessionCryptoContext::load_or_create(dir.path(), b"correct-password").unwrap();
+        let key_material = test_key_material();
+        let wrong_key_material = test_key_material();
+        let ctx = SessionCryptoContext::load_or_create(dir.path(), &key_material).unwrap();
         let encrypted = ctx
             .encrypt_bytes("session-1", "history", br#"{"msg":"hello"}"#)
             .unwrap();
-        let wrong = SessionCryptoContext::load_or_create(dir.path(), b"wrong-password").unwrap();
+        let wrong = SessionCryptoContext::load_or_create(dir.path(), &wrong_key_material).unwrap();
         let err = wrong
             .decrypt_bytes("session-1", "history", &encrypted)
             .unwrap_err();
         assert_eq!(err, SessionCryptoError::DecryptionFailed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_crypto_manifest_is_created_with_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let key_material = test_key_material();
+        let _ctx = SessionCryptoContext::load_or_create(dir.path(), &key_material).unwrap();
+
+        let mode = fs::metadata(dir.path().join(CRYPTO_MANIFEST_PATH))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
     }
 }

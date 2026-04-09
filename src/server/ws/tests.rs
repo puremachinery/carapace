@@ -1,10 +1,13 @@
 use super::*;
+use crate::test_support::env::ScopedEnv;
 use std::error::Error as _;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::Arc;
 use tempfile::tempdir;
 
-static SESSION_INTEGRITY_ENV_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+fn test_integrity_value() -> String {
+    format!("fixture-{}", uuid::Uuid::new_v4())
+}
 
 #[test]
 fn test_try_new_reports_activity_service_startup_error() {
@@ -246,55 +249,79 @@ fn test_resolve_session_integrity_config_invalid_value_uses_defaults() {
 
 #[test]
 fn test_resolve_session_integrity_secret_prefers_explicit_server_secret() {
-    let _lock = SESSION_INTEGRITY_ENV_TEST_LOCK.lock().unwrap();
+    let mut env_guard = ScopedEnv::new();
+    let server_secret = test_integrity_value();
     let cfg = json!({
         "gateway": {
             "auth": {
-                "token": "gateway-token",
-                "password": "gateway-password"
+                "token": test_integrity_value(),
+                "password": test_integrity_value()
             }
         }
     });
-    std::env::set_var("CARAPACE_SERVER_SECRET", "explicit-server-secret");
-    let (secret, source) = crate::sessions::resolve_session_integrity_secret_from_value(&cfg)
+    env_guard.set("CARAPACE_SERVER_SECRET", &server_secret);
+    let (secret, source) = crate::sessions::resolve_session_integrity_secret_from_value(&cfg, None)
         .expect("secret should resolve from explicit server secret");
-    std::env::remove_var("CARAPACE_SERVER_SECRET");
-    assert_eq!(secret, "explicit-server-secret");
+    assert_eq!(secret, server_secret);
     assert_eq!(source, "CARAPACE_SERVER_SECRET");
 }
 
 #[test]
 fn test_resolve_session_integrity_secret_falls_back_to_gateway_credentials() {
+    let token_value = test_integrity_value();
     let from_token = json!({
         "gateway": {
             "auth": {
-                "token": "gateway-token"
+                "token": token_value.clone()
             }
         }
     });
     let (secret, source) =
-        crate::sessions::resolve_session_integrity_secret_from_value(&from_token)
+        crate::sessions::resolve_session_integrity_secret_from_value(&from_token, None)
             .expect("secret should resolve from gateway token");
-    assert_eq!(secret, "gateway-token");
+    assert_eq!(secret, token_value);
     assert_eq!(source, "gateway.auth.token");
 
+    let password_value = test_integrity_value();
     let from_password = json!({
         "gateway": {
             "auth": {
-                "password": "gateway-password"
+                "password": password_value.clone()
             }
         }
     });
     let (secret, source) =
-        crate::sessions::resolve_session_integrity_secret_from_value(&from_password)
+        crate::sessions::resolve_session_integrity_secret_from_value(&from_password, None)
             .expect("secret should resolve from gateway password");
-    assert_eq!(secret, "gateway-password");
+    assert_eq!(secret, password_value);
     assert_eq!(source, "gateway.auth.password");
 }
 
 #[test]
+fn test_resolve_session_integrity_secret_prefers_gateway_env_over_config() {
+    let mut env_guard = ScopedEnv::new();
+    let env_token = test_integrity_value();
+    env_guard
+        .set("CARAPACE_GATEWAY_TOKEN", &env_token)
+        .set("CARAPACE_GATEWAY_PASSWORD", test_integrity_value());
+    let cfg = json!({
+        "gateway": {
+            "auth": {
+                "token": test_integrity_value(),
+                "password": test_integrity_value()
+            }
+        }
+    });
+
+    let (secret, source) = crate::sessions::resolve_session_integrity_secret_from_value(&cfg, None)
+        .expect("gateway env token should resolve before config");
+    assert_eq!(secret, env_token);
+    assert_eq!(source, "CARAPACE_GATEWAY_TOKEN");
+}
+
+#[test]
 fn test_resolve_session_integrity_secret_ignores_empty_values() {
-    let _lock = SESSION_INTEGRITY_ENV_TEST_LOCK.lock().unwrap();
+    let mut env_guard = ScopedEnv::new();
     let cfg = json!({
         "gateway": {
             "auth": {
@@ -303,9 +330,8 @@ fn test_resolve_session_integrity_secret_ignores_empty_values() {
             }
         }
     });
-    std::env::set_var("CARAPACE_SERVER_SECRET", "");
-    let secret = crate::sessions::resolve_session_integrity_secret_from_value(&cfg);
-    std::env::remove_var("CARAPACE_SERVER_SECRET");
+    env_guard.set("CARAPACE_SERVER_SECRET", "");
+    let secret = crate::sessions::resolve_session_integrity_secret_from_value(&cfg, None);
     assert!(secret.is_none());
 }
 
@@ -316,7 +342,7 @@ fn test_resolve_session_integrity_secret_returns_none_when_all_missing() {
             "auth": {}
         }
     });
-    let secret = crate::sessions::resolve_session_integrity_secret_from_value(&cfg);
+    let secret = crate::sessions::resolve_session_integrity_secret_from_value(&cfg, None);
     assert!(secret.is_none());
 }
 

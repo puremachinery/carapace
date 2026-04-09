@@ -61,12 +61,28 @@ pub(crate) fn resolve_session_encryption_config(
 
 pub(crate) fn resolve_session_integrity_secret_from_value(
     cfg: &serde_json::Value,
+    fallback_secret: Option<(String, &'static str)>,
 ) -> Option<(String, &'static str)> {
     if let Some(secret) = std::env::var("CARAPACE_SERVER_SECRET")
         .ok()
         .filter(|value| !value.is_empty())
     {
         return Some((secret, "CARAPACE_SERVER_SECRET"));
+    }
+    if let Some(secret) = std::env::var("CARAPACE_GATEWAY_TOKEN")
+        .ok()
+        .filter(|value| !value.is_empty())
+    {
+        return Some((secret, "CARAPACE_GATEWAY_TOKEN"));
+    }
+    if let Some(secret) = std::env::var("CARAPACE_GATEWAY_PASSWORD")
+        .ok()
+        .filter(|value| !value.is_empty())
+    {
+        return Some((secret, "CARAPACE_GATEWAY_PASSWORD"));
+    }
+    if let Some(secret) = fallback_secret {
+        return Some(secret);
     }
     if let Some(secret) = cfg
         .pointer("/gateway/auth/token")
@@ -91,6 +107,7 @@ pub(crate) fn resolve_session_integrity_secret_from_value(
 pub fn configured_store_with_path(
     base_path: std::path::PathBuf,
     cfg: &serde_json::Value,
+    fallback_integrity_secret: Option<(String, &'static str)>,
 ) -> Result<SessionStore, SessionStoreError> {
     let integrity_config = resolve_session_integrity_config(cfg);
     let encryption_config = resolve_session_encryption_config(cfg);
@@ -115,7 +132,9 @@ pub fn configured_store_with_path(
     }
 
     if integrity_config.enabled {
-        if let Some((server_secret, _source)) = resolve_session_integrity_secret_from_value(cfg) {
+        if let Some((server_secret, _source)) =
+            resolve_session_integrity_secret_from_value(cfg, fallback_integrity_secret)
+        {
             let hmac_key = integrity::derive_hmac_key(server_secret.as_bytes());
             store = store.with_hmac_key(hmac_key);
         }
@@ -131,7 +150,7 @@ pub fn configured_store_with_path_from_current_config(
     let cfg = crate::config::load_config().map_err(|err| {
         SessionStoreError::Io(format!("failed to load config for sessions: {err}"))
     })?;
-    configured_store_with_path(base_path, &cfg)
+    configured_store_with_path(base_path, &cfg, None)
 }
 
 /// Canonicalize an explicit session hint to a deterministic opaque session ID.

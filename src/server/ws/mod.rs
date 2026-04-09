@@ -1198,14 +1198,71 @@ pub async fn build_ws_state_owned_from_value(cfg: &Value) -> Result<WsServerStat
     }
     let config = build_ws_config_from_value(cfg).await?;
     let mut state = WsServerState::new_persistent(config, state_dir).await?;
-    let session_store =
-        sessions::configured_store_with_path(state.session_store.base_path().to_path_buf(), cfg)
-            .map_err(|err| {
-                WsConfigError::Runtime(format!("failed to configure session store: {err}"))
-            })?;
+    let integrity_config = sessions::resolve_session_integrity_config(cfg);
+    let encryption_config = sessions::resolve_session_encryption_config(cfg);
+    let fallback_integrity_secret = resolve_session_integrity_secret(
+        &state.config.auth.resolved,
+        std::env::var("CARAPACE_SERVER_SECRET").ok(),
+    );
+    let encryption_password_present = crate::config::config_password().is_some();
+    let session_store = sessions::configured_store_with_path(
+        state.session_store.base_path().to_path_buf(),
+        cfg,
+        fallback_integrity_secret.clone(),
+    )
+    .map_err(|err| WsConfigError::Runtime(format!("failed to configure session store: {err}")))?;
     state.session_store = Arc::new(session_store);
 
+    if encryption_config.mode.uses_encryption() && encryption_password_present {
+        tracing::info!(mode = ?encryption_config.mode, "session encryption enabled");
+        tracing::info!(
+            action = ?integrity_config.action,
+            source = "session encryption master key",
+            "session integrity verification enabled"
+        );
+    } else if integrity_config.enabled {
+        if let Some((_, source)) = fallback_integrity_secret {
+            tracing::info!(
+                action = ?integrity_config.action,
+                source,
+                "session integrity verification enabled"
+            );
+        } else {
+            tracing::warn!(
+                "sessions.integrity.enabled is true but no server secret found \
+                 (set gateway.auth.token/password or CARAPACE_SERVER_SECRET); \
+                 sessions will run without integrity verification"
+            );
+        }
+    }
+
     Ok(state)
+}
+
+fn resolve_session_integrity_secret(
+    auth: &auth::ResolvedGatewayAuth,
+    env_server_secret: Option<String>,
+) -> Option<(String, &'static str)> {
+    if let Some(secret) = env_server_secret.filter(|value| !value.is_empty()) {
+        return Some((secret, "CARAPACE_SERVER_SECRET"));
+    }
+    if let Some(secret) = auth
+        .token
+        .as_ref()
+        .filter(|value| !value.is_empty())
+        .cloned()
+    {
+        return Some((secret, "gateway token"));
+    }
+    if let Some(secret) = auth
+        .password
+        .as_ref()
+        .filter(|value| !value.is_empty())
+        .cloned()
+    {
+        return Some((secret, "gateway password"));
+    }
+    None
 }
 
 pub async fn build_ws_state_owned_from_config() -> Result<WsServerState, WsConfigError> {

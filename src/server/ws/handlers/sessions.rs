@@ -531,16 +531,21 @@ fn enrich_session_list(
     sessions
         .iter()
         .filter(|entry| {
-            if entry.access == sessions::SessionAccessState::Locked {
+            if entry.is_locked() {
                 if let Some(minutes) = filters.active_minutes {
                     let cutoff = now - minutes * 60_000;
-                    return entry.updated_at.unwrap_or(0) >= cutoff;
+                    if entry.updated_at().unwrap_or(0) < cutoff {
+                        return false;
+                    }
                 }
                 if let Some(ref search) = filters.search_filter {
-                    return entry
-                        .session_id
+                    if !entry
+                        .session_id()
                         .to_lowercase()
-                        .contains(&search.to_lowercase());
+                        .contains(&search.to_lowercase())
+                    {
+                        return false;
+                    }
                 }
                 if filters.label_filter.is_some() {
                     return false;
@@ -549,8 +554,7 @@ fn enrich_session_list(
             }
 
             let session = entry
-                .session
-                .as_ref()
+                .session()
                 .expect("available session entries must carry a session");
             if !filters.include_global && session.session_key == "global" {
                 return false;
@@ -595,13 +599,12 @@ fn enrich_session_list(
             true
         })
         .map(|entry| {
-            if entry.access == sessions::SessionAccessState::Locked {
+            if entry.is_locked() {
                 return locked_session_row(entry);
             }
 
             let session = entry
-                .session
-                .as_ref()
+                .session()
                 .expect("available session entries must carry a session");
             let mut row = session_row(session);
             if filters.include_last_message {
@@ -651,14 +654,10 @@ pub(super) fn handle_sessions_list(
             )
         })?;
 
-    if filters.label_filter.is_some()
-        && sessions
-            .iter()
-            .any(|entry| entry.access == sessions::SessionAccessState::Locked)
-    {
+    if filters.label_filter.is_some() && sessions.iter().any(|entry| entry.is_locked()) {
         return Err(error_shape(
             ERROR_UNAVAILABLE,
-            "encrypted sessions are locked; set CARAPACE_CONFIG_PASSWORD to filter by label",
+            "encrypted sessions are locked; unlock encrypted sessions to filter by label",
             None,
         ));
     }
@@ -832,8 +831,8 @@ fn locked_session_row(entry: &sessions::SessionListEntry) -> Value {
         "channel": Value::Null,
         "chatId": Value::Null,
         "userId": Value::Null,
-        "updatedAt": entry.updated_at,
-        "sessionId": entry.session_id,
+        "updatedAt": entry.updated_at(),
+        "sessionId": entry.session_id(),
         "messageCount": Value::Null,
         "thinkingLevel": Value::Null,
         "model": Value::Null
@@ -3042,6 +3041,10 @@ mod tests {
 
     use crate::sessions;
 
+    fn test_key_material() -> Vec<u8> {
+        format!("fixture-{}", uuid::Uuid::new_v4()).into_bytes()
+    }
+
     fn make_state_with_temp_sessions() -> (WsServerState, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
         let store = std::sync::Arc::new(sessions::SessionStore::with_base_path(
@@ -3056,9 +3059,10 @@ mod tests {
     fn test_handle_sessions_list_surfaces_locked_encrypted_sessions() {
         let tmp = tempfile::tempdir().unwrap();
         let base_path = tmp.path().join("sessions");
+        let key_material = test_key_material();
 
         let crypto =
-            sessions::crypto::SessionCryptoContext::load_or_create(&base_path, b"test-password")
+            sessions::crypto::SessionCryptoContext::load_or_create(&base_path, &key_material)
                 .unwrap();
         let hmac_key = crypto.integrity_hmac_key();
         let unlocked_store = std::sync::Arc::new(
@@ -3092,6 +3096,52 @@ mod tests {
         assert_eq!(rows[0]["access"], "locked");
         assert_eq!(rows[0]["encrypted"], true);
         assert!(rows[0]["key"].is_null());
+    }
+
+    #[test]
+    fn test_handle_sessions_list_applies_locked_filters_conjunctively() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base_path = tmp.path().join("sessions");
+        let key_material = test_key_material();
+
+        let crypto =
+            sessions::crypto::SessionCryptoContext::load_or_create(&base_path, &key_material)
+                .unwrap();
+        let hmac_key = crypto.integrity_hmac_key();
+        let unlocked_store = std::sync::Arc::new(
+            sessions::SessionStore::with_base_path(base_path.clone())
+                .with_encryption_mode(sessions::EncryptionMode::IfPassword)
+                .with_crypto_context(std::sync::Arc::new(crypto))
+                .with_hmac_key(hmac_key),
+        );
+        let unlocked_state = WsServerState::new(crate::server::ws::WsServerConfig::default())
+            .with_session_store(unlocked_store);
+        let session = unlocked_state
+            .session_store
+            .create_session("agent-1", sessions::SessionMetadata::default())
+            .unwrap();
+        unlocked_state
+            .session_store
+            .append_message(sessions::ChatMessage::user(&session.id, "hello"))
+            .unwrap();
+
+        let locked_store = std::sync::Arc::new(
+            sessions::SessionStore::with_base_path(base_path)
+                .with_encryption_mode(sessions::EncryptionMode::IfPassword),
+        );
+        let locked_state = WsServerState::new(crate::server::ws::WsServerConfig::default())
+            .with_session_store(locked_store);
+
+        let result = handle_sessions_list(
+            &locked_state,
+            Some(&json!({
+                "activeMinutes": 1,
+                "search": "no-match"
+            })),
+        )
+        .unwrap();
+        let rows = result["sessions"].as_array().unwrap();
+        assert!(rows.is_empty());
     }
 
     fn make_conn(conn_id: &str) -> ConnectionContext {

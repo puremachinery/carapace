@@ -722,7 +722,7 @@ fn session_list_tool() -> BuiltinTool {
                 Ok(sessions) => {
                     let session_list: Vec<Value> = sessions
                         .iter()
-                        .map(|entry| match (&entry.access, &entry.session) {
+                        .map(|entry| match (entry.access(), entry.session()) {
                             (crate::sessions::SessionAccessState::Available, Some(s)) => json!({
                                 "id": s.id,
                                 "session_key": s.session_key,
@@ -734,12 +734,12 @@ fn session_list_tool() -> BuiltinTool {
                                 "access": "available",
                             }),
                             (crate::sessions::SessionAccessState::Locked, _) => json!({
-                                "id": entry.session_id,
+                                "id": entry.session_id(),
                                 "session_key": Value::Null,
                                 "status": Value::Null,
                                 "message_count": Value::Null,
                                 "created_at": Value::Null,
-                                "updated_at": entry.updated_at,
+                                "updated_at": entry.updated_at(),
                                 "name": Value::Null,
                                 "access": "locked",
                                 "encrypted": true,
