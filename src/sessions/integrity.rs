@@ -304,6 +304,18 @@ pub fn verify_hmac_path(
     verify_hmac_digest(&computed, file_path, config)
 }
 
+fn hmacs_match(stored: &[u8], computed: &[u8; HMAC_DIGEST_SIZE]) -> bool {
+    if stored.len() != HMAC_DIGEST_SIZE {
+        return false;
+    }
+
+    let mut diff = 0u8;
+    for (&stored_byte, &computed_byte) in stored.iter().zip(computed.iter()) {
+        diff |= stored_byte ^ computed_byte;
+    }
+    diff == 0
+}
+
 fn verify_hmac_digest(
     computed: &[u8; 32],
     file_path: &Path,
@@ -328,7 +340,7 @@ fn verify_hmac_digest(
                 },
             };
 
-            if stored_hmac.as_slice() != computed {
+            if !hmacs_match(&stored_hmac, computed) {
                 if try_promote_pending_hmac_sidecar(computed, file_path)? {
                     tracing::warn!(
                         file = %file_name,
@@ -443,7 +455,7 @@ fn try_promote_pending_hmac_sidecar(
         }
     };
 
-    if stored_hmac.as_slice() != computed {
+    if !hmacs_match(&stored_hmac, computed) {
         return Ok(false);
     }
 

@@ -1116,6 +1116,7 @@ impl SessionStore {
         let _lock =
             FileLock::acquire(&archive_path).map_err(|e| SessionStoreError::Io(e.to_string()))?;
         let archive_content = fs::read(&archive_path)?;
+        self.verify_archive_integrity(&archive_path, &archive_content)?;
         if super::crypto::has_encrypted_payload_prefix(&archive_content) {
             return Ok(());
         }
@@ -1227,6 +1228,14 @@ impl SessionStore {
         _session_id: &str,
     ) -> Result<(), SessionStoreError> {
         self.verify_integrity_path_with_compat(history_path)
+    }
+
+    fn verify_archive_integrity(
+        &self,
+        archive_path: &Path,
+        archive_bytes: &[u8],
+    ) -> Result<(), SessionStoreError> {
+        self.verify_integrity_bytes_with_compat(archive_bytes, archive_path)
     }
 
     fn prepare_history_hmac_for_path(
@@ -2200,6 +2209,7 @@ impl SessionStore {
         }
 
         let archive_content = fs::read(&archive_path)?;
+        self.verify_archive_integrity(&archive_path, &archive_content)?;
         let archive_was_plaintext = !super::crypto::has_encrypted_payload_prefix(&archive_content);
         let archived = self.decode_archive(session_id, &archive_content)?;
 
@@ -2298,6 +2308,7 @@ impl SessionStore {
 
         // Read archived_at from the file
         let content = fs::read(&archive_path)?;
+        self.verify_archive_integrity(&archive_path, &content)?;
         let archived = self.decode_archive(session_id, &content)?;
 
         Ok(Some((archive_path, size, archived.archived_at)))
@@ -3321,6 +3332,83 @@ mod tests {
             .all(|line| crypto::is_encrypted_payload(line.as_bytes())));
         #[cfg(unix)]
         assert_private_mode(&history_path);
+    }
+
+    #[test]
+    fn test_restore_session_rejects_tampered_plaintext_archive_under_integrity_reject() {
+        let temp_dir = TempDir::new().unwrap();
+        let hmac_key = Zeroizing::new(integrity::derive_hmac_key(b"archive-secret"));
+        let store = SessionStore::with_base_path(temp_dir.path().to_path_buf())
+            .with_hmac_key(hmac_key)
+            .with_integrity_action(integrity::IntegrityAction::Reject);
+        let session = store
+            .create_session("agent-1", SessionMetadata::default())
+            .unwrap();
+        store
+            .append_message(ChatMessage::user(&session.id, "before-archive"))
+            .unwrap();
+        store.archive_session(&session.id, false).unwrap();
+
+        let archive_path = store.archive_path(&session.id).unwrap();
+        fs::write(&archive_path, br#"{"tampered":true}"#).unwrap();
+
+        let err = store.restore_session(&session.id).unwrap_err();
+        assert!(matches!(err, SessionStoreError::Io(_)));
+    }
+
+    #[test]
+    fn test_get_archive_info_rejects_tampered_plaintext_archive_under_integrity_reject() {
+        let temp_dir = TempDir::new().unwrap();
+        let hmac_key = Zeroizing::new(integrity::derive_hmac_key(b"archive-secret"));
+        let store = SessionStore::with_base_path(temp_dir.path().to_path_buf())
+            .with_hmac_key(hmac_key)
+            .with_integrity_action(integrity::IntegrityAction::Reject);
+        let session = store
+            .create_session("agent-1", SessionMetadata::default())
+            .unwrap();
+        store
+            .append_message(ChatMessage::user(&session.id, "before-archive"))
+            .unwrap();
+        store.archive_session(&session.id, false).unwrap();
+
+        let archive_path = store.archive_path(&session.id).unwrap();
+        fs::write(&archive_path, br#"{"tampered":true}"#).unwrap();
+
+        let err = store.get_archive_info(&session.id).unwrap_err();
+        assert!(matches!(err, SessionStoreError::Io(_)));
+    }
+
+    #[test]
+    fn test_encryption_migration_rejects_tampered_plaintext_archive_under_integrity_reject() {
+        let temp_dir = TempDir::new().unwrap();
+        let key_material = test_key_material();
+        let legacy_secret = test_key_material();
+        let legacy_hmac_key = Zeroizing::new(integrity::derive_hmac_key(&legacy_secret));
+
+        let plaintext_store = SessionStore::with_base_path(temp_dir.path().to_path_buf())
+            .with_hmac_key(legacy_hmac_key)
+            .with_integrity_action(integrity::IntegrityAction::Reject);
+        let session = plaintext_store
+            .create_session("agent-1", SessionMetadata::default())
+            .unwrap();
+        plaintext_store
+            .append_message(ChatMessage::user(&session.id, "before-archive"))
+            .unwrap();
+        plaintext_store.archive_session(&session.id, false).unwrap();
+
+        let archive_path = plaintext_store.archive_path(&session.id).unwrap();
+        fs::write(&archive_path, br#"{"tampered":true}"#).unwrap();
+
+        let encrypted_store = reopen_store_with_encryption_and_legacy_hmac(
+            temp_dir.path(),
+            Some(&key_material),
+            EncryptionMode::IfPassword,
+            Some(&legacy_secret),
+        )
+        .with_integrity_action(integrity::IntegrityAction::Reject);
+
+        let err = encrypted_store.get_session(&session.id).unwrap_err();
+        assert!(matches!(err, SessionStoreError::Io(_)));
     }
 
     #[test]
