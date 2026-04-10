@@ -276,6 +276,37 @@ fn read_prefixed_file_bytes(path: &Path) -> Result<Option<Vec<u8>>, SessionCrypt
     Ok(Some(bytes))
 }
 
+fn read_prefixed_file_bytes_locked(path: &Path) -> Result<Option<Vec<u8>>, SessionCryptoError> {
+    let _lock = FileLock::acquire(path)?;
+    read_prefixed_file_bytes(path)
+}
+
+fn history_contains_decryptable_encrypted_line_locked(
+    path: &Path,
+    master_key: &[u8],
+    session_id: &str,
+) -> Result<bool, SessionCryptoError> {
+    let _lock = FileLock::acquire(path)?;
+    let reader = BufReader::new(File::open(path)?);
+    for line in reader.split(b'\n') {
+        let line = line?;
+        if line.is_empty() || !has_encrypted_payload_prefix(&line) {
+            continue;
+        }
+        if decrypt_prefixed_bytes_with_master_key(
+            master_key,
+            session_id,
+            SESSION_HISTORY_PURPOSE,
+            &line,
+        )
+        .is_ok()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn verify_manifest_backfill_password(
     base_path: &Path,
     master_key: &[u8],
@@ -292,7 +323,7 @@ fn verify_manifest_backfill_password(
                 let Some(session_id) = path.file_stem().and_then(|stem| stem.to_str()) else {
                     continue;
                 };
-                let Some(bytes) = read_prefixed_file_bytes(&path)? else {
+                let Some(bytes) = read_prefixed_file_bytes_locked(&path)? else {
                     continue;
                 };
                 if decrypt_prefixed_bytes_with_master_key(
@@ -310,25 +341,10 @@ fn verify_manifest_backfill_password(
                 let Some(session_id) = path.file_stem().and_then(|stem| stem.to_str()) else {
                     continue;
                 };
-                let reader = BufReader::new(File::open(&path)?);
-                for line in reader.split(b'\n') {
-                    let line = line?;
-                    if line.is_empty() {
-                        continue;
-                    }
-                    if !has_encrypted_payload_prefix(&line) {
-                        continue;
-                    }
-                    if decrypt_prefixed_bytes_with_master_key(
-                        master_key,
-                        session_id,
-                        SESSION_HISTORY_PURPOSE,
-                        &line,
-                    )
-                    .is_ok()
-                    {
-                        return Ok(true);
-                    }
+                if history_contains_decryptable_encrypted_line_locked(
+                    &path, master_key, session_id,
+                )? {
+                    return Ok(true);
                 }
             }
             _ => {}
@@ -349,7 +365,7 @@ fn verify_manifest_backfill_password(
             let Some(session_id) = file_name.strip_suffix(".archive.json") else {
                 continue;
             };
-            let Some(bytes) = read_prefixed_file_bytes(&path)? else {
+            let Some(bytes) = read_prefixed_file_bytes_locked(&path)? else {
                 continue;
             };
             if decrypt_prefixed_bytes_with_master_key(
@@ -831,6 +847,49 @@ mod tests {
             .and_then(Value::as_str)
             .expect("integrity tag backfilled");
         assert!(!integrity.is_empty());
+    }
+
+    #[test]
+    fn test_crypto_context_backfill_waits_for_locked_metadata_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_material = test_key_material();
+        let ctx = SessionCryptoContext::load_or_create(dir.path(), &key_material).unwrap();
+        let encrypted = ctx
+            .encrypt_bytes("session-1", "metadata", br#"{"hello":"world"}"#)
+            .unwrap();
+        let session_path = dir.path().join("session-1.json");
+        fs::write(&session_path, &encrypted).unwrap();
+
+        let manifest_path = dir.path().join(CRYPTO_MANIFEST_PATH);
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest.as_object_mut().unwrap().remove("integrity");
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let session_lock = FileLock::acquire(&session_path).unwrap();
+        let base_path = dir.path().to_path_buf();
+        let thread_key_material = key_material.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let join = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = SessionCryptoContext::load_or_create(&base_path, &thread_key_material)
+                .map(|ctx| ctx.manifest_integrity_valid());
+            result_tx.send(result).unwrap();
+        });
+
+        started_rx.recv().unwrap();
+        assert!(result_rx.try_recv().is_err());
+
+        drop(session_lock);
+
+        let manifest_valid = result_rx.recv().unwrap().unwrap();
+        join.join().unwrap();
+        assert!(manifest_valid);
     }
 
     #[test]
