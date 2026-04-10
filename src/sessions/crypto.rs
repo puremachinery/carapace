@@ -7,7 +7,7 @@
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
@@ -34,6 +34,9 @@ const SESSION_ENCRYPTION_ROOT_TAG: &[u8] = b"carapace:session-encryption-root:v1
 const SESSION_ENCRYPTION_INFO_PREFIX: &[u8] = b"carapace:session-encryption-key:v1:";
 const SESSION_INTEGRITY_INFO: &[u8] = b"carapace:session-integrity-hmac:v2";
 const SESSION_MANIFEST_INTEGRITY_INFO: &[u8] = b"carapace:session-manifest-integrity:v1";
+const SESSION_METADATA_PURPOSE: &str = "metadata";
+const SESSION_HISTORY_PURPOSE: &str = "history";
+const SESSION_ARCHIVE_PURPOSE: &str = "archive";
 const ROOT_SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 12;
 type HmacSha256 = Hmac<Sha256>;
@@ -195,6 +198,161 @@ fn aad_bytes(session_id: &str, purpose: &str) -> Vec<u8> {
     format!("carapace:session:{purpose}:v1:{session_id}").into_bytes()
 }
 
+fn derive_session_key_from_master(
+    master_key: &[u8],
+    session_id: &str,
+    purpose: &str,
+) -> Result<Zeroizing<[u8; PASSWORD_DERIVED_KEY_LEN]>, SessionCryptoError> {
+    let mut info = Vec::with_capacity(
+        SESSION_ENCRYPTION_INFO_PREFIX.len() + session_id.len() + purpose.len() + 1,
+    );
+    info.extend_from_slice(SESSION_ENCRYPTION_INFO_PREFIX);
+    info.extend_from_slice(session_id.as_bytes());
+    info.push(b':');
+    info.extend_from_slice(purpose.as_bytes());
+    expand_hkdf(master_key, &info)
+}
+
+fn decrypt_prefixed_bytes_with_master_key(
+    master_key: &[u8],
+    session_id: &str,
+    purpose: &str,
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, SessionCryptoError> {
+    if !has_encrypted_payload_prefix(ciphertext) {
+        return Err(SessionCryptoError::BadFormat(
+            "missing cse1: prefix".to_string(),
+        ));
+    }
+    let envelope: EncryptedEnvelope = serde_json::from_slice(strip_prefix(ciphertext))?;
+    if envelope.format != SESSION_ENCRYPTED_FORMAT_V1 {
+        return Err(SessionCryptoError::BadFormat(format!(
+            "unsupported encrypted session format '{}'",
+            envelope.format
+        )));
+    }
+
+    let nonce_bytes = decode_b64::<NONCE_LEN>("n", &envelope.n)?;
+    let ciphertext =
+        BASE64
+            .decode(&envelope.c)
+            .map_err(|err| SessionCryptoError::Base64Decode {
+                field: "c".to_string(),
+                message: err.to_string(),
+            })?;
+    let key = derive_session_key_from_master(master_key, session_id, purpose)?;
+    let cipher = Aes256Gcm::new((&*key).into());
+    let aad = aad_bytes(session_id, purpose);
+    cipher
+        .decrypt(
+            Nonce::from_slice(&nonce_bytes),
+            Payload {
+                msg: ciphertext.as_ref(),
+                aad: &aad,
+            },
+        )
+        .map_err(|_| SessionCryptoError::DecryptionFailed)
+}
+
+fn verify_manifest_backfill_password(
+    base_path: &Path,
+    master_key: &[u8],
+) -> Result<bool, SessionCryptoError> {
+    let mut saw_encrypted_artifact = false;
+
+    for entry in fs::read_dir(base_path)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+
+        match path.extension().and_then(|ext| ext.to_str()) {
+            Some("json") => {
+                let Some(session_id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                    continue;
+                };
+                let bytes = fs::read(&path)?;
+                if !has_encrypted_payload_prefix(&bytes) {
+                    continue;
+                }
+                saw_encrypted_artifact = true;
+                if decrypt_prefixed_bytes_with_master_key(
+                    master_key,
+                    session_id,
+                    SESSION_METADATA_PURPOSE,
+                    &bytes,
+                )
+                .is_ok()
+                {
+                    return Ok(true);
+                }
+            }
+            Some("jsonl") => {
+                let Some(session_id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                    continue;
+                };
+                let reader = BufReader::new(File::open(&path)?);
+                for line in reader.split(b'\n') {
+                    let line = line?;
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if !has_encrypted_payload_prefix(&line) {
+                        continue;
+                    }
+                    saw_encrypted_artifact = true;
+                    if decrypt_prefixed_bytes_with_master_key(
+                        master_key,
+                        session_id,
+                        SESSION_HISTORY_PURPOSE,
+                        &line,
+                    )
+                    .is_ok()
+                    {
+                        return Ok(true);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let archive_dir = base_path.join("archives");
+    if archive_dir.is_dir() {
+        for entry in fs::read_dir(&archive_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let Some(session_id) = file_name.strip_suffix(".archive.json") else {
+                continue;
+            };
+            let bytes = fs::read(&path)?;
+            if !has_encrypted_payload_prefix(&bytes) {
+                continue;
+            }
+            saw_encrypted_artifact = true;
+            if decrypt_prefixed_bytes_with_master_key(
+                master_key,
+                session_id,
+                SESSION_ARCHIVE_PURPOSE,
+                &bytes,
+            )
+            .is_ok()
+            {
+                return Ok(true);
+            }
+        }
+    }
+
+    Ok(!saw_encrypted_artifact)
+}
+
 fn manifest_integrity_tag(
     master_key: &[u8],
     manifest: &CryptoManifest,
@@ -301,13 +459,21 @@ impl SessionCryptoContext {
         } else if let Some(encoded_tag) = manifest.integrity.as_deref() {
             verify_manifest_integrity(master_key.as_ref(), &manifest, encoded_tag)?
         } else {
-            tracing::warn!(
-                manifest_path = %manifest_path.display(),
-                "backfilling missing session crypto manifest integrity tag"
-            );
-            manifest.integrity = Some(manifest_integrity_tag(master_key.as_ref(), &manifest)?);
-            write_manifest_atomic(&manifest_path, &manifest)?;
-            true
+            if verify_manifest_backfill_password(base_path, master_key.as_ref())? {
+                tracing::warn!(
+                    manifest_path = %manifest_path.display(),
+                    "backfilling missing session crypto manifest integrity tag"
+                );
+                manifest.integrity = Some(manifest_integrity_tag(master_key.as_ref(), &manifest)?);
+                write_manifest_atomic(&manifest_path, &manifest)?;
+                true
+            } else {
+                tracing::warn!(
+                    manifest_path = %manifest_path.display(),
+                    "refusing to backfill missing session crypto manifest integrity tag because the provided password did not decrypt any existing encrypted session artifact"
+                );
+                false
+            }
         };
         let integrity_hmac_key = expand_hkdf(master_key.as_ref(), SESSION_INTEGRITY_INFO)?;
 
@@ -337,14 +503,7 @@ impl SessionCryptoContext {
         purpose: &str,
     ) -> Result<Zeroizing<[u8; PASSWORD_DERIVED_KEY_LEN]>, SessionCryptoError> {
         self.ensure_manifest_integrity()?;
-        let mut info = Vec::with_capacity(
-            SESSION_ENCRYPTION_INFO_PREFIX.len() + session_id.len() + purpose.len() + 1,
-        );
-        info.extend_from_slice(SESSION_ENCRYPTION_INFO_PREFIX);
-        info.extend_from_slice(session_id.as_bytes());
-        info.push(b':');
-        info.extend_from_slice(purpose.as_bytes());
-        expand_hkdf(self.master_key.as_ref(), &info)
+        derive_session_key_from_master(self.master_key.as_ref(), session_id, purpose)
     }
 
     /// Derive the session-store-wide HMAC key rooted in the encryption master key.
@@ -399,39 +558,13 @@ impl SessionCryptoContext {
         purpose: &str,
         ciphertext: &[u8],
     ) -> Result<Vec<u8>, SessionCryptoError> {
-        if !has_encrypted_payload_prefix(ciphertext) {
-            return Err(SessionCryptoError::BadFormat(
-                "missing cse1: prefix".to_string(),
-            ));
-        }
-        let envelope: EncryptedEnvelope = serde_json::from_slice(strip_prefix(ciphertext))?;
-        if envelope.format != SESSION_ENCRYPTED_FORMAT_V1 {
-            return Err(SessionCryptoError::BadFormat(format!(
-                "unsupported encrypted session format '{}'",
-                envelope.format
-            )));
-        }
-
-        let nonce_bytes = decode_b64::<NONCE_LEN>("n", &envelope.n)?;
-        let ciphertext =
-            BASE64
-                .decode(&envelope.c)
-                .map_err(|err| SessionCryptoError::Base64Decode {
-                    field: "c".to_string(),
-                    message: err.to_string(),
-                })?;
-        let key = self.derive_session_key(session_id, purpose)?;
-        let cipher = Aes256Gcm::new((&*key).into());
-        let aad = aad_bytes(session_id, purpose);
-        cipher
-            .decrypt(
-                Nonce::from_slice(&nonce_bytes),
-                Payload {
-                    msg: ciphertext.as_ref(),
-                    aad: &aad,
-                },
-            )
-            .map_err(|_| SessionCryptoError::DecryptionFailed)
+        self.ensure_manifest_integrity()?;
+        decrypt_prefixed_bytes_with_master_key(
+            self.master_key.as_ref(),
+            session_id,
+            purpose,
+            ciphertext,
+        )
     }
 
     pub fn encrypt_json<T: Serialize>(
@@ -570,6 +703,7 @@ mod tests {
         let encrypted = ctx
             .encrypt_bytes("session-1", "metadata", br#"{"hello":"world"}"#)
             .unwrap();
+        fs::write(dir.path().join("session-1.json"), &encrypted).unwrap();
 
         let manifest_path = dir.path().join(CRYPTO_MANIFEST_PATH);
         let mut manifest: Value =
@@ -594,6 +728,50 @@ mod tests {
             .and_then(Value::as_str)
             .expect("integrity tag backfilled");
         assert!(!integrity.is_empty());
+    }
+
+    #[test]
+    fn test_crypto_context_refuses_backfill_with_unverified_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_material = test_key_material();
+        let wrong_key_material = test_key_material();
+        let ctx = SessionCryptoContext::load_or_create(dir.path(), &key_material).unwrap();
+        let encrypted = ctx
+            .encrypt_bytes("session-1", "metadata", br#"{"hello":"world"}"#)
+            .unwrap();
+        fs::write(dir.path().join("session-1.json"), &encrypted).unwrap();
+
+        let manifest_path = dir.path().join(CRYPTO_MANIFEST_PATH);
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest.as_object_mut().unwrap().remove("integrity");
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let wrong = SessionCryptoContext::load_or_create(dir.path(), &wrong_key_material).unwrap();
+        assert!(!wrong.manifest_integrity_valid());
+        assert_eq!(
+            wrong
+                .decrypt_bytes("session-1", "metadata", &encrypted)
+                .unwrap_err(),
+            SessionCryptoError::ManifestIntegrityFailed
+        );
+
+        let manifest_after_wrong: Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        assert!(manifest_after_wrong.get("integrity").is_none());
+
+        let repaired = SessionCryptoContext::load_or_create(dir.path(), &key_material).unwrap();
+        assert!(repaired.manifest_integrity_valid());
+        assert_eq!(
+            repaired
+                .decrypt_bytes("session-1", "metadata", &encrypted)
+                .unwrap(),
+            br#"{"hello":"world"}"#
+        );
     }
 
     #[test]

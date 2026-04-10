@@ -165,8 +165,12 @@ impl AppendHmacState {
     }
 
     pub fn sidecar_payload(&self) -> String {
-        let hmac: [u8; 32] = self.0.clone().finalize().into_bytes().into();
+        let hmac = self.hmac();
         encode_sidecar_hmac_v1(&hmac)
+    }
+
+    pub fn hmac(&self) -> [u8; 32] {
+        self.0.clone().finalize().into_bytes().into()
     }
 }
 
@@ -488,7 +492,16 @@ fn write_pending_hmac_payload(file_path: &Path, payload: &str) -> Result<(), io:
 pub fn sidecar_matches_state(file_path: &Path, state: &AppendHmacState) -> Result<bool, io::Error> {
     let sidecar = hmac_path(file_path);
     match fs::read_to_string(&sidecar) {
-        Ok(raw) => Ok(raw.trim() == state.sidecar_payload()),
+        Ok(raw) => {
+            let file_name = file_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("<unknown>");
+            let Ok((stored_hmac, _)) = parse_sidecar_hmac(&raw, file_name) else {
+                return Ok(false);
+            };
+            Ok(hmacs_match(&stored_hmac, &state.hmac()))
+        }
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(err) => Err(err),
     }
