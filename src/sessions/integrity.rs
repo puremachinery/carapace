@@ -6,15 +6,22 @@
 use std::fs;
 use std::io;
 use std::io::Read;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
+use subtle::ConstantTimeEq;
 
 type HmacSha256 = Hmac<Sha256>;
 const HMAC_DIGEST_SIZE: usize = 32;
+
+#[cfg(test)]
+static APPEND_HMAC_PATH_REBUILD_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Domain separation tag for HMAC key derivation.
 const KEY_DERIVATION_TAG: &[u8] = b"session-integrity-hmac-v1";
@@ -118,6 +125,55 @@ fn hmac_path(file_path: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
+fn pending_hmac_path(file_path: &Path) -> PathBuf {
+    let mut path = hmac_path(file_path).as_os_str().to_owned();
+    path.push(".tmp");
+    PathBuf::from(path)
+}
+
+#[derive(Clone)]
+pub struct AppendHmacState(HmacSha256);
+
+impl AppendHmacState {
+    fn from_reader<R: Read>(key: &[u8; 32], reader: &mut R) -> Result<Self, io::Error> {
+        let mut mac = HmacSha256::new_from_slice(key).expect("HMAC-SHA256 accepts any key length");
+        let mut buf = [0u8; 8192];
+        loop {
+            let read = reader.read(&mut buf)?;
+            if read == 0 {
+                break;
+            }
+            mac.update(&buf[..read]);
+        }
+        Ok(Self(mac))
+    }
+
+    pub fn from_path(key: &[u8; 32], file_path: &Path) -> Result<Self, io::Error> {
+        if !file_path.exists() {
+            return Ok(Self(
+                HmacSha256::new_from_slice(key).expect("HMAC-SHA256 accepts any key length"),
+            ));
+        }
+        let mut file = fs::File::open(file_path)?;
+        Self::from_reader(key, &mut file)
+    }
+
+    pub fn extend(&self, appended: &[u8]) -> Self {
+        let mut mac = self.0.clone();
+        mac.update(appended);
+        Self(mac)
+    }
+
+    pub fn sidecar_payload(&self) -> String {
+        let hmac = self.hmac();
+        encode_sidecar_hmac_v1(&hmac)
+    }
+
+    pub fn hmac(&self) -> [u8; 32] {
+        self.0.clone().finalize().into_bytes().into()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HmacSidecarFormat {
     LegacyHex,
@@ -182,19 +238,78 @@ fn parse_sidecar_hmac(
 /// that was just written to `file_path`). The function computes the HMAC and
 /// writes it to `{file_path}.hmac`.
 pub fn write_hmac_file(key: &[u8; 32], data: &[u8], file_path: &Path) -> Result<(), io::Error> {
-    let hmac = compute_hmac(key, data);
-    let sidecar = hmac_path(file_path);
-    fs::write(&sidecar, encode_sidecar_hmac_v1(&hmac))?;
-    Ok(())
+    prepare_pending_hmac_file(key, data, file_path)?;
+    commit_pending_hmac_sidecar(file_path)
 }
 
 /// Write an HMAC sidecar file for the data currently stored at `file_path`.
 pub fn write_hmac_file_for_path(key: &[u8; 32], file_path: &Path) -> Result<(), io::Error> {
-    let mut file = fs::File::open(file_path)?;
+    prepare_pending_hmac_file_for_path(key, file_path, file_path)?;
+    commit_pending_hmac_sidecar(file_path)
+}
+
+/// Prepare a pending HMAC sidecar for the provided bytes.
+pub fn prepare_pending_hmac_file(
+    key: &[u8; 32],
+    data: &[u8],
+    file_path: &Path,
+) -> Result<(), io::Error> {
+    let hmac = compute_hmac(key, data);
+    write_pending_hmac_payload(file_path, &encode_sidecar_hmac_v1(&hmac))
+}
+
+/// Prepare a pending HMAC sidecar for data stored at `source_path`.
+pub fn prepare_pending_hmac_file_for_path(
+    key: &[u8; 32],
+    source_path: &Path,
+    file_path: &Path,
+) -> Result<(), io::Error> {
+    let mut file = fs::File::open(source_path)?;
     let hmac = compute_hmac_reader(key, &mut file)?;
+    write_pending_hmac_payload(file_path, &encode_sidecar_hmac_v1(&hmac))
+}
+
+/// Prepare a pending HMAC sidecar from an existing rolling HMAC state.
+pub fn prepare_pending_hmac_file_for_state(
+    file_path: &Path,
+    state: &AppendHmacState,
+) -> Result<(), io::Error> {
+    write_pending_hmac_payload(file_path, &state.sidecar_payload())
+}
+
+/// Prepare a pending HMAC sidecar for the current file contents plus appended bytes.
+pub fn prepare_pending_hmac_file_for_appended_bytes(
+    key: &[u8; 32],
+    file_path: &Path,
+    appended: &[u8],
+) -> Result<AppendHmacState, io::Error> {
+    #[cfg(test)]
+    APPEND_HMAC_PATH_REBUILD_COUNT.fetch_add(1, Ordering::SeqCst);
+
+    let base = AppendHmacState::from_path(key, file_path)?;
+    prepare_pending_hmac_file_for_appended_bytes_with_state(file_path, &base, appended)
+}
+
+/// Prepare a pending HMAC sidecar for appended bytes using an already-validated state.
+pub fn prepare_pending_hmac_file_for_appended_bytes_with_state(
+    file_path: &Path,
+    base_state: &AppendHmacState,
+    appended: &[u8],
+) -> Result<AppendHmacState, io::Error> {
+    let next_state = base_state.extend(appended);
+    write_pending_hmac_payload(file_path, &next_state.sidecar_payload())?;
+    Ok(next_state)
+}
+
+/// Commit a pending HMAC sidecar prepared for `file_path`.
+pub fn commit_pending_hmac_sidecar(file_path: &Path) -> Result<(), io::Error> {
+    let pending = pending_hmac_path(file_path);
     let sidecar = hmac_path(file_path);
-    fs::write(&sidecar, encode_sidecar_hmac_v1(&hmac))?;
-    Ok(())
+    match fs::rename(&pending, &sidecar) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound && sidecar.exists() => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 /// Delete the HMAC sidecar file for the given data file, if it exists.
@@ -251,6 +366,13 @@ pub fn verify_hmac_path(
     verify_hmac_digest(&computed, file_path, config)
 }
 
+fn hmacs_match(stored: &[u8], computed: &[u8; HMAC_DIGEST_SIZE]) -> bool {
+    if stored.len() != HMAC_DIGEST_SIZE {
+        return false;
+    }
+    stored.ct_eq(computed.as_ref()).into()
+}
+
 fn verify_hmac_digest(
     computed: &[u8; 32],
     file_path: &Path,
@@ -275,7 +397,14 @@ fn verify_hmac_digest(
                 },
             };
 
-            if stored_hmac.as_slice() != computed {
+            if !hmacs_match(&stored_hmac, computed) {
+                if try_promote_pending_hmac_sidecar(computed, file_path)? {
+                    tracing::warn!(
+                        file = %file_name,
+                        "recovered pending HMAC sidecar after interrupted write"
+                    );
+                    return Ok(());
+                }
                 let msg = format!("HMAC verification failed for {file_name} — possible tampering");
 
                 match config.action {
@@ -307,6 +436,13 @@ fn verify_hmac_digest(
             }
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            if try_promote_pending_hmac_sidecar(computed, file_path)? {
+                tracing::warn!(
+                    file = %file_name,
+                    "recovered pending HMAC sidecar after interrupted write"
+                );
+                return Ok(());
+            }
             match config.action {
                 IntegrityAction::Warn => {
                     tracing::warn!(
@@ -334,6 +470,83 @@ fn verify_hmac_digest(
         }
         Err(e) => Err(IntegrityError::Io(e)),
     }
+}
+
+fn write_pending_hmac_payload(file_path: &Path, payload: &str) -> Result<(), io::Error> {
+    let pending = pending_hmac_path(file_path);
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    let mut file = options.open(&pending)?;
+    file.write_all(payload.as_bytes())?;
+    file.sync_all()?;
+    Ok(())
+}
+
+pub fn sidecar_matches_state(file_path: &Path, state: &AppendHmacState) -> Result<bool, io::Error> {
+    let sidecar = hmac_path(file_path);
+    match fs::read_to_string(&sidecar) {
+        Ok(raw) => {
+            let file_name = file_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("<unknown>");
+            let Ok((stored_hmac, _)) = parse_sidecar_hmac(&raw, file_name) else {
+                return Ok(false);
+            };
+            Ok(hmacs_match(&stored_hmac, &state.hmac()))
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn reset_append_hmac_path_rebuild_count() {
+    APPEND_HMAC_PATH_REBUILD_COUNT.store(0, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(crate) fn append_hmac_path_rebuild_count() -> usize {
+    APPEND_HMAC_PATH_REBUILD_COUNT.load(Ordering::SeqCst)
+}
+
+fn try_promote_pending_hmac_sidecar(
+    computed: &[u8; 32],
+    file_path: &Path,
+) -> Result<bool, IntegrityError> {
+    let pending = pending_hmac_path(file_path);
+    let pending_raw = match fs::read_to_string(&pending) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(IntegrityError::Io(err)),
+    };
+
+    let pending_name = pending
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("<unknown>");
+    let (stored_hmac, _) = match parse_sidecar_hmac(&pending_raw, pending_name) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            tracing::warn!("{}", err);
+            return Ok(false);
+        }
+    };
+
+    if !hmacs_match(&stored_hmac, computed) {
+        let _ = fs::remove_file(&pending);
+        return Ok(false);
+    }
+
+    fs::rename(&pending, hmac_path(file_path)).map_err(IntegrityError::Io)?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -696,6 +909,45 @@ mod tests {
 
         let result = verify_hmac_file(&key, data.as_bytes(), &file_path, &config);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_commit_pending_hmac_sidecar_succeeds_if_already_promoted() {
+        let dir = TempDir::new().unwrap();
+        let file_path = dir.path().join("history.jsonl");
+        let data = "line1\n";
+        fs::write(&file_path, data).unwrap();
+
+        let key = derive_hmac_key(b"test-secret");
+        prepare_pending_hmac_file(&key, data.as_bytes(), &file_path).unwrap();
+
+        let pending = pending_hmac_path(&file_path);
+        let sidecar = hmac_path(&file_path);
+        fs::rename(&pending, &sidecar).unwrap();
+
+        let result = commit_pending_hmac_sidecar(&file_path);
+        assert!(result.is_ok());
+        assert!(sidecar.exists());
+        assert!(!pending.exists());
+    }
+
+    #[test]
+    fn test_try_promote_pending_hmac_sidecar_removes_stale_pending_file() {
+        let dir = TempDir::new().unwrap();
+        let file_path = dir.path().join("history.jsonl");
+        let stale_data = "old\n";
+        let current_data = "new\n";
+        fs::write(&file_path, current_data).unwrap();
+
+        let key = derive_hmac_key(b"test-secret");
+        prepare_pending_hmac_file(&key, stale_data.as_bytes(), &file_path).unwrap();
+        let pending = pending_hmac_path(&file_path);
+        assert!(pending.exists());
+
+        let computed = compute_hmac(&key, current_data.as_bytes());
+        let promoted = try_promote_pending_hmac_sidecar(&computed, &file_path).unwrap();
+        assert!(!promoted);
+        assert!(!pending.exists());
     }
 
     // ==================== Disabled Config ====================

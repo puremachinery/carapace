@@ -1191,23 +1191,52 @@ pub enum WsConfigError {
     Runtime(String),
 }
 
-fn resolve_session_integrity_config(cfg: &Value) -> crate::sessions::integrity::IntegrityConfig {
-    let Some(integrity_cfg) = cfg.get("sessions").and_then(|s| s.get("integrity")) else {
-        return crate::sessions::integrity::IntegrityConfig::default();
-    };
+pub async fn build_ws_state_owned_from_value(cfg: &Value) -> Result<WsServerState, WsConfigError> {
+    let state_dir = resolve_state_dir();
+    if let Err(err) = credentials::migrate_plaintext_credentials(state_dir.clone()).await {
+        tracing::warn!(error = %err, "Credential migration failed");
+    }
+    let config = build_ws_config_from_value(cfg).await?;
+    let mut state = WsServerState::new_persistent(config, state_dir).await?;
+    let integrity_config = sessions::resolve_session_integrity_config(cfg);
+    let encryption_config = sessions::resolve_session_encryption_config(cfg);
+    let fallback_integrity_secret = resolve_session_integrity_secret(
+        &state.config.auth.resolved,
+        std::env::var("CARAPACE_SERVER_SECRET").ok(),
+    );
+    let encryption_password_present = crate::config::config_password().is_some();
+    let session_store = sessions::configured_store_with_path(
+        state.session_store.base_path().to_path_buf(),
+        cfg,
+        fallback_integrity_secret.clone(),
+    )
+    .map_err(|err| WsConfigError::Runtime(format!("failed to configure session store: {err}")))?;
+    state.session_store = Arc::new(session_store);
 
-    match serde_json::from_value::<crate::sessions::integrity::IntegrityConfig>(
-        integrity_cfg.clone(),
-    ) {
-        Ok(parsed) => parsed,
-        Err(err) => {
-            tracing::warn!(
-                error = %err,
-                "invalid sessions.integrity config; using secure defaults"
+    if encryption_config.mode.uses_encryption() && encryption_password_present {
+        tracing::info!(mode = ?encryption_config.mode, "session encryption enabled");
+        tracing::info!(
+            action = ?integrity_config.action,
+            source = "session encryption master key",
+            "session integrity verification enabled"
+        );
+    } else if integrity_config.enabled {
+        if let Some((_, source)) = fallback_integrity_secret {
+            tracing::info!(
+                action = ?integrity_config.action,
+                source,
+                "session integrity verification enabled"
             );
-            crate::sessions::integrity::IntegrityConfig::default()
+        } else {
+            tracing::warn!(
+                "sessions.integrity.enabled is true but no server secret found \
+                 (set gateway.auth.token/password or CARAPACE_SERVER_SECRET); \
+                 sessions will run without integrity verification"
+            );
         }
     }
+
+    Ok(state)
 }
 
 fn resolve_session_integrity_secret(
@@ -1234,49 +1263,6 @@ fn resolve_session_integrity_secret(
         return Some((secret, "gateway password"));
     }
     None
-}
-
-pub async fn build_ws_state_owned_from_value(cfg: &Value) -> Result<WsServerState, WsConfigError> {
-    let state_dir = resolve_state_dir();
-    if let Err(err) = credentials::migrate_plaintext_credentials(state_dir.clone()).await {
-        tracing::warn!(error = %err, "Credential migration failed");
-    }
-    let config = build_ws_config_from_value(cfg).await?;
-    let mut state = WsServerState::new_persistent(config, state_dir).await?;
-
-    // Wire session integrity HMAC key from resolved auth/server secret.
-    let integrity_config = resolve_session_integrity_config(cfg);
-    if integrity_config.enabled {
-        let integrity_secret = resolve_session_integrity_secret(
-            &state.config.auth.resolved,
-            std::env::var("CARAPACE_SERVER_SECRET").ok(),
-        );
-
-        if let Some((server_secret, source)) = integrity_secret {
-            let hmac_key = crate::sessions::integrity::derive_hmac_key(server_secret.as_bytes());
-
-            let session_store = sessions::SessionStore::with_base_path(
-                state.session_store.base_path().to_path_buf(),
-            )
-            .with_hmac_key(hmac_key)
-            .with_integrity_action(integrity_config.action);
-            state.session_store = Arc::new(session_store);
-
-            tracing::info!(
-                action = ?integrity_config.action,
-                source = source,
-                "session integrity verification enabled"
-            );
-        } else {
-            tracing::warn!(
-                "sessions.integrity.enabled is true but no server secret found \
-                 (set gateway.auth.token/password or CARAPACE_SERVER_SECRET); \
-                 sessions will run without integrity verification"
-            );
-        }
-    }
-
-    Ok(state)
 }
 
 pub async fn build_ws_state_owned_from_config() -> Result<WsServerState, WsConfigError> {

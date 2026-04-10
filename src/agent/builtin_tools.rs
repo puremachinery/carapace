@@ -703,19 +703,27 @@ fn session_list_tool() -> BuiltinTool {
             // Load sessions from the on-disk store.
             // Use the same base path resolution as the server.
             let base_path = resolve_sessions_path();
-            let store = crate::sessions::SessionStore::with_base_path(base_path);
+            let store =
+                match crate::sessions::configured_store_with_path_from_current_config(base_path) {
+                    Ok(store) => store,
+                    Err(e) => {
+                        return ToolInvokeResult::tool_error(format!(
+                            "failed to initialize session store: {e}"
+                        ))
+                    }
+                };
 
             let filter = crate::sessions::SessionFilter {
                 limit: Some(limit),
                 ..Default::default()
             };
 
-            match store.list_sessions(filter) {
+            match store.list_session_entries(filter) {
                 Ok(sessions) => {
                     let session_list: Vec<Value> = sessions
                         .iter()
-                        .map(|s| {
-                            json!({
+                        .filter_map(|entry| match (entry.access(), entry.session()) {
+                            (crate::sessions::SessionAccessState::Available, Some(s)) => json!({
                                 "id": s.id,
                                 "session_key": s.session_key,
                                 "status": format!("{:?}", s.status),
@@ -723,7 +731,25 @@ fn session_list_tool() -> BuiltinTool {
                                 "created_at": s.created_at,
                                 "updated_at": s.updated_at,
                                 "name": s.metadata.name,
+                                "access": "available",
                             })
+                            .into(),
+                            (crate::sessions::SessionAccessState::Locked, _) => json!({
+                                "id": entry.session_id(),
+                                "session_key": Value::Null,
+                                "status": Value::Null,
+                                "message_count": Value::Null,
+                                "created_at": Value::Null,
+                                "updated_at": entry.updated_at(),
+                                "name": Value::Null,
+                                "access": "locked",
+                                "encrypted": true,
+                            })
+                            .into(),
+                            _ => {
+                                tracing::warn!("skipping inconsistent session list entry");
+                                None
+                            }
                         })
                         .collect();
                     ToolInvokeResult::success(json!({ "sessions": session_list }))
@@ -767,7 +793,15 @@ fn session_read_tool() -> BuiltinTool {
             let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
 
             let base_path = resolve_sessions_path();
-            let store = crate::sessions::SessionStore::with_base_path(base_path);
+            let store =
+                match crate::sessions::configured_store_with_path_from_current_config(base_path) {
+                    Ok(store) => store,
+                    Err(e) => {
+                        return ToolInvokeResult::tool_error(format!(
+                            "failed to initialize session store: {e}"
+                        ))
+                    }
+                };
 
             match store.get_history(&session_id, Some(limit), None) {
                 Ok(messages) => {

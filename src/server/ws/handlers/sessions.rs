@@ -524,13 +524,39 @@ fn parse_session_list_filters(params: Option<&Value>) -> SessionListFilters {
 /// Also applies client-side filters (global/unknown exclusion, agent, active minutes, label, search).
 fn enrich_session_list(
     state: &WsServerState,
-    sessions: &[sessions::Session],
+    sessions: &[sessions::SessionListEntry],
     filters: &SessionListFilters,
 ) -> Vec<Value> {
     let now = now_ms() as i64;
     sessions
         .iter()
-        .filter(|session| {
+        .filter(|entry| {
+            if entry.is_locked() {
+                if let Some(minutes) = filters.active_minutes {
+                    let cutoff = now - minutes * 60_000;
+                    if entry.updated_at().unwrap_or(0) < cutoff {
+                        return false;
+                    }
+                }
+                if let Some(ref search) = filters.search_filter {
+                    if !entry
+                        .session_id()
+                        .to_lowercase()
+                        .contains(&search.to_lowercase())
+                    {
+                        return false;
+                    }
+                }
+                if filters.label_filter.is_some() {
+                    return false;
+                }
+                return true;
+            }
+
+            let Some(session) = entry.session() else {
+                tracing::warn!("skipping inconsistent available session entry during filter");
+                return false;
+            };
             if !filters.include_global && session.session_key == "global" {
                 return false;
             }
@@ -573,7 +599,15 @@ fn enrich_session_list(
             }
             true
         })
-        .map(|session| {
+        .filter_map(|entry| {
+            if entry.is_locked() {
+                return Some(locked_session_row(entry));
+            }
+
+            let Some(session) = entry.session() else {
+                tracing::warn!("skipping inconsistent available session entry during projection");
+                return None;
+            };
             let mut row = session_row(session);
             if filters.include_last_message {
                 if let Ok(messages) = state.session_store.get_history(&session.id, Some(1), None) {
@@ -600,7 +634,7 @@ fn enrich_session_list(
                     }
                 }
             }
-            row
+            Some(row)
         })
         .collect::<Vec<_>>()
 }
@@ -613,7 +647,7 @@ pub(super) fn handle_sessions_list(
 
     let sessions = state
         .session_store
-        .list_sessions(filters.filter.clone())
+        .list_session_entries(filters.filter.clone())
         .map_err(|err| {
             error_shape(
                 ERROR_UNAVAILABLE,
@@ -621,6 +655,14 @@ pub(super) fn handle_sessions_list(
                 None,
             )
         })?;
+
+    if filters.label_filter.is_some() && sessions.iter().any(|entry| entry.is_locked()) {
+        return Err(error_shape(
+            ERROR_UNAVAILABLE,
+            "encrypted sessions are locked; unlock encrypted sessions to filter by label",
+            None,
+        ));
+    }
 
     let rows = enrich_session_list(state, &sessions, &filters);
     Ok(json!({
@@ -766,6 +808,7 @@ fn session_row(session: &sessions::Session) -> Value {
     json!({
         "key": session.session_key,
         "kind": classify_session_key(&session.session_key, &session.metadata),
+        "access": "available",
         "label": session.metadata.name,
         "displayName": session.metadata.description,
         "channel": session.metadata.channel,
@@ -776,6 +819,25 @@ fn session_row(session: &sessions::Session) -> Value {
         "messageCount": session.message_count,
         "thinkingLevel": session.metadata.thinking_level,
         "model": session.metadata.model
+    })
+}
+
+fn locked_session_row(entry: &sessions::SessionListEntry) -> Value {
+    json!({
+        "key": Value::Null,
+        "kind": "locked",
+        "access": "locked",
+        "encrypted": true,
+        "label": Value::Null,
+        "displayName": Value::Null,
+        "channel": Value::Null,
+        "chatId": Value::Null,
+        "userId": Value::Null,
+        "updatedAt": entry.updated_at(),
+        "sessionId": entry.session_id(),
+        "messageCount": Value::Null,
+        "thinkingLevel": Value::Null,
+        "model": Value::Null
     })
 }
 
@@ -2981,6 +3043,10 @@ mod tests {
 
     use crate::sessions;
 
+    fn test_key_material() -> Vec<u8> {
+        format!("fixture-{}", uuid::Uuid::new_v4()).into_bytes()
+    }
+
     fn make_state_with_temp_sessions() -> (WsServerState, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
         let store = std::sync::Arc::new(sessions::SessionStore::with_base_path(
@@ -2989,6 +3055,95 @@ mod tests {
         let state = WsServerState::new(crate::server::ws::WsServerConfig::default())
             .with_session_store(store);
         (state, tmp)
+    }
+
+    #[test]
+    fn test_handle_sessions_list_surfaces_locked_encrypted_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base_path = tmp.path().join("sessions");
+        let key_material = test_key_material();
+
+        let crypto =
+            sessions::crypto::SessionCryptoContext::load_or_create(&base_path, &key_material)
+                .unwrap();
+        let hmac_key = crypto.integrity_hmac_key().unwrap();
+        let unlocked_store = std::sync::Arc::new(
+            sessions::SessionStore::with_base_path(base_path.clone())
+                .with_encryption_mode(sessions::EncryptionMode::IfPassword)
+                .with_crypto_context(std::sync::Arc::new(crypto))
+                .with_hmac_key(hmac_key),
+        );
+        let unlocked_state = WsServerState::new(crate::server::ws::WsServerConfig::default())
+            .with_session_store(unlocked_store);
+        let session = unlocked_state
+            .session_store
+            .create_session("agent-1", sessions::SessionMetadata::default())
+            .unwrap();
+        unlocked_state
+            .session_store
+            .append_message(sessions::ChatMessage::user(&session.id, "hello"))
+            .unwrap();
+
+        let locked_store = std::sync::Arc::new(
+            sessions::SessionStore::with_base_path(base_path)
+                .with_encryption_mode(sessions::EncryptionMode::IfPassword),
+        );
+        let locked_state = WsServerState::new(crate::server::ws::WsServerConfig::default())
+            .with_session_store(locked_store);
+
+        let result = handle_sessions_list(&locked_state, None).unwrap();
+        let rows = result["sessions"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["sessionId"], session.id);
+        assert_eq!(rows[0]["access"], "locked");
+        assert_eq!(rows[0]["encrypted"], true);
+        assert!(rows[0]["key"].is_null());
+    }
+
+    #[test]
+    fn test_handle_sessions_list_applies_locked_filters_conjunctively() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base_path = tmp.path().join("sessions");
+        let key_material = test_key_material();
+
+        let crypto =
+            sessions::crypto::SessionCryptoContext::load_or_create(&base_path, &key_material)
+                .unwrap();
+        let hmac_key = crypto.integrity_hmac_key().unwrap();
+        let unlocked_store = std::sync::Arc::new(
+            sessions::SessionStore::with_base_path(base_path.clone())
+                .with_encryption_mode(sessions::EncryptionMode::IfPassword)
+                .with_crypto_context(std::sync::Arc::new(crypto))
+                .with_hmac_key(hmac_key),
+        );
+        let unlocked_state = WsServerState::new(crate::server::ws::WsServerConfig::default())
+            .with_session_store(unlocked_store);
+        let session = unlocked_state
+            .session_store
+            .create_session("agent-1", sessions::SessionMetadata::default())
+            .unwrap();
+        unlocked_state
+            .session_store
+            .append_message(sessions::ChatMessage::user(&session.id, "hello"))
+            .unwrap();
+
+        let locked_store = std::sync::Arc::new(
+            sessions::SessionStore::with_base_path(base_path)
+                .with_encryption_mode(sessions::EncryptionMode::IfPassword),
+        );
+        let locked_state = WsServerState::new(crate::server::ws::WsServerConfig::default())
+            .with_session_store(locked_store);
+
+        let result = handle_sessions_list(
+            &locked_state,
+            Some(&json!({
+                "activeMinutes": 1,
+                "search": "no-match"
+            })),
+        )
+        .unwrap();
+        let rows = result["sessions"].as_array().unwrap();
+        assert!(rows.is_empty());
     }
 
     fn make_conn(conn_id: &str) -> ConnectionContext {

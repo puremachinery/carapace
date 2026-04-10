@@ -166,7 +166,7 @@ fn get_cache_ttl() -> Option<Duration> {
     Some(Duration::from_millis(ms))
 }
 
-fn config_password() -> Option<Zeroizing<Vec<u8>>> {
+pub(crate) fn config_password() -> Option<Zeroizing<Vec<u8>>> {
     let password = env::var(CONFIG_PASSWORD_ENV).ok()?;
     if password.is_empty() {
         return None;

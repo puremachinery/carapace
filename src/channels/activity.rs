@@ -2678,6 +2678,13 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), stop_typing_notify.notified())
             .await
             .expect("aborting the waiter should not cancel a committed stop worker");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while stop_state.load(Ordering::Acquire) != STOP_STATE_COMPLETED {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("committed stop worker should still mark completion after waiter abort");
 
         assert_eq!(plugin.stop_typing_count.load(Ordering::Relaxed), 1);
         assert_eq!(stop_state.load(Ordering::Acquire), STOP_STATE_COMPLETED);

@@ -45,6 +45,7 @@ sha2 = "0.11"
 sha2_10 = { package = "sha2", version = "0.10" }
 hkdf = "0.13"
 hmac = "0.13"
+subtle = "2"
 pbkdf2 = "0.12"
 mdns-sd = "0.19"
 rcgen = "0.14"
