@@ -969,7 +969,10 @@ impl SessionStore {
         &bytes[start..end]
     }
 
-    fn read_verified_history_bytes(&self, history_path: &Path) -> Result<Vec<u8>, SessionStoreError> {
+    fn read_verified_history_bytes(
+        &self,
+        history_path: &Path,
+    ) -> Result<Vec<u8>, SessionStoreError> {
         let content = fs::read(history_path)?;
         self.verify_integrity_bytes_with_compat(&content, history_path)?;
         Ok(content)

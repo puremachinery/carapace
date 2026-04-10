@@ -204,6 +204,10 @@ Example uses the Linux config directory (`~/.config/carapace`).
 **Encrypted-session backup note**: If session encryption is enabled, back up
 `.crypto-manifest` with the rest of the Carapace state. The config password
 alone is not enough to recover encrypted sessions if that manifest is lost.
+**Encrypted-session rotation note**: There is currently no in-place session
+rekey flow. Changing `CARAPACE_CONFIG_PASSWORD` does not re-encrypt existing
+session artifacts; if the password must change, export or delete the existing
+encrypted sessions and start a fresh session store.
 **Task payload note**: `tasks/queue.json` is plaintext durable state for operator
 workflows. Do not store raw secrets in task payload text.
 

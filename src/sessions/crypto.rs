@@ -568,8 +568,7 @@ mod tests {
             .unwrap();
         assert_eq!(decrypted, br#"{"hello":"world"}"#);
 
-        let manifest: Value =
-            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        let manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
         let integrity = manifest
             .get("integrity")
             .and_then(Value::as_str)
