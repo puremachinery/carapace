@@ -656,6 +656,22 @@ struct CachedSession {
     history_migration_satisfied: bool,
 }
 
+struct CachedHistoryHmac {
+    state: super::integrity::AppendHmacState,
+    file_len: u64,
+    modified_at_ms: Option<i64>,
+}
+
+impl std::fmt::Debug for CachedHistoryHmac {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedHistoryHmac")
+            .field("state", &"<redacted>")
+            .field("file_len", &self.file_len)
+            .field("modified_at_ms", &self.modified_at_ms)
+            .finish()
+    }
+}
+
 /// Thread-safe session store with file-based persistence
 #[derive(Debug)]
 pub struct SessionStore {
@@ -679,6 +695,8 @@ pub struct SessionStore {
     crypto: Option<Arc<super::crypto::SessionCryptoContext>>,
     /// Locked-session stubs discovered by the store-owned disk scan.
     locked_session_entries: RwLock<HashMap<String, SessionListEntry>>,
+    /// Store-owned rolling HMAC state for history append fast paths.
+    history_hmac_states: RwLock<HashMap<String, CachedHistoryHmac>>,
 }
 
 impl Default for SessionStore {
@@ -709,6 +727,7 @@ impl SessionStore {
             encryption_mode: super::crypto::EncryptionMode::Off,
             crypto: None,
             locked_session_entries: RwLock::new(HashMap::new()),
+            history_hmac_states: RwLock::new(HashMap::new()),
         }
     }
 
@@ -1091,9 +1110,15 @@ impl SessionStore {
                 .map_err(|e| std::io::Error::other(e.to_string()))?
                 .sync_all()?;
         }
-        self.prepare_history_hmac_for_path(&temp_path, history_path, session_id)?;
+        let hmac_state =
+            self.prepare_history_hmac_for_path(&temp_path, history_path, session_id)?;
         fs::rename(&temp_path, history_path)?;
         self.commit_history_hmac(history_path, session_id)?;
+        if let Some(state) = hmac_state {
+            self.store_history_hmac_state(session_id, history_path, state);
+        } else {
+            self.clear_history_hmac_state(session_id);
+        }
         Ok(())
     }
 
@@ -1250,22 +1275,93 @@ impl SessionStore {
         self.verify_integrity_bytes_with_compat(archive_bytes, archive_path)
     }
 
+    fn history_file_signature(history_path: &Path) -> Option<(u64, Option<i64>)> {
+        let metadata = fs::metadata(history_path).ok()?;
+        let modified_at_ms = metadata
+            .modified()
+            .ok()
+            .and_then(|ts| ts.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|dur| dur.as_millis() as i64);
+        Some((metadata.len(), modified_at_ms))
+    }
+
+    fn cached_history_hmac_state_for_append(
+        &self,
+        session_id: &str,
+        history_path: &Path,
+    ) -> Option<super::integrity::AppendHmacState> {
+        let cached = {
+            let states = self.history_hmac_states.read();
+            states
+                .get(session_id)
+                .map(|entry| (entry.state.clone(), entry.file_len, entry.modified_at_ms))
+        }?;
+
+        if Self::history_file_signature(history_path) != Some((cached.1, cached.2)) {
+            self.clear_history_hmac_state(session_id);
+            return None;
+        }
+
+        match super::integrity::sidecar_matches_state(history_path, &cached.0) {
+            Ok(true) => Some(cached.0),
+            Ok(false) | Err(_) => {
+                self.clear_history_hmac_state(session_id);
+                None
+            }
+        }
+    }
+
+    fn store_history_hmac_state(
+        &self,
+        session_id: &str,
+        history_path: &Path,
+        state: super::integrity::AppendHmacState,
+    ) {
+        let Some((file_len, modified_at_ms)) = Self::history_file_signature(history_path) else {
+            self.clear_history_hmac_state(session_id);
+            return;
+        };
+        let mut states = self.history_hmac_states.write();
+        states.insert(
+            session_id.to_string(),
+            CachedHistoryHmac {
+                state,
+                file_len,
+                modified_at_ms,
+            },
+        );
+    }
+
+    fn clear_history_hmac_state(&self, session_id: &str) {
+        let mut states = self.history_hmac_states.write();
+        states.remove(session_id);
+    }
+
     fn prepare_history_hmac_for_path(
         &self,
         source_path: &Path,
         history_path: &Path,
         session_id: &str,
-    ) -> Result<(), SessionStoreError> {
+    ) -> Result<Option<super::integrity::AppendHmacState>, SessionStoreError> {
         if let Some(ref key) = self.hmac_key {
-            super::integrity::prepare_pending_hmac_file_for_path(key, source_path, history_path)
-                .map_err(|e| {
+            let state =
+                super::integrity::AppendHmacState::from_path(key, source_path).map_err(|e| {
                     SessionStoreError::Io(format!(
                         "failed to stage HMAC sidecar for history {}: {}",
                         session_id, e
                     ))
                 })?;
+            super::integrity::prepare_pending_hmac_file_for_state(history_path, &state).map_err(
+                |e| {
+                    SessionStoreError::Io(format!(
+                        "failed to stage HMAC sidecar for history {}: {}",
+                        session_id, e
+                    ))
+                },
+            )?;
+            return Ok(Some(state));
         }
-        Ok(())
+        Ok(None)
     }
 
     fn prepare_history_hmac_for_appended_bytes(
@@ -1273,21 +1369,32 @@ impl SessionStore {
         history_path: &Path,
         appended: &[u8],
         session_id: &str,
-    ) -> Result<(), SessionStoreError> {
+    ) -> Result<Option<super::integrity::AppendHmacState>, SessionStoreError> {
         if let Some(ref key) = self.hmac_key {
-            super::integrity::prepare_pending_hmac_file_for_appended_bytes(
-                key,
-                history_path,
-                appended,
-            )
+            let next_state = if let Some(cached) =
+                self.cached_history_hmac_state_for_append(session_id, history_path)
+            {
+                super::integrity::prepare_pending_hmac_file_for_appended_bytes_with_state(
+                    history_path,
+                    &cached,
+                    appended,
+                )
+            } else {
+                super::integrity::prepare_pending_hmac_file_for_appended_bytes(
+                    key,
+                    history_path,
+                    appended,
+                )
+            }
             .map_err(|e| {
                 SessionStoreError::Io(format!(
                     "failed to stage HMAC sidecar for history {}: {}",
                     session_id, e
                 ))
             })?;
+            return Ok(Some(next_state));
         }
-        Ok(())
+        Ok(None)
     }
 
     fn commit_history_hmac(
@@ -1618,6 +1725,7 @@ impl SessionStore {
             fs::remove_file(&history_path)?;
         }
         self.delete_history_hmac(&history_path, session_id)?;
+        self.clear_history_hmac_state(session_id);
 
         // Reset message count and compaction metadata
         session.message_count = 0;
@@ -1661,6 +1769,7 @@ impl SessionStore {
             )));
         }
         self.delete_history_hmac(&history_path, session_id)?;
+        self.clear_history_hmac_state(session_id);
 
         // Remove from caches
         {
@@ -1812,7 +1921,8 @@ impl SessionStore {
         let encoded = self.encode_history_message(&message)?;
         let mut appended = encoded;
         appended.push(b'\n');
-        self.prepare_history_hmac_for_appended_bytes(&history_path, &appended, &session_id)?;
+        let hmac_state =
+            self.prepare_history_hmac_for_appended_bytes(&history_path, &appended, &session_id)?;
         let file = Self::open_private_append_file(&history_path)?;
         let mut writer = BufWriter::new(file);
         writer.write_all(&appended)?;
@@ -1823,6 +1933,9 @@ impl SessionStore {
             .sync_all()?;
 
         self.commit_history_hmac(&history_path, &session_id)?;
+        if let Some(state) = hmac_state {
+            self.store_history_hmac_state(&session_id, &history_path, state);
+        }
 
         // Update session message count
         self.increment_message_count(&session_id)?;
@@ -1863,7 +1976,8 @@ impl SessionStore {
             appended.extend_from_slice(&encoded);
             appended.push(b'\n');
         }
-        self.prepare_history_hmac_for_appended_bytes(&history_path, &appended, session_id)?;
+        let hmac_state =
+            self.prepare_history_hmac_for_appended_bytes(&history_path, &appended, session_id)?;
         let file = Self::open_private_append_file(&history_path)?;
         let mut writer = BufWriter::new(file);
         writer.write_all(&appended)?;
@@ -1874,6 +1988,9 @@ impl SessionStore {
             .sync_all()?;
 
         self.commit_history_hmac(&history_path, session_id)?;
+        if let Some(state) = hmac_state {
+            self.store_history_hmac_state(session_id, &history_path, state);
+        }
 
         // Update message count
         for _ in messages {
@@ -1960,6 +2077,7 @@ impl SessionStore {
             fs::remove_file(&history_path)?;
         }
         self.delete_history_hmac(&history_path, session_id)?;
+        self.clear_history_hmac_state(session_id);
 
         // Reset message count
         {
@@ -2168,6 +2286,7 @@ impl SessionStore {
                 fs::remove_file(&history_path)?;
             }
             self.delete_history_hmac(&history_path, session_id)?;
+            self.clear_history_hmac_state(session_id);
         } else if self.encryption_active() {
             self.rewrite_history_file_from_messages(&history_path, session_id, &archived.messages)?;
         }
@@ -4065,6 +4184,68 @@ mod tests {
         fs::write(&history_path, "tampered\n").unwrap();
         let result = store.get_history(&session.id, None, None);
         assert!(result.is_err(), "tampered history should be rejected");
+    }
+
+    #[test]
+    fn test_append_history_hmac_reuses_cached_state_after_first_append() {
+        let temp_dir = TempDir::new().unwrap();
+        let key = Zeroizing::new(integrity::derive_hmac_key(b"history-secret"));
+        let store = SessionStore::with_base_path(temp_dir.path().to_path_buf())
+            .with_hmac_key(key)
+            .with_integrity_action(integrity::IntegrityAction::Reject);
+
+        let session = store
+            .create_session("agent-1", SessionMetadata::default())
+            .unwrap();
+
+        integrity::reset_append_hmac_path_rebuild_count();
+
+        store
+            .append_message(ChatMessage::user(&session.id, "first"))
+            .unwrap();
+        assert_eq!(integrity::append_hmac_path_rebuild_count(), 1);
+
+        store
+            .append_message(ChatMessage::assistant(&session.id, "second"))
+            .unwrap();
+        assert_eq!(
+            integrity::append_hmac_path_rebuild_count(),
+            1,
+            "second append should reuse the cached HMAC state"
+        );
+    }
+
+    #[test]
+    fn test_append_history_hmac_rebuilds_when_sidecar_or_metadata_changes() {
+        let temp_dir = TempDir::new().unwrap();
+        let key = Zeroizing::new(integrity::derive_hmac_key(b"history-secret"));
+        let store = SessionStore::with_base_path(temp_dir.path().to_path_buf())
+            .with_hmac_key(key)
+            .with_integrity_action(integrity::IntegrityAction::Reject);
+
+        let session = store
+            .create_session("agent-1", SessionMetadata::default())
+            .unwrap();
+
+        integrity::reset_append_hmac_path_rebuild_count();
+
+        store
+            .append_message(ChatMessage::user(&session.id, "first"))
+            .unwrap();
+        assert_eq!(integrity::append_hmac_path_rebuild_count(), 1);
+
+        let history_path = store.session_history_path(&session.id).unwrap();
+        let sidecar = hmac_sidecar_path(&history_path);
+        fs::write(&sidecar, "v1:deadbeef").unwrap();
+
+        store
+            .append_message(ChatMessage::assistant(&session.id, "second"))
+            .unwrap();
+        assert_eq!(
+            integrity::append_hmac_path_rebuild_count(),
+            2,
+            "cache should be invalidated when the committed sidecar no longer matches"
+        );
     }
 
     #[test]

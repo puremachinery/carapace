@@ -8,6 +8,8 @@ use std::io;
 use std::io::Read;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit, Mac};
@@ -17,6 +19,9 @@ use subtle::ConstantTimeEq;
 
 type HmacSha256 = Hmac<Sha256>;
 const HMAC_DIGEST_SIZE: usize = 32;
+
+#[cfg(test)]
+static APPEND_HMAC_PATH_REBUILD_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Domain separation tag for HMAC key derivation.
 const KEY_DERIVATION_TAG: &[u8] = b"session-integrity-hmac-v1";
@@ -126,6 +131,45 @@ fn pending_hmac_path(file_path: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
+#[derive(Clone)]
+pub struct AppendHmacState(HmacSha256);
+
+impl AppendHmacState {
+    fn from_reader<R: Read>(key: &[u8; 32], reader: &mut R) -> Result<Self, io::Error> {
+        let mut mac = HmacSha256::new_from_slice(key).expect("HMAC-SHA256 accepts any key length");
+        let mut buf = [0u8; 8192];
+        loop {
+            let read = reader.read(&mut buf)?;
+            if read == 0 {
+                break;
+            }
+            mac.update(&buf[..read]);
+        }
+        Ok(Self(mac))
+    }
+
+    pub fn from_path(key: &[u8; 32], file_path: &Path) -> Result<Self, io::Error> {
+        if !file_path.exists() {
+            return Ok(Self(
+                HmacSha256::new_from_slice(key).expect("HMAC-SHA256 accepts any key length"),
+            ));
+        }
+        let mut file = fs::File::open(file_path)?;
+        Self::from_reader(key, &mut file)
+    }
+
+    pub fn extend(&self, appended: &[u8]) -> Self {
+        let mut mac = self.0.clone();
+        mac.update(appended);
+        Self(mac)
+    }
+
+    pub fn sidecar_payload(&self) -> String {
+        let hmac: [u8; 32] = self.0.clone().finalize().into_bytes().into();
+        encode_sidecar_hmac_v1(&hmac)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HmacSidecarFormat {
     LegacyHex,
@@ -221,27 +265,36 @@ pub fn prepare_pending_hmac_file_for_path(
     write_pending_hmac_payload(file_path, &encode_sidecar_hmac_v1(&hmac))
 }
 
+/// Prepare a pending HMAC sidecar from an existing rolling HMAC state.
+pub fn prepare_pending_hmac_file_for_state(
+    file_path: &Path,
+    state: &AppendHmacState,
+) -> Result<(), io::Error> {
+    write_pending_hmac_payload(file_path, &state.sidecar_payload())
+}
+
 /// Prepare a pending HMAC sidecar for the current file contents plus appended bytes.
 pub fn prepare_pending_hmac_file_for_appended_bytes(
     key: &[u8; 32],
     file_path: &Path,
     appended: &[u8],
-) -> Result<(), io::Error> {
-    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC-SHA256 accepts any key length");
-    if file_path.exists() {
-        let mut file = fs::File::open(file_path)?;
-        let mut buf = [0u8; 8192];
-        loop {
-            let read = file.read(&mut buf)?;
-            if read == 0 {
-                break;
-            }
-            mac.update(&buf[..read]);
-        }
-    }
-    mac.update(appended);
-    let hmac: [u8; 32] = mac.finalize().into_bytes().into();
-    write_pending_hmac_payload(file_path, &encode_sidecar_hmac_v1(&hmac))
+) -> Result<AppendHmacState, io::Error> {
+    #[cfg(test)]
+    APPEND_HMAC_PATH_REBUILD_COUNT.fetch_add(1, Ordering::SeqCst);
+
+    let base = AppendHmacState::from_path(key, file_path)?;
+    prepare_pending_hmac_file_for_appended_bytes_with_state(file_path, &base, appended)
+}
+
+/// Prepare a pending HMAC sidecar for appended bytes using an already-validated state.
+pub fn prepare_pending_hmac_file_for_appended_bytes_with_state(
+    file_path: &Path,
+    base_state: &AppendHmacState,
+    appended: &[u8],
+) -> Result<AppendHmacState, io::Error> {
+    let next_state = base_state.extend(appended);
+    write_pending_hmac_payload(file_path, &next_state.sidecar_payload())?;
+    Ok(next_state)
 }
 
 /// Commit a pending HMAC sidecar prepared for `file_path`.
@@ -430,6 +483,25 @@ fn write_pending_hmac_payload(file_path: &Path, payload: &str) -> Result<(), io:
     file.write_all(payload.as_bytes())?;
     file.sync_all()?;
     Ok(())
+}
+
+pub fn sidecar_matches_state(file_path: &Path, state: &AppendHmacState) -> Result<bool, io::Error> {
+    let sidecar = hmac_path(file_path);
+    match fs::read_to_string(&sidecar) {
+        Ok(raw) => Ok(raw.trim() == state.sidecar_payload()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn reset_append_hmac_path_rebuild_count() {
+    APPEND_HMAC_PATH_REBUILD_COUNT.store(0, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(crate) fn append_hmac_path_rebuild_count() -> usize {
+    APPEND_HMAC_PATH_REBUILD_COUNT.load(Ordering::SeqCst)
 }
 
 fn try_promote_pending_hmac_sidecar(
