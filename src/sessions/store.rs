@@ -1030,7 +1030,10 @@ impl SessionStore {
             Err(err) => {
                 let locked_without_crypto =
                     self.encrypted_artifact_locked_without_crypto_bytes(content);
-                if matches!(self.integrity_action, super::integrity::IntegrityAction::Reject) {
+                if matches!(
+                    self.integrity_action,
+                    super::integrity::IntegrityAction::Reject
+                ) {
                     if locked_without_crypto {
                         return Err(Self::session_locked_without_password());
                     }
