@@ -32,6 +32,10 @@ const SESSION_ENCRYPTED_FORMAT_V1: &str = "session-enc-v1";
 const SESSION_ENCRYPTED_PREFIX_V1: &[u8] = b"cse1:";
 const SESSION_ENCRYPTION_ROOT_TAG: &[u8] = b"carapace:session-encryption-root:v1";
 const SESSION_ENCRYPTION_INFO_PREFIX: &[u8] = b"carapace:session-encryption-key:v1:";
+// `:v2` here is intentional namespace separation from the pre-encryption
+// integrity key derivation in `sessions::integrity` (`session-integrity-hmac-v1`).
+// This label belongs to the session-encryption HKDF hierarchy, not the older
+// server-secret HMAC derivation path.
 const SESSION_INTEGRITY_INFO: &[u8] = b"carapace:session-integrity-hmac:v2";
 const SESSION_MANIFEST_INTEGRITY_INFO: &[u8] = b"carapace:session-manifest-integrity:v1";
 const SESSION_METADATA_PURPOSE: &str = "metadata";
@@ -370,10 +374,9 @@ fn verify_manifest_integrity(
     encoded_tag: &str,
 ) -> Result<bool, SessionCryptoError> {
     let key = expand_hkdf(master_key, SESSION_MANIFEST_INTEGRITY_INFO)?;
-    let expected = match BASE64.decode(encoded_tag) {
-        Ok(expected) => expected,
-        Err(_) => return Ok(false),
-    };
+    let expected = BASE64.decode(encoded_tag).map_err(|err| {
+        SessionCryptoError::BadFormat(format!("invalid base64 in manifest integrity field: {err}"))
+    })?;
     let mut mac = HmacSha256::new_from_slice(key.as_ref())
         .map_err(|err| SessionCryptoError::KeyDerivation(err.to_string()))?;
     mac.update(&manifest_integrity_input(manifest));
@@ -693,6 +696,30 @@ mod tests {
             .decrypt_bytes("session-1", "metadata", &encrypted)
             .unwrap_err();
         assert_eq!(err, SessionCryptoError::ManifestIntegrityFailed);
+    }
+
+    #[test]
+    fn test_crypto_context_reports_invalid_manifest_integrity_base64() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_material = test_key_material();
+        let _ctx = SessionCryptoContext::load_or_create(dir.path(), &key_material).unwrap();
+
+        let manifest_path = dir.path().join(CRYPTO_MANIFEST_PATH);
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["integrity"] = Value::String("%%%not-base64%%%".to_string());
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let err = SessionCryptoContext::load_or_create(dir.path(), &key_material).unwrap_err();
+        assert!(matches!(
+            err,
+            SessionCryptoError::BadFormat(message)
+                if message.contains("invalid base64 in manifest integrity field")
+        ));
     }
 
     #[test]
