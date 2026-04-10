@@ -1,8 +1,13 @@
 use super::*;
+use crate::test_support::env::ScopedEnv;
 use std::error::Error as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tempfile::tempdir;
+
+fn test_integrity_value() -> String {
+    format!("fixture-{}", uuid::Uuid::new_v4())
+}
 
 #[test]
 fn test_try_new_reports_activity_service_startup_error() {
@@ -198,7 +203,7 @@ fn test_get_value_at_path() {
 #[test]
 fn test_resolve_session_integrity_config_defaults_to_enabled_warn() {
     let cfg = json!({});
-    let integrity = resolve_session_integrity_config(&cfg);
+    let integrity = crate::sessions::resolve_session_integrity_config(&cfg);
     assert!(integrity.enabled);
     assert_eq!(
         integrity.action,
@@ -216,7 +221,7 @@ fn test_resolve_session_integrity_config_respects_overrides() {
             }
         }
     });
-    let integrity = resolve_session_integrity_config(&cfg);
+    let integrity = crate::sessions::resolve_session_integrity_config(&cfg);
     assert!(!integrity.enabled);
     assert_eq!(
         integrity.action,
@@ -234,7 +239,7 @@ fn test_resolve_session_integrity_config_invalid_value_uses_defaults() {
             }
         }
     });
-    let integrity = resolve_session_integrity_config(&cfg);
+    let integrity = crate::sessions::resolve_session_integrity_config(&cfg);
     assert!(integrity.enabled);
     assert_eq!(
         integrity.action,
@@ -244,67 +249,100 @@ fn test_resolve_session_integrity_config_invalid_value_uses_defaults() {
 
 #[test]
 fn test_resolve_session_integrity_secret_prefers_explicit_server_secret() {
-    let resolved_auth = auth::ResolvedGatewayAuth {
-        mode: auth::AuthMode::Token,
-        token: Some("gateway-token".to_string()),
-        password: Some("gateway-password".to_string()),
-        allow_tailscale: false,
-    };
-    let (secret, source) = resolve_session_integrity_secret(
-        &resolved_auth,
-        Some("explicit-server-secret".to_string()),
-    )
-    .expect("secret should resolve from explicit server secret");
-    assert_eq!(secret, "explicit-server-secret");
+    let mut env_guard = ScopedEnv::new();
+    let server_secret = test_integrity_value();
+    let cfg = json!({
+        "gateway": {
+            "auth": {
+                "token": test_integrity_value(),
+                "password": test_integrity_value()
+            }
+        }
+    });
+    env_guard.set("CARAPACE_SERVER_SECRET", &server_secret);
+    let (secret, source) = crate::sessions::resolve_session_integrity_secret_from_value(&cfg, None)
+        .expect("secret should resolve from explicit server secret");
+    assert_eq!(secret, server_secret);
     assert_eq!(source, "CARAPACE_SERVER_SECRET");
 }
 
 #[test]
 fn test_resolve_session_integrity_secret_falls_back_to_gateway_credentials() {
-    let from_token = auth::ResolvedGatewayAuth {
-        mode: auth::AuthMode::Token,
-        token: Some("gateway-token".to_string()),
-        password: None,
-        allow_tailscale: false,
-    };
-    let (secret, source) = resolve_session_integrity_secret(&from_token, None)
-        .expect("secret should resolve from gateway token");
-    assert_eq!(secret, "gateway-token");
-    assert_eq!(source, "gateway token");
+    let token_value = test_integrity_value();
+    let from_token = json!({
+        "gateway": {
+            "auth": {
+                "token": token_value.clone()
+            }
+        }
+    });
+    let (secret, source) =
+        crate::sessions::resolve_session_integrity_secret_from_value(&from_token, None)
+            .expect("secret should resolve from gateway token");
+    assert_eq!(secret, token_value);
+    assert_eq!(source, "gateway.auth.token");
 
-    let from_password = auth::ResolvedGatewayAuth {
-        mode: auth::AuthMode::Password,
-        token: None,
-        password: Some("gateway-password".to_string()),
-        allow_tailscale: false,
-    };
-    let (secret, source) = resolve_session_integrity_secret(&from_password, None)
-        .expect("secret should resolve from gateway password");
-    assert_eq!(secret, "gateway-password");
-    assert_eq!(source, "gateway password");
+    let password_value = test_integrity_value();
+    let from_password = json!({
+        "gateway": {
+            "auth": {
+                "password": password_value.clone()
+            }
+        }
+    });
+    let (secret, source) =
+        crate::sessions::resolve_session_integrity_secret_from_value(&from_password, None)
+            .expect("secret should resolve from gateway password");
+    assert_eq!(secret, password_value);
+    assert_eq!(source, "gateway.auth.password");
+}
+
+#[test]
+fn test_resolve_session_integrity_secret_prefers_gateway_env_over_config() {
+    let mut env_guard = ScopedEnv::new();
+    let env_token = test_integrity_value();
+    env_guard
+        .set("CARAPACE_GATEWAY_TOKEN", &env_token)
+        .set("CARAPACE_GATEWAY_PASSWORD", test_integrity_value());
+    let cfg = json!({
+        "gateway": {
+            "auth": {
+                "token": test_integrity_value(),
+                "password": test_integrity_value()
+            }
+        }
+    });
+
+    let (secret, source) = crate::sessions::resolve_session_integrity_secret_from_value(&cfg, None)
+        .expect("gateway env token should resolve before config");
+    assert_eq!(secret, env_token);
+    assert_eq!(source, "CARAPACE_GATEWAY_TOKEN");
 }
 
 #[test]
 fn test_resolve_session_integrity_secret_ignores_empty_values() {
-    let resolved_auth = auth::ResolvedGatewayAuth {
-        mode: auth::AuthMode::Token,
-        token: Some(String::new()),
-        password: Some(String::new()),
-        allow_tailscale: false,
-    };
-    let secret = resolve_session_integrity_secret(&resolved_auth, Some(String::new()));
+    let mut env_guard = ScopedEnv::new();
+    let cfg = json!({
+        "gateway": {
+            "auth": {
+                "token": "",
+                "password": ""
+            }
+        }
+    });
+    env_guard.set("CARAPACE_SERVER_SECRET", "");
+    let secret = crate::sessions::resolve_session_integrity_secret_from_value(&cfg, None);
     assert!(secret.is_none());
 }
 
 #[test]
 fn test_resolve_session_integrity_secret_returns_none_when_all_missing() {
-    let resolved_auth = auth::ResolvedGatewayAuth {
-        mode: auth::AuthMode::Token,
-        token: None,
-        password: None,
-        allow_tailscale: false,
-    };
-    let secret = resolve_session_integrity_secret(&resolved_auth, None);
+    let cfg = json!({
+        "gateway": {
+            "auth": {}
+        }
+    });
+    let secret = crate::sessions::resolve_session_integrity_secret_from_value(&cfg, None);
     assert!(secret.is_none());
 }
 
