@@ -262,8 +262,6 @@ fn verify_manifest_backfill_password(
     base_path: &Path,
     master_key: &[u8],
 ) -> Result<bool, SessionCryptoError> {
-    let mut saw_encrypted_artifact = false;
-
     for entry in fs::read_dir(base_path)? {
         let entry = entry?;
         let path = entry.path();
@@ -280,7 +278,6 @@ fn verify_manifest_backfill_password(
                 if !has_encrypted_payload_prefix(&bytes) {
                     continue;
                 }
-                saw_encrypted_artifact = true;
                 if decrypt_prefixed_bytes_with_master_key(
                     master_key,
                     session_id,
@@ -305,7 +302,6 @@ fn verify_manifest_backfill_password(
                     if !has_encrypted_payload_prefix(&line) {
                         continue;
                     }
-                    saw_encrypted_artifact = true;
                     if decrypt_prefixed_bytes_with_master_key(
                         master_key,
                         session_id,
@@ -340,7 +336,6 @@ fn verify_manifest_backfill_password(
             if !has_encrypted_payload_prefix(&bytes) {
                 continue;
             }
-            saw_encrypted_artifact = true;
             if decrypt_prefixed_bytes_with_master_key(
                 master_key,
                 session_id,
@@ -354,7 +349,7 @@ fn verify_manifest_backfill_password(
         }
     }
 
-    Ok(!saw_encrypted_artifact)
+    Ok(false)
 }
 
 fn manifest_integrity_tag(
@@ -672,6 +667,21 @@ mod tests {
     }
 
     #[test]
+    fn test_crypto_context_rejects_cross_purpose_decryption() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_material = test_key_material();
+        let ctx = SessionCryptoContext::load_or_create(dir.path(), &key_material).unwrap();
+        let encrypted = ctx
+            .encrypt_bytes("session-a", "metadata", br#"{"hello":"world"}"#)
+            .unwrap();
+
+        let err = ctx
+            .decrypt_bytes("session-a", "history", &encrypted)
+            .unwrap_err();
+        assert_eq!(err, SessionCryptoError::DecryptionFailed);
+    }
+
+    #[test]
     fn test_crypto_context_detects_tampered_manifest() {
         let dir = tempfile::tempdir().unwrap();
         let key_material = test_key_material();
@@ -799,6 +809,30 @@ mod tests {
                 .unwrap(),
             br#"{"hello":"world"}"#
         );
+    }
+
+    #[test]
+    fn test_crypto_context_refuses_backfill_without_encrypted_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_material = test_key_material();
+        let _ctx = SessionCryptoContext::load_or_create(dir.path(), &key_material).unwrap();
+
+        let manifest_path = dir.path().join(CRYPTO_MANIFEST_PATH);
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest.as_object_mut().unwrap().remove("integrity");
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let reopened = SessionCryptoContext::load_or_create(dir.path(), &key_material).unwrap();
+        assert!(!reopened.manifest_integrity_valid());
+
+        let manifest_after: Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        assert!(manifest_after.get("integrity").is_none());
     }
 
     #[test]
