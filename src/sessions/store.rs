@@ -1028,6 +1028,21 @@ impl SessionStore {
                 })
             }
             Err(err) => {
+                let locked_without_crypto =
+                    self.encrypted_artifact_locked_without_crypto_bytes(content);
+                if matches!(self.integrity_action, super::integrity::IntegrityAction::Reject) {
+                    if locked_without_crypto {
+                        return Err(Self::session_locked_without_password());
+                    }
+                    tracing::warn!(
+                        error_kind = integrity_error_kind(&err),
+                        "session integrity verification issue"
+                    );
+                    return Err(SessionStoreError::Io(format!(
+                        "session integrity verification failed for {}",
+                        file_path.display()
+                    )));
+                }
                 tracing::warn!(
                     error_kind = integrity_error_kind(&err),
                     "session integrity verification issue"
@@ -4032,6 +4047,61 @@ mod tests {
         fs::write(&history_path, "tampered\n").unwrap();
         let result = store.get_history(&session.id, None, None);
         assert!(result.is_err(), "tampered history should be rejected");
+    }
+
+    #[test]
+    fn test_reject_mode_fails_closed_on_history_sidecar_io_error() {
+        let temp_dir = TempDir::new().unwrap();
+        let key = Zeroizing::new(integrity::derive_hmac_key(b"history-secret"));
+        let store = SessionStore::with_base_path(temp_dir.path().to_path_buf())
+            .with_hmac_key(key)
+            .with_integrity_action(integrity::IntegrityAction::Reject);
+
+        let session = store
+            .create_session("agent-1", SessionMetadata::default())
+            .unwrap();
+        store
+            .append_message(ChatMessage::user(&session.id, "Hello"))
+            .unwrap();
+
+        let history_path = store.session_history_path(&session.id).unwrap();
+        let sidecar = hmac_sidecar_path(&history_path);
+        fs::remove_file(&sidecar).unwrap();
+        fs::create_dir(&sidecar).unwrap();
+
+        let err = store.get_history(&session.id, None, None).unwrap_err();
+        assert!(matches!(err, SessionStoreError::Io(_)));
+    }
+
+    #[test]
+    fn test_reject_mode_without_password_keeps_locked_stub_on_metadata_sidecar_io_error() {
+        let key_material = test_key_material();
+        let server_secret = test_key_material();
+        let (encrypted_store, temp_dir) = create_encrypted_store(&key_material);
+        let session = encrypted_store
+            .create_session("agent-1", SessionMetadata::default())
+            .unwrap();
+
+        let meta_path = encrypted_store.session_meta_path(&session.id).unwrap();
+        let sidecar = hmac_sidecar_path(&meta_path);
+        fs::remove_file(&sidecar).unwrap();
+        fs::create_dir(&sidecar).unwrap();
+
+        let locked_store = SessionStore::with_base_path(temp_dir.path().to_path_buf())
+            .with_encryption_mode(EncryptionMode::IfPassword)
+            .with_hmac_key(Zeroizing::new(integrity::derive_hmac_key(&server_secret)))
+            .with_integrity_action(integrity::IntegrityAction::Reject);
+
+        let entries = locked_store
+            .list_session_entries(SessionFilter::default())
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].session_id(), session.id);
+        assert_eq!(entries[0].access(), SessionAccessState::Locked);
+        assert!(matches!(
+            locked_store.get_session(&session.id),
+            Err(SessionStoreError::Locked(_))
+        ));
     }
 
     #[test]
