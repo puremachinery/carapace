@@ -2865,11 +2865,16 @@ mod tests {
 
     #[test]
     fn test_session_encryption_mode_valid() {
-        let cfg = json!({ "sessions": { "encryption": { "mode": "required" } } });
-        let issues = validate_schema(&cfg);
-        assert!(!issues
-            .iter()
-            .any(|i| i.path.starts_with(".sessions.encryption")));
+        for mode in ["off", "if_password", "required"] {
+            let cfg = json!({ "sessions": { "encryption": { "mode": mode } } });
+            let issues = validate_schema(&cfg);
+            assert!(
+                !issues
+                    .iter()
+                    .any(|i| i.path.starts_with(".sessions.encryption")),
+                "expected mode {mode} to validate without session encryption issues"
+            );
+        }
     }
 
     #[test]

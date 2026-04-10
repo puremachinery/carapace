@@ -653,6 +653,7 @@ impl SessionFilter {
 struct CachedSession {
     session: Session,
     dirty: bool,
+    history_migration_satisfied: bool,
 }
 
 /// Thread-safe session store with file-based persistence
@@ -757,6 +758,28 @@ impl SessionStore {
 
     fn encryption_active(&self) -> bool {
         self.crypto.is_some() && self.encryption_mode.uses_encryption()
+    }
+
+    fn new_cached_session(&self, session: Session, dirty: bool) -> CachedSession {
+        CachedSession {
+            session,
+            dirty,
+            history_migration_satisfied: self.encryption_active(),
+        }
+    }
+
+    fn history_migration_satisfied_in_cache(&self, session_id: &str) -> bool {
+        self.sessions
+            .read()
+            .get(session_id)
+            .map(|cached| cached.history_migration_satisfied)
+            .unwrap_or(false)
+    }
+
+    fn mark_history_migration_satisfied(&self, session_id: &str) {
+        if let Some(cached) = self.sessions.write().get_mut(session_id) {
+            cached.history_migration_satisfied = true;
+        }
     }
 
     fn lock_message(reason: impl Into<String>) -> SessionStoreError {
@@ -1347,10 +1370,7 @@ impl SessionStore {
             key_map.insert(session.session_key.clone(), session.id.clone());
             sessions.insert(
                 session.id.clone(),
-                CachedSession {
-                    session: session.clone(),
-                    dirty: false,
-                },
+                self.new_cached_session(session.clone(), false),
             );
         }
 
@@ -1424,10 +1444,7 @@ impl SessionStore {
                 key_map.insert(session.session_key.clone(), session.id.clone());
                 sessions.insert(
                     session.id.clone(),
-                    CachedSession {
-                        session: session.clone(),
-                        dirty: false,
-                    },
+                    self.new_cached_session(session.clone(), false),
                 );
 
                 Ok(session)
@@ -1737,7 +1754,10 @@ impl SessionStore {
         let history_path = self.session_history_path(&session_id)?;
         let _lock =
             FileLock::acquire(&history_path).map_err(|e| SessionStoreError::Io(e.to_string()))?;
-        self.migrate_history_file_if_needed(&history_path, &session_id)?;
+        if self.encryption_active() && !self.history_migration_satisfied_in_cache(&session_id) {
+            self.migrate_history_file_if_needed(&history_path, &session_id)?;
+            self.mark_history_migration_satisfied(&session_id);
+        }
         let encoded = self.encode_history_message(&message)?;
         let mut appended = encoded;
         appended.push(b'\n');
@@ -1781,7 +1801,10 @@ impl SessionStore {
         let history_path = self.session_history_path(session_id)?;
         let _lock =
             FileLock::acquire(&history_path).map_err(|e| SessionStoreError::Io(e.to_string()))?;
-        self.migrate_history_file_if_needed(&history_path, session_id)?;
+        if self.encryption_active() && !self.history_migration_satisfied_in_cache(session_id) {
+            self.migrate_history_file_if_needed(&history_path, session_id)?;
+            self.mark_history_migration_satisfied(session_id);
+        }
         let mut appended = Vec::new();
 
         for msg in messages {
@@ -2383,10 +2406,7 @@ impl SessionStore {
             key_map.insert(session.session_key.clone(), session.id.clone());
             sessions.insert(
                 session.id.clone(),
-                CachedSession {
-                    session: session.clone(),
-                    dirty: false,
-                },
+                self.new_cached_session(session.clone(), false),
             );
         }
 
@@ -2575,10 +2595,7 @@ impl SessionStore {
                 let mut sessions = self.sessions.write();
                 sessions.insert(
                     session_id.to_string(),
-                    CachedSession {
-                        session,
-                        dirty: true,
-                    },
+                    self.new_cached_session(session, true),
                 );
             }
         }

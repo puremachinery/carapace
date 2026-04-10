@@ -406,7 +406,8 @@ Enable Carapace to listen and respond on external chat platforms.
     - When `encryption.mode` is `if_password`, Carapace encrypts session metadata, history, and archives when `CARAPACE_CONFIG_PASSWORD` is available, still reads older plaintext sessions, and rewrites older plaintext session artifacts into encrypted form on first read or write.
     - When `encryption.mode` is `required`, session operations fail closed until `CARAPACE_CONFIG_PASSWORD` is set.
     - Without the password in `if_password` mode, plaintext sessions remain readable but encrypted sessions surface as locked until the password is provided.
-    - When session encryption is active, Carapace keeps the session HMAC sidecars enabled even if `sessions.integrity.enabled` is `false`, because encrypted histories still rely on file-level integrity to detect ciphertext deletion or reordering.
+    - When session encryption is active, Carapace keeps the session HMAC sidecars enabled even if `sessions.integrity.enabled` is `false`. With `integrity.action = "reject"`, those sidecars fail closed on missing or mismatched history bytes and therefore catch ciphertext deletion or reordering; with `"warn"`, they remain advisory and only log.
+    - Touch-time migration of pre-encryption session sidecars still uses the same legacy integrity secret source order as the plaintext store (`CARAPACE_SERVER_SECRET` first, then gateway auth fallbacks). If you still have unread plaintext sessions, prefer keeping a stable `CARAPACE_SERVER_SECRET` during the migration window; rotating the legacy integrity secret before those sessions are touched can invalidate their old sidecars.
 - **`session`**
   - *What it does:* Governs active chat/session scoping behavior and provides a legacy/global fallback for channel typing.
   - *Common values:*
