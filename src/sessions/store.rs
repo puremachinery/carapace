@@ -957,56 +957,8 @@ impl SessionStore {
     }
 
     fn verify_integrity_path_with_compat(&self, file_path: &Path) -> Result<(), SessionStoreError> {
-        let Some(ref key) = self.hmac_key else {
-            return Ok(());
-        };
-        let integrity_config = super::integrity::IntegrityConfig {
-            enabled: true,
-            action: self.integrity_action,
-        };
-        match super::integrity::verify_hmac_path(key, file_path, &integrity_config) {
-            Ok(()) => Ok(()),
-            Err(super::integrity::IntegrityError::Rejected { .. }) => {
-                let locked_without_crypto =
-                    self.encrypted_artifact_locked_without_crypto_path(file_path)?;
-                if locked_without_crypto {
-                    return Err(Self::session_locked_without_password());
-                }
-
-                let Some(ref legacy_key) = self.legacy_hmac_key else {
-                    return Err(SessionStoreError::Io(format!(
-                        "session integrity verification failed for {}",
-                        file_path.display()
-                    )));
-                };
-                super::integrity::verify_hmac_path(legacy_key, file_path, &integrity_config)
-                    .map_err(|err| match err {
-                        super::integrity::IntegrityError::Rejected { file } => {
-                            SessionStoreError::Io(format!(
-                                "session integrity verification failed for {}",
-                                file
-                            ))
-                        }
-                        other => {
-                            tracing::warn!(
-                                error_kind = integrity_error_kind(&other),
-                                "session integrity verification issue"
-                            );
-                            SessionStoreError::Io(format!(
-                                "session integrity verification failed for {}",
-                                file_path.display()
-                            ))
-                        }
-                    })
-            }
-            Err(err) => {
-                tracing::warn!(
-                    error_kind = integrity_error_kind(&err),
-                    "session integrity verification issue"
-                );
-                Ok(())
-            }
-        }
+        let content = fs::read(file_path)?;
+        self.verify_integrity_bytes_with_compat(&content, file_path)
     }
 
     fn verify_integrity_bytes_with_compat(
@@ -1078,17 +1030,6 @@ impl SessionStore {
         self.crypto.is_none()
             && self.encryption_mode.uses_encryption()
             && super::crypto::has_encrypted_payload_prefix(content)
-    }
-
-    fn encrypted_artifact_locked_without_crypto_path(
-        &self,
-        file_path: &Path,
-    ) -> Result<bool, SessionStoreError> {
-        if self.crypto.is_some() || !self.encryption_mode.uses_encryption() {
-            return Ok(false);
-        }
-        let content = fs::read(file_path)?;
-        Ok(super::crypto::has_encrypted_payload_prefix(&content))
     }
 
     fn locked_filter_error(&self) -> SessionStoreError {
