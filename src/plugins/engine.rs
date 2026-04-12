@@ -132,7 +132,10 @@ impl PluginEngine {
     /// Interval mismatches are rejected only while a ticker is still live and
     /// shared by current runtime holders. Once the last `Arc<EpochTicker>` is
     /// dropped, the next caller starts a fresh ticker and may choose a new
-    /// interval.
+    /// interval. Mismatches against an in-flight `Starting` slot also return
+    /// immediately; callers that still want a different interval after that
+    /// startup fails or panics must schedule their own retry after receiving
+    /// `EnsureEpochTickerError::IntervalMismatch`.
     pub(crate) fn ensure_epoch_ticker<F, E>(
         &self,
         interval: Duration,
