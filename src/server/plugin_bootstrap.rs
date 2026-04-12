@@ -167,7 +167,9 @@ fn managed_plugin_activation_entry(entry: &ManagedPluginConfigEntry) -> PluginAc
 
 fn plugin_runtime_init_error_is_fatal(error: &RuntimeError) -> bool {
     match error {
-        RuntimeError::ThreadSpawn { .. } | RuntimeError::EngineMismatch => true,
+        RuntimeError::ThreadSpawn { .. }
+        | RuntimeError::EngineMismatch
+        | RuntimeError::EpochTickerIntervalMismatch { .. } => true,
         // All other runtime init failures intentionally degrade into a report-only
         // bootstrap result so startup can continue without plugin execution.
         RuntimeError::PluginNotFound(_)
@@ -178,7 +180,6 @@ fn plugin_runtime_init_error_is_fatal(error: &RuntimeError) -> bool {
         | RuntimeError::HostError(_)
         | RuntimeError::LoaderError(_)
         | RuntimeError::WasmtimeError(_)
-        | RuntimeError::EpochTickerIntervalMismatch { .. }
         | RuntimeError::PluginError { .. }
         | RuntimeError::FuelExhausted { .. }
         | RuntimeError::CapabilityDenied { .. } => false,
@@ -875,7 +876,7 @@ mod tests {
         assert!(plugin_runtime_init_error_is_fatal(
             &RuntimeError::EngineMismatch
         ));
-        assert!(!plugin_runtime_init_error_is_fatal(
+        assert!(plugin_runtime_init_error_is_fatal(
             &RuntimeError::EpochTickerIntervalMismatch {
                 existing: Duration::from_millis(1),
                 requested: Duration::from_millis(2),

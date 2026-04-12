@@ -1112,6 +1112,8 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
             permission_config,
         } = inputs;
         let epoch_deadline_ticks = compute_epoch_deadline_ticks(DEFAULT_EXECUTION_TIMEOUT);
+        // PluginEngine retains the ticker Arc internally; the runtime keeps the
+        // PluginEngine Arc so the shared ticker stays alive for the runtime lifetime.
         plugin_engine
             .ensure_epoch_ticker(DEFAULT_EPOCH_TICK_INTERVAL, epoch_ticker_factory)
             .map_err(RuntimeError::from)?;
