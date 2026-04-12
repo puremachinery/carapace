@@ -163,6 +163,11 @@ impl PluginEngine {
                 }) => {
                     let existing_interval = *existing_interval;
                     if existing_interval != interval {
+                        // Mismatches against an in-flight startup are reported
+                        // immediately. If that startup later fails or panics,
+                        // `StartingTickerGuard` clears the slot back to `None`,
+                        // and callers that still want a different interval may
+                        // retry against the now-empty slot.
                         return Err(EnsureEpochTickerError::IntervalMismatch {
                             existing: existing_interval,
                             requested: interval,
