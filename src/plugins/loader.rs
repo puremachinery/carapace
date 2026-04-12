@@ -200,7 +200,7 @@ impl std::fmt::Debug for LoadedPlugin {
         f.debug_struct("LoadedPlugin")
             .field("manifest", &self.manifest)
             .field("wasm_path", &self.wasm_path)
-            .field("component_cached", &true)
+            .field("component", &"<compiled>")
             .field("discovered_capabilities", &self.discovered_capabilities)
             .finish()
     }
@@ -226,8 +226,8 @@ pub(crate) fn validate_plugin_component_bytes(
     source: &str,
     wasm_bytes: &[u8],
 ) -> Result<(), LoaderError> {
-    let engine = super::engine::shared_component_validation_engine()
-        .map_err(LoaderError::EngineError)?;
+    let engine =
+        super::engine::shared_component_validation_engine().map_err(LoaderError::EngineError)?;
     compile_plugin_component(engine, source, wasm_bytes)?;
     Ok(())
 }
@@ -699,7 +699,6 @@ impl PluginLoader {
         signature_config: super::signature::SignatureConfig,
         engine: Arc<super::engine::PluginEngine>,
     ) -> Result<Self, LoaderError> {
-
         Ok(Self {
             engine,
             plugins: RwLock::new(HashMap::new()),
@@ -808,11 +807,8 @@ impl PluginLoader {
 
         // Validate and introspect the component bytes with the same binary format
         // the runtime later instantiates.
-        let component = compile_plugin_component(
-            self.engine(),
-            &wasm_path.display().to_string(),
-            &wasm_bytes,
-        )?;
+        let component =
+            compile_plugin_component(self.engine(), &wasm_path.display().to_string(), &wasm_bytes)?;
 
         let discovered_capabilities = Some(super::sandbox::enumerate_capabilities(
             &component,
@@ -829,8 +825,13 @@ impl PluginLoader {
             return Err(LoaderError::InvalidPluginId(plugin_id));
         }
 
-        let plugin_manifest =
-            derive_manifest(&plugin_id, wasm_path, &wasm_bytes, &component, self.engine());
+        let plugin_manifest = derive_manifest(
+            &plugin_id,
+            wasm_path,
+            &wasm_bytes,
+            &component,
+            self.engine(),
+        );
 
         let loaded = Arc::new(LoadedPlugin {
             manifest: plugin_manifest,

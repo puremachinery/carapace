@@ -41,7 +41,7 @@ use super::bindings::{
 use super::capabilities::{RateLimiterRegistry, SsrfConfig};
 #[cfg(test)]
 use super::engine::EPOCH_TICKER_THREAD_NAME;
-use super::engine::EpochTicker;
+use super::engine::{EnsureEpochTickerError, EpochTicker};
 use super::host::{HostError, HttpRequest, PluginHostContext};
 use super::loader::{LoadedPlugin, PluginKind, PluginLoader, PluginManifest};
 use super::permissions::{
@@ -538,6 +538,17 @@ pub enum RuntimeError {
     #[error("Wasmtime error: {0}")]
     WasmtimeError(String),
 
+    #[error("Plugin runtime engine must match the plugin loader engine")]
+    EngineMismatch,
+
+    #[error(
+        "Plugin epoch ticker interval mismatch: existing {existing:?}, requested {requested:?}"
+    )]
+    EpochTickerIntervalMismatch {
+        existing: Duration,
+        requested: Duration,
+    },
+
     #[error("Plugin returned error: [{code}] {message}")]
     PluginError { code: String, message: String },
 
@@ -563,6 +574,21 @@ impl From<StartupThreadSpawnError> for RuntimeError {
     }
 }
 
+impl From<EnsureEpochTickerError<RuntimeError>> for RuntimeError {
+    fn from(error: EnsureEpochTickerError<RuntimeError>) -> Self {
+        match error {
+            EnsureEpochTickerError::IntervalMismatch {
+                existing,
+                requested,
+            } => Self::EpochTickerIntervalMismatch {
+                existing,
+                requested,
+            },
+            EnsureEpochTickerError::Start(source) => source,
+        }
+    }
+}
+
 /// State held in each plugin's wasmtime store
 pub struct HostState<B: CredentialBackend + Send + Sync + 'static> {
     /// Plugin ID for this instance
@@ -581,6 +607,9 @@ pub struct HostState<B: CredentialBackend + Send + Sync + 'static> {
 
 /// Plugin runtime that manages WASM plugin instances
 pub struct PluginRuntime<B: CredentialBackend + 'static> {
+    /// Shared plugin engine retained directly so ticker ownership remains explicit.
+    plugin_engine: Arc<super::engine::PluginEngine>,
+
     /// Plugin loader
     loader: Arc<PluginLoader>,
 
@@ -791,11 +820,11 @@ impl<B: CredentialBackend + Send + Sync + 'static> Drop for PluginInstanceHandle
 impl<B: CredentialBackend + Send + Sync + 'static> PluginInstanceHandle<B> {
     fn initialize_worker_state(
         plugin_id: String,
+        engine: Engine,
         component: Component,
         epoch_deadline_ticks: u64,
         host_ctx: Arc<PluginHostContext<B>>,
     ) -> Result<PluginWorkerState<B>, RuntimeError> {
-        let engine = component.engine().clone();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -846,6 +875,7 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginInstanceHandle<B> {
 
     fn spawn(
         manifest: PluginManifest,
+        engine: Engine,
         component: Component,
         epoch_deadline_ticks: u64,
         host_ctx: Arc<PluginHostContext<B>>,
@@ -860,6 +890,7 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginInstanceHandle<B> {
             .spawn(move || {
                 let mut state = match Self::initialize_worker_state(
                     plugin_id,
+                    engine,
                     component,
                     epoch_deadline_ticks,
                     host_ctx,
@@ -1036,8 +1067,11 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
         sandbox_config: super::sandbox::SandboxConfig,
         permission_config: PermissionConfig,
     ) -> Result<Self, RuntimeError> {
+        if !Arc::ptr_eq(&plugin_engine, loader.shared_engine()) {
+            return Err(RuntimeError::EngineMismatch);
+        }
+
         Self::with_permissions_config_and_epoch_ticker_factory(
-            plugin_engine,
             loader,
             credential_store,
             rate_limiters,
@@ -1049,7 +1083,6 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
     }
 
     fn with_permissions_config_and_epoch_ticker_factory<F>(
-        plugin_engine: Arc<super::engine::PluginEngine>,
         loader: Arc<PluginLoader>,
         credential_store: Arc<CredentialStore<B>>,
         rate_limiters: Arc<RateLimiterRegistry>,
@@ -1061,16 +1094,14 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
     where
         F: FnOnce(Engine, Duration) -> Result<EpochTicker, RuntimeError>,
     {
-        if !Arc::ptr_eq(&plugin_engine, loader.shared_engine()) {
-            return Err(RuntimeError::WasmtimeError(
-                "plugin runtime engine must match the plugin loader engine".to_string(),
-            ));
-        }
-
+        let plugin_engine = loader.shared_engine().clone();
         let epoch_deadline_ticks = compute_epoch_deadline_ticks(DEFAULT_EXECUTION_TIMEOUT);
-        plugin_engine.ensure_epoch_ticker(DEFAULT_EPOCH_TICK_INTERVAL, epoch_ticker_factory)?;
+        plugin_engine
+            .ensure_epoch_ticker(DEFAULT_EPOCH_TICK_INTERVAL, epoch_ticker_factory)
+            .map_err(RuntimeError::from)?;
 
         Ok(Self {
+            plugin_engine,
             loader,
             credential_store,
             rate_limiters,
@@ -1086,6 +1117,11 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
     /// Get the plugin registry
     pub fn registry(&self) -> Arc<PluginRegistry> {
         self.registry.clone()
+    }
+
+    #[cfg(test)]
+    fn engine(&self) -> &Engine {
+        self.plugin_engine.engine()
     }
 
     /// Load and instantiate all plugins from the loader
@@ -1179,12 +1215,14 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
 
         // Initialize the dedicated plugin worker off the async runtime thread.
         let manifest = loaded.manifest.clone();
+        let engine = self.plugin_engine.engine().clone();
         let component = loaded.component.clone();
         let epoch_deadline_ticks = self.epoch_deadline_ticks;
         let handle = Arc::new(
             tokio::task::spawn_blocking(move || {
                 PluginInstanceHandle::spawn(
                     manifest,
+                    engine,
                     component,
                     epoch_deadline_ticks,
                     host_ctx,
@@ -1837,7 +1875,6 @@ mod tests {
         std::fs::create_dir_all(&plugins_dir).unwrap();
 
         let loader = Arc::new(PluginLoader::new(plugins_dir).unwrap());
-        let plugin_engine = loader.shared_engine().clone();
         let backend = MockCredentialBackend::new(true);
         let credential_store = Arc::new(
             CredentialStore::new(backend, temp_dir.path().to_path_buf())
@@ -1846,7 +1883,6 @@ mod tests {
         );
 
         let err = match PluginRuntime::with_permissions_config_and_epoch_ticker_factory(
-            plugin_engine,
             loader,
             credential_store,
             Arc::new(RateLimiterRegistry::new()),
@@ -1874,13 +1910,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_runtime_creation_rejects_engine_mismatch() {
+        let temp_dir = tempdir().unwrap();
+        let plugins_dir = temp_dir.path().join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+
+        let loader = Arc::new(PluginLoader::new(plugins_dir).unwrap());
+        let mismatched_engine = super::super::PluginEngine::for_runtime().unwrap();
+        let backend = MockCredentialBackend::new(true);
+        let credential_store = Arc::new(
+            CredentialStore::new(backend, temp_dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+
+        let err = match PluginRuntime::with_permissions_config_and_engine(
+            mismatched_engine,
+            loader,
+            credential_store,
+            Arc::new(RateLimiterRegistry::new()),
+            SsrfConfig::default(),
+            crate::plugins::sandbox::SandboxConfig::default(),
+            PermissionConfig::default(),
+        ) {
+            Ok(_) => panic!("runtime startup should reject a mismatched plugin engine"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(err, RuntimeError::EngineMismatch));
+    }
+
+    #[tokio::test]
     async fn test_runtime_creation_preserves_epoch_ticker_spawn_error_chain() {
         let temp_dir = tempdir().unwrap();
         let plugins_dir = temp_dir.path().join("plugins");
         std::fs::create_dir_all(&plugins_dir).unwrap();
 
         let loader = Arc::new(PluginLoader::new(plugins_dir).unwrap());
-        let plugin_engine = loader.shared_engine().clone();
         let backend = MockCredentialBackend::new(true);
         let credential_store = Arc::new(
             CredentialStore::new(backend, temp_dir.path().to_path_buf())
@@ -1889,7 +1955,6 @@ mod tests {
         );
 
         let err = match PluginRuntime::with_permissions_config_and_epoch_ticker_factory(
-            plugin_engine,
             loader,
             credential_store,
             Arc::new(RateLimiterRegistry::new()),
@@ -1995,18 +2060,21 @@ mod tests {
             .write(true)
             .open(&plugin_path)
             .unwrap()
-            .set_times(
-                std::fs::FileTimes::new().set_modified(
-                    std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
-                ),
-            )
+            .set_times(std::fs::FileTimes::new().set_modified(
+                std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+            ))
             .unwrap();
 
         loader.load_plugin(&plugin_path).unwrap();
         runtime.instantiate_plugin("alpha").await.unwrap();
 
         let initial_loaded_version = loader.get_plugin("alpha").unwrap().manifest.version.clone();
-        let initial_live_version = runtime.get_instance("alpha").unwrap().manifest.version.clone();
+        let initial_live_version = runtime
+            .get_instance("alpha")
+            .unwrap()
+            .manifest
+            .version
+            .clone();
         assert_eq!(initial_live_version, initial_loaded_version);
 
         std::fs::write(&plugin_path, tool_plugin_component_bytes()).unwrap();
@@ -2014,11 +2082,9 @@ mod tests {
             .write(true)
             .open(&plugin_path)
             .unwrap()
-            .set_times(
-                std::fs::FileTimes::new().set_modified(
-                    std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000),
-                ),
-            )
+            .set_times(std::fs::FileTimes::new().set_modified(
+                std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000),
+            ))
             .unwrap();
 
         loader.reload_plugin("alpha").unwrap();
@@ -2033,7 +2099,12 @@ mod tests {
         runtime.unload_plugin("alpha").unwrap();
         runtime.instantiate_plugin("alpha").await.unwrap();
 
-        let restarted_version = runtime.get_instance("alpha").unwrap().manifest.version.clone();
+        let restarted_version = runtime
+            .get_instance("alpha")
+            .unwrap()
+            .manifest
+            .version
+            .clone();
         assert_eq!(restarted_version, reloaded_version);
 
         runtime.unload_plugin("alpha").unwrap();
@@ -2377,7 +2448,7 @@ mod tests {
         // Verify the engine was created with fuel consumption enabled
         // by checking that we can create a store and set fuel on it
         let store = Store::new(
-            runtime.loader.engine(),
+            runtime.engine(),
             HostState {
                 plugin_id: "test".to_string(),
                 host_ctx: Arc::new(PluginHostContext::new(
@@ -2403,7 +2474,7 @@ mod tests {
     async fn test_zero_fuel_store() {
         let runtime = create_test_runtime().await;
         let mut store = Store::new(
-            runtime.loader.engine(),
+            runtime.engine(),
             HostState {
                 plugin_id: "test".to_string(),
                 host_ctx: Arc::new(PluginHostContext::new(

@@ -174,6 +174,8 @@ fn plugin_runtime_init_error_is_fatal(error: &RuntimeError) -> bool {
         | RuntimeError::HostError(_)
         | RuntimeError::LoaderError(_)
         | RuntimeError::WasmtimeError(_)
+        | RuntimeError::EngineMismatch
+        | RuntimeError::EpochTickerIntervalMismatch { .. }
         | RuntimeError::PluginError { .. }
         | RuntimeError::FuelExhausted { .. }
         | RuntimeError::CapabilityDenied { .. } => false,
@@ -476,7 +478,7 @@ fn discover_and_load_plugins(cfg: Value, state_dir: PathBuf) -> BlockingPluginBo
     let plugin_engine = match initialize_plugin_engine() {
         Ok(plugin_engine) => plugin_engine,
         Err(error) => {
-            let reason = format!("failed to initialize plugin engine: {error}");
+            let reason = format!("failed to initialize plugin loader: {error}");
             report.errors.push(reason.clone());
             push_loader_init_failure_entries(&mut report, &managed_entries, &reason);
             return BlockingPluginBootstrapResult {

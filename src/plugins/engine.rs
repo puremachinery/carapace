@@ -11,6 +11,10 @@ use crate::StartupThreadSpawnError;
 
 pub(crate) const EPOCH_TICKER_THREAD_NAME: &str = "plugin-epoch-ticker";
 
+fn normalize_epoch_ticker_interval(interval: Duration) -> Duration {
+    interval.max(Duration::from_millis(1))
+}
+
 fn plugin_engine_config() -> Config {
     let mut config = Config::new();
     config.wasm_component_model(true);
@@ -34,9 +38,23 @@ pub(crate) fn shared_component_validation_engine() -> Result<&'static Engine, St
     }
 }
 
+#[derive(Debug)]
+pub(crate) enum EnsureEpochTickerError<E> {
+    IntervalMismatch {
+        existing: Duration,
+        requested: Duration,
+    },
+    Start(E),
+}
+
+struct EpochTickerState {
+    interval: Duration,
+    ticker: Arc<EpochTicker>,
+}
+
 pub(crate) struct PluginEngine {
     engine: Engine,
-    epoch_ticker: Mutex<Option<Arc<EpochTicker>>>,
+    epoch_ticker: Mutex<Option<EpochTickerState>>,
 }
 
 impl PluginEngine {
@@ -55,27 +73,30 @@ impl PluginEngine {
         &self,
         interval: Duration,
         factory: F,
-    ) -> Result<Arc<EpochTicker>, E>
+    ) -> Result<Arc<EpochTicker>, EnsureEpochTickerError<E>>
     where
         F: FnOnce(Engine, Duration) -> Result<EpochTicker, E>,
     {
+        let interval = normalize_epoch_ticker_interval(interval);
         let mut ticker = self.epoch_ticker.lock();
         if let Some(existing) = ticker.as_ref() {
-            return Ok(existing.clone());
+            if existing.interval != interval {
+                return Err(EnsureEpochTickerError::IntervalMismatch {
+                    existing: existing.interval,
+                    requested: interval,
+                });
+            }
+            return Ok(existing.ticker.clone());
         }
 
-        let created = Arc::new(factory(self.engine.clone(), interval)?);
-        *ticker = Some(created.clone());
+        let created = Arc::new(
+            factory(self.engine.clone(), interval).map_err(EnsureEpochTickerError::Start)?,
+        );
+        *ticker = Some(EpochTickerState {
+            interval,
+            ticker: created.clone(),
+        });
         Ok(created)
-    }
-}
-
-impl Default for PluginEngine {
-    fn default() -> Self {
-        Self {
-            engine: build_plugin_engine().expect("plugin engine should initialize"),
-            epoch_ticker: Mutex::new(None),
-        }
     }
 }
 
@@ -110,6 +131,7 @@ impl EpochTicker {
         interval: Duration,
         spawner: NamedThreadSpawner,
     ) -> Result<Self, StartupThreadSpawnError> {
+        let interval = normalize_epoch_ticker_interval(interval);
         let stop = Arc::new(AtomicBool::new(false));
         let handle = spawn_startup_named_thread_with_spawner(
             EPOCH_TICKER_THREAD_NAME,
@@ -130,5 +152,46 @@ impl Drop for EpochTicker {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ensure_epoch_ticker_rejects_mismatched_interval_requests() {
+        let plugin_engine = PluginEngine::for_runtime().expect("plugin engine");
+
+        plugin_engine
+            .ensure_epoch_ticker(Duration::ZERO, |_engine, _interval| {
+                Ok::<EpochTicker, ()>(EpochTicker {
+                    stop: Arc::new(AtomicBool::new(false)),
+                    handle: None,
+                })
+            })
+            .expect("first ticker request should succeed");
+
+        let err = match plugin_engine.ensure_epoch_ticker(
+            Duration::from_millis(2),
+            |_engine, _interval| {
+                Ok::<EpochTicker, ()>(EpochTicker {
+                    stop: Arc::new(AtomicBool::new(false)),
+                    handle: None,
+                })
+            },
+        ) {
+            Ok(_) => panic!("mismatched interval should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(
+            err,
+            EnsureEpochTickerError::IntervalMismatch {
+                existing,
+                requested,
+            } if existing == Duration::from_millis(1)
+                && requested == Duration::from_millis(2)
+        ));
     }
 }
