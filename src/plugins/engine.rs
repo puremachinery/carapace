@@ -1,4 +1,4 @@
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
@@ -60,7 +60,9 @@ where
     let engine = init()?;
     match engine_cell.set(engine) {
         Ok(()) => {}
-        Err(engine) => drop(engine),
+        Err(_) => unreachable!(
+            "OnceLock::set cannot fail while init_lock is held and cell is confirmed empty"
+        ),
     }
 
     Ok(engine_cell
@@ -82,9 +84,15 @@ struct EpochTickerState {
     ticker: Weak<EpochTicker>,
 }
 
+enum EpochTickerSlot {
+    Starting { interval: Duration },
+    Ready(EpochTickerState),
+}
+
 pub(crate) struct PluginEngine {
     engine: Engine,
-    epoch_ticker: Mutex<Option<EpochTickerState>>,
+    epoch_ticker: Mutex<Option<EpochTickerSlot>>,
+    epoch_ticker_ready: Condvar,
 }
 
 impl PluginEngine {
@@ -92,6 +100,7 @@ impl PluginEngine {
         Ok(Arc::new(Self {
             engine: build_plugin_engine()?,
             epoch_ticker: Mutex::new(None),
+            epoch_ticker_ready: Condvar::new(),
         }))
     }
 
@@ -115,25 +124,57 @@ impl PluginEngine {
     {
         let interval = normalize_epoch_ticker_interval(interval);
         let mut ticker = self.epoch_ticker.lock();
-        if let Some(existing) = ticker.as_ref() {
-            if let Some(ticker) = existing.ticker.upgrade() {
-                if existing.interval != interval {
-                    return Err(EnsureEpochTickerError::IntervalMismatch {
-                        existing: existing.interval,
-                        requested: interval,
-                    });
+        loop {
+            match ticker.as_ref() {
+                Some(EpochTickerSlot::Ready(existing)) => {
+                    let existing_interval = existing.interval;
+                    if let Some(existing_ticker) = existing.ticker.upgrade() {
+                        if existing_interval != interval {
+                            return Err(EnsureEpochTickerError::IntervalMismatch {
+                                existing: existing_interval,
+                                requested: interval,
+                            });
+                        }
+                        return Ok(existing_ticker);
+                    }
+                    *ticker = None;
                 }
-                return Ok(ticker);
+                Some(EpochTickerSlot::Starting {
+                    interval: existing_interval,
+                }) => {
+                    let existing_interval = *existing_interval;
+                    if existing_interval != interval {
+                        return Err(EnsureEpochTickerError::IntervalMismatch {
+                            existing: existing_interval,
+                            requested: interval,
+                        });
+                    }
+                    self.epoch_ticker_ready.wait(&mut ticker);
+                }
+                None => {
+                    *ticker = Some(EpochTickerSlot::Starting { interval });
+                    break;
+                }
             }
         }
 
-        let created = Arc::new(
-            factory(self.engine.clone(), interval).map_err(EnsureEpochTickerError::Start)?,
-        );
-        *ticker = Some(EpochTickerState {
+        drop(ticker);
+        let created = match factory(self.engine.clone(), interval) {
+            Ok(ticker) => Arc::new(ticker),
+            Err(error) => {
+                let mut ticker = self.epoch_ticker.lock();
+                *ticker = None;
+                self.epoch_ticker_ready.notify_all();
+                return Err(EnsureEpochTickerError::Start(error));
+            }
+        };
+
+        let mut ticker = self.epoch_ticker.lock();
+        *ticker = Some(EpochTickerSlot::Ready(EpochTickerState {
             interval,
             ticker: Arc::downgrade(&created),
-        });
+        }));
+        self.epoch_ticker_ready.notify_all();
         Ok(created)
     }
 }
@@ -385,6 +426,54 @@ mod tests {
             attempts.load(Ordering::SeqCst),
             1,
             "only one thread should run the expensive engine initializer"
+        );
+    }
+
+    #[test]
+    fn ensure_epoch_ticker_serializes_concurrent_creation() {
+        let plugin_engine = PluginEngine::for_runtime().expect("plugin engine");
+        let attempts = AtomicUsize::new(0);
+        let release = AtomicBool::new(false);
+
+        std::thread::scope(|scope| {
+            let mut joins = Vec::new();
+            for _ in 0..8 {
+                joins.push(scope.spawn(|| {
+                    plugin_engine
+                        .ensure_epoch_ticker(Duration::from_millis(1), |_engine, _interval| {
+                            attempts.fetch_add(1, Ordering::SeqCst);
+                            while !release.load(Ordering::SeqCst) {
+                                std::hint::spin_loop();
+                            }
+                            Ok::<EpochTicker, ()>(EpochTicker {
+                                stop: Arc::new(AtomicBool::new(false)),
+                                handle: None,
+                            })
+                        })
+                        .expect("concurrent ticker initialization should succeed")
+                }));
+            }
+
+            while attempts.load(Ordering::SeqCst) == 0 {
+                std::hint::spin_loop();
+            }
+            release.store(true, Ordering::SeqCst);
+
+            let first = joins
+                .pop()
+                .expect("at least one join handle")
+                .join()
+                .expect("first thread should succeed");
+            for join in joins {
+                let ticker = join.join().expect("thread should succeed");
+                assert!(Arc::ptr_eq(&ticker, &first));
+            }
+        });
+
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "only one ticker factory should run for concurrent same-interval requests"
         );
     }
 }
