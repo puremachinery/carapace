@@ -9,7 +9,7 @@ use crate::plugins::loader::{is_reserved_plugin_id, load_plugins_manifest, Loade
 use crate::plugins::permissions::PermissionConfig;
 use crate::plugins::sandbox::SandboxConfig;
 use crate::plugins::signature::SignatureConfig;
-use crate::plugins::{PluginLoader, PluginRegistry, PluginRuntime, RuntimeError};
+use crate::plugins::{PluginEngine, PluginLoader, PluginRegistry, PluginRuntime, RuntimeError};
 use crate::server::ws::WsServerState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -312,10 +312,7 @@ fn resolve_managed_plugin_path(
     Ok(canonical_path)
 }
 
-fn initialize_plugin_loader(
-    managed_dir: PathBuf,
-    signature_config: SignatureConfig,
-) -> Result<Arc<PluginLoader>, LoaderError> {
+fn initialize_plugin_engine() -> Result<Arc<PluginEngine>, LoaderError> {
     #[cfg(test)]
     if let Some(message) = std::env::var_os(TEST_FORCE_PLUGIN_LOADER_INIT_FAILURE_ENV)
         .filter(|value| !value.is_empty())
@@ -325,7 +322,16 @@ fn initialize_plugin_loader(
         ));
     }
 
-    PluginLoader::with_signature_config(managed_dir, signature_config).map(Arc::new)
+    PluginEngine::for_runtime().map_err(LoaderError::EngineError)
+}
+
+fn initialize_plugin_loader(
+    managed_dir: PathBuf,
+    signature_config: SignatureConfig,
+    plugin_engine: Arc<PluginEngine>,
+) -> Result<Arc<PluginLoader>, LoaderError> {
+    PluginLoader::with_signature_config_and_engine(managed_dir, signature_config, plugin_engine)
+        .map(Arc::new)
 }
 
 fn discover_config_path_plugins(path: &Path) -> Result<Vec<PathBuf>, String> {
@@ -420,6 +426,7 @@ pub(crate) fn start_plugin_services(
 
 struct BlockingPluginBootstrapResult {
     report: PluginActivationReport,
+    plugin_engine: Option<Arc<PluginEngine>>,
     loader: Option<Arc<PluginLoader>>,
     loaded_plugin_ids: Vec<String>,
     report_index_by_plugin_id: HashMap<String, usize>,
@@ -454,6 +461,7 @@ fn discover_and_load_plugins(cfg: Value, state_dir: PathBuf) -> BlockingPluginBo
         }
         return BlockingPluginBootstrapResult {
             report,
+            plugin_engine: None,
             loader: None,
             loaded_plugin_ids: Vec::new(),
             report_index_by_plugin_id: HashMap::new(),
@@ -465,7 +473,28 @@ fn discover_and_load_plugins(cfg: Value, state_dir: PathBuf) -> BlockingPluginBo
     let signature_config = plugin_signature_config_from_config(&cfg);
     let sandbox_config = plugin_sandbox_config_from_config(&cfg);
     let permission_config = PermissionConfig::default();
-    let loader = match initialize_plugin_loader(managed_dir.clone(), signature_config) {
+    let plugin_engine = match initialize_plugin_engine() {
+        Ok(plugin_engine) => plugin_engine,
+        Err(error) => {
+            let reason = format!("failed to initialize plugin engine: {error}");
+            report.errors.push(reason.clone());
+            push_loader_init_failure_entries(&mut report, &managed_entries, &reason);
+            return BlockingPluginBootstrapResult {
+                report,
+                plugin_engine: None,
+                loader: None,
+                loaded_plugin_ids: Vec::new(),
+                report_index_by_plugin_id: HashMap::new(),
+                sandbox_config,
+                permission_config,
+            };
+        }
+    };
+    let loader = match initialize_plugin_loader(
+        managed_dir.clone(),
+        signature_config,
+        plugin_engine.clone(),
+    ) {
         Ok(loader) => loader,
         Err(error) => {
             let reason = format!("failed to initialize plugin loader: {error}");
@@ -473,6 +502,7 @@ fn discover_and_load_plugins(cfg: Value, state_dir: PathBuf) -> BlockingPluginBo
             push_loader_init_failure_entries(&mut report, &managed_entries, &reason);
             return BlockingPluginBootstrapResult {
                 report,
+                plugin_engine: None,
                 loader: None,
                 loaded_plugin_ids: Vec::new(),
                 report_index_by_plugin_id: HashMap::new(),
@@ -623,6 +653,7 @@ fn discover_and_load_plugins(cfg: Value, state_dir: PathBuf) -> BlockingPluginBo
     let loaded_plugin_ids = loader.list_plugins();
     BlockingPluginBootstrapResult {
         report,
+        plugin_engine: Some(plugin_engine),
         loader: Some(loader),
         loaded_plugin_ids,
         report_index_by_plugin_id,
@@ -661,12 +692,21 @@ pub(crate) async fn bootstrap_plugin_runtime(
 
     let BlockingPluginBootstrapResult {
         mut report,
+        plugin_engine,
         loader,
         loaded_plugin_ids,
         report_index_by_plugin_id,
         sandbox_config,
         permission_config,
     } = blocking;
+
+    let Some(plugin_engine) = plugin_engine else {
+        return Ok(PluginBootstrapResult {
+            registry,
+            runtime: None,
+            activation_report: report,
+        });
+    };
 
     let Some(loader) = loader else {
         return Ok(PluginBootstrapResult {
@@ -705,7 +745,8 @@ pub(crate) async fn bootstrap_plugin_runtime(
         }
     };
 
-    let runtime = match PluginRuntime::with_permissions_config(
+    let runtime = match PluginRuntime::with_permissions_config_and_engine(
+        plugin_engine,
         loader.clone(),
         credential_store,
         Arc::new(crate::plugins::RateLimiterRegistry::new()),

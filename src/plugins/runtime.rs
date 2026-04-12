@@ -22,19 +22,15 @@
 use std::collections::HashMap;
 #[cfg(test)]
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use parking_lot::RwLock;
 use thiserror::Error;
 use wasmtime::component::{Component, ComponentType, Lift, Linker, Lower};
-use wasmtime::{Config, Engine, ResourceLimiter, Store, StoreContextMut};
+use wasmtime::{Engine, ResourceLimiter, Store, StoreContextMut};
 
 use crate::credentials::{CredentialBackend, CredentialStore};
-use crate::thread_util::{
-    spawn_named_thread, spawn_startup_named_thread_with_spawner, NamedThreadSpawner,
-};
 
 use super::bindings::{
     BindingError, ChannelCapabilities, ChannelInfo, ChannelPluginInstance, ChatType,
@@ -43,6 +39,9 @@ use super::bindings::{
     WebhookPluginInstance, WebhookRequest, WebhookResponse, WitHost,
 };
 use super::capabilities::{RateLimiterRegistry, SsrfConfig};
+#[cfg(test)]
+use super::engine::EPOCH_TICKER_THREAD_NAME;
+use super::engine::EpochTicker;
 use super::host::{HostError, HttpRequest, PluginHostContext};
 use super::loader::{LoadedPlugin, PluginKind, PluginLoader, PluginManifest};
 use super::permissions::{
@@ -72,64 +71,12 @@ pub const DEFAULT_FUEL_BUDGET: u64 = 1_000_000_000;
 
 /// Bounded queue depth for per-plugin worker requests.
 const PLUGIN_WORKER_QUEUE_CAPACITY: usize = 64;
-const EPOCH_TICKER_THREAD_NAME: &str = "plugin-epoch-ticker";
 
 fn compute_epoch_deadline_ticks(timeout: Duration) -> u64 {
     let interval_ms = DEFAULT_EPOCH_TICK_INTERVAL.as_millis().max(1);
     let timeout_ms = timeout.as_millis().max(1);
     let ticks = timeout_ms.div_ceil(interval_ms);
     ticks as u64
-}
-
-struct EpochTicker {
-    stop: Arc<AtomicBool>,
-    handle: Option<std::thread::JoinHandle<()>>,
-}
-
-impl EpochTicker {
-    fn routine(
-        engine: Engine,
-        interval: Duration,
-        stop: Arc<AtomicBool>,
-    ) -> crate::thread_util::NamedThreadRoutine {
-        Box::new(move || {
-            while !stop.load(Ordering::SeqCst) {
-                std::thread::sleep(interval);
-                engine.increment_epoch();
-            }
-        })
-    }
-
-    fn start(engine: Engine, interval: Duration) -> Result<Self, StartupThreadSpawnError> {
-        Self::start_with_spawner(engine, interval, spawn_named_thread)
-    }
-
-    fn start_with_spawner(
-        engine: Engine,
-        interval: Duration,
-        spawner: NamedThreadSpawner,
-    ) -> Result<Self, StartupThreadSpawnError> {
-        let stop = Arc::new(AtomicBool::new(false));
-        let handle = spawn_startup_named_thread_with_spawner(
-            EPOCH_TICKER_THREAD_NAME,
-            Self::routine(engine, interval, Arc::clone(&stop)),
-            spawner,
-        )?;
-
-        Ok(Self {
-            stop,
-            handle: Some(handle),
-        })
-    }
-}
-
-impl Drop for EpochTicker {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
-    }
 }
 
 struct PluginResourceLimiter {
@@ -634,9 +581,6 @@ pub struct HostState<B: CredentialBackend + Send + Sync + 'static> {
 
 /// Plugin runtime that manages WASM plugin instances
 pub struct PluginRuntime<B: CredentialBackend + 'static> {
-    /// Wasmtime engine (shared)
-    engine: Engine,
-
     /// Plugin loader
     loader: Arc<PluginLoader>,
 
@@ -657,9 +601,6 @@ pub struct PluginRuntime<B: CredentialBackend + 'static> {
 
     /// Epoch deadline ticks for wall-clock timeouts
     epoch_deadline_ticks: u64,
-
-    /// Epoch ticker for wall-clock timeouts (kept for drop)
-    _epoch_ticker: EpochTicker,
 
     /// Loaded plugin instances by ID
     instances: RwLock<HashMap<String, Arc<PluginInstanceHandle<B>>>>,
@@ -850,11 +791,11 @@ impl<B: CredentialBackend + Send + Sync + 'static> Drop for PluginInstanceHandle
 impl<B: CredentialBackend + Send + Sync + 'static> PluginInstanceHandle<B> {
     fn initialize_worker_state(
         plugin_id: String,
-        wasm_bytes: Vec<u8>,
-        engine: Engine,
+        component: Component,
         epoch_deadline_ticks: u64,
         host_ctx: Arc<PluginHostContext<B>>,
     ) -> Result<PluginWorkerState<B>, RuntimeError> {
+        let engine = component.engine().clone();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -886,10 +827,6 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginInstanceHandle<B> {
             let mut linker: Linker<HostState<B>> = Linker::new(&engine);
             PluginRuntime::<B>::add_host_functions_to_linker(&mut linker)?;
 
-            let component = Component::new(&engine, &wasm_bytes).map_err(|e| {
-                RuntimeError::WasmtimeError(format!("Failed to create component: {}", e))
-            })?;
-
             let instance = linker
                 .instantiate_async(&mut store, &component)
                 .await
@@ -909,8 +846,7 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginInstanceHandle<B> {
 
     fn spawn(
         manifest: PluginManifest,
-        wasm_bytes: Vec<u8>,
-        engine: Engine,
+        component: Component,
         epoch_deadline_ticks: u64,
         host_ctx: Arc<PluginHostContext<B>>,
     ) -> Result<Self, RuntimeError> {
@@ -924,8 +860,7 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginInstanceHandle<B> {
             .spawn(move || {
                 let mut state = match Self::initialize_worker_state(
                     plugin_id,
-                    wasm_bytes,
-                    engine,
+                    component,
                     epoch_deadline_ticks,
                     host_ctx,
                 ) {
@@ -1081,7 +1016,28 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
         sandbox_config: super::sandbox::SandboxConfig,
         permission_config: PermissionConfig,
     ) -> Result<Self, RuntimeError> {
+        Self::with_permissions_config_and_engine(
+            loader.shared_engine().clone(),
+            loader,
+            credential_store,
+            rate_limiters,
+            ssrf_config,
+            sandbox_config,
+            permission_config,
+        )
+    }
+
+    pub(crate) fn with_permissions_config_and_engine(
+        plugin_engine: Arc<super::engine::PluginEngine>,
+        loader: Arc<PluginLoader>,
+        credential_store: Arc<CredentialStore<B>>,
+        rate_limiters: Arc<RateLimiterRegistry>,
+        ssrf_config: SsrfConfig,
+        sandbox_config: super::sandbox::SandboxConfig,
+        permission_config: PermissionConfig,
+    ) -> Result<Self, RuntimeError> {
         Self::with_permissions_config_and_epoch_ticker_factory(
+            plugin_engine,
             loader,
             credential_store,
             rate_limiters,
@@ -1093,6 +1049,7 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
     }
 
     fn with_permissions_config_and_epoch_ticker_factory<F>(
+        plugin_engine: Arc<super::engine::PluginEngine>,
         loader: Arc<PluginLoader>,
         credential_store: Arc<CredentialStore<B>>,
         rate_limiters: Arc<RateLimiterRegistry>,
@@ -1104,21 +1061,16 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
     where
         F: FnOnce(Engine, Duration) -> Result<EpochTicker, RuntimeError>,
     {
-        // Configure wasmtime engine
-        let mut config = Config::new();
-        config.wasm_component_model(true);
-        config.consume_fuel(true);
-        config.epoch_interruption(true);
-        // Memory limits are enforced per-instance via resource limiter
-
-        let engine =
-            Engine::new(&config).map_err(|e| RuntimeError::WasmtimeError(e.to_string()))?;
+        if !Arc::ptr_eq(&plugin_engine, loader.shared_engine()) {
+            return Err(RuntimeError::WasmtimeError(
+                "plugin runtime engine must match the plugin loader engine".to_string(),
+            ));
+        }
 
         let epoch_deadline_ticks = compute_epoch_deadline_ticks(DEFAULT_EXECUTION_TIMEOUT);
-        let epoch_ticker = epoch_ticker_factory(engine.clone(), DEFAULT_EPOCH_TICK_INTERVAL)?;
+        plugin_engine.ensure_epoch_ticker(DEFAULT_EPOCH_TICK_INTERVAL, epoch_ticker_factory)?;
 
         Ok(Self {
-            engine,
             loader,
             credential_store,
             rate_limiters,
@@ -1126,7 +1078,6 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
             sandbox_config,
             permission_config,
             epoch_deadline_ticks,
-            _epoch_ticker: epoch_ticker,
             instances: RwLock::new(HashMap::new()),
             registry: Arc::new(PluginRegistry::new()),
         })
@@ -1228,15 +1179,13 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
 
         // Initialize the dedicated plugin worker off the async runtime thread.
         let manifest = loaded.manifest.clone();
-        let wasm_bytes = loaded.wasm_bytes.clone();
-        let engine = self.engine.clone();
+        let component = loaded.component.clone();
         let epoch_deadline_ticks = self.epoch_deadline_ticks;
         let handle = Arc::new(
             tokio::task::spawn_blocking(move || {
                 PluginInstanceHandle::spawn(
                     manifest,
-                    wasm_bytes,
-                    engine,
+                    component,
                     epoch_deadline_ticks,
                     host_ctx,
                 )
@@ -1821,6 +1770,7 @@ impl<B: CredentialBackend + Send + Sync + 'static> HookPluginInstance for HookAd
 mod tests {
     use super::*;
     use crate::credentials::MockCredentialBackend;
+    use crate::test_support::plugins::tool_plugin_component_bytes;
     use std::error::Error as _;
     use tempfile::tempdir;
 
@@ -1887,6 +1837,7 @@ mod tests {
         std::fs::create_dir_all(&plugins_dir).unwrap();
 
         let loader = Arc::new(PluginLoader::new(plugins_dir).unwrap());
+        let plugin_engine = loader.shared_engine().clone();
         let backend = MockCredentialBackend::new(true);
         let credential_store = Arc::new(
             CredentialStore::new(backend, temp_dir.path().to_path_buf())
@@ -1895,6 +1846,7 @@ mod tests {
         );
 
         let err = match PluginRuntime::with_permissions_config_and_epoch_ticker_factory(
+            plugin_engine,
             loader,
             credential_store,
             Arc::new(RateLimiterRegistry::new()),
@@ -1928,6 +1880,7 @@ mod tests {
         std::fs::create_dir_all(&plugins_dir).unwrap();
 
         let loader = Arc::new(PluginLoader::new(plugins_dir).unwrap());
+        let plugin_engine = loader.shared_engine().clone();
         let backend = MockCredentialBackend::new(true);
         let credential_store = Arc::new(
             CredentialStore::new(backend, temp_dir.path().to_path_buf())
@@ -1936,6 +1889,7 @@ mod tests {
         );
 
         let err = match PluginRuntime::with_permissions_config_and_epoch_ticker_factory(
+            plugin_engine,
             loader,
             credential_store,
             Arc::new(RateLimiterRegistry::new()),
@@ -1984,6 +1938,106 @@ mod tests {
         let runtime = create_test_runtime().await;
         let loaded = runtime.load_all().await.unwrap();
         assert!(loaded.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_instantiate_plugin_can_reuse_cached_component_after_unload() {
+        let temp_dir = tempdir().unwrap();
+        let plugins_dir = temp_dir.path().join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+
+        let loader = Arc::new(PluginLoader::new(plugins_dir.clone()).unwrap());
+        let backend = MockCredentialBackend::new(true);
+        let credential_store = Arc::new(
+            CredentialStore::new(backend, temp_dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let runtime = PluginRuntime::new(loader.clone(), credential_store).unwrap();
+
+        let plugin_path = plugins_dir.join("alpha.wasm");
+        std::fs::write(&plugin_path, tool_plugin_component_bytes()).unwrap();
+
+        let plugin_id = loader.load_plugin(&plugin_path).unwrap();
+        assert_eq!(plugin_id, "alpha");
+
+        runtime.instantiate_plugin("alpha").await.unwrap();
+        assert!(runtime.get_instance("alpha").is_some());
+        assert_eq!(runtime.registry().get_tools().len(), 1);
+
+        runtime.unload_plugin("alpha").unwrap();
+        assert!(runtime.get_instance("alpha").is_none());
+        assert!(runtime.registry().get_tools().is_empty());
+
+        runtime.instantiate_plugin("alpha").await.unwrap();
+        assert!(runtime.get_instance("alpha").is_some());
+        assert_eq!(runtime.registry().get_tools().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_reload_plugin_requires_worker_cycle_to_pick_up_new_component() {
+        let temp_dir = tempdir().unwrap();
+        let plugins_dir = temp_dir.path().join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+
+        let loader = Arc::new(PluginLoader::new(plugins_dir.clone()).unwrap());
+        let backend = MockCredentialBackend::new(true);
+        let credential_store = Arc::new(
+            CredentialStore::new(backend, temp_dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let runtime = PluginRuntime::new(loader.clone(), credential_store).unwrap();
+
+        let plugin_path = plugins_dir.join("alpha.wasm");
+        std::fs::write(&plugin_path, tool_plugin_component_bytes()).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&plugin_path)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new().set_modified(
+                    std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+                ),
+            )
+            .unwrap();
+
+        loader.load_plugin(&plugin_path).unwrap();
+        runtime.instantiate_plugin("alpha").await.unwrap();
+
+        let initial_loaded_version = loader.get_plugin("alpha").unwrap().manifest.version.clone();
+        let initial_live_version = runtime.get_instance("alpha").unwrap().manifest.version.clone();
+        assert_eq!(initial_live_version, initial_loaded_version);
+
+        std::fs::write(&plugin_path, tool_plugin_component_bytes()).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&plugin_path)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new().set_modified(
+                    std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000),
+                ),
+            )
+            .unwrap();
+
+        loader.reload_plugin("alpha").unwrap();
+
+        let reloaded_version = loader.get_plugin("alpha").unwrap().manifest.version.clone();
+        assert_ne!(reloaded_version, initial_loaded_version);
+        assert_eq!(
+            runtime.get_instance("alpha").unwrap().manifest.version,
+            initial_live_version
+        );
+
+        runtime.unload_plugin("alpha").unwrap();
+        runtime.instantiate_plugin("alpha").await.unwrap();
+
+        let restarted_version = runtime.get_instance("alpha").unwrap().manifest.version.clone();
+        assert_eq!(restarted_version, reloaded_version);
+
+        runtime.unload_plugin("alpha").unwrap();
+        assert!(runtime.get_instance("alpha").is_none());
     }
 
     #[test]
@@ -2323,7 +2377,7 @@ mod tests {
         // Verify the engine was created with fuel consumption enabled
         // by checking that we can create a store and set fuel on it
         let store = Store::new(
-            &runtime.engine,
+            runtime.loader.engine(),
             HostState {
                 plugin_id: "test".to_string(),
                 host_ctx: Arc::new(PluginHostContext::new(
@@ -2349,7 +2403,7 @@ mod tests {
     async fn test_zero_fuel_store() {
         let runtime = create_test_runtime().await;
         let mut store = Store::new(
-            &runtime.engine,
+            runtime.loader.engine(),
             HostState {
                 plugin_id: "test".to_string(),
                 host_ctx: Arc::new(PluginHostContext::new(

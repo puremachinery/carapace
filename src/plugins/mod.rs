@@ -66,6 +66,7 @@ pub(crate) fn validate_managed_plugin_name(name: &str) -> Result<(), String> {
 pub mod bindings;
 pub mod capabilities;
 pub mod dispatch;
+mod engine;
 pub mod hook_utils;
 pub mod host;
 pub mod loader;
@@ -96,6 +97,7 @@ pub use dispatch::{
     is_modifiable_hook, DispatchError, HookDispatchResult, HookDispatcher, ToolDispatcher,
     WebhookDispatcher, MODIFIABLE_HOOKS,
 };
+pub(crate) use engine::PluginEngine;
 pub use host::{
     HostError, HttpRequest, HttpResponse, MediaFetchResult, PluginHostContext,
     PluginHostContextBuilder, MAX_HTTP_BODY_SIZE, MAX_LOG_MESSAGE_SIZE, MAX_URL_LENGTH,

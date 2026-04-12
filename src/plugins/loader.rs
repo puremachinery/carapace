@@ -20,11 +20,11 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::SystemTime;
 use thiserror::Error;
 use wasmtime::component::Component as WasmComponent;
-use wasmtime::{Config, Engine};
+use wasmtime::Engine;
 
 pub(crate) const RESERVED_PLUGIN_CONFIG_KEYS: &[&str] =
     &["enabled", "entries", "load", "sandbox", "signature"];
@@ -189,8 +189,8 @@ pub struct LoadedPlugin {
     pub manifest: PluginManifest,
     /// Path to the WASM file
     pub wasm_path: PathBuf,
-    /// Raw WASM bytes (for component instantiation)
-    pub wasm_bytes: Vec<u8>,
+    /// Compiled WASM component bound to the shared plugin engine.
+    pub component: WasmComponent,
     /// Discovered WASM capabilities (from component import enumeration).
     pub discovered_capabilities: Option<super::sandbox::DiscoveredCapabilities>,
 }
@@ -200,7 +200,7 @@ impl std::fmt::Debug for LoadedPlugin {
         f.debug_struct("LoadedPlugin")
             .field("manifest", &self.manifest)
             .field("wasm_path", &self.wasm_path)
-            .field("wasm_bytes_len", &self.wasm_bytes.len())
+            .field("component_cached", &true)
             .field("discovered_capabilities", &self.discovered_capabilities)
             .finish()
     }
@@ -211,29 +211,24 @@ impl std::fmt::Debug for LoadedPlugin {
 /// WASM binary magic bytes (\0asm)
 const WASM_MAGIC: [u8; 4] = [0x00, 0x61, 0x73, 0x6D];
 
-fn component_engine() -> Result<Engine, LoaderError> {
-    let mut config = Config::new();
-    config.wasm_component_model(true);
-    Engine::new(&config).map_err(|e| LoaderError::EngineError(e.to_string()))
-}
-
-fn shared_component_validation_engine() -> Result<&'static Engine, LoaderError> {
-    static ENGINE: OnceLock<Result<Engine, String>> = OnceLock::new();
-    match ENGINE.get_or_init(|| component_engine().map_err(|error| error.to_string())) {
-        Ok(engine) => Ok(engine),
-        Err(message) => Err(LoaderError::EngineError(message.clone())),
-    }
+fn compile_plugin_component(
+    engine: &Engine,
+    source: &str,
+    wasm_bytes: &[u8],
+) -> Result<WasmComponent, LoaderError> {
+    WasmComponent::new(engine, wasm_bytes).map_err(|e| LoaderError::WasmCompileError {
+        path: source.to_string(),
+        message: e.to_string(),
+    })
 }
 
 pub(crate) fn validate_plugin_component_bytes(
     source: &str,
     wasm_bytes: &[u8],
 ) -> Result<(), LoaderError> {
-    let engine = shared_component_validation_engine()?;
-    WasmComponent::new(engine, wasm_bytes).map_err(|e| LoaderError::WasmCompileError {
-        path: source.to_string(),
-        message: e.to_string(),
-    })?;
+    let engine = super::engine::shared_component_validation_engine()
+        .map_err(LoaderError::EngineError)?;
+    compile_plugin_component(engine, source, wasm_bytes)?;
     Ok(())
 }
 
@@ -672,8 +667,8 @@ pub fn load_plugins_manifest(plugins_dir: &Path) -> Result<Option<serde_json::Va
 
 /// Plugin loader that manages discovery and loading of WASM plugins
 pub struct PluginLoader {
-    /// Wasmtime engine (shared across all plugins)
-    engine: Engine,
+    /// Shared plugin execution engine used to compile cached components.
+    engine: Arc<super::engine::PluginEngine>,
     /// Loaded plugins by ID
     plugins: RwLock<HashMap<String, Arc<LoadedPlugin>>>,
     /// Plugins directory
@@ -693,7 +688,17 @@ impl PluginLoader {
         plugins_dir: PathBuf,
         signature_config: super::signature::SignatureConfig,
     ) -> Result<Self, LoaderError> {
-        let engine = component_engine()?;
+        let engine =
+            super::engine::PluginEngine::for_runtime().map_err(LoaderError::EngineError)?;
+        Self::with_signature_config_and_engine(plugins_dir, signature_config, engine)
+    }
+
+    /// Create a new plugin loader with explicit signature config and shared engine.
+    pub(crate) fn with_signature_config_and_engine(
+        plugins_dir: PathBuf,
+        signature_config: super::signature::SignatureConfig,
+        engine: Arc<super::engine::PluginEngine>,
+    ) -> Result<Self, LoaderError> {
 
         Ok(Self {
             engine,
@@ -705,6 +710,11 @@ impl PluginLoader {
 
     /// Get the wasmtime engine
     pub fn engine(&self) -> &Engine {
+        self.engine.engine()
+    }
+
+    /// Get the shared plugin engine.
+    pub(crate) fn shared_engine(&self) -> &Arc<super::engine::PluginEngine> {
         &self.engine
     }
 
@@ -798,16 +808,15 @@ impl PluginLoader {
 
         // Validate and introspect the component bytes with the same binary format
         // the runtime later instantiates.
-        let component = WasmComponent::new(&self.engine, &wasm_bytes).map_err(|e| {
-            LoaderError::WasmCompileError {
-                path: wasm_path.display().to_string(),
-                message: e.to_string(),
-            }
-        })?;
+        let component = compile_plugin_component(
+            self.engine(),
+            &wasm_path.display().to_string(),
+            &wasm_bytes,
+        )?;
 
         let discovered_capabilities = Some(super::sandbox::enumerate_capabilities(
             &component,
-            &self.engine,
+            self.engine(),
         ));
 
         let plugin_id = wasm_path
@@ -821,12 +830,12 @@ impl PluginLoader {
         }
 
         let plugin_manifest =
-            derive_manifest(&plugin_id, wasm_path, &wasm_bytes, &component, &self.engine);
+            derive_manifest(&plugin_id, wasm_path, &wasm_bytes, &component, self.engine());
 
         let loaded = Arc::new(LoadedPlugin {
             manifest: plugin_manifest,
             wasm_path: wasm_path.to_path_buf(),
-            wasm_bytes,
+            component,
             discovered_capabilities,
         });
 
@@ -874,17 +883,16 @@ impl PluginLoader {
 
         // Validate and introspect the component bytes with the same binary format
         // the runtime later instantiates.
-        let component = WasmComponent::new(&self.engine, wasm_bytes).map_err(|e| {
-            LoaderError::WasmCompileError {
-                path: format!("<bytes:{}>", manifest.id),
-                message: e.to_string(),
-            }
-        })?;
+        let component = compile_plugin_component(
+            self.engine(),
+            &format!("<bytes:{}>", manifest.id),
+            wasm_bytes,
+        )?;
 
         // Enumerate WASM capabilities for sandbox checking
         let discovered_capabilities = Some(super::sandbox::enumerate_capabilities(
             &component,
-            &self.engine,
+            self.engine(),
         ));
 
         let plugin_id = manifest.id.clone();
@@ -893,7 +901,7 @@ impl PluginLoader {
         let loaded = LoadedPlugin {
             manifest,
             wasm_path: PathBuf::new(), // No file path for byte-loaded plugins
-            wasm_bytes: wasm_bytes.to_vec(),
+            component,
             discovered_capabilities,
         };
 
@@ -940,7 +948,9 @@ impl PluginLoader {
     /// Reload a plugin from its WASM file.
     ///
     /// The new module is compiled and verified *before* replacing the old one,
-    /// so the plugin stays available if the reload fails.
+    /// so the plugin stays available if the reload fails. Callers must still
+    /// unload and re-instantiate any live runtime worker to pick up the new
+    /// compiled component.
     pub fn reload_plugin(&self, plugin_id: &str) -> Result<(), LoaderError> {
         let wasm_path = {
             let plugins = self.plugins.read();
