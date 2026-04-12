@@ -1072,6 +1072,7 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
         }
 
         Self::with_permissions_config_and_epoch_ticker_factory(
+            plugin_engine,
             loader,
             credential_store,
             rate_limiters,
@@ -1083,6 +1084,7 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
     }
 
     fn with_permissions_config_and_epoch_ticker_factory<F>(
+        plugin_engine: Arc<super::engine::PluginEngine>,
         loader: Arc<PluginLoader>,
         credential_store: Arc<CredentialStore<B>>,
         rate_limiters: Arc<RateLimiterRegistry>,
@@ -1094,7 +1096,6 @@ impl<B: CredentialBackend + Send + Sync + 'static> PluginRuntime<B> {
     where
         F: FnOnce(Engine, Duration) -> Result<EpochTicker, RuntimeError>,
     {
-        let plugin_engine = loader.shared_engine().clone();
         let epoch_deadline_ticks = compute_epoch_deadline_ticks(DEFAULT_EXECUTION_TIMEOUT);
         plugin_engine
             .ensure_epoch_ticker(DEFAULT_EPOCH_TICK_INTERVAL, epoch_ticker_factory)
@@ -1828,40 +1829,6 @@ mod tests {
         PluginRuntime::new(loader, credential_store).unwrap()
     }
 
-    #[test]
-    fn test_epoch_ticker_start_reports_thread_spawn_error() {
-        fn fail_spawner(
-            _builder: std::thread::Builder,
-            routine: crate::thread_util::NamedThreadRoutine,
-        ) -> io::Result<std::thread::JoinHandle<()>> {
-            drop(routine);
-            Err(io::Error::other("simulated epoch ticker thread exhaustion"))
-        }
-
-        let engine = Engine::default();
-        let err = match EpochTicker::start_with_spawner(
-            engine,
-            DEFAULT_EPOCH_TICK_INTERVAL,
-            fail_spawner,
-        ) {
-            Ok(_) => panic!("epoch ticker startup should report thread spawn failure"),
-            Err(err) => err,
-        };
-
-        let io_source = err
-            .source()
-            .expect("thread spawn error should preserve the original io::Error source");
-        let io_error = io_source
-            .downcast_ref::<io::Error>()
-            .expect("thread spawn error source should remain an io::Error");
-
-        assert_eq!(io_error.kind(), io::ErrorKind::Other);
-        assert_eq!(err.thread_name(), EPOCH_TICKER_THREAD_NAME);
-        assert!(err
-            .to_string()
-            .contains("simulated epoch ticker thread exhaustion"));
-    }
-
     #[tokio::test]
     async fn test_runtime_creation() {
         let runtime = create_test_runtime().await;
@@ -1875,6 +1842,7 @@ mod tests {
         std::fs::create_dir_all(&plugins_dir).unwrap();
 
         let loader = Arc::new(PluginLoader::new(plugins_dir).unwrap());
+        let plugin_engine = loader.shared_engine().clone();
         let backend = MockCredentialBackend::new(true);
         let credential_store = Arc::new(
             CredentialStore::new(backend, temp_dir.path().to_path_buf())
@@ -1883,6 +1851,7 @@ mod tests {
         );
 
         let err = match PluginRuntime::with_permissions_config_and_epoch_ticker_factory(
+            plugin_engine,
             loader,
             credential_store,
             Arc::new(RateLimiterRegistry::new()),
@@ -1947,6 +1916,7 @@ mod tests {
         std::fs::create_dir_all(&plugins_dir).unwrap();
 
         let loader = Arc::new(PluginLoader::new(plugins_dir).unwrap());
+        let plugin_engine = loader.shared_engine().clone();
         let backend = MockCredentialBackend::new(true);
         let credential_store = Arc::new(
             CredentialStore::new(backend, temp_dir.path().to_path_buf())
@@ -1955,6 +1925,7 @@ mod tests {
         );
 
         let err = match PluginRuntime::with_permissions_config_and_epoch_ticker_factory(
+            plugin_engine,
             loader,
             credential_store,
             Arc::new(RateLimiterRegistry::new()),

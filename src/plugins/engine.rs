@@ -126,12 +126,11 @@ impl EpochTicker {
         Self::start_with_spawner(engine, interval, spawn_named_thread)
     }
 
-    pub(crate) fn start_with_spawner(
+    fn start_with_spawner(
         engine: Engine,
         interval: Duration,
         spawner: NamedThreadSpawner,
     ) -> Result<Self, StartupThreadSpawnError> {
-        let interval = normalize_epoch_ticker_interval(interval);
         let stop = Arc::new(AtomicBool::new(false));
         let handle = spawn_startup_named_thread_with_spawner(
             EPOCH_TICKER_THREAD_NAME,
@@ -158,6 +157,9 @@ impl Drop for EpochTicker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugins::runtime::DEFAULT_EPOCH_TICK_INTERVAL;
+    use std::error::Error;
+    use std::io;
 
     #[test]
     fn ensure_epoch_ticker_rejects_mismatched_interval_requests() {
@@ -193,5 +195,39 @@ mod tests {
             } if existing == Duration::from_millis(1)
                 && requested == Duration::from_millis(2)
         ));
+    }
+
+    #[test]
+    fn epoch_ticker_start_reports_thread_spawn_error() {
+        fn fail_spawner(
+            _builder: std::thread::Builder,
+            routine: crate::thread_util::NamedThreadRoutine,
+        ) -> io::Result<std::thread::JoinHandle<()>> {
+            drop(routine);
+            Err(io::Error::other("simulated epoch ticker thread exhaustion"))
+        }
+
+        let engine = Engine::default();
+        let err = match EpochTicker::start_with_spawner(
+            engine,
+            DEFAULT_EPOCH_TICK_INTERVAL,
+            fail_spawner,
+        ) {
+            Ok(_) => panic!("epoch ticker startup should report thread spawn failure"),
+            Err(err) => err,
+        };
+
+        let io_source = err
+            .source()
+            .expect("thread spawn error should preserve the original io::Error source");
+        let io_error = io_source
+            .downcast_ref::<io::Error>()
+            .expect("thread spawn error source should remain an io::Error");
+
+        assert_eq!(io_error.kind(), io::ErrorKind::Other);
+        assert_eq!(err.thread_name(), EPOCH_TICKER_THREAD_NAME);
+        assert!(err
+            .to_string()
+            .contains("simulated epoch ticker thread exhaustion"));
     }
 }

@@ -692,7 +692,7 @@ mod tests {
     use crate::server::plugin_bootstrap::{
         bootstrap_plugin_runtime, load_plugin_candidate, start_plugin_services,
         stop_plugin_services, PluginActivationEntry, PluginActivationReport,
-        PluginActivationSource, PluginActivationState, TEST_FORCE_PLUGIN_LOADER_INIT_FAILURE_ENV,
+        PluginActivationSource, PluginActivationState, TEST_FORCE_PLUGIN_ENGINE_INIT_FAILURE_ENV,
     };
     use crate::server::ws::WsServerConfig;
     use crate::test_support::{env::ScopedEnv, plugins::tool_plugin_component_bytes};
@@ -1191,8 +1191,8 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let mut env = ScopedEnv::new();
         env.set(
-            TEST_FORCE_PLUGIN_LOADER_INIT_FAILURE_ENV,
-            "forced loader init failure",
+            TEST_FORCE_PLUGIN_ENGINE_INIT_FAILURE_ENV,
+            "forced engine init failure",
         );
         let cfg = json!({
             "plugins": {
@@ -1220,7 +1220,7 @@ mod tests {
         assert_eq!(report.errors.len(), 1);
         assert_eq!(
             report.errors[0],
-            "failed to initialize plugin engine: Wasmtime engine error: forced loader init failure"
+            "failed to initialize plugin engine: Wasmtime engine error: forced engine init failure"
         );
         assert_eq!(report.entries.len(), 2);
 
@@ -1234,7 +1234,7 @@ mod tests {
         assert_eq!(
             alpha.reason.as_deref(),
             Some(
-                "failed to initialize plugin engine: Wasmtime engine error: forced loader init failure"
+                "failed to initialize plugin engine: Wasmtime engine error: forced engine init failure"
             )
         );
         assert_eq!(alpha.install_id.as_ref(), Some(&json!("install-alpha")));

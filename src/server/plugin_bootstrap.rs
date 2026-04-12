@@ -88,6 +88,10 @@ pub(crate) struct PluginBootstrapResult {
 }
 
 #[cfg(test)]
+pub(crate) const TEST_FORCE_PLUGIN_ENGINE_INIT_FAILURE_ENV: &str =
+    "CARAPACE_TEST_FORCE_PLUGIN_ENGINE_INIT_FAILURE";
+
+#[cfg(test)]
 pub(crate) const TEST_FORCE_PLUGIN_LOADER_INIT_FAILURE_ENV: &str =
     "CARAPACE_TEST_FORCE_PLUGIN_LOADER_INIT_FAILURE";
 
@@ -315,7 +319,7 @@ fn resolve_managed_plugin_path(
 
 fn initialize_plugin_engine() -> Result<Arc<PluginEngine>, LoaderError> {
     #[cfg(test)]
-    if let Some(message) = std::env::var_os(TEST_FORCE_PLUGIN_LOADER_INIT_FAILURE_ENV)
+    if let Some(message) = std::env::var_os(TEST_FORCE_PLUGIN_ENGINE_INIT_FAILURE_ENV)
         .filter(|value| !value.is_empty())
     {
         return Err(LoaderError::EngineError(
@@ -331,6 +335,15 @@ fn initialize_plugin_loader(
     signature_config: SignatureConfig,
     plugin_engine: Arc<PluginEngine>,
 ) -> Result<Arc<PluginLoader>, LoaderError> {
+    #[cfg(test)]
+    if let Some(message) = std::env::var_os(TEST_FORCE_PLUGIN_LOADER_INIT_FAILURE_ENV)
+        .filter(|value| !value.is_empty())
+    {
+        return Err(LoaderError::EngineError(
+            message.to_string_lossy().into_owned(),
+        ));
+    }
+
     PluginLoader::with_signature_config_and_engine(managed_dir, signature_config, plugin_engine)
         .map(Arc::new)
 }
@@ -427,6 +440,8 @@ pub(crate) fn start_plugin_services(
 
 struct BlockingPluginBootstrapResult {
     report: PluginActivationReport,
+    // Engine initialization can succeed before loader initialization fails, so
+    // these options intentionally represent separate bootstrap phases.
     plugin_engine: Option<Arc<PluginEngine>>,
     loader: Option<Arc<PluginLoader>>,
     loaded_plugin_ids: Vec<String>,
@@ -503,7 +518,7 @@ fn discover_and_load_plugins(cfg: Value, state_dir: PathBuf) -> BlockingPluginBo
             push_loader_init_failure_entries(&mut report, &managed_entries, &reason);
             return BlockingPluginBootstrapResult {
                 report,
-                plugin_engine: None,
+                plugin_engine: Some(plugin_engine),
                 loader: None,
                 loaded_plugin_ids: Vec::new(),
                 report_index_by_plugin_id: HashMap::new(),
@@ -843,9 +858,12 @@ pub(crate) fn stop_plugin_services(ws_state: &WsServerState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::env::ScopedEnv;
+    use serde_json::json;
+    use std::time::Duration;
 
     #[test]
-    fn test_plugin_runtime_thread_spawn_errors_are_fatal() {
+    fn test_plugin_runtime_init_error_classification() {
         assert!(plugin_runtime_init_error_is_fatal(
             &RuntimeError::ThreadSpawn {
                 source: crate::StartupThreadSpawnError::new(
@@ -858,7 +876,54 @@ mod tests {
             &RuntimeError::EngineMismatch
         ));
         assert!(!plugin_runtime_init_error_is_fatal(
+            &RuntimeError::EpochTickerIntervalMismatch {
+                existing: Duration::from_millis(1),
+                requested: Duration::from_millis(2),
+            }
+        ));
+        assert!(!plugin_runtime_init_error_is_fatal(
             &RuntimeError::InstantiationError("component load failed".to_string(),)
         ));
+    }
+
+    #[test]
+    fn discover_and_load_plugins_preserves_engine_on_loader_init_failure() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut env = ScopedEnv::new();
+        env.set(
+            TEST_FORCE_PLUGIN_LOADER_INIT_FAILURE_ENV,
+            "forced loader init failure",
+        );
+        let cfg = json!({
+            "plugins": {
+                "entries": {
+                    "alpha": {
+                        "enabled": true,
+                        "installId": "install-alpha",
+                        "requestedAt": 1700000001000u64
+                    }
+                }
+            }
+        });
+
+        let result = discover_and_load_plugins(cfg, temp.path().to_path_buf());
+
+        assert!(result.plugin_engine.is_some());
+        assert!(result.loader.is_none());
+        assert_eq!(
+            result.report.errors,
+            vec!["failed to initialize plugin loader: Wasmtime engine error: forced loader init failure"]
+        );
+        assert_eq!(result.report.entries.len(), 1);
+        assert_eq!(
+            result.report.entries[0].state,
+            PluginActivationState::Failed
+        );
+        assert_eq!(
+            result.report.entries[0].reason.as_deref(),
+            Some(
+                "failed to initialize plugin loader: Wasmtime engine error: forced loader init failure"
+            )
+        );
     }
 }
