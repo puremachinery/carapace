@@ -15,6 +15,10 @@ fn normalize_epoch_ticker_interval(interval: Duration) -> Duration {
     interval.max(Duration::from_millis(1))
 }
 
+// Single source of truth for plugin engine configuration. Standalone
+// validation, loader compilation, and runtime instantiation must stay aligned
+// so install-time validation matches the engine later used for cached
+// component compilation and execution.
 fn plugin_engine_config() -> Config {
     let mut config = Config::new();
     config.wasm_component_model(true);
@@ -89,6 +93,21 @@ enum EpochTickerSlot {
     Ready(EpochTickerState),
 }
 
+struct StartingTickerGuard<'a> {
+    slot: &'a Mutex<Option<EpochTickerSlot>>,
+    ready: &'a Condvar,
+}
+
+impl Drop for StartingTickerGuard<'_> {
+    fn drop(&mut self) {
+        let mut slot = self.slot.lock();
+        if matches!(slot.as_ref(), Some(EpochTickerSlot::Starting { .. })) {
+            *slot = None;
+            self.ready.notify_all();
+        }
+    }
+}
+
 pub(crate) struct PluginEngine {
     engine: Engine,
     epoch_ticker: Mutex<Option<EpochTickerSlot>>,
@@ -159,14 +178,13 @@ impl PluginEngine {
         }
 
         drop(ticker);
+        let starting_guard = StartingTickerGuard {
+            slot: &self.epoch_ticker,
+            ready: &self.epoch_ticker_ready,
+        };
         let created = match factory(self.engine.clone(), interval) {
             Ok(ticker) => Arc::new(ticker),
-            Err(error) => {
-                let mut ticker = self.epoch_ticker.lock();
-                *ticker = None;
-                self.epoch_ticker_ready.notify_all();
-                return Err(EnsureEpochTickerError::Start(error));
-            }
+            Err(error) => return Err(EnsureEpochTickerError::Start(error)),
         };
 
         let mut ticker = self.epoch_ticker.lock();
@@ -175,6 +193,8 @@ impl PluginEngine {
             ticker: Arc::downgrade(&created),
         }));
         self.epoch_ticker_ready.notify_all();
+        drop(ticker);
+        drop(starting_guard);
         Ok(created)
     }
 }
@@ -239,6 +259,7 @@ mod tests {
     use crate::plugins::runtime::DEFAULT_EPOCH_TICK_INTERVAL;
     use std::error::Error;
     use std::io;
+    use std::panic::AssertUnwindSafe;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
@@ -475,5 +496,47 @@ mod tests {
             1,
             "only one ticker factory should run for concurrent same-interval requests"
         );
+    }
+
+    #[test]
+    fn ensure_epoch_ticker_clears_starting_slot_after_factory_panic() {
+        let plugin_engine = PluginEngine::for_runtime().expect("plugin engine");
+
+        let panic_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _ = plugin_engine.ensure_epoch_ticker(
+                Duration::from_millis(1),
+                |_engine, _interval| {
+                    panic!("simulated ticker startup panic");
+                    #[allow(unreachable_code)]
+                    Ok::<EpochTicker, ()>(EpochTicker {
+                        stop: Arc::new(AtomicBool::new(false)),
+                        handle: None,
+                    })
+                },
+            );
+        }));
+        assert!(panic_result.is_err());
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let plugin_engine = Arc::clone(&plugin_engine);
+        let join = std::thread::spawn(move || {
+            let result = plugin_engine.ensure_epoch_ticker(
+                Duration::from_millis(1),
+                |_engine, _interval| {
+                    Ok::<EpochTicker, ()>(EpochTicker {
+                        stop: Arc::new(AtomicBool::new(false)),
+                        handle: None,
+                    })
+                },
+            );
+            tx.send(result.is_ok()).expect("send result");
+        });
+
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1)),
+            Ok(true),
+            "subsequent callers should not block forever after a startup panic"
+        );
+        join.join().expect("join waiter thread");
     }
 }
