@@ -564,14 +564,7 @@ fn validate_channel_features(features: &Value, path: &str, issues: &mut Vec<Sche
         let read_receipts_path = format!("{}.readReceipts", path);
         if let Some(read_receipts_obj) = read_receipts.as_object() {
             for key in read_receipts_obj.keys() {
-                if key == "mode" {
-                    issues.push(SchemaIssue {
-                        severity: Severity::Error,
-                        path: format!("{}.mode", read_receipts_path),
-                        message: "readReceipts mode is no longer supported; remove this key"
-                            .to_string(),
-                    });
-                } else if key != "enabled" {
+                if key != "enabled" {
                     issues.push(SchemaIssue {
                         severity: Severity::Warning,
                         path: format!("{}.{}", read_receipts_path, key),
@@ -2950,30 +2943,6 @@ mod tests {
     }
 
     #[test]
-    fn test_channels_features_read_receipts_mode_is_rejected_as_error() {
-        let cfg = json!({
-            "channels": {
-                "signal": {
-                    "features": {
-                        "readReceipts": {
-                            "enabled": true,
-                            "mode": "after-response"
-                        }
-                    }
-                }
-            }
-        });
-        let issues = validate_schema(&cfg);
-        assert!(issues.iter().any(|issue| {
-            issue.path == ".channels.signal.features.readReceipts.mode"
-                && issue.severity == Severity::Error
-                && issue
-                    .message
-                    .contains("readReceipts mode is no longer supported")
-        }));
-    }
-
-    #[test]
     fn test_channels_features_typing_interval_warns_when_unusually_large() {
         let cfg = json!({
             "channels": {
@@ -3182,6 +3151,7 @@ mod tests {
                         },
                         "readReceipts": {
                             "enabled": true,
+                            "mode": "after-response",
                             "extra": true
                         }
                     }
@@ -3196,6 +3166,9 @@ mod tests {
         assert!(issues.iter().any(|issue| issue.path
             == ".channels.signal.features.typing.intervalSecond"
             && issue.message.contains("unknown typing feature key")));
+        assert!(issues.iter().any(|issue| issue.path
+            == ".channels.signal.features.readReceipts.mode"
+            && issue.message.contains("unknown readReceipts feature key")));
         assert!(issues.iter().any(|issue| issue.path
             == ".channels.signal.features.readReceipts.extra"
             && issue.message.contains("unknown readReceipts feature key")));
