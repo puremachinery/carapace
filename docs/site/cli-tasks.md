@@ -43,7 +43,7 @@ Command ladder:
 ## Backup, restore, reset
 
 - Backup state: `cara backup --output ./carapace-backup.tar.gz`
-- Restore state: `cara restore --path ./carapace-backup.tar.gz`
+- Restore state: `cara restore ./carapace-backup.tar.gz`
 - Reset categories: `cara reset --all --force`
 
 ## Update lifecycle
