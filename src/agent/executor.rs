@@ -2284,7 +2284,6 @@ mod tests {
             state.message_pipeline().clone(),
             plugin_registry.clone(),
             state.channel_registry().clone(),
-            state.clone(),
             delivery_shutdown_rx,
         ));
 

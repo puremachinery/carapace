@@ -195,6 +195,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             http_config,
             cfg,
             resolved.address,
+            shutdown_tx,
             hook_registry.clone(),
             tools_registry.clone(),
         )
@@ -779,6 +780,7 @@ async fn launch_non_tls_server(
     http_config: server::http::HttpConfig,
     cfg: Value,
     bind_address: SocketAddr,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
     hook_registry: Arc<hooks::registry::HookRegistry>,
     tools_registry: Arc<plugins::tools::ToolsRegistry>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -797,6 +799,7 @@ async fn launch_non_tls_server(
 
     let reason = await_shutdown_trigger().await;
     info!("Shutdown signal received ({})", reason);
+    let _ = shutdown_tx.send(true);
     handle.shutdown().await;
     Ok(())
 }

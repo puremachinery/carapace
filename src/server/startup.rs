@@ -474,10 +474,9 @@ pub fn spawn_background_tasks(
     if let Some(plugin_reg) = ws_state.plugin_registry().cloned() {
         let pipeline = ws_state.message_pipeline().clone();
         let channels = ws_state.channel_registry().clone();
-        let state = ws_state.clone();
         let rx = shutdown_rx.clone();
         tokio::spawn(messages::delivery::delivery_loop(
-            pipeline, plugin_reg, channels, state, rx,
+            pipeline, plugin_reg, channels, rx,
         ));
     }
 

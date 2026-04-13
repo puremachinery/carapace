@@ -2950,6 +2950,30 @@ mod tests {
     }
 
     #[test]
+    fn test_channels_features_read_receipts_mode_is_rejected_as_error() {
+        let cfg = json!({
+            "channels": {
+                "signal": {
+                    "features": {
+                        "readReceipts": {
+                            "enabled": true,
+                            "mode": "after-response"
+                        }
+                    }
+                }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(issues.iter().any(|issue| {
+            issue.path == ".channels.signal.features.readReceipts.mode"
+                && issue.severity == Severity::Error
+                && issue
+                    .message
+                    .contains("readReceipts mode is no longer supported")
+        }));
+    }
+
+    #[test]
     fn test_channels_features_typing_interval_warns_when_unusually_large() {
         let cfg = json!({
             "channels": {

@@ -409,13 +409,8 @@ impl ActivityService {
     }
 
     #[cfg(test)]
-    pub(crate) fn with_read_receipt_queue_for_test(read_receipt_queue: Arc<TaskQueue>) -> Self {
-        Self::try_with_read_receipt_queue(read_receipt_queue)
-            .expect("failed to initialize test activity service startup helpers")
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_limits_for_test(
+    fn with_test_components(
+        read_receipt_queue: Arc<TaskQueue>,
         backlog_warning_threshold: usize,
         read_receipt_ownership_high_watermark: usize,
     ) -> Self {
@@ -423,15 +418,49 @@ impl ActivityService {
             dispatcher: Arc::new(ActivityDispatcher::with_backlog_warning_threshold(
                 backlog_warning_threshold,
             )),
-            read_receipt_queue: Arc::new(TaskQueue::with_capacity_limit(
-                None,
-                Some(read_receipt_ownership_high_watermark),
-            )),
+            read_receipt_queue,
             read_receipt_wake: Arc::new(tokio::sync::Notify::new()),
             reserved_read_receipt_ownership: Arc::new(Mutex::new(HashSet::new())),
             unsupported_feature_warnings: Mutex::new(UnsupportedActivityWarningRegistry::default()),
             read_receipt_ownership_high_watermark,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_read_receipt_queue_for_test(read_receipt_queue: Arc<TaskQueue>) -> Self {
+        Self::with_test_components(
+            read_receipt_queue,
+            ACTIVITY_DISPATCH_BACKLOG_WARNING_THRESHOLD,
+            READ_RECEIPT_OWNERSHIP_HIGH_WATERMARK,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_read_receipt_queue_and_limits_for_test(
+        read_receipt_queue: Arc<TaskQueue>,
+        backlog_warning_threshold: usize,
+        read_receipt_ownership_high_watermark: usize,
+    ) -> Self {
+        Self::with_test_components(
+            read_receipt_queue,
+            backlog_warning_threshold,
+            read_receipt_ownership_high_watermark,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_limits_for_test(
+        backlog_warning_threshold: usize,
+        read_receipt_ownership_high_watermark: usize,
+    ) -> Self {
+        Self::with_test_components(
+            Arc::new(TaskQueue::with_capacity_limit(
+                None,
+                Some(read_receipt_ownership_high_watermark),
+            )),
+            backlog_warning_threshold,
+            read_receipt_ownership_high_watermark,
+        )
     }
 
     pub fn dispatcher(&self) -> &Arc<ActivityDispatcher> {
@@ -3134,6 +3163,85 @@ mod tests {
             service.can_accept_read_receipt_ownership("signal"),
             "releasing the claimed slot should restore the now-unused reserved capacity"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_complete_claimed_read_receipt_releases_capacity_before_direct_send_finishes() {
+        let mark_read_started = Arc::new(Notify::new());
+        let plugin = Arc::new(MockChannel {
+            caps: ChannelCapabilities {
+                read_receipts: true,
+                ..Default::default()
+            },
+            mark_read_started_notify: Some(mark_read_started.clone()),
+            mark_read_delay: Duration::from_millis(150),
+            ..MockChannel::new(ChannelCapabilities {
+                read_receipts: true,
+                ..Default::default()
+            })
+        });
+        let plugin_registry = Arc::new(PluginRegistry::new());
+        plugin_registry.register_channel("signal".to_string(), plugin.clone());
+        let service = Arc::new(
+            ActivityService::with_read_receipt_queue_and_limits_for_test(
+                Arc::new(TaskQueue::with_capacity_limit(None, Some(0))),
+                8,
+                1,
+            ),
+        );
+        let state = Arc::new(
+            crate::server::ws::WsServerState::new(crate::server::ws::WsServerConfig::default())
+                .with_plugin_registry(plugin_registry)
+                .with_activity_service(service.clone()),
+        );
+
+        let first_claim = service
+            .try_claim_read_receipt(
+                "signal",
+                ReadReceiptContext {
+                    recipient: "+15551230001".to_string(),
+                    timestamp: Some(1),
+                    ..Default::default()
+                },
+            )
+            .expect("first claim should reserve the only ownership slot");
+        assert!(
+            !service.can_accept_read_receipt_ownership("signal"),
+            "the claimed slot should consume the full high-watermark budget"
+        );
+
+        let completion = tokio::spawn({
+            let service = service.clone();
+            let state = state.clone();
+            let first_claim = first_claim.clone();
+            async move {
+                service
+                    .complete_claimed_read_receipt(state.as_ref(), &first_claim)
+                    .await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), mark_read_started.notified())
+            .await
+            .expect("direct-send fallback should enter mark_read");
+
+        let second_claim = service
+            .try_claim_read_receipt(
+                "signal",
+                ReadReceiptContext {
+                    recipient: "+15551230002".to_string(),
+                    timestamp: Some(2),
+                    ..Default::default()
+                },
+            )
+            .expect("capacity should be released before the direct send finishes");
+        assert!(service.withhold_claimed_read_receipt(&second_claim));
+
+        completion
+            .await
+            .expect("completion task should join cleanly")
+            .expect("direct-send fallback should succeed");
+        assert_eq!(plugin.mark_read_count.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test(flavor = "current_thread")]

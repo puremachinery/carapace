@@ -13,7 +13,6 @@ use crate::channels::ChannelRegistry;
 use crate::messages::outbound::{MessageContent, MessagePipeline};
 use crate::plugins::hook_utils;
 use crate::plugins::{self, OutboundContext, PluginRegistry};
-use crate::server::ws::WsServerState;
 
 /// Run the delivery worker loop.
 ///
@@ -22,7 +21,6 @@ pub async fn delivery_loop(
     pipeline: Arc<MessagePipeline>,
     plugin_registry: Arc<PluginRegistry>,
     channel_registry: Arc<ChannelRegistry>,
-    state: Arc<WsServerState>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     loop {
@@ -42,14 +40,8 @@ pub async fn delivery_loop(
 
         let channel_ids = pipeline.channels_with_messages();
 
-        process_channel_messages(
-            &channel_ids,
-            &pipeline,
-            &plugin_registry,
-            &channel_registry,
-            &state,
-        )
-        .await;
+        process_channel_messages(&channel_ids, &pipeline, &plugin_registry, &channel_registry)
+            .await;
     }
 }
 
@@ -59,7 +51,6 @@ pub(crate) async fn process_channel_messages(
     pipeline: &MessagePipeline,
     plugin_registry: &Arc<PluginRegistry>,
     channel_registry: &ChannelRegistry,
-    state: &Arc<WsServerState>,
 ) {
     for channel_id in channel_ids {
         let work = pipeline.next_delivery_work_for_channel(channel_id);
@@ -174,7 +165,7 @@ pub(crate) async fn process_channel_messages(
             }),
         );
 
-        handle_delivery_result(pipeline, &message_id, result, state).await;
+        handle_delivery_result(pipeline, &message_id, result).await;
     }
 }
 
@@ -183,7 +174,6 @@ async fn handle_delivery_result(
     pipeline: &MessagePipeline,
     message_id: &crate::messages::outbound::MessageId,
     result: Result<plugins::DeliveryResult, plugins::BindingError>,
-    _state: &Arc<WsServerState>,
 ) {
     match result {
         Ok(delivery) if delivery.ok => {
@@ -477,16 +467,11 @@ mod tests {
 
         // Run one iteration (use shutdown to stop after one pass)
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let state = Arc::new(crate::server::ws::WsServerState::new(
-            crate::server::ws::WsServerConfig::default(),
-        ));
-
         let pl = pipeline.clone();
         let pr = plugin_reg.clone();
         let cr = channel_reg.clone();
-        let st = state.clone();
         let handle = tokio::spawn(async move {
-            delivery_loop(pl, pr, cr, st, shutdown_rx).await;
+            delivery_loop(pl, pr, cr, shutdown_rx).await;
         });
 
         // Give it time to process
@@ -509,13 +494,9 @@ mod tests {
         let result = pipeline.queue(msg, MsgOutboundContext::new()).unwrap();
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let state = Arc::new(crate::server::ws::WsServerState::new(
-            crate::server::ws::WsServerConfig::default(),
-        ));
-
         let pl = pipeline.clone();
         let handle = tokio::spawn(async move {
-            delivery_loop(pl, plugin_reg, channel_reg, state, shutdown_rx).await;
+            delivery_loop(pl, plugin_reg, channel_reg, shutdown_rx).await;
         });
 
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -540,13 +521,9 @@ mod tests {
         pipeline.queue(msg, MsgOutboundContext::new()).unwrap();
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let state = Arc::new(crate::server::ws::WsServerState::new(
-            crate::server::ws::WsServerConfig::default(),
-        ));
-
         let pl = pipeline.clone();
         let handle = tokio::spawn(async move {
-            delivery_loop(pl, plugin_reg, channel_reg, state, shutdown_rx).await;
+            delivery_loop(pl, plugin_reg, channel_reg, shutdown_rx).await;
         });
 
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -570,13 +547,9 @@ mod tests {
         let result = pipeline.queue(msg, ctx).unwrap();
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let state = Arc::new(crate::server::ws::WsServerState::new(
-            crate::server::ws::WsServerConfig::default(),
-        ));
-
         let pl = pipeline.clone();
         let handle = tokio::spawn(async move {
-            delivery_loop(pl, plugin_reg, channel_reg, state, shutdown_rx).await;
+            delivery_loop(pl, plugin_reg, channel_reg, shutdown_rx).await;
         });
 
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -615,13 +588,9 @@ mod tests {
         let result = pipeline.queue(msg, ctx).unwrap();
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let state = Arc::new(crate::server::ws::WsServerState::new(
-            crate::server::ws::WsServerConfig::default(),
-        ));
-
         let pl = pipeline.clone();
         let handle = tokio::spawn(async move {
-            delivery_loop(pl, plugin_reg, channel_reg, state, shutdown_rx).await;
+            delivery_loop(pl, plugin_reg, channel_reg, shutdown_rx).await;
         });
 
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -658,13 +627,9 @@ mod tests {
         let result = pipeline.queue(msg, ctx).unwrap();
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let state = Arc::new(crate::server::ws::WsServerState::new(
-            crate::server::ws::WsServerConfig::default(),
-        ));
-
         let pl = pipeline.clone();
         let handle = tokio::spawn(async move {
-            delivery_loop(pl, plugin_reg, channel_reg, state, shutdown_rx).await;
+            delivery_loop(pl, plugin_reg, channel_reg, shutdown_rx).await;
         });
 
         // Allow enough time for multiple delivery loop iterations to run.
@@ -704,12 +669,8 @@ mod tests {
             make_pipeline_and_registries("shutdown-ch", None, true);
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(true); // already shut down
-        let state = Arc::new(crate::server::ws::WsServerState::new(
-            crate::server::ws::WsServerConfig::default(),
-        ));
-
         let handle = tokio::spawn(async move {
-            delivery_loop(pipeline, plugin_reg, channel_reg, state, shutdown_rx).await;
+            delivery_loop(pipeline, plugin_reg, channel_reg, shutdown_rx).await;
         });
 
         // Should exit quickly since shutdown is already true
