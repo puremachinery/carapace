@@ -302,6 +302,37 @@ impl TaskQueue {
         task
     }
 
+    /// Add a new task that starts already claimed in `running` state.
+    ///
+    /// This is for call sites that durably persist work before executing it
+    /// inline, while still relying on queue recovery to resume the work after
+    /// a crash or restart.
+    ///
+    /// The same capacity-full contract as [`Self::enqueue`] applies: on full
+    /// queue with no evictable terminal task, the returned `Failed` task ID is
+    /// synthetic and not present in the queue.
+    pub fn enqueue_running_with_policy(&self, payload: Value, policy: TaskPolicy) -> DurableTask {
+        let now = now_ms();
+        let mut task = self.build_task(
+            payload,
+            BuildTaskParams {
+                state: TaskState::Running,
+                next_run_at_ms: None,
+                last_error: None,
+                policy,
+                blocked_reason: None,
+                now,
+            },
+        );
+        task.attempts = 1;
+
+        self.insert_task(&mut task, now);
+        if task.state == TaskState::Failed {
+            task.attempts = 0;
+        }
+        task
+    }
+
     /// Add a new task that starts in `blocked` state.
     pub fn enqueue_blocked_with_policy(
         &self,
@@ -479,6 +510,45 @@ impl TaskQueue {
                             next_run_at_ms,
                             policy_fallback,
                         )
+                    },
+                    fallback_task,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Async-safe enqueue wrapper for tasks that start already claimed in
+    /// `running` state.
+    pub async fn enqueue_running_async_with_policy(
+        self: &Arc<Self>,
+        payload: Value,
+        policy: TaskPolicy,
+    ) -> DurableTask {
+        let queue = Arc::clone(self);
+        let payload_fallback = payload.clone();
+        let policy_fallback = policy.clone();
+        match tokio::task::spawn_blocking(move || {
+            queue.enqueue_running_with_policy(payload, policy)
+        })
+        .await
+        {
+            Ok(task) => task,
+            Err(err) => {
+                warn!(error = %err, "enqueue worker failed");
+                warn!(
+                    "falling back to a dedicated running-task enqueue thread after enqueue worker failure"
+                );
+                let fallback_task = self.build_failed_enqueue_task(
+                    payload_fallback.clone(),
+                    policy_fallback.clone(),
+                    None,
+                );
+                self.enqueue_via_dedicated_thread(
+                    "task-queue-running-enqueue-fallback",
+                    move |queue_fallback| {
+                        queue_fallback
+                            .enqueue_running_with_policy(payload_fallback, policy_fallback)
                     },
                     fallback_task,
                 )
@@ -1104,6 +1174,37 @@ mod tests {
         assert_eq!(claimed[0].id, task.id);
         assert_eq!(claimed[0].state, TaskState::Running);
         assert_eq!(claimed[0].attempts, 1);
+    }
+
+    #[test]
+    fn test_enqueue_running_with_policy_marks_task_running_and_increments_attempts() {
+        let queue = TaskQueue::in_memory();
+        let task = queue
+            .enqueue_running_with_policy(serde_json::json!({"kind":"demo"}), TaskPolicy::default());
+
+        assert_eq!(task.state, TaskState::Running);
+        assert_eq!(task.attempts, 1);
+        let stored = queue.get(&task.id).expect("task should be persisted");
+        assert_eq!(stored.state, TaskState::Running);
+        assert_eq!(stored.attempts, 1);
+    }
+
+    #[test]
+    fn test_enqueue_running_with_policy_returns_synthetic_failed_task_when_queue_is_full() {
+        let queue = TaskQueue::with_capacity_limit(None, Some(0));
+        let task = queue
+            .enqueue_running_with_policy(serde_json::json!({"kind":"demo"}), TaskPolicy::default());
+
+        assert_eq!(task.state, TaskState::Failed);
+        assert_eq!(task.attempts, 0);
+        assert_eq!(
+            task.last_error.as_deref(),
+            Some(TASK_QUEUE_FULL_NO_EVICTION_ERROR)
+        );
+        assert!(
+            queue.get(&task.id).is_none(),
+            "failed enqueue should return a synthetic task id, not a persisted queue entry"
+        );
     }
 
     #[test]

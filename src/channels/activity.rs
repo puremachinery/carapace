@@ -547,19 +547,40 @@ impl ActivityService {
             .await
     }
 
-    pub async fn enqueue_ready_read_receipt(
+    async fn persist_ready_read_receipt_task(
         &self,
         channel_id: &str,
         ctx: ReadReceiptContext,
-    ) -> Option<String> {
-        let task = self
-            .read_receipt_queue
+    ) -> crate::tasks::DurableTask {
+        self.read_receipt_queue
             .enqueue_async(
                 serde_json::to_value(ReadReceiptTaskPayload::new(channel_id, ctx))
                     .expect("read receipt task payload should serialize"),
                 None,
             )
-            .await;
+            .await
+    }
+
+    async fn persist_running_read_receipt_task(
+        &self,
+        channel_id: &str,
+        ctx: ReadReceiptContext,
+    ) -> crate::tasks::DurableTask {
+        self.read_receipt_queue
+            .enqueue_running_async_with_policy(
+                serde_json::to_value(ReadReceiptTaskPayload::new(channel_id, ctx))
+                    .expect("read receipt task payload should serialize"),
+                crate::tasks::TaskPolicy::default(),
+            )
+            .await
+    }
+
+    pub async fn enqueue_ready_read_receipt(
+        &self,
+        channel_id: &str,
+        ctx: ReadReceiptContext,
+    ) -> Option<String> {
+        let task = self.persist_ready_read_receipt_task(channel_id, ctx).await;
         if task.state == crate::tasks::TaskState::Failed {
             tracing::warn!(
                 channel = %channel_id,
@@ -576,18 +597,121 @@ impl ActivityService {
         }
     }
 
+    async fn finalize_read_receipt_task(
+        &self,
+        task_id: &str,
+        outcome: &TaskExecutionOutcome,
+    ) -> Result<(), String> {
+        let updated = match outcome {
+            TaskExecutionOutcome::Done { run_id } => {
+                tokio::task::spawn_blocking({
+                    let queue = self.read_receipt_queue.clone();
+                    let task_id = task_id.to_string();
+                    let run_id = run_id.clone();
+                    move || queue.mark_done(&task_id, run_id.as_deref())
+                })
+                .await
+            }
+            TaskExecutionOutcome::RetryWait { delay_ms, error } => {
+                tokio::task::spawn_blocking({
+                    let queue = self.read_receipt_queue.clone();
+                    let task_id = task_id.to_string();
+                    let error = error.clone();
+                    let delay_ms = *delay_ms;
+                    move || queue.mark_retry_wait(&task_id, delay_ms, &error)
+                })
+                .await
+            }
+            TaskExecutionOutcome::Blocked { reason, category } => {
+                tokio::task::spawn_blocking({
+                    let queue = self.read_receipt_queue.clone();
+                    let task_id = task_id.to_string();
+                    let reason = reason.clone();
+                    let category = *category;
+                    move || queue.mark_blocked(&task_id, &reason, category)
+                })
+                .await
+            }
+            TaskExecutionOutcome::Failed { error } => {
+                tokio::task::spawn_blocking({
+                    let queue = self.read_receipt_queue.clone();
+                    let task_id = task_id.to_string();
+                    let error = error.clone();
+                    move || queue.mark_failed(&task_id, &error)
+                })
+                .await
+            }
+            TaskExecutionOutcome::Cancelled { reason } => {
+                tokio::task::spawn_blocking({
+                    let queue = self.read_receipt_queue.clone();
+                    let task_id = task_id.to_string();
+                    let reason = reason.clone();
+                    move || queue.mark_cancelled(&task_id, reason.as_deref())
+                })
+                .await
+            }
+        }
+        .map_err(|err| format!("read receipt inline-state worker failed: {err}"))?;
+
+        if updated {
+            Ok(())
+        } else {
+            Err(format!(
+                "failed to update read receipt task '{}' after inline dispatch",
+                task_id
+            ))
+        }
+    }
+
+    fn inline_read_receipt_result(
+        outcome: TaskExecutionOutcome,
+        finalize_result: Result<(), String>,
+    ) -> Result<(), String> {
+        match (outcome, finalize_result) {
+            (TaskExecutionOutcome::Done { .. }, Ok(())) => Ok(()),
+            (TaskExecutionOutcome::Done { .. }, Err(err)) => Err(format!(
+                "read receipt was sent but durable task finalization failed: {err}"
+            )),
+            (TaskExecutionOutcome::RetryWait { error, .. }, Ok(())) => Err(error),
+            (TaskExecutionOutcome::RetryWait { error, .. }, Err(err)) => Err(format!(
+                "{error}; additionally failed to persist the retry schedule: {err}"
+            )),
+            (TaskExecutionOutcome::Blocked { reason, .. }, Ok(())) => Err(reason),
+            (TaskExecutionOutcome::Blocked { reason, .. }, Err(err)) => Err(format!(
+                "{reason}; additionally failed to persist the blocked state: {err}"
+            )),
+            (TaskExecutionOutcome::Failed { error }, Ok(())) => Err(error),
+            (TaskExecutionOutcome::Failed { error }, Err(err)) => Err(format!(
+                "{error}; additionally failed to persist the failure state: {err}"
+            )),
+            (TaskExecutionOutcome::Cancelled { reason }, Ok(())) => {
+                Err(reason.unwrap_or_else(|| {
+                    "read receipt task was cancelled during immediate dispatch".to_string()
+                }))
+            }
+            (TaskExecutionOutcome::Cancelled { reason }, Err(err)) => Err(format!(
+                "{}; additionally failed to persist the cancellation state: {err}",
+                reason.unwrap_or_else(|| {
+                    "read receipt task was cancelled during immediate dispatch".to_string()
+                })
+            )),
+        }
+    }
+
     pub async fn acknowledge_read_receipt_now(
         &self,
         state: &WsServerState,
         channel_id: &str,
         ctx: ReadReceiptContext,
     ) -> Result<(), String> {
-        if self
-            .enqueue_ready_read_receipt(channel_id, ctx.clone())
-            .await
-            .is_some()
-        {
-            return Ok(());
+        let task = self
+            .persist_running_read_receipt_task(channel_id, ctx.clone())
+            .await;
+        if task.state != crate::tasks::TaskState::Failed {
+            let task_id = task.id.clone();
+            let outcome = execute_read_receipt_task(state, task).await;
+            let finalize_result = self.finalize_read_receipt_task(&task_id, &outcome).await;
+            return Self::inline_read_receipt_result(outcome, finalize_result);
         }
 
         tracing::warn!(
@@ -1106,50 +1230,53 @@ pub(crate) async fn send_read_receipt_immediately(
         })
 }
 
+async fn execute_read_receipt_task(
+    state: &WsServerState,
+    task: crate::tasks::DurableTask,
+) -> TaskExecutionOutcome {
+    if let Some(error) = read_receipt_policy_violation_error(&task) {
+        return TaskExecutionOutcome::Failed { error };
+    }
+
+    let payload = match ReadReceiptTaskPayload::from_value(task.payload) {
+        Ok(payload) => payload,
+        Err(err) => {
+            return TaskExecutionOutcome::Failed {
+                error: format!("invalid read receipt task payload: {err}"),
+            };
+        }
+    };
+
+    let plugin = match prepare_read_receipt_dispatch_plugin(state, &payload.channel_id).await {
+        Ok(plugin) => plugin,
+        Err(ReadReceiptDispatchError::Retryable(err)) => {
+            return TaskExecutionOutcome::RetryWait {
+                delay_ms: READ_RECEIPT_RETRY_DELAY_MS,
+                error: err,
+            };
+        }
+        Err(ReadReceiptDispatchError::Permanent(err)) => {
+            return TaskExecutionOutcome::Failed { error: err };
+        }
+    };
+
+    match send_verified_read_receipt_with_plugin(plugin, &payload.channel_id, payload.context).await
+    {
+        Ok(()) => TaskExecutionOutcome::Done { run_id: None },
+        Err(ReadReceiptDispatchError::Retryable(err)) => TaskExecutionOutcome::RetryWait {
+            delay_ms: READ_RECEIPT_RETRY_DELAY_MS,
+            error: err,
+        },
+        Err(ReadReceiptDispatchError::Permanent(err)) => {
+            TaskExecutionOutcome::Failed { error: err }
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl TaskExecutor for ReadReceiptTaskExecutor {
     async fn execute(&self, task: crate::tasks::DurableTask) -> TaskExecutionOutcome {
-        if let Some(error) = read_receipt_policy_violation_error(&task) {
-            return TaskExecutionOutcome::Failed { error };
-        }
-
-        let payload = match ReadReceiptTaskPayload::from_value(task.payload) {
-            Ok(payload) => payload,
-            Err(err) => {
-                return TaskExecutionOutcome::Failed {
-                    error: format!("invalid read receipt task payload: {err}"),
-                };
-            }
-        };
-
-        let plugin =
-            match prepare_read_receipt_dispatch_plugin(self.state.as_ref(), &payload.channel_id)
-                .await
-            {
-                Ok(plugin) => plugin,
-                Err(ReadReceiptDispatchError::Retryable(err)) => {
-                    return TaskExecutionOutcome::RetryWait {
-                        delay_ms: READ_RECEIPT_RETRY_DELAY_MS,
-                        error: err,
-                    };
-                }
-                Err(ReadReceiptDispatchError::Permanent(err)) => {
-                    return TaskExecutionOutcome::Failed { error: err };
-                }
-            };
-
-        match send_verified_read_receipt_with_plugin(plugin, &payload.channel_id, payload.context)
-            .await
-        {
-            Ok(()) => TaskExecutionOutcome::Done { run_id: None },
-            Err(ReadReceiptDispatchError::Retryable(err)) => TaskExecutionOutcome::RetryWait {
-                delay_ms: READ_RECEIPT_RETRY_DELAY_MS,
-                error: err,
-            },
-            Err(ReadReceiptDispatchError::Permanent(err)) => {
-                TaskExecutionOutcome::Failed { error: err }
-            }
-        }
+        execute_read_receipt_task(self.state.as_ref(), task).await
     }
 }
 
@@ -3242,6 +3369,92 @@ mod tests {
             .expect("completion task should join cleanly")
             .expect("direct-send fallback should succeed");
         assert_eq!(plugin.mark_read_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_acknowledge_read_receipt_now_returns_err_when_retry_is_scheduled() {
+        let service = Arc::new(ActivityService::new());
+        let state = Arc::new(
+            crate::server::ws::WsServerState::new(crate::server::ws::WsServerConfig::default())
+                .with_activity_service(service.clone()),
+        );
+
+        let err = service
+            .acknowledge_read_receipt_now(
+                state.as_ref(),
+                "signal",
+                ReadReceiptContext {
+                    recipient: "+15551234567".to_string(),
+                    timestamp: Some(123),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("retryable inline dispatch should not report success");
+
+        assert!(
+            err.contains("plugin registry unavailable"),
+            "retryable error should surface the underlying dispatch reason"
+        );
+        let tasks = service.read_receipt_queue().list();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].state, crate::tasks::TaskState::RetryWait);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_acknowledge_read_receipt_now_falls_back_to_direct_send_when_persist_fails() {
+        let plugin = Arc::new(MockChannel::new(ChannelCapabilities {
+            read_receipts: true,
+            ..Default::default()
+        }));
+        let plugin_registry = Arc::new(PluginRegistry::new());
+        plugin_registry.register_channel("signal".to_string(), plugin.clone());
+        let service = Arc::new(ActivityService::with_read_receipt_queue_for_test(Arc::new(
+            TaskQueue::with_capacity_limit(None, Some(0)),
+        )));
+        let state = Arc::new(
+            crate::server::ws::WsServerState::new(crate::server::ws::WsServerConfig::default())
+                .with_plugin_registry(plugin_registry)
+                .with_activity_service(service.clone()),
+        );
+
+        service
+            .acknowledge_read_receipt_now(
+                state.as_ref(),
+                "signal",
+                ReadReceiptContext {
+                    recipient: "+15551234567".to_string(),
+                    timestamp: Some(123),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("persist failure should fall back to direct read receipt dispatch");
+
+        assert_eq!(plugin.mark_read_count.load(Ordering::Relaxed), 1);
+        assert!(
+            service.read_receipt_queue().list().is_empty(),
+            "synthetic failed enqueue should not leave a persisted queue entry"
+        );
+    }
+
+    #[test]
+    fn test_inline_read_receipt_result_reports_sent_but_unfinalized_done_state() {
+        let result = ActivityService::inline_read_receipt_result(
+            TaskExecutionOutcome::Done { run_id: None },
+            Err("queue update failed".to_string()),
+        );
+
+        let err =
+            result.expect_err("done outcome with failed finalization should surface an error");
+        assert!(
+            err.contains("read receipt was sent but durable task finalization failed"),
+            "unexpected error message: {err}"
+        );
+        assert!(
+            err.contains("queue update failed"),
+            "unexpected error message: {err}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
