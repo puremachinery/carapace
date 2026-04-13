@@ -67,8 +67,6 @@ pub struct AgentRun {
     pub delivery_recipient_id: Option<String>,
     /// Optional channel-specific typing context for inbound activity features.
     pub typing_context: Option<crate::plugins::TypingContext>,
-    /// Receive-time read-receipt ownership captured before run dispatch.
-    pub read_receipt: Option<crate::channels::activity::ClaimedReadReceipt>,
     /// Current status
     pub status: AgentRunStatus,
     /// Original message that started this run
@@ -106,7 +104,6 @@ pub struct AgentRunSnapshot {
     pub run_id: String,
     pub session_key: String,
     pub message: String,
-    pub read_receipt: Option<crate::channels::activity::ClaimedReadReceipt>,
     pub status: AgentRunStatus,
 }
 
@@ -232,7 +229,6 @@ impl AgentRunRegistry {
                 run_id: run.run_id.clone(),
                 session_key: run.session_key.clone(),
                 message: run.message.clone(),
-                read_receipt: run.read_receipt.clone(),
                 status: run.status,
             })
             .collect()
@@ -1990,7 +1986,6 @@ fn setup_agent_session(
         session_key: session.session_key.clone(),
         delivery_recipient_id: None,
         typing_context: None,
-        read_receipt: None,
         status: AgentRunStatus::Queued,
         message: message.to_string(),
         response: String::new(),
@@ -2531,7 +2526,6 @@ fn trigger_agent_if_enabled(
         session_key: session.session_key.clone(),
         delivery_recipient_id: None,
         typing_context: None,
-        read_receipt: None,
         status: AgentRunStatus::Queued,
         message: message.to_string(),
         response: String::new(),
@@ -2830,7 +2824,6 @@ mod tests {
             session_key: session_key.to_string(),
             delivery_recipient_id: None,
             typing_context: None,
-            read_receipt: None,
             status: AgentRunStatus::Queued,
             message: "test message".to_string(),
             response: String::new(),

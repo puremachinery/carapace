@@ -13,7 +13,6 @@ use crate::channels::ChannelRegistry;
 use crate::messages::outbound::{MessageContent, MessagePipeline};
 use crate::plugins::hook_utils;
 use crate::plugins::{self, OutboundContext, PluginRegistry};
-use crate::server::ws::WsServerState;
 
 /// Run the delivery worker loop.
 ///
@@ -22,7 +21,6 @@ pub async fn delivery_loop(
     pipeline: Arc<MessagePipeline>,
     plugin_registry: Arc<PluginRegistry>,
     channel_registry: Arc<ChannelRegistry>,
-    state: Arc<WsServerState>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     loop {
@@ -42,14 +40,8 @@ pub async fn delivery_loop(
 
         let channel_ids = pipeline.channels_with_messages();
 
-        process_channel_messages(
-            &channel_ids,
-            &pipeline,
-            &plugin_registry,
-            &channel_registry,
-            &state,
-        )
-        .await;
+        process_channel_messages(&channel_ids, &pipeline, &plugin_registry, &channel_registry)
+            .await;
     }
 }
 
@@ -59,9 +51,7 @@ pub(crate) async fn process_channel_messages(
     pipeline: &MessagePipeline,
     plugin_registry: &Arc<PluginRegistry>,
     channel_registry: &ChannelRegistry,
-    state: &Arc<WsServerState>,
 ) {
-    let activity_service = state.activity_service();
     for channel_id in channel_ids {
         let work = pipeline.next_delivery_work_for_channel(channel_id);
         for expired in work.expired {
@@ -75,12 +65,6 @@ pub(crate) async fn process_channel_messages(
                     "failed to mark queued message as expired before delivery"
                 );
             }
-            withhold_pending_read_receipt(
-                activity_service,
-                &expired.message.metadata,
-                crate::channels::activity::READ_RECEIPT_WITHHELD_MESSAGE_EXPIRED_REASON,
-            )
-            .await;
         }
 
         if !channel_registry.is_connected(channel_id) {
@@ -114,12 +98,6 @@ pub(crate) async fn process_channel_messages(
                     );
                     let _ = pipeline.mark_failed(&message_id, "message cancelled by hook");
                 }
-                withhold_pending_read_receipt(
-                    activity_service,
-                    &message.metadata,
-                    crate::channels::activity::READ_RECEIPT_WITHHELD_HOOK_CANCELLED_REASON,
-                )
-                .await;
                 continue;
             }
 
@@ -144,12 +122,6 @@ pub(crate) async fn process_channel_messages(
             Some(p) => p,
             None => {
                 let _ = pipeline.mark_failed(&message_id, "no plugin registered for channel");
-                withhold_pending_read_receipt(
-                    activity_service,
-                    &message.metadata,
-                    crate::channels::activity::READ_RECEIPT_WITHHELD_PLUGIN_MISSING_REASON,
-                )
-                .await;
                 continue;
             }
         };
@@ -193,39 +165,19 @@ pub(crate) async fn process_channel_messages(
             }),
         );
 
-        handle_delivery_result(pipeline, &message.metadata, &message_id, result, state).await;
-    }
-}
-
-async fn withhold_pending_read_receipt(
-    activity_service: &crate::channels::activity::ActivityService,
-    metadata: &crate::messages::outbound::MessageMetadata,
-    reason: &str,
-) {
-    if let Some(read_receipt) = metadata.read_receipt.as_ref() {
-        activity_service
-            .withhold_owned_read_receipt(read_receipt, reason)
-            .await;
+        handle_delivery_result(pipeline, &message_id, result).await;
     }
 }
 
 /// Handle the result of a message delivery attempt.
 async fn handle_delivery_result(
     pipeline: &MessagePipeline,
-    metadata: &crate::messages::outbound::MessageMetadata,
     message_id: &crate::messages::outbound::MessageId,
     result: Result<plugins::DeliveryResult, plugins::BindingError>,
-    state: &Arc<WsServerState>,
 ) {
-    let activity_service = state.activity_service();
     match result {
         Ok(delivery) if delivery.ok => {
             let _ = pipeline.mark_sent(message_id);
-            if let Some(read_receipt) = metadata.read_receipt.clone() {
-                activity_service
-                    .complete_owned_read_receipt_after_delivery(&read_receipt)
-                    .await;
-            }
         }
         Ok(delivery) => {
             let error = delivery
@@ -240,22 +192,10 @@ async fn handle_delivery_result(
                 );
             } else {
                 let _ = pipeline.mark_failed(message_id, &error);
-                withhold_pending_read_receipt(
-                    activity_service,
-                    metadata,
-                    crate::channels::activity::READ_RECEIPT_WITHHELD_DELIVERY_FAILED_REASON,
-                )
-                .await;
             }
         }
         Err(e) => {
             let _ = pipeline.mark_failed(message_id, e.to_string());
-            withhold_pending_read_receipt(
-                activity_service,
-                metadata,
-                crate::channels::activity::READ_RECEIPT_WITHHELD_DELIVERY_CALL_FAILED_REASON,
-            )
-            .await;
         }
     }
 }
@@ -287,10 +227,9 @@ fn apply_message_hook_overrides(
     }
 
     if let Some(metadata) = obj.get("metadata") {
-        if let Ok(mut metadata) =
+        if let Ok(metadata) =
             serde_json::from_value::<crate::messages::outbound::MessageMetadata>(metadata.clone())
         {
-            metadata.restore_runtime_only_fields_from(&message.metadata);
             message.metadata = metadata;
         }
     }
@@ -369,8 +308,8 @@ mod tests {
         MessageContent, OutboundContext as MsgOutboundContext, OutboundMessage,
     };
     use crate::plugins::{
-        BindingError, ChannelCapabilities, ChannelPluginInstance, DeliveryResult, HookEvent,
-        HookPluginInstance, HookResult, OutboundContext, ReadReceiptContext,
+        BindingError, ChannelCapabilities, ChannelPluginInstance, DeliveryResult, OutboundContext,
+        ReadReceiptContext,
     };
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
@@ -388,9 +327,6 @@ mod tests {
         retryable: bool,
         transient_failures: AtomicU32,
     }
-
-    struct CancellingHook;
-
     impl MockChannel {
         fn new() -> Self {
             Self {
@@ -416,31 +352,6 @@ mod tests {
                 mark_read_delay: Duration::ZERO,
                 fail: true,
                 retryable,
-                transient_failures: AtomicU32::new(0),
-            }
-        }
-
-        fn fail_then_succeed(retryable: bool, failures: u32) -> Self {
-            Self {
-                retryable,
-                transient_failures: AtomicU32::new(failures),
-                ..Self::new()
-            }
-        }
-
-        fn with_read_receipts() -> Self {
-            Self {
-                caps: ChannelCapabilities {
-                    read_receipts: true,
-                    ..Default::default()
-                },
-                send_text_count: AtomicU32::new(0),
-                send_media_count: AtomicU32::new(0),
-                mark_read_count: AtomicU32::new(0),
-                mark_read_notify: None,
-                mark_read_delay: Duration::ZERO,
-                fail: false,
-                retryable: false,
                 transient_failures: AtomicU32::new(0),
             }
         }
@@ -515,61 +426,6 @@ mod tests {
             Ok(())
         }
     }
-
-    impl HookPluginInstance for CancellingHook {
-        fn get_hooks(&self) -> Result<Vec<String>, BindingError> {
-            Ok(vec!["message_sending".to_string()])
-        }
-
-        fn handle(&self, _event: HookEvent) -> Result<HookResult, BindingError> {
-            Ok(HookResult {
-                handled: true,
-                cancel: true,
-                modified_payload: None,
-            })
-        }
-    }
-
-    fn test_activity_service() -> Arc<crate::channels::activity::ActivityService> {
-        Arc::new(crate::channels::activity::ActivityService::with_backlog_warning_threshold(8))
-    }
-
-    fn test_state_with_activity_service(
-        activity_service: Arc<crate::channels::activity::ActivityService>,
-    ) -> Arc<crate::server::ws::WsServerState> {
-        Arc::new(
-            crate::server::ws::WsServerState::new(crate::server::ws::WsServerConfig::default())
-                .with_activity_service(activity_service),
-        )
-    }
-
-    async fn enqueue_after_response_read_receipt_task(
-        activity_service: &crate::channels::activity::ActivityService,
-        recipient: &str,
-        timestamp: u64,
-    ) -> crate::messages::outbound::PendingReadReceipt {
-        let task_id = activity_service
-            .enqueue_after_response_read_receipt(
-                "signal",
-                ReadReceiptContext {
-                    recipient: recipient.to_string(),
-                    timestamp: Some(timestamp),
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("read receipt task should be persisted");
-        crate::channels::activity::OwnedReadReceipt::new(
-            "signal",
-            ReadReceiptContext {
-                recipient: recipient.to_string(),
-                timestamp: Some(timestamp),
-                ..Default::default()
-            },
-            task_id,
-        )
-    }
-
     fn make_pipeline_and_registries(
         channel_id: &str,
         plugin: Option<Arc<dyn ChannelPluginInstance>>,
@@ -611,16 +467,11 @@ mod tests {
 
         // Run one iteration (use shutdown to stop after one pass)
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let state = Arc::new(crate::server::ws::WsServerState::new(
-            crate::server::ws::WsServerConfig::default(),
-        ));
-
         let pl = pipeline.clone();
         let pr = plugin_reg.clone();
         let cr = channel_reg.clone();
-        let st = state.clone();
         let handle = tokio::spawn(async move {
-            delivery_loop(pl, pr, cr, st, shutdown_rx).await;
+            delivery_loop(pl, pr, cr, shutdown_rx).await;
         });
 
         // Give it time to process
@@ -643,13 +494,9 @@ mod tests {
         let result = pipeline.queue(msg, MsgOutboundContext::new()).unwrap();
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let state = Arc::new(crate::server::ws::WsServerState::new(
-            crate::server::ws::WsServerConfig::default(),
-        ));
-
         let pl = pipeline.clone();
         let handle = tokio::spawn(async move {
-            delivery_loop(pl, plugin_reg, channel_reg, state, shutdown_rx).await;
+            delivery_loop(pl, plugin_reg, channel_reg, shutdown_rx).await;
         });
 
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -674,13 +521,9 @@ mod tests {
         pipeline.queue(msg, MsgOutboundContext::new()).unwrap();
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let state = Arc::new(crate::server::ws::WsServerState::new(
-            crate::server::ws::WsServerConfig::default(),
-        ));
-
         let pl = pipeline.clone();
         let handle = tokio::spawn(async move {
-            delivery_loop(pl, plugin_reg, channel_reg, state, shutdown_rx).await;
+            delivery_loop(pl, plugin_reg, channel_reg, shutdown_rx).await;
         });
 
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -704,13 +547,9 @@ mod tests {
         let result = pipeline.queue(msg, ctx).unwrap();
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let state = Arc::new(crate::server::ws::WsServerState::new(
-            crate::server::ws::WsServerConfig::default(),
-        ));
-
         let pl = pipeline.clone();
         let handle = tokio::spawn(async move {
-            delivery_loop(pl, plugin_reg, channel_reg, state, shutdown_rx).await;
+            delivery_loop(pl, plugin_reg, channel_reg, shutdown_rx).await;
         });
 
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -738,75 +577,6 @@ mod tests {
         assert_eq!(queued.last_error, Some("mock failure".to_string()));
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn test_retryable_delivery_failure_preserves_read_receipt_until_success() {
-        let mock = Arc::new(MockChannel::fail_then_succeed(true, 1));
-        let (pipeline, plugin_reg, channel_reg) =
-            make_pipeline_and_registries("signal", Some(mock.clone()), true);
-        let activity_service = test_activity_service();
-        let state = test_state_with_activity_service(activity_service.clone());
-        let read_receipt =
-            enqueue_after_response_read_receipt_task(&activity_service, "+15551234567", 123).await;
-
-        let msg = OutboundMessage::new("signal", MessageContent::text("hello")).with_metadata(
-            crate::messages::outbound::MessageMetadata {
-                recipient_id: Some("+15551234567".to_string()),
-                read_receipt: Some(read_receipt.clone()),
-                ..Default::default()
-            },
-        );
-        let queued = pipeline
-            .queue(msg, MsgOutboundContext::new().with_retries(2))
-            .unwrap();
-
-        process_channel_messages(
-            &["signal".to_string()],
-            &pipeline,
-            &plugin_reg,
-            &channel_reg,
-            &state,
-        )
-        .await;
-
-        let first_attempt = pipeline
-            .get_message(&queued.message_id)
-            .expect("message should remain queued after retryable failure");
-        assert_eq!(
-            first_attempt.status,
-            crate::messages::outbound::DeliveryStatus::Queued
-        );
-        assert!(
-            first_attempt.message.metadata.read_receipt.is_some(),
-            "retryable failure should preserve read receipt metadata for the next attempt"
-        );
-        let pending_task = activity_service
-            .read_receipt_queue()
-            .get(read_receipt.task_id())
-            .expect("read receipt task should still exist after retryable failure");
-        assert_eq!(pending_task.state, crate::tasks::TaskState::Blocked);
-
-        process_channel_messages(
-            &["signal".to_string()],
-            &pipeline,
-            &plugin_reg,
-            &channel_reg,
-            &state,
-        )
-        .await;
-
-        assert_eq!(
-            pipeline.get_status(&queued.message_id),
-            Some(crate::messages::outbound::DeliveryStatus::Sent)
-        );
-        assert_eq!(mock.send_text_count.load(Ordering::Relaxed), 2);
-        let activated_task = activity_service
-            .read_receipt_queue()
-            .get(read_receipt.task_id())
-            .expect("successful retry should activate the durable read receipt task");
-        assert_eq!(activated_task.state, crate::tasks::TaskState::RetryWait);
-        activity_service.shutdown().await;
-    }
-
     #[tokio::test]
     async fn test_delivery_non_retryable_failure_marks_failed() {
         let mock = Arc::new(MockChannel::failing(false));
@@ -818,13 +588,9 @@ mod tests {
         let result = pipeline.queue(msg, ctx).unwrap();
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let state = Arc::new(crate::server::ws::WsServerState::new(
-            crate::server::ws::WsServerConfig::default(),
-        ));
-
         let pl = pipeline.clone();
         let handle = tokio::spawn(async move {
-            delivery_loop(pl, plugin_reg, channel_reg, state, shutdown_rx).await;
+            delivery_loop(pl, plugin_reg, channel_reg, shutdown_rx).await;
         });
 
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -861,13 +627,9 @@ mod tests {
         let result = pipeline.queue(msg, ctx).unwrap();
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let state = Arc::new(crate::server::ws::WsServerState::new(
-            crate::server::ws::WsServerConfig::default(),
-        ));
-
         let pl = pipeline.clone();
         let handle = tokio::spawn(async move {
-            delivery_loop(pl, plugin_reg, channel_reg, state, shutdown_rx).await;
+            delivery_loop(pl, plugin_reg, channel_reg, shutdown_rx).await;
         });
 
         // Allow enough time for multiple delivery loop iterations to run.
@@ -907,12 +669,8 @@ mod tests {
             make_pipeline_and_registries("shutdown-ch", None, true);
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(true); // already shut down
-        let state = Arc::new(crate::server::ws::WsServerState::new(
-            crate::server::ws::WsServerConfig::default(),
-        ));
-
         let handle = tokio::spawn(async move {
-            delivery_loop(pipeline, plugin_reg, channel_reg, state, shutdown_rx).await;
+            delivery_loop(pipeline, plugin_reg, channel_reg, shutdown_rx).await;
         });
 
         // Should exit quickly since shutdown is already true
@@ -921,478 +679,5 @@ mod tests {
             .await
             .expect("delivery loop should exit on shutdown")
             .expect("task should not panic");
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn test_handle_delivery_result_marks_read_after_success_when_enabled() {
-        let mock = Arc::new(MockChannel::with_read_receipts());
-        let (pipeline, _plugin_reg, _channel_reg) =
-            make_pipeline_and_registries("signal", Some(mock.clone()), true);
-        let activity_service = test_activity_service();
-        let state = test_state_with_activity_service(activity_service.clone());
-        let read_receipt =
-            enqueue_after_response_read_receipt_task(&activity_service, "+15551234567", 123).await;
-
-        let msg = OutboundMessage::new("signal", MessageContent::text("hello")).with_metadata(
-            crate::messages::outbound::MessageMetadata {
-                recipient_id: Some("+15551234567".to_string()),
-                read_receipt: Some(read_receipt.clone()),
-                ..Default::default()
-            },
-        );
-        let queued = pipeline.queue(msg, MsgOutboundContext::new()).unwrap();
-        let message = pipeline
-            .get_message(&queued.message_id)
-            .expect("queued message should be available");
-
-        handle_delivery_result(
-            &pipeline,
-            &message.message.metadata,
-            &queued.message_id,
-            Ok(plugins::DeliveryResult {
-                ok: true,
-                message_id: Some("sent-1".to_string()),
-                error: None,
-                retryable: false,
-                conversation_id: None,
-                to_jid: None,
-                poll_id: None,
-            }),
-            &state,
-        )
-        .await;
-
-        assert_eq!(
-            pipeline.get_status(&queued.message_id),
-            Some(crate::messages::outbound::DeliveryStatus::Sent)
-        );
-        let activated_task = activity_service
-            .read_receipt_queue()
-            .get(read_receipt.task_id())
-            .expect("delivery success should preserve the durable read receipt task");
-        assert_eq!(activated_task.state, crate::tasks::TaskState::RetryWait);
-        activity_service.shutdown().await;
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn test_process_channel_messages_marks_read_after_success_when_enabled() {
-        let mock = Arc::new(MockChannel::with_read_receipts());
-        let (pipeline, plugin_reg, channel_reg) =
-            make_pipeline_and_registries("signal", Some(mock.clone()), true);
-        let activity_service = test_activity_service();
-        let state = test_state_with_activity_service(activity_service.clone());
-        let read_receipt =
-            enqueue_after_response_read_receipt_task(&activity_service, "+15551234567", 123).await;
-
-        let msg = OutboundMessage::new("signal", MessageContent::text("hello")).with_metadata(
-            crate::messages::outbound::MessageMetadata {
-                recipient_id: Some("+15551234567".to_string()),
-                read_receipt: Some(read_receipt.clone()),
-                ..Default::default()
-            },
-        );
-        let queued = pipeline.queue(msg, MsgOutboundContext::new()).unwrap();
-
-        process_channel_messages(
-            &["signal".to_string()],
-            &pipeline,
-            &plugin_reg,
-            &channel_reg,
-            &state,
-        )
-        .await;
-
-        assert_eq!(mock.send_text_count.load(Ordering::Relaxed), 1);
-        assert_eq!(
-            pipeline.get_status(&queued.message_id),
-            Some(crate::messages::outbound::DeliveryStatus::Sent)
-        );
-        let activated_task = activity_service
-            .read_receipt_queue()
-            .get(read_receipt.task_id())
-            .expect("delivery success should activate the durable read receipt task");
-        assert_eq!(activated_task.state, crate::tasks::TaskState::RetryWait);
-        activity_service.shutdown().await;
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn test_process_channel_messages_withholds_read_receipt_on_hook_cancellation() {
-        let mock = Arc::new(MockChannel::with_read_receipts());
-        let (pipeline, plugin_reg, channel_reg) =
-            make_pipeline_and_registries("signal", Some(mock.clone()), true);
-        plugin_reg.register_hook("cancel-hook".to_string(), Arc::new(CancellingHook));
-        let activity_service = test_activity_service();
-        let state = test_state_with_activity_service(activity_service.clone());
-        let read_receipt =
-            enqueue_after_response_read_receipt_task(&activity_service, "+15551234567", 123).await;
-
-        let msg = OutboundMessage::new("signal", MessageContent::text("hello")).with_metadata(
-            crate::messages::outbound::MessageMetadata {
-                recipient_id: Some("+15551234567".to_string()),
-                read_receipt: Some(read_receipt.clone()),
-                ..Default::default()
-            },
-        );
-        let queued = pipeline.queue(msg, MsgOutboundContext::new()).unwrap();
-
-        process_channel_messages(
-            &["signal".to_string()],
-            &pipeline,
-            &plugin_reg,
-            &channel_reg,
-            &state,
-        )
-        .await;
-
-        assert_eq!(mock.send_text_count.load(Ordering::Relaxed), 0);
-        assert_eq!(
-            pipeline.get_status(&queued.message_id),
-            Some(crate::messages::outbound::DeliveryStatus::Cancelled)
-        );
-        let withheld_task = activity_service
-            .read_receipt_queue()
-            .get(read_receipt.task_id())
-            .expect("hook cancellation should preserve the durable read receipt task");
-        assert_eq!(withheld_task.state, crate::tasks::TaskState::Cancelled);
-        assert_eq!(
-            withheld_task.last_error.as_deref(),
-            Some(crate::channels::activity::READ_RECEIPT_WITHHELD_HOOK_CANCELLED_REASON)
-        );
-        activity_service.shutdown().await;
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn test_process_channel_messages_withholds_read_receipt_when_plugin_missing() {
-        let activity_service = test_activity_service();
-        let state = test_state_with_activity_service(activity_service.clone());
-        let read_receipt =
-            enqueue_after_response_read_receipt_task(&activity_service, "+15551234567", 123).await;
-        let pipeline = Arc::new(MessagePipeline::new());
-        let plugin_reg = Arc::new(PluginRegistry::new());
-        let channel_reg = Arc::new(ChannelRegistry::new());
-        channel_reg.register(
-            crate::channels::ChannelInfo::new("signal", "signal")
-                .with_status(crate::channels::ChannelStatus::Connected),
-        );
-
-        let msg = OutboundMessage::new("signal", MessageContent::text("hello")).with_metadata(
-            crate::messages::outbound::MessageMetadata {
-                recipient_id: Some("+15551234567".to_string()),
-                read_receipt: Some(read_receipt.clone()),
-                ..Default::default()
-            },
-        );
-        let queued = pipeline.queue(msg, MsgOutboundContext::new()).unwrap();
-
-        process_channel_messages(
-            &["signal".to_string()],
-            &pipeline,
-            &plugin_reg,
-            &channel_reg,
-            &state,
-        )
-        .await;
-
-        assert_eq!(
-            pipeline.get_status(&queued.message_id),
-            Some(crate::messages::outbound::DeliveryStatus::Failed)
-        );
-        let withheld_task = activity_service
-            .read_receipt_queue()
-            .get(read_receipt.task_id())
-            .expect("missing plugin should preserve the durable read receipt task");
-        assert_eq!(withheld_task.state, crate::tasks::TaskState::Cancelled);
-        assert_eq!(
-            withheld_task.last_error.as_deref(),
-            Some(crate::channels::activity::READ_RECEIPT_WITHHELD_PLUGIN_MISSING_REASON)
-        );
-        activity_service.shutdown().await;
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn test_process_channel_messages_withholds_read_receipt_when_message_expires_before_delivery(
-    ) {
-        let mock = Arc::new(MockChannel::with_read_receipts());
-        let (pipeline, plugin_reg, channel_reg) =
-            make_pipeline_and_registries("signal", Some(mock.clone()), true);
-        let activity_service = test_activity_service();
-        let state = test_state_with_activity_service(activity_service.clone());
-        let read_receipt =
-            enqueue_after_response_read_receipt_task(&activity_service, "+15551234567", 123).await;
-
-        let mut msg = OutboundMessage::new("signal", MessageContent::text("hello")).with_metadata(
-            crate::messages::outbound::MessageMetadata {
-                recipient_id: Some("+15551234567".to_string()),
-                read_receipt: Some(read_receipt.clone()),
-                ttl_ms: 1,
-                ..Default::default()
-            },
-        );
-        msg.created_at -= 10_000;
-        let queued = pipeline.queue(msg, MsgOutboundContext::new()).unwrap();
-
-        process_channel_messages(
-            &["signal".to_string()],
-            &pipeline,
-            &plugin_reg,
-            &channel_reg,
-            &state,
-        )
-        .await;
-
-        assert_eq!(mock.send_text_count.load(Ordering::Relaxed), 0);
-        assert_eq!(
-            pipeline.get_status(&queued.message_id),
-            Some(crate::messages::outbound::DeliveryStatus::Expired)
-        );
-        let withheld_task = activity_service
-            .read_receipt_queue()
-            .get(read_receipt.task_id())
-            .expect("expired delivery should preserve the durable read receipt task");
-        assert_eq!(withheld_task.state, crate::tasks::TaskState::Cancelled);
-        assert_eq!(
-            withheld_task.last_error.as_deref(),
-            Some(crate::channels::activity::READ_RECEIPT_WITHHELD_MESSAGE_EXPIRED_REASON)
-        );
-        activity_service.shutdown().await;
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn test_process_channel_messages_expires_read_receipt_when_channel_is_disconnected() {
-        let mock = Arc::new(MockChannel::with_read_receipts());
-        let (pipeline, plugin_reg, channel_reg) =
-            make_pipeline_and_registries("signal", Some(mock.clone()), false);
-        let activity_service = test_activity_service();
-        let state = test_state_with_activity_service(activity_service.clone());
-        let read_receipt =
-            enqueue_after_response_read_receipt_task(&activity_service, "+15551234567", 123).await;
-
-        let mut msg = OutboundMessage::new("signal", MessageContent::text("hello")).with_metadata(
-            crate::messages::outbound::MessageMetadata {
-                recipient_id: Some("+15551234567".to_string()),
-                read_receipt: Some(read_receipt.clone()),
-                ttl_ms: 1,
-                ..Default::default()
-            },
-        );
-        msg.created_at -= 10_000;
-        let queued = pipeline.queue(msg, MsgOutboundContext::new()).unwrap();
-
-        process_channel_messages(
-            &["signal".to_string()],
-            &pipeline,
-            &plugin_reg,
-            &channel_reg,
-            &state,
-        )
-        .await;
-
-        assert_eq!(mock.send_text_count.load(Ordering::Relaxed), 0);
-        assert_eq!(
-            pipeline.get_status(&queued.message_id),
-            Some(crate::messages::outbound::DeliveryStatus::Expired)
-        );
-        let withheld_task = activity_service
-            .read_receipt_queue()
-            .get(read_receipt.task_id())
-            .expect("expired disconnected delivery should preserve the durable read receipt task");
-        assert_eq!(withheld_task.state, crate::tasks::TaskState::Cancelled);
-        assert_eq!(
-            withheld_task.last_error.as_deref(),
-            Some(crate::channels::activity::READ_RECEIPT_WITHHELD_MESSAGE_EXPIRED_REASON)
-        );
-        activity_service.shutdown().await;
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn test_handle_delivery_result_skips_read_receipt_on_delivery_failure() {
-        let mock = Arc::new(MockChannel::with_read_receipts());
-        let (pipeline, _plugin_reg, _channel_reg) =
-            make_pipeline_and_registries("signal", Some(mock.clone()), true);
-        let activity_service = test_activity_service();
-        let state = test_state_with_activity_service(activity_service.clone());
-        let read_receipt =
-            enqueue_after_response_read_receipt_task(&activity_service, "+15551234567", 123).await;
-
-        let msg = OutboundMessage::new("signal", MessageContent::text("hello")).with_metadata(
-            crate::messages::outbound::MessageMetadata {
-                recipient_id: Some("+15551234567".to_string()),
-                read_receipt: Some(read_receipt.clone()),
-                ..Default::default()
-            },
-        );
-        let queued = pipeline.queue(msg, MsgOutboundContext::new()).unwrap();
-        let message = pipeline
-            .get_message(&queued.message_id)
-            .expect("queued message should be available");
-
-        handle_delivery_result(
-            &pipeline,
-            &message.message.metadata,
-            &queued.message_id,
-            Ok(plugins::DeliveryResult {
-                ok: false,
-                message_id: None,
-                error: Some("send failed".to_string()),
-                retryable: false,
-                conversation_id: None,
-                to_jid: None,
-                poll_id: None,
-            }),
-            &state,
-        )
-        .await;
-        activity_service.shutdown().await;
-
-        assert_eq!(
-            pipeline.get_status(&queued.message_id),
-            Some(crate::messages::outbound::DeliveryStatus::Failed)
-        );
-        let withheld_task = activity_service
-            .read_receipt_queue()
-            .get(read_receipt.task_id())
-            .expect("failed delivery should preserve the durable read receipt task");
-        assert_eq!(withheld_task.state, crate::tasks::TaskState::Cancelled);
-        assert_eq!(
-            withheld_task.last_error.as_deref(),
-            Some(crate::channels::activity::READ_RECEIPT_WITHHELD_DELIVERY_FAILED_REASON)
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn test_handle_delivery_result_skips_read_receipt_when_metadata_absent() {
-        let mock = Arc::new(MockChannel::with_read_receipts());
-        let (pipeline, _plugin_reg, _channel_reg) =
-            make_pipeline_and_registries("signal", Some(mock.clone()), true);
-        let activity_service = test_activity_service();
-        let state = test_state_with_activity_service(activity_service.clone());
-
-        let msg = OutboundMessage::new("signal", MessageContent::text("hello")).with_metadata(
-            crate::messages::outbound::MessageMetadata {
-                recipient_id: Some("+15551234567".to_string()),
-                ..Default::default()
-            },
-        );
-        let queued = pipeline.queue(msg, MsgOutboundContext::new()).unwrap();
-        let message = pipeline
-            .get_message(&queued.message_id)
-            .expect("queued message should be available");
-
-        handle_delivery_result(
-            &pipeline,
-            &message.message.metadata,
-            &queued.message_id,
-            Ok(plugins::DeliveryResult {
-                ok: true,
-                message_id: Some("sent-1".to_string()),
-                error: None,
-                retryable: false,
-                conversation_id: None,
-                to_jid: None,
-                poll_id: None,
-            }),
-            &state,
-        )
-        .await;
-        activity_service.shutdown().await;
-
-        assert_eq!(
-            pipeline.get_status(&queued.message_id),
-            Some(crate::messages::outbound::DeliveryStatus::Sent)
-        );
-        assert_eq!(mock.mark_read_count.load(Ordering::Relaxed), 0);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn test_handle_delivery_result_does_not_block_on_slow_read_receipt_dispatch() {
-        let mock = Arc::new(MockChannel::with_read_receipts());
-        let (pipeline, _plugin_reg, _channel_reg) =
-            make_pipeline_and_registries("signal", Some(mock.clone()), true);
-        let activity_service = test_activity_service();
-        let state = test_state_with_activity_service(activity_service.clone());
-        let read_receipt =
-            enqueue_after_response_read_receipt_task(&activity_service, "+15551234567", 123).await;
-
-        let msg = OutboundMessage::new("signal", MessageContent::text("hello")).with_metadata(
-            crate::messages::outbound::MessageMetadata {
-                recipient_id: Some("+15551234567".to_string()),
-                read_receipt: Some(read_receipt.clone()),
-                ..Default::default()
-            },
-        );
-        let queued = pipeline.queue(msg, MsgOutboundContext::new()).unwrap();
-        let message = pipeline
-            .get_message(&queued.message_id)
-            .expect("queued message should be available");
-
-        let started_at = std::time::Instant::now();
-        handle_delivery_result(
-            &pipeline,
-            &message.message.metadata,
-            &queued.message_id,
-            Ok(plugins::DeliveryResult {
-                ok: true,
-                message_id: Some("sent-1".to_string()),
-                error: None,
-                retryable: false,
-                conversation_id: None,
-                to_jid: None,
-                poll_id: None,
-            }),
-            &state,
-        )
-        .await;
-        assert!(
-            started_at.elapsed() < Duration::from_millis(50),
-            "delivery result handling should only persist durable receipt activation"
-        );
-        activity_service.shutdown().await;
-        let activated_task = activity_service
-            .read_receipt_queue()
-            .get(read_receipt.task_id())
-            .expect("delivery success should activate the durable read receipt task");
-        assert_eq!(activated_task.state, crate::tasks::TaskState::RetryWait);
-    }
-
-    #[test]
-    fn test_apply_message_hook_overrides_preserves_runtime_read_receipt() {
-        let mut message = OutboundMessage::new("signal", MessageContent::text("hello"));
-        message.metadata = crate::messages::outbound::MessageMetadata {
-            recipient_id: Some("+15551234567".to_string()),
-            read_receipt: Some(crate::channels::activity::OwnedReadReceipt::new(
-                "signal",
-                ReadReceiptContext {
-                    recipient: "+15551234567".to_string(),
-                    timestamp: Some(123),
-                    ..Default::default()
-                },
-                "receipt-task-123",
-            )),
-            ..Default::default()
-        };
-
-        apply_message_hook_overrides(
-            &mut message,
-            &json!({
-                "metadata": {
-                    "recipient_id": "+15557654321",
-                    "priority": 2
-                }
-            }),
-        );
-
-        assert_eq!(
-            message.metadata.recipient_id.as_deref(),
-            Some("+15557654321")
-        );
-        assert_eq!(message.metadata.priority, 2);
-        assert_eq!(
-            message
-                .metadata
-                .read_receipt
-                .as_ref()
-                .map(|receipt| receipt.task_id()),
-            Some("receipt-task-123")
-        );
     }
 }

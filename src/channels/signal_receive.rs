@@ -143,55 +143,6 @@ fn read_receipt_context_for_signal_run(
     build_signal_read_receipt_context(envelope, data_message, sender)
 }
 
-async fn maybe_dispatch_read_receipt_for_ignored_signal_message(
-    state: &Arc<WsServerState>,
-    sender: Option<&str>,
-    read_receipt_context: Option<ReadReceiptContext>,
-    carapace_manages_read_receipts: bool,
-    read_receipt_reservation: &mut Option<
-        crate::channels::activity::ReadReceiptOwnershipReservation,
-    >,
-    reason: &str,
-) {
-    if !carapace_manages_read_receipts {
-        return;
-    }
-
-    let Some(sender) = sender else {
-        warn!(
-            ignored_reason = reason,
-            "Signal read receipts are enabled but an ignored message had no sender; Carapace cannot acknowledge it explicitly"
-        );
-        return;
-    };
-
-    let Some(read_receipt_context) = read_receipt_context else {
-        warn!(
-            sender = %sender,
-            ignored_reason = reason,
-            "Signal read receipts are enabled but an ignored message did not include a timestamp; Carapace cannot acknowledge it explicitly"
-        );
-        return;
-    };
-
-    let Some(read_receipt) = read_receipt_reservation
-        .as_mut()
-        .and_then(|reservation| reservation.claim(read_receipt_context))
-    else {
-        warn!(
-            sender = %sender,
-            ignored_reason = reason,
-            "Signal read receipts were reserved for this poll but no reserved ownership remained for an ignored message; leaving it unread"
-        );
-        return;
-    };
-
-    state
-        .activity_service()
-        .complete_claimed_read_receipt_without_run(state.as_ref(), &read_receipt)
-        .await
-}
-
 fn summarize_signal_receive_response_error(error: &reqwest::Error) -> &'static str {
     if error.is_decode() {
         "invalid Signal receive response body"
@@ -293,7 +244,7 @@ async fn can_manage_signal_read_receipts(
     state: &WsServerState,
     capability_cache: &mut SignalReadReceiptCapabilityCache,
 ) -> Option<crate::channels::activity::ReadReceiptOwnershipReservation> {
-    if !activity_policy.read_receipts.enabled || state.llm_provider().is_none() {
+    if !activity_policy.read_receipts.enabled {
         return None;
     }
 
@@ -586,30 +537,10 @@ async fn process_envelope(
 
     let text = match &data_message.message {
         Some(t) if !t.is_empty() => t,
-        _ => {
-            maybe_dispatch_read_receipt_for_ignored_signal_message(
-                state,
-                sender,
-                read_receipt_context,
-                carapace_manages_read_receipts,
-                read_receipt_reservation,
-                "ignored non-text Signal message",
-            )
-            .await;
-            return;
-        } // No text content
+        _ => return, // No text content
     };
 
     if signal_group_id(data_message).is_some() {
-        maybe_dispatch_read_receipt_for_ignored_signal_message(
-            state,
-            sender,
-            read_receipt_context,
-            carapace_manages_read_receipts,
-            read_receipt_reservation,
-            "ignored unsupported Signal group message",
-        )
-        .await;
         warn!("Ignoring Signal group message: Signal outbound currently supports direct messages only");
         return;
     }
@@ -654,7 +585,7 @@ async fn process_envelope(
             to: peer_id.clone(),
             ..Default::default()
         }),
-        read_receipt: read_receipt.clone(),
+        claimed_read_receipt: read_receipt,
         ..Default::default()
     };
 
@@ -670,18 +601,6 @@ async fn process_envelope(
     .await
     {
         Ok(result) => {
-            if !result.run_spawned {
-                if let Some(read_receipt) = read_receipt.as_ref() {
-                    state
-                        .activity_service()
-                        .complete_claimed_read_receipt_without_run(state.as_ref(), read_receipt)
-                        .await;
-                    warn!(
-                        sender = %sender,
-                        "Signal read receipts were claimed for this message but no LLM provider was available at dispatch time; completing the explicit acknowledgment immediately"
-                    );
-                }
-            }
             debug!(
                 run_id = %result.run_id,
                 sender = %sender,
@@ -689,17 +608,6 @@ async fn process_envelope(
             );
         }
         Err(err) => {
-            if let Some(read_receipt) = read_receipt.as_ref() {
-                state
-                    .activity_service()
-                    .withhold_claimed_read_receipt(read_receipt);
-                warn!(
-                    sender = %sender,
-                    channel = %read_receipt.channel_id(),
-                    reason = crate::channels::activity::READ_RECEIPT_WITHHELD_INBOUND_DISPATCH_FAILED_REASON,
-                    "leaving Signal message unread because inbound dispatch failed before a durable after-response receipt obligation was created"
-                );
-            }
             error!(sender = %sender, error = %err, "Failed to dispatch Signal message");
         }
     }
@@ -1234,10 +1142,7 @@ mod tests {
         let state = test_state_with_provider(true);
         let activity_service = crate::channels::activity::ActivityService::new();
         let activity_policy = crate::channels::activity::ChannelActivityPolicy {
-            read_receipts: crate::channels::activity::ReadReceiptFeaturePolicy {
-                enabled: true,
-                ..Default::default()
-            },
+            read_receipts: crate::channels::activity::ReadReceiptFeaturePolicy { enabled: true },
             ..Default::default()
         };
         let mut capability_cache = SignalReadReceiptCapabilityCache::default();
@@ -1290,10 +1195,7 @@ mod tests {
             crate::channels::activity::ActivityService::with_limits_for_test(8, 3);
         let state = test_state_with_provider_and_signal_plugin();
         let activity_policy = crate::channels::activity::ChannelActivityPolicy {
-            read_receipts: crate::channels::activity::ReadReceiptFeaturePolicy {
-                enabled: true,
-                ..Default::default()
-            },
+            read_receipts: crate::channels::activity::ReadReceiptFeaturePolicy { enabled: true },
             ..Default::default()
         };
         let mut capability_cache = SignalReadReceiptCapabilityCache::default();
@@ -1324,7 +1226,7 @@ mod tests {
             crate::channels::activity::ActivityService::with_limits_for_test(8, 1);
         let state = test_state_with_provider_and_signal_plugin();
         activity_service
-            .enqueue_after_response_read_receipt(
+            .enqueue_ready_read_receipt(
                 "signal",
                 ReadReceiptContext {
                     recipient: "+15551234567".to_string(),
@@ -1335,10 +1237,7 @@ mod tests {
             .await
             .expect("backlog setup should persist a durable read receipt obligation");
         let activity_policy = crate::channels::activity::ChannelActivityPolicy {
-            read_receipts: crate::channels::activity::ReadReceiptFeaturePolicy {
-                enabled: true,
-                ..Default::default()
-            },
+            read_receipts: crate::channels::activity::ReadReceiptFeaturePolicy { enabled: true },
             ..Default::default()
         };
         let mut capability_cache = SignalReadReceiptCapabilityCache::default();
@@ -1364,14 +1263,18 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn test_snapshot_signal_receive_poll_leaves_auto_receipts_enabled_without_provider() {
+    async fn test_snapshot_signal_receive_poll_suppresses_auto_receipts_without_provider() {
         let activity_service = crate::channels::activity::ActivityService::new();
-        let state = test_state_with_provider(false);
+        let plugin_registry = Arc::new(PluginRegistry::new());
+        plugin_registry.register_channel(
+            "signal".to_string(),
+            Arc::new(MockSignalReadReceiptChannel::new(Arc::new(Notify::new()))),
+        );
+        let state = Arc::new(
+            WsServerState::new(WsServerConfig::default()).with_plugin_registry(plugin_registry),
+        );
         let activity_policy = crate::channels::activity::ChannelActivityPolicy {
-            read_receipts: crate::channels::activity::ReadReceiptFeaturePolicy {
-                enabled: true,
-                ..Default::default()
-            },
+            read_receipts: crate::channels::activity::ReadReceiptFeaturePolicy { enabled: true },
             ..Default::default()
         };
         let mut capability_cache = SignalReadReceiptCapabilityCache::default();
@@ -1386,10 +1289,10 @@ mod tests {
         )
         .await;
 
-        assert!(!snapshot.carapace_manages_read_receipts());
+        assert!(snapshot.carapace_manages_read_receipts());
         assert_eq!(
             snapshot.receive_url.as_str(),
-            "http://localhost:8080/api/v1/receive/%2B15551234567?debug=1"
+            "http://localhost:8080/api/v1/receive/%2B15551234567?debug=1&max_messages=10000&send_read_receipts=false"
         );
         drop(snapshot);
         state.shutdown_activity_service().await;
@@ -1402,10 +1305,7 @@ mod tests {
         let activity_service = crate::channels::activity::ActivityService::new();
         let state = test_state_with_provider_and_signal_plugin_without_receipts();
         let activity_policy = crate::channels::activity::ChannelActivityPolicy {
-            read_receipts: crate::channels::activity::ReadReceiptFeaturePolicy {
-                enabled: true,
-                ..Default::default()
-            },
+            read_receipts: crate::channels::activity::ReadReceiptFeaturePolicy { enabled: true },
             ..Default::default()
         };
         let mut capability_cache = SignalReadReceiptCapabilityCache::default();
@@ -1705,7 +1605,7 @@ mod tests {
                 .lock()
                 .snapshot_runs()
                 .iter()
-                .any(|run| run.message == "first" && run.read_receipt.is_none())
+                .any(|run| run.message == "first")
         })
         .await;
 
@@ -1724,17 +1624,12 @@ mod tests {
 
         wait_for_condition(Duration::from_secs(2), || {
             state
-                .agent_run_registry
-                .lock()
-                .snapshot_runs()
+                .activity_service()
+                .read_receipt_queue()
+                .list()
                 .iter()
-                .any(|run| {
-                    run.message == "second"
-                        && run
-                            .read_receipt
-                            .as_ref()
-                            .and_then(|receipt| receipt.context().timestamp)
-                            == Some(1706745601000_u64)
+                .any(|task| {
+                    task.payload["context"]["timestamp"].as_u64() == Some(1706745601000_u64)
                 })
         })
         .await;
@@ -1763,17 +1658,17 @@ mod tests {
             .iter()
             .find(|run| run.message == "first")
             .expect("first inbound run");
-        assert!(first.read_receipt.is_none());
+        assert_eq!(first.status, crate::server::ws::AgentRunStatus::Queued);
 
         let second = runs
             .iter()
             .find(|run| run.message == "second")
             .expect("second inbound run");
+        assert_eq!(second.status, crate::server::ws::AgentRunStatus::Queued);
+        let receipt_tasks = state.activity_service().read_receipt_queue().list();
+        assert_eq!(receipt_tasks.len(), 1);
         assert_eq!(
-            second
-                .read_receipt
-                .as_ref()
-                .and_then(|receipt| receipt.context().timestamp),
+            receipt_tasks[0].payload["context"]["timestamp"].as_u64(),
             Some(1706745601000_u64)
         );
 
@@ -1781,7 +1676,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn test_process_envelope_acknowledges_ignored_non_text_message_when_managed() {
+    async fn test_process_envelope_does_not_acknowledge_ignored_non_text_message() {
         let notify = Arc::new(Notify::new());
         let signal_channel = Arc::new(MockSignalReadReceiptChannel::new(notify.clone()));
         let plugin_registry = Arc::new(PluginRegistry::new());
@@ -1789,10 +1684,6 @@ mod tests {
         let state = Arc::new(
             WsServerState::new(WsServerConfig::default()).with_plugin_registry(plugin_registry),
         );
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        state
-            .activity_service()
-            .spawn_read_receipt_worker(state.clone(), shutdown_rx);
         let envelope = SignalEnvelope {
             source_number: Some("+15559876543".to_string()),
             source: None,
@@ -1809,33 +1700,21 @@ mod tests {
             .reserve_available_read_receipt_ownership("signal");
         process_envelope(&envelope, &state, true, &mut read_receipt_reservation).await;
 
-        tokio::time::timeout(Duration::from_secs(1), notify.notified())
-            .await
-            .expect("ignored non-text messages should still be acknowledged");
-        assert_eq!(signal_channel.mark_read_count.load(Ordering::Relaxed), 1);
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                let tasks = state.activity_service().read_receipt_queue().list();
-                if tasks.len() == 1 && tasks[0].state == crate::tasks::TaskState::Done {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("ignored-envelope receipt task should settle to done");
+        assert_eq!(signal_channel.mark_read_count.load(Ordering::Relaxed), 0);
+        assert!(state
+            .activity_service()
+            .read_receipt_queue()
+            .list()
+            .is_empty());
         assert!(
             state.agent_run_registry.lock().snapshot_runs().is_empty(),
             "ignored non-text messages should not create agent runs"
         );
-        shutdown_tx
-            .send(true)
-            .expect("read receipt worker shutdown signal should send");
         state.shutdown_activity_service().await;
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn test_process_envelope_acknowledges_ignored_group_message_when_managed() {
+    async fn test_process_envelope_does_not_acknowledge_ignored_group_message() {
         let notify = Arc::new(Notify::new());
         let signal_channel = Arc::new(MockSignalReadReceiptChannel::new(notify.clone()));
         let plugin_registry = Arc::new(PluginRegistry::new());
@@ -1843,10 +1722,6 @@ mod tests {
         let state = Arc::new(
             WsServerState::new(WsServerConfig::default()).with_plugin_registry(plugin_registry),
         );
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        state
-            .activity_service()
-            .spawn_read_receipt_worker(state.clone(), shutdown_rx);
         let envelope = SignalEnvelope {
             source_number: Some("+15559876543".to_string()),
             source: None,
@@ -1865,28 +1740,16 @@ mod tests {
             .reserve_available_read_receipt_ownership("signal");
         process_envelope(&envelope, &state, true, &mut read_receipt_reservation).await;
 
-        tokio::time::timeout(Duration::from_secs(1), notify.notified())
-            .await
-            .expect("ignored group messages should still be acknowledged");
-        assert_eq!(signal_channel.mark_read_count.load(Ordering::Relaxed), 1);
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                let tasks = state.activity_service().read_receipt_queue().list();
-                if tasks.len() == 1 && tasks[0].state == crate::tasks::TaskState::Done {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("ignored-group receipt task should settle to done");
+        assert_eq!(signal_channel.mark_read_count.load(Ordering::Relaxed), 0);
+        assert!(state
+            .activity_service()
+            .read_receipt_queue()
+            .list()
+            .is_empty());
         assert!(
             state.agent_run_registry.lock().snapshot_runs().is_empty(),
             "ignored group messages should not create agent runs"
         );
-        shutdown_tx
-            .send(true)
-            .expect("read receipt worker shutdown signal should send");
         state.shutdown_activity_service().await;
     }
 
@@ -1906,10 +1769,7 @@ mod tests {
                 .with_activity_service(activity_service.clone()),
         );
         let activity_policy = crate::channels::activity::ChannelActivityPolicy {
-            read_receipts: crate::channels::activity::ReadReceiptFeaturePolicy {
-                enabled: true,
-                ..Default::default()
-            },
+            read_receipts: crate::channels::activity::ReadReceiptFeaturePolicy { enabled: true },
             ..Default::default()
         };
         let mut capability_cache = SignalReadReceiptCapabilityCache::default();
@@ -1960,13 +1820,12 @@ mod tests {
         .await;
 
         let runs = state.agent_run_registry.lock().snapshot_runs();
-        let run = runs
-            .iter()
-            .find(|run| run.message == "hello")
-            .expect("reserved-capacity path should still dispatch the inbound run");
-        assert!(
-            run.read_receipt.is_some(),
-            "process_envelope should consume the poll reservation into a claimed receipt"
+        assert!(runs.iter().any(|run| run.message == "hello"));
+        let receipt_tasks = state.activity_service().read_receipt_queue().list();
+        assert_eq!(receipt_tasks.len(), 1);
+        assert_eq!(
+            receipt_tasks[0].payload["context"]["timestamp"].as_u64(),
+            Some(1706745600000)
         );
     }
 
@@ -2017,7 +1876,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn test_process_envelope_completes_claimed_receipt_when_provider_disappears_after_poll() {
+    async fn test_process_envelope_completes_claimed_receipt_when_llm_provider_disappears_after_poll(
+    ) {
         let notify = Arc::new(Notify::new());
         let signal_channel = Arc::new(MockSignalReadReceiptChannel::new(notify.clone()));
         let plugin_registry = Arc::new(PluginRegistry::new());
@@ -2028,10 +1888,7 @@ mod tests {
                 .with_plugin_registry(plugin_registry),
         );
         let activity_policy = crate::channels::activity::ChannelActivityPolicy {
-            read_receipts: crate::channels::activity::ReadReceiptFeaturePolicy {
-                enabled: true,
-                ..Default::default()
-            },
+            read_receipts: crate::channels::activity::ReadReceiptFeaturePolicy { enabled: true },
             ..Default::default()
         };
         let mut capability_cache = SignalReadReceiptCapabilityCache::default();
@@ -2044,7 +1901,7 @@ mod tests {
         .await;
         assert!(
             read_receipt_reservation.is_some(),
-            "provider should be available at poll time so Carapace claims the receipt"
+            "LLM provider presence should not affect receipt ownership at poll time"
         );
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -2096,12 +1953,7 @@ mod tests {
             .iter()
             .find(|run| run.message == "hello")
             .expect("dispatch should still register the inbound run context");
-        assert_eq!(
-            run.read_receipt
-                .as_ref()
-                .and_then(|receipt| receipt.context().timestamp),
-            Some(1706745600000)
-        );
+        assert_eq!(run.status, crate::server::ws::AgentRunStatus::Queued);
         shutdown_tx
             .send(true)
             .expect("read receipt worker shutdown signal should send");

@@ -10,7 +10,7 @@ A hardened alternative to openclaw / clawdbot — for when your assistant needs 
 
 - **Multi-provider LLM engine** — Anthropic, OpenAI API key, Codex subscription login, Ollama, Google Gemini, Vertex AI, AWS Bedrock, and Venice AI with streaming, tool dispatch, and cancellation
 - **Multi-channel messaging** — Signal, Telegram, Discord, Slack, console, and webhooks
-- **Channel activity framework** — per-channel typing indicators and after-response read receipts, with Signal as the first activity-enabled built-in channel
+- **Channel activity framework** — per-channel typing indicators and append-time read receipts, with Signal as the first activity-enabled built-in channel
 - **Tooling and local workspace access** — built-in agent tools, guarded filesystem tools for explicit roots, and channel-specific tool schemas
 - **Signed plugin runtime** — plugins are signature-verified and run with strict permissions and resource limits
 - **Secure defaults** — local-first binding, locked-down auth behavior, encrypted secret storage, guarded tool execution, root-scoped filesystem access, and OS-level subprocess sandboxing for protected paths
@@ -111,7 +111,7 @@ of truth.
   (Google sign-in or API key via CLI and Control UI), Codex onboarding
   (OpenAI subscription login via CLI and Control UI), Vertex AI provider
   support, per-channel activity features with Signal typing indicators and
-  after-response read receipts, and guarded filesystem tools for explicit
+  append-time read receipts, and guarded filesystem tools for explicit
   workspace roots
 
 ## Docs

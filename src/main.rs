@@ -171,6 +171,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     log_startup_banner(&tls_setup, &resolved, &state_dir, &ws_state);
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    server::startup::spawn_background_tasks(&ws_state, &cfg, &shutdown_rx);
     spawn_network_services(&cfg, &tls_setup, resolved.address.port(), &shutdown_rx);
     spawn_signal_receive_loop_if_configured(&cfg, &ws_state, &shutdown_rx);
     spawn_telegram_receive_loop_if_configured(&cfg, &ws_state, &shutdown_rx);
@@ -182,8 +183,6 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             tls_result,
             http_config,
             &ws_state,
-            &cfg,
-            &shutdown_rx,
             shutdown_tx,
             resolved.address,
             hook_registry.clone(),
@@ -196,6 +195,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             http_config,
             cfg,
             resolved.address,
+            shutdown_tx,
             hook_registry.clone(),
             tools_registry.clone(),
         )
@@ -780,6 +780,7 @@ async fn launch_non_tls_server(
     http_config: server::http::HttpConfig,
     cfg: Value,
     bind_address: SocketAddr,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
     hook_registry: Arc<hooks::registry::HookRegistry>,
     tools_registry: Arc<plugins::tools::ToolsRegistry>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -791,13 +792,14 @@ async fn launch_non_tls_server(
         tools_registry,
         bind_address,
         raw_config: cfg,
-        spawn_background_tasks: true,
+        spawn_background_tasks: false,
     };
 
     let handle = server::startup::run_server_with_config(server_config).await?;
 
     let reason = await_shutdown_trigger().await;
     info!("Shutdown signal received ({})", reason);
+    let _ = shutdown_tx.send(true);
     handle.shutdown().await;
     Ok(())
 }
@@ -901,8 +903,6 @@ async fn launch_tls_server(
     tls_result: tls::TlsSetupResult,
     http_config: server::http::HttpConfig,
     ws_state: &Arc<server::ws::WsServerState>,
-    cfg: &Value,
-    shutdown_rx: &tokio::sync::watch::Receiver<bool>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     addr: SocketAddr,
     hook_registry: Arc<hooks::registry::HookRegistry>,
@@ -923,9 +923,6 @@ async fn launch_tls_server(
         .with_state(ws_state.clone());
 
     let app = http_router.merge(ws_router);
-
-    // Spawn background tasks
-    server::startup::spawn_background_tasks(ws_state, cfg, shutdown_rx);
 
     let rustls_config =
         axum_server::tls_rustls::RustlsConfig::from_config(tls_result.server_config);

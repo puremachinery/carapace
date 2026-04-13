@@ -120,7 +120,7 @@ remain partial or incomplete. Verified-vs-partial feature state is tracked in
 
 - **Platform backend coverage.** Seatbelt/Landlock/Windows AppContainer+Job subprocess wiring is implemented across probe/tailscale/whois/SSH tunnel callsites. Unsupported targets still fail closed. On Windows, deny-network execution is supported through command-output helpers, while spawned deny-network subprocess requests fail closed.
 - **Control UI.** Foundation is shipped (`/ui` auth/session handling, status/channels, redacted config read + safe patch path, task operator actions, pairing flow). Richer operator workflows and UX refinements remain in-progress.
-- **Channels.** Discord is verified end-to-end. Telegram supports webhook and localhost long-polling fallback. Signal now includes inbound polling plus optional typing indicators and after-response read receipts, but still lacks published live smoke evidence. Slack is implemented but not yet smoke-tested in real environments.
+- **Channels.** Discord is verified end-to-end. Telegram supports webhook and localhost long-polling fallback. Signal now includes inbound polling plus optional typing indicators and append-time read receipts, but still lacks published live smoke evidence. Slack is implemented but not yet smoke-tested in real environments.
 - **Smoke evidence process.** Live channel validation criteria and report template are tracked in `docs/channel-smoke.md`.
 - **Audit log emission.** The audit log module is implemented (append-only JSONL, 19 event types, 50 MB rotation) but event emission is not yet wired into all runtime paths.
 

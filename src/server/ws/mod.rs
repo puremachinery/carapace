@@ -733,8 +733,7 @@ impl WsServerState {
             .map_err(WsConfigError::Runtime)?;
         state
             .activity_service
-            .cleanup_orphaned_blocked_read_receipts_after_restart()
-            .await
+            .reject_legacy_persisted_read_receipt_tasks(&cleanup_state_dir)
             .map_err(WsConfigError::Runtime)?;
         tokio::task::spawn_blocking(move || {
             crate::update::cleanup_old_binaries(&cleanup_state_dir)

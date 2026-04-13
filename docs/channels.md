@@ -77,8 +77,12 @@ When `channels.signal.features.typing.enabled` is true, Carapace refreshes the
 Signal typing indicator while the assistant is generating a reply and clears it
 before outbound delivery.
 When `channels.signal.features.readReceipts.enabled` is true, Carapace polls
-Signal with `send_read_receipts=false` and only sends a read receipt after a
-successful assistant response is delivered. When the feature is disabled,
+Signal with `send_read_receipts=false` and only sends a read receipt after the
+inbound message is durably appended to Carapace's session/history store. This
+happens before any LLM response is generated or delivered. If the append fails,
+Carapace leaves the message unread. Unsupported Signal messages that Carapace
+does not ingest today, including group messages and non-text messages, also
+remain unread while this feature is enabled. When the feature is disabled,
 Signal keeps its normal auto-read-receipt behavior.
 
 ## Telegram (Bot API + Webhook or Polling)

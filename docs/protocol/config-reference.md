@@ -425,9 +425,8 @@ Enable Carapace to listen and respond on external chat platforms.
     - `defaults.features.typing.mode`: `"thinking"` (Default)
     - `defaults.features.typing.intervalSeconds`: Integer. (Default: `3`)
     - `defaults.features.readReceipts.enabled`: `true` or `false`. (Default: `false`)
-    - `defaults.features.readReceipts.mode`: `"after-response"` (Default)
     - `<channel>.features.typing.*`: Per-channel override for typing behavior.
-    - `<channel>.features.readReceipts.*`: Per-channel override for read receipts.
+    - `<channel>.features.readReceipts.enabled`: Per-channel override for append-time read receipts.
 - **`logging`**
   - *What it does:* Dictates what diagnostic events are printed into terminal or backend logs.
   - *Common values:*

@@ -132,10 +132,6 @@ impl MessageContent {
     }
 }
 
-/// Runtime-only read-receipt ownership carried from inbound receive time
-/// through outbound delivery finalization.
-pub type PendingReadReceipt = crate::channels::activity::OwnedReadReceipt;
-
 /// Metadata for message delivery context
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MessageMetadata {
@@ -151,11 +147,6 @@ pub struct MessageMetadata {
     /// User ID of the recipient
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recipient_id: Option<String>,
-    /// Optional runtime-only read-receipt action to trigger after successful delivery.
-    ///
-    /// This field is intentionally skipped across serialization boundaries.
-    #[serde(skip, default)]
-    pub read_receipt: Option<PendingReadReceipt>,
     /// Channel-specific extra data
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extra: Option<serde_json::Value>,
@@ -165,16 +156,6 @@ pub struct MessageMetadata {
     /// Time-to-live in milliseconds (0 = no expiry)
     #[serde(default)]
     pub ttl_ms: u64,
-}
-
-impl MessageMetadata {
-    /// Restore runtime-only metadata after deserializing hook overrides.
-    ///
-    /// `read_receipt` is intentionally skipped across serialization boundaries,
-    /// so hook output can never preserve it on its own.
-    pub fn restore_runtime_only_fields_from(&mut self, previous: &Self) {
-        self.read_receipt = previous.read_receipt.clone();
-    }
 }
 
 /// An outbound message to be delivered
@@ -1068,26 +1049,6 @@ mod tests {
         msg.created_at = now_millis() - 2000; // Created 2 seconds ago
 
         assert!(msg.is_expired());
-    }
-
-    #[test]
-    fn test_message_metadata_skips_read_receipt_serialization() {
-        let metadata = MessageMetadata {
-            read_receipt: Some(crate::channels::activity::OwnedReadReceipt::new(
-                "signal",
-                crate::plugins::ReadReceiptContext {
-                    recipient: "+15551234567".to_string(),
-                    timestamp: Some(123),
-                    ..Default::default()
-                },
-                "receipt-task-123",
-            )),
-            ..Default::default()
-        };
-
-        let value = serde_json::to_value(&metadata).unwrap();
-        assert!(value.get("read_receipt").is_none());
-        assert!(value.get("readReceipt").is_none());
     }
 
     #[test]

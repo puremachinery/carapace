@@ -944,52 +944,18 @@ fn finalize_run(
     registry.mark_completed(run_id, accumulated_text);
 }
 
-fn delivery_context_from_registry(
-    state: &WsServerState,
-    run_id: &str,
-) -> (
-    Option<String>,
-    Option<crate::channels::activity::ClaimedReadReceipt>,
-) {
+fn delivery_context_from_registry(state: &WsServerState, run_id: &str) -> Option<String> {
     let registry = state.agent_run_registry.lock();
     registry
         .get(run_id)
-        .map(|run| (run.delivery_recipient_id.clone(), run.read_receipt.clone()))
+        .map(|run| run.delivery_recipient_id.clone())
         .unwrap_or_else(|| {
             tracing::warn!(
                 run_id = %run_id,
                 "agent run missing from registry before delivery finalization"
             );
-            (None, None)
+            None
         })
-}
-
-async fn withhold_claimed_read_receipt_on_failed_run(
-    state: &Arc<WsServerState>,
-    run_id: &str,
-    channel_id: Option<&str>,
-) {
-    let Some(claimed_read_receipt) = delivery_context_from_registry(state, run_id).1 else {
-        return;
-    };
-    if !state
-        .activity_service()
-        .withhold_claimed_read_receipt(&claimed_read_receipt)
-    {
-        return;
-    }
-
-    match channel_id {
-        Some(channel_id) => tracing::warn!(
-            run_id = %run_id,
-            channel = %channel_id,
-            "withholding explicit read receipt because Carapace already owned the receive-time acknowledgement and the response was not delivered successfully"
-        ),
-        None => tracing::warn!(
-            run_id = %run_id,
-            "withholding explicit read receipt because Carapace already owned the receive-time acknowledgement and the response was not delivered successfully"
-        ),
-    }
 }
 
 /// Execute a single LLM turn: call the provider, stream the response,
@@ -1116,11 +1082,9 @@ pub async fn execute_run(
         registry.mark_started(&run_id)
     };
     if !run_started {
-        withhold_claimed_read_receipt_on_failed_run(&state, &run_id, None).await;
         return Err(AgentError::Cancelled);
     }
 
-    let mut error_channel_id: Option<String> = None;
     let result = async {
         broadcast_agent_event(
             &state,
@@ -1138,7 +1102,6 @@ pub async fn execute_run(
         .await
         .map_err(|e| AgentError::SessionNotFound(format!("{session_key}: {e}")))?;
         let message_channel = session.metadata.channel.clone();
-        error_channel_id = message_channel.clone();
 
         if let Some(result) = dispatch_plugin_hook(
             &state,
@@ -1159,8 +1122,8 @@ pub async fn execute_run(
                 return Err(AgentError::Cancelled);
             }
             if let Some(payload) = parse_hook_payload(&result, "before_agent_start") {
-                let cfg = crate::config::load_config()
-                    .unwrap_or(Value::Object(serde_json::Map::new()));
+                let cfg =
+                    crate::config::load_config().unwrap_or(Value::Object(serde_json::Map::new()));
                 apply_agent_hook_overrides(&mut config, &payload, &cfg)?;
             }
         }
@@ -1198,7 +1161,8 @@ pub async fn execute_run(
 
         // 2c. Classifier (optional, fail-open)
         if let Some(ref clf_config) = config.classifier {
-            if clf_config.enabled && clf_config.mode != crate::agent::classifier::ClassifierMode::Off
+            if clf_config.enabled
+                && clf_config.mode != crate::agent::classifier::ClassifierMode::Off
             {
                 let last_user_msg = crate::sessions::get_history_blocking(
                     state.session_store().clone(),
@@ -1334,9 +1298,11 @@ pub async fn execute_run(
                         .get(&run_id)
                         .and_then(|run| run.typing_context.clone())
                         .or_else(|| {
-                            session.metadata.chat_id.clone().map(|to| crate::plugins::TypingContext {
-                                to,
-                                ..Default::default()
+                            session.metadata.chat_id.clone().map(|to| {
+                                crate::plugins::TypingContext {
+                                    to,
+                                    ..Default::default()
+                                }
                             })
                         })
                 };
@@ -1409,8 +1375,7 @@ pub async fn execute_run(
             } else {
                 None
             };
-            let (delivery_recipient_id, read_receipt) =
-                delivery_context_from_registry(&state, &run_id);
+            let delivery_recipient_id = delivery_context_from_registry(&state, &run_id);
 
             if let Some(handle) = typing_handle.take() {
                 handle.stop().await;
@@ -1421,53 +1386,8 @@ pub async fn execute_run(
                     let recipient_id =
                         delivery_recipient_id.or_else(|| session.metadata.chat_id.clone());
                     if let (Some(channel_id), Some(chat_id)) = (&message_channel, recipient_id) {
-                        if channel_activity_policy
-                            .as_ref()
-                            .map(|policy| policy.read_receipts.enabled)
-                            .unwrap_or(false)
-                            && read_receipt.is_none()
-                            && !channel_capabilities
-                                .as_ref()
-                                .map(|capabilities| capabilities.read_receipts)
-                                .unwrap_or(false)
-                        {
-                            state
-                                .activity_service()
-                                .warn_unsupported_feature(channel_id, "read_receipts");
-                        }
-                        let pending_read_receipt = if let Some(read_receipt) = read_receipt.as_ref()
-                        {
-                            if capability_probe_failed {
-                                tracing::warn!(
-                                    run_id = %run_id,
-                                    channel = %channel_id,
-                                    "preserving explicit read receipt after capability probe failure because upstream auto-receipts were already suppressed at receive time"
-                                );
-                            }
-                            match state
-                                .activity_service()
-                                .prepare_after_response_read_receipt(read_receipt)
-                                .await
-                            {
-                                Ok(receipt) => Some(receipt),
-                                Err(err) => {
-                                    tracing::error!(
-                                        run_id = %run_id,
-                                        channel = %channel_id,
-                                        error = %err,
-                                        "failed to persist after-response read receipt before delivery queueing"
-                                    );
-                                    return Err(AgentError::Delivery(format!(
-                                        "failed to persist after-response read receipt before delivery queueing on channel '{channel_id}': {err}"
-                                    )));
-                                }
-                            }
-                        } else {
-                            None
-                        };
                         let metadata = crate::messages::outbound::MessageMetadata {
                             recipient_id: Some(chat_id),
-                            read_receipt: pending_read_receipt.clone(),
                             ..Default::default()
                         };
                         let outbound = crate::messages::outbound::OutboundMessage::new(
@@ -1485,48 +1405,9 @@ pub async fn execute_run(
                                 error = %err,
                                 "failed to queue agent response for delivery"
                             );
-                            if let Some(read_receipt) = pending_read_receipt.as_ref() {
-                                state
-                                    .activity_service()
-                                    .withhold_owned_read_receipt(
-                                        read_receipt,
-                                        crate::channels::activity::READ_RECEIPT_WITHHELD_RESPONSE_QUEUE_FAILED_REASON,
-                                    )
-                                    .await;
-                            }
                         }
-                    } else if read_receipt.is_some() {
-                        if let Some(read_receipt) = read_receipt.as_ref() {
-                            state
-                                .activity_service()
-                                .withhold_claimed_read_receipt(read_receipt);
-                        }
-                        tracing::warn!(
-                            run_id = %run_id,
-                            "withholding explicit read receipt because no outbound delivery target was available"
-                        );
                     }
-                } else if read_receipt.is_some() {
-                    if let Some(read_receipt) = read_receipt.as_ref() {
-                        state
-                            .activity_service()
-                            .withhold_claimed_read_receipt(read_receipt);
-                    }
-                    tracing::warn!(
-                        run_id = %run_id,
-                        "withholding explicit read receipt because the agent produced no deliverable response text"
-                    );
                 }
-            } else if read_receipt.is_some() {
-                if let Some(read_receipt) = read_receipt.as_ref() {
-                    state
-                        .activity_service()
-                        .withhold_claimed_read_receipt(read_receipt);
-                }
-                tracing::warn!(
-                    run_id = %run_id,
-                    "withholding explicit read receipt because outbound delivery was disabled for this run"
-                );
             }
 
             finalize_run(
@@ -1552,11 +1433,6 @@ pub async fn execute_run(
         execution_result
     }
     .await;
-
-    if result.is_err() {
-        withhold_claimed_read_receipt_on_failed_run(&state, &run_id, error_channel_id.as_deref())
-            .await;
-    }
 
     result
 }
@@ -1742,23 +1618,16 @@ mod tests {
 
     struct ActivityRecordingChannel {
         events: Mutex<Vec<&'static str>>,
+        send_notify: Notify,
         mark_read_notify: Notify,
-        capability_error: Option<&'static str>,
     }
 
     impl ActivityRecordingChannel {
         fn new() -> Self {
             Self {
                 events: Mutex::new(Vec::new()),
+                send_notify: Notify::new(),
                 mark_read_notify: Notify::new(),
-                capability_error: None,
-            }
-        }
-
-        fn with_capability_error(error: &'static str) -> Self {
-            Self {
-                capability_error: Some(error),
-                ..Self::new()
             }
         }
 
@@ -1784,9 +1653,6 @@ mod tests {
         }
 
         fn get_capabilities(&self) -> Result<ChannelCapabilities, BindingError> {
-            if let Some(error) = self.capability_error {
-                return Err(BindingError::CallError(error.to_string()));
-            }
             Ok(ChannelCapabilities {
                 typing_indicators: true,
                 read_receipts: true,
@@ -1796,6 +1662,7 @@ mod tests {
 
         fn send_text(&self, _ctx: OutboundContext) -> Result<DeliveryResult, BindingError> {
             self.record("send");
+            self.send_notify.notify_one();
             Ok(DeliveryResult {
                 ok: true,
                 message_id: Some("sent-1".to_string()),
@@ -2178,7 +2045,6 @@ mod tests {
                 session_key: session_key.to_string(),
                 delivery_recipient_id: None,
                 typing_context: None,
-                read_receipt: None,
                 status: AgentRunStatus::Queued,
                 message: "Hello".to_string(),
                 response: String::new(),
@@ -2193,16 +2059,13 @@ mod tests {
         session
     }
 
-    async fn setup_session_and_run_with_channel_activity(
+    fn setup_session_and_run_with_channel_activity(
         state: &WsServerState,
         session_key: &str,
         run_id: &str,
         channel: &str,
         chat_id: &str,
-    ) -> (
-        sessions::Session,
-        crate::channels::activity::ClaimedReadReceipt,
-    ) {
+    ) -> sessions::Session {
         let metadata = sessions::SessionMetadata {
             channel: Some(channel.to_string()),
             chat_id: Some(chat_id.to_string()),
@@ -2216,17 +2079,6 @@ mod tests {
             .session_store()
             .append_message(sessions::ChatMessage::user(&session.id, "Hello"))
             .unwrap();
-        let claimed_read_receipt = state
-            .activity_service()
-            .try_claim_read_receipt(
-                channel,
-                ReadReceiptContext {
-                    recipient: chat_id.to_string(),
-                    timestamp: Some(123),
-                    ..Default::default()
-                },
-            )
-            .expect("test should reserve read receipt ownership");
         {
             use crate::server::ws::{AgentRun, AgentRunStatus};
             let now = std::time::SystemTime::now()
@@ -2242,7 +2094,6 @@ mod tests {
                     to: chat_id.to_string(),
                     ..Default::default()
                 }),
-                read_receipt: Some(claimed_read_receipt.clone()),
                 status: AgentRunStatus::Queued,
                 message: "Hello".to_string(),
                 response: String::new(),
@@ -2254,15 +2105,14 @@ mod tests {
                 waiters: Vec::new(),
             });
         }
-        (session, claimed_read_receipt)
+        session
     }
 
     #[test]
     fn test_delivery_context_from_registry_returns_none_when_run_missing() {
         let (state, _tmp) = make_test_state();
-        let (recipient, read_receipt) = delivery_context_from_registry(&state, "missing-run");
+        let recipient = delivery_context_from_registry(&state, "missing-run");
         assert!(recipient.is_none());
-        assert!(read_receipt.is_none());
     }
 
     #[tokio::test]
@@ -2387,8 +2237,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_execute_run_channel_activity_lifecycle_orders_stop_before_delivery_and_marks_read(
-    ) {
+    async fn test_execute_run_channel_activity_lifecycle_orders_stop_before_delivery() {
         let _config_guard = crate::test_support::config::ScopedConfigCache::new();
         crate::config::clear_cache();
         crate::config::update_cache(
@@ -2401,8 +2250,7 @@ mod tests {
                                 "intervalSeconds": 30
                             },
                             "readReceipts": {
-                                "enabled": true,
-                                "mode": "after-response"
+                                "enabled": true
                             }
                         }
                     }
@@ -2423,14 +2271,7 @@ mod tests {
         let run_id = "run-channel-activity";
         let session_key = "test-channel-activity";
         let chat_id = "+15551234567";
-        let (_session, _claimed_read_receipt) = setup_session_and_run_with_channel_activity(
-            &state,
-            session_key,
-            run_id,
-            "signal",
-            chat_id,
-        )
-        .await;
+        setup_session_and_run_with_channel_activity(&state, session_key, run_id, "signal", chat_id);
 
         let provider = Arc::new(MockProvider::text("Hello world!"));
         let config = AgentConfig {
@@ -2443,14 +2284,8 @@ mod tests {
             state.message_pipeline().clone(),
             plugin_registry.clone(),
             state.channel_registry().clone(),
-            state.clone(),
             delivery_shutdown_rx,
         ));
-        let (read_receipt_shutdown_tx, read_receipt_shutdown_rx) =
-            tokio::sync::watch::channel(false);
-        state
-            .activity_service()
-            .spawn_read_receipt_worker(state.clone(), read_receipt_shutdown_rx);
 
         let result = execute_run(
             run_id.to_string(),
@@ -2465,13 +2300,10 @@ mod tests {
 
         tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            plugin.mark_read_notify.notified(),
+            plugin.send_notify.notified(),
         )
         .await
-        .expect("delivery success should trigger a read receipt");
-        read_receipt_shutdown_tx
-            .send(true)
-            .expect("read receipt worker shutdown signal should send");
+        .expect("delivery loop should send the queued outbound message");
         delivery_shutdown_tx
             .send(true)
             .expect("delivery loop shutdown signal should send");
@@ -2482,381 +2314,8 @@ mod tests {
             .expect("delivery loop task should succeed");
         state.shutdown_activity_service().await;
 
-        assert_eq!(plugin.events(), vec!["start", "stop", "send", "read"]);
-        let receipt_tasks = state.activity_service().read_receipt_queue().list();
-        assert_eq!(receipt_tasks.len(), 1);
-        assert_eq!(receipt_tasks[0].state, crate::tasks::TaskState::Done);
+        assert_eq!(plugin.events(), vec!["start", "stop", "send"]);
         crate::config::clear_cache();
-    }
-
-    #[tokio::test]
-    async fn test_execute_run_channel_activity_preserves_receive_time_read_receipt_context_when_policy_disables_later(
-    ) {
-        let _config_guard = crate::test_support::config::ScopedConfigCache::new();
-        crate::config::clear_cache();
-        crate::config::update_cache(serde_json::json!({}), serde_json::json!({}));
-
-        let plugin = Arc::new(ActivityRecordingChannel::new());
-        let plugin_registry = Arc::new(PluginRegistry::new());
-        plugin_registry.register_channel("signal".to_string(), plugin);
-        let (state, _tmp) = make_test_state_with_plugin_registry(plugin_registry);
-        state.channel_registry().register(
-            crate::channels::ChannelInfo::new("signal", "Signal")
-                .with_status(crate::channels::ChannelStatus::Connected),
-        );
-
-        let run_id = "run-channel-activity-disabled";
-        let session_key = "test-channel-activity-disabled";
-        let chat_id = "+15551234567";
-        let (_session, _read_receipt_task_id) = setup_session_and_run_with_channel_activity(
-            &state,
-            session_key,
-            run_id,
-            "signal",
-            chat_id,
-        )
-        .await;
-
-        let provider = Arc::new(MockProvider::text("Hello world!"));
-        let config = AgentConfig {
-            max_turns: 5,
-            deliver: true,
-            ..Default::default()
-        };
-
-        let result = execute_run(
-            run_id.to_string(),
-            session_key.to_string(),
-            config,
-            state.clone(),
-            provider,
-            CancellationToken::new(),
-        )
-        .await;
-        assert!(result.is_ok(), "execute_run failed: {:?}", result.err());
-
-        let queued = state
-            .message_pipeline()
-            .next_for_channel("signal")
-            .expect("execute_run should queue a signal delivery");
-        assert!(
-            queued.message.metadata.read_receipt.is_some(),
-            "receive-time read receipt context should be preserved even if policy is later disabled"
-        );
-
-        crate::config::clear_cache();
-    }
-
-    #[tokio::test]
-    async fn test_execute_run_channel_activity_preserves_receive_time_read_receipt_context_when_capability_probe_fails(
-    ) {
-        let _config_guard = crate::test_support::config::ScopedConfigCache::new();
-        crate::config::clear_cache();
-        crate::config::update_cache(serde_json::json!({}), serde_json::json!({}));
-
-        let plugin = Arc::new(ActivityRecordingChannel::with_capability_error(
-            "capability probe failed",
-        ));
-        let plugin_registry = Arc::new(PluginRegistry::new());
-        plugin_registry.register_channel("signal".to_string(), plugin);
-        let (state, _tmp) = make_test_state_with_plugin_registry(plugin_registry);
-        state.channel_registry().register(
-            crate::channels::ChannelInfo::new("signal", "Signal")
-                .with_status(crate::channels::ChannelStatus::Connected),
-        );
-
-        let run_id = "run-channel-activity-capability-failure";
-        let session_key = "test-channel-activity-capability-failure";
-        let chat_id = "+15551234567";
-        let (_session, _read_receipt_task_id) = setup_session_and_run_with_channel_activity(
-            &state,
-            session_key,
-            run_id,
-            "signal",
-            chat_id,
-        )
-        .await;
-
-        let provider = Arc::new(MockProvider::text("Hello world!"));
-        let config = AgentConfig {
-            max_turns: 5,
-            deliver: true,
-            ..Default::default()
-        };
-
-        let result = execute_run(
-            run_id.to_string(),
-            session_key.to_string(),
-            config,
-            state.clone(),
-            provider,
-            CancellationToken::new(),
-        )
-        .await;
-        assert!(result.is_ok(), "execute_run failed: {:?}", result.err());
-
-        let queued = state
-            .message_pipeline()
-            .next_for_channel("signal")
-            .expect("execute_run should queue a signal delivery");
-        assert!(
-            queued.message.metadata.read_receipt.is_some(),
-            "receive-time read receipt context should be preserved even if the later capability probe fails"
-        );
-
-        crate::config::clear_cache();
-    }
-
-    #[tokio::test]
-    async fn test_execute_run_channel_activity_withholds_receive_time_read_receipt_when_run_errors_after_policy_disables_later(
-    ) {
-        let _config_guard = crate::test_support::config::ScopedConfigCache::new();
-        crate::config::clear_cache();
-        crate::config::update_cache(serde_json::json!({}), serde_json::json!({}));
-
-        let (state, _tmp) = make_test_state();
-        let run_id = "run-channel-activity-error-disabled";
-        let session_key = "test-channel-activity-error-disabled";
-        let chat_id = "+15551234567";
-        let (_session, _claimed_read_receipt) = setup_session_and_run_with_channel_activity(
-            &state,
-            session_key,
-            run_id,
-            "signal",
-            chat_id,
-        )
-        .await;
-
-        let provider = Arc::new(MockProvider::new(vec![vec![StreamEvent::Error {
-            message: "provider failed".to_string(),
-        }]]));
-        let config = AgentConfig {
-            max_turns: 5,
-            deliver: true,
-            ..Default::default()
-        };
-
-        let result = execute_run(
-            run_id.to_string(),
-            session_key.to_string(),
-            config,
-            state.clone(),
-            provider,
-            CancellationToken::new(),
-        )
-        .await;
-        assert!(
-            result.is_err(),
-            "execute_run should surface provider failure"
-        );
-
-        assert!(
-            state
-                .activity_service()
-                .read_receipt_queue()
-                .list()
-                .is_empty(),
-            "run errors before delivery should not persist a durable read receipt task"
-        );
-        assert!(
-            state
-                .activity_service()
-                .can_accept_read_receipt_ownership("signal"),
-            "run errors before delivery should release claimed receipt ownership"
-        );
-
-        crate::config::clear_cache();
-    }
-
-    #[tokio::test]
-    async fn test_execute_run_withholds_receive_time_read_receipt_on_session_lookup_failure() {
-        let (state, _tmp) = make_test_state();
-        let run_id = "run-channel-activity-missing-session";
-        let session_key = "missing-session-for-activity";
-        let chat_id = "+15551234567";
-        {
-            use crate::server::ws::{AgentRun, AgentRunStatus};
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64;
-            let mut registry = state.agent_run_registry.lock();
-            registry.register(AgentRun {
-                run_id: run_id.to_string(),
-                session_key: session_key.to_string(),
-                delivery_recipient_id: Some(chat_id.to_string()),
-                typing_context: Some(TypingContext {
-                    to: chat_id.to_string(),
-                    ..Default::default()
-                }),
-                read_receipt: Some(
-                    state
-                        .activity_service()
-                        .try_claim_read_receipt(
-                            "signal",
-                            ReadReceiptContext {
-                                recipient: chat_id.to_string(),
-                                timestamp: Some(123),
-                                ..Default::default()
-                            },
-                        )
-                        .expect("test should reserve read receipt ownership"),
-                ),
-                status: AgentRunStatus::Queued,
-                message: "Hello".to_string(),
-                response: String::new(),
-                error: None,
-                created_at: now,
-                started_at: None,
-                completed_at: None,
-                cancel_token: CancellationToken::new(),
-                waiters: Vec::new(),
-            });
-        }
-
-        let result = execute_run(
-            run_id.to_string(),
-            session_key.to_string(),
-            AgentConfig::default(),
-            state.clone(),
-            Arc::new(MockProvider::text("unused")),
-            CancellationToken::new(),
-        )
-        .await;
-        assert!(
-            matches!(result, Err(AgentError::SessionNotFound(_))),
-            "missing session should fail before delivery setup, got {:?}",
-            result
-        );
-
-        assert!(
-            state
-                .activity_service()
-                .read_receipt_queue()
-                .list()
-                .is_empty(),
-            "session lookup failure should not persist a durable read receipt task"
-        );
-        assert!(
-            state
-                .activity_service()
-                .can_accept_read_receipt_ownership("signal"),
-            "session lookup failure should release claimed receipt ownership"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_execute_run_fails_when_after_response_receipt_cannot_be_persisted() {
-        let plugin = Arc::new(ActivityRecordingChannel::new());
-        let plugin_registry = Arc::new(PluginRegistry::new());
-        plugin_registry.register_channel("signal".to_string(), plugin);
-        let activity_service = Arc::new(
-            crate::channels::activity::ActivityService::with_read_receipt_queue_for_test(Arc::new(
-                crate::tasks::TaskQueue::with_capacity_limit(None, Some(0)),
-            )),
-        );
-        let state = Arc::new(
-            crate::server::ws::WsServerState::new(crate::server::ws::WsServerConfig::default())
-                .with_plugin_registry(plugin_registry)
-                .with_activity_service(activity_service),
-        );
-        state.channel_registry().register(
-            crate::channels::ChannelInfo::new("signal", "Signal")
-                .with_status(crate::channels::ChannelStatus::Connected),
-        );
-
-        let run_id = "run-channel-activity-missing-task-id";
-        let session_key = "test-channel-activity-missing-task-id";
-        let chat_id = "+15551234567";
-        let metadata = sessions::SessionMetadata {
-            channel: Some("signal".to_string()),
-            chat_id: Some(chat_id.to_string()),
-            ..Default::default()
-        };
-        let session = state
-            .session_store()
-            .get_or_create_session(session_key, metadata)
-            .expect("test should create a session");
-        state
-            .session_store()
-            .append_message(sessions::ChatMessage::user(&session.id, "Hello"))
-            .expect("test should append a user message");
-        {
-            use crate::server::ws::{AgentRun, AgentRunStatus};
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64;
-            let mut registry = state.agent_run_registry.lock();
-            registry.register(AgentRun {
-                run_id: run_id.to_string(),
-                session_key: session_key.to_string(),
-                delivery_recipient_id: Some(chat_id.to_string()),
-                typing_context: Some(TypingContext {
-                    to: chat_id.to_string(),
-                    ..Default::default()
-                }),
-                read_receipt: Some(
-                    state
-                        .activity_service()
-                        .try_claim_read_receipt(
-                            "signal",
-                            ReadReceiptContext {
-                                recipient: chat_id.to_string(),
-                                timestamp: Some(123),
-                                ..Default::default()
-                            },
-                        )
-                        .expect("test should reserve read receipt ownership"),
-                ),
-                status: AgentRunStatus::Queued,
-                message: "Hello".to_string(),
-                response: String::new(),
-                error: None,
-                created_at: now,
-                started_at: None,
-                completed_at: None,
-                cancel_token: CancellationToken::new(),
-                waiters: Vec::new(),
-            });
-        }
-
-        let result = execute_run(
-            run_id.to_string(),
-            session_key.to_string(),
-            AgentConfig {
-                deliver: true,
-                ..Default::default()
-            },
-            state.clone(),
-            Arc::new(MockProvider::text("Hello world!")),
-            CancellationToken::new(),
-        )
-        .await;
-        assert!(
-            matches!(result, Err(AgentError::Delivery(_))),
-            "receipt persistence failure should surface as a delivery error, got {:?}",
-            result
-        );
-
-        assert!(
-            state.message_pipeline().channels_with_messages().is_empty(),
-            "delivery should not be queued when the after-response receipt cannot be persisted durably"
-        );
-        assert!(
-            state
-                .activity_service()
-                .read_receipt_queue()
-                .list()
-                .is_empty(),
-            "failed receipt preparation should not leave a durable receipt task behind"
-        );
-        assert!(
-            state
-                .activity_service()
-                .can_accept_read_receipt_ownership("signal"),
-            "failed receipt preparation should release the claimed ownership reservation"
-        );
     }
 
     #[tokio::test]
@@ -2873,8 +2332,7 @@ mod tests {
                                 "intervalSeconds": 30
                             },
                             "readReceipts": {
-                                "enabled": true,
-                                "mode": "after-response"
+                                "enabled": true
                             }
                         }
                     }
@@ -2895,14 +2353,7 @@ mod tests {
         let run_id = "run-channel-activity-no-delivery";
         let session_key = "test-channel-activity-no-delivery";
         let chat_id = "+15551234567";
-        let (_session, _claimed_read_receipt) = setup_session_and_run_with_channel_activity(
-            &state,
-            session_key,
-            run_id,
-            "signal",
-            chat_id,
-        )
-        .await;
+        setup_session_and_run_with_channel_activity(&state, session_key, run_id, "signal", chat_id);
 
         let provider = Arc::new(MockProvider::text("Hello world!"));
         let config = AgentConfig {
@@ -2929,20 +2380,6 @@ mod tests {
         assert!(
             plugin.events().is_empty(),
             "deliver=false should not emit typing or read-receipt channel activity"
-        );
-        assert!(
-            state
-                .activity_service()
-                .read_receipt_queue()
-                .list()
-                .is_empty(),
-            "deliver=false should not persist a durable read receipt task"
-        );
-        assert!(
-            state
-                .activity_service()
-                .can_accept_read_receipt_ownership("signal"),
-            "deliver=false should release the claimed ownership reservation"
         );
 
         crate::config::clear_cache();
@@ -3158,7 +2595,6 @@ mod tests {
                 session_key: session_key.to_string(),
                 delivery_recipient_id: Some("fresh-peer".to_string()),
                 typing_context: None,
-                read_receipt: None,
                 status: AgentRunStatus::Queued,
                 message: "Hello".to_string(),
                 response: String::new(),
@@ -3226,7 +2662,6 @@ mod tests {
                 session_key: session_key.to_string(),
                 delivery_recipient_id: None,
                 typing_context: None,
-                read_receipt: None,
                 status: AgentRunStatus::Queued,
                 message: "Hello".to_string(),
                 response: String::new(),

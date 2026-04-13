@@ -400,7 +400,7 @@ Defaults are applied during config loading before validation. Key defaults inclu
 - `session.typingIntervalSeconds`: `3` (defaulted session value; legacy/global channel-typing fallback only when explicitly set in config, and applies across all typing-capable channels unless overridden under `channels.*.features.typing`)
 - `session.mainKey`: `"main"` (enforced even if another value is supplied)
 - Channel typing activity defaults: typing is disabled by default; when enabled by `channels.defaults.features.typing` or `channels.<channel>.features.typing`, the default mode is `"thinking"` with a `3`-second interval.
-- Channel read-receipt activity defaults: read receipts are disabled by default; when enabled by `channels.defaults.features.readReceipts` or `channels.<channel>.features.readReceipts`, the default mode is `"after-response"`.
+- Channel read-receipt activity defaults: read receipts are disabled by default; when enabled by `channels.defaults.features.readReceipts` or `channels.<channel>.features.readReceipts`, Carapace sends an explicit receipt immediately after the inbound message is durably appended to the session store.
 - `cron.maxConcurrentRuns`: `2`
 - `gateway.port`: `18789`
 - `gateway.bind`: `"loopback"`
@@ -432,7 +432,6 @@ Defaults are applied during config loading before validation. Key defaults inclu
 - `agents.list[].identity.avatar` must be workspace‑relative or http(s)/data URI.
 - `plugins.entries.<plugin-id>` may only contain `enabled`, `installId`, and `requestedAt`.
 - `channels.*.features.typing.mode` currently supports `"thinking"`.
-- `channels.*.features.readReceipts.mode` currently supports `"after-response"`.
 - `browser.profiles` names must be `^[a-z0-9-]+$` and must set `cdpPort` or `cdpUrl`.
 
 ## Errors
