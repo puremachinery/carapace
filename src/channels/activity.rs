@@ -3401,6 +3401,43 @@ mod tests {
         assert_eq!(tasks[0].state, crate::tasks::TaskState::RetryWait);
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_acknowledge_read_receipt_now_falls_back_to_direct_send_when_persist_fails() {
+        let plugin = Arc::new(MockChannel::new(ChannelCapabilities {
+            read_receipts: true,
+            ..Default::default()
+        }));
+        let plugin_registry = Arc::new(PluginRegistry::new());
+        plugin_registry.register_channel("signal".to_string(), plugin.clone());
+        let service = Arc::new(ActivityService::with_read_receipt_queue_for_test(Arc::new(
+            TaskQueue::with_capacity_limit(None, Some(0)),
+        )));
+        let state = Arc::new(
+            crate::server::ws::WsServerState::new(crate::server::ws::WsServerConfig::default())
+                .with_plugin_registry(plugin_registry)
+                .with_activity_service(service.clone()),
+        );
+
+        service
+            .acknowledge_read_receipt_now(
+                state.as_ref(),
+                "signal",
+                ReadReceiptContext {
+                    recipient: "+15551234567".to_string(),
+                    timestamp: Some(123),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("persist failure should fall back to direct read receipt dispatch");
+
+        assert_eq!(plugin.mark_read_count.load(Ordering::Relaxed), 1);
+        assert!(
+            service.read_receipt_queue().list().is_empty(),
+            "synthetic failed enqueue should not leave a persisted queue entry"
+        );
+    }
+
     #[test]
     fn test_inline_read_receipt_result_reports_sent_but_unfinalized_done_state() {
         let result = ActivityService::inline_read_receipt_result(

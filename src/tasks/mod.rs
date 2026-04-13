@@ -307,6 +307,10 @@ impl TaskQueue {
     /// This is for call sites that durably persist work before executing it
     /// inline, while still relying on queue recovery to resume the work after
     /// a crash or restart.
+    ///
+    /// The same capacity-full contract as [`Self::enqueue`] applies: on full
+    /// queue with no evictable terminal task, the returned `Failed` task ID is
+    /// synthetic and not present in the queue.
     pub fn enqueue_running_with_policy(&self, payload: Value, policy: TaskPolicy) -> DurableTask {
         let now = now_ms();
         let mut task = self.build_task(
@@ -1183,6 +1187,24 @@ mod tests {
         let stored = queue.get(&task.id).expect("task should be persisted");
         assert_eq!(stored.state, TaskState::Running);
         assert_eq!(stored.attempts, 1);
+    }
+
+    #[test]
+    fn test_enqueue_running_with_policy_returns_synthetic_failed_task_when_queue_is_full() {
+        let queue = TaskQueue::with_capacity_limit(None, Some(0));
+        let task = queue
+            .enqueue_running_with_policy(serde_json::json!({"kind":"demo"}), TaskPolicy::default());
+
+        assert_eq!(task.state, TaskState::Failed);
+        assert_eq!(task.attempts, 0);
+        assert_eq!(
+            task.last_error.as_deref(),
+            Some(TASK_QUEUE_FULL_NO_EVICTION_ERROR)
+        );
+        assert!(
+            queue.get(&task.id).is_none(),
+            "failed enqueue should return a synthetic task id, not a persisted queue entry"
+        );
     }
 
     #[test]
