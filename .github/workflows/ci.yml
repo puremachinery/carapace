@@ -170,7 +170,7 @@ jobs:
         run: ./scripts/run-nextest-guarded.sh --all-targets -P golden
       - name: Upload nextest stall diagnostics (ws-golden)
         if: failure()
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: nextest-list-stall-ws-golden-${{ github.run_id }}-${{ github.run_attempt }}
           path: .local/reports/nextest-list-stalls/**
@@ -208,7 +208,7 @@ jobs:
         run: ./scripts/run-nextest-guarded.sh --all-targets -P fast
       - name: Upload nextest stall diagnostics (test-pr)
         if: failure()
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: nextest-list-stall-test-pr-${{ github.run_id }}-${{ github.run_attempt }}
           path: .local/reports/nextest-list-stalls/**
@@ -241,7 +241,7 @@ jobs:
         run: cargo nextest run --all-targets -P full
       - name: Upload nextest stall diagnostics (test-push)
         if: failure() && runner.os != 'Windows'
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: nextest-list-stall-test-push-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: .local/reports/nextest-list-stalls/**
@@ -401,7 +401,7 @@ jobs:
       - name: Report unsafe usage
         run: cargo geiger --all-targets --output-format ascii 2>&1 | tee geiger-report.txt
       - name: Upload geiger report
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: geiger-report
           path: geiger-report.txt
@@ -462,7 +462,7 @@ jobs:
         run: ./scripts/run-nextest-guarded.sh --all-targets -P integration
       - name: Upload nextest stall diagnostics (manual integration)
         if: failure()
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: nextest-list-stall-manual-integration-${{ github.run_id }}-${{ github.run_attempt }}
           path: .local/reports/nextest-list-stalls/**
@@ -494,7 +494,7 @@ jobs:
         run: cargo nextest run --all-targets -P full
       - name: Upload nextest stall diagnostics (manual full)
         if: failure() && runner.os != 'Windows'
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: nextest-list-stall-manual-full-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: .local/reports/nextest-list-stalls/**
