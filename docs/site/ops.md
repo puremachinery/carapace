@@ -85,7 +85,7 @@ cara backup --output ./carapace-backup.tar.gz
 Restore from backup:
 
 ```bash
-cara restore --path ./carapace-backup.tar.gz
+cara restore ./carapace-backup.tar.gz
 ```
 
 ## 7) Update flow

@@ -71,7 +71,7 @@ Use this when an upgrade causes a regression.
 1. Stop Cara.
 2. Reinstall the previous known-good binary (pinned tag URL).
 3. Restore backup created before the upgrade:
-   - `cara restore --path ./carapace-backup.tar.gz`
+   - `cara restore ./carapace-backup.tar.gz`
 4. Start Cara.
 5. Verify:
    - `cara status --port 18789`
