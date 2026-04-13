@@ -2319,6 +2319,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_inbound_signal_read_receipt_is_sent_before_typing_starts() {
+        let _config_guard = crate::test_support::config::ScopedConfigCache::new();
+        crate::config::clear_cache();
+        crate::config::update_cache(
+            serde_json::json!({
+                "channels": {
+                    "signal": {
+                        "features": {
+                            "typing": {
+                                "enabled": true,
+                                "intervalSeconds": 30
+                            },
+                            "readReceipts": {
+                                "enabled": true
+                            }
+                        }
+                    }
+                }
+            }),
+            serde_json::json!({}),
+        );
+
+        let plugin = Arc::new(ActivityRecordingChannel::new());
+        let plugin_registry = Arc::new(PluginRegistry::new());
+        plugin_registry.register_channel("signal".to_string(), plugin.clone());
+        let (state, _tmp) = make_test_state_with_plugin_registry(plugin_registry);
+        let (read_receipt_shutdown_tx, read_receipt_shutdown_rx) =
+            tokio::sync::watch::channel(false);
+        state
+            .activity_service()
+            .spawn_read_receipt_worker(state.clone(), read_receipt_shutdown_rx);
+
+        let chat_id = "+15551234567";
+        let claimed_read_receipt = state
+            .activity_service()
+            .try_claim_read_receipt(
+                "signal",
+                ReadReceiptContext {
+                    recipient: chat_id.to_string(),
+                    timestamp: Some(1706745600000),
+                    ..Default::default()
+                },
+            )
+            .expect("receipt ownership should be claimable before inbound append");
+
+        let dispatch = crate::channels::inbound::dispatch_inbound_text_with_options(
+            &state,
+            "signal",
+            chat_id,
+            chat_id,
+            "Hello",
+            Some(chat_id.to_string()),
+            crate::channels::inbound::InboundDispatchOptions {
+                claimed_read_receipt: Some(claimed_read_receipt),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("inbound dispatch should succeed");
+
+        assert_eq!(
+            plugin.events(),
+            vec!["read"],
+            "the claimed Signal receipt should be sent before the run can start typing"
+        );
+
+        let session_key = {
+            let registry = state.agent_run_registry.lock();
+            registry
+                .get(&dispatch.run_id)
+                .expect("inbound dispatch should register the run")
+                .session_key
+                .clone()
+        };
+
+        let provider = Arc::new(MockProvider::new(vec![vec![StreamEvent::Stop {
+            reason: StopReason::EndTurn,
+            usage: TokenUsage {
+                input_tokens: 5,
+                output_tokens: 0,
+            },
+        }]]));
+        let config = AgentConfig {
+            max_turns: 5,
+            deliver: true,
+            ..Default::default()
+        };
+
+        let result = execute_run(
+            dispatch.run_id,
+            session_key,
+            config,
+            state.clone(),
+            provider,
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(result.is_ok(), "execute_run failed: {:?}", result.err());
+
+        assert_eq!(
+            plugin.events(),
+            vec!["read", "start", "stop"],
+            "Signal should be marked read before typing begins"
+        );
+
+        let receipt_tasks = state.activity_service().read_receipt_queue().list();
+        assert_eq!(receipt_tasks.len(), 1);
+        assert_eq!(receipt_tasks[0].state, crate::tasks::TaskState::Done);
+
+        read_receipt_shutdown_tx
+            .send(true)
+            .expect("read receipt worker shutdown signal should send");
+        state.shutdown_activity_service().await;
+        crate::config::clear_cache();
+    }
+
+    #[tokio::test]
     async fn test_execute_run_skips_channel_activity_when_delivery_disabled() {
         let _config_guard = crate::test_support::config::ScopedConfigCache::new();
         crate::config::clear_cache();

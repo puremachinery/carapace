@@ -597,6 +597,28 @@ impl TaskQueue {
         claimed
     }
 
+    /// Claim one specific due task and move it to `running`.
+    pub fn claim_task(&self, id: &str, now: u64) -> Option<DurableTask> {
+        let mut claimed = None;
+        {
+            let mut tasks = self.tasks.write();
+            if let Some(task) = tasks.iter_mut().find(|task| task.id == id) {
+                if is_due(task, now) {
+                    task.state = TaskState::Running;
+                    task.attempts = task.attempts.saturating_add(1);
+                    task.next_run_at_ms = None;
+                    task.updated_at_ms = now;
+                    claimed = Some(task.clone());
+                }
+            }
+        }
+
+        if claimed.is_some() {
+            self.flush_to_disk();
+        }
+        claimed
+    }
+
     /// Mark a task as done.
     pub fn mark_done(&self, id: &str, run_id: Option<&str>) -> bool {
         self.update_task_if(
@@ -1104,6 +1126,19 @@ mod tests {
         assert_eq!(claimed[0].id, task.id);
         assert_eq!(claimed[0].state, TaskState::Running);
         assert_eq!(claimed[0].attempts, 1);
+    }
+
+    #[test]
+    fn test_claim_task_marks_specific_due_task_running_and_increments_attempts() {
+        let queue = TaskQueue::in_memory();
+        let task = queue.enqueue(serde_json::json!({"kind":"demo"}), Some(1));
+
+        let claimed = queue
+            .claim_task(&task.id, 10)
+            .expect("specific due task should be claimable");
+        assert_eq!(claimed.id, task.id);
+        assert_eq!(claimed.state, TaskState::Running);
+        assert_eq!(claimed.attempts, 1);
     }
 
     #[test]
