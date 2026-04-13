@@ -663,6 +663,41 @@ impl ActivityService {
         }
     }
 
+    fn inline_read_receipt_result(
+        outcome: TaskExecutionOutcome,
+        finalize_result: Result<(), String>,
+    ) -> Result<(), String> {
+        match (outcome, finalize_result) {
+            (TaskExecutionOutcome::Done { .. }, Ok(())) => Ok(()),
+            (TaskExecutionOutcome::Done { .. }, Err(err)) => Err(format!(
+                "read receipt was sent but durable task finalization failed: {err}"
+            )),
+            (TaskExecutionOutcome::RetryWait { error, .. }, Ok(())) => Err(error),
+            (TaskExecutionOutcome::RetryWait { error, .. }, Err(err)) => Err(format!(
+                "{error}; additionally failed to persist the retry schedule: {err}"
+            )),
+            (TaskExecutionOutcome::Blocked { reason, .. }, Ok(())) => Err(reason),
+            (TaskExecutionOutcome::Blocked { reason, .. }, Err(err)) => Err(format!(
+                "{reason}; additionally failed to persist the blocked state: {err}"
+            )),
+            (TaskExecutionOutcome::Failed { error }, Ok(())) => Err(error),
+            (TaskExecutionOutcome::Failed { error }, Err(err)) => Err(format!(
+                "{error}; additionally failed to persist the failure state: {err}"
+            )),
+            (TaskExecutionOutcome::Cancelled { reason }, Ok(())) => {
+                Err(reason.unwrap_or_else(|| {
+                    "read receipt task was cancelled during immediate dispatch".to_string()
+                }))
+            }
+            (TaskExecutionOutcome::Cancelled { reason }, Err(err)) => Err(format!(
+                "{}; additionally failed to persist the cancellation state: {err}",
+                reason.unwrap_or_else(|| {
+                    "read receipt task was cancelled during immediate dispatch".to_string()
+                })
+            )),
+        }
+    }
+
     pub async fn acknowledge_read_receipt_now(
         &self,
         state: &WsServerState,
@@ -675,16 +710,8 @@ impl ActivityService {
         if task.state != crate::tasks::TaskState::Failed {
             let task_id = task.id.clone();
             let outcome = execute_read_receipt_task(state, task).await;
-            self.finalize_read_receipt_task(&task_id, &outcome).await?;
-            return match outcome {
-                TaskExecutionOutcome::Done { .. } => Ok(()),
-                TaskExecutionOutcome::RetryWait { error, .. } => Err(error),
-                TaskExecutionOutcome::Blocked { reason, .. } => Err(reason),
-                TaskExecutionOutcome::Failed { error } => Err(error),
-                TaskExecutionOutcome::Cancelled { reason } => Err(reason.unwrap_or_else(|| {
-                    "read receipt task was cancelled during immediate dispatch".to_string()
-                })),
-            };
+            let finalize_result = self.finalize_read_receipt_task(&task_id, &outcome).await;
+            return Self::inline_read_receipt_result(outcome, finalize_result);
         }
 
         tracing::warn!(
@@ -3372,6 +3399,25 @@ mod tests {
         let tasks = service.read_receipt_queue().list();
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].state, crate::tasks::TaskState::RetryWait);
+    }
+
+    #[test]
+    fn test_inline_read_receipt_result_reports_sent_but_unfinalized_done_state() {
+        let result = ActivityService::inline_read_receipt_result(
+            TaskExecutionOutcome::Done { run_id: None },
+            Err("queue update failed".to_string()),
+        );
+
+        let err =
+            result.expect_err("done outcome with failed finalization should surface an error");
+        assert!(
+            err.contains("read receipt was sent but durable task finalization failed"),
+            "unexpected error message: {err}"
+        );
+        assert!(
+            err.contains("queue update failed"),
+            "unexpected error message: {err}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
