@@ -29,6 +29,10 @@ pub struct SignalEnvelope {
     #[serde(default, rename = "sourceNumber")]
     pub source_number: Option<String>,
 
+    /// Source UUID (used when phone number privacy is enabled).
+    #[serde(default, rename = "sourceUuid")]
+    pub source_uuid: Option<String>,
+
     /// Legacy source field.
     #[serde(default)]
     pub source: Option<String>,
@@ -59,11 +63,16 @@ pub struct SignalDataMessage {
 }
 
 impl SignalEnvelope {
-    /// Returns the effective source number, preferring `sourceNumber` over `source`.
+    /// Returns the effective source identifier for the envelope.
+    ///
+    /// This prefers `sourceNumber` when present, but may also return
+    /// `sourceUuid` (for phone-number privacy) or the legacy `source` field,
+    /// so the result is not guaranteed to be a phone number.
     pub fn effective_source_number(&self) -> Option<&str> {
         self.source_number
             .as_deref()
             .filter(|s| !s.trim().is_empty())
+            .or_else(|| self.source_uuid.as_deref().filter(|s| !s.trim().is_empty()))
             .or_else(|| self.source.as_deref().filter(|s| !s.trim().is_empty()))
     }
 }
@@ -932,6 +941,46 @@ mod tests {
     #[test]
     fn test_effective_source_number_empty_source_number_fallback() {
         let envelope = SignalEnvelope {
+            source_uuid: None,
+            source_number: Some("   ".to_string()),
+            source: Some("+15559876543".to_string()),
+            timestamp: None,
+            data_message: None,
+        };
+        assert_eq!(envelope.effective_source_number(), Some("+15559876543"));
+    }
+
+    #[test]
+    fn test_effective_source_number_uuid_fallback() {
+        let envelope = SignalEnvelope {
+            source_uuid: Some("bc10cb01-949e-4c75-8eb6-04dbdbda16e0".to_string()),
+            source_number: None,
+            source: Some("+15559876543".to_string()),
+            timestamp: None,
+            data_message: None,
+        };
+        assert_eq!(
+            envelope.effective_source_number(),
+            Some("bc10cb01-949e-4c75-8eb6-04dbdbda16e0")
+        );
+    }
+
+    #[test]
+    fn test_effective_source_number_both_absent_fallback() {
+        let envelope = SignalEnvelope {
+            source_uuid: None,
+            source_number: None,
+            source: Some("+15559876543".to_string()),
+            timestamp: None,
+            data_message: None,
+        };
+        assert_eq!(envelope.effective_source_number(), Some("+15559876543"));
+    }
+
+    #[test]
+    fn test_effective_source_number_both_empty_fallback() {
+        let envelope = SignalEnvelope {
+            source_uuid: Some("   ".to_string()),
             source_number: Some("   ".to_string()),
             source: Some("+15559876543".to_string()),
             timestamp: None,
@@ -1340,6 +1389,7 @@ mod tests {
     #[test]
     fn test_build_signal_read_receipt_context_uses_available_timestamp() {
         let envelope = SignalEnvelope {
+            source_uuid: None,
             source_number: Some("+15559876543".to_string()),
             source: None,
             timestamp: None,
@@ -1363,6 +1413,7 @@ mod tests {
     #[test]
     fn test_build_signal_read_receipt_context_prefers_data_message_timestamp() {
         let envelope = SignalEnvelope {
+            source_uuid: None,
             source_number: Some("+15559876543".to_string()),
             source: None,
             timestamp: Some(1706745600999),
@@ -1385,6 +1436,7 @@ mod tests {
     #[test]
     fn test_build_signal_read_receipt_context_skips_missing_timestamp() {
         let envelope = SignalEnvelope {
+            source_uuid: None,
             source_number: Some("+15559876543".to_string()),
             source: None,
             timestamp: None,
@@ -1406,6 +1458,7 @@ mod tests {
     #[test]
     fn test_read_receipt_context_for_signal_run_skips_context_when_feature_disabled() {
         let envelope = SignalEnvelope {
+            source_uuid: None,
             source_number: Some("+15559876543".to_string()),
             source: None,
             timestamp: Some(1706745600000),
@@ -1428,6 +1481,7 @@ mod tests {
     #[test]
     fn test_read_receipt_context_for_signal_run_returns_context_when_feature_enabled() {
         let envelope = SignalEnvelope {
+            source_uuid: None,
             source_number: Some("+15559876543".to_string()),
             source: None,
             timestamp: Some(1706745600999),
@@ -1463,6 +1517,7 @@ mod tests {
     #[test]
     fn test_resolve_sender_and_peer_ignores_empty_group_id() {
         let envelope = SignalEnvelope {
+            source_uuid: None,
             source_number: Some("+15559876543".to_string()),
             source: None,
             timestamp: None,
@@ -1488,6 +1543,7 @@ mod tests {
     #[test]
     fn test_resolve_sender_and_peer_rejects_group_message_with_phone_number_like_id() {
         let envelope = SignalEnvelope {
+            source_uuid: None,
             source_number: Some("+15559876543".to_string()),
             source: None,
             timestamp: None,
@@ -1510,6 +1566,7 @@ mod tests {
     #[test]
     fn test_resolve_sender_and_peer_rejects_group_messages() {
         let envelope = SignalEnvelope {
+            source_uuid: None,
             source_number: Some("+15559876543".to_string()),
             source: None,
             timestamp: None,
@@ -1685,6 +1742,7 @@ mod tests {
             WsServerState::new(WsServerConfig::default()).with_plugin_registry(plugin_registry),
         );
         let envelope = SignalEnvelope {
+            source_uuid: None,
             source_number: Some("+15559876543".to_string()),
             source: None,
             timestamp: Some(1706745600000),
@@ -1723,6 +1781,7 @@ mod tests {
             WsServerState::new(WsServerConfig::default()).with_plugin_registry(plugin_registry),
         );
         let envelope = SignalEnvelope {
+            source_uuid: None,
             source_number: Some("+15559876543".to_string()),
             source: None,
             timestamp: Some(1706745600000),
@@ -1800,6 +1859,7 @@ mod tests {
             "other claims should be blocked while the poll reservation owns the slot"
         );
         let envelope = SignalEnvelope {
+            source_uuid: None,
             source_number: Some("+15559876543".to_string()),
             source: None,
             timestamp: Some(1706745600000),
@@ -1846,6 +1906,7 @@ mod tests {
                 .with_activity_service(activity_service),
         );
         let envelope = SignalEnvelope {
+            source_uuid: None,
             source_number: Some("+15559876543".to_string()),
             source: None,
             timestamp: Some(1706745600000),
@@ -1911,6 +1972,7 @@ mod tests {
         state.set_llm_provider(None);
 
         let envelope = SignalEnvelope {
+            source_uuid: None,
             source_number: Some("+15559876543".to_string()),
             source: None,
             timestamp: Some(1706745600000),
