@@ -126,69 +126,7 @@ impl GeminiProvider {
         }
 
         // Convert LlmMessages to Gemini contents format
-        let mut contents: Vec<Value> = Vec::new();
-
-        for msg in &request.messages {
-            let role = match msg.role {
-                LlmRole::User => "user",
-                LlmRole::Assistant => "model",
-            };
-
-            let mut parts: Vec<Value> = Vec::new();
-
-            for block in &msg.content {
-                match block {
-                    ContentBlock::Text { text, metadata } => {
-                        let mut part = json!({ "text": text });
-                        apply_gemini_thought_signature(&mut part, metadata);
-                        parts.push(part);
-                    }
-                    ContentBlock::ToolUse {
-                        id: _,
-                        name,
-                        input,
-                        metadata,
-                    } => {
-                        let mut part = json!({
-                            "functionCall": {
-                                "name": name,
-                                "args": input,
-                            }
-                        });
-                        apply_gemini_thought_signature(&mut part, metadata);
-                        parts.push(part);
-                    }
-                    ContentBlock::ToolResult {
-                        tool_use_id: _,
-                        content,
-                        is_error: _,
-                    } => {
-                        // For tool results, we need to look up the tool name.
-                        // Gemini uses functionResponse with name and response.
-                        // We look backwards through messages to find the matching tool use name.
-                        let tool_name = find_tool_name_for_result(&request.messages, block);
-                        let part = json!({
-                            "functionResponse": {
-                                "name": tool_name,
-                                "response": {
-                                    "result": content,
-                                }
-                            }
-                        });
-                        parts.push(part);
-                    }
-                }
-            }
-
-            if !parts.is_empty() {
-                contents.push(json!({
-                    "role": role,
-                    "parts": parts,
-                }));
-            }
-        }
-
-        body["contents"] = json!(contents);
+        body["contents"] = json!(build_gemini_contents(&request.messages));
 
         // Tools (function declarations)
         if !request.tools.is_empty() {
@@ -300,6 +238,89 @@ impl GeminiProvider {
             }
         }
     }
+}
+
+pub(crate) fn build_gemini_contents(messages: &[LlmMessage]) -> Vec<Value> {
+    let mut contents: Vec<Value> = Vec::new();
+    let mut current_role: Option<&'static str> = None;
+    let mut current_parts: Vec<Value> = Vec::new();
+
+    for msg in messages {
+        let role = match msg.role {
+            LlmRole::User => "user",
+            LlmRole::Assistant => "model",
+        };
+
+        let mut parts: Vec<Value> = Vec::new();
+
+        for block in &msg.content {
+            match block {
+                ContentBlock::Text { text, metadata } => {
+                    let mut part = json!({ "text": text });
+                    apply_gemini_thought_signature(&mut part, metadata);
+                    parts.push(part);
+                }
+                ContentBlock::ToolUse {
+                    id: _,
+                    name,
+                    input,
+                    metadata,
+                } => {
+                    let mut part = json!({
+                        "functionCall": {
+                            "name": name,
+                            "args": input,
+                        }
+                    });
+                    apply_gemini_thought_signature(&mut part, metadata);
+                    parts.push(part);
+                }
+                ContentBlock::ToolResult {
+                    tool_use_id: _,
+                    content,
+                    is_error: _,
+                } => {
+                    // For tool results, we need to look up the tool name.
+                    // Gemini uses functionResponse with name and response.
+                    // We look backwards through messages to find the matching tool use name.
+                    let tool_name = find_tool_name_for_result(messages, block);
+                    let part = json!({
+                        "functionResponse": {
+                            "name": tool_name,
+                            "response": {
+                                "result": content,
+                            }
+                        }
+                    });
+                    parts.push(part);
+                }
+            }
+        }
+
+        if !parts.is_empty() {
+            if Some(role) == current_role {
+                current_parts.extend(parts);
+            } else {
+                if let Some(r) = current_role {
+                    contents.push(json!({
+                        "role": r,
+                        "parts": std::mem::take(&mut current_parts),
+                    }));
+                }
+                current_role = Some(role);
+                current_parts = parts;
+            }
+        }
+    }
+
+    if let Some(r) = current_role {
+        contents.push(json!({
+            "role": r,
+            "parts": current_parts,
+        }));
+    }
+
+    contents
 }
 
 /// Find the tool name that corresponds to a ToolResult block by searching

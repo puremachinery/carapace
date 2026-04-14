@@ -227,66 +227,9 @@ pub(crate) fn build_gemini_body(request: &CompletionRequest) -> Value {
     }
 
     // Convert LlmMessages to Gemini contents format
-    let mut contents: Vec<Value> = Vec::new();
-
-    for msg in &request.messages {
-        let role = match msg.role {
-            LlmRole::User => "user",
-            LlmRole::Assistant => "model",
-        };
-
-        let mut parts: Vec<Value> = Vec::new();
-
-        for block in &msg.content {
-            match block {
-                ContentBlock::Text { text, metadata } => {
-                    let mut part = json!({ "text": text });
-                    apply_gemini_thought_signature(&mut part, metadata);
-                    parts.push(part);
-                }
-                ContentBlock::ToolUse {
-                    id: _,
-                    name,
-                    input,
-                    metadata,
-                } => {
-                    let mut part = json!({
-                        "functionCall": {
-                            "name": name,
-                            "args": input,
-                        }
-                    });
-                    apply_gemini_thought_signature(&mut part, metadata);
-                    parts.push(part);
-                }
-                ContentBlock::ToolResult {
-                    tool_use_id: _,
-                    content,
-                    is_error: _,
-                } => {
-                    let tool_name = find_tool_name_for_result(&request.messages, block);
-                    let part = json!({
-                        "functionResponse": {
-                            "name": tool_name,
-                            "response": {
-                                "result": content,
-                            }
-                        }
-                    });
-                    parts.push(part);
-                }
-            }
-        }
-
-        if !parts.is_empty() {
-            contents.push(json!({
-                "role": role,
-                "parts": parts,
-            }));
-        }
-    }
-
-    body["contents"] = json!(contents);
+    body["contents"] = json!(crate::agent::gemini::build_gemini_contents(
+        &request.messages
+    ));
 
     // Tools
     if !request.tools.is_empty() {
@@ -790,25 +733,6 @@ impl TokenProvider for FallbackTokenProvider {
     }
 }
 
-fn find_tool_name_for_result<'a>(messages: &'a [LlmMessage], block: &ContentBlock) -> &'a str {
-    let target_id = match block {
-        ContentBlock::ToolResult { tool_use_id, .. } => tool_use_id,
-        _ => return "unknown",
-    };
-
-    for msg in messages.iter().rev() {
-        for b in &msg.content {
-            if let ContentBlock::ToolUse { id, name, .. } = b {
-                if id == target_id {
-                    return name;
-                }
-            }
-        }
-    }
-
-    "unknown"
-}
-
 /// Strip the `vertex:` prefix from a model identifier.
 ///
 /// Returns the bare model name suitable for passing to the Vertex API
@@ -1303,6 +1227,98 @@ mod tests {
         assert_eq!(
             body["contents"][0]["parts"][0]["thoughtSignature"],
             "sig-tool"
+        );
+    }
+
+    #[test]
+    fn test_gemini_adapter_build_body_batches_consecutive_roles() {
+        let request = CompletionRequest {
+            model: "gemini-1.5-pro".to_string(),
+            messages: vec![
+                LlmMessage {
+                    role: LlmRole::User,
+                    content: vec![ContentBlock::Text {
+                        text: "First user message".to_string(),
+                        metadata: None,
+                    }],
+                },
+                LlmMessage {
+                    role: LlmRole::Assistant,
+                    content: vec![ContentBlock::ToolUse {
+                        id: "call_1".to_string(),
+                        name: "get_weather".to_string(),
+                        input: json!({"city": "SF"}),
+                        metadata: None,
+                    }],
+                },
+                LlmMessage {
+                    role: LlmRole::Assistant,
+                    content: vec![ContentBlock::ToolUse {
+                        id: "call_2".to_string(),
+                        name: "get_time".to_string(),
+                        input: json!({"tz": "UTC"}),
+                        metadata: None,
+                    }],
+                },
+                LlmMessage {
+                    role: LlmRole::User,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: "call_1".to_string(),
+                        content: "72F".to_string(),
+                        is_error: false,
+                    }],
+                },
+                LlmMessage {
+                    role: LlmRole::User,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: "call_2".to_string(),
+                        content: "12:00".to_string(),
+                        is_error: false,
+                    }],
+                },
+            ],
+            system: None,
+            temperature: None,
+            max_tokens: 100,
+            tools: vec![],
+            extra: None,
+        };
+
+        let body = build_gemini_body(&request);
+        let contents = body["contents"].as_array().unwrap();
+
+        // Should be 3 content entries: user, model (batched 2), user (batched 2)
+        assert_eq!(contents.len(), 3);
+
+        assert_eq!(contents[0]["role"], "user");
+        assert_eq!(contents[0]["parts"].as_array().unwrap().len(), 1);
+        assert_eq!(contents[0]["parts"][0]["text"], "First user message");
+
+        assert_eq!(contents[1]["role"], "model");
+        assert_eq!(contents[1]["parts"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            contents[1]["parts"][0]["functionCall"]["name"],
+            "get_weather"
+        );
+        assert_eq!(contents[1]["parts"][1]["functionCall"]["name"], "get_time");
+
+        assert_eq!(contents[2]["role"], "user");
+        assert_eq!(contents[2]["parts"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            contents[2]["parts"][0]["functionResponse"]["name"],
+            "get_weather"
+        );
+        assert_eq!(
+            contents[2]["parts"][0]["functionResponse"]["response"]["result"],
+            "72F"
+        );
+        assert_eq!(
+            contents[2]["parts"][1]["functionResponse"]["name"],
+            "get_time"
+        );
+        assert_eq!(
+            contents[2]["parts"][1]["functionResponse"]["response"]["result"],
+            "12:00"
         );
     }
 
