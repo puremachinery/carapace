@@ -63,7 +63,11 @@ pub struct SignalDataMessage {
 }
 
 impl SignalEnvelope {
-    /// Returns the effective source number, preferring `sourceNumber` over `sourceUuid` and `source`.
+    /// Returns the effective source identifier for the envelope.
+    ///
+    /// This prefers `sourceNumber` when present, but may also return
+    /// `sourceUuid` (for phone-number privacy) or the legacy `source` field,
+    /// so the result is not guaranteed to be a phone number.
     pub fn effective_source_number(&self) -> Option<&str> {
         self.source_number
             .as_deref()
