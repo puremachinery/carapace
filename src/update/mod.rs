@@ -1,8 +1,10 @@
 //! Shared updater pipeline with mandatory Sigstore verification and transaction-based resume.
 
 use serde::{Deserialize, Serialize};
-use sha2_10::{Digest, Sha256};
-use sigstore::bundle::verify::policy::SingleX509ExtPolicy;
+use sha2::{Digest, Sha256};
+use sigstore_trust_root::TrustedRoot;
+use sigstore_types::Bundle;
+use sigstore_verify::{VerificationPolicy, Verifier};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -13,6 +15,9 @@ use tokio::io::AsyncWriteExt;
 
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
+
+#[cfg(test)]
+use sigstore_types::Sha256Hash;
 
 pub const EXPECTED_OIDC_ISSUER: &str = "https://token.actions.githubusercontent.com";
 pub const EXPECTED_IDENTITY_PREFIX: &str =
@@ -789,48 +794,10 @@ async fn verify_bundle_signature(
     bundle_bytes: &[u8],
     expected_identity: &str,
 ) -> Result<(), UpdateError> {
-    let bundle =
-        serde_json::from_slice::<sigstore::bundle::Bundle>(bundle_bytes).map_err(|err| {
-            UpdateError::non_retryable(
-                Some(UpdatePhase::Verified),
-                format!("bundle parse failed: {err}"),
-            )
-        })?;
+    let bundle = parse_sigstore_bundle(bundle_bytes)?;
     let expected_identity = expected_identity.to_string();
     tokio::task::spawn_blocking(move || {
-        let verifier =
-            sigstore::bundle::verify::blocking::Verifier::production().map_err(|err| {
-                UpdateError::retryable(
-                    Some(UpdatePhase::Verified),
-                    format!("failed to initialize sigstore trust root: {err}"),
-                )
-            })?;
-
-        let mut hasher = Sha256::new();
-        hasher.update(&binary_bytes);
-
-        let issuer_policy = sigstore::bundle::verify::policy::OIDCIssuer::new(EXPECTED_OIDC_ISSUER);
-        let identity_policy = sigstore::bundle::verify::policy::Identity::new(
-            &expected_identity,
-            EXPECTED_OIDC_ISSUER,
-        );
-        let all = sigstore::bundle::verify::policy::AllOf::new([
-            &issuer_policy as &dyn sigstore::bundle::verify::policy::VerificationPolicy,
-            &identity_policy as &dyn sigstore::bundle::verify::policy::VerificationPolicy,
-        ])
-        .ok_or_else(|| {
-            UpdateError::non_retryable(
-                Some(UpdatePhase::Verified),
-                "invalid sigstore verification policy",
-            )
-        })?;
-
-        verifier
-            .verify_digest(hasher, bundle, &all, true)
-            .map_err(|err| {
-                let message = format!("bundle verification failed: {err}");
-                UpdateError::non_retryable(Some(UpdatePhase::Verified), message)
-            })
+        verify_sigstore_bundle_bytes_sync(&binary_bytes, &bundle, &expected_identity)
     })
     .await
     .map_err(|err| {
@@ -839,6 +806,107 @@ async fn verify_bundle_signature(
             format!("bundle verification worker task failed: {err}"),
         )
     })?
+}
+
+#[cfg(test)]
+async fn verify_bundle_signature_digest(
+    artifact_digest_hex: &str,
+    bundle_bytes: &[u8],
+    expected_identity: &str,
+) -> Result<(), UpdateError> {
+    let bundle = parse_sigstore_bundle(bundle_bytes)?;
+    let artifact_digest_hex = artifact_digest_hex.to_string();
+    let expected_identity = expected_identity.to_string();
+    tokio::task::spawn_blocking(move || {
+        verify_sigstore_bundle_digest_sync(&artifact_digest_hex, &bundle, &expected_identity)
+    })
+    .await
+    .map_err(|err| {
+        UpdateError::retryable(
+            Some(UpdatePhase::Verified),
+            format!("bundle verification worker task failed: {err}"),
+        )
+    })?
+}
+
+fn parse_sigstore_bundle(bundle_bytes: &[u8]) -> Result<Bundle, UpdateError> {
+    serde_json::from_slice::<Bundle>(bundle_bytes).map_err(|err| {
+        UpdateError::non_retryable(
+            Some(UpdatePhase::Verified),
+            format!("bundle parse failed: {err}"),
+        )
+    })
+}
+
+fn build_sigstore_policy(expected_identity: &str) -> VerificationPolicy {
+    VerificationPolicy::default()
+        .require_issuer(EXPECTED_OIDC_ISSUER)
+        .require_identity(expected_identity)
+}
+
+fn verify_sigstore_bundle_bytes_sync(
+    binary_bytes: &[u8],
+    bundle: &Bundle,
+    expected_identity: &str,
+) -> Result<(), UpdateError> {
+    let trust_root = TrustedRoot::production().map_err(|err| {
+        UpdateError::retryable(
+            Some(UpdatePhase::Verified),
+            format!("failed to initialize sigstore trust root: {err}"),
+        )
+    })?;
+    let verifier = Verifier::new(&trust_root);
+    let policy = build_sigstore_policy(expected_identity);
+    let result = verifier
+        .verify(binary_bytes, bundle, &policy)
+        .map_err(|err| {
+            UpdateError::non_retryable(
+                Some(UpdatePhase::Verified),
+                format!("bundle verification failed: {err}"),
+            )
+        })?;
+    if !result.success {
+        return Err(UpdateError::non_retryable(
+            Some(UpdatePhase::Verified),
+            "bundle verification failed".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn verify_sigstore_bundle_digest_sync(
+    artifact_digest_hex: &str,
+    bundle: &Bundle,
+    expected_identity: &str,
+) -> Result<(), UpdateError> {
+    let digest = Sha256Hash::from_hex(artifact_digest_hex).map_err(|err| {
+        UpdateError::non_retryable(
+            Some(UpdatePhase::Verified),
+            format!("invalid test artifact digest: {err}"),
+        )
+    })?;
+    let trust_root = TrustedRoot::production().map_err(|err| {
+        UpdateError::retryable(
+            Some(UpdatePhase::Verified),
+            format!("failed to initialize sigstore trust root: {err}"),
+        )
+    })?;
+    let verifier = Verifier::new(&trust_root);
+    let policy = build_sigstore_policy(expected_identity);
+    let result = verifier.verify(digest, bundle, &policy).map_err(|err| {
+        UpdateError::non_retryable(
+            Some(UpdatePhase::Verified),
+            format!("bundle verification failed: {err}"),
+        )
+    })?;
+    if !result.success {
+        return Err(UpdateError::non_retryable(
+            Some(UpdatePhase::Verified),
+            "bundle verification failed".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn checksum_entry_matches_asset(line: &str, asset_name: &str) -> bool {
@@ -1449,6 +1517,11 @@ pub async fn auto_resume_with_backoff(
 mod tests {
     use super::*;
 
+    const V070_SHA256SUMS_DIGEST: &str =
+        "acc4012c1a51190fc354e4e5d77ebe0779097e36d30e3ce523efb05581394163";
+    const V070_SHA256SUMS_BUNDLE: &[u8] =
+        include_bytes!("../../tests/fixtures/update/v0.7.0-sha256sums.bundle");
+
     static TEST_APPLY_FAILURE_FLAGS_LOCK: LazyLock<std::sync::Mutex<()>> =
         LazyLock::new(|| std::sync::Mutex::new(()));
 
@@ -1750,6 +1823,30 @@ mod tests {
         .await
         .expect_err("malformed bundle must fail");
         assert!(err.message.contains("bundle parse failed"));
+        assert!(!err.retryable);
+    }
+
+    #[tokio::test]
+    async fn test_verify_bundle_signature_accepts_v070_sha256sums_bundle() {
+        verify_bundle_signature_digest(
+            V070_SHA256SUMS_DIGEST,
+            V070_SHA256SUMS_BUNDLE,
+            &expected_identity_for_tag("v0.7.0"),
+        )
+        .await
+        .expect("current release bundle should verify");
+    }
+
+    #[tokio::test]
+    async fn test_verify_bundle_signature_rejects_wrong_identity_for_valid_bundle() {
+        let err = verify_bundle_signature_digest(
+            V070_SHA256SUMS_DIGEST,
+            V070_SHA256SUMS_BUNDLE,
+            "https://github.com/puremachinery/carapace/.github/workflows/release.yml@refs/tags/v9.9.9",
+        )
+        .await
+        .expect_err("wrong identity must fail verification");
+        assert!(err.message.contains("bundle verification failed"));
         assert!(!err.retryable);
     }
 

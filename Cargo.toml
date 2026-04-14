@@ -40,8 +40,8 @@ getrandom = "0.4"
 hex = "0.4"
 sha2 = "0.11"
 # Retain the legacy digest stack only for dependencies and legacy persisted
-# format reads that still require it (`pbkdf2 0.12` and the current `sigstore`
-# verifier surface). New hashing and HKDF call sites should use `sha2`.
+# format reads that still require it (`pbkdf2 0.12`). New hashing and HKDF call
+# sites should use `sha2`.
 sha2_10 = { package = "sha2", version = "0.10" }
 hkdf = "0.13"
 hmac = "0.13"
@@ -65,7 +65,9 @@ tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 urlencoding = "2"
 crc32fast = "1"
 rpassword = "7"
-sigstore = { version = "0.13", default-features = false, features = ["bundle", "verify", "sigstore-trust-root", "rustls-tls"] }
+sigstore-trust-root = "0.6"
+sigstore-types = "0.6"
+sigstore-verify = "0.6"
 
 [target.'cfg(windows)'.dependencies]
 win32job = "2.0.3"
