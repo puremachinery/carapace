@@ -227,7 +227,9 @@ pub(crate) fn build_gemini_body(request: &CompletionRequest) -> Value {
     }
 
     // Convert LlmMessages to Gemini contents format
-    body["contents"] = json!(crate::agent::gemini::build_gemini_contents(&request.messages));
+    body["contents"] = json!(crate::agent::gemini::build_gemini_contents(
+        &request.messages
+    ));
 
     // Tools
     if !request.tools.is_empty() {
