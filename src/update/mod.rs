@@ -14,6 +14,10 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
 #[cfg(test)]
+use sigstore_trust_root::{
+    TufConfig, PRODUCTION_TUF_ROOT, SIGSTORE_PRODUCTION_TRUSTED_ROOT, TRUSTED_ROOT_TARGET,
+};
+#[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub const EXPECTED_OIDC_ISSUER: &str = "https://token.actions.githubusercontent.com";
@@ -787,12 +791,11 @@ async fn download_asset(
 }
 
 async fn verify_bundle_signature(
-    artifact_digest_hex: &str,
+    artifact_digest: Sha256Hash,
     bundle_bytes: &[u8],
     expected_identity: &str,
 ) -> Result<(), UpdateError> {
     let bundle = parse_sigstore_bundle(bundle_bytes)?;
-    let artifact_digest = parse_sigstore_digest(artifact_digest_hex)?;
     let trust_root = load_sigstore_trust_root().await?;
     let expected_identity = expected_identity.to_string();
     tokio::task::spawn_blocking(move || {
@@ -814,12 +817,11 @@ async fn verify_bundle_signature(
 
 #[cfg(test)]
 async fn verify_bundle_signature_digest(
-    artifact_digest_hex: &str,
+    artifact_digest: Sha256Hash,
     bundle_bytes: &[u8],
     expected_identity: &str,
 ) -> Result<(), UpdateError> {
     let bundle = parse_sigstore_bundle(bundle_bytes)?;
-    let artifact_digest = parse_sigstore_digest(artifact_digest_hex)?;
     let trust_root = load_embedded_sigstore_trust_root()?;
     let expected_identity = expected_identity.to_string();
     tokio::task::spawn_blocking(move || {
@@ -846,6 +848,21 @@ async fn load_sigstore_trust_root() -> Result<TrustedRoot, UpdateError> {
             format!("failed to initialize sigstore trust root: {err}"),
         )
     })
+}
+
+#[cfg(test)]
+async fn load_sigstore_trust_root_with_config(
+    config: TufConfig,
+    tuf_root: &'static [u8],
+) -> Result<TrustedRoot, UpdateError> {
+    TrustedRoot::from_tuf_with_config(config, tuf_root)
+        .await
+        .map_err(|err| {
+            UpdateError::retryable(
+                Some(UpdatePhase::Verified),
+                format!("failed to initialize sigstore trust root: {err}"),
+            )
+        })
 }
 
 #[cfg(test)]
@@ -1110,6 +1127,7 @@ async fn run_transaction_once(
     }
 
     let staged_hash = sha256_bytes(&binary_bytes);
+    let staged_digest = parse_sigstore_digest(&staged_hash)?;
     tx.staged_path = Some(staged_path.to_string_lossy().to_string());
     tx.bundle_path = Some(bundle_path.to_string_lossy().to_string());
     tx.sha256 = Some(staged_hash.clone());
@@ -1123,7 +1141,7 @@ async fn run_transaction_once(
     persist_update_transaction(&request.state_dir, tx)?;
 
     let expected_identity = expected_identity_for_tag(&version_to_tag(&tx.version));
-    verify_bundle_signature(&staged_hash, &bundle_bytes, &expected_identity).await?;
+    verify_bundle_signature(staged_digest, &bundle_bytes, &expected_identity).await?;
 
     let checksum_asset = release
         .assets
@@ -1511,6 +1529,9 @@ mod tests {
 
     const V070_SHA256SUMS_DIGEST: &str =
         "acc4012c1a51190fc354e4e5d77ebe0779097e36d30e3ce523efb05581394163";
+    // The leaf certificate in this bundle is expired relative to current wall clock time,
+    // but Sigstore verification correctly anchors certificate validity to the verified
+    // transparency-log integrated time carried in the bundle, so this fixture remains stable.
     const V070_SHA256SUMS_BUNDLE: &[u8] =
         include_bytes!("../../tests/fixtures/update/v0.7.0-sha256sums.bundle");
 
@@ -1794,9 +1815,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_verify_bundle_signature_missing_bundle_is_rejected() {
-        let digest = sha256_bytes(b"artifact-bytes");
+        let digest = parse_sigstore_digest(&sha256_bytes(b"artifact-bytes")).unwrap();
         let err = verify_bundle_signature(
-            &digest,
+            digest,
             b"",
             "https://github.com/puremachinery/carapace/.github/workflows/release.yml@refs/tags/v0.1.0",
         )
@@ -1808,9 +1829,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_verify_bundle_signature_malformed_bundle_is_rejected() {
-        let digest = sha256_bytes(b"artifact-bytes");
+        let digest = parse_sigstore_digest(&sha256_bytes(b"artifact-bytes")).unwrap();
         let err = verify_bundle_signature(
-            &digest,
+            digest,
             br#"{"kindVersion":"oops"}"#,
             "https://github.com/puremachinery/carapace/.github/workflows/release.yml@refs/tags/v0.1.0",
         )
@@ -1823,7 +1844,7 @@ mod tests {
     #[tokio::test]
     async fn test_verify_bundle_signature_accepts_v070_sha256sums_bundle() {
         verify_bundle_signature_digest(
-            V070_SHA256SUMS_DIGEST,
+            parse_sigstore_digest(V070_SHA256SUMS_DIGEST).unwrap(),
             V070_SHA256SUMS_BUNDLE,
             &expected_identity_for_tag("v0.7.0"),
         )
@@ -1834,7 +1855,7 @@ mod tests {
     #[tokio::test]
     async fn test_verify_bundle_signature_rejects_wrong_identity_for_valid_bundle() {
         let err = verify_bundle_signature_digest(
-            V070_SHA256SUMS_DIGEST,
+            parse_sigstore_digest(V070_SHA256SUMS_DIGEST).unwrap(),
             V070_SHA256SUMS_BUNDLE,
             "https://github.com/puremachinery/carapace/.github/workflows/release.yml@refs/tags/v9.9.9",
         )
@@ -1847,7 +1868,10 @@ mod tests {
     #[tokio::test]
     async fn test_verify_bundle_signature_rejects_wrong_digest_for_valid_bundle() {
         let err = verify_bundle_signature_digest(
-            "bcc4012c1a51190fc354e4e5d77ebe0779097e36d30e3ce523efb05581394163",
+            parse_sigstore_digest(
+                "bcc4012c1a51190fc354e4e5d77ebe0779097e36d30e3ce523efb05581394163",
+            )
+            .unwrap(),
             V070_SHA256SUMS_BUNDLE,
             &expected_identity_for_tag("v0.7.0"),
         )
@@ -1864,6 +1888,33 @@ mod tests {
         assert_eq!(policy.issuer.as_deref(), Some(EXPECTED_OIDC_ISSUER));
         assert!(policy.verify_tlog);
         assert!(policy.verify_certificate);
+    }
+
+    #[tokio::test]
+    async fn test_load_sigstore_trust_root_offline_tuf_cache_matches_embedded_production() {
+        let dir = tempfile::tempdir().unwrap();
+        let targets_dir = dir.path().join("targets");
+        std::fs::create_dir_all(&targets_dir).unwrap();
+        std::fs::write(
+            targets_dir.join(TRUSTED_ROOT_TARGET),
+            SIGSTORE_PRODUCTION_TRUSTED_ROOT,
+        )
+        .unwrap();
+
+        let root = load_sigstore_trust_root_with_config(
+            TufConfig::production()
+                .with_cache_dir(dir.path().to_path_buf())
+                .offline(),
+            PRODUCTION_TUF_ROOT,
+        )
+        .await
+        .expect("offline TUF loader should read cached trusted root");
+        let embedded = load_embedded_sigstore_trust_root().unwrap();
+
+        assert_eq!(
+            serde_json::to_value(&root).unwrap(),
+            serde_json::to_value(&embedded).unwrap()
+        );
     }
 
     #[tokio::test]
