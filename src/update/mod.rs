@@ -1865,6 +1865,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_verify_bundle_signature_digest_missing_bundle_is_rejected() {
+        let err = verify_bundle_signature_digest(
+            parse_sigstore_digest(&sha256_bytes(b"artifact-bytes")).unwrap(),
+            b"",
+            &expected_identity_for_tag("v0.7.0"),
+        )
+        .await
+        .expect_err("empty bundle must fail");
+        assert!(err.message.contains("bundle parse failed"));
+        assert!(!err.retryable);
+        assert_eq!(err.phase, Some(UpdatePhase::Verified));
+    }
+
+    #[tokio::test]
     async fn test_verify_bundle_signature_accepts_v070_sha256sums_bundle() {
         verify_bundle_signature_digest(
             parse_sigstore_digest(V070_SHA256SUMS_DIGEST).unwrap(),
