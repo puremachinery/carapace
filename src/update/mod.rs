@@ -1847,32 +1847,21 @@ mod tests {
         assert!(err.message.contains("Backup path (if present):"));
     }
 
-    #[tokio::test]
-    async fn test_verify_bundle_signature_missing_bundle_is_rejected() {
-        let digest = parse_sigstore_digest(&sha256_bytes(b"artifact-bytes")).unwrap();
-        let err = verify_bundle_signature(
-            digest,
-            b"",
-            "https://github.com/puremachinery/carapace/.github/workflows/release.yml@refs/tags/v0.1.0",
-        )
-        .await
-        .expect_err("empty bundle must fail");
+    #[test]
+    fn test_parse_sigstore_bundle_missing_bundle_is_rejected() {
+        let err = parse_sigstore_bundle(b"").expect_err("empty bundle must fail");
         assert!(err.message.contains("bundle parse failed"));
         assert!(!err.retryable);
+        assert_eq!(err.phase, Some(UpdatePhase::Verified));
     }
 
-    #[tokio::test]
-    async fn test_verify_bundle_signature_malformed_bundle_is_rejected() {
-        let digest = parse_sigstore_digest(&sha256_bytes(b"artifact-bytes")).unwrap();
-        let err = verify_bundle_signature(
-            digest,
-            br#"{"kindVersion":"oops"}"#,
-            "https://github.com/puremachinery/carapace/.github/workflows/release.yml@refs/tags/v0.1.0",
-        )
-        .await
-        .expect_err("malformed bundle must fail");
+    #[test]
+    fn test_parse_sigstore_bundle_malformed_bundle_is_rejected() {
+        let err = parse_sigstore_bundle(br#"{"kindVersion":"oops"}"#)
+            .expect_err("malformed bundle must fail");
         assert!(err.message.contains("bundle parse failed"));
         assert!(!err.retryable);
+        assert_eq!(err.phase, Some(UpdatePhase::Verified));
     }
 
     #[tokio::test]
@@ -1975,6 +1964,25 @@ mod tests {
             serde_json::to_value(&root).unwrap(),
             serde_json::to_value(&embedded).unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn test_load_sigstore_trust_root_offline_failure_is_retryable() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = load_sigstore_trust_root_with_config(
+            TufConfig::production()
+                .with_cache_dir(dir.path().to_path_buf())
+                .offline(),
+            PRODUCTION_TUF_ROOT,
+        )
+        .await
+        .expect_err("missing offline TUF cache should fail");
+
+        assert!(err.retryable);
+        assert_eq!(err.phase, Some(UpdatePhase::Verified));
+        assert!(err
+            .message
+            .contains("failed to initialize sigstore trust root"));
     }
 
     #[tokio::test]
