@@ -388,9 +388,7 @@ pub fn compute_sha256(path: &Path) -> Result<String, UpdateError> {
 }
 
 pub fn sha256_bytes(data: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    hex::encode(hasher.finalize())
+    hex::encode(sha256_digest_bytes(data).as_bytes())
 }
 
 /// Verify a staged artifact hash against one checksum entry line from SHA256SUMS.
