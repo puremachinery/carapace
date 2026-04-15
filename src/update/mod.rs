@@ -795,10 +795,11 @@ async fn verify_bundle_signature(
     bundle_bytes: &[u8],
     expected_identity: &str,
 ) -> Result<(), UpdateError> {
+    let bundle = parse_sigstore_bundle(bundle_bytes)?;
     let trust_root = load_sigstore_trust_root().await?;
-    verify_bundle_signature_with_trust_root(
+    verify_parsed_bundle_signature_with_trust_root(
         artifact_digest,
-        bundle_bytes,
+        bundle,
         expected_identity,
         trust_root,
     )
@@ -811,23 +812,23 @@ async fn verify_bundle_signature_digest(
     bundle_bytes: &[u8],
     expected_identity: &str,
 ) -> Result<(), UpdateError> {
+    let bundle = parse_sigstore_bundle(bundle_bytes)?;
     let trust_root = load_embedded_sigstore_trust_root()?;
-    verify_bundle_signature_with_trust_root(
+    verify_parsed_bundle_signature_with_trust_root(
         artifact_digest,
-        bundle_bytes,
+        bundle,
         expected_identity,
         trust_root,
     )
     .await
 }
 
-async fn verify_bundle_signature_with_trust_root(
+async fn verify_parsed_bundle_signature_with_trust_root(
     artifact_digest: Sha256Hash,
-    bundle_bytes: &[u8],
+    bundle: Bundle,
     expected_identity: &str,
     trust_root: TrustedRoot,
 ) -> Result<(), UpdateError> {
-    let bundle = parse_sigstore_bundle(bundle_bytes)?;
     let expected_identity = expected_identity.to_string();
     tokio::task::spawn_blocking(move || {
         verify_sigstore_bundle_digest_sync(
@@ -923,10 +924,19 @@ fn verify_sigstore_bundle_digest_sync(
     expected_identity: &str,
     trust_root: &TrustedRoot,
 ) -> Result<(), UpdateError> {
-    let verifier = Verifier::new(trust_root);
     let policy = build_sigstore_policy(expected_identity);
+    verify_sigstore_bundle_with_policy_sync(artifact_digest, bundle, &policy, trust_root)
+}
+
+fn verify_sigstore_bundle_with_policy_sync(
+    artifact_digest: Sha256Hash,
+    bundle: &Bundle,
+    policy: &VerificationPolicy,
+    trust_root: &TrustedRoot,
+) -> Result<(), UpdateError> {
+    let verifier = Verifier::new(trust_root);
     verifier
-        .verify(artifact_digest, bundle, &policy)
+        .verify(artifact_digest, bundle, policy)
         .map_err(|err| {
             UpdateError::non_retryable(
                 Some(UpdatePhase::Verified),
@@ -1145,7 +1155,7 @@ async fn run_transaction_once(
     }
 
     let staged_digest = sha256_digest_bytes(&binary_bytes);
-    let staged_hash = staged_digest.to_hex();
+    let staged_hash = hex::encode(staged_digest.as_bytes());
     tx.staged_path = Some(staged_path.to_string_lossy().to_string());
     tx.bundle_path = Some(bundle_path.to_string_lossy().to_string());
     tx.sha256 = Some(staged_hash.clone());
@@ -1689,6 +1699,12 @@ mod tests {
     }
 
     #[test]
+    fn test_sha256_digest_bytes_hex_matches_sha256_bytes() {
+        let digest = sha256_digest_bytes(b"hello");
+        assert_eq!(hex::encode(digest.as_bytes()), sha256_bytes(b"hello"));
+    }
+
+    #[test]
     fn test_verify_checksum_rejects_mismatch() {
         let err = verify_checksum(
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -1900,6 +1916,30 @@ mod tests {
     }
 
     #[test]
+    fn test_verify_sigstore_bundle_rejects_wrong_issuer_for_valid_bundle() {
+        let bundle = parse_sigstore_bundle(V070_SHA256SUMS_BUNDLE).unwrap();
+        let trust_root = load_embedded_sigstore_trust_root().unwrap();
+        let policy = VerificationPolicy {
+            identity: Some(expected_identity_for_tag("v0.7.0")),
+            issuer: Some("https://accounts.google.com".to_string()),
+            verify_tlog: true,
+            verify_timestamp: true,
+            verify_certificate: true,
+            clock_skew_seconds: DEFAULT_CLOCK_SKEW_SECONDS,
+        };
+
+        let err = verify_sigstore_bundle_with_policy_sync(
+            parse_sigstore_digest(V070_SHA256SUMS_DIGEST).unwrap(),
+            &bundle,
+            &policy,
+            &trust_root,
+        )
+        .expect_err("wrong issuer must fail verification");
+        assert!(err.message.contains("bundle verification failed"));
+        assert!(!err.retryable);
+    }
+
+    #[test]
     fn test_build_sigstore_policy_requires_expected_issuer_and_identity() {
         let policy = build_sigstore_policy("expected-identity");
         assert_eq!(policy.identity.as_deref(), Some("expected-identity"));
@@ -1957,9 +1997,9 @@ mod tests {
         .await
         .expect("offline TUF loader should read cached trusted root");
 
-        verify_bundle_signature_with_trust_root(
+        verify_parsed_bundle_signature_with_trust_root(
             parse_sigstore_digest(V070_SHA256SUMS_DIGEST).unwrap(),
-            V070_SHA256SUMS_BUNDLE,
+            parse_sigstore_bundle(V070_SHA256SUMS_BUNDLE).unwrap(),
             &expected_identity_for_tag("v0.7.0"),
             trust_root,
         )
