@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sigstore_trust_root::TrustedRoot;
 use sigstore_types::{Bundle, Sha256Hash};
-use sigstore_verify::{VerificationPolicy, Verifier};
+use sigstore_verify::{VerificationPolicy, Verifier, DEFAULT_CLOCK_SKEW_SECONDS};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -795,24 +795,14 @@ async fn verify_bundle_signature(
     bundle_bytes: &[u8],
     expected_identity: &str,
 ) -> Result<(), UpdateError> {
-    let bundle = parse_sigstore_bundle(bundle_bytes)?;
     let trust_root = load_sigstore_trust_root().await?;
-    let expected_identity = expected_identity.to_string();
-    tokio::task::spawn_blocking(move || {
-        verify_sigstore_bundle_digest_sync(
-            artifact_digest,
-            &bundle,
-            &expected_identity,
-            &trust_root,
-        )
-    })
+    verify_bundle_signature_with_trust_root(
+        artifact_digest,
+        bundle_bytes,
+        expected_identity,
+        trust_root,
+    )
     .await
-    .map_err(|err| {
-        UpdateError::retryable(
-            Some(UpdatePhase::Verified),
-            format!("bundle verification worker task failed: {err}"),
-        )
-    })?
 }
 
 #[cfg(test)]
@@ -821,8 +811,23 @@ async fn verify_bundle_signature_digest(
     bundle_bytes: &[u8],
     expected_identity: &str,
 ) -> Result<(), UpdateError> {
-    let bundle = parse_sigstore_bundle(bundle_bytes)?;
     let trust_root = load_embedded_sigstore_trust_root()?;
+    verify_bundle_signature_with_trust_root(
+        artifact_digest,
+        bundle_bytes,
+        expected_identity,
+        trust_root,
+    )
+    .await
+}
+
+async fn verify_bundle_signature_with_trust_root(
+    artifact_digest: Sha256Hash,
+    bundle_bytes: &[u8],
+    expected_identity: &str,
+    trust_root: TrustedRoot,
+) -> Result<(), UpdateError> {
+    let bundle = parse_sigstore_bundle(bundle_bytes)?;
     let expected_identity = expected_identity.to_string();
     tokio::task::spawn_blocking(move || {
         verify_sigstore_bundle_digest_sync(
@@ -884,6 +889,14 @@ fn parse_sigstore_bundle(bundle_bytes: &[u8]) -> Result<Bundle, UpdateError> {
     })
 }
 
+fn sha256_digest_bytes(data: &[u8]) -> Sha256Hash {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    let digest: [u8; 32] = hasher.finalize().into();
+    Sha256Hash::from_bytes(digest)
+}
+
+#[cfg(test)]
 fn parse_sigstore_digest(artifact_digest_hex: &str) -> Result<Sha256Hash, UpdateError> {
     Sha256Hash::from_hex(artifact_digest_hex).map_err(|err| {
         UpdateError::non_retryable(
@@ -894,9 +907,14 @@ fn parse_sigstore_digest(artifact_digest_hex: &str) -> Result<Sha256Hash, Update
 }
 
 fn build_sigstore_policy(expected_identity: &str) -> VerificationPolicy {
-    VerificationPolicy::default()
-        .require_issuer(EXPECTED_OIDC_ISSUER)
-        .require_identity(expected_identity)
+    VerificationPolicy {
+        identity: Some(expected_identity.to_string()),
+        issuer: Some(EXPECTED_OIDC_ISSUER.to_string()),
+        verify_tlog: true,
+        verify_timestamp: true,
+        verify_certificate: true,
+        clock_skew_seconds: DEFAULT_CLOCK_SKEW_SECONDS,
+    }
 }
 
 fn verify_sigstore_bundle_digest_sync(
@@ -1126,8 +1144,8 @@ async fn run_transaction_once(
         })?;
     }
 
-    let staged_hash = sha256_bytes(&binary_bytes);
-    let staged_digest = parse_sigstore_digest(&staged_hash)?;
+    let staged_digest = sha256_digest_bytes(&binary_bytes);
+    let staged_hash = staged_digest.to_hex();
     tx.staged_path = Some(staged_path.to_string_lossy().to_string());
     tx.bundle_path = Some(bundle_path.to_string_lossy().to_string());
     tx.sha256 = Some(staged_hash.clone());
@@ -1887,7 +1905,9 @@ mod tests {
         assert_eq!(policy.identity.as_deref(), Some("expected-identity"));
         assert_eq!(policy.issuer.as_deref(), Some(EXPECTED_OIDC_ISSUER));
         assert!(policy.verify_tlog);
+        assert!(policy.verify_timestamp);
         assert!(policy.verify_certificate);
+        assert_eq!(policy.clock_skew_seconds, DEFAULT_CLOCK_SKEW_SECONDS);
     }
 
     #[tokio::test]
@@ -1915,6 +1935,36 @@ mod tests {
             serde_json::to_value(&root).unwrap(),
             serde_json::to_value(&embedded).unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn test_verify_bundle_signature_accepts_v070_sha256sums_bundle_with_offline_tuf_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let targets_dir = dir.path().join("targets");
+        std::fs::create_dir_all(&targets_dir).unwrap();
+        std::fs::write(
+            targets_dir.join(TRUSTED_ROOT_TARGET),
+            SIGSTORE_PRODUCTION_TRUSTED_ROOT,
+        )
+        .unwrap();
+
+        let trust_root = load_sigstore_trust_root_with_config(
+            TufConfig::production()
+                .with_cache_dir(dir.path().to_path_buf())
+                .offline(),
+            PRODUCTION_TUF_ROOT,
+        )
+        .await
+        .expect("offline TUF loader should read cached trusted root");
+
+        verify_bundle_signature_with_trust_root(
+            parse_sigstore_digest(V070_SHA256SUMS_DIGEST).unwrap(),
+            V070_SHA256SUMS_BUNDLE,
+            &expected_identity_for_tag("v0.7.0"),
+            trust_root,
+        )
+        .await
+        .expect("offline TUF trust root should verify the current release bundle");
     }
 
     #[tokio::test]
