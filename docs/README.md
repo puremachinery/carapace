@@ -17,7 +17,6 @@ A security-focused, open-source personal AI assistant.
 - [Security & Ops Hub](site/security-ops.md) — day-2 security/ops paths
 - [Reference Hub](site/reference.md) — protocol/architecture reference routing
 - [Cookbook](cookbook/README.md) — task-focused walkthroughs
-- [Roadmap](roadmap.md) — now/next/later priorities
 - [Release & Upgrade Policy](release.md) — compatibility, migration, rollback, release checklist
 - [Channel Setup](channels.md) — Signal, Telegram, Discord, Slack, webhooks
 - [Channel Smoke Validation](channel-smoke.md) — reproducible live channel checks + evidence capture
@@ -51,4 +50,6 @@ A security-focused, open-source personal AI assistant.
 | Rate limiting | [security.md](security.md#rate-limiting) | Default limits per endpoint |
 | Inbound classifier | [security.md](security.md#prompt-injection-considerations) | LLM-based attack classification |
 | Venice AI provider | [architecture.md](architecture.md#key-files) | OpenAI-compatible composition wrapper |
-| Session storage | [architecture.md](architecture.md#key-files) | JSONL history, compaction |
+| Session storage | [architecture.md](architecture.md#key-files) | JSONL history, compaction, encryption at rest |
+| Named routes | [config-reference.md](protocol/config-reference.md#2a-named-routes-optional) | Reusable backend route definitions |
+| Import / migrate | [getting-started.md](getting-started.md#migrating-from-another-tool) | Import from OpenClaw, OpenCode, Aider, NemoClaw |

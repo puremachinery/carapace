@@ -243,8 +243,8 @@ Routes decouple backend selection from agent identity. Instead of embedding `pro
   - *Example:*
     ```json5
     routes: {
-      fast: { model: "gemini:gemini-2.0-flash", label: "Fast lookups" },
-      deep: { model: "anthropic:claude-sonnet-4-20250514" },
+      fast: { model: "gemini:gemini-2.5-flash", label: "Fast lookups" },
+      deep: { model: "anthropic:claude-opus-4-6" },
       local: { model: "ollama:llama3" },
     }
     ```

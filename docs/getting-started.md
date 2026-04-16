@@ -20,7 +20,7 @@ If you want the website flow instead of Markdown docs, start at
 
 - A `cara` binary on your PATH
 - A supported LLM provider API key (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
-  `GOOGLE_API_KEY`, or `VENICE_API_KEY`), or local Ollama
+  `GOOGLE_API_KEY`, or `VENICE_API_KEY`), local Ollama, or a local Claude CLI
 - For Gemini Google sign-in: `GOOGLE_OAUTH_CLIENT_ID` and `GOOGLE_OAUTH_CLIENT_SECRET`
   available in the shell running `cara setup`, or supplied through the Control UI onboarding form
 - For Gemini Google sign-in: `CARAPACE_CONFIG_PASSWORD`
@@ -36,8 +36,10 @@ Install options:
 If you are starting from zero, optimize for a fast verified first outcome:
 
 - Choose `local-chat` first unless you already know you need a channel on day 1.
-- Fastest cloud start: set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`.
-- Fastest fully local start: run Ollama and point Carapace at `OLLAMA_BASE_URL`.
+- Fastest cloud start: set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` and configure
+  a qualified `provider:model` default (e.g. `anthropic:claude-sonnet-4-6`).
+- Fastest fully local start: run Ollama and point Carapace at `OLLAMA_BASE_URL`,
+  or use an installed Claude CLI via `claude-cli:` routing.
 - If you want a guarded local workspace assistant, start with the
   [guarded local project assistant recipe](cookbook/guarded-local-project-assistant.md)
   after your first successful local-chat verify.
@@ -61,6 +63,7 @@ Or skip the provider menu explicitly by choosing one provider:
 cara setup --provider ollama
 cara setup --provider gemini --auth-mode api-key
 cara setup --provider gemini --auth-mode oauth
+cara setup --provider claude-cli
 ```
 
 ### Migrating from another tool?
@@ -143,6 +146,35 @@ If `CARAPACE_CONFIG_PASSWORD` is set, secrets at known paths are encrypted
 at rest (AES‑256‑GCM). If the password is missing or wrong at startup,
 encrypted values are replaced with empty strings in the loaded config (the
 on-disk file is not modified).
+
+### Session Encryption at Rest
+
+Session history and metadata can be encrypted at rest via
+`sessions.encryption.mode`. When enabled with `CARAPACE_CONFIG_PASSWORD`,
+sessions are AES‑256‑GCM encrypted with `.crypto-manifest` recovery
+metadata. There is no in-place rekey — changing the password requires a
+fresh encrypted session store. See `docs/protocol/config-reference.md` for
+mode options.
+
+### Named Execution Routes
+
+Instead of repeating `provider:model` strings across agents, define named
+routes once under the top-level `routes` map and reference them by name:
+
+```json5
+{
+  "routes": {
+    "fast":   { "model": "gemini:gemini-2.5-flash" },
+    "strong": { "model": "anthropic:claude-opus-4-6" }
+  },
+  "agents": {
+    "defaults": { "route": "fast" }
+  }
+}
+```
+
+See the [named routes cookbook recipe](cookbook/named-routes-multi-model.md)
+for a full walkthrough.
 
 ## Security Baseline
 

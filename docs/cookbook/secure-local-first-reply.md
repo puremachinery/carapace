@@ -40,15 +40,25 @@ Create `carapace.json5`:
       "token": "${CARAPACE_GATEWAY_TOKEN}"
     }
   },
+  "agents": {
+    "defaults": {
+      "model": "anthropic:claude-sonnet-4-6"
+    }
+  },
   "anthropic": {
     "apiKey": "${ANTHROPIC_API_KEY}"
   }
 }
 ```
 
-If you use OpenAI instead, replace the provider block with:
+If you use OpenAI instead, replace the provider block and model:
 
 ```json5
+"agents": {
+  "defaults": {
+    "model": "openai:gpt-5.4"
+  }
+},
 "openai": {
   "apiKey": "${OPENAI_API_KEY}"
 }

@@ -114,7 +114,7 @@ Garden. You must enable the model's API in your GCP project first.
 
 ```text
 // agents.defaults.model or agents.list[].model
-vertex:publishers/anthropic/models/claude-sonnet-4-20250514
+vertex:publishers/anthropic/models/claude-sonnet-4-6
 vertex:publishers/meta/models/llama-3.1-405b-instruct-maas
 vertex:publishers/mistral/models/mistral-large-2411
 vertex:publishers/nvidia/models/llama-3.1-nemotron-70b-instruct
@@ -182,7 +182,7 @@ Supported env vars:
 
 Carapace automatically routes your requests to the correct AI provider based on the `model` string configured in your agent (see [agent.model](../protocol/config-reference.md)).
 
-- **Canonical Provider Prefix**: Every model requires an explicit `provider:model` colon prefix: `anthropic:claude-sonnet-4-20250514`, `openai:gpt-4o`, `gemini:gemini-2.0-flash`, `vertex:gemini-2.5-flash`, `vertex:publishers/anthropic/models/claude-sonnet-4-20250514`, `bedrock:anthropic.claude-3-sonnet`, `ollama:llama3`, `codex:gpt-5.4`, `venice:llama-3.3-70b`, `claude-cli:opus`.
+- **Canonical Provider Prefix**: Every model requires an explicit `provider:model` colon prefix: `anthropic:claude-sonnet-4-6`, `openai:gpt-5.4`, `gemini:gemini-2.5-flash`, `vertex:gemini-2.5-flash`, `vertex:publishers/anthropic/models/claude-sonnet-4-6`, `bedrock:anthropic.claude-3-sonnet`, `ollama:llama3`, `codex:gpt-5.4`, `venice:llama-3.3-70b`, `claude-cli:opus`.
 - **No implicit routing**: Bare model names (without a `provider:` prefix) are rejected with a clear error. Always specify the provider.
 
 Here is an example `carapace.json5` snippet locking agents onto specific providers using prefixes:
