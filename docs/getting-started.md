@@ -63,8 +63,12 @@ Or skip the provider menu explicitly by choosing one provider:
 cara setup --provider ollama
 cara setup --provider gemini --auth-mode api-key
 cara setup --provider gemini --auth-mode oauth
-cara setup --provider claude-cli
 ```
+
+To use the local Claude CLI provider, configure it directly in
+`carapace.json5` using `claude-cli:<model>` in `agents.defaults.model`
+or a specific agent's `model` field. The setup wizard does not currently
+expose Claude CLI as a `--provider` option.
 
 ### Migrating from another tool?
 

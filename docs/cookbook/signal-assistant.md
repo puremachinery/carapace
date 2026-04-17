@@ -100,8 +100,9 @@ curl -H "Authorization: Bearer ${CARAPACE_GATEWAY_TOKEN}" http://127.0.0.1:18789
 1. Send a direct message to your Signal number from another device.
 2. Confirm Carapace logs show the inbound message.
 3. Confirm a typing indicator appears while the assistant generates a reply.
-4. Confirm the message is marked as read after Carapace appends it to the
-   session store (before the LLM response is delivered).
+4. Confirm the inbound message is marked as read in Signal at or before the
+   assistant reply arrives. (See [channel setup](../channels.md) for the
+   exact session-append ordering if you need to debug receipt timing.)
 5. Confirm the assistant reply arrives.
 
 For reproducible live checks, use [Channel Smoke Validation](../channel-smoke.md).

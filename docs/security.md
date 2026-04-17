@@ -75,7 +75,7 @@ graph TB
     end
 
     subgraph "Plugin Boundary"
-        PluginSig["Sigstore Signature Verification"]
+        PluginSig["Ed25519 Signature Verification"]
         PluginCaps["Capability Sandbox<br/>(deny-by-default: HTTP, creds, media)"]
         PluginRes["Resource Limits<br/>(64MB memory, fuel CPU budget,<br/>30s epoch wall-clock timeout)"]
         PluginPerms["Fine-Grained Permissions<br/>(URL patterns, credential scopes)"]

@@ -24,8 +24,10 @@ Manage configuration values.
 ### `cara setup`
 Interactive first-run wizard for provider/auth/network/channel setup.
 
-Supported providers include Anthropic, OpenAI, Gemini (API key or OAuth),
-Ollama, Bedrock, Vertex, Codex, Venice, and Claude CLI.
+Supported `--provider` values: Anthropic, OpenAI, Gemini (API key or OAuth),
+Ollama, Bedrock, Vertex, Codex, and Venice. The Claude CLI provider is
+configured directly in `carapace.json5` via `claude-cli:<model>` in agent
+`model` fields; it is not currently exposed through `cara setup --provider`.
 Wizard outcomes include `local-chat`, `discord`, `telegram`, and `hooks`.
 Use `--force` to overwrite an existing config file.
 All model references require explicit `provider:model` routing (e.g.

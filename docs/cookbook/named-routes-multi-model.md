@@ -94,6 +94,8 @@ cara chat
 
 ```json5
 "routes": {
+  // Date-suffixed IDs pin a specific stable snapshot; non-dated aliases
+  // (e.g. `claude-opus-4-6`) track the latest snapshot for that family.
   "fast":   { "model": "anthropic:claude-haiku-4-5-20251001" },
   "strong": { "model": "anthropic:claude-opus-4-6" }
 }
