@@ -25,6 +25,10 @@ feature_inventory_markdown: |
   - [x] **Gemini provider** — streaming, tool use, cancellation, API key or Google auth-profile runtime (`gemini.rs`)
   - [x] **Bedrock provider** — SigV4 signing, tool use, streaming via emitted events (`bedrock.rs`) wired via `factory.rs`
   - [x] **Venice AI provider** — OpenAI-compat wrapper, model prefix stripping (`venice.rs`). Wired in factory.rs, reads VENICE_API_KEY.
+  - [x] **Claude CLI provider** — local Claude CLI-backed provider for guarded use cases (`claude_cli.rs`)
+  - [x] **Vertex AI third-party publishers** — Anthropic, Meta, Mistral, Nvidia models via `streamRawPredict` (`vertex.rs`)
+  - [x] **Explicit `provider:model` routing** — canonical prefix syntax required across config and request surfaces; bare model names rejected by request/config validation (`provider.rs`, `schema.rs`)
+  - [x] **Named execution routes** — reusable `routes` map definitions with `route` selectors on agents/defaults/sessions/requests (`routes.rs`)
   - [x] **Provider auto-discovery** — env vars + config resolution (`factory.rs`)
   - [x] **Base URL override** — custom API endpoints for all providers
   - [x] **Agent execution loop** — turn loop, tool dispatch, max turns/tokens, cancellation (`mod.rs`)
@@ -79,6 +83,7 @@ feature_inventory_markdown: |
   - [x] **chat** — interactive local REPL session over WebSocket
   - [x] **verify** — first-run outcome verification (local chat/channels/hooks/autonomy)
   - [x] **tls init-ca / issue-cert / revoke-cert / show-ca** — cluster CA management
+  - [x] **import** — configuration migration from OpenClaw, OpenCode, Aider, NemoClaw with previewed mappings
 
   ### Config (`src/config/`)
 
@@ -202,9 +207,9 @@ feature_inventory_markdown: |
   ### Plugins (`src/plugins/`)
 
   - [x] **WASM component model** — wasmtime 43 runtime
-  - [x] **Ed25519 signature verification** — plugin authenticity (required by default)
+  - [x] **Ed25519 signature verification** — plugin authenticity verified at load time via the plugin signature path (`signature.rs`, called from `loader.rs`), required by default. (Note: Sigstore verification is used separately by the updater pipeline for release bundles in `update/mod.rs`, not for plugin load-time verification.)
   - [x] **Plugin loader** — .wasm file loading with manifest
-  - [x] **Plugin startup activation** — managed plugins from `state_dir/plugins` plus explicit `plugins.load.paths`, disabled globally by `plugins.enabled = false`, restart required for activation changes
+  - [x] **Plugin startup activation** — managed plugins from `state_dir/plugins` plus explicit `plugins.load.paths`, disabled globally by `plugins.enabled = false`, restart required for activation changes. Install/update writes are transactional. Shared engine caches compiled components across plugins.
   - [x] **Credential isolation** — plugin ID prefixing
   - [x] **SSRF protection** — private IP/localhost blocking
   - [x] **Config access enforcement** — plugins.<id>.* only
@@ -262,6 +267,7 @@ feature_inventory_markdown: |
   - [x] **File locking** — concurrent-safe operations (flock RAII), including per-session-key creation locks
   - [x] **Retention policies** — age-based cleanup
   - [x] **Scoping** — channel/session scope + reset policy across ingress
+  - [x] **Encryption at rest** — AES-256-GCM session encryption with `.crypto-manifest` recovery metadata, configurable via `sessions.encryption.mode` (`crypto.rs`). No in-place rekey; password change requires fresh encrypted store.
 
   ### Tasks (`src/tasks/`)
 

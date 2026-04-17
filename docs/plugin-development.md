@@ -407,6 +407,10 @@ cara plugins status --port 18789 --name demo-plugin
 
 Important managed-plugin behavior:
 
+- install/update writes are transactional — if the operation fails after
+  staging, the CLI restores the previous artifact state
+- the shared WASM engine caches compiled plugin components across plugins
+  for faster activation
 - artifacts live under `state_dir/plugins`
 - metadata lives in `plugins-manifest.json`
 - install metadata lives under `plugins.entries.<name>`

@@ -39,6 +39,11 @@ $env:CARAPACE_GATEWAY_TOKEN = [System.BitConverter]::ToString($bytes).Replace('-
       "token": "${CARAPACE_GATEWAY_TOKEN}"
     }
   },
+  "agents": {
+    "defaults": {
+      "model": "anthropic:claude-sonnet-4-6"
+    }
+  },
   "anthropic": {
     "apiKey": "${ANTHROPIC_API_KEY}"
   },

@@ -16,6 +16,7 @@ and troubleshooting paths.
 - [CLI Tasks Index](cli-tasks.md)
 - [First Run](first-run.md)
 - [cara CLI Guide](../cli.md) — includes `cara plugins status|bins|install|update`
+- [Migrate from another tool](../cli.md#cara-import) — `cara import openclaw|opencode|aider|nemoclaw`
 - [Trigger Cara from other apps](../cookbook/hooks-safe-automation.md)
 
 ## Full command reference

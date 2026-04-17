@@ -102,17 +102,20 @@ of truth.
 
 ## Roadmap
 
-- [Roadmap](docs/roadmap.md) — what we're building now, next, and later
-- Up next: Anthropic subscription onboarding, guided Bedrock/Vertex onboarding,
-  provider migration/import paths, and advanced Control UI flows
-- Recently shipped: first stable release, long-running assistant MVP (durable
-  queue + autonomy verify), cross-platform subprocess sandboxing, guided setup
-  (`cara setup`), first-run verifier (`cara verify`), Gemini onboarding
-  (Google sign-in or API key via CLI and Control UI), Codex onboarding
-  (OpenAI subscription login via CLI and Control UI), Vertex AI provider
-  support, per-channel activity features with Signal typing indicators and
-  append-time read receipts, and guarded filesystem tools for explicit
-  workspace roots
+Active and planned work is tracked on
+[GitHub Issues](https://github.com/puremachinery/carapace/issues).
+The [feature inventory](docs/feature-status.yaml) is the source of truth for
+what currently ships.
+
+Recently shipped: long-running assistant MVP (durable queue + autonomy
+verify), cross-platform subprocess sandboxing, guided setup
+(`cara setup`), first-run verifier (`cara verify`), Gemini onboarding
+(Google sign-in or API key via CLI and Control UI), Codex onboarding
+(OpenAI subscription login via CLI and Control UI), Vertex AI provider
+support, per-channel activity features with Signal typing indicators and
+append-time read receipts, guarded filesystem tools for explicit workspace
+roots, named execution routes, session encryption at rest, and configuration
+migration from OpenClaw/OpenCode/Aider/NemoClaw.
 
 ## Docs
 
@@ -126,7 +129,6 @@ of truth.
 - [Channel setup](docs/channels.md) — Signal, Telegram, Discord, Slack, webhooks
 - [Channel smoke validation](docs/channel-smoke.md) — live checks and evidence capture
 - [Cookbook](docs/cookbook/README.md) — outcome-first walkthroughs
-- [Roadmap](docs/roadmap.md) — near-term and longer-term priorities
 - [Release & upgrade policy](docs/release.md) — compatibility, migration, rollback, release checklist
 - [CLI guide](docs/cli.md) — subcommands, flags, and device identity
 - [Documentation index](docs/README.md) — architecture/protocol/security references

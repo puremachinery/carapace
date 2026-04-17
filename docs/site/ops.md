@@ -82,6 +82,15 @@ Create a backup before major config/channel changes:
 cara backup --output ./carapace-backup.tar.gz
 ```
 
+If session encryption is enabled, the backup includes `.crypto-manifest`
+files. These are required to decrypt encrypted session artifacts — the
+config password alone is not sufficient without the manifest. Keep backups
+in a secure location.
+
+If you need to change `CARAPACE_CONFIG_PASSWORD` after encrypted sessions
+exist, there is no in-place rekey. Export or delete existing encrypted
+sessions and start a fresh encrypted store with the new password.
+
 Restore from backup:
 
 ```bash

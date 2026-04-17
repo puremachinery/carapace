@@ -30,7 +30,7 @@ graph TB
         end
 
         subgraph "State Management"
-            Sessions[Session Store<br/>JSONL history, archiving]
+            Sessions[Session Store<br/>JSONL history, archiving,<br/>encryption at rest]
             Nodes[Node Registry<br/>pairing, tokens]
             Devices[Device Registry<br/>pairing, tokens]
             Cron[Cron Scheduler<br/>scheduled jobs]
@@ -44,7 +44,7 @@ graph TB
         end
 
         subgraph "Extensions"
-            Plugins[Plugin Runtime<br/>WASM/wasmtime]
+            Plugins[Plugin Runtime<br/>WASM/wasmtime,<br/>shared cached engine]
             PluginDispatch[Plugin Dispatch<br/>tools, webhooks, hooks]
         end
 
@@ -230,7 +230,8 @@ sequenceDiagram
 | Tool Registry | `src/plugins/tools.rs` | Registers built-in tools plus config-gated filesystem tools at startup |
 | Filesystem Tools | `src/agent/filesystem_tools.rs` | Root-scoped file read/search/stat/list plus opt-in write/move with path validation and exclude enforcement |
 | Channels | `src/channels/mod.rs` | Channel registry, status tracking |
-| Sessions | `src/sessions/store.rs` | Session CRUD, JSONL history, compaction, archiving |
+| Routes | `src/config/routes.rs` | Named execution routes, route resolution for agents/defaults |
+| Sessions | `src/sessions/store.rs` | Session CRUD, JSONL history, compaction, archiving, encryption at rest |
 | Nodes | `src/nodes/mod.rs` | Node pairing state machine |
 | Devices | `src/devices/mod.rs` | Device pairing state machine |
 | Cron | `src/cron/mod.rs` | Scheduled job management, run history |
@@ -246,6 +247,8 @@ sequenceDiagram
 | Messages | `src/messages/outbound.rs` | Outbound message queue |
 | Media | `src/media/` | Media fetch, store, pipeline |
 | Credentials | `src/credentials/mod.rs` | Encrypted credential storage |
+| Claude CLI Provider | `src/agent/claude_cli.rs` | Local Claude CLI-backed provider |
+| Vertex Third-Party | `src/agent/vertex.rs` | Vertex AI including Anthropic/Meta/Mistral/Nvidia via streamRawPredict |
 | Venice Provider | `src/agent/venice.rs` | Venice AI provider (OpenAI-compatible composition) |
 | Classifier | `src/agent/classifier.rs` | Inbound message classifier (prompt injection, social engineering) |
 | Logging | `src/logging/mod.rs` | tracing setup, ring buffer, log tail streaming |

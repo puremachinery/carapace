@@ -73,6 +73,11 @@ docker run -d -p 8080:8080 -v $HOME/.local/share/signal-api:/home/.local/share/s
 
 For non-loopback Signal deployments, set `signal.baseUrl` to `https://...`.
 Carapace rejects non-HTTPS non-loopback Signal URLs.
+
+When the sender has phone-number privacy enabled, Signal delivers a
+`sourceUuid` instead of a `sourceNumber`. Carapace falls back to the UUID
+as the sender identifier in that case.
+
 When `channels.signal.features.typing.enabled` is true, Carapace refreshes the
 Signal typing indicator while the assistant is generating a reply and clears it
 before outbound delivery.

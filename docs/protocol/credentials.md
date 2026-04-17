@@ -43,6 +43,13 @@ Examples:
 Values are stored as JSON strings so we can evolve schemas without changing the
 secret store interface.
 
+### Encryption envelope
+
+New secret writes use the `enc:v2` envelope backed by Argon2id key
+derivation. Legacy `enc:v1` (PBKDF2) material remains readable for
+backward compatibility. The versioned auth-profile store includes an
+envelope version tag so the runtime can decode both formats transparently.
+
 ### Data payloads
 
 Minimum JSON schema per secret type:

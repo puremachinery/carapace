@@ -11,12 +11,13 @@ If you are new to Carapace, start with:
 - [Use Cara with VS Code, JetBrains, chat UIs, and scripts](openai-compatible-endpoint.md)
 - [Add Carapace to Discord](discord-assistant.md)
 - [Add Carapace to Telegram](telegram-webhook-assistant.md)
+- [Add Carapace to Signal](signal-assistant.md)
+- [Route requests to different models](named-routes-multi-model.md)
 - [Trigger Cara from other apps](hooks-safe-automation.md)
 
 ### Planned
 
 - Add Carapace to Slack
-- Add Carapace to Signal
 - Run Cara fully local with Ollama
 - Secure remote access with Tailscale
 - Move Cara to a new machine (backup + restore)

@@ -124,6 +124,7 @@ For a plain-English guide to the most commonly tuned sections, see
 - `canvasHost` – canvas host server settings
 - `talk` – TTS/voice settings
 - `gateway` – service settings
+- `routes` – named execution routes (`routes.<name>.model`)
 - `plugins` – plugin load/allowlist/config
 - `filesystem` – root-scoped filesystem tool registration and limits
 - `anthropic` – Anthropic provider settings (apiKey, authProfile, baseUrl)
@@ -190,6 +191,7 @@ This is a condensed map; refer to the JSON schema for full detail.
 - `sessions`
   - `retention.enabled`, `retention.days`, `retention.intervalHours`
   - `integrity.enabled` (default `true`), `integrity.action` (`warn` | `reject`, default `warn`)
+  - `encryption.mode` (`off` | `if_password` | `required`) – session encryption at rest with `.crypto-manifest` recovery metadata; no in-place rekey
   - Legacy: `sessions.retentionDays`, `session.retention.*`
 - `logging`
   - `level`, `format`, `consoleStyle`, `redactSensitive`

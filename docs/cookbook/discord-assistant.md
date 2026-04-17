@@ -39,6 +39,11 @@ $env:CARAPACE_GATEWAY_TOKEN = [System.BitConverter]::ToString($bytes).Replace('-
       "token": "${CARAPACE_GATEWAY_TOKEN}"
     }
   },
+  "agents": {
+    "defaults": {
+      "model": "anthropic:claude-sonnet-4-6"
+    }
+  },
   "anthropic": {
     "apiKey": "${ANTHROPIC_API_KEY}"
   },
@@ -50,9 +55,14 @@ $env:CARAPACE_GATEWAY_TOKEN = [System.BitConverter]::ToString($bytes).Replace('-
 }
 ```
 
-If using OpenAI, swap the provider block:
+If using OpenAI, swap the provider block and model:
 
 ```json5
+"agents": {
+  "defaults": {
+    "model": "openai:gpt-5.4"
+  }
+},
 "openai": {
   "apiKey": "${OPENAI_API_KEY}"
 }

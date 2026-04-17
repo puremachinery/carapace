@@ -59,7 +59,7 @@ graph TB
     subgraph "Agent Pipeline"
         PromptGuard["Prompt Guard<br/>(pre-flight injection scan,<br/>untrusted content tagging)"]
         Classifier["Inbound Classifier<br/>(LLM-based attack detection,<br/>off/warn/block modes)"]
-        LLM["LLM Provider<br/>(Anthropic, OpenAI, Ollama,<br/>Gemini, Bedrock, Venice)"]
+        LLM["LLM Provider<br/>(Anthropic, OpenAI, Ollama,<br/>Gemini, Bedrock, Venice, Claude CLI)"]
         ToolDispatch["Tool Dispatch<br/>(allowlist + deny-list policy)"]
         ExecApproval["Exec Approval<br/>(user consent gate)"]
         Sandbox["OS Sandbox<br/>(Seatbelt / Landlock / rlimits)"]

@@ -49,6 +49,11 @@ Create `carapace.json5`:
       "path": "/hooks"
     }
   },
+  "agents": {
+    "defaults": {
+      "model": "anthropic:claude-sonnet-4-6"
+    }
+  },
   "anthropic": {
     "apiKey": "${ANTHROPIC_API_KEY}"
   }
