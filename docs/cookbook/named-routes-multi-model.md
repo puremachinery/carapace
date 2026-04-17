@@ -75,7 +75,7 @@ In another terminal:
 
 ```bash
 cara status --port 18789
-cara chat
+cara chat --port 18789
 ```
 
 ## 3) Verify

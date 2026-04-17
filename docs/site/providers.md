@@ -120,6 +120,13 @@ vertex:publishers/mistral/models/mistral-large-2411
 vertex:publishers/nvidia/models/llama-3.1-nemotron-70b-instruct
 ```
 
+Vertex AI accepts both short aliases (e.g. `claude-sonnet-4-6`) and
+dated snapshot IDs (e.g. `claude-sonnet-4-20250514`) for Anthropic
+publisher models. Use the aliased form to follow the latest snapshot,
+or pin to a dated ID when you need a specific stable snapshot. Check
+the [Vertex AI Model Garden](https://console.cloud.google.com/vertex-ai/model-garden)
+for the currently published model IDs per publisher.
+
 ### Gemini / Bedrock / Venice
 
 These providers are supported directly by the setup wizard now. If multiple
