@@ -22,6 +22,26 @@ on:
       - "scripts/check-pages-links.sh"
       - "scripts/check-docs-state-messaging.sh"
       - ".github/workflows/pages.yml"
+  pull_request:
+    paths:
+      - "website/**"
+      - "docs/cookbook/**"
+      - "docs/getting-started.md"
+      - "docs/plugin-development.md"
+      - "docs/release.md"
+      - "docs/cli.md"
+      - "docs/channels.md"
+      - "docs/channel-smoke.md"
+      - "docs/security.md"
+      - "docs/security-comparison.md"
+      - "docs/feature-status.yaml"
+      - "docs/feature-evidence.yaml"
+      - "docs/site/**"
+      - "SECURITY.md"
+      - "scripts/build-pages-content.sh"
+      - "scripts/check-pages-links.sh"
+      - "scripts/check-docs-state-messaging.sh"
+      - ".github/workflows/pages.yml"
   workflow_dispatch:
 
 permissions:
@@ -29,8 +49,10 @@ permissions:
   pages: write
   id-token: write
 
+# Scope concurrency by ref so PR validation runs don't cancel an in-flight
+# master deploy (and vice versa).
 concurrency:
-  group: pages
+  group: pages-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -60,13 +82,19 @@ jobs:
       - name: Validate generated internal links
         run: ./scripts/check-pages-links.sh public
 
-      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+      # Artifact upload + deploy only run on push to master; PRs stop after
+      # validation. upload-pages-artifact also requires pages/id-token scope
+      # that is not granted to pull_request events from forks.
+      - if: github.event_name == 'push'
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
 
-      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+      - if: github.event_name == 'push'
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: public
 
   deploy:
+    if: github.event_name == 'push'
     name: Deploy Pages
     needs: build
     runs-on: ubuntu-latest
