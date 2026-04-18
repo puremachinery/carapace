@@ -45,10 +45,32 @@ rewrite_links() {
   local body="$1"
   local kind="$2"
 
+  # Absolute-URL redirects for out-of-site references are depth-agnostic and
+  # must run before the cookbook pre-pass below so the broad `../X.md` rule
+  # does not accidentally rewrite them to a relative HTML path.
   body="$(printf '%s' "$body" | sed -E \
     -e 's|href="\.\./CONTRIBUTING\.md"|href="https://github.com/puremachinery/carapace/blob/main/CONTRIBUTING.md"|g' \
     -e 's|href="\.\./architecture\.md(#[-A-Za-z0-9._/]*)?"|href="https://github.com/puremachinery/carapace/blob/main/docs/architecture.md\1"|g' \
     -e 's|href="\.\./protocol/([^":#]+)\.md(#[-A-Za-z0-9._/]*)?"|href="https://github.com/puremachinery/carapace/blob/main/docs/protocol/\1.md\2"|g' \
+    -e 's|href="protocol/([^":#]+)\.md"|href="https://github.com/puremachinery/carapace/blob/main/docs/protocol/\1.md"|g')"
+
+  # Cookbook pages publish one level deeper (public/cookbook/*.html), so every
+  # `../X.md` reference to a sibling top-level doc must keep the `../` prefix
+  # rather than being stripped by the generic rewrites below. Handle slug
+  # renames (security.md -> security-model.html, SECURITY.md -> security-policy.html)
+  # explicitly before the catch-all. The `../feature-*.yaml` rules mirror the
+  # docs-kind rules but preserve `../` for depth.
+  if [[ "$kind" == "cookbook" ]]; then
+    body="$(printf '%s' "$body" | sed -E \
+      -e 's|href="\.\./security\.md(#[-A-Za-z0-9._/]*)?"|href="../security-model.html\1"|g' \
+      -e 's|href="\.\./\.\./SECURITY\.md(#[-A-Za-z0-9._/]*)?"|href="../security-policy.html\1"|g' \
+      -e 's|href="\.\./SECURITY\.md(#[-A-Za-z0-9._/]*)?"|href="../security-policy.html\1"|g' \
+      -e 's|href="\.\./([A-Za-z0-9._-]+)\.md(#[-A-Za-z0-9._/]*)?"|href="../\1.html\2"|g' \
+      -e 's|href="\.\./feature-status\.yaml"|href="../feature-status.yaml"|g' \
+      -e 's|href="\.\./feature-evidence\.yaml"|href="../feature-evidence.yaml"|g')"
+  fi
+
+  body="$(printf '%s' "$body" | sed -E \
     -e 's|href="\.\./release\.md"|href="release.html"|g' \
     -e 's|href="\.\./cli\.md"|href="cli.html"|g' \
     -e 's|href="\.\./feature-status\.yaml"|href="feature-status.yaml"|g' \
@@ -62,7 +84,6 @@ rewrite_links() {
     -e 's|href="\.\./SECURITY\.md"|href="security-policy.html"|g' \
     -e 's|href="\.\./([A-Za-z0-9._-]+)\.md(#[-A-Za-z0-9._/]*)?"|href="\1.html\2"|g' \
     -e 's|href="docs/security\.md"|href="security-model.html"|g' \
-    -e 's|href="protocol/([^":#]+)\.md"|href="https://github.com/puremachinery/carapace/blob/main/docs/protocol/\1.md"|g' \
     -e 's|href="cookbook/README\.md"|href="cookbook/"|g' \
     -e 's|href="cookbook/([^":#]+)\.md(#[-A-Za-z0-9._/]*)?"|href="cookbook/\1.html\2"|g' \
     -e 's|href="\.\./cookbook/README\.md"|href="cookbook/"|g' \
