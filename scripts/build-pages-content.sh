@@ -52,7 +52,7 @@ rewrite_links() {
     -e 's|href="\.\./CONTRIBUTING\.md"|href="https://github.com/puremachinery/carapace/blob/main/CONTRIBUTING.md"|g' \
     -e 's|href="\.\./architecture\.md(#[-A-Za-z0-9._/]*)?"|href="https://github.com/puremachinery/carapace/blob/main/docs/architecture.md\1"|g' \
     -e 's|href="\.\./protocol/([^":#]+)\.md(#[-A-Za-z0-9._/]*)?"|href="https://github.com/puremachinery/carapace/blob/main/docs/protocol/\1.md\2"|g' \
-    -e 's|href="protocol/([^":#]+)\.md"|href="https://github.com/puremachinery/carapace/blob/main/docs/protocol/\1.md"|g')"
+    -e 's|href="protocol/([^":#]+)\.md(#[-A-Za-z0-9._/]*)?"|href="https://github.com/puremachinery/carapace/blob/main/docs/protocol/\1.md\2"|g')"
 
   # Cookbook pages publish one level deeper (public/cookbook/*.html), so every
   # `../X.md` reference to a sibling top-level doc must keep the `../` prefix
@@ -68,21 +68,23 @@ rewrite_links() {
       -e 's|href="\.\./([A-Za-z0-9._-]+)\.md(#[-A-Za-z0-9._/]*)?"|href="../\1.html\2"|g' \
       -e 's|href="\.\./feature-status\.yaml"|href="../feature-status.yaml"|g' \
       -e 's|href="\.\./feature-evidence\.yaml"|href="../feature-evidence.yaml"|g')"
+  else
+    body="$(printf '%s' "$body" | sed -E \
+      -e 's|href="\.\./release\.md"|href="release.html"|g' \
+      -e 's|href="\.\./cli\.md"|href="cli.html"|g' \
+      -e 's|href="\.\./feature-status\.yaml"|href="feature-status.yaml"|g' \
+      -e 's|href="\.\./feature-evidence\.yaml"|href="feature-evidence.yaml"|g' \
+      -e 's|href="\.\./channel-smoke\.md"|href="channel-smoke.html"|g' \
+      -e 's|href="\.\./channels\.md"|href="channels.html"|g' \
+      -e 's|href="\.\./getting-started\.md"|href="getting-started.html"|g' \
+      -e 's|href="\.\./security\.md(#[-A-Za-z0-9._/]*)?"|href="security-model.html\1"|g' \
+      -e 's|href="\.\./security-comparison\.md(#[-A-Za-z0-9._/]*)?"|href="security-comparison.html\1"|g' \
+      -e 's|href="\.\./\.\./SECURITY\.md(#[-A-Za-z0-9._/]*)?"|href="security-policy.html\1"|g' \
+      -e 's|href="\.\./SECURITY\.md(#[-A-Za-z0-9._/]*)?"|href="security-policy.html\1"|g' \
+      -e 's|href="\.\./([A-Za-z0-9._-]+)\.md(#[-A-Za-z0-9._/]*)?"|href="\1.html\2"|g')"
   fi
 
   body="$(printf '%s' "$body" | sed -E \
-    -e 's|href="\.\./release\.md"|href="release.html"|g' \
-    -e 's|href="\.\./cli\.md"|href="cli.html"|g' \
-    -e 's|href="\.\./feature-status\.yaml"|href="feature-status.yaml"|g' \
-    -e 's|href="\.\./feature-evidence\.yaml"|href="feature-evidence.yaml"|g' \
-    -e 's|href="\.\./channel-smoke\.md"|href="channel-smoke.html"|g' \
-    -e 's|href="\.\./channels\.md"|href="channels.html"|g' \
-    -e 's|href="\.\./getting-started\.md"|href="getting-started.html"|g' \
-    -e 's|href="\.\./security\.md"|href="security-model.html"|g' \
-    -e 's|href="\.\./security-comparison\.md"|href="security-comparison.html"|g' \
-    -e 's|href="\.\./\.\./SECURITY\.md"|href="security-policy.html"|g' \
-    -e 's|href="\.\./SECURITY\.md"|href="security-policy.html"|g' \
-    -e 's|href="\.\./([A-Za-z0-9._-]+)\.md(#[-A-Za-z0-9._/]*)?"|href="\1.html\2"|g' \
     -e 's|href="docs/security\.md"|href="security-model.html"|g' \
     -e 's|href="cookbook/README\.md"|href="cookbook/"|g' \
     -e 's|href="cookbook/([^":#]+)\.md(#[-A-Za-z0-9._/]*)?"|href="cookbook/\1.html\2"|g' \
