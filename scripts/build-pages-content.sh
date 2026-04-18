@@ -45,6 +45,15 @@ rewrite_links() {
   local body="$1"
   local kind="$2"
 
+  # Cookbook pages publish one level deeper (public/cookbook/*.html), so
+  # `../channels.md` / `../channel-smoke.md` references must keep the `../`
+  # prefix instead of being stripped by the generic rewrites below.
+  if [[ "$kind" == "cookbook" ]]; then
+    body="$(printf '%s' "$body" | sed -E \
+      -e 's|href="\.\./channel-smoke\.md(#[-A-Za-z0-9._/]*)?"|href="../channel-smoke.html\1"|g' \
+      -e 's|href="\.\./channels\.md(#[-A-Za-z0-9._/]*)?"|href="../channels.html\1"|g')"
+  fi
+
   body="$(printf '%s' "$body" | sed -E \
     -e 's|href="\.\./CONTRIBUTING\.md"|href="https://github.com/puremachinery/carapace/blob/main/CONTRIBUTING.md"|g' \
     -e 's|href="\.\./architecture\.md(#[-A-Za-z0-9._/]*)?"|href="https://github.com/puremachinery/carapace/blob/main/docs/architecture.md\1"|g' \
