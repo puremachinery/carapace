@@ -22,20 +22,42 @@ on:
       - "scripts/check-pages-links.sh"
       - "scripts/check-docs-state-messaging.sh"
       - ".github/workflows/pages.yml"
+  pull_request:
+    paths:
+      - "website/**"
+      - "docs/cookbook/**"
+      - "docs/getting-started.md"
+      - "docs/plugin-development.md"
+      - "docs/release.md"
+      - "docs/cli.md"
+      - "docs/channels.md"
+      - "docs/channel-smoke.md"
+      - "docs/security.md"
+      - "docs/security-comparison.md"
+      - "docs/feature-status.yaml"
+      - "docs/feature-evidence.yaml"
+      - "docs/site/**"
+      - "SECURITY.md"
+      - "scripts/build-pages-content.sh"
+      - "scripts/check-pages-links.sh"
+      - "scripts/check-docs-state-messaging.sh"
+      - ".github/workflows/pages.yml"
   workflow_dispatch:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
+# Scope concurrency by ref so PR validation runs don't cancel an in-flight
+# master deploy (and vice versa).
 concurrency:
-  group: pages
+  group: pages-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  build:
-    name: Build Pages artifact
+  validate:
+    name: Validate Pages content
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -60,6 +82,32 @@ jobs:
       - name: Validate generated internal links
         run: ./scripts/check-pages-links.sh public
 
+  package:
+    if: github.event_name == 'push'
+    name: Package Pages artifact
+    needs: validate
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Prepare site
+        run: |
+          rm -rf public
+          mkdir -p public
+          cp -R website/. public/
+
+      - name: Install Pandoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pandoc
+
+      - name: Render website docs pages from Markdown
+        run: ./scripts/build-pages-content.sh public
+
       - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
 
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
@@ -67,8 +115,15 @@ jobs:
           path: public
 
   deploy:
+    if: github.event_name == 'push'
     name: Deploy Pages
-    needs: build
+    needs: package
+    permissions:
+      pages: write
+      id-token: write
+    concurrency:
+      group: pages-deploy
+      cancel-in-progress: true
     runs-on: ubuntu-latest
     environment:
       name: github-pages

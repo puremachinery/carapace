@@ -83,23 +83,6 @@ If you want Cara to inspect one local project directory, enable the
 `filesystem` block for a single workspace root and start with the
 [guarded local project assistant recipe](docs/cookbook/guarded-local-project-assistant.md).
 
-## Status
-
-Carapace ships a stable release line. Core paths are tested and verified for
-routine use, while partial and in-progress areas remain explicitly documented.
-
-- Working now: setup wizard, local chat (`cara chat`), token auth enforcement,
-  health/control endpoints (including durable task controls), control UI
-  frontend foundation (status/channels/redacted config editor), Codex
-  subscription onboarding, per-channel activity config with Signal
-  typing/read-receipt flows, and OpenAI-compatible HTTP endpoints.
-- In progress: advanced Control UI flows (pairing/workflow UX), broader
-  channel smoke evidence, and hardened internet-facing deployment guidance.
-
-See [docs/feature-status.yaml](docs/feature-status.yaml) and
-[docs/feature-evidence.yaml](docs/feature-evidence.yaml) for the current source
-of truth.
-
 ## Roadmap
 
 Active and planned work is tracked on
