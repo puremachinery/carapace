@@ -112,7 +112,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -123,7 +123,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -597,9 +597,9 @@ dependencies = [
 
 [[package]]
 name = "clap"
-version = "4.6.0"
+version = "4.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b193af5b67834b676abd72466a96c1024e6a6ad978a1f484bd90b85c94041351"
+checksum = "1ddb117e43bbf7dacf0a4190fef4d345b9bad68dfc649cb349e7d17d28428e51"
 dependencies = [
  "clap_builder",
  "clap_derive",
@@ -619,9 +619,9 @@ dependencies = [
 
 [[package]]
 name = "clap_derive"
-version = "4.6.0"
+version = "4.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1110bd8a634a1ab8cb04345d8d878267d57c3cf1b38d91b71af6686408bbca6a"
+checksum = "f2ce8604710f6733aa641a2b3731eaa1e8b3d9973d5e3565da11800813f997a9"
 dependencies = [
  "heck",
  "proc-macro2",
@@ -1165,7 +1165,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1284,7 +1284,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1829,7 +1829,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "tokio",
  "tower-service",
  "tracing",
@@ -2306,9 +2306,9 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "mdns-sd"
-version = "0.19.0"
+version = "0.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "451927183d65d600e52b4e877a1251e051576f84fa01e5b4a50b450dfaaa537c"
+checksum = "c2bb8ce26633738d98ffcef71ec58bff967c6675be50229823c2835f6316e67e"
 dependencies = [
  "fastrand",
  "flume",
@@ -2438,7 +2438,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2801,7 +2801,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -2839,7 +2839,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -3215,7 +3215,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3273,7 +3273,7 @@ dependencies = [
  "security-framework 3.7.0",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3570,9 +3570,9 @@ dependencies = [
 
 [[package]]
 name = "sigstore-bundle"
-version = "0.6.4"
+version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e1c326f5796df635de915cc1b2d29485423df10a4997be6103091772f503451"
+checksum = "15ee875bc02244694d5b380ba437349d269cf168bbd84e896437c579317ac6e4"
 dependencies = [
  "base64",
  "hex",
@@ -3588,9 +3588,9 @@ dependencies = [
 
 [[package]]
 name = "sigstore-crypto"
-version = "0.6.4"
+version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6271208173601a0f058f5fb5354561905a7ead9b4185d85a6c2ed97fbdd31338"
+checksum = "c38e3886caf4e1a5a20806c0dc0f5acf33a0bd9c720415ece9e44ddc7a7bf1c1"
 dependencies = [
  "aws-lc-rs",
  "base64",
@@ -3610,9 +3610,9 @@ dependencies = [
 
 [[package]]
 name = "sigstore-merkle"
-version = "0.6.4"
+version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "692e1c1037124c0305e6e342c6a5fa180a31d6ce0eafc0e6c8f001d200083f8d"
+checksum = "eaa2a84ceb4b2a7bd42cff428555b7ac8897ce22b8c74a56558b53ac6ff10af9"
 dependencies = [
  "base64",
  "hex",
@@ -3623,9 +3623,9 @@ dependencies = [
 
 [[package]]
 name = "sigstore-rekor"
-version = "0.6.4"
+version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "21abbf2ab10930dd2eb77cbc4c24b1efa6da89f6f0dce9b28b7c1362e7b80da8"
+checksum = "c012c1a119e2533d236d5d4244fec16e3be1243ce3fa0e0e9130cb6fc5f830c9"
 dependencies = [
  "base64",
  "hex",
@@ -3641,9 +3641,9 @@ dependencies = [
 
 [[package]]
 name = "sigstore-trust-root"
-version = "0.6.4"
+version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "45f9d2f2dc33e04c80cfd5f11c93b64f0a2555b1d7f92b5aa16307266f05ad8c"
+checksum = "6fa1be3a70fdefac1156561f70b44263601dce6ca8ce7022c0c51b142ec0138f"
 dependencies = [
  "base64",
  "chrono",
@@ -3665,9 +3665,9 @@ dependencies = [
 
 [[package]]
 name = "sigstore-tsa"
-version = "0.6.4"
+version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c43c677d430038c216b4f6368efc8cea42f35eca4d20fe5fcf51133d71b3b51b"
+checksum = "2d48313c1591c98f6233882786809069ff8f047271d3ffac48fb34966f61ba4e"
 dependencies = [
  "aws-lc-rs",
  "base64",
@@ -3691,9 +3691,9 @@ dependencies = [
 
 [[package]]
 name = "sigstore-types"
-version = "0.6.4"
+version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47aa6bca8f329e06c7ccb5b9f9be82b165b2be063396be0ee57b13402b994744"
+checksum = "7cb6793ac7a0960807ed731055763f0cdf3ae356c5eccfdb21a44b9671e96d6c"
 dependencies = [
  "base64",
  "chrono",
@@ -3706,9 +3706,9 @@ dependencies = [
 
 [[package]]
 name = "sigstore-verify"
-version = "0.6.4"
+version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d44caf1ea504259cf70c7c16527d8a3fa07bd9374ba4e59ec247e7d13a7f2cb8"
+checksum = "056618bdcc8d8b015f97f49602f95e6adf4ee851eb777d11a01241cdc40f5abe"
 dependencies = [
  "base64",
  "chrono",
@@ -3828,7 +3828,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3953,7 +3953,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4093,9 +4093,9 @@ dependencies = [
 
 [[package]]
 name = "tokio"
-version = "1.52.0"
+version = "1.52.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a91135f59b1cbf38c91e73cf3386fca9bb77915c45ce2771460c9d92f0f3d776"
+checksum = "b67dee974fe86fd92cc45b7a95fdd2f99a36a6d7b0d431a231178d3d670bbcc6"
 dependencies = [
  "bytes",
  "libc",
@@ -4511,9 +4511,9 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "uuid"
-version = "1.23.0"
+version = "1.23.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ac8b6f42ead25368cf5b098aeb3dc8a1a2c05a3eee8a9a1a68c640edbfc79d9"
+checksum = "ddd74a9687298c6858e9b88ec8935ec45d22e8fd5e6394fa1bd4e99a87789c76"
 dependencies = [
  "getrandom 0.4.2",
  "js-sys",
@@ -5147,7 +5147,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
