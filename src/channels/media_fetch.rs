@@ -4,7 +4,7 @@ use std::net::IpAddr;
 use std::time::Duration;
 
 use hickory_resolver::config::ResolverConfig;
-use hickory_resolver::name_server::TokioConnectionProvider;
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::TokioResolver;
 
 use crate::media::fetch::{DEFAULT_FETCH_TIMEOUT_MS, MAX_FETCH_TIMEOUT_MS, MAX_URL_LENGTH};
@@ -125,9 +125,12 @@ fn resolve_and_validate_dns(
     let fut = async move {
         let resolver = TokioResolver::builder_with_config(
             ResolverConfig::default(),
-            TokioConnectionProvider::default(),
+            TokioRuntimeProvider::default(),
         )
-        .build();
+        .build()
+        .map_err(|e| {
+            ResolveDnsError::Retryable(format!("DNS resolver initialization failed: {e}"))
+        })?;
         let lookup = resolver.lookup_ip(&host).await.map_err(|e| {
             ResolveDnsError::Retryable(format!("DNS resolution failed: {host}: {e}"))
         })?;

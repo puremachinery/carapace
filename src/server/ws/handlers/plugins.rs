@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use hickory_resolver::config::ResolverConfig;
-use hickory_resolver::name_server::TokioConnectionProvider;
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::TokioResolver;
 
 #[cfg(unix)]
@@ -352,9 +352,12 @@ fn validate_and_resolve_dns(url: &url::Url) -> Result<(String, u16, Option<IpAdd
         let ip = run_sync_blocking_send(async move {
             let resolver = TokioResolver::builder_with_config(
                 ResolverConfig::default(),
-                TokioConnectionProvider::default(),
+                TokioRuntimeProvider::default(),
             )
-            .build();
+            .build()
+            .map_err(|e| {
+                PluginDnsError::Unavailable(format!("DNS resolver initialization failed: {e}"))
+            })?;
 
             let lookup = resolver.lookup_ip(&host_for_lookup).await.map_err(|e| {
                 PluginDnsError::Unavailable(format!(
