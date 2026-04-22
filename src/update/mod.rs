@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sigstore_trust_root::TrustedRoot;
+use sigstore_trust_root::{TrustedRoot, TufConfig};
 use sigstore_types::{Bundle, Sha256Hash};
 use sigstore_verify::{VerificationPolicy, Verifier, DEFAULT_CLOCK_SKEW_SECONDS};
 use std::fmt;
@@ -15,7 +15,7 @@ use tokio::io::AsyncWriteExt;
 
 #[cfg(test)]
 use sigstore_trust_root::{
-    TufConfig, PRODUCTION_TUF_ROOT, SIGSTORE_PRODUCTION_TRUSTED_ROOT, TRUSTED_ROOT_TARGET,
+    PRODUCTION_TUF_ROOT, SIGSTORE_PRODUCTION_TRUSTED_ROOT, TRUSTED_ROOT_TARGET,
 };
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -846,20 +846,7 @@ async fn verify_parsed_bundle_signature_with_trust_root(
 }
 
 async fn load_sigstore_trust_root() -> Result<TrustedRoot, UpdateError> {
-    TrustedRoot::from_tuf().await.map_err(|err| {
-        UpdateError::retryable(
-            Some(UpdatePhase::Verified),
-            format!("failed to initialize sigstore trust root: {err}"),
-        )
-    })
-}
-
-#[cfg(test)]
-async fn load_sigstore_trust_root_with_config(
-    config: TufConfig,
-    tuf_root: &'static [u8],
-) -> Result<TrustedRoot, UpdateError> {
-    TrustedRoot::from_tuf_with_config(config, tuf_root)
+    TrustedRoot::from_tuf(TufConfig::production())
         .await
         .map_err(|err| {
             UpdateError::retryable(
@@ -870,8 +857,20 @@ async fn load_sigstore_trust_root_with_config(
 }
 
 #[cfg(test)]
+async fn load_sigstore_trust_root_with_config(
+    config: TufConfig,
+) -> Result<TrustedRoot, UpdateError> {
+    TrustedRoot::from_tuf(config).await.map_err(|err| {
+        UpdateError::retryable(
+            Some(UpdatePhase::Verified),
+            format!("failed to initialize sigstore trust root: {err}"),
+        )
+    })
+}
+
+#[cfg(test)]
 fn load_embedded_sigstore_trust_root() -> Result<TrustedRoot, UpdateError> {
-    TrustedRoot::production().map_err(|err| {
+    TrustedRoot::from_json(SIGSTORE_PRODUCTION_TRUSTED_ROOT).map_err(|err| {
         UpdateError::retryable(
             Some(UpdatePhase::Verified),
             format!("failed to initialize sigstore trust root: {err}"),
@@ -1954,7 +1953,7 @@ mod tests {
     #[tokio::test]
     async fn test_load_sigstore_trust_root_offline_tuf_cache_matches_embedded_production() {
         let dir = tempfile::tempdir().unwrap();
-        let targets_dir = dir.path().join("targets");
+        let targets_dir = dir.path().join("sigstore-rust");
         std::fs::create_dir_all(&targets_dir).unwrap();
         std::fs::write(
             targets_dir.join(TRUSTED_ROOT_TARGET),
@@ -1966,7 +1965,6 @@ mod tests {
             TufConfig::production()
                 .with_cache_dir(dir.path().to_path_buf())
                 .offline(),
-            PRODUCTION_TUF_ROOT,
         )
         .await
         .expect("offline TUF loader should read cached trusted root");
@@ -1979,16 +1977,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_load_sigstore_trust_root_offline_failure_is_retryable() {
+    async fn test_load_sigstore_trust_root_offline_production_falls_back_to_embedded() {
         let dir = tempfile::tempdir().unwrap();
-        let err = load_sigstore_trust_root_with_config(
+        let root = load_sigstore_trust_root_with_config(
             TufConfig::production()
                 .with_cache_dir(dir.path().to_path_buf())
                 .offline(),
-            PRODUCTION_TUF_ROOT,
         )
         .await
-        .expect_err("missing offline TUF cache should fail");
+        .expect("offline production loader should fall back to embedded trusted root");
+        let embedded = load_embedded_sigstore_trust_root().unwrap();
+
+        assert_eq!(
+            serde_json::to_value(&root).unwrap(),
+            serde_json::to_value(&embedded).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_load_sigstore_trust_root_offline_custom_missing_cache_failure_is_retryable() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = load_sigstore_trust_root_with_config(
+            TufConfig::custom("https://example.invalid/sigstore-tuf/", PRODUCTION_TUF_ROOT)
+                .with_cache_dir(dir.path().to_path_buf())
+                .offline(),
+        )
+        .await
+        .expect_err("custom offline TUF loader should fail without cached target");
 
         assert!(err.retryable);
         assert_eq!(err.phase, Some(UpdatePhase::Verified));
@@ -2000,7 +2015,7 @@ mod tests {
     #[tokio::test]
     async fn test_verify_bundle_signature_accepts_v070_sha256sums_bundle_with_offline_tuf_root() {
         let dir = tempfile::tempdir().unwrap();
-        let targets_dir = dir.path().join("targets");
+        let targets_dir = dir.path().join("sigstore-rust");
         std::fs::create_dir_all(&targets_dir).unwrap();
         std::fs::write(
             targets_dir.join(TRUSTED_ROOT_TARGET),
@@ -2012,7 +2027,6 @@ mod tests {
             TufConfig::production()
                 .with_cache_dir(dir.path().to_path_buf())
                 .offline(),
-            PRODUCTION_TUF_ROOT,
         )
         .await
         .expect("offline TUF loader should read cached trusted root");
