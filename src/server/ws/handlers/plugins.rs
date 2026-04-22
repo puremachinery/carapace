@@ -8,8 +8,6 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use hickory_resolver::config::ResolverConfig;
-use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::TokioResolver;
 
 #[cfg(unix)]
@@ -350,14 +348,11 @@ fn validate_and_resolve_dns(url: &url::Url) -> Result<(String, u16, Option<IpAdd
         // Host is a hostname -- resolve DNS and validate every returned IP.
         let host_for_lookup = host.clone();
         let ip = run_sync_blocking_send(async move {
-            let resolver = TokioResolver::builder_with_config(
-                ResolverConfig::default(),
-                TokioRuntimeProvider::default(),
-            )
-            .build()
-            .map_err(|e| {
-                PluginDnsError::Unavailable(format!("DNS resolver initialization failed: {e}"))
-            })?;
+            let resolver = TokioResolver::builder_tokio()
+                .and_then(|builder| builder.build())
+                .map_err(|e| {
+                    PluginDnsError::Unavailable(format!("DNS resolver initialization failed: {e}"))
+                })?;
 
             let lookup = resolver.lookup_ip(&host_for_lookup).await.map_err(|e| {
                 PluginDnsError::Unavailable(format!(

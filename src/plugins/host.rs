@@ -8,8 +8,6 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hickory_resolver::config::ResolverConfig;
-use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::TokioResolver;
 use parking_lot::RwLock;
 use reqwest::Client;
@@ -96,6 +94,9 @@ pub enum HostError {
 
     #[error("HTTP error: {0}")]
     Http(String),
+
+    #[error("DNS error: {0}")]
+    DnsResolution(String),
 
     #[error("Media fetch error: {0}")]
     MediaFetch(String),
@@ -534,18 +535,16 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
     /// returns a public IP but later returns a private IP.
     async fn resolve_and_validate_dns(&self, host: &str) -> Result<IpAddr, HostError> {
         // Create a resolver
-        let resolver = TokioResolver::builder_with_config(
-            ResolverConfig::default(),
-            TokioRuntimeProvider::default(),
-        )
-        .build()
-        .map_err(|e| HostError::Http(format!("DNS resolver initialization failed: {e}")))?;
+        let resolver = TokioResolver::builder_tokio()
+            .and_then(|builder| builder.build())
+            .map_err(|e| {
+                HostError::DnsResolution(format!("resolver initialization failed: {e}"))
+            })?;
 
         // Resolve the hostname
-        let lookup = resolver
-            .lookup_ip(host)
-            .await
-            .map_err(|e| HostError::Http(format!("DNS resolution failed for {}: {}", host, e)))?;
+        let lookup = resolver.lookup_ip(host).await.map_err(|e| {
+            HostError::DnsResolution(format!("resolution failed for {}: {}", host, e))
+        })?;
 
         // Collect IPs and validate each one
         let mut validated_ip: Option<IpAddr> = None;
@@ -558,7 +557,7 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
 
         // Ensure at least one IP was resolved and validated
         validated_ip.ok_or_else(|| {
-            HostError::Http(format!("DNS resolution returned no addresses for {}", host))
+            HostError::DnsResolution(format!("resolution returned no addresses for {}", host))
         })
     }
 
@@ -662,7 +661,9 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
             }
             Err(e) => {
                 return Err(match e {
-                    HostError::Http(msg) => HostError::MediaFetch(msg),
+                    HostError::Http(msg) | HostError::DnsResolution(msg) => {
+                        HostError::MediaFetch(msg)
+                    }
                     other => other,
                 });
             }
@@ -721,7 +722,9 @@ impl<B: CredentialBackend + 'static> PluginHostContext<B> {
                 .resolve_and_validate_dns(&host)
                 .await
                 .map_err(|e| match e {
-                    HostError::Http(msg) => HostError::MediaFetch(msg),
+                    HostError::Http(msg) | HostError::DnsResolution(msg) => {
+                        HostError::MediaFetch(msg)
+                    }
                     other => other,
                 })?;
             let socket_addr = std::net::SocketAddr::new(validated_ip, port);

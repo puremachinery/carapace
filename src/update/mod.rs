@@ -1953,7 +1953,7 @@ mod tests {
     #[tokio::test]
     async fn test_load_sigstore_trust_root_offline_tuf_cache_matches_embedded_production() {
         let dir = tempfile::tempdir().unwrap();
-        let targets_dir = dir.path().join("targets");
+        let targets_dir = dir.path().join("sigstore-rust");
         std::fs::create_dir_all(&targets_dir).unwrap();
         std::fs::write(
             targets_dir.join(TRUSTED_ROOT_TARGET),
@@ -2015,7 +2015,7 @@ mod tests {
     #[tokio::test]
     async fn test_verify_bundle_signature_accepts_v070_sha256sums_bundle_with_offline_tuf_root() {
         let dir = tempfile::tempdir().unwrap();
-        let targets_dir = dir.path().join("targets");
+        let targets_dir = dir.path().join("sigstore-rust");
         std::fs::create_dir_all(&targets_dir).unwrap();
         std::fs::write(
             targets_dir.join(TRUSTED_ROOT_TARGET),
