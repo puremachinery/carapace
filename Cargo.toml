@@ -82,7 +82,7 @@ tokio-test = "0.4"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 wit-component = { version = "0.246.2", features = ["dummy-module"] }
-wit-parser = "0.246.2"
+wit-parser = "0.247.0"
 
 [features]
 gateway = []
