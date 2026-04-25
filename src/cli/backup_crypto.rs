@@ -223,7 +223,7 @@ mod tests {
         iterations: u32,
     ) -> [u8; KEY_LEN] {
         let mut key = [0u8; KEY_LEN];
-        pbkdf2::pbkdf2_hmac::<sha2_10::Sha256>(passphrase, salt, iterations, &mut key);
+        pbkdf2::pbkdf2_hmac::<sha2::Sha256>(passphrase, salt, iterations, &mut key);
         key
     }
 

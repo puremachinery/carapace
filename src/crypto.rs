@@ -5,7 +5,7 @@ use std::sync::{LazyLock, Mutex};
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use pbkdf2::pbkdf2_hmac;
-use sha2_10::Sha256;
+use sha2::Sha256;
 use thiserror::Error;
 
 /// Standard derived-key length for password-based encryption.
@@ -92,7 +92,7 @@ pub(crate) fn derive_key_argon2id(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sha2_10::Digest;
+    use sha2::Digest;
 
     #[test]
     fn test_derive_key_pbkdf2_sha256_rejects_short_salt() {
