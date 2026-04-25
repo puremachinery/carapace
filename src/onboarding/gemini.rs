@@ -597,6 +597,8 @@ mod tests {
         let mut env_guard = ScopedEnv::new();
         env_guard.set("CARAPACE_CONFIG_PASSWORD", "test-config-password");
         let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("carapace.json");
+        env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
         let mut config = json!({});
         let provider_config = OAuthProvider::Google
             .default_config(
