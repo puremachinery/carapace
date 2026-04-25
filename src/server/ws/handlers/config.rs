@@ -3,11 +3,15 @@
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::super::*;
+
+static CONFIG_WRITE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Serialize)]
 pub(crate) struct ConfigIssue {
@@ -168,7 +172,7 @@ pub(crate) fn persist_config_file(path: &PathBuf, config_value: &Value) -> Resul
     config::seal_config_secrets(&mut config_value)?;
     let content = serde_json::to_string_pretty(&config_value)
         .map_err(|err| format!("failed to serialize config: {}", err))?;
-    let tmp_path = path.with_extension("json.tmp");
+    let tmp_path = config_write_temp_path(path);
     {
         let mut file = fs::File::create(&tmp_path)
             .map_err(|err| format!("failed to write config: {}", err))?;
@@ -179,10 +183,23 @@ pub(crate) fn persist_config_file(path: &PathBuf, config_value: &Value) -> Resul
         file.sync_all()
             .map_err(|err| format!("failed to sync config: {}", err))?;
     }
-    fs::rename(&tmp_path, path).map_err(|err| format!("failed to replace config: {}", err))?;
+    if let Err(err) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(format!("failed to replace config: {}", err));
+    }
 
     config::clear_cache();
     Ok(())
+}
+
+fn config_write_temp_path(path: &Path) -> PathBuf {
+    let counter = CONFIG_WRITE_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut file_name = path
+        .file_name()
+        .map(OsString::from)
+        .unwrap_or_else(|| OsString::from("carapace.json"));
+    file_name.push(format!(".tmp.{}.{counter}", std::process::id()));
+    path.with_file_name(file_name)
 }
 
 pub(super) fn write_config_file(path: &PathBuf, config_value: &Value) -> Result<(), ErrorShape> {
@@ -454,6 +471,20 @@ pub fn broadcast_config_changed(state: &WsServerState, mode: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_config_write_temp_path_is_unique_in_target_dir() {
+        let path = PathBuf::from("config-dir").join("carapace.json");
+        let first = config_write_temp_path(&path);
+        let second = config_write_temp_path(&path);
+
+        assert_ne!(first, second);
+        assert_eq!(first.parent(), path.parent());
+        assert!(first
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("carapace.json.tmp.")));
+    }
 
     #[test]
     fn test_handle_config_validate_accepts_object() {

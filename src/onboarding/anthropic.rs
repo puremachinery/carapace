@@ -226,6 +226,8 @@ mod tests {
         let temp = tempdir().unwrap();
         let mut env = ScopedEnv::new();
         env.set("CARAPACE_CONFIG_PASSWORD", "test-password");
+        let config_path = temp.path().join("carapace.json");
+        env.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
 
         let payload_len =
             ANTHROPIC_SETUP_TOKEN_MIN_TOTAL_LENGTH - ANTHROPIC_SETUP_TOKEN_PREFIX.len();
