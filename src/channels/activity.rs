@@ -3160,30 +3160,16 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_collect_configured_unsupported_features_for_registered_channels() {
-        let _config_guard = crate::test_support::config::ScopedConfigCache::new();
-        crate::config::clear_cache();
-        crate::config::update_cache(
-            serde_json::json!({
-                "channels": {
-                    "custom": {
-                        "features": {
-                            "typing": { "enabled": true },
-                            "readReceipts": { "enabled": true },
-                        }
+        let _fixture = crate::test_support::config::StableConfigFixture::new(serde_json::json!({
+            "channels": {
+                "custom": {
+                    "features": {
+                        "typing": { "enabled": true },
+                        "readReceipts": { "enabled": true },
                     }
                 }
-            }),
-            serde_json::json!({
-                "channels": {
-                    "custom": {
-                        "features": {
-                            "typing": { "enabled": true },
-                            "readReceipts": { "enabled": true },
-                        }
-                    }
-                }
-            }),
-        );
+            }
+        }));
 
         let plugin_registry = Arc::new(PluginRegistry::new());
         plugin_registry.register_channel(
@@ -3196,7 +3182,6 @@ mod tests {
 
         assert!(unsupported.contains(&("custom".to_string(), "typing")));
         assert!(unsupported.contains(&("custom".to_string(), "read_receipts")));
-        crate::config::clear_cache();
     }
 
     #[tokio::test(flavor = "current_thread")]

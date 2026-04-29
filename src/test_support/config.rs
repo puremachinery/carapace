@@ -91,6 +91,19 @@ impl StableConfigFixture {
             _cache_guard: cache_guard,
         }
     }
+
+    pub(crate) fn update(&self, raw_value: Value) {
+        let config_path = self._tempdir.path().join("carapace.json5");
+        std::fs::write(
+            &config_path,
+            serde_json::to_string(&raw_value).expect("serialize fixture config"),
+        )
+        .expect("write fixture config file");
+
+        let (raw, value) = crate::config::load_config_pair_uncached(&config_path)
+            .expect("load_config_pair_uncached on fixture file");
+        crate::config::update_cache(raw, value);
+    }
 }
 
 impl Drop for StableConfigFixture {
