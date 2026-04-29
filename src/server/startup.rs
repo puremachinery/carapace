@@ -214,11 +214,14 @@ pub async fn build_ws_state_with_runtime_dependencies(
         Some(multi_provider) => ws_state.with_llm_provider(Arc::new(multi_provider)),
         None => {
             return Err(
-                "No LLM provider configured. Set one of: ANTHROPIC_API_KEY, \
-                 OPENAI_API_KEY, GOOGLE_API_KEY, VENICE_API_KEY; configure Ollama; or \
-                 configure an authProfile (anthropic.authProfile, google.authProfile, \
-                 codex.authProfile). Carapace requires at least one LLM provider to \
-                 start."
+                "No LLM provider configured. Configure at least one supported \
+                 provider before starting Carapace — examples include setting \
+                 ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_API_KEY, or VENICE_API_KEY; \
+                 configuring Ollama; configuring an authProfile (anthropic.authProfile, \
+                 google.authProfile, codex.authProfile); or configuring AWS Bedrock \
+                 (AWS_REGION + credentials), Vertex AI (VERTEX_PROJECT_ID), or the \
+                 Claude CLI provider. See `crate::agent::factory::build_providers` \
+                 for the authoritative set."
                     .into(),
             );
         }
@@ -1903,17 +1906,13 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let state_dir = temp.path().join("state");
         let config_path = temp.path().join("carapace.json5");
-        let mut env = ScopedEnv::new();
+        // Start from `provider_env_cleared()` to unset every provider-relevant
+        // env var (covers Bedrock, Vertex, Claude CLI in addition to the four
+        // API keys), then layer the test-specific paths on top.
+        let mut env = crate::test_support::env::provider_env_cleared();
         env.set("CARAPACE_STATE_DIR", state_dir.as_os_str())
             .set("CARAPACE_CONFIG_PATH", config_path.as_os_str())
-            .set("CARAPACE_DISABLE_CONFIG_CACHE", "1")
-            // Explicitly clear every provider env var so the call sees a true
-            // no-provider state regardless of the operator's shell environment.
-            .unset("ANTHROPIC_API_KEY")
-            .unset("OPENAI_API_KEY")
-            .unset("GOOGLE_API_KEY")
-            .unset("VENICE_API_KEY")
-            .unset("OLLAMA_BASE_URL");
+            .set("CARAPACE_DISABLE_CONFIG_CACHE", "1");
         crate::config::clear_cache();
 
         let tools_registry = Arc::new(ToolsRegistry::new());

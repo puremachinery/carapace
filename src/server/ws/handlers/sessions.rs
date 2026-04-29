@@ -2113,6 +2113,17 @@ pub(super) fn handle_agent(
         return Err(error_shape(code, &error.to_string(), None));
     }
 
+    // Validate the provider precondition *before* `setup_agent_session`
+    // appends the user message and registers a queued run, so a defensive
+    // failure here doesn't orphan state in the agent_run_registry or the
+    // session store.
+    let Some(provider) = state.llm_provider() else {
+        let error = crate::agent::AgentConfigurationError::provider_not_configured();
+        error.log_operator_hint();
+        let code = error.code().as_str();
+        return Err(error_shape(code, &error.to_string(), None));
+    };
+
     let (run_id, session_key_out, cancel_token) = setup_agent_session(
         &state,
         session,
@@ -2120,15 +2131,6 @@ pub(super) fn handle_agent(
         agent_params.idempotency_key,
     )?;
 
-    // Spawn the agent executor. Startup and hot-reload guarantee a provider
-    // is configured; the None branch is defensive and surfaces a typed config
-    // error instead of silently queuing.
-    let Some(provider) = state.llm_provider() else {
-        let error = crate::agent::AgentConfigurationError::provider_not_configured();
-        error.log_operator_hint();
-        let code = error.code().as_str();
-        return Err(error_shape(code, &error.to_string(), None));
-    };
     config.system = params
         .and_then(|v| v.get("system"))
         .and_then(|v| v.as_str())

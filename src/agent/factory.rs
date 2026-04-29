@@ -955,40 +955,11 @@ fn hash_key_prefix(key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::env::ScopedEnv;
+    use crate::test_support::env::{provider_env_cleared, ScopedEnv};
     use serde_json::json;
 
-    const PROVIDER_ENV_KEYS: &[&str] = &[
-        "ANTHROPIC_API_KEY",
-        "ANTHROPIC_BASE_URL",
-        "CARAPACE_CONFIG_PASSWORD",
-        "CARAPACE_STATE_DIR",
-        "OPENAI_API_KEY",
-        "OPENAI_BASE_URL",
-        "OPENAI_OAUTH_CLIENT_ID",
-        "OPENAI_OAUTH_CLIENT_SECRET",
-        "OPENAI_HTTP_REFERER",
-        "OPENAI_X_TITLE",
-        "OPENAI_TITLE",
-        "OLLAMA_BASE_URL",
-        "GOOGLE_API_KEY",
-        "GOOGLE_API_BASE_URL",
-        "VENICE_API_KEY",
-        "VENICE_BASE_URL",
-        "AWS_REGION",
-        "AWS_DEFAULT_REGION",
-        "AWS_ACCESS_KEY_ID",
-        "VERTEX_PROJECT_ID",
-        "VERTEX_LOCATION",
-        "VERTEX_MODEL",
-    ];
-
     fn clean_provider_env() -> ScopedEnv {
-        let mut env = ScopedEnv::new();
-        for key in PROVIDER_ENV_KEYS {
-            env.unset(key);
-        }
-        env
+        provider_env_cleared()
     }
 
     #[test]

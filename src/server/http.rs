@@ -1313,6 +1313,20 @@ async fn dispatch_agent_run(
         return Err((StatusCode::BAD_REQUEST, Json(AgentResponse::from(&error))).into_response());
     }
 
+    // Validate the provider precondition *before* registering the run so a
+    // defensive failure here doesn't orphan an entry in agent_run_registry.
+    // Also use 503 (server-side misconfiguration) rather than 400, matching
+    // the existing OpenAI-compat path's status for the same condition.
+    let Some(provider) = ws.llm_provider() else {
+        let error = AgentError::Configuration(AgentConfigurationError::provider_not_configured());
+        error.log_configuration_hint();
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(AgentResponse::from(&error)),
+        )
+            .into_response());
+    };
+
     // Register the agent run
     let cancel_token = tokio_util::sync::CancellationToken::new();
     let run = crate::server::ws::AgentRun {
@@ -1336,14 +1350,6 @@ async fn dispatch_agent_run(
         registry.register(run);
     }
 
-    // Spawn agent executor. Startup and hot-reload guarantee a provider is
-    // configured; the None branch is defensive and surfaces a typed config
-    // error instead of silently queuing.
-    let Some(provider) = ws.llm_provider() else {
-        let error = AgentError::Configuration(AgentConfigurationError::provider_not_configured());
-        error.log_configuration_hint();
-        return Err((StatusCode::BAD_REQUEST, Json(AgentResponse::from(&error))).into_response());
-    };
     config.deliver = validated.deliver;
     config.extra = validated.venice_parameters.clone();
     crate::agent::spawn_run(
@@ -2899,7 +2905,10 @@ mod tests {
             .unwrap();
 
         let response = router.oneshot(req).await.unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        // 503 SERVICE_UNAVAILABLE matches the existing OpenAI-compat path
+        // for the identical server-side misconfiguration; 400 would
+        // mis-signal a client-side problem.
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await

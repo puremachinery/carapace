@@ -164,16 +164,20 @@ pub async fn dispatch_inbound_text_with_options(
         registry.register(run);
     }
 
+    // Inbound channels keep the run registered even on the defensive
+    // no-provider branch. The registry entry is what lets out-of-band
+    // execution paths (e.g. tests that drive `execute_run` manually after
+    // an inbound message arrives) pick the run up. Channel listeners also
+    // have no synchronous error response path, so an orphaned registry
+    // entry here is bounded by the listener's own backpressure.
     let Some(provider) = state.llm_provider() else {
-        // Startup and hot-reload guarantee a provider is configured; the None
-        // branch is defensive. Log via the operator-hint helper so the
-        // misconfiguration is visible without crashing the channel listener.
         crate::agent::AgentConfigurationError::provider_not_configured().log_operator_hint();
         return Ok(InboundDispatchResult {
             run_id,
             run_spawned: false,
         });
     };
+
     let mut config = crate::agent::AgentConfig::default();
     if let Err(e) = crate::agent::resolve_agent_model(
         &mut config,
