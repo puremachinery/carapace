@@ -2510,12 +2510,15 @@ fn trigger_agent_if_enabled(
             ..Default::default()
         },
     ) {
+        e.log_configuration_hint();
         tracing::warn!(error = %e, "agent auto-reply skipped: model resolution failed");
         return (None, "queued");
     }
     crate::agent::apply_agent_config_from_settings(&mut config, &cfg, None);
     if config.model.trim().is_empty() {
-        tracing::warn!("agent auto-reply skipped: no model configured");
+        let error = crate::agent::AgentConfigurationError::missing_model();
+        error.log_operator_hint();
+        tracing::warn!(error = %error, "agent auto-reply skipped: no model configured");
         return (None, "queued");
     }
     config.deliver = true;
