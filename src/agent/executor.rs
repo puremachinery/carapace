@@ -2406,10 +2406,21 @@ mod tests {
 
         // No-provider dispatch doesn't register the run — manually register
         // it so the controlled `execute_run` below has a registry entry to
-        // update. Resolve the session key the same way dispatch did.
-        let cfg = serde_json::json!({});
-        let (session_key, _, _) =
-            crate::sessions::resolve_scoped_session_key(&cfg, "signal", chat_id, chat_id, None);
+        // update. Read the session key off the persisted session rather than
+        // re-deriving it; this stays aligned with dispatch's internal session
+        // resolution even if the fixture grows session-scoping config later.
+        let user_sessions = state
+            .session_store()
+            .list_sessions(crate::sessions::SessionFilter {
+                user_id: Some(chat_id.to_string()),
+                ..Default::default()
+            })
+            .expect("dispatch should have persisted exactly one session");
+        let session_key = user_sessions
+            .iter()
+            .find(|s| s.metadata.channel.as_deref() == Some("signal"))
+            .map(|s| s.session_key.clone())
+            .expect("dispatch should have created a signal session for chat_id");
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
