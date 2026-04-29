@@ -115,7 +115,7 @@ Highest to lowest precedence:
 
 If the caller declared a capability and no level 3 or 4 entry was
 configured, the as-drafted design would hard-error rather than fall
-through to levels 5–6 — see Open Question O3.
+through to levels 5–6 — see Open Question O2.
 
 ### Detection
 
@@ -209,12 +209,23 @@ backend. The existing `src/config/routes.rs` tests cover the current
 
 Independent of whether this design is ever built, the principle holds:
 any capability declaration that crosses the request boundary should be a
-closed, typed enum at the API edge, not a free-form string blob or
-`serde_json::Value`. Unknown values are rejected at deserialization time;
-adding a new value is an explicit enum + schema change. This matches the
-typed-boundary discipline documented in
-[`AGENTS.md`](../../AGENTS.md) ("Typed Boundary Discipline" section) and
-[`.claude/rules/rust-patterns.md`](../../.claude/rules/rust-patterns.md).
+**closed, typed enum** at the API edge, not a free-form string blob or
+`serde_json::Value`. Concretely:
+
+- Unknown enum values are rejected at deserialization / boundary
+  validation time, not silently accepted and re-validated downstream.
+- Adding a new variant is an explicit enum + schema update — never an
+  arbitrary new string.
+- Downstream resolver code matches on a known set of variants, not on ad
+  hoc string parsing.
+
+If review cycles repeatedly request relaxing the enum to a string for
+"extensibility," treat that as evidence that the boundary is
+under-typed and add a variant instead, not a sanitizer or allowlist.
+
+(This principle is repo-internal contributor convention — Carapace's
+`AGENTS.md` and `.claude/rules/` are gitignored, so the relevant guidance
+is summarized inline here rather than linked.)
 
 ## References
 
@@ -229,5 +240,3 @@ typed-boundary discipline documented in
   Whisper), `src/agent/venice.rs` (Venice provider, image-capable models)
 - Architecture overview: [`docs/architecture.md`](../architecture.md)
 - Feature inventory: [`docs/feature-status.yaml`](../feature-status.yaml)
-- Repository conventions: [`AGENTS.md`](../../AGENTS.md),
-  [`.claude/rules/rust-patterns.md`](../../.claude/rules/rust-patterns.md)
