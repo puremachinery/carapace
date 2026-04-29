@@ -83,7 +83,7 @@ impl AgentConfigurationError {
             operator_hint:
                 "no model configured; set `route` or `model` in agent config or defaults \
                  (e.g. `agents.defaults.route: \"fast\"` or \
-                 `agents.defaults.model: \"anthropic:claude-sonnet-4-20250514\"`)"
+                 `agents.defaults.model: \"provider:model\"`)"
                     .to_string(),
         }
     }
@@ -98,6 +98,14 @@ impl AgentConfigurationError {
 
     pub fn operator_hint(&self) -> &str {
         &self.operator_hint
+    }
+
+    pub fn log_operator_hint(&self) {
+        warn!(
+            code = self.code.as_str(),
+            operator_hint = %self.operator_hint,
+            "agent configuration error"
+        );
     }
 }
 
@@ -147,6 +155,14 @@ pub enum AgentError {
 
     #[error("classifier blocked message ({0}): {1}")]
     ClassifierBlocked(String, String),
+}
+
+impl AgentError {
+    pub fn log_configuration_hint(&self) {
+        if let Self::Configuration(error) = self {
+            error.log_operator_hint();
+        }
+    }
 }
 
 /// Configuration for an agent run.

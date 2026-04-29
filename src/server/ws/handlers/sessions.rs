@@ -2099,15 +2099,16 @@ pub(super) fn handle_agent(
             session_model: session.metadata.model.as_deref(),
         },
     ) {
+        e.log_configuration_hint();
         return Err(error_shape(ERROR_UNAVAILABLE, &e.to_string(), None));
     }
     crate::agent::apply_agent_config_from_settings(&mut config, &cfg, agent_id);
     if config.model.trim().is_empty() {
-        return Err(error_shape(
-            ERROR_UNAVAILABLE,
-            "no model configured; set `agents.defaults.model` in config or provide a `model` parameter",
-            None,
-        ));
+        let error = crate::agent::AgentError::Configuration(
+            crate::agent::AgentConfigurationError::missing_model(),
+        );
+        error.log_configuration_hint();
+        return Err(error_shape(ERROR_UNAVAILABLE, &error.to_string(), None));
     }
 
     let (run_id, session_key_out, cancel_token) = setup_agent_session(
