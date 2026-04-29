@@ -2753,6 +2753,94 @@ mod tests {
         assert_eq!(json["error"], "message required");
     }
 
+    /// Integration test for issue #398: when route resolution fails, the
+    /// HTTP `/hooks/agent` response body must carry the stable wire-format
+    /// `errorCode` and the human-readable `error` message must NOT contain
+    /// any of the internal config-key paths the leaky pre-#398 messages
+    /// did. Exercises the actual axum handler via `oneshot` (with a real
+    /// `ws_state` so `dispatch_agent_run` actually runs), not just the
+    /// `AgentResponse` constructor in isolation.
+    #[tokio::test]
+    async fn test_hooks_agent_unknown_route_emits_typed_error_code() {
+        let (temp, _guard) = set_temp_config_path();
+        // Empty config — no routes map, no agents.defaults.model. The
+        // request below specifies an unknown route name, which forces
+        // `resolve_execution_target` into the `UnknownRoute` arm.
+        std::fs::write(temp.path().join("carapace-test-config.json5"), "{}").unwrap();
+        let (ws_state, _tmp) = make_test_ws_state();
+        let router =
+            test_router_with_hook_registry(test_config(), Arc::new(HookRegistry::new()), ws_state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/hooks/agent")
+            .header("authorization", "Bearer test-hooks-token")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"message":"hello","route":"nonexistent-route-name"}"#,
+            ))
+            .unwrap();
+
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["errorCode"], "unknown_route");
+
+        let error_msg = json["error"].as_str().expect("error message");
+        assert!(
+            !error_msg.contains("`routes`")
+                && !error_msg.contains("top-level")
+                && !error_msg.contains("agents.defaults"),
+            "human-readable error must not leak internal config-key paths: {error_msg}"
+        );
+    }
+
+    /// Companion to the unknown-route test: with no route or model
+    /// configured anywhere, `resolve_execution_target` returns
+    /// `MissingModel`, which surfaces as `errorCode: "missing_model"`
+    /// on the HTTP wire.
+    #[tokio::test]
+    async fn test_hooks_agent_missing_model_emits_typed_error_code() {
+        let (temp, _guard) = set_temp_config_path();
+        std::fs::write(temp.path().join("carapace-test-config.json5"), "{}").unwrap();
+        let (ws_state, _tmp) = make_test_ws_state();
+        let router =
+            test_router_with_hook_registry(test_config(), Arc::new(HookRegistry::new()), ws_state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/hooks/agent")
+            .header("authorization", "Bearer test-hooks-token")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"message":"hello"}"#))
+            .unwrap();
+
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["errorCode"], "missing_model");
+
+        let error_msg = json["error"].as_str().expect("error message");
+        assert!(
+            !error_msg.contains("`route`")
+                && !error_msg.contains("`model`")
+                && !error_msg.contains("agents.defaults"),
+            "human-readable error must not leak internal config-key paths: {error_msg}"
+        );
+    }
+
     #[tokio::test]
     async fn test_hooks_mapping_agent_dispatches_real_run() {
         let (temp, _guard) = set_temp_config_path();

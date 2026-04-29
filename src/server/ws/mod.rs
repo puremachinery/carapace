@@ -77,6 +77,14 @@ const ERROR_INVALID_REQUEST: &str = "invalid_request";
 const ERROR_NOT_PAIRED: &str = "not_paired";
 const ERROR_UNAVAILABLE: &str = "unavailable";
 const ERROR_RATE_LIMITED: &str = "rate_limited";
+/// Documented in `docs/protocol/websocket.md` and exercised by the
+/// `tests/golden/ws/errors.json` schema, but not yet emitted from any
+/// live Rust code path. Reserved for future "channel not configured"
+/// errors. Kept here so the wire-code set is discoverable from one
+/// place and a future emit site can `use ERROR_NOT_LINKED` rather than
+/// re-introducing a string literal.
+#[allow(dead_code)]
+const ERROR_NOT_LINKED: &str = "not_linked";
 // Note: Node doesn't use ERROR_FORBIDDEN - use ERROR_INVALID_REQUEST for auth errors
 
 const ALLOWED_CLIENT_IDS: [&str; 12] = [
