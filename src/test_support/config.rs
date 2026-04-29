@@ -56,6 +56,12 @@ impl ScopedConfigCache {
 pub(crate) struct StableConfigFixture {
     _env_guard: ScopedEnv,
     _tempdir: TempDir,
+    // MUST remain LAST: Rust drops fields in declaration order, and the
+    // explicit `Drop::drop` impl runs first. Keeping the cache guard last
+    // means it is released *after* both `Drop::drop` (which clears the
+    // cache) and the env/tempdir teardown above. Any new field added below
+    // this one would release the cache lock prematurely and re-introduce
+    // the lock window the fixture exists to close.
     _cache_guard: ScopedConfigCache,
 }
 
