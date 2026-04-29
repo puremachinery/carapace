@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use crate::agent::AgentConfigurationError;
 use crate::cron::CronPayload;
 use crate::messages::outbound::{
     MessageContent, MessageMetadata, OutboundContext, OutboundMessage,
@@ -19,6 +20,7 @@ pub const NO_LLM_PROVIDER_CONFIGURED_ERROR: &str = "no LLM provider configured";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CronExecuteError {
     LlmNotConfigured,
+    Configuration(AgentConfigurationError),
     Other(String),
 }
 
@@ -26,6 +28,7 @@ impl std::fmt::Display for CronExecuteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CronExecuteError::LlmNotConfigured => f.write_str(NO_LLM_PROVIDER_CONFIGURED_ERROR),
+            CronExecuteError::Configuration(error) => write!(f, "{error}"),
             CronExecuteError::Other(message) => f.write_str(message),
         }
     }
@@ -183,9 +186,9 @@ async fn execute_agent_turn(
         .llm_provider()
         .ok_or(CronExecuteError::LlmNotConfigured)?;
     if config.model.trim().is_empty() {
-        return Err(CronExecuteError::Other(
-            "no model configured; set `agents.defaults.model` in config or provide a model in the cron task".to_string(),
-        ));
+        let error = AgentConfigurationError::missing_model();
+        error.log_operator_hint();
+        return Err(CronExecuteError::Configuration(error));
     }
 
     let cancel_token = CancellationToken::new();
@@ -506,7 +509,23 @@ mod tests {
     use crate::cron::CronPayload;
     use crate::server::ws::{WsServerConfig, WsServerState};
     use crate::sessions;
+    use async_trait::async_trait;
     use std::sync::Arc;
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
+
+    struct NeverCalledProvider;
+
+    #[async_trait]
+    impl crate::agent::LlmProvider for NeverCalledProvider {
+        async fn complete(
+            &self,
+            _request: crate::agent::provider::CompletionRequest,
+            _cancel_token: CancellationToken,
+        ) -> Result<mpsc::Receiver<crate::agent::StreamEvent>, crate::agent::AgentError> {
+            panic!("cron missing-model guard should run before provider.complete");
+        }
+    }
 
     /// Create a WsServerState backed by a temp directory so tests work on all
     /// platforms (including Windows CI where writing to ~/.config/carapace may fail).
@@ -553,6 +572,40 @@ mod tests {
         let result = execute_payload("job-2", &payload, &state, ExecutionLimits::default()).await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), CronExecuteError::LlmNotConfigured);
+    }
+
+    #[tokio::test]
+    async fn test_execute_agent_turn_missing_model_returns_safe_error() {
+        let (state, _tmp) = make_test_state();
+        state.set_llm_provider(Some(Arc::new(NeverCalledProvider)));
+
+        let payload = CronPayload::AgentTurn {
+            message: "do something".to_string(),
+            model: None,
+            route: None,
+            thinking: None,
+            timeout_seconds: None,
+            allow_unsafe_external_content: None,
+            deliver: None,
+            channel: None,
+            to: None,
+            best_effort_deliver: None,
+        };
+
+        let result = execute_payload(
+            "job-missing-model",
+            &payload,
+            &state,
+            ExecutionLimits::default(),
+        )
+        .await;
+        let error = result.unwrap_err();
+        assert!(matches!(error, CronExecuteError::Configuration(_)));
+
+        let message = error.to_string();
+        assert_eq!(message, "agent model is not configured");
+        assert!(!message.contains("agents.defaults.model"), "got: {message}");
+        assert!(!message.contains("anthropic:"), "got: {message}");
     }
 
     #[tokio::test]

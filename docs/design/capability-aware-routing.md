@@ -228,10 +228,12 @@ followed by `(None, "queued")` — the error string is logged
 server-side only and never reaches the external caller. That path is
 **not** a leak surface and needs no remediation in #398.
 
-Note this is **not** the OpenAI-compat provider-error surface
-(`src/server/openai.rs`); that path handles errors from
-`call_llm_provider`, not route-resolution. The two surfaces are
-disjoint.
+Note this route-resolution leak is **not** the OpenAI-compat
+`call_llm_provider` error surface (`src/server/openai.rs`); that path
+handles provider call failures, not route-resolution. The OpenAI-compat
+`carapace` / `agent:` alias path has its own missing-default-model
+guard, and the current code applies the same topology-free
+`AgentConfigurationError::missing_model()` message there.
 
 Before the resolver fix, the two external messages from
 `resolve_execution_target` mixed several disclosure classes:

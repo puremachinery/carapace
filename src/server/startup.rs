@@ -153,6 +153,12 @@ impl TaskExecutor for RuntimeTaskExecutor {
                     }
                 }
             }
+            Err(crate::cron::executor::CronExecuteError::Configuration(error)) => {
+                TaskExecutionOutcome::Blocked {
+                    category: TaskBlockedReason::ConfigMissing,
+                    reason: error.to_string(),
+                }
+            }
             Err(crate::cron::executor::CronExecuteError::Other(error)) => {
                 TaskExecutionOutcome::Failed { error }
             }

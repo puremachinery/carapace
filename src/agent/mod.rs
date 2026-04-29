@@ -96,7 +96,8 @@ impl AgentConfigurationError {
         self.public_message
     }
 
-    pub fn operator_hint(&self) -> &str {
+    #[cfg(test)]
+    pub(crate) fn operator_hint(&self) -> &str {
         &self.operator_hint
     }
 
