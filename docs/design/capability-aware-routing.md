@@ -140,11 +140,14 @@ at the boundary).
 
 ## Open questions (would need resolution before any implementation)
 
-Several review findings on the original draft of this document
-([PR #395](https://github.com/puremachinery/carapace/pull/395)) point at
-real correctness gaps. They are **left unresolved** here because a
-deferred design is more honest as a record of what was considered than as
-a polished spec for unbuilt work. Anyone reopening this should resolve
+The first draft of this document (April 2026) proposed a polished
+implementation blueprint. Review surfaced several real correctness
+gaps — `RouteConfig` shape, default-fallback consistency,
+error-variant taxonomy, exhaustiveness annotation, test matrix — and
+the document was reframed as a deferred record. Those gaps are kept
+**unresolved** below rather than silently fixed, because a deferred
+design is more honest as a record of what was considered than as a
+polished spec for unbuilt work. Anyone reopening this should resolve
 these first.
 
 ### O1. The `RouteConfig` shape would need to change (high)
@@ -189,26 +192,31 @@ path like `routes.byCapability.<bucket>` in the surfaced message leaks
 internal configuration topology to anyone who can probe the API — a
 low-value but real information leak in a security-first gateway.
 
-**This is a current-codebase concern, not just a future one.**
+**This is a current-codebase concern, not just a future one** — and
+it is being tracked separately at higher urgency than this deferred
+design doc implies.
+
 `src/config/routes.rs` already surfaces config-key-path remediation
 hints through `AgentError::Provider` for two error paths that reach
-external callers today:
+external callers today via `src/server/openai.rs:~742` and the
+streaming SSE path:
 
 - `unknown route "<name>"; define it in the top-level \`routes\` config
   map` (`src/config/routes.rs:~98`)
 - `no model configured; set \`route\` or \`model\` in agent config or
   defaults` (`src/config/routes.rs:~120`)
 
-Both messages flow to external callers via the OpenAI-compatible server
-layer today. Capability routing would extend the same pattern, not
-introduce it. The general invariant — internal config-key paths must
-not leak through `AgentError::Provider` to external clients — should
-be remediated in the existing routes resolver independently of whether
-capability routing is ever built. Track that as a separate issue (a
-`ConfigError`-family variant + a stable wire-format code mapped at the
-server boundary) and treat O3 here as an extension obligation: any
-revived capability-routing design must use the new variant family
-rather than adding to the existing leak surface.
+The remediation — introduce a `ConfigError`-family variant, surface a
+stable wire-format code at the server boundary, keep human-readable
+config hints in operator-facing surfaces (logs, Control UI) — is
+tracked as a standalone issue:
+
+- [puremachinery/carapace#398](https://github.com/puremachinery/carapace/issues/398)
+
+Capability routing would have extended the same leak pattern, not
+introduced it. If/when this design is revived, the implementation
+must use whatever `ConfigError`-family variant ships from #398 rather
+than adding to the existing surface.
 
 ### O4. `#[non_exhaustive]` vs "closed enum" (low)
 
