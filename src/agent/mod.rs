@@ -165,12 +165,8 @@ impl AgentError {
         }
     }
 
-    /// Stable wire-format error code for typed errors that carry one
-    /// (currently only [`AgentError::Configuration`]). Returns `None`
-    /// for free-form errors that do not have a documented code.
-    /// Server boundary layers use this to populate their wire response
-    /// (`AgentResponse.error_code` for HTTP, the `code` position of
-    /// `error_shape` for WebSocket).
+    /// Stable wire-format error code for typed errors. Returns `None`
+    /// for free-form variants without a documented code.
     pub fn wire_code(&self) -> Option<&'static str> {
         match self {
             Self::Configuration(error) => Some(error.code().as_str()),

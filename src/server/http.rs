@@ -1304,21 +1304,13 @@ async fn dispatch_agent_run(
         },
     ) {
         e.log_configuration_hint();
-        let response = match e.wire_code() {
-            Some(code) => AgentResponse::error_with_code(code, &e.to_string()),
-            None => AgentResponse::error(&e.to_string()),
-        };
-        return Err((StatusCode::BAD_REQUEST, Json(response)).into_response());
+        return Err((StatusCode::BAD_REQUEST, Json(AgentResponse::from(&e))).into_response());
     }
     crate::agent::apply_agent_config_from_settings(&mut config, &cfg, None);
     if config.model.trim().is_empty() {
         let error = AgentError::Configuration(AgentConfigurationError::missing_model());
         error.log_configuration_hint();
-        let response = match error.wire_code() {
-            Some(code) => AgentResponse::error_with_code(code, &error.to_string()),
-            None => AgentResponse::error(&error.to_string()),
-        };
-        return Err((StatusCode::BAD_REQUEST, Json(response)).into_response());
+        return Err((StatusCode::BAD_REQUEST, Json(AgentResponse::from(&error))).into_response());
     }
 
     // Register the agent run

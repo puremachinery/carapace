@@ -2100,6 +2100,10 @@ pub(super) fn handle_agent(
         },
     ) {
         e.log_configuration_hint();
+        // `error_shape` derives `retryable` from `code == ERROR_UNAVAILABLE`,
+        // so emitting a typed wire code (e.g. "unknown_route") correctly
+        // surfaces `retryable: false` — config errors need operator
+        // intervention, not retry.
         let code = e.wire_code().unwrap_or(ERROR_UNAVAILABLE);
         return Err(error_shape(code, &e.to_string(), None));
     }
