@@ -312,6 +312,9 @@ mod tests {
         let plaintext = b"same plaintext".to_vec();
         let blob_a = encrypt_aead_blob(&key, &plaintext, &[]).unwrap();
         let blob_b = encrypt_aead_blob(&key, &plaintext, &[]).unwrap();
+        // This is a probabilistic smoke check over 96-bit random nonces; it
+        // catches fixed or broken RNG behavior, not a deterministic uniqueness
+        // proof.
         assert_ne!(
             blob_a.nonce, blob_b.nonce,
             "each encrypt call must produce a fresh nonce"

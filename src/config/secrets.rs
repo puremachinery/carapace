@@ -435,21 +435,10 @@ fn map_envelope_error(error: CryptoEnvelopeError) -> SecretError {
         }
         CryptoEnvelopeError::DecryptionFailed => SecretError::DecryptionFailed,
         CryptoEnvelopeError::RandomFailure(message) => SecretError::RandomFailure(message),
-        CryptoEnvelopeError::Base64Decode { field, message } => SecretError::Base64Decode {
-            field: field.to_string(),
-            message,
-        },
-        CryptoEnvelopeError::FieldLength {
-            field,
-            expected,
-            got,
-        } => match field {
-            "nonce" => SecretError::InvalidNonceLength { expected, got },
-            "salt" => SecretError::InvalidSaltLength { expected, got },
-            other => SecretError::BadFormat(format!(
-                "field '{other}' has wrong length: expected {expected}, got {got}"
-            )),
-        },
+        other @ CryptoEnvelopeError::Base64Decode { .. }
+        | other @ CryptoEnvelopeError::FieldLength { .. } => {
+            SecretError::BadFormat(format!("unexpected envelope parsing error: {other}"))
+        }
     }
 }
 
