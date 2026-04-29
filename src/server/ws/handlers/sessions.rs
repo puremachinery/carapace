@@ -3179,7 +3179,7 @@ mod tests {
             "route": "nonexistent-route-name"
         });
 
-        let err = handle_agent(Some(&params), Arc::new(state), &conn).unwrap_err();
+        let err = handle_agent(Some(&params), std::sync::Arc::new(state), &conn).unwrap_err();
         assert_eq!(err.code, "unknown_route");
         assert!(!err.retryable);
     }
@@ -3196,7 +3196,7 @@ mod tests {
             "idempotencyKey": "ws-model-test-1"
         });
 
-        let err = handle_agent(Some(&params), Arc::new(state), &conn).unwrap_err();
+        let err = handle_agent(Some(&params), std::sync::Arc::new(state), &conn).unwrap_err();
         assert_eq!(err.code, "missing_model");
         assert!(!err.retryable);
     }

@@ -159,7 +159,7 @@ fn test_error_shape_rate_limited_is_retryable() {
     assert_eq!(err.code, "rate_limited");
     assert!(
         err.retryable,
-        "rate_limited must be retryable per RETRYABLE_CODES + #405"
+        "rate_limited must be retryable per RETRYABLE_CODES"
     );
 }
 
