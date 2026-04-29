@@ -100,6 +100,14 @@ routes: {
 This is the design as drafted. It carries the **open questions** below
 that would need resolution before this could ship.
 
+> **Heads up for anyone copy-pasting the example above into a live config:**
+> adding `routes.byCapability` today would be **silently ignored** by
+> `load_routes`, which iterates every key under `routes` and tries
+> `serde_json::from_value::<RouteConfig>` on each value. `byCapability`
+> is an object (not a `RouteConfig`), and `RouteConfig` has no `route`
+> field today, so the entry would emit a `tracing::warn!` and be
+> dropped. See **O1** below for what would have to change first.
+
 ### Resolution order (as drafted)
 
 Highest to lowest precedence:
@@ -200,7 +208,8 @@ design doc implies.
 `src/config/routes.rs` already surfaces config-key-path remediation
 hints through `AgentError::Provider` for two error paths that reach
 external callers today. `resolve_execution_target` is called from
-`resolve_agent_model` (`src/agent/mod.rs:254`), and the resulting
+inside `resolve_agent_model` (defined at `src/agent/mod.rs:254`, with
+the actual call site at `src/agent/mod.rs:~293`), and the resulting
 `AgentError` is fmt-stringified to external callers via:
 
 - HTTP: `src/server/http.rs:~1308` (`AgentResponse::error(&e.to_string())`)
