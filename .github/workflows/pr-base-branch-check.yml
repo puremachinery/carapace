@@ -1,0 +1,31 @@
+name: PR Base Branch Check
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  check-base-branch:
+    name: Verify base is master
+    runs-on: ubuntu-latest
+    steps:
+      - name: Reject non-master base
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if [[ "$BASE_REF" != "master" ]]; then
+            echo "::error title=PR base must be master::This PR targets '$BASE_REF', not 'master'."
+            echo ""
+            echo "If this is a stacked PR whose dependency has merged, retarget to master:"
+            echo "  gh pr edit $PR_NUMBER --base master"
+            echo ""
+            echo "Stacked PRs that merge into a stale base produce orphaned merge commits"
+            echo "that GitHub reports as MERGED but never reach master. See the post-mortem"
+            echo "on PR #407 for context."
+            exit 1
+          fi
+          echo "Base is master — ok."
