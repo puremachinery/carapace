@@ -81,11 +81,14 @@ impl Drop for ScopedEnv {
 /// entries make tests that try to force a no-provider state flaky in CI
 /// environments where some of these are set ambiently (e.g. AWS credentials
 /// in GitHub-hosted runners inside AWS).
+///
+/// Strictly provider-detection keys only — runtime infrastructure env vars
+/// (e.g. `CARAPACE_CONFIG_PASSWORD`, `CARAPACE_STATE_DIR`) are deliberately
+/// not in this set, so callers that layer those on top of `provider_env_cleared()`
+/// don't have them silently unset.
 const PROVIDER_ENV_KEYS: &[&str] = &[
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_BASE_URL",
-    "CARAPACE_CONFIG_PASSWORD",
-    "CARAPACE_STATE_DIR",
     "OPENAI_API_KEY",
     "OPENAI_BASE_URL",
     "OPENAI_OAUTH_CLIENT_ID",
