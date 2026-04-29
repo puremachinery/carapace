@@ -85,6 +85,13 @@ const ERROR_RATE_LIMITED: &str = "rate_limited";
 /// re-introducing a string literal.
 #[allow(dead_code)]
 const ERROR_NOT_LINKED: &str = "not_linked";
+/// Wire code for `AgentConfigurationErrorCode::ProviderNotConfigured`.
+/// Kept here alongside the other ERROR_* constants so the wire-code
+/// set is discoverable from one place; the actual emit site uses
+/// `AgentConfigurationError::provider_not_configured()` flowing
+/// through `wire_code()`.
+#[allow(dead_code)]
+const ERROR_PROVIDER_NOT_CONFIGURED: &str = "provider_not_configured";
 // Note: Node doesn't use ERROR_FORBIDDEN - use ERROR_INVALID_REQUEST for auth errors
 
 /// Wire codes whose `retryable` field is `true` in the error response.

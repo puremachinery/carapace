@@ -164,49 +164,50 @@ pub async fn dispatch_inbound_text_with_options(
         registry.register(run);
     }
 
-    let run_spawned = if let Some(provider) = state.llm_provider() {
-        let mut config = crate::agent::AgentConfig::default();
-        if let Err(e) = crate::agent::resolve_agent_model(
-            &mut config,
-            cfg.as_ref(),
-            None,
-            &crate::agent::ModelResolutionOverrides {
-                session_route: session.metadata.route.as_deref(),
-                session_model: session.metadata.model.as_deref(),
-                ..Default::default()
-            },
-        ) {
-            warn!(error = %e, "inbound agent run skipped: model resolution failed");
-            return Ok(InboundDispatchResult {
-                run_id,
-                run_spawned: false,
-            });
-        }
-        crate::agent::apply_agent_config_from_settings(&mut config, cfg.as_ref(), None);
-        config.deliver = true;
-        crate::agent::spawn_run(
-            run_id.clone(),
-            session.session_key.clone(),
-            config,
-            state.clone(),
-            provider,
-            cancel_token,
-        );
-        debug!(
-            run_id = %run_id,
-            channel = %channel,
-            sender = %sender_id,
-            "Inbound agent run dispatched"
-        );
-        true
-    } else {
-        debug!(
-            run_id = %run_id,
-            channel = %channel,
-            "Inbound message queued (no LLM provider)"
-        );
-        false
+    let Some(provider) = state.llm_provider() else {
+        // Startup and hot-reload guarantee a provider is configured; the None
+        // branch is defensive. Log via the operator-hint helper so the
+        // misconfiguration is visible without crashing the channel listener.
+        crate::agent::AgentConfigurationError::provider_not_configured().log_operator_hint();
+        return Ok(InboundDispatchResult {
+            run_id,
+            run_spawned: false,
+        });
     };
+    let mut config = crate::agent::AgentConfig::default();
+    if let Err(e) = crate::agent::resolve_agent_model(
+        &mut config,
+        cfg.as_ref(),
+        None,
+        &crate::agent::ModelResolutionOverrides {
+            session_route: session.metadata.route.as_deref(),
+            session_model: session.metadata.model.as_deref(),
+            ..Default::default()
+        },
+    ) {
+        warn!(error = %e, "inbound agent run skipped: model resolution failed");
+        return Ok(InboundDispatchResult {
+            run_id,
+            run_spawned: false,
+        });
+    }
+    crate::agent::apply_agent_config_from_settings(&mut config, cfg.as_ref(), None);
+    config.deliver = true;
+    crate::agent::spawn_run(
+        run_id.clone(),
+        session.session_key.clone(),
+        config,
+        state.clone(),
+        provider,
+        cancel_token,
+    );
+    debug!(
+        run_id = %run_id,
+        channel = %channel,
+        sender = %sender_id,
+        "Inbound agent run dispatched"
+    );
+    let run_spawned = true;
 
     Ok(InboundDispatchResult {
         run_id,

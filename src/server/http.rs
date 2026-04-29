@@ -1336,22 +1336,25 @@ async fn dispatch_agent_run(
         registry.register(run);
     }
 
-    // Spawn agent executor if LLM provider is configured
-    if let Some(provider) = ws.llm_provider() {
-        config.deliver = validated.deliver;
-        config.extra = validated.venice_parameters.clone();
-        crate::agent::spawn_run(
-            run_id.to_string(),
-            session.session_key.clone(),
-            config,
-            ws.clone(),
-            provider,
-            cancel_token,
-        );
-        debug!("Agent job dispatched: runId='{}'", run_id);
-    } else {
-        debug!("Agent job queued (no LLM provider): runId='{}'", run_id);
-    }
+    // Spawn agent executor. Startup and hot-reload guarantee a provider is
+    // configured; the None branch is defensive and surfaces a typed config
+    // error instead of silently queuing.
+    let Some(provider) = ws.llm_provider() else {
+        let error = AgentError::Configuration(AgentConfigurationError::provider_not_configured());
+        error.log_configuration_hint();
+        return Err((StatusCode::BAD_REQUEST, Json(AgentResponse::from(&error))).into_response());
+    };
+    config.deliver = validated.deliver;
+    config.extra = validated.venice_parameters.clone();
+    crate::agent::spawn_run(
+        run_id.to_string(),
+        session.session_key.clone(),
+        config,
+        ws.clone(),
+        provider,
+        cancel_token,
+    );
+    debug!("Agent job dispatched: runId='{}'", run_id);
 
     Ok(())
 }
@@ -2513,6 +2516,34 @@ mod tests {
         (Arc::new(state), tmp)
     }
 
+    /// Inert provider for tests that need `dispatch_agent_run` to reach the
+    /// spawn arm without making real network calls. Returns an empty stream;
+    /// `crate::agent::spawn_run` will exhaust it without error.
+    struct StaticTestProvider;
+
+    #[async_trait::async_trait]
+    impl crate::agent::LlmProvider for StaticTestProvider {
+        async fn complete(
+            &self,
+            _request: crate::agent::provider::CompletionRequest,
+            _cancel_token: tokio_util::sync::CancellationToken,
+        ) -> Result<tokio::sync::mpsc::Receiver<crate::agent::StreamEvent>, AgentError> {
+            let (_tx, rx) = tokio::sync::mpsc::channel(1);
+            Ok(rx)
+        }
+    }
+
+    fn make_test_ws_state_with_provider() -> (Arc<WsServerState>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(sessions::SessionStore::with_base_path(
+            tmp.path().join("sessions"),
+        ));
+        let state = WsServerState::new(WsServerConfig::default())
+            .with_session_store(store)
+            .with_llm_provider(Arc::new(StaticTestProvider));
+        (Arc::new(state), tmp)
+    }
+
     #[test]
     fn test_sender_scope_for_hook_request_with_ipv4_remote_addr() {
         let headers = HeaderMap::new();
@@ -2841,6 +2872,50 @@ mod tests {
         );
     }
 
+    /// `/hooks/agent` surfaces `provider_not_configured` with `ok: false`
+    /// when the request resolves to a valid model but no LLM provider is
+    /// attached to the runtime. Startup is supposed to fail-fast in that
+    /// case (per #351); this test pins the typed error a misconfigured
+    /// state would surface, ensuring the path doesn't silently queue.
+    #[tokio::test]
+    async fn test_hooks_agent_provider_not_configured_emits_typed_error_code() {
+        let (temp, _guard) = set_temp_config_path();
+        std::fs::write(
+            temp.path().join("carapace-test-config.json5"),
+            r#"{ agents: { defaults: { model: "anthropic:test-model" } } }"#,
+        )
+        .unwrap();
+        // make_test_ws_state has no provider; that's the misconfigured path.
+        let (ws_state, _tmp) = make_test_ws_state();
+        let router =
+            test_router_with_hook_registry(test_config(), Arc::new(HookRegistry::new()), ws_state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/hooks/agent")
+            .header("authorization", "Bearer test-hooks-token")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"message":"hello"}"#))
+            .unwrap();
+
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["errorCode"], "provider_not_configured");
+
+        let error_msg = json["error"].as_str().expect("error message");
+        assert!(
+            !error_msg.contains("ANTHROPIC_API_KEY") && !error_msg.contains("authProfile"),
+            "wire-facing message must not leak operator-only env-var hints: {error_msg}"
+        );
+    }
+
     #[tokio::test]
     async fn test_hooks_mapping_agent_dispatches_real_run() {
         let (temp, _guard) = set_temp_config_path();
@@ -2849,7 +2924,7 @@ mod tests {
             r#"{ agents: { defaults: { model: "anthropic:test-model" } } }"#,
         )
         .unwrap();
-        let (ws_state, _tmp) = make_test_ws_state();
+        let (ws_state, _tmp) = make_test_ws_state_with_provider();
         let hook_registry = Arc::new(HookRegistry::new());
         let mut mapping = HookMapping::new("agent-map")
             .with_path("agent-map")

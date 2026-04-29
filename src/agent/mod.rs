@@ -46,6 +46,7 @@ pub use tool_policy::ToolPolicy;
 pub enum AgentConfigurationErrorCode {
     UnknownRoute,
     MissingModel,
+    ProviderNotConfigured,
 }
 
 impl AgentConfigurationErrorCode {
@@ -53,6 +54,7 @@ impl AgentConfigurationErrorCode {
         match self {
             Self::UnknownRoute => "unknown_route",
             Self::MissingModel => "missing_model",
+            Self::ProviderNotConfigured => "provider_not_configured",
         }
     }
 }
@@ -85,6 +87,17 @@ impl AgentConfigurationError {
                  (e.g. `agents.defaults.route: \"fast\"` or \
                  `agents.defaults.model: \"provider:model\"`)"
                     .to_string(),
+        }
+    }
+
+    pub fn provider_not_configured() -> Self {
+        Self {
+            code: AgentConfigurationErrorCode::ProviderNotConfigured,
+            public_message: "no LLM provider is configured",
+            operator_hint: "no LLM provider is configured; set ANTHROPIC_API_KEY, OPENAI_API_KEY, \
+                 GOOGLE_API_KEY, or VENICE_API_KEY, configure Ollama, or configure an \
+                 authProfile (anthropic.authProfile, google.authProfile, codex.authProfile)"
+                .to_string(),
         }
     }
 
