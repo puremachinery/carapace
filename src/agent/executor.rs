@@ -2404,14 +2404,48 @@ mod tests {
             "the claimed Signal receipt should be sent before the run can start typing"
         );
 
-        let session_key = {
-            let registry = state.agent_run_registry.lock();
-            registry
-                .get(&dispatch.run_id)
-                .expect("inbound dispatch should register the run")
-                .session_key
-                .clone()
-        };
+        // No-provider dispatch doesn't register the run — manually register
+        // it so the controlled `execute_run` below has a registry entry to
+        // update. Read the session key off the persisted session rather than
+        // re-deriving it; this stays aligned with dispatch's internal session
+        // resolution even if the fixture grows session-scoping config later.
+        let user_sessions = state
+            .session_store()
+            .list_sessions(crate::sessions::SessionFilter {
+                user_id: Some(chat_id.to_string()),
+                ..Default::default()
+            })
+            .expect("dispatch should have persisted exactly one session");
+        let session_key = user_sessions
+            .iter()
+            .find(|s| s.metadata.channel.as_deref() == Some("signal"))
+            .map(|s| s.session_key.clone())
+            .expect("dispatch should have created a signal session for chat_id");
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        {
+            let mut registry = state.agent_run_registry.lock();
+            registry.register(crate::server::ws::AgentRun {
+                run_id: dispatch.run_id.clone(),
+                session_key: session_key.clone(),
+                delivery_recipient_id: Some(chat_id.to_string()),
+                typing_context: Some(TypingContext {
+                    to: chat_id.to_string(),
+                    ..Default::default()
+                }),
+                status: crate::server::ws::AgentRunStatus::Queued,
+                message: "Hello".to_string(),
+                response: String::new(),
+                error: None,
+                created_at: now_ms,
+                started_at: None,
+                completed_at: None,
+                cancel_token: CancellationToken::new(),
+                waiters: Vec::new(),
+            });
+        }
 
         let provider = Arc::new(MockProvider::new(vec![vec![StreamEvent::Stop {
             reason: StopReason::EndTurn,

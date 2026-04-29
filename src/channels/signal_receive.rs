@@ -633,32 +633,15 @@ mod tests {
     use axum::routing::get;
     use axum::{Json, Router};
     use parking_lot::Mutex;
-    use tokio::sync::mpsc;
     use tokio::sync::Notify;
-    use tokio_util::sync::CancellationToken;
 
     use super::*;
-    use crate::agent::provider::CompletionRequest;
-    use crate::agent::{AgentError, LlmProvider, StreamEvent};
     use crate::plugins::{
         BindingError, ChannelCapabilities, ChannelInfo, ChannelPluginInstance, PluginRegistry,
     };
     use crate::server::ws::WsServerConfig;
     use crate::tasks::TaskQueue;
-
-    struct StaticTestProvider;
-
-    #[async_trait::async_trait]
-    impl LlmProvider for StaticTestProvider {
-        async fn complete(
-            &self,
-            _request: CompletionRequest,
-            _cancel_token: CancellationToken,
-        ) -> Result<mpsc::Receiver<StreamEvent>, AgentError> {
-            let (_tx, rx) = mpsc::channel(1);
-            Ok(rx)
-        }
-    }
+    use crate::test_support::agent::StaticTestProvider;
 
     fn test_state_with_provider(enabled: bool) -> Arc<WsServerState> {
         let state = WsServerState::new(WsServerConfig::default());
@@ -2006,12 +1989,14 @@ mod tests {
         .await
         .expect("immediate no-run receipt task should settle to done");
 
-        let runs = state.agent_run_registry.lock().snapshot_runs();
-        let run = runs
-            .iter()
-            .find(|run| run.message == "hello")
-            .expect("dispatch should still register the inbound run context");
-        assert_eq!(run.status, crate::server::ws::AgentRunStatus::Queued);
+        // Receipt completion + session-message persistence happen above
+        // (asserted via mark_read_count and the queue task); the run-tracking
+        // entry is gated on provider availability and must not be orphaned
+        // when the provider is absent at dispatch time.
+        assert!(
+            state.agent_run_registry.lock().snapshot_runs().is_empty(),
+            "no provider at dispatch time should not orphan a run-registry entry"
+        );
         shutdown_tx
             .send(true)
             .expect("read receipt worker shutdown signal should send");

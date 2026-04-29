@@ -1313,6 +1313,20 @@ async fn dispatch_agent_run(
         return Err((StatusCode::BAD_REQUEST, Json(AgentResponse::from(&error))).into_response());
     }
 
+    // Provider availability is a precondition for queueing a run; check it
+    // before `registry.register` so a missing provider can't orphan an entry.
+    // Returns 503 (server-side misconfiguration), matching the OpenAI-compat
+    // path's status for the same condition.
+    let Some(provider) = ws.llm_provider() else {
+        let error = AgentError::Configuration(AgentConfigurationError::provider_not_configured());
+        error.log_configuration_hint();
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(AgentResponse::from(&error)),
+        )
+            .into_response());
+    };
+
     // Register the agent run
     let cancel_token = tokio_util::sync::CancellationToken::new();
     let run = crate::server::ws::AgentRun {
@@ -1336,22 +1350,17 @@ async fn dispatch_agent_run(
         registry.register(run);
     }
 
-    // Spawn agent executor if LLM provider is configured
-    if let Some(provider) = ws.llm_provider() {
-        config.deliver = validated.deliver;
-        config.extra = validated.venice_parameters.clone();
-        crate::agent::spawn_run(
-            run_id.to_string(),
-            session.session_key.clone(),
-            config,
-            ws.clone(),
-            provider,
-            cancel_token,
-        );
-        debug!("Agent job dispatched: runId='{}'", run_id);
-    } else {
-        debug!("Agent job queued (no LLM provider): runId='{}'", run_id);
-    }
+    config.deliver = validated.deliver;
+    config.extra = validated.venice_parameters.clone();
+    crate::agent::spawn_run(
+        run_id.to_string(),
+        session.session_key.clone(),
+        config,
+        ws.clone(),
+        provider,
+        cancel_token,
+    );
+    debug!("Agent job dispatched: runId='{}'", run_id);
 
     Ok(())
 }
@@ -2513,6 +2522,17 @@ mod tests {
         (Arc::new(state), tmp)
     }
 
+    fn make_test_ws_state_with_provider() -> (Arc<WsServerState>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(sessions::SessionStore::with_base_path(
+            tmp.path().join("sessions"),
+        ));
+        let state = WsServerState::new(WsServerConfig::default())
+            .with_session_store(store)
+            .with_llm_provider(Arc::new(crate::test_support::agent::StaticTestProvider));
+        (Arc::new(state), tmp)
+    }
+
     #[test]
     fn test_sender_scope_for_hook_request_with_ipv4_remote_addr() {
         let headers = HeaderMap::new();
@@ -2841,6 +2861,51 @@ mod tests {
         );
     }
 
+    /// `/hooks/agent` surfaces `provider_not_configured` with `ok: false`
+    /// when the request resolves to a valid model but no LLM provider is
+    /// attached to the runtime. Pins that the path doesn't silently queue.
+    #[tokio::test]
+    async fn test_hooks_agent_provider_not_configured_emits_typed_error_code() {
+        let (temp, _guard) = set_temp_config_path();
+        std::fs::write(
+            temp.path().join("carapace-test-config.json5"),
+            r#"{ agents: { defaults: { model: "anthropic:test-model" } } }"#,
+        )
+        .unwrap();
+        // make_test_ws_state has no provider; that's the misconfigured path.
+        let (ws_state, _tmp) = make_test_ws_state();
+        let router =
+            test_router_with_hook_registry(test_config(), Arc::new(HookRegistry::new()), ws_state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/hooks/agent")
+            .header("authorization", "Bearer test-hooks-token")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"message":"hello"}"#))
+            .unwrap();
+
+        let response = router.oneshot(req).await.unwrap();
+        // 503 SERVICE_UNAVAILABLE matches the existing OpenAI-compat path
+        // for the identical server-side misconfiguration; 400 would
+        // mis-signal a client-side problem.
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["errorCode"], "provider_not_configured");
+
+        let error_msg = json["error"].as_str().expect("error message");
+        assert!(
+            !error_msg.contains("ANTHROPIC_API_KEY") && !error_msg.contains("authProfile"),
+            "wire-facing message must not leak operator-only env-var hints: {error_msg}"
+        );
+    }
+
     #[tokio::test]
     async fn test_hooks_mapping_agent_dispatches_real_run() {
         let (temp, _guard) = set_temp_config_path();
@@ -2849,7 +2914,7 @@ mod tests {
             r#"{ agents: { defaults: { model: "anthropic:test-model" } } }"#,
         )
         .unwrap();
-        let (ws_state, _tmp) = make_test_ws_state();
+        let (ws_state, _tmp) = make_test_ws_state_with_provider();
         let hook_registry = Arc::new(HookRegistry::new());
         let mut mapping = HookMapping::new("agent-map")
             .with_path("agent-map")

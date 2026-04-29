@@ -2113,6 +2113,16 @@ pub(super) fn handle_agent(
         return Err(error_shape(code, &error.to_string(), None));
     }
 
+    // Provider availability is a precondition for queueing a run; check it
+    // before `setup_agent_session` so a missing provider can't orphan a
+    // user-message append + registry entry.
+    let Some(provider) = state.llm_provider() else {
+        let error = crate::agent::AgentConfigurationError::provider_not_configured();
+        error.log_operator_hint();
+        let code = error.code().as_str();
+        return Err(error_shape(code, &error.to_string(), None));
+    };
+
     let (run_id, session_key_out, cancel_token) = setup_agent_session(
         &state,
         session,
@@ -2120,37 +2130,30 @@ pub(super) fn handle_agent(
         agent_params.idempotency_key,
     )?;
 
-    // Spawn the agent executor if an LLM provider is configured
-    let status = if let Some(provider) = state.llm_provider() {
-        config.system = params
-            .and_then(|v| v.get("system"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        config.deliver = params
-            .and_then(|v| v.get("deliver"))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        config.extra = params
-            .and_then(|v| v.get("venice_parameters"))
-            .filter(|v| v.is_object())
-            .cloned();
-        crate::agent::spawn_run(
-            run_id.clone(),
-            session_key_out.clone(),
-            config,
-            state.clone(),
-            provider,
-            cancel_token,
-        );
-        "accepted"
-    } else {
-        // No provider configured — run stays queued
-        "queued"
-    };
+    config.system = params
+        .and_then(|v| v.get("system"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    config.deliver = params
+        .and_then(|v| v.get("deliver"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    config.extra = params
+        .and_then(|v| v.get("venice_parameters"))
+        .filter(|v| v.is_object())
+        .cloned();
+    crate::agent::spawn_run(
+        run_id.clone(),
+        session_key_out.clone(),
+        config,
+        state.clone(),
+        provider,
+        cancel_token,
+    );
 
     Ok(json!({
         "runId": run_id,
-        "status": status,
+        "status": "accepted",
         "message": agent_params.message,
         "sessionKey": session_key_out,
         "streaming": agent_params.stream
@@ -3199,6 +3202,36 @@ mod tests {
         let err = handle_agent(Some(&params), std::sync::Arc::new(state), &conn).unwrap_err();
         assert_eq!(err.code, "missing_model");
         assert!(!err.retryable);
+    }
+
+    /// `handle_agent` surfaces `provider_not_configured` with `retryable:
+    /// false` when the request resolves to a valid model but no LLM provider
+    /// is attached to the state. Startup and hot-reload are supposed to
+    /// guarantee a provider exists, but if a misconfigured WsServerState
+    /// reaches the handler, we surface a typed config error rather than
+    /// silently queuing the run.
+    #[test]
+    fn test_handle_agent_provider_not_configured_returns_typed_code() {
+        let _fixture = crate::test_support::config::StableConfigFixture::new(serde_json::json!({
+            "agents": { "defaults": { "model": "anthropic:test-model" } }
+        }));
+        let (state, _tmp) = make_state_with_temp_sessions();
+        // Note: state has no llm_provider set — this is the misconfigured
+        // path the typed error guards against.
+        let conn = make_conn("conn-provider-test");
+        let params = json!({
+            "message": "hello",
+            "idempotencyKey": "ws-provider-test-1"
+        });
+
+        let err = handle_agent(Some(&params), std::sync::Arc::new(state), &conn).unwrap_err();
+        assert_eq!(err.code, "provider_not_configured");
+        assert!(!err.retryable);
+        assert!(
+            !err.message.contains("ANTHROPIC_API_KEY"),
+            "wire-facing message must not leak operator-only env-var hints: {}",
+            err.message
+        );
     }
 
     #[test]

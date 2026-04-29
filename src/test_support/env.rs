@@ -76,6 +76,57 @@ impl Drop for ScopedEnv {
     }
 }
 
+/// Env vars that any LLM provider in `crate::agent::factory::build_providers`
+/// can read. Keep aligned with the providers that factory matches on; missing
+/// entries make tests that try to force a no-provider state flaky in CI
+/// environments where some of these are set ambiently (e.g. AWS credentials
+/// in GitHub-hosted runners inside AWS).
+///
+/// Strictly provider-detection keys only — runtime infrastructure env vars
+/// (e.g. `CARAPACE_CONFIG_PASSWORD`, `CARAPACE_STATE_DIR`) are deliberately
+/// not in this set, so callers that layer those on top of `provider_env_cleared()`
+/// don't have them silently unset.
+const PROVIDER_ENV_KEYS: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_BASE_URL",
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "OPENAI_OAUTH_CLIENT_ID",
+    "OPENAI_OAUTH_CLIENT_SECRET",
+    "OPENAI_HTTP_REFERER",
+    "OPENAI_X_TITLE",
+    "OPENAI_TITLE",
+    "OLLAMA_BASE_URL",
+    "GOOGLE_API_KEY",
+    "GOOGLE_API_BASE_URL",
+    "VENICE_API_KEY",
+    "VENICE_BASE_URL",
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    // OIDC-based auth in GitHub Actions sets AWS_SESSION_TOKEN (with or
+    // without AWS_ACCESS_KEY_ID); Bedrock provider detection should not
+    // see it leak through into a "no-provider" test.
+    "AWS_SESSION_TOKEN",
+    "VERTEX_PROJECT_ID",
+    "VERTEX_LOCATION",
+    "VERTEX_MODEL",
+    "CLAUDE_CLI_ENABLED",
+];
+
+/// Returns a `ScopedEnv` with every provider-relevant env var unset so
+/// `build_providers` sees a true no-provider state regardless of the host
+/// environment. Tests that need specific provider vars can chain `.set(...)`
+/// on the returned guard.
+pub(crate) fn provider_env_cleared() -> ScopedEnv {
+    let mut env = ScopedEnv::new();
+    for key in PROVIDER_ENV_KEYS {
+        env.unset(key);
+    }
+    env
+}
+
 #[cfg(test)]
 mod tests {
     use super::ScopedEnv;
