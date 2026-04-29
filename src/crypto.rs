@@ -41,8 +41,11 @@ pub(crate) enum PasswordKdfError {
 /// AEAD-blob length, in bytes, of the AES-256-GCM 96-bit nonce.
 pub(crate) const AEAD_NONCE_LEN: usize = 12;
 
-/// AES-256-GCM encryption-key length in bytes.
-pub(crate) const AEAD_KEY_LEN: usize = 32;
+/// AES-256-GCM encryption-key length in bytes. Aliased to
+/// `PASSWORD_DERIVED_KEY_LEN` so the KDF and AEAD layers share one
+/// source of truth for the key size; if either side ever needs a
+/// different size, that change should be deliberate, not silent.
+pub(crate) const AEAD_KEY_LEN: usize = PASSWORD_DERIVED_KEY_LEN;
 
 /// Inner AEAD blob produced by [`encrypt_aead_blob`].
 ///
@@ -131,19 +134,26 @@ fn encrypt_aead_blob_inner(
 
 /// Decrypt an AEAD blob under `key` and `aad`, returning the plaintext.
 ///
+/// Takes slices for both `nonce` and `ciphertext` so callers that already
+/// own borrowed views (parsed from a string segment, sliced from a file
+/// buffer) can pass them through without a `to_vec()` clone. For large
+/// payloads (backup files, session histories) avoiding that clone is a
+/// noticeable memory-pressure win.
+///
 /// Returns [`CryptoEnvelopeError::DecryptionFailed`] for any AEAD failure
 /// (wrong key, wrong AAD, tampered ciphertext, or truncated tag).
 pub(crate) fn decrypt_aead_blob(
     key: &[u8; AEAD_KEY_LEN],
-    blob: &AeadBlob,
+    nonce: &[u8; AEAD_NONCE_LEN],
+    ciphertext: &[u8],
     aad: &[u8],
 ) -> Result<Vec<u8>, CryptoEnvelopeError> {
     let cipher = Aes256Gcm::new(key.into());
     cipher
         .decrypt(
-            Nonce::from_slice(&blob.nonce),
+            Nonce::from_slice(nonce),
             Payload {
-                msg: blob.ciphertext.as_ref(),
+                msg: ciphertext,
                 aad,
             },
         )
@@ -248,7 +258,7 @@ mod tests {
         let key = aead_kat_key();
         let plaintext = b"hello AEAD world".to_vec();
         let blob = encrypt_aead_blob(&key, &plaintext, &[]).unwrap();
-        let recovered = decrypt_aead_blob(&key, &blob, &[]).unwrap();
+        let recovered = decrypt_aead_blob(&key, &blob.nonce, &blob.ciphertext, &[]).unwrap();
         assert_eq!(recovered, plaintext);
     }
 
@@ -258,7 +268,7 @@ mod tests {
         let aad = b"carapace:aead-aad-bind:v1".as_slice();
         let plaintext = b"this is bound to AAD".to_vec();
         let blob = encrypt_aead_blob(&key, &plaintext, aad).unwrap();
-        let recovered = decrypt_aead_blob(&key, &blob, aad).unwrap();
+        let recovered = decrypt_aead_blob(&key, &blob.nonce, &blob.ciphertext, aad).unwrap();
         assert_eq!(recovered, plaintext);
     }
 
@@ -269,7 +279,7 @@ mod tests {
         let plaintext = b"this is bound to AAD".to_vec();
         let blob = encrypt_aead_blob(&key, &plaintext, aad).unwrap();
         let wrong_aad = b"carapace:aead-aad-bind:v2".as_slice();
-        let err = decrypt_aead_blob(&key, &blob, wrong_aad).unwrap_err();
+        let err = decrypt_aead_blob(&key, &blob.nonce, &blob.ciphertext, wrong_aad).unwrap_err();
         assert_eq!(err, CryptoEnvelopeError::DecryptionFailed);
     }
 
@@ -280,7 +290,7 @@ mod tests {
         let blob = encrypt_aead_blob(&key, &plaintext, &[]).unwrap();
         let mut wrong_key = key;
         wrong_key[0] ^= 0xFF;
-        let err = decrypt_aead_blob(&wrong_key, &blob, &[]).unwrap_err();
+        let err = decrypt_aead_blob(&wrong_key, &blob.nonce, &blob.ciphertext, &[]).unwrap_err();
         assert_eq!(err, CryptoEnvelopeError::DecryptionFailed);
     }
 
@@ -292,7 +302,7 @@ mod tests {
         if let Some(byte) = blob.ciphertext.first_mut() {
             *byte ^= 0xFF;
         }
-        let err = decrypt_aead_blob(&key, &blob, &[]).unwrap_err();
+        let err = decrypt_aead_blob(&key, &blob.nonce, &blob.ciphertext, &[]).unwrap_err();
         assert_eq!(err, CryptoEnvelopeError::DecryptionFailed);
     }
 
@@ -332,7 +342,7 @@ mod tests {
         let plaintext = b"carapace-shared-aead-helper".as_slice();
         let aad = b"carapace:aead-blob-helper-aad:v1".as_slice();
         let blob = encrypt_aead_blob_with_nonce_for_test(&key, &nonce, plaintext, aad).unwrap();
-        let recovered = decrypt_aead_blob(&key, &blob, aad).unwrap();
+        let recovered = decrypt_aead_blob(&key, &blob.nonce, &blob.ciphertext, aad).unwrap();
         assert_eq!(recovered, plaintext);
         // AAD-bound ciphertext must differ from the empty-AAD KAT above.
         let no_aad_blob =

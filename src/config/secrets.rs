@@ -16,7 +16,7 @@ use zeroize::Zeroizing;
 
 use crate::crypto::{
     decode_b64_fixed, decrypt_aead_blob, derive_key_argon2id, derive_key_pbkdf2_sha256,
-    encrypt_aead_blob, AeadBlob, CryptoEnvelopeError, PasswordKdfError, PASSWORD_DERIVED_KEY_LEN,
+    encrypt_aead_blob, CryptoEnvelopeError, PasswordKdfError, PASSWORD_DERIVED_KEY_LEN,
 };
 
 const ENC_PREFIX_V1: &str = "enc:v1:";
@@ -186,6 +186,24 @@ impl SecretStore {
         })
     }
 
+    /// Test-only constructor that bypasses KDF and uses caller-supplied key
+    /// material directly. Used by golden-vector tests that need a fast,
+    /// deterministic store without paying the Argon2id cost.
+    #[cfg(test)]
+    pub(crate) fn from_raw_key_and_salt_for_test(
+        key: [u8; PASSWORD_DERIVED_KEY_LEN],
+        salt: [u8; SALT_LEN],
+    ) -> Self {
+        Self {
+            access: SecretStoreAccess::Ready {
+                key: Zeroizing::new(key),
+                mode: SecretStoreMode::Full,
+            },
+            salt,
+            write_version: SecretEnvelopeVersion::current(),
+        }
+    }
+
     /// Create a store for rekey-based decryption without random salt generation.
     ///
     /// Note: `decrypt()` will always fail for real ciphertexts because the
@@ -210,36 +228,56 @@ impl SecretStore {
 
     /// Encrypt a plaintext string, returning the current `enc:v2:...` format.
     pub fn encrypt(&self, plaintext: &str) -> Result<String, SecretError> {
-        let key = match &self.access {
+        let key = self.encrypt_key()?;
+        let blob = encrypt_aead_blob(key, plaintext.as_bytes(), &[]).map_err(map_envelope_error)?;
+        Ok(self.format_envelope(blob.nonce, &blob.ciphertext))
+    }
+
+    /// Test-only encrypt path that pins the AEAD nonce instead of generating
+    /// a random one, so golden-vector tests can pin canonical persisted
+    /// bytes against the *production* envelope formatter rather than a
+    /// reconstructed copy.
+    #[cfg(test)]
+    pub(crate) fn encrypt_with_nonce_for_test(
+        &self,
+        plaintext: &str,
+        nonce: &[u8; NONCE_LEN],
+    ) -> Result<String, SecretError> {
+        let key = self.encrypt_key()?;
+        let blob = crate::crypto::encrypt_aead_blob_with_nonce_for_test(
+            key,
+            nonce,
+            plaintext.as_bytes(),
+            &[],
+        )
+        .map_err(map_envelope_error)?;
+        Ok(self.format_envelope(blob.nonce, &blob.ciphertext))
+    }
+
+    fn encrypt_key(&self) -> Result<&[u8; PASSWORD_DERIVED_KEY_LEN], SecretError> {
+        match &self.access {
             SecretStoreAccess::Ready {
                 key,
                 mode: SecretStoreMode::Full,
-            } => key,
+            } => Ok(key),
             SecretStoreAccess::Ready {
                 mode: SecretStoreMode::DecryptOnly,
                 ..
-            } => {
-                return Err(SecretError::EncryptionFailed(
-                    "decrypt-only secret store cannot encrypt".to_string(),
-                ));
-            }
-            SecretStoreAccess::InitFailed(err) => return Err(err.clone()),
-        };
+            } => Err(SecretError::EncryptionFailed(
+                "decrypt-only secret store cannot encrypt".to_string(),
+            )),
+            SecretStoreAccess::InitFailed(err) => Err(err.clone()),
+        }
+    }
 
-        let blob =
-            encrypt_aead_blob(key, plaintext.as_bytes(), &[]).map_err(map_envelope_error)?;
-
-        let nonce_b64 = BASE64.encode(blob.nonce);
-        let ct_b64 = BASE64.encode(&blob.ciphertext);
-        let salt_b64 = BASE64.encode(self.salt);
-
-        Ok(format!(
+    fn format_envelope(&self, nonce: [u8; NONCE_LEN], ciphertext: &[u8]) -> String {
+        format!(
             "{}{}:{}:{}",
             self.write_version.prefix(),
-            nonce_b64,
-            ct_b64,
-            salt_b64
-        ))
+            BASE64.encode(nonce),
+            BASE64.encode(ciphertext),
+            BASE64.encode(self.salt),
+        )
     }
 
     /// Decrypt a supported `enc:v1:` or `enc:v2:` string back to plaintext
@@ -323,16 +361,17 @@ pub(crate) fn parse_encrypted(encrypted: &str) -> Result<EncryptedParts, SecretE
         )));
     }
 
-    let nonce: [u8; NONCE_LEN] = decode_b64_fixed("nonce", segments[0]).map_err(|err| match err {
-        CryptoEnvelopeError::Base64Decode { field, message } => SecretError::Base64Decode {
-            field: field.to_string(),
-            message,
-        },
-        CryptoEnvelopeError::FieldLength { expected, got, .. } => {
-            SecretError::InvalidNonceLength { expected, got }
-        }
-        other => SecretError::BadFormat(other.to_string()),
-    })?;
+    let nonce: [u8; NONCE_LEN] =
+        decode_b64_fixed("nonce", segments[0]).map_err(|err| match err {
+            CryptoEnvelopeError::Base64Decode { field, message } => SecretError::Base64Decode {
+                field: field.to_string(),
+                message,
+            },
+            CryptoEnvelopeError::FieldLength { expected, got, .. } => {
+                SecretError::InvalidNonceLength { expected, got }
+            }
+            other => SecretError::BadFormat(other.to_string()),
+        })?;
 
     let ciphertext = BASE64
         .decode(segments[1])
@@ -366,11 +405,8 @@ fn decrypt_with_key(
     nonce: &[u8; NONCE_LEN],
     ciphertext: &[u8],
 ) -> Result<String, SecretError> {
-    let blob = AeadBlob {
-        nonce: *nonce,
-        ciphertext: ciphertext.to_vec(),
-    };
-    let plaintext_bytes = decrypt_aead_blob(key, &blob, &[]).map_err(map_envelope_error)?;
+    let plaintext_bytes =
+        decrypt_aead_blob(key, nonce, ciphertext, &[]).map_err(map_envelope_error)?;
     String::from_utf8(plaintext_bytes).map_err(|_| SecretError::DecryptionFailed)
 }
 
@@ -1346,13 +1382,13 @@ mod tests {
 
     #[test]
     fn test_enc_v2_persisted_format_golden_vector() {
-        // Golden vector pinning the canonical `enc:v2:` envelope for a fixed
-        // key + salt + nonce + plaintext. Guards against silent drift in the
-        // persisted format (segment ordering, base64 encoding, AES-GCM bytes).
-        // The key and salt are hashed labels; the nonce is also derived
-        // deterministically. The expected ciphertext is computed independently
-        // with the underlying `Aes256Gcm` API (not the helper) so any future
-        // helper change that altered persisted bytes would flag here.
+        // True golden vector: pins the canonical `enc:v2:` envelope to a
+        // hardcoded literal string for a fixed key + salt + nonce +
+        // plaintext, and computes the actual envelope through the
+        // *production* `SecretStore` write path (with a test-only nonce
+        // override). Any drift in the helper's AEAD bytes, the envelope
+        // segment ordering, the base64 alphabet, or the prefix would change
+        // the literal and the assertion would fail.
         let key: [u8; PASSWORD_DERIVED_KEY_LEN] =
             sha2::Sha256::digest(b"carapace-secrets-golden-key").into();
         let salt_digest = sha2::Sha256::digest(b"carapace-secrets-golden-salt");
@@ -1365,38 +1401,25 @@ mod tests {
             .expect("nonce slice length");
         let plaintext = "sk-live-golden-secret";
 
-        // Independently compute the expected canonical ciphertext bytes.
-        let cipher = Aes256Gcm::new((&key).into());
-        let expected_ct = cipher
-            .encrypt(Nonce::from_slice(&nonce), plaintext.as_bytes())
-            .expect("golden encryption");
-        let expected_envelope = format!(
-            "enc:v2:{}:{}:{}",
-            BASE64.encode(nonce),
-            BASE64.encode(&expected_ct),
-            BASE64.encode(salt)
-        );
+        // Pinned canonical `enc:v2:` envelope for the fixed inputs above.
+        // Regenerate by replacing this constant with `""`, running the test,
+        // and copying the value from the assertion's "actual" panic message.
+        // Any deliberate persisted-format change must update this constant.
+        const EXPECTED_ENVELOPE: &str =
+            "enc:v2:HVld7esM3b11YwFS:/wAwmf1W35FauNExFxCqEMI+C6VcAxWkJ8TRWp69uF/85BSPBw==:WysQE5dy+IR3iQR5+ynVZQ==";
 
-        // Build the same envelope through the public store path with a fixed
-        // key+salt store, but injecting the same nonce. The store's `encrypt`
-        // generates its own random nonce, so we exercise the persisted-format
-        // path explicitly here using `encrypt_with_raw_key_and_salt`-style
-        // construction that pins all inputs.
-        let actual_ct = Aes256Gcm::new((&key).into())
-            .encrypt(Nonce::from_slice(&nonce), plaintext.as_bytes())
-            .expect("actual encryption");
-        let actual_envelope = format!(
-            "enc:v2:{}:{}:{}",
-            BASE64.encode(nonce),
-            BASE64.encode(&actual_ct),
-            BASE64.encode(salt)
-        );
-        assert_eq!(actual_envelope, expected_envelope);
+        // Build the actual envelope through the production write path with a
+        // test-only nonce override. This exercises `SecretStore::encrypt`'s
+        // formatter, helper call, and prefix selection — not a reconstruction.
+        let store = SecretStore::from_raw_key_and_salt_for_test(key, salt);
+        let actual_envelope = store
+            .encrypt_with_nonce_for_test(plaintext, &nonce)
+            .expect("production encrypt with test nonce");
+        assert_eq!(actual_envelope, EXPECTED_ENVELOPE);
 
-        // Round-trip via the public parser/decrypt path to confirm the
-        // canonical envelope decodes back to the same plaintext under this
-        // fixed key.
-        let parts = parse_encrypted(&expected_envelope).expect("parse golden envelope");
+        // Round-trip via the public parser + decrypt path to confirm the
+        // canonical envelope decodes back to the same plaintext.
+        let parts = parse_encrypted(EXPECTED_ENVELOPE).expect("parse golden envelope");
         assert_eq!(parts.version, SecretEnvelopeVersion::V2);
         assert_eq!(parts.nonce, nonce);
         assert_eq!(parts.salt, salt);

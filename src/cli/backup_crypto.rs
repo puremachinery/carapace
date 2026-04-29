@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
 use crate::crypto::{
-    decrypt_aead_blob, derive_key_argon2id, derive_key_pbkdf2_sha256, encrypt_aead_blob, AeadBlob,
+    decrypt_aead_blob, derive_key_argon2id, derive_key_pbkdf2_sha256, encrypt_aead_blob,
     CryptoEnvelopeError, PASSWORD_DERIVED_KEY_LEN,
 };
 
@@ -122,6 +122,43 @@ fn derive_key(
     }
 }
 
+/// Write the canonical `CRPC_ENC` envelope (magic + version + salt + nonce +
+/// ciphertext-with-tag) to `writer`. Shared between the production
+/// `encrypt_backup` path and the test-only golden-vector helper so any drift
+/// in this layout fails both call sites at once.
+fn write_encrypted_backup_bytes<W: std::io::Write>(
+    writer: &mut W,
+    salt: &[u8; SALT_LEN],
+    nonce: &[u8; NONCE_LEN],
+    ciphertext: &[u8],
+) -> std::io::Result<()> {
+    writer.write_all(MAGIC)?;
+    writer.write_all(&[FORMAT_VERSION])?;
+    writer.write_all(salt)?;
+    writer.write_all(nonce)?;
+    writer.write_all(ciphertext)?;
+    Ok(())
+}
+
+/// Test-only helper that runs the production envelope-byte path with a
+/// caller-supplied key + salt + nonce so golden-vector tests can pin
+/// canonical persisted bytes against what production actually writes.
+#[cfg(test)]
+pub(crate) fn build_encrypted_backup_bytes_for_test(
+    key: &[u8; KEY_LEN],
+    salt: &[u8; SALT_LEN],
+    plaintext: &[u8],
+    nonce: &[u8; NONCE_LEN],
+) -> Result<Vec<u8>, BackupCryptoError> {
+    let blob = crate::crypto::encrypt_aead_blob_with_nonce_for_test(key, nonce, plaintext, &[])
+        .map_err(map_envelope_error)?;
+    let mut out =
+        Vec::with_capacity(MAGIC.len() + 1 + SALT_LEN + NONCE_LEN + blob.ciphertext.len());
+    write_encrypted_backup_bytes(&mut out, salt, &blob.nonce, &blob.ciphertext)
+        .map_err(BackupCryptoError::from)?;
+    Ok(out)
+}
+
 /// Encrypt a backup file with AES-256-GCM.
 ///
 /// Reads `input`, encrypts with a key derived from `passphrase`, and writes
@@ -150,11 +187,7 @@ pub fn encrypt_backup(
         ))
     })?;
 
-    file.write_all(MAGIC)?;
-    file.write_all(&[FORMAT_VERSION])?;
-    file.write_all(&salt)?;
-    file.write_all(&blob.nonce)?;
-    file.write_all(&blob.ciphertext)?;
+    write_encrypted_backup_bytes(&mut file, &salt, &blob.nonce, &blob.ciphertext)?;
     file.flush()?;
 
     let metadata = std::fs::metadata(output)?;
@@ -195,14 +228,13 @@ pub fn decrypt_backup(
 
     let key = Zeroizing::new(derive_key(version, passphrase.as_bytes(), salt)?);
 
+    // `split_at(NONCE_LEN)` already guaranteed the slice length, but use
+    // `try_into` rather than `expect` so a future refactor of the parser
+    // cannot turn this into a panic in a user-facing decrypt path.
     let nonce: [u8; NONCE_LEN] = nonce_bytes
         .try_into()
-        .expect("split_at(NONCE_LEN) produces exactly NONCE_LEN bytes");
-    let blob = AeadBlob {
-        nonce,
-        ciphertext: ciphertext.to_vec(),
-    };
-    let plaintext = decrypt_aead_blob(&key, &blob, &[]).map_err(map_envelope_error)?;
+        .map_err(|_| BackupCryptoError::InvalidMagic)?;
+    let plaintext = decrypt_aead_blob(&key, &nonce, ciphertext, &[]).map_err(map_envelope_error)?;
 
     std::fs::write(output, &plaintext).map_err(|e| {
         BackupCryptoError::IoError(format!(
@@ -686,10 +718,12 @@ mod tests {
 
     #[test]
     fn test_crpc_enc_persisted_layout_golden_vector() {
-        // Golden vector pinning the full `CRPC_ENC` byte sequence for a fixed
-        // key + salt + nonce + plaintext. Bypasses Argon2id (uses a pre-derived
-        // key) so the test stays fast. Guards against drift in the persisted
-        // header layout (magic + version + salt + nonce + ciphertext).
+        // True golden vector: pins the full canonical `CRPC_ENC` byte
+        // sequence to a hardcoded literal `&[u8]` for a fixed key + salt +
+        // nonce + plaintext. The actual bytes come from the *production*
+        // envelope-writer (`build_encrypted_backup_bytes_for_test`), so any
+        // drift in MAGIC, FORMAT_VERSION, segment ordering, or AEAD output
+        // would break the assertion against the literal.
         let key: [u8; KEY_LEN] = sha2::Sha256::digest(b"carapace-backup-golden-key").into();
         let salt_digest = sha2::Sha256::digest(b"carapace-backup-golden-salt");
         let salt: [u8; SALT_LEN] = salt_digest.into();
@@ -699,42 +733,47 @@ mod tests {
             .expect("nonce slice length");
         let plaintext = b"carapace backup golden plaintext";
 
-        // Independently compute expected ciphertext using the raw `Aes256Gcm`
-        // API. If this assertion ever fails, the inner crypto-envelope bytes
-        // for the backup format have drifted.
-        let cipher = Aes256Gcm::new((&key).into());
-        let expected_ct = cipher
-            .encrypt(Nonce::from_slice(&nonce_bytes), plaintext.as_ref())
-            .expect("golden backup encryption");
+        // Pinned canonical CRPC_ENC bytes for the inputs above. Layout:
+        //   bytes  0..8  : MAGIC ("CRPC_ENC")
+        //   byte      8  : FORMAT_VERSION_V2 (0x02)
+        //   bytes  9..41 : salt (32 bytes)
+        //   bytes 41..53 : nonce (12 bytes)
+        //   bytes 53..   : AES-256-GCM ciphertext-with-tag
+        // Regenerate by replacing this with `&[]`, running the test, and
+        // copying the value from the assertion's "actual" panic message.
+        // Any deliberate persisted-format change must update this constant.
+        const EXPECTED_CRPC_BYTES: &[u8] = &[
+            67, 82, 80, 67, 95, 69, 78, 67, 2, 86, 219, 5, 152, 182, 223, 204, 105, 158, 92, 27,
+            245, 226, 163, 65, 202, 169, 5, 60, 96, 165, 203, 239, 47, 46, 105, 131, 248, 164, 120,
+            17, 24, 141, 133, 102, 77, 194, 3, 51, 33, 145, 148, 0, 32, 173, 226, 28, 57, 88, 99,
+            213, 105, 120, 109, 73, 249, 113, 243, 203, 230, 22, 129, 179, 75, 47, 255, 137, 207,
+            64, 245, 147, 169, 143, 74, 182, 252, 214, 85, 185, 66, 150, 74, 144, 38, 49, 44, 107,
+            139, 147, 215, 93, 128,
+        ];
 
-        let mut expected = Vec::new();
-        expected.extend_from_slice(MAGIC);
-        expected.push(FORMAT_VERSION_V2);
-        expected.extend_from_slice(&salt);
-        expected.extend_from_slice(&nonce_bytes);
-        expected.extend_from_slice(&expected_ct);
+        let actual_bytes =
+            build_encrypted_backup_bytes_for_test(&key, &salt, plaintext, &nonce_bytes)
+                .expect("production backup envelope build");
+        assert_eq!(actual_bytes, EXPECTED_CRPC_BYTES);
 
-        // Decode the golden bytes through the same parsing logic that
-        // `decrypt_backup` uses to confirm round-trip works.
-        assert_eq!(&expected[..MAGIC.len()], MAGIC.as_slice());
-        assert_eq!(expected[MAGIC.len()], FORMAT_VERSION_V2);
+        // Round-trip via the production decrypt path: parse magic / version /
+        // salt / nonce, derive key (pre-derived here), and AEAD-decrypt.
         let header_offset = MAGIC.len() + 1;
+        let nonce_offset = header_offset + SALT_LEN;
+        let ct_offset = nonce_offset + NONCE_LEN;
+        assert_eq!(&actual_bytes[..MAGIC.len()], MAGIC.as_slice());
+        assert_eq!(actual_bytes[MAGIC.len()], FORMAT_VERSION_V2);
         assert_eq!(
-            &expected[header_offset..header_offset + SALT_LEN],
+            &actual_bytes[header_offset..header_offset + SALT_LEN],
             salt.as_slice()
         );
-        let nonce_offset = header_offset + SALT_LEN;
         assert_eq!(
-            &expected[nonce_offset..nonce_offset + NONCE_LEN],
+            &actual_bytes[nonce_offset..nonce_offset + NONCE_LEN],
             nonce_bytes.as_slice()
         );
-        let ct_offset = nonce_offset + NONCE_LEN;
-        let recovered = cipher
-            .decrypt(
-                Nonce::from_slice(&nonce_bytes),
-                expected[ct_offset..].as_ref(),
-            )
-            .expect("golden backup decryption");
+        let recovered =
+            crate::crypto::decrypt_aead_blob(&key, &nonce_bytes, &actual_bytes[ct_offset..], &[])
+                .expect("golden backup decryption via shared helper");
         assert_eq!(recovered, plaintext);
     }
 
