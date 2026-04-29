@@ -52,17 +52,19 @@ const FIXTURE_CONFIG_FILE_NAME: &str = "carapace.json5";
 /// the in-memory cache from the same file via `load_config_pair_uncached`.
 /// If the cache later expires, the disk fallback returns identical content.
 ///
-/// Field declaration order is load-bearing: the explicit `Drop` impl runs
-/// first (clears the cache), then fields drop top-to-bottom. `_cache_guard`
-/// is declared LAST so the global cache lock is still held while the env
-/// and tempdir teardown runs — no other cache user can observe a stale
-/// lock window. Adding a new field below `_cache_guard` would re-introduce
-/// that window.
+/// Teardown order is explicit in `Drop`: clear the cache, restore the env,
+/// remove the tempdir, then release the cache lock. The inner resource struct
+/// is exhaustively destructured there, so adding another guarded resource
+/// fails to compile until the teardown order is reconsidered.
 pub(crate) struct StableConfigFixture {
+    inner: Option<StableConfigFixtureInner>,
+}
+
+struct StableConfigFixtureInner {
     config_path: PathBuf,
-    _env_guard: ScopedEnv,
-    _tempdir: TempDir,
-    _cache_guard: ScopedConfigCache,
+    env_guard: ScopedEnv,
+    tempdir: TempDir,
+    cache_guard: ScopedConfigCache,
 }
 
 impl StableConfigFixture {
@@ -77,24 +79,44 @@ impl StableConfigFixture {
         env_guard.set("CARAPACE_CONFIG_PATH", config_path.as_os_str());
 
         Self {
-            config_path,
-            _env_guard: env_guard,
-            _tempdir: tempdir,
-            _cache_guard: cache_guard,
+            inner: Some(StableConfigFixtureInner {
+                config_path,
+                env_guard,
+                tempdir,
+                cache_guard,
+            }),
         }
     }
 
     pub(crate) fn update(&self, raw_value: Value) {
-        write_and_prime(&self.config_path, &raw_value);
+        let inner = self
+            .inner
+            .as_ref()
+            .expect("stable config fixture should be live while tests update it");
+        write_and_prime(&inner.config_path, &raw_value);
     }
 }
 
 impl Drop for StableConfigFixture {
     fn drop(&mut self) {
-        // Runs before any field drops. Clearing here ensures the cache is
-        // empty while `_cache_guard` still holds the global cache lock,
-        // preventing the next test from observing leaked state.
+        let Some(inner) = self.inner.take() else {
+            return;
+        };
+        let StableConfigFixtureInner {
+            config_path,
+            env_guard,
+            tempdir,
+            cache_guard,
+        } = inner;
+
+        // Clearing here ensures the cache is empty while `cache_guard` still
+        // holds the global cache lock, preventing the next test from observing
+        // leaked state.
         crate::config::clear_cache();
+        drop(config_path);
+        drop(env_guard);
+        drop(tempdir);
+        drop(cache_guard);
     }
 }
 

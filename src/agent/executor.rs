@@ -2450,6 +2450,10 @@ mod tests {
         )
         .await
         .expect("typing stop should be observed");
+        assert!(
+            state.message_pipeline().channels_with_messages().is_empty(),
+            "empty provider response should not queue outbound delivery"
+        );
         assert_eq!(
             plugin.events(),
             vec!["read", "start", "stop"],
