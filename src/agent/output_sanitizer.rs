@@ -27,11 +27,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutputSanitizerConfig {
     /// Master switch for HTML sanitization. Default: `true`.
-    #[serde(default = "default_true", rename = "sanitizeHtml")]
+    #[serde(default = "default_true", alias = "sanitizeHtml")]
     pub sanitize_html: bool,
     /// CSP policy string attached to sanitized output. Use an empty string to
     /// disable.  Default: restrictive agent-content policy.
-    #[serde(default = "default_csp_policy", rename = "cspPolicy")]
+    #[serde(default = "default_csp_policy", alias = "cspPolicy")]
     pub csp_policy: String,
 }
 
@@ -871,6 +871,14 @@ mod tests {
         let parsed: OutputSanitizerConfig = serde_json::from_str(json).unwrap();
         assert!(parsed.sanitize_html);
         assert!(parsed.csp_policy.contains("default-src 'none'"));
+    }
+
+    #[test]
+    fn test_config_deserialize_camel_case_aliases() {
+        let json = r#"{"sanitizeHtml":false,"cspPolicy":"default-src 'self'"}"#;
+        let parsed: OutputSanitizerConfig = serde_json::from_str(json).unwrap();
+        assert!(!parsed.sanitize_html);
+        assert_eq!(parsed.csp_policy, "default-src 'self'");
     }
 
     // ==================== XSS Attack Vectors ====================

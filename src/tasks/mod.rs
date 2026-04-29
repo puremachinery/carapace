@@ -32,6 +32,10 @@ fn now_ms() -> u64 {
     crate::time::unix_now_ms_u64()
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// Durable lifecycle states for long-running task processing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -107,7 +111,7 @@ impl TaskPolicyPatch {
 
 /// A single persisted task record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct DurableTask {
     pub id: String,
     pub state: TaskState,
@@ -127,8 +131,8 @@ pub struct DurableTask {
     pub policy: TaskPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_reason: Option<TaskBlockedReason>,
-    /// Accepted from task queue files written by previous task-policy code.
-    #[serde(default, skip_serializing)]
+    /// True when the task was created with an explicit continuation policy.
+    #[serde(default, skip_serializing_if = "is_false")]
     pub policy_explicit: bool,
 }
 
@@ -368,7 +372,7 @@ impl TaskQueue {
             run_ids: Vec::new(),
             policy: params.policy,
             blocked_reason: params.blocked_reason,
-            policy_explicit: false,
+            policy_explicit: true,
         }
     }
 
@@ -1411,6 +1415,7 @@ mod tests {
         let queue = TaskQueue::new(Some(path));
         queue.load().expect("existing queue should load");
         let loaded = queue.get("existing-task").expect("task should load");
+        assert!(!loaded.policy_explicit);
         assert_eq!(loaded.policy, TaskPolicy::default());
     }
 
@@ -1454,8 +1459,8 @@ mod tests {
         queue.flush_to_disk();
         let persisted = std::fs::read_to_string(path).unwrap();
         assert!(
-            !persisted.contains("policyExplicit"),
-            "new queue writes should use the current task schema"
+            persisted.contains("\"policyExplicit\": true"),
+            "queue writes must retain explicit policy metadata for API-created tasks"
         );
     }
 

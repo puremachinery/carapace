@@ -2350,7 +2350,8 @@ async fn run_message_loop(
         if validate_request_params(tx, &req_id, &method, &params, json_depth_limit).is_err() {
             continue;
         }
-        let method_known = GATEWAY_METHODS.contains(&method.as_str());
+        let canonical_method = handlers::canonicalize_ws_method_name(&method);
+        let method_known = GATEWAY_METHODS.contains(&canonical_method);
         let result = dispatch_method(&method, params.as_ref(), state, conn).await;
         send_dispatch_result(tx, &req_id, &method, method_known, result);
     }

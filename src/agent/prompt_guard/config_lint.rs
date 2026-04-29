@@ -38,6 +38,7 @@ pub fn lint_agent_configs(agents: &Value, config: &ConfigLintConfig) -> Vec<Sche
             if policy == "AllowAll" || policy == "allowAll" || policy == "allow_all" {
                 let has_guard = agent_obj
                     .get("exfiltrationGuard")
+                    .or_else(|| agent_obj.get("exfiltration_guard"))
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
 
@@ -54,7 +55,7 @@ pub fn lint_agent_configs(agents: &Value, config: &ConfigLintConfig) -> Vec<Sche
         }
 
         // Warn: missing maxTokens
-        if !agent_obj.contains_key("maxTokens") {
+        if !agent_obj.contains_key("maxTokens") && !agent_obj.contains_key("max_tokens") {
             issues.push(SchemaIssue {
                 severity: Severity::Warning,
                 path: format!("{}.maxTokens", path_prefix),
@@ -282,7 +283,7 @@ mod tests {
     }
 
     #[test]
-    fn test_exfiltration_guard_snake_case_does_not_suppress_warning() {
+    fn test_exfiltration_guard_snake_case() {
         let agents = json!({
             "list": [{
                 "model": "gpt-4",
@@ -292,6 +293,6 @@ mod tests {
             }]
         });
         let issues = lint_agent_configs(&agents, &default_config());
-        assert!(issues.iter().any(|i| i.path.contains("toolPolicy")));
+        assert!(!issues.iter().any(|i| i.path.contains("toolPolicy")));
     }
 }

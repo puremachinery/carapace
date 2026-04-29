@@ -957,8 +957,23 @@ fn validate_agents(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schema
     if let Some(v) = defaults.get("maxConcurrent") {
         check_positive_integer(v, ".agents.defaults.maxConcurrent", issues);
     }
-    if let Some(v) = defaults.get("timeoutSeconds") {
+    let timeout_seconds = defaults.get("timeoutSeconds");
+    let timeout_alias = defaults.get("timeout");
+
+    if let Some(v) = timeout_seconds {
         check_positive_integer(v, ".agents.defaults.timeoutSeconds", issues);
+    }
+    if let Some(v) = timeout_alias {
+        check_positive_integer(v, ".agents.defaults.timeout", issues);
+    }
+    if timeout_seconds.is_some() && timeout_alias.is_some() {
+        issues.push(SchemaIssue {
+            severity: Severity::Warning,
+            path: ".agents.defaults.timeout".to_string(),
+            message:
+                "Both agents.defaults.timeoutSeconds and agents.defaults.timeout are set; timeoutSeconds takes precedence"
+                    .to_string(),
+        });
     }
     if let Some(v) = defaults.get("contextTokens") {
         check_positive_integer(v, ".agents.defaults.contextTokens", issues);
@@ -1265,6 +1280,12 @@ fn prompt_guard_entry(agents: &Value) -> Option<(&'static str, &serde_json::Map<
         .get("promptGuard")
         .and_then(|v| v.as_object())
         .map(|v| ("promptGuard", v))
+        .or_else(|| {
+            agents
+                .get("prompt_guard")
+                .and_then(|v| v.as_object())
+                .map(|v| ("prompt_guard", v))
+        })
 }
 
 fn prompt_guard_config_lint_obj(
@@ -1295,13 +1316,19 @@ fn validate_output_sanitizer(obj: &serde_json::Map<String, Value>, issues: &mut 
         None => return,
     };
 
-    let output = agents.get("outputSanitizer").and_then(|v| v.as_object());
+    let output = agents
+        .get("outputSanitizer")
+        .or_else(|| agents.get("output_sanitizer"))
+        .and_then(|v| v.as_object());
     let output = match output {
         Some(o) => o,
         None => return,
     };
 
-    if let Some(enabled) = output.get("sanitizeHtml") {
+    if let Some(enabled) = output
+        .get("sanitizeHtml")
+        .or_else(|| output.get("sanitize_html"))
+    {
         if !enabled.is_boolean() {
             issues.push(SchemaIssue {
                 severity: Severity::Warning,
@@ -1311,7 +1338,7 @@ fn validate_output_sanitizer(obj: &serde_json::Map<String, Value>, issues: &mut 
         }
     }
 
-    if let Some(policy) = output.get("cspPolicy") {
+    if let Some(policy) = output.get("cspPolicy").or_else(|| output.get("csp_policy")) {
         if !policy.is_string() {
             issues.push(SchemaIssue {
                 severity: Severity::Warning,
@@ -2544,6 +2571,26 @@ mod tests {
     }
 
     #[test]
+    fn test_agents_defaults_timeout_alias_valid() {
+        let cfg = json!({ "agents": { "defaults": { "timeout": 60 } } });
+        let issues = validate_schema(&cfg);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.path.starts_with(".agents.defaults")),
+            "Expected no issues for agents.defaults, but found: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_agents_defaults_warns_when_both_timeout_keys_are_set() {
+        let cfg = json!({ "agents": { "defaults": { "timeoutSeconds": 60, "timeout": 30 } } });
+        let issues = validate_schema(&cfg);
+        assert!(issues.iter().any(|i| i.path == ".agents.defaults.timeout"));
+    }
+
+    #[test]
     fn test_agents_defaults_zero_warns() {
         let cfg = json!({ "agents": { "defaults": { "maxConcurrent": 0 } } });
         let issues = validate_schema(&cfg);
@@ -2559,6 +2606,22 @@ mod tests {
                 "outputSanitizer": {
                     "sanitizeHtml": false,
                     "cspPolicy": "default-src 'self'"
+                }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(!issues
+            .iter()
+            .any(|i| i.path.starts_with(".agents.outputSanitizer")));
+    }
+
+    #[test]
+    fn test_agents_output_sanitizer_snake_case_valid() {
+        let cfg = json!({
+            "agents": {
+                "output_sanitizer": {
+                    "sanitize_html": false,
+                    "csp_policy": "default-src 'self'"
                 }
             }
         });
@@ -2645,6 +2708,27 @@ mod tests {
             .any(|i| i.path == ".agents.list[0].toolPolicy"));
         assert!(issues.iter().any(|i| i.path == ".agents.list[0].maxTokens"));
         assert!(issues.iter().any(|i| i.path == ".agents.list[0].model"));
+    }
+
+    #[test]
+    fn test_prompt_guard_snake_case_paths_reflect_variant() {
+        let cfg = json!({
+            "agents": {
+                "prompt_guard": {
+                    "enabled": "true",
+                    "config_lint": {
+                        "enabled": "true"
+                    }
+                }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(issues
+            .iter()
+            .any(|i| i.path == ".agents.prompt_guard.enabled"));
+        assert!(issues
+            .iter()
+            .any(|i| i.path == ".agents.prompt_guard.config_lint.enabled"));
     }
 
     // --- session retention ---

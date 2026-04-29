@@ -33,6 +33,10 @@ pub struct SignalEnvelope {
     #[serde(default, rename = "sourceUuid")]
     pub source_uuid: Option<String>,
 
+    /// Source field emitted by some signal-cli-rest-api versions.
+    #[serde(default)]
+    pub source: Option<String>,
+
     /// Timestamp of the message.
     #[serde(default)]
     pub timestamp: Option<u64>,
@@ -54,20 +58,21 @@ pub struct SignalDataMessage {
     pub timestamp: Option<u64>,
 
     /// Group info, if this is a group message.
-    #[serde(default, rename = "groupInfo")]
+    #[serde(default, alias = "groupInfo")]
     pub group_info: Option<SignalGroupInfo>,
 }
 
 impl SignalEnvelope {
     /// Returns the effective source identifier for the envelope.
     ///
-    /// Returns `sourceNumber` or `sourceUuid`, so the result is not guaranteed
-    /// to be a phone number.
+    /// Returns `sourceNumber`, `sourceUuid`, or `source`, so the result is not
+    /// guaranteed to be a phone number.
     pub fn effective_source_number(&self) -> Option<&str> {
         self.source_number
             .as_deref()
             .filter(|s| !s.trim().is_empty())
             .or_else(|| self.source_uuid.as_deref().filter(|s| !s.trim().is_empty()))
+            .or_else(|| self.source.as_deref().filter(|s| !s.trim().is_empty()))
     }
 }
 
@@ -75,7 +80,7 @@ impl SignalEnvelope {
 #[derive(Debug, Deserialize)]
 pub struct SignalGroupInfo {
     /// Group identifier (base64).
-    #[serde(default, rename = "groupId")]
+    #[serde(default, alias = "groupId")]
     pub group_id: Option<String>,
 }
 
@@ -895,6 +900,26 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_group_message_with_snake_case_fields() {
+        let json = r#"[
+            {
+                "sourceNumber": "+15559876543",
+                "dataMessage": {
+                    "message": "Group hello",
+                    "group_info": {
+                        "group_id": "dGVzdGdyb3VwaWQ="
+                    }
+                }
+            }
+        ]"#;
+
+        let envelopes: Vec<SignalEnvelope> = serde_json::from_str(json).unwrap();
+        let dm = envelopes[0].data_message.as_ref().unwrap();
+        let group = dm.group_info.as_ref().unwrap();
+        assert_eq!(group.group_id.as_deref(), Some("dGVzdGdyb3VwaWQ="));
+    }
+
+    #[test]
     fn test_parse_empty_response() {
         let json = "[]";
         let envelopes: Vec<SignalEnvelope> = serde_json::from_str(json).unwrap();
@@ -932,10 +957,38 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_envelope_with_source_field() {
+        let json = r#"[
+            {
+                "source": "+15559876543",
+                "dataMessage": {
+                    "message": "Hello"
+                }
+            }
+        ]"#;
+
+        let envelopes: Vec<SignalEnvelope> = serde_json::from_str(json).unwrap();
+        assert_eq!(envelopes[0].effective_source_number(), Some("+15559876543"));
+    }
+
+    #[test]
+    fn test_effective_source_number_empty_source_number_fallback() {
+        let envelope = SignalEnvelope {
+            source_uuid: None,
+            source_number: Some("   ".to_string()),
+            source: Some("+15559876543".to_string()),
+            timestamp: None,
+            data_message: None,
+        };
+        assert_eq!(envelope.effective_source_number(), Some("+15559876543"));
+    }
+
+    #[test]
     fn test_effective_source_number_uuid_fallback() {
         let envelope = SignalEnvelope {
             source_uuid: Some("bc10cb01-949e-4c75-8eb6-04dbdbda16e0".to_string()),
             source_number: None,
+            source: None,
             timestamp: None,
             data_message: None,
         };
@@ -950,6 +1003,7 @@ mod tests {
         let envelope = SignalEnvelope {
             source_uuid: None,
             source_number: None,
+            source: None,
             timestamp: None,
             data_message: None,
         };
@@ -961,10 +1015,11 @@ mod tests {
         let envelope = SignalEnvelope {
             source_uuid: Some("   ".to_string()),
             source_number: Some("   ".to_string()),
+            source: Some("+15559876543".to_string()),
             timestamp: None,
             data_message: None,
         };
-        assert_eq!(envelope.effective_source_number(), None);
+        assert_eq!(envelope.effective_source_number(), Some("+15559876543"));
     }
 
     #[test]
@@ -1368,6 +1423,7 @@ mod tests {
         let envelope = SignalEnvelope {
             source_uuid: None,
             source_number: Some("+15559876543".to_string()),
+            source: None,
             timestamp: None,
             data_message: Some(SignalDataMessage {
                 message: Some("Hello".to_string()),
@@ -1391,6 +1447,7 @@ mod tests {
         let envelope = SignalEnvelope {
             source_uuid: None,
             source_number: Some("+15559876543".to_string()),
+            source: None,
             timestamp: Some(1706745600999),
             data_message: Some(SignalDataMessage {
                 message: Some("Hello".to_string()),
@@ -1413,6 +1470,7 @@ mod tests {
         let envelope = SignalEnvelope {
             source_uuid: None,
             source_number: Some("+15559876543".to_string()),
+            source: None,
             timestamp: None,
             data_message: Some(SignalDataMessage {
                 message: Some("Hello".to_string()),
@@ -1434,6 +1492,7 @@ mod tests {
         let envelope = SignalEnvelope {
             source_uuid: None,
             source_number: Some("+15559876543".to_string()),
+            source: None,
             timestamp: Some(1706745600000),
             data_message: Some(SignalDataMessage {
                 message: Some("Hello".to_string()),
@@ -1456,6 +1515,7 @@ mod tests {
         let envelope = SignalEnvelope {
             source_uuid: None,
             source_number: Some("+15559876543".to_string()),
+            source: None,
             timestamp: Some(1706745600999),
             data_message: Some(SignalDataMessage {
                 message: Some("Hello".to_string()),
@@ -1491,6 +1551,7 @@ mod tests {
         let envelope = SignalEnvelope {
             source_uuid: None,
             source_number: Some("+15559876543".to_string()),
+            source: None,
             timestamp: None,
             data_message: Some(SignalDataMessage {
                 message: Some("Hello".to_string()),
@@ -1516,6 +1577,7 @@ mod tests {
         let envelope = SignalEnvelope {
             source_uuid: None,
             source_number: Some("+15559876543".to_string()),
+            source: None,
             timestamp: None,
             data_message: Some(SignalDataMessage {
                 message: Some("Hello".to_string()),
@@ -1538,6 +1600,7 @@ mod tests {
         let envelope = SignalEnvelope {
             source_uuid: None,
             source_number: Some("+15559876543".to_string()),
+            source: None,
             timestamp: None,
             data_message: Some(SignalDataMessage {
                 message: Some("Hello".to_string()),
@@ -1709,6 +1772,7 @@ mod tests {
         let envelope = SignalEnvelope {
             source_uuid: None,
             source_number: Some("+15559876543".to_string()),
+            source: None,
             timestamp: Some(1706745600000),
             data_message: Some(SignalDataMessage {
                 message: None,
@@ -1747,6 +1811,7 @@ mod tests {
         let envelope = SignalEnvelope {
             source_uuid: None,
             source_number: Some("+15559876543".to_string()),
+            source: None,
             timestamp: Some(1706745600000),
             data_message: Some(SignalDataMessage {
                 message: Some("hello".to_string()),
@@ -1824,6 +1889,7 @@ mod tests {
         let envelope = SignalEnvelope {
             source_uuid: None,
             source_number: Some("+15559876543".to_string()),
+            source: None,
             timestamp: Some(1706745600000),
             data_message: Some(SignalDataMessage {
                 message: Some("hello".to_string()),
@@ -1870,6 +1936,7 @@ mod tests {
         let envelope = SignalEnvelope {
             source_uuid: None,
             source_number: Some("+15559876543".to_string()),
+            source: None,
             timestamp: Some(1706745600000),
             data_message: Some(SignalDataMessage {
                 message: Some("hello".to_string()),
@@ -1935,6 +2002,7 @@ mod tests {
         let envelope = SignalEnvelope {
             source_uuid: None,
             source_number: Some("+15559876543".to_string()),
+            source: None,
             timestamp: Some(1706745600000),
             data_message: Some(SignalDataMessage {
                 message: Some("hello".to_string()),

@@ -99,6 +99,53 @@ pub(super) fn handle_status(state: &WsServerState) -> Value {
     build_status_response(state)
 }
 
+pub(super) fn canonicalize_ws_method_name(method: &str) -> &str {
+    match method {
+        "agent.run" => "agent",
+        "agent.cancel" => "chat.abort",
+        "session.list" => "sessions.list",
+        "session.preview" => "sessions.preview",
+        "session.create" => "sessions.create",
+        "session.load" => "sessions.load",
+        "session.fork" => "sessions.fork",
+        "session.rename" => "sessions.rename",
+        "session.switch" => "sessions.switch",
+        "session.patch" => "sessions.patch",
+        "session.reset" => "sessions.reset",
+        "session.delete" => "sessions.delete",
+        "session.compact" => "sessions.compact",
+        "session.archive" => "sessions.archive",
+        "session.restore" => "sessions.restore",
+        "session.archives" => "sessions.archives",
+        "session.archive.delete" => "sessions.archive.delete",
+        "session.export_user" => "sessions.export_user",
+        "session.purge_user" => "sessions.purge_user",
+        "config.update" => "config.patch",
+        "exec.list" | "exec.approvals.list" => "exec.approvals.get",
+        "exec.approve" | "exec.deny" => "exec.approval.resolve",
+        _ => method,
+    }
+}
+
+fn with_decision_override(params: Option<&Value>, decision: &str) -> Option<Value> {
+    let mut value = params.cloned().unwrap_or_else(|| json!({}));
+    if let Value::Object(ref mut map) = value {
+        map.entry("decision".to_string())
+            .or_insert_with(|| Value::String(decision.to_string()));
+    }
+    Some(value)
+}
+
+fn normalize_ws_request<'a>(method: &'a str, params: Option<&Value>) -> (&'a str, Option<Value>) {
+    let canonical = canonicalize_ws_method_name(method);
+    let params = match method {
+        "exec.approve" => with_decision_override(params, "allow-once"),
+        "exec.deny" => with_decision_override(params, "deny"),
+        _ => None,
+    };
+    (canonical, params)
+}
+
 /// Methods exclusively for the `node` role
 ///
 /// These methods can ONLY be called by node connections.
@@ -760,6 +807,10 @@ pub(super) async fn dispatch_method(
     state: &Arc<WsServerState>,
     conn: &ConnectionContext,
 ) -> Result<Value, ErrorShape> {
+    let original_method = method;
+    let (method, params_override) = normalize_ws_request(method, params);
+    let params = params_override.as_ref().or(params);
+
     // Check authorization before dispatching
     check_method_authorization(method, conn)?;
 
@@ -866,7 +917,7 @@ pub(super) async fn dispatch_method(
         _ => Err(error_shape(
             ERROR_UNAVAILABLE,
             "method unavailable",
-            Some(json!({ "method": method })),
+            Some(json!({ "method": original_method })),
         )),
     }
 }
