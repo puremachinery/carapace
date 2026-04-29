@@ -379,7 +379,7 @@ fn test_ws_errors_trace_valid() {
     );
 
     // Validate required error codes
-    let required_error_codes = ["INVALID_REQUEST", "NOT_LINKED", "NOT_PAIRED"];
+    let required_error_codes = ["invalid_request", "not_linked", "not_paired"];
     for code in required_error_codes {
         assert!(
             trace.error_codes.codes.contains_key(code),

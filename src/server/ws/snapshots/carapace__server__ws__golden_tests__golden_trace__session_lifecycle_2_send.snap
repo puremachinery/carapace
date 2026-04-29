@@ -5,7 +5,7 @@ expression: normalized
 ---
 {
   "error": {
-    "code": "INVALID_REQUEST",
+    "code": "invalid_request",
     "message": "idempotencyKey is required",
     "retryable": false
   },

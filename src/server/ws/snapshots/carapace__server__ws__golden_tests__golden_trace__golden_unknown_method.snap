@@ -5,7 +5,7 @@ expression: normalized
 ---
 {
   "error": {
-    "code": "UNAVAILABLE",
+    "code": "unavailable",
     "message": "method unavailable",
     "retryable": true
   },

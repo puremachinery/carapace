@@ -145,7 +145,7 @@ Error:
   "id": "unique-request-id",
   "ok": false,
   "error": {
-    "code": "INVALID_REQUEST",
+    "code": "invalid_request",
     "message": "description",
     "details": { ... },
     "retryable": false
@@ -370,13 +370,48 @@ Events are broadcast to connected clients. See `src/server/ws/mod.rs` for implem
 
 ## Error Codes
 
-| Code | Description | Retryable |
-|------|-------------|-----------|
-| `INVALID_REQUEST` | Validation/protocol error | No |
-| `NOT_LINKED` | Channel not configured | No |
-| `NOT_PAIRED` | Device not paired | No |
-| `AGENT_TIMEOUT` | Agent exceeded timeout | Yes |
-| `UNAVAILABLE` | Service temporarily unavailable | Yes |
+Wire codes are stable, lower_snake_case strings. Clients dispatch on the
+`error.code` field of the error response. The `Retryable` column reflects
+what `error_shape` actually emits on the wire today (currently
+hard-coded: `retryable: true` only when `code == "unavailable"`). Codes
+not emitted via `error_shape` are noted explicitly.
+
+### Top-level `error.code` values (emitted via `error_shape`)
+
+| Code | Description | Retryable on wire |
+|------|-------------|-------------------|
+| `invalid_request` | Validation / protocol error | No |
+| `not_paired` | Device not paired | No |
+| `unavailable` | Service temporarily unavailable | Yes |
+| `rate_limited` | Per-resource rate limit exceeded | No (see note) |
+| `unknown_route` | Request referenced a route not in the `routes` map | No |
+| `missing_model` | Resolution found no `route` or `model` for the request | No |
+
+*Note on `rate_limited`*: semantically the operation is retryable (with
+backoff / `Retry-After`), but `error_shape`'s current hard-coded
+retryable check produces `retryable: false`. Clients should treat
+`rate_limited` as retryable regardless of the field; a future fix
+will align the wire field with intent
+(tracked at [#405](https://github.com/puremachinery/carapace/issues/405)).
+
+### Reserved codes (documented but not yet emitted)
+
+| Code | Description |
+|------|-------------|
+| `not_linked` | Channel not configured. Constant `ERROR_NOT_LINKED` is reserved in `src/server/ws/mod.rs`; no live emit site yet. |
+| `agent_timeout` | Agent exceeded timeout. Documented for client compatibility; no live emit at the top-level `error.code` position currently. |
+
+### Codes that are NOT top-level `error.code` values
+
+These appear in nested positions or are emitted by non-WebSocket
+surfaces. Clients dispatching on `error.code` will not see them there.
+
+| Code | Where it actually appears |
+|------|---------------------------|
+| `not_connected` | `error.details.nodeError.code` (outer `error.code` is `unavailable`) |
+| `timeout` | `error.details.code` (outer `error.code` is `unavailable`) when a node-invoke times out |
+| `csrf_error` | HTTP middleware error body (not a WS error frame) |
+| `invalid_input` | Plugin host error surface (not a WS error frame) |
 
 ## Close Codes
 
