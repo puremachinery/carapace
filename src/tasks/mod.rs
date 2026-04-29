@@ -123,9 +123,13 @@ pub struct DurableTask {
     pub updated_at_ms: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub run_ids: Vec<String>,
+    #[serde(default)]
     pub policy: TaskPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_reason: Option<TaskBlockedReason>,
+    /// Accepted from task queue files written by previous task-policy code.
+    #[serde(default, skip_serializing)]
+    pub policy_explicit: bool,
 }
 
 /// Queue stats by state.
@@ -364,6 +368,7 @@ impl TaskQueue {
             run_ids: Vec::new(),
             policy: params.policy,
             blocked_reason: params.blocked_reason,
+            policy_explicit: false,
         }
     }
 
@@ -1382,12 +1387,12 @@ mod tests {
     }
 
     #[test]
-    fn test_load_rejects_current_queue_missing_policy() {
+    fn test_load_defaults_missing_policy_for_existing_queue() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("tasks").join("queue.json");
         std::fs::create_dir_all(path.parent().expect("tasks directory")).unwrap();
-        let invalid = serde_json::json!([{
-            "id": "invalid-task",
+        let existing = serde_json::json!([{
+            "id": "existing-task",
             "state": "queued",
             "attempts": 0,
             "nextRunAtMs": null,
@@ -1399,23 +1404,23 @@ mod tests {
         }]);
         std::fs::write(
             &path,
-            serde_json::to_vec_pretty(&invalid).expect("invalid queue json"),
+            serde_json::to_vec_pretty(&existing).expect("existing queue json"),
         )
         .unwrap();
 
         let queue = TaskQueue::new(Some(path));
-        let err = queue.load().expect_err("missing policy should fail closed");
-        assert!(err.contains("current task queue file"), "{err}");
-        assert!(queue.list().is_empty());
+        queue.load().expect("existing queue should load");
+        let loaded = queue.get("existing-task").expect("task should load");
+        assert_eq!(loaded.policy, TaskPolicy::default());
     }
 
     #[test]
-    fn test_load_rejects_removed_policy_explicit_field() {
+    fn test_load_accepts_queue_with_policy_explicit_field() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("tasks").join("queue.json");
         std::fs::create_dir_all(path.parent().expect("tasks directory")).unwrap();
-        let invalid = serde_json::json!([{
-            "id": "invalid-task",
+        let current_master = serde_json::json!([{
+            "id": "task-from-current-master",
             "state": "queued",
             "attempts": 0,
             "nextRunAtMs": null,
@@ -1434,16 +1439,24 @@ mod tests {
         }]);
         std::fs::write(
             &path,
-            serde_json::to_vec_pretty(&invalid).expect("invalid queue json"),
+            serde_json::to_vec_pretty(&current_master).expect("current queue json"),
         )
         .unwrap();
 
-        let queue = TaskQueue::new(Some(path));
-        let err = queue
-            .load()
-            .expect_err("removed task fields should fail current-format load");
-        assert!(err.contains("policyExplicit"), "{err}");
-        assert!(queue.list().is_empty());
+        let queue = TaskQueue::new(Some(path.clone()));
+        queue.load().expect("current persisted queue should load");
+        let loaded = queue
+            .get("task-from-current-master")
+            .expect("task should load");
+        assert!(loaded.policy_explicit);
+        assert_eq!(loaded.policy.max_attempts, 100);
+
+        queue.flush_to_disk();
+        let persisted = std::fs::read_to_string(path).unwrap();
+        assert!(
+            !persisted.contains("policyExplicit"),
+            "new queue writes should use the current task schema"
+        );
     }
 
     #[tokio::test]
@@ -1489,6 +1502,7 @@ mod tests {
                     run_ids: Vec::new(),
                     policy: TaskPolicy::default(),
                     blocked_reason: Some(TaskBlockedReason::Unknown),
+                    policy_explicit: false,
                 });
             }
             tasks[0].id = "done-oldest".to_string();
@@ -1521,6 +1535,7 @@ mod tests {
                     run_ids: Vec::new(),
                     policy: TaskPolicy::default(),
                     blocked_reason: None,
+                    policy_explicit: false,
                 });
             }
         }
@@ -1564,6 +1579,7 @@ mod tests {
                     run_ids: Vec::new(),
                     policy: TaskPolicy::default(),
                     blocked_reason: None,
+                    policy_explicit: false,
                 });
             }
         }

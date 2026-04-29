@@ -715,6 +715,7 @@ mod tests {
             run_ids: Vec::new(),
             policy: crate::tasks::TaskPolicy::default(),
             blocked_reason: None,
+            policy_explicit: false,
         }
     }
 

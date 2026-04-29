@@ -122,6 +122,12 @@ pub fn configured_store_with_path(
         .as_ref()
         .filter(|_| encryption_config.mode.uses_encryption())
     {
+        let legacy_hmac_key =
+            resolve_session_integrity_secret_from_value(cfg, fallback_integrity_secret).map(
+                |(server_secret, _source)| {
+                    Zeroizing::new(integrity::derive_hmac_key(server_secret.as_bytes()))
+                },
+            );
         let crypto =
             crypto::SessionCryptoContext::load_or_create(store.base_path(), password.as_ref())
                 .map_err(SessionStoreError::from)?;
@@ -134,6 +140,9 @@ pub fn configured_store_with_path(
         store = store.with_crypto_context(Arc::new(crypto));
         if let Some(hmac_key) = hmac_key {
             store = store.with_hmac_key(hmac_key);
+        }
+        if let Some(legacy_hmac_key) = legacy_hmac_key {
+            store = store.with_legacy_hmac_key(legacy_hmac_key);
         }
         return Ok(store);
     }

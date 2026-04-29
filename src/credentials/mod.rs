@@ -16,6 +16,10 @@ mod linux;
 #[cfg(target_os = "windows")]
 mod windows;
 
+mod migration;
+
+pub use migration::{migrate_plaintext_credentials, MigrationReport};
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -1221,6 +1225,7 @@ pub struct MockCredentialBackend {
 }
 
 impl MockCredentialBackend {
+    #[allow(dead_code)]
     pub fn new(available: bool) -> Self {
         Self {
             credentials: Arc::new(RwLock::new(HashMap::new())),

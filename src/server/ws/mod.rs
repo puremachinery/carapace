@@ -1224,6 +1224,9 @@ pub enum WsConfigError {
 
 pub async fn build_ws_state_owned_from_value(cfg: &Value) -> Result<WsServerState, WsConfigError> {
     let state_dir = resolve_state_dir();
+    if let Err(err) = credentials::migrate_plaintext_credentials(state_dir.clone()).await {
+        tracing::warn!(error = %err, "Credential migration failed");
+    }
     let config = build_ws_config_from_value(cfg).await?;
     let mut state = WsServerState::new_persistent(config, state_dir).await?;
     let integrity_config = sessions::resolve_session_integrity_config(cfg);

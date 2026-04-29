@@ -485,7 +485,7 @@ impl MultiProvider {
                 }
                 _ => {
                     if model.contains('/') {
-                        "model \"{model}\" is not a valid provider:model value".to_string()
+                        format!("model \"{model}\" is not a valid provider:model value")
                     } else {
                         let suggestion = crate::model_names::prefix_bare_model(model);
                         if suggestion != model {
