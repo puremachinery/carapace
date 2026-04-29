@@ -88,6 +88,16 @@ impl StableConfigFixture {
         }
     }
 
+    /// Replace the on-disk fixture content and prime the in-memory cache
+    /// with the new pair.
+    ///
+    /// **Must only be called from a `current_thread` tokio runtime.** The
+    /// implementation does `fs::write` followed by `update_cache`, and a
+    /// concurrent task on a multi-thread runtime could read the file
+    /// (after the write) while the cache still holds the previous pair —
+    /// re-introducing the read-vs-write race the fixture was designed to
+    /// close. All current callers use `#[tokio::test(flavor = "current_thread")]`,
+    /// which is the supported context.
     pub(crate) fn update(&self, raw_value: Value) {
         let inner = self
             .inner
