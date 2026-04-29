@@ -435,10 +435,7 @@ fn map_envelope_error(error: CryptoEnvelopeError) -> SecretError {
         }
         CryptoEnvelopeError::DecryptionFailed => SecretError::DecryptionFailed,
         CryptoEnvelopeError::RandomFailure(message) => SecretError::RandomFailure(message),
-        other @ CryptoEnvelopeError::Base64Decode { .. }
-        | other @ CryptoEnvelopeError::FieldLength { .. } => {
-            SecretError::BadFormat(format!("unexpected envelope parsing error: {other}"))
-        }
+        other => SecretError::BadFormat(format!("unexpected envelope parsing error: {other}")),
     }
 }
 
