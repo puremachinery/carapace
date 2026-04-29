@@ -310,9 +310,12 @@ mod tests {
     fn test_aead_blob_decryption_rejects_tampered_nonce() {
         let key = aead_kat_key();
         let plaintext = b"hello AEAD world".to_vec();
-        let mut blob = encrypt_aead_blob(&key, &plaintext, &[]).unwrap();
-        blob.nonce[0] ^= 0xFF;
-        let err = decrypt_aead_blob(&key, &blob.nonce, &blob.ciphertext, &[]).unwrap_err();
+        let blob = encrypt_aead_blob(&key, &plaintext, &[]).unwrap();
+        let wrong_nonce = encrypt_aead_blob(&key, b"different nonce source", &[])
+            .unwrap()
+            .nonce;
+        assert_ne!(wrong_nonce, blob.nonce);
+        let err = decrypt_aead_blob(&key, &wrong_nonce, &blob.ciphertext, &[]).unwrap_err();
         assert_eq!(err, CryptoEnvelopeError::DecryptionFailed);
     }
 
