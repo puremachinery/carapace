@@ -96,6 +96,12 @@ pub struct AgentResponse {
     pub run_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Stable wire-format error code for structured errors (e.g.
+    /// `"unknown_route"`, `"missing_model"` from
+    /// [`crate::agent::AgentConfigurationErrorCode`]). Absent on
+    /// free-form errors. Clients may dispatch on this string.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
 }
 
 impl AgentResponse {
@@ -104,6 +110,7 @@ impl AgentResponse {
             ok: true,
             run_id: Some(run_id),
             error: None,
+            error_code: None,
         }
     }
 
@@ -112,6 +119,20 @@ impl AgentResponse {
             ok: false,
             run_id: None,
             error: Some(msg.to_string()),
+            error_code: None,
+        }
+    }
+
+    /// Build an error response carrying both a stable wire-format code
+    /// and a human-readable message. Use this for typed errors that
+    /// document a code clients can dispatch on (e.g.
+    /// [`crate::agent::AgentConfigurationError`]).
+    pub fn error_with_code(code: &str, msg: &str) -> Self {
+        AgentResponse {
+            ok: false,
+            run_id: None,
+            error: Some(msg.to_string()),
+            error_code: Some(code.to_string()),
         }
     }
 }
@@ -289,6 +310,35 @@ impl HooksErrorResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_agent_response_error_omits_error_code_field() {
+        // Free-form errors must NOT carry an `errorCode` on the wire so
+        // existing clients that haven't been updated for typed codes
+        // don't see a partial / misleading one.
+        let resp = AgentResponse::error("something broke");
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["error"], "something broke");
+        assert!(
+            json.get("errorCode").is_none(),
+            "errorCode must be absent for free-form errors: {json}"
+        );
+    }
+
+    #[test]
+    fn test_agent_response_error_with_code_emits_camelcase_field() {
+        // Typed-error path: clients dispatch on `errorCode`. The field is
+        // serialized in camelCase (`errorCode`, not `error_code`) per the
+        // struct's `#[serde(rename_all = "camelCase")]`, and the value is
+        // the stable wire-format code from `AgentError::wire_code()`.
+        let resp =
+            AgentResponse::error_with_code("unknown_route", "requested route is not configured");
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["error"], "requested route is not configured");
+        assert_eq!(json["errorCode"], "unknown_route");
+    }
 
     #[test]
     fn test_wake_mode_from_str() {

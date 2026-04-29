@@ -2100,7 +2100,8 @@ pub(super) fn handle_agent(
         },
     ) {
         e.log_configuration_hint();
-        return Err(error_shape(ERROR_UNAVAILABLE, &e.to_string(), None));
+        let code = e.wire_code().unwrap_or(ERROR_UNAVAILABLE);
+        return Err(error_shape(code, &e.to_string(), None));
     }
     crate::agent::apply_agent_config_from_settings(&mut config, &cfg, agent_id);
     if config.model.trim().is_empty() {
@@ -2108,7 +2109,8 @@ pub(super) fn handle_agent(
             crate::agent::AgentConfigurationError::missing_model(),
         );
         error.log_configuration_hint();
-        return Err(error_shape(ERROR_UNAVAILABLE, &error.to_string(), None));
+        let code = error.wire_code().unwrap_or(ERROR_UNAVAILABLE);
+        return Err(error_shape(code, &error.to_string(), None));
     }
 
     let (run_id, session_key_out, cancel_token) = setup_agent_session(
