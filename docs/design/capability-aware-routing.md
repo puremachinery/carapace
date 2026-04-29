@@ -233,13 +233,20 @@ Note this is **not** the OpenAI-compat provider-error surface
 `call_llm_provider`, not route-resolution. The two surfaces are
 disjoint.
 
-Before the resolver fix, the two leaking error messages from
-`resolve_execution_target` were:
+Before the resolver fix, the two external messages from
+`resolve_execution_target` mixed several disclosure classes:
 
 - `unknown route "<name>"; define it in the top-level \`routes\` config
-  map`
+  map` — reflected caller input (`<name>`) plus internal config
+  topology (`routes`).
 - `no model configured; set \`route\` or \`model\` in agent config or
-  defaults`
+  defaults (e.g. \`agents.defaults.route: "fast"\` or
+  \`agents.defaults.model: "anthropic:claude-sonnet-4-20250514"\`)` —
+  internal config-key names, a sample named-route identifier, and a
+  concrete provider/model ID.
+
+The current fix keeps all of those details out of `Display` and retains
+them only in the operator hint.
 
 The active-codebase bug was tracked as a standalone issue:
 
