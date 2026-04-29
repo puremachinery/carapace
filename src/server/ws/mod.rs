@@ -87,6 +87,25 @@ const ERROR_RATE_LIMITED: &str = "rate_limited";
 const ERROR_NOT_LINKED: &str = "not_linked";
 // Note: Node doesn't use ERROR_FORBIDDEN - use ERROR_INVALID_REQUEST for auth errors
 
+/// Wire codes whose `retryable` field is `true` in the error response.
+///
+/// Adding a new retryable code requires extending this list — codes not
+/// listed here surface as `retryable: false` regardless of intent. Keeping
+/// the classification explicit prevents silent doc-vs-wire drift (issue
+/// #405): a previous version derived `retryable` from `code == ERROR_UNAVAILABLE`
+/// alone, which silently produced `retryable: false` for `rate_limited`
+/// despite the protocol doc claiming the opposite.
+///
+/// Domain-level codes from `AgentConfigurationError` (e.g. `unknown_route`,
+/// `missing_model`) are intentionally NOT retryable — they require operator
+/// intervention.
+const RETRYABLE_CODES: &[&str] = &[ERROR_UNAVAILABLE, ERROR_RATE_LIMITED];
+
+/// Returns `true` if a wire code should surface `retryable: true` to clients.
+fn wire_code_is_retryable(code: &str) -> bool {
+    RETRYABLE_CODES.contains(&code)
+}
+
 const ALLOWED_CLIENT_IDS: [&str; 12] = [
     "webchat-ui",
     "carapace-control-ui",
@@ -3220,7 +3239,7 @@ fn error_shape(code: &'static str, message: &str, details: Option<Value>) -> Err
     ErrorShape {
         code,
         message: message.to_string(),
-        retryable: code == ERROR_UNAVAILABLE,
+        retryable: wire_code_is_retryable(code),
         details,
     }
 }

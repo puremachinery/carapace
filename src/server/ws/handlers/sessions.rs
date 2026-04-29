@@ -3168,6 +3168,48 @@ mod tests {
         }
     }
 
+    /// Integration test for issue #406: when the WS `handle_agent` path
+    /// hits a route-resolution error, the resulting `ErrorShape` must
+    /// carry the typed wire code (`unknown_route`) and `retryable: false`.
+    /// Exercises the full handler, not just the `wire_code()` helper, so a
+    /// regression that reverted the dispatch from
+    /// `e.wire_code().unwrap_or(ERROR_UNAVAILABLE)` back to a fixed
+    /// `ERROR_UNAVAILABLE` would fail this assertion.
+    #[test]
+    fn test_handle_agent_unknown_route_returns_typed_code() {
+        // Empty config — no routes, no defaults.
+        let _fixture = crate::test_support::config::StableConfigFixture::new(serde_json::json!({}));
+        let (state, _tmp) = make_state_with_temp_sessions();
+        let conn = make_conn("conn-route-test");
+        let params = json!({
+            "message": "hello",
+            "idempotencyKey": "ws-route-test-1",
+            "route": "nonexistent-route-name"
+        });
+
+        let err = handle_agent(Some(&params), Arc::new(state), &conn).unwrap_err();
+        assert_eq!(err.code, "unknown_route");
+        assert!(!err.retryable);
+    }
+
+    /// Companion to the unknown-route test for issue #406. With no route
+    /// or model anywhere, `resolve_execution_target` returns `MissingModel`
+    /// which surfaces as `error.code: "missing_model"` on the WS wire.
+    #[test]
+    fn test_handle_agent_missing_model_returns_typed_code() {
+        let _fixture = crate::test_support::config::StableConfigFixture::new(serde_json::json!({}));
+        let (state, _tmp) = make_state_with_temp_sessions();
+        let conn = make_conn("conn-model-test");
+        let params = json!({
+            "message": "hello",
+            "idempotencyKey": "ws-model-test-1"
+        });
+
+        let err = handle_agent(Some(&params), Arc::new(state), &conn).unwrap_err();
+        assert_eq!(err.code, "missing_model");
+        assert!(!err.retryable);
+    }
+
     #[test]
     fn test_handle_sessions_create_with_key() {
         let (state, _tmp) = make_state_with_temp_sessions();
