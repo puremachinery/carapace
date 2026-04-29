@@ -2100,7 +2100,12 @@ pub(super) fn handle_agent(
         },
     ) {
         e.log_configuration_hint();
-        return Err(error_shape(ERROR_UNAVAILABLE, &e.to_string(), None));
+        // `error_shape` derives `retryable` from `code == ERROR_UNAVAILABLE`,
+        // so emitting a typed wire code (e.g. "unknown_route") correctly
+        // surfaces `retryable: false` — config errors need operator
+        // intervention, not retry.
+        let code = e.wire_code().unwrap_or(ERROR_UNAVAILABLE);
+        return Err(error_shape(code, &e.to_string(), None));
     }
     crate::agent::apply_agent_config_from_settings(&mut config, &cfg, agent_id);
     if config.model.trim().is_empty() {
@@ -2108,7 +2113,8 @@ pub(super) fn handle_agent(
             crate::agent::AgentConfigurationError::missing_model(),
         );
         error.log_configuration_hint();
-        return Err(error_shape(ERROR_UNAVAILABLE, &error.to_string(), None));
+        let code = error.wire_code().unwrap_or(ERROR_UNAVAILABLE);
+        return Err(error_shape(code, &error.to_string(), None));
     }
 
     let (run_id, session_key_out, cancel_token) = setup_agent_session(
@@ -3257,7 +3263,7 @@ mod tests {
         let result = handle_sessions_archive(&state, None);
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert_eq!(err.code, "INVALID_REQUEST");
+        assert_eq!(err.code, "invalid_request");
     }
 
     #[test]
@@ -3322,7 +3328,7 @@ mod tests {
         let result = handle_sessions_restore(&state, None);
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert_eq!(err.code, "INVALID_REQUEST");
+        assert_eq!(err.code, "invalid_request");
     }
 
     #[test]
@@ -3401,7 +3407,7 @@ mod tests {
         let result = handle_sessions_archive_delete(&state, None);
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert_eq!(err.code, "INVALID_REQUEST");
+        assert_eq!(err.code, "invalid_request");
     }
 
     #[test]
@@ -3434,7 +3440,7 @@ mod tests {
         let (state, _tmp) = make_state_with_temp_sessions();
         let result = handle_sessions_export_user(&state, None);
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code, "INVALID_REQUEST");
+        assert_eq!(result.unwrap_err().code, "invalid_request");
     }
 
     #[test]
@@ -3443,7 +3449,7 @@ mod tests {
         let params = json!({ "userId": "" });
         let result = handle_sessions_export_user(&state, Some(&params));
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code, "INVALID_REQUEST");
+        assert_eq!(result.unwrap_err().code, "invalid_request");
     }
 
     #[test]
@@ -3452,7 +3458,7 @@ mod tests {
         let params = json!({ "userId": "   " });
         let result = handle_sessions_export_user(&state, Some(&params));
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code, "INVALID_REQUEST");
+        assert_eq!(result.unwrap_err().code, "invalid_request");
     }
 
     #[test]
@@ -3499,7 +3505,7 @@ mod tests {
         let (state, _tmp) = make_state_with_temp_sessions();
         let result = handle_sessions_purge_user(&state, None);
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code, "INVALID_REQUEST");
+        assert_eq!(result.unwrap_err().code, "invalid_request");
     }
 
     #[test]
@@ -3508,7 +3514,7 @@ mod tests {
         let params = json!({ "userId": "" });
         let result = handle_sessions_purge_user(&state, Some(&params));
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code, "INVALID_REQUEST");
+        assert_eq!(result.unwrap_err().code, "invalid_request");
     }
 
     #[test]
@@ -3517,7 +3523,7 @@ mod tests {
         let params = json!({ "userId": "  \t  " });
         let result = handle_sessions_purge_user(&state, Some(&params));
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code, "INVALID_REQUEST");
+        assert_eq!(result.unwrap_err().code, "invalid_request");
     }
 
     #[test]

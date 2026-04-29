@@ -556,11 +556,11 @@ mod tests {
     #[test]
     fn test_plugin_error_display() {
         let err = PluginError {
-            code: "INVALID_INPUT".to_string(),
+            code: "invalid_input".to_string(),
             message: "Missing required field".to_string(),
             retryable: false,
         };
-        assert_eq!(err.to_string(), "[INVALID_INPUT] Missing required field");
+        assert_eq!(err.to_string(), "[invalid_input] Missing required field");
     }
 
     #[test]
