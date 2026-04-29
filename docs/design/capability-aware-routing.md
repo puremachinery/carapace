@@ -204,8 +204,16 @@ external callers today. `resolve_execution_target` is called from
 `AgentError` is fmt-stringified to external callers via:
 
 - HTTP: `src/server/http.rs:~1308` (`AgentResponse::error(&e.to_string())`)
-- WebSocket: `src/server/ws/handlers/sessions.rs:~2097` and `~2502`
-  (`error_shape(ERROR_UNAVAILABLE, &e.to_string(), None)`)
+- WebSocket: `src/server/ws/handlers/sessions.rs:~2102`
+  (`error_shape(ERROR_UNAVAILABLE, &e.to_string(), None)`, called
+  from the `resolve_agent_model` site at line ~2091)
+
+The auto-reply background-trigger path in the same file (around
+line ~2502) also calls `resolve_agent_model`, but its error arm is
+`tracing::warn!(...)` followed by a generic `(None, "queued")` return
+— the error string is logged server-side only and never reaches the
+external caller. That path is **not** a leak surface and needs no
+remediation in #398.
 
 Note this is **not** the OpenAI-compat provider-error surface
 (`src/server/openai.rs`); that path handles errors from
