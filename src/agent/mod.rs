@@ -41,11 +41,82 @@ pub use provider::{LlmProvider, StreamEvent};
 use tokio_util::sync::CancellationToken;
 pub use tool_policy::ToolPolicy;
 
+/// Stable categories for configuration failures surfaced through `AgentError`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentConfigurationErrorCode {
+    UnknownRoute,
+    MissingModel,
+}
+
+impl AgentConfigurationErrorCode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UnknownRoute => "unknown_route",
+            Self::MissingModel => "missing_model",
+        }
+    }
+}
+
+/// Configuration resolution error with an external-safe display message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentConfigurationError {
+    code: AgentConfigurationErrorCode,
+    public_message: &'static str,
+    operator_hint: String,
+}
+
+impl AgentConfigurationError {
+    pub fn unknown_route(route_name: &str) -> Self {
+        Self {
+            code: AgentConfigurationErrorCode::UnknownRoute,
+            public_message: "requested route is not configured",
+            operator_hint: format!(
+                "unknown route \"{route_name}\"; define it in the top-level `routes` config map"
+            ),
+        }
+    }
+
+    pub fn missing_model() -> Self {
+        Self {
+            code: AgentConfigurationErrorCode::MissingModel,
+            public_message: "agent model is not configured",
+            operator_hint:
+                "no model configured; set `route` or `model` in agent config or defaults \
+                 (e.g. `agents.defaults.route: \"fast\"` or \
+                 `agents.defaults.model: \"anthropic:claude-sonnet-4-20250514\"`)"
+                    .to_string(),
+        }
+    }
+
+    pub fn code(&self) -> AgentConfigurationErrorCode {
+        self.code
+    }
+
+    pub fn public_message(&self) -> &'static str {
+        self.public_message
+    }
+
+    pub fn operator_hint(&self) -> &str {
+        &self.operator_hint
+    }
+}
+
+impl std::fmt::Display for AgentConfigurationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.public_message)
+    }
+}
+
+impl std::error::Error for AgentConfigurationError {}
+
 /// Errors that can occur during agent execution.
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
     #[error("LLM provider error: {0}")]
     Provider(String),
+
+    #[error("{0}")]
+    Configuration(AgentConfigurationError),
 
     #[error("session not found: {0}")]
     SessionNotFound(String),

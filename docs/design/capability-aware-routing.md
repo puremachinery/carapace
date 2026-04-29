@@ -181,12 +181,12 @@ was incorrect.
 
 ### O2. The default-capability fallback was inconsistent (high)
 
-The draft listed `agents.defaults.capabilityRoutes` as a low-priority
-fallback in §2 ("Where capability routes would live") but the §3
-pseudocode hard-errored before consulting it. The two surfaces must be
-reconciled — either the lookup is genuinely added as a checked level
-before the hard error, or `agents.defaults.capabilityRoutes` is dropped
-from the proposal and capability routing is documented as always
+An earlier iteration of the proposed design listed
+`agents.defaults.capabilityRoutes` as a low-priority fallback, but the
+resolver pseudocode hard-errored before consulting it. The two surfaces
+must be reconciled — either the lookup is genuinely added as a checked
+level before the hard error, or `agents.defaults.capabilityRoutes` is
+dropped from the proposal and capability routing is documented as always
 hard-fail when `routes.byCapability` is absent.
 
 This is the choice point that determines whether the system is "strict"
@@ -194,7 +194,7 @@ This is the choice point that determines whether the system is "strict"
 documented default). Both are defensible; pick one and reflect it in
 both the prose and the resolver pseudocode.
 
-### O3. Configuration error must not surface as `AgentError::Provider` (medium)
+### O3. Configuration errors need a topology-free public surface (medium)
 
 `AgentError::Provider` messages flow to external callers from the
 HTTP and WebSocket layers (concrete sites listed below). Including a
@@ -203,15 +203,16 @@ surfaced message leaks internal configuration topology to anyone who
 can probe the API — a low-value but real information leak in a
 security-first gateway.
 
-**This is a current-codebase concern, not just a future one** — and
-it is being tracked separately at higher urgency than this deferred
-design doc implies.
+The current route resolver now addresses the live version of this issue:
+`resolve_execution_target` in `src/config/routes.rs` returns
+`AgentError::Configuration(AgentConfigurationError)` for route
+configuration failures. Its `Display` string is stable and
+topology-free for external callers, while the detailed config-key
+remediation remains available through an operator hint.
 
-`resolve_execution_target` in `src/config/routes.rs` already surfaces
-config-key-path remediation hints through `AgentError::Provider` for
-two error paths that reach external callers today. The resolver is
-called from inside `resolve_agent_model` (in `src/agent/mod.rs`), and
-the resulting `AgentError` is fmt-stringified to external callers via:
+The resolver is called from inside `resolve_agent_model` (in
+`src/agent/mod.rs`), and the resulting `AgentError` is fmt-stringified
+to external callers via:
 
 - **HTTP** — the `AgentResponse::error(&e.to_string())` arm in
   `src/server/http.rs` after the request handler's
@@ -232,24 +233,22 @@ Note this is **not** the OpenAI-compat provider-error surface
 `call_llm_provider`, not route-resolution. The two surfaces are
 disjoint.
 
-The two leaking error messages from `resolve_execution_target`:
+Before the resolver fix, the two leaking error messages from
+`resolve_execution_target` were:
 
 - `unknown route "<name>"; define it in the top-level \`routes\` config
   map`
 - `no model configured; set \`route\` or \`model\` in agent config or
   defaults`
 
-The remediation — introduce a `ConfigError`-family variant, surface a
-stable wire-format code at the server boundary, keep human-readable
-config hints in operator-facing surfaces (logs, Control UI) — is
-tracked as a standalone issue:
+The active-codebase bug was tracked as a standalone issue:
 
 - [puremachinery/carapace#398](https://github.com/puremachinery/carapace/issues/398)
 
 Capability routing would have extended the same leak pattern, not
 introduced it. If/when this design is revived, the implementation
-must use whatever `ConfigError`-family variant ships from #398 rather
-than adding to the existing surface.
+must use the configuration-error family rather than adding a new
+provider-error surface.
 
 ### O4. `#[non_exhaustive]` vs "closed enum" (low)
 

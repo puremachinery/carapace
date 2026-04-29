@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
 
-use crate::agent::AgentError;
+use crate::agent::{AgentConfigurationError, AgentError};
 
 /// A named route — backend target + optional metadata.
 #[derive(Debug, Clone, Deserialize)]
@@ -95,10 +95,7 @@ pub fn resolve_execution_target(
             let route_name = route_name.trim();
             if !route_name.is_empty() {
                 let config = routes.get(route_name).ok_or_else(|| {
-                    AgentError::Provider(format!(
-                        "unknown route \"{route_name}\"; \
-                         define it in the top-level `routes` config map"
-                    ))
+                    AgentError::Configuration(AgentConfigurationError::unknown_route(route_name))
                 })?;
                 return Ok(ResolvedRoute {
                     model: config.model.clone(),
@@ -117,11 +114,8 @@ pub fn resolve_execution_target(
         }
     }
 
-    Err(AgentError::Provider(
-        "no model configured; set `route` or `model` in agent config or defaults \
-         (e.g. `agents.defaults.route: \"fast\"` or \
-         `agents.defaults.model: \"anthropic:claude-sonnet-4-20250514\"`)"
-            .to_string(),
+    Err(AgentError::Configuration(
+        AgentConfigurationError::missing_model(),
     ))
 }
 
@@ -309,8 +303,21 @@ mod tests {
         };
         let err = resolve_execution_target(&routes, &inputs).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("unknown route"), "got: {msg}");
-        assert!(msg.contains("nonexistent"), "got: {msg}");
+        assert_eq!(msg, "requested route is not configured");
+        assert!(!msg.contains("nonexistent"), "got: {msg}");
+        assert!(!msg.contains("routes"), "got: {msg}");
+
+        let AgentError::Configuration(config_error) = err else {
+            panic!("expected configuration error");
+        };
+        assert_eq!(
+            config_error.code().as_str(),
+            "unknown_route",
+            "got: {:?}",
+            config_error.code()
+        );
+        assert!(config_error.operator_hint().contains("nonexistent"));
+        assert!(config_error.operator_hint().contains("`routes`"));
     }
 
     #[test]
@@ -338,7 +345,20 @@ mod tests {
         let inputs = RouteResolutionInputs::default();
         let err = resolve_execution_target(&routes, &inputs).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("no model configured"), "got: {msg}");
+        assert_eq!(msg, "agent model is not configured");
+        assert!(!msg.contains("agents.defaults"), "got: {msg}");
+        assert!(!msg.contains("route"), "got: {msg}");
+
+        let AgentError::Configuration(config_error) = err else {
+            panic!("expected configuration error");
+        };
+        assert_eq!(
+            config_error.code().as_str(),
+            "missing_model",
+            "got: {:?}",
+            config_error.code()
+        );
+        assert!(config_error.operator_hint().contains("agents.defaults"));
     }
 
     #[test]
