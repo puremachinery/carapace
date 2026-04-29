@@ -13,6 +13,11 @@ static TEST_ENV_LOCK: Mutex<()> = parking_lot::const_mutex(());
 ///
 /// Under the current `parking_lot` configuration this guard is not `Send`, so
 /// async tests on a multi-thread runtime should not hold it across an `.await`.
+///
+/// **Lock order:** when a test holds both this guard and a
+/// [`ScopedConfigCache`](super::config::ScopedConfigCache), always acquire
+/// `ScopedConfigCache` first and `ScopedEnv` second. Inverting that order
+/// could deadlock under parallel test execution.
 pub(crate) struct ScopedEnv {
     _lock: MutexGuard<'static, ()>,
     original_values: HashMap<OsString, Option<OsString>>,
