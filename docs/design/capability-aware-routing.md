@@ -205,36 +205,37 @@ security-first gateway.
 it is being tracked separately at higher urgency than this deferred
 design doc implies.
 
-`src/config/routes.rs` already surfaces config-key-path remediation
-hints through `AgentError::Provider` for two error paths that reach
-external callers today. `resolve_execution_target` is called from
-inside `resolve_agent_model` (defined at `src/agent/mod.rs:254`, with
-the actual call site at `src/agent/mod.rs:~293`), and the resulting
-`AgentError` is fmt-stringified to external callers via:
+`resolve_execution_target` in `src/config/routes.rs` already surfaces
+config-key-path remediation hints through `AgentError::Provider` for
+two error paths that reach external callers today. The resolver is
+called from inside `resolve_agent_model` (in `src/agent/mod.rs`), and
+the resulting `AgentError` is fmt-stringified to external callers via:
 
-- HTTP: `src/server/http.rs:~1308` (`AgentResponse::error(&e.to_string())`)
-- WebSocket: `src/server/ws/handlers/sessions.rs:~2102`
-  (`error_shape(ERROR_UNAVAILABLE, &e.to_string(), None)`, called
-  from the `resolve_agent_model` site at line ~2091)
+- **HTTP** — the `AgentResponse::error(&e.to_string())` arm in
+  `src/server/http.rs` after the request handler's
+  `resolve_agent_model` call.
+- **WebSocket** — the `error_shape(ERROR_UNAVAILABLE, &e.to_string(), None)`
+  arm in `src/server/ws/handlers/sessions.rs` after the agent-run
+  handler's `resolve_agent_model` call.
 
-The auto-reply background-trigger path in the same file (around
-line ~2502) also calls `resolve_agent_model`, but its error arm is
-`tracing::warn!(...)` followed by a generic `(None, "queued")` return
-— the error string is logged server-side only and never reaches the
-external caller. That path is **not** a leak surface and needs no
-remediation in #398.
+A second `resolve_agent_model` call site exists in
+`src/server/ws/handlers/sessions.rs` for the auto-reply
+background-trigger path, but its error arm is `tracing::warn!(...)`
+followed by `(None, "queued")` — the error string is logged
+server-side only and never reaches the external caller. That path is
+**not** a leak surface and needs no remediation in #398.
 
 Note this is **not** the OpenAI-compat provider-error surface
 (`src/server/openai.rs`); that path handles errors from
 `call_llm_provider`, not route-resolution. The two surfaces are
 disjoint.
 
-The two leaking error messages:
+The two leaking error messages from `resolve_execution_target`:
 
 - `unknown route "<name>"; define it in the top-level \`routes\` config
-  map` (`src/config/routes.rs:~98`)
+  map`
 - `no model configured; set \`route\` or \`model\` in agent config or
-  defaults` (`src/config/routes.rs:~120`)
+  defaults`
 
 The remediation — introduce a `ConfigError`-family variant, surface a
 stable wire-format code at the server boundary, keep human-readable
