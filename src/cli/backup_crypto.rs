@@ -144,7 +144,7 @@ fn write_encrypted_backup_bytes<W: std::io::Write>(
 /// caller-supplied key + salt + nonce so golden-vector tests can pin
 /// canonical persisted bytes against what production actually writes.
 #[cfg(test)]
-pub(crate) fn build_encrypted_backup_bytes_for_test(
+fn build_encrypted_backup_bytes_for_test(
     key: &[u8; KEY_LEN],
     salt: &[u8; SALT_LEN],
     plaintext: &[u8],
@@ -228,12 +228,15 @@ pub fn decrypt_backup(
 
     let key = Zeroizing::new(derive_key(version, passphrase.as_bytes(), salt)?);
 
-    // `split_at(NONCE_LEN)` already guaranteed the slice length, but use
-    // `try_into` rather than `expect` so a future refactor of the parser
-    // cannot turn this into a panic in a user-facing decrypt path.
+    // The preceding `split_at(NONCE_LEN)` constructs `nonce_bytes` as
+    // exactly `NONCE_LEN` bytes when the earlier header-length check
+    // (`HEADER_LEN`) has already passed, so this conversion is provably
+    // infallible. `expect` is appropriate here — mapping to a header-shape
+    // error variant would be misleading because the magic and version were
+    // already validated above.
     let nonce: [u8; NONCE_LEN] = nonce_bytes
         .try_into()
-        .map_err(|_| BackupCryptoError::InvalidMagic)?;
+        .expect("split_at(NONCE_LEN) yields exactly NONCE_LEN bytes after header validation");
     let plaintext = decrypt_aead_blob(&key, &nonce, ciphertext, &[]).map_err(map_envelope_error)?;
 
     std::fs::write(output, &plaintext).map_err(|e| {

@@ -320,19 +320,26 @@ mod tests {
 
     #[test]
     fn test_aead_blob_known_answer_vector_empty_aad() {
-        // Pinned canonical bytes for fixed key + nonce + plaintext + empty AAD.
-        // Computed independently below using the underlying `Aes256Gcm` API
-        // directly. If this assertion ever changes, the helper's nonce-inside,
-        // empty-AAD path has drifted from raw `Aes256Gcm` semantics.
+        // True KAT: pin the canonical AES-256-GCM ciphertext-with-tag bytes
+        // for fixed key + nonce + plaintext + empty AAD to a hardcoded
+        // literal. The previous version computed expected via raw
+        // `Aes256Gcm::encrypt` on the right side and `encrypt_aead_blob_with_nonce_for_test`
+        // (which itself calls raw `Aes256Gcm::encrypt`) on the left, so any
+        // crate-level drift in `aes-gcm` would have moved both sides
+        // together and the assertion would still have passed.
+        //
+        // Regenerate by replacing this with `&[]`, running the test, and
+        // copying the value from the assertion's "actual" panic message.
+        const EXPECTED_CIPHERTEXT: &[u8] = &[
+            223, 106, 180, 182, 174, 173, 98, 110, 145, 103, 141, 196, 65, 138, 204, 55, 177, 128,
+            130, 170, 2, 209, 220, 213, 236, 81, 45, 35, 87, 3, 35, 237, 247, 103, 127, 125, 150,
+            146, 250, 33, 182, 179, 201,
+        ];
         let key = aead_kat_key();
         let nonce = aead_kat_nonce();
         let plaintext = b"carapace-shared-aead-helper".as_slice();
         let blob = encrypt_aead_blob_with_nonce_for_test(&key, &nonce, plaintext, &[]).unwrap();
-        let cipher = Aes256Gcm::new((&key).into());
-        let expected = cipher
-            .encrypt(Nonce::from_slice(&nonce), plaintext)
-            .expect("KAT reference encryption");
-        assert_eq!(blob.ciphertext, expected);
+        assert_eq!(blob.ciphertext, EXPECTED_CIPHERTEXT);
     }
 
     #[test]

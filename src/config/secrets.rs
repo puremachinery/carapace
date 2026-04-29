@@ -190,7 +190,7 @@ impl SecretStore {
     /// material directly. Used by golden-vector tests that need a fast,
     /// deterministic store without paying the Argon2id cost.
     #[cfg(test)]
-    pub(crate) fn from_raw_key_and_salt_for_test(
+    fn from_raw_key_and_salt_for_test(
         key: [u8; PASSWORD_DERIVED_KEY_LEN],
         salt: [u8; SALT_LEN],
     ) -> Self {
@@ -238,7 +238,7 @@ impl SecretStore {
     /// bytes against the *production* envelope formatter rather than a
     /// reconstructed copy.
     #[cfg(test)]
-    pub(crate) fn encrypt_with_nonce_for_test(
+    fn encrypt_with_nonce_for_test(
         &self,
         plaintext: &str,
         nonce: &[u8; NONCE_LEN],

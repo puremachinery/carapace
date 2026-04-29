@@ -475,7 +475,7 @@ impl SessionCryptoContext {
     /// Test-only constructor that bypasses KDF and manifest I/O. Used by
     /// golden-vector tests that need a fast, deterministic context.
     #[cfg(test)]
-    pub(crate) fn from_master_key_for_test(
+    fn from_master_key_for_test(
         master_key: [u8; PASSWORD_DERIVED_KEY_LEN],
     ) -> Result<Self, SessionCryptoError> {
         let integrity_hmac_key = expand_hkdf(&master_key, SESSION_INTEGRITY_INFO)?;
@@ -616,7 +616,7 @@ impl SessionCryptoContext {
     /// bytes against the production write path (key derivation + AEAD +
     /// envelope wrapping) rather than a reconstruction.
     #[cfg(test)]
-    pub(crate) fn encrypt_bytes_with_nonce_for_test(
+    fn encrypt_bytes_with_nonce_for_test(
         &self,
         session_id: &str,
         purpose: &str,
