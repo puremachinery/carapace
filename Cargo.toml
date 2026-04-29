@@ -77,8 +77,8 @@ insta = { version = "1", features = ["json"] }
 tokio-test = "0.4"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
-wit-component = { version = "0.247.0", features = ["dummy-module"] }
-wit-parser = "0.247.0"
+wit-component = { version = "0.248.0", features = ["dummy-module"] }
+wit-parser = "0.248.0"
 
 [features]
 gateway = []
