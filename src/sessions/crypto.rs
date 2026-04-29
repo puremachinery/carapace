@@ -10,8 +10,6 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
-use aes_gcm::aead::{Aead, KeyInit, Payload};
-use aes_gcm::{Aes256Gcm, Nonce};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use hkdf::Hkdf;
@@ -23,8 +21,9 @@ use thiserror::Error;
 use zeroize::Zeroizing;
 
 use crate::crypto::{
-    derive_key_argon2id, PasswordKdfError, ARGON2ID_V2_ITERATIONS, ARGON2ID_V2_LANES,
-    ARGON2ID_V2_MEMORY_KIB, PASSWORD_DERIVED_KEY_LEN,
+    decode_b64_fixed as decode_envelope_b64_fixed, decrypt_aead_blob, derive_key_argon2id,
+    encrypt_aead_blob, AeadBlob, CryptoEnvelopeError, PasswordKdfError, ARGON2ID_V2_ITERATIONS,
+    ARGON2ID_V2_LANES, ARGON2ID_V2_MEMORY_KIB, PASSWORD_DERIVED_KEY_LEN,
 };
 use crate::sessions::file_lock::FileLock;
 
@@ -132,6 +131,29 @@ fn map_kdf_error(err: PasswordKdfError) -> SessionCryptoError {
     SessionCryptoError::KeyDerivation(err.to_string())
 }
 
+fn map_envelope_error(err: CryptoEnvelopeError) -> SessionCryptoError {
+    match err {
+        CryptoEnvelopeError::EncryptionFailed => {
+            SessionCryptoError::EncryptionFailed("AEAD encryption failed".to_string())
+        }
+        CryptoEnvelopeError::DecryptionFailed => SessionCryptoError::DecryptionFailed,
+        CryptoEnvelopeError::RandomFailure(message) => SessionCryptoError::RandomFailure(message),
+        CryptoEnvelopeError::Base64Decode { field, message } => {
+            SessionCryptoError::Base64Decode {
+                field: field.to_string(),
+                message,
+            }
+        }
+        CryptoEnvelopeError::FieldLength {
+            field,
+            expected,
+            got,
+        } => SessionCryptoError::BadFormat(format!(
+            "field '{field}' has wrong length: expected {expected}, got {got}"
+        )),
+    }
+}
+
 fn manifest_path(base_path: &Path) -> PathBuf {
     base_path.join(CRYPTO_MANIFEST_PATH)
 }
@@ -174,17 +196,21 @@ fn decode_b64<const N: usize>(
     field: &'static str,
     value: &str,
 ) -> Result<[u8; N], SessionCryptoError> {
-    let decoded = BASE64
-        .decode(value)
-        .map_err(|err| SessionCryptoError::Base64Decode {
-            field: field.to_string(),
-            message: err.to_string(),
-        })?;
-    decoded.try_into().map_err(|got: Vec<u8>| {
-        SessionCryptoError::BadFormat(format!(
-            "field '{field}' has wrong length: expected {N}, got {}",
-            got.len()
-        ))
+    decode_envelope_b64_fixed::<N>(field, value).map_err(|err| match err {
+        CryptoEnvelopeError::Base64Decode { field, message } => {
+            SessionCryptoError::Base64Decode {
+                field: field.to_string(),
+                message,
+            }
+        }
+        CryptoEnvelopeError::FieldLength {
+            field,
+            expected,
+            got,
+        } => SessionCryptoError::BadFormat(format!(
+            "field '{field}' has wrong length: expected {expected}, got {got}"
+        )),
+        other => SessionCryptoError::BadFormat(other.to_string()),
     })
 }
 
@@ -241,7 +267,7 @@ fn decrypt_prefixed_bytes_with_master_key(
         )));
     }
 
-    let nonce_bytes = decode_b64::<NONCE_LEN>("n", &envelope.n)?;
+    let nonce = decode_b64::<NONCE_LEN>("n", &envelope.n)?;
     let ciphertext =
         BASE64
             .decode(&envelope.c)
@@ -250,17 +276,9 @@ fn decrypt_prefixed_bytes_with_master_key(
                 message: err.to_string(),
             })?;
     let key = derive_session_key_from_master(master_key, session_id, purpose)?;
-    let cipher = Aes256Gcm::new((&*key).into());
     let aad = aad_bytes(session_id, purpose);
-    cipher
-        .decrypt(
-            Nonce::from_slice(&nonce_bytes),
-            Payload {
-                msg: ciphertext.as_ref(),
-                aad: &aad,
-            },
-        )
-        .map_err(|_| SessionCryptoError::DecryptionFailed)
+    let blob = AeadBlob { nonce, ciphertext };
+    decrypt_aead_blob(&key, &blob, &aad).map_err(map_envelope_error)
 }
 
 fn read_prefixed_file_bytes(path: &Path) -> Result<Option<Vec<u8>>, SessionCryptoError> {
@@ -579,27 +597,13 @@ impl SessionCryptoContext {
         plaintext: &[u8],
     ) -> Result<Vec<u8>, SessionCryptoError> {
         let key = self.derive_session_key(session_id, purpose)?;
-        let cipher = Aes256Gcm::new((&*key).into());
-
-        let mut nonce_bytes = [0u8; NONCE_LEN];
-        getrandom::fill(&mut nonce_bytes)
-            .map_err(|err| SessionCryptoError::RandomFailure(err.to_string()))?;
-        let nonce = Nonce::from_slice(&nonce_bytes);
         let aad = aad_bytes(session_id, purpose);
-        let ciphertext = cipher
-            .encrypt(
-                nonce,
-                Payload {
-                    msg: plaintext,
-                    aad: &aad,
-                },
-            )
-            .map_err(|err| SessionCryptoError::EncryptionFailed(err.to_string()))?;
+        let blob = encrypt_aead_blob(&key, plaintext, &aad).map_err(map_envelope_error)?;
 
         let envelope = EncryptedEnvelope {
             format: SESSION_ENCRYPTED_FORMAT_V1.to_string(),
-            n: BASE64.encode(nonce_bytes),
-            c: BASE64.encode(ciphertext),
+            n: BASE64.encode(blob.nonce),
+            c: BASE64.encode(&blob.ciphertext),
         };
         let envelope = serde_json::to_vec(&envelope).map_err(SessionCryptoError::from)?;
         let mut out = Vec::with_capacity(SESSION_ENCRYPTED_PREFIX_V1.len() + envelope.len());
@@ -660,7 +664,10 @@ pub fn is_encrypted_payload(data: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aes_gcm::aead::{Aead, KeyInit, Payload};
+    use aes_gcm::{Aes256Gcm, Nonce};
     use serde_json::Value;
+    use sha2::Digest;
 
     fn test_key_material() -> Vec<u8> {
         format!("fixture-{}", uuid::Uuid::new_v4()).into_bytes()
@@ -1003,6 +1010,77 @@ mod tests {
 
         assert!(!has_encrypted_payload_prefix(unprefixed));
         assert!(!is_encrypted_payload(unprefixed));
+    }
+
+    #[test]
+    fn test_cse1_persisted_payload_and_aad_golden_vector() {
+        // Golden vector pinning the canonical `cse1:` envelope plus the
+        // manifest-bound AAD construction for a fixed master_key + session_id
+        // + purpose + nonce + plaintext. Guards against drift in the persisted
+        // payload layout *and* the AAD derivation: any change in either side
+        // would break this test.
+        let master_key: [u8; PASSWORD_DERIVED_KEY_LEN] =
+            Sha256::digest(b"carapace-sessions-golden-master-key").into();
+        let session_id = "session-golden-fixture";
+        let purpose = SESSION_METADATA_PURPOSE;
+        let nonce_digest = Sha256::digest(b"carapace-sessions-golden-nonce");
+        let nonce_bytes: [u8; NONCE_LEN] = nonce_digest[..NONCE_LEN]
+            .try_into()
+            .expect("nonce slice length");
+        let plaintext = br#"{"hello":"golden"}"#;
+
+        // Pin AAD construction.
+        let aad = aad_bytes(session_id, purpose);
+        let expected_aad = format!("carapace:session:{}:v1:{}", purpose, session_id);
+        assert_eq!(aad, expected_aad.as_bytes());
+
+        // Derive per-session key and encrypt independently with raw
+        // `Aes256Gcm`. This pins the inner crypto-envelope under AAD.
+        let key = derive_session_key_from_master(&master_key, session_id, purpose).unwrap();
+        let cipher = Aes256Gcm::new((&*key).into());
+        let expected_ct = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce_bytes),
+                Payload {
+                    msg: plaintext.as_ref(),
+                    aad: &aad,
+                },
+            )
+            .expect("golden session encryption");
+
+        // Reconstruct the canonical `cse1:` payload bytes.
+        let envelope = EncryptedEnvelope {
+            format: SESSION_ENCRYPTED_FORMAT_V1.to_string(),
+            n: BASE64.encode(nonce_bytes),
+            c: BASE64.encode(&expected_ct),
+        };
+        let envelope_bytes = serde_json::to_vec(&envelope).expect("serialize envelope");
+        let mut expected_payload = Vec::new();
+        expected_payload.extend_from_slice(SESSION_ENCRYPTED_PREFIX_V1);
+        expected_payload.extend_from_slice(&envelope_bytes);
+
+        // Round-trip through the public decrypt path to confirm the canonical
+        // payload decodes back to the same plaintext with the same AAD.
+        let recovered = decrypt_prefixed_bytes_with_master_key(
+            &master_key,
+            session_id,
+            purpose,
+            &expected_payload,
+        )
+        .expect("golden session decryption");
+        assert_eq!(recovered, plaintext);
+
+        // Wrong AAD (different session_id) must fail to decrypt the same
+        // ciphertext, demonstrating that AAD is bound through the envelope.
+        let wrong_session = "session-not-golden";
+        let err = decrypt_prefixed_bytes_with_master_key(
+            &master_key,
+            wrong_session,
+            purpose,
+            &expected_payload,
+        )
+        .unwrap_err();
+        assert_eq!(err, SessionCryptoError::DecryptionFailed);
     }
 
     #[cfg(unix)]

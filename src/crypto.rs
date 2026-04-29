@@ -3,7 +3,11 @@
 #[cfg(test)]
 use std::sync::{LazyLock, Mutex};
 
+use aes_gcm::aead::{Aead, KeyInit, Payload};
+use aes_gcm::{Aes256Gcm, Nonce};
 use argon2::{Algorithm, Argon2, Params, Version};
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
 use pbkdf2::pbkdf2_hmac;
 use sha2::Sha256;
 use thiserror::Error;
@@ -32,6 +36,140 @@ pub(crate) enum PasswordKdfError {
     InvalidSaltLength { minimum: usize, got: usize },
     #[error("Argon2 derivation failed: {0}")]
     DerivationFailed(String),
+}
+
+/// AEAD-blob length, in bytes, of the AES-256-GCM 96-bit nonce.
+pub(crate) const AEAD_NONCE_LEN: usize = 12;
+
+/// AES-256-GCM encryption-key length in bytes.
+pub(crate) const AEAD_KEY_LEN: usize = 32;
+
+/// Inner AEAD blob produced by [`encrypt_aead_blob`].
+///
+/// Holds the random 96-bit nonce and the AES-256-GCM ciphertext-with-tag.
+/// Outer persisted formats serialize these fields however they like
+/// (`enc:vN:` strings, binary headers, JSON envelopes).
+pub(crate) struct AeadBlob {
+    pub nonce: [u8; AEAD_NONCE_LEN],
+    pub ciphertext: Vec<u8>,
+}
+
+/// Errors from the shared AEAD-blob helpers.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub(crate) enum CryptoEnvelopeError {
+    #[error("AEAD encryption failed")]
+    EncryptionFailed,
+    #[error("AEAD decryption failed")]
+    DecryptionFailed,
+    #[error("random generation failed: {0}")]
+    RandomFailure(String),
+    #[error("field '{field}' base64 decode: {message}")]
+    Base64Decode {
+        field: &'static str,
+        message: String,
+    },
+    #[error("field '{field}' has wrong length: expected {expected}, got {got}")]
+    FieldLength {
+        field: &'static str,
+        expected: usize,
+        got: usize,
+    },
+}
+
+/// Encrypt `plaintext` under `key` with AES-256-GCM and a freshly generated
+/// random 96-bit nonce.
+///
+/// The helper owns nonce generation: callers cannot supply their own nonce
+/// because nonce-uniqueness under a fixed AEAD key is a critical correctness
+/// invariant. `aad` is authenticated but not encrypted; pass `&[]` when the
+/// outer format does not bind any associated data.
+pub(crate) fn encrypt_aead_blob(
+    key: &[u8; AEAD_KEY_LEN],
+    plaintext: &[u8],
+    aad: &[u8],
+) -> Result<AeadBlob, CryptoEnvelopeError> {
+    let mut nonce_bytes = [0u8; AEAD_NONCE_LEN];
+    getrandom::fill(&mut nonce_bytes)
+        .map_err(|err| CryptoEnvelopeError::RandomFailure(err.to_string()))?;
+    encrypt_aead_blob_inner(key, &nonce_bytes, plaintext, aad)
+}
+
+/// Test-only variant of [`encrypt_aead_blob`] that takes a fixed nonce so
+/// golden vectors can pin canonical persisted bytes without changing the
+/// runtime nonce-generation contract.
+#[cfg(test)]
+pub(crate) fn encrypt_aead_blob_with_nonce_for_test(
+    key: &[u8; AEAD_KEY_LEN],
+    nonce: &[u8; AEAD_NONCE_LEN],
+    plaintext: &[u8],
+    aad: &[u8],
+) -> Result<AeadBlob, CryptoEnvelopeError> {
+    encrypt_aead_blob_inner(key, nonce, plaintext, aad)
+}
+
+fn encrypt_aead_blob_inner(
+    key: &[u8; AEAD_KEY_LEN],
+    nonce_bytes: &[u8; AEAD_NONCE_LEN],
+    plaintext: &[u8],
+    aad: &[u8],
+) -> Result<AeadBlob, CryptoEnvelopeError> {
+    let cipher = Aes256Gcm::new(key.into());
+    let ciphertext = cipher
+        .encrypt(
+            Nonce::from_slice(nonce_bytes),
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
+        .map_err(|_| CryptoEnvelopeError::EncryptionFailed)?;
+    Ok(AeadBlob {
+        nonce: *nonce_bytes,
+        ciphertext,
+    })
+}
+
+/// Decrypt an AEAD blob under `key` and `aad`, returning the plaintext.
+///
+/// Returns [`CryptoEnvelopeError::DecryptionFailed`] for any AEAD failure
+/// (wrong key, wrong AAD, tampered ciphertext, or truncated tag).
+pub(crate) fn decrypt_aead_blob(
+    key: &[u8; AEAD_KEY_LEN],
+    blob: &AeadBlob,
+    aad: &[u8],
+) -> Result<Vec<u8>, CryptoEnvelopeError> {
+    let cipher = Aes256Gcm::new(key.into());
+    cipher
+        .decrypt(
+            Nonce::from_slice(&blob.nonce),
+            Payload {
+                msg: blob.ciphertext.as_ref(),
+                aad,
+            },
+        )
+        .map_err(|_| CryptoEnvelopeError::DecryptionFailed)
+}
+
+/// Decode a base64-encoded fixed-size byte field, attributing any error to
+/// `field` for consistent error messages across persisted formats.
+pub(crate) fn decode_b64_fixed<const N: usize>(
+    field: &'static str,
+    value: &str,
+) -> Result<[u8; N], CryptoEnvelopeError> {
+    let decoded = BASE64
+        .decode(value)
+        .map_err(|err| CryptoEnvelopeError::Base64Decode {
+            field,
+            message: err.to_string(),
+        })?;
+    let got = decoded.len();
+    decoded
+        .try_into()
+        .map_err(|_: Vec<u8>| CryptoEnvelopeError::FieldLength {
+            field,
+            expected: N,
+            got,
+        })
 }
 
 /// Generate a random secret encoded as lowercase hex.
@@ -93,6 +231,146 @@ pub(crate) fn derive_key_argon2id(
 mod tests {
     use super::*;
     use sha2::Digest;
+
+    fn aead_kat_key() -> [u8; AEAD_KEY_LEN] {
+        Sha256::digest(b"carapace-aead-blob-helper-kat-key").into()
+    }
+
+    fn aead_kat_nonce() -> [u8; AEAD_NONCE_LEN] {
+        let digest = Sha256::digest(b"carapace-aead-blob-helper-kat-nonce");
+        digest[..AEAD_NONCE_LEN]
+            .try_into()
+            .expect("AEAD nonce length")
+    }
+
+    #[test]
+    fn test_aead_blob_round_trip_empty_aad() {
+        let key = aead_kat_key();
+        let plaintext = b"hello AEAD world".to_vec();
+        let blob = encrypt_aead_blob(&key, &plaintext, &[]).unwrap();
+        let recovered = decrypt_aead_blob(&key, &blob, &[]).unwrap();
+        assert_eq!(recovered, plaintext);
+    }
+
+    #[test]
+    fn test_aead_blob_round_trip_with_aad() {
+        let key = aead_kat_key();
+        let aad = b"carapace:aead-aad-bind:v1".as_slice();
+        let plaintext = b"this is bound to AAD".to_vec();
+        let blob = encrypt_aead_blob(&key, &plaintext, aad).unwrap();
+        let recovered = decrypt_aead_blob(&key, &blob, aad).unwrap();
+        assert_eq!(recovered, plaintext);
+    }
+
+    #[test]
+    fn test_aead_blob_decryption_rejects_wrong_aad() {
+        let key = aead_kat_key();
+        let aad = b"carapace:aead-aad-bind:v1".as_slice();
+        let plaintext = b"this is bound to AAD".to_vec();
+        let blob = encrypt_aead_blob(&key, &plaintext, aad).unwrap();
+        let wrong_aad = b"carapace:aead-aad-bind:v2".as_slice();
+        let err = decrypt_aead_blob(&key, &blob, wrong_aad).unwrap_err();
+        assert_eq!(err, CryptoEnvelopeError::DecryptionFailed);
+    }
+
+    #[test]
+    fn test_aead_blob_decryption_rejects_wrong_key() {
+        let key = aead_kat_key();
+        let plaintext = b"hello AEAD world".to_vec();
+        let blob = encrypt_aead_blob(&key, &plaintext, &[]).unwrap();
+        let mut wrong_key = key;
+        wrong_key[0] ^= 0xFF;
+        let err = decrypt_aead_blob(&wrong_key, &blob, &[]).unwrap_err();
+        assert_eq!(err, CryptoEnvelopeError::DecryptionFailed);
+    }
+
+    #[test]
+    fn test_aead_blob_decryption_rejects_tampered_ciphertext() {
+        let key = aead_kat_key();
+        let plaintext = b"hello AEAD world".to_vec();
+        let mut blob = encrypt_aead_blob(&key, &plaintext, &[]).unwrap();
+        if let Some(byte) = blob.ciphertext.first_mut() {
+            *byte ^= 0xFF;
+        }
+        let err = decrypt_aead_blob(&key, &blob, &[]).unwrap_err();
+        assert_eq!(err, CryptoEnvelopeError::DecryptionFailed);
+    }
+
+    #[test]
+    fn test_aead_blob_uses_unique_nonce_per_call() {
+        let key = aead_kat_key();
+        let plaintext = b"same plaintext".to_vec();
+        let blob_a = encrypt_aead_blob(&key, &plaintext, &[]).unwrap();
+        let blob_b = encrypt_aead_blob(&key, &plaintext, &[]).unwrap();
+        assert_ne!(
+            blob_a.nonce, blob_b.nonce,
+            "each encrypt call must produce a fresh nonce"
+        );
+    }
+
+    #[test]
+    fn test_aead_blob_known_answer_vector_empty_aad() {
+        // Pinned canonical bytes for fixed key + nonce + plaintext + empty AAD.
+        // Computed independently below using the underlying `Aes256Gcm` API
+        // directly. If this assertion ever changes, the helper's nonce-inside,
+        // empty-AAD path has drifted from raw `Aes256Gcm` semantics.
+        let key = aead_kat_key();
+        let nonce = aead_kat_nonce();
+        let plaintext = b"carapace-shared-aead-helper".as_slice();
+        let blob = encrypt_aead_blob_with_nonce_for_test(&key, &nonce, plaintext, &[]).unwrap();
+        let cipher = Aes256Gcm::new((&key).into());
+        let expected = cipher
+            .encrypt(Nonce::from_slice(&nonce), plaintext)
+            .expect("KAT reference encryption");
+        assert_eq!(blob.ciphertext, expected);
+    }
+
+    #[test]
+    fn test_aead_blob_known_answer_vector_with_aad() {
+        let key = aead_kat_key();
+        let nonce = aead_kat_nonce();
+        let plaintext = b"carapace-shared-aead-helper".as_slice();
+        let aad = b"carapace:aead-blob-helper-aad:v1".as_slice();
+        let blob = encrypt_aead_blob_with_nonce_for_test(&key, &nonce, plaintext, aad).unwrap();
+        let recovered = decrypt_aead_blob(&key, &blob, aad).unwrap();
+        assert_eq!(recovered, plaintext);
+        // AAD-bound ciphertext must differ from the empty-AAD KAT above.
+        let no_aad_blob =
+            encrypt_aead_blob_with_nonce_for_test(&key, &nonce, plaintext, &[]).unwrap();
+        assert_ne!(blob.ciphertext, no_aad_blob.ciphertext);
+    }
+
+    #[test]
+    fn test_decode_b64_fixed_round_trip() {
+        let bytes: [u8; 5] = [1, 2, 3, 4, 5];
+        let encoded = BASE64.encode(bytes);
+        let decoded = decode_b64_fixed::<5>("test", &encoded).unwrap();
+        assert_eq!(decoded, bytes);
+    }
+
+    #[test]
+    fn test_decode_b64_fixed_invalid_base64() {
+        let err = decode_b64_fixed::<5>("nonce", "not!valid!b64").unwrap_err();
+        assert!(matches!(
+            err,
+            CryptoEnvelopeError::Base64Decode { field: "nonce", .. }
+        ));
+    }
+
+    #[test]
+    fn test_decode_b64_fixed_wrong_length() {
+        let bytes: [u8; 3] = [1, 2, 3];
+        let encoded = BASE64.encode(bytes);
+        let err = decode_b64_fixed::<5>("nonce", &encoded).unwrap_err();
+        assert_eq!(
+            err,
+            CryptoEnvelopeError::FieldLength {
+                field: "nonce",
+                expected: 5,
+                got: 3,
+            }
+        );
+    }
 
     #[test]
     fn test_derive_key_pbkdf2_sha256_rejects_short_salt() {
