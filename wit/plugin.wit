@@ -546,8 +546,8 @@ interface provider {
         image,
     }
 
-    // Model compatibility flags (all optional to match Node's ModelCompatConfig)
-    record model-compat {
+    // Model provider behavior flags.
+    record model-capabilities {
         supports-store: option<bool>,              // Supports response storage
         supports-developer-role: option<bool>,     // Supports developer message role
         supports-reasoning-effort: option<bool>,   // Supports reasoning effort parameter
@@ -567,7 +567,7 @@ interface provider {
     // 4. model-definition.cost: all values must be >= 0
     // 5. model-definition.context-window: must be > 0
     // 6. model-definition.max-tokens: must be > 0 and <= context-window
-    // 7. model-compat.max-tokens-field: if present, must be "max_completion_tokens" or "max_tokens"
+    // 7. model-capabilities.max-tokens-field: if present, must be "max_completion_tokens" or "max_tokens"
     //
     // Invalid models are rejected with plugin-error { code: "INVALID_MODEL", message: "<details>" }
     // The host logs validation failures for debugging.
@@ -583,7 +583,7 @@ interface provider {
         context-window: u32,        // Max context tokens
         max-tokens: u32,            // Max output tokens
         headers: option<string>,    // JSON object of custom headers
-        compat: option<model-compat>, // Compatibility flags
+        capabilities: option<model-capabilities>, // Provider behavior flags
     }
 
     // Chat message for completion requests

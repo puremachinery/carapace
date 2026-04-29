@@ -37,39 +37,6 @@ All model references require explicit `provider:model` routing (e.g.
 
 For the full setup flow and decision guidance, use [First Run](site/first-run.md).
 
-### `cara import`
-Import configuration from another tool into Carapace.
-
-```bash
-cara import <source> [--force]
-```
-
-Supported sources:
-- `openclaw` — imports from `~/.openclaw/openclaw.json`, `.env`, and
-  `~/.clawdbot/` (legacy). Maps provider API keys, channel tokens, gateway
-  auth, model selection, and env-block secrets. Supports JSON5 config and
-  dotenv files.
-- `opencode` — imports from `~/.opencode.json` (home, XDG, or local project).
-  Maps provider API keys and the coder agent model.
-- `aider` — imports from `~/.aider.conf.yml` (home or project) and `.env`.
-  Maps API keys and model from YAML and dotenv with litellm model ID
-  remapping.
-- `nemoclaw` — imports from `~/.nemoclaw/config.json`. Resolves credentials
-  from the env var named in `credentialEnv`. Maps Anthropic, OpenAI, Gemini,
-  and Ollama endpoints.
-
-The import flow:
-1. Discovers the source config on disk
-2. Shows a preview table of mapped fields (secrets redacted) and skipped
-   surfaces with reasons
-3. Asks for confirmation before writing
-4. Writes Carapace config with restricted file permissions and secret
-   encryption
-
-Use `--force` to overwrite an existing Carapace config.
-
-After import, run `cara verify` to validate the imported providers work.
-
 ### `cara verify`
 Run first-run outcome checks with pass/fail output and next-step guidance.
 
@@ -275,17 +242,8 @@ If none are found, local-direct access may still work when configured.
 
 The CLI creates a device identity for WebSocket access:
 
-- Stored in OS credential store when available
-- Legacy fallback file: `{config_dir}/device-identity.json` (owner-only perms)
+- Stored in OS credential store
 - A service-issued `connect.challenge` nonce is signed and sent in `connect`
-
-Strict mode to disallow legacy fallback:
-
-- `CARAPACE_DEVICE_IDENTITY_STRICT=1`
-
-Strict mode behavior:
-- credential store unavailable -> hard error
-- legacy fallback file present -> hard error
 
 ## State Directory
 

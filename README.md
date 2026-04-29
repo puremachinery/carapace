@@ -97,8 +97,7 @@ verify), cross-platform subprocess sandboxing, guided setup
 (OpenAI subscription login via CLI and Control UI), Vertex AI provider
 support, per-channel activity features with Signal typing indicators and
 append-time read receipts, guarded filesystem tools for explicit workspace
-roots, named execution routes, session encryption at rest, and configuration
-migration from OpenClaw/OpenCode/Aider/NemoClaw.
+roots, named execution routes, and session encryption at rest.
 
 ## Docs
 
@@ -112,7 +111,7 @@ migration from OpenClaw/OpenCode/Aider/NemoClaw.
 - [Channel setup](docs/channels.md) — Signal, Telegram, Discord, Slack, webhooks
 - [Channel smoke validation](docs/channel-smoke.md) — live checks and evidence capture
 - [Cookbook](docs/cookbook/README.md) — outcome-first walkthroughs
-- [Release & upgrade policy](docs/release.md) — compatibility, migration, rollback, release checklist
+- [Release & upgrade policy](docs/release.md) — upgrade, migration, rollback, release checklist
 - [CLI guide](docs/cli.md) — subcommands, flags, and device identity
 - [Documentation index](docs/README.md) — architecture/protocol/security references
 - [Security reporting policy](SECURITY.md) — private vulnerability reporting and response expectations

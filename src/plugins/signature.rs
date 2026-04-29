@@ -21,11 +21,11 @@ pub struct SignatureConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
     /// When `true`, unsigned plugins are rejected (otherwise just warned).
-    #[serde(default = "default_true", alias = "requireSignature")]
+    #[serde(default = "default_true", rename = "requireSignature")]
     pub require_signature: bool,
     /// Hex-encoded Ed25519 public keys of trusted publishers.
     /// If non-empty, the plugin's publisher key must be in this list.
-    #[serde(default, alias = "trustedPublishers")]
+    #[serde(default, rename = "trustedPublishers")]
     pub trusted_publishers: Vec<String>,
 }
 

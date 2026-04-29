@@ -17,11 +17,10 @@ A security-focused, open-source personal AI assistant.
 - [Security & Ops Hub](site/security-ops.md) — day-2 security/ops paths
 - [Reference Hub](site/reference.md) — protocol/architecture reference routing
 - [Cookbook](cookbook/README.md) — task-focused walkthroughs
-- [Release & Upgrade Policy](release.md) — compatibility, migration, rollback, release checklist
+- [Release & Upgrade Policy](release.md) — upgrade, migration, rollback, release checklist
 - [Channel Setup](channels.md) — Signal, Telegram, Discord, Slack, webhooks
 - [Channel Smoke Validation](channel-smoke.md) — reproducible live channel checks + evidence capture
 - [CLI Guide](cli.md) — subcommands, flags, and device identity
-- [Migrating from another tool](getting-started.md#migrating-from-another-tool) — import config from OpenClaw, OpenCode, Aider, or NemoClaw
 - [Security Policy](../SECURITY.md) — vulnerability reporting and response expectations
 
 ## Architecture & Security
@@ -52,4 +51,3 @@ A security-focused, open-source personal AI assistant.
 | Venice AI provider | [architecture.md](architecture.md#key-files) | OpenAI-compatible composition wrapper |
 | Session storage | [architecture.md](architecture.md#key-files) | JSONL history, compaction, encryption at rest |
 | Named routes | [config-reference.md](protocol/config-reference.md#2a-named-routes-optional) | Reusable backend route definitions |
-| Import / migrate | [getting-started.md](getting-started.md#migrating-from-another-tool) | Import from OpenClaw, OpenCode, Aider, NemoClaw |

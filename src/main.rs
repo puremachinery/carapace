@@ -69,13 +69,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             auth_mode,
         }) => cli::handle_setup(force, provider, auth_mode),
 
-        Some(Command::Import { source, force }) => match source {
-            cli::ImportSource::Openclaw => cli::handle_import_openclaw(force),
-            cli::ImportSource::Opencode => cli::handle_import_opencode(force),
-            cli::ImportSource::Aider => cli::handle_import_aider(force),
-            cli::ImportSource::Nemoclaw => cli::handle_import_nemoclaw(force),
-        },
-
         Some(Command::Pair { url, name, trust }) => {
             cli::handle_pair(&url, name.as_deref(), trust).await
         }

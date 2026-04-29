@@ -92,35 +92,15 @@ impl std::error::Error for AuthProfileError {}
 
 /// Current store format version.
 ///
-/// Version 1: bare JSON array of profiles (implicit, no envelope).
 /// Version 2: `{ "version": 2, "profiles": [...] }` envelope. Supports
-///   `OAuthProvider::Anthropic`, `AuthProfileCredentialKind::Token`, and
-///   per-profile resilience (unknown profiles are preserved as raw JSON
-///   on round-trip instead of failing the entire load).
-///
-/// This is a one-way door: once a version-2 file is written, older binaries
-/// that expect a bare array will fail to load the file. This is preferred
-/// over silent data loss or corruption.
+///   `OAuthProvider::Anthropic` and `AuthProfileCredentialKind::Token`.
 const CURRENT_STORE_VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AuthProfileStoreEnvelope {
     version: u32,
-    profiles: Vec<Value>,
-}
-
-/// A profile that could not be deserialized but is preserved for round-trip
-/// safety. The raw JSON value is kept so it can be written back without loss.
-#[derive(Debug, Clone)]
-struct SkippedProfile {
-    raw: Value,
-}
-
-/// Result of loading the profile store: successfully parsed profiles plus
-/// any that were skipped (preserved for round-trip).
-struct LoadedProfiles {
     profiles: Vec<AuthProfile>,
-    skipped: Vec<SkippedProfile>,
 }
 
 struct LastUsedPersistence {
@@ -137,9 +117,6 @@ struct LastUsedPersistenceState {
 
 struct ProfileStoreShared {
     profiles: RwLock<Vec<AuthProfile>>,
-    /// Profiles that could not be deserialized but are preserved for
-    /// round-trip safety (e.g., profiles from a newer binary version).
-    skipped_profiles: RwLock<Vec<SkippedProfile>>,
     state_path: PathBuf,
     secret_store: Option<Arc<SecretStore>>,
     /// Password bytes kept for `decrypt_rekey` (values on disk may have been
@@ -159,7 +136,6 @@ impl ProfileStoreShared {
     ) -> Self {
         Self {
             profiles: RwLock::new(Vec::new()),
-            skipped_profiles: RwLock::new(Vec::new()),
             state_path,
             secret_store,
             encryption_password,
@@ -194,71 +170,32 @@ impl LastUsedPersistenceState {
     }
 }
 
-/// Parse a store file, auto-detecting bare-array (v1) vs envelope (v2) format.
-fn parse_store_file(content: &str) -> Result<LoadedProfiles, AuthProfileError> {
-    let raw_values: Vec<Value> = match serde_json::from_str::<Value>(content) {
-        Ok(Value::Array(arr)) => arr,
+/// Parse a store file in the current envelope format.
+fn parse_store_file(content: &str) -> Result<Vec<AuthProfile>, AuthProfileError> {
+    match serde_json::from_str::<Value>(content) {
         Ok(Value::Object(map)) => {
             let envelope: AuthProfileStoreEnvelope = serde_json::from_value(Value::Object(map))
                 .map_err(|e| AuthProfileError::SerializationError(e.to_string()))?;
-            if envelope.version > CURRENT_STORE_VERSION {
+            if envelope.version != CURRENT_STORE_VERSION {
                 return Err(AuthProfileError::SerializationError(format!(
-                    "auth profile store version {} is newer than supported version {}; \
-                     upgrade Carapace or restore from a backup",
+                    "auth profile store version {} is not supported; expected version {}",
                     envelope.version, CURRENT_STORE_VERSION
                 )));
             }
-            envelope.profiles
+            Ok(envelope.profiles)
         }
-        Ok(_) => {
-            return Err(AuthProfileError::SerializationError(
-                "expected JSON array or object at top level".to_string(),
-            ));
-        }
-        Err(e) => {
-            return Err(AuthProfileError::SerializationError(e.to_string()));
-        }
-    };
-
-    let mut profiles = Vec::new();
-    let mut skipped = Vec::new();
-
-    for raw in raw_values {
-        match serde_json::from_value::<AuthProfile>(raw.clone()) {
-            Ok(profile) => profiles.push(profile),
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "skipping unrecognized auth profile during load (preserved for round-trip)"
-                );
-                skipped.push(SkippedProfile { raw });
-            }
-        }
+        Ok(_) => Err(AuthProfileError::SerializationError(
+            "expected auth profile store envelope object at top level".to_string(),
+        )),
+        Err(e) => Err(AuthProfileError::SerializationError(e.to_string())),
     }
-
-    Ok(LoadedProfiles { profiles, skipped })
 }
 
-/// Serialize profiles (plus any skipped raw values) into the versioned
-/// envelope format.
-fn serialize_store(
-    profiles: &[AuthProfile],
-    skipped: &[SkippedProfile],
-) -> Result<String, AuthProfileError> {
-    let mut raw_values: Vec<Value> = profiles
-        .iter()
-        .map(serde_json::to_value)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| AuthProfileError::SerializationError(e.to_string()))?;
-
-    // Append skipped profiles so they survive round-trip.
-    for s in skipped {
-        raw_values.push(s.raw.clone());
-    }
-
+/// Serialize profiles into the versioned envelope format.
+fn serialize_store(profiles: &[AuthProfile]) -> Result<String, AuthProfileError> {
     let envelope = AuthProfileStoreEnvelope {
         version: CURRENT_STORE_VERSION,
-        profiles: raw_values,
+        profiles: profiles.to_vec(),
     };
 
     serde_json::to_string_pretty(&envelope)
@@ -312,6 +249,7 @@ impl fmt::Display for AuthProfileCredentialKind {
 
 /// OAuth2 token set for a profile.
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OAuthTokens {
     pub access_token: String,
     pub refresh_token: Option<String>,
@@ -325,6 +263,7 @@ pub struct OAuthTokens {
 /// This stores the provider metadata needed to refresh an OAuth-backed runtime
 /// session without relying on the application config as a secret transport.
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StoredOAuthProviderConfig {
     pub client_id: String,
     pub client_secret: String,
@@ -366,6 +305,7 @@ impl From<&OAuthProviderConfig> for StoredOAuthProviderConfig {
 
 /// A stored auth profile.
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthProfile {
     pub id: String,
     pub name: String,
@@ -1006,14 +946,11 @@ fn decode_jwt_payload(token: &str) -> Option<Value> {
 /// Persistent store for auth profiles.
 ///
 /// Profiles are stored in `{state_dir}/auth_profiles.json` using a versioned
-/// envelope format: `{ "version": 2, "profiles": [...] }`. Legacy bare-array
-/// files (version 1) are auto-detected on load and upgraded on save.
+/// envelope format: `{ "version": 2, "profiles": [...] }`.
 /// Uses `parking_lot::RwLock` for synchronous interior mutability.
 ///
 /// When a `SecretStore` is provided, sensitive token fields (`access_token`,
-/// `refresh_token`) are encrypted at rest using AES-256-GCM.  Plaintext
-/// values loaded from disk (backward-compatible) are transparently encrypted
-/// on the next save.
+/// `refresh_token`) are encrypted at rest using AES-256-GCM.
 pub struct ProfileStore {
     shared: Arc<ProfileStoreShared>,
     last_used_worker: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -1055,8 +992,7 @@ impl ProfileStore {
     ///
     /// When a `SecretStore` is provided, `access_token` and `refresh_token`
     /// values are encrypted before being written to disk and decrypted when
-    /// loaded.  Existing plaintext values are accepted on load (backward
-    /// compatible) and will be encrypted on the next save.
+    /// loaded.
     ///
     /// The `password` is retained so that values encrypted with a different
     /// salt (e.g. from a previous run) can still be decrypted via key
@@ -1301,8 +1237,7 @@ impl ProfileStore {
     /// Load profiles from disk. Replaces any in-memory data.
     ///
     /// If a `SecretStore` is configured, encrypted token fields using
-    /// supported `enc:v1:` / `enc:v2:` envelopes are decrypted transparently.
-    /// Plaintext values are left as-is for backward compatibility.
+    /// supported `enc:v2:` envelopes are decrypted transparently.
     pub fn load(&self) -> Result<(), AuthProfileError> {
         let _persist_guard = self.lock_persist();
         if !self.shared.state_path.exists() {
@@ -1311,8 +1246,7 @@ impl ProfileStore {
 
         let content = fs::read_to_string(&self.shared.state_path)
             .map_err(|e| AuthProfileError::IoError(e.to_string()))?;
-        let loaded = parse_store_file(&content)?;
-        let mut profiles = loaded.profiles;
+        let mut profiles = parse_store_file(&content)?;
 
         // Decrypt token fields if we have a SecretStore
         if let Some(ref store) = self.shared.secret_store {
@@ -1323,15 +1257,13 @@ impl ProfileStore {
                 .map(|v| v.as_slice())
                 .unwrap_or(&[]);
             for profile in profiles.iter_mut() {
-                Self::decrypt_profile_credential(profile, store, password);
+                Self::decrypt_profile_credential(profile, store, password)?;
             }
         }
 
         let mut profiles_guard = self.shared.profiles.write();
-        let mut skipped_guard = self.shared.skipped_profiles.write();
         let mut state = self.lock_last_used_state();
         *profiles_guard = profiles;
-        *skipped_guard = loaded.skipped;
         state.reset_generations();
         self.shared.last_used_persistence.condvar.notify_all();
         Ok(())
@@ -1378,10 +1310,7 @@ impl ProfileStore {
             }
         }
 
-        let content = {
-            let skipped = shared.skipped_profiles.read();
-            serialize_store(&to_save, &skipped)?
-        };
+        let content = serialize_store(&to_save)?;
 
         // Ensure parent directory exists
         if let Some(parent) = shared.state_path.parent() {
@@ -1424,9 +1353,8 @@ impl ProfileStore {
         })
     }
 
-    /// Encrypt sensitive token fields in-place. Already-encrypted values
-    /// using supported `enc:v1:` / `enc:v2:` envelopes are skipped to avoid
-    /// double-encryption.
+    /// Encrypt sensitive token fields in-place. Already-encrypted `enc:v2:`
+    /// values are skipped to avoid double-encryption.
     fn encrypt_tokens(
         tokens: &mut OAuthTokens,
         store: &SecretStore,
@@ -1483,14 +1411,14 @@ impl ProfileStore {
         Ok(())
     }
 
-    /// Decrypt sensitive token fields in-place. Plaintext values (no
-    /// supported `enc:v1:` / `enc:v2:` prefix) are left as-is for backward
-    /// compatibility.
-    ///
     /// Uses `decrypt_rekey` so that values encrypted with a different salt
     /// (e.g. from a previous `SecretStore` instance) are still decryptable
     /// as long as the same password is used.
-    fn decrypt_tokens(tokens: &mut OAuthTokens, store: &SecretStore, password: &[u8]) {
+    fn decrypt_tokens(
+        tokens: &mut OAuthTokens,
+        store: &SecretStore,
+        password: &[u8],
+    ) -> Result<(), AuthProfileError> {
         if is_encrypted(&tokens.access_token) {
             match store.decrypt_rekey(&tokens.access_token, password) {
                 Ok(plaintext) => tokens.access_token = plaintext,
@@ -1499,6 +1427,10 @@ impl ProfileStore {
                     tokens.access_token = String::new();
                 }
             }
+        } else if !tokens.access_token.is_empty() {
+            return Err(AuthProfileError::SerializationError(
+                "auth profile access_token is not encrypted".to_string(),
+            ));
         }
         if let Some(ref rt) = tokens.refresh_token {
             if is_encrypted(rt) {
@@ -1509,21 +1441,30 @@ impl ProfileStore {
                         tokens.refresh_token = Some(String::new());
                     }
                 }
+            } else if !rt.is_empty() {
+                return Err(AuthProfileError::SerializationError(
+                    "auth profile refresh_token is not encrypted".to_string(),
+                ));
             }
         }
+        Ok(())
     }
 
-    fn decrypt_profile_credential(profile: &mut AuthProfile, store: &SecretStore, password: &[u8]) {
+    fn decrypt_profile_credential(
+        profile: &mut AuthProfile,
+        store: &SecretStore,
+        password: &[u8],
+    ) -> Result<(), AuthProfileError> {
         match profile.credential_kind {
             AuthProfileCredentialKind::OAuth => {
                 if let Some(tokens) = profile.tokens.as_mut() {
-                    Self::decrypt_tokens(tokens, store, password);
+                    Self::decrypt_tokens(tokens, store, password)?;
                 }
                 Self::decrypt_provider_config_secret(
                     &mut profile.oauth_provider_config,
                     store,
                     password,
-                );
+                )?;
             }
             AuthProfileCredentialKind::Token => {
                 if let Some(token) = profile.token.as_mut() {
@@ -1537,19 +1478,24 @@ impl ProfileStore {
                                 );
                             }
                         }
+                    } else if !token.is_empty() {
+                        return Err(AuthProfileError::SerializationError(
+                            "auth profile token is not encrypted".to_string(),
+                        ));
                     }
                 }
             }
         }
+        Ok(())
     }
 
     fn decrypt_provider_config_secret(
         provider_config: &mut Option<StoredOAuthProviderConfig>,
         store: &SecretStore,
         password: &[u8],
-    ) {
+    ) -> Result<(), AuthProfileError> {
         let Some(provider_config) = provider_config.as_mut() else {
-            return;
+            return Ok(());
         };
         if is_encrypted(&provider_config.client_secret) {
             match store.decrypt_rekey(&provider_config.client_secret, password) {
@@ -1562,7 +1508,12 @@ impl ProfileStore {
                     provider_config.client_secret = String::new();
                 }
             }
+        } else if !provider_config.client_secret.is_empty() {
+            return Err(AuthProfileError::SerializationError(
+                "oauth provider client_secret is not encrypted".to_string(),
+            ));
         }
+        Ok(())
     }
 
     /// Add a profile. Fails if MAX_PROFILES would be exceeded.
@@ -2868,57 +2819,6 @@ mod tests {
     }
 
     #[test]
-    fn test_encrypted_profile_store_backward_compat_plaintext_load() {
-        let dir = tempdir().unwrap();
-
-        // First, write profiles using a plaintext store (no encryption)
-        {
-            let store = ProfileStore::new(dir.path().to_path_buf());
-            store.add(sample_profile("plain-1")).unwrap();
-        }
-
-        // Verify it's plaintext on disk
-        let raw = std::fs::read_to_string(dir.path().join("auth_profiles.json")).unwrap();
-        assert!(
-            raw.contains("access-123"),
-            "plaintext store should write tokens in clear"
-        );
-
-        // Now load with an encrypted store -- plaintext values should be read fine.
-        // Password value is irrelevant here because no ciphertext is being decrypted;
-        // this verifies backward-compatible opening of plaintext profile files.
-        let password = random_password();
-        let store2 = ProfileStore::with_encryption(dir.path().to_path_buf(), &password).unwrap();
-        store2.load().unwrap();
-
-        let profile = store2.get("plain-1").unwrap();
-        assert_eq!(
-            oauth_tokens(&profile).access_token,
-            "access-123",
-            "plaintext access_token should load correctly in encrypted store"
-        );
-        assert_eq!(
-            oauth_tokens(&profile).refresh_token,
-            Some("refresh-456".to_string()),
-            "plaintext refresh_token should load correctly in encrypted store"
-        );
-
-        // Trigger a save -- tokens should now be encrypted
-        store2.update_last_used("plain-1");
-        store2.flush_pending_last_used_for_tests().unwrap();
-
-        let raw2 = std::fs::read_to_string(dir.path().join("auth_profiles.json")).unwrap();
-        assert!(
-            !raw2.contains("access-123"),
-            "after save, access_token should be encrypted"
-        );
-        assert!(
-            raw2.contains("enc:v2:"),
-            "after save, encrypted tokens should be on disk"
-        );
-    }
-
-    #[test]
     fn test_no_secret_store_saves_plaintext() {
         let dir = tempdir().unwrap();
         let store = ProfileStore::new(dir.path().to_path_buf());
@@ -3092,22 +2992,6 @@ mod tests {
     // -------------------------------------------------------------------
 
     #[test]
-    fn load_bare_array_v1_format() {
-        let dir = tempdir().unwrap();
-        let state_path = dir.path().join("auth_profiles.json");
-
-        let v1_json = serde_json::to_string_pretty(&vec![sample_profile("v1-test")]).unwrap();
-        std::fs::write(&state_path, &v1_json).unwrap();
-
-        let store = ProfileStore::new(dir.path().to_path_buf());
-        store.load().unwrap();
-
-        let profiles = store.shared.profiles.read();
-        assert_eq!(profiles.len(), 1);
-        assert_eq!(profiles[0].id, "v1-test");
-    }
-
-    #[test]
     fn save_writes_versioned_envelope() {
         let dir = tempdir().unwrap();
         let store = ProfileStore::new(dir.path().to_path_buf());
@@ -3129,29 +3013,6 @@ mod tests {
         assert_eq!(parsed["version"], 2);
         assert!(parsed["profiles"].is_array());
         assert_eq!(parsed["profiles"].as_array().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn roundtrip_v1_to_v2() {
-        let dir = tempdir().unwrap();
-        let state_path = dir.path().join("auth_profiles.json");
-
-        // Write a v1 bare array.
-        let v1_json = serde_json::to_string_pretty(&vec![sample_profile("rt-test")]).unwrap();
-        std::fs::write(&state_path, &v1_json).unwrap();
-
-        let store = ProfileStore::new(dir.path().to_path_buf());
-        store.load().unwrap();
-        store.save().unwrap();
-
-        // File should now be v2 envelope.
-        let raw = std::fs::read_to_string(&state_path).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(parsed["version"], 2);
-
-        // Reload should still work.
-        store.load().unwrap();
-        assert_eq!(store.shared.profiles.read().len(), 1);
     }
 
     #[test]
@@ -3177,18 +3038,17 @@ mod tests {
     }
 
     #[test]
-    fn unknown_profile_skipped_and_preserved() {
+    fn unknown_profile_provider_fails_store_load() {
         let dir = tempdir().unwrap();
         let state_path = dir.path().join("auth_profiles.json");
 
         let good_profile = serde_json::to_value(sample_profile("good")).unwrap();
-        // An unknown provider variant will fail deserialization.
         let bad_profile = serde_json::json!({
             "id": "bad",
             "name": "Bad Profile",
             "provider": "unknown_future_provider",
             "created_at_ms": 0,
-            "credential_kind": "oauth",
+            "credential_kind": "o-auth",
             "tokens": { "access_token": "x", "token_type": "Bearer" }
         });
 
@@ -3203,27 +3063,18 @@ mod tests {
         .unwrap();
 
         let store = ProfileStore::new(dir.path().to_path_buf());
-        store.load().unwrap();
-
-        // Good profile loaded, bad one skipped.
-        assert_eq!(store.shared.profiles.read().len(), 1);
-        assert_eq!(store.shared.profiles.read()[0].id, "good");
-        assert_eq!(store.shared.skipped_profiles.read().len(), 1);
-
-        // Save and reload — skipped profile is preserved.
-        store.save().unwrap();
-        let raw = std::fs::read_to_string(&state_path).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(parsed["profiles"].as_array().unwrap().len(), 2);
-
-        // Reload — same result.
-        store.load().unwrap();
-        assert_eq!(store.shared.profiles.read().len(), 1);
-        assert_eq!(store.shared.skipped_profiles.read().len(), 1);
+        let err = store
+            .load()
+            .expect_err("unknown provider should fail current-format load");
+        assert!(
+            err.to_string().contains("unknown_future_provider"),
+            "got: {err}"
+        );
+        assert!(store.shared.profiles.read().is_empty());
     }
 
     #[test]
-    fn unknown_credential_kind_skipped() {
+    fn unknown_credential_kind_fails_store_load() {
         let dir = tempdir().unwrap();
         let state_path = dir.path().join("auth_profiles.json");
 
@@ -3246,10 +3097,36 @@ mod tests {
         .unwrap();
 
         let store = ProfileStore::new(dir.path().to_path_buf());
-        store.load().unwrap();
+        let err = store
+            .load()
+            .expect_err("unknown credential kind should fail current-format load");
+        assert!(err.to_string().contains("passkey"), "got: {err}");
+        assert!(store.shared.profiles.read().is_empty());
+    }
 
-        assert_eq!(store.shared.profiles.read().len(), 0);
-        assert_eq!(store.shared.skipped_profiles.read().len(), 1);
+    #[test]
+    fn unknown_profile_field_fails_store_load() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("auth_profiles.json");
+
+        let mut profile = serde_json::to_value(sample_profile("strict")).unwrap();
+        profile["unknownField"] = serde_json::json!(true);
+        let envelope = serde_json::json!({
+            "version": 2,
+            "profiles": [profile]
+        });
+        std::fs::write(
+            &state_path,
+            serde_json::to_string_pretty(&envelope).unwrap(),
+        )
+        .unwrap();
+
+        let store = ProfileStore::new(dir.path().to_path_buf());
+        let err = store
+            .load()
+            .expect_err("unknown profile fields should fail current-format load");
+        assert!(err.to_string().contains("unknownField"), "got: {err}");
+        assert!(store.shared.profiles.read().is_empty());
     }
 
     #[test]
@@ -3306,9 +3183,6 @@ mod tests {
             msg.contains("99"),
             "error should mention the version: {msg}"
         );
-        assert!(
-            msg.contains("upgrade"),
-            "error should suggest upgrade: {msg}"
-        );
+        assert!(msg.contains("expected version 2"), "got: {msg}");
     }
 }

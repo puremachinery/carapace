@@ -878,7 +878,7 @@ pub struct ValidationIssue {
 /// Validate a config value against the schema.
 ///
 /// Delegates to the typed schema validation in [`schema::validate_schema`]
-/// and converts results to the legacy [`ValidationIssue`] type.
+/// and converts results to the public [`ValidationIssue`] type.
 pub fn validate_config(config: &Value) -> Vec<ValidationIssue> {
     schema::validate_schema(config)
         .into_iter()
@@ -1377,8 +1377,8 @@ mod tests {
 
         let normalized = load_config_shared().unwrap();
         assert_eq!(
-            normalized["session"]["typingMode"],
-            Value::String("thinking".to_string())
+            normalized["channels"]["signal"]["features"]["typing"]["enabled"],
+            Value::Bool(true)
         );
 
         std::fs::write(

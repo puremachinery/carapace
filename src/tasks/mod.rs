@@ -32,10 +32,6 @@ fn now_ms() -> u64 {
     crate::time::unix_now_ms_u64()
 }
 
-fn is_false(value: &bool) -> bool {
-    !*value
-}
-
 /// Durable lifecycle states for long-running task processing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -72,7 +68,7 @@ pub enum TaskBlockedReason {
 
 /// Per-task continuation policy budgets.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TaskPolicy {
     pub max_attempts: u32,
     pub max_total_runtime_ms: u64,
@@ -111,7 +107,7 @@ impl TaskPolicyPatch {
 
 /// A single persisted task record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DurableTask {
     pub id: String,
     pub state: TaskState,
@@ -127,14 +123,9 @@ pub struct DurableTask {
     pub updated_at_ms: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub run_ids: Vec<String>,
-    #[serde(default)]
     pub policy: TaskPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_reason: Option<TaskBlockedReason>,
-    /// True when the task was created with an explicit continuation policy.
-    /// Legacy tasks loaded from pre-policy queue files default to false.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub policy_explicit: bool,
 }
 
 /// Queue stats by state.
@@ -205,30 +196,31 @@ impl TaskQueue {
     /// This synchronous path is intended for non-async contexts and tests.
     /// Runtime startup should prefer [`Self::load_async`] so file I/O does not
     /// run on Tokio worker threads.
-    pub fn load(&self) {
+    pub fn load(&self) -> Result<(), String> {
         let path = match &self.persist_path {
             Some(p) => p,
-            None => return,
+            None => return Ok(()),
         };
 
         let data = match fs::read(path) {
             Ok(bytes) => bytes,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(err) => {
-                warn!(path = %path.display(), error = %err, "failed to read tasks file");
-                return;
+                let message = format!("failed to read task queue file {}: {err}", path.display());
+                warn!(path = %path.display(), error = %err, "{message}");
+                return Err(message);
             }
         };
 
         let mut loaded: Vec<DurableTask> = match serde_json::from_slice(&data) {
             Ok(tasks) => tasks,
             Err(err) => {
-                tracing::error!(
-                    path = %path.display(),
-                    error = %err,
-                    "failed to parse tasks file; starting with empty task queue"
+                let message = format!(
+                    "failed to parse current task queue file {}; persisted tasks were not loaded: {err}. Remove or repair the file before restarting",
+                    path.display()
                 );
-                return;
+                tracing::error!(path = %path.display(), error = %err, "{message}");
+                return Err(message);
             }
         };
 
@@ -250,6 +242,7 @@ impl TaskQueue {
         if recovered_running {
             self.flush_to_disk();
         }
+        Ok(())
     }
 
     /// Async-safe wrapper around [`Self::load`] for runtime startup paths.
@@ -263,7 +256,7 @@ impl TaskQueue {
                 );
                 tracing::error!("{message}");
                 message
-            })
+            })?
     }
 
     /// Add a new task in `queued` state.
@@ -371,7 +364,6 @@ impl TaskQueue {
             run_ids: Vec::new(),
             policy: params.policy,
             blocked_reason: params.blocked_reason,
-            policy_explicit: true,
         }
     }
 
@@ -812,9 +804,6 @@ impl TaskQueue {
                     }
                     if let Some(max_run_timeout_seconds) = policy_patch.max_run_timeout_seconds {
                         task.policy.max_run_timeout_seconds = max_run_timeout_seconds;
-                    }
-                    if policy_patch.has_updates() {
-                        task.policy_explicit = true;
                     }
                 }
                 if let Some(reason) = reason {
@@ -1350,7 +1339,7 @@ mod tests {
         assert!(queue.mark_failed(&task.id, "boom"));
 
         let loaded = TaskQueue::new(Some(path));
-        loaded.load();
+        loaded.load().unwrap();
         let persisted = loaded.get(&task.id).expect("task should load");
         assert_eq!(persisted.state, TaskState::Failed);
         assert_eq!(persisted.last_error.as_deref(), Some("boom"));
@@ -1367,7 +1356,7 @@ mod tests {
         let _ = queue.claim_due(now_ms(), 1);
 
         let recovered = TaskQueue::new(Some(path));
-        recovered.load();
+        recovered.load().unwrap();
         let loaded = recovered.get(&task.id).expect("task should load");
         assert_eq!(loaded.state, TaskState::RetryWait);
         assert!(loaded.next_run_at_ms.is_some());
@@ -1383,13 +1372,78 @@ mod tests {
         let _ = queue.claim_due(now_ms(), 1);
 
         let recovered = TaskQueue::new(Some(path.clone()));
-        recovered.load();
+        recovered.load().unwrap();
 
         let persisted: Vec<DurableTask> =
             serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         assert_eq!(persisted.len(), 1);
         assert_eq!(persisted[0].state, TaskState::RetryWait);
         assert!(persisted[0].next_run_at_ms.is_some());
+    }
+
+    #[test]
+    fn test_load_rejects_current_queue_missing_policy() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tasks").join("queue.json");
+        std::fs::create_dir_all(path.parent().expect("tasks directory")).unwrap();
+        let invalid = serde_json::json!([{
+            "id": "invalid-task",
+            "state": "queued",
+            "attempts": 0,
+            "nextRunAtMs": null,
+            "lastError": null,
+            "payload": { "kind": "demo" },
+            "createdAtMs": 1,
+            "updatedAtMs": 1,
+            "runIds": []
+        }]);
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&invalid).expect("invalid queue json"),
+        )
+        .unwrap();
+
+        let queue = TaskQueue::new(Some(path));
+        let err = queue.load().expect_err("missing policy should fail closed");
+        assert!(err.contains("current task queue file"), "{err}");
+        assert!(queue.list().is_empty());
+    }
+
+    #[test]
+    fn test_load_rejects_removed_policy_explicit_field() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tasks").join("queue.json");
+        std::fs::create_dir_all(path.parent().expect("tasks directory")).unwrap();
+        let invalid = serde_json::json!([{
+            "id": "invalid-task",
+            "state": "queued",
+            "attempts": 0,
+            "nextRunAtMs": null,
+            "lastError": null,
+            "payload": { "kind": "demo" },
+            "createdAtMs": 1,
+            "updatedAtMs": 1,
+            "runIds": [],
+            "policy": {
+                "maxAttempts": 100,
+                "maxTotalRuntimeMs": 604800000,
+                "maxTurns": 25,
+                "maxRunTimeoutSeconds": 600
+            },
+            "policyExplicit": true
+        }]);
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&invalid).expect("invalid queue json"),
+        )
+        .unwrap();
+
+        let queue = TaskQueue::new(Some(path));
+        let err = queue
+            .load()
+            .expect_err("removed task fields should fail current-format load");
+        assert!(err.contains("policyExplicit"), "{err}");
+        assert!(queue.list().is_empty());
     }
 
     #[tokio::test]
@@ -1418,35 +1472,6 @@ mod tests {
     }
 
     #[test]
-    fn test_load_legacy_task_defaults_policy_explicit_false() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("tasks").join("queue.json");
-        std::fs::create_dir_all(path.parent().expect("tasks directory")).unwrap();
-        let legacy = serde_json::json!([{
-            "id": "legacy-task",
-            "state": "queued",
-            "attempts": 250,
-            "nextRunAtMs": null,
-            "lastError": null,
-            "payload": { "kind": "demo" },
-            "createdAtMs": 1,
-            "updatedAtMs": 1,
-            "runIds": []
-        }]);
-        std::fs::write(
-            &path,
-            serde_json::to_vec_pretty(&legacy).expect("legacy queue json"),
-        )
-        .unwrap();
-
-        let queue = TaskQueue::new(Some(path));
-        queue.load();
-        let loaded = queue.get("legacy-task").expect("legacy task should load");
-        assert!(!loaded.policy_explicit);
-        assert_eq!(loaded.policy, TaskPolicy::default());
-    }
-
-    #[test]
     fn test_enqueue_evicts_terminal_before_blocked() {
         let queue = TaskQueue::in_memory();
         {
@@ -1464,7 +1489,6 @@ mod tests {
                     run_ids: Vec::new(),
                     policy: TaskPolicy::default(),
                     blocked_reason: Some(TaskBlockedReason::Unknown),
-                    policy_explicit: true,
                 });
             }
             tasks[0].id = "done-oldest".to_string();
@@ -1497,7 +1521,6 @@ mod tests {
                     run_ids: Vec::new(),
                     policy: TaskPolicy::default(),
                     blocked_reason: None,
-                    policy_explicit: true,
                 });
             }
         }
@@ -1541,7 +1564,6 @@ mod tests {
                     run_ids: Vec::new(),
                     policy: TaskPolicy::default(),
                     blocked_reason: None,
-                    policy_explicit: true,
                 });
             }
         }

@@ -79,10 +79,8 @@ const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "routes",
 ];
 
-/// Built-in channel IDs that currently accept `channels.<id>.features.*`.
-///
-/// Unknown channel IDs remain allowed for forward compatibility, but we use
-/// this set to catch obvious typos in built-in names.
+/// Built-in channel IDs used to catch obvious typos without rejecting plugin
+/// channel IDs that are registered outside the core binary.
 const BUILTIN_CHANNEL_CONFIG_IDS: &[&str] = &[
     "console", "signal", "telegram", "discord", "slack", "webhook",
 ];
@@ -959,23 +957,8 @@ fn validate_agents(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schema
     if let Some(v) = defaults.get("maxConcurrent") {
         check_positive_integer(v, ".agents.defaults.maxConcurrent", issues);
     }
-    let timeout_seconds = defaults.get("timeoutSeconds");
-    let timeout_legacy = defaults.get("timeout");
-
-    if let Some(v) = timeout_seconds {
+    if let Some(v) = defaults.get("timeoutSeconds") {
         check_positive_integer(v, ".agents.defaults.timeoutSeconds", issues);
-    }
-    if let Some(v) = timeout_legacy {
-        check_positive_integer(v, ".agents.defaults.timeout", issues);
-    }
-    if timeout_seconds.is_some() && timeout_legacy.is_some() {
-        issues.push(SchemaIssue {
-            severity: Severity::Warning,
-            path: ".agents.defaults.timeout".to_string(),
-            message:
-                "Both agents.defaults.timeoutSeconds and agents.defaults.timeout are set; timeoutSeconds takes precedence and timeout is legacy and should be removed"
-                    .to_string(),
-        });
     }
     if let Some(v) = defaults.get("contextTokens") {
         check_positive_integer(v, ".agents.defaults.contextTokens", issues);
@@ -1071,19 +1054,18 @@ fn check_model_has_provider_prefix(model: &str, path: &str, issues: &mut Vec<Sch
     }
 
     if !has_known_prefix {
-        let suggestion = crate::migration::prefix_bare_model(model);
-        let hint = if suggestion != model {
-            let verb = if model.contains('/') {
-                "uses deprecated slash syntax"
-            } else {
-                "is missing a provider prefix"
-            };
-            format!("`{path}` = \"{model}\" {verb}; use `{suggestion}` instead")
+        let suggestion = crate::model_names::prefix_bare_model(model);
+        let hint = if model.contains('/') {
+            format!("`{path}` = \"{model}\" is not a valid provider:model value")
+        } else if suggestion != model {
+            format!(
+                "`{path}` = \"{model}\" is missing a provider prefix; use `{suggestion}` instead"
+            )
         } else if let Some((prefix, _)) = model.split_once(':').filter(|(p, _)| !p.contains('.')) {
+            let known_prefixes = crate::model_names::known_provider_prefixes_message();
             format!(
                 "`{path}` = \"{model}\" uses unrecognized provider prefix \"{prefix}:\"; \
-                 known prefixes are anthropic:, openai:, gemini:, vertex:, bedrock:, \
-                 ollama:, codex:, venice:, claude-cli:"
+                 known prefixes are {known_prefixes}"
             )
         } else {
             format!(
@@ -1101,7 +1083,6 @@ fn check_model_has_provider_prefix(model: &str, path: &str, issues: &mut Vec<Sch
 
 fn validate_session(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIssue>) {
     let sessions = obj.get("sessions").and_then(|v| v.as_object());
-    let legacy_session = obj.get("session").and_then(|v| v.as_object());
 
     if let Some(retention) = sessions
         .and_then(|s| s.get("retention"))
@@ -1119,48 +1100,6 @@ fn validate_session(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schem
                 });
             }
         }
-    }
-
-    if let Some(days) = sessions.and_then(|s| s.get("retentionDays")) {
-        check_positive_integer(days, ".sessions.retentionDays", issues);
-    }
-
-    if let Some(retention) = legacy_session
-        .and_then(|s| s.get("retention"))
-        .and_then(|v| v.as_object())
-    {
-        if let Some(days) = retention.get("days") {
-            check_positive_integer(days, ".session.retention.days", issues);
-        }
-        if let Some(enabled) = retention.get("enabled") {
-            if !enabled.is_boolean() {
-                issues.push(SchemaIssue {
-                    severity: Severity::Warning,
-                    path: ".session.retention.enabled".to_string(),
-                    message: "enabled must be a boolean".to_string(),
-                });
-            }
-        }
-    }
-
-    if let Some(typing_mode) = legacy_session.and_then(|s| s.get("typingMode")) {
-        match typing_mode.as_str() {
-            Some(mode) if mode.eq_ignore_ascii_case("thinking") => {}
-            Some(mode) => issues.push(SchemaIssue {
-                severity: Severity::Warning,
-                path: ".session.typingMode".to_string(),
-                message: format!("typingMode must be \"thinking\", got \"{}\"", mode),
-            }),
-            None => issues.push(SchemaIssue {
-                severity: Severity::Warning,
-                path: ".session.typingMode".to_string(),
-                message: "typingMode must be a string".to_string(),
-            }),
-        }
-    }
-
-    if let Some(typing_interval) = legacy_session.and_then(|s| s.get("typingIntervalSeconds")) {
-        check_typing_interval_seconds(typing_interval, ".session.typingIntervalSeconds", issues);
     }
 }
 
@@ -1315,14 +1254,6 @@ fn validate_prompt_guard(obj: &serde_json::Map<String, Value>, issues: &mut Vec<
             );
         }
     }
-
-    if let Some(_legacy_config_lint) = pg.get("configLint") {
-        issues.push(SchemaIssue {
-            severity: Severity::Error,
-            path: format!("{prompt_guard_path}.configLint"),
-            message: "configLint is a legacy key; use config_lint".to_string(),
-        });
-    }
 }
 
 fn prompt_guard_obj(agents: &Value) -> Option<&serde_json::Map<String, Value>> {
@@ -1330,18 +1261,10 @@ fn prompt_guard_obj(agents: &Value) -> Option<&serde_json::Map<String, Value>> {
 }
 
 fn prompt_guard_entry(agents: &Value) -> Option<(&'static str, &serde_json::Map<String, Value>)> {
-    // `promptGuard` remains the canonical form. If both keys are present,
-    // prefer it and ignore the legacy/alternate snake_case wrapper.
     agents
         .get("promptGuard")
         .and_then(|v| v.as_object())
         .map(|v| ("promptGuard", v))
-        .or_else(|| {
-            agents
-                .get("prompt_guard")
-                .and_then(|v| v.as_object())
-                .map(|v| ("prompt_guard", v))
-        })
 }
 
 fn prompt_guard_config_lint_obj(
@@ -1372,19 +1295,13 @@ fn validate_output_sanitizer(obj: &serde_json::Map<String, Value>, issues: &mut 
         None => return,
     };
 
-    let output = agents
-        .get("outputSanitizer")
-        .or_else(|| agents.get("output_sanitizer"))
-        .and_then(|v| v.as_object());
+    let output = agents.get("outputSanitizer").and_then(|v| v.as_object());
     let output = match output {
         Some(o) => o,
         None => return,
     };
 
-    if let Some(enabled) = output
-        .get("sanitizeHtml")
-        .or_else(|| output.get("sanitize_html"))
-    {
+    if let Some(enabled) = output.get("sanitizeHtml") {
         if !enabled.is_boolean() {
             issues.push(SchemaIssue {
                 severity: Severity::Warning,
@@ -1394,7 +1311,7 @@ fn validate_output_sanitizer(obj: &serde_json::Map<String, Value>, issues: &mut 
         }
     }
 
-    if let Some(policy) = output.get("cspPolicy").or_else(|| output.get("csp_policy")) {
+    if let Some(policy) = output.get("cspPolicy") {
         if !policy.is_string() {
             issues.push(SchemaIssue {
                 severity: Severity::Warning,
@@ -2627,26 +2544,6 @@ mod tests {
     }
 
     #[test]
-    fn test_agents_defaults_timeout_legacy_alias_valid() {
-        let cfg = json!({ "agents": { "defaults": { "timeout": 60 } } });
-        let issues = validate_schema(&cfg);
-        assert!(
-            !issues
-                .iter()
-                .any(|i| i.path.starts_with(".agents.defaults")),
-            "Expected no issues for agents.defaults, but found: {:?}",
-            issues
-        );
-    }
-
-    #[test]
-    fn test_agents_defaults_warns_when_both_timeout_keys_are_set() {
-        let cfg = json!({ "agents": { "defaults": { "timeoutSeconds": 60, "timeout": 30 } } });
-        let issues = validate_schema(&cfg);
-        assert!(issues.iter().any(|i| i.path == ".agents.defaults.timeout"));
-    }
-
-    #[test]
     fn test_agents_defaults_zero_warns() {
         let cfg = json!({ "agents": { "defaults": { "maxConcurrent": 0 } } });
         let issues = validate_schema(&cfg);
@@ -2688,25 +2585,6 @@ mod tests {
         assert!(issues
             .iter()
             .any(|i| i.path == ".agents.outputSanitizer.cspPolicy"));
-    }
-
-    #[test]
-    fn test_prompt_guard_config_lint_camel_case_rejected() {
-        let cfg = json!({
-            "agents": {
-                "promptGuard": {
-                    "configLint": {
-                        "enabled": true
-                    }
-                }
-            }
-        });
-        let issues = validate_schema(&cfg);
-        assert!(issues.iter().any(|i| {
-            i.path == ".agents.promptGuard.configLint"
-                && i.severity == Severity::Error
-                && i.message.contains("use config_lint")
-        }));
     }
 
     #[test]
@@ -2769,48 +2647,6 @@ mod tests {
         assert!(issues.iter().any(|i| i.path == ".agents.list[0].model"));
     }
 
-    #[test]
-    fn test_prompt_guard_config_lint_camel_case_does_not_trigger_lint_checks() {
-        let cfg = json!({
-            "agents": {
-                "promptGuard": {
-                    "configLint": {
-                        "enabled": true
-                    }
-                },
-                "list": [{
-                    "toolPolicy": "AllowAll"
-                }]
-            }
-        });
-        let issues = validate_schema(&cfg);
-        assert!(issues.iter().any(|i| {
-            i.path == ".agents.promptGuard.configLint" && i.severity == Severity::Error
-        }));
-        assert!(!issues.iter().any(|i| i.path.starts_with(".agents.list[0]")));
-    }
-
-    #[test]
-    fn test_prompt_guard_snake_case_paths_reflect_variant() {
-        let cfg = json!({
-            "agents": {
-                "prompt_guard": {
-                    "enabled": "true",
-                    "configLint": {
-                        "enabled": "true"
-                    }
-                }
-            }
-        });
-        let issues = validate_schema(&cfg);
-        assert!(issues
-            .iter()
-            .any(|i| i.path == ".agents.prompt_guard.enabled"));
-        assert!(issues
-            .iter()
-            .any(|i| i.path == ".agents.prompt_guard.configLint"));
-    }
-
     // --- session retention ---
 
     #[test]
@@ -2827,15 +2663,6 @@ mod tests {
         assert!(issues
             .iter()
             .any(|i| i.path == ".sessions.retention.enabled"));
-    }
-
-    #[test]
-    fn test_sessions_retention_days_legacy() {
-        let cfg = json!({ "sessions": { "retentionDays": 45 } });
-        let issues = validate_schema(&cfg);
-        assert!(!issues
-            .iter()
-            .any(|i| i.path.starts_with(".sessions.retentionDays")));
     }
 
     #[test]
@@ -2966,7 +2793,7 @@ mod tests {
     }
 
     #[test]
-    fn test_unknown_channel_config_entry_is_accepted_for_forward_compatibility() {
+    fn test_plugin_channel_config_entry_is_accepted() {
         let cfg = json!({
             "channels": {
                 "matrix": {
@@ -2981,7 +2808,7 @@ mod tests {
         let issues = validate_schema(&cfg);
         assert!(
             !issues.iter().any(|issue| issue.path == ".channels.matrix"),
-            "unexpected channel-id warning for forward-compatible entry: {:?}",
+            "unexpected channel-id warning for plugin channel entry: {:?}",
             issues
         );
     }
@@ -3076,36 +2903,6 @@ mod tests {
         let issues = validate_schema(&cfg);
         assert!(issues.iter().any(|issue| {
             issue.path == ".channels" && issue.message.contains("channels must be an object")
-        }));
-    }
-
-    #[test]
-    fn test_legacy_session_typing_mode_warns_on_unknown_value() {
-        let cfg = json!({
-            "session": {
-                "typingMode": "thinkng"
-            }
-        });
-        let issues = validate_schema(&cfg);
-        assert!(issues
-            .iter()
-            .any(|issue| issue.path == ".session.typingMode"
-                && issue.message.contains("typingMode must be \"thinking\"")));
-    }
-
-    #[test]
-    fn test_legacy_session_typing_interval_warns_when_unusually_large() {
-        let cfg = json!({
-            "session": {
-                "typingIntervalSeconds": 9999999
-            }
-        });
-        let issues = validate_schema(&cfg);
-        assert!(issues.iter().any(|issue| {
-            issue.path == ".session.typingIntervalSeconds"
-                && issue
-                    .message
-                    .contains("typing interval above 3600 seconds is unusually large")
         }));
     }
 

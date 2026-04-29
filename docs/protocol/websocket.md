@@ -220,14 +220,6 @@ the code wins.
 - `sessions.export_user` - Export all sessions and histories for a user (GDPR data portability)
 - `sessions.purge_user` - Delete all sessions and histories for a user (GDPR right to erasure)
 
-Compatibility aliases:
-- `agent.run` → `agent`
-- `agent.cancel` → `chat.abort`
-- `session.*` → `sessions.*`
-- `config.update` → `config.patch`
-- `exec.list` / `exec.approvals.list` → `exec.approvals.get`
-- `exec.approve` / `exec.deny` → `exec.approval.resolve` (defaults decision to allow-once/deny when missing)
-
 ### TTS (Text-to-Speech)
 - `tts.status` - Get TTS status
 - `tts.providers` - List TTS providers
@@ -392,7 +384,7 @@ extending that set.
 | Code | Description |
 |------|-------------|
 | `not_linked` | Channel not configured. Constant `ERROR_NOT_LINKED` is reserved in `src/server/ws/mod.rs`; no live emit site yet. |
-| `agent_timeout` | Agent exceeded timeout. Documented for client compatibility; no live emit at the top-level `error.code` position currently. |
+| `agent_timeout` | Agent exceeded timeout. Reserved for clients; no live emit at the top-level `error.code` position currently. |
 
 ### Codes that are NOT top-level `error.code` values
 

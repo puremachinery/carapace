@@ -10,7 +10,6 @@ expression: normalized
     "exists": "<CONFIG_EXISTS>",
     "hash": "<CONFIG_HASH>",
     "issues": "<CONFIG_ISSUES>",
-    "legacyIssues": [],
     "parsed": "<CONFIG_PARSED>",
     "path": "<PATH>",
     "raw": "<CONFIG_RAW>",

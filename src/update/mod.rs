@@ -45,7 +45,6 @@ static TEST_FORCE_RESTORE_FAIL: AtomicBool = AtomicBool::new(false);
 pub struct GitHubAsset {
     pub name: String,
     pub browser_download_url: String,
-    #[allow(dead_code)]
     pub size: u64,
 }
 

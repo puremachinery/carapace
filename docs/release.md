@@ -1,7 +1,7 @@
 # Release & Upgrade Policy
 
 This document is for maintainers and operators preparing or consuming releases.
-It defines compatibility expectations, migration and rollback behavior, and a
+It defines upgrade expectations, migration and rollback behavior, and a
 repeatable release checklist.
 
 ## Security Contact
@@ -11,13 +11,13 @@ repeatable release checklist.
 
 Do not post vulnerability details in public issues.
 
-## Compatibility Statement
+## Upgrade Statement
 
 Current status: Carapace ships a stable release line, beginning with `v0.1.0`.
 
-Stable-release compatibility policy is active:
+Stable-release upgrade policy is active:
 
-- Compatibility target is **N-1 -> N** for stable releases only.
+- Upgrade target is **N-1 -> N** for stable releases only.
   - Example: `v0.3.0` must support data/config from `v0.2.x` stable releases.
   - Preview tags are explicitly out of contract.
 - Every stable release note must include migration + rollback sections.
@@ -25,19 +25,19 @@ Stable-release compatibility policy is active:
 
 Historical preview-tag guidance:
 
-- Preview tags (`vX.Y.Z-previewN`) are best-effort compatibility only.
+- Preview tags (`vX.Y.Z-previewN`) are best-effort only.
 - Before upgrading between preview tags or from preview to stable, take a
   backup.
-- If an upgrade is not compatible with existing local state, release notes must
+- If an upgrade cannot use existing local state, release notes must
   call this out with explicit migration/rollback steps.
 
 ### Versioned N-1 Contract (stable channel)
 
 | Surface | N-1 -> N expectation | Breaking-change requirement |
 | --- | --- | --- |
-| Config format (`config.json5`) | New stable versions load prior stable config and preserve behavior unless explicitly deprecated. | If a key/shape is removed or semantics change, provide migration steps and at least one stable deprecation window. |
+| Config format (`config.json5`) | New stable versions document the accepted config shape for that release. | If a key/shape is removed or semantics change, provide operator steps and rollback guidance. |
 | State files (`state_dir`) | New stable versions read prior stable state and perform safe migrations where needed. | If migration is not automatic, ship operator migration steps and rollback steps. |
-| Session/task persistence (`sessions/`, `tasks/`) | New stable versions can read prior stable persisted session/task data or fail closed with actionable remediation. | If format changes are incompatible, provide conversion path and recovery procedure from backup. |
+| Session/task persistence (`sessions/`, `tasks/`) | New stable versions can read current persisted session/task data or fail closed with actionable remediation. | If format changes reject existing data, provide conversion path and recovery procedure from backup. |
 
 Contract boundary:
 
@@ -115,7 +115,7 @@ Every release should include these sections:
 - High-level changes in this release.
 
 ## Breaking Changes
-- What changed incompatibly, who is affected, and impact.
+- What changed, who is affected, and impact.
 
 ## Migration Steps
 - Exact commands or file changes required after upgrade.

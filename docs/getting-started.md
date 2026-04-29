@@ -70,21 +70,6 @@ To use the local Claude CLI provider, configure it directly in
 or a specific agent's `model` field. The setup wizard does not currently
 expose Claude CLI as a `--provider` option.
 
-### Migrating from another tool?
-
-If you already have provider keys configured in OpenClaw, OpenCode, Aider, or
-NemoClaw, import them instead of re-entering manually:
-
-```bash
-cara import openclaw   # from ~/.openclaw/
-cara import opencode   # from ~/.opencode.json
-cara import aider      # from ~/.aider.conf.yml + .env
-cara import nemoclaw   # from ~/.nemoclaw/config.json
-```
-
-Import shows a preview of what will be mapped and asks for confirmation before
-writing. Run `cara verify` afterward to validate the imported setup works.
-
 `--auth-mode oauth` is interactive-only in the CLI. It launches a Google
 sign-in flow and completes through a loopback callback on a local port. The Control UI exposes
 the same Gemini onboarding choices if you prefer to do it in the browser.

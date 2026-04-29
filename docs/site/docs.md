@@ -16,7 +16,6 @@ Navigate docs by outcome area instead of file-by-file browsing.
 - [Getting Started](../getting-started.md)
 - [Install](install.md)
 - [First Run](first-run.md)
-- [Migrating from another tool](../getting-started.md#migrating-from-another-tool) — import from OpenClaw, OpenCode, Aider, or NemoClaw
 - [Guarded local project assistant recipe](../cookbook/guarded-local-project-assistant.md)
 - [Help](help.md)
 - [Cookbook recipes](../cookbook/README.md)

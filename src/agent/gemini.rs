@@ -282,7 +282,7 @@ pub(crate) fn build_gemini_contents(messages: &[LlmMessage]) -> Vec<Value> {
                 } => {
                     // For tool results, we need to look up the tool name.
                     // Gemini uses functionResponse with name and response.
-                    // We look backwards through messages to find the matching tool use name.
+                    // Search prior messages to find the matching tool use name.
                     let tool_name = find_tool_name_for_result(messages, block);
                     let part = json!({
                         "functionResponse": {
@@ -324,7 +324,7 @@ pub(crate) fn build_gemini_contents(messages: &[LlmMessage]) -> Vec<Value> {
 }
 
 /// Find the tool name that corresponds to a ToolResult block by searching
-/// backwards through the messages for a matching ToolUse with the same ID.
+/// prior messages for a matching ToolUse with the same ID.
 fn find_tool_name_for_result(messages: &[LlmMessage], block: &ContentBlock) -> String {
     let target_id = match block {
         ContentBlock::ToolResult { tool_use_id, .. } => tool_use_id,

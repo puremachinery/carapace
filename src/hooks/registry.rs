@@ -56,13 +56,7 @@ pub struct HookMapping {
     /// Display name (supports templates)
     pub name: Option<String>,
     /// Session scope override (supports templates).
-    /// Serialized/deserialized as `sessionKey` for backward compatibility.
-    #[serde(
-        rename = "sessionKey",
-        alias = "session_scope",
-        alias = "sessionScope",
-        alias = "session_key"
-    )]
+    #[serde(rename = "sessionKey")]
     pub session_scope: Option<String>,
     /// Message template for agent action
     pub message_template: Option<String>,
@@ -629,27 +623,15 @@ mod tests {
     }
 
     #[test]
-    fn test_hook_mapping_deserializes_session_key_compat() {
+    fn test_hook_mapping_deserializes_session_key() {
         let mapping: HookMapping = serde_json::from_value(json!({
             "id": "test",
             "action": "agent",
             "messageTemplate": "hello",
-            "sessionKey": "hook:legacy"
+            "sessionKey": "hook:current"
         }))
         .unwrap();
-        assert_eq!(mapping.session_scope.as_deref(), Some("hook:legacy"));
-    }
-
-    #[test]
-    fn test_hook_mapping_deserializes_session_scope_alias() {
-        let mapping: HookMapping = serde_json::from_value(json!({
-            "id": "test",
-            "action": "agent",
-            "messageTemplate": "hello",
-            "sessionScope": "hook:new"
-        }))
-        .unwrap();
-        assert_eq!(mapping.session_scope.as_deref(), Some("hook:new"));
+        assert_eq!(mapping.session_scope.as_deref(), Some("hook:current"));
     }
 
     #[test]

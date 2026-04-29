@@ -16,7 +16,6 @@ use crate::plugins::{
 
 /// Maximum media size to fetch and upload (50 MB).
 const MAX_MEDIA_BYTES: u64 = 50 * 1024 * 1024;
-#[allow(dead_code)]
 const VALIDATION_TIMEOUT_SECS: u64 = 5;
 
 /// A channel plugin that delivers messages via the Slack Web API.
@@ -42,7 +41,6 @@ impl SlackChannel {
         format!("{}/{}", base, path)
     }
 
-    #[allow(dead_code)]
     pub fn validate(&self) -> ChannelAuthResult {
         let client = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(VALIDATION_TIMEOUT_SECS))

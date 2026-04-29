@@ -77,12 +77,7 @@ pub struct AgentRequest {
     pub thinking: Option<String>,
     pub deliver: Option<bool>,
     pub wake_mode: Option<String>,
-    #[serde(
-        rename = "sessionKey",
-        alias = "session_scope",
-        alias = "sessionScope",
-        alias = "session_key"
-    )]
+    #[serde(rename = "sessionKey")]
     pub session_scope: Option<String>,
     pub timeout_seconds: Option<f64>,
     pub allow_unsafe_external_content: Option<bool>,
@@ -683,23 +678,13 @@ mod tests {
     }
 
     #[test]
-    fn test_agent_request_deserializes_session_key_compat() {
+    fn test_agent_request_deserializes_session_key() {
         let req: AgentRequest = serde_json::from_value(serde_json::json!({
             "message": "hello",
-            "sessionKey": "hook:legacy"
+            "sessionKey": "hook:current"
         }))
         .unwrap();
-        assert_eq!(req.session_scope.as_deref(), Some("hook:legacy"));
-    }
-
-    #[test]
-    fn test_agent_request_deserializes_session_scope_alias() {
-        let req: AgentRequest = serde_json::from_value(serde_json::json!({
-            "message": "hello",
-            "sessionScope": "hook:new"
-        }))
-        .unwrap();
-        assert_eq!(req.session_scope.as_deref(), Some("hook:new"));
+        assert_eq!(req.session_scope.as_deref(), Some("hook:current"));
     }
 
     #[test]

@@ -2250,7 +2250,7 @@ pub(super) fn handle_agent_identity_get(params: Option<&Value>) -> Result<Value,
 /// - `runId` (required): The run ID to wait for
 /// - `timeoutMs` (optional): Maximum time to wait in milliseconds (default: 120000 = 2 min)
 ///
-/// ## Response (Node-compatible)
+/// ## Response
 /// ```json
 /// {
 ///   "runId": "...",

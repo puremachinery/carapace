@@ -27,7 +27,7 @@ pub struct SecurityHeadersConfig {
     pub content_type_options: String,
     /// Referrer-Policy header value
     pub referrer_policy: String,
-    /// X-XSS-Protection header value (legacy but still useful for older browsers)
+    /// X-XSS-Protection header value for older browsers.
     pub xss_protection: String,
     /// Permissions-Policy header value
     pub permissions_policy: Option<String>,
@@ -261,7 +261,7 @@ pub async fn security_headers_middleware(
         headers.insert(header::REFERRER_POLICY, value);
     }
 
-    // X-XSS-Protection (legacy but still helps older browsers)
+    // X-XSS-Protection
     if let Ok(value) = config.xss_protection.parse() {
         headers.insert("x-xss-protection", value);
     }

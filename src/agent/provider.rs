@@ -477,26 +477,27 @@ impl MultiProvider {
                     // Looks like a provider:model pattern (no dots in prefix).
                     // Bedrock native IDs like `anthropic.claude-v1:0` contain dots
                     // before the colon, so they fall to the else branch.
+                    let known_prefixes = crate::model_names::known_provider_prefixes_message();
                     format!(
                         "model \"{model}\" uses unrecognized provider prefix \"{prefix}:\"; \
-                         known prefixes are anthropic:, openai:, gemini:, vertex:, bedrock:, \
-                         ollama:, codex:, venice:, claude-cli:"
+                         known prefixes are {known_prefixes}"
                     )
                 }
                 _ => {
-                    let suggestion = crate::migration::prefix_bare_model(model);
-                    if suggestion != model {
-                        let verb = if model.contains('/') {
-                            "uses deprecated slash syntax"
-                        } else {
-                            "is missing a provider prefix"
-                        };
-                        format!("model \"{model}\" {verb}; use `{suggestion}` instead")
+                    if model.contains('/') {
+                        "model \"{model}\" is not a valid provider:model value".to_string()
                     } else {
-                        format!(
-                            "model \"{model}\" is missing a provider prefix; \
-                             use the provider:model format (e.g. `anthropic:{model}`)"
-                        )
+                        let suggestion = crate::model_names::prefix_bare_model(model);
+                        if suggestion != model {
+                            format!(
+                                "model \"{model}\" is missing a provider prefix; use `{suggestion}` instead"
+                            )
+                        } else {
+                            format!(
+                                "model \"{model}\" is missing a provider prefix; \
+                                 use the provider:model format (e.g. `anthropic:{model}`)"
+                            )
+                        }
                     }
                 }
             };
@@ -627,8 +628,8 @@ mod tests {
             Ok(_) => panic!("expected error"),
         };
         assert!(
-            msg.contains("deprecated slash syntax"),
-            "slash form should mention deprecated syntax: {msg}"
+            msg.contains("not a valid provider:model value"),
+            "got: {msg}"
         );
     }
 

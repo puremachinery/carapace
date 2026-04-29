@@ -1515,7 +1515,10 @@ mod tests {
     #[test]
     fn test_assess_provider_setup_loads_anthropic_token_profile_summary() {
         let temp = TempDir::new().unwrap();
-        let store = ProfileStore::new(temp.path().to_path_buf());
+        let mut env = ScopedEnv::new();
+        env.set("CARAPACE_CONFIG_PASSWORD", "test-password");
+        let store =
+            ProfileStore::with_encryption(temp.path().to_path_buf(), b"test-password").unwrap();
         store
             .add(AuthProfile {
                 id: "anthropic:default".to_string(),
@@ -1539,8 +1542,6 @@ mod tests {
             "auth": { "profiles": { "enabled": true } },
             "anthropic": { "authProfile": "anthropic:default" }
         });
-        let mut env = ScopedEnv::new();
-        env.set("CARAPACE_CONFIG_PASSWORD", "test-password");
 
         let assessment = assess_provider_setup(&cfg, temp.path(), SetupProvider::Anthropic, vec![]);
 
@@ -1554,7 +1555,10 @@ mod tests {
     #[test]
     fn test_assess_provider_setup_rejects_anthropic_token_profile_without_token() {
         let temp = TempDir::new().unwrap();
-        let store = ProfileStore::new(temp.path().to_path_buf());
+        let mut env = ScopedEnv::new();
+        env.set("CARAPACE_CONFIG_PASSWORD", "test-password");
+        let store =
+            ProfileStore::with_encryption(temp.path().to_path_buf(), b"test-password").unwrap();
         store
             .add(AuthProfile {
                 id: "anthropic:default".to_string(),
@@ -1578,8 +1582,6 @@ mod tests {
             "auth": { "profiles": { "enabled": true } },
             "anthropic": { "authProfile": "anthropic:default" }
         });
-        let mut env = ScopedEnv::new();
-        env.set("CARAPACE_CONFIG_PASSWORD", "test-password");
 
         let assessment = assess_provider_setup(&cfg, temp.path(), SetupProvider::Anthropic, vec![]);
 
@@ -1994,7 +1996,8 @@ mod tests {
     #[test]
     fn test_assess_provider_setup_skips_profile_store_load_when_password_missing() {
         let temp = TempDir::new().unwrap();
-        let store = ProfileStore::new(temp.path().to_path_buf());
+        let store =
+            ProfileStore::with_encryption(temp.path().to_path_buf(), b"test-password").unwrap();
         store
             .add(sample_profile("openai-123", OAuthProvider::OpenAI))
             .unwrap();
@@ -2024,7 +2027,10 @@ mod tests {
     #[test]
     fn test_assess_provider_setup_loads_gemini_oauth_profile_summary() {
         let temp = TempDir::new().unwrap();
-        let store = ProfileStore::new(temp.path().to_path_buf());
+        let mut env = ScopedEnv::new();
+        env.set("CARAPACE_CONFIG_PASSWORD", "test-password");
+        let store =
+            ProfileStore::with_encryption(temp.path().to_path_buf(), b"test-password").unwrap();
         store
             .add(sample_profile("google-123", OAuthProvider::Google))
             .unwrap();
@@ -2034,8 +2040,6 @@ mod tests {
             "auth": { "profiles": { "enabled": true } },
             "google": { "authProfile": "google-123" }
         });
-        let mut env = ScopedEnv::new();
-        env.set("CARAPACE_CONFIG_PASSWORD", "test-password");
 
         let assessment = assess_provider_setup(&cfg, temp.path(), SetupProvider::Gemini, vec![]);
 
