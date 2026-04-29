@@ -371,25 +371,47 @@ Events are broadcast to connected clients. See `src/server/ws/mod.rs` for implem
 ## Error Codes
 
 Wire codes are stable, lower_snake_case strings. Clients dispatch on the
-`code` field of the error response. Configuration-error codes
-(`unknown_route`, `missing_model`) come from `AgentConfigurationErrorCode`
-in the agent layer; the codes below are emitted by the WebSocket
-transport and protocol layers.
+`error.code` field of the error response. The `Retryable` column reflects
+what `error_shape` actually emits on the wire today (currently
+hard-coded: `retryable: true` only when `code == "unavailable"`). Codes
+not emitted via `error_shape` are noted explicitly.
 
-| Code | Description | Retryable |
-|------|-------------|-----------|
-| `invalid_request` | Validation/protocol error | No |
-| `not_linked` | Channel not configured | No |
+### Top-level `error.code` values (emitted via `error_shape`)
+
+| Code | Description | Retryable on wire |
+|------|-------------|-------------------|
+| `invalid_request` | Validation / protocol error | No |
 | `not_paired` | Device not paired | No |
-| `agent_timeout` | Agent exceeded timeout | Yes |
 | `unavailable` | Service temporarily unavailable | Yes |
+| `rate_limited` | Per-resource rate limit exceeded | No (see note) |
 | `unknown_route` | Request referenced a route not in the `routes` map | No |
 | `missing_model` | Resolution found no `route` or `model` for the request | No |
-| `not_connected` | Targeted node is not currently connected | No |
-| `rate_limited` | Per-resource rate limit exceeded | Yes |
-| `csrf_error` | CSRF token missing or invalid | No |
-| `invalid_input` | Plugin input validation failed | No |
-| `timeout` | Generic timeout (e.g. node invoke) | Yes |
+
+*Note on `rate_limited`*: semantically the operation is retryable (with
+backoff / `Retry-After`), but `error_shape`'s current hard-coded
+retryable check produces `retryable: false`. Clients should treat
+`rate_limited` as retryable regardless of the field; a future fix to
+`error_shape` (tracked separately) will align the wire field with
+intent.
+
+### Reserved codes (documented but not yet emitted)
+
+| Code | Description |
+|------|-------------|
+| `not_linked` | Channel not configured. Constant `ERROR_NOT_LINKED` is reserved in `src/server/ws/mod.rs`; no live emit site yet. |
+| `agent_timeout` | Agent exceeded timeout. Documented for client compatibility; no live emit at the top-level `error.code` position currently. |
+
+### Codes that are NOT top-level `error.code` values
+
+These appear in nested positions or are emitted by non-WebSocket
+surfaces. Clients dispatching on `error.code` will not see them there.
+
+| Code | Where it actually appears |
+|------|---------------------------|
+| `not_connected` | `error.details.nodeError.code` (outer `error.code` is `unavailable`) |
+| `timeout` | `error.details.code` (outer `error.code` is `unavailable`) when a node-invoke times out |
+| `csrf_error` | HTTP middleware error body (not a WS error frame) |
+| `invalid_input` | Plugin host error surface (not a WS error frame) |
 
 ## Close Codes
 
