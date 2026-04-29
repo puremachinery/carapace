@@ -344,11 +344,26 @@ mod tests {
 
     #[test]
     fn test_aead_blob_known_answer_vector_with_aad() {
+        // True KAT: pin the canonical AES-256-GCM ciphertext-with-tag bytes
+        // for fixed key + nonce + plaintext + AAD to a hardcoded literal. A
+        // round-trip assertion alone could pass even if `msg` and `aad` were
+        // silently swapped at the AEAD boundary, so this also pins the
+        // exact wire bytes against drift.
+        //
+        // Regenerate by replacing this with `&[0xDE, 0xAD]`, running the
+        // test, and copying the value from the assertion's "actual" panic.
+        const EXPECTED_CIPHERTEXT_WITH_AAD: &[u8] = &[
+            223, 106, 180, 182, 174, 173, 98, 110, 145, 103, 141, 196, 65, 138, 204, 55, 177, 128,
+            130, 170, 2, 209, 220, 213, 236, 81, 45, 212, 153, 81, 215, 125, 195, 204, 219, 130,
+            66, 62, 236, 190, 166, 28, 72,
+        ];
         let key = aead_kat_key();
         let nonce = aead_kat_nonce();
         let plaintext = b"carapace-shared-aead-helper".as_slice();
         let aad = b"carapace:aead-blob-helper-aad:v1".as_slice();
         let blob = encrypt_aead_blob_with_nonce_for_test(&key, &nonce, plaintext, aad).unwrap();
+        assert_eq!(blob.ciphertext, EXPECTED_CIPHERTEXT_WITH_AAD);
+
         let recovered = decrypt_aead_blob(&key, &blob.nonce, &blob.ciphertext, aad).unwrap();
         assert_eq!(recovered, plaintext);
         // AAD-bound ciphertext must differ from the empty-AAD KAT above.
