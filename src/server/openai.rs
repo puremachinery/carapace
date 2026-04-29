@@ -23,6 +23,7 @@ use uuid::Uuid;
 use crate::agent::provider::{
     CompletionRequest, ContentBlock, LlmMessage, LlmRole, StopReason, StreamEvent, TokenUsage,
 };
+use crate::agent::AgentConfigurationError;
 use crate::agent::LlmProvider;
 use crate::auth;
 use crate::server::connect_info::MaybeConnectInfo;
@@ -225,10 +226,10 @@ pub struct OpenAiState {
     pub llm_provider: Option<Arc<dyn LlmProvider>>,
 }
 
-/// Resolve the model from the user's `agents.defaults.model` config setting.
+/// Resolve the model from the user's default agent model config setting.
 ///
-/// Returns an empty string if no model is configured — `select_provider`
-/// will produce a clear "no model configured" error downstream.
+/// Returns an empty string if no model is configured; callers translate that
+/// to a topology-free public error and log the operator remediation hint.
 fn resolve_configured_model() -> String {
     crate::config::load_config_shared()
         .ok()
@@ -240,6 +241,16 @@ fn resolve_configured_model() -> String {
                 .map(|s| s.to_string())
         })
         .unwrap_or_default()
+}
+
+fn missing_model_openai_response() -> Response {
+    let error = AgentConfigurationError::missing_model();
+    error.log_operator_hint();
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(OpenAiError::invalid_request(error.to_string())),
+    )
+        .into_response()
 }
 
 /// Parse agent ID from model string
@@ -682,14 +693,7 @@ pub async fn chat_completions_handler(
     let model = if is_alias {
         let resolved = resolve_configured_model();
         if resolved.is_empty() {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(OpenAiError::invalid_request(
-                    "no model configured; set `agents.defaults.model` in your config \
-                     (e.g. `anthropic:claude-sonnet-4-20250514`)",
-                )),
-            )
-                .into_response();
+            return missing_model_openai_response();
         }
         resolved
     } else {
@@ -1053,14 +1057,7 @@ pub async fn responses_handler(
     let model = if is_alias {
         let resolved = resolve_configured_model();
         if resolved.is_empty() {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(OpenAiError::invalid_request(
-                    "no model configured; set `agents.defaults.model` in your config \
-                     (e.g. `anthropic:claude-sonnet-4-20250514`)",
-                )),
-            )
-                .into_response();
+            return missing_model_openai_response();
         }
         resolved
     } else {
@@ -1971,9 +1968,18 @@ mod tests {
         )
         .await;
 
-        // Without agents.defaults.model in config, the carapace alias resolves
-        // to empty — returns 422 with a configuration guidance message.
+        // Without a default agent model in config, the carapace alias resolves
+        // to empty and returns a topology-free public error.
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(parsed["error"]["message"], "agent model is not configured");
+        let message = parsed["error"]["message"].as_str().unwrap();
+        assert!(!message.contains("agents.defaults.model"), "got: {message}");
+        assert!(!message.contains("anthropic:"), "got: {message}");
     }
 
     #[tokio::test]
@@ -2409,6 +2415,45 @@ mod tests {
         assert_eq!(parsed["usage"]["input_tokens"], 80);
         assert_eq!(parsed["usage"]["output_tokens"], 20);
         assert_eq!(parsed["usage"]["total_tokens"], 100);
+    }
+
+    #[tokio::test]
+    async fn test_responses_carapace_alias_without_config_returns_safe_error() {
+        let provider = Arc::new(MockLlmProvider::text_response("ok", 10, 5));
+        let state = OpenAiState {
+            responses_enabled: true,
+            llm_provider: Some(provider),
+            gateway_token: Some("test-token".to_string()),
+            ..Default::default()
+        };
+
+        let body = serde_json::to_vec(&serde_json::json!({
+            "model": "carapace",
+            "input": "Hello"
+        }))
+        .unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer test-token".parse().unwrap());
+
+        let response = responses_handler(
+            State(state),
+            loopback_connect_info(),
+            headers,
+            axum::body::Bytes::from(body),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(parsed["error"]["message"], "agent model is not configured");
+        let message = parsed["error"]["message"].as_str().unwrap();
+        assert!(!message.contains("agents.defaults.model"), "got: {message}");
+        assert!(!message.contains("anthropic:"), "got: {message}");
     }
 
     #[tokio::test]

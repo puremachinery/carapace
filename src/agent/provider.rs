@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::AgentError;
+use crate::agent::{AgentConfigurationError, AgentError};
 use crate::auth::profiles::{AuthProfile, AuthProfileCredentialKind};
 
 /// A streaming event from the LLM.
@@ -395,11 +395,9 @@ impl MultiProvider {
     /// Bare models without a prefix are rejected.
     fn select_provider(&self, model: &str) -> Result<&dyn LlmProvider, AgentError> {
         if model.is_empty() {
-            return Err(AgentError::Provider(
-                "no model configured; set `agents.defaults.model` in your config \
-                 (e.g. `anthropic:claude-sonnet-4-20250514`)"
-                    .to_string(),
-            ));
+            let error = AgentConfigurationError::missing_model();
+            error.log_operator_hint();
+            return Err(AgentError::Configuration(error));
         }
 
         // Check for provider prefix with empty model name (e.g. "openai:" or "anthropic:")
@@ -835,14 +833,15 @@ mod tests {
         let provider = MultiProvider::new(None, None);
         let err = provider.select_provider("");
         assert!(err.is_err());
-        let msg = match err {
-            Err(e) => e.to_string(),
+        let error = match err {
+            Err(e) => e,
             Ok(_) => panic!("expected error"),
         };
-        assert!(
-            msg.contains("no model configured"),
-            "empty model should give configuration guidance: {msg}"
-        );
+        let msg = error.to_string();
+        assert_eq!(msg, "agent model is not configured");
+        assert!(!msg.contains("agents.defaults.model"), "got: {msg}");
+        assert!(!msg.contains("anthropic:"), "got: {msg}");
+        assert!(matches!(error, AgentError::Configuration(_)));
     }
 
     #[test]

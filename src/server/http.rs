@@ -39,7 +39,7 @@ use crate::server::headers::{security_headers_middleware, SecurityHeadersConfig}
 use crate::server::openai::{self, OpenAiState};
 use crate::server::ratelimit::{rate_limit_middleware, RateLimitConfig, RateLimiter};
 
-use crate::agent::LlmProvider;
+use crate::agent::{AgentConfigurationError, AgentError, LlmProvider};
 use crate::auth;
 use crate::channels::{inbound, slack_inbound, telegram_inbound, ChannelRegistry};
 use crate::hooks::auth::{extract_hooks_token, validate_hooks_token};
@@ -1303,6 +1303,7 @@ async fn dispatch_agent_run(
             session_model: session.metadata.model.as_deref(),
         },
     ) {
+        e.log_configuration_hint();
         return Err((
             StatusCode::BAD_REQUEST,
             Json(AgentResponse::error(&e.to_string())),
@@ -1311,11 +1312,11 @@ async fn dispatch_agent_run(
     }
     crate::agent::apply_agent_config_from_settings(&mut config, &cfg, None);
     if config.model.trim().is_empty() {
+        let error = AgentError::Configuration(AgentConfigurationError::missing_model());
+        error.log_configuration_hint();
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(AgentResponse::error(
-                "no model configured; set `agents.defaults.model` in config or provide a model in the request",
-            )),
+            Json(AgentResponse::error(&error.to_string())),
         )
             .into_response());
     }
