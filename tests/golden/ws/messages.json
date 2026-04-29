@@ -44,7 +44,7 @@
       },
       "examples": [
         { "type": "res", "id": "h1", "ok": true, "payload": { "ts": 1706000000000, "status": "healthy" } },
-        { "type": "res", "id": "bad", "ok": false, "error": { "code": "INVALID_REQUEST", "message": "missing field" } },
+        { "type": "res", "id": "bad", "ok": false, "error": { "code": "invalid_request", "message": "missing field" } },
         { "type": "res", "id": "s1", "ok": true, "payload": { "sessions": [] } }
       ]
     },

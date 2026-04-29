@@ -67,10 +67,24 @@ const LOGS_MAX_LIMIT: usize = 5_000;
 const LOGS_MAX_BYTES: usize = 1_000_000;
 const MAX_JSON_DEPTH: usize = 32;
 
-const ERROR_INVALID_REQUEST: &str = "INVALID_REQUEST";
-const ERROR_NOT_PAIRED: &str = "NOT_PAIRED";
-const ERROR_UNAVAILABLE: &str = "UNAVAILABLE";
-const ERROR_RATE_LIMITED: &str = "RATE_LIMITED";
+// WS error codes are wire-format strings clients dispatch on. Convention:
+// lower_snake_case to match the rest of the JSON wire surface and OpenAI-
+// compat error families (`invalid_request_error`, etc.). All emit sites
+// — including ad-hoc string literals in node.rs, plugin runtime, ratelimit,
+// csrf, and integration goldens — must use the lower_snake form. See PR
+// renaming this from the prior SCREAMING_SNAKE convention.
+const ERROR_INVALID_REQUEST: &str = "invalid_request";
+const ERROR_NOT_PAIRED: &str = "not_paired";
+const ERROR_UNAVAILABLE: &str = "unavailable";
+const ERROR_RATE_LIMITED: &str = "rate_limited";
+/// Documented in `docs/protocol/websocket.md` and exercised by the
+/// `tests/golden/ws/errors.json` schema, but not yet emitted from any
+/// live Rust code path. Reserved for future "channel not configured"
+/// errors. Kept here so the wire-code set is discoverable from one
+/// place and a future emit site can `use ERROR_NOT_LINKED` rather than
+/// re-introducing a string literal.
+#[allow(dead_code)]
+const ERROR_NOT_LINKED: &str = "not_linked";
 // Note: Node doesn't use ERROR_FORBIDDEN - use ERROR_INVALID_REQUEST for auth errors
 
 const ALLOWED_CLIENT_IDS: [&str; 12] = [
@@ -1602,7 +1616,7 @@ impl NodeRegistry {
                     payload: None,
                     payload_json: None,
                     error: Some(NodeInvokeError {
-                        code: Some("NOT_CONNECTED".to_string()),
+                        code: Some("not_connected".to_string()),
                         message: Some("node disconnected".to_string()),
                     }),
                 });

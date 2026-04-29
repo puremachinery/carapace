@@ -293,7 +293,7 @@
             "id": "c1",
             "ok": false,
             "error": {
-              "code": "INVALID_REQUEST",
+              "code": "invalid_request",
               "message": "protocol mismatch",
               "details": { "expectedProtocol": 3 }
             }
@@ -324,7 +324,7 @@
             "id": "h1",
             "ok": false,
             "error": {
-              "code": "INVALID_REQUEST",
+              "code": "invalid_request",
               "message": "invalid handshake: first request must be connect"
             }
           }
