@@ -9,12 +9,12 @@
   "error_codes": {
     "source": "src/gateway/protocol/schema/error-codes.ts ErrorCodes",
     "codes": {
-      "NOT_LINKED": {
+      "not_linked": {
         "description": "Channel or service not linked/configured",
         "retryable": false,
         "example_message": "channel not linked"
       },
-      "NOT_PAIRED": {
+      "not_paired": {
         "description": "Device identity not paired with gateway",
         "retryable": false,
         "example_message": "device identity required",
@@ -23,12 +23,12 @@
           "Also returned when device needs to re-pair (role/scope upgrade)"
         ]
       },
-      "AGENT_TIMEOUT": {
+      "agent_timeout": {
         "description": "Agent execution timed out",
         "retryable": true,
         "example_message": "agent timed out after 300000ms"
       },
-      "INVALID_REQUEST": {
+      "invalid_request": {
         "description": "Request validation failed or invalid operation",
         "retryable": false,
         "common_messages": [
@@ -48,7 +48,7 @@
           "control ui requires HTTPS or localhost (secure context)"
         ]
       },
-      "UNAVAILABLE": {
+      "unavailable": {
         "description": "Service temporarily unavailable",
         "retryable": true,
         "example_message": "service temporarily unavailable"
@@ -71,21 +71,21 @@
     },
     "examples": [
       {
-        "code": "INVALID_REQUEST",
+        "code": "invalid_request",
         "message": "invalid connect params: at /client/id: must be string"
       },
       {
-        "code": "INVALID_REQUEST",
+        "code": "invalid_request",
         "message": "protocol mismatch",
         "details": { "expectedProtocol": 3 }
       },
       {
-        "code": "NOT_PAIRED",
+        "code": "not_paired",
         "message": "pairing required",
         "details": { "requestId": "req-abc123" }
       },
       {
-        "code": "AGENT_TIMEOUT",
+        "code": "agent_timeout",
         "message": "agent timed out after 300000ms",
         "retryable": true
       }
@@ -142,7 +142,7 @@
           "type": "res",
           "id": "h1",
           "ok": false,
-          "error": { "code": "INVALID_REQUEST", "message": "invalid handshake: first request must be connect" }
+          "error": { "code": "invalid_request", "message": "invalid handshake: first request must be connect" }
         },
         "close_code": 1008,
         "close_reason": "invalid handshake: first request must be connect"
@@ -161,7 +161,7 @@
           "type": "res",
           "id": "c1",
           "ok": false,
-          "error": { "code": "INVALID_REQUEST", "message": "invalid connect params: at /maxProtocol: must have required property 'maxProtocol'" }
+          "error": { "code": "invalid_request", "message": "invalid connect params: at /maxProtocol: must have required property 'maxProtocol'" }
         },
         "close_code": 1008
       },
@@ -184,7 +184,7 @@
           "id": "c1",
           "ok": false,
           "error": {
-            "code": "INVALID_REQUEST",
+            "code": "invalid_request",
             "message": "protocol mismatch",
             "details": { "expectedProtocol": 3 }
           }
@@ -211,7 +211,7 @@
           "type": "res",
           "id": "c1",
           "ok": false,
-          "error": { "code": "INVALID_REQUEST", "message": "invalid role" }
+          "error": { "code": "invalid_request", "message": "invalid role" }
         },
         "close_code": 1008,
         "close_reason": "invalid role"
@@ -236,7 +236,7 @@
           "type": "res",
           "id": "c1",
           "ok": false,
-          "error": { "code": "NOT_PAIRED", "message": "device identity required" }
+          "error": { "code": "not_paired", "message": "device identity required" }
         },
         "close_code": 1008,
         "close_reason": "device identity required"
@@ -248,7 +248,7 @@
         "response": {
           "type": "res",
           "ok": false,
-          "error": { "code": "INVALID_REQUEST", "message": "device identity mismatch" }
+          "error": { "code": "invalid_request", "message": "device identity mismatch" }
         },
         "close_code": 1008,
         "close_reason": "device identity mismatch"
@@ -261,7 +261,7 @@
         "response": {
           "type": "res",
           "ok": false,
-          "error": { "code": "INVALID_REQUEST", "message": "device signature expired" }
+          "error": { "code": "invalid_request", "message": "device signature expired" }
         },
         "close_code": 1008
       },
@@ -272,7 +272,7 @@
         "response": {
           "type": "res",
           "ok": false,
-          "error": { "code": "INVALID_REQUEST", "message": "device nonce required" }
+          "error": { "code": "invalid_request", "message": "device nonce required" }
         },
         "close_code": 1008
       },
@@ -283,7 +283,7 @@
         "response": {
           "type": "res",
           "ok": false,
-          "error": { "code": "INVALID_REQUEST", "message": "device nonce mismatch" }
+          "error": { "code": "invalid_request", "message": "device nonce mismatch" }
         },
         "close_code": 1008
       },
@@ -294,7 +294,7 @@
         "response": {
           "type": "res",
           "ok": false,
-          "error": { "code": "INVALID_REQUEST", "message": "device signature invalid" }
+          "error": { "code": "invalid_request", "message": "device signature invalid" }
         },
         "close_code": 1008
       },
@@ -306,7 +306,7 @@
           "type": "res",
           "ok": false,
           "error": {
-            "code": "NOT_PAIRED",
+            "code": "not_paired",
             "message": "pairing required",
             "details": { "requestId": "{{pairing_request_id}}" }
           }
@@ -323,7 +323,7 @@
         "response": {
           "type": "res",
           "ok": false,
-          "error": { "code": "INVALID_REQUEST", "message": "unauthorized: gateway token missing (set gateway.remote.token to match gateway.auth.token)" }
+          "error": { "code": "invalid_request", "message": "unauthorized: gateway token missing (set gateway.remote.token to match gateway.auth.token)" }
         },
         "close_code": 1008
       },
@@ -333,7 +333,7 @@
         "response": {
           "type": "res",
           "ok": false,
-          "error": { "code": "INVALID_REQUEST", "message": "unauthorized: gateway token mismatch (set gateway.remote.token to match gateway.auth.token)" }
+          "error": { "code": "invalid_request", "message": "unauthorized: gateway token mismatch (set gateway.remote.token to match gateway.auth.token)" }
         },
         "close_code": 1008
       },
@@ -343,7 +343,7 @@
         "response": {
           "type": "res",
           "ok": false,
-          "error": { "code": "INVALID_REQUEST", "message": "unauthorized: gateway password missing (set gateway.remote.password to match gateway.auth.password)" }
+          "error": { "code": "invalid_request", "message": "unauthorized: gateway password missing (set gateway.remote.password to match gateway.auth.password)" }
         },
         "close_code": 1008
       },
@@ -354,7 +354,7 @@
         "response": {
           "type": "res",
           "ok": false,
-          "error": { "code": "INVALID_REQUEST", "message": "control ui requires HTTPS or localhost (secure context)" }
+          "error": { "code": "invalid_request", "message": "control ui requires HTTPS or localhost (secure context)" }
         },
         "close_code": 1008
       }
@@ -374,7 +374,7 @@
           "type": "res",
           "id": "c2",
           "ok": false,
-          "error": { "code": "INVALID_REQUEST", "message": "connect is only valid as the first request" }
+          "error": { "code": "invalid_request", "message": "connect is only valid as the first request" }
         },
         "notes": "Does not close connection"
       },

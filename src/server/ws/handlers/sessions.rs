@@ -3263,7 +3263,7 @@ mod tests {
         let result = handle_sessions_archive(&state, None);
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert_eq!(err.code, "INVALID_REQUEST");
+        assert_eq!(err.code, "invalid_request");
     }
 
     #[test]
@@ -3328,7 +3328,7 @@ mod tests {
         let result = handle_sessions_restore(&state, None);
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert_eq!(err.code, "INVALID_REQUEST");
+        assert_eq!(err.code, "invalid_request");
     }
 
     #[test]
@@ -3407,7 +3407,7 @@ mod tests {
         let result = handle_sessions_archive_delete(&state, None);
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert_eq!(err.code, "INVALID_REQUEST");
+        assert_eq!(err.code, "invalid_request");
     }
 
     #[test]
@@ -3440,7 +3440,7 @@ mod tests {
         let (state, _tmp) = make_state_with_temp_sessions();
         let result = handle_sessions_export_user(&state, None);
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code, "INVALID_REQUEST");
+        assert_eq!(result.unwrap_err().code, "invalid_request");
     }
 
     #[test]
@@ -3449,7 +3449,7 @@ mod tests {
         let params = json!({ "userId": "" });
         let result = handle_sessions_export_user(&state, Some(&params));
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code, "INVALID_REQUEST");
+        assert_eq!(result.unwrap_err().code, "invalid_request");
     }
 
     #[test]
@@ -3458,7 +3458,7 @@ mod tests {
         let params = json!({ "userId": "   " });
         let result = handle_sessions_export_user(&state, Some(&params));
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code, "INVALID_REQUEST");
+        assert_eq!(result.unwrap_err().code, "invalid_request");
     }
 
     #[test]
@@ -3505,7 +3505,7 @@ mod tests {
         let (state, _tmp) = make_state_with_temp_sessions();
         let result = handle_sessions_purge_user(&state, None);
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code, "INVALID_REQUEST");
+        assert_eq!(result.unwrap_err().code, "invalid_request");
     }
 
     #[test]
@@ -3514,7 +3514,7 @@ mod tests {
         let params = json!({ "userId": "" });
         let result = handle_sessions_purge_user(&state, Some(&params));
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code, "INVALID_REQUEST");
+        assert_eq!(result.unwrap_err().code, "invalid_request");
     }
 
     #[test]
@@ -3523,7 +3523,7 @@ mod tests {
         let params = json!({ "userId": "  \t  " });
         let result = handle_sessions_purge_user(&state, Some(&params));
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code, "INVALID_REQUEST");
+        assert_eq!(result.unwrap_err().code, "invalid_request");
     }
 
     #[test]

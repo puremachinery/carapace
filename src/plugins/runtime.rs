@@ -2404,11 +2404,11 @@ mod tests {
     #[test]
     fn test_wit_plugin_error_fields() {
         let pe = WitPluginError {
-            code: "RATE_LIMITED".to_string(),
+            code: "rate_limited".to_string(),
             message: "Too many requests".to_string(),
             retryable: true,
         };
-        assert_eq!(pe.code, "RATE_LIMITED");
+        assert_eq!(pe.code, "rate_limited");
         assert_eq!(pe.message, "Too many requests");
         assert!(pe.retryable);
     }

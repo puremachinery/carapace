@@ -5,7 +5,7 @@ expression: normalized
 ---
 {
   "error": {
-    "code": "INVALID_REQUEST",
+    "code": "invalid_request",
     "message": "method 'config.set' requires role 'write', connection has role 'read'",
     "retryable": false
   },

@@ -145,7 +145,7 @@ Error:
   "id": "unique-request-id",
   "ok": false,
   "error": {
-    "code": "INVALID_REQUEST",
+    "code": "invalid_request",
     "message": "description",
     "details": { ... },
     "retryable": false
@@ -370,13 +370,26 @@ Events are broadcast to connected clients. See `src/server/ws/mod.rs` for implem
 
 ## Error Codes
 
+Wire codes are stable, lower_snake_case strings. Clients dispatch on the
+`code` field of the error response. Configuration-error codes
+(`unknown_route`, `missing_model`) come from `AgentConfigurationErrorCode`
+in the agent layer; the codes below are emitted by the WebSocket
+transport and protocol layers.
+
 | Code | Description | Retryable |
 |------|-------------|-----------|
-| `INVALID_REQUEST` | Validation/protocol error | No |
-| `NOT_LINKED` | Channel not configured | No |
-| `NOT_PAIRED` | Device not paired | No |
-| `AGENT_TIMEOUT` | Agent exceeded timeout | Yes |
-| `UNAVAILABLE` | Service temporarily unavailable | Yes |
+| `invalid_request` | Validation/protocol error | No |
+| `not_linked` | Channel not configured | No |
+| `not_paired` | Device not paired | No |
+| `agent_timeout` | Agent exceeded timeout | Yes |
+| `unavailable` | Service temporarily unavailable | Yes |
+| `unknown_route` | Request referenced a route not in the `routes` map | No |
+| `missing_model` | Resolution found no `route` or `model` for the request | No |
+| `not_connected` | Targeted node is not currently connected | No |
+| `rate_limited` | Per-resource rate limit exceeded | Yes |
+| `csrf_error` | CSRF token missing or invalid | No |
+| `invalid_input` | Plugin input validation failed | No |
+| `timeout` | Generic timeout (e.g. node invoke) | Yes |
 
 ## Close Codes
 
