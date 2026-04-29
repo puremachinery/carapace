@@ -117,6 +117,18 @@ If the caller declared a capability and no level 3 or 4 entry was
 configured, the as-drafted design would hard-error rather than fall
 through to levels 5–6 — see Open Question O2.
 
+**Note on intra-agent precedence (level 3 over level 5).** The
+as-drafted order puts per-agent capability override above the agent's
+own default `route` / `model`. That means a caller declaring `vision`
+on a request can silently redirect traffic away from the agent's named
+route to whatever `agent.capabilityRoutes.vision` points at. Capability
+routing is billing-relevant (see §5 and O5), so this is a deliberate
+precedence choice that any implementation must call out explicitly in
+operator-facing docs and in usage tracking. If this design is revived,
+the implementation issue should decide whether the operator gets at
+least an audit log entry when a capability override displaces the
+agent's default route.
+
 ### Detection
 
 If implemented, the first slice would require **explicit caller
@@ -177,12 +189,26 @@ path like `routes.byCapability.<bucket>` in the surfaced message leaks
 internal configuration topology to anyone who can probe the API — a
 low-value but real information leak in a security-first gateway.
 
-If this design is revived, the error must be a distinct variant (e.g. a
-`ConfigError::CapabilityNotConfigured { capability }` or similar) that
-the server layer maps to a generic, stable code (e.g.
-`"capability_not_configured"`) for external callers. The remediation
-hint with the exact config key belongs in server logs and the Control
-UI, not in the wire-format error string.
+**This is a current-codebase concern, not just a future one.**
+`src/config/routes.rs` already surfaces config-key-path remediation
+hints through `AgentError::Provider` for two error paths that reach
+external callers today:
+
+- `unknown route "<name>"; define it in the top-level \`routes\` config
+  map` (`src/config/routes.rs:~98`)
+- `no model configured; set \`route\` or \`model\` in agent config or
+  defaults` (`src/config/routes.rs:~120`)
+
+Both messages flow to external callers via the OpenAI-compatible server
+layer today. Capability routing would extend the same pattern, not
+introduce it. The general invariant — internal config-key paths must
+not leak through `AgentError::Provider` to external clients — should
+be remediated in the existing routes resolver independently of whether
+capability routing is ever built. Track that as a separate issue (a
+`ConfigError`-family variant + a stable wire-format code mapped at the
+server boundary) and treat O3 here as an extension obligation: any
+revived capability-routing design must use the new variant family
+rather than adding to the existing leak surface.
 
 ### O4. `#[non_exhaustive]` vs "closed enum" (low)
 
