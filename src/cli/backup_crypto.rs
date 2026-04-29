@@ -756,8 +756,11 @@ mod tests {
                 .expect("production backup envelope build");
         assert_eq!(actual_bytes, EXPECTED_CRPC_BYTES);
 
-        // Round-trip via the production decrypt path: parse magic / version /
-        // salt / nonce, derive key (pre-derived here), and AEAD-decrypt.
+        // Validates the byte layout and the shared AEAD helper by slicing the
+        // pinned bytes against the documented offsets and decrypting with the
+        // pre-derived key. This deliberately does NOT call `decrypt_backup`
+        // — that function's parsing path (file I/O + Argon2id) is exercised
+        // by the encrypt/decrypt round-trip tests elsewhere in this file.
         let header_offset = MAGIC.len() + 1;
         let nonce_offset = header_offset + SALT_LEN;
         let ct_offset = nonce_offset + NONCE_LEN;
