@@ -2404,14 +2404,38 @@ mod tests {
             "the claimed Signal receipt should be sent before the run can start typing"
         );
 
-        let session_key = {
-            let registry = state.agent_run_registry.lock();
-            registry
-                .get(&dispatch.run_id)
-                .expect("inbound dispatch should register the run")
-                .session_key
-                .clone()
-        };
+        // Inbound dispatch in the no-provider state intentionally does not
+        // register a run (no orphan in agent_run_registry). The session
+        // record + read receipt have already been persisted; the run-tracking
+        // entry is provided manually here so the manual `execute_run` below
+        // — which is the controlled provider for the typing-ordering check —
+        // has a registry entry to update.
+        let session_key = dispatch.session_key.clone();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        {
+            let mut registry = state.agent_run_registry.lock();
+            registry.register(crate::server::ws::AgentRun {
+                run_id: dispatch.run_id.clone(),
+                session_key: session_key.clone(),
+                delivery_recipient_id: Some(chat_id.to_string()),
+                typing_context: Some(TypingContext {
+                    to: chat_id.to_string(),
+                    ..Default::default()
+                }),
+                status: crate::server::ws::AgentRunStatus::Queued,
+                message: "Hello".to_string(),
+                response: String::new(),
+                error: None,
+                created_at: now_ms,
+                started_at: None,
+                completed_at: None,
+                cancel_token: CancellationToken::new(),
+                waiters: Vec::new(),
+            });
+        }
 
         let provider = Arc::new(MockProvider::new(vec![vec![StreamEvent::Stop {
             reason: StopReason::EndTurn,

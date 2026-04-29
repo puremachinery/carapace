@@ -220,8 +220,8 @@ pub async fn build_ws_state_with_runtime_dependencies(
                  configuring Ollama; configuring an authProfile (anthropic.authProfile, \
                  google.authProfile, codex.authProfile); or configuring AWS Bedrock \
                  (AWS_REGION + credentials), Vertex AI (VERTEX_PROJECT_ID), or the \
-                 Claude CLI provider. See `crate::agent::factory::build_providers` \
-                 for the authoritative set."
+                 Claude CLI provider. Other supported provider configurations may \
+                 also be valid; see the project documentation for the full list."
                     .into(),
             );
         }

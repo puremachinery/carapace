@@ -102,6 +102,10 @@ pub(crate) const PROVIDER_ENV_KEYS: &[&str] = &[
     "AWS_DEFAULT_REGION",
     "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY",
+    // OIDC-based auth in GitHub Actions sets AWS_SESSION_TOKEN (with or
+    // without AWS_ACCESS_KEY_ID); Bedrock provider detection should not
+    // see it leak through into a "no-provider" test.
+    "AWS_SESSION_TOKEN",
     "VERTEX_PROJECT_ID",
     "VERTEX_LOCATION",
     "VERTEX_MODEL",

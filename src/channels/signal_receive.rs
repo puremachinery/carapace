@@ -2006,12 +2006,15 @@ mod tests {
         .await
         .expect("immediate no-run receipt task should settle to done");
 
-        let runs = state.agent_run_registry.lock().snapshot_runs();
-        let run = runs
-            .iter()
-            .find(|run| run.message == "hello")
-            .expect("dispatch should still register the inbound run context");
-        assert_eq!(run.status, crate::server::ws::AgentRunStatus::Queued);
+        // Per the #351 inbound reorder: when no provider is present at
+        // dispatch time, dispatch_inbound_text_with_options skips the
+        // registry registration to avoid orphan entries. Receipt completion
+        // and session-message persistence still happen above; only the
+        // run-tracking entry is omitted.
+        assert!(
+            state.agent_run_registry.lock().snapshot_runs().is_empty(),
+            "no provider at dispatch time should not orphan a run-registry entry"
+        );
         shutdown_tx
             .send(true)
             .expect("read receipt worker shutdown signal should send");
