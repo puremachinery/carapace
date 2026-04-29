@@ -1313,10 +1313,10 @@ async fn dispatch_agent_run(
         return Err((StatusCode::BAD_REQUEST, Json(AgentResponse::from(&error))).into_response());
     }
 
-    // Validate the provider precondition *before* registering the run so a
-    // defensive failure here doesn't orphan an entry in agent_run_registry.
-    // Also use 503 (server-side misconfiguration) rather than 400, matching
-    // the existing OpenAI-compat path's status for the same condition.
+    // Provider availability is a precondition for queueing a run; check it
+    // before `registry.register` so a missing provider can't orphan an entry.
+    // Returns 503 (server-side misconfiguration), matching the OpenAI-compat
+    // path's status for the same condition.
     let Some(provider) = ws.llm_provider() else {
         let error = AgentError::Configuration(AgentConfigurationError::provider_not_configured());
         error.log_configuration_hint();
@@ -2522,23 +2522,6 @@ mod tests {
         (Arc::new(state), tmp)
     }
 
-    /// Inert provider for tests that need `dispatch_agent_run` to reach the
-    /// spawn arm without making real network calls. Returns an empty stream;
-    /// `crate::agent::spawn_run` will exhaust it without error.
-    struct StaticTestProvider;
-
-    #[async_trait::async_trait]
-    impl crate::agent::LlmProvider for StaticTestProvider {
-        async fn complete(
-            &self,
-            _request: crate::agent::provider::CompletionRequest,
-            _cancel_token: tokio_util::sync::CancellationToken,
-        ) -> Result<tokio::sync::mpsc::Receiver<crate::agent::StreamEvent>, AgentError> {
-            let (_tx, rx) = tokio::sync::mpsc::channel(1);
-            Ok(rx)
-        }
-    }
-
     fn make_test_ws_state_with_provider() -> (Arc<WsServerState>, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(sessions::SessionStore::with_base_path(
@@ -2546,7 +2529,7 @@ mod tests {
         ));
         let state = WsServerState::new(WsServerConfig::default())
             .with_session_store(store)
-            .with_llm_provider(Arc::new(StaticTestProvider));
+            .with_llm_provider(Arc::new(crate::test_support::agent::StaticTestProvider));
         (Arc::new(state), tmp)
     }
 
@@ -2880,9 +2863,7 @@ mod tests {
 
     /// `/hooks/agent` surfaces `provider_not_configured` with `ok: false`
     /// when the request resolves to a valid model but no LLM provider is
-    /// attached to the runtime. Startup is supposed to fail-fast in that
-    /// case (per #351); this test pins the typed error a misconfigured
-    /// state would surface, ensuring the path doesn't silently queue.
+    /// attached to the runtime. Pins that the path doesn't silently queue.
     #[tokio::test]
     async fn test_hooks_agent_provider_not_configured_emits_typed_error_code() {
         let (temp, _guard) = set_temp_config_path();

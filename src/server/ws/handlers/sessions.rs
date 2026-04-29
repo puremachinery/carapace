@@ -2113,10 +2113,9 @@ pub(super) fn handle_agent(
         return Err(error_shape(code, &error.to_string(), None));
     }
 
-    // Validate the provider precondition *before* `setup_agent_session`
-    // appends the user message and registers a queued run, so a defensive
-    // failure here doesn't orphan state in the agent_run_registry or the
-    // session store.
+    // Provider availability is a precondition for queueing a run; check it
+    // before `setup_agent_session` so a missing provider can't orphan a
+    // user-message append + registry entry.
     let Some(provider) = state.llm_provider() else {
         let error = crate::agent::AgentConfigurationError::provider_not_configured();
         error.log_operator_hint();

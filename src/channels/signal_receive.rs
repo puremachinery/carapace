@@ -633,32 +633,15 @@ mod tests {
     use axum::routing::get;
     use axum::{Json, Router};
     use parking_lot::Mutex;
-    use tokio::sync::mpsc;
     use tokio::sync::Notify;
-    use tokio_util::sync::CancellationToken;
 
     use super::*;
-    use crate::agent::provider::CompletionRequest;
-    use crate::agent::{AgentError, LlmProvider, StreamEvent};
     use crate::plugins::{
         BindingError, ChannelCapabilities, ChannelInfo, ChannelPluginInstance, PluginRegistry,
     };
     use crate::server::ws::WsServerConfig;
     use crate::tasks::TaskQueue;
-
-    struct StaticTestProvider;
-
-    #[async_trait::async_trait]
-    impl LlmProvider for StaticTestProvider {
-        async fn complete(
-            &self,
-            _request: CompletionRequest,
-            _cancel_token: CancellationToken,
-        ) -> Result<mpsc::Receiver<StreamEvent>, AgentError> {
-            let (_tx, rx) = mpsc::channel(1);
-            Ok(rx)
-        }
-    }
+    use crate::test_support::agent::StaticTestProvider;
 
     fn test_state_with_provider(enabled: bool) -> Arc<WsServerState> {
         let state = WsServerState::new(WsServerConfig::default());
@@ -2006,11 +1989,10 @@ mod tests {
         .await
         .expect("immediate no-run receipt task should settle to done");
 
-        // Per the #351 inbound reorder: when no provider is present at
-        // dispatch time, dispatch_inbound_text_with_options skips the
-        // registry registration to avoid orphan entries. Receipt completion
-        // and session-message persistence still happen above; only the
-        // run-tracking entry is omitted.
+        // Receipt completion + session-message persistence happen above
+        // (asserted via mark_read_count and the queue task); the run-tracking
+        // entry is gated on provider availability and must not be orphaned
+        // when the provider is absent at dispatch time.
         assert!(
             state.agent_run_registry.lock().snapshot_runs().is_empty(),
             "no provider at dispatch time should not orphan a run-registry entry"

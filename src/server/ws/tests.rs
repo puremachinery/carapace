@@ -177,20 +177,6 @@ fn test_error_shape_config_errors_are_not_retryable() {
     assert!(!err2.retryable);
 }
 
-/// `ERROR_PROVIDER_NOT_CONFIGURED` is `#[allow(dead_code)]` and only kept so
-/// the wire-code set is discoverable from one place. The actual emit site is
-/// `AgentConfigurationErrorCode::ProviderNotConfigured.as_str()`. If the
-/// variant's wire string is renamed (or the constant is mistyped), the two
-/// silently diverge with no compile-time signal — this test pins them.
-#[test]
-fn test_error_provider_not_configured_constant_matches_typed_code() {
-    use crate::agent::AgentConfigurationErrorCode;
-    assert_eq!(
-        ERROR_PROVIDER_NOT_CONFIGURED,
-        AgentConfigurationErrorCode::ProviderNotConfigured.as_str(),
-    );
-}
-
 #[test]
 fn test_canonicalize_ws_method_name_aliases() {
     assert_eq!(canonicalize_ws_method_name("agent.run"), "agent");

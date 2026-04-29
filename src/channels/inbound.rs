@@ -22,7 +22,6 @@ pub struct InboundDispatchOptions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InboundDispatchResult {
     pub run_id: String,
-    pub session_key: String,
     pub run_spawned: bool,
 }
 
@@ -129,19 +128,14 @@ pub async fn dispatch_inbound_text_with_options(
     }
 
     let run_id = uuid::Uuid::new_v4().to_string();
-    let session_key = session.session_key.clone();
 
-    // Check the provider precondition *before* registering a queued run, so
-    // a defensive failure here doesn't orphan an entry in the
-    // agent_run_registry. The user message + read receipt were persisted
-    // earlier in this function (the channel acknowledged receipt), but the
-    // run-tracking entry only makes sense if execution will actually be
-    // attempted. Consistent with the WS / HTTP handlers.
+    // Provider availability gates the run-tracking entry; the user message
+    // + read receipt above were persisted unconditionally because the
+    // channel already acknowledged receipt.
     let Some(provider) = state.llm_provider() else {
         crate::agent::AgentConfigurationError::provider_not_configured().log_operator_hint();
         return Ok(InboundDispatchResult {
             run_id,
-            session_key,
             run_spawned: false,
         });
     };
@@ -163,7 +157,7 @@ pub async fn dispatch_inbound_text_with_options(
     let cancel_token = tokio_util::sync::CancellationToken::new();
     let run = AgentRun {
         run_id: run_id.clone(),
-        session_key: session_key.clone(),
+        session_key: session.session_key.clone(),
         delivery_recipient_id,
         typing_context,
         status: AgentRunStatus::Queued,
@@ -196,7 +190,6 @@ pub async fn dispatch_inbound_text_with_options(
         warn!(error = %e, "inbound agent run skipped: model resolution failed");
         return Ok(InboundDispatchResult {
             run_id,
-            session_key,
             run_spawned: false,
         });
     }
@@ -204,7 +197,7 @@ pub async fn dispatch_inbound_text_with_options(
     config.deliver = true;
     crate::agent::spawn_run(
         run_id.clone(),
-        session_key.clone(),
+        session.session_key.clone(),
         config,
         state.clone(),
         provider,
@@ -219,7 +212,6 @@ pub async fn dispatch_inbound_text_with_options(
 
     Ok(InboundDispatchResult {
         run_id,
-        session_key,
         run_spawned: true,
     })
 }
@@ -296,23 +288,7 @@ mod tests {
         }
     }
 
-    /// Inert provider for tests that need `dispatch_inbound_text_with_options`
-    /// to reach the spawn arm. Returns an empty stream; `crate::agent::spawn_run`
-    /// drains it without any real network I/O.
-    struct StaticTestProvider;
-
-    #[async_trait::async_trait]
-    impl crate::agent::LlmProvider for StaticTestProvider {
-        async fn complete(
-            &self,
-            _request: crate::agent::provider::CompletionRequest,
-            _cancel_token: tokio_util::sync::CancellationToken,
-        ) -> Result<tokio::sync::mpsc::Receiver<crate::agent::StreamEvent>, crate::agent::AgentError>
-        {
-            let (_tx, rx) = tokio::sync::mpsc::channel(1);
-            Ok(rx)
-        }
-    }
+    use crate::test_support::agent::StaticTestProvider;
 
     fn install_empty_config() -> serde_json::Value {
         let cfg = json!({});
@@ -425,10 +401,9 @@ mod tests {
                 1,
             ),
         );
-        // Inject an inert provider so dispatch reaches the spawn arm — the
-        // reordered provider check (added with #351 fix) means a no-provider
-        // state would short-circuit before `registry.register`. This test is
-        // about receipt-completion failure semantics, not provider absence.
+        // Inject an inert provider so dispatch reaches the registry-register
+        // arm. This test is about receipt-completion failure semantics, not
+        // provider absence.
         let state = Arc::new(
             WsServerState::new(WsServerConfig::default())
                 .with_session_store(session_store)
@@ -466,11 +441,8 @@ mod tests {
         .await
         .expect("receipt completion failure should not abort inbound dispatch");
 
-        // Empty config means no model resolves, so the spawn arm is skipped.
-        // This test pre-dates #351 and was originally written against the
-        // no-provider queue-without-spawn path; with a provider injected
-        // (required after the #351 reorder) the same observable shape comes
-        // from `resolve_agent_model` failing instead.
+        // Empty config means no model resolves, so the spawn arm is skipped
+        // even though the provider is configured.
         assert!(!result.run_spawned);
         assert!(activity_service.read_receipt_queue().list().is_empty());
         assert!(
@@ -519,19 +491,17 @@ mod tests {
             "run_id is generated even when not registered, for caller correlation"
         );
         assert!(
-            !result.session_key.is_empty(),
-            "session_key is returned so the caller can locate the session record"
-        );
-        assert!(
             state.agent_run_registry.lock().snapshot_runs().is_empty(),
             "no provider → no orphan registry entry"
         );
 
-        // The user message was still durably appended (channel acknowledged
-        // receipt regardless of whether the agent can run). Verify by reading
-        // the session that dispatch created.
+        // The user message was still durably appended; resolve the same
+        // session key dispatch used and verify the message landed.
+        let cfg = json!({});
+        let (session_key, _, _) =
+            resolve_scoped_session_key(&cfg, "signal", "+15551234567", "+15551234567", None);
         let session = session_store
-            .get_session_by_key(&result.session_key)
+            .get_session_by_key(&session_key)
             .expect("dispatch should create the session");
         let messages = session_store
             .get_history(&session.id, None, None)

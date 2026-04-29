@@ -2404,13 +2404,12 @@ mod tests {
             "the claimed Signal receipt should be sent before the run can start typing"
         );
 
-        // Inbound dispatch in the no-provider state intentionally does not
-        // register a run (no orphan in agent_run_registry). The session
-        // record + read receipt have already been persisted; the run-tracking
-        // entry is provided manually here so the manual `execute_run` below
-        // — which is the controlled provider for the typing-ordering check —
-        // has a registry entry to update.
-        let session_key = dispatch.session_key.clone();
+        // No-provider dispatch doesn't register the run — manually register
+        // it so the controlled `execute_run` below has a registry entry to
+        // update. Resolve the session key the same way dispatch did.
+        let cfg = serde_json::json!({});
+        let (session_key, _, _) =
+            crate::sessions::resolve_scoped_session_key(&cfg, "signal", chat_id, chat_id, None);
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()

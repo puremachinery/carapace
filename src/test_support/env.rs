@@ -81,7 +81,7 @@ impl Drop for ScopedEnv {
 /// entries make tests that try to force a no-provider state flaky in CI
 /// environments where some of these are set ambiently (e.g. AWS credentials
 /// in GitHub-hosted runners inside AWS).
-pub(crate) const PROVIDER_ENV_KEYS: &[&str] = &[
+const PROVIDER_ENV_KEYS: &[&str] = &[
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_BASE_URL",
     "CARAPACE_CONFIG_PASSWORD",

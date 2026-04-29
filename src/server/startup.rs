@@ -601,7 +601,13 @@ fn spawn_config_watcher_bridge(
                                                  a provider config to apply further \
                                                  changes."
                                             );
-                                            // Don't update fingerprint — next reload will retry.
+                                            // Update the fingerprint so identical
+                                            // re-saves of the no-provider config don't
+                                            // re-run the (failed) build_providers work.
+                                            // A subsequent reload that *restores* a
+                                            // provider will produce a new fingerprint
+                                            // and retry the swap.
+                                            current_fingerprint = new_fingerprint;
                                             continue;
                                         }
                                         Err(e) => {
@@ -1897,10 +1903,10 @@ mod tests {
         crate::config::clear_cache();
     }
 
-    /// Startup must fail-fast when no LLM provider is configured. Carapace
-    /// without a provider is unsupported (per #351); the error message must
-    /// name at least one of the supported provider env vars so an operator
-    /// can fix the misconfiguration without consulting docs.
+    /// `build_ws_state_with_runtime_dependencies` must error out when no LLM
+    /// provider is configured, and the message must name at least one
+    /// supported env var so an operator can fix the misconfiguration without
+    /// consulting docs.
     #[tokio::test]
     async fn build_ws_state_with_runtime_dependencies_errors_when_no_provider() {
         let temp = tempfile::tempdir().expect("temp dir");
