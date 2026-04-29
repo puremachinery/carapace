@@ -390,9 +390,9 @@ not emitted via `error_shape` are noted explicitly.
 *Note on `rate_limited`*: semantically the operation is retryable (with
 backoff / `Retry-After`), but `error_shape`'s current hard-coded
 retryable check produces `retryable: false`. Clients should treat
-`rate_limited` as retryable regardless of the field; a future fix to
-`error_shape` (tracked separately) will align the wire field with
-intent.
+`rate_limited` as retryable regardless of the field; a future fix
+will align the wire field with intent
+(tracked at [#405](https://github.com/puremachinery/carapace/issues/405)).
 
 ### Reserved codes (documented but not yet emitted)
 
