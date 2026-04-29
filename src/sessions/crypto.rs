@@ -1051,13 +1051,11 @@ mod tests {
 
     #[test]
     fn test_cse1_persisted_payload_and_aad_golden_vector() {
-        // True golden vector: pins the canonical `cse1:` payload bytes to a
-        // hardcoded literal `&[u8]` for a fixed master_key + session_id +
-        // purpose + nonce + plaintext, AND exercises
-        // `SessionCryptoContext::encrypt_bytes` (via the test-only nonce
-        // override) so the full production write path is asserted —
-        // session-key derivation, manifest-bound AAD, AEAD, JSON envelope,
-        // prefix. Drift in any of those would change the literal.
+        // Golden vector: pin the canonical `cse1:` payload bytes for fixed
+        // master_key + session_id + purpose + nonce + plaintext, exercised
+        // through the production `encrypt_bytes` path (test-only nonce
+        // override). The full chain is asserted: session-key derivation,
+        // manifest-bound AAD, AEAD, JSON envelope, prefix.
         let master_key: [u8; PASSWORD_DERIVED_KEY_LEN] =
             Sha256::digest(b"carapace-sessions-golden-master-key").into();
         let session_id = "session-golden-fixture";

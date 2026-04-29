@@ -320,16 +320,10 @@ mod tests {
 
     #[test]
     fn test_aead_blob_known_answer_vector_empty_aad() {
-        // True KAT: pin the canonical AES-256-GCM ciphertext-with-tag bytes
-        // for fixed key + nonce + plaintext + empty AAD to a hardcoded
-        // literal. The previous version computed expected via raw
-        // `Aes256Gcm::encrypt` on the right side and `encrypt_aead_blob_with_nonce_for_test`
-        // (which itself calls raw `Aes256Gcm::encrypt`) on the left, so any
-        // crate-level drift in `aes-gcm` would have moved both sides
-        // together and the assertion would still have passed.
-        //
-        // Regenerate by replacing this with `&[]`, running the test, and
-        // copying the value from the assertion's "actual" panic message.
+        // KAT: pin the AES-256-GCM ciphertext-with-tag bytes for fixed
+        // key + nonce + plaintext + empty AAD. To regenerate, replace
+        // EXPECTED_CIPHERTEXT with `&[]`, run the test, and copy the
+        // "actual" value from the assertion panic.
         const EXPECTED_CIPHERTEXT: &[u8] = &[
             223, 106, 180, 182, 174, 173, 98, 110, 145, 103, 141, 196, 65, 138, 204, 55, 177, 128,
             130, 170, 2, 209, 220, 213, 236, 81, 45, 35, 87, 3, 35, 237, 247, 103, 127, 125, 150,
@@ -344,14 +338,11 @@ mod tests {
 
     #[test]
     fn test_aead_blob_known_answer_vector_with_aad() {
-        // True KAT: pin the canonical AES-256-GCM ciphertext-with-tag bytes
-        // for fixed key + nonce + plaintext + AAD to a hardcoded literal. A
-        // round-trip assertion alone could pass even if `msg` and `aad` were
-        // silently swapped at the AEAD boundary, so this also pins the
-        // exact wire bytes against drift.
-        //
-        // Regenerate by replacing this with `&[0xDE, 0xAD]`, running the
-        // test, and copying the value from the assertion's "actual" panic.
+        // KAT: pin the AAD-bound ciphertext-with-tag bytes. Pinning the
+        // literal (rather than only round-tripping) catches a regression
+        // that silently swapped `msg` and `aad` at the AEAD boundary —
+        // round-trip alone would still pass under a swapped convention.
+        // Regenerate as for the empty-AAD KAT above.
         const EXPECTED_CIPHERTEXT_WITH_AAD: &[u8] = &[
             223, 106, 180, 182, 174, 173, 98, 110, 145, 103, 141, 196, 65, 138, 204, 55, 177, 128,
             130, 170, 2, 209, 220, 213, 236, 81, 45, 212, 153, 81, 215, 125, 195, 204, 219, 130,

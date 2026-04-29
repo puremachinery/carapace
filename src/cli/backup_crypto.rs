@@ -228,12 +228,8 @@ pub fn decrypt_backup(
 
     let key = Zeroizing::new(derive_key(version, passphrase.as_bytes(), salt)?);
 
-    // The preceding `split_at(NONCE_LEN)` constructs `nonce_bytes` as
-    // exactly `NONCE_LEN` bytes when the earlier header-length check
-    // (`HEADER_LEN`) has already passed, so this conversion is provably
-    // infallible. `expect` is appropriate here — mapping to a header-shape
-    // error variant would be misleading because the magic and version were
-    // already validated above.
+    // `HEADER_LEN` was already verified above and `split_at(NONCE_LEN)`
+    // yields exactly `NONCE_LEN` bytes, so this conversion cannot fail.
     let nonce: [u8; NONCE_LEN] = nonce_bytes
         .try_into()
         .expect("split_at(NONCE_LEN) yields exactly NONCE_LEN bytes after header validation");
@@ -721,12 +717,13 @@ mod tests {
 
     #[test]
     fn test_crpc_enc_persisted_layout_golden_vector() {
-        // True golden vector: pins the full canonical `CRPC_ENC` byte
-        // sequence to a hardcoded literal `&[u8]` for a fixed key + salt +
-        // nonce + plaintext. The actual bytes come from the *production*
-        // envelope-writer (`build_encrypted_backup_bytes_for_test`), so any
-        // drift in MAGIC, FORMAT_VERSION, segment ordering, or AEAD output
-        // would break the assertion against the literal.
+        // Golden vector: pin the canonical `CRPC_ENC` byte sequence for
+        // fixed key + salt + nonce + plaintext, with the actual bytes
+        // produced via the production envelope writer
+        // (`build_encrypted_backup_bytes_for_test` shares
+        // `write_encrypted_backup_bytes` with `encrypt_backup`). Drift in
+        // MAGIC, FORMAT_VERSION, segment ordering, or AEAD output fails
+        // this test.
         let key: [u8; KEY_LEN] = sha2::Sha256::digest(b"carapace-backup-golden-key").into();
         let salt_digest = sha2::Sha256::digest(b"carapace-backup-golden-salt");
         let salt: [u8; SALT_LEN] = salt_digest.into();

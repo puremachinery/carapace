@@ -1382,13 +1382,11 @@ mod tests {
 
     #[test]
     fn test_enc_v2_persisted_format_golden_vector() {
-        // True golden vector: pins the canonical `enc:v2:` envelope to a
-        // hardcoded literal string for a fixed key + salt + nonce +
-        // plaintext, and computes the actual envelope through the
-        // *production* `SecretStore` write path (with a test-only nonce
-        // override). Any drift in the helper's AEAD bytes, the envelope
-        // segment ordering, the base64 alphabet, or the prefix would change
-        // the literal and the assertion would fail.
+        // Golden vector: pin the canonical `enc:v2:` envelope for fixed
+        // key + salt + nonce + plaintext, with the actual envelope produced
+        // via the production `SecretStore::encrypt` path (test-only nonce
+        // override). Drift in AEAD bytes, segment ordering, base64
+        // alphabet, or prefix all change the literal and fail this test.
         let key: [u8; PASSWORD_DERIVED_KEY_LEN] =
             sha2::Sha256::digest(b"carapace-secrets-golden-key").into();
         let salt_digest = sha2::Sha256::digest(b"carapace-secrets-golden-salt");
