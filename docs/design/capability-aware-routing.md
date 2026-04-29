@@ -85,13 +85,15 @@ JSON-RPC surface (e.g. `imageGeneration`).
 A new optional sub-key under the existing `routes` object:
 
 ```json5
+// Model IDs are placeholders — substitute the current versioned IDs
+// for whatever providers a future implementation supports.
 routes: {
-  fast: { model: "anthropic:claude-sonnet-4-20250514" },
-  smart: { model: "anthropic:claude-opus-4-20250514" },
+  fast: { model: "anthropic:claude-sonnet" },
+  smart: { model: "anthropic:claude-opus" },
   byCapability: {
     vision:             { route: "smart" },
-    imageGeneration:    { model: "venice:flux-1.1-pro" },
-    audioTranscription: { model: "openai:whisper-1" },
+    imageGeneration:    { model: "venice:flux" },
+    audioTranscription: { model: "openai:whisper" },
     reasoning:          { route: "smart" },
   },
 },
@@ -130,7 +132,7 @@ as-drafted order puts per-agent capability override above the agent's
 own default `route` / `model`. That means a caller declaring `vision`
 on a request can silently redirect traffic away from the agent's named
 route to whatever `agent.capabilityRoutes.vision` points at. Capability
-routing is billing-relevant (see §5 and O5), so this is a deliberate
+routing is billing-relevant (see O5), so this is a deliberate
 precedence choice that any implementation must call out explicitly in
 operator-facing docs and in usage tracking. If this design is revived,
 the implementation issue should decide whether the operator gets at
