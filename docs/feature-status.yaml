@@ -78,6 +78,7 @@ feature_inventory_markdown: |
   - [x] **restore** — extract backup with path traversal protection
   - [x] **reset** — clear sessions/cron/usage/memory
   - [x] **setup** — interactive provider-first configuration wizard, including Codex subscription-login and Gemini API-key or Google sign-in onboarding
+  - [x] **import** — configuration import from OpenClaw, OpenCode, Aider, NemoClaw with previewed mappings
   - [x] **pair** — device identity handshake + node pairing initiation (remote gateways supported)
   - [x] **update** — version check and self-update
   - [x] **chat** — interactive local REPL session over WebSocket

@@ -11,6 +11,7 @@
 //! - `restore` -- restore from a backup archive
 //! - `reset` -- clear specific data categories
 //! - `setup` -- interactive first-run configuration wizard
+//! - `import` -- import configuration from another tool
 //! - `pair` -- pair with a remote gateway node
 //! - `update` -- check for updates or self-update
 //! - `task` -- manage long-running objective tasks
@@ -215,9 +216,32 @@ pub enum Command {
         telegram_to: Option<String>,
     },
 
+    /// Import configuration from another tool.
+    Import {
+        /// Source tool to import from.
+        #[arg(value_enum)]
+        source: ImportSource,
+
+        /// Overwrite existing Carapace configuration if it already exists.
+        #[arg(long)]
+        force: bool,
+    },
+
     /// Manage mTLS certificates for gateway-to-gateway communication.
     #[command(subcommand)]
     Tls(TlsCommand),
+}
+
+#[derive(clap::ValueEnum, Clone, Debug)]
+pub enum ImportSource {
+    /// Import from OpenClaw (~/.openclaw/ or ~/.clawdbot/).
+    Openclaw,
+    /// Import from OpenCode (~/.opencode.json).
+    Opencode,
+    /// Import from Aider (~/.aider.conf.yml and .env).
+    Aider,
+    /// Import from NemoClaw (~/.nemoclaw/config.json).
+    Nemoclaw,
 }
 
 #[derive(Subcommand, Debug)]
@@ -7443,6 +7467,242 @@ fn configure_provider_noninteractive(
     Ok(ProviderSetupResult::default())
 }
 
+/// Run the `import openclaw` subcommand.
+pub fn handle_import_openclaw(force: bool) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::migration::openclaw;
+
+    let discovery = match openclaw::discover() {
+        Some(d) => d,
+        None => {
+            eprintln!("No OpenClaw installation found.");
+            eprintln!(
+                "Checked: ~/.openclaw/, ~/.clawdbot/, $OPENCLAW_CONFIG_PATH, $OPENCLAW_STATE_DIR"
+            );
+            return Err("no OpenClaw config found".into());
+        }
+    };
+
+    println!("Found OpenClaw config: {}", discovery.config_path.display());
+    if let Some(ref env) = discovery.env_path {
+        println!("Found .env file: {}", env.display());
+    }
+    if let Some(ref creds) = discovery.credentials_path {
+        println!("Found credentials: {}", creds.display());
+    }
+    println!();
+
+    let plan = openclaw::plan_import(&discovery);
+    execute_import_plan(plan, force)
+}
+
+/// Run the `import opencode` subcommand.
+pub fn handle_import_opencode(force: bool) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::migration::opencode;
+
+    let discovery = match opencode::discover() {
+        Some(d) => d,
+        None => {
+            eprintln!("No OpenCode installation found.");
+            eprintln!(
+                "Checked: ./.opencode.json, ~/.opencode.json, $XDG_CONFIG_HOME/opencode/, ~/.config/opencode/"
+            );
+            return Err("no OpenCode config found".into());
+        }
+    };
+
+    println!("Found OpenCode config: {}", discovery.config_path.display());
+    println!();
+
+    let plan = opencode::plan_import(&discovery);
+    execute_import_plan(plan, force)
+}
+
+/// Run the `import aider` subcommand.
+pub fn handle_import_aider(force: bool) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::migration::aider;
+
+    let discovery = match aider::discover() {
+        Some(d) => d,
+        None => {
+            eprintln!("No Aider installation found.");
+            eprintln!("Checked: ./.aider.conf.yml, ~/.aider.conf.yml, ./.env");
+            return Err("no Aider config found".into());
+        }
+    };
+
+    if let Some(ref config) = discovery.config_path {
+        println!("Found Aider config: {}", config.display());
+    }
+    if let Some(ref env) = discovery.env_path {
+        println!("Found .env file: {}", env.display());
+    }
+    println!();
+
+    let plan = aider::plan_import(&discovery);
+    execute_import_plan(plan, force)
+}
+
+/// Run the `import nemoclaw` subcommand.
+pub fn handle_import_nemoclaw(force: bool) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::migration::nemoclaw;
+
+    let discovery = match nemoclaw::discover() {
+        Some(d) => d,
+        None => {
+            eprintln!("No NemoClaw installation found.");
+            eprintln!("Checked: ~/.nemoclaw/config.json");
+            return Err("no NemoClaw config found".into());
+        }
+    };
+
+    println!("Found NemoClaw config: {}", discovery.config_path.display());
+    println!();
+
+    let plan = nemoclaw::plan_import(&discovery);
+    execute_import_plan(plan, force)
+}
+
+fn execute_import_plan(
+    plan: crate::migration::ImportPlan,
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config_path = config::get_config_path();
+    if config_path.exists() && !force {
+        eprintln!(
+            "Carapace config already exists at {}.",
+            config_path.display()
+        );
+        eprintln!("Use --force to overwrite, or edit the existing config manually.");
+        return Err("existing config found; use --force to overwrite".into());
+    }
+
+    for warning in &plan.warnings {
+        eprintln!("Warning: {warning}");
+    }
+
+    if plan.is_empty() && plan.skipped.is_empty() {
+        println!(
+            "No importable configuration found in the {} config.",
+            plan.source_name
+        );
+        return Ok(());
+    }
+
+    if !plan.mappings.is_empty() {
+        println!("The following fields will be imported:\n");
+        println!(
+            "  {:<45} {:<30} Value",
+            format!("{} source", plan.source_name),
+            "Carapace key"
+        );
+        println!(
+            "  {:<45} {:<30} {}",
+            "-".repeat(44),
+            "-".repeat(29),
+            "-".repeat(20)
+        );
+        for mapping in &plan.mappings {
+            let display_value = if mapping.sensitive {
+                "[REDACTED]".to_string()
+            } else {
+                mapping
+                    .value
+                    .as_str()
+                    .map(|s| truncate_display(s, 40))
+                    .unwrap_or_else(|| mapping.value.to_string())
+            };
+            println!(
+                "  {:<45} {:<30} {}",
+                truncate_display(&mapping.source_path, 44),
+                mapping.carapace_key,
+                display_value
+            );
+        }
+        println!();
+    }
+
+    if !plan.skipped.is_empty() {
+        println!("Skipped (no Carapace mapping):\n");
+        for skipped in &plan.skipped {
+            println!("  {} - {}", skipped.source_path, skipped.reason);
+        }
+        println!();
+    }
+
+    if plan.is_empty() {
+        println!("No importable fields found after scanning.");
+        return Ok(());
+    }
+
+    if !prompt_yes_no(
+        &format!(
+            "Write {} field(s) to {}?",
+            plan.mappings.len(),
+            config_path.display()
+        ),
+        true,
+    )? {
+        println!("Import cancelled.");
+        return Ok(());
+    }
+
+    let mut config = plan.build_carapace_config();
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if let Err(e) = config::seal_config_secrets(&mut config) {
+        return Err(format!("Failed to encrypt secrets: {e}").into());
+    }
+    let content = json5::to_string(&config)?;
+    write_config_restricted(&config_path, &content)?;
+
+    println!("\nConfig written to {}", config_path.display());
+    println!();
+    println!("Next steps:");
+    println!("  cara verify    - validate that imported providers work");
+    println!("  cara status    - check gateway health after starting");
+    println!("  cara setup     - reconfigure or add providers interactively");
+
+    Ok(())
+}
+
+fn truncate_display(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{truncated}...")
+    }
+}
+
+fn write_config_restricted(
+    path: &std::path::Path,
+    content: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(content.as_bytes())?;
+    }
+    #[cfg(not(unix))]
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
+        file.write_all(content.as_bytes())?;
+    }
+    Ok(())
+}
+
 /// Run the `setup` subcommand -- interactive first-run wizard.
 pub fn handle_setup(
     force: bool,
@@ -8386,6 +8646,43 @@ mod tests {
             cli.command,
             Some(Command::Config(ConfigCommand::Path))
         ));
+    }
+
+    #[test]
+    fn test_cli_import_sources() {
+        for (source_arg, expected_source) in [
+            ("openclaw", ImportSource::Openclaw),
+            ("opencode", ImportSource::Opencode),
+            ("aider", ImportSource::Aider),
+            ("nemoclaw", ImportSource::Nemoclaw),
+        ] {
+            let cli = Cli::try_parse_from(["cara", "import", source_arg]).unwrap();
+            match cli.command {
+                Some(Command::Import { source, force }) => {
+                    assert!(matches!(
+                        (source, expected_source),
+                        (ImportSource::Openclaw, ImportSource::Openclaw)
+                            | (ImportSource::Opencode, ImportSource::Opencode)
+                            | (ImportSource::Aider, ImportSource::Aider)
+                            | (ImportSource::Nemoclaw, ImportSource::Nemoclaw)
+                    ));
+                    assert!(!force);
+                }
+                other => panic!("Expected Import, got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn test_cli_import_force() {
+        let cli = Cli::try_parse_from(["cara", "import", "openclaw", "--force"]).unwrap();
+        match cli.command {
+            Some(Command::Import { source, force }) => {
+                assert!(matches!(source, ImportSource::Openclaw));
+                assert!(force);
+            }
+            other => panic!("Expected Import, got {:?}", other),
+        }
     }
 
     #[test]

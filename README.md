@@ -97,7 +97,8 @@ verify), cross-platform subprocess sandboxing, guided setup
 (OpenAI subscription login via CLI and Control UI), Vertex AI provider
 support, per-channel activity features with Signal typing indicators and
 append-time read receipts, guarded filesystem tools for explicit workspace
-roots, named execution routes, and session encryption at rest.
+roots, named execution routes, session encryption at rest, and configuration
+import from OpenClaw, OpenCode, Aider, and NemoClaw.
 
 ## Docs
 

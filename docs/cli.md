@@ -37,6 +37,38 @@ All model references require explicit `provider:model` routing (e.g.
 
 For the full setup flow and decision guidance, use [First Run](site/first-run.md).
 
+### `cara import`
+Import configuration from another tool into Carapace.
+
+```bash
+cara import <source> [--force]
+```
+
+Supported sources:
+- `openclaw` — imports from `~/.openclaw/openclaw.json`, `.env`, and
+  `~/.clawdbot/`. Maps provider API keys, channel tokens, gateway auth, model
+  selection, and env-block secrets. Supports JSON5 config and dotenv files.
+- `opencode` — imports from `~/.opencode.json` (home, XDG, or local project).
+  Maps provider API keys and the coder agent model.
+- `aider` — imports from `~/.aider.conf.yml` (home or project) and `.env`.
+  Maps API keys and model from YAML and dotenv with litellm model ID
+  remapping.
+- `nemoclaw` — imports from `~/.nemoclaw/config.json`. Resolves credentials
+  from the env var named in `credentialEnv`. Maps Anthropic, OpenAI, Gemini,
+  and Ollama endpoints.
+
+The import flow:
+1. Discovers the source config on disk
+2. Shows a preview table of mapped fields (secrets redacted) and skipped
+   surfaces with reasons
+3. Asks for confirmation before writing
+4. Writes Carapace config with restricted file permissions and secret
+   encryption
+
+Use `--force` to overwrite an existing Carapace config.
+
+After import, run `cara verify` to validate the imported providers work.
+
 ### `cara verify`
 Run first-run outcome checks with pass/fail output and next-step guidance.
 

@@ -17,7 +17,14 @@ use crate::config;
 use crate::server::bind::DEFAULT_PORT;
 
 /// Available wizard types
-pub const WIZARD_TYPES: [&str; 5] = ["setup", "channel", "agent", "provider", "plugin"];
+pub const WIZARD_TYPES: [&str; 6] = [
+    "setup",
+    "channel",
+    "agent",
+    "provider",
+    "plugin",
+    "migration",
+];
 
 /// Wizard timeout in seconds (30 minutes)
 const WIZARD_TIMEOUT_SECS: u64 = 1800;
