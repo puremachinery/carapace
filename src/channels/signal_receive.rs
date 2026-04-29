@@ -1588,8 +1588,6 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_signal_receive_loop_reload_affects_future_polls_and_messages_only() {
-        crate::config::clear_cache();
-
         let initial_config = serde_json::json!({
             "channels": {
                 "signal": {
@@ -1601,7 +1599,7 @@ mod tests {
                 }
             }
         });
-        crate::config::update_cache(initial_config.clone(), initial_config);
+        let fixture = crate::test_support::config::StableConfigFixture::new(initial_config);
 
         let requests = Arc::new(Mutex::new(Vec::new()));
         let responses = Arc::new(Mutex::new(VecDeque::from(vec![
@@ -1677,7 +1675,7 @@ mod tests {
                 }
             }
         });
-        crate::config::update_cache(reloaded_config.clone(), reloaded_config);
+        fixture.update(reloaded_config);
 
         wait_for_condition(Duration::from_secs(2), || {
             state
@@ -1728,8 +1726,6 @@ mod tests {
             receipt_tasks[0].payload["context"]["timestamp"].as_u64(),
             Some(1706745601000_u64)
         );
-
-        crate::config::clear_cache();
     }
 
     #[tokio::test(flavor = "current_thread")]

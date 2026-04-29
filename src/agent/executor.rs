@@ -1620,6 +1620,8 @@ mod tests {
         events: Mutex<Vec<&'static str>>,
         send_notify: Notify,
         mark_read_notify: Notify,
+        start_notify: Notify,
+        stop_notify: Notify,
     }
 
     impl ActivityRecordingChannel {
@@ -1628,6 +1630,8 @@ mod tests {
                 events: Mutex::new(Vec::new()),
                 send_notify: Notify::new(),
                 mark_read_notify: Notify::new(),
+                start_notify: Notify::new(),
+                stop_notify: Notify::new(),
             }
         }
 
@@ -1680,11 +1684,13 @@ mod tests {
 
         fn start_typing(&self, _ctx: TypingContext) -> Result<(), BindingError> {
             self.record("start");
+            self.start_notify.notify_one();
             Ok(())
         }
 
         fn stop_typing(&self, _ctx: TypingContext) -> Result<(), BindingError> {
             self.record("stop");
+            self.stop_notify.notify_one();
             Ok(())
         }
 
@@ -2236,28 +2242,23 @@ mod tests {
         assert_eq!(run.response, "The time is now.");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_execute_run_channel_activity_lifecycle_orders_stop_before_delivery() {
-        let _config_guard = crate::test_support::config::ScopedConfigCache::new();
-        crate::config::clear_cache();
-        crate::config::update_cache(
-            serde_json::json!({
-                "channels": {
-                    "signal": {
-                        "features": {
-                            "typing": {
-                                "enabled": true,
-                                "intervalSeconds": 30
-                            },
-                            "readReceipts": {
-                                "enabled": true
-                            }
+        let _fixture = crate::test_support::config::StableConfigFixture::new(serde_json::json!({
+            "channels": {
+                "signal": {
+                    "features": {
+                        "typing": {
+                            "enabled": true,
+                            "intervalSeconds": 30
+                        },
+                        "readReceipts": {
+                            "enabled": true
                         }
                     }
                 }
-            }),
-            serde_json::json!({}),
-        );
+            }
+        }));
 
         let plugin = Arc::new(ActivityRecordingChannel::new());
         let plugin_registry = Arc::new(PluginRegistry::new());
@@ -2298,6 +2299,23 @@ mod tests {
         .await;
         assert!(result.is_ok(), "execute_run failed: {:?}", result.err());
 
+        // Structural lifecycle awaits: each `Notify` stores a permit on
+        // `notify_one`, so this is order-independent for correctness but
+        // ordered here for readability. By the time `execute_run` returns,
+        // typing has already started and stopped; only delivery is still in
+        // flight on the spawned `delivery_loop`.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            plugin.start_notify.notified(),
+        )
+        .await
+        .expect("typing start should be observed before assertions");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            plugin.stop_notify.notified(),
+        )
+        .await
+        .expect("typing stop should be observed before delivery is queued");
         tokio::time::timeout(
             std::time::Duration::from_secs(2),
             plugin.send_notify.notified(),
@@ -2315,31 +2333,25 @@ mod tests {
         state.shutdown_activity_service().await;
 
         assert_eq!(plugin.events(), vec!["start", "stop", "send"]);
-        crate::config::clear_cache();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_inbound_signal_read_receipt_is_sent_before_typing_starts() {
-        let _config_guard = crate::test_support::config::ScopedConfigCache::new();
-        crate::config::clear_cache();
-        crate::config::update_cache(
-            serde_json::json!({
-                "channels": {
-                    "signal": {
-                        "features": {
-                            "typing": {
-                                "enabled": true,
-                                "intervalSeconds": 30
-                            },
-                            "readReceipts": {
-                                "enabled": true
-                            }
+        let _fixture = crate::test_support::config::StableConfigFixture::new(serde_json::json!({
+            "channels": {
+                "signal": {
+                    "features": {
+                        "typing": {
+                            "enabled": true,
+                            "intervalSeconds": 30
+                        },
+                        "readReceipts": {
+                            "enabled": true
                         }
                     }
                 }
-            }),
-            serde_json::json!({}),
-        );
+            }
+        }));
 
         let plugin = Arc::new(ActivityRecordingChannel::new());
         let plugin_registry = Arc::new(PluginRegistry::new());
@@ -2379,6 +2391,13 @@ mod tests {
         .await
         .expect("inbound dispatch should succeed");
 
+        // Wait for the read receipt to be observed before asserting ordering.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            plugin.mark_read_notify.notified(),
+        )
+        .await
+        .expect("read receipt should fire before run starts");
         assert_eq!(
             plugin.events(),
             vec!["read"],
@@ -2418,6 +2437,23 @@ mod tests {
         .await;
         assert!(result.is_ok(), "execute_run failed: {:?}", result.err());
 
+        // Wait for the run's typing lifecycle to be observed before asserting.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            plugin.start_notify.notified(),
+        )
+        .await
+        .expect("typing start should be observed");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            plugin.stop_notify.notified(),
+        )
+        .await
+        .expect("typing stop should be observed");
+        assert!(
+            state.message_pipeline().channels_with_messages().is_empty(),
+            "empty provider response should not queue outbound delivery"
+        );
         assert_eq!(
             plugin.events(),
             vec!["read", "start", "stop"],
@@ -2432,31 +2468,25 @@ mod tests {
             .send(true)
             .expect("read receipt worker shutdown signal should send");
         state.shutdown_activity_service().await;
-        crate::config::clear_cache();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_execute_run_skips_channel_activity_when_delivery_disabled() {
-        let _config_guard = crate::test_support::config::ScopedConfigCache::new();
-        crate::config::clear_cache();
-        crate::config::update_cache(
-            serde_json::json!({
-                "channels": {
-                    "signal": {
-                        "features": {
-                            "typing": {
-                                "enabled": true,
-                                "intervalSeconds": 30
-                            },
-                            "readReceipts": {
-                                "enabled": true
-                            }
+        let _fixture = crate::test_support::config::StableConfigFixture::new(serde_json::json!({
+            "channels": {
+                "signal": {
+                    "features": {
+                        "typing": {
+                            "enabled": true,
+                            "intervalSeconds": 30
+                        },
+                        "readReceipts": {
+                            "enabled": true
                         }
                     }
                 }
-            }),
-            serde_json::json!({}),
-        );
+            }
+        }));
 
         let plugin = Arc::new(ActivityRecordingChannel::new());
         let plugin_registry = Arc::new(PluginRegistry::new());
@@ -2498,8 +2528,6 @@ mod tests {
             plugin.events().is_empty(),
             "deliver=false should not emit typing or read-receipt channel activity"
         );
-
-        crate::config::clear_cache();
     }
 
     #[tokio::test]
