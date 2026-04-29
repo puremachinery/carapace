@@ -2100,10 +2100,6 @@ pub(super) fn handle_agent(
         },
     ) {
         e.log_configuration_hint();
-        // `error_shape` derives `retryable` from `code == ERROR_UNAVAILABLE`,
-        // so emitting a typed wire code (e.g. "unknown_route") correctly
-        // surfaces `retryable: false` — config errors need operator
-        // intervention, not retry.
         let code = e.wire_code().unwrap_or(ERROR_UNAVAILABLE);
         return Err(error_shape(code, &e.to_string(), None));
     }
@@ -3168,13 +3164,9 @@ mod tests {
         }
     }
 
-    /// Integration test for issue #406: when the WS `handle_agent` path
-    /// hits a route-resolution error, the resulting `ErrorShape` must
-    /// carry the typed wire code (`unknown_route`) and `retryable: false`.
-    /// Exercises the full handler, not just the `wire_code()` helper, so a
-    /// regression that reverted the dispatch from
-    /// `e.wire_code().unwrap_or(ERROR_UNAVAILABLE)` back to a fixed
-    /// `ERROR_UNAVAILABLE` would fail this assertion.
+    /// `handle_agent` surfaces `unknown_route` with `retryable: false`
+    /// end-to-end when the request references a route name not in the
+    /// routes config.
     #[test]
     fn test_handle_agent_unknown_route_returns_typed_code() {
         // Empty config — no routes, no defaults.
@@ -3192,9 +3184,8 @@ mod tests {
         assert!(!err.retryable);
     }
 
-    /// Companion to the unknown-route test for issue #406. With no route
-    /// or model anywhere, `resolve_execution_target` returns `MissingModel`
-    /// which surfaces as `error.code: "missing_model"` on the WS wire.
+    /// `handle_agent` surfaces `missing_model` with `retryable: false`
+    /// end-to-end when no route or model resolves anywhere.
     #[test]
     fn test_handle_agent_missing_model_returns_typed_code() {
         let _fixture = crate::test_support::config::StableConfigFixture::new(serde_json::json!({}));

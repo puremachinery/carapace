@@ -152,11 +152,7 @@ fn test_error_shape() {
     assert!(err2.details.is_some());
 }
 
-/// Regression for issue #405: `rate_limited` must surface
-/// `retryable: true` on the wire. Previously `error_shape` derived
-/// retryability from `code == ERROR_UNAVAILABLE` only, so `rate_limited`
-/// silently produced `retryable: false` despite the protocol doc
-/// claiming the opposite. The `RETRYABLE_CODES` set fixes this.
+/// `rate_limited` must surface `retryable: true` on the wire.
 #[test]
 fn test_error_shape_rate_limited_is_retryable() {
     let err = error_shape(ERROR_RATE_LIMITED, "rate limit exceeded", None);
@@ -167,10 +163,9 @@ fn test_error_shape_rate_limited_is_retryable() {
     );
 }
 
-/// Configuration-error codes (`unknown_route`, `missing_model`) are
-/// intentionally NOT retryable — they require operator intervention.
-/// Asserting both rules out a future change to `RETRYABLE_CODES` that
-/// would silently mis-classify domain codes as retryable.
+/// Configuration-error codes (`unknown_route`, `missing_model`) must
+/// surface `retryable: false`. Pinning both rules out a future change
+/// to `RETRYABLE_CODES` that mis-classifies domain codes as retryable.
 #[test]
 fn test_error_shape_config_errors_are_not_retryable() {
     let err = error_shape("unknown_route", "requested route is not configured", None);

@@ -89,16 +89,19 @@ const ERROR_NOT_LINKED: &str = "not_linked";
 
 /// Wire codes whose `retryable` field is `true` in the error response.
 ///
-/// Adding a new retryable code requires extending this list — codes not
-/// listed here surface as `retryable: false` regardless of intent. Keeping
-/// the classification explicit prevents silent doc-vs-wire drift (issue
-/// #405): a previous version derived `retryable` from `code == ERROR_UNAVAILABLE`
-/// alone, which silently produced `retryable: false` for `rate_limited`
-/// despite the protocol doc claiming the opposite.
+/// Adding a new retryable code requires extending this list — unlisted
+/// codes surface as `retryable: false`. The slice is the single source
+/// of truth for retryable classification; `error_shape` consults it via
+/// `wire_code_is_retryable`. Domain-level codes from
+/// `AgentConfigurationError` (e.g. `unknown_route`, `missing_model`)
+/// are intentionally absent — config errors require operator
+/// intervention, not retry.
 ///
-/// Domain-level codes from `AgentConfigurationError` (e.g. `unknown_route`,
-/// `missing_model`) are intentionally NOT retryable — they require operator
-/// intervention.
+/// A typed-enum alternative (variants carrying retryability as a method)
+/// would compile-time-enforce the classification but require migrating
+/// every `error_shape` call site away from `&'static str`. The slice is
+/// the smaller, grep-able shape that fits the existing `const ERROR_*`
+/// convention.
 const RETRYABLE_CODES: &[&str] = &[ERROR_UNAVAILABLE, ERROR_RATE_LIMITED];
 
 /// Returns `true` if a wire code should surface `retryable: true` to clients.
