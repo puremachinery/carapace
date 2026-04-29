@@ -186,11 +186,12 @@ both the prose and the resolver pseudocode.
 
 ### O3. Configuration error must not surface as `AgentError::Provider` (medium)
 
-`AgentError::Provider` messages flow to external callers via
-`src/server/openai.rs` and the WS layer. Including a literal config-key
-path like `routes.byCapability.<bucket>` in the surfaced message leaks
-internal configuration topology to anyone who can probe the API — a
-low-value but real information leak in a security-first gateway.
+`AgentError::Provider` messages flow to external callers from the
+HTTP and WebSocket layers (concrete sites listed below). Including a
+literal config-key path like `routes.byCapability.<bucket>` in the
+surfaced message leaks internal configuration topology to anyone who
+can probe the API — a low-value but real information leak in a
+security-first gateway.
 
 **This is a current-codebase concern, not just a future one** — and
 it is being tracked separately at higher urgency than this deferred
@@ -198,8 +199,20 @@ design doc implies.
 
 `src/config/routes.rs` already surfaces config-key-path remediation
 hints through `AgentError::Provider` for two error paths that reach
-external callers today via `src/server/openai.rs:~742` and the
-streaming SSE path:
+external callers today. `resolve_execution_target` is called from
+`resolve_agent_model` (`src/agent/mod.rs:254`), and the resulting
+`AgentError` is fmt-stringified to external callers via:
+
+- HTTP: `src/server/http.rs:~1308` (`AgentResponse::error(&e.to_string())`)
+- WebSocket: `src/server/ws/handlers/sessions.rs:~2097` and `~2502`
+  (`error_shape(ERROR_UNAVAILABLE, &e.to_string(), None)`)
+
+Note this is **not** the OpenAI-compat provider-error surface
+(`src/server/openai.rs`); that path handles errors from
+`call_llm_provider`, not route-resolution. The two surfaces are
+disjoint.
+
+The two leaking error messages:
 
 - `unknown route "<name>"; define it in the top-level \`routes\` config
   map` (`src/config/routes.rs:~98`)
