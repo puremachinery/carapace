@@ -371,28 +371,21 @@ Events are broadcast to connected clients. See `src/server/ws/mod.rs` for implem
 ## Error Codes
 
 Wire codes are stable, lower_snake_case strings. Clients dispatch on the
-`error.code` field of the error response. The `Retryable` column reflects
-what `error_shape` actually emits on the wire today (currently
-hard-coded: `retryable: true` only when `code == "unavailable"`). Codes
-not emitted via `error_shape` are noted explicitly.
+`error.code` field of the error response. The `Retryable` column matches
+what `error_shape` emits on the wire — derived from the `RETRYABLE_CODES`
+set in `src/server/ws/mod.rs`. Adding a new retryable code requires
+extending that set.
 
 ### Top-level `error.code` values (emitted via `error_shape`)
 
-| Code | Description | Retryable on wire |
-|------|-------------|-------------------|
+| Code | Description | Retryable |
+|------|-------------|-----------|
 | `invalid_request` | Validation / protocol error | No |
 | `not_paired` | Device not paired | No |
 | `unavailable` | Service temporarily unavailable | Yes |
-| `rate_limited` | Per-resource rate limit exceeded | No (see note) |
+| `rate_limited` | Per-resource rate limit exceeded | Yes |
 | `unknown_route` | Request referenced a route not in the `routes` map | No |
 | `missing_model` | Resolution found no `route` or `model` for the request | No |
-
-*Note on `rate_limited`*: semantically the operation is retryable (with
-backoff / `Retry-After`), but `error_shape`'s current hard-coded
-retryable check produces `retryable: false`. Clients should treat
-`rate_limited` as retryable regardless of the field; a future fix
-will align the wire field with intent
-(tracked at [#405](https://github.com/puremachinery/carapace/issues/405)).
 
 ### Reserved codes (documented but not yet emitted)
 

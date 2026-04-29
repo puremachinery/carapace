@@ -2100,10 +2100,6 @@ pub(super) fn handle_agent(
         },
     ) {
         e.log_configuration_hint();
-        // `error_shape` derives `retryable` from `code == ERROR_UNAVAILABLE`,
-        // so emitting a typed wire code (e.g. "unknown_route") correctly
-        // surfaces `retryable: false` — config errors need operator
-        // intervention, not retry.
         let code = e.wire_code().unwrap_or(ERROR_UNAVAILABLE);
         return Err(error_shape(code, &e.to_string(), None));
     }
@@ -3166,6 +3162,43 @@ mod tests {
             },
             device_id: None,
         }
+    }
+
+    /// `handle_agent` surfaces `unknown_route` with `retryable: false`
+    /// end-to-end when the request references a route name not in the
+    /// routes config.
+    #[test]
+    fn test_handle_agent_unknown_route_returns_typed_code() {
+        // Empty config — no routes, no defaults.
+        let _fixture = crate::test_support::config::StableConfigFixture::new(serde_json::json!({}));
+        let (state, _tmp) = make_state_with_temp_sessions();
+        let conn = make_conn("conn-route-test");
+        let params = json!({
+            "message": "hello",
+            "idempotencyKey": "ws-route-test-1",
+            "route": "nonexistent-route-name"
+        });
+
+        let err = handle_agent(Some(&params), Arc::new(state), &conn).unwrap_err();
+        assert_eq!(err.code, "unknown_route");
+        assert!(!err.retryable);
+    }
+
+    /// `handle_agent` surfaces `missing_model` with `retryable: false`
+    /// end-to-end when no route or model resolves anywhere.
+    #[test]
+    fn test_handle_agent_missing_model_returns_typed_code() {
+        let _fixture = crate::test_support::config::StableConfigFixture::new(serde_json::json!({}));
+        let (state, _tmp) = make_state_with_temp_sessions();
+        let conn = make_conn("conn-model-test");
+        let params = json!({
+            "message": "hello",
+            "idempotencyKey": "ws-model-test-1"
+        });
+
+        let err = handle_agent(Some(&params), Arc::new(state), &conn).unwrap_err();
+        assert_eq!(err.code, "missing_model");
+        assert!(!err.retryable);
     }
 
     #[test]

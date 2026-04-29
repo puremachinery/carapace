@@ -152,6 +152,31 @@ fn test_error_shape() {
     assert!(err2.details.is_some());
 }
 
+/// `rate_limited` must surface `retryable: true` on the wire.
+#[test]
+fn test_error_shape_rate_limited_is_retryable() {
+    let err = error_shape(ERROR_RATE_LIMITED, "rate limit exceeded", None);
+    assert_eq!(err.code, "rate_limited");
+    assert!(
+        err.retryable,
+        "rate_limited must be retryable per RETRYABLE_CODES + #405"
+    );
+}
+
+/// Configuration-error codes (`unknown_route`, `missing_model`) must
+/// surface `retryable: false`. Pinning both rules out a future change
+/// to `RETRYABLE_CODES` that mis-classifies domain codes as retryable.
+#[test]
+fn test_error_shape_config_errors_are_not_retryable() {
+    let err = error_shape("unknown_route", "requested route is not configured", None);
+    assert_eq!(err.code, "unknown_route");
+    assert!(!err.retryable);
+
+    let err2 = error_shape("missing_model", "agent model is not configured", None);
+    assert_eq!(err2.code, "missing_model");
+    assert!(!err2.retryable);
+}
+
 #[test]
 fn test_canonicalize_ws_method_name_aliases() {
     assert_eq!(canonicalize_ws_method_name("agent.run"), "agent");

@@ -87,6 +87,28 @@ const ERROR_RATE_LIMITED: &str = "rate_limited";
 const ERROR_NOT_LINKED: &str = "not_linked";
 // Note: Node doesn't use ERROR_FORBIDDEN - use ERROR_INVALID_REQUEST for auth errors
 
+/// Wire codes whose `retryable` field is `true` in the error response.
+///
+/// Adding a new retryable code requires extending this list — unlisted
+/// codes surface as `retryable: false`. The slice is the single source
+/// of truth for retryable classification; `error_shape` consults it via
+/// `wire_code_is_retryable`. Domain-level codes from
+/// `AgentConfigurationError` (e.g. `unknown_route`, `missing_model`)
+/// are intentionally absent — config errors require operator
+/// intervention, not retry.
+///
+/// A typed-enum alternative (variants carrying retryability as a method)
+/// would compile-time-enforce the classification but require migrating
+/// every `error_shape` call site away from `&'static str`. The slice is
+/// the smaller, grep-able shape that fits the existing `const ERROR_*`
+/// convention.
+const RETRYABLE_CODES: &[&str] = &[ERROR_UNAVAILABLE, ERROR_RATE_LIMITED];
+
+/// Returns `true` if a wire code should surface `retryable: true` to clients.
+fn wire_code_is_retryable(code: &str) -> bool {
+    RETRYABLE_CODES.contains(&code)
+}
+
 const ALLOWED_CLIENT_IDS: [&str; 12] = [
     "webchat-ui",
     "carapace-control-ui",
@@ -3220,7 +3242,7 @@ fn error_shape(code: &'static str, message: &str, details: Option<Value>) -> Err
     ErrorShape {
         code,
         message: message.to_string(),
-        retryable: code == ERROR_UNAVAILABLE,
+        retryable: wire_code_is_retryable(code),
         details,
     }
 }
