@@ -2099,15 +2099,23 @@ pub(super) fn handle_agent(
             session_model: session.metadata.model.as_deref(),
         },
     ) {
-        return Err(error_shape(ERROR_UNAVAILABLE, &e.to_string(), None));
+        let code = match &e {
+            crate::agent::AgentError::Config(cfg_err) => cfg_err.wire_code(),
+            _ => ERROR_UNAVAILABLE,
+        };
+        return Err(error_shape(code, &e.to_string(), None));
     }
     crate::agent::apply_agent_config_from_settings(&mut config, &cfg, agent_id);
     if config.model.trim().is_empty() {
-        return Err(error_shape(
-            ERROR_UNAVAILABLE,
-            "no model configured; set `agents.defaults.model` in config or provide a `model` parameter",
-            None,
-        ));
+        // Defensive: see equivalent comment in `src/server/http.rs`. Surface
+        // the typed `ConfigError` so HTTP and WS produce consistent wire
+        // shapes for the same error.
+        let cfg_err = crate::agent::ConfigError::NoModelConfigured;
+        tracing::warn!(
+            "no model configured after resolve_agent_model; \
+             set `agents.defaults.model` in config or provide a `model` parameter"
+        );
+        return Err(error_shape(cfg_err.wire_code(), &cfg_err.to_string(), None));
     }
 
     let (run_id, session_key_out, cancel_token) = setup_agent_session(

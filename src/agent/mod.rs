@@ -41,11 +41,50 @@ pub use provider::{LlmProvider, StreamEvent};
 use tokio_util::sync::CancellationToken;
 pub use tool_policy::ToolPolicy;
 
+/// Configuration errors raised at the routing/model-resolution boundary.
+///
+/// These are surfaced to external API callers via the HTTP and WebSocket
+/// layers — `Display` deliberately produces wire-safe messages that do
+/// NOT name internal configuration-key paths (no `routes`, `top-level`,
+/// `agents.defaults.model`, etc.). Operator-facing remediation hints
+/// belong in `tracing::warn!` at the construction site, not in the
+/// returned error message. See issue #398.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ConfigError {
+    /// A request or session referenced a `route` name that is not in the
+    /// configured routes map.
+    #[error("unknown route \"{route}\"")]
+    UnknownRoute { route: String },
+
+    /// Resolution found neither a `route` nor a `model` in any scope, so
+    /// no backend model could be selected for the request.
+    #[error("no model configured for this request")]
+    NoModelConfigured,
+}
+
+impl ConfigError {
+    /// Stable wire-format error code surfaced to external callers in the
+    /// HTTP / WS error response. Documented as part of the public API
+    /// contract — clients may dispatch on these strings.
+    pub fn wire_code(&self) -> &'static str {
+        match self {
+            Self::UnknownRoute { .. } => "unknown_route",
+            Self::NoModelConfigured => "no_model_configured",
+        }
+    }
+}
+
 /// Errors that can occur during agent execution.
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
     #[error("LLM provider error: {0}")]
     Provider(String),
+
+    /// Configuration-resolution error. Carries a typed
+    /// [`ConfigError`] whose `Display` is wire-safe; the server layer
+    /// maps it to a stable `wire_code()` for external clients.
+    #[error("{0}")]
+    Config(#[from] ConfigError),
 
     #[error("session not found: {0}")]
     SessionNotFound(String),

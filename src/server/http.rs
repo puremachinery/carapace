@@ -1303,18 +1303,31 @@ async fn dispatch_agent_run(
             session_model: session.metadata.model.as_deref(),
         },
     ) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(AgentResponse::error(&e.to_string())),
-        )
-            .into_response());
+        let response = match &e {
+            crate::agent::AgentError::Config(cfg_err) => {
+                AgentResponse::error_with_code(cfg_err.wire_code(), &cfg_err.to_string())
+            }
+            other => AgentResponse::error(&other.to_string()),
+        };
+        return Err((StatusCode::BAD_REQUEST, Json(response)).into_response());
     }
     crate::agent::apply_agent_config_from_settings(&mut config, &cfg, None);
     if config.model.trim().is_empty() {
+        // Defensive: `resolve_agent_model` should have errored above if no
+        // model was configured. Reaching this branch means it succeeded but
+        // wrote an empty model — surface the same typed `ConfigError` so
+        // callers see a consistent wire shape and `tracing::warn!` carries
+        // the operator-facing remediation hint.
+        let cfg_err = crate::agent::ConfigError::NoModelConfigured;
+        tracing::warn!(
+            "no model configured after resolve_agent_model; \
+             set `agents.defaults.model` in config or provide a `model` parameter"
+        );
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(AgentResponse::error(
-                "no model configured; set `agents.defaults.model` in config or provide a model in the request",
+            Json(AgentResponse::error_with_code(
+                cfg_err.wire_code(),
+                &cfg_err.to_string(),
             )),
         )
             .into_response());

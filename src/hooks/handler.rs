@@ -96,6 +96,12 @@ pub struct AgentResponse {
     pub run_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Stable wire-format error code (e.g. `"unknown_route"`,
+    /// `"no_model_configured"`). Present only on structured errors that
+    /// have a documented code; absent on free-form errors. Clients may
+    /// dispatch on this string.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
 }
 
 impl AgentResponse {
@@ -104,6 +110,7 @@ impl AgentResponse {
             ok: true,
             run_id: Some(run_id),
             error: None,
+            error_code: None,
         }
     }
 
@@ -112,6 +119,19 @@ impl AgentResponse {
             ok: false,
             run_id: None,
             error: Some(msg.to_string()),
+            error_code: None,
+        }
+    }
+
+    /// Build an error response with both a wire-format code and a
+    /// human-readable message. Use this for typed errors that carry a
+    /// stable code clients can dispatch on (e.g. [`crate::agent::ConfigError`]).
+    pub fn error_with_code(code: &str, msg: &str) -> Self {
+        AgentResponse {
+            ok: false,
+            run_id: None,
+            error: Some(msg.to_string()),
+            error_code: Some(code.to_string()),
         }
     }
 }

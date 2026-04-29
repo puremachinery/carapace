@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
 
-use crate::agent::AgentError;
+use crate::agent::{AgentError, ConfigError};
 
 /// A named route — backend target + optional metadata.
 #[derive(Debug, Clone, Deserialize)]
@@ -95,10 +95,18 @@ pub fn resolve_execution_target(
             let route_name = route_name.trim();
             if !route_name.is_empty() {
                 let config = routes.get(route_name).ok_or_else(|| {
-                    AgentError::Provider(format!(
-                        "unknown route \"{route_name}\"; \
-                         define it in the top-level `routes` config map"
-                    ))
+                    // Operator-facing remediation hint: name the config key.
+                    // The wire-facing message (via `ConfigError::Display`) is
+                    // deliberately narrower — it does not embed `routes`,
+                    // `top-level`, or any other internal config-key path.
+                    tracing::warn!(
+                        route = %route_name,
+                        "unknown route requested; define it in the top-level \
+                         `routes` config map"
+                    );
+                    AgentError::Config(ConfigError::UnknownRoute {
+                        route: route_name.to_string(),
+                    })
                 })?;
                 return Ok(ResolvedRoute {
                     model: config.model.clone(),
@@ -117,12 +125,13 @@ pub fn resolve_execution_target(
         }
     }
 
-    Err(AgentError::Provider(
+    // Same operator/wire split as above.
+    tracing::warn!(
         "no model configured; set `route` or `model` in agent config or defaults \
          (e.g. `agents.defaults.route: \"fast\"` or \
          `agents.defaults.model: \"anthropic:claude-sonnet-4-20250514\"`)"
-            .to_string(),
-    ))
+    );
+    Err(AgentError::Config(ConfigError::NoModelConfigured))
 }
 
 /// Parse the top-level `routes` map from config. Returns empty map if not present.
@@ -339,6 +348,70 @@ mod tests {
         let err = resolve_execution_target(&routes, &inputs).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("no model configured"), "got: {msg}");
+    }
+
+    /// Regression for #398: the wire-format error message for both
+    /// `UnknownRoute` and `NoModelConfigured` must not embed any of the
+    /// internal config-key paths the leaky pre-#398 messages did.
+    #[test]
+    fn config_error_messages_do_not_leak_config_key_paths() {
+        let leak_substrings = [
+            "top-level",
+            "agent config or defaults",
+            "`routes`",
+            "`route`",
+            "`model`",
+            "agents.defaults",
+            "config map",
+        ];
+
+        // UnknownRoute case.
+        let routes = make_routes();
+        let inputs = RouteResolutionInputs {
+            agent: SelectorLevel {
+                route: Some("nonexistent"),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let unknown_route_err = resolve_execution_target(&routes, &inputs).unwrap_err();
+        let unknown_msg = unknown_route_err.to_string();
+        for needle in &leak_substrings {
+            assert!(
+                !unknown_msg.contains(needle),
+                "UnknownRoute wire message must not contain {needle:?}: got {unknown_msg:?}"
+            );
+        }
+
+        // NoModelConfigured case.
+        let empty_routes = HashMap::new();
+        let no_model_err =
+            resolve_execution_target(&empty_routes, &RouteResolutionInputs::default()).unwrap_err();
+        let no_model_msg = no_model_err.to_string();
+        for needle in &leak_substrings {
+            assert!(
+                !no_model_msg.contains(needle),
+                "NoModelConfigured wire message must not contain {needle:?}: got {no_model_msg:?}"
+            );
+        }
+    }
+
+    /// Stable wire-format codes for `ConfigError` are part of the public
+    /// API contract — clients dispatch on these strings.
+    #[test]
+    fn config_error_wire_codes_are_stable() {
+        use crate::agent::ConfigError;
+        assert_eq!(
+            ConfigError::UnknownRoute {
+                route: "x".to_string()
+            }
+            .wire_code(),
+            "unknown_route"
+        );
+        assert_eq!(
+            ConfigError::NoModelConfigured.wire_code(),
+            "no_model_configured"
+        );
     }
 
     #[test]
