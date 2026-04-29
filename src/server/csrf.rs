@@ -544,7 +544,7 @@ fn csrf_error_response(error: CsrfError) -> Response<Body> {
         StatusCode::FORBIDDEN,
         [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
         format!(
-            r#"{{"error":{{"code":"CSRF_ERROR","message":"{}"}}}}"#,
+            r#"{{"error":{{"code":"csrf_error","message":"{}"}}}}"#,
             message
         ),
     )

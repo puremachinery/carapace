@@ -561,7 +561,7 @@ fn rate_limit_exceeded_response(retry_after_secs: u64) -> Response<Body> {
             (header::RETRY_AFTER, &retry_after_secs.to_string()),
         ],
         format!(
-            r#"{{"error":{{"code":"RATE_LIMIT_EXCEEDED","message":"Too many requests","retryAfter":{}}}}}"#,
+            r#"{{"error":{{"code":"rate_limit_exceeded","message":"Too many requests","retryAfter":{}}}}}"#,
             retry_after_secs
         ),
     )

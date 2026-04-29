@@ -142,12 +142,12 @@ fn test_try_new_persistent_unloaded_builds_registries_before_activity_service() 
 #[test]
 fn test_error_shape() {
     let err = error_shape(ERROR_INVALID_REQUEST, "test error", None);
-    assert_eq!(err.code, "INVALID_REQUEST");
+    assert_eq!(err.code, "invalid_request");
     assert_eq!(err.message, "test error");
     assert!(!err.retryable);
 
     let err2 = error_shape(ERROR_UNAVAILABLE, "temp error", Some(json!({"foo": "bar"})));
-    assert_eq!(err2.code, "UNAVAILABLE");
+    assert_eq!(err2.code, "unavailable");
     assert!(err2.retryable);
     assert!(err2.details.is_some());
 }
@@ -909,7 +909,7 @@ fn test_method_authorization_error_contains_details() {
 
     assert!(result.is_err());
     let err = result.unwrap_err();
-    assert_eq!(err.code, "INVALID_REQUEST");
+    assert_eq!(err.code, "invalid_request");
     assert!(err.message.contains("config.set"));
     assert!(err.message.contains("write"));
     assert!(err.message.contains("read"));

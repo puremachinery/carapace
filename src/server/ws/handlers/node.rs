@@ -748,7 +748,7 @@ fn validate_node_command(
                 ERROR_UNAVAILABLE,
                 "node not connected",
                 Some(json!({
-                    "details": { "nodeId": node_id, "nodeError": { "code": "NOT_CONNECTED" } }
+                    "details": { "nodeId": node_id, "nodeError": { "code": "not_connected" } }
                 })),
             )
         })?;
@@ -829,7 +829,7 @@ async fn await_node_invoke_result(
             payload: None,
             payload_json: None,
             error: Some(NodeInvokeError {
-                code: Some("UNAVAILABLE".to_string()),
+                code: Some("unavailable".to_string()),
                 message: Some("node invoke failed".to_string()),
             }),
         },
@@ -839,7 +839,7 @@ async fn await_node_invoke_result(
                 ERROR_UNAVAILABLE,
                 "node invoke timed out",
                 Some(json!({
-                    "details": { "code": "TIMEOUT", "nodeId": node_id, "command": command }
+                    "details": { "code": "timeout", "nodeId": node_id, "command": command }
                 })),
             ));
         }
@@ -933,7 +933,7 @@ pub(crate) async fn handle_node_invoke(
                 "details": {
                     "nodeId": invoke_params.node_id,
                     "command": invoke_params.command,
-                    "nodeError": { "code": "UNAVAILABLE" }
+                    "nodeError": { "code": "unavailable" }
                 }
             })),
         ));

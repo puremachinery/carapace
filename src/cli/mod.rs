@@ -2086,7 +2086,7 @@ async fn connect_cli_ws_authenticated(
         .await?;
 
     if let Err(err) = await_ws_response_with_error(&mut ws_read, &mut ws_write, "connect-1").await {
-        let message = if err.code.as_deref() == Some("NOT_PAIRED")
+        let message = if err.code.as_deref() == Some("not_paired")
             && err.message.contains("pairing required")
         {
             let mut message =
@@ -8240,7 +8240,7 @@ pub async fn handle_pair(
         .send(Message::Text(serde_json::to_string(&connect_frame)?.into()))
         .await?;
     if let Err(err) = await_ws_response_with_error(&mut ws_read, &mut ws_write, "connect-1").await {
-        if err.code.as_deref() == Some("NOT_PAIRED") && err.message.contains("pairing required") {
+        if err.code.as_deref() == Some("not_paired") && err.message.contains("pairing required") {
             eprintln!("Device pairing required for this CLI.");
             if let Some(details) = err.details.as_ref() {
                 if let Some(request_id) = extract_pairing_request_id(details) {
