@@ -657,8 +657,21 @@ fn handle_provider_reload(ws_state: &Arc<WsServerState>, state: &mut ReloadState
 }
 
 /// Restore the cache and process env to the last-known-good snapshot.
+///
+/// Disabled-cache caveat: when `CARAPACE_DISABLE_CONFIG_CACHE` is set,
+/// `load_config_shared` / `load_raw_config_shared` skip `CONFIG_CACHE` and
+/// re-read from disk. Subscribers of `subscribe_config_changes` that
+/// re-read on each notification will still observe the operator's bad
+/// save until the file itself is repaired — rollback only protects the
+/// in-memory cache, the WS broadcast (suppressed via `Reverted`), the
+/// live `WsServerState` provider, and `CONFIG_ENV_STATE`. We log a
+/// warning in this case so the operator knows manual repair is required.
 fn revert_to_last_good(state: &ReloadState) {
     if let Some((raw, normalized)) = state.last_good_cache.as_ref() {
+        // `update_cache_arc` increments the change counter; subscribers
+        // that re-read on every notification will see the rolled-back
+        // value on the second tick (the watcher's bad-config install
+        // fired the first). Lazy/coalescing subscribers see only good.
         config::update_cache_arc(Arc::clone(raw), Arc::clone(normalized));
     } else {
         warn!(
@@ -667,6 +680,14 @@ fn revert_to_last_good(state: &ReloadState) {
         );
     }
     config::restore_env_state(&state.last_good_env);
+    if std::env::var("CARAPACE_DISABLE_CONFIG_CACHE").is_ok() {
+        warn!(
+            "Hot-reload rollback ran with CARAPACE_DISABLE_CONFIG_CACHE=1; \
+             on-disk config still reflects the rejected save. Subscribers \
+             that re-read from disk on each change notification will see \
+             the bad config until the file is repaired."
+        );
+    }
 }
 
 /// Spawn a task that bridges config watcher reload events to WebSocket broadcasts
@@ -2163,6 +2184,17 @@ mod tests {
             make_reload_state_with_anthropic_provider();
         let prior_fingerprint = state.current_fingerprint.clone();
 
+        // Add a non-provider env entry between fixture init and the reload
+        // so the unchanged-provider arm has a distinguishable post-snapshot
+        // to verify against without perturbing the provider fingerprint.
+        const PROBE_VAR: &str = "CARAPACE_TEST_PROBE_VAR";
+        crate::config::apply_config_env_for_test(HashMap::from([
+            (
+                TEST_PROVIDER_KEY.to_string(),
+                "test-initial-key".to_string(),
+            ),
+            (PROBE_VAR.to_string(), "probe-value".to_string()),
+        ]));
         let new_raw = json!({ "marker": "raw-edited" });
         let new_normalized = json!({ "marker": "normalized-edited" });
         crate::config::update_cache(new_raw.clone(), new_normalized.clone());
@@ -2177,6 +2209,18 @@ mod tests {
             .expect("last_good_cache populated");
         assert_eq!(**raw_after, new_raw);
         assert_eq!(**normalized_after, new_normalized);
+        // Restoring the captured snapshot must keep the probe set — pins
+        // last_good_env advancement on the unchanged-provider arm. Without
+        // advance_last_good's snapshot_env_state call, last_good_env would
+        // still be the fixture's pre-probe state and restore would unset
+        // the probe.
+        crate::config::restore_env_state(&state.last_good_env);
+        assert_eq!(
+            std::env::var(PROBE_VAR).ok(),
+            Some("probe-value".to_string())
+        );
+
+        std::env::remove_var(PROBE_VAR);
     }
 
     /// `Err(_)` arm of `build_providers` must roll back the same way

@@ -265,22 +265,7 @@ pub fn load_config() -> Result<Value, ConfigError> {
 
 /// Load and parse the configuration file with caching, returning a shared value.
 pub fn load_config_shared() -> Result<Arc<Value>, ConfigError> {
-    let path = get_config_path();
-
-    // Check cache first
-    if let Some(ttl) = get_cache_ttl() {
-        let cache = CONFIG_CACHE.read();
-        if let Some(cached) = cache.as_ref() {
-            if cached.loaded_at.elapsed() < ttl {
-                return Ok(Arc::clone(&cached.value));
-            }
-        }
-    }
-
-    let cached = load_cached_config_uncached(&path)?;
-    let shared = Arc::clone(&cached.value);
-    maybe_store_cached_config(cached);
-    Ok(shared)
+    with_cached_config(|cached| Arc::clone(&cached.value))
 }
 
 /// Load the explicit user config without applying defaults, returning a shared value.
@@ -288,48 +273,38 @@ pub fn load_config_shared() -> Result<Arc<Value>, ConfigError> {
 /// The returned value still has includes resolved, env substitution applied,
 /// and encrypted secrets decrypted. Missing files return an empty object `{}`.
 pub(crate) fn load_raw_config_shared() -> Result<Arc<Value>, ConfigError> {
-    let path = get_config_path();
-
-    if let Some(ttl) = get_cache_ttl() {
-        let cache = CONFIG_CACHE.read();
-        if let Some(cached) = cache.as_ref() {
-            if cached.loaded_at.elapsed() < ttl {
-                return Ok(Arc::clone(&cached.raw_value));
-            }
-        }
-    }
-
-    let cached = load_cached_config_uncached(&path)?;
-    let shared = Arc::clone(&cached.raw_value);
-    maybe_store_cached_config(cached);
-    Ok(shared)
+    with_cached_config(|cached| Arc::clone(&cached.raw_value))
 }
 
 /// Load a consistent `(raw, normalized)` pair from the same cache
 /// generation. On the cache-hit path this is a single `CONFIG_CACHE` read
-/// lock; on the cache-miss / TTL-expired / cache-disabled path the lock is
-/// dropped before the disk read, but both halves come from the same
-/// `CachedConfig` struct produced by `load_cached_config_uncached`, so the
-/// pair is still consistent — what callers (notably the hot-reload bridge)
-/// can rely on is that the raw and normalized values describe the same
-/// underlying config snapshot, never two different generations.
+/// lock; on the cache-miss path both halves come from the same
+/// `CachedConfig` produced by `load_cached_config_uncached`. The hot-reload
+/// bridge relies on raw and normalized describing the same underlying
+/// snapshot, never two different generations.
 pub(crate) fn load_both_config_shared() -> Result<(Arc<Value>, Arc<Value>), ConfigError> {
-    let path = get_config_path();
+    with_cached_config(|cached| (Arc::clone(&cached.raw_value), Arc::clone(&cached.value)))
+}
 
+/// Run `project` against the current cached config, refreshing from disk
+/// if the cache is empty / TTL-expired / cache-disabled. Centralizes the
+/// TTL guard + cache-miss + `maybe_store_cached_config` path so policy
+/// changes (e.g. event-based invalidation, separate raw/normalized TTLs)
+/// only need editing in one place.
+fn with_cached_config<R>(project: impl FnOnce(&CachedConfig) -> R) -> Result<R, ConfigError> {
     if let Some(ttl) = get_cache_ttl() {
         let cache = CONFIG_CACHE.read();
         if let Some(cached) = cache.as_ref() {
             if cached.loaded_at.elapsed() < ttl {
-                return Ok((Arc::clone(&cached.raw_value), Arc::clone(&cached.value)));
+                return Ok(project(cached));
             }
         }
     }
 
-    let cached = load_cached_config_uncached(&path)?;
-    let raw = Arc::clone(&cached.raw_value);
-    let normalized = Arc::clone(&cached.value);
+    let cached = load_cached_config_uncached(&get_config_path())?;
+    let result = project(&cached);
     maybe_store_cached_config(cached);
-    Ok((raw, normalized))
+    Ok(result)
 }
 
 /// Return the currently cached explicit user config if the cache entry is still fresh.
