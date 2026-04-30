@@ -1419,6 +1419,36 @@ fn validate_plugins_signature(obj: &serde_json::Map<String, Value>, issues: &mut
         None => return,
     };
 
+    for (alias, canonical) in [
+        ("require_signature", "requireSignature"),
+        ("trusted_publishers", "trustedPublishers"),
+    ] {
+        reject_removed_alias(
+            sig,
+            alias,
+            &format!(".plugins.signature.{alias}"),
+            &format!(".plugins.signature.{canonical}"),
+            issues,
+        );
+    }
+
+    for field in sig.keys() {
+        if !matches!(
+            field.as_str(),
+            "enabled"
+                | "requireSignature"
+                | "trustedPublishers"
+                | "require_signature"
+                | "trusted_publishers"
+        ) {
+            issues.push(SchemaIssue {
+                severity: Severity::Error,
+                path: format!(".plugins.signature.{field}"),
+                message: "unknown plugins.signature field".to_string(),
+            });
+        }
+    }
+
     if let Some(enabled) = sig.get("enabled") {
         if !enabled.is_boolean() {
             issues.push(SchemaIssue {
@@ -3662,6 +3692,29 @@ mod tests {
             i.severity == Severity::Error
                 && i.path == ".plugins.entries.entries"
                 && i.message.contains("reserved for plugin configuration")
+        }));
+    }
+
+    #[test]
+    fn test_plugins_signature_removed_aliases_rejected() {
+        let config = json!({
+            "plugins": {
+                "signature": {
+                    "require_signature": false,
+                    "trusted_publishers": ["abc123"]
+                }
+            }
+        });
+        let issues = validate_schema(&config);
+        assert!(issues.iter().any(|i| {
+            i.severity == Severity::Error
+                && i.path == ".plugins.signature.require_signature"
+                && i.message.contains(".plugins.signature.requireSignature")
+        }));
+        assert!(issues.iter().any(|i| {
+            i.severity == Severity::Error
+                && i.path == ".plugins.signature.trusted_publishers"
+                && i.message.contains(".plugins.signature.trustedPublishers")
         }));
     }
 

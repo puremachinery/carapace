@@ -16,6 +16,7 @@ fn default_true() -> bool {
 
 /// Signature verification configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SignatureConfig {
     /// Master switch — when `false`, signature checks are skipped.
     #[serde(default = "default_true")]
@@ -524,6 +525,14 @@ mod tests {
         assert!(parsed.enabled);
         assert!(parsed.require_signature);
         assert_eq!(parsed.trusted_publishers, vec!["abc123".to_string()]);
+    }
+
+    #[test]
+    fn test_config_serde_rejects_removed_snake_case_aliases() {
+        let result: Result<SignatureConfig, _> =
+            serde_json::from_str(r#"{"trusted_publishers":["abc123"],"require_signature":false}"#);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unknown field"));
     }
 
     // ==================== Signature Parsing ====================

@@ -191,6 +191,9 @@ the code wins.
 - `config.validate` - Validate configuration without persisting
 - `config.schema` - Get configuration schema
 
+`config.get` reports current diagnostics through `issues` and `warnings`.
+The reserved `legacyIssues` response field was removed in `v0.7.0`.
+
 ### Agent
 - `agent` - Run agent with message
 - `agent.identity.get` - Get agent identity

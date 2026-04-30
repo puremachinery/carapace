@@ -72,7 +72,7 @@ pub enum TaskBlockedReason {
 
 /// Per-task continuation policy budgets.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct TaskPolicy {
     pub max_attempts: u32,
     pub max_total_runtime_ms: u64,
@@ -1462,6 +1462,46 @@ mod tests {
             persisted.contains("\"policyExplicit\": true"),
             "queue writes must retain explicit policy metadata for API-created tasks"
         );
+    }
+
+    #[test]
+    fn test_load_ignores_unknown_future_policy_fields() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tasks").join("queue.json");
+        std::fs::create_dir_all(path.parent().expect("tasks directory")).unwrap();
+        let queue_with_future_policy_field = serde_json::json!([{
+            "id": "task-with-future-policy-field",
+            "state": "queued",
+            "attempts": 0,
+            "nextRunAtMs": null,
+            "lastError": null,
+            "payload": { "kind": "demo" },
+            "createdAtMs": 1,
+            "updatedAtMs": 1,
+            "runIds": [],
+            "policy": {
+                "maxAttempts": 100,
+                "maxTotalRuntimeMs": 604800000,
+                "maxTurns": 25,
+                "maxRunTimeoutSeconds": 600,
+                "futureBudget": 42
+            }
+        }]);
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&queue_with_future_policy_field)
+                .expect("queue json with future policy field"),
+        )
+        .unwrap();
+
+        let queue = TaskQueue::new(Some(path));
+        queue
+            .load()
+            .expect("future policy fields should not block startup");
+        let loaded = queue
+            .get("task-with-future-policy-field")
+            .expect("task should load");
+        assert_eq!(loaded.policy.max_attempts, 100);
     }
 
     #[tokio::test]

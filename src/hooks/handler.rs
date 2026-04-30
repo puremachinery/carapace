@@ -65,8 +65,8 @@ impl WakeResponse {
 }
 
 /// Request body for POST /hooks/agent
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AgentRequest {
     pub message: Option<String>,
     pub name: Option<String>,
@@ -685,6 +685,24 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(req.session_scope.as_deref(), Some("hook:current"));
+    }
+
+    #[test]
+    fn test_agent_request_rejects_removed_session_key_aliases() {
+        for field in ["sessionScope", "session_key"] {
+            let mut value = serde_json::json!({ "message": "hello" });
+            value
+                .as_object_mut()
+                .expect("object")
+                .insert(field.to_string(), serde_json::json!("hook:old"));
+
+            let err = serde_json::from_value::<AgentRequest>(value)
+                .expect_err("removed session alias should be rejected");
+            assert!(
+                err.to_string().contains("unknown field"),
+                "unexpected error for {field}: {err}"
+            );
+        }
     }
 
     #[test]

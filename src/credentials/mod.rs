@@ -43,6 +43,15 @@ pub const WRITE_RATE_LIMIT_PER_MINUTE: usize = 10;
 
 /// Suffix used for staged credential rotation.
 const PENDING_SUFFIX: &str = ":pending";
+const WHATSAPP_LEGACY_PLAINTEXT_FILENAMES: &[&str] =
+    &["creds.json", "identity.json", "session.json"];
+const WHATSAPP_LEGACY_PLAINTEXT_PREFIXES: &[&str] = &[
+    "app-state-sync-key-",
+    "app-state-sync-version-",
+    "pre-key-",
+    "sender-key-",
+    "session-",
+];
 
 /// Credential store errors
 #[derive(Debug, Clone, PartialEq)]
@@ -186,7 +195,11 @@ fn plaintext_credential_paths(state_dir: &Path) -> Vec<PathBuf> {
             if let Ok(files) = fs::read_dir(account_path) {
                 for file in files.flatten() {
                     let path = file.path();
-                    if path.file_name().and_then(|name| name.to_str()) != Some("session.enc") {
+                    if path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(is_legacy_whatsapp_plaintext_file)
+                    {
                         paths.push(path);
                     }
                 }
@@ -195,6 +208,14 @@ fn plaintext_credential_paths(state_dir: &Path) -> Vec<PathBuf> {
     }
 
     paths
+}
+
+fn is_legacy_whatsapp_plaintext_file(name: &str) -> bool {
+    WHATSAPP_LEGACY_PLAINTEXT_FILENAMES.contains(&name)
+        || (name.ends_with(".json")
+            && WHATSAPP_LEGACY_PLAINTEXT_PREFIXES
+                .iter()
+                .any(|prefix| name.starts_with(prefix)))
 }
 
 fn agent_ids_for_plaintext_scan(state_dir: &Path) -> Vec<String> {
@@ -1395,6 +1416,43 @@ mod tests {
 
         // Should reject the next write
         assert!(!tracker.check_and_record("test-plugin"));
+    }
+
+    #[test]
+    fn test_plaintext_credential_guard_detects_known_whatsapp_files() {
+        let temp = tempdir().unwrap();
+        let account_dir = temp
+            .path()
+            .join("credentials")
+            .join("whatsapp")
+            .join("default");
+        std::fs::create_dir_all(&account_dir).unwrap();
+        let legacy_path = account_dir.join("session-123.json");
+        std::fs::write(&legacy_path, "{}").unwrap();
+
+        let err = reject_plaintext_credential_files(temp.path())
+            .expect_err("known plaintext WhatsApp file should be rejected");
+        assert_eq!(
+            err,
+            CredentialError::PlaintextCredentialFileDetected(legacy_path.display().to_string())
+        );
+    }
+
+    #[test]
+    fn test_plaintext_credential_guard_ignores_incidental_whatsapp_files() {
+        let temp = tempdir().unwrap();
+        let account_dir = temp
+            .path()
+            .join("credentials")
+            .join("whatsapp")
+            .join("default");
+        std::fs::create_dir_all(&account_dir).unwrap();
+        std::fs::write(account_dir.join("session.enc"), "encrypted").unwrap();
+        std::fs::write(account_dir.join(".DS_Store"), "finder").unwrap();
+        std::fs::write(account_dir.join("notes.json"), "{}").unwrap();
+
+        reject_plaintext_credential_files(temp.path())
+            .expect("incidental WhatsApp files should not block startup");
     }
 
     #[tokio::test]

@@ -40,7 +40,7 @@ pub struct HookTransform {
 
 /// Hook mapping configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HookMapping {
     /// Unique identifier for the mapping
     pub id: Option<String>,
@@ -632,6 +632,28 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(mapping.session_scope.as_deref(), Some("hook:current"));
+    }
+
+    #[test]
+    fn test_hook_mapping_rejects_removed_session_key_aliases() {
+        for field in ["sessionScope", "session_key"] {
+            let mut value = json!({
+                "id": "test",
+                "action": "agent",
+                "messageTemplate": "hello"
+            });
+            value
+                .as_object_mut()
+                .expect("object")
+                .insert(field.to_string(), json!("hook:old"));
+
+            let err = serde_json::from_value::<HookMapping>(value)
+                .expect_err("removed session alias should be rejected");
+            assert!(
+                err.to_string().contains("unknown field"),
+                "unexpected error for {field}: {err}"
+            );
+        }
     }
 
     #[test]
