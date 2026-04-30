@@ -273,14 +273,21 @@ fn is_legacy_whatsapp_plaintext_file(path: &Path) -> bool {
     matched_name && whatsapp_plaintext_file_has_credential_shape(path)
 }
 
-fn whatsapp_plaintext_file_has_credential_shape(path: &Path) -> bool {
+// Read the file, parse as JSON, and apply `predicate`. Unreadable or
+// unparseable files fail closed (treated as credential-shaped) so the
+// startup guard rejects them instead of silently waving them through.
+fn plaintext_file_has_credential_shape(path: &Path, predicate: fn(&Value) -> bool) -> bool {
     let Ok(content) = fs::read_to_string(path) else {
         return true;
     };
     let Ok(value) = serde_json::from_str::<Value>(&content) else {
         return true;
     };
-    whatsapp_json_has_credential_shape(&value)
+    predicate(&value)
+}
+
+fn whatsapp_plaintext_file_has_credential_shape(path: &Path) -> bool {
+    plaintext_file_has_credential_shape(path, whatsapp_json_has_credential_shape)
 }
 
 fn whatsapp_json_has_credential_shape(value: &Value) -> bool {
@@ -297,13 +304,7 @@ fn whatsapp_json_has_credential_shape(value: &Value) -> bool {
 }
 
 fn pairing_plaintext_file_has_credential_shape(path: &Path) -> bool {
-    let Ok(content) = fs::read_to_string(path) else {
-        return true;
-    };
-    let Ok(value) = serde_json::from_str::<Value>(&content) else {
-        return true;
-    };
-    pairing_json_has_credential_shape(&value)
+    plaintext_file_has_credential_shape(path, pairing_json_has_credential_shape)
 }
 
 fn pairing_json_has_credential_shape(value: &Value) -> bool {

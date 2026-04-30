@@ -1591,22 +1591,8 @@ mod tests {
         assert!(queue.list().is_empty());
     }
 
-    #[test]
-    fn test_load_rejects_malformed_queue_with_path() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("tasks").join("queue.json");
-        std::fs::create_dir_all(path.parent().expect("tasks directory")).unwrap();
-        std::fs::write(&path, b"not json").unwrap();
-
-        let queue = TaskQueue::new(Some(path.clone()));
-        let err = queue
-            .load()
-            .expect_err("malformed queue data should block startup");
-        assert!(err.contains(&path.display().to_string()), "got: {err}");
-        assert!(err.contains("A copy was written to"), "got: {err}");
-        assert!(err.contains("Remove or repair the file"), "got: {err}");
-
-        let backup = std::fs::read_dir(path.parent().expect("tasks directory"))
+    fn assert_corrupt_queue_backup_contains(parent: &Path, expected: &[u8]) {
+        let backup = std::fs::read_dir(parent)
             .unwrap()
             .filter_map(Result::ok)
             .map(|entry| entry.path())
@@ -1617,14 +1603,34 @@ mod tests {
                     .is_some_and(|name| name.starts_with("queue.json.corrupt."))
             })
             .expect("malformed queue load should write a corrupt backup");
-        assert_eq!(std::fs::read(backup).unwrap(), b"not json");
+        assert_eq!(std::fs::read(backup).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_load_rejects_malformed_queue_with_path() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tasks").join("queue.json");
+        let parent = path.parent().expect("tasks directory");
+        std::fs::create_dir_all(parent).unwrap();
+        std::fs::write(&path, b"not json").unwrap();
+
+        let queue = TaskQueue::new(Some(path.clone()));
+        let err = queue
+            .load()
+            .expect_err("malformed queue data should block startup");
+        assert!(err.contains(&path.display().to_string()), "got: {err}");
+        assert!(err.contains("A copy was written to"), "got: {err}");
+        assert!(err.contains("Remove or repair the file"), "got: {err}");
+
+        assert_corrupt_queue_backup_contains(parent, b"not json");
     }
 
     #[tokio::test]
     async fn test_load_async_rejects_malformed_queue_with_path() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("tasks").join("queue.json");
-        std::fs::create_dir_all(path.parent().expect("tasks directory")).unwrap();
+        let parent = path.parent().expect("tasks directory");
+        std::fs::create_dir_all(parent).unwrap();
         std::fs::write(&path, b"not json").unwrap();
 
         let queue = Arc::new(TaskQueue::new(Some(path.clone())));
@@ -1636,18 +1642,7 @@ mod tests {
         assert!(err.contains("A copy was written to"), "got: {err}");
         assert!(err.contains("Remove or repair the file"), "got: {err}");
 
-        let backup = std::fs::read_dir(path.parent().expect("tasks directory"))
-            .unwrap()
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .find(|candidate| {
-                candidate
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with("queue.json.corrupt."))
-            })
-            .expect("async malformed queue load should write a corrupt backup");
-        assert_eq!(std::fs::read(backup).unwrap(), b"not json");
+        assert_corrupt_queue_backup_contains(parent, b"not json");
     }
 
     #[tokio::test]

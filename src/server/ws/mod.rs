@@ -1224,7 +1224,14 @@ pub enum WsConfigError {
 
 pub async fn build_ws_state_owned_from_value(cfg: &Value) -> Result<WsServerState, WsConfigError> {
     let state_dir = resolve_state_dir();
-    credentials::reject_plaintext_credential_files(&state_dir)?;
+    {
+        let state_dir = state_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            credentials::reject_plaintext_credential_files(&state_dir)
+        })
+        .await
+        .map_err(|e| WsConfigError::Runtime(format!("plaintext credential scan join: {e}")))??;
+    }
     let config = build_ws_config_from_value(cfg).await?;
     let mut state = WsServerState::new_persistent(config, state_dir).await?;
     let integrity_config = sessions::resolve_session_integrity_config(cfg);
