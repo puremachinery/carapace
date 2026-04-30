@@ -432,6 +432,12 @@ fn verify_hmac_digest(
                             error = %e,
                             "failed to rewrite unversioned HMAC sidecar"
                         );
+                    } else {
+                        tracing::debug!(
+                            file = %file_name,
+                            sidecar = %sidecar.display(),
+                            "rewrote unversioned HMAC sidecar to current format"
+                        );
                     }
                 }
                 tracing::debug!(file = %file_name, "session integrity verification passed");

@@ -79,6 +79,26 @@ const WHATSAPP_LEGACY_CREDENTIAL_JSON_KEYS: &[&str] = &[
     "signedPreKey",
     "signalIdentities",
 ];
+const PAIRING_LEGACY_CREDENTIAL_JSON_KEYS: &[&str] = &[
+    "allowFrom",
+    "allowedFrom",
+    "allowlist",
+    "clientId",
+    "contacts",
+    "credential",
+    "credentials",
+    "deviceId",
+    "identity",
+    "jid",
+    "key",
+    "pairing",
+    "phone",
+    "secret",
+    "senders",
+    "session",
+    "store",
+    "token",
+];
 
 /// Credential store errors
 #[derive(Debug, Clone, PartialEq)]
@@ -212,7 +232,9 @@ fn plaintext_credential_paths(state_dir: &Path) -> Vec<PathBuf> {
             let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
-            if name.ends_with("-pairing.json") || name.ends_with("-allowFrom.json") {
+            if (name.ends_with("-pairing.json") || name.ends_with("-allowFrom.json"))
+                && pairing_plaintext_file_has_credential_shape(&path)
+            {
                 paths.push(path);
             }
         }
@@ -272,6 +294,27 @@ fn whatsapp_json_has_credential_shape(value: &Value) -> bool {
                 && object.get("type").and_then(Value::as_str) == Some("Buffer")
                 && object.get("data").is_some_and(Value::is_array))
     })
+}
+
+fn pairing_plaintext_file_has_credential_shape(path: &Path) -> bool {
+    let Ok(content) = fs::read_to_string(path) else {
+        return true;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&content) else {
+        return true;
+    };
+    pairing_json_has_credential_shape(&value)
+}
+
+fn pairing_json_has_credential_shape(value: &Value) -> bool {
+    match value {
+        Value::String(value) => !value.trim().is_empty(),
+        Value::Array(items) => !items.is_empty(),
+        Value::Object(object) => object
+            .keys()
+            .any(|key| PAIRING_LEGACY_CREDENTIAL_JSON_KEYS.contains(&key.as_str())),
+        _ => false,
+    }
 }
 
 fn agent_plaintext_credential_paths(state_dir: &Path) -> Vec<PathBuf> {
@@ -1517,6 +1560,51 @@ mod tests {
                 oauth_path.display().to_string()
             ]
         );
+    }
+
+    #[test]
+    fn test_plaintext_credential_guard_detects_pairing_files_with_credential_shape() {
+        let temp = tempdir().unwrap();
+        let credentials_dir = temp.path().join("credentials");
+        std::fs::create_dir_all(&credentials_dir).unwrap();
+        let pairing_path = credentials_dir.join("telegram-pairing.json");
+        let allow_from_path = credentials_dir.join("telegram-allowFrom.json");
+        std::fs::write(&pairing_path, r#"{"token":"secret"}"#).unwrap();
+        std::fs::write(&allow_from_path, r#"["+15551234567"]"#).unwrap();
+
+        let err = reject_plaintext_credential_files(temp.path())
+            .expect_err("credential-shaped pairing files should be rejected");
+        let CredentialError::PlaintextCredentialFilesDetected(paths) = err else {
+            panic!("expected plaintext credential rejection");
+        };
+
+        assert_eq!(
+            paths,
+            vec![
+                allow_from_path.display().to_string(),
+                pairing_path.display().to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_plaintext_credential_guard_ignores_incidental_pairing_files() {
+        let temp = tempdir().unwrap();
+        let credentials_dir = temp.path().join("credentials");
+        std::fs::create_dir_all(&credentials_dir).unwrap();
+        std::fs::write(
+            credentials_dir.join("2026-01-15-pairing.json"),
+            r#"{"message":"debug note"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            credentials_dir.join("2026-01-15-allowFrom.json"),
+            r#"{"message":"debug note"}"#,
+        )
+        .unwrap();
+
+        reject_plaintext_credential_files(temp.path())
+            .expect("incidental pairing files should not block startup");
     }
 
     #[test]
