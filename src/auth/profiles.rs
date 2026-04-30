@@ -1472,6 +1472,7 @@ impl ProfileStore {
     /// (e.g. from a previous `SecretStore` instance) are still decryptable
     /// as long as the same password is used.
     fn decrypt_tokens(
+        profile_id: &str,
         tokens: &mut OAuthTokens,
         store: &SecretStore,
         password: &[u8],
@@ -1485,7 +1486,10 @@ impl ProfileStore {
                 }
             }
         } else if !tokens.access_token.is_empty() {
-            return Err(Self::plaintext_encrypted_profile_error("access_token"));
+            return Err(Self::plaintext_encrypted_profile_error(
+                profile_id,
+                "access_token",
+            ));
         }
         if let Some(ref rt) = tokens.refresh_token {
             if is_encrypted(rt) {
@@ -1497,7 +1501,10 @@ impl ProfileStore {
                     }
                 }
             } else if !rt.is_empty() {
-                return Err(Self::plaintext_encrypted_profile_error("refresh_token"));
+                return Err(Self::plaintext_encrypted_profile_error(
+                    profile_id,
+                    "refresh_token",
+                ));
             }
         }
         Ok(())
@@ -1508,12 +1515,14 @@ impl ProfileStore {
         store: &SecretStore,
         password: &[u8],
     ) -> Result<(), AuthProfileError> {
+        let profile_id = profile.id.clone();
         match profile.credential_kind {
             AuthProfileCredentialKind::OAuth => {
                 if let Some(tokens) = profile.tokens.as_mut() {
-                    Self::decrypt_tokens(tokens, store, password)?;
+                    Self::decrypt_tokens(&profile_id, tokens, store, password)?;
                 }
                 Self::decrypt_provider_config_secret(
+                    &profile_id,
                     &mut profile.oauth_provider_config,
                     store,
                     password,
@@ -1532,7 +1541,10 @@ impl ProfileStore {
                             }
                         }
                     } else if !token.is_empty() {
-                        return Err(Self::plaintext_encrypted_profile_error("token"));
+                        return Err(Self::plaintext_encrypted_profile_error(
+                            &profile_id,
+                            "token",
+                        ));
                     }
                 }
             }
@@ -1541,6 +1553,7 @@ impl ProfileStore {
     }
 
     fn decrypt_provider_config_secret(
+        profile_id: &str,
         provider_config: &mut Option<StoredOAuthProviderConfig>,
         store: &SecretStore,
         password: &[u8],
@@ -1561,15 +1574,16 @@ impl ProfileStore {
             }
         } else if !provider_config.client_secret.is_empty() {
             return Err(Self::plaintext_encrypted_profile_error(
+                profile_id,
                 "oauth provider client_secret",
             ));
         }
         Ok(())
     }
 
-    fn plaintext_encrypted_profile_error(field_name: &str) -> AuthProfileError {
+    fn plaintext_encrypted_profile_error(profile_id: &str, field_name: &str) -> AuthProfileError {
         AuthProfileError::SerializationError(format!(
-            "auth profile {field_name} is stored in plaintext while auth-profile encryption is enabled; unset CARAPACE_CONFIG_PASSWORD, delete or re-create the affected auth profile, then enroll it again under encryption"
+            "auth profile '{profile_id}' field {field_name} is stored in plaintext while auth-profile encryption is enabled; unset CARAPACE_CONFIG_PASSWORD, delete or re-create the affected auth profile, then enroll it again under encryption"
         ))
     }
 
@@ -3034,6 +3048,7 @@ mod tests {
             .expect_err("plaintext auth profile should fail under encryption");
         let message = err.to_string();
 
+        assert!(message.contains("'plaintext'"), "got: {message}");
         assert!(message.contains("stored in plaintext"), "got: {message}");
         assert!(
             message.contains("delete or re-create the affected auth profile"),
@@ -3069,6 +3084,7 @@ mod tests {
             .load()
             .expect_err("plaintext profile should fail under encryption");
 
+        assert!(err.to_string().contains("'plaintext'"), "got: {err}");
         assert!(
             err.to_string().contains("stored in plaintext"),
             "got: {err}"

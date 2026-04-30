@@ -232,7 +232,7 @@ pub enum Command {
     Tls(TlsCommand),
 }
 
-#[derive(clap::ValueEnum, Clone, Debug)]
+#[derive(clap::ValueEnum, Clone, Debug, PartialEq, Eq)]
 pub enum ImportSource {
     /// Import from OpenClaw (~/.openclaw/ or ~/.clawdbot/).
     Openclaw,
@@ -8804,13 +8804,7 @@ mod tests {
             let cli = Cli::try_parse_from(["cara", "import", source_arg]).unwrap();
             match cli.command {
                 Some(Command::Import { source, force }) => {
-                    assert!(matches!(
-                        (source, expected_source),
-                        (ImportSource::Openclaw, ImportSource::Openclaw)
-                            | (ImportSource::Opencode, ImportSource::Opencode)
-                            | (ImportSource::Aider, ImportSource::Aider)
-                            | (ImportSource::Nemoclaw, ImportSource::Nemoclaw)
-                    ));
+                    assert_eq!(source, expected_source);
                     assert!(!force);
                 }
                 other => panic!("Expected Import, got {:?}", other),

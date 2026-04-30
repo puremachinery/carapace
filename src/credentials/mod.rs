@@ -177,11 +177,7 @@ fn plaintext_credential_paths(state_dir: &Path) -> Vec<PathBuf> {
         credentials_dir.join("creds.json"),
     ];
 
-    for agent_id in agent_ids_for_plaintext_scan(state_dir) {
-        let agent_dir = state_dir.join("agents").join(agent_id).join("agent");
-        paths.push(agent_dir.join("auth-profiles.json"));
-        paths.push(agent_dir.join("auth.json"));
-    }
+    paths.extend(agent_plaintext_credential_paths(state_dir));
 
     if let Ok(entries) = fs::read_dir(&credentials_dir) {
         for entry in entries.flatten() {
@@ -228,23 +224,21 @@ fn is_legacy_whatsapp_plaintext_file(name: &str) -> bool {
                 .any(|prefix| name.starts_with(prefix)))
 }
 
-fn agent_ids_for_plaintext_scan(state_dir: &Path) -> Vec<String> {
-    let mut ids = Vec::new();
+fn agent_plaintext_credential_paths(state_dir: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
     let agents_dir = state_dir.join("agents");
     if let Ok(entries) = fs::read_dir(agents_dir) {
         for entry in entries.flatten() {
-            if !entry.path().is_dir() {
+            let agent_root = entry.path();
+            if !agent_root.is_dir() {
                 continue;
             }
-            if let Some(name) = entry.file_name().to_str() {
-                ids.push(name.to_string());
-            }
+            let agent_dir = agent_root.join("agent");
+            paths.push(agent_dir.join("auth-profiles.json"));
+            paths.push(agent_dir.join("auth.json"));
         }
     }
-    if ids.is_empty() {
-        ids.push("main".to_string());
-    }
-    ids
+    paths
 }
 
 /// Delete a keyring credential entry with idempotent not-found semantics.
@@ -1472,6 +1466,24 @@ mod tests {
                 creds_path.display().to_string(),
                 oauth_path.display().to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn test_plaintext_credential_guard_detects_non_default_agent_files() {
+        let temp = tempdir().unwrap();
+        let agent_dir = temp.path().join("agents").join("primary").join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let auth_path = agent_dir.join("auth.json");
+        std::fs::write(&auth_path, "{}").unwrap();
+
+        let err = reject_plaintext_credential_files(temp.path())
+            .expect_err("non-default agent plaintext credential file should be rejected");
+        assert_eq!(
+            err,
+            CredentialError::PlaintextCredentialFilesDetected(vec![auth_path
+                .display()
+                .to_string()])
         );
     }
 

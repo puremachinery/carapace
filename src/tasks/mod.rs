@@ -805,6 +805,7 @@ impl TaskQueue {
                     task.payload = payload.clone();
                 }
                 if let Some(policy_patch) = &policy_patch {
+                    task.policy_explicit = true;
                     if let Some(max_attempts) = policy_patch.max_attempts {
                         task.policy.max_attempts = max_attempts;
                     }
@@ -1263,6 +1264,30 @@ mod tests {
         assert_eq!(updated.state, TaskState::RetryWait);
         assert_eq!(updated.last_error.as_deref(), Some("resume blocked"));
         assert!(updated.blocked_reason.is_none());
+    }
+
+    #[test]
+    fn test_patch_task_policy_marks_legacy_task_policy_explicit() {
+        let queue = TaskQueue::in_memory();
+        let task = queue.enqueue(serde_json::json!({"kind":"demo"}), None);
+        {
+            let mut tasks = queue.tasks.write();
+            tasks[0].policy_explicit = false;
+        }
+
+        assert!(queue.patch_task(
+            &task.id,
+            None,
+            Some(TaskPolicyPatch {
+                max_attempts: Some(3),
+                ..TaskPolicyPatch::default()
+            }),
+            None,
+        ));
+
+        let updated = queue.get(&task.id).expect("task should exist");
+        assert!(updated.policy_explicit);
+        assert_eq!(updated.policy.max_attempts, 3);
     }
 
     #[test]
