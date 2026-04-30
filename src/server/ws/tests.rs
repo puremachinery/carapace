@@ -195,7 +195,7 @@ async fn test_startup_rejects_plaintext_credential_file() {
     assert!(matches!(
         err,
         WsConfigError::Credentials(
-            crate::credentials::CredentialError::PlaintextCredentialFileDetected(_)
+            crate::credentials::CredentialError::PlaintextCredentialFilesDetected(_)
         )
     ));
     assert!(err.to_string().contains("delete it and re-enroll"));

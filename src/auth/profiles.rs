@@ -97,10 +97,23 @@ impl std::error::Error for AuthProfileError {}
 const CURRENT_STORE_VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct AuthProfileStoreEnvelope {
     version: u32,
+    profiles: Vec<Value>,
+}
+
+/// A profile that could not be deserialized but is preserved for round-trip
+/// safety. The raw JSON value is kept so it can be written back without loss.
+#[derive(Debug, Clone)]
+struct SkippedProfile {
+    raw: Value,
+}
+
+/// Result of loading the profile store: successfully parsed profiles plus
+/// any that were skipped and preserved for round-trip.
+struct LoadedProfiles {
     profiles: Vec<AuthProfile>,
+    skipped: Vec<SkippedProfile>,
 }
 
 struct LastUsedPersistence {
@@ -117,6 +130,9 @@ struct LastUsedPersistenceState {
 
 struct ProfileStoreShared {
     profiles: RwLock<Vec<AuthProfile>>,
+    /// Profiles that could not be deserialized but are preserved for
+    /// round-trip safety (for example profiles from a newer binary version).
+    skipped_profiles: RwLock<Vec<SkippedProfile>>,
     state_path: PathBuf,
     secret_store: Option<Arc<SecretStore>>,
     /// Password bytes kept for `decrypt_rekey` (values on disk may have been
@@ -136,6 +152,7 @@ impl ProfileStoreShared {
     ) -> Self {
         Self {
             profiles: RwLock::new(Vec::new()),
+            skipped_profiles: RwLock::new(Vec::new()),
             state_path,
             secret_store,
             encryption_password,
@@ -171,8 +188,8 @@ impl LastUsedPersistenceState {
 }
 
 /// Parse a store file in the current envelope format.
-fn parse_store_file(content: &str) -> Result<Vec<AuthProfile>, AuthProfileError> {
-    match serde_json::from_str::<Value>(content) {
+fn parse_store_file(content: &str) -> Result<LoadedProfiles, AuthProfileError> {
+    let raw_values = match serde_json::from_str::<Value>(content) {
         Ok(Value::Object(map)) => {
             let envelope: AuthProfileStoreEnvelope = serde_json::from_value(Value::Object(map))
                 .map_err(|e| AuthProfileError::SerializationError(e.to_string()))?;
@@ -182,20 +199,51 @@ fn parse_store_file(content: &str) -> Result<Vec<AuthProfile>, AuthProfileError>
                     envelope.version, CURRENT_STORE_VERSION
                 )));
             }
-            Ok(envelope.profiles)
+            envelope.profiles
         }
-        Ok(_) => Err(AuthProfileError::SerializationError(
-            "expected auth profile store envelope object at top level".to_string(),
-        )),
-        Err(e) => Err(AuthProfileError::SerializationError(e.to_string())),
+        Ok(_) => {
+            return Err(AuthProfileError::SerializationError(
+                "expected auth profile store envelope object at top level".to_string(),
+            ));
+        }
+        Err(e) => return Err(AuthProfileError::SerializationError(e.to_string())),
+    };
+
+    let mut profiles = Vec::new();
+    let mut skipped = Vec::new();
+    for raw in raw_values {
+        match serde_json::from_value::<AuthProfile>(raw.clone()) {
+            Ok(profile) => profiles.push(profile),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "skipping unrecognized auth profile during load (preserved for round-trip)"
+                );
+                skipped.push(SkippedProfile { raw });
+            }
+        }
     }
+
+    Ok(LoadedProfiles { profiles, skipped })
 }
 
 /// Serialize profiles into the versioned envelope format.
-fn serialize_store(profiles: &[AuthProfile]) -> Result<String, AuthProfileError> {
+fn serialize_store(
+    profiles: &[AuthProfile],
+    skipped: &[SkippedProfile],
+) -> Result<String, AuthProfileError> {
+    let mut raw_values: Vec<Value> = profiles
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| AuthProfileError::SerializationError(e.to_string()))?;
+    for skipped_profile in skipped {
+        raw_values.push(skipped_profile.raw.clone());
+    }
+
     let envelope = AuthProfileStoreEnvelope {
         version: CURRENT_STORE_VERSION,
-        profiles: profiles.to_vec(),
+        profiles: raw_values,
     };
 
     serde_json::to_string_pretty(&envelope)
@@ -249,7 +297,6 @@ impl fmt::Display for AuthProfileCredentialKind {
 
 /// OAuth2 token set for a profile.
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct OAuthTokens {
     pub access_token: String,
     pub refresh_token: Option<String>,
@@ -263,7 +310,6 @@ pub struct OAuthTokens {
 /// This stores the provider metadata needed to refresh an OAuth-backed runtime
 /// session without relying on the application config as a secret transport.
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct StoredOAuthProviderConfig {
     pub client_id: String,
     pub client_secret: String,
@@ -305,7 +351,6 @@ impl From<&OAuthProviderConfig> for StoredOAuthProviderConfig {
 
 /// A stored auth profile.
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct AuthProfile {
     pub id: String,
     pub name: String,
@@ -1246,7 +1291,8 @@ impl ProfileStore {
 
         let content = fs::read_to_string(&self.shared.state_path)
             .map_err(|e| AuthProfileError::IoError(e.to_string()))?;
-        let mut profiles = parse_store_file(&content)?;
+        let loaded = parse_store_file(&content)?;
+        let mut profiles = loaded.profiles;
 
         // Decrypt token fields if we have a SecretStore
         if let Some(ref store) = self.shared.secret_store {
@@ -1262,8 +1308,10 @@ impl ProfileStore {
         }
 
         let mut profiles_guard = self.shared.profiles.write();
+        let mut skipped_guard = self.shared.skipped_profiles.write();
         let mut state = self.lock_last_used_state();
         *profiles_guard = profiles;
+        *skipped_guard = loaded.skipped;
         state.reset_generations();
         self.shared.last_used_persistence.condvar.notify_all();
         Ok(())
@@ -1310,7 +1358,10 @@ impl ProfileStore {
             }
         }
 
-        let content = serialize_store(&to_save)?;
+        let content = {
+            let skipped = shared.skipped_profiles.read();
+            serialize_store(&to_save, &skipped)?
+        };
 
         // Ensure parent directory exists
         if let Some(parent) = shared.state_path.parent() {
@@ -2096,6 +2147,129 @@ mod tests {
             oauth_tokens(&deserialized).access_token,
             oauth_tokens(&profile).access_token
         );
+    }
+
+    #[test]
+    fn test_parse_store_ignores_unknown_future_profile_fields() {
+        let content = serde_json::json!({
+            "version": 2,
+            "profiles": [{
+                "id": "future-fields",
+                "name": "Future Fields",
+                "provider": "anthropic",
+                "created_at_ms": 1,
+                "credential_kind": "o-auth",
+                "future_profile_field": true,
+                "tokens": {
+                    "access_token": "access",
+                    "refresh_token": "refresh",
+                    "token_type": "Bearer",
+                    "expires_at_ms": 2,
+                    "scope": "profile",
+                    "future_token_field": "kept by newer binaries"
+                },
+                "oauth_provider_config": {
+                    "client_id": "client",
+                    "client_secret": "secret",
+                    "redirect_uri": "http://localhost/callback",
+                    "auth_url": "https://example.test/auth",
+                    "token_url": "https://example.test/token",
+                    "userinfo_url": "https://example.test/user",
+                    "scopes": ["profile"],
+                    "future_provider_field": "kept by newer binaries"
+                }
+            }]
+        })
+        .to_string();
+
+        let loaded = parse_store_file(&content).unwrap();
+
+        assert_eq!(loaded.profiles.len(), 1);
+        assert!(loaded.skipped.is_empty());
+        assert_eq!(loaded.profiles[0].id, "future-fields");
+        assert_eq!(oauth_tokens(&loaded.profiles[0]).access_token, "access");
+    }
+
+    #[test]
+    fn test_parse_store_preserves_unrecognized_current_version_profiles() {
+        let content = serde_json::json!({
+            "version": 2,
+            "profiles": [
+                {
+                    "id": "known",
+                    "name": "Known",
+                    "provider": "anthropic",
+                    "created_at_ms": 1,
+                    "credential_kind": "token",
+                    "token": "sk-ant-test"
+                },
+                {
+                    "id": "future-provider",
+                    "name": "Future Provider",
+                    "provider": "future-provider",
+                    "created_at_ms": 2,
+                    "credential_kind": "token",
+                    "token": "future-token"
+                }
+            ]
+        })
+        .to_string();
+
+        let loaded = parse_store_file(&content).unwrap();
+        assert_eq!(loaded.profiles.len(), 1);
+        assert_eq!(loaded.skipped.len(), 1);
+
+        let serialized = serialize_store(&loaded.profiles, &loaded.skipped).unwrap();
+        let serialized: Value = serde_json::from_str(&serialized).unwrap();
+        let profiles = serialized["profiles"].as_array().unwrap();
+        assert!(profiles.iter().any(|profile| profile["id"] == "known"));
+        assert!(profiles
+            .iter()
+            .any(|profile| profile["id"] == "future-provider"));
+    }
+
+    #[test]
+    fn test_profile_store_preserves_skipped_profiles_on_save() {
+        let dir = tempdir().unwrap();
+        let state_path = profile_store_state_path(dir.path());
+        std::fs::write(
+            &state_path,
+            serde_json::json!({
+                "version": 2,
+                "profiles": [
+                    {
+                        "id": "known",
+                        "name": "Known",
+                        "provider": "anthropic",
+                        "created_at_ms": 1,
+                        "credential_kind": "token",
+                        "token": "sk-ant-test"
+                    },
+                    {
+                        "id": "future-provider",
+                        "name": "Future Provider",
+                        "provider": "future-provider",
+                        "created_at_ms": 2,
+                        "credential_kind": "token",
+                        "token": "future-token"
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let store = ProfileStore::new(dir.path().to_path_buf());
+        store.load().unwrap();
+        store.save().unwrap();
+        store.shutdown_last_used_worker();
+
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap())
+            .expect("saved store should be valid JSON");
+        let profiles = saved["profiles"].as_array().unwrap();
+        assert!(profiles
+            .iter()
+            .any(|profile| profile["id"] == "future-provider"));
     }
 
     // -----------------------------------------------------------------------
@@ -3060,7 +3234,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_profile_provider_fails_store_load() {
+    fn unknown_profile_provider_is_skipped_and_preserved_on_load() {
         let dir = tempdir().unwrap();
         let state_path = dir.path().join("auth_profiles.json");
 
@@ -3085,18 +3259,24 @@ mod tests {
         .unwrap();
 
         let store = ProfileStore::new(dir.path().to_path_buf());
-        let err = store
-            .load()
-            .expect_err("unknown provider should fail current-format load");
-        assert!(
-            err.to_string().contains("unknown_future_provider"),
-            "got: {err}"
-        );
-        assert!(store.shared.profiles.read().is_empty());
+        store.load().unwrap();
+        assert_eq!(store.shared.profiles.read().len(), 1);
+        assert_eq!(store.shared.profiles.read()[0].id, "good");
+        assert_eq!(store.shared.skipped_profiles.read().len(), 1);
+        store.save().unwrap();
+
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap())
+            .expect("saved store should be valid JSON");
+        assert!(saved["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|profile| profile["provider"] == "unknown_future_provider"));
+        store.shutdown_last_used_worker();
     }
 
     #[test]
-    fn unknown_credential_kind_fails_store_load() {
+    fn unknown_credential_kind_is_skipped_and_preserved_on_load() {
         let dir = tempdir().unwrap();
         let state_path = dir.path().join("auth_profiles.json");
 
@@ -3119,15 +3299,23 @@ mod tests {
         .unwrap();
 
         let store = ProfileStore::new(dir.path().to_path_buf());
-        let err = store
-            .load()
-            .expect_err("unknown credential kind should fail current-format load");
-        assert!(err.to_string().contains("passkey"), "got: {err}");
+        store.load().unwrap();
         assert!(store.shared.profiles.read().is_empty());
+        assert_eq!(store.shared.skipped_profiles.read().len(), 1);
+        store.save().unwrap();
+
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap())
+            .expect("saved store should be valid JSON");
+        assert!(saved["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|profile| profile["credential_kind"] == "passkey"));
+        store.shutdown_last_used_worker();
     }
 
     #[test]
-    fn unknown_profile_field_fails_store_load() {
+    fn unknown_profile_field_is_ignored_for_current_version_load() {
         let dir = tempdir().unwrap();
         let state_path = dir.path().join("auth_profiles.json");
 
@@ -3144,11 +3332,10 @@ mod tests {
         .unwrap();
 
         let store = ProfileStore::new(dir.path().to_path_buf());
-        let err = store
-            .load()
-            .expect_err("unknown profile fields should fail current-format load");
-        assert!(err.to_string().contains("unknownField"), "got: {err}");
-        assert!(store.shared.profiles.read().is_empty());
+        store.load().unwrap();
+        assert_eq!(store.shared.profiles.read().len(), 1);
+        assert!(store.shared.skipped_profiles.read().is_empty());
+        store.shutdown_last_used_worker();
     }
 
     #[test]

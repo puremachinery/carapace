@@ -81,7 +81,7 @@ pub enum CredentialError {
     /// Index file is corrupted
     IndexCorrupted,
     /// Plaintext credential files are no longer accepted.
-    PlaintextCredentialFileDetected(String),
+    PlaintextCredentialFilesDetected(Vec<String>),
     /// File lock acquisition failed
     LockFailed,
     /// Credential verification failed after write
@@ -125,10 +125,16 @@ impl std::fmt::Display for CredentialError {
                 WRITE_RATE_LIMIT_PER_MINUTE
             ),
             Self::IndexCorrupted => write!(f, "Credential index file is corrupted"),
-            Self::PlaintextCredentialFileDetected(path) => write!(
+            Self::PlaintextCredentialFilesDetected(paths) if paths.len() == 1 => write!(
                 f,
                 "plaintext credential file detected at {}; delete it and re-enroll",
-                path
+                paths[0]
+            ),
+            Self::PlaintextCredentialFilesDetected(paths) => write!(
+                f,
+                "plaintext credential files detected ({}): {}; delete them and re-enroll",
+                paths.len(),
+                paths.join(", ")
             ),
             Self::LockFailed => write!(f, "Failed to acquire file lock"),
             Self::VerificationFailed => write!(f, "Failed to verify credential after write"),
@@ -148,14 +154,18 @@ pub fn is_retryable(error: &CredentialError) -> bool {
 }
 
 pub(crate) fn reject_plaintext_credential_files(state_dir: &Path) -> Result<(), CredentialError> {
-    if let Some(path) = plaintext_credential_paths(state_dir)
+    let mut paths: Vec<String> = plaintext_credential_paths(state_dir)
         .into_iter()
-        .find(|path| path.is_file())
-    {
-        return Err(CredentialError::PlaintextCredentialFileDetected(
-            path.display().to_string(),
-        ));
+        .filter(|path| path.is_file())
+        .map(|path| path.display().to_string())
+        .collect();
+    paths.sort();
+    paths.dedup();
+
+    if !paths.is_empty() {
+        return Err(CredentialError::PlaintextCredentialFilesDetected(paths));
     }
+
     Ok(())
 }
 
@@ -1434,7 +1444,34 @@ mod tests {
             .expect_err("known plaintext WhatsApp file should be rejected");
         assert_eq!(
             err,
-            CredentialError::PlaintextCredentialFileDetected(legacy_path.display().to_string())
+            CredentialError::PlaintextCredentialFilesDetected(vec![legacy_path
+                .display()
+                .to_string()])
+        );
+    }
+
+    #[test]
+    fn test_plaintext_credential_guard_reports_all_detected_files() {
+        let temp = tempdir().unwrap();
+        let credentials_dir = temp.path().join("credentials");
+        std::fs::create_dir_all(&credentials_dir).unwrap();
+        let oauth_path = credentials_dir.join("oauth.json");
+        let creds_path = credentials_dir.join("creds.json");
+        std::fs::write(&oauth_path, "{}").unwrap();
+        std::fs::write(&creds_path, "{}").unwrap();
+
+        let err = reject_plaintext_credential_files(temp.path())
+            .expect_err("all plaintext credential files should be reported");
+        let CredentialError::PlaintextCredentialFilesDetected(paths) = err else {
+            panic!("expected plaintext credential rejection");
+        };
+
+        assert_eq!(
+            paths,
+            vec![
+                creds_path.display().to_string(),
+                oauth_path.display().to_string()
+            ]
         );
     }
 

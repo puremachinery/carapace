@@ -308,7 +308,8 @@ pub fn delete_hmac_sidecar(file_path: &Path) -> Result<(), io::Error> {
 /// - Missing `.hmac` file with `action: Reject` → returns error.
 /// - HMAC mismatch with `action: Warn` → logs warning.
 /// - HMAC mismatch with `action: Reject` → returns error.
-/// - Sidecar parse/format errors with `action: Warn` → logs warning.
+/// - Sidecar parse/format errors with `action: Warn` → logs warning, writes
+///   current HMAC.
 /// - Sidecar parse/format errors with `action: Reject` → returns error.
 pub fn verify_hmac_file(
     key: &[u8; 32],
@@ -344,6 +345,24 @@ fn hmacs_match(stored: &[u8], computed: &[u8; HMAC_DIGEST_SIZE]) -> bool {
     stored.ct_eq(computed.as_ref()).into()
 }
 
+fn write_current_hmac_sidecar_for_warn(
+    sidecar: &Path,
+    computed: &[u8; HMAC_DIGEST_SIZE],
+    file_name: &str,
+) {
+    tracing::warn!(
+        file = %file_name,
+        "warn-mode integrity sidecar creation trusts current bytes; prior tampering cannot be detected"
+    );
+    if let Err(e) = fs::write(sidecar, encode_sidecar_hmac_v1(computed)) {
+        tracing::warn!(
+            file = %file_name,
+            error = %e,
+            "failed to write HMAC sidecar"
+        );
+    }
+}
+
 fn verify_hmac_digest(
     computed: &[u8; 32],
     file_path: &Path,
@@ -362,6 +381,11 @@ fn verify_hmac_digest(
                 Err(e) => match config.action {
                     IntegrityAction::Warn => {
                         tracing::warn!("{}", e);
+                        tracing::warn!(
+                            file = %file_name,
+                            "unsupported HMAC sidecar format; writing current HMAC sidecar"
+                        );
+                        write_current_hmac_sidecar_for_warn(&sidecar, computed, file_name);
                         return Ok(());
                     }
                     IntegrityAction::Reject => return Err(e),
@@ -406,17 +430,7 @@ fn verify_hmac_digest(
                         file = %file_name,
                         "no HMAC sidecar found; writing current HMAC sidecar"
                     );
-                    tracing::warn!(
-                        file = %file_name,
-                        "warn-mode integrity sidecar creation trusts current bytes; prior tampering cannot be detected"
-                    );
-                    if let Err(e) = fs::write(&sidecar, encode_sidecar_hmac_v1(computed)) {
-                        tracing::warn!(
-                            file = %file_name,
-                            error = %e,
-                            "failed to write HMAC sidecar"
-                        );
-                    }
+                    write_current_hmac_sidecar_for_warn(&sidecar, computed, file_name);
                     Ok(())
                 }
                 IntegrityAction::Reject => Err(IntegrityError::Rejected {
@@ -791,6 +805,33 @@ mod tests {
     }
 
     #[test]
+    fn test_verify_warns_and_rewrites_unversioned_sidecar() {
+        let dir = TempDir::new().unwrap();
+        let file_path = dir.path().join("meta.json");
+        let data = r#"{"id":"current"}"#;
+        fs::write(&file_path, data).unwrap();
+
+        let key = derive_hmac_key(b"current-secret");
+        let digest = compute_hmac(&key, data.as_bytes());
+        let sidecar = dir.path().join("meta.json.hmac");
+        fs::write(&sidecar, hex::encode(digest)).unwrap();
+
+        let config = IntegrityConfig {
+            enabled: true,
+            action: IntegrityAction::Warn,
+        };
+
+        let result = verify_hmac_file(&key, data.as_bytes(), &file_path, &config);
+        assert!(
+            result.is_ok(),
+            "unversioned sidecar should warn-and-continue in Warn mode"
+        );
+
+        let rewritten = fs::read_to_string(&sidecar).unwrap();
+        assert_eq!(rewritten, encode_sidecar_hmac_v1(&digest));
+    }
+
+    #[test]
     fn test_verify_rejects_unknown_sidecar_version() {
         let dir = TempDir::new().unwrap();
         let file_path = dir.path().join("meta.json");
@@ -835,8 +876,9 @@ mod tests {
             "unknown sidecar version should warn-and-continue in Warn mode"
         );
 
-        let unchanged = fs::read_to_string(&sidecar).unwrap();
-        assert_eq!(unchanged, "v2:deadbeef");
+        let digest = compute_hmac(&key, data.as_bytes());
+        let rewritten = fs::read_to_string(&sidecar).unwrap();
+        assert_eq!(rewritten, encode_sidecar_hmac_v1(&digest));
     }
 
     #[test]

@@ -11,6 +11,8 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tracing::warn;
 use uuid::Uuid;
@@ -659,6 +661,7 @@ impl SessionFilter {
 struct CachedSession {
     session: Session,
     dirty: bool,
+    history_file_current_confirmed: bool,
 }
 
 struct CachedHistoryHmac {
@@ -700,6 +703,8 @@ pub struct SessionStore {
     locked_session_entries: RwLock<HashMap<String, SessionListEntry>>,
     /// Store-owned rolling HMAC state for history append fast paths.
     history_hmac_states: RwLock<HashMap<String, CachedHistoryHmac>>,
+    #[cfg(test)]
+    history_current_file_read_count: Arc<AtomicUsize>,
 }
 
 impl Default for SessionStore {
@@ -730,6 +735,8 @@ impl SessionStore {
             crypto: None,
             locked_session_entries: RwLock::new(HashMap::new()),
             history_hmac_states: RwLock::new(HashMap::new()),
+            #[cfg(test)]
+            history_current_file_read_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -776,7 +783,28 @@ impl SessionStore {
     }
 
     fn new_cached_session(&self, session: Session, dirty: bool) -> CachedSession {
-        CachedSession { session, dirty }
+        CachedSession {
+            session,
+            dirty,
+            history_file_current_confirmed: self.encryption_active(),
+        }
+    }
+
+    fn history_file_current_confirmed(&self, session_id: &str) -> bool {
+        self.encryption_active()
+            && self
+                .sessions
+                .read()
+                .get(session_id)
+                .is_some_and(|cached| cached.history_file_current_confirmed)
+    }
+
+    fn mark_history_file_current(&self, session_id: &str) {
+        let current = self.encryption_active();
+        let mut sessions = self.sessions.write();
+        if let Some(cached) = sessions.get_mut(session_id) {
+            cached.history_file_current_confirmed = current;
+        }
     }
 
     fn lock_message(reason: impl Into<String>) -> SessionStoreError {
@@ -1085,13 +1113,26 @@ impl SessionStore {
         } else {
             self.clear_history_hmac_state(session_id);
         }
+        self.mark_history_file_current(session_id);
         Ok(())
     }
 
-    fn ensure_history_file_current(&self, history_path: &Path) -> Result<(), SessionStoreError> {
-        if !self.encryption_active() || !history_path.exists() {
+    fn ensure_history_file_current(
+        &self,
+        history_path: &Path,
+        session_id: &str,
+    ) -> Result<(), SessionStoreError> {
+        if !self.encryption_active() || self.history_file_current_confirmed(session_id) {
             return Ok(());
         }
+        if !history_path.exists() {
+            self.mark_history_file_current(session_id);
+            return Ok(());
+        }
+
+        #[cfg(test)]
+        self.history_current_file_read_count
+            .fetch_add(1, Ordering::SeqCst);
 
         let history_bytes = self.read_verified_history_bytes(history_path)?;
         let Some(line) = history_bytes
@@ -1099,6 +1140,7 @@ impl SessionStore {
             .map(Self::trim_ascii_whitespace)
             .find(|line| !line.is_empty())
         else {
+            self.mark_history_file_current(session_id);
             return Ok(());
         };
 
@@ -1107,6 +1149,7 @@ impl SessionStore {
                 "session history is not encrypted; current session encryption requires encrypted artifacts",
             ));
         }
+        self.mark_history_file_current(session_id);
         Ok(())
     }
 
@@ -1141,7 +1184,7 @@ impl SessionStore {
         if history_path.exists() {
             let _history_lock = FileLock::acquire(&history_path)
                 .map_err(|e| SessionStoreError::Io(e.to_string()))?;
-            self.ensure_history_file_current(&history_path)?;
+            self.ensure_history_file_current(&history_path, &session.id)?;
         }
         self.ensure_archive_file_current(&session.id)
     }
@@ -1680,6 +1723,7 @@ impl SessionStore {
         }
         self.delete_history_hmac(&history_path, session_id)?;
         self.clear_history_hmac_state(session_id);
+        self.mark_history_file_current(session_id);
 
         // Reset message count and compaction metadata
         session.message_count = 0;
@@ -1870,7 +1914,7 @@ impl SessionStore {
         let history_path = self.session_history_path(&session_id)?;
         let _lock =
             FileLock::acquire(&history_path).map_err(|e| SessionStoreError::Io(e.to_string()))?;
-        self.ensure_history_file_current(&history_path)?;
+        self.ensure_history_file_current(&history_path, &session_id)?;
         let encoded = self.encode_history_message(&message)?;
         let mut appended = encoded;
         appended.push(b'\n');
@@ -1889,6 +1933,7 @@ impl SessionStore {
         if let Some(state) = hmac_state {
             self.store_history_hmac_state(&session_id, &history_path, state);
         }
+        self.mark_history_file_current(&session_id);
 
         // Update session message count
         self.increment_message_count(&session_id)?;
@@ -1929,7 +1974,7 @@ impl SessionStore {
         let history_path = self.session_history_path(session_id)?;
         let _lock =
             FileLock::acquire(&history_path).map_err(|e| SessionStoreError::Io(e.to_string()))?;
-        self.ensure_history_file_current(&history_path)?;
+        self.ensure_history_file_current(&history_path, session_id)?;
         let mut appended = Vec::new();
 
         for msg in messages {
@@ -1952,6 +1997,7 @@ impl SessionStore {
         if let Some(state) = hmac_state {
             self.store_history_hmac_state(session_id, &history_path, state);
         }
+        self.mark_history_file_current(session_id);
 
         // Update message count
         for _ in messages {
@@ -2039,6 +2085,7 @@ impl SessionStore {
         }
         self.delete_history_hmac(&history_path, session_id)?;
         self.clear_history_hmac_state(session_id);
+        self.mark_history_file_current(session_id);
 
         // Reset message count
         {
@@ -2248,6 +2295,7 @@ impl SessionStore {
             }
             self.delete_history_hmac(&history_path, session_id)?;
             self.clear_history_hmac_state(session_id);
+            self.mark_history_file_current(session_id);
         } else if self.encryption_active() {
             self.rewrite_history_file_from_messages(&history_path, session_id, &archived.messages)?;
         }
@@ -3232,6 +3280,47 @@ mod tests {
         );
         let reopened_history = reopened.get_history(&session.id, None, None).unwrap();
         assert_eq!(reopened_history.len(), 1);
+    }
+
+    #[test]
+    fn test_append_reuses_encrypted_history_current_check_after_load() {
+        let key_material = test_key_material();
+        let (store, temp_dir) = create_encrypted_store_without_hmac(&key_material);
+        let session = store
+            .create_session("agent-1", SessionMetadata::default())
+            .unwrap();
+        store
+            .append_message(ChatMessage::user(&session.id, "first"))
+            .unwrap();
+
+        let crypto = SessionCryptoContext::load_or_create(temp_dir.path(), &key_material).unwrap();
+        let reopened = SessionStore::with_base_path(temp_dir.path().to_path_buf())
+            .with_encryption_mode(EncryptionMode::IfPassword)
+            .with_crypto_context(Arc::new(crypto));
+        reopened
+            .history_current_file_read_count
+            .store(0, Ordering::SeqCst);
+
+        reopened
+            .append_message(ChatMessage::assistant(&session.id, "second"))
+            .unwrap();
+        assert_eq!(
+            reopened
+                .history_current_file_read_count
+                .load(Ordering::SeqCst),
+            1
+        );
+
+        reopened
+            .append_message(ChatMessage::user(&session.id, "third"))
+            .unwrap();
+        assert_eq!(
+            reopened
+                .history_current_file_read_count
+                .load(Ordering::SeqCst),
+            1,
+            "history currentness should stay cached for later appends"
+        );
     }
 
     #[test]
