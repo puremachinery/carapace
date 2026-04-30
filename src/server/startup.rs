@@ -561,19 +561,18 @@ fn spawn_activity_feature_support_warnings(
 /// Last-known-good config snapshot held by `spawn_config_watcher_bridge`.
 ///
 /// When a reload turns out to be invalid for provider hot-swap purposes (no
-/// provider, or build error), the bridge restores this pair into the cache
-/// so other config sections that came in alongside the bad provider edit
-/// are rolled back too. This guarantees a consistent steady state after
-/// rollback — WS clients are not notified of the bad reload, and any
-/// subsequent request reads the rolled-back config — rather than leaving
-/// the cache partially applied. (Process-env injection performed by
-/// `apply_config_env_vars` is **not** rolled back by this mechanism; if the
-/// rejected reload changed an env-injected provider variable, that env
-/// state stays at whatever the watcher applied.)
+/// provider, or build error), the bridge restores this trio into the
+/// process so other config sections that came in alongside the bad provider
+/// edit are rolled back too. This guarantees a consistent steady state
+/// after rollback — WS clients are not notified of the bad reload, any
+/// subsequent request reads the rolled-back config, **and** any process-env
+/// vars that the rejected reload injected via the config `env` block are
+/// reverted to the values from `last_good_env`.
 #[derive(Clone)]
 struct ReloadState {
     last_good_raw: Arc<Value>,
     last_good_normalized: Arc<Value>,
+    last_good_env: config::InjectedConfigEnvState,
     current_fingerprint: crate::agent::factory::ProviderFingerprint,
 }
 
@@ -623,11 +622,13 @@ fn handle_provider_reload(ws_state: &Arc<WsServerState>, state: &mut ReloadState
 
     let new_fingerprint = crate::agent::factory::fingerprint_providers(&new_cfg_arc);
     if new_fingerprint == state.current_fingerprint {
-        // Provider unchanged; new (raw, value) is valid wrt provider, capture
+        // Provider unchanged; new (raw, value) is valid wrt provider. Capture
         // it as the new last-good so a future no-provider reload rolls back to
-        // *this* state, not an older one.
+        // *this* state, not an older one. Also re-snapshot the env state since
+        // the watcher applied any new env-injected vars before the event fired.
         state.last_good_raw = new_raw_arc;
         state.last_good_normalized = new_cfg_arc;
+        state.last_good_env = config::snapshot_env_state();
         return ReloadOutcome::Apply;
     }
 
@@ -638,6 +639,7 @@ fn handle_provider_reload(ws_state: &Arc<WsServerState>, state: &mut ReloadState
             info!("LLM providers hot-swapped successfully");
             state.last_good_raw = new_raw_arc;
             state.last_good_normalized = new_cfg_arc;
+            state.last_good_env = config::snapshot_env_state();
             state.current_fingerprint = new_fingerprint;
             ReloadOutcome::Apply
         }
@@ -647,10 +649,7 @@ fn handle_provider_reload(ws_state: &Arc<WsServerState>, state: &mut ReloadState
                  to keep the previous provider active. Restore a provider config to \
                  apply further changes."
             );
-            config::update_cache(
-                (*state.last_good_raw).clone(),
-                (*state.last_good_normalized).clone(),
-            );
+            revert_to_last_good(state);
             ReloadOutcome::Reverted
         }
         Err(e) => {
@@ -658,13 +657,19 @@ fn handle_provider_reload(ws_state: &Arc<WsServerState>, state: &mut ReloadState
                 "Failed to rebuild LLM providers: {} (reverting reload to keep previous provider)",
                 e
             );
-            config::update_cache(
-                (*state.last_good_raw).clone(),
-                (*state.last_good_normalized).clone(),
-            );
+            revert_to_last_good(state);
             ReloadOutcome::Reverted
         }
     }
+}
+
+/// Restore the cache and process env to the last-known-good snapshot.
+fn revert_to_last_good(state: &ReloadState) {
+    config::update_cache(
+        (*state.last_good_raw).clone(),
+        (*state.last_good_normalized).clone(),
+    );
+    config::restore_env_state(&state.last_good_env);
 }
 
 /// Spawn a task that bridges config watcher reload events to WebSocket broadcasts
@@ -692,6 +697,7 @@ fn spawn_config_watcher_bridge(
     let mut reload_state = ReloadState {
         last_good_raw: Arc::new(initial_raw),
         last_good_normalized: Arc::new(initial_normalized.clone()),
+        last_good_env: config::snapshot_env_state(),
         current_fingerprint: crate::agent::factory::fingerprint_providers(&initial_normalized),
     };
     tokio::spawn(async move {
@@ -2055,6 +2061,7 @@ mod tests {
         let reload_state = ReloadState {
             last_good_raw: Arc::new(initial_raw),
             last_good_normalized: Arc::new(initial_normalized.clone()),
+            last_good_env: crate::config::snapshot_env_state(),
             current_fingerprint: crate::agent::factory::fingerprint_providers(&initial_normalized),
         };
         (cache_guard, env, ws_state, reload_state)

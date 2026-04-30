@@ -116,13 +116,32 @@ static CONFIG_CHANGE_TX: LazyLock<tokio::sync::watch::Sender<u64>> = LazyLock::n
 });
 
 #[derive(Clone, Default)]
-struct InjectedConfigEnvState {
+pub(crate) struct InjectedConfigEnvState {
     active_values: HashMap<String, String>,
     previous_values: HashMap<String, Option<OsString>>,
 }
 
 static CONFIG_ENV_STATE: LazyLock<Mutex<InjectedConfigEnvState>> =
     LazyLock::new(|| Mutex::new(InjectedConfigEnvState::default()));
+
+/// Take an opaque snapshot of the currently-injected config env state. The
+/// returned value can later be passed to [`restore_env_state`] to revert
+/// process env to the snapshot's view of the world. Used by the config
+/// watcher bridge to make hot-reload rollback include env-injected changes,
+/// not just the cached `(raw, normalized)` pair.
+pub(crate) fn snapshot_env_state() -> InjectedConfigEnvState {
+    CONFIG_ENV_STATE.lock().clone()
+}
+
+/// Restore the process env injected by config to the state captured by
+/// [`snapshot_env_state`]. Vars that were active at snapshot time are set
+/// back to their snapshot values; vars active *now* but not at snapshot time
+/// are unset (or restored to the pre-injection shell value if one was
+/// captured at the time those vars were first injected).
+pub(crate) fn restore_env_state(snapshot: &InjectedConfigEnvState) {
+    let mut current = CONFIG_ENV_STATE.lock();
+    restore_config_env_state(snapshot, &mut current);
+}
 
 /// Get the config file path.
 /// Priority: CARAPACE_CONFIG_PATH > CARAPACE_STATE_DIR/carapace.json5 > ~/.config/carapace/carapace.json5
