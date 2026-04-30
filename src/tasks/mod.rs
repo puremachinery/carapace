@@ -214,9 +214,12 @@ impl TaskQueue {
             Ok(bytes) => bytes,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(err) => {
-                let message = format!("failed to read task queue file {}: {err}", path.display());
+                let message = format!(
+                    "failed to read task queue file {}; starting with an empty task queue: {err}",
+                    path.display()
+                );
                 warn!(path = %path.display(), error = %err, "{message}");
-                return Err(message);
+                return Ok(());
             }
         };
 
@@ -1502,6 +1505,34 @@ mod tests {
             .get("task-with-future-policy-field")
             .expect("task should load");
         assert_eq!(loaded.policy.max_attempts, 100);
+    }
+
+    #[test]
+    fn test_load_starts_empty_when_queue_file_is_unreadable() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tasks").join("queue.json");
+        std::fs::create_dir_all(&path).unwrap();
+
+        let queue = TaskQueue::new(Some(path));
+        queue
+            .load()
+            .expect("transient queue read failures should not block startup");
+        assert!(queue.list().is_empty());
+    }
+
+    #[test]
+    fn test_load_rejects_malformed_queue_with_path() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tasks").join("queue.json");
+        std::fs::create_dir_all(path.parent().expect("tasks directory")).unwrap();
+        std::fs::write(&path, b"not json").unwrap();
+
+        let queue = TaskQueue::new(Some(path.clone()));
+        let err = queue
+            .load()
+            .expect_err("malformed queue data should block startup");
+        assert!(err.contains(&path.display().to_string()), "got: {err}");
+        assert!(err.contains("Remove or repair the file"), "got: {err}");
     }
 
     #[tokio::test]

@@ -786,7 +786,7 @@ impl SessionStore {
         CachedSession {
             session,
             dirty,
-            history_file_current_confirmed: self.encryption_active(),
+            history_file_current_confirmed: false,
         }
     }
 
@@ -1528,6 +1528,7 @@ impl SessionStore {
                 self.new_cached_session(session.clone(), false),
             );
         }
+        self.mark_history_file_current(&session.id);
 
         Ok(session)
     }
@@ -1601,6 +1602,9 @@ impl SessionStore {
                     session.id.clone(),
                     self.new_cached_session(session.clone(), false),
                 );
+                drop(sessions);
+                drop(key_map);
+                self.mark_history_file_current(&session.id);
 
                 Ok(session)
             }
@@ -2559,6 +2563,7 @@ impl SessionStore {
                 self.new_cached_session(session.clone(), false),
             );
         }
+        self.mark_history_file_current(&session.id);
 
         Ok(session)
     }
@@ -2743,10 +2748,15 @@ impl SessionStore {
                 session.last_activity_at = Some(now_millis());
 
                 let mut sessions = self.sessions.write();
-                sessions.insert(
-                    session_id.to_string(),
-                    self.new_cached_session(session, true),
-                );
+                if let Some(cached) = sessions.get_mut(session_id) {
+                    cached.session = session;
+                    cached.dirty = true;
+                } else {
+                    sessions.insert(
+                        session_id.to_string(),
+                        self.new_cached_session(session, true),
+                    );
+                }
             }
         }
 
@@ -3320,6 +3330,20 @@ mod tests {
                 .load(Ordering::SeqCst),
             1,
             "history currentness should stay cached for later appends"
+        );
+    }
+
+    #[test]
+    fn test_cached_session_history_currentness_starts_unconfirmed() {
+        let key_material = test_key_material();
+        let (store, _temp_dir) = create_encrypted_store_without_hmac(&key_material);
+        let session = Session::new("agent-1", SessionMetadata::default());
+
+        let cached = store.new_cached_session(session, false);
+
+        assert!(
+            !cached.history_file_current_confirmed,
+            "cache entries must be promoted only after an explicit history-currentness check"
         );
     }
 

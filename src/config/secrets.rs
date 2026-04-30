@@ -436,6 +436,67 @@ pub fn is_encrypted(value: &str) -> bool {
     SecretEnvelopeVersion::parse_prefix(value).is_some()
 }
 
+/// Unsupported encrypted envelope found while scanning config values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnsupportedEncryptedValue {
+    pub(crate) path: String,
+    pub(crate) prefix: String,
+}
+
+/// Return the first `enc:v*` value that looks encrypted but is not supported.
+pub(crate) fn find_unsupported_encrypted_value(
+    config: &Value,
+) -> Option<UnsupportedEncryptedValue> {
+    find_unsupported_encrypted_inner(config, ".", 0)
+}
+
+fn find_unsupported_encrypted_inner(
+    config: &Value,
+    path: &str,
+    depth: usize,
+) -> Option<UnsupportedEncryptedValue> {
+    if depth > MAX_SCAN_DEPTH {
+        tracing::warn!(
+            "find_unsupported_encrypted_value: maximum recursion depth ({}) exceeded, stopping scan",
+            MAX_SCAN_DEPTH
+        );
+        return None;
+    }
+
+    match config {
+        Value::String(s) => {
+            unsupported_encrypted_prefix(s).map(|prefix| UnsupportedEncryptedValue {
+                path: path.to_string(),
+                prefix,
+            })
+        }
+        Value::Object(map) => map.iter().find_map(|(key, value)| {
+            let child_path = if path == "." {
+                format!(".{key}")
+            } else {
+                format!("{path}.{key}")
+            };
+            find_unsupported_encrypted_inner(value, &child_path, depth + 1)
+        }),
+        Value::Array(arr) => arr.iter().enumerate().find_map(|(index, value)| {
+            find_unsupported_encrypted_inner(value, &format!("{path}[{index}]"), depth + 1)
+        }),
+        _ => None,
+    }
+}
+
+fn unsupported_encrypted_prefix(value: &str) -> Option<String> {
+    if SecretEnvelopeVersion::parse_prefix(value).is_some() || !value.starts_with("enc:v") {
+        return None;
+    }
+
+    let mut segments = value.split(':');
+    match (segments.next(), segments.next()) {
+        (Some("enc"), Some(version)) if version.starts_with('v') => Some(format!("enc:{version}")),
+        _ => Some("enc:v".to_string()),
+    }
+}
+
 /// Maximum recursion depth for `resolve_secrets` to prevent stack overflow
 /// on programmatically constructed JSON trees.
 const MAX_RESOLVE_DEPTH: usize = 64;
@@ -989,6 +1050,18 @@ mod tests {
         assert!(!is_encrypted(""));
         assert!(!is_encrypted("enc:v3:abc:def:ghi"));
         assert!(!is_encrypted("ENC:V2:abc:def:ghi"));
+    }
+
+    #[test]
+    fn test_find_unsupported_encrypted_value_reports_path_and_prefix() {
+        let config = json!({
+            "anthropic": { "apiKey": "enc:v1:aaa:bbb:ccc" },
+            "openai": { "apiKey": "plain" }
+        });
+
+        let unsupported = find_unsupported_encrypted_value(&config).unwrap();
+        assert_eq!(unsupported.path, ".anthropic.apiKey");
+        assert_eq!(unsupported.prefix, "enc:v1");
     }
 
     #[test]

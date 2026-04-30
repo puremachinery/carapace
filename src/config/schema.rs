@@ -1154,6 +1154,16 @@ fn check_model_has_provider_prefix(model: &str, path: &str, issues: &mut Vec<Sch
 fn validate_session(obj: &serde_json::Map<String, Value>, issues: &mut Vec<SchemaIssue>) {
     let sessions = obj.get("sessions").and_then(|v| v.as_object());
 
+    if let Some(sessions_obj) = sessions {
+        reject_removed_alias(
+            sessions_obj,
+            "retentionDays",
+            ".sessions.retentionDays",
+            ".sessions.retention.days",
+            issues,
+        );
+    }
+
     if let Some(retention) = sessions
         .and_then(|s| s.get("retention"))
         .and_then(|v| v.as_object())
@@ -2916,6 +2926,17 @@ mod tests {
         assert!(issues
             .iter()
             .any(|i| i.path == ".sessions.retention.enabled"));
+    }
+
+    #[test]
+    fn test_session_retention_days_alias_rejected() {
+        let cfg = json!({ "sessions": { "retentionDays": 30 } });
+        let issues = validate_schema(&cfg);
+        assert_alias_rejected(
+            &issues,
+            ".sessions.retentionDays",
+            ".sessions.retention.days",
+        );
     }
 
     #[test]
