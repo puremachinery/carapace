@@ -455,21 +455,24 @@ pub(crate) struct ConfigSecretScanDepthExceeded {
     pub(crate) max_depth: usize,
 }
 
-/// Return the first `enc:v*` value that looks encrypted but is not supported.
-pub(crate) fn find_unsupported_encrypted_value(
+/// Return all `enc:v*` values that look encrypted but are not supported.
+pub(crate) fn find_unsupported_encrypted_values(
     config: &Value,
-) -> Result<Option<UnsupportedEncryptedValue>, ConfigSecretScanDepthExceeded> {
-    find_unsupported_encrypted_inner(config, ".", 0)
+) -> Result<Vec<UnsupportedEncryptedValue>, ConfigSecretScanDepthExceeded> {
+    let mut unsupported = Vec::new();
+    collect_unsupported_encrypted_inner(config, ".", 0, &mut unsupported)?;
+    Ok(unsupported)
 }
 
-fn find_unsupported_encrypted_inner(
+fn collect_unsupported_encrypted_inner(
     config: &Value,
     path: &str,
     depth: usize,
-) -> Result<Option<UnsupportedEncryptedValue>, ConfigSecretScanDepthExceeded> {
+    unsupported: &mut Vec<UnsupportedEncryptedValue>,
+) -> Result<(), ConfigSecretScanDepthExceeded> {
     if depth > MAX_SCAN_DEPTH {
         tracing::warn!(
-            "find_unsupported_encrypted_value: maximum recursion depth ({}) exceeded, stopping scan",
+            "find_unsupported_encrypted_values: maximum recursion depth ({}) exceeded, stopping scan",
             MAX_SCAN_DEPTH
         );
         return Err(ConfigSecretScanDepthExceeded {
@@ -480,12 +483,13 @@ fn find_unsupported_encrypted_inner(
 
     match config {
         Value::String(s) => {
-            Ok(
-                unsupported_encrypted_prefix(s).map(|prefix| UnsupportedEncryptedValue {
+            if let Some(prefix) = unsupported_encrypted_prefix(s) {
+                unsupported.push(UnsupportedEncryptedValue {
                     path: path.to_string(),
                     prefix,
-                }),
-            )
+                });
+            }
+            Ok(())
         }
         Value::Object(map) => {
             for (key, value) in map {
@@ -494,25 +498,22 @@ fn find_unsupported_encrypted_inner(
                 } else {
                     format!("{path}.{key}")
                 };
-                if let Some(unsupported) =
-                    find_unsupported_encrypted_inner(value, &child_path, depth + 1)?
-                {
-                    return Ok(Some(unsupported));
-                }
+                collect_unsupported_encrypted_inner(value, &child_path, depth + 1, unsupported)?;
             }
-            Ok(None)
+            Ok(())
         }
         Value::Array(arr) => {
             for (index, value) in arr.iter().enumerate() {
-                if let Some(unsupported) =
-                    find_unsupported_encrypted_inner(value, &format!("{path}[{index}]"), depth + 1)?
-                {
-                    return Ok(Some(unsupported));
-                }
+                collect_unsupported_encrypted_inner(
+                    value,
+                    &format!("{path}[{index}]"),
+                    depth + 1,
+                    unsupported,
+                )?;
             }
-            Ok(None)
+            Ok(())
         }
-        _ => Ok(None),
+        _ => Ok(()),
     }
 }
 
@@ -1084,25 +1085,36 @@ mod tests {
     }
 
     #[test]
-    fn test_find_unsupported_encrypted_value_reports_path_and_prefix() {
+    fn test_find_unsupported_encrypted_values_reports_paths_and_prefixes() {
         let config = json!({
             "anthropic": { "apiKey": "enc:v1:aaa:bbb:ccc" },
-            "openai": { "apiKey": "plain" }
+            "openai": { "apiKey": "enc:v3:ddd:eee:fff" }
         });
 
-        let unsupported = find_unsupported_encrypted_value(&config).unwrap().unwrap();
-        assert_eq!(unsupported.path, ".anthropic.apiKey");
-        assert_eq!(unsupported.prefix, "enc:v1");
+        let unsupported = find_unsupported_encrypted_values(&config).unwrap();
+        assert_eq!(
+            unsupported,
+            vec![
+                UnsupportedEncryptedValue {
+                    path: ".anthropic.apiKey".to_string(),
+                    prefix: "enc:v1".to_string(),
+                },
+                UnsupportedEncryptedValue {
+                    path: ".openai.apiKey".to_string(),
+                    prefix: "enc:v3".to_string(),
+                },
+            ]
+        );
     }
 
     #[test]
-    fn test_find_unsupported_encrypted_value_reports_depth_exceeded() {
+    fn test_find_unsupported_encrypted_values_reports_depth_exceeded() {
         let mut config = json!("enc:v1:aaa:bbb:ccc");
         for index in 0..=MAX_SCAN_DEPTH {
             config = json!({ format!("level{index}"): config });
         }
 
-        let err = find_unsupported_encrypted_value(&config).unwrap_err();
+        let err = find_unsupported_encrypted_values(&config).unwrap_err();
 
         assert!(err.path.contains(".level"));
         assert_eq!(err.max_depth, MAX_SCAN_DEPTH);

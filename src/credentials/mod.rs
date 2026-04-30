@@ -17,6 +17,7 @@ mod linux;
 mod windows;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as IoWrite;
@@ -51,6 +52,32 @@ const WHATSAPP_LEGACY_PLAINTEXT_PREFIXES: &[&str] = &[
     "pre-key-",
     "sender-key-",
     "session-",
+];
+const WHATSAPP_LEGACY_CREDENTIAL_JSON_KEYS: &[&str] = &[
+    "_sessions",
+    "account",
+    "accountSettings",
+    "advSecretKey",
+    "chainKey",
+    "currentRatchet",
+    "fingerprint",
+    "firstUnuploadedPreKeyId",
+    "identityKey",
+    "indexInfo",
+    "keyData",
+    "lastAccountSyncTimestamp",
+    "me",
+    "myAppStateKeyId",
+    "nextPreKeyId",
+    "noiseKey",
+    "pendingPreKey",
+    "processedHistoryMessages",
+    "registrationId",
+    "senderKeyState",
+    "senderSigningKey",
+    "signedIdentityKey",
+    "signedPreKey",
+    "signalIdentities",
 ];
 
 /// Credential store errors
@@ -201,11 +228,7 @@ fn plaintext_credential_paths(state_dir: &Path) -> Vec<PathBuf> {
             if let Ok(files) = fs::read_dir(account_path) {
                 for file in files.flatten() {
                     let path = file.path();
-                    if path
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .is_some_and(is_legacy_whatsapp_plaintext_file)
-                    {
+                    if is_legacy_whatsapp_plaintext_file(&path) {
                         paths.push(path);
                     }
                 }
@@ -216,12 +239,39 @@ fn plaintext_credential_paths(state_dir: &Path) -> Vec<PathBuf> {
     paths
 }
 
-fn is_legacy_whatsapp_plaintext_file(name: &str) -> bool {
-    WHATSAPP_LEGACY_PLAINTEXT_FILENAMES.contains(&name)
+fn is_legacy_whatsapp_plaintext_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let matched_name = WHATSAPP_LEGACY_PLAINTEXT_FILENAMES.contains(&name)
         || (name.ends_with(".json")
             && WHATSAPP_LEGACY_PLAINTEXT_PREFIXES
                 .iter()
-                .any(|prefix| name.starts_with(prefix)))
+                .any(|prefix| name.starts_with(prefix)));
+    matched_name && whatsapp_plaintext_file_has_credential_shape(path)
+}
+
+fn whatsapp_plaintext_file_has_credential_shape(path: &Path) -> bool {
+    let Ok(content) = fs::read_to_string(path) else {
+        return true;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&content) else {
+        return true;
+    };
+    whatsapp_json_has_credential_shape(&value)
+}
+
+fn whatsapp_json_has_credential_shape(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+
+    object.keys().any(|key| {
+        WHATSAPP_LEGACY_CREDENTIAL_JSON_KEYS.contains(&key.as_str())
+            || (key == "type"
+                && object.get("type").and_then(Value::as_str) == Some("Buffer")
+                && object.get("data").is_some_and(Value::is_array))
+    })
 }
 
 fn agent_plaintext_credential_paths(state_dir: &Path) -> Vec<PathBuf> {
@@ -1432,7 +1482,7 @@ mod tests {
             .join("default");
         std::fs::create_dir_all(&account_dir).unwrap();
         let legacy_path = account_dir.join("session-123.json");
-        std::fs::write(&legacy_path, "{}").unwrap();
+        std::fs::write(&legacy_path, r#"{"_sessions":{}}"#).unwrap();
 
         let err = reject_plaintext_credential_files(temp.path())
             .expect_err("known plaintext WhatsApp file should be rejected");
@@ -1499,9 +1549,36 @@ mod tests {
         std::fs::write(account_dir.join("session.enc"), "encrypted").unwrap();
         std::fs::write(account_dir.join(".DS_Store"), "finder").unwrap();
         std::fs::write(account_dir.join("notes.json"), "{}").unwrap();
+        std::fs::write(
+            account_dir.join("session-debug.json"),
+            r#"{"message":"operator note"}"#,
+        )
+        .unwrap();
 
         reject_plaintext_credential_files(temp.path())
             .expect("incidental WhatsApp files should not block startup");
+    }
+
+    #[test]
+    fn test_plaintext_credential_guard_detects_buffer_shaped_whatsapp_file() {
+        let temp = tempdir().unwrap();
+        let account_dir = temp
+            .path()
+            .join("credentials")
+            .join("whatsapp")
+            .join("default");
+        std::fs::create_dir_all(&account_dir).unwrap();
+        let legacy_path = account_dir.join("pre-key-1.json");
+        std::fs::write(&legacy_path, r#"{"type":"Buffer","data":[1,2,3]}"#).unwrap();
+
+        let err = reject_plaintext_credential_files(temp.path())
+            .expect_err("credential-shaped WhatsApp file should be rejected");
+        assert_eq!(
+            err,
+            CredentialError::PlaintextCredentialFilesDetected(vec![legacy_path
+                .display()
+                .to_string()])
+        );
     }
 
     #[tokio::test]

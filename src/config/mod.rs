@@ -175,17 +175,31 @@ pub(crate) fn config_password() -> Option<Zeroizing<Vec<u8>>> {
 }
 
 fn resolve_config_secrets(value: &mut Value) -> Result<(), ConfigError> {
-    match secrets::find_unsupported_encrypted_value(value) {
-        Ok(Some(unsupported)) => {
-            return Err(ConfigError::ValidationError {
-                path: unsupported.path,
-                message: format!(
-                    "unsupported encrypted config secret envelope {}; only enc:v2 is supported; re-enter or re-encrypt this config secret",
-                    unsupported.prefix
-                ),
-            });
+    match secrets::find_unsupported_encrypted_values(value) {
+        Ok(unsupported) if !unsupported.is_empty() => {
+            let path = if unsupported.len() == 1 {
+                unsupported[0].path.clone()
+            } else {
+                ".".to_string()
+            };
+            let message = if unsupported.len() == 1 {
+                format!(
+                    "unsupported encrypted config secret envelope {} at {}; only enc:v2 is supported; re-enter or re-encrypt this config secret",
+                    unsupported[0].prefix, unsupported[0].path
+                )
+            } else {
+                let entries = unsupported
+                    .iter()
+                    .map(|value| format!("{} at {}", value.prefix, value.path))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "unsupported encrypted config secret envelopes: {entries}; only enc:v2 is supported; re-enter or re-encrypt these config secrets"
+                )
+            };
+            return Err(ConfigError::ValidationError { path, message });
         }
-        Ok(None) => {}
+        Ok(_) => {}
         Err(err) => {
             return Err(ConfigError::ValidationError {
                 path: err.path,
@@ -1347,6 +1361,29 @@ mod tests {
             Err(ConfigError::ValidationError { path, message })
                 if path == ".anthropic.apiKey"
                     && message.contains("unsupported encrypted config secret envelope enc:v1")
+                    && message.contains("enc:v2")
+        ));
+    }
+
+    #[test]
+    fn test_load_config_reports_all_unsupported_encrypted_secret_prefixes() {
+        let dir = TempDir::new().unwrap();
+        let main_path = create_temp_config(
+            &dir,
+            "config.json5",
+            r#"{
+                "anthropic": { "apiKey": "enc:v1:aaa:bbb:ccc" },
+                "openai": { "apiKey": "enc:v3:ddd:eee:fff" }
+            }"#,
+        );
+
+        let result = load_config_uncached(&main_path);
+        assert!(matches!(
+            result,
+            Err(ConfigError::ValidationError { path, message })
+                if path == "."
+                    && message.contains("enc:v1 at .anthropic.apiKey")
+                    && message.contains("enc:v3 at .openai.apiKey")
                     && message.contains("enc:v2")
         ));
     }
