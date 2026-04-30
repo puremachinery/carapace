@@ -124,41 +124,39 @@ pub(crate) struct InjectedConfigEnvState {
 static CONFIG_ENV_STATE: LazyLock<Mutex<InjectedConfigEnvState>> =
     LazyLock::new(|| Mutex::new(InjectedConfigEnvState::default()));
 
-/// Take an opaque snapshot of the currently-injected config env state. The
-/// returned value can later be passed to [`restore_env_state`] to revert
-/// process env to the snapshot's view of the world. Used by the config
-/// watcher bridge to make hot-reload rollback include env-injected changes,
-/// not just the cached `(raw, normalized)` pair.
+/// Snapshot of the currently-injected config env state, opaque to callers.
 pub(crate) fn snapshot_env_state() -> InjectedConfigEnvState {
     CONFIG_ENV_STATE.lock().clone()
 }
 
-/// Test-only helper: install config-injected env vars via the same
-/// `apply_config_env_vars` primitive the watcher uses, so tests that want
-/// `CONFIG_ENV_STATE` to be non-empty (e.g. for env-rollback assertions)
-/// can populate it without driving a full file reload.
+/// Restore process env to the state captured by [`snapshot_env_state`].
+pub(crate) fn restore_env_state(snapshot: &InjectedConfigEnvState) {
+    let mut current = CONFIG_ENV_STATE.lock();
+    restore_config_env_state(snapshot, &mut current);
+}
+
 #[cfg(test)]
 pub(crate) fn apply_config_env_for_test(vars: HashMap<String, String>) {
     let mut state = CONFIG_ENV_STATE.lock();
     apply_config_env_vars(&vars, &mut state);
 }
 
-/// Test-only RAII guard that resets `CONFIG_ENV_STATE` to empty on drop.
-/// Use alongside `ScopedConfigCache` / `ScopedEnv` for tests that mutate
-/// the global env-injection tracker via `apply_config_env_for_test`, so a
-/// dirty state can't bleed into a parallel test's `snapshot_env_state()`
-/// return value.
+#[cfg(test)]
+fn reset_config_env_state() {
+    let mut state = CONFIG_ENV_STATE.lock();
+    let empty = InjectedConfigEnvState::default();
+    restore_config_env_state(&empty, &mut state);
+}
+
+/// RAII guard that empties `CONFIG_ENV_STATE` on construction and drop, so
+/// tests that mutate the global env tracker can't bleed into each other.
 #[cfg(test)]
 pub(crate) struct ScopedEnvStateForTest;
 
 #[cfg(test)]
 impl ScopedEnvStateForTest {
     pub(crate) fn new() -> Self {
-        // Reset on entry too — guards against a previous test that didn't
-        // clean up (panic, missed guard) leaving stale state behind.
-        let mut state = CONFIG_ENV_STATE.lock();
-        let empty = InjectedConfigEnvState::default();
-        restore_config_env_state(&empty, &mut state);
+        reset_config_env_state();
         Self
     }
 }
@@ -166,20 +164,8 @@ impl ScopedEnvStateForTest {
 #[cfg(test)]
 impl Drop for ScopedEnvStateForTest {
     fn drop(&mut self) {
-        let mut state = CONFIG_ENV_STATE.lock();
-        let empty = InjectedConfigEnvState::default();
-        restore_config_env_state(&empty, &mut state);
+        reset_config_env_state();
     }
-}
-
-/// Restore the process env injected by config to the state captured by
-/// [`snapshot_env_state`]. Vars that were active at snapshot time are set
-/// back to their snapshot values; vars active *now* but not at snapshot time
-/// are unset (or restored to the pre-injection shell value if one was
-/// captured at the time those vars were first injected).
-pub(crate) fn restore_env_state(snapshot: &InjectedConfigEnvState) {
-    let mut current = CONFIG_ENV_STATE.lock();
-    restore_config_env_state(snapshot, &mut current);
 }
 
 /// Get the config file path.
@@ -909,10 +895,16 @@ pub fn clear_cache() {
 /// This is used by the config watcher and reload mechanism to install a new
 /// raw + normalized config pair without going through file I/O again.
 pub fn update_cache(raw_value: Value, value: Value) {
+    update_cache_arc(Arc::new(raw_value), Arc::new(value));
+}
+
+/// `Arc`-taking variant of [`update_cache`] for callers that already hold
+/// `Arc<Value>` snapshots — avoids a deep JSON clone at the cache boundary.
+pub(crate) fn update_cache_arc(raw_value: Arc<Value>, value: Arc<Value>) {
     let mut cache = CONFIG_CACHE.write();
     *cache = Some(CachedConfig {
-        value: Arc::new(value),
-        raw_value: Arc::new(raw_value),
+        value,
+        raw_value,
         loaded_at: Instant::now(),
     });
     broadcast_config_change();
@@ -991,9 +983,7 @@ mod tests {
     }
 
     fn reset_config_env_state_for_test() {
-        let mut state = CONFIG_ENV_STATE.lock();
-        let empty = InjectedConfigEnvState::default();
-        restore_config_env_state(&empty, &mut state);
+        super::reset_config_env_state();
     }
 
     #[test]
@@ -1434,20 +1424,13 @@ mod tests {
         assert!(after > before);
     }
 
-    /// Round-trip test for the `snapshot_env_state` / `restore_env_state`
-    /// API consumed by the config-watcher bridge: capture a state with a
-    /// known config-injected var, mutate it, and assert that restoring
-    /// from the snapshot reverts process env to the snapshot value.
     #[test]
     fn test_snapshot_then_restore_env_state_reverts_config_injected_var() {
-        // Test-unique key so we don't fight other env-touching tests on
-        // shared globals.
+        // Test-unique key so we don't fight other env-touching tests.
         const TEST_KEY: &str = "CARAPACE_TEST_ENV_RESTORE_VAR";
         reset_config_env_state_for_test();
         std::env::remove_var(TEST_KEY);
 
-        // Apply an initial config-injected value via the same primitive the
-        // watcher uses.
         {
             let mut state = CONFIG_ENV_STATE.lock();
             apply_config_env_vars(
@@ -1459,8 +1442,6 @@ mod tests {
 
         let snapshot = snapshot_env_state();
 
-        // Now apply a bad value, simulating the watcher having committed an
-        // env-mutating reload that the bridge will roll back.
         {
             let mut state = CONFIG_ENV_STATE.lock();
             apply_config_env_vars(
@@ -1470,7 +1451,6 @@ mod tests {
         }
         assert_eq!(std::env::var(TEST_KEY).ok(), Some("bad".to_string()));
 
-        // Roll back via the public API the bridge uses.
         restore_env_state(&snapshot);
         assert_eq!(
             std::env::var(TEST_KEY).ok(),
