@@ -207,6 +207,11 @@ fn parse_store_file(content: &str) -> Result<LoadedProfiles, AuthProfileError> {
             }
             envelope.profiles
         }
+        Ok(Value::Array(_)) => {
+            return Err(AuthProfileError::SerializationError(
+                "auth profile store uses the unsupported legacy bare-array format; delete the file and re-enroll auth profiles".to_string(),
+            ));
+        }
         Ok(_) => {
             return Err(AuthProfileError::SerializationError(
                 "expected auth profile store envelope object at top level".to_string(),
@@ -1583,7 +1588,7 @@ impl ProfileStore {
 
     fn plaintext_encrypted_profile_error(profile_id: &str, field_name: &str) -> AuthProfileError {
         AuthProfileError::SerializationError(format!(
-            "auth profile '{profile_id}' field {field_name} is stored in plaintext while auth-profile encryption is enabled; unset CARAPACE_CONFIG_PASSWORD, delete or re-create the affected auth profile, then enroll it again under encryption"
+            "auth profile '{profile_id}' field {field_name} is stored in plaintext while auth-profile encryption is enabled; do not run the gateway normally without CARAPACE_CONFIG_PASSWORD. Use a maintenance shell with CARAPACE_CONFIG_PASSWORD unset only to delete or re-create the affected auth profile, then set CARAPACE_CONFIG_PASSWORD again and enroll it under encryption"
         ))
     }
 
@@ -3051,6 +3056,11 @@ mod tests {
         assert!(message.contains("'plaintext'"), "got: {message}");
         assert!(message.contains("stored in plaintext"), "got: {message}");
         assert!(
+            message.contains("do not run the gateway normally without CARAPACE_CONFIG_PASSWORD"),
+            "got: {message}"
+        );
+        assert!(message.contains("maintenance shell"), "got: {message}");
+        assert!(
             message.contains("delete or re-create the affected auth profile"),
             "got: {message}"
         );
@@ -3308,7 +3318,11 @@ mod tests {
         let err = store.load().unwrap_err();
         assert!(
             err.to_string()
-                .contains("expected auth profile store envelope object"),
+                .contains("unsupported legacy bare-array format"),
+            "got: {err}"
+        );
+        assert!(
+            err.to_string().contains("delete the file and re-enroll"),
             "got: {err}"
         );
         assert!(store.shared.profiles.read().is_empty());

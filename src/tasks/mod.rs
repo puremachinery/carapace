@@ -215,11 +215,11 @@ impl TaskQueue {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(err) => {
                 let message = format!(
-                    "failed to read task queue file {}; starting with an empty task queue: {err}",
+                    "failed to read task queue file {}; persisted tasks were not loaded: {err}. Remove or repair the file before restarting",
                     path.display()
                 );
-                warn!(path = %path.display(), error = %err, "{message}");
-                return Ok(());
+                tracing::error!(path = %path.display(), error = %err, "{message}");
+                return Err(message);
             }
         };
 
@@ -1557,15 +1557,17 @@ mod tests {
     }
 
     #[test]
-    fn test_load_starts_empty_when_queue_file_is_unreadable() {
+    fn test_load_rejects_unreadable_queue_with_path() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("tasks").join("queue.json");
         std::fs::create_dir_all(&path).unwrap();
 
-        let queue = TaskQueue::new(Some(path));
-        queue
+        let queue = TaskQueue::new(Some(path.clone()));
+        let err = queue
             .load()
-            .expect("transient queue read failures should not block startup");
+            .expect_err("queue read failures should block startup");
+        assert!(err.contains(&path.display().to_string()), "got: {err}");
+        assert!(err.contains("Remove or repair the file"), "got: {err}");
         assert!(queue.list().is_empty());
     }
 

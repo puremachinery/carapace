@@ -146,13 +146,25 @@ pub fn memory_rss_bytes() -> Option<u64> {
     use mach2::message::mach_msg_type_number_t;
     use mach2::task::task_info;
     use mach2::task_info::{task_info_t, MACH_TASK_BASIC_INFO};
+    use mach2::time_value::time_value;
     use mach2::traps::mach_task_self;
-    use mach2::vm_types::natural_t;
+    use mach2::vm_types::{integer_t, mach_vm_size_t, natural_t};
+
+    #[repr(C, packed(4))]
+    struct MachTaskBasicInfo {
+        _virtual_size: mach_vm_size_t,
+        resident_size: mach_vm_size_t,
+        _resident_size_max: mach_vm_size_t,
+        _user_time: time_value,
+        _system_time: time_value,
+        _policy: integer_t,
+        _suspend_count: integer_t,
+    }
 
     unsafe {
         let task = mach_task_self();
-        let mut info: libc::mach_task_basic_info_data_t = std::mem::zeroed();
-        let mut count = (std::mem::size_of::<libc::mach_task_basic_info_data_t>()
+        let mut info: MachTaskBasicInfo = std::mem::zeroed();
+        let mut count = (std::mem::size_of::<MachTaskBasicInfo>()
             / std::mem::size_of::<natural_t>()) as mach_msg_type_number_t;
         let kr = task_info(
             task,
@@ -161,7 +173,7 @@ pub fn memory_rss_bytes() -> Option<u64> {
             &mut count,
         );
         if kr == KERN_SUCCESS {
-            Some(info.resident_size)
+            Some(std::ptr::addr_of!(info.resident_size).read_unaligned())
         } else {
             None
         }
