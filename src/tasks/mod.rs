@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs::{self, File};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -226,8 +226,16 @@ impl TaskQueue {
         let mut loaded: Vec<DurableTask> = match serde_json::from_slice(&data) {
             Ok(tasks) => tasks,
             Err(err) => {
+                let backup_note = match Self::write_corrupt_queue_backup(path, &data) {
+                    Ok(backup_path) => {
+                        format!(" A copy was written to {}.", backup_path.display())
+                    }
+                    Err(backup_err) => {
+                        format!(" Failed to write corrupt queue backup: {backup_err}.")
+                    }
+                };
                 let message = format!(
-                    "failed to parse current task queue file {}; persisted tasks were not loaded: {err}. Remove or repair the file before restarting",
+                    "failed to parse current task queue file {}; persisted tasks were not loaded: {err}.{backup_note} Remove or repair the file before restarting",
                     path.display()
                 );
                 tracing::error!(path = %path.display(), error = %err, "{message}");
@@ -254,6 +262,18 @@ impl TaskQueue {
             self.flush_to_disk();
         }
         Ok(())
+    }
+
+    fn corrupt_queue_backup_path(path: &Path) -> PathBuf {
+        let mut backup = path.as_os_str().to_os_string();
+        backup.push(format!(".corrupt.{}", now_ms()));
+        PathBuf::from(backup)
+    }
+
+    fn write_corrupt_queue_backup(path: &Path, data: &[u8]) -> std::io::Result<PathBuf> {
+        let backup_path = Self::corrupt_queue_backup_path(path);
+        fs::write(&backup_path, data)?;
+        Ok(backup_path)
     }
 
     /// Async-safe wrapper around [`Self::load`] for runtime startup paths.
@@ -1583,7 +1603,21 @@ mod tests {
             .load()
             .expect_err("malformed queue data should block startup");
         assert!(err.contains(&path.display().to_string()), "got: {err}");
+        assert!(err.contains("A copy was written to"), "got: {err}");
         assert!(err.contains("Remove or repair the file"), "got: {err}");
+
+        let backup = std::fs::read_dir(path.parent().expect("tasks directory"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|candidate| {
+                candidate
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("queue.json.corrupt."))
+            })
+            .expect("malformed queue load should write a corrupt backup");
+        assert_eq!(std::fs::read(backup).unwrap(), b"not json");
     }
 
     #[tokio::test]

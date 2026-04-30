@@ -161,11 +161,14 @@ pub fn memory_rss_bytes() -> Option<u64> {
         _suspend_count: integer_t,
     }
 
+    const MACH_TASK_BASIC_INFO_COUNT: usize = 12;
+    const _: [(); MACH_TASK_BASIC_INFO_COUNT * std::mem::size_of::<natural_t>()] =
+        [(); std::mem::size_of::<MachTaskBasicInfo>()];
+
     unsafe {
         let task = mach_task_self();
         let mut info: MachTaskBasicInfo = std::mem::zeroed();
-        let mut count = (std::mem::size_of::<MachTaskBasicInfo>()
-            / std::mem::size_of::<natural_t>()) as mach_msg_type_number_t;
+        let mut count = MACH_TASK_BASIC_INFO_COUNT as mach_msg_type_number_t;
         let kr = task_info(
             task,
             MACH_TASK_BASIC_INFO,
