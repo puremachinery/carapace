@@ -143,6 +143,35 @@ pub(crate) fn apply_config_env_for_test(vars: HashMap<String, String>) {
     apply_config_env_vars(&vars, &mut state);
 }
 
+/// Test-only RAII guard that resets `CONFIG_ENV_STATE` to empty on drop.
+/// Use alongside `ScopedConfigCache` / `ScopedEnv` for tests that mutate
+/// the global env-injection tracker via `apply_config_env_for_test`, so a
+/// dirty state can't bleed into a parallel test's `snapshot_env_state()`
+/// return value.
+#[cfg(test)]
+pub(crate) struct ScopedEnvStateForTest;
+
+#[cfg(test)]
+impl ScopedEnvStateForTest {
+    pub(crate) fn new() -> Self {
+        // Reset on entry too — guards against a previous test that didn't
+        // clean up (panic, missed guard) leaving stale state behind.
+        let mut state = CONFIG_ENV_STATE.lock();
+        let empty = InjectedConfigEnvState::default();
+        restore_config_env_state(&empty, &mut state);
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for ScopedEnvStateForTest {
+    fn drop(&mut self) {
+        let mut state = CONFIG_ENV_STATE.lock();
+        let empty = InjectedConfigEnvState::default();
+        restore_config_env_state(&empty, &mut state);
+    }
+}
+
 /// Restore the process env injected by config to the state captured by
 /// [`snapshot_env_state`]. Vars that were active at snapshot time are set
 /// back to their snapshot values; vars active *now* but not at snapshot time
@@ -290,12 +319,14 @@ pub(crate) fn load_raw_config_shared() -> Result<Arc<Value>, ConfigError> {
     Ok(shared)
 }
 
-/// Load the cached `(raw, normalized)` pair atomically, under a single
-/// `CONFIG_CACHE` lock acquisition. Equivalent to calling
-/// `load_raw_config_shared()` and `load_config_shared()` back-to-back, except
-/// that no other writer can interleave between the two reads — important for
-/// callers (notably the hot-reload bridge) that need the two halves to come
-/// from the same reload generation.
+/// Load a consistent `(raw, normalized)` pair from the same cache
+/// generation. On the cache-hit path this is a single `CONFIG_CACHE` read
+/// lock; on the cache-miss / TTL-expired / cache-disabled path the lock is
+/// dropped before the disk read, but both halves come from the same
+/// `CachedConfig` struct produced by `load_cached_config_uncached`, so the
+/// pair is still consistent — what callers (notably the hot-reload bridge)
+/// can rely on is that the raw and normalized values describe the same
+/// underlying config snapshot, never two different generations.
 pub(crate) fn load_both_config_shared() -> Result<(Arc<Value>, Arc<Value>), ConfigError> {
     let path = get_config_path();
 

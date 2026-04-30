@@ -703,19 +703,15 @@ fn spawn_config_watcher_bridge(
     // config layer directly so a future revert restores the cache's `raw_value`
     // slot to a true raw snapshot — `load_raw_config_shared` callers expect
     // "no defaults applied".
-    // Capture the initial last-good cache pair only if both raw and
-    // normalized loads succeed — writing a placeholder into either slot on
-    // a later rollback would silently degrade `load_raw_config_shared` /
-    // `load_config_shared` consumers. If either fails, leave
+    // Capture the initial last-good cache pair via the same single-lock
+    // helper the per-event path uses, so the (raw, normalized) halves come
+    // from the same cache generation. If the load fails, leave
     // `last_good_cache: None`; the bridge still hot-swaps providers on
     // subsequent successful reloads (each `Apply` populates the field) and
     // env-only rollback still works in the meantime.
-    let initial_cache = match (
-        config::load_raw_config_shared(),
-        config::load_config_shared(),
-    ) {
-        (Ok(raw), Ok(normalized)) => Some((raw, normalized)),
-        (Err(e), _) | (_, Err(e)) => {
+    let initial_cache = match config::load_both_config_shared() {
+        Ok(pair) => Some(pair),
+        Err(e) => {
             warn!(
                 "Failed to capture initial config snapshot for hot-reload bridge: {} \
                  (cache rollback unavailable until next successful reload)",
@@ -2075,17 +2071,22 @@ mod tests {
     /// the assertions, and `CONFIG_ENV_STATE` is pre-populated via
     /// `apply_config_env_for_test` so `last_good_env` snapshots have
     /// non-empty content — that lets the rollback tests actually exercise
-    /// `restore_env_state` rather than treating it as a no-op.
+    /// `restore_env_state` rather than treating it as a no-op. The
+    /// returned `ScopedEnvStateForTest` resets the env tracker on drop so
+    /// concurrent tests don't observe each other's `active_values`.
     fn make_reload_state_with_anthropic_provider() -> (
         crate::test_support::config::ScopedConfigCache,
         ScopedEnv,
+        crate::config::ScopedEnvStateForTest,
         Arc<WsServerState>,
         ReloadState,
     ) {
+        use crate::config::ScopedEnvStateForTest;
         use crate::test_support::config::ScopedConfigCache;
 
         let cache_guard = ScopedConfigCache::new();
         crate::config::clear_cache();
+        let env_state_guard = ScopedEnvStateForTest::new();
         let mut env = crate::test_support::env::provider_env_cleared();
         env.set("ANTHROPIC_API_KEY", "test-initial-key");
 
@@ -2108,7 +2109,7 @@ mod tests {
             last_good_env: crate::config::snapshot_env_state(),
             current_fingerprint: crate::agent::factory::fingerprint_providers(&initial_normalized),
         };
-        (cache_guard, env, ws_state, reload_state)
+        (cache_guard, env, env_state_guard, ws_state, reload_state)
     }
 
     /// On a no-provider reload: both the raw and normalized cache slots roll
@@ -2118,7 +2119,8 @@ mod tests {
     /// bridge returns `Reverted` so the WS broadcast is suppressed.
     #[test]
     fn handle_provider_reload_reverts_when_new_config_has_no_provider() {
-        let (_cache, mut env, ws_state, mut state) = make_reload_state_with_anthropic_provider();
+        let (_cache, mut env, _env_state, ws_state, mut state) =
+            make_reload_state_with_anthropic_provider();
         let prior_fingerprint = state.current_fingerprint.clone();
         let (prior_raw, prior_normalized) = state
             .last_good_cache
@@ -2171,7 +2173,8 @@ mod tests {
     /// updates, and the bridge returns `Apply`.
     #[test]
     fn handle_provider_reload_swaps_provider_and_applies_on_valid_change() {
-        let (_cache, mut env, ws_state, mut state) = make_reload_state_with_anthropic_provider();
+        let (_cache, mut env, _env_state, ws_state, mut state) =
+            make_reload_state_with_anthropic_provider();
 
         // Simulate the watcher applying a rotated env-injected key, then
         // committing the new cache. Mirror the change in process env via
@@ -2216,7 +2219,8 @@ mod tests {
     /// see the non-provider edits.
     #[test]
     fn handle_provider_reload_captures_new_last_good_when_provider_unchanged() {
-        let (_cache, _env, ws_state, mut state) = make_reload_state_with_anthropic_provider();
+        let (_cache, _env, _env_state, ws_state, mut state) =
+            make_reload_state_with_anthropic_provider();
         let prior_fingerprint = state.current_fingerprint.clone();
 
         let new_raw = json!({ "marker": "raw-edited" });
@@ -2242,11 +2246,12 @@ mod tests {
     /// only one of them rolls back.
     #[test]
     fn handle_provider_reload_reverts_when_build_providers_errors() {
-        let (_cache, mut env, ws_state, mut state) = make_reload_state_with_anthropic_provider();
-        let prior_raw = state
+        let (_cache, mut env, _env_state, ws_state, mut state) =
+            make_reload_state_with_anthropic_provider();
+        let (prior_raw, prior_normalized) = state
             .last_good_cache
             .as_ref()
-            .map(|(r, _)| r.clone())
+            .map(|(r, n)| (r.clone(), n.clone()))
             .expect("fixture installs last_good_cache");
         let prior_fingerprint = state.current_fingerprint.clone();
 
@@ -2268,6 +2273,11 @@ mod tests {
         assert_eq!(outcome, ReloadOutcome::Reverted);
         let raw_after = crate::config::load_raw_config_shared().expect("raw populated");
         assert_eq!(*raw_after, *prior_raw);
+        // Mirror the Ok(None) test's normalized-slot check so a regression
+        // that only restored raw (not normalized) wouldn't slip through the
+        // Err(_) branch coverage.
+        let normalized_after = crate::config::load_config_shared().expect("normalized populated");
+        assert_eq!(*normalized_after, *prior_normalized);
         assert_eq!(state.current_fingerprint, prior_fingerprint);
     }
 
