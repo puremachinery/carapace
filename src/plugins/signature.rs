@@ -14,6 +14,9 @@ fn default_true() -> bool {
     true
 }
 
+pub(crate) const SIGNATURE_CONFIG_FIELDS: &[&str] =
+    &["enabled", "requireSignature", "trustedPublishers"];
+
 /// Signature verification configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -516,6 +519,25 @@ mod tests {
         assert_eq!(parsed.enabled, config.enabled);
         assert_eq!(parsed.require_signature, config.require_signature);
         assert_eq!(parsed.trusted_publishers, config.trusted_publishers);
+    }
+
+    #[test]
+    fn test_signature_config_field_list_matches_serialized_keys() {
+        let value = serde_json::to_value(SignatureConfig::default()).unwrap();
+        let object = value.as_object().unwrap();
+
+        for key in object.keys() {
+            assert!(
+                SIGNATURE_CONFIG_FIELDS.contains(&key.as_str()),
+                "SignatureConfig field list is missing serialized key {key}"
+            );
+        }
+        for key in SIGNATURE_CONFIG_FIELDS {
+            assert!(
+                object.contains_key(*key),
+                "SignatureConfig field list contains stale key {key}"
+            );
+        }
     }
 
     #[test]

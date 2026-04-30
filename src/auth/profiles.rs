@@ -1479,9 +1479,7 @@ impl ProfileStore {
                 }
             }
         } else if !tokens.access_token.is_empty() {
-            return Err(AuthProfileError::SerializationError(
-                "auth profile access_token is not encrypted".to_string(),
-            ));
+            return Err(Self::plaintext_encrypted_profile_error("access_token"));
         }
         if let Some(ref rt) = tokens.refresh_token {
             if is_encrypted(rt) {
@@ -1493,9 +1491,7 @@ impl ProfileStore {
                     }
                 }
             } else if !rt.is_empty() {
-                return Err(AuthProfileError::SerializationError(
-                    "auth profile refresh_token is not encrypted".to_string(),
-                ));
+                return Err(Self::plaintext_encrypted_profile_error("refresh_token"));
             }
         }
         Ok(())
@@ -1530,9 +1526,7 @@ impl ProfileStore {
                             }
                         }
                     } else if !token.is_empty() {
-                        return Err(AuthProfileError::SerializationError(
-                            "auth profile token is not encrypted".to_string(),
-                        ));
+                        return Err(Self::plaintext_encrypted_profile_error("token"));
                     }
                 }
             }
@@ -1560,11 +1554,17 @@ impl ProfileStore {
                 }
             }
         } else if !provider_config.client_secret.is_empty() {
-            return Err(AuthProfileError::SerializationError(
-                "oauth provider client_secret is not encrypted".to_string(),
+            return Err(Self::plaintext_encrypted_profile_error(
+                "oauth provider client_secret",
             ));
         }
         Ok(())
+    }
+
+    fn plaintext_encrypted_profile_error(field_name: &str) -> AuthProfileError {
+        AuthProfileError::SerializationError(format!(
+            "auth profile {field_name} is stored in plaintext while auth-profile encryption is enabled; unset CARAPACE_CONFIG_PASSWORD, delete or re-create the affected auth profile, then enroll it again under encryption"
+        ))
     }
 
     /// Add a profile. Fails if MAX_PROFILES would be exceeded.
@@ -3011,6 +3011,27 @@ mod tests {
         assert!(
             !raw.contains("enc:v"),
             "without SecretStore, no encryption prefix should appear"
+        );
+    }
+
+    #[test]
+    fn test_encrypted_store_rejects_plaintext_profile_with_guidance() {
+        let dir = tempdir().unwrap();
+        let plaintext_store = ProfileStore::new(dir.path().to_path_buf());
+        plaintext_store.add(sample_profile("plaintext")).unwrap();
+
+        let password = random_password();
+        let encrypted_store =
+            ProfileStore::with_encryption(dir.path().to_path_buf(), &password).unwrap();
+        let err = encrypted_store
+            .load()
+            .expect_err("plaintext auth profile should fail under encryption");
+        let message = err.to_string();
+
+        assert!(message.contains("stored in plaintext"), "got: {message}");
+        assert!(
+            message.contains("delete or re-create the affected auth profile"),
+            "got: {message}"
         );
     }
 

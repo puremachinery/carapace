@@ -1481,27 +1481,172 @@ pub(crate) struct StoredDeviceIdentity {
     secret_key: String,
 }
 
+const DEVICE_IDENTITY_FILENAME: &str = "device-identity.json";
 const CONNECT_CHALLENGE_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn device_identity_path(state_dir: &Path) -> PathBuf {
+    state_dir.join(DEVICE_IDENTITY_FILENAME)
+}
+
+fn strict_device_identity_mode() -> bool {
+    env_flag_enabled("CARAPACE_DEVICE_IDENTITY_STRICT")
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
 
 pub(crate) async fn load_or_create_device_identity(
     state_dir: &Path,
 ) -> Result<StoredDeviceIdentity, Box<dyn std::error::Error>> {
     std::fs::create_dir_all(state_dir)?;
+    let identity_path = device_identity_path(state_dir);
+    let strict = strict_device_identity_mode();
 
     match credentials::read_device_identity(state_dir.to_path_buf()).await {
         Ok(Some(data)) => {
             let identity: StoredDeviceIdentity = serde_json::from_str(&data)?;
             validate_device_identity(&identity)?;
+            if identity_path.exists() {
+                if let Err(err) = std::fs::remove_file(&identity_path) {
+                    eprintln!(
+                        "Warning: failed to remove file-backed device identity: {}",
+                        err
+                    );
+                }
+            }
             return Ok(identity);
         }
         Ok(None) => {}
-        Err(err) => return Err(err.into()),
+        Err(err) => {
+            if strict && should_fallback_to_device_identity_file(&err) {
+                return Err(format!(
+                    "credential store unavailable ({err}); strict device identity mode enabled"
+                )
+                .into());
+            }
+            if !should_fallback_to_device_identity_file(&err) {
+                return Err(err.into());
+            }
+            warn_device_identity_file_fallback(&err);
+        }
+    }
+
+    if identity_path.exists() {
+        if strict {
+            return Err(format!(
+                "file-backed device identity present at {}; strict device identity mode enabled",
+                identity_path.display()
+            )
+            .into());
+        }
+        let data = std::fs::read_to_string(&identity_path)?;
+        let identity: StoredDeviceIdentity = serde_json::from_str(&data)?;
+        validate_device_identity(&identity)?;
+        if let Err(err) = credentials::write_device_identity(
+            state_dir.to_path_buf(),
+            &serde_json::to_string(&identity)?,
+        )
+        .await
+        {
+            if strict && should_fallback_to_device_identity_file(&err) {
+                return Err(format!(
+                    "credential store unavailable ({err}); strict device identity mode enabled"
+                )
+                .into());
+            }
+            if !should_fallback_to_device_identity_file(&err) {
+                return Err(err.into());
+            }
+            warn_device_identity_file_fallback(&err);
+            write_device_identity_file(&identity_path, &identity)?;
+            return Ok(identity);
+        }
+        let _ = std::fs::remove_file(&identity_path);
+        return Ok(identity);
     }
 
     let identity = generate_device_identity()?;
-    credentials::write_device_identity(state_dir.to_path_buf(), &serde_json::to_string(&identity)?)
-        .await?;
+    if let Err(err) = credentials::write_device_identity(
+        state_dir.to_path_buf(),
+        &serde_json::to_string(&identity)?,
+    )
+    .await
+    {
+        if strict && should_fallback_to_device_identity_file(&err) {
+            return Err(format!(
+                "credential store unavailable ({err}); strict device identity mode enabled"
+            )
+            .into());
+        }
+        if !should_fallback_to_device_identity_file(&err) {
+            return Err(err.into());
+        }
+        warn_device_identity_file_fallback(&err);
+        write_device_identity_file(&identity_path, &identity)?;
+    }
     Ok(identity)
+}
+
+fn should_fallback_to_device_identity_file(err: &credentials::CredentialError) -> bool {
+    matches!(
+        err,
+        credentials::CredentialError::StoreUnavailable(_)
+            | credentials::CredentialError::StoreLocked
+            | credentials::CredentialError::AccessDenied
+    )
+}
+
+fn warn_device_identity_file_fallback(err: &credentials::CredentialError) {
+    match err {
+        credentials::CredentialError::StoreLocked => {
+            eprintln!("Warning: credential store is locked; using file-backed device identity.");
+        }
+        credentials::CredentialError::AccessDenied => {
+            eprintln!(
+                "Warning: credential store access denied; using file-backed device identity."
+            );
+        }
+        credentials::CredentialError::StoreUnavailable(_) => {
+            eprintln!("Warning: credential store unavailable; using file-backed device identity.");
+        }
+        _ => {
+            eprintln!("Warning: credential store error; using file-backed device identity.");
+        }
+    }
+}
+
+fn write_device_identity_file(
+    path: &Path,
+    identity: &StoredDeviceIdentity,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let contents = serde_json::to_string_pretty(identity)?;
+    #[cfg(unix)]
+    {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(contents.as_bytes())?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, contents)?;
+    }
+    Ok(())
 }
 
 fn validate_device_identity(
@@ -10352,6 +10497,36 @@ mod tests {
         let signing_key = signing_key_from_identity(&identity).unwrap();
         let public_key = signing_key.verifying_key().to_bytes();
         assert_eq!(encode_base64_url(&public_key), identity.public_key);
+    }
+
+    #[test]
+    fn test_device_identity_file_fallback_error_policy() {
+        assert!(should_fallback_to_device_identity_file(
+            &credentials::CredentialError::StoreUnavailable("no dbus".to_string())
+        ));
+        assert!(should_fallback_to_device_identity_file(
+            &credentials::CredentialError::StoreLocked
+        ));
+        assert!(should_fallback_to_device_identity_file(
+            &credentials::CredentialError::AccessDenied
+        ));
+        assert!(!should_fallback_to_device_identity_file(
+            &credentials::CredentialError::JsonError("bad identity".to_string())
+        ));
+    }
+
+    #[test]
+    fn test_device_identity_file_round_trip() {
+        let temp = tempfile::tempdir().unwrap();
+        let identity = generate_device_identity().unwrap();
+        let path = device_identity_path(temp.path());
+
+        write_device_identity_file(&path, &identity).unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let loaded: StoredDeviceIdentity = serde_json::from_str(&raw).unwrap();
+        validate_device_identity(&loaded).unwrap();
+        assert_eq!(loaded.device_id, identity.device_id);
     }
 
     #[test]

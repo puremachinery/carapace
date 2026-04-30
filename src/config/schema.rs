@@ -3,6 +3,7 @@
 use serde_json::Value;
 
 use crate::plugins::loader::{is_reserved_plugin_id, RESERVED_PLUGIN_CONFIG_KEYS};
+use crate::plugins::signature::SIGNATURE_CONFIG_FIELDS;
 
 const MAX_REASONABLE_TYPING_INTERVAL_SECONDS: u64 = 3600;
 
@@ -1438,14 +1439,9 @@ fn validate_plugins_signature(obj: &serde_json::Map<String, Value>, issues: &mut
     }
 
     for field in sig.keys() {
-        if !matches!(
-            field.as_str(),
-            "enabled"
-                | "requireSignature"
-                | "trustedPublishers"
-                | "require_signature"
-                | "trusted_publishers"
-        ) {
+        if !SIGNATURE_CONFIG_FIELDS.contains(&field.as_str())
+            && !matches!(field.as_str(), "require_signature" | "trusted_publishers")
+        {
             issues.push(SchemaIssue {
                 severity: Severity::Error,
                 path: format!(".plugins.signature.{field}"),
