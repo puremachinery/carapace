@@ -4172,6 +4172,42 @@ mod tests {
     }
 
     #[test]
+    fn test_append_message_rejects_session_with_mismatched_metadata_sidecar() {
+        let temp_dir = TempDir::new().unwrap();
+        let current_key = integrity::derive_hmac_key(b"current-session-secret");
+        let legacy_key = integrity::derive_hmac_key(b"legacy-session-secret");
+        let store = SessionStore::with_base_path(temp_dir.path().to_path_buf())
+            .with_hmac_key(Zeroizing::new(current_key))
+            .with_integrity_action(integrity::IntegrityAction::Reject);
+
+        let session = store
+            .create_session("agent-1", SessionMetadata::default())
+            .unwrap();
+        let meta_path = store.session_meta_path(&session.id).unwrap();
+        let metadata = fs::read(&meta_path).unwrap();
+        integrity::write_hmac_file(&legacy_key, &metadata, &meta_path).unwrap();
+
+        let reopened = SessionStore::with_base_path(temp_dir.path().to_path_buf())
+            .with_hmac_key(Zeroizing::new(current_key))
+            .with_integrity_action(integrity::IntegrityAction::Reject);
+        let err = reopened
+            .append_message(ChatMessage::user(&session.id, "should fail"))
+            .expect_err("append should propagate get_session integrity rejection");
+
+        assert!(
+            matches!(err, SessionStoreError::Io(ref message)
+                if message.contains("session integrity verification failed")
+                    && message.contains(&meta_path.display().to_string())),
+            "got: {err}"
+        );
+        let history_path = reopened.session_history_path(&session.id).unwrap();
+        assert!(
+            !history_path.exists(),
+            "failed metadata integrity must prevent history append"
+        );
+    }
+
+    #[test]
     fn test_append_history_hmac_reuses_cached_state_after_first_append() {
         let temp_dir = TempDir::new().unwrap();
         let key = Zeroizing::new(integrity::derive_hmac_key(b"history-secret"));

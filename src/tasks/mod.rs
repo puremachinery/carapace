@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::fs::{self, File};
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -264,16 +264,33 @@ impl TaskQueue {
         Ok(())
     }
 
-    fn corrupt_queue_backup_path(path: &Path) -> PathBuf {
+    fn corrupt_queue_backup_path(path: &Path, timestamp_ms: u64, attempt: u32) -> PathBuf {
         let mut backup = path.as_os_str().to_os_string();
-        backup.push(format!(".corrupt.{}", now_ms()));
+        backup.push(format!(".corrupt.{timestamp_ms}.{attempt}"));
         PathBuf::from(backup)
     }
 
     fn write_corrupt_queue_backup(path: &Path, data: &[u8]) -> std::io::Result<PathBuf> {
-        let backup_path = Self::corrupt_queue_backup_path(path);
-        fs::write(&backup_path, data)?;
-        Ok(backup_path)
+        let timestamp_ms = now_ms();
+        for attempt in 0..1024 {
+            let backup_path = Self::corrupt_queue_backup_path(path, timestamp_ms, attempt);
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&backup_path)
+            {
+                Ok(mut file) => {
+                    file.write_all(data)?;
+                    return Ok(backup_path);
+                }
+                Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
+                Err(err) => return Err(err),
+            }
+        }
+        Err(std::io::Error::new(
+            ErrorKind::AlreadyExists,
+            "failed to allocate unique corrupt queue backup path",
+        ))
     }
 
     /// Async-safe wrapper around [`Self::load`] for runtime startup paths.
@@ -1623,6 +1640,22 @@ mod tests {
         assert!(err.contains("Remove or repair the file"), "got: {err}");
 
         assert_corrupt_queue_backup_contains(parent, b"not json");
+    }
+
+    #[test]
+    fn test_corrupt_queue_backups_do_not_overwrite_existing_backups() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tasks").join("queue.json");
+        std::fs::create_dir_all(path.parent().expect("tasks directory")).unwrap();
+
+        let first = TaskQueue::write_corrupt_queue_backup(&path, b"first corrupt queue")
+            .expect("first backup should be written");
+        let second = TaskQueue::write_corrupt_queue_backup(&path, b"second corrupt queue")
+            .expect("second backup should be written");
+
+        assert_ne!(first, second);
+        assert_eq!(std::fs::read(first).unwrap(), b"first corrupt queue");
+        assert_eq!(std::fs::read(second).unwrap(), b"second corrupt queue");
     }
 
     #[tokio::test]

@@ -64,6 +64,10 @@ impl fmt::Display for BackupCryptoError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidMagic => write!(f, "invalid magic bytes: not an encrypted backup"),
+            Self::UnsupportedVersion(1) => write!(
+                f,
+                "unsupported format version: 1; V1 backups must be restored with a pre-v0.7.0 binary before upgrading, then re-created with the current backup format"
+            ),
             Self::UnsupportedVersion(v) => write!(f, "unsupported format version: {}", v),
             Self::DecryptionFailed => {
                 write!(f, "decryption failed: wrong passphrase or corrupted data")
@@ -477,9 +481,12 @@ mod tests {
         let passphrase = random_passphrase();
         let result = decrypt_backup(&v1_backup, &passphrase, &output);
         assert!(matches!(
-            result,
+            &result,
             Err(BackupCryptoError::UnsupportedVersion(1))
         ));
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains("pre-v0.7.0 binary"), "got: {message}");
+        assert!(message.contains("current backup format"), "got: {message}");
     }
 
     #[test]

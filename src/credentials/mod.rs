@@ -99,6 +99,23 @@ const PAIRING_LEGACY_CREDENTIAL_JSON_KEYS: &[&str] = &[
     "store",
     "token",
 ];
+const AGENT_LEGACY_CREDENTIAL_JSON_KEYS: &[&str] = &[
+    "access_token",
+    "accessToken",
+    "api_key",
+    "apiKey",
+    "client_secret",
+    "clientSecret",
+    "key",
+    "oauth_token",
+    "oauthToken",
+    "refresh_token",
+    "refreshToken",
+    "secret",
+    "setup_token",
+    "setupToken",
+    "token",
+];
 
 /// Credential store errors
 #[derive(Debug, Clone, PartialEq)]
@@ -328,11 +345,50 @@ fn agent_plaintext_credential_paths(state_dir: &Path) -> Vec<PathBuf> {
                 continue;
             }
             let agent_dir = agent_root.join("agent");
-            paths.push(agent_dir.join("auth-profiles.json"));
-            paths.push(agent_dir.join("auth.json"));
+            let auth_profiles = agent_dir.join("auth-profiles.json");
+            if agent_plaintext_file_has_credential_shape(&auth_profiles) {
+                paths.push(auth_profiles);
+            }
+            let auth = agent_dir.join("auth.json");
+            if agent_plaintext_file_has_credential_shape(&auth) {
+                paths.push(auth);
+            }
         }
     }
     paths
+}
+
+fn agent_plaintext_file_has_credential_shape(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    plaintext_file_has_credential_shape(path, agent_json_has_credential_shape)
+}
+
+fn agent_json_has_credential_shape(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => object.iter().any(|(key, value)| {
+            if AGENT_LEGACY_CREDENTIAL_JSON_KEYS.contains(&key.as_str()) {
+                credential_value_has_plaintext(value)
+            } else {
+                agent_json_has_credential_shape(value)
+            }
+        }),
+        Value::Array(items) => items.iter().any(agent_json_has_credential_shape),
+        _ => false,
+    }
+}
+
+fn credential_value_has_plaintext(value: &Value) -> bool {
+    match value {
+        Value::String(value) => {
+            let value = value.trim();
+            !value.is_empty() && !value.starts_with("enc:v")
+        }
+        Value::Array(items) => items.iter().any(credential_value_has_plaintext),
+        Value::Object(object) => object.values().any(credential_value_has_plaintext),
+        _ => false,
+    }
 }
 
 /// Delete a keyring credential entry with idempotent not-found semantics.
@@ -1614,7 +1670,7 @@ mod tests {
         let agent_dir = temp.path().join("agents").join("primary").join("agent");
         std::fs::create_dir_all(&agent_dir).unwrap();
         let auth_path = agent_dir.join("auth.json");
-        std::fs::write(&auth_path, "{}").unwrap();
+        std::fs::write(&auth_path, r#"{"anthropic":{"apiKey":"secret"}}"#).unwrap();
 
         let err = reject_plaintext_credential_files(temp.path())
             .expect_err("non-default agent plaintext credential file should be rejected");
@@ -1624,6 +1680,43 @@ mod tests {
                 .display()
                 .to_string()])
         );
+    }
+
+    #[test]
+    fn test_plaintext_credential_guard_detects_agent_auth_profile_plaintext_secret() {
+        let temp = tempdir().unwrap();
+        let agent_dir = temp.path().join("agents").join("primary").join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let auth_profiles_path = agent_dir.join("auth-profiles.json");
+        std::fs::write(
+            &auth_profiles_path,
+            r#"[{"id":"anthropic:default","provider":"anthropic","token":"secret"}]"#,
+        )
+        .unwrap();
+
+        let err = reject_plaintext_credential_files(temp.path())
+            .expect_err("agent auth profile with plaintext secret should be rejected");
+        assert_eq!(
+            err,
+            CredentialError::PlaintextCredentialFilesDetected(vec![auth_profiles_path
+                .display()
+                .to_string()])
+        );
+    }
+
+    #[test]
+    fn test_plaintext_credential_guard_ignores_current_agent_auth_profile_envelope() {
+        let temp = tempdir().unwrap();
+        let agent_dir = temp.path().join("agents").join("primary").join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("auth-profiles.json"),
+            r#"{"version":2,"profiles":[{"id":"anthropic:default","provider":"anthropic","credential_kind":"token","token":"enc:v2:aaa:bbb:ccc"}]}"#,
+        )
+        .unwrap();
+
+        reject_plaintext_credential_files(temp.path())
+            .expect("current encrypted auth profile envelope should not block startup");
     }
 
     #[test]

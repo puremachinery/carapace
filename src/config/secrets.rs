@@ -1091,7 +1091,9 @@ mod tests {
             "openai": { "apiKey": "enc:v3:ddd:eee:fff" }
         });
 
-        let unsupported = find_unsupported_encrypted_values(&config).unwrap();
+        let mut unsupported = find_unsupported_encrypted_values(&config).unwrap();
+        unsupported.sort_by(|left, right| left.path.cmp(&right.path));
+
         assert_eq!(
             unsupported,
             vec![
