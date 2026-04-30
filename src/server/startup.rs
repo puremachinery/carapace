@@ -603,9 +603,10 @@ fn handle_provider_reload(ws_state: &Arc<WsServerState>, state: &mut ReloadState
         Ok(arc) => arc,
         Err(e) => {
             warn!(
-                "Failed to load reloaded normalized config: {} (suppressing broadcast)",
+                "Failed to load reloaded normalized config: {} (rolling back to last-known-good)",
                 e
             );
+            revert_to_last_good(state);
             return ReloadOutcome::Reverted;
         }
     };
@@ -613,9 +614,10 @@ fn handle_provider_reload(ws_state: &Arc<WsServerState>, state: &mut ReloadState
         Ok(arc) => arc,
         Err(e) => {
             warn!(
-                "Failed to load reloaded raw config: {} (suppressing broadcast)",
+                "Failed to load reloaded raw config: {} (rolling back to last-known-good)",
                 e
             );
+            revert_to_last_good(state);
             return ReloadOutcome::Reverted;
         }
     };
@@ -688,9 +690,21 @@ fn spawn_config_watcher_bridge(
     // config layer directly so a future revert restores the cache's `raw_value`
     // slot to a true raw snapshot — `load_raw_config_shared` callers expect
     // "no defaults applied".
+    // If raw loading fails (uncommon — the caller already loaded the config
+    // successfully to start the server), use an empty placeholder rather than
+    // the normalized `raw_config` parameter: `last_good_raw` must not contain
+    // defaults-applied JSON, since a future rollback writes it back into the
+    // cache's `raw_value` slot and `load_raw_config_shared` callers expect
+    // "no defaults applied".
     let initial_raw = config::load_raw_config_shared()
         .map(|arc| (*arc).clone())
-        .unwrap_or_else(|_| raw_config.clone());
+        .unwrap_or_else(|e| {
+            warn!(
+                "Failed to load initial raw config for hot-reload bridge: {} (using empty placeholder; first rollback would zero the raw cache slot)",
+                e
+            );
+            Value::Object(serde_json::Map::new())
+        });
     let initial_normalized = config::load_config_shared()
         .map(|arc| (*arc).clone())
         .unwrap_or_else(|_| raw_config.clone());
@@ -2163,20 +2177,14 @@ mod tests {
 
         let outcome = handle_provider_reload(&ws_state, &mut state);
 
-        // Either outcome is acceptable: the test's purpose is to pin that
-        // *whatever* build_providers returns for this misconfig is handled
-        // in a way that doesn't silently leave the cache mutated. If the
-        // future `Err(_)` arm diverges from `Ok(None)`, this test will need
-        // to assert the new contract explicitly.
-        assert!(
-            matches!(outcome, ReloadOutcome::Reverted | ReloadOutcome::Apply),
-            "outcome must be one of the documented variants"
-        );
-        if outcome == ReloadOutcome::Reverted {
-            let raw_after = crate::config::load_raw_config_shared().expect("raw populated");
-            assert_eq!(*raw_after, *prior_raw);
-            assert_eq!(state.current_fingerprint, prior_fingerprint);
-        }
+        // Both `Ok(None)` and `Err(_)` arms of `build_providers` unconditionally
+        // call `revert_to_last_good` and return `Reverted`. Asserting the
+        // exact outcome (rather than `matches!(.., Reverted | Apply)`) gives
+        // real regression protection if the two arms ever diverge.
+        assert_eq!(outcome, ReloadOutcome::Reverted);
+        let raw_after = crate::config::load_raw_config_shared().expect("raw populated");
+        assert_eq!(*raw_after, *prior_raw);
+        assert_eq!(state.current_fingerprint, prior_fingerprint);
     }
 
     #[test]
