@@ -21,6 +21,7 @@ pub mod logging;
 pub mod media;
 pub mod messages;
 pub mod migration;
+pub(crate) mod model_names;
 pub mod nodes;
 pub mod onboarding;
 pub mod paths;

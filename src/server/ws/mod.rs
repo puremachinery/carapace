@@ -69,7 +69,7 @@ const MAX_JSON_DEPTH: usize = 32;
 
 // WS error codes are wire-format strings clients dispatch on. Convention:
 // lower_snake_case to match the rest of the JSON wire surface and OpenAI-
-// compat error families (`invalid_request_error`, etc.). All emit sites
+// style error families (`invalid_request_error`, etc.). All emit sites
 // — including ad-hoc string literals in node.rs, plugin runtime, ratelimit,
 // csrf, and integration goldens — must use the lower_snake form. See PR
 // renaming this from the prior SCREAMING_SNAKE convention.
@@ -767,10 +767,6 @@ impl WsServerState {
             .load_async()
             .await
             .map_err(WsConfigError::Runtime)?;
-        state
-            .activity_service
-            .reject_legacy_persisted_read_receipt_tasks(&cleanup_state_dir)
-            .map_err(WsConfigError::Runtime)?;
         tokio::task::spawn_blocking(move || {
             crate::update::cleanup_old_binaries(&cleanup_state_dir)
         })
@@ -1228,9 +1224,7 @@ pub enum WsConfigError {
 
 pub async fn build_ws_state_owned_from_value(cfg: &Value) -> Result<WsServerState, WsConfigError> {
     let state_dir = resolve_state_dir();
-    if let Err(err) = credentials::migrate_plaintext_credentials(state_dir.clone()).await {
-        tracing::warn!(error = %err, "Credential migration failed");
-    }
+    credentials::reject_plaintext_credential_files(&state_dir)?;
     let config = build_ws_config_from_value(cfg).await?;
     let mut state = WsServerState::new_persistent(config, state_dir).await?;
     let integrity_config = sessions::resolve_session_integrity_config(cfg);
@@ -1493,25 +1487,11 @@ fn parse_ws_server_options(
         .unwrap_or_default();
 
     let sessions_obj = cfg.get("sessions").and_then(|v| v.as_object());
-    let legacy_session_obj = cfg.get("session").and_then(|v| v.as_object());
     let session_retention_days = sessions_obj
         .and_then(|s| s.get("retention"))
         .and_then(|r| r.get("days"))
         .and_then(|v| v.as_u64())
-        .map(|d| d as u32)
-        .or_else(|| {
-            sessions_obj
-                .and_then(|s| s.get("retentionDays"))
-                .and_then(|v| v.as_u64())
-                .map(|d| d as u32)
-        })
-        .or_else(|| {
-            legacy_session_obj
-                .and_then(|s| s.get("retention"))
-                .and_then(|r| r.get("days"))
-                .and_then(|v| v.as_u64())
-                .map(|d| d as u32)
-        });
+        .map(|d| d as u32);
 
     let ws_obj = gateway
         .and_then(|g| g.get("ws"))
@@ -2368,8 +2348,7 @@ async fn run_message_loop(
         if validate_request_params(tx, &req_id, &method, &params, json_depth_limit).is_err() {
             continue;
         }
-        let canonical_method = handlers::canonicalize_ws_method_name(&method);
-        let method_known = GATEWAY_METHODS.contains(&canonical_method);
+        let method_known = GATEWAY_METHODS.contains(&method.as_str());
         let result = dispatch_method(&method, params.as_ref(), state, conn).await;
         send_dispatch_result(tx, &req_id, &method, method_known, result);
     }

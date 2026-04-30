@@ -129,76 +129,7 @@ pub(super) fn parse_presence(text: &str) -> ParsedPresence {
         }
     }
 
-    // Fallback parsing for non-Node formats (backwards compat)
-    apply_presence_fallbacks(&mut parsed, text);
-
     parsed
-}
-
-/// Apply fallback parsing rules for fields not found in the primary segment parse.
-fn apply_presence_fallbacks(parsed: &mut ParsedPresence, text: &str) {
-    if parsed.version.is_none() {
-        parsed.version = fallback_version(text);
-    }
-    if parsed.platform.is_none() {
-        parsed.platform = fallback_platform(text);
-    }
-    if parsed.last_input_seconds.is_none() {
-        parsed.last_input_seconds = fallback_idle_seconds(text);
-    }
-    if parsed.mode.is_none() {
-        parsed.mode = fallback_mode(text);
-    }
-}
-
-/// Try to extract a version from "vX.Y.Z" format words.
-fn fallback_version(text: &str) -> Option<String> {
-    for word in text.split_whitespace() {
-        if word.starts_with('v')
-            && word.len() > 1
-            && word.chars().nth(1).is_some_and(|c| c.is_ascii_digit())
-        {
-            return Some(word[1..].to_string());
-        }
-    }
-    None
-}
-
-/// Try to extract a platform from bracket notation like [darwin].
-fn fallback_platform(text: &str) -> Option<String> {
-    let start = text.find('[')?;
-    let end = text[start..].find(']')?;
-    let platform = &text[start + 1..start + end];
-    if matches!(
-        platform.to_lowercase().as_str(),
-        "darwin" | "linux" | "win32" | "windows" | "macos" | "ios" | "android"
-    ) {
-        Some(platform.to_string())
-    } else {
-        None
-    }
-}
-
-/// Try to extract idle seconds from "idle:300" format.
-fn fallback_idle_seconds(text: &str) -> Option<u64> {
-    for word in text.split_whitespace() {
-        if let Some(seconds) = word.strip_prefix("idle:") {
-            if let Ok(secs) = seconds.parse::<u64>() {
-                return Some(secs);
-            }
-        }
-    }
-    None
-}
-
-/// Try to extract mode from "mode:gateway" format.
-fn fallback_mode(text: &str) -> Option<String> {
-    for word in text.split_whitespace() {
-        if let Some(mode) = word.strip_prefix("mode:") {
-            return Some(mode.to_string());
-        }
-    }
-    None
 }
 
 /// Handle last-heartbeat - returns heartbeat info
@@ -828,38 +759,6 @@ mod tests {
         let text = "host · version 2.0.0";
         let parsed = parse_presence(text);
         assert_eq!(parsed.version, Some("2.0.0".to_string()));
-    }
-
-    #[test]
-    fn test_parse_presence_fallback_v_version() {
-        // Fallback format: v1.2.3
-        let text = "myhost v1.2.3";
-        let parsed = parse_presence(text);
-        assert_eq!(parsed.version, Some("1.2.3".to_string()));
-    }
-
-    #[test]
-    fn test_parse_presence_fallback_bracketed_platform() {
-        // Fallback format: [darwin]
-        let text = "myhost [darwin]";
-        let parsed = parse_presence(text);
-        assert_eq!(parsed.platform, Some("darwin".to_string()));
-    }
-
-    #[test]
-    fn test_parse_presence_fallback_idle_colon() {
-        // Fallback format: idle:300
-        let text = "myhost idle:300";
-        let parsed = parse_presence(text);
-        assert_eq!(parsed.last_input_seconds, Some(300));
-    }
-
-    #[test]
-    fn test_parse_presence_fallback_mode_colon() {
-        // Fallback format: mode:gateway
-        let text = "myhost mode:gateway";
-        let parsed = parse_presence(text);
-        assert_eq!(parsed.mode, Some("gateway".to_string()));
     }
 
     #[test]

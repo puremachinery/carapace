@@ -16,10 +16,6 @@ mod linux;
 #[cfg(target_os = "windows")]
 mod windows;
 
-mod migration;
-
-pub use migration::{migrate_plaintext_credentials, MigrationReport};
-
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -47,6 +43,15 @@ pub const WRITE_RATE_LIMIT_PER_MINUTE: usize = 10;
 
 /// Suffix used for staged credential rotation.
 const PENDING_SUFFIX: &str = ":pending";
+const WHATSAPP_LEGACY_PLAINTEXT_FILENAMES: &[&str] =
+    &["creds.json", "identity.json", "session.json"];
+const WHATSAPP_LEGACY_PLAINTEXT_PREFIXES: &[&str] = &[
+    "app-state-sync-key-",
+    "app-state-sync-version-",
+    "pre-key-",
+    "sender-key-",
+    "session-",
+];
 
 /// Credential store errors
 #[derive(Debug, Clone, PartialEq)]
@@ -75,6 +80,8 @@ pub enum CredentialError {
     RateLimitExceeded,
     /// Index file is corrupted
     IndexCorrupted,
+    /// Plaintext credential files are no longer accepted.
+    PlaintextCredentialFilesDetected(Vec<String>),
     /// File lock acquisition failed
     LockFailed,
     /// Credential verification failed after write
@@ -118,6 +125,17 @@ impl std::fmt::Display for CredentialError {
                 WRITE_RATE_LIMIT_PER_MINUTE
             ),
             Self::IndexCorrupted => write!(f, "Credential index file is corrupted"),
+            Self::PlaintextCredentialFilesDetected(paths) if paths.len() == 1 => write!(
+                f,
+                "plaintext credential file detected at {}; delete it and re-enroll",
+                paths[0]
+            ),
+            Self::PlaintextCredentialFilesDetected(paths) => write!(
+                f,
+                "plaintext credential files detected ({}): {}; delete them and re-enroll",
+                paths.len(),
+                paths.join(", ")
+            ),
             Self::LockFailed => write!(f, "Failed to acquire file lock"),
             Self::VerificationFailed => write!(f, "Failed to verify credential after write"),
             Self::Internal(msg) => write!(f, "Internal error: {}", msg),
@@ -133,6 +151,94 @@ pub fn is_retryable(error: &CredentialError) -> bool {
         error,
         CredentialError::Timeout | CredentialError::IoError(_) | CredentialError::RateLimitExceeded
     )
+}
+
+pub(crate) fn reject_plaintext_credential_files(state_dir: &Path) -> Result<(), CredentialError> {
+    let mut paths: Vec<String> = plaintext_credential_paths(state_dir)
+        .into_iter()
+        .filter(|path| path.is_file())
+        .map(|path| path.display().to_string())
+        .collect();
+    paths.sort();
+    paths.dedup();
+
+    if !paths.is_empty() {
+        return Err(CredentialError::PlaintextCredentialFilesDetected(paths));
+    }
+
+    Ok(())
+}
+
+fn plaintext_credential_paths(state_dir: &Path) -> Vec<PathBuf> {
+    let credentials_dir = state_dir.join("credentials");
+    let mut paths = vec![
+        credentials_dir.join("oauth.json"),
+        credentials_dir.join("github-copilot.token.json"),
+        credentials_dir.join("creds.json"),
+    ];
+
+    paths.extend(agent_plaintext_credential_paths(state_dir));
+
+    if let Ok(entries) = fs::read_dir(&credentials_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if name.ends_with("-pairing.json") || name.ends_with("-allowFrom.json") {
+                paths.push(path);
+            }
+        }
+    }
+
+    let whatsapp_root = credentials_dir.join("whatsapp");
+    if let Ok(accounts) = fs::read_dir(&whatsapp_root) {
+        for account in accounts.flatten() {
+            let account_path = account.path();
+            if !account_path.is_dir() {
+                continue;
+            }
+            if let Ok(files) = fs::read_dir(account_path) {
+                for file in files.flatten() {
+                    let path = file.path();
+                    if path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(is_legacy_whatsapp_plaintext_file)
+                    {
+                        paths.push(path);
+                    }
+                }
+            }
+        }
+    }
+
+    paths
+}
+
+fn is_legacy_whatsapp_plaintext_file(name: &str) -> bool {
+    WHATSAPP_LEGACY_PLAINTEXT_FILENAMES.contains(&name)
+        || (name.ends_with(".json")
+            && WHATSAPP_LEGACY_PLAINTEXT_PREFIXES
+                .iter()
+                .any(|prefix| name.starts_with(prefix)))
+}
+
+fn agent_plaintext_credential_paths(state_dir: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let agents_dir = state_dir.join("agents");
+    if let Ok(entries) = fs::read_dir(agents_dir) {
+        for entry in entries.flatten() {
+            let agent_root = entry.path();
+            if !agent_root.is_dir() {
+                continue;
+            }
+            let agent_dir = agent_root.join("agent");
+            paths.push(agent_dir.join("auth-profiles.json"));
+            paths.push(agent_dir.join("auth.json"));
+        }
+    }
+    paths
 }
 
 /// Delete a keyring credential entry with idempotent not-found semantics.
@@ -1225,7 +1331,6 @@ pub struct MockCredentialBackend {
 }
 
 impl MockCredentialBackend {
-    #[allow(dead_code)]
     pub fn new(available: bool) -> Self {
         Self {
             credentials: Arc::new(RwLock::new(HashMap::new())),
@@ -1315,6 +1420,88 @@ mod tests {
 
         // Should reject the next write
         assert!(!tracker.check_and_record("test-plugin"));
+    }
+
+    #[test]
+    fn test_plaintext_credential_guard_detects_known_whatsapp_files() {
+        let temp = tempdir().unwrap();
+        let account_dir = temp
+            .path()
+            .join("credentials")
+            .join("whatsapp")
+            .join("default");
+        std::fs::create_dir_all(&account_dir).unwrap();
+        let legacy_path = account_dir.join("session-123.json");
+        std::fs::write(&legacy_path, "{}").unwrap();
+
+        let err = reject_plaintext_credential_files(temp.path())
+            .expect_err("known plaintext WhatsApp file should be rejected");
+        assert_eq!(
+            err,
+            CredentialError::PlaintextCredentialFilesDetected(vec![legacy_path
+                .display()
+                .to_string()])
+        );
+    }
+
+    #[test]
+    fn test_plaintext_credential_guard_reports_all_detected_files() {
+        let temp = tempdir().unwrap();
+        let credentials_dir = temp.path().join("credentials");
+        std::fs::create_dir_all(&credentials_dir).unwrap();
+        let oauth_path = credentials_dir.join("oauth.json");
+        let creds_path = credentials_dir.join("creds.json");
+        std::fs::write(&oauth_path, "{}").unwrap();
+        std::fs::write(&creds_path, "{}").unwrap();
+
+        let err = reject_plaintext_credential_files(temp.path())
+            .expect_err("all plaintext credential files should be reported");
+        let CredentialError::PlaintextCredentialFilesDetected(paths) = err else {
+            panic!("expected plaintext credential rejection");
+        };
+
+        assert_eq!(
+            paths,
+            vec![
+                creds_path.display().to_string(),
+                oauth_path.display().to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_plaintext_credential_guard_detects_non_default_agent_files() {
+        let temp = tempdir().unwrap();
+        let agent_dir = temp.path().join("agents").join("primary").join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let auth_path = agent_dir.join("auth.json");
+        std::fs::write(&auth_path, "{}").unwrap();
+
+        let err = reject_plaintext_credential_files(temp.path())
+            .expect_err("non-default agent plaintext credential file should be rejected");
+        assert_eq!(
+            err,
+            CredentialError::PlaintextCredentialFilesDetected(vec![auth_path
+                .display()
+                .to_string()])
+        );
+    }
+
+    #[test]
+    fn test_plaintext_credential_guard_ignores_incidental_whatsapp_files() {
+        let temp = tempdir().unwrap();
+        let account_dir = temp
+            .path()
+            .join("credentials")
+            .join("whatsapp")
+            .join("default");
+        std::fs::create_dir_all(&account_dir).unwrap();
+        std::fs::write(account_dir.join("session.enc"), "encrypted").unwrap();
+        std::fs::write(account_dir.join(".DS_Store"), "finder").unwrap();
+        std::fs::write(account_dir.join("notes.json"), "{}").unwrap();
+
+        reject_plaintext_credential_files(temp.path())
+            .expect("incidental WhatsApp files should not block startup");
     }
 
     #[tokio::test]

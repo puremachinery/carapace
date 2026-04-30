@@ -177,32 +177,28 @@ fn test_error_shape_config_errors_are_not_retryable() {
     assert!(!err2.retryable);
 }
 
-#[test]
-fn test_canonicalize_ws_method_name_aliases() {
-    assert_eq!(canonicalize_ws_method_name("agent.run"), "agent");
-    assert_eq!(canonicalize_ws_method_name("agent.cancel"), "chat.abort");
-    assert_eq!(canonicalize_ws_method_name("session.list"), "sessions.list");
-    assert_eq!(canonicalize_ws_method_name("config.update"), "config.patch");
-    assert_eq!(
-        canonicalize_ws_method_name("exec.list"),
-        "exec.approvals.get"
-    );
-    assert_eq!(
-        canonicalize_ws_method_name("exec.approvals.list"),
-        "exec.approvals.get"
-    );
-    assert_eq!(
-        canonicalize_ws_method_name("exec.approve"),
-        "exec.approval.resolve"
-    );
-    assert_eq!(
-        canonicalize_ws_method_name("exec.deny"),
-        "exec.approval.resolve"
-    );
-    assert_eq!(
-        canonicalize_ws_method_name("config.validate"),
-        "config.validate"
-    );
+#[tokio::test(flavor = "current_thread")]
+async fn test_startup_rejects_plaintext_credential_file() {
+    let temp = tempdir().expect("tempdir");
+    let state_dir = temp.path().join("state");
+    let credentials_dir = state_dir.join("credentials");
+    std::fs::create_dir_all(&credentials_dir).expect("create credentials dir");
+    let plaintext_path = credentials_dir.join("oauth.json");
+    std::fs::write(&plaintext_path, "{}").expect("write plaintext credential file");
+
+    let mut env = ScopedEnv::new();
+    env.set("CARAPACE_STATE_DIR", state_dir.as_os_str());
+
+    let err = build_ws_state_owned_from_value(&json!({}))
+        .await
+        .expect_err("plaintext credential file should fail startup");
+    assert!(matches!(
+        err,
+        WsConfigError::Credentials(
+            crate::credentials::CredentialError::PlaintextCredentialFilesDetected(_)
+        )
+    ));
+    assert!(err.to_string().contains("delete it and re-enroll"));
 }
 
 #[test]
@@ -925,6 +921,54 @@ fn test_method_authorization_unknown_method_requires_admin() {
     let admin_conn = make_conn("admin");
     let result = check_method_authorization("unknown.method.xyz", &admin_conn);
     assert!(result.is_ok(), "Unknown method should be allowed for admin");
+}
+
+#[tokio::test]
+async fn test_legacy_ws_method_aliases_are_unavailable() {
+    let state = Arc::new(WsServerState::new(WsServerConfig::default()));
+    let conn = make_conn("admin");
+    let aliases = [
+        "agent.run",
+        "agent.cancel",
+        "session.list",
+        "session.preview",
+        "session.create",
+        "session.load",
+        "session.fork",
+        "session.rename",
+        "session.switch",
+        "session.patch",
+        "session.reset",
+        "session.delete",
+        "session.compact",
+        "session.archive",
+        "session.restore",
+        "session.archives",
+        "session.archive.delete",
+        "session.export_user",
+        "session.purge_user",
+        "config.update",
+        "exec.list",
+        "exec.approvals.list",
+        "exec.approve",
+        "exec.deny",
+    ];
+
+    for alias in aliases {
+        let err = dispatch_method(alias, Some(&json!({})), &state, &conn)
+            .await
+            .expect_err("legacy method alias should be unavailable");
+        assert_eq!(err.code, ERROR_UNAVAILABLE, "{alias}");
+        assert_eq!(err.message, "method unavailable", "{alias}");
+        assert_eq!(
+            err.details
+                .as_ref()
+                .and_then(|details| details.get("method"))
+                .and_then(|method| method.as_str()),
+            Some(alias),
+            "{alias}"
+        );
+    }
 }
 
 #[test]

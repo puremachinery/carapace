@@ -17,7 +17,7 @@ Secrets covered:
 - WhatsApp Web session material (treated as secret data)
 
 Non-secrets (allowed to remain on disk as plaintext metadata):
-- Config files (`carapace.json5`, with legacy `.json` fallback) and include files
+- Config files (`carapace.json5`) and include files
 - Profile ordering/usage stats metadata (no secret fields)
 
 ## Storage API (Rust)
@@ -45,10 +45,9 @@ secret store interface.
 
 ### Encryption envelope
 
-New secret writes use the `enc:v2` envelope backed by Argon2id key
-derivation. Legacy `enc:v1` (PBKDF2) material remains readable for
-backward compatibility. The versioned auth-profile store includes an
-envelope version tag so the runtime can decode both formats transparently.
+Secret writes use the `enc:v2` envelope backed by Argon2id key derivation.
+The versioned auth-profile store includes an envelope version tag so the
+runtime can validate the current format before decrypting.
 
 ### Data payloads
 

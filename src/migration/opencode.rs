@@ -204,7 +204,7 @@ pub fn remap_model_id(opencode_model: &str) -> String {
     }
 
     // Bare well-known model families need a provider prefix for Carapace routing.
-    crate::migration::prefix_bare_model(opencode_model)
+    crate::migration::prefix_imported_model(opencode_model)
 }
 
 #[cfg(test)]

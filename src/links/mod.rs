@@ -541,7 +541,7 @@ fn truncate_preview(text: &str, max_len: usize) -> String {
         return text.to_string();
     }
 
-    // Walk backward from max_len to find a char boundary
+    // Walk toward the start from max_len to find a char boundary.
     let mut end = max_len;
     while end > 0 && !text.is_char_boundary(end) {
         end -= 1;

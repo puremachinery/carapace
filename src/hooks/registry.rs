@@ -40,7 +40,7 @@ pub struct HookTransform {
 
 /// Hook mapping configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", try_from = "HookMappingWire")]
 pub struct HookMapping {
     /// Unique identifier for the mapping
     pub id: Option<String>,
@@ -56,13 +56,7 @@ pub struct HookMapping {
     /// Display name (supports templates)
     pub name: Option<String>,
     /// Session scope override (supports templates).
-    /// Serialized/deserialized as `sessionKey` for backward compatibility.
-    #[serde(
-        rename = "sessionKey",
-        alias = "session_scope",
-        alias = "sessionScope",
-        alias = "session_key"
-    )]
+    #[serde(rename = "sessionKey")]
     pub session_scope: Option<String>,
     /// Message template for agent action
     pub message_template: Option<String>,
@@ -86,6 +80,66 @@ pub struct HookMapping {
     pub timeout_seconds: Option<u32>,
     /// Transform module configuration
     pub transform: Option<HookTransform>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HookMappingWire {
+    id: Option<String>,
+    #[serde(default)]
+    r#match: HookMatch,
+    #[serde(default)]
+    action: HookAction,
+    #[serde(default)]
+    wake_mode: Option<String>,
+    name: Option<String>,
+    #[serde(rename = "sessionKey")]
+    session_scope: Option<String>,
+    message_template: Option<String>,
+    text_template: Option<String>,
+    deliver: Option<bool>,
+    allow_unsafe_external_content: Option<bool>,
+    channel: Option<String>,
+    to: Option<String>,
+    model: Option<String>,
+    route: Option<String>,
+    thinking: Option<String>,
+    timeout_seconds: Option<u32>,
+    transform: Option<HookTransform>,
+    #[serde(default, rename = "sessionScope")]
+    removed_session_scope: Option<serde::de::IgnoredAny>,
+    #[serde(default, rename = "session_key")]
+    removed_session_key_snake: Option<serde::de::IgnoredAny>,
+}
+
+impl TryFrom<HookMappingWire> for HookMapping {
+    type Error = String;
+
+    fn try_from(value: HookMappingWire) -> Result<Self, Self::Error> {
+        super::reject_removed_session_scope_aliases(
+            value.removed_session_scope,
+            value.removed_session_key_snake,
+        )?;
+        Ok(Self {
+            id: value.id,
+            r#match: value.r#match,
+            action: value.action,
+            wake_mode: value.wake_mode,
+            name: value.name,
+            session_scope: value.session_scope,
+            message_template: value.message_template,
+            text_template: value.text_template,
+            deliver: value.deliver,
+            allow_unsafe_external_content: value.allow_unsafe_external_content,
+            channel: value.channel,
+            to: value.to,
+            model: value.model,
+            route: value.route,
+            thinking: value.thinking,
+            timeout_seconds: value.timeout_seconds,
+            transform: value.transform,
+        })
+    }
 }
 
 impl HookMapping {
@@ -629,27 +683,51 @@ mod tests {
     }
 
     #[test]
-    fn test_hook_mapping_deserializes_session_key_compat() {
+    fn test_hook_mapping_deserializes_session_key() {
         let mapping: HookMapping = serde_json::from_value(json!({
             "id": "test",
             "action": "agent",
             "messageTemplate": "hello",
-            "sessionKey": "hook:legacy"
+            "sessionKey": "hook:current"
         }))
         .unwrap();
-        assert_eq!(mapping.session_scope.as_deref(), Some("hook:legacy"));
+        assert_eq!(mapping.session_scope.as_deref(), Some("hook:current"));
     }
 
     #[test]
-    fn test_hook_mapping_deserializes_session_scope_alias() {
+    fn test_hook_mapping_ignores_unrelated_unknown_fields() {
         let mapping: HookMapping = serde_json::from_value(json!({
             "id": "test",
             "action": "agent",
             "messageTemplate": "hello",
-            "sessionScope": "hook:new"
+            "sessionKey": "hook:current",
+            "futureField": { "ownedByOperator": true }
         }))
         .unwrap();
-        assert_eq!(mapping.session_scope.as_deref(), Some("hook:new"));
+        assert_eq!(mapping.id.as_deref(), Some("test"));
+        assert_eq!(mapping.session_scope.as_deref(), Some("hook:current"));
+    }
+
+    #[test]
+    fn test_hook_mapping_rejects_removed_session_key_aliases() {
+        for field in ["sessionScope", "session_key"] {
+            let mut value = json!({
+                "id": "test",
+                "action": "agent",
+                "messageTemplate": "hello"
+            });
+            value
+                .as_object_mut()
+                .expect("object")
+                .insert(field.to_string(), json!("hook:old"));
+
+            let err = serde_json::from_value::<HookMapping>(value)
+                .expect_err("removed session alias should be rejected");
+            assert!(
+                err.to_string().contains("unknown field"),
+                "unexpected error for {field}: {err}"
+            );
+        }
     }
 
     #[test]

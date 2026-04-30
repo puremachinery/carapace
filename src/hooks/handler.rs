@@ -65,8 +65,8 @@ impl WakeResponse {
 }
 
 /// Request body for POST /hooks/agent
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Deserialize)]
+#[serde(try_from = "AgentRequestWire")]
 pub struct AgentRequest {
     pub message: Option<String>,
     pub name: Option<String>,
@@ -77,16 +77,60 @@ pub struct AgentRequest {
     pub thinking: Option<String>,
     pub deliver: Option<bool>,
     pub wake_mode: Option<String>,
-    #[serde(
-        rename = "sessionKey",
-        alias = "session_scope",
-        alias = "sessionScope",
-        alias = "session_key"
-    )]
+    #[serde(rename = "sessionKey")]
     pub session_scope: Option<String>,
     pub timeout_seconds: Option<f64>,
     pub allow_unsafe_external_content: Option<bool>,
     pub venice_parameters: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentRequestWire {
+    message: Option<String>,
+    name: Option<String>,
+    channel: Option<String>,
+    to: Option<String>,
+    model: Option<String>,
+    route: Option<String>,
+    thinking: Option<String>,
+    deliver: Option<bool>,
+    wake_mode: Option<String>,
+    #[serde(rename = "sessionKey")]
+    session_scope: Option<String>,
+    timeout_seconds: Option<f64>,
+    allow_unsafe_external_content: Option<bool>,
+    venice_parameters: Option<serde_json::Value>,
+    #[serde(default, rename = "sessionScope")]
+    removed_session_scope: Option<serde::de::IgnoredAny>,
+    #[serde(default, rename = "session_key")]
+    removed_session_key_snake: Option<serde::de::IgnoredAny>,
+}
+
+impl TryFrom<AgentRequestWire> for AgentRequest {
+    type Error = String;
+
+    fn try_from(value: AgentRequestWire) -> Result<Self, Self::Error> {
+        super::reject_removed_session_scope_aliases(
+            value.removed_session_scope,
+            value.removed_session_key_snake,
+        )?;
+        Ok(Self {
+            message: value.message,
+            name: value.name,
+            channel: value.channel,
+            to: value.to,
+            model: value.model,
+            route: value.route,
+            thinking: value.thinking,
+            deliver: value.deliver,
+            wake_mode: value.wake_mode,
+            session_scope: value.session_scope,
+            timeout_seconds: value.timeout_seconds,
+            allow_unsafe_external_content: value.allow_unsafe_external_content,
+            venice_parameters: value.venice_parameters,
+        })
+    }
 }
 
 /// Response body for POST /hooks/agent
@@ -683,23 +727,43 @@ mod tests {
     }
 
     #[test]
-    fn test_agent_request_deserializes_session_key_compat() {
+    fn test_agent_request_deserializes_session_key() {
         let req: AgentRequest = serde_json::from_value(serde_json::json!({
             "message": "hello",
-            "sessionKey": "hook:legacy"
+            "sessionKey": "hook:current"
         }))
         .unwrap();
-        assert_eq!(req.session_scope.as_deref(), Some("hook:legacy"));
+        assert_eq!(req.session_scope.as_deref(), Some("hook:current"));
     }
 
     #[test]
-    fn test_agent_request_deserializes_session_scope_alias() {
+    fn test_agent_request_ignores_unrelated_unknown_fields() {
         let req: AgentRequest = serde_json::from_value(serde_json::json!({
             "message": "hello",
-            "sessionScope": "hook:new"
+            "sessionKey": "hook:current",
+            "futureField": { "keptByClient": true }
         }))
         .unwrap();
-        assert_eq!(req.session_scope.as_deref(), Some("hook:new"));
+        assert_eq!(req.message.as_deref(), Some("hello"));
+        assert_eq!(req.session_scope.as_deref(), Some("hook:current"));
+    }
+
+    #[test]
+    fn test_agent_request_rejects_removed_session_key_aliases() {
+        for field in ["sessionScope", "session_key"] {
+            let mut value = serde_json::json!({ "message": "hello" });
+            value
+                .as_object_mut()
+                .expect("object")
+                .insert(field.to_string(), serde_json::json!("hook:old"));
+
+            let err = serde_json::from_value::<AgentRequest>(value)
+                .expect_err("removed session alias should be rejected");
+            assert!(
+                err.to_string().contains("unknown field"),
+                "unexpected error for {field}: {err}"
+            );
+        }
     }
 
     #[test]

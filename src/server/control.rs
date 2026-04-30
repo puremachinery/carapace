@@ -6,7 +6,6 @@
 //! - GET /control/config - Redacted config snapshot + optimistic concurrency hash
 //! - GET /control/onboarding/status - Shared provider onboarding/status snapshot
 //! - PATCH /control/config - Safe config updates (controlUi subtree)
-//! - POST /control/config - Legacy broader config updates
 //! - POST /control/tasks - Create objective task
 //! - GET /control/tasks - List objective tasks
 //! - GET /control/tasks/{id} - Get task by ID
@@ -876,17 +875,7 @@ pub async fn config_patch_handler(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    config_update_handler(state, connect_info, headers, body, true).await
-}
-
-/// POST /control/config - Legacy broader config updates (compatibility path).
-pub async fn config_handler(
-    state: State<ControlState>,
-    connect_info: MaybeConnectInfo,
-    headers: HeaderMap,
-    body: axum::body::Bytes,
-) -> Response {
-    config_update_handler(state, connect_info, headers, body, false).await
+    config_update_handler(state, connect_info, headers, body).await
 }
 
 async fn config_update_handler(
@@ -894,7 +883,6 @@ async fn config_update_handler(
     connect_info: MaybeConnectInfo,
     headers: HeaderMap,
     body: axum::body::Bytes,
-    restrict_to_control_ui_paths: bool,
 ) -> Response {
     // Check auth
     let remote_addr = connect_info.0;
@@ -938,7 +926,7 @@ async fn config_update_handler(
     }
 
     // Restrict PATCH writes to the explicit controlUi subtree.
-    if restrict_to_control_ui_paths && !is_allowed_control_ui_config_path(path) {
+    if !is_allowed_control_ui_config_path(path) {
         return (
             StatusCode::FORBIDDEN,
             Json(ControlError::new(

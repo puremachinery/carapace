@@ -254,7 +254,7 @@ Routes decouple backend selection from agent identity. Instead of embedding `pro
 
 **Precedence:** When resolving which model to use for a request, Carapace checks scopes in order: request, session, agent, defaults. Within each scope, `route` is checked before `model`. A route name that doesn't exist in the map is a hard error — it does not fall back to a sibling `model` field or lower precedence levels.
 
-**Legacy compatibility:** If no `routes` map is defined and agents use `model` directly, everything works as before. Routes are purely additive.
+If no `routes` map is defined and agents use `model` directly, route resolution reads those model values as the active configuration.
 
 ---
 
@@ -403,20 +403,17 @@ Enable Carapace to listen and respond on external chat platforms.
     - `integrity.action`: `"warn"` (Default) or `"reject"`.
     - `encryption.mode`: `"off"`, `"if_password"` (Default), or `"required"`.
   - *Behavior notes:*
-    - When `encryption.mode` is `if_password`, Carapace encrypts session metadata, history, and archives when `CARAPACE_CONFIG_PASSWORD` is available, still reads older plaintext sessions, and rewrites older plaintext session artifacts into encrypted form on first read or write.
+    - When `encryption.mode` is `if_password`, Carapace encrypts session metadata, history, and archives when `CARAPACE_CONFIG_PASSWORD` is available. Unencrypted session artifacts are rejected while encryption is active.
     - When `encryption.mode` is `required`, session operations fail closed until `CARAPACE_CONFIG_PASSWORD` is set.
     - Without the password in `if_password` mode, plaintext sessions remain readable but encrypted sessions surface as locked until the password is provided.
     - Encrypted session recovery depends on the session crypto manifest stored alongside the session artifacts (`.crypto-manifest`). Back up that manifest with the rest of the Carapace state; the password alone is not enough to recover encrypted sessions if the manifest is lost.
     - There is currently no in-place session-encryption rekey/password-change flow. Changing `CARAPACE_CONFIG_PASSWORD` without recreating the session store will leave existing encrypted sessions unreadable; if the password must change, export or delete the existing encrypted sessions and start with a fresh session store and `.crypto-manifest`.
     - When session encryption is active, Carapace keeps the session HMAC sidecars enabled even if `sessions.integrity.enabled` is `false`. With `integrity.action = "reject"`, those sidecars fail closed on missing or mismatched history bytes and therefore catch ciphertext deletion or reordering; with `"warn"`, they remain advisory and only log.
-    - Touch-time migration of pre-encryption session sidecars still uses the same legacy integrity secret source order as the plaintext store (`CARAPACE_SERVER_SECRET` first, then gateway auth fallbacks). If you still have unread plaintext sessions, prefer keeping a stable `CARAPACE_SERVER_SECRET` during the migration window; rotating the legacy integrity secret before those sessions are touched can invalidate their old sidecars.
 - **`session`**
-  - *What it does:* Governs active chat/session scoping behavior and provides a legacy/global fallback for channel typing.
+  - *What it does:* Governs active chat/session scoping behavior.
   - *Common values:*
     - `scope`: `"per-sender"` (Default), `"global"`, or `"per-channel-peer"`.
     - `dmScope`: `"main"` (Default).
-    - `typingMode`: `"thinking"` (Default session value; legacy/global channel-typing fallback only when explicitly set in config, and it applies across all typing-capable channels unless overridden under `channels.*.features.typing`).
-    - `typingIntervalSeconds`: Integer. Seconds between typing-indicator pulses. (Default: `3`; legacy/global channel-typing fallback only when explicitly set in config, and it applies across all typing-capable channels unless overridden under `channels.*.features.typing`)
     - `mainKey`: String. Identifier for the main session slot. Always enforced as `"main"` regardless of what you set. (Default: `"main"`)
 - **`channels`**
   - *What it does:* Applies per-channel override policy, including channel activity features such as typing indicators and read receipts.

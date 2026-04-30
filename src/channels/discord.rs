@@ -16,7 +16,6 @@ use crate::plugins::{
 
 /// Maximum media size to fetch and upload (25 MB).
 const MAX_MEDIA_BYTES: u64 = 25 * 1024 * 1024;
-#[allow(dead_code)]
 const VALIDATION_TIMEOUT_SECS: u64 = 5;
 pub const DISCORD_DEFAULT_API_BASE_URL: &str = "https://discord.com/api/v10";
 
@@ -43,7 +42,6 @@ impl DiscordChannel {
         format!("{}/{}", base, path)
     }
 
-    #[allow(dead_code)]
     pub fn validate(&self) -> ChannelAuthResult {
         let client = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(VALIDATION_TIMEOUT_SECS))
