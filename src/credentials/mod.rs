@@ -16,10 +16,6 @@ mod linux;
 #[cfg(target_os = "windows")]
 mod windows;
 
-mod migration;
-
-pub use migration::{migrate_plaintext_credentials, MigrationReport};
-
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -75,6 +71,8 @@ pub enum CredentialError {
     RateLimitExceeded,
     /// Index file is corrupted
     IndexCorrupted,
+    /// Plaintext credential files are no longer accepted.
+    PlaintextCredentialFileDetected(String),
     /// File lock acquisition failed
     LockFailed,
     /// Credential verification failed after write
@@ -118,6 +116,11 @@ impl std::fmt::Display for CredentialError {
                 WRITE_RATE_LIMIT_PER_MINUTE
             ),
             Self::IndexCorrupted => write!(f, "Credential index file is corrupted"),
+            Self::PlaintextCredentialFileDetected(path) => write!(
+                f,
+                "plaintext credential file detected at {}; delete it and re-enroll",
+                path
+            ),
             Self::LockFailed => write!(f, "Failed to acquire file lock"),
             Self::VerificationFailed => write!(f, "Failed to verify credential after write"),
             Self::Internal(msg) => write!(f, "Internal error: {}", msg),
@@ -133,6 +136,84 @@ pub fn is_retryable(error: &CredentialError) -> bool {
         error,
         CredentialError::Timeout | CredentialError::IoError(_) | CredentialError::RateLimitExceeded
     )
+}
+
+pub(crate) fn reject_plaintext_credential_files(state_dir: &Path) -> Result<(), CredentialError> {
+    if let Some(path) = plaintext_credential_paths(state_dir)
+        .into_iter()
+        .find(|path| path.is_file())
+    {
+        return Err(CredentialError::PlaintextCredentialFileDetected(
+            path.display().to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn plaintext_credential_paths(state_dir: &Path) -> Vec<PathBuf> {
+    let credentials_dir = state_dir.join("credentials");
+    let mut paths = vec![
+        credentials_dir.join("oauth.json"),
+        credentials_dir.join("github-copilot.token.json"),
+        credentials_dir.join("creds.json"),
+    ];
+
+    for agent_id in agent_ids_for_plaintext_scan(state_dir) {
+        let agent_dir = state_dir.join("agents").join(agent_id).join("agent");
+        paths.push(agent_dir.join("auth-profiles.json"));
+        paths.push(agent_dir.join("auth.json"));
+    }
+
+    if let Ok(entries) = fs::read_dir(&credentials_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if name.ends_with("-pairing.json") || name.ends_with("-allowFrom.json") {
+                paths.push(path);
+            }
+        }
+    }
+
+    let whatsapp_root = credentials_dir.join("whatsapp");
+    if let Ok(accounts) = fs::read_dir(&whatsapp_root) {
+        for account in accounts.flatten() {
+            let account_path = account.path();
+            if !account_path.is_dir() {
+                continue;
+            }
+            if let Ok(files) = fs::read_dir(account_path) {
+                for file in files.flatten() {
+                    let path = file.path();
+                    if path.file_name().and_then(|name| name.to_str()) != Some("session.enc") {
+                        paths.push(path);
+                    }
+                }
+            }
+        }
+    }
+
+    paths
+}
+
+fn agent_ids_for_plaintext_scan(state_dir: &Path) -> Vec<String> {
+    let mut ids = Vec::new();
+    let agents_dir = state_dir.join("agents");
+    if let Ok(entries) = fs::read_dir(agents_dir) {
+        for entry in entries.flatten() {
+            if !entry.path().is_dir() {
+                continue;
+            }
+            if let Some(name) = entry.file_name().to_str() {
+                ids.push(name.to_string());
+            }
+        }
+    }
+    if ids.is_empty() {
+        ids.push("main".to_string());
+    }
+    ids
 }
 
 /// Delete a keyring credential entry with idempotent not-found semantics.
@@ -1225,7 +1306,6 @@ pub struct MockCredentialBackend {
 }
 
 impl MockCredentialBackend {
-    #[allow(dead_code)]
     pub fn new(available: bool) -> Self {
         Self {
             credentials: Arc::new(RwLock::new(HashMap::new())),

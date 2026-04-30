@@ -949,48 +949,97 @@ fn validate_agents(obj: &serde_json::Map<String, Value>, issues: &mut Vec<Schema
         None => return,
     };
 
-    let defaults = match agents.get("defaults").and_then(|v| v.as_object()) {
-        Some(d) => d,
-        None => return,
-    };
+    reject_removed_alias(
+        agents,
+        "prompt_guard",
+        ".agents.prompt_guard",
+        ".agents.promptGuard",
+        issues,
+    );
+    reject_removed_alias(
+        agents,
+        "output_sanitizer",
+        ".agents.output_sanitizer",
+        ".agents.outputSanitizer",
+        issues,
+    );
 
-    if let Some(v) = defaults.get("maxConcurrent") {
-        check_positive_integer(v, ".agents.defaults.maxConcurrent", issues);
-    }
-    let timeout_seconds = defaults.get("timeoutSeconds");
-    let timeout_alias = defaults.get("timeout");
+    if let Some(defaults) = agents.get("defaults").and_then(|v| v.as_object()) {
+        reject_agent_override_aliases(defaults, ".agents.defaults", issues);
+        reject_removed_alias(
+            defaults,
+            "timeout",
+            ".agents.defaults.timeout",
+            ".agents.defaults.timeoutSeconds",
+            issues,
+        );
 
-    if let Some(v) = timeout_seconds {
-        check_positive_integer(v, ".agents.defaults.timeoutSeconds", issues);
-    }
-    if let Some(v) = timeout_alias {
-        check_positive_integer(v, ".agents.defaults.timeout", issues);
-    }
-    if timeout_seconds.is_some() && timeout_alias.is_some() {
-        issues.push(SchemaIssue {
-            severity: Severity::Warning,
-            path: ".agents.defaults.timeout".to_string(),
-            message:
-                "Both agents.defaults.timeoutSeconds and agents.defaults.timeout are set; timeoutSeconds takes precedence"
-                    .to_string(),
-        });
-    }
-    if let Some(v) = defaults.get("contextTokens") {
-        check_positive_integer(v, ".agents.defaults.contextTokens", issues);
-    }
+        if let Some(v) = defaults.get("maxConcurrent") {
+            check_positive_integer(v, ".agents.defaults.maxConcurrent", issues);
+        }
+        if let Some(v) = defaults.get("timeoutSeconds") {
+            check_positive_integer(v, ".agents.defaults.timeoutSeconds", issues);
+        }
+        if let Some(v) = defaults.get("contextTokens") {
+            check_positive_integer(v, ".agents.defaults.contextTokens", issues);
+        }
 
-    // Validate model uses provider:model syntax.
-    if let Some(model) = defaults.get("model") {
-        check_model_field(model, ".agents.defaults.model", issues);
+        // Validate model uses provider:model syntax.
+        if let Some(model) = defaults.get("model") {
+            check_model_field(model, ".agents.defaults.model", issues);
+        }
     }
 
     // Validate per-agent models.
     if let Some(list) = agents.get("list").and_then(|v| v.as_array()) {
         for (i, entry) in list.iter().enumerate() {
+            if let Some(entry) = entry.as_object() {
+                reject_agent_override_aliases(entry, &format!(".agents.list[{i}]"), issues);
+            }
             if let Some(model) = entry.get("model") {
                 check_model_field(model, &format!(".agents.list[{i}].model"), issues);
             }
         }
+    }
+}
+
+fn reject_agent_override_aliases(
+    obj: &serde_json::Map<String, Value>,
+    path: &str,
+    issues: &mut Vec<SchemaIssue>,
+) {
+    for (alias, canonical) in [
+        ("max_turns", "maxTurns"),
+        ("max_tokens", "maxTokens"),
+        ("exfiltration_guard", "exfiltrationGuard"),
+        ("prompt_guard", "promptGuard"),
+        ("output_sanitizer", "outputSanitizer"),
+        ("process_sandbox", "sandbox"),
+        ("processSandbox", "sandbox"),
+    ] {
+        reject_removed_alias(
+            obj,
+            alias,
+            &format!("{path}.{alias}"),
+            &format!("{path}.{canonical}"),
+            issues,
+        );
+    }
+}
+
+fn reject_removed_alias(
+    obj: &serde_json::Map<String, Value>,
+    alias: &str,
+    path: &str,
+    canonical_path: &str,
+    issues: &mut Vec<SchemaIssue>,
+) {
+    if obj.contains_key(alias) {
+        issues.push(SchemaIssue {
+            severity: Severity::Error,
+            path: path.to_string(),
+            message: format!("unknown field; use {canonical_path}"),
+        });
     }
 }
 
@@ -1269,6 +1318,14 @@ fn validate_prompt_guard(obj: &serde_json::Map<String, Value>, issues: &mut Vec<
             );
         }
     }
+
+    reject_removed_alias(
+        pg,
+        "configLint",
+        &format!("{prompt_guard_path}.configLint"),
+        &format!("{prompt_guard_path}.config_lint"),
+        issues,
+    );
 }
 
 fn prompt_guard_obj(agents: &Value) -> Option<&serde_json::Map<String, Value>> {
@@ -1280,12 +1337,6 @@ fn prompt_guard_entry(agents: &Value) -> Option<(&'static str, &serde_json::Map<
         .get("promptGuard")
         .and_then(|v| v.as_object())
         .map(|v| ("promptGuard", v))
-        .or_else(|| {
-            agents
-                .get("prompt_guard")
-                .and_then(|v| v.as_object())
-                .map(|v| ("prompt_guard", v))
-        })
 }
 
 fn prompt_guard_config_lint_obj(
@@ -1316,19 +1367,28 @@ fn validate_output_sanitizer(obj: &serde_json::Map<String, Value>, issues: &mut 
         None => return,
     };
 
-    let output = agents
-        .get("outputSanitizer")
-        .or_else(|| agents.get("output_sanitizer"))
-        .and_then(|v| v.as_object());
+    let output = agents.get("outputSanitizer").and_then(|v| v.as_object());
     let output = match output {
         Some(o) => o,
         None => return,
     };
 
-    if let Some(enabled) = output
-        .get("sanitizeHtml")
-        .or_else(|| output.get("sanitize_html"))
-    {
+    reject_removed_alias(
+        output,
+        "sanitize_html",
+        ".agents.outputSanitizer.sanitize_html",
+        ".agents.outputSanitizer.sanitizeHtml",
+        issues,
+    );
+    reject_removed_alias(
+        output,
+        "csp_policy",
+        ".agents.outputSanitizer.csp_policy",
+        ".agents.outputSanitizer.cspPolicy",
+        issues,
+    );
+
+    if let Some(enabled) = output.get("sanitizeHtml") {
         if !enabled.is_boolean() {
             issues.push(SchemaIssue {
                 severity: Severity::Warning,
@@ -1338,7 +1398,7 @@ fn validate_output_sanitizer(obj: &serde_json::Map<String, Value>, issues: &mut 
         }
     }
 
-    if let Some(policy) = output.get("cspPolicy").or_else(|| output.get("csp_policy")) {
+    if let Some(policy) = output.get("cspPolicy") {
         if !policy.is_string() {
             issues.push(SchemaIssue {
                 severity: Severity::Warning,
@@ -2570,24 +2630,97 @@ mod tests {
         );
     }
 
+    fn assert_alias_rejected(issues: &[SchemaIssue], path: &str, canonical: &str) {
+        let issue = issues
+            .iter()
+            .find(|issue| issue.path == path)
+            .unwrap_or_else(|| panic!("missing issue at {path}; got {issues:?}"));
+        assert_eq!(issue.severity, Severity::Error);
+        assert!(issue.message.contains(canonical), "got: {:?}", issue);
+    }
+
     #[test]
-    fn test_agents_defaults_timeout_alias_valid() {
+    fn test_agents_defaults_timeout_alias_rejected() {
         let cfg = json!({ "agents": { "defaults": { "timeout": 60 } } });
         let issues = validate_schema(&cfg);
-        assert!(
-            !issues
-                .iter()
-                .any(|i| i.path.starts_with(".agents.defaults")),
-            "Expected no issues for agents.defaults, but found: {:?}",
-            issues
+        assert_alias_rejected(
+            &issues,
+            ".agents.defaults.timeout",
+            ".agents.defaults.timeoutSeconds",
         );
     }
 
     #[test]
-    fn test_agents_defaults_warns_when_both_timeout_keys_are_set() {
-        let cfg = json!({ "agents": { "defaults": { "timeoutSeconds": 60, "timeout": 30 } } });
+    fn test_agents_top_level_snake_case_aliases_rejected() {
+        let cfg = json!({
+            "agents": {
+                "prompt_guard": { "enabled": true },
+                "output_sanitizer": { "sanitize_html": false }
+            }
+        });
         let issues = validate_schema(&cfg);
-        assert!(issues.iter().any(|i| i.path == ".agents.defaults.timeout"));
+        assert_alias_rejected(&issues, ".agents.prompt_guard", ".agents.promptGuard");
+        assert_alias_rejected(
+            &issues,
+            ".agents.output_sanitizer",
+            ".agents.outputSanitizer",
+        );
+    }
+
+    #[test]
+    fn test_agent_override_aliases_rejected() {
+        let cfg = json!({
+            "agents": {
+                "defaults": {
+                    "max_tokens": 1234,
+                    "processSandbox": { "enabled": true }
+                },
+                "list": [{
+                    "id": "main",
+                    "max_turns": 7,
+                    "exfiltration_guard": true,
+                    "prompt_guard": { "enabled": true },
+                    "output_sanitizer": { "sanitizeHtml": false },
+                    "process_sandbox": { "enabled": true }
+                }]
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert_alias_rejected(
+            &issues,
+            ".agents.defaults.max_tokens",
+            ".agents.defaults.maxTokens",
+        );
+        assert_alias_rejected(
+            &issues,
+            ".agents.defaults.processSandbox",
+            ".agents.defaults.sandbox",
+        );
+        assert_alias_rejected(
+            &issues,
+            ".agents.list[0].max_turns",
+            ".agents.list[0].maxTurns",
+        );
+        assert_alias_rejected(
+            &issues,
+            ".agents.list[0].exfiltration_guard",
+            ".agents.list[0].exfiltrationGuard",
+        );
+        assert_alias_rejected(
+            &issues,
+            ".agents.list[0].prompt_guard",
+            ".agents.list[0].promptGuard",
+        );
+        assert_alias_rejected(
+            &issues,
+            ".agents.list[0].output_sanitizer",
+            ".agents.list[0].outputSanitizer",
+        );
+        assert_alias_rejected(
+            &issues,
+            ".agents.list[0].process_sandbox",
+            ".agents.list[0].sandbox",
+        );
     }
 
     #[test]
@@ -2616,22 +2749,6 @@ mod tests {
     }
 
     #[test]
-    fn test_agents_output_sanitizer_snake_case_valid() {
-        let cfg = json!({
-            "agents": {
-                "output_sanitizer": {
-                    "sanitize_html": false,
-                    "csp_policy": "default-src 'self'"
-                }
-            }
-        });
-        let issues = validate_schema(&cfg);
-        assert!(!issues
-            .iter()
-            .any(|i| i.path.starts_with(".agents.outputSanitizer")));
-    }
-
-    #[test]
     fn test_agents_output_sanitizer_invalid_types() {
         let cfg = json!({
             "agents": {
@@ -2648,6 +2765,29 @@ mod tests {
         assert!(issues
             .iter()
             .any(|i| i.path == ".agents.outputSanitizer.cspPolicy"));
+    }
+
+    #[test]
+    fn test_agents_output_sanitizer_field_aliases_rejected() {
+        let cfg = json!({
+            "agents": {
+                "outputSanitizer": {
+                    "sanitize_html": false,
+                    "csp_policy": "default-src 'self'"
+                }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert_alias_rejected(
+            &issues,
+            ".agents.outputSanitizer.sanitize_html",
+            ".agents.outputSanitizer.sanitizeHtml",
+        );
+        assert_alias_rejected(
+            &issues,
+            ".agents.outputSanitizer.csp_policy",
+            ".agents.outputSanitizer.cspPolicy",
+        );
     }
 
     #[test]
@@ -2689,6 +2829,25 @@ mod tests {
     }
 
     #[test]
+    fn test_prompt_guard_config_lint_camel_case_alias_rejected() {
+        let cfg = json!({
+            "agents": {
+                "promptGuard": {
+                    "configLint": {
+                        "enabled": true
+                    }
+                }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert_alias_rejected(
+            &issues,
+            ".agents.promptGuard.configLint",
+            ".agents.promptGuard.config_lint",
+        );
+    }
+
+    #[test]
     fn test_prompt_guard_config_lint_snake_case_triggers_lint_checks() {
         let cfg = json!({
             "agents": {
@@ -2708,27 +2867,6 @@ mod tests {
             .any(|i| i.path == ".agents.list[0].toolPolicy"));
         assert!(issues.iter().any(|i| i.path == ".agents.list[0].maxTokens"));
         assert!(issues.iter().any(|i| i.path == ".agents.list[0].model"));
-    }
-
-    #[test]
-    fn test_prompt_guard_snake_case_paths_reflect_variant() {
-        let cfg = json!({
-            "agents": {
-                "prompt_guard": {
-                    "enabled": "true",
-                    "config_lint": {
-                        "enabled": "true"
-                    }
-                }
-            }
-        });
-        let issues = validate_schema(&cfg);
-        assert!(issues
-            .iter()
-            .any(|i| i.path == ".agents.prompt_guard.enabled"));
-        assert!(issues
-            .iter()
-            .any(|i| i.path == ".agents.prompt_guard.config_lint.enabled"));
     }
 
     // --- session retention ---

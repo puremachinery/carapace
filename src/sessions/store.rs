@@ -659,7 +659,6 @@ impl SessionFilter {
 struct CachedSession {
     session: Session,
     dirty: bool,
-    history_migration_satisfied: bool,
 }
 
 struct CachedHistoryHmac {
@@ -691,8 +690,6 @@ pub struct SessionStore {
     compact_threshold: usize,
     /// Optional HMAC key for session integrity verification.
     hmac_key: Option<Zeroizing<[u8; 32]>>,
-    /// Optional legacy HMAC key for pre-encryption session artifacts.
-    legacy_hmac_key: Option<Zeroizing<[u8; 32]>>,
     /// Action to take when integrity verification fails.
     integrity_action: super::integrity::IntegrityAction,
     /// Session encryption mode.
@@ -728,7 +725,6 @@ impl SessionStore {
             key_to_id: RwLock::new(HashMap::new()),
             compact_threshold: DEFAULT_COMPACT_THRESHOLD,
             hmac_key: None,
-            legacy_hmac_key: None,
             integrity_action: super::integrity::IntegrityAction::Warn,
             encryption_mode: super::crypto::EncryptionMode::Off,
             crypto: None,
@@ -746,12 +742,6 @@ impl SessionStore {
     /// Set the HMAC key for session integrity verification.
     pub fn with_hmac_key(mut self, key: Zeroizing<[u8; 32]>) -> Self {
         self.hmac_key = Some(key);
-        self
-    }
-
-    /// Set the legacy HMAC key used for pre-encryption session artifacts.
-    pub fn with_legacy_hmac_key(mut self, key: Zeroizing<[u8; 32]>) -> Self {
-        self.legacy_hmac_key = Some(key);
         self
     }
 
@@ -786,25 +776,7 @@ impl SessionStore {
     }
 
     fn new_cached_session(&self, session: Session, dirty: bool) -> CachedSession {
-        CachedSession {
-            session,
-            dirty,
-            history_migration_satisfied: self.encryption_active(),
-        }
-    }
-
-    fn history_migration_satisfied_in_cache(&self, session_id: &str) -> bool {
-        self.sessions
-            .read()
-            .get(session_id)
-            .map(|cached| cached.history_migration_satisfied)
-            .unwrap_or(false)
-    }
-
-    fn mark_history_migration_satisfied(&self, session_id: &str) {
-        if let Some(cached) = self.sessions.write().get_mut(session_id) {
-            cached.history_migration_satisfied = true;
-        }
+        CachedSession { session, dirty }
     }
 
     fn lock_message(reason: impl Into<String>) -> SessionStoreError {
@@ -850,6 +822,11 @@ impl SessionStore {
                 .decrypt_json(session_id, SESSION_METADATA_PURPOSE, content)
                 .map_err(Into::into);
         }
+        if self.encryption_active() {
+            return Err(Self::lock_message(
+                "session metadata is not encrypted; current session encryption requires encrypted artifacts",
+            ));
+        }
         serde_json::from_slice(content).map_err(Into::into)
     }
 
@@ -875,6 +852,11 @@ impl SessionStore {
             return crypto
                 .decrypt_json(session_id, SESSION_HISTORY_PURPOSE, line)
                 .map_err(Into::into);
+        }
+        if self.encryption_active() {
+            return Err(Self::lock_message(
+                "session history is not encrypted; current session encryption requires encrypted artifacts",
+            ));
         }
         serde_json::from_slice(line).map_err(Into::into)
     }
@@ -904,6 +886,11 @@ impl SessionStore {
             return crypto
                 .decrypt_json(session_id, SESSION_ARCHIVE_PURPOSE, content)
                 .map_err(Into::into);
+        }
+        if self.encryption_active() {
+            return Err(Self::lock_message(
+                "session archive is not encrypted; current session encryption requires encrypted artifacts",
+            ));
         }
         serde_json::from_slice(content).map_err(Into::into)
     }
@@ -999,11 +986,11 @@ impl SessionStore {
         history_path: &Path,
     ) -> Result<Vec<u8>, SessionStoreError> {
         let content = fs::read(history_path)?;
-        self.verify_integrity_bytes_with_compat(&content, history_path)?;
+        self.verify_integrity_bytes(&content, history_path)?;
         Ok(content)
     }
 
-    fn verify_integrity_bytes_with_compat(
+    fn verify_integrity_bytes(
         &self,
         content: &[u8],
         file_path: &Path,
@@ -1021,33 +1008,10 @@ impl SessionStore {
         match super::integrity::verify_hmac_file(key, content, file_path, &integrity_config) {
             Ok(()) => Ok(()),
             Err(super::integrity::IntegrityError::Rejected { .. }) => {
-                let Some(ref legacy_key) = self.legacy_hmac_key else {
-                    return Err(SessionStoreError::Io(format!(
-                        "session integrity verification failed for {}",
-                        file_path.display()
-                    )));
-                };
-                super::integrity::verify_hmac_file(
-                    legacy_key,
-                    content,
-                    file_path,
-                    &integrity_config,
-                )
-                .map_err(|err| match err {
-                    super::integrity::IntegrityError::Rejected { file } => SessionStoreError::Io(
-                        format!("session integrity verification failed for {}", file),
-                    ),
-                    other => {
-                        tracing::warn!(
-                            error_kind = integrity_error_kind(&other),
-                            "session integrity verification issue"
-                        );
-                        SessionStoreError::Io(format!(
-                            "session integrity verification failed for {}",
-                            file_path.display()
-                        ))
-                    }
-                })
+                Err(SessionStoreError::Io(format!(
+                    "session integrity verification failed for {}",
+                    file_path.display()
+                )))
             }
             Err(err) => {
                 if matches!(
@@ -1124,11 +1088,7 @@ impl SessionStore {
         Ok(())
     }
 
-    fn migrate_history_file_if_needed(
-        &self,
-        history_path: &Path,
-        session_id: &str,
-    ) -> Result<(), SessionStoreError> {
+    fn ensure_history_file_current(&self, history_path: &Path) -> Result<(), SessionStoreError> {
         if !self.encryption_active() || !history_path.exists() {
             return Ok(());
         }
@@ -1142,15 +1102,15 @@ impl SessionStore {
             return Ok(());
         };
 
-        if super::crypto::has_encrypted_payload_prefix(line) {
-            return Ok(());
+        if !super::crypto::has_encrypted_payload_prefix(line) {
+            return Err(Self::lock_message(
+                "session history is not encrypted; current session encryption requires encrypted artifacts",
+            ));
         }
-
-        let messages = self.get_history(session_id, None, None)?;
-        self.rewrite_history_file_from_messages(history_path, session_id, &messages)
+        Ok(())
     }
 
-    fn migrate_archive_file_if_needed(&self, session_id: &str) -> Result<(), SessionStoreError> {
+    fn ensure_archive_file_current(&self, session_id: &str) -> Result<(), SessionStoreError> {
         if !self.encryption_active() {
             return Ok(());
         }
@@ -1164,34 +1124,26 @@ impl SessionStore {
             FileLock::acquire(&archive_path).map_err(|e| SessionStoreError::Io(e.to_string()))?;
         let archive_content = fs::read(&archive_path)?;
         self.verify_archive_integrity(&archive_path, &archive_content)?;
-        if super::crypto::has_encrypted_payload_prefix(&archive_content) {
-            return Ok(());
+        if !super::crypto::has_encrypted_payload_prefix(&archive_content) {
+            return Err(Self::lock_message(
+                "session archive is not encrypted; current session encryption requires encrypted artifacts",
+            ));
         }
-
-        let archived = self.decode_archive(session_id, &archive_content)?;
-        self.write_archive_file(&archive_path, session_id, &archived)
+        Ok(())
     }
 
-    fn migrate_session_artifacts_if_needed(
-        &self,
-        session: &Session,
-        meta_needs_migration: bool,
-    ) -> Result<(), SessionStoreError> {
+    fn ensure_session_artifacts_current(&self, session: &Session) -> Result<(), SessionStoreError> {
         if !self.encryption_active() {
             return Ok(());
-        }
-
-        if meta_needs_migration {
-            self.write_session_meta(session)?;
         }
 
         let history_path = self.session_history_path(&session.id)?;
         if history_path.exists() {
             let _history_lock = FileLock::acquire(&history_path)
                 .map_err(|e| SessionStoreError::Io(e.to_string()))?;
-            self.migrate_history_file_if_needed(&history_path, &session.id)?;
+            self.ensure_history_file_current(&history_path)?;
         }
-        self.migrate_archive_file_if_needed(&session.id)
+        self.ensure_archive_file_current(&session.id)
     }
 
     /// Validate session_id to prevent path traversal attacks.
@@ -1274,7 +1226,7 @@ impl SessionStore {
         archive_path: &Path,
         archive_bytes: &[u8],
     ) -> Result<(), SessionStoreError> {
-        self.verify_integrity_bytes_with_compat(archive_bytes, archive_path)
+        self.verify_integrity_bytes(archive_bytes, archive_path)
     }
 
     fn history_file_signature(history_path: &Path) -> Option<(u64, Option<i64>)> {
@@ -1906,20 +1858,19 @@ impl SessionStore {
         // Check session status - archived sessions are read-only.
         // Use get_session to check both cache and disk, ensuring the guard
         // works even if the session hasn't been loaded into memory yet.
-        if let Ok(session) = self.get_session(&session_id) {
-            if session.status == SessionStatus::Archived {
+        match self.get_session(&session_id) {
+            Ok(session) if session.status == SessionStatus::Archived => {
                 return Err(SessionStoreError::AlreadyArchived(session_id));
             }
+            Ok(_) | Err(SessionStoreError::NotFound(_)) => {}
+            Err(err) => return Err(err),
         }
 
         // Append to history file (JSONL format)
         let history_path = self.session_history_path(&session_id)?;
         let _lock =
             FileLock::acquire(&history_path).map_err(|e| SessionStoreError::Io(e.to_string()))?;
-        if self.encryption_active() && !self.history_migration_satisfied_in_cache(&session_id) {
-            self.migrate_history_file_if_needed(&history_path, &session_id)?;
-            self.mark_history_migration_satisfied(&session_id);
-        }
+        self.ensure_history_file_current(&history_path)?;
         let encoded = self.encode_history_message(&message)?;
         let mut appended = encoded;
         appended.push(b'\n');
@@ -1967,19 +1918,18 @@ impl SessionStore {
         }
 
         // Check session status
-        if let Ok(session) = self.get_session(session_id) {
-            if session.status == SessionStatus::Archived {
+        match self.get_session(session_id) {
+            Ok(session) if session.status == SessionStatus::Archived => {
                 return Err(SessionStoreError::AlreadyArchived(session_id.to_string()));
             }
+            Ok(_) | Err(SessionStoreError::NotFound(_)) => {}
+            Err(err) => return Err(err),
         }
 
         let history_path = self.session_history_path(session_id)?;
         let _lock =
             FileLock::acquire(&history_path).map_err(|e| SessionStoreError::Io(e.to_string()))?;
-        if self.encryption_active() && !self.history_migration_satisfied_in_cache(session_id) {
-            self.migrate_history_file_if_needed(&history_path, session_id)?;
-            self.mark_history_migration_satisfied(session_id);
-        }
+        self.ensure_history_file_current(&history_path)?;
         let mut appended = Vec::new();
 
         for msg in messages {
@@ -2348,16 +2298,11 @@ impl SessionStore {
 
         let archive_content = fs::read(&archive_path)?;
         self.verify_archive_integrity(&archive_path, &archive_content)?;
-        let archive_was_plaintext = !super::crypto::has_encrypted_payload_prefix(&archive_content);
         let archived = self.decode_archive(session_id, &archive_content)?;
 
         let history_path = self.session_history_path(session_id)?;
         let _history_lock = FileLock::acquire(&history_path)?;
         self.rewrite_history_file_from_messages(&history_path, session_id, &archived.messages)?;
-
-        if self.encryption_active() && archive_was_plaintext {
-            self.write_archive_file(&archive_path, session_id, &archived)?;
-        }
 
         let message_count = archived.messages.len();
 
@@ -2518,10 +2463,9 @@ impl SessionStore {
 
         let content = fs::read(&meta_path)?;
         let meta_was_encrypted = super::crypto::has_encrypted_payload_prefix(&content);
-        let meta_needs_migration = !meta_was_encrypted;
 
         // Verify session integrity if HMAC key is configured
-        self.verify_integrity_bytes_with_compat(&content, &meta_path)?;
+        self.verify_integrity_bytes(&content, &meta_path)?;
 
         let session = match self.decode_session_metadata(session_id, &content) {
             Ok(session) => session,
@@ -2546,7 +2490,12 @@ impl SessionStore {
             Err(err) => return Err(err),
         };
 
-        self.migrate_session_artifacts_if_needed(&session, meta_needs_migration)?;
+        if self.encryption_active() && !meta_was_encrypted {
+            return Err(Self::lock_message(
+                "session metadata is not encrypted; current session encryption requires encrypted artifacts",
+            ));
+        }
+        self.ensure_session_artifacts_current(&session)?;
 
         if update_locked_scan_state {
             self.clear_locked_session_entry(session_id);
@@ -2880,19 +2829,6 @@ mod tests {
             if let Some(hmac_key) = hmac_key {
                 store = store.with_hmac_key(hmac_key);
             }
-        }
-        store
-    }
-
-    fn reopen_store_with_encryption_and_legacy_hmac(
-        base_path: &Path,
-        password: Option<&[u8]>,
-        mode: EncryptionMode,
-        legacy_secret: Option<&[u8]>,
-    ) -> SessionStore {
-        let mut store = reopen_store_with_encryption(base_path, password, mode);
-        if let Some(secret) = legacy_secret {
-            store = store.with_legacy_hmac_key(Zeroizing::new(integrity::derive_hmac_key(secret)));
         }
         store
     }
@@ -3246,7 +3182,7 @@ mod tests {
             .with_integrity_action(integrity::IntegrityAction::Warn);
 
         assert!(matches!(
-            locked_store.verify_integrity_bytes_with_compat(&content, &meta_path),
+            locked_store.verify_integrity_bytes(&content, &meta_path),
             Err(SessionStoreError::Locked(_))
         ));
     }
@@ -3299,157 +3235,6 @@ mod tests {
     }
 
     #[test]
-    fn test_reject_mode_migrates_legacy_integrity_sidecars_when_encryption_enabled() {
-        let temp_dir = TempDir::new().unwrap();
-        let key_material = test_key_material();
-        let legacy_secret = test_key_material();
-        let legacy_hmac_key = Zeroizing::new(integrity::derive_hmac_key(&legacy_secret));
-
-        let plaintext_store = SessionStore::with_base_path(temp_dir.path().to_path_buf())
-            .with_hmac_key(legacy_hmac_key)
-            .with_integrity_action(integrity::IntegrityAction::Reject);
-        let session = plaintext_store
-            .create_session("agent-1", SessionMetadata::default())
-            .unwrap();
-        plaintext_store
-            .append_message(ChatMessage::user(&session.id, "before"))
-            .unwrap();
-
-        let encrypted_store = reopen_store_with_encryption_and_legacy_hmac(
-            temp_dir.path(),
-            Some(&key_material),
-            EncryptionMode::IfPassword,
-            Some(&legacy_secret),
-        )
-        .with_integrity_action(integrity::IntegrityAction::Reject);
-
-        encrypted_store
-            .append_message(ChatMessage::user(&session.id, "after"))
-            .unwrap();
-
-        let history = encrypted_store
-            .get_history(&session.id, None, None)
-            .unwrap();
-        assert_eq!(history.len(), 2);
-
-        let meta_raw = fs::read(encrypted_store.session_meta_path(&session.id).unwrap()).unwrap();
-        assert!(crypto::is_encrypted_payload(&meta_raw));
-        let history_raw =
-            fs::read_to_string(encrypted_store.session_history_path(&session.id).unwrap()).unwrap();
-        let first_line = history_raw
-            .lines()
-            .find(|line| !line.trim().is_empty())
-            .unwrap();
-        assert!(crypto::is_encrypted_payload(first_line.as_bytes()));
-
-        let reopened = reopen_store_with_encryption(
-            temp_dir.path(),
-            Some(&key_material),
-            EncryptionMode::IfPassword,
-        )
-        .with_integrity_action(integrity::IntegrityAction::Reject);
-        let reopened_history = reopened.get_history(&session.id, None, None).unwrap();
-        assert_eq!(reopened_history.len(), 2);
-    }
-
-    #[test]
-    fn test_encrypted_append_migrates_legacy_plaintext_history_and_metadata() {
-        let temp_dir = TempDir::new().unwrap();
-        let key_material = test_key_material();
-        let plaintext_store = SessionStore::with_base_path(temp_dir.path().to_path_buf());
-        let session = plaintext_store
-            .create_session("agent-1", SessionMetadata::default())
-            .unwrap();
-        plaintext_store
-            .append_message(ChatMessage::user(&session.id, "before"))
-            .unwrap();
-
-        let history_path = plaintext_store.session_history_path(&session.id).unwrap();
-        let meta_path = plaintext_store.session_meta_path(&session.id).unwrap();
-        let legacy_line = fs::read_to_string(&history_path).unwrap();
-        assert!(!crypto::is_encrypted_payload(
-            legacy_line.lines().next().unwrap().as_bytes()
-        ));
-        assert!(!crypto::is_encrypted_payload(
-            &fs::read(&meta_path).unwrap()
-        ));
-
-        let encrypted_store = reopen_store_with_encryption(
-            temp_dir.path(),
-            Some(&key_material),
-            EncryptionMode::IfPassword,
-        );
-        encrypted_store
-            .append_message(ChatMessage::assistant(&session.id, "after"))
-            .unwrap();
-
-        let history_lines = fs::read_to_string(&history_path).unwrap();
-        assert!(history_lines
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .all(|line| crypto::is_encrypted_payload(line.as_bytes())));
-        assert!(crypto::is_encrypted_payload(&fs::read(&meta_path).unwrap()));
-
-        let history = encrypted_store
-            .get_history(&session.id, None, None)
-            .unwrap();
-        assert_eq!(history.len(), 2);
-        assert_eq!(history[0].content, "before");
-        assert_eq!(history[1].content, "after");
-    }
-
-    #[test]
-    fn test_loading_plaintext_session_under_encryption_migrates_all_artifacts() {
-        let temp_dir = TempDir::new().unwrap();
-        let key_material = test_key_material();
-        let plaintext_store = SessionStore::with_base_path(temp_dir.path().to_path_buf());
-        let session = plaintext_store
-            .create_session("agent-1", SessionMetadata::default())
-            .unwrap();
-        plaintext_store
-            .append_message(ChatMessage::user(&session.id, "before"))
-            .unwrap();
-        plaintext_store.archive_session(&session.id, false).unwrap();
-
-        let history_path = plaintext_store.session_history_path(&session.id).unwrap();
-        let meta_path = plaintext_store.session_meta_path(&session.id).unwrap();
-        let archive_path = plaintext_store.archive_path(&session.id).unwrap();
-
-        assert!(!crypto::is_encrypted_payload(
-            &fs::read(&meta_path).unwrap()
-        ));
-        assert!(fs::read_to_string(&history_path)
-            .unwrap()
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .all(|line| !crypto::is_encrypted_payload(line.as_bytes())));
-        assert!(!crypto::is_encrypted_payload(
-            &fs::read(&archive_path).unwrap()
-        ));
-
-        let encrypted_store = reopen_store_with_encryption(
-            temp_dir.path(),
-            Some(&key_material),
-            EncryptionMode::IfPassword,
-        );
-        let entries = encrypted_store
-            .list_session_entries(SessionFilter::default())
-            .unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].session_id(), session.id);
-
-        assert!(crypto::is_encrypted_payload(&fs::read(&meta_path).unwrap()));
-        assert!(fs::read_to_string(&history_path)
-            .unwrap()
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .all(|line| crypto::is_encrypted_payload(line.as_bytes())));
-        assert!(crypto::is_encrypted_payload(
-            &fs::read(&archive_path).unwrap()
-        ));
-    }
-
-    #[test]
     fn test_encrypted_compaction_rewrites_history_as_ciphertext() {
         let key_material = test_key_material();
         let (store, _temp) = create_encrypted_store(&key_material);
@@ -3483,20 +3268,18 @@ mod tests {
     }
 
     #[test]
-    fn test_restore_session_reencrypts_plaintext_archive_when_encryption_enabled() {
+    fn test_restore_session_rejects_unencrypted_archive_when_encryption_enabled() {
         let temp_dir = TempDir::new().unwrap();
-        let plaintext_store = SessionStore::with_base_path(temp_dir.path().to_path_buf());
-        let session = plaintext_store
+        let unencrypted_store = SessionStore::with_base_path(temp_dir.path().to_path_buf());
+        let session = unencrypted_store
             .create_session("agent-1", SessionMetadata::default())
             .unwrap();
-        plaintext_store
+        unencrypted_store
             .append_message(ChatMessage::user(&session.id, "before-archive"))
             .unwrap();
-        let archive_result = plaintext_store.archive_session(&session.id, true).unwrap();
-        let archive_path = PathBuf::from(&archive_result.archive_path);
-        assert!(!crypto::is_encrypted_payload(
-            &fs::read(&archive_path).unwrap()
-        ));
+        unencrypted_store
+            .archive_session(&session.id, true)
+            .unwrap();
 
         let key_material = test_key_material();
         let encrypted_store = reopen_store_with_encryption(
@@ -3504,22 +3287,31 @@ mod tests {
             Some(&key_material),
             EncryptionMode::IfPassword,
         );
-        let restored = encrypted_store.restore_session(&session.id).unwrap();
-        assert_eq!(restored.message_count, 1);
+        let err = encrypted_store.restore_session(&session.id).unwrap_err();
+        assert!(matches!(err, SessionStoreError::Locked(_)));
+    }
 
-        let archive_raw = fs::read(&archive_path).unwrap();
-        assert!(crypto::is_encrypted_payload(&archive_raw));
-        #[cfg(unix)]
-        assert_private_mode(&archive_path);
+    #[test]
+    fn test_get_history_rejects_unencrypted_history_when_encryption_enabled() {
+        let temp_dir = TempDir::new().unwrap();
+        let unencrypted_store = SessionStore::with_base_path(temp_dir.path().to_path_buf());
+        let session = unencrypted_store
+            .create_session("agent-1", SessionMetadata::default())
+            .unwrap();
+        unencrypted_store
+            .append_message(ChatMessage::user(&session.id, "plaintext-history"))
+            .unwrap();
 
-        let history_path = encrypted_store.session_history_path(&session.id).unwrap();
-        let history_raw = fs::read_to_string(&history_path).unwrap();
-        assert!(history_raw
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .all(|line| crypto::is_encrypted_payload(line.as_bytes())));
-        #[cfg(unix)]
-        assert_private_mode(&history_path);
+        let key_material = test_key_material();
+        let encrypted_store = reopen_store_with_encryption(
+            temp_dir.path(),
+            Some(&key_material),
+            EncryptionMode::IfPassword,
+        );
+        let err = encrypted_store
+            .get_history(&session.id, None, None)
+            .unwrap_err();
+        assert!(matches!(err, SessionStoreError::Locked(_)));
     }
 
     #[test]
@@ -3561,7 +3353,7 @@ mod tests {
     }
 
     #[test]
-    fn test_restore_session_rejects_tampered_plaintext_archive_under_integrity_reject() {
+    fn test_restore_session_rejects_tampered_unencrypted_archive_under_integrity_reject() {
         let temp_dir = TempDir::new().unwrap();
         let hmac_key = Zeroizing::new(integrity::derive_hmac_key(b"archive-secret"));
         let store = SessionStore::with_base_path(temp_dir.path().to_path_buf())
@@ -3583,7 +3375,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_archive_info_rejects_tampered_plaintext_archive_under_integrity_reject() {
+    fn test_get_archive_info_rejects_tampered_unencrypted_archive_under_integrity_reject() {
         let temp_dir = TempDir::new().unwrap();
         let hmac_key = Zeroizing::new(integrity::derive_hmac_key(b"archive-secret"));
         let store = SessionStore::with_base_path(temp_dir.path().to_path_buf())
@@ -3602,94 +3394,6 @@ mod tests {
 
         let err = store.get_archive_info(&session.id).unwrap_err();
         assert!(matches!(err, SessionStoreError::Io(_)));
-    }
-
-    #[test]
-    fn test_encryption_migration_rejects_tampered_plaintext_archive_under_integrity_reject() {
-        let temp_dir = TempDir::new().unwrap();
-        let key_material = test_key_material();
-        let legacy_secret = test_key_material();
-        let legacy_hmac_key = Zeroizing::new(integrity::derive_hmac_key(&legacy_secret));
-
-        let plaintext_store = SessionStore::with_base_path(temp_dir.path().to_path_buf())
-            .with_hmac_key(legacy_hmac_key)
-            .with_integrity_action(integrity::IntegrityAction::Reject);
-        let session = plaintext_store
-            .create_session("agent-1", SessionMetadata::default())
-            .unwrap();
-        plaintext_store
-            .append_message(ChatMessage::user(&session.id, "before-archive"))
-            .unwrap();
-        plaintext_store.archive_session(&session.id, false).unwrap();
-
-        let archive_path = plaintext_store.archive_path(&session.id).unwrap();
-        fs::write(&archive_path, br#"{"tampered":true}"#).unwrap();
-
-        let encrypted_store = reopen_store_with_encryption_and_legacy_hmac(
-            temp_dir.path(),
-            Some(&key_material),
-            EncryptionMode::IfPassword,
-            Some(&legacy_secret),
-        )
-        .with_integrity_action(integrity::IntegrityAction::Reject);
-
-        let err = encrypted_store.get_session(&session.id).unwrap_err();
-        assert!(matches!(err, SessionStoreError::Io(_)));
-    }
-
-    #[test]
-    fn test_archive_migration_updates_hmac_sidecar_under_reject_mode() {
-        let temp_dir = TempDir::new().unwrap();
-        let key_material = test_key_material();
-        let legacy_secret = test_key_material();
-        let legacy_hmac_key = Zeroizing::new(integrity::derive_hmac_key(&legacy_secret));
-
-        let plaintext_store = SessionStore::with_base_path(temp_dir.path().to_path_buf())
-            .with_hmac_key(legacy_hmac_key)
-            .with_integrity_action(integrity::IntegrityAction::Reject);
-        let session = plaintext_store
-            .create_session("agent-1", SessionMetadata::default())
-            .unwrap();
-        plaintext_store
-            .append_message(ChatMessage::user(&session.id, "before-archive"))
-            .unwrap();
-        plaintext_store.archive_session(&session.id, false).unwrap();
-
-        let archive_path = plaintext_store.archive_path(&session.id).unwrap();
-        let archive_raw = fs::read(&archive_path).unwrap();
-        let reject = integrity::IntegrityConfig {
-            enabled: true,
-            action: integrity::IntegrityAction::Reject,
-        };
-        integrity::verify_hmac_file(
-            plaintext_store.hmac_key.as_ref().unwrap(),
-            &archive_raw,
-            &archive_path,
-            &reject,
-        )
-        .unwrap();
-
-        let encrypted_store = reopen_store_with_encryption_and_legacy_hmac(
-            temp_dir.path(),
-            Some(&key_material),
-            EncryptionMode::IfPassword,
-            Some(&legacy_secret),
-        )
-        .with_integrity_action(integrity::IntegrityAction::Reject);
-        let entries = encrypted_store
-            .list_session_entries(SessionFilter::default())
-            .unwrap();
-        assert_eq!(entries.len(), 1);
-
-        let migrated_archive_raw = fs::read(&archive_path).unwrap();
-        assert!(crypto::is_encrypted_payload(&migrated_archive_raw));
-        integrity::verify_hmac_file(
-            encrypted_store.hmac_key.as_ref().unwrap(),
-            &migrated_archive_raw,
-            &archive_path,
-            &reject,
-        )
-        .unwrap();
     }
 
     #[test]
@@ -4472,7 +4176,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_history_ignores_plaintext_format_field_matching_encryption_format() {
+    fn test_get_history_ignores_json_format_field_matching_encryption_format() {
         let (store, _temp) = create_test_store();
         let session = store
             .create_session("agent-1", SessionMetadata::default())

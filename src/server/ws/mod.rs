@@ -1224,9 +1224,7 @@ pub enum WsConfigError {
 
 pub async fn build_ws_state_owned_from_value(cfg: &Value) -> Result<WsServerState, WsConfigError> {
     let state_dir = resolve_state_dir();
-    if let Err(err) = credentials::migrate_plaintext_credentials(state_dir.clone()).await {
-        tracing::warn!(error = %err, "Credential migration failed");
-    }
+    credentials::reject_plaintext_credential_files(&state_dir)?;
     let config = build_ws_config_from_value(cfg).await?;
     let mut state = WsServerState::new_persistent(config, state_dir).await?;
     let integrity_config = sessions::resolve_session_integrity_config(cfg);
@@ -2350,8 +2348,7 @@ async fn run_message_loop(
         if validate_request_params(tx, &req_id, &method, &params, json_depth_limit).is_err() {
             continue;
         }
-        let canonical_method = handlers::canonicalize_ws_method_name(&method);
-        let method_known = GATEWAY_METHODS.contains(&canonical_method);
+        let method_known = GATEWAY_METHODS.contains(&method.as_str());
         let result = dispatch_method(&method, params.as_ref(), state, conn).await;
         send_dispatch_result(tx, &req_id, &method, method_known, result);
     }

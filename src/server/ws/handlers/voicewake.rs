@@ -23,8 +23,6 @@ static VOICEWAKE_STATE: LazyLock<RwLock<VoicewakeState>> =
 pub struct VoicewakeState {
     /// Whether voicewake is enabled
     pub enabled: bool,
-    /// Primary wake keyword.
-    pub keyword: Option<String>,
     /// All active triggers (Node parity)
     pub triggers: Vec<String>,
     /// Sensitivity level (0.0 to 1.0)
@@ -41,7 +39,6 @@ impl Default for VoicewakeState {
     fn default() -> Self {
         Self {
             enabled: false,
-            keyword: None,
             triggers: Vec::new(),
             sensitivity: 0.5,
             confirmation_sound: true,
@@ -55,7 +52,6 @@ impl Default for VoicewakeState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceVoicewakeSettings {
     pub enabled: bool,
-    pub keyword: Option<String>,
     pub triggers: Vec<String>,
     pub sensitivity: Option<f64>,
 }
@@ -78,6 +74,14 @@ pub(super) fn handle_voicewake_get() -> Result<Value, ErrorShape> {
 
 /// Enable voicewake
 pub(super) fn handle_voicewake_enable(params: Option<&Value>) -> Result<Value, ErrorShape> {
+    if params.and_then(|v| v.get("keyword")).is_some() {
+        return Err(error_shape(
+            ERROR_INVALID_REQUEST,
+            "keyword is no longer supported; use triggers",
+            None,
+        ));
+    }
+
     let mut state = VOICEWAKE_STATE.write();
 
     if let Some(triggers) = params
@@ -89,18 +93,6 @@ pub(super) fn handle_voicewake_enable(params: Option<&Value>) -> Result<Value, E
             .filter_map(|v| v.as_str().map(ToOwned::to_owned))
             .collect();
         state.triggers = normalize_triggers(raw_triggers);
-        state.keyword = state.triggers.first().cloned();
-    } else if let Some(keyword) = params
-        .and_then(|v| v.get("keyword"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-    {
-        let keyword = keyword.to_string();
-        state.keyword = Some(keyword.clone());
-        if state.triggers.is_empty() || !state.triggers.contains(&keyword) {
-            state.triggers = vec![keyword];
-        }
     }
 
     // Set sensitivity if provided
@@ -116,7 +108,6 @@ pub(super) fn handle_voicewake_enable(params: Option<&Value>) -> Result<Value, E
     Ok(json!({
         "ok": true,
         "enabled": true,
-        "keyword": state.keyword,
         "triggers": state.triggers,
         "sensitivity": state.sensitivity
     }))
@@ -216,7 +207,6 @@ pub(super) fn handle_voicewake_set(
         let mut voicewake_state = VOICEWAKE_STATE.write();
 
         voicewake_state.triggers = triggers.clone();
-        voicewake_state.keyword = triggers.first().cloned();
         voicewake_state.enabled = !triggers.is_empty();
     }
 
@@ -260,7 +250,6 @@ pub(super) fn handle_voicewake_test(params: Option<&Value>) -> Result<Value, Err
         "ok": true,
         "detected": false,
         "confidence": 0.0,
-        "keyword": state.keyword,
         "triggers": state.triggers,
         "threshold": state.threshold,
         "audioBytes": audio_data.len()
@@ -301,25 +290,20 @@ mod tests {
         let result = handle_voicewake_enable(Some(&params)).unwrap();
         assert_eq!(result["ok"], true);
         assert_eq!(result["enabled"], true);
-        assert_eq!(result["keyword"], "hey claude");
         assert_eq!(result["triggers"][0], "hey claude");
         assert_eq!(result["sensitivity"], 0.8);
     }
 
     #[test]
-    fn test_voicewake_enable_keyword_sets_trigger() {
+    fn test_voicewake_enable_rejects_keyword() {
         let _lock = TEST_LOCK.lock().unwrap();
         reset_state();
         let params = json!({
-            "keyword": "hey claude",
-            "sensitivity": 0.8
+            "keyword": "hey claude"
         });
-        let result = handle_voicewake_enable(Some(&params)).unwrap();
-        assert_eq!(result["ok"], true);
-        assert_eq!(result["enabled"], true);
-        assert_eq!(result["keyword"], "hey claude");
-        assert_eq!(result["triggers"][0], "hey claude");
-        assert_eq!(result["sensitivity"], 0.8);
+        let err = handle_voicewake_enable(Some(&params)).unwrap_err();
+        assert_eq!(err.code, ERROR_INVALID_REQUEST);
+        assert!(err.message.contains("triggers"), "got: {}", err.message);
     }
 
     #[test]
@@ -347,10 +331,6 @@ mod tests {
         let triggers = result["triggers"].as_array().unwrap();
         assert_eq!(triggers.len(), 1);
         assert_eq!(triggers[0], "claude");
-        assert_eq!(
-            handle_voicewake_test(Some(&json!({"audioData": "abc"}))).unwrap()["keyword"],
-            "claude"
-        );
     }
 
     #[test]
