@@ -598,29 +598,21 @@ enum ReloadOutcome {
 /// back to the previous good state (if the new config has no provider or
 /// the build failed).
 ///
-/// Reads the current config via `load_config_shared` / `load_raw_config_shared`
-/// rather than the TTL-gated `peek_fresh_*` variants so the bridge keeps
-/// working when `CARAPACE_DISABLE_CONFIG_CACHE` is set or the cache TTL has
-/// just expired. If either load fails, we suppress the broadcast (return
-/// `Reverted`) rather than letting clients observe a possibly-inconsistent
-/// state.
+/// Reads the current config via `load_both_config_shared` (one
+/// `CONFIG_CACHE` lock acquisition for the raw + normalized pair) rather
+/// than two separate calls — keeps the two halves from the same reload
+/// generation even if a future async refactor inserts an `.await` between
+/// successive cache reads. Uses the non-cache-gated variant so the bridge
+/// keeps working when `CARAPACE_DISABLE_CONFIG_CACHE` is set or the cache
+/// TTL has just expired. If the load fails, we suppress the broadcast
+/// (return `Reverted`) rather than letting clients observe a
+/// possibly-inconsistent state.
 fn handle_provider_reload(ws_state: &Arc<WsServerState>, state: &mut ReloadState) -> ReloadOutcome {
-    let new_cfg_arc = match config::load_config_shared() {
-        Ok(arc) => arc,
+    let (new_raw_arc, new_cfg_arc) = match config::load_both_config_shared() {
+        Ok(pair) => pair,
         Err(e) => {
             warn!(
-                "Failed to load reloaded normalized config: {} (rolling back to last-known-good)",
-                e
-            );
-            revert_to_last_good(state);
-            return ReloadOutcome::Reverted;
-        }
-    };
-    let new_raw_arc = match config::load_raw_config_shared() {
-        Ok(arc) => arc,
-        Err(e) => {
-            warn!(
-                "Failed to load reloaded raw config: {} (rolling back to last-known-good)",
+                "Failed to load reloaded config: {} (rolling back to last-known-good)",
                 e
             );
             revert_to_last_good(state);
@@ -655,6 +647,14 @@ fn handle_provider_reload(ws_state: &Arc<WsServerState>, state: &mut ReloadState
                  to keep the previous provider active. Restore a provider config to \
                  apply further changes."
             );
+            // Note: we deliberately do NOT advance current_fingerprint here.
+            // If the operator re-saves the same no-provider config, the
+            // fingerprint mismatch (vs the still-valid last-known-good one)
+            // re-triggers `build_providers`, giving a transient build error
+            // a chance to recover on retry. The cost is one redundant
+            // build_providers call per re-save; at human save rates this is
+            // negligible, and the loop terminates as soon as the operator
+            // restores a provider config.
             revert_to_last_good(state);
             ReloadOutcome::Reverted
         }
@@ -2072,7 +2072,10 @@ mod tests {
     /// `ReloadState` whose `last_good_*` mirror an `ANTHROPIC_API_KEY` setup.
     /// The initial cache holds **distinct** raw and normalized values so a
     /// rollback-mixup that wrote one into the other's slot would surface in
-    /// the assertions.
+    /// the assertions, and `CONFIG_ENV_STATE` is pre-populated via
+    /// `apply_config_env_for_test` so `last_good_env` snapshots have
+    /// non-empty content — that lets the rollback tests actually exercise
+    /// `restore_env_state` rather than treating it as a no-op.
     fn make_reload_state_with_anthropic_provider() -> (
         crate::test_support::config::ScopedConfigCache,
         ScopedEnv,
@@ -2085,6 +2088,15 @@ mod tests {
         crate::config::clear_cache();
         let mut env = crate::test_support::env::provider_env_cleared();
         env.set("ANTHROPIC_API_KEY", "test-initial-key");
+
+        // Make the initial CONFIG_ENV_STATE non-empty so the
+        // `last_good_env` snapshot below holds a real value to restore on
+        // rollback. The map key matches the `ScopedEnv` set above so the
+        // tracker's `active_values` reflects what's actually in process env.
+        crate::config::apply_config_env_for_test(HashMap::from([(
+            "ANTHROPIC_API_KEY".to_string(),
+            "test-initial-key".to_string(),
+        )]));
 
         let initial_raw = json!({ "marker": "raw-initial" });
         let initial_normalized = json!({ "marker": "normalized-initial" });
@@ -2101,8 +2113,9 @@ mod tests {
 
     /// On a no-provider reload: both the raw and normalized cache slots roll
     /// back to the previous good state, `last_good_cache` and
-    /// `current_fingerprint` are unchanged, and the bridge returns `Reverted`
-    /// so the WS broadcast is suppressed.
+    /// `current_fingerprint` are unchanged, the env-injected
+    /// `ANTHROPIC_API_KEY` is restored to its pre-reload value, and the
+    /// bridge returns `Reverted` so the WS broadcast is suppressed.
     #[test]
     fn handle_provider_reload_reverts_when_new_config_has_no_provider() {
         let (_cache, mut env, ws_state, mut state) = make_reload_state_with_anthropic_provider();
@@ -2113,6 +2126,12 @@ mod tests {
             .map(|(r, n)| (r.clone(), n.clone()))
             .expect("fixture installs last_good_cache");
 
+        // Simulate the watcher having committed a bad reload: drop the
+        // env-injected provider var via apply_config_env_for_test (the same
+        // primitive the real watcher uses), update the cache to the new
+        // (raw, normalized), and ALSO mutate process env directly so the
+        // ScopedEnv guard's view stays consistent with CONFIG_ENV_STATE.
+        crate::config::apply_config_env_for_test(HashMap::new());
         env.unset("ANTHROPIC_API_KEY");
         let new_raw = json!({ "marker": "raw-new", "agents": { "defaults": { "route": "fast" } } });
         let new_normalized =
@@ -2135,15 +2154,32 @@ mod tests {
         assert!(Arc::ptr_eq(raw_after_state, &prior_raw));
         assert!(Arc::ptr_eq(normalized_after_state, &prior_normalized));
         assert_eq!(state.current_fingerprint, prior_fingerprint);
+        // Env-injected ANTHROPIC_API_KEY restored to the snapshot value:
+        // verifies revert_to_last_good actually called restore_env_state
+        // with a non-empty snapshot. A regression that drops the
+        // restore_env_state call would leave process env unset here.
+        assert_eq!(
+            std::env::var("ANTHROPIC_API_KEY").ok(),
+            Some("test-initial-key".to_string()),
+            "rollback must restore the env-injected provider var"
+        );
     }
 
     /// On a successful provider swap: provider installed on the state,
     /// `last_good_cache` advances to the new (raw, normalized) pair,
-    /// fingerprint updates, and the bridge returns `Apply`.
+    /// `last_good_env` advances to the new env tracker snapshot, fingerprint
+    /// updates, and the bridge returns `Apply`.
     #[test]
     fn handle_provider_reload_swaps_provider_and_applies_on_valid_change() {
         let (_cache, mut env, ws_state, mut state) = make_reload_state_with_anthropic_provider();
 
+        // Simulate the watcher applying a rotated env-injected key, then
+        // committing the new cache. Mirror the change in process env via
+        // ScopedEnv so visible env stays in sync with CONFIG_ENV_STATE.
+        crate::config::apply_config_env_for_test(HashMap::from([(
+            "ANTHROPIC_API_KEY".to_string(),
+            "test-rotated-key".to_string(),
+        )]));
         env.set("ANTHROPIC_API_KEY", "test-rotated-key");
         let new_raw = json!({ "marker": "raw-rotated" });
         let new_normalized = json!({ "marker": "normalized-rotated" });
@@ -2162,6 +2198,17 @@ mod tests {
             .expect("last_good_cache populated");
         assert_eq!(**raw_after, new_raw);
         assert_eq!(**normalized_after, new_normalized);
+        // last_good_env should now reflect the rotated tracker snapshot —
+        // verifies the `state.last_good_env = config::snapshot_env_state()`
+        // line in the swap arm. If that line is deleted, restoring this
+        // snapshot later would put env back to "test-initial-key" rather
+        // than the rotated value.
+        crate::config::restore_env_state(&state.last_good_env);
+        assert_eq!(
+            std::env::var("ANTHROPIC_API_KEY").ok(),
+            Some("test-rotated-key".to_string()),
+            "last_good_env must capture the post-swap env tracker"
+        );
     }
 
     /// Provider unchanged but other config edited: capture the new (raw,
@@ -2247,17 +2294,10 @@ mod tests {
         let state = ReloadState {
             last_good_cache: None,
             last_good_env: crate::config::snapshot_env_state(),
-            current_fingerprint: crate::agent::factory::ProviderFingerprint {
-                anthropic: None,
-                openai: None,
-                codex: None,
-                ollama: None,
-                gemini: None,
-                venice: None,
-                bedrock: None,
-                vertex: None,
-                claude_cli: None,
-            },
+            // Compute the empty-config fingerprint via the same factory the
+            // bridge uses so this test survives any future addition to
+            // `ProviderFingerprint`.
+            current_fingerprint: crate::agent::factory::fingerprint_providers(&json!({})),
         };
 
         revert_to_last_good(&state);

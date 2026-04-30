@@ -133,6 +133,16 @@ pub(crate) fn snapshot_env_state() -> InjectedConfigEnvState {
     CONFIG_ENV_STATE.lock().clone()
 }
 
+/// Test-only helper: install config-injected env vars via the same
+/// `apply_config_env_vars` primitive the watcher uses, so tests that want
+/// `CONFIG_ENV_STATE` to be non-empty (e.g. for env-rollback assertions)
+/// can populate it without driving a full file reload.
+#[cfg(test)]
+pub(crate) fn apply_config_env_for_test(vars: HashMap<String, String>) {
+    let mut state = CONFIG_ENV_STATE.lock();
+    apply_config_env_vars(&vars, &mut state);
+}
+
 /// Restore the process env injected by config to the state captured by
 /// [`snapshot_env_state`]. Vars that were active at snapshot time are set
 /// back to their snapshot values; vars active *now* but not at snapshot time
@@ -278,6 +288,31 @@ pub(crate) fn load_raw_config_shared() -> Result<Arc<Value>, ConfigError> {
     let shared = Arc::clone(&cached.raw_value);
     maybe_store_cached_config(cached);
     Ok(shared)
+}
+
+/// Load the cached `(raw, normalized)` pair atomically, under a single
+/// `CONFIG_CACHE` lock acquisition. Equivalent to calling
+/// `load_raw_config_shared()` and `load_config_shared()` back-to-back, except
+/// that no other writer can interleave between the two reads — important for
+/// callers (notably the hot-reload bridge) that need the two halves to come
+/// from the same reload generation.
+pub(crate) fn load_both_config_shared() -> Result<(Arc<Value>, Arc<Value>), ConfigError> {
+    let path = get_config_path();
+
+    if let Some(ttl) = get_cache_ttl() {
+        let cache = CONFIG_CACHE.read();
+        if let Some(cached) = cache.as_ref() {
+            if cached.loaded_at.elapsed() < ttl {
+                return Ok((Arc::clone(&cached.raw_value), Arc::clone(&cached.value)));
+            }
+        }
+    }
+
+    let cached = load_cached_config_uncached(&path)?;
+    let raw = Arc::clone(&cached.raw_value);
+    let normalized = Arc::clone(&cached.value);
+    maybe_store_cached_config(cached);
+    Ok((raw, normalized))
 }
 
 /// Return the currently cached explicit user config if the cache entry is still fresh.
