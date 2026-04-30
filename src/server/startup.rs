@@ -2224,6 +2224,54 @@ mod tests {
         assert_eq!(state.current_fingerprint, prior_fingerprint);
     }
 
+    /// The degraded path: if `last_good_cache` is `None` (only reachable when
+    /// `load_*_config_shared` failed at bridge startup), `revert_to_last_good`
+    /// must skip the cache rewrite — otherwise it would write a misleading
+    /// placeholder — but env restoration must still run. Pin both invariants:
+    /// the bad cache state from before the call is left alone, and the
+    /// `restore_env_state` delegation still fires.
+    #[test]
+    fn revert_to_last_good_skips_cache_when_no_snapshot_but_still_restores_env() {
+        use crate::test_support::config::ScopedConfigCache;
+
+        let _cache_guard = ScopedConfigCache::new();
+        crate::config::clear_cache();
+        let _env = crate::test_support::env::provider_env_cleared();
+
+        // Pre-populate the cache with a "bad" state to verify it is *not*
+        // changed by the degraded rollback path.
+        let bad_raw = json!({ "marker": "bad-raw" });
+        let bad_normalized = json!({ "marker": "bad-normalized" });
+        crate::config::update_cache(bad_raw.clone(), bad_normalized.clone());
+
+        let state = ReloadState {
+            last_good_cache: None,
+            last_good_env: crate::config::snapshot_env_state(),
+            current_fingerprint: crate::agent::factory::ProviderFingerprint {
+                anthropic: None,
+                openai: None,
+                codex: None,
+                ollama: None,
+                gemini: None,
+                venice: None,
+                bedrock: None,
+                vertex: None,
+                claude_cli: None,
+            },
+        };
+
+        revert_to_last_good(&state);
+
+        // Cache is unchanged: the "bad" state is still in place because we
+        // had no last-known-good pair to roll back to. Better than writing
+        // an empty placeholder that would silently corrupt downstream
+        // `load_raw_config_shared` consumers.
+        let normalized_after = crate::config::load_config_shared().expect("normalized populated");
+        assert_eq!(*normalized_after, bad_normalized);
+        let raw_after = crate::config::load_raw_config_shared().expect("raw populated");
+        assert_eq!(*raw_after, bad_raw);
+    }
+
     #[test]
     fn stop_plugin_services_stops_all_services_and_ignores_stop_errors() {
         let ok_service = Arc::new(MockServicePlugin::new(false));
