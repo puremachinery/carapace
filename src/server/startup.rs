@@ -668,10 +668,19 @@ fn handle_provider_reload(ws_state: &Arc<WsServerState>, state: &mut ReloadState
 /// warning in this case so the operator knows manual repair is required.
 fn revert_to_last_good(state: &ReloadState) {
     if let Some((raw, normalized)) = state.last_good_cache.as_ref() {
-        // `update_cache_arc` increments the change counter; subscribers
-        // that re-read on every notification will see the rolled-back
-        // value on the second tick (the watcher's bad-config install
-        // fired the first). Lazy/coalescing subscribers see only good.
+        // `update_cache_arc` increments `CONFIG_CHANGE_TX` (a `tokio::sync::watch`
+        // channel) for the second time on this reload — the watcher's bad-config
+        // install fired the first. Watch receivers coalesce to the latest
+        // counter value, so a `changed().await` after the rollback observes
+        // only the rolled-back state. The bridge runs synchronously between
+        // those two `update_cache*` calls (no `.await`), so even non-coalescing
+        // future subscribers (e.g. a `broadcast` channel) only see N+1 followed
+        // by N+2 with no scheduler interleaving — they must be idempotent or
+        // explicitly ignore N+1 transitions while a reload is in flight. Adding
+        // an `.await` between the watcher's install and the bridge's revert
+        // would break that guarantee; if/when that happens, this rollback path
+        // should consolidate into a single non-broadcasting cache write plus
+        // an explicit rollback signal.
         config::update_cache_arc(Arc::clone(raw), Arc::clone(normalized));
     } else {
         warn!(
@@ -2236,9 +2245,13 @@ mod tests {
             .expect("fixture installs last_good_cache");
         let prior_fingerprint = state.current_fingerprint.clone();
 
-        // Non-existent auth profile makes `build_providers` return `Err(_)`
-        // rather than `Ok(None)`.
+        // The encryption-guard inside `build_anthropic_provider` returns
+        // `Err(_)` when an `authProfile` is configured but
+        // `CARAPACE_CONFIG_PASSWORD` is unset (the default in test envs).
+        // The `/nonexistent` path itself is never read — the guard fires
+        // before the profile-store lookup.
         env.unset(TEST_PROVIDER_KEY);
+        env.unset("CARAPACE_CONFIG_PASSWORD");
         let new_raw = json!({
             "anthropic": { "authProfile": "/nonexistent/path/that/does/not/resolve" }
         });
@@ -2253,6 +2266,46 @@ mod tests {
         let normalized_after = crate::config::load_config_shared().expect("normalized populated");
         assert_eq!(*normalized_after, *prior_normalized);
         assert_eq!(state.current_fingerprint, prior_fingerprint);
+    }
+
+    /// When `load_both_config_shared` itself fails (unparseable on-disk
+    /// config + cache disabled), `handle_provider_reload` must still call
+    /// `revert_to_last_good` and return `Reverted`. Pinning this branch
+    /// guards against a future refactor that shortens the early-exit and
+    /// inadvertently skips the rollback.
+    #[test]
+    fn handle_provider_reload_reverts_when_initial_load_fails() {
+        use crate::test_support::config::ScopedConfigCache;
+
+        let _cache_guard = ScopedConfigCache::new();
+        crate::config::clear_cache();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bad_path = temp.path().join("config.json5");
+        std::fs::write(&bad_path, "{ unbalanced").expect("write bad config");
+        let mut env = crate::test_support::env::provider_env_cleared();
+        env.set("CARAPACE_CONFIG_PATH", bad_path.as_os_str())
+            .set("CARAPACE_DISABLE_CONFIG_CACHE", "1");
+
+        let prior_raw = Arc::new(json!({ "marker": "prior-raw" }));
+        let prior_normalized = Arc::new(json!({ "marker": "prior-normalized" }));
+        let prior_fingerprint = crate::agent::factory::fingerprint_providers(&prior_normalized);
+        let mut state = ReloadState {
+            last_good_cache: Some((Arc::clone(&prior_raw), Arc::clone(&prior_normalized))),
+            last_good_env: crate::config::snapshot_env_state(),
+            current_fingerprint: prior_fingerprint.clone(),
+        };
+        let ws_state = Arc::new(WsServerState::new(WsServerConfig::default()));
+
+        let outcome = handle_provider_reload(&ws_state, &mut state);
+
+        assert_eq!(outcome, ReloadOutcome::Reverted);
+        assert_eq!(state.current_fingerprint, prior_fingerprint);
+        let (raw_after, normalized_after) = state
+            .last_good_cache
+            .as_ref()
+            .expect("last_good_cache stays populated");
+        assert!(Arc::ptr_eq(raw_after, &prior_raw));
+        assert!(Arc::ptr_eq(normalized_after, &prior_normalized));
     }
 
     /// `revert_to_last_good` with `last_good_cache: None` must leave the
