@@ -66,7 +66,7 @@ impl WakeResponse {
 
 /// Request body for POST /hooks/agent
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentRequest {
     pub message: Option<String>,
     pub name: Option<String>,
@@ -688,21 +688,19 @@ mod tests {
     }
 
     #[test]
-    fn test_agent_request_rejects_unknown_fields() {
-        let err = serde_json::from_value::<AgentRequest>(serde_json::json!({
+    fn test_agent_request_ignores_unrelated_unknown_fields() {
+        let req = serde_json::from_value::<AgentRequest>(serde_json::json!({
             "message": "hello",
             "sessionKey": "hook:current",
             "futureField": { "keptByClient": true }
         }))
-        .expect_err("unknown hook agent request fields should be rejected");
-        assert!(
-            err.to_string().contains("unknown field `futureField`"),
-            "unexpected error: {err}"
-        );
+        .unwrap();
+        assert_eq!(req.message.as_deref(), Some("hello"));
+        assert_eq!(req.session_scope.as_deref(), Some("hook:current"));
     }
 
     #[test]
-    fn test_agent_request_rejects_removed_session_key_aliases() {
+    fn test_agent_request_ignores_removed_session_key_aliases() {
         for field in ["sessionScope", "session_key"] {
             let mut value = serde_json::json!({ "message": "hello" });
             value
@@ -710,11 +708,12 @@ mod tests {
                 .expect("object")
                 .insert(field.to_string(), serde_json::json!("hook:old"));
 
-            let err = serde_json::from_value::<AgentRequest>(value)
-                .expect_err("removed session alias should be rejected");
-            assert!(
-                err.to_string().contains("unknown field"),
-                "unexpected error for {field}: {err}"
+            let req = serde_json::from_value::<AgentRequest>(value)
+                .expect("removed session alias should not affect current request parsing");
+            assert_eq!(req.message.as_deref(), Some("hello"));
+            assert_eq!(
+                req.session_scope, None,
+                "{field} must not populate sessionKey"
             );
         }
     }

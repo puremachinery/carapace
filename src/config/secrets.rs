@@ -448,10 +448,17 @@ pub(crate) struct UnsupportedEncryptedValue {
     pub(crate) prefix: String,
 }
 
+/// Config scan exceeded the bounded recursion depth.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConfigSecretScanDepthExceeded {
+    pub(crate) path: String,
+    pub(crate) max_depth: usize,
+}
+
 /// Return the first `enc:v*` value that looks encrypted but is not supported.
 pub(crate) fn find_unsupported_encrypted_value(
     config: &Value,
-) -> Option<UnsupportedEncryptedValue> {
+) -> Result<Option<UnsupportedEncryptedValue>, ConfigSecretScanDepthExceeded> {
     find_unsupported_encrypted_inner(config, ".", 0)
 }
 
@@ -459,34 +466,53 @@ fn find_unsupported_encrypted_inner(
     config: &Value,
     path: &str,
     depth: usize,
-) -> Option<UnsupportedEncryptedValue> {
+) -> Result<Option<UnsupportedEncryptedValue>, ConfigSecretScanDepthExceeded> {
     if depth > MAX_SCAN_DEPTH {
         tracing::warn!(
             "find_unsupported_encrypted_value: maximum recursion depth ({}) exceeded, stopping scan",
             MAX_SCAN_DEPTH
         );
-        return None;
+        return Err(ConfigSecretScanDepthExceeded {
+            path: path.to_string(),
+            max_depth: MAX_SCAN_DEPTH,
+        });
     }
 
     match config {
         Value::String(s) => {
-            unsupported_encrypted_prefix(s).map(|prefix| UnsupportedEncryptedValue {
-                path: path.to_string(),
-                prefix,
-            })
+            Ok(
+                unsupported_encrypted_prefix(s).map(|prefix| UnsupportedEncryptedValue {
+                    path: path.to_string(),
+                    prefix,
+                }),
+            )
         }
-        Value::Object(map) => map.iter().find_map(|(key, value)| {
-            let child_path = if path == "." {
-                format!(".{key}")
-            } else {
-                format!("{path}.{key}")
-            };
-            find_unsupported_encrypted_inner(value, &child_path, depth + 1)
-        }),
-        Value::Array(arr) => arr.iter().enumerate().find_map(|(index, value)| {
-            find_unsupported_encrypted_inner(value, &format!("{path}[{index}]"), depth + 1)
-        }),
-        _ => None,
+        Value::Object(map) => {
+            for (key, value) in map {
+                let child_path = if path == "." {
+                    format!(".{key}")
+                } else {
+                    format!("{path}.{key}")
+                };
+                if let Some(unsupported) =
+                    find_unsupported_encrypted_inner(value, &child_path, depth + 1)?
+                {
+                    return Ok(Some(unsupported));
+                }
+            }
+            Ok(None)
+        }
+        Value::Array(arr) => {
+            for (index, value) in arr.iter().enumerate() {
+                if let Some(unsupported) =
+                    find_unsupported_encrypted_inner(value, &format!("{path}[{index}]"), depth + 1)?
+                {
+                    return Ok(Some(unsupported));
+                }
+            }
+            Ok(None)
+        }
+        _ => Ok(None),
     }
 }
 
@@ -1064,9 +1090,22 @@ mod tests {
             "openai": { "apiKey": "plain" }
         });
 
-        let unsupported = find_unsupported_encrypted_value(&config).unwrap();
+        let unsupported = find_unsupported_encrypted_value(&config).unwrap().unwrap();
         assert_eq!(unsupported.path, ".anthropic.apiKey");
         assert_eq!(unsupported.prefix, "enc:v1");
+    }
+
+    #[test]
+    fn test_find_unsupported_encrypted_value_reports_depth_exceeded() {
+        let mut config = json!("enc:v1:aaa:bbb:ccc");
+        for index in 0..=MAX_SCAN_DEPTH {
+            config = json!({ format!("level{index}"): config });
+        }
+
+        let err = find_unsupported_encrypted_value(&config).unwrap_err();
+
+        assert!(err.path.contains(".level"));
+        assert_eq!(err.max_depth, MAX_SCAN_DEPTH);
     }
 
     #[test]

@@ -924,7 +924,7 @@ fn test_method_authorization_unknown_method_requires_admin() {
 }
 
 #[tokio::test]
-async fn test_legacy_ws_method_aliases_are_unavailable() {
+async fn test_legacy_ws_method_aliases_are_unknown_on_wire() {
     let state = Arc::new(WsServerState::new(WsServerConfig::default()));
     let conn = make_conn("admin");
     let aliases = [
@@ -968,6 +968,21 @@ async fn test_legacy_ws_method_aliases_are_unavailable() {
             Some(alias),
             "{alias}"
         );
+        assert!(
+            !GATEWAY_METHODS.contains(&alias),
+            "legacy alias should not be advertised as a current method"
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        send_dispatch_result(&tx, "legacy-alias-test", alias, false, Err(err));
+        let Some(Message::Text(text)) = rx.recv().await else {
+            panic!("expected response frame for legacy alias {alias}");
+        };
+        let frame: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(frame["ok"], false, "{alias}");
+        assert_eq!(frame["error"]["code"], ERROR_INVALID_REQUEST, "{alias}");
+        assert_eq!(frame["error"]["message"], "unknown method", "{alias}");
+        assert_eq!(frame["error"]["details"]["method"], alias, "{alias}");
     }
 }
 

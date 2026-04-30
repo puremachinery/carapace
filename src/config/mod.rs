@@ -175,14 +175,26 @@ pub(crate) fn config_password() -> Option<Zeroizing<Vec<u8>>> {
 }
 
 fn resolve_config_secrets(value: &mut Value) -> Result<(), ConfigError> {
-    if let Some(unsupported) = secrets::find_unsupported_encrypted_value(value) {
-        return Err(ConfigError::ValidationError {
-            path: unsupported.path,
-            message: format!(
-                "unsupported encrypted config secret envelope {}; only enc:v2 is supported; re-enter or re-encrypt this config secret",
-                unsupported.prefix
-            ),
-        });
+    match secrets::find_unsupported_encrypted_value(value) {
+        Ok(Some(unsupported)) => {
+            return Err(ConfigError::ValidationError {
+                path: unsupported.path,
+                message: format!(
+                    "unsupported encrypted config secret envelope {}; only enc:v2 is supported; re-enter or re-encrypt this config secret",
+                    unsupported.prefix
+                ),
+            });
+        }
+        Ok(None) => {}
+        Err(err) => {
+            return Err(ConfigError::ValidationError {
+                path: err.path,
+                message: format!(
+                    "config secret scan exceeded maximum depth {}; reduce config nesting before using encrypted config secrets",
+                    err.max_depth
+                ),
+            });
+        }
     }
 
     let Some(password) = config_password() else {
@@ -1320,6 +1332,30 @@ mod tests {
 
     #[test]
     fn test_load_config_rejects_unsupported_encrypted_secret_prefix() {
+        let dir = TempDir::new().unwrap();
+        let main_path = create_temp_config(
+            &dir,
+            "config.json5",
+            r#"{
+                "anthropic": { "apiKey": "enc:v1:aaa:bbb:ccc" }
+            }"#,
+        );
+
+        let result = load_config_uncached(&main_path);
+        assert!(matches!(
+            result,
+            Err(ConfigError::ValidationError { path, message })
+                if path == ".anthropic.apiKey"
+                    && message.contains("unsupported encrypted config secret envelope enc:v1")
+                    && message.contains("enc:v2")
+        ));
+    }
+
+    #[test]
+    fn test_load_config_rejects_unsupported_encrypted_secret_prefix_with_password() {
+        let mut env_guard = ScopedEnv::new();
+        env_guard.set("CARAPACE_CONFIG_PASSWORD", "test-password");
+
         let dir = TempDir::new().unwrap();
         let main_path = create_temp_config(
             &dir,
