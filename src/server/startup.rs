@@ -210,10 +210,17 @@ pub async fn build_ws_state_with_runtime_dependencies(
     let ws_state = match crate::agent::factory::build_providers(cfg)? {
         Some(multi_provider) => ws_state.with_llm_provider(Arc::new(multi_provider)),
         None => {
-            info!(
-                "No LLM provider configured (set ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_API_KEY, VENICE_API_KEY, configure Ollama, configure anthropic.authProfile, configure google.authProfile, or configure codex.authProfile)"
+            return Err(
+                "No LLM provider configured. Configure at least one supported \
+                 provider before starting Carapace — examples include setting \
+                 ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_API_KEY, or VENICE_API_KEY; \
+                 configuring Ollama; configuring an authProfile (anthropic.authProfile, \
+                 google.authProfile, codex.authProfile); or configuring AWS Bedrock \
+                 (AWS_REGION + credentials), Vertex AI (VERTEX_PROJECT_ID), or the \
+                 Claude CLI provider. Other supported provider configurations may \
+                 also be valid; see the project documentation for the full list."
+                    .into(),
             );
-            ws_state
         }
     };
 
@@ -584,8 +591,21 @@ fn spawn_config_watcher_bridge(
                                             info!("LLM providers hot-swapped successfully");
                                         }
                                         Ok(None) => {
-                                            ws_state_for_config.set_llm_provider(None);
-                                            info!("LLM providers removed (none configured)");
+                                            warn!(
+                                                "Reloaded config has no LLM provider; \
+                                                 keeping previous provider. Carapace \
+                                                 cannot run without a provider — restore \
+                                                 a provider config to apply further \
+                                                 changes."
+                                            );
+                                            // Update the fingerprint so identical
+                                            // re-saves of the no-provider config don't
+                                            // re-run the (failed) build_providers work.
+                                            // A subsequent reload that *restores* a
+                                            // provider will produce a new fingerprint
+                                            // and retry the swap.
+                                            current_fingerprint = new_fingerprint;
+                                            continue;
                                         }
                                         Err(e) => {
                                             warn!(
@@ -1860,7 +1880,11 @@ mod tests {
         let mut env = ScopedEnv::new();
         env.set("CARAPACE_STATE_DIR", state_dir.as_os_str())
             .set("CARAPACE_CONFIG_PATH", config_path.as_os_str())
-            .set("CARAPACE_DISABLE_CONFIG_CACHE", "1");
+            .set("CARAPACE_DISABLE_CONFIG_CACHE", "1")
+            // Provide a minimal LLM provider so build_ws_state_with_runtime_dependencies
+            // doesn't fail-fast on missing-provider — this test is exercising the plugin
+            // activation report, not provider configuration.
+            .set("ANTHROPIC_API_KEY", "test-key");
         crate::config::clear_cache();
 
         let tools_registry = Arc::new(ToolsRegistry::new());
@@ -1873,6 +1897,42 @@ mod tests {
             .plugin_activation_report()
             .expect("plugin activation report");
         assert!(report.entries.is_empty());
+
+        crate::config::clear_cache();
+    }
+
+    /// `build_ws_state_with_runtime_dependencies` must error out when no LLM
+    /// provider is configured, and the message must name at least one
+    /// supported env var so an operator can fix the misconfiguration without
+    /// consulting docs.
+    #[tokio::test]
+    async fn build_ws_state_with_runtime_dependencies_errors_when_no_provider() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let state_dir = temp.path().join("state");
+        let config_path = temp.path().join("carapace.json5");
+        // Start from `provider_env_cleared()` to unset every provider-relevant
+        // env var (covers Bedrock, Vertex, Claude CLI in addition to the four
+        // API keys), then layer the test-specific paths on top.
+        let mut env = crate::test_support::env::provider_env_cleared();
+        env.set("CARAPACE_STATE_DIR", state_dir.as_os_str())
+            .set("CARAPACE_CONFIG_PATH", config_path.as_os_str())
+            .set("CARAPACE_DISABLE_CONFIG_CACHE", "1");
+        crate::config::clear_cache();
+
+        let tools_registry = Arc::new(ToolsRegistry::new());
+        let result =
+            build_ws_state_with_runtime_dependencies(&json!({}), &state_dir, tools_registry).await;
+
+        let err = result.expect_err("startup must error when no provider configured");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("No LLM provider configured"),
+            "error must name the failure: {msg}"
+        );
+        assert!(
+            msg.contains("ANTHROPIC_API_KEY") && msg.contains("authProfile"),
+            "error must list at least one env var and the authProfile path: {msg}"
+        );
 
         crate::config::clear_cache();
     }

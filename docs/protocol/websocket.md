@@ -378,6 +378,7 @@ extending that set.
 | `rate_limited` | Per-resource rate limit exceeded | Yes |
 | `unknown_route` | Request referenced a route not in the `routes` map | No |
 | `missing_model` | Resolution found no `route` or `model` for the request | No |
+| `provider_not_configured` | No LLM provider is configured. Operator must set an API key or auth profile; not retryable. | No |
 
 ### Reserved codes (documented but not yet emitted)
 

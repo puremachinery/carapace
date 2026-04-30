@@ -128,6 +128,18 @@ pub async fn dispatch_inbound_text_with_options(
     }
 
     let run_id = uuid::Uuid::new_v4().to_string();
+
+    // Provider availability gates the run-tracking entry; the user message
+    // + read receipt above were persisted unconditionally because the
+    // channel already acknowledged receipt.
+    let Some(provider) = state.llm_provider() else {
+        crate::agent::AgentConfigurationError::provider_not_configured().log_operator_hint();
+        return Ok(InboundDispatchResult {
+            run_id,
+            run_spawned: false,
+        });
+    };
+
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -164,53 +176,43 @@ pub async fn dispatch_inbound_text_with_options(
         registry.register(run);
     }
 
-    let run_spawned = if let Some(provider) = state.llm_provider() {
-        let mut config = crate::agent::AgentConfig::default();
-        if let Err(e) = crate::agent::resolve_agent_model(
-            &mut config,
-            cfg.as_ref(),
-            None,
-            &crate::agent::ModelResolutionOverrides {
-                session_route: session.metadata.route.as_deref(),
-                session_model: session.metadata.model.as_deref(),
-                ..Default::default()
-            },
-        ) {
-            warn!(error = %e, "inbound agent run skipped: model resolution failed");
-            return Ok(InboundDispatchResult {
-                run_id,
-                run_spawned: false,
-            });
-        }
-        crate::agent::apply_agent_config_from_settings(&mut config, cfg.as_ref(), None);
-        config.deliver = true;
-        crate::agent::spawn_run(
-            run_id.clone(),
-            session.session_key.clone(),
-            config,
-            state.clone(),
-            provider,
-            cancel_token,
-        );
-        debug!(
-            run_id = %run_id,
-            channel = %channel,
-            sender = %sender_id,
-            "Inbound agent run dispatched"
-        );
-        true
-    } else {
-        debug!(
-            run_id = %run_id,
-            channel = %channel,
-            "Inbound message queued (no LLM provider)"
-        );
-        false
-    };
+    let mut config = crate::agent::AgentConfig::default();
+    if let Err(e) = crate::agent::resolve_agent_model(
+        &mut config,
+        cfg.as_ref(),
+        None,
+        &crate::agent::ModelResolutionOverrides {
+            session_route: session.metadata.route.as_deref(),
+            session_model: session.metadata.model.as_deref(),
+            ..Default::default()
+        },
+    ) {
+        warn!(error = %e, "inbound agent run skipped: model resolution failed");
+        return Ok(InboundDispatchResult {
+            run_id,
+            run_spawned: false,
+        });
+    }
+    crate::agent::apply_agent_config_from_settings(&mut config, cfg.as_ref(), None);
+    config.deliver = true;
+    crate::agent::spawn_run(
+        run_id.clone(),
+        session.session_key.clone(),
+        config,
+        state.clone(),
+        provider,
+        cancel_token,
+    );
+    debug!(
+        run_id = %run_id,
+        channel = %channel,
+        sender = %sender_id,
+        "Inbound agent run dispatched"
+    );
 
     Ok(InboundDispatchResult {
         run_id,
-        run_spawned,
+        run_spawned: true,
     })
 }
 
@@ -285,6 +287,8 @@ mod tests {
             Ok(())
         }
     }
+
+    use crate::test_support::agent::StaticTestProvider;
 
     fn install_empty_config() -> serde_json::Value {
         let cfg = json!({});
@@ -397,7 +401,15 @@ mod tests {
                 1,
             ),
         );
-        let state = build_state(session_store, activity_service.clone(), None);
+        // Inject an inert provider so dispatch reaches the registry-register
+        // arm. This test is about receipt-completion failure semantics, not
+        // provider absence.
+        let state = Arc::new(
+            WsServerState::new(WsServerConfig::default())
+                .with_session_store(session_store)
+                .with_activity_service(activity_service.clone())
+                .with_llm_provider(Arc::new(StaticTestProvider)),
+        );
 
         let claimed_read_receipt = activity_service
             .try_claim_read_receipt(
@@ -429,6 +441,8 @@ mod tests {
         .await
         .expect("receipt completion failure should not abort inbound dispatch");
 
+        // Empty config means no model resolves, so the spawn arm is skipped
+        // even though the provider is configured.
         assert!(!result.run_spawned);
         assert!(activity_service.read_receipt_queue().list().is_empty());
         assert!(
@@ -439,6 +453,62 @@ mod tests {
         assert!(
             runs.iter().any(|run| run.message == "hello"),
             "the durable append should still register the inbound run context"
+        );
+
+        state.shutdown_activity_service().await;
+        crate::config::clear_cache();
+    }
+
+    /// Pin the no-provider observable behavior on the inbound path: dispatch
+    /// returns `run_spawned: false` with the run *not* registered in the
+    /// agent_run_registry (no orphan), the user message is still durably
+    /// persisted (channels acknowledge receipt regardless of provider state),
+    /// and `session_key` is returned so out-of-band callers can correlate.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_dispatch_inbound_text_no_provider_skips_register_without_orphan() {
+        install_empty_config();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_store = Arc::new(SessionStore::with_base_path(temp.path().to_path_buf()));
+        let activity_service = Arc::new(ActivityService::with_limits_for_test(8, 1));
+        // No provider — exercises the defensive provider_not_configured path.
+        let state = build_state(session_store.clone(), activity_service.clone(), None);
+
+        let result = dispatch_inbound_text_with_options(
+            &state,
+            "signal",
+            "+15551234567",
+            "+15551234567",
+            "hello",
+            Some("+15551234567".to_string()),
+            InboundDispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch should still return Ok in the defensive no-provider path");
+
+        assert!(!result.run_spawned, "no provider → no spawn");
+        assert!(
+            !result.run_id.is_empty(),
+            "run_id is generated even when not registered, for caller correlation"
+        );
+        assert!(
+            state.agent_run_registry.lock().snapshot_runs().is_empty(),
+            "no provider → no orphan registry entry"
+        );
+
+        // The user message was still durably appended; resolve the same
+        // session key dispatch used and verify the message landed.
+        let cfg = json!({});
+        let (session_key, _, _) =
+            resolve_scoped_session_key(&cfg, "signal", "+15551234567", "+15551234567", None);
+        let session = session_store
+            .get_session_by_key(&session_key)
+            .expect("dispatch should create the session");
+        let messages = session_store
+            .get_history(&session.id, None, None)
+            .expect("session history should be readable");
+        assert!(
+            messages.iter().any(|m| m.content == "hello"),
+            "inbound message must be persisted even on the no-provider path"
         );
 
         state.shutdown_activity_service().await;
