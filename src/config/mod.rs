@@ -1368,6 +1368,54 @@ mod tests {
         assert!(after > before);
     }
 
+    /// Round-trip test for the `snapshot_env_state` / `restore_env_state`
+    /// API consumed by the config-watcher bridge: capture a state with a
+    /// known config-injected var, mutate it, and assert that restoring
+    /// from the snapshot reverts process env to the snapshot value.
+    #[test]
+    fn test_snapshot_then_restore_env_state_reverts_config_injected_var() {
+        // Test-unique key so we don't fight other env-touching tests on
+        // shared globals.
+        const TEST_KEY: &str = "CARAPACE_TEST_ENV_RESTORE_VAR";
+        reset_config_env_state_for_test();
+        std::env::remove_var(TEST_KEY);
+
+        // Apply an initial config-injected value via the same primitive the
+        // watcher uses.
+        {
+            let mut state = CONFIG_ENV_STATE.lock();
+            apply_config_env_vars(
+                &HashMap::from([(TEST_KEY.to_string(), "initial".to_string())]),
+                &mut state,
+            );
+        }
+        assert_eq!(std::env::var(TEST_KEY).ok(), Some("initial".to_string()));
+
+        let snapshot = snapshot_env_state();
+
+        // Now apply a bad value, simulating the watcher having committed an
+        // env-mutating reload that the bridge will roll back.
+        {
+            let mut state = CONFIG_ENV_STATE.lock();
+            apply_config_env_vars(
+                &HashMap::from([(TEST_KEY.to_string(), "bad".to_string())]),
+                &mut state,
+            );
+        }
+        assert_eq!(std::env::var(TEST_KEY).ok(), Some("bad".to_string()));
+
+        // Roll back via the public API the bridge uses.
+        restore_env_state(&snapshot);
+        assert_eq!(
+            std::env::var(TEST_KEY).ok(),
+            Some("initial".to_string()),
+            "restore_env_state must put process env back to the snapshot value"
+        );
+
+        reset_config_env_state_for_test();
+        std::env::remove_var(TEST_KEY);
+    }
+
     #[test]
     fn test_raw_and_normalized_cache_share_one_file_snapshot() {
         clear_cache();
