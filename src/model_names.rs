@@ -14,6 +14,34 @@ pub(crate) fn known_provider_prefixes_message() -> String {
     KNOWN_PROVIDER_PREFIXES.join(", ")
 }
 
+/// Suggest the canonical `provider:model` spelling for known slash-form inputs.
+///
+/// This is used only for diagnostics. Slash-form model values are still rejected
+/// at config/runtime boundaries.
+pub(crate) fn slash_form_model_suggestion(model: &str) -> Option<String> {
+    let (provider, rest) = model.split_once('/')?;
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return None;
+    }
+
+    let prefix = match provider.trim().to_ascii_lowercase().as_str() {
+        "anthropic" => "anthropic",
+        "openai" => "openai",
+        "gemini" | "google" => "gemini",
+        "bedrock" => "bedrock",
+        "vertex" => "vertex",
+        "ollama" => "ollama",
+        "codex" => "codex",
+        "venice" => "venice",
+        "claude-cli" => "claude-cli",
+        "models" if rest.to_ascii_lowercase().starts_with("gemini-") => "gemini",
+        _ => return None,
+    };
+
+    Some(format!("{prefix}:{rest}"))
+}
+
 /// Add a canonical provider prefix to a bare model name for Carapace routing.
 ///
 /// Handles well-known model families:
@@ -63,7 +91,10 @@ pub(crate) fn prefix_bare_model(model: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{known_provider_prefixes_message, prefix_bare_model, KNOWN_PROVIDER_PREFIXES};
+    use super::{
+        known_provider_prefixes_message, prefix_bare_model, slash_form_model_suggestion,
+        KNOWN_PROVIDER_PREFIXES,
+    };
 
     #[test]
     fn known_prefix_message_tracks_prefix_list() {
@@ -96,6 +127,19 @@ mod tests {
             prefix_bare_model("models/gemini-2.0-flash"),
             "models/gemini-2.0-flash"
         );
+    }
+
+    #[test]
+    fn slash_model_values_get_diagnostic_suggestions() {
+        assert_eq!(
+            slash_form_model_suggestion("models/gemini-2.0-flash").as_deref(),
+            Some("gemini:gemini-2.0-flash")
+        );
+        assert_eq!(
+            slash_form_model_suggestion("ollama/mistral").as_deref(),
+            Some("ollama:mistral")
+        );
+        assert!(slash_form_model_suggestion("unknown/model").is_none());
     }
 
     #[test]

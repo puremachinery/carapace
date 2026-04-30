@@ -1120,7 +1120,12 @@ fn check_model_has_provider_prefix(model: &str, path: &str, issues: &mut Vec<Sch
     if !has_known_prefix {
         let suggestion = crate::model_names::prefix_bare_model(model);
         let hint = if model.contains('/') {
-            format!("`{path}` = \"{model}\" is not a valid provider:model value")
+            match crate::model_names::slash_form_model_suggestion(model) {
+                Some(suggestion) => {
+                    format!("`{path}` = \"{model}\" uses slash syntax; use `{suggestion}` instead")
+                }
+                None => format!("`{path}` = \"{model}\" is not a valid provider:model value"),
+            }
         } else if suggestion != model {
             format!(
                 "`{path}` = \"{model}\" is missing a provider prefix; use `{suggestion}` instead"
@@ -3837,6 +3842,22 @@ mod tests {
             i.severity == Severity::Error
                 && i.path == ".routes.fast.model"
                 && i.message.contains("unrecognized provider prefix")
+        }));
+    }
+
+    #[test]
+    fn test_routes_slash_model_prefix_gets_canonical_hint() {
+        let cfg = json!({
+            "routes": {
+                "fast": { "model": "models/gemini-2.0-flash" }
+            }
+        });
+        let issues = validate_schema(&cfg);
+        assert!(issues.iter().any(|i| {
+            i.severity == Severity::Error
+                && i.path == ".routes.fast.model"
+                && i.message.contains("uses slash syntax")
+                && i.message.contains("gemini:gemini-2.0-flash")
         }));
     }
 

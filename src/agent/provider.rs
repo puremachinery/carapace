@@ -485,7 +485,14 @@ impl MultiProvider {
                 }
                 _ => {
                     if model.contains('/') {
-                        format!("model \"{model}\" is not a valid provider:model value")
+                        match crate::model_names::slash_form_model_suggestion(model) {
+                            Some(suggestion) => format!(
+                                "model \"{model}\" uses slash syntax; use `{suggestion}` instead"
+                            ),
+                            None => {
+                                format!("model \"{model}\" is not a valid provider:model value")
+                            }
+                        }
                     } else {
                         let suggestion = crate::model_names::prefix_bare_model(model);
                         if suggestion != model {
@@ -628,7 +635,7 @@ mod tests {
             Ok(_) => panic!("expected error"),
         };
         assert!(
-            msg.contains("not a valid provider:model value"),
+            msg.contains("uses slash syntax") && msg.contains("ollama:mistral"),
             "got: {msg}"
         );
     }
