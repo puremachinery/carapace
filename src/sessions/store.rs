@@ -25,6 +25,7 @@ const DEFAULT_COMPACT_THRESHOLD: usize = 100;
 
 /// Maximum message count before forcing compaction
 const MAX_MESSAGES_BEFORE_COMPACT: usize = 500;
+const MAX_HISTORY_CURRENTNESS_SCAN_BYTES: u64 = 64 * 1024 * 1024;
 const SESSION_METADATA_PURPOSE: &str = "metadata";
 const SESSION_HISTORY_PURPOSE: &str = "history";
 const SESSION_ARCHIVE_PURPOSE: &str = "archive";
@@ -1130,12 +1131,33 @@ impl SessionStore {
         history_path: &Path,
         session_id: &str,
     ) -> Result<(), SessionStoreError> {
+        self.ensure_history_file_current_with_limit(
+            history_path,
+            session_id,
+            MAX_HISTORY_CURRENTNESS_SCAN_BYTES,
+        )
+    }
+
+    fn ensure_history_file_current_with_limit(
+        &self,
+        history_path: &Path,
+        session_id: &str,
+        max_scan_bytes: u64,
+    ) -> Result<(), SessionStoreError> {
         if !self.encryption_active() || self.history_file_current_confirmed(session_id) {
             return Ok(());
         }
         if !history_path.exists() {
             self.mark_history_file_current(session_id);
             return Ok(());
+        }
+
+        let history_size = fs::metadata(history_path)?.len();
+        if history_size > max_scan_bytes {
+            return Err(Self::lock_message(format!(
+                "session history is too large to verify current encryption state ({} bytes > {} bytes); export, compact, or reset this session before using encryption",
+                history_size, max_scan_bytes
+            )));
         }
 
         #[cfg(test)]
@@ -3346,6 +3368,42 @@ mod tests {
     }
 
     #[test]
+    fn test_ensure_history_file_current_rejects_oversized_history_before_read() {
+        let key_material = test_key_material();
+        let (store, temp_dir) = create_encrypted_store_without_hmac(&key_material);
+        let session = store
+            .create_session("agent-1", SessionMetadata::default())
+            .unwrap();
+        store
+            .append_message(ChatMessage::user(&session.id, "first"))
+            .unwrap();
+        let history_path = store.session_history_path(&session.id).unwrap();
+
+        let reopened = reopen_store_with_encryption(
+            temp_dir.path(),
+            Some(&key_material),
+            EncryptionMode::IfPassword,
+        );
+        reopened
+            .history_current_file_read_count
+            .store(0, Ordering::SeqCst);
+        let err = reopened
+            .ensure_history_file_current_with_limit(&history_path, &session.id, 1)
+            .expect_err("oversized currentness scan should lock the session");
+
+        assert!(matches!(err, SessionStoreError::Locked(message)
+            if message.contains("too large to verify current encryption state")
+                && message.contains("export, compact, or reset")));
+        assert_eq!(
+            reopened
+                .history_current_file_read_count
+                .load(Ordering::SeqCst),
+            0,
+            "oversized histories should be rejected before reading the file"
+        );
+    }
+
+    #[test]
     fn test_cached_session_history_currentness_starts_unconfirmed() {
         let key_material = test_key_material();
         let (store, _temp_dir) = create_encrypted_store_without_hmac(&key_material);
@@ -4193,12 +4251,20 @@ mod tests {
         let err = reopened
             .append_message(ChatMessage::user(&session.id, "should fail"))
             .expect_err("append should propagate get_session integrity rejection");
-
+        let message = match err {
+            SessionStoreError::Io(message) => message,
+            other => panic!(
+                "expected metadata integrity IO error, got {}",
+                session_store_error_kind(&other)
+            ),
+        };
         assert!(
-            matches!(err, SessionStoreError::Io(ref message)
-                if message.contains("session integrity verification failed")
-                    && message.contains(&meta_path.display().to_string())),
-            "got: {err}"
+            message.contains("session integrity verification failed"),
+            "expected integrity failure wording"
+        );
+        assert!(
+            message.contains(&meta_path.display().to_string()),
+            "expected metadata path in integrity failure"
         );
         let history_path = reopened.session_history_path(&session.id).unwrap();
         assert!(

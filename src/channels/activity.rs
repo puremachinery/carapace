@@ -140,7 +140,7 @@ impl ReadReceiptTaskPayload {
         let payload: Self = serde_json::from_value(value).map_err(|err| err.to_string())?;
         if payload.kind != READ_RECEIPT_TASK_KIND {
             return Err(format!(
-                "unsupported read receipt task kind '{}'; expected '{}'",
+                "unsupported read receipt task kind '{}'; expected '{}'. If this came from a persisted pre-upgrade task, remove or repair activity/read_receipts.json",
                 payload.kind, READ_RECEIPT_TASK_KIND
             ));
         }
@@ -3002,6 +3002,7 @@ mod tests {
                     error.contains("unsupported read receipt task kind"),
                     "{error}"
                 );
+                assert!(error.contains("activity/read_receipts.json"), "{error}");
             }
             other => panic!("expected unsupported kind failure, got {other:?}"),
         }

@@ -116,6 +116,7 @@ const AGENT_LEGACY_CREDENTIAL_JSON_KEYS: &[&str] = &[
     "setupToken",
     "token",
 ];
+const CREDENTIAL_SHAPE_SCAN_MAX_DEPTH: usize = 64;
 
 /// Credential store errors
 #[derive(Debug, Clone, PartialEq)]
@@ -366,27 +367,50 @@ fn agent_plaintext_file_has_credential_shape(path: &Path) -> bool {
 }
 
 fn agent_json_has_credential_shape(value: &Value) -> bool {
+    agent_json_has_credential_shape_inner(value, 0)
+}
+
+fn agent_json_has_credential_shape_inner(value: &Value, depth: usize) -> bool {
+    if depth > CREDENTIAL_SHAPE_SCAN_MAX_DEPTH {
+        return true;
+    }
+
     match value {
         Value::Object(object) => object.iter().any(|(key, value)| {
             if AGENT_LEGACY_CREDENTIAL_JSON_KEYS.contains(&key.as_str()) {
-                credential_value_has_plaintext(value)
+                credential_value_has_plaintext_inner(value, depth + 1)
             } else {
-                agent_json_has_credential_shape(value)
+                agent_json_has_credential_shape_inner(value, depth + 1)
             }
         }),
-        Value::Array(items) => items.iter().any(agent_json_has_credential_shape),
+        Value::Array(items) => items
+            .iter()
+            .any(|item| agent_json_has_credential_shape_inner(item, depth + 1)),
         _ => false,
     }
 }
 
+#[cfg(test)]
 fn credential_value_has_plaintext(value: &Value) -> bool {
+    credential_value_has_plaintext_inner(value, 0)
+}
+
+fn credential_value_has_plaintext_inner(value: &Value, depth: usize) -> bool {
+    if depth > CREDENTIAL_SHAPE_SCAN_MAX_DEPTH {
+        return true;
+    }
+
     match value {
         Value::String(value) => {
             let value = value.trim();
             !value.is_empty() && !value.starts_with("enc:v")
         }
-        Value::Array(items) => items.iter().any(credential_value_has_plaintext),
-        Value::Object(object) => object.values().any(credential_value_has_plaintext),
+        Value::Array(items) => items
+            .iter()
+            .any(|item| credential_value_has_plaintext_inner(item, depth + 1)),
+        Value::Object(object) => object
+            .values()
+            .any(|value| credential_value_has_plaintext_inner(value, depth + 1)),
         _ => false,
     }
 }
@@ -1702,6 +1726,26 @@ mod tests {
                 .display()
                 .to_string()])
         );
+    }
+
+    #[test]
+    fn test_agent_credential_shape_scan_fails_closed_at_depth_limit() {
+        let mut value = serde_json::json!({"note": "not credential"});
+        for index in 0..=CREDENTIAL_SHAPE_SCAN_MAX_DEPTH {
+            value = serde_json::json!({ format!("level{index}"): value });
+        }
+
+        assert!(agent_json_has_credential_shape(&value));
+    }
+
+    #[test]
+    fn test_agent_credential_plaintext_scan_fails_closed_at_depth_limit() {
+        let mut value = serde_json::json!("enc:v2:aaa:bbb:ccc");
+        for _ in 0..=CREDENTIAL_SHAPE_SCAN_MAX_DEPTH {
+            value = serde_json::json!([value]);
+        }
+
+        assert!(credential_value_has_plaintext(&value));
     }
 
     #[test]
