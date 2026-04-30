@@ -558,6 +558,92 @@ fn spawn_activity_feature_support_warnings(
     });
 }
 
+/// Last-known-good config snapshot held by `spawn_config_watcher_bridge`.
+///
+/// When a reload turns out to be invalid for provider hot-swap purposes (no
+/// provider, or build error), the bridge restores this pair into the cache so
+/// other config sections that came in alongside the bad provider edit are
+/// rolled back too — the reload is atomic from a downstream subscriber's
+/// perspective rather than partially applied.
+#[derive(Clone)]
+struct ReloadState {
+    last_good_raw: Arc<Value>,
+    last_good_normalized: Arc<Value>,
+    current_fingerprint: crate::agent::factory::ProviderFingerprint,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReloadOutcome {
+    /// New config validated (provider unchanged or hot-swapped). Broadcast to
+    /// downstream subscribers.
+    Apply,
+    /// Cache rolled back to the previous known-good state. Suppress the
+    /// downstream broadcast — there is nothing for clients to pick up.
+    Reverted,
+}
+
+/// Validate a freshly-reloaded config against provider invariants and either
+/// install the new provider (if the fingerprint changed) or roll the cache
+/// back to the previous good state (if the new config has no provider or
+/// the build failed).
+///
+/// Reads the current config out of the cache via `load_config_shared` /
+/// `peek_fresh_raw_config_shared`; the watcher updates the cache before
+/// emitting the `Reloaded` event we're handling here.
+fn handle_provider_reload(ws_state: &Arc<WsServerState>, state: &mut ReloadState) -> ReloadOutcome {
+    let Ok(new_cfg_arc) = config::load_config_shared() else {
+        return ReloadOutcome::Apply;
+    };
+    let Some(new_raw_arc) = config::peek_fresh_raw_config_shared() else {
+        return ReloadOutcome::Apply;
+    };
+
+    let new_fingerprint = crate::agent::factory::fingerprint_providers(&new_cfg_arc);
+    if new_fingerprint == state.current_fingerprint {
+        // Provider unchanged; new (raw, value) is valid wrt provider, capture
+        // it as the new last-good so a future no-provider reload rolls back to
+        // *this* state, not an older one.
+        state.last_good_raw = new_raw_arc;
+        state.last_good_normalized = new_cfg_arc;
+        return ReloadOutcome::Apply;
+    }
+
+    info!("LLM provider configuration changed, rebuilding providers");
+    match crate::agent::factory::build_providers(&new_cfg_arc) {
+        Ok(Some(mp)) => {
+            ws_state.set_llm_provider(Some(Arc::new(mp)));
+            info!("LLM providers hot-swapped successfully");
+            state.last_good_raw = new_raw_arc;
+            state.last_good_normalized = new_cfg_arc;
+            state.current_fingerprint = new_fingerprint;
+            ReloadOutcome::Apply
+        }
+        Ok(None) => {
+            warn!(
+                "Reloaded config has no LLM provider; reverting all reloaded changes \
+                 to keep the previous provider active. Restore a provider config to \
+                 apply further changes."
+            );
+            config::update_cache(
+                (*state.last_good_raw).clone(),
+                (*state.last_good_normalized).clone(),
+            );
+            ReloadOutcome::Reverted
+        }
+        Err(e) => {
+            warn!(
+                "Failed to rebuild LLM providers: {} (reverting reload to keep previous provider)",
+                e
+            );
+            config::update_cache(
+                (*state.last_good_raw).clone(),
+                (*state.last_good_normalized).clone(),
+            );
+            ReloadOutcome::Reverted
+        }
+    }
+}
+
 /// Spawn a task that bridges config watcher reload events to WebSocket broadcasts
 /// and performs LLM provider hot-swap when the provider fingerprint changes.
 fn spawn_config_watcher_bridge(
@@ -569,57 +655,30 @@ fn spawn_config_watcher_bridge(
     let mut config_rx = config_watcher.subscribe();
     let ws_state_for_config = ws_state.clone();
     let mut config_shutdown_rx = shutdown_rx.clone();
-    // Track current provider fingerprint for change detection
-    let mut current_fingerprint = crate::agent::factory::fingerprint_providers(raw_config);
+    let initial_normalized = config::load_config_shared()
+        .map(|arc| (*arc).clone())
+        .unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
+    let mut reload_state = ReloadState {
+        last_good_raw: Arc::new(raw_config.clone()),
+        last_good_normalized: Arc::new(initial_normalized),
+        current_fingerprint: crate::agent::factory::fingerprint_providers(raw_config),
+    };
     tokio::spawn(async move {
         loop {
             tokio::select! {
                 event = config_rx.recv() => {
                     match event {
                         Ok(config::watcher::ConfigEvent::Reloaded(result)) => {
-                            crate::server::ws::broadcast_config_changed(
-                                &ws_state_for_config,
-                                &result.mode,
-                            );
-                            // Hot-swap LLM providers if config changed
-                            if let Ok(new_cfg) = config::load_config() {
-                                let new_fingerprint =
-                                    crate::agent::factory::fingerprint_providers(&new_cfg);
-                                if new_fingerprint != current_fingerprint {
-                                    info!("LLM provider configuration changed, rebuilding providers");
-                                    match crate::agent::factory::build_providers(&new_cfg) {
-                                        Ok(Some(mp)) => {
-                                            ws_state_for_config
-                                                .set_llm_provider(Some(std::sync::Arc::new(mp)));
-                                            info!("LLM providers hot-swapped successfully");
-                                        }
-                                        Ok(None) => {
-                                            warn!(
-                                                "Reloaded config has no LLM provider; \
-                                                 keeping previous provider. Carapace \
-                                                 cannot run without a provider — restore \
-                                                 a provider config to apply further \
-                                                 changes."
-                                            );
-                                            // Update the fingerprint so identical
-                                            // re-saves of the no-provider config don't
-                                            // re-run the (failed) build_providers work.
-                                            // A subsequent reload that *restores* a
-                                            // provider will produce a new fingerprint
-                                            // and retry the swap.
-                                            current_fingerprint = new_fingerprint;
-                                            continue;
-                                        }
-                                        Err(e) => {
-                                            warn!(
-                                                "Failed to rebuild LLM providers: {} (keeping previous)",
-                                                e
-                                            );
-                                            // Don't update fingerprint on failure
-                                            continue;
-                                        }
-                                    }
-                                    current_fingerprint = new_fingerprint;
+                            match handle_provider_reload(&ws_state_for_config, &mut reload_state) {
+                                ReloadOutcome::Apply => {
+                                    crate::server::ws::broadcast_config_changed(
+                                        &ws_state_for_config,
+                                        &result.mode,
+                                    );
+                                }
+                                ReloadOutcome::Reverted => {
+                                    // Cache rolled back; suppress the WS broadcast so
+                                    // clients don't observe a transient invalid state.
                                 }
                             }
                         }
@@ -1937,6 +1996,102 @@ mod tests {
         );
 
         crate::config::clear_cache();
+    }
+
+    /// Build a config-cache-locked, env-cleared test scope plus a starting
+    /// `ReloadState` whose `last_good_*` mirror an `ANTHROPIC_API_KEY` setup.
+    fn make_reload_state_with_anthropic_provider() -> (
+        crate::test_support::config::ScopedConfigCache,
+        ScopedEnv,
+        Arc<WsServerState>,
+        ReloadState,
+    ) {
+        use crate::test_support::config::ScopedConfigCache;
+
+        let cache_guard = ScopedConfigCache::new();
+        crate::config::clear_cache();
+        let mut env = crate::test_support::env::provider_env_cleared();
+        env.set("ANTHROPIC_API_KEY", "test-initial-key");
+
+        let initial = json!({});
+        crate::config::update_cache(initial.clone(), initial.clone());
+
+        let ws_state = Arc::new(WsServerState::new(WsServerConfig::default()));
+        let reload_state = ReloadState {
+            last_good_raw: Arc::new(initial.clone()),
+            last_good_normalized: Arc::new(initial.clone()),
+            current_fingerprint: crate::agent::factory::fingerprint_providers(&initial),
+        };
+        (cache_guard, env, ws_state, reload_state)
+    }
+
+    /// On a no-provider reload: cache rolls back to the previous good state,
+    /// `last_good_*` and `current_fingerprint` are unchanged, and the bridge
+    /// returns `Reverted` so the WS broadcast is suppressed.
+    #[test]
+    fn handle_provider_reload_reverts_when_new_config_has_no_provider() {
+        let (_cache, mut env, ws_state, mut state) = make_reload_state_with_anthropic_provider();
+        let prior_fingerprint = state.current_fingerprint.clone();
+        let prior_raw = state.last_good_raw.clone();
+
+        // Simulate the watcher having installed a no-provider reload: empty
+        // env (no ANTHROPIC_API_KEY) + an unrelated config edit. The
+        // unrelated edit is what would otherwise leak through partial-apply.
+        env.unset("ANTHROPIC_API_KEY");
+        let new_cfg = json!({ "agents": { "defaults": { "route": "fast" } } });
+        crate::config::update_cache(new_cfg.clone(), new_cfg.clone());
+
+        let outcome = handle_provider_reload(&ws_state, &mut state);
+
+        assert_eq!(outcome, ReloadOutcome::Reverted);
+        // Cache rolled back to the prior state.
+        let cached = crate::config::load_config_shared().expect("cache populated");
+        assert_eq!(*cached, *prior_raw);
+        // last_good_* and fingerprint untouched.
+        assert!(Arc::ptr_eq(&state.last_good_raw, &prior_raw));
+        assert_eq!(state.current_fingerprint, prior_fingerprint);
+    }
+
+    /// On a successful provider swap: provider installed on the state,
+    /// `last_good_*` advances to the new pair, fingerprint updates, and the
+    /// bridge returns `Apply` so the WS broadcast fires normally.
+    #[test]
+    fn handle_provider_reload_swaps_provider_and_applies_on_valid_change() {
+        let (_cache, mut env, ws_state, mut state) = make_reload_state_with_anthropic_provider();
+
+        env.set("ANTHROPIC_API_KEY", "test-rotated-key");
+        let new_cfg = json!({ "agents": { "defaults": { "route": "rotated" } } });
+        crate::config::update_cache(new_cfg.clone(), new_cfg.clone());
+
+        let outcome = handle_provider_reload(&ws_state, &mut state);
+
+        assert_eq!(outcome, ReloadOutcome::Apply);
+        assert!(
+            ws_state.llm_provider().is_some(),
+            "swap should install a provider on the WsServerState"
+        );
+        // last_good now reflects the new (raw, normalized) pair.
+        assert_eq!(*state.last_good_raw, new_cfg);
+    }
+
+    /// Provider unchanged but other config edited: capture the new (raw,
+    /// normalized) as last_good (so a future no-provider rollback reverts to
+    /// *this* state, not an older one) and return `Apply` so subscribers see
+    /// the non-provider edits.
+    #[test]
+    fn handle_provider_reload_captures_new_last_good_when_provider_unchanged() {
+        let (_cache, _env, ws_state, mut state) = make_reload_state_with_anthropic_provider();
+        let prior_fingerprint = state.current_fingerprint.clone();
+
+        // Same provider env; only non-provider config changed.
+        let new_cfg = json!({ "agents": { "defaults": { "route": "edited" } } });
+        crate::config::update_cache(new_cfg.clone(), new_cfg.clone());
+
+        let outcome = handle_provider_reload(&ws_state, &mut state);
+
+        assert_eq!(outcome, ReloadOutcome::Apply);
+        assert_eq!(state.current_fingerprint, prior_fingerprint);
+        assert_eq!(*state.last_good_raw, new_cfg);
     }
 
     #[test]
