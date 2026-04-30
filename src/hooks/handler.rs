@@ -66,7 +66,7 @@ impl WakeResponse {
 
 /// Request body for POST /hooks/agent
 #[derive(Debug, Deserialize)]
-#[serde(try_from = "AgentRequestWire")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AgentRequest {
     pub message: Option<String>,
     pub name: Option<String>,
@@ -82,55 +82,6 @@ pub struct AgentRequest {
     pub timeout_seconds: Option<f64>,
     pub allow_unsafe_external_content: Option<bool>,
     pub venice_parameters: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AgentRequestWire {
-    message: Option<String>,
-    name: Option<String>,
-    channel: Option<String>,
-    to: Option<String>,
-    model: Option<String>,
-    route: Option<String>,
-    thinking: Option<String>,
-    deliver: Option<bool>,
-    wake_mode: Option<String>,
-    #[serde(rename = "sessionKey")]
-    session_scope: Option<String>,
-    timeout_seconds: Option<f64>,
-    allow_unsafe_external_content: Option<bool>,
-    venice_parameters: Option<serde_json::Value>,
-    #[serde(default, rename = "sessionScope")]
-    removed_session_scope: Option<serde::de::IgnoredAny>,
-    #[serde(default, rename = "session_key")]
-    removed_session_key_snake: Option<serde::de::IgnoredAny>,
-}
-
-impl TryFrom<AgentRequestWire> for AgentRequest {
-    type Error = String;
-
-    fn try_from(value: AgentRequestWire) -> Result<Self, Self::Error> {
-        super::reject_removed_session_scope_aliases(
-            value.removed_session_scope,
-            value.removed_session_key_snake,
-        )?;
-        Ok(Self {
-            message: value.message,
-            name: value.name,
-            channel: value.channel,
-            to: value.to,
-            model: value.model,
-            route: value.route,
-            thinking: value.thinking,
-            deliver: value.deliver,
-            wake_mode: value.wake_mode,
-            session_scope: value.session_scope,
-            timeout_seconds: value.timeout_seconds,
-            allow_unsafe_external_content: value.allow_unsafe_external_content,
-            venice_parameters: value.venice_parameters,
-        })
-    }
 }
 
 /// Response body for POST /hooks/agent
@@ -737,15 +688,17 @@ mod tests {
     }
 
     #[test]
-    fn test_agent_request_ignores_unrelated_unknown_fields() {
-        let req: AgentRequest = serde_json::from_value(serde_json::json!({
+    fn test_agent_request_rejects_unknown_fields() {
+        let err = serde_json::from_value::<AgentRequest>(serde_json::json!({
             "message": "hello",
             "sessionKey": "hook:current",
             "futureField": { "keptByClient": true }
         }))
-        .unwrap();
-        assert_eq!(req.message.as_deref(), Some("hello"));
-        assert_eq!(req.session_scope.as_deref(), Some("hook:current"));
+        .expect_err("unknown hook agent request fields should be rejected");
+        assert!(
+            err.to_string().contains("unknown field `futureField`"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

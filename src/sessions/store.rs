@@ -121,28 +121,36 @@ fn session_store_error_kind(err: &SessionStoreError) -> &'static str {
     }
 }
 
-fn session_store_error_export_warning(err: &SessionStoreError) -> &'static str {
+fn session_store_error_export_warning(err: &SessionStoreError) -> String {
     match err {
-        SessionStoreError::NotFound(_) => "session data was not found on disk",
-        SessionStoreError::AlreadyExists(_) => "session data already exists on disk",
-        SessionStoreError::Io(_) => "session data could not be read from disk",
-        SessionStoreError::Serialization(_) => "session data is malformed",
-        SessionStoreError::InvalidSessionKey(_) => "session data uses an invalid session key",
+        SessionStoreError::NotFound(_) => "session data was not found on disk".to_string(),
+        SessionStoreError::AlreadyExists(_) => "session data already exists on disk".to_string(),
+        SessionStoreError::Io(_) => "session data could not be read from disk".to_string(),
+        SessionStoreError::Serialization(_) => "session data is malformed".to_string(),
+        SessionStoreError::InvalidSessionKey(_) => {
+            "session data uses an invalid session key".to_string()
+        }
         SessionStoreError::CompactionInProgress(_) => {
-            "session data is being compacted and is temporarily unavailable"
+            "session data is being compacted and is temporarily unavailable".to_string()
         }
-        SessionStoreError::AlreadyArchived(_) => "session data is already archived",
-        SessionStoreError::NotArchived(_) => "session data is not archived",
-        SessionStoreError::ArchiveNotFound(_) => "session archive was not found on disk",
-        SessionStoreError::InvalidUserId(_) => "session data is associated with an invalid user ID",
+        SessionStoreError::AlreadyArchived(_) => "session data is already archived".to_string(),
+        SessionStoreError::NotArchived(_) => "session data is not archived".to_string(),
+        SessionStoreError::ArchiveNotFound(_) => {
+            "session archive was not found on disk".to_string()
+        }
+        SessionStoreError::InvalidUserId(_) => {
+            "session data is associated with an invalid user ID".to_string()
+        }
         SessionStoreError::InvalidMessageBatch(_) => {
-            "session message batch contains messages for multiple sessions"
+            "session message batch contains messages for multiple sessions".to_string()
         }
-        SessionStoreError::Locked(_) => {
-            "encrypted session data is unavailable without the config password"
+        SessionStoreError::Locked(message) => message.clone(),
+        SessionStoreError::DecryptionFailed(_) => {
+            "encrypted session data could not be decrypted".to_string()
         }
-        SessionStoreError::DecryptionFailed(_) => "encrypted session data could not be decrypted",
-        SessionStoreError::Crypto(_) => "encrypted session data is unreadable or corrupted",
+        SessionStoreError::Crypto(_) => {
+            "encrypted session data is unreadable or corrupted".to_string()
+        }
     }
 }
 
@@ -1135,19 +1143,23 @@ impl SessionStore {
             .fetch_add(1, Ordering::SeqCst);
 
         let history_bytes = self.read_verified_history_bytes(history_path)?;
-        let Some(line) = history_bytes
+        let mut has_history = false;
+        for line in history_bytes
             .split(|byte| *byte == b'\n')
             .map(Self::trim_ascii_whitespace)
-            .find(|line| !line.is_empty())
-        else {
+            .filter(|line| !line.is_empty())
+        {
+            has_history = true;
+            if !super::crypto::has_encrypted_payload_prefix(line) {
+                return Err(Self::lock_message(
+                    "session history is not encrypted; current session encryption requires encrypted artifacts",
+                ));
+            }
+        }
+
+        if !has_history {
             self.mark_history_file_current(session_id);
             return Ok(());
-        };
-
-        if !super::crypto::has_encrypted_payload_prefix(line) {
-            return Err(Self::lock_message(
-                "session history is not encrypted; current session encryption requires encrypted artifacts",
-            ));
         }
         self.mark_history_file_current(session_id);
         Ok(())
@@ -3348,6 +3360,40 @@ mod tests {
     }
 
     #[test]
+    fn test_append_rejects_mixed_encrypted_and_plaintext_history() {
+        let key_material = test_key_material();
+        let (store, temp_dir) = create_encrypted_store_without_hmac(&key_material);
+        let session = store
+            .create_session("agent-1", SessionMetadata::default())
+            .unwrap();
+        store
+            .append_message(ChatMessage::user(&session.id, "encrypted-first"))
+            .unwrap();
+
+        let history_path = store.session_history_path(&session.id).unwrap();
+        let plaintext = serde_json::to_vec(&ChatMessage::user(&session.id, "plaintext-tail"))
+            .expect("plaintext history fixture should serialize");
+        let mut history = OpenOptions::new().append(true).open(&history_path).unwrap();
+        history.write_all(&plaintext).unwrap();
+        history.write_all(b"\n").unwrap();
+        history.sync_all().unwrap();
+
+        let crypto = SessionCryptoContext::load_or_create(temp_dir.path(), &key_material).unwrap();
+        let reopened = SessionStore::with_base_path(temp_dir.path().to_path_buf())
+            .with_encryption_mode(EncryptionMode::IfPassword)
+            .with_crypto_context(Arc::new(crypto));
+
+        let err = reopened
+            .append_message(ChatMessage::assistant(&session.id, "should fail"))
+            .expect_err("mixed-format history must not be marked current");
+        assert!(matches!(
+            err,
+            SessionStoreError::Locked(message)
+                if message.contains("session history is not encrypted")
+        ));
+    }
+
+    #[test]
     fn test_encrypted_compaction_rewrites_history_as_ciphertext() {
         let key_material = test_key_material();
         let (store, _temp) = create_encrypted_store(&key_material);
@@ -5165,6 +5211,39 @@ mod tests {
         assert!(warning.ends_with(": session data could not be read from disk"));
         assert!(!warning.contains("Session store is locked"));
         assert!(!warning.contains("history-secret"));
+    }
+
+    #[test]
+    fn test_export_user_data_warning_uses_encryption_gate_reason() {
+        let key_material = test_key_material();
+        let (store, _temp_dir) = create_encrypted_store_without_hmac(&key_material);
+        let session = store
+            .create_session(
+                "agent-1",
+                SessionMetadata {
+                    user_id: Some("user-1".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store
+            .append_message(ChatMessage::user(&session.id, "encrypted-first"))
+            .unwrap();
+
+        let history_path = store.session_history_path(&session.id).unwrap();
+        let plaintext = serde_json::to_vec(&ChatMessage::user(&session.id, "plaintext-history"))
+            .expect("plaintext history fixture should serialize");
+        fs::write(&history_path, [plaintext.as_slice(), b"\n"].concat()).unwrap();
+
+        let result = store.export_user_data("user-1").unwrap();
+        let warnings = result["warnings"].as_array().unwrap();
+        assert_eq!(warnings.len(), 1);
+        let warning = warnings[0].as_str().unwrap();
+        assert!(warning.contains("failed to export session"));
+        assert!(warning.ends_with(
+            "session history is not encrypted; current session encryption requires encrypted artifacts"
+        ));
+        assert!(!warning.contains("without the config password"));
     }
 
     #[test]

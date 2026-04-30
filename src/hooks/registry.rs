@@ -40,7 +40,7 @@ pub struct HookTransform {
 
 /// Hook mapping configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", try_from = "HookMappingWire")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HookMapping {
     /// Unique identifier for the mapping
     pub id: Option<String>,
@@ -80,66 +80,6 @@ pub struct HookMapping {
     pub timeout_seconds: Option<u32>,
     /// Transform module configuration
     pub transform: Option<HookTransform>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct HookMappingWire {
-    id: Option<String>,
-    #[serde(default)]
-    r#match: HookMatch,
-    #[serde(default)]
-    action: HookAction,
-    #[serde(default)]
-    wake_mode: Option<String>,
-    name: Option<String>,
-    #[serde(rename = "sessionKey")]
-    session_scope: Option<String>,
-    message_template: Option<String>,
-    text_template: Option<String>,
-    deliver: Option<bool>,
-    allow_unsafe_external_content: Option<bool>,
-    channel: Option<String>,
-    to: Option<String>,
-    model: Option<String>,
-    route: Option<String>,
-    thinking: Option<String>,
-    timeout_seconds: Option<u32>,
-    transform: Option<HookTransform>,
-    #[serde(default, rename = "sessionScope")]
-    removed_session_scope: Option<serde::de::IgnoredAny>,
-    #[serde(default, rename = "session_key")]
-    removed_session_key_snake: Option<serde::de::IgnoredAny>,
-}
-
-impl TryFrom<HookMappingWire> for HookMapping {
-    type Error = String;
-
-    fn try_from(value: HookMappingWire) -> Result<Self, Self::Error> {
-        super::reject_removed_session_scope_aliases(
-            value.removed_session_scope,
-            value.removed_session_key_snake,
-        )?;
-        Ok(Self {
-            id: value.id,
-            r#match: value.r#match,
-            action: value.action,
-            wake_mode: value.wake_mode,
-            name: value.name,
-            session_scope: value.session_scope,
-            message_template: value.message_template,
-            text_template: value.text_template,
-            deliver: value.deliver,
-            allow_unsafe_external_content: value.allow_unsafe_external_content,
-            channel: value.channel,
-            to: value.to,
-            model: value.model,
-            route: value.route,
-            thinking: value.thinking,
-            timeout_seconds: value.timeout_seconds,
-            transform: value.transform,
-        })
-    }
 }
 
 impl HookMapping {
@@ -695,17 +635,19 @@ mod tests {
     }
 
     #[test]
-    fn test_hook_mapping_ignores_unrelated_unknown_fields() {
-        let mapping: HookMapping = serde_json::from_value(json!({
+    fn test_hook_mapping_rejects_unknown_fields() {
+        let err = serde_json::from_value::<HookMapping>(json!({
             "id": "test",
             "action": "agent",
             "messageTemplate": "hello",
             "sessionKey": "hook:current",
             "futureField": { "ownedByOperator": true }
         }))
-        .unwrap();
-        assert_eq!(mapping.id.as_deref(), Some("test"));
-        assert_eq!(mapping.session_scope.as_deref(), Some("hook:current"));
+        .expect_err("unknown hook mapping fields should be rejected");
+        assert!(
+            err.to_string().contains("unknown field `futureField`"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
