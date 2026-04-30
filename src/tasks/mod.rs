@@ -805,18 +805,21 @@ impl TaskQueue {
                     task.payload = payload.clone();
                 }
                 if let Some(policy_patch) = &policy_patch {
-                    task.policy_explicit = true;
-                    if let Some(max_attempts) = policy_patch.max_attempts {
-                        task.policy.max_attempts = max_attempts;
-                    }
-                    if let Some(max_total_runtime_ms) = policy_patch.max_total_runtime_ms {
-                        task.policy.max_total_runtime_ms = max_total_runtime_ms;
-                    }
-                    if let Some(max_turns) = policy_patch.max_turns {
-                        task.policy.max_turns = max_turns;
-                    }
-                    if let Some(max_run_timeout_seconds) = policy_patch.max_run_timeout_seconds {
-                        task.policy.max_run_timeout_seconds = max_run_timeout_seconds;
+                    if policy_patch.has_updates() {
+                        task.policy_explicit = true;
+                        if let Some(max_attempts) = policy_patch.max_attempts {
+                            task.policy.max_attempts = max_attempts;
+                        }
+                        if let Some(max_total_runtime_ms) = policy_patch.max_total_runtime_ms {
+                            task.policy.max_total_runtime_ms = max_total_runtime_ms;
+                        }
+                        if let Some(max_turns) = policy_patch.max_turns {
+                            task.policy.max_turns = max_turns;
+                        }
+                        if let Some(max_run_timeout_seconds) = policy_patch.max_run_timeout_seconds
+                        {
+                            task.policy.max_run_timeout_seconds = max_run_timeout_seconds;
+                        }
                     }
                 }
                 if let Some(reason) = reason {
@@ -1288,6 +1291,27 @@ mod tests {
         let updated = queue.get(&task.id).expect("task should exist");
         assert!(updated.policy_explicit);
         assert_eq!(updated.policy.max_attempts, 3);
+    }
+
+    #[test]
+    fn test_patch_task_ignores_empty_policy_patch_when_other_fields_change() {
+        let queue = TaskQueue::in_memory();
+        let task = queue.enqueue(serde_json::json!({"kind":"demo"}), None);
+        {
+            let mut tasks = queue.tasks.write();
+            tasks[0].policy_explicit = false;
+        }
+
+        assert!(queue.patch_task(
+            &task.id,
+            None,
+            Some(TaskPolicyPatch::default()),
+            Some("operator note"),
+        ));
+
+        let updated = queue.get(&task.id).expect("task should exist");
+        assert!(!updated.policy_explicit);
+        assert_eq!(updated.last_error.as_deref(), Some("operator note"));
     }
 
     #[test]

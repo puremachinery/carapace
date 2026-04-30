@@ -436,6 +436,11 @@ pub fn is_encrypted(value: &str) -> bool {
     SecretEnvelopeVersion::parse_prefix(value).is_some()
 }
 
+fn looks_like_encrypted_value(value: &str) -> bool {
+    SecretEnvelopeVersion::parse_prefix(value).is_some()
+        || unsupported_encrypted_prefix(value).is_some()
+}
+
 /// Unsupported encrypted envelope found while scanning config values.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct UnsupportedEncryptedValue {
@@ -519,7 +524,7 @@ fn contains_encrypted_inner(config: &Value, depth: usize) -> bool {
     }
 
     match config {
-        Value::String(s) => is_encrypted(s),
+        Value::String(s) => looks_like_encrypted_value(s),
         Value::Object(map) => map.values().any(|v| contains_encrypted_inner(v, depth + 1)),
         Value::Array(arr) => arr.iter().any(|v| contains_encrypted_inner(v, depth + 1)),
         _ => false,
@@ -542,7 +547,7 @@ fn scrub_encrypted_inner(config: &mut Value, depth: usize) {
 
     match config {
         Value::String(s) => {
-            if is_encrypted(s) {
+            if looks_like_encrypted_value(s) {
                 *config = Value::Null;
             }
         }
@@ -1176,6 +1181,15 @@ mod tests {
     }
 
     #[test]
+    fn test_scrub_encrypted_values_replaces_unsupported_envelope_with_null() {
+        let mut config = json!({ "apiKey": "enc:v1:aaa:bbb:ccc", "name": "bot" });
+        scrub_encrypted_values(&mut config);
+
+        assert!(config["apiKey"].is_null());
+        assert_eq!(config["name"], "bot");
+    }
+
+    #[test]
     fn test_seal_secrets_single_path() {
         let store = new_test_store();
         let mut config = json!({
@@ -1389,6 +1403,13 @@ mod tests {
 
         let plain = json!({ "apiKey": "plaintext", "name": "bot" });
         assert!(!contains_encrypted_values(&plain));
+    }
+
+    #[test]
+    fn test_contains_encrypted_values_detects_unsupported_envelope() {
+        let config = json!({ "apiKey": "enc:v1:aaa:bbb:ccc", "name": "bot" });
+
+        assert!(contains_encrypted_values(&config));
     }
 
     #[test]
