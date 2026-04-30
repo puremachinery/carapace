@@ -193,6 +193,12 @@ fn parse_store_file(content: &str) -> Result<LoadedProfiles, AuthProfileError> {
         Ok(Value::Object(map)) => {
             let envelope: AuthProfileStoreEnvelope = serde_json::from_value(Value::Object(map))
                 .map_err(|e| AuthProfileError::SerializationError(e.to_string()))?;
+            if envelope.version > CURRENT_STORE_VERSION {
+                return Err(AuthProfileError::SerializationError(format!(
+                    "auth profile store version {} is newer than supported version {}; upgrade Carapace or restore from a backup",
+                    envelope.version, CURRENT_STORE_VERSION
+                )));
+            }
             if envelope.version != CURRENT_STORE_VERSION {
                 return Err(AuthProfileError::SerializationError(format!(
                     "auth profile store version {} is not supported; expected version {}",
@@ -3036,6 +3042,44 @@ mod tests {
     }
 
     #[test]
+    fn test_encrypted_store_plaintext_profile_load_error_leaves_store_empty() {
+        let dir = tempdir().unwrap();
+        let password = random_password();
+
+        {
+            let store = ProfileStore::with_encryption(dir.path().to_path_buf(), &password).unwrap();
+            store.add(sample_profile("encrypted")).unwrap();
+        }
+
+        let state_path = dir.path().join("auth_profiles.json");
+        let mut envelope: Value =
+            serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+        envelope["profiles"]
+            .as_array_mut()
+            .expect("profiles array")
+            .push(serde_json::to_value(sample_profile("plaintext")).unwrap());
+        std::fs::write(
+            &state_path,
+            serde_json::to_string_pretty(&envelope).unwrap(),
+        )
+        .unwrap();
+
+        let store = ProfileStore::with_encryption(dir.path().to_path_buf(), &password).unwrap();
+        let err = store
+            .load()
+            .expect_err("plaintext profile should fail under encryption");
+
+        assert!(
+            err.to_string().contains("stored in plaintext"),
+            "got: {err}"
+        );
+        assert!(
+            store.shared.profiles.read().is_empty(),
+            "failed load must not publish a partially-decrypted profile set"
+        );
+    }
+
+    #[test]
     fn test_encrypted_store_no_double_encryption() {
         let dir = tempdir().unwrap();
         let password = random_password();
@@ -3413,6 +3457,7 @@ mod tests {
             msg.contains("99"),
             "error should mention the version: {msg}"
         );
-        assert!(msg.contains("expected version 2"), "got: {msg}");
+        assert!(msg.contains("newer than supported version 2"), "got: {msg}");
+        assert!(msg.contains("upgrade Carapace"), "got: {msg}");
     }
 }
