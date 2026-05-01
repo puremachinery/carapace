@@ -370,21 +370,6 @@ Responses:
 - `409 Conflict` when config changed since provided hash
 - `422 Unprocessable Entity` for schema-invalid updates
 
-### POST `/control/config`
-
-Legacy broader config-mutation endpoint.
-
-Request shape is the same as `PATCH /control/config` (`path`, `value`,
-optional `baseHash`), but unlike PATCH it is not limited to
-`gateway.controlUi.*` (protected prefixes still remain blocked).
-
-Responses:
-- `200 OK` with `{ "ok": true, "applied": {...}, "hash": "..." }`
-- `400 Bad Request` for invalid JSON/path/baseHash usage
-- `403 Forbidden` for protected paths
-- `409 Conflict` when config changed since provided hash
-- `422 Unprocessable Entity` for schema-invalid updates
-
 ## Control Task API
 
 Control task endpoints are part of the service control plane and use **service

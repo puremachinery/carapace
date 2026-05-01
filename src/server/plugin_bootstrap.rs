@@ -137,11 +137,14 @@ pub(crate) fn configured_plugin_paths(cfg: &Value) -> Vec<PathBuf> {
     paths
 }
 
-fn plugin_signature_config_from_config(cfg: &Value) -> SignatureConfig {
-    cfg.pointer("/plugins/signature")
-        .cloned()
-        .and_then(|value| serde_json::from_value(value).ok())
-        .unwrap_or_default()
+fn plugin_signature_config_from_config(cfg: &Value) -> Result<SignatureConfig, String> {
+    let Some(value) = cfg.pointer("/plugins/signature").cloned() else {
+        return Ok(SignatureConfig::default());
+    };
+
+    serde_json::from_value(value).map_err(|error| {
+        format!("invalid plugins.signature config: {error}; use enabled, requireSignature, and trustedPublishers")
+    })
 }
 
 fn plugin_sandbox_config_from_config(cfg: &Value) -> SandboxConfig {
@@ -487,9 +490,24 @@ fn discover_and_load_plugins(cfg: Value, state_dir: PathBuf) -> BlockingPluginBo
         };
     }
 
-    let signature_config = plugin_signature_config_from_config(&cfg);
     let sandbox_config = plugin_sandbox_config_from_config(&cfg);
     let permission_config = PermissionConfig::default();
+    let signature_config = match plugin_signature_config_from_config(&cfg) {
+        Ok(signature_config) => signature_config,
+        Err(error) => {
+            report.errors.push(error.clone());
+            push_plugin_init_failure_entries(&mut report, &managed_entries, &error);
+            return BlockingPluginBootstrapResult {
+                report,
+                plugin_engine: None,
+                loader: None,
+                loaded_plugin_ids: Vec::new(),
+                report_index_by_plugin_id: HashMap::new(),
+                sandbox_config,
+                permission_config,
+            };
+        }
+    };
     let plugin_engine = match initialize_plugin_engine() {
         Ok(plugin_engine) => plugin_engine,
         Err(error) => {
@@ -925,6 +943,40 @@ mod tests {
             Some(
                 "failed to initialize plugin loader: Wasmtime engine error: forced loader init failure"
             )
+        );
+    }
+
+    #[test]
+    fn discover_and_load_plugins_rejects_removed_signature_config_aliases() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let cfg = json!({
+            "plugins": {
+                "signature": {
+                    "trusted_publishers": ["abc123"]
+                },
+                "entries": {
+                    "alpha": {
+                        "enabled": true,
+                        "installId": "install-alpha",
+                        "requestedAt": 1700000001000u64
+                    }
+                }
+            }
+        });
+
+        let result = discover_and_load_plugins(cfg, temp.path().to_path_buf());
+
+        assert!(result.plugin_engine.is_none());
+        assert!(result.loader.is_none());
+        assert!(result.report.errors.iter().any(|error| {
+            error.contains("invalid plugins.signature config")
+                && error.contains("trusted_publishers")
+                && error.contains("unknown field")
+        }));
+        assert_eq!(result.report.entries.len(), 1);
+        assert_eq!(
+            result.report.entries[0].state,
+            PluginActivationState::Failed
         );
     }
 }

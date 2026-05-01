@@ -27,11 +27,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutputSanitizerConfig {
     /// Master switch for HTML sanitization. Default: `true`.
-    #[serde(default = "default_true", alias = "sanitizeHtml")]
+    #[serde(default = "default_true", rename = "sanitizeHtml")]
     pub sanitize_html: bool,
     /// CSP policy string attached to sanitized output. Use an empty string to
     /// disable.  Default: restrictive agent-content policy.
-    #[serde(default = "default_csp_policy", alias = "cspPolicy")]
+    #[serde(default = "default_csp_policy", rename = "cspPolicy")]
     pub csp_policy: String,
 }
 

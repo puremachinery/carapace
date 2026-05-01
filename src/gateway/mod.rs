@@ -307,7 +307,7 @@ pub struct GatewayConnectResult {
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GatewayStore {
-    /// Schema version for future migrations.
+    /// Store schema version.
     pub version: u32,
     /// Registered gateway entries.
     #[serde(default)]

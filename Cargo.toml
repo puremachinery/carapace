@@ -42,7 +42,6 @@ sha2 = "0.11"
 hkdf = "0.13"
 hmac = "0.13"
 subtle = "2"
-pbkdf2 = "0.13"
 mdns-sd = "0.19"
 rcgen = "0.14"
 x509-parser = "0.18"
@@ -70,6 +69,9 @@ win32job = "2.0.3"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Threading"] }
 rappct = "0.13.3"
 self-replace = "1.5"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+mach2 = "0.4"
 
 [dev-dependencies]
 filetime = "0.2"

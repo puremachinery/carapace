@@ -11,8 +11,7 @@
     "required": true,
     "methods": [
       "Authorization: Bearer <token>",
-      "X-Carapace-Token: <token>",
-      "?token=<token> (deprecated)"
+      "X-Carapace-Token: <token>"
     ]
   },
   "request_schema": {

@@ -400,7 +400,7 @@ fn validate_and_resolve_dns(url: &url::Url) -> Result<(String, u16, Option<IpAdd
 }
 
 /// Build an HTTP client pinned to the validated IP (if any) and download the WASM
-/// binary. Validates response status, size limit, and component compatibility.
+/// binary. Validates response status, size limit, and component requirements.
 fn download_with_pinned_ip(
     url: &url::Url,
     host: &str,

@@ -135,7 +135,7 @@ impl NodePairingRequestBuilder {
 }
 
 impl NodePairingRequest {
-    /// Create a new pending pairing request (legacy API for backward compatibility)
+    /// Create a new pending pairing request.
     pub fn new(
         node_id: String,
         public_key: Option<String>,
@@ -371,7 +371,7 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NodePairingStore {
-    /// Version for schema migration
+    /// Store schema version.
     pub version: u32,
     /// Pending pairing requests by request_id
     #[serde(default)]
@@ -580,7 +580,7 @@ impl NodePairingRegistry {
 
     // === Pairing Request Methods ===
 
-    /// Create a new pairing request (legacy API for backward compatibility)
+    /// Create a new pairing request.
     pub fn request_pairing(
         &self,
         node_id: String,
@@ -601,7 +601,7 @@ impl NodePairingRegistry {
         Ok(outcome.request)
     }
 
-    /// Create a new pairing request (legacy API for backward compatibility)
+    /// Create a new pairing request with status metadata.
     pub fn request_pairing_with_status(
         &self,
         node_id: String,

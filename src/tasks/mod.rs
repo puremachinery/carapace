@@ -6,9 +6,9 @@ use async_trait::async_trait;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::fs::{self, File};
-use std::io::Write;
-use std::path::PathBuf;
+use std::fs::{self, File, OpenOptions};
+use std::io::{ErrorKind, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -20,6 +20,7 @@ use uuid::Uuid;
 const DEFAULT_MAX_TASKS: usize = 10_000;
 #[cfg(test)]
 const MAX_TASKS: usize = DEFAULT_MAX_TASKS;
+const MAX_CORRUPT_QUEUE_BACKUPS: usize = 8;
 const TASK_QUEUE_FULL_NO_EVICTION_ERROR: &str =
     "task queue full: no terminal tasks available for eviction";
 const ENQUEUE_WORKER_FAILED_ERROR: &str = "task queue enqueue worker failed";
@@ -132,7 +133,6 @@ pub struct DurableTask {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_reason: Option<TaskBlockedReason>,
     /// True when the task was created with an explicit continuation policy.
-    /// Legacy tasks loaded from pre-policy queue files default to false.
     #[serde(default, skip_serializing_if = "is_false")]
     pub policy_explicit: bool,
 }
@@ -205,30 +205,42 @@ impl TaskQueue {
     /// This synchronous path is intended for non-async contexts and tests.
     /// Runtime startup should prefer [`Self::load_async`] so file I/O does not
     /// run on Tokio worker threads.
-    pub fn load(&self) {
+    pub fn load(&self) -> Result<(), String> {
         let path = match &self.persist_path {
             Some(p) => p,
-            None => return,
+            None => return Ok(()),
         };
 
         let data = match fs::read(path) {
             Ok(bytes) => bytes,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(err) => {
-                warn!(path = %path.display(), error = %err, "failed to read tasks file");
-                return;
+                let message = format!(
+                    "failed to read task queue file {}; persisted tasks were not loaded: {err}. Remove or repair the file before restarting",
+                    path.display()
+                );
+                tracing::error!(path = %path.display(), error = %err, "{message}");
+                return Err(message);
             }
         };
 
         let mut loaded: Vec<DurableTask> = match serde_json::from_slice(&data) {
             Ok(tasks) => tasks,
             Err(err) => {
-                tracing::error!(
-                    path = %path.display(),
-                    error = %err,
-                    "failed to parse tasks file; starting with empty task queue"
+                let backup_note = match Self::write_corrupt_queue_backup(path, &data) {
+                    Ok(backup_path) => {
+                        format!(" A copy was written to {}.", backup_path.display())
+                    }
+                    Err(backup_err) => {
+                        format!(" Failed to write corrupt queue backup: {backup_err}.")
+                    }
+                };
+                let message = format!(
+                    "failed to parse current task queue file {}; persisted tasks were not loaded: {err}.{backup_note} Remove or repair the file before restarting",
+                    path.display()
                 );
-                return;
+                tracing::error!(path = %path.display(), error = %err, "{message}");
+                return Err(message);
             }
         };
 
@@ -250,6 +262,108 @@ impl TaskQueue {
         if recovered_running {
             self.flush_to_disk();
         }
+        Ok(())
+    }
+
+    fn corrupt_queue_backup_path(path: &Path, timestamp_ms: u64, attempt: u32) -> PathBuf {
+        let mut backup = path.as_os_str().to_os_string();
+        backup.push(format!(".corrupt.{timestamp_ms}.{attempt}"));
+        PathBuf::from(backup)
+    }
+
+    fn write_corrupt_queue_backup(path: &Path, data: &[u8]) -> std::io::Result<PathBuf> {
+        let timestamp_ms = now_ms();
+        for attempt in 0..1024 {
+            let backup_path = Self::corrupt_queue_backup_path(path, timestamp_ms, attempt);
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&backup_path)
+            {
+                Ok(mut file) => {
+                    file.write_all(data)?;
+                    file.sync_all()?;
+                    drop(file);
+                    Self::prune_corrupt_queue_backups(path, MAX_CORRUPT_QUEUE_BACKUPS);
+                    return Ok(backup_path);
+                }
+                Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
+                Err(err) => return Err(err),
+            }
+        }
+        Err(std::io::Error::other(
+            "exhausted unique corrupt queue backup path attempts; prune old backups and retry",
+        ))
+    }
+
+    fn corrupt_queue_backup_sort_key(path: &Path, prefix: &str) -> Option<(u64, u32)> {
+        let name = path.file_name()?.to_str()?;
+        let suffix = name.strip_prefix(prefix)?;
+        let (timestamp, attempt) = suffix.rsplit_once('.')?;
+        Some((timestamp.parse().ok()?, attempt.parse().ok()?))
+    }
+
+    fn prune_corrupt_queue_backups(path: &Path, keep: usize) {
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            return;
+        };
+        let prefix = format!("{file_name}.corrupt.");
+        let Ok(entries) = std::fs::read_dir(parent) else {
+            return;
+        };
+
+        let mut unparseable_backups = Vec::new();
+        let mut backups = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|candidate| {
+                candidate
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&prefix))
+            })
+            .filter_map(|candidate| {
+                match Self::corrupt_queue_backup_sort_key(&candidate, &prefix) {
+                    Some((timestamp, attempt)) => Some((timestamp, attempt, candidate)),
+                    None => {
+                        unparseable_backups.push(candidate);
+                        None
+                    }
+                }
+            })
+            .collect::<Vec<_>>();
+
+        if backups.len() + unparseable_backups.len() > keep && !unparseable_backups.is_empty() {
+            warn!(
+                prefix,
+                keep,
+                unparseable_count = unparseable_backups.len(),
+                "non-conforming corrupt task queue backup filenames are not eligible for retention pruning"
+            );
+        }
+
+        backups.sort_by(
+            |(left_timestamp, left_attempt, left_path),
+             (right_timestamp, right_attempt, right_path)| {
+                right_timestamp
+                    .cmp(left_timestamp)
+                    .then_with(|| right_attempt.cmp(left_attempt))
+                    .then_with(|| right_path.cmp(left_path))
+            },
+        );
+
+        for (_, _, stale_path) in backups.into_iter().skip(keep) {
+            if let Err(err) = std::fs::remove_file(&stale_path) {
+                tracing::warn!(
+                    path = %stale_path.display(),
+                    error = %err,
+                    "failed to prune stale corrupt task queue backup"
+                );
+            }
+        }
     }
 
     /// Async-safe wrapper around [`Self::load`] for runtime startup paths.
@@ -263,7 +377,7 @@ impl TaskQueue {
                 );
                 tracing::error!("{message}");
                 message
-            })
+            })?
     }
 
     /// Add a new task in `queued` state.
@@ -801,20 +915,21 @@ impl TaskQueue {
                     task.payload = payload.clone();
                 }
                 if let Some(policy_patch) = &policy_patch {
-                    if let Some(max_attempts) = policy_patch.max_attempts {
-                        task.policy.max_attempts = max_attempts;
-                    }
-                    if let Some(max_total_runtime_ms) = policy_patch.max_total_runtime_ms {
-                        task.policy.max_total_runtime_ms = max_total_runtime_ms;
-                    }
-                    if let Some(max_turns) = policy_patch.max_turns {
-                        task.policy.max_turns = max_turns;
-                    }
-                    if let Some(max_run_timeout_seconds) = policy_patch.max_run_timeout_seconds {
-                        task.policy.max_run_timeout_seconds = max_run_timeout_seconds;
-                    }
                     if policy_patch.has_updates() {
                         task.policy_explicit = true;
+                        if let Some(max_attempts) = policy_patch.max_attempts {
+                            task.policy.max_attempts = max_attempts;
+                        }
+                        if let Some(max_total_runtime_ms) = policy_patch.max_total_runtime_ms {
+                            task.policy.max_total_runtime_ms = max_total_runtime_ms;
+                        }
+                        if let Some(max_turns) = policy_patch.max_turns {
+                            task.policy.max_turns = max_turns;
+                        }
+                        if let Some(max_run_timeout_seconds) = policy_patch.max_run_timeout_seconds
+                        {
+                            task.policy.max_run_timeout_seconds = max_run_timeout_seconds;
+                        }
                     }
                 }
                 if let Some(reason) = reason {
@@ -1265,6 +1380,51 @@ mod tests {
     }
 
     #[test]
+    fn test_patch_task_policy_marks_legacy_task_policy_explicit() {
+        let queue = TaskQueue::in_memory();
+        let task = queue.enqueue(serde_json::json!({"kind":"demo"}), None);
+        {
+            let mut tasks = queue.tasks.write();
+            tasks[0].policy_explicit = false;
+        }
+
+        assert!(queue.patch_task(
+            &task.id,
+            None,
+            Some(TaskPolicyPatch {
+                max_attempts: Some(3),
+                ..TaskPolicyPatch::default()
+            }),
+            None,
+        ));
+
+        let updated = queue.get(&task.id).expect("task should exist");
+        assert!(updated.policy_explicit);
+        assert_eq!(updated.policy.max_attempts, 3);
+    }
+
+    #[test]
+    fn test_patch_task_ignores_empty_policy_patch_when_other_fields_change() {
+        let queue = TaskQueue::in_memory();
+        let task = queue.enqueue(serde_json::json!({"kind":"demo"}), None);
+        {
+            let mut tasks = queue.tasks.write();
+            tasks[0].policy_explicit = false;
+        }
+
+        assert!(queue.patch_task(
+            &task.id,
+            None,
+            Some(TaskPolicyPatch::default()),
+            Some("operator note"),
+        ));
+
+        let updated = queue.get(&task.id).expect("task should exist");
+        assert!(!updated.policy_explicit);
+        assert_eq!(updated.last_error.as_deref(), Some("operator note"));
+    }
+
+    #[test]
     fn test_mark_done_requires_running_and_records_run_id() {
         let queue = TaskQueue::in_memory();
         let task = queue.enqueue(serde_json::json!({"kind":"demo"}), None);
@@ -1350,7 +1510,7 @@ mod tests {
         assert!(queue.mark_failed(&task.id, "boom"));
 
         let loaded = TaskQueue::new(Some(path));
-        loaded.load();
+        loaded.load().unwrap();
         let persisted = loaded.get(&task.id).expect("task should load");
         assert_eq!(persisted.state, TaskState::Failed);
         assert_eq!(persisted.last_error.as_deref(), Some("boom"));
@@ -1367,7 +1527,7 @@ mod tests {
         let _ = queue.claim_due(now_ms(), 1);
 
         let recovered = TaskQueue::new(Some(path));
-        recovered.load();
+        recovered.load().unwrap();
         let loaded = recovered.get(&task.id).expect("task should load");
         assert_eq!(loaded.state, TaskState::RetryWait);
         assert!(loaded.next_run_at_ms.is_some());
@@ -1383,13 +1543,285 @@ mod tests {
         let _ = queue.claim_due(now_ms(), 1);
 
         let recovered = TaskQueue::new(Some(path.clone()));
-        recovered.load();
+        recovered.load().unwrap();
 
         let persisted: Vec<DurableTask> =
             serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         assert_eq!(persisted.len(), 1);
         assert_eq!(persisted[0].state, TaskState::RetryWait);
         assert!(persisted[0].next_run_at_ms.is_some());
+    }
+
+    #[test]
+    fn test_load_defaults_missing_policy_for_existing_queue() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tasks").join("queue.json");
+        std::fs::create_dir_all(path.parent().expect("tasks directory")).unwrap();
+        let existing = serde_json::json!([{
+            "id": "existing-task",
+            "state": "queued",
+            "attempts": 0,
+            "nextRunAtMs": null,
+            "lastError": null,
+            "payload": { "kind": "demo" },
+            "createdAtMs": 1,
+            "updatedAtMs": 1,
+            "runIds": []
+        }]);
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&existing).expect("existing queue json"),
+        )
+        .unwrap();
+
+        let queue = TaskQueue::new(Some(path));
+        queue.load().expect("existing queue should load");
+        let loaded = queue.get("existing-task").expect("task should load");
+        assert!(!loaded.policy_explicit);
+        assert_eq!(loaded.policy, TaskPolicy::default());
+    }
+
+    #[test]
+    fn test_load_accepts_queue_with_policy_explicit_field() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tasks").join("queue.json");
+        std::fs::create_dir_all(path.parent().expect("tasks directory")).unwrap();
+        let current_master = serde_json::json!([{
+            "id": "task-from-current-master",
+            "state": "queued",
+            "attempts": 0,
+            "nextRunAtMs": null,
+            "lastError": null,
+            "payload": { "kind": "demo" },
+            "createdAtMs": 1,
+            "updatedAtMs": 1,
+            "runIds": [],
+            "policy": {
+                "maxAttempts": 100,
+                "maxTotalRuntimeMs": 604800000,
+                "maxTurns": 25,
+                "maxRunTimeoutSeconds": 600
+            },
+            "policyExplicit": true
+        }]);
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&current_master).expect("current queue json"),
+        )
+        .unwrap();
+
+        let queue = TaskQueue::new(Some(path.clone()));
+        queue.load().expect("current persisted queue should load");
+        let loaded = queue
+            .get("task-from-current-master")
+            .expect("task should load");
+        assert!(loaded.policy_explicit);
+        assert_eq!(loaded.policy.max_attempts, 100);
+
+        queue.flush_to_disk();
+        let persisted = std::fs::read_to_string(path).unwrap();
+        assert!(
+            persisted.contains("\"policyExplicit\": true"),
+            "queue writes must retain explicit policy metadata for API-created tasks"
+        );
+    }
+
+    #[test]
+    fn test_load_ignores_unknown_future_policy_fields() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tasks").join("queue.json");
+        std::fs::create_dir_all(path.parent().expect("tasks directory")).unwrap();
+        let queue_with_future_policy_field = serde_json::json!([{
+            "id": "task-with-future-policy-field",
+            "state": "queued",
+            "attempts": 0,
+            "nextRunAtMs": null,
+            "lastError": null,
+            "payload": { "kind": "demo" },
+            "createdAtMs": 1,
+            "updatedAtMs": 1,
+            "runIds": [],
+            "policy": {
+                "maxAttempts": 100,
+                "maxTotalRuntimeMs": 604800000,
+                "maxTurns": 25,
+                "maxRunTimeoutSeconds": 600,
+                "futureBudget": 42
+            }
+        }]);
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&queue_with_future_policy_field)
+                .expect("queue json with future policy field"),
+        )
+        .unwrap();
+
+        let queue = TaskQueue::new(Some(path));
+        queue
+            .load()
+            .expect("future policy fields should not block startup");
+        let loaded = queue
+            .get("task-with-future-policy-field")
+            .expect("task should load");
+        assert_eq!(loaded.policy.max_attempts, 100);
+    }
+
+    #[test]
+    fn test_load_rejects_unreadable_queue_with_path() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tasks").join("queue.json");
+        std::fs::create_dir_all(&path).unwrap();
+
+        let queue = TaskQueue::new(Some(path.clone()));
+        let err = queue
+            .load()
+            .expect_err("queue read failures should block startup");
+        assert!(err.contains(&path.display().to_string()), "got: {err}");
+        assert!(err.contains("Remove or repair the file"), "got: {err}");
+        assert!(queue.list().is_empty());
+    }
+
+    fn assert_corrupt_queue_backup_contains(parent: &Path, expected: &[u8]) {
+        let backup = std::fs::read_dir(parent)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|candidate| {
+                candidate
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("queue.json.corrupt."))
+            })
+            .expect("malformed queue load should write a corrupt backup");
+        assert_eq!(std::fs::read(backup).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_load_rejects_malformed_queue_with_path() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tasks").join("queue.json");
+        let parent = path.parent().expect("tasks directory");
+        std::fs::create_dir_all(parent).unwrap();
+        std::fs::write(&path, b"not json").unwrap();
+
+        let queue = TaskQueue::new(Some(path.clone()));
+        let err = queue
+            .load()
+            .expect_err("malformed queue data should block startup");
+        assert!(err.contains(&path.display().to_string()), "got: {err}");
+        assert!(err.contains("A copy was written to"), "got: {err}");
+        assert!(err.contains("Remove or repair the file"), "got: {err}");
+
+        assert_corrupt_queue_backup_contains(parent, b"not json");
+    }
+
+    #[test]
+    fn test_corrupt_queue_backups_do_not_overwrite_existing_backups() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tasks").join("queue.json");
+        std::fs::create_dir_all(path.parent().expect("tasks directory")).unwrap();
+
+        let first = TaskQueue::write_corrupt_queue_backup(&path, b"first corrupt queue")
+            .expect("first backup should be written");
+        let second = TaskQueue::write_corrupt_queue_backup(&path, b"second corrupt queue")
+            .expect("second backup should be written");
+
+        assert_ne!(first, second);
+        assert_eq!(std::fs::read(first).unwrap(), b"first corrupt queue");
+        assert_eq!(std::fs::read(second).unwrap(), b"second corrupt queue");
+    }
+
+    #[test]
+    fn test_corrupt_queue_backups_are_retention_bounded() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tasks").join("queue.json");
+        let parent = path.parent().expect("tasks directory");
+        std::fs::create_dir_all(parent).unwrap();
+        let mut latest = None;
+
+        for index in 0..(MAX_CORRUPT_QUEUE_BACKUPS + 3) {
+            latest = Some(
+                TaskQueue::write_corrupt_queue_backup(
+                    &path,
+                    format!("corrupt queue {index}").as_bytes(),
+                )
+                .expect("backup should be written"),
+            );
+        }
+
+        let backups = std::fs::read_dir(parent)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with("queue.json.corrupt."))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            backups.len() <= MAX_CORRUPT_QUEUE_BACKUPS,
+            "corrupt queue backup retention should be bounded"
+        );
+        assert!(
+            latest.expect("latest backup path").exists(),
+            "latest corrupt queue backup should be retained"
+        );
+    }
+
+    #[test]
+    fn test_corrupt_queue_backup_retention_preserves_unparseable_names() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tasks").join("queue.json");
+        let parent = path.parent().expect("tasks directory");
+        std::fs::create_dir_all(parent).unwrap();
+        let unparseable = parent.join("queue.json.corrupt.operator-note");
+        std::fs::write(&unparseable, b"manual note").unwrap();
+
+        for index in 0..(MAX_CORRUPT_QUEUE_BACKUPS + 2) {
+            TaskQueue::write_corrupt_queue_backup(
+                &path,
+                format!("corrupt queue {index}").as_bytes(),
+            )
+            .expect("backup should be written");
+        }
+
+        assert!(
+            unparseable.exists(),
+            "operator-created backup-like files should not be pruned"
+        );
+        let parseable_count = std::fs::read_dir(parent)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|candidate| {
+                TaskQueue::corrupt_queue_backup_sort_key(candidate, "queue.json.corrupt.").is_some()
+            })
+            .count();
+        assert!(
+            parseable_count <= MAX_CORRUPT_QUEUE_BACKUPS,
+            "parseable corrupt queue backups should remain retention bounded"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_load_async_rejects_malformed_queue_with_path() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tasks").join("queue.json");
+        let parent = path.parent().expect("tasks directory");
+        std::fs::create_dir_all(parent).unwrap();
+        std::fs::write(&path, b"not json").unwrap();
+
+        let queue = Arc::new(TaskQueue::new(Some(path.clone())));
+        let err = queue
+            .load_async()
+            .await
+            .expect_err("async malformed queue load should block startup");
+        assert!(err.contains(&path.display().to_string()), "got: {err}");
+        assert!(err.contains("A copy was written to"), "got: {err}");
+        assert!(err.contains("Remove or repair the file"), "got: {err}");
+
+        assert_corrupt_queue_backup_contains(parent, b"not json");
     }
 
     #[tokio::test]
@@ -1418,35 +1850,6 @@ mod tests {
     }
 
     #[test]
-    fn test_load_legacy_task_defaults_policy_explicit_false() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("tasks").join("queue.json");
-        std::fs::create_dir_all(path.parent().expect("tasks directory")).unwrap();
-        let legacy = serde_json::json!([{
-            "id": "legacy-task",
-            "state": "queued",
-            "attempts": 250,
-            "nextRunAtMs": null,
-            "lastError": null,
-            "payload": { "kind": "demo" },
-            "createdAtMs": 1,
-            "updatedAtMs": 1,
-            "runIds": []
-        }]);
-        std::fs::write(
-            &path,
-            serde_json::to_vec_pretty(&legacy).expect("legacy queue json"),
-        )
-        .unwrap();
-
-        let queue = TaskQueue::new(Some(path));
-        queue.load();
-        let loaded = queue.get("legacy-task").expect("legacy task should load");
-        assert!(!loaded.policy_explicit);
-        assert_eq!(loaded.policy, TaskPolicy::default());
-    }
-
-    #[test]
     fn test_enqueue_evicts_terminal_before_blocked() {
         let queue = TaskQueue::in_memory();
         {
@@ -1464,7 +1867,7 @@ mod tests {
                     run_ids: Vec::new(),
                     policy: TaskPolicy::default(),
                     blocked_reason: Some(TaskBlockedReason::Unknown),
-                    policy_explicit: true,
+                    policy_explicit: false,
                 });
             }
             tasks[0].id = "done-oldest".to_string();
@@ -1497,7 +1900,7 @@ mod tests {
                     run_ids: Vec::new(),
                     policy: TaskPolicy::default(),
                     blocked_reason: None,
-                    policy_explicit: true,
+                    policy_explicit: false,
                 });
             }
         }
@@ -1541,7 +1944,7 @@ mod tests {
                     run_ids: Vec::new(),
                     policy: TaskPolicy::default(),
                     blocked_reason: None,
-                    policy_explicit: true,
+                    policy_explicit: false,
                 });
             }
         }

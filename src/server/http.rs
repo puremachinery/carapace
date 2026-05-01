@@ -673,7 +673,6 @@ fn register_session_routes(
     let control_state_status = control_state.clone();
     let control_state_channels = control_state.clone();
     let control_state_config_read = control_state.clone();
-    let control_state_config_post = control_state.clone();
     let control_state_config_patch = control_state.clone();
     let control_state_onboarding_status = control_state.clone();
     let control_state_gemini_oauth_start = control_state.clone();
@@ -712,14 +711,6 @@ fn register_session_routes(
                 let state = control_state_config_read.clone();
                 async move { control::config_read_handler(State(state), connect_info, headers).await }
             })
-            .post(
-                move |connect_info: MaybeConnectInfo, headers: HeaderMap, body: Bytes| {
-                    let state = control_state_config_post.clone();
-                    async move {
-                        control::config_handler(State(state), connect_info, headers, body).await
-                    }
-                },
-            )
             .patch(
                 move |connect_info: MaybeConnectInfo, headers: HeaderMap, body: Bytes| {
                     let state = control_state_config_patch.clone();
@@ -3154,54 +3145,6 @@ mod tests {
             .unwrap();
         let response = router.oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    }
-
-    #[tokio::test]
-    async fn test_control_config_post_alias_updates_allowed_path() {
-        let (_temp, _guard) = set_temp_config_path();
-        let router = test_router(test_config());
-        let snapshot = read_control_config_snapshot(router.clone()).await;
-        let mut req_body = json!({
-            "path": "gateway.controlUi.basePath",
-            "value": "/ui-admin",
-        });
-        if let Some(hash) = snapshot["hash"].as_str() {
-            req_body["baseHash"] = json!(hash);
-        }
-
-        let req = Request::builder()
-            .method("POST")
-            .uri("/control/config")
-            .header("authorization", "Bearer test-gateway-token")
-            .header("content-type", "application/json")
-            .body(Body::from(req_body.to_string()))
-            .unwrap();
-        let response = router.oneshot(req).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn test_control_config_post_allows_legacy_non_control_ui_paths() {
-        let (_temp, _guard) = set_temp_config_path();
-        let router = test_router(test_config());
-        let snapshot = read_control_config_snapshot(router.clone()).await;
-        let mut req_body = json!({
-            "path": "gateway.port",
-            "value": 18789,
-        });
-        if let Some(hash) = snapshot["hash"].as_str() {
-            req_body["baseHash"] = json!(hash);
-        }
-
-        let req = Request::builder()
-            .method("POST")
-            .uri("/control/config")
-            .header("authorization", "Bearer test-gateway-token")
-            .header("content-type", "application/json")
-            .body(Body::from(req_body.to_string()))
-            .unwrap();
-        let response = router.oneshot(req).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

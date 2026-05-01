@@ -65,7 +65,7 @@ impl WakeResponse {
 }
 
 /// Request body for POST /hooks/agent
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentRequest {
     pub message: Option<String>,
@@ -77,12 +77,7 @@ pub struct AgentRequest {
     pub thinking: Option<String>,
     pub deliver: Option<bool>,
     pub wake_mode: Option<String>,
-    #[serde(
-        rename = "sessionKey",
-        alias = "session_scope",
-        alias = "sessionScope",
-        alias = "session_key"
-    )]
+    #[serde(rename = "sessionKey")]
     pub session_scope: Option<String>,
     pub timeout_seconds: Option<f64>,
     pub allow_unsafe_external_content: Option<bool>,
@@ -683,23 +678,44 @@ mod tests {
     }
 
     #[test]
-    fn test_agent_request_deserializes_session_key_compat() {
+    fn test_agent_request_deserializes_session_key() {
         let req: AgentRequest = serde_json::from_value(serde_json::json!({
             "message": "hello",
-            "sessionKey": "hook:legacy"
+            "sessionKey": "hook:current"
         }))
         .unwrap();
-        assert_eq!(req.session_scope.as_deref(), Some("hook:legacy"));
+        assert_eq!(req.session_scope.as_deref(), Some("hook:current"));
     }
 
     #[test]
-    fn test_agent_request_deserializes_session_scope_alias() {
-        let req: AgentRequest = serde_json::from_value(serde_json::json!({
+    fn test_agent_request_ignores_unrelated_unknown_fields() {
+        let req = serde_json::from_value::<AgentRequest>(serde_json::json!({
             "message": "hello",
-            "sessionScope": "hook:new"
+            "sessionKey": "hook:current",
+            "futureField": { "keptByClient": true }
         }))
         .unwrap();
-        assert_eq!(req.session_scope.as_deref(), Some("hook:new"));
+        assert_eq!(req.message.as_deref(), Some("hello"));
+        assert_eq!(req.session_scope.as_deref(), Some("hook:current"));
+    }
+
+    #[test]
+    fn test_agent_request_ignores_removed_session_key_aliases() {
+        for field in ["sessionScope", "session_key"] {
+            let mut value = serde_json::json!({ "message": "hello" });
+            value
+                .as_object_mut()
+                .expect("object")
+                .insert(field.to_string(), serde_json::json!("hook:old"));
+
+            let req = serde_json::from_value::<AgentRequest>(value)
+                .expect("removed session alias should not affect current request parsing");
+            assert_eq!(req.message.as_deref(), Some("hello"));
+            assert_eq!(
+                req.session_scope, None,
+                "{field} must not populate sessionKey"
+            );
+        }
     }
 
     #[test]

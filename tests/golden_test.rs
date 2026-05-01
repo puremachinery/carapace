@@ -607,7 +607,7 @@ impl SchemaValidator {
                 }
             }
             _ => {
-                // For other types, check type compatibility
+                // Other scalar types are accepted by shape.
             }
         }
     }

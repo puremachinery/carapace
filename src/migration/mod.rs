@@ -7,20 +7,16 @@ pub mod nemoclaw;
 pub mod openclaw;
 pub mod opencode;
 
-/// Add a canonical provider prefix to a bare model name for Carapace routing.
+/// Add a canonical provider prefix to an imported model name for Carapace routing.
 ///
-/// Handles:
-/// - Well-known model families: `claude-*` → `anthropic:`, `gpt-*`/`o1*`/`o3*`/`o4*`/`chatgpt-*` → `openai:`,
-///   `gemini-*`/`models/gemini-*` → `gemini:`, `anthropic.claude-*`/`amazon.titan-*`/`meta.llama*` → `bedrock:`
-/// - Deprecated slash forms: `provider/model` → `provider:model` for known providers
+/// External tools use a mix of bare model names and provider/model identifiers.
+/// Convert the known imported forms into Carapace's current provider:model form.
+/// Well-known bare model families are delegated to the current model-name helper.
 ///
 /// Unrecognized models pass through unchanged.
-pub(crate) fn prefix_bare_model(model: &str) -> String {
-    let lower = model.to_ascii_lowercase();
-
-    // Deprecated provider/model slash forms → provider:model
+pub(crate) fn prefix_imported_model(model: &str) -> String {
     if let Some((provider, rest)) = model.split_once('/') {
-        let provider_lower = provider.to_lowercase();
+        let provider_lower = provider.to_ascii_lowercase();
         match provider_lower.as_str() {
             "anthropic" => return format!("anthropic:{rest}"),
             "openai" => return format!("openai:{rest}"),
@@ -34,44 +30,11 @@ pub(crate) fn prefix_bare_model(model: &str) -> String {
             "models" if rest.to_ascii_lowercase().starts_with("gemini-") => {
                 return format!("gemini:{rest}");
             }
-            _ => {} // Not a known provider/ form, fall through to bare-name checks
+            _ => {}
         }
     }
 
-    // If it already has a provider:model colon form (no dots in prefix), don't double-prefix.
-    // Bedrock native IDs like anthropic.claude-v1:0 have dots before the colon and still
-    // need to be prefixed with bedrock:.
-    if let Some((prefix, _)) = model.split_once(':') {
-        if !prefix.contains('.') {
-            return model.to_string();
-        }
-    }
-
-    // Well-known bare model families (claude-cli before claude- to avoid mismatch)
-    if lower == "claude-cli" {
-        "claude-cli:default".to_string()
-    } else if lower.starts_with("claude-") {
-        format!("anthropic:{model}")
-    } else if lower.starts_with("gpt-")
-        || lower == "o1"
-        || lower.starts_with("o1-")
-        || lower == "o3"
-        || lower.starts_with("o3-")
-        || lower == "o4"
-        || lower.starts_with("o4-")
-        || lower.starts_with("chatgpt-")
-    {
-        format!("openai:{model}")
-    } else if lower.starts_with("gemini-") {
-        format!("gemini:{model}")
-    } else if lower.starts_with("anthropic.claude-")
-        || lower.starts_with("amazon.titan-")
-        || lower.starts_with("meta.llama")
-    {
-        format!("bedrock:{model}")
-    } else {
-        model.to_string()
-    }
+    crate::model_names::prefix_bare_model(model)
 }
 
 /// A field that was successfully mapped to Carapace config.

@@ -467,10 +467,10 @@ dependencies = [
  "json5",
  "keyring",
  "libc",
+ "mach2",
  "mdns-sd",
  "notify",
  "parking_lot",
- "pbkdf2",
  "rappct",
  "rcgen",
  "regex",
@@ -2619,16 +2619,6 @@ dependencies = [
  "base64ct",
  "rand_core 0.6.4",
  "subtle",
-]
-
-[[package]]
-name = "pbkdf2"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "112d82ceb8c5bf524d9af484d4e4970c9fd5a0cc15ba14ad93dccd28873b0629"
-dependencies = [
- "digest 0.11.2",
- "hmac",
 ]
 
 [[package]]

@@ -329,7 +329,7 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DevicePairingStore {
-    /// Version for schema migration
+    /// Store schema version.
     pub version: u32,
     /// Pending pairing requests by request_id
     #[serde(default)]

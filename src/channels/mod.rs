@@ -23,14 +23,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChannelAuthErrorKind {
     Auth,
     Transient,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ChannelAuthError {
     kind: ChannelAuthErrorKind,
@@ -38,7 +36,6 @@ pub struct ChannelAuthError {
 }
 
 impl ChannelAuthError {
-    #[allow(dead_code)]
     pub fn auth(message: impl Into<String>) -> Self {
         Self {
             kind: ChannelAuthErrorKind::Auth,
@@ -46,7 +43,6 @@ impl ChannelAuthError {
         }
     }
 
-    #[allow(dead_code)]
     pub fn transient(message: impl Into<String>) -> Self {
         Self {
             kind: ChannelAuthErrorKind::Transient,
@@ -54,18 +50,15 @@ impl ChannelAuthError {
         }
     }
 
-    #[allow(dead_code)]
     pub fn is_auth(&self) -> bool {
         self.kind == ChannelAuthErrorKind::Auth
     }
 
-    #[allow(dead_code)]
     pub fn message(&self) -> &str {
         &self.message
     }
 }
 
-#[allow(dead_code)]
 pub type ChannelAuthResult = Result<(), ChannelAuthError>;
 
 /// Connection status of a channel

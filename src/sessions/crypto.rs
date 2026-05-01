@@ -691,6 +691,10 @@ pub fn has_encrypted_payload_prefix(data: &[u8]) -> bool {
     has_prefix(data)
 }
 
+pub(crate) fn encrypted_payload_prefix() -> &'static [u8] {
+    SESSION_ENCRYPTED_PREFIX_V1
+}
+
 pub fn is_encrypted_payload(data: &[u8]) -> bool {
     if !has_encrypted_payload_prefix(data) {
         return false;

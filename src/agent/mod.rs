@@ -211,7 +211,7 @@ pub struct AgentConfig {
     /// When `true`, exfiltration-sensitive tools (those that send data to
     /// external services) are blocked at both the definition and dispatch
     /// levels.  This prevents prompt-injection attacks from silently
-    /// exfiltrating user data.  Default: `false` (backward-compatible).
+    /// exfiltrating user data. Default: `false`.
     pub exfiltration_guard: bool,
     /// Prompt guard configuration for defense-in-depth filtering.
     pub prompt_guard: prompt_guard::PromptGuardConfig,
@@ -276,10 +276,7 @@ pub fn apply_agent_config_from_settings(
     };
 
     // Global prompt guard/output sanitizer defaults
-    if let Some(pg_value) = agents
-        .get("promptGuard")
-        .or_else(|| agents.get("prompt_guard"))
-    {
+    if let Some(pg_value) = agents.get("promptGuard") {
         match serde_json::from_value(pg_value.clone()) {
             Ok(pg_cfg) => {
                 config.prompt_guard = pg_cfg;
@@ -290,9 +287,7 @@ pub fn apply_agent_config_from_settings(
         }
     }
 
-    let output_value = agents
-        .get("outputSanitizer")
-        .or_else(|| agents.get("output_sanitizer"));
+    let output_value = agents.get("outputSanitizer");
     if let Some(os_value) = output_value {
         match serde_json::from_value(os_value.clone()) {
             Ok(os_cfg) => {
@@ -418,21 +413,13 @@ fn apply_agent_overrides(config: &mut AgentConfig, agent_obj: &serde_json::Map<S
         }
     }
 
-    if let Some(max_turns) = agent_obj
-        .get("maxTurns")
-        .or_else(|| agent_obj.get("max_turns"))
-        .and_then(|v| v.as_u64())
-    {
+    if let Some(max_turns) = agent_obj.get("maxTurns").and_then(|v| v.as_u64()) {
         if max_turns > 0 {
             config.max_turns = max_turns.min(u32::MAX as u64) as u32;
         }
     }
 
-    if let Some(max_tokens) = agent_obj
-        .get("maxTokens")
-        .or_else(|| agent_obj.get("max_tokens"))
-        .and_then(|v| v.as_u64())
-    {
+    if let Some(max_tokens) = agent_obj.get("maxTokens").and_then(|v| v.as_u64()) {
         if max_tokens > 0 {
             config.max_tokens = max_tokens.min(u32::MAX as u64) as u32;
         }
@@ -455,39 +442,25 @@ fn apply_agent_overrides(config: &mut AgentConfig, agent_obj: &serde_json::Map<S
         }
     }
 
-    if let Some(exfiltration_guard) = agent_obj
-        .get("exfiltrationGuard")
-        .or_else(|| agent_obj.get("exfiltration_guard"))
-        .and_then(|v| v.as_bool())
-    {
+    if let Some(exfiltration_guard) = agent_obj.get("exfiltrationGuard").and_then(|v| v.as_bool()) {
         config.exfiltration_guard = exfiltration_guard;
     }
 
-    if let Some(pg_value) = agent_obj
-        .get("promptGuard")
-        .or_else(|| agent_obj.get("prompt_guard"))
-    {
+    if let Some(pg_value) = agent_obj.get("promptGuard") {
         match serde_json::from_value(pg_value.clone()) {
             Ok(pg_cfg) => config.prompt_guard = pg_cfg,
             Err(e) => warn!(error = %e, "invalid agent promptGuard config; using defaults"),
         }
     }
 
-    if let Some(os_value) = agent_obj
-        .get("outputSanitizer")
-        .or_else(|| agent_obj.get("output_sanitizer"))
-    {
+    if let Some(os_value) = agent_obj.get("outputSanitizer") {
         match serde_json::from_value(os_value.clone()) {
             Ok(os_cfg) => config.output_sanitizer = os_cfg,
             Err(e) => warn!(error = %e, "invalid agent outputSanitizer config; using defaults"),
         }
     }
 
-    if let Some(sandbox_value) = agent_obj
-        .get("sandbox")
-        .or_else(|| agent_obj.get("processSandbox"))
-        .or_else(|| agent_obj.get("process_sandbox"))
-    {
+    if let Some(sandbox_value) = agent_obj.get("sandbox") {
         config.process_sandbox = sandbox::ProcessSandboxConfig::from_config(Some(sandbox_value));
     }
 
@@ -893,7 +866,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_agent_model_legacy_model_no_routes() {
+    fn resolve_agent_model_defaults_model_without_routes() {
         let settings = serde_json::json!({
             "agents": {
                 "defaults": { "model": "openai:gpt-4o" }

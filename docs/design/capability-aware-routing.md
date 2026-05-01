@@ -267,7 +267,7 @@ proposed `#[non_exhaustive]` on it. Pick one:
 - Closed and fixed: drop `#[non_exhaustive]`, accept that adding a
   variant is a breaking change for any future external consumer (likely
   fine for a gateway-internal type).
-- Open and forward-compatible: keep `#[non_exhaustive]` but drop the
+- Open to future variants: keep `#[non_exhaustive]` but drop the
   "closed" framing, and document that downstream consumers must use a
   wildcard arm.
 

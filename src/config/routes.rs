@@ -362,7 +362,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_compat_model_only_no_routes_map() {
+    fn resolve_defaults_model_without_routes_map() {
         let routes = HashMap::new();
         let inputs = RouteResolutionInputs {
             defaults: SelectorLevel {

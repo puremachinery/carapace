@@ -27,14 +27,10 @@ service HTTP port 18789. Adjust paths/ports for your deployment.
 - Channel activity features are configured under `channels.defaults.features.*`
   and `channels.<channel>.features.*`.
 - Today those channel-specific activity settings are implemented for built-in
-  native channels; external/plugin channel entries are accepted for forward
-  compatibility but may be ignored until plugin channel activity capabilities
-  are added.
-- `session.typingMode` and `session.typingIntervalSeconds` remain as a
-  legacy/global fallback for typing only when you explicitly set them in
-  config; that fallback applies across all typing-capable channels unless you
-  override it with `channels.defaults.features.typing` or
-  `channels.<channel>.features.typing`. Prefer `channels.*.features.typing`.
+  native channels; external/plugin channel entries may be ignored until plugin
+  channel activity capabilities are added.
+- Configure typing indicators with `channels.defaults.features.typing` or
+  `channels.<channel>.features.typing`.
 
 ## Signal (signal-cli-rest-api)
 

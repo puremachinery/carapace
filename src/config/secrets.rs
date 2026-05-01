@@ -3,9 +3,8 @@
 //! Provides AES-256-GCM encryption for storing sensitive configuration values
 //! (API keys, tokens, etc.) in encrypted form on disk.
 //!
-//! Encrypted values use versioned envelopes:
-//! - `enc:v1:BASE64_NONCE:BASE64_CIPHERTEXT:BASE64_SALT` for legacy PBKDF2
-//! - `enc:v2:BASE64_NONCE:BASE64_CIPHERTEXT:BASE64_SALT` for current Argon2id
+//! Encrypted values use the current `enc:v2:BASE64_NONCE:BASE64_CIPHERTEXT:BASE64_SALT`
+//! envelope with Argon2id-derived keys.
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
@@ -15,11 +14,10 @@ use thiserror::Error;
 use zeroize::Zeroizing;
 
 use crate::crypto::{
-    decode_b64_fixed, decrypt_aead_blob, derive_key_argon2id, derive_key_pbkdf2_sha256,
-    encrypt_aead_blob, CryptoEnvelopeError, PasswordKdfError, PASSWORD_DERIVED_KEY_LEN,
+    decode_b64_fixed, decrypt_aead_blob, derive_key_argon2id, encrypt_aead_blob,
+    CryptoEnvelopeError, PasswordKdfError, PASSWORD_DERIVED_KEY_LEN,
 };
 
-const ENC_PREFIX_V1: &str = "enc:v1:";
 const ENC_PREFIX_V2: &str = "enc:v2:";
 
 /// Salt length in bytes
@@ -61,7 +59,6 @@ pub enum SecretError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SecretEnvelopeVersion {
-    V1,
     V2,
 }
 
@@ -72,15 +69,12 @@ impl SecretEnvelopeVersion {
 
     pub(crate) fn prefix(self) -> &'static str {
         match self {
-            Self::V1 => ENC_PREFIX_V1,
             Self::V2 => ENC_PREFIX_V2,
         }
     }
 
     pub(crate) fn parse_prefix(value: &str) -> Option<Self> {
-        if value.starts_with(ENC_PREFIX_V1) {
-            Some(Self::V1)
-        } else if value.starts_with(ENC_PREFIX_V2) {
+        if value.starts_with(ENC_PREFIX_V2) {
             Some(Self::V2)
         } else {
             None
@@ -93,7 +87,6 @@ impl SecretEnvelopeVersion {
         salt: &[u8; SALT_LEN],
     ) -> Result<[u8; PASSWORD_DERIVED_KEY_LEN], PasswordKdfError> {
         match self {
-            Self::V1 => derive_key_pbkdf2_sha256(password, salt),
             Self::V2 => derive_key_argon2id(password, salt),
         }
     }
@@ -149,10 +142,10 @@ impl SecretStore {
 
     /// Create a `SecretStore` from an existing password and salt.
     ///
-    /// This compatibility-preserving constructor never panics and never
-    /// returns `Result`. If current-key derivation fails, the returned store
-    /// retains the initialization error and surfaces it from `encrypt()` /
-    /// `decrypt()` rather than silently using a bogus key.
+    /// This constructor never panics and never returns `Result`. If current-key
+    /// derivation fails, the returned store retains the initialization error and
+    /// surfaces it from `encrypt()` / `decrypt()` rather than silently using a
+    /// bogus key.
     pub fn from_password_and_salt(password: &[u8], salt: &[u8; SALT_LEN]) -> Self {
         match Self::try_from_password_and_salt(password, salt) {
             Ok(store) => store,
@@ -280,8 +273,8 @@ impl SecretStore {
         )
     }
 
-    /// Decrypt a supported `enc:v1:` or `enc:v2:` string back to plaintext
-    /// when it matches this store's current salt and write version.
+    /// Decrypt a supported `enc:v2:` string back to plaintext when it matches
+    /// this store's current salt and write version.
     ///
     /// This direct path fails closed with `DecryptionFailed` for version or
     /// salt mismatches as well as wrong-password/corrupt-data cases; use
@@ -334,18 +327,17 @@ pub(crate) struct EncryptedParts {
     pub(crate) salt: [u8; SALT_LEN],
 }
 
-/// Parse a supported `enc:v1:NONCE:CIPHERTEXT:SALT` or
-/// `enc:v2:NONCE:CIPHERTEXT:SALT` string into its components.
+/// Parse a supported `enc:v2:NONCE:CIPHERTEXT:SALT` string into its components.
 pub(crate) fn parse_encrypted(encrypted: &str) -> Result<EncryptedParts, SecretError> {
     let Some(version) = SecretEnvelopeVersion::parse_prefix(encrypted) else {
         let preview: String = encrypted.chars().take(10).collect();
         let message = if encrypted.starts_with("enc:v") {
             format!(
-                "unsupported enc version; expected enc:v1 or enc:v2, got '{}'",
+                "unsupported enc version; expected enc:v2, got '{}'",
                 preview
             )
         } else {
-            format!("expected enc:v1 or enc:v2 prefix, got '{}'", preview)
+            format!("expected enc:v2 prefix, got '{}'", preview)
         };
         return Err(SecretError::BadFormat(message));
     };
@@ -444,6 +436,99 @@ pub fn is_encrypted(value: &str) -> bool {
     SecretEnvelopeVersion::parse_prefix(value).is_some()
 }
 
+fn looks_like_encrypted_value(value: &str) -> bool {
+    SecretEnvelopeVersion::parse_prefix(value).is_some()
+        || unsupported_encrypted_prefix(value).is_some()
+}
+
+/// Unsupported encrypted envelope found while scanning config values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnsupportedEncryptedValue {
+    pub(crate) path: String,
+    pub(crate) prefix: String,
+}
+
+/// Config scan exceeded the bounded recursion depth.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConfigSecretScanDepthExceeded {
+    pub(crate) path: String,
+    pub(crate) max_depth: usize,
+}
+
+/// Return all `enc:v*` values that look encrypted but are not supported.
+pub(crate) fn find_unsupported_encrypted_values(
+    config: &Value,
+) -> Result<Vec<UnsupportedEncryptedValue>, ConfigSecretScanDepthExceeded> {
+    let mut unsupported = Vec::new();
+    collect_unsupported_encrypted_inner(config, ".", 0, &mut unsupported)?;
+    Ok(unsupported)
+}
+
+fn collect_unsupported_encrypted_inner(
+    config: &Value,
+    path: &str,
+    depth: usize,
+    unsupported: &mut Vec<UnsupportedEncryptedValue>,
+) -> Result<(), ConfigSecretScanDepthExceeded> {
+    if depth > MAX_SCAN_DEPTH {
+        tracing::warn!(
+            "find_unsupported_encrypted_values: maximum recursion depth ({}) exceeded, stopping scan",
+            MAX_SCAN_DEPTH
+        );
+        return Err(ConfigSecretScanDepthExceeded {
+            path: path.to_string(),
+            max_depth: MAX_SCAN_DEPTH,
+        });
+    }
+
+    match config {
+        Value::String(s) => {
+            if let Some(prefix) = unsupported_encrypted_prefix(s) {
+                unsupported.push(UnsupportedEncryptedValue {
+                    path: path.to_string(),
+                    prefix,
+                });
+            }
+            Ok(())
+        }
+        Value::Object(map) => {
+            for (key, value) in map {
+                let child_path = if path == "." {
+                    format!(".{key}")
+                } else {
+                    format!("{path}.{key}")
+                };
+                collect_unsupported_encrypted_inner(value, &child_path, depth + 1, unsupported)?;
+            }
+            Ok(())
+        }
+        Value::Array(arr) => {
+            for (index, value) in arr.iter().enumerate() {
+                collect_unsupported_encrypted_inner(
+                    value,
+                    &format!("{path}[{index}]"),
+                    depth + 1,
+                    unsupported,
+                )?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn unsupported_encrypted_prefix(value: &str) -> Option<String> {
+    if SecretEnvelopeVersion::parse_prefix(value).is_some() || !value.starts_with("enc:v") {
+        return None;
+    }
+
+    let mut segments = value.split(':');
+    match (segments.next(), segments.next()) {
+        (Some("enc"), Some(version)) if version.starts_with('v') => Some(format!("enc:{version}")),
+        _ => Some("enc:v".to_string()),
+    }
+}
+
 /// Maximum recursion depth for `resolve_secrets` to prevent stack overflow
 /// on programmatically constructed JSON trees.
 const MAX_RESOLVE_DEPTH: usize = 64;
@@ -453,24 +538,16 @@ const MAX_SCAN_DEPTH: usize = 64;
 
 /// Check if any values in the config tree are encrypted.
 pub fn contains_encrypted_values(config: &Value) -> bool {
-    contains_encrypted_inner(config, 0)
-}
-
-fn contains_encrypted_inner(config: &Value, depth: usize) -> bool {
-    if depth > MAX_SCAN_DEPTH {
-        tracing::warn!(
-            "contains_encrypted_values: maximum recursion depth ({}) exceeded, stopping scan",
-            MAX_SCAN_DEPTH
-        );
-        return false;
+    let mut pending = vec![config];
+    while let Some(value) = pending.pop() {
+        match value {
+            Value::String(s) if looks_like_encrypted_value(s) => return true,
+            Value::Object(map) => pending.extend(map.values()),
+            Value::Array(arr) => pending.extend(arr.iter()),
+            _ => {}
+        }
     }
-
-    match config {
-        Value::String(s) => is_encrypted(s),
-        Value::Object(map) => map.values().any(|v| contains_encrypted_inner(v, depth + 1)),
-        Value::Array(arr) => arr.iter().any(|v| contains_encrypted_inner(v, depth + 1)),
-        _ => false,
-    }
+    false
 }
 
 /// Replace encrypted values with nulls in-place.
@@ -489,7 +566,7 @@ fn scrub_encrypted_inner(config: &mut Value, depth: usize) {
 
     match config {
         Value::String(s) => {
-            if is_encrypted(s) {
+            if looks_like_encrypted_value(s) {
                 *config = Value::Null;
             }
         }
@@ -507,8 +584,7 @@ fn scrub_encrypted_inner(config: &mut Value, depth: usize) {
     }
 }
 
-/// Walk a JSON value tree and decrypt all supported `enc:v1:` / `enc:v2:`
-/// strings in-place.
+/// Walk a JSON value tree and decrypt all supported `enc:v2:` strings in-place.
 ///
 /// Uses the password to re-derive keys from embedded salts so that values
 /// encrypted with different salts can all be resolved.
@@ -827,15 +903,6 @@ mod tests {
     }
 
     #[test]
-    fn test_decrypt_rekey_legacy_v1_correct_password() {
-        let password = random_password();
-        let store = SecretStore::for_decrypt(&password);
-        let encrypted = encrypt_with_version(SecretEnvelopeVersion::V1, &password, "hello-v1");
-        let decrypted = store.decrypt_rekey(&encrypted, &password).unwrap();
-        assert_eq!(decrypted, "hello-v1");
-    }
-
-    #[test]
     fn test_for_decrypt_store_rejects_direct_encrypt_and_decrypt() {
         let password = random_password();
         let store = SecretStore::for_decrypt(&password);
@@ -854,20 +921,6 @@ mod tests {
             "crafted",
         );
         assert_eq!(store.decrypt(&crafted), Err(SecretError::DecryptionFailed));
-    }
-
-    #[test]
-    fn test_decrypt_rejects_legacy_v1_on_current_v2_store_even_with_matching_salt() {
-        let password = random_password();
-        let encrypted = encrypt_with_version(SecretEnvelopeVersion::V1, &password, "hello-v1");
-        let parts = parse_encrypted(&encrypted).expect("parse v1 envelope");
-        let current_store =
-            SecretStore::try_from_password_and_salt(&password, &parts.salt).expect("current store");
-
-        assert_eq!(
-            current_store.decrypt(&encrypted),
-            Err(SecretError::DecryptionFailed)
-        );
     }
 
     #[test]
@@ -923,6 +976,17 @@ mod tests {
     fn test_bad_format_unsupported_version() {
         let store = new_test_store();
         let result = store.decrypt("enc:v3:aaa:bbb:ccc");
+        assert!(matches!(
+            result,
+            Err(SecretError::BadFormat(message))
+                if message.contains("unsupported enc version")
+        ));
+    }
+
+    #[test]
+    fn test_enc_v1_secret_rejected() {
+        let store = new_test_store();
+        let result = store.decrypt("enc:v1:aaa:bbb:ccc");
         assert!(matches!(
             result,
             Err(SecretError::BadFormat(message))
@@ -1001,7 +1065,6 @@ mod tests {
 
     #[test]
     fn test_is_encrypted_true() {
-        assert!(is_encrypted("enc:v1:abc:def:ghi"));
         assert!(is_encrypted("enc:v2:abc:def:ghi"));
     }
 
@@ -1010,7 +1073,45 @@ mod tests {
         assert!(!is_encrypted("plain-text-value"));
         assert!(!is_encrypted(""));
         assert!(!is_encrypted("enc:v3:abc:def:ghi"));
-        assert!(!is_encrypted("ENC:V1:abc:def:ghi"));
+        assert!(!is_encrypted("ENC:V2:abc:def:ghi"));
+    }
+
+    #[test]
+    fn test_find_unsupported_encrypted_values_reports_paths_and_prefixes() {
+        let config = json!({
+            "anthropic": { "apiKey": "enc:v1:aaa:bbb:ccc" },
+            "openai": { "apiKey": "enc:v3:ddd:eee:fff" }
+        });
+
+        let mut unsupported = find_unsupported_encrypted_values(&config).unwrap();
+        unsupported.sort_by(|left, right| left.path.cmp(&right.path));
+
+        assert_eq!(
+            unsupported,
+            vec![
+                UnsupportedEncryptedValue {
+                    path: ".anthropic.apiKey".to_string(),
+                    prefix: "enc:v1".to_string(),
+                },
+                UnsupportedEncryptedValue {
+                    path: ".openai.apiKey".to_string(),
+                    prefix: "enc:v3".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_find_unsupported_encrypted_values_reports_depth_exceeded() {
+        let mut config = json!("enc:v1:aaa:bbb:ccc");
+        for index in 0..=MAX_SCAN_DEPTH {
+            config = json!({ format!("level{index}"): config });
+        }
+
+        let err = find_unsupported_encrypted_values(&config).unwrap_err();
+
+        assert!(err.path.contains(".level"));
+        assert_eq!(err.max_depth, MAX_SCAN_DEPTH);
     }
 
     #[test]
@@ -1118,6 +1219,15 @@ mod tests {
         let encrypted = store.encrypt("secret").unwrap();
 
         let mut config = json!({ "apiKey": encrypted, "name": "bot" });
+        scrub_encrypted_values(&mut config);
+
+        assert!(config["apiKey"].is_null());
+        assert_eq!(config["name"], "bot");
+    }
+
+    #[test]
+    fn test_scrub_encrypted_values_replaces_unsupported_envelope_with_null() {
+        let mut config = json!({ "apiKey": "enc:v1:aaa:bbb:ccc", "name": "bot" });
         scrub_encrypted_values(&mut config);
 
         assert!(config["apiKey"].is_null());
@@ -1315,20 +1425,6 @@ mod tests {
     }
 
     #[test]
-    fn test_pbkdf2_known_vector() {
-        let passphrase = sha2::Sha256::digest(b"carapace-secret-v1-kat-passphrase");
-        let salt = sha2::Sha256::digest(b"carapace-secret-v1-kat-salt");
-        // Expected output generated independently via Python hashlib.pbkdf2_hmac:
-        // python3 -c 'import hashlib; p=hashlib.sha256(b"carapace-secret-v1-kat-passphrase").digest(); s=hashlib.sha256(b"carapace-secret-v1-kat-salt").digest()[:16]; print(hashlib.pbkdf2_hmac("sha256", p, s, 600000, 32).hex())'
-        let expected = "fba539b769b63cfb5a65da14de9267f70c7fa022345df609c146231d5668f5a6";
-        let salt_bytes: &[u8; SALT_LEN] = (&salt[..SALT_LEN]).try_into().unwrap();
-        let key = derive_key_pbkdf2_sha256(passphrase.as_slice(), salt_bytes).unwrap();
-        assert_eq!(hex::encode(key), expected);
-        let key2 = derive_key_pbkdf2_sha256(passphrase.as_slice(), salt_bytes).unwrap();
-        assert_eq!(key, key2, "PBKDF2 must be deterministic");
-    }
-
-    #[test]
     fn test_current_argon2id_known_answer_vector() {
         let passphrase = sha2::Sha256::digest(b"carapace-secret-kat-passphrase");
         let salt = sha2::Sha256::digest(b"carapace-secret-kat-salt");
@@ -1343,18 +1439,6 @@ mod tests {
     }
 
     #[test]
-    fn test_argon2id_current_key_differs_from_legacy_pbkdf2() {
-        let password = random_password();
-        let salt = random_salt();
-        let legacy = derive_key_pbkdf2_sha256(&password, &salt).unwrap();
-        let current = derive_current_key(&password, &salt);
-        assert_ne!(
-            legacy, current,
-            "legacy PBKDF2 and current Argon2id derivation must not alias"
-        );
-    }
-
-    #[test]
     fn test_contains_encrypted_values_detects_ciphertext() {
         let store = new_test_store();
         let encrypted = store.encrypt("secret").unwrap();
@@ -1364,6 +1448,13 @@ mod tests {
 
         let plain = json!({ "apiKey": "plaintext", "name": "bot" });
         assert!(!contains_encrypted_values(&plain));
+    }
+
+    #[test]
+    fn test_contains_encrypted_values_detects_unsupported_envelope() {
+        let config = json!({ "apiKey": "enc:v1:aaa:bbb:ccc", "name": "bot" });
+
+        assert!(contains_encrypted_values(&config));
     }
 
     #[test]

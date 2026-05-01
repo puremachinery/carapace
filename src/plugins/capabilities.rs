@@ -269,7 +269,7 @@ pub struct SsrfConfig {
 /// - IPv6 localhost: ::1
 /// - Cloud metadata endpoints (169.254.169.254, fd00:ec2::254)
 ///
-/// # Tailscale Compatibility
+/// # Tailscale Deployments
 ///
 /// Tailscale uses addresses from 100.64.0.0/10 (CGNAT range). By default,
 /// these are blocked to prevent SSRF attacks. If your deployment runs on

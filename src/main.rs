@@ -807,10 +807,14 @@ async fn launch_non_tls_server(
 /// Load configuration from disk and validate it against the schema.
 /// Returns the config on success, or an error if schema validation finds errors.
 fn load_and_validate_config() -> Result<Value, Box<dyn std::error::Error>> {
-    let cfg = config::load_config().unwrap_or_else(|e| {
-        warn!("Failed to load config: {}, using defaults", e);
-        Value::Object(serde_json::Map::new())
-    });
+    let cfg = match config::load_config() {
+        Ok(cfg) => cfg,
+        Err(err @ config::ConfigError::ValidationError { .. }) => return Err(Box::new(err)),
+        Err(err) => {
+            warn!("Failed to load config: {}, using defaults", err);
+            Value::Object(serde_json::Map::new())
+        }
+    };
 
     let schema_issues = config::schema::validate_schema(&cfg);
     let mut has_errors = false;
