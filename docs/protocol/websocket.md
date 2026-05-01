@@ -383,13 +383,6 @@ extending that set.
 | `missing_model` | Resolution found no `route` or `model` for the request | No |
 | `provider_not_configured` | No LLM provider is configured. Operator must set an API key or auth profile; not retryable. | No |
 
-### Reserved codes (documented but not yet emitted)
-
-| Code | Description |
-|------|-------------|
-| `not_linked` | Channel not configured. Constant `ERROR_NOT_LINKED` is reserved in `src/server/ws/mod.rs`; no live emit site yet. |
-| `agent_timeout` | Agent exceeded timeout. Reserved for clients; no live emit at the top-level `error.code` position currently. |
-
 ### Codes that are NOT top-level `error.code` values
 
 These appear in nested positions or are emitted by non-WebSocket

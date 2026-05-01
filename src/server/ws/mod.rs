@@ -76,14 +76,6 @@ const ERROR_INVALID_REQUEST: &str = "invalid_request";
 const ERROR_NOT_PAIRED: &str = "not_paired";
 const ERROR_UNAVAILABLE: &str = "unavailable";
 const ERROR_RATE_LIMITED: &str = "rate_limited";
-/// Documented in `docs/protocol/websocket.md` and exercised by the
-/// `tests/golden/ws/errors.json` schema, but not yet emitted from any
-/// live Rust code path. Reserved for future "channel not configured"
-/// errors. Kept here so the wire-code set is discoverable from one
-/// place and a future emit site can `use ERROR_NOT_LINKED` rather than
-/// re-introducing a string literal.
-#[allow(dead_code)]
-const ERROR_NOT_LINKED: &str = "not_linked";
 // Note: Node doesn't use ERROR_FORBIDDEN - use ERROR_INVALID_REQUEST for auth errors
 
 /// Wire codes whose `retryable` field is `true` in the error response.
@@ -1587,8 +1579,6 @@ struct NodeSession {
 #[derive(Debug)]
 struct PendingInvoke {
     node_id: String,
-    #[allow(dead_code)] // populated, read later
-    command: String,
     responder: oneshot::Sender<NodeInvokeResult>,
 }
 
@@ -1671,12 +1661,6 @@ impl NodeRegistry {
         self.nodes_by_id.values().cloned().collect()
     }
 
-    fn conn_id_for_node(&self, node_id: &str) -> Option<String> {
-        self.nodes_by_id
-            .get(node_id)
-            .map(|session| session.conn_id.clone())
-    }
-
     fn insert_pending_invoke(&mut self, invoke_id: String, pending: PendingInvoke) {
         self.pending_invokes.insert(invoke_id, pending);
     }
@@ -1722,12 +1706,10 @@ struct ConnectParams {
     device: Option<DeviceIdentity>,
     #[serde(default)]
     auth: Option<AuthParams>,
-    #[serde(default)]
-    #[allow(dead_code)] // deserialized from client
-    locale: Option<String>,
-    #[serde(default)]
-    #[allow(dead_code)] // deserialized from client
-    user_agent: Option<String>,
+    #[serde(default, rename = "locale")]
+    _locale: Option<String>,
+    #[serde(default, rename = "userAgent")]
+    _user_agent: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -3595,55 +3577,6 @@ pub fn broadcast_talk_mode(state: &WsServerState, enabled: bool, channel: Option
         payload["channel"] = json!(ch);
     }
     broadcast_event(state, "talk.mode", payload);
-}
-
-/// Send an event to a specific node connection (for node.invoke.request).
-/// This is used to request a node to invoke a command.
-///
-/// # Arguments
-/// * `state` - Server state
-/// * `node_id` - Target node identifier
-/// * `invoke_id` - Invocation identifier
-/// * `command` - Command to invoke
-/// * `args` - Command arguments
-/// * `cwd` - Optional working directory
-/// * `env` - Optional environment variables
-/// * `timeout_ms` - Optional timeout in milliseconds
-///
-/// Returns true if the event was sent successfully
-#[allow(clippy::too_many_arguments)]
-pub fn send_node_invoke_request(
-    state: &WsServerState,
-    node_id: &str,
-    invoke_id: &str,
-    command: &str,
-    args: Vec<String>,
-    cwd: Option<&str>,
-    env: Option<HashMap<String, String>>,
-    timeout_ms: Option<u64>,
-) -> bool {
-    let node_registry = state.node_registry.lock();
-    let Some(conn_id) = node_registry.conn_id_for_node(node_id) else {
-        return false;
-    };
-    drop(node_registry);
-
-    let mut payload = json!({
-        "id": invoke_id,
-        "command": command,
-        "args": args
-    });
-    if let Some(c) = cwd {
-        payload["cwd"] = json!(c);
-    }
-    if let Some(e) = env {
-        payload["env"] = serde_json::to_value(e).unwrap_or(json!({}));
-    }
-    if let Some(t) = timeout_ms {
-        payload["timeoutMs"] = json!(t);
-    }
-
-    send_event_to_connection(state, &conn_id, "node.invoke.request", payload)
 }
 
 fn send_response(

@@ -392,39 +392,6 @@ fn check_origin(
     }
 }
 
-/// CSRF middleware shared state
-#[derive(Clone)]
-pub struct CsrfLayer {
-    store: CsrfTokenStore,
-}
-
-impl CsrfLayer {
-    /// Create a new CSRF layer with default configuration
-    pub fn new() -> Self {
-        Self {
-            store: CsrfTokenStore::new(CsrfConfig::default()),
-        }
-    }
-
-    /// Create a new CSRF layer with custom configuration
-    pub fn with_config(config: CsrfConfig) -> Self {
-        Self {
-            store: CsrfTokenStore::new(config),
-        }
-    }
-
-    /// Get the token store
-    pub fn store(&self) -> &CsrfTokenStore {
-        &self.store
-    }
-}
-
-impl Default for CsrfLayer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Determine if CSRF validation is needed for this request.
 ///
 /// Returns `true` when the HTTP method is state-changing (POST, PUT, DELETE,
@@ -623,16 +590,6 @@ pub fn ensure_csrf_cookies(
     Ok(set_cookies)
 }
 
-/// Convenience function to create CSRF layer
-pub fn layer() -> CsrfLayer {
-    CsrfLayer::new()
-}
-
-/// Convenience function to create CSRF layer with config
-pub fn layer_with_config(config: CsrfConfig) -> CsrfLayer {
-    CsrfLayer::with_config(config)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -777,12 +734,6 @@ mod tests {
     }
 
     #[test]
-    fn test_layer_creation() {
-        let _layer = layer();
-        let _layer_with_config = layer_with_config(CsrfConfig::default());
-    }
-
-    #[test]
     fn test_default_config() {
         let config = CsrfConfig::default();
         assert_eq!(config.cookie_name, "__Host-csrf");
@@ -922,12 +873,5 @@ mod tests {
 
         assert_eq!(csrf_cookie_name(&config), "csrf");
         assert_eq!(session_cookie_name(&config), "session");
-    }
-
-    #[test]
-    fn test_csrf_layer_store_access() {
-        let layer = CsrfLayer::new();
-        let token = layer.store().generate_token("test-session").unwrap();
-        assert!(!token.value.is_empty());
     }
 }

@@ -9,24 +9,10 @@
 //! Integration tests (against a running gateway) are separate and gated behind
 //! a feature flag since they require a live server.
 
-#![allow(dead_code)] // Many fields are used only for validation via deserialization
-
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
-
-/// Root structure for golden trace files
-#[derive(Debug, Deserialize)]
-struct GoldenTrace {
-    #[serde(rename = "$schema")]
-    schema: Option<String>,
-    description: String,
-    #[serde(default)]
-    source_files: Vec<String>,
-    #[serde(flatten)]
-    extra: HashMap<String, Value>,
-}
 
 /// WebSocket handshake trace structure
 #[derive(Debug, Deserialize)]
@@ -36,7 +22,6 @@ struct WsHandshakeTrace {
     description: String,
     source_files: Vec<String>,
     protocol_version: u32,
-    notes: Vec<String>,
     scenarios: Vec<WsScenario>,
     connect_params_schema: Value,
     hello_ok_schema: Value,
@@ -47,17 +32,12 @@ struct WsScenario {
     name: String,
     description: String,
     #[serde(default)]
-    source_reference: Option<String>,
     steps: Vec<WsStep>,
-    #[serde(default)]
-    notes: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct WsStep {
     action: String,
-    #[serde(flatten)]
-    extra: HashMap<String, Value>,
 }
 
 /// WebSocket messages trace structure
@@ -85,12 +65,6 @@ struct WsEventsTrace {
 #[derive(Debug, Deserialize)]
 struct EventDefinition {
     description: String,
-    #[serde(default)]
-    source: Option<String>,
-    #[serde(default)]
-    payload_schema: Option<Value>,
-    #[serde(flatten)]
-    extra: HashMap<String, Value>,
 }
 
 /// WebSocket errors trace structure
@@ -102,8 +76,6 @@ struct WsErrorsTrace {
     source_files: Vec<String>,
     error_codes: ErrorCodesSection,
     close_codes: CloseCodesSection,
-    #[serde(flatten)]
-    extra: HashMap<String, Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -115,8 +87,6 @@ struct ErrorCodesSection {
 
 #[derive(Debug, Deserialize)]
 struct CloseCodesSection {
-    #[serde(default)]
-    notes: Option<Vec<String>>,
     codes: HashMap<String, Value>,
 }
 
@@ -124,8 +94,6 @@ struct CloseCodesSection {
 struct ErrorCodeDef {
     description: String,
     retryable: bool,
-    #[serde(flatten)]
-    extra: HashMap<String, Value>,
 }
 
 /// HTTP endpoint trace structure
@@ -135,12 +103,6 @@ struct HttpEndpointTrace {
     schema: Option<String>,
     description: String,
     source_files: Vec<String>,
-    #[serde(default)]
-    endpoint: Option<String>,
-    #[serde(default)]
-    method: Option<String>,
-    #[serde(flatten)]
-    extra: HashMap<String, Value>,
 }
 
 // ============================================================================
@@ -298,11 +260,16 @@ fn test_ws_messages_trace_valid() {
         serde_json::from_str(&content).expect("Failed to parse messages.json");
 
     assert_eq!(trace.schema.as_deref(), Some("golden-trace-v1"));
+    assert!(
+        !trace.description.is_empty(),
+        "description should not be empty"
+    );
     assert!(!trace.source_files.is_empty());
     assert!(
         !trace.frame_types.is_empty(),
         "frame_types should not be empty"
     );
+    assert!(trace.methods.is_object(), "methods should be an object");
 
     // Validate frame types include req, res, event
     assert!(
@@ -327,6 +294,10 @@ fn test_ws_events_trace_valid() {
     let trace: WsEventsTrace = serde_json::from_str(&content).expect("Failed to parse events.json");
 
     assert_eq!(trace.schema.as_deref(), Some("golden-trace-v1"));
+    assert!(
+        !trace.description.is_empty(),
+        "description should not be empty"
+    );
     assert!(!trace.source_files.is_empty());
     assert!(!trace.events.is_empty(), "events should not be empty");
     assert!(
@@ -368,7 +339,19 @@ fn test_ws_errors_trace_valid() {
     let trace: WsErrorsTrace = serde_json::from_str(&content).expect("Failed to parse errors.json");
 
     assert_eq!(trace.schema.as_deref(), Some("golden-trace-v1"));
+    assert!(
+        !trace.description.is_empty(),
+        "description should not be empty"
+    );
     assert!(!trace.source_files.is_empty());
+    assert!(
+        trace
+            .error_codes
+            .source
+            .as_deref()
+            .is_some_and(|s| !s.is_empty()),
+        "error_codes.source should not be empty"
+    );
     assert!(
         !trace.error_codes.codes.is_empty(),
         "error_codes.codes should not be empty"
@@ -379,7 +362,12 @@ fn test_ws_errors_trace_valid() {
     );
 
     // Validate required error codes
-    let required_error_codes = ["invalid_request", "not_linked", "not_paired"];
+    let required_error_codes = [
+        "invalid_request",
+        "not_paired",
+        "unavailable",
+        "rate_limited",
+    ];
     for code in required_error_codes {
         assert!(
             trace.error_codes.codes.contains_key(code),
@@ -405,6 +393,16 @@ fn test_ws_errors_trace_valid() {
             "error code '{}' should have description",
             code
         );
+        let retryable_codes = ["unavailable", "rate_limited"];
+        if retryable_codes.contains(&code.as_str()) {
+            assert!(def.retryable, "error code '{}' should be retryable", code);
+        } else {
+            assert!(
+                !def.retryable,
+                "error code '{}' should not be retryable",
+                code
+            );
+        }
     }
 }
 

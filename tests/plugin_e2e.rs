@@ -229,31 +229,18 @@ impl WebhookPluginInstance for MockWebhookPlugin {
 
 /// Mock service plugin
 struct MockServicePlugin {
-    #[allow(dead_code)]
-    id: String,
     running: AtomicBool,
     start_count: AtomicUsize,
     stop_count: AtomicUsize,
 }
 
 impl MockServicePlugin {
-    fn new(id: &str) -> Self {
+    fn new() -> Self {
         Self {
-            id: id.to_string(),
             running: AtomicBool::new(false),
             start_count: AtomicUsize::new(0),
             stop_count: AtomicUsize::new(0),
         }
-    }
-
-    #[allow(dead_code)]
-    fn start_count(&self) -> usize {
-        self.start_count.load(Ordering::SeqCst)
-    }
-
-    #[allow(dead_code)]
-    fn stop_count(&self) -> usize {
-        self.stop_count.load(Ordering::SeqCst)
     }
 }
 
@@ -734,8 +721,8 @@ fn test_registry_get_by_id() {
 fn test_service_lifecycle() {
     let registry = PluginRegistry::new();
 
-    let service1 = Arc::new(MockServicePlugin::new("worker-1"));
-    let service2 = Arc::new(MockServicePlugin::new("worker-2"));
+    let service1 = Arc::new(MockServicePlugin::new());
+    let service2 = Arc::new(MockServicePlugin::new());
 
     registry.register_service("worker-1".to_string(), service1.clone());
     registry.register_service("worker-2".to_string(), service2.clone());
@@ -743,6 +730,10 @@ fn test_service_lifecycle() {
     // Initially not healthy
     assert!(!service1.health().unwrap());
     assert!(!service2.health().unwrap());
+    assert_eq!(service1.start_count.load(Ordering::SeqCst), 0);
+    assert_eq!(service2.start_count.load(Ordering::SeqCst), 0);
+    assert_eq!(service1.stop_count.load(Ordering::SeqCst), 0);
+    assert_eq!(service2.stop_count.load(Ordering::SeqCst), 0);
 
     // Start services
     for (_, service) in registry.get_services() {
@@ -751,6 +742,10 @@ fn test_service_lifecycle() {
 
     assert!(service1.health().unwrap());
     assert!(service2.health().unwrap());
+    assert_eq!(service1.start_count.load(Ordering::SeqCst), 1);
+    assert_eq!(service2.start_count.load(Ordering::SeqCst), 1);
+    assert_eq!(service1.stop_count.load(Ordering::SeqCst), 0);
+    assert_eq!(service2.stop_count.load(Ordering::SeqCst), 0);
 
     // Stop services
     for (_, service) in registry.get_services() {
@@ -759,6 +754,10 @@ fn test_service_lifecycle() {
 
     assert!(!service1.health().unwrap());
     assert!(!service2.health().unwrap());
+    assert_eq!(service1.start_count.load(Ordering::SeqCst), 1);
+    assert_eq!(service2.start_count.load(Ordering::SeqCst), 1);
+    assert_eq!(service1.stop_count.load(Ordering::SeqCst), 1);
+    assert_eq!(service2.stop_count.load(Ordering::SeqCst), 1);
 }
 
 // ============== Channel Plugin Tests ==============

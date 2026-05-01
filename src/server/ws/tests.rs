@@ -177,6 +177,40 @@ fn test_error_shape_config_errors_are_not_retryable() {
     assert!(!err2.retryable);
 }
 
+#[test]
+fn test_connect_params_validate_optional_client_metadata_types() {
+    let base = json!({
+        "minProtocol": 3,
+        "maxProtocol": 3,
+        "client": {
+            "id": "webchat-ui",
+            "version": "test",
+            "platform": "web",
+            "mode": "control"
+        }
+    });
+
+    let mut valid = base.clone();
+    valid["locale"] = json!("en-US");
+    valid["userAgent"] = json!("carapace-test");
+    serde_json::from_value::<ConnectParams>(valid)
+        .expect("string locale/userAgent should remain accepted");
+
+    let mut invalid_locale = base.clone();
+    invalid_locale["locale"] = json!({});
+    assert!(
+        serde_json::from_value::<ConnectParams>(invalid_locale).is_err(),
+        "locale must remain type-validated when present"
+    );
+
+    let mut invalid_user_agent = base;
+    invalid_user_agent["userAgent"] = json!({});
+    assert!(
+        serde_json::from_value::<ConnectParams>(invalid_user_agent).is_err(),
+        "userAgent must remain type-validated when present"
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn test_startup_rejects_plaintext_credential_file() {
     let temp = tempdir().expect("tempdir");
