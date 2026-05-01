@@ -150,7 +150,10 @@ fn reset_config_env_state() {
 
 /// RAII guard that empties `CONFIG_ENV_STATE` on construction and drop, so
 /// tests that mutate the global env tracker can't bleed into each other.
+/// `#[must_use]` so a bare `ScopedEnvStateForTest::new();` (which would drop
+/// the guard immediately and leave the test body unprotected) is a warning.
 #[cfg(test)]
+#[must_use = "ScopedEnvStateForTest must be bound to a binding that lives for the test body; otherwise it drops immediately and leaves the test unprotected"]
 pub(crate) struct ScopedEnvStateForTest;
 
 #[cfg(test)]

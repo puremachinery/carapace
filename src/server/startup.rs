@@ -2345,6 +2345,62 @@ mod tests {
         );
     }
 
+    /// In `CARAPACE_DISABLE_CONFIG_CACHE` mode, `revert_to_last_good` still
+    /// restores env (`CONFIG_ENV_STATE` is independent of `CONFIG_CACHE`)
+    /// but cannot protect direct disk readers — `load_config_shared`
+    /// bypasses the cache in this mode and re-reads the operator's bad
+    /// file. This pins the documented partial-rollback contract.
+    #[test]
+    fn revert_to_last_good_in_cache_disabled_mode_restores_env_but_disk_readers_see_bad_file() {
+        use crate::config::ScopedEnvStateForTest;
+        use crate::test_support::config::ScopedConfigCache;
+
+        let _cache_guard = ScopedConfigCache::new();
+        crate::config::clear_cache();
+        let _env_state_guard = ScopedEnvStateForTest::new();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bad_path = temp.path().join("config.json5");
+        std::fs::write(&bad_path, r#"{"marker": "bad-on-disk"}"#).expect("write bad config");
+        let mut env = crate::test_support::env::provider_env_cleared();
+        env.set("CARAPACE_CONFIG_PATH", bad_path.as_os_str())
+            .set("CARAPACE_DISABLE_CONFIG_CACHE", "1")
+            .set(TEST_PROVIDER_KEY, "test-initial-key");
+        crate::config::apply_config_env_for_test(HashMap::from([(
+            TEST_PROVIDER_KEY.to_string(),
+            "test-initial-key".to_string(),
+        )]));
+
+        let prior_raw = Arc::new(json!({ "marker": "prior-raw" }));
+        let prior_normalized = Arc::new(json!({ "marker": "prior-normalized" }));
+        let state = ReloadState {
+            last_good_cache: Some((Arc::clone(&prior_raw), Arc::clone(&prior_normalized))),
+            last_good_env: crate::config::snapshot_env_state(),
+            current_fingerprint: crate::agent::factory::fingerprint_providers(&prior_normalized),
+        };
+
+        // Mutate the env so restore_env_state has observable work.
+        env.unset(TEST_PROVIDER_KEY);
+
+        revert_to_last_good(&state);
+
+        // Env restoration works regardless of cache mode.
+        assert_eq!(
+            std::env::var(TEST_PROVIDER_KEY).ok(),
+            Some("test-initial-key".to_string()),
+            "env restoration must work in disabled-cache mode"
+        );
+
+        // load_config_shared bypasses CONFIG_CACHE in disabled mode and
+        // returns the on-disk bad content — the documented limitation that
+        // the warning log in revert_to_last_good announces to operators.
+        let on_disk = crate::config::load_config_shared().expect("disk read");
+        assert_eq!(
+            on_disk["marker"],
+            json!("bad-on-disk"),
+            "disabled-cache load must keep returning the bad disk file post-rollback"
+        );
+    }
+
     /// `revert_to_last_good` with `last_good_cache: None` must leave the
     /// cache untouched (no placeholder write) and still run env restoration.
     /// Documented limitation: the bad config previously installed by the
