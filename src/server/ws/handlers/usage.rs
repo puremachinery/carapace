@@ -118,6 +118,11 @@ pub(super) fn handle_usage_status() -> Result<Value, ErrorShape> {
     Ok(json!({
         "enabled": status.enabled,
         "tracking": status.enabled,
+        // `pricingConfigured` distinguishes "no operator pricing set →
+        // totalCost is structurally 0.0" from "real $0 spend." Clients
+        // should render the former as "cost not configured" rather than
+        // "$0.00." See `gateway.usage.pricing.{default,overrides}`.
+        "pricingConfigured": usage::is_pricing_configured(),
         "summary": {
             "inputTokens": input_tokens,
             "outputTokens": output_tokens,
@@ -187,6 +192,7 @@ pub(super) fn handle_usage_cost(params: Option<&Value>) -> Result<Value, ErrorSh
             "totalTokens": input_tokens + output_tokens,
             "requests": requests,
             "totalCost": total_cost,
+            "pricingConfigured": usage::is_pricing_configured(),
             "sessionCount": session_count,
             "byProvider": [],
             "byModel": [],
@@ -221,6 +227,7 @@ pub(super) fn handle_usage_cost(params: Option<&Value>) -> Result<Value, ErrorSh
             "totalTokens": input_tokens + output_tokens,
             "requests": requests,
             "totalCost": total_cost,
+            "pricingConfigured": usage::is_pricing_configured(),
             "sessionCount": session_count,
             "byProvider": by_provider.iter().map(provider_usage_to_value).collect::<Vec<_>>(),
             "byModel": by_model.iter().map(model_usage_to_value).collect::<Vec<_>>(),
@@ -242,6 +249,7 @@ pub(super) fn handle_usage_cost(params: Option<&Value>) -> Result<Value, ErrorSh
         "totalTokens": breakdown.total_input_tokens + breakdown.total_output_tokens,
         "requests": breakdown.total_requests,
         "totalCost": breakdown.total_cost,
+        "pricingConfigured": usage::is_pricing_configured(),
         "sessionCount": session_count,
         "byProvider": by_provider.iter().map(provider_usage_to_value).collect::<Vec<_>>(),
         "byModel": by_model.iter().map(model_usage_to_value).collect::<Vec<_>>(),
@@ -256,6 +264,7 @@ pub(super) fn handle_usage_session(params: Option<&Value>) -> Result<Value, Erro
         .and_then(|v| v.as_str())
         .ok_or_else(|| error_shape(ERROR_INVALID_REQUEST, "sessionKey is required", None))?;
 
+    let pricing_configured = usage::is_pricing_configured();
     match usage::get_session_usage(session_key) {
         Some(usage) => Ok(json!({
             "sessionKey": session_key,
@@ -264,6 +273,7 @@ pub(super) fn handle_usage_session(params: Option<&Value>) -> Result<Value, Erro
             "totalTokens": usage.input_tokens + usage.output_tokens,
             "requests": usage.requests,
             "cost": usage.cost_usd,
+            "pricingConfigured": pricing_configured,
             "firstUsedAt": usage.first_used_at,
             "lastUsedAt": usage.last_used_at
         })),
@@ -274,6 +284,7 @@ pub(super) fn handle_usage_session(params: Option<&Value>) -> Result<Value, Erro
             "totalTokens": 0,
             "requests": 0,
             "cost": 0.0,
+            "pricingConfigured": pricing_configured,
             "firstUsedAt": null,
             "lastUsedAt": null
         })),
@@ -284,7 +295,8 @@ pub(super) fn handle_usage_session(params: Option<&Value>) -> Result<Value, Erro
 pub(super) fn handle_usage_providers() -> Result<Value, ErrorShape> {
     let providers = usage::get_providers();
     Ok(json!({
-        "providers": providers.iter().map(provider_usage_to_value).collect::<Vec<_>>()
+        "providers": providers.iter().map(provider_usage_to_value).collect::<Vec<_>>(),
+        "pricingConfigured": usage::is_pricing_configured(),
     }))
 }
 

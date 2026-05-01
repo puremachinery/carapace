@@ -564,9 +564,17 @@ mod tests {
 
     #[test]
     fn remap_model_bare() {
+        // Both the rolling alias and the dated snapshot form should be
+        // routed to the Anthropic provider; real OpenClaw exports often
+        // contain dated IDs like `claude-sonnet-4-5-20250929` that
+        // operators picked when reproducibility mattered.
         assert_eq!(
             remap_model_id("claude-sonnet-4-6"),
             "anthropic:claude-sonnet-4-6"
+        );
+        assert_eq!(
+            remap_model_id("claude-sonnet-4-5-20250929"),
+            "anthropic:claude-sonnet-4-5-20250929"
         );
     }
 

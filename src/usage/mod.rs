@@ -107,6 +107,15 @@ impl ModelPricing {
     }
 }
 
+/// Whether any operator pricing is configured (a `default` rate or one or
+/// more `overrides`). Callers use this to render `cost_usd: 0.0` as
+/// "cost not configured" instead of "$0.00 actual"; without it the two
+/// are indistinguishable on the wire.
+pub fn is_pricing_configured() -> bool {
+    let config = PRICING_CONFIG.read();
+    config.default.is_some() || !config.overrides.is_empty()
+}
+
 /// Resolve a per-model pricing rate from operator-configured overrides /
 /// default. Returns `None` when no operator pricing matches — Carapace
 /// does not ship a built-in price table.
@@ -1125,10 +1134,32 @@ pub fn record_usage(
     tracker.maybe_save();
 }
 
-/// Update model pricing overrides from config (global tracker).
+/// Update model pricing overrides from config (global tracker). Logs a
+/// warn when usage tracking is enabled but no pricing rates are configured
+/// — operators upgrading from a build that shipped a built-in price table
+/// would otherwise silently see `cost_usd = 0.0` everywhere with no signal
+/// that they need to add `gateway.usage.pricing.{default,overrides}`.
 pub fn update_pricing_from_config(config: &serde_json::Value) {
-    let mut pricing = PRICING_CONFIG.write();
-    *pricing = parse_pricing_config(config);
+    let new_config = parse_pricing_config(config);
+    let pricing_unconfigured = new_config.default.is_none() && new_config.overrides.is_empty();
+    let usage_enabled = config
+        .get("usage")
+        .and_then(|v| v.as_object())
+        .and_then(|usage| usage.get("enabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    {
+        let mut pricing = PRICING_CONFIG.write();
+        *pricing = new_config;
+    }
+    if usage_enabled && pricing_unconfigured {
+        tracing::warn!(
+            "Usage tracking is enabled but `gateway.usage.pricing` is not configured; \
+             cost fields in usage responses will be 0.0. Set \
+             `gateway.usage.pricing.default` or `.overrides` to record cost estimates, \
+             or disable tracking via `usage.enabled = false`."
+        );
+    }
 }
 
 /// Get current usage status (global tracker)
