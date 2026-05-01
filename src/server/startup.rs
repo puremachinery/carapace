@@ -2266,25 +2266,38 @@ mod tests {
         let normalized_after = crate::config::load_config_shared().expect("normalized populated");
         assert_eq!(*normalized_after, *prior_normalized);
         assert_eq!(state.current_fingerprint, prior_fingerprint);
+        assert_eq!(
+            std::env::var(TEST_PROVIDER_KEY).ok(),
+            Some("test-initial-key".to_string()),
+            "rollback must restore the env-injected provider var on the Err arm too"
+        );
     }
 
     /// When `load_both_config_shared` itself fails (unparseable on-disk
-    /// config + cache disabled), `handle_provider_reload` must still call
-    /// `revert_to_last_good` and return `Reverted`. Pinning this branch
-    /// guards against a future refactor that shortens the early-exit and
-    /// inadvertently skips the rollback.
+    /// config), `handle_provider_reload` must still call `revert_to_last_good`
+    /// and return `Reverted`. Verified by reading back the post-rollback cache
+    /// (which proves `update_cache_arc` ran) and asserting env restoration
+    /// (which proves `restore_env_state` ran).
     #[test]
     fn handle_provider_reload_reverts_when_initial_load_fails() {
+        use crate::config::ScopedEnvStateForTest;
         use crate::test_support::config::ScopedConfigCache;
 
         let _cache_guard = ScopedConfigCache::new();
         crate::config::clear_cache();
+        let _env_state_guard = ScopedEnvStateForTest::new();
         let temp = tempfile::tempdir().expect("tempdir");
         let bad_path = temp.path().join("config.json5");
         std::fs::write(&bad_path, "{ unbalanced").expect("write bad config");
         let mut env = crate::test_support::env::provider_env_cleared();
-        env.set("CARAPACE_CONFIG_PATH", bad_path.as_os_str())
-            .set("CARAPACE_DISABLE_CONFIG_CACHE", "1");
+        env.set("CARAPACE_CONFIG_PATH", bad_path.as_os_str());
+        // Cache enabled (no DISABLE flag) so the rollback's update_cache_arc
+        // write is observable via load_config_shared after the call.
+        env.set(TEST_PROVIDER_KEY, "test-initial-key");
+        crate::config::apply_config_env_for_test(HashMap::from([(
+            TEST_PROVIDER_KEY.to_string(),
+            "test-initial-key".to_string(),
+        )]));
 
         let prior_raw = Arc::new(json!({ "marker": "prior-raw" }));
         let prior_normalized = Arc::new(json!({ "marker": "prior-normalized" }));
@@ -2296,16 +2309,36 @@ mod tests {
         };
         let ws_state = Arc::new(WsServerState::new(WsServerConfig::default()));
 
+        // Mutate the env after snapshotting so restore_env_state has a
+        // distinguishable post-state to restore from.
+        env.unset(TEST_PROVIDER_KEY);
+
         let outcome = handle_provider_reload(&ws_state, &mut state);
 
         assert_eq!(outcome, ReloadOutcome::Reverted);
         assert_eq!(state.current_fingerprint, prior_fingerprint);
-        let (raw_after, normalized_after) = state
+        // The rollback's update_cache_arc wrote prior_(raw, normalized) into
+        // CONFIG_CACHE — read them back via load_config_shared to pin the
+        // cache write. Without the rollback, the cache stays empty and the
+        // shared-load would re-read the still-bad disk file and Err.
+        let normalized_after =
+            crate::config::load_config_shared().expect("rollback wrote the normalized cache");
+        assert_eq!(*normalized_after, *prior_normalized);
+        let raw_after =
+            crate::config::load_raw_config_shared().expect("rollback wrote the raw cache");
+        assert_eq!(*raw_after, *prior_raw);
+        // last_good_cache itself untouched — revert_to_last_good takes &state.
+        let (cache_raw, cache_normalized) = state
             .last_good_cache
             .as_ref()
             .expect("last_good_cache stays populated");
-        assert!(Arc::ptr_eq(raw_after, &prior_raw));
-        assert!(Arc::ptr_eq(normalized_after, &prior_normalized));
+        assert!(Arc::ptr_eq(cache_raw, &prior_raw));
+        assert!(Arc::ptr_eq(cache_normalized, &prior_normalized));
+        assert_eq!(
+            std::env::var(TEST_PROVIDER_KEY).ok(),
+            Some("test-initial-key".to_string()),
+            "rollback must restore env on the load-failure arm too"
+        );
     }
 
     /// `revert_to_last_good` with `last_good_cache: None` must leave the
