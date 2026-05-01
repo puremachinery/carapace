@@ -2260,6 +2260,17 @@ mod tests {
             "anthropic": { "authProfile": "/nonexistent/path/that/does/not/resolve" }
         });
         let new_normalized = new_raw.clone();
+        // Pre-assert that this config truly reaches the `Err` arm of
+        // `build_providers` (not `Ok(None)`). If a future refactor of
+        // `build_anthropic_provider`'s guard ordering makes the same input
+        // return `Ok(None)` instead, this assertion fails loudly — without
+        // it, the test would silently exercise the no-provider arm and the
+        // doc comment above would rot. `build_providers` is non-`Send`, so
+        // we must call it on the current thread.
+        assert!(
+            crate::agent::factory::build_providers(&new_normalized).is_err(),
+            "test config must reach the Err arm of build_providers"
+        );
         crate::config::update_cache(new_raw, new_normalized);
 
         let outcome = handle_provider_reload(&ws_state, &mut state);
