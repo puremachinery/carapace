@@ -191,7 +191,28 @@ impl ConfigWatcher {
 }
 
 /// Convert a `ReloadMode` to its string label.
-fn mode_label(mode: &ReloadMode) -> &'static str {
+/// Resolve the reload mode for a manual reload (SIGHUP, WS `config.reload`).
+/// Reads `gateway.reload.mode` from `CONFIG_CACHE` via `Arc` projection (no
+/// deep clone) and falls back to `Hot` when the operator hasn't configured
+/// reloads — manual reloads always do at least a hot reload.
+pub(crate) fn manual_reload_mode() -> ReloadMode {
+    let configured = super::load_config_shared()
+        .ok()
+        .and_then(|cfg| {
+            cfg.get("gateway")
+                .and_then(|g| g.get("reload"))
+                .and_then(|r| r.get("mode"))
+                .and_then(|m| m.as_str())
+                .map(ReloadMode::parse_mode)
+        })
+        .unwrap_or(ReloadMode::Hot);
+    match configured {
+        ReloadMode::Off => ReloadMode::Hot,
+        other => other,
+    }
+}
+
+pub(crate) fn mode_label(mode: &ReloadMode) -> &'static str {
     match mode {
         ReloadMode::Hot => "hot",
         ReloadMode::Hybrid => "hybrid",

@@ -412,30 +412,15 @@ pub(super) fn handle_config_schema() -> Result<Value, ErrorShape> {
 
 /// Handle the `config.reload` WS method (admin-only).
 ///
-/// Routes the reload through the hot-reload bridge: the bridge owns the
-/// load + provider validation + cache install + WS broadcast, identical to
-/// the file-watcher and SIGHUP paths. A reload that drops the LLM provider
-/// (or otherwise fails validation) is rejected before the cache is touched
-/// and the client receives an error response.
+/// Routes through the hot-reload bridge so the WS reload exercises the
+/// same provider-validation pipeline as the file-watcher and SIGHUP paths.
+/// A reload that drops the LLM provider is rejected before the cache is
+/// touched; the client gets an error response.
 pub(super) async fn handle_config_reload(state: &WsServerState) -> Result<Value, ErrorShape> {
-    use crate::config::watcher::ReloadMode;
+    use crate::config::watcher::{manual_reload_mode, mode_label};
     use crate::server::startup::{ReloadCommand, ReloadCommandResult};
 
-    // Determine reload mode from current config (default "hot" for manual
-    // reloads; never "off" since the operator explicitly asked to reload).
-    let current_config =
-        config::load_config().unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
-    let mode_str = current_config
-        .get("gateway")
-        .and_then(|g| g.get("reload"))
-        .and_then(|r| r.get("mode"))
-        .and_then(|m| m.as_str())
-        .unwrap_or("hot");
-    let mode = match ReloadMode::parse_mode(mode_str) {
-        ReloadMode::Off => "hot".to_string(),
-        ReloadMode::Hot => "hot".to_string(),
-        ReloadMode::Hybrid => "hybrid".to_string(),
-    };
+    let mode = manual_reload_mode();
 
     let Some(command_tx) = state.reload_command_tx() else {
         return Err(error_shape(
@@ -459,26 +444,29 @@ pub(super) async fn handle_config_reload(state: &WsServerState) -> Result<Value,
             None,
         ));
     }
-    match response_rx.await {
-        Ok(ReloadCommandResult::Applied { warnings }) => Ok(json!({
+    // The bridge always replies; an `Err(_)` here would mean the bridge task
+    // panicked between command receipt and respond_to.send — fold it into a
+    // generic LoadError so the WS handler never silently no-ops.
+    let result = response_rx.await.unwrap_or_else(|_| {
+        ReloadCommandResult::LoadError(
+            "config-reload bridge dropped the response without replying".into(),
+        )
+    });
+    match result {
+        ReloadCommandResult::Applied { warnings } => Ok(json!({
             "ok": true,
-            "mode": mode,
+            "mode": mode_label(&mode),
             "warnings": warnings,
         })),
-        Ok(ReloadCommandResult::Reverted) => Err(error_shape(
+        ReloadCommandResult::Reverted => Err(error_shape(
             ERROR_UNAVAILABLE,
             "reload rejected: the new config has no LLM provider configured (or build_providers \
              failed). The previous config is still active.",
             None,
         )),
-        Ok(ReloadCommandResult::LoadError(message)) => {
+        ReloadCommandResult::LoadError(message) => {
             Err(error_shape(ERROR_UNAVAILABLE, &message, None))
         }
-        Err(_) => Err(error_shape(
-            ERROR_UNAVAILABLE,
-            "config-reload bridge dropped the response without replying",
-            None,
-        )),
     }
 }
 
@@ -588,20 +576,20 @@ mod tests {
             state.set_reload_command_tx(Some(command_tx));
             let bridge = tokio::spawn(async move {
                 let cmd = command_rx.recv().await.expect("command received");
-                // Echo back the mode the handler resolved so the assertion
+                // Echo the mode label the handler resolved so the assertion
                 // pins the round-trip without depending on whatever
                 // gateway.reload.mode the ambient on-disk config carries.
-                let mode = cmd.mode.clone();
+                let label = crate::config::watcher::mode_label(&cmd.mode).to_string();
                 let _ = cmd.respond_to.send(ReloadCommandResult::Applied {
                     warnings: vec!["a: warn-one".to_string()],
                 });
-                mode
+                label
             });
             let result = handle_config_reload(&state).await;
-            let resolved_mode = bridge.await.unwrap();
+            let resolved_label = bridge.await.unwrap();
             let value = result.expect("Applied → Ok");
             assert_eq!(value["ok"], true);
-            assert_eq!(value["mode"], serde_json::Value::String(resolved_mode));
+            assert_eq!(value["mode"], serde_json::Value::String(resolved_label));
             // Warnings from the bridge must round-trip into the response so
             // clients can surface non-fatal validation issues to the operator.
             assert_eq!(

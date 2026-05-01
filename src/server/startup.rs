@@ -348,22 +348,10 @@ fn spawn_sighup_handler(
             tokio::select! {
                 _ = sighup.recv() => {
                     info!("SIGHUP received, triggering config reload");
-                    let current_cfg = config::load_config()
-                        .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
-                    let mode_str = current_cfg
-                        .get("gateway")
-                        .and_then(|g| g.get("reload"))
-                        .and_then(|r| r.get("mode"))
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("hot");
-                    let mode = match config::watcher::ReloadMode::parse_mode(mode_str) {
-                        config::watcher::ReloadMode::Off => config::watcher::ReloadMode::Hot,
-                        other => other,
-                    };
-                    // `perform_reload_async` loads the payload but does not
-                    // install it; the bridge owns cache install + WS broadcast
-                    // after provider validation, so SIGHUP just routes the
-                    // event and lets the bridge do the rest.
+                    let mode = config::watcher::manual_reload_mode();
+                    // perform_reload_async loads the payload but doesn't install
+                    // it — the bridge owns cache install + WS broadcast after
+                    // provider validation. SIGHUP just routes the event.
                     let event = config::watcher::perform_reload_async(&mode).await;
                     let _ = config_event_tx.send(event);
                 }
@@ -550,20 +538,14 @@ fn spawn_activity_feature_support_warnings(
     });
 }
 
-/// State carried across reload events for env-rollback and fingerprint
-/// comparison. The cache itself is no longer tracked here: the bridge owns
-/// the cache write, so by construction `CONFIG_CACHE` always reflects the
-/// last validated reload — there is no bad-state value for the cache to
-/// roll back to.
+/// Cross-event state for env-rollback and provider-fingerprint comparison.
 struct ReloadState {
-    /// Snapshot of `CONFIG_ENV_STATE` taken before the loader injected the
-    /// pending reload's env vars (the loader necessarily injects to support
-    /// `${VAR}` substitution). Restored on `Reverted` to undo a rejected
-    /// reload's env mutations.
+    /// Pre-load env snapshot used to revert `CONFIG_ENV_STATE` on a rejected
+    /// reload (the loader injects `${VAR}` env before later validation can
+    /// fail).
     last_good_env: config::InjectedConfigEnvState,
-    /// Fingerprint of the currently-installed provider. Used to short-circuit
-    /// `build_providers` when the new config doesn't change the provider
-    /// shape.
+    /// Fingerprint of the currently-installed provider; short-circuits
+    /// `build_providers` when the new config doesn't change provider shape.
     current_fingerprint: crate::agent::factory::ProviderFingerprint,
 }
 
@@ -588,11 +570,17 @@ enum ReloadOutcome {
 /// on-disk state, avoiding a TOCTOU between the WS handler's load and the
 /// bridge's processing.
 pub(crate) struct ReloadCommand {
-    /// Reload mode label to forward to `broadcast_config_changed` on Apply.
-    pub mode: String,
+    /// Reload mode requested by the caller; converted to a label only when
+    /// the bridge fires `broadcast_config_changed` on `Apply`.
+    pub mode: config::watcher::ReloadMode,
     /// One-shot channel the bridge uses to report back the outcome.
     pub respond_to: tokio::sync::oneshot::Sender<ReloadCommandResult>,
 }
+
+/// Mode label for a `config.changed` broadcast emitted from the
+/// lag-recovery path (no `ReloadMode` corresponds — the bridge converged
+/// to disk after dropping events).
+const LAG_RECOVERY_MODE_LABEL: &str = "lag-recovery";
 
 /// Bridge-side result of processing a [`ReloadCommand`].
 #[derive(Debug)]
@@ -608,16 +596,13 @@ pub(crate) enum ReloadCommandResult {
     LoadError(String),
 }
 
-/// Validate the freshly-loaded `(raw, normalized)` payload against provider
-/// invariants. On `Apply`, the bridge installs the payload in `CONFIG_CACHE`
-/// (single broadcast) and updates `state` with the new env snapshot and
-/// fingerprint. On `Reverted`, the cache is left untouched (it still holds
-/// the previously-validated config) and env is restored to `last_good_env`.
+/// Validate `(raw, normalized)` against provider invariants. On `Apply`,
+/// install the payload in `CONFIG_CACHE` and refresh `state`'s env snapshot
+/// + fingerprint. On `Reverted`, the caller is responsible for env restore.
 ///
 /// Disabled-cache caveat: with `CARAPACE_DISABLE_CONFIG_CACHE=1`, direct
-/// disk readers via `load_*_config_shared` continue to read the operator's
-/// bad save until the file is repaired. The warn-log in the `Reverted`
-/// branch announces this to operators.
+/// disk readers continue to read the operator's bad save until the file is
+/// repaired — the warn-log in `revert_pending_env` announces this.
 fn handle_provider_reload(
     ws_state: &Arc<WsServerState>,
     state: &mut ReloadState,
@@ -675,50 +660,40 @@ fn drain_pending_events(rx: &mut tokio::sync::broadcast::Receiver<config::watche
     while let Ok(_) | Err(TryRecvError::Lagged(_)) = rx.try_recv() {}
 }
 
-/// Handle a synchronous reload command from the WS `config.reload` admin
-/// RPC (or any other caller that needs to know the outcome).
+/// Run a fresh load + provider validation + cache install. Returns the
+/// outcome without broadcasting; the caller chooses the broadcast label so
+/// the lag-recovery path can label its tick distinctly from a normal reload.
 ///
-/// The bridge does the load itself rather than trusting a payload from the
-/// caller — this avoids a TOCTOU window between the WS handler's load and
-/// the bridge's processing. A successful Apply broadcasts the WS
-/// `config.changed` event so clients re-read.
-async fn handle_reload_command(
+/// `perform_reload_async` already handles `spawn_blocking` + JoinError. On
+/// `ReloadFailed` the loader may have partially mutated `CONFIG_ENV_STATE`
+/// before failing (env injection runs before secrets resolution); we
+/// `revert_pending_env` to put env back to last good. The cache itself
+/// never moved on a load failure.
+async fn dispatch_bridge_reload(
     ws_state: &Arc<WsServerState>,
     state: &mut ReloadState,
-    mode: &str,
+    mode: &config::watcher::ReloadMode,
 ) -> ReloadCommandResult {
-    // `load_pending_config` (via `load_raw_config_uncached`) can mutate
-    // `CONFIG_ENV_STATE` before failing — env vars get applied for `${VAR}`
-    // substitution and the loader only rolls them back on its own
-    // substitution-failure arm. Any later error (parse, schema, secret
-    // resolution) returns `Err` with env still drifted. We call
-    // `revert_pending_env` on every load-failure path so the process env
-    // and the tracker stay consistent with `state.last_good_env`.
-    let pending = match tokio::task::spawn_blocking(config::load_pending_config).await {
-        Ok(Ok(p)) => p,
-        Ok(Err(e)) => {
+    use config::watcher::{perform_reload_async, ConfigEvent};
+    match perform_reload_async(mode).await {
+        ConfigEvent::Reloaded(success) => {
+            let outcome = handle_provider_reload(
+                ws_state,
+                state,
+                success.payload.raw,
+                success.payload.normalized,
+            );
+            match outcome {
+                ReloadOutcome::Apply => ReloadCommandResult::Applied {
+                    warnings: success.warnings,
+                },
+                ReloadOutcome::Reverted => ReloadCommandResult::Reverted,
+            }
+        }
+        ConfigEvent::ReloadFailed(failure) => {
             revert_pending_env(state);
-            return ReloadCommandResult::LoadError(e.to_string());
+            ReloadCommandResult::LoadError(failure.error)
         }
-        Err(e) => {
-            revert_pending_env(state);
-            return ReloadCommandResult::LoadError(format!("reload task join: {e}"));
-        }
-    };
-    // Capture validation warnings before the move into handle_provider_reload
-    // so the WS handler can surface them to the requesting client.
-    let warnings: Vec<String> = pending
-        .issues
-        .iter()
-        .map(|i| format!("{}: {}", i.path, i.message))
-        .collect();
-    let outcome = handle_provider_reload(ws_state, state, pending.raw, pending.normalized);
-    match outcome {
-        ReloadOutcome::Apply => {
-            crate::server::ws::broadcast_config_changed(ws_state, mode);
-            ReloadCommandResult::Applied { warnings }
-        }
-        ReloadOutcome::Reverted => ReloadCommandResult::Reverted,
     }
 }
 
@@ -748,19 +723,18 @@ fn spawn_config_watcher_bridge(
     let mut config_rx = config_watcher.subscribe();
     let ws_state_for_config = ws_state.clone();
     let mut config_shutdown_rx = shutdown_rx.clone();
-    // `raw_config` is the normalized startup config (despite the name) — the
-    // server is already running with it, so use it as the fingerprint
-    // baseline. The cache itself is whatever the startup-time load installed.
+    // `raw_config` is the normalized startup config (parameter name is a
+    // historical misnomer) — the server is already running with it, so it's
+    // the right fingerprint baseline.
     let current_fingerprint = crate::agent::factory::fingerprint_providers(raw_config);
     let mut reload_state = ReloadState {
         last_good_env: config::snapshot_env_state(),
         current_fingerprint,
     };
 
-    // Command inbox for synchronous reload requests (e.g. WS `config.reload`).
-    // The mpsc sender is published on `WsServerState` so handlers can find
-    // it; the receiver is owned by this bridge task. Capacity 8 keeps a
-    // burst of admin reloads from blocking the WS handler thread.
+    // Command inbox for synchronous reload requests (WS `config.reload`).
+    // Capacity 8: enough headroom for an admin reload burst without
+    // blocking WS handler threads.
     let (command_tx, mut command_rx) = tokio::sync::mpsc::channel::<ReloadCommand>(8);
     ws_state.set_reload_command_tx(Some(command_tx));
 
@@ -793,62 +767,32 @@ fn spawn_config_watcher_bridge(
                         }
                         Ok(config::watcher::ConfigEvent::ReloadFailed(_)) => {}
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            // The broadcast buffer dropped `n` events. The
-                            // queued events the bridge would have processed
-                            // are now stale; reload from disk to converge to
-                            // the on-disk truth instead of catching up on
-                            // possibly-superseded payloads.
+                            // Buffered events are stale; reload from disk to
+                            // converge to current on-disk state, then drain
+                            // the buffer so the next recv() blocks on a fresh
+                            // event rather than replaying superseded ones.
                             warn!(
                                 "Config event receiver lagged by {} events; reloading from disk to converge",
                                 n
                             );
-                            // `load_pending_config` can leave `CONFIG_ENV_STATE`
-                            // and process env mutated when it fails partway
-                            // through (env injection happens before secrets
-                            // resolution and other validation). On every
-                            // load-failure arm we revert env to last good so
-                            // the rejected reload doesn't strand env vars in
-                            // the process. The cache itself never moved.
-                            let pending = match tokio::task::spawn_blocking(
-                                config::load_pending_config,
-                            )
-                            .await
-                            {
-                                Ok(Ok(p)) => p,
-                                Ok(Err(e)) => {
-                                    error!("Lag-recovery load failed: {}", e);
-                                    revert_pending_env(&reload_state);
-                                    drain_pending_events(&mut config_rx);
-                                    continue;
-                                }
-                                Err(e) => {
-                                    error!("Lag-recovery join failed: {}", e);
-                                    revert_pending_env(&reload_state);
-                                    drain_pending_events(&mut config_rx);
-                                    continue;
-                                }
-                            };
-                            let outcome = handle_provider_reload(
+                            let outcome = dispatch_bridge_reload(
                                 &ws_state_for_config,
                                 &mut reload_state,
-                                pending.raw,
-                                pending.normalized,
-                            );
-                            if outcome == ReloadOutcome::Apply {
+                                &config::watcher::ReloadMode::Hot,
+                            )
+                            .await;
+                            if let ReloadCommandResult::LoadError(ref e) = outcome {
+                                error!("Lag-recovery load failed: {}", e);
+                            }
+                            // The bridge's broadcast for lag-recovery uses a
+                            // distinct mode label so clients can tell this
+                            // tick from a normal reload.
+                            if matches!(outcome, ReloadCommandResult::Applied { .. }) {
                                 crate::server::ws::broadcast_config_changed(
                                     &ws_state_for_config,
-                                    "lag-recovery",
+                                    LAG_RECOVERY_MODE_LABEL,
                                 );
                             }
-                            // Discard any events still buffered after the
-                            // lag — `tokio::sync::broadcast::Receiver`
-                            // advances its cursor to the oldest still-buffered
-                            // message after a `Lagged`, so without draining,
-                            // the next `recv()` would replay E3..En in
-                            // order, each running a full fingerprint check
-                            // and possibly rebuilding providers against
-                            // stale intermediate states. We've already
-                            // converged to the latest disk state above.
                             drain_pending_events(&mut config_rx);
                             continue;
                         }
@@ -858,12 +802,18 @@ fn spawn_config_watcher_bridge(
                     }
                 }
                 Some(command) = command_rx.recv() => {
-                    let outcome = handle_reload_command(
+                    let outcome = dispatch_bridge_reload(
                         &ws_state_for_config,
                         &mut reload_state,
                         &command.mode,
                     )
                     .await;
+                    if matches!(outcome, ReloadCommandResult::Applied { .. }) {
+                        crate::server::ws::broadcast_config_changed(
+                            &ws_state_for_config,
+                            config::watcher::mode_label(&command.mode),
+                        );
+                    }
                     let _ = command.respond_to.send(outcome);
                 }
                 _ = config_shutdown_rx.changed() => {
@@ -873,12 +823,9 @@ fn spawn_config_watcher_bridge(
                 }
             }
         }
-        // Bridge is exiting; clear the command sender so any caller
-        // checking `state.reload_command_tx().is_some()` as a liveness
-        // signal sees the bridge as gone, not just unresponsive. Sends
-        // through the cloned tx in WS handlers will return Err once the
-        // receiver drops below, but clearing the slot keeps the visible
-        // state consistent.
+        // Clear the command sender so callers checking
+        // `reload_command_tx().is_some()` as a liveness gate see the
+        // bridge as gone rather than stuck-Some with a closed receiver.
         ws_state_for_config.set_reload_command_tx(None);
     });
 }
