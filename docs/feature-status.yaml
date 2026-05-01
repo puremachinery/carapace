@@ -59,7 +59,7 @@ feature_inventory_markdown: |
 
   - [x] **Channel registry** — thread-safe channel tracking, status enum
   - [x] **Console channel** — built-in testing channel
-  - [x] **Channel activity framework** — per-channel typing/read-receipt policy, runtime dispatch, append-time receipt completion, and startup rejection of legacy persisted receipt state.
+  - [x] **Channel activity framework** — per-channel typing/read-receipt policy, runtime dispatch, append-time receipt completion, and current durable receipt state enforcement.
   - [x] **Telegram/Discord/Slack runtime wiring** — outbound + inbound (Telegram webhook/long-polling, Slack Events API, Discord Gateway).
   - [x] **Signal runtime wiring** — outbound via signal-cli REST + inbound polling receive loop.
   - [x] **Signal activity features** — typing indicators + explicit append-time read receipts on the built-in Signal channel.
@@ -78,12 +78,12 @@ feature_inventory_markdown: |
   - [x] **restore** — extract backup with path traversal protection
   - [x] **reset** — clear sessions/cron/usage/memory
   - [x] **setup** — interactive provider-first configuration wizard, including Codex subscription-login and Gemini API-key or Google sign-in onboarding
+  - [x] **import** — configuration import from OpenClaw, OpenCode, Aider, NemoClaw with previewed mappings
   - [x] **pair** — device identity handshake + node pairing initiation (remote gateways supported)
   - [x] **update** — version check and self-update
   - [x] **chat** — interactive local REPL session over WebSocket
   - [x] **verify** — first-run outcome verification (local chat/channels/hooks/autonomy)
   - [x] **tls init-ca / issue-cert / revoke-cert / show-ca** — cluster CA management
-  - [x] **import** — configuration migration from OpenClaw, OpenCode, Aider, NemoClaw with previewed mappings
 
   ### Config (`src/config/`)
 
@@ -97,7 +97,7 @@ feature_inventory_markdown: |
   - [x] **Shared config snapshots** — `load_config_shared` cache reused by inbound dispatch and media analysis paths
   - [x] **Schema validation** — error/warning severity
   - [x] **Config defaults** — fallback values
-  - [x] **Secret encryption** — AES-256-GCM at rest with Argon2id for new writes and PBKDF2 legacy-read compatibility
+  - [x] **Secret encryption** — AES-256-GCM at rest with Argon2id envelopes
 
   ### Credentials (`src/credentials/`)
 
@@ -239,10 +239,10 @@ feature_inventory_markdown: |
 
   #### WebSocket Handlers
 
-  - [x] **agent.run / agent.cancel** — LLM execution + cancellation
+  - [x] **agent / chat.abort** — LLM execution + cancellation
   - [x] **session.create/load/list/fork/rename/delete/switch** — session management
-  - [x] **config.get/update/reload/validate** — configuration
-  - [x] **exec.approve/deny/list** — exec approval workflow
+  - [x] **config.get/patch/reload/validate** — configuration
+  - [x] **exec.approval.request/resolve + exec.approvals.get/set** — exec approval workflow
   - [x] **system.info** — system metadata + runtime stats
   - [x] **logs.tail** — streaming log buffer
   - [x] **plugins.status** — plugin listing + activation state
@@ -261,7 +261,7 @@ feature_inventory_markdown: |
 
   - [x] **JSONL format** — append-friendly history
   - [x] **Compaction** — truncate old messages
-  - [x] **HMAC integrity** — SHA-256 HMAC (metadata + history), enabled by default (`warn` mode migration)
+  - [x] **HMAC integrity** — SHA-256 HMAC (metadata + history), enabled by default in `warn` mode
   - [x] **Session archiving + restoration**
   - [x] **Session filters** — list/search by criteria
   - [x] **File locking** — concurrent-safe operations (flock RAII), including per-session-key creation locks

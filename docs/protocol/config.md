@@ -114,7 +114,7 @@ For a plain-English guide to the most commonly tuned sections, see
 - `messages` – messaging behavior defaults
 - `commands` – command policy/config
 - `approvals` – exec approval settings
-- `session` – session defaults plus legacy/global typing fallback (`scope`, `dmScope`, `typingMode`, `typingIntervalSeconds`, `mainKey`)
+- `session` – session defaults (`scope`, `dmScope`, `mainKey`)
 - `sessions` – session behavior (retention, cleanup)
 - `usage` – usage tracking configuration (pricing overrides)
 - `cron` – cron scheduler settings
@@ -183,8 +183,7 @@ This is a condensed map; refer to the JSON schema for full detail.
 - `classifier`
   - `enabled`, `mode` (`off` | `warn` | `block`), `model`, `blockThreshold`
 - `session`
-  - `scope`, `dmScope`, `typingMode`, `typingIntervalSeconds`, `mainKey`
-  - `typingMode` / `typingIntervalSeconds` are legacy/global fallback for channel typing only when you explicitly set them in config; prefer `channels.defaults.features.typing` and `channels.<channel>.features.typing`
+  - `scope`, `dmScope`, `mainKey`
 - `channels`
   - `defaults.features.typing`, `defaults.features.readReceipts`
   - `<channel>.features.typing`, `<channel>.features.readReceipts`
@@ -192,7 +191,6 @@ This is a condensed map; refer to the JSON schema for full detail.
   - `retention.enabled`, `retention.days`, `retention.intervalHours`
   - `integrity.enabled` (default `true`), `integrity.action` (`warn` | `reject`, default `warn`)
   - `encryption.mode` (`off` | `if_password` | `required`) – session encryption at rest with `.crypto-manifest` recovery metadata; no in-place rekey
-  - Legacy: `sessions.retentionDays`, `session.retention.*`
 - `logging`
   - `level`, `format`, `consoleStyle`, `redactSensitive`
 - `cron`
@@ -398,8 +396,6 @@ Defaults are applied during config loading before validation. Key defaults inclu
 - `agents.defaults.compaction.mode`: `"safeguard"`
 - `session.scope`: `"per-sender"`
 - `session.dmScope`: `"main"`
-- `session.typingMode`: `"thinking"` (defaulted session value; legacy/global channel-typing fallback only when explicitly set in config, and applies across all typing-capable channels unless overridden under `channels.*.features.typing`)
-- `session.typingIntervalSeconds`: `3` (defaulted session value; legacy/global channel-typing fallback only when explicitly set in config, and applies across all typing-capable channels unless overridden under `channels.*.features.typing`)
 - `session.mainKey`: `"main"` (enforced even if another value is supplied)
 - Channel typing activity defaults: typing is disabled by default; when enabled by `channels.defaults.features.typing` or `channels.<channel>.features.typing`, the default mode is `"thinking"` with a `3`-second interval.
 - Channel read-receipt activity defaults: read receipts are disabled by default; when enabled by `channels.defaults.features.readReceipts` or `channels.<channel>.features.readReceipts`, Carapace sends an explicit receipt immediately after the inbound message is durably appended to the session store.
@@ -424,7 +420,7 @@ Defaults are applied during config loading before validation. Key defaults inclu
   - `contextWindow`: `DEFAULT_CONTEXT_TOKENS`
   - `maxTokens`: `min(8192, contextWindow)`
 - `talk.apiKey` may be injected from the environment if missing.
-- `sessions.integrity.enabled`: `true` (HMAC key source order: `CARAPACE_SERVER_SECRET` → gateway auth secrets; keep a stable `CARAPACE_SERVER_SECRET` while unread plaintext sessions are still being touch-migrated)
+- `sessions.integrity.enabled`: `true` (HMAC key source order: `CARAPACE_SERVER_SECRET` → gateway auth secrets)
 - `sessions.integrity.action`: `"warn"` (missing/mismatched sidecars are advisory-only; use `"reject"` to fail closed, including encrypted-history deletion/reordering detection)
 
 ## Validation Rules (Highlights)

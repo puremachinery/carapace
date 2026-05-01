@@ -40,7 +40,7 @@ pub struct HookTransform {
 
 /// Hook mapping configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HookMapping {
     /// Unique identifier for the mapping
     pub id: Option<String>,
@@ -56,13 +56,7 @@ pub struct HookMapping {
     /// Display name (supports templates)
     pub name: Option<String>,
     /// Session scope override (supports templates).
-    /// Serialized/deserialized as `sessionKey` for backward compatibility.
-    #[serde(
-        rename = "sessionKey",
-        alias = "session_scope",
-        alias = "sessionScope",
-        alias = "session_key"
-    )]
+    #[serde(rename = "sessionKey")]
     pub session_scope: Option<String>,
     /// Message template for agent action
     pub message_template: Option<String>,
@@ -629,27 +623,53 @@ mod tests {
     }
 
     #[test]
-    fn test_hook_mapping_deserializes_session_key_compat() {
+    fn test_hook_mapping_deserializes_session_key() {
         let mapping: HookMapping = serde_json::from_value(json!({
             "id": "test",
             "action": "agent",
             "messageTemplate": "hello",
-            "sessionKey": "hook:legacy"
+            "sessionKey": "hook:current"
         }))
         .unwrap();
-        assert_eq!(mapping.session_scope.as_deref(), Some("hook:legacy"));
+        assert_eq!(mapping.session_scope.as_deref(), Some("hook:current"));
     }
 
     #[test]
-    fn test_hook_mapping_deserializes_session_scope_alias() {
-        let mapping: HookMapping = serde_json::from_value(json!({
+    fn test_hook_mapping_rejects_unknown_fields() {
+        let err = serde_json::from_value::<HookMapping>(json!({
             "id": "test",
             "action": "agent",
             "messageTemplate": "hello",
-            "sessionScope": "hook:new"
+            "sessionKey": "hook:current",
+            "futureField": { "ownedByOperator": true }
         }))
-        .unwrap();
-        assert_eq!(mapping.session_scope.as_deref(), Some("hook:new"));
+        .expect_err("unknown hook mapping fields should be rejected");
+        assert!(
+            err.to_string().contains("unknown field `futureField`"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_hook_mapping_rejects_removed_session_key_aliases() {
+        for field in ["sessionScope", "session_key"] {
+            let mut value = json!({
+                "id": "test",
+                "action": "agent",
+                "messageTemplate": "hello"
+            });
+            value
+                .as_object_mut()
+                .expect("object")
+                .insert(field.to_string(), json!("hook:old"));
+
+            let err = serde_json::from_value::<HookMapping>(value)
+                .expect_err("removed session alias should be rejected");
+            assert!(
+                err.to_string().contains("unknown field"),
+                "unexpected error for {field}: {err}"
+            );
+        }
     }
 
     #[test]

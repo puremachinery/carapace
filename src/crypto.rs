@@ -8,16 +8,12 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
-use pbkdf2::pbkdf2_hmac;
+#[cfg(test)]
 use sha2::Sha256;
 use thiserror::Error;
 
 /// Standard derived-key length for password-based encryption.
 pub(crate) const PASSWORD_DERIVED_KEY_LEN: usize = 32;
-
-/// Legacy PBKDF2 iteration count retained for decrypting older persisted
-/// formats and for format-v1 compatibility tests.
-pub(crate) const LEGACY_PBKDF2_ITERATIONS: u32 = 600_000;
 
 /// Argon2id parameters for current password-derived encryption writes.
 pub(crate) const ARGON2ID_V2_MEMORY_KIB: u32 = 64 * 1024;
@@ -187,22 +183,6 @@ pub(crate) fn generate_hex_secret(byte_len: usize) -> Result<String, getrandom::
     let mut bytes = vec![0u8; byte_len];
     getrandom::fill(&mut bytes)?;
     Ok(hex::encode(bytes))
-}
-
-pub(crate) fn derive_key_pbkdf2_sha256(
-    password: &[u8],
-    salt: &[u8],
-) -> Result<[u8; PASSWORD_DERIVED_KEY_LEN], PasswordKdfError> {
-    if salt.len() < PASSWORD_KDF_MIN_SALT_LEN {
-        return Err(PasswordKdfError::InvalidSaltLength {
-            minimum: PASSWORD_KDF_MIN_SALT_LEN,
-            got: salt.len(),
-        });
-    }
-
-    let mut out = [0u8; PASSWORD_DERIVED_KEY_LEN];
-    pbkdf2_hmac::<Sha256>(password, salt, LEGACY_PBKDF2_ITERATIONS, &mut out);
-    Ok(out)
 }
 
 pub(crate) fn derive_key_argon2id(
@@ -407,20 +387,6 @@ mod tests {
                 field: "nonce",
                 expected: 5,
                 got: 3,
-            }
-        );
-    }
-
-    #[test]
-    fn test_derive_key_pbkdf2_sha256_rejects_short_salt() {
-        let password = Sha256::digest(b"carapace-pbkdf2-short-salt-password");
-        let salt = Sha256::digest(b"carapace-pbkdf2-short-salt-salt");
-        let err = derive_key_pbkdf2_sha256(password.as_slice(), &salt[..15]).unwrap_err();
-        assert_eq!(
-            err,
-            PasswordKdfError::InvalidSaltLength {
-                minimum: PASSWORD_KDF_MIN_SALT_LEN,
-                got: 15,
             }
         );
     }

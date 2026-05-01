@@ -413,7 +413,7 @@ pub fn remap_model_id(openclaw_model: &str) -> String {
         }
     } else {
         // No provider prefix — apply well-known model family prefixes.
-        crate::migration::prefix_bare_model(openclaw_model)
+        crate::migration::prefix_imported_model(openclaw_model)
     }
 }
 

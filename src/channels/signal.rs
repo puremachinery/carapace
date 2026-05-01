@@ -69,10 +69,8 @@ pub struct SignalChannel {
 impl SignalChannel {
     /// Create a new Signal channel targeting the given signal-cli-rest-api instance.
     ///
-    /// This constructor intentionally does not fail closed for URL policy checks
-    /// to preserve compatibility with existing configs (including localhost
-    /// signal-cli-rest-api over HTTP). Enforcement happens at send time in
-    /// `post_send` and `send_media`.
+    /// This constructor records URL policy diagnostics but defers enforcement
+    /// to the send paths so channel construction stays side-effect free.
     pub fn new(base_url: String, phone_number: String) -> Self {
         if let Ok(parsed) = url::Url::parse(&base_url) {
             if parsed.scheme() == "http" && is_loopback_host(&parsed) {

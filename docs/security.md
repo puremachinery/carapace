@@ -68,7 +68,7 @@ graph TB
     end
 
     subgraph "Data at Rest"
-        Secrets["AES-256-GCM Encrypted Secrets<br/>(Argon2id v2 writes, PBKDF2 legacy reads)"]
+        Secrets["AES-256-GCM Encrypted Secrets<br/>(Argon2id v2 envelopes)"]
         Sessions["HMAC-SHA256 Session Integrity"]
         Audit["Append-Only Audit Log<br/>(JSONL, 19 event types)"]
         Keychain["Platform Credential Store<br/>(Keychain / Secret Service / Windows)"]
@@ -183,7 +183,7 @@ Example uses the Linux config directory (`~/.config/carapace`).
 
 ```
 ~/.config/carapace/
-├── carapace.json5          # Config (may contain tokens; legacy .json fallback)
+├── carapace.json5          # Config (may contain tokens)
 ├── credentials/            # Channel credentials, allowlists
 │   ├── whatsapp/          # WhatsApp session data
 │   └── *-allowFrom.json   # Pairing allowlists
@@ -298,7 +298,6 @@ The control UI (`/control/*` endpoints) requires:
 - CSRF protection (double-submit cookie with `__Host-` prefix, `SameSite=Strict`, origin/host validation)
 - Config mutation split:
   - `PATCH /control/config` is restricted to `gateway.controlUi.*`
-  - `POST /control/config` is the legacy broader path (still blocked from protected prefixes)
 - Protected config prefixes blocked from control mutation include auth/hooks/credentials/secrets plus provider and channel secrets (for example `anthropic.apiKey`, `openai.apiKey`, `google.apiKey`, `venice.apiKey`, `bedrock.secretAccessKey`, `telegram.botToken`, `discord.botToken`, `slack.signingSecret`) and provider endpoint overrides (`*.baseUrl`).
 
 ```rust

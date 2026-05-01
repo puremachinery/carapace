@@ -98,7 +98,6 @@ pub struct ExecApprovalRecord {
 /// Internal entry for a pending approval.
 struct PendingEntry {
     record: ExecApprovalRecord,
-    #[allow(dead_code)]
     responder: oneshot::Sender<Option<ExecApprovalDecision>>,
     expires_at: Instant,
 }

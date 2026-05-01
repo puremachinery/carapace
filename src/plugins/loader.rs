@@ -73,6 +73,9 @@ pub enum LoaderError {
         actual: String,
     },
 
+    #[error("Plugin manifest entry for '{plugin_name}' is missing required sha256")]
+    MissingPluginHash { plugin_name: String },
+
     #[error("Plugin signature verification failed for '{plugin_name}': {reason}")]
     SignatureVerificationFailed { plugin_name: String, reason: String },
 }
@@ -603,9 +606,6 @@ fn compute_sha256_hex(data: &[u8]) -> String {
 
 /// Verify that a plugin's WASM bytes match the expected SHA-256 hash stored in the
 /// plugins manifest.
-///
-/// If no manifest entry or no `sha256` field exists for the plugin (legacy entry),
-/// verification is skipped with a warning log and `Ok(())` is returned.
 pub fn verify_plugin_hash_on_load(
     plugin_name: &str,
     wasm_bytes: &[u8],
@@ -640,11 +640,13 @@ pub fn verify_plugin_hash_on_load(
             Ok(())
         }
         None => {
-            tracing::warn!(
+            tracing::error!(
                 plugin = %plugin_name,
-                "no sha256 hash in manifest for plugin, skipping verification (legacy entry)"
+                "plugin manifest entry is missing required sha256"
             );
-            Ok(())
+            Err(LoaderError::MissingPluginHash {
+                plugin_name: plugin_name.to_string(),
+            })
         }
     }
 }

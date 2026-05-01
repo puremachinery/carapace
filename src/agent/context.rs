@@ -158,8 +158,8 @@ fn parse_block_metadata(item: &Value) -> Option<ContentBlockMetadata> {
 
 /// Try to parse assistant content as structured blocks.
 ///
-/// Accepts the legacy tool-use JSON shape plus the newer metadata-bearing text
-/// block shape used for Gemini/Vertex thought-signature round-tripping.
+/// Accepts structured blocks used for tool state and Gemini/Vertex
+/// thought-signature round-tripping.
 fn try_parse_assistant_blocks(content: &str) -> Option<Vec<ContentBlock>> {
     let parsed: Value = serde_json::from_str(content).ok()?;
     let arr = parsed.as_array()?;

@@ -6,8 +6,7 @@
     "src/gateway/hooks.ts"
   ],
   "notes": [
-    "Token extraction priority: Authorization Bearer > X-Carapace-Token header > ?token query param",
-    "Query param token triggers deprecation warning in server logs",
+    "Token extraction priority: Authorization Bearer > X-Carapace-Token header",
     "Hooks must be enabled via config: hooks.enabled=true, hooks.token required",
     "Default base path is /hooks, configurable via hooks.path",
     "Max body size defaults to 256KB (DEFAULT_HOOKS_MAX_BODY_BYTES = 256 * 1024)"
@@ -90,21 +89,6 @@
           "properties": { "ok": { "type": "boolean", "const": true } }
         }
       }
-    },
-    {
-      "name": "authorized_query_token_deprecated",
-      "description": "Query parameter token works but is deprecated - logs security warning",
-      "request": {
-        "method": "POST",
-        "path": "/hooks/wake?token={{hooks_token}}",
-        "headers": { "Content-Type": "application/json" },
-        "body": { "text": "test message" }
-      },
-      "response": { "status": 200 },
-      "notes": [
-        "Server logs deprecation warning about security implications",
-        "Tokens in URLs appear in logs, browser history, and referrer headers"
-      ]
     },
     {
       "name": "hooks_disabled",

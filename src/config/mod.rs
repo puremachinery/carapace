@@ -221,19 +221,59 @@ pub(crate) fn config_password() -> Option<Zeroizing<Vec<u8>>> {
     Some(Zeroizing::new(password.into_bytes()))
 }
 
-fn resolve_config_secrets(value: &mut Value) {
-    let Some(password) = config_password() else {
-        if secrets::contains_encrypted_values(value) {
-            tracing::warn!(
-                "{} is not set; encrypted config values will remain locked",
-                CONFIG_PASSWORD_ENV
-            );
-            secrets::scrub_encrypted_values(value);
+fn resolve_config_secrets(value: &mut Value) -> Result<(), ConfigError> {
+    let has_encrypted_values = secrets::contains_encrypted_values(value);
+    if !has_encrypted_values {
+        return Ok(());
+    }
+
+    match secrets::find_unsupported_encrypted_values(value) {
+        Ok(unsupported) if !unsupported.is_empty() => {
+            let path = if unsupported.len() == 1 {
+                unsupported[0].path.clone()
+            } else {
+                ".".to_string()
+            };
+            let message = if unsupported.len() == 1 {
+                format!(
+                    "unsupported encrypted config secret envelope {} at {}; only enc:v2 is supported; re-enter or re-encrypt this config secret",
+                    unsupported[0].prefix, unsupported[0].path
+                )
+            } else {
+                let entries = unsupported
+                    .iter()
+                    .map(|value| format!("{} at {}", value.prefix, value.path))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "unsupported encrypted config secret envelopes: {entries}; only enc:v2 is supported; re-enter or re-encrypt these config secrets"
+                )
+            };
+            return Err(ConfigError::ValidationError { path, message });
         }
-        return;
+        Ok(_) => {}
+        Err(err) => {
+            return Err(ConfigError::ValidationError {
+                path: err.path,
+                message: format!(
+                    "config secret scan exceeded maximum depth {}; reduce config nesting before using encrypted config secrets",
+                    err.max_depth
+                ),
+            });
+        }
+    }
+
+    let Some(password) = config_password() else {
+        tracing::warn!(
+            "{} is not set; encrypted config values will remain locked",
+            CONFIG_PASSWORD_ENV
+        );
+        secrets::scrub_encrypted_values(value);
+        return Ok(());
     };
     let store = secrets::SecretStore::for_decrypt(password.as_ref());
     secrets::resolve_secrets(value, &store, password.as_ref());
+    Ok(())
 }
 
 pub(crate) fn seal_config_secrets(value: &mut Value) -> Result<(), String> {
@@ -384,7 +424,7 @@ fn load_raw_config_uncached(path: &Path) -> Result<Value, ConfigError> {
     drop(env_state);
 
     // Resolve encrypted secrets if configured.
-    resolve_config_secrets(&mut value);
+    resolve_config_secrets(&mut value)?;
 
     Ok(value)
 }
@@ -956,7 +996,7 @@ pub struct ValidationIssue {
 /// Validate a config value against the schema.
 ///
 /// Delegates to the typed schema validation in [`schema::validate_schema`]
-/// and converts results to the legacy [`ValidationIssue`] type.
+/// and converts results to the public [`ValidationIssue`] type.
 pub fn validate_config(config: &Value) -> Vec<ValidationIssue> {
     schema::validate_schema(config)
         .into_iter()
@@ -1384,6 +1424,100 @@ mod tests {
     }
 
     #[test]
+    fn test_load_config_rejects_unsupported_encrypted_secret_prefix() {
+        let dir = TempDir::new().unwrap();
+        let main_path = create_temp_config(
+            &dir,
+            "config.json5",
+            r#"{
+                "anthropic": { "apiKey": "enc:v1:aaa:bbb:ccc" }
+            }"#,
+        );
+
+        let result = load_config_uncached(&main_path);
+        assert!(matches!(
+            result,
+            Err(ConfigError::ValidationError { path, message })
+                if path == ".anthropic.apiKey"
+                    && message.contains("unsupported encrypted config secret envelope enc:v1")
+                    && message.contains("enc:v2")
+        ));
+    }
+
+    #[test]
+    fn test_load_config_reports_all_unsupported_encrypted_secret_prefixes() {
+        let dir = TempDir::new().unwrap();
+        let main_path = create_temp_config(
+            &dir,
+            "config.json5",
+            r#"{
+                "anthropic": { "apiKey": "enc:v1:aaa:bbb:ccc" },
+                "openai": { "apiKey": "enc:v3:ddd:eee:fff" }
+            }"#,
+        );
+
+        let result = load_config_uncached(&main_path);
+        assert!(matches!(
+            result,
+            Err(ConfigError::ValidationError { path, message })
+                if path == "."
+                    && message.contains("enc:v1 at .anthropic.apiKey")
+                    && message.contains("enc:v3 at .openai.apiKey")
+                    && message.contains("enc:v2")
+        ));
+    }
+
+    #[test]
+    fn test_load_config_rejects_unsupported_encrypted_secret_prefix_with_password() {
+        let mut env_guard = ScopedEnv::new();
+        env_guard.set("CARAPACE_CONFIG_PASSWORD", "test-password");
+
+        let dir = TempDir::new().unwrap();
+        let main_path = create_temp_config(
+            &dir,
+            "config.json5",
+            r#"{
+                "anthropic": { "apiKey": "enc:v1:aaa:bbb:ccc" }
+            }"#,
+        );
+
+        let result = load_config_uncached(&main_path);
+        assert!(matches!(
+            result,
+            Err(ConfigError::ValidationError { path, message })
+                if path == ".anthropic.apiKey"
+                    && message.contains("unsupported encrypted config secret envelope enc:v1")
+                    && message.contains("enc:v2")
+        ));
+    }
+
+    #[test]
+    fn test_resolve_config_secrets_allows_deep_plain_config() {
+        let mut config = serde_json::json!("plain");
+        for index in 0..70 {
+            config = serde_json::json!({ format!("level{index}"): config });
+        }
+
+        resolve_config_secrets(&mut config)
+            .expect("deep plain config should not fail encrypted-secret scanning");
+    }
+
+    #[test]
+    fn test_resolve_config_secrets_rejects_deep_unsupported_encrypted_secret() {
+        let mut config = serde_json::json!("enc:v1:aaa:bbb:ccc");
+        for index in 0..70 {
+            config = serde_json::json!({ format!("level{index}"): config });
+        }
+
+        let err = resolve_config_secrets(&mut config)
+            .expect_err("deep unsupported encrypted secret should fail startup");
+
+        assert!(matches!(err, ConfigError::ValidationError { path, message }
+            if path.contains(".level")
+                && message.contains("config secret scan exceeded maximum depth")));
+    }
+
+    #[test]
     fn test_include_depth_limit() {
         let dir = TempDir::new().unwrap();
 
@@ -1491,8 +1625,8 @@ mod tests {
 
         let normalized = load_config_shared().unwrap();
         assert_eq!(
-            normalized["session"]["typingMode"],
-            Value::String("thinking".to_string())
+            normalized["channels"]["signal"]["features"]["typing"]["enabled"],
+            Value::Bool(true)
         );
 
         std::fs::write(

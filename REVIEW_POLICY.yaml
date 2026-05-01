@@ -140,7 +140,7 @@ review_types:
   # ============================================================================
   architecture:
     api_design:
-      description: "API contracts, versioning, backwards compatibility, REST/GraphQL conventions"
+      description: "API contracts, versioning, REST/GraphQL conventions"
       enabled: true
       frequency: "every_pr"
       severity: "medium"
@@ -286,7 +286,7 @@ review_types:
       severity: "medium"
 
     deployment:
-      description: "Rollback safety, migration ordering, blue-green compatibility"
+      description: "Rollback safety, migration ordering, blue-green releases"
       enabled: true
       frequency: "every_pr"
       severity: "high"
@@ -305,7 +305,7 @@ review_types:
   # ============================================================================
   compliance:
     licenses:
-      description: "Dependency licenses, compatibility, attribution requirements"
+      description: "Dependency licenses, platform support, attribution requirements"
       enabled: true
       frequency: "quarterly"
       severity: "medium"

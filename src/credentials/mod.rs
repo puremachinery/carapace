@@ -16,11 +16,8 @@ mod linux;
 #[cfg(target_os = "windows")]
 mod windows;
 
-mod migration;
-
-pub use migration::{migrate_plaintext_credentials, MigrationReport};
-
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as IoWrite;
@@ -47,6 +44,111 @@ pub const WRITE_RATE_LIMIT_PER_MINUTE: usize = 10;
 
 /// Suffix used for staged credential rotation.
 const PENDING_SUFFIX: &str = ":pending";
+const WHATSAPP_LEGACY_PLAINTEXT_FILENAMES: &[&str] =
+    &["creds.json", "identity.json", "session.json"];
+const WHATSAPP_LEGACY_PLAINTEXT_PREFIXES: &[&str] = &[
+    "app-state-sync-key-",
+    "app-state-sync-version-",
+    "pre-key-",
+    "sender-key-",
+    "session-",
+];
+const WHATSAPP_LEGACY_CREDENTIAL_JSON_KEYS: &[&str] = &[
+    "_sessions",
+    "account",
+    "accountSettings",
+    "advSecretKey",
+    "chainKey",
+    "currentRatchet",
+    "fingerprint",
+    "firstUnuploadedPreKeyId",
+    "identityKey",
+    "indexInfo",
+    "keyData",
+    "lastAccountSyncTimestamp",
+    "me",
+    "myAppStateKeyId",
+    "nextPreKeyId",
+    "noiseKey",
+    "pendingPreKey",
+    "processedHistoryMessages",
+    "registrationId",
+    "senderKeyState",
+    "senderSigningKey",
+    "signedIdentityKey",
+    "signedPreKey",
+    "signalIdentities",
+];
+const PAIRING_LEGACY_CREDENTIAL_JSON_KEYS: &[&str] = &[
+    "allowFrom",
+    "allowedFrom",
+    "allowlist",
+    "clientId",
+    "contacts",
+    "credential",
+    "credentials",
+    "deviceId",
+    "identity",
+    "jid",
+    "key",
+    "pairing",
+    "phone",
+    "secret",
+    "senders",
+    "session",
+    "store",
+    "token",
+];
+const AGENT_LEGACY_CREDENTIAL_JSON_KEYS: &[&str] = &[
+    "access_token",
+    "accessToken",
+    "api_key",
+    "apiKey",
+    "client_secret",
+    "clientSecret",
+    "key",
+    "oauth_token",
+    "oauthToken",
+    "refresh_token",
+    "refreshToken",
+    "secret",
+    "setup_token",
+    "setupToken",
+    "token",
+];
+// Matches the config-secret JSON scan bound so startup file-shape probes have
+// the same conservative stack-safety limit.
+const CREDENTIAL_SHAPE_SCAN_MAX_DEPTH: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PlaintextCredentialScanFailure {
+    ReadFailed,
+    InvalidJson,
+    DepthLimitExceeded,
+}
+
+impl std::fmt::Display for PlaintextCredentialScanFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ReadFailed => write!(f, "read failed"),
+            Self::InvalidJson => write!(f, "invalid JSON"),
+            Self::DepthLimitExceeded => write!(f, "JSON nesting exceeds scan depth limit"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PlaintextCredentialScanIssue {
+    pub path: String,
+    pub failure: PlaintextCredentialScanFailure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CredentialShapeScan {
+    Absent,
+    Present,
+    Indeterminate(PlaintextCredentialScanFailure),
+}
 
 /// Credential store errors
 #[derive(Debug, Clone, PartialEq)]
@@ -75,6 +177,15 @@ pub enum CredentialError {
     RateLimitExceeded,
     /// Index file is corrupted
     IndexCorrupted,
+    /// Plaintext credential files are no longer accepted.
+    PlaintextCredentialFilesDetected(Vec<String>),
+    /// Potential plaintext credential files could not be safely inspected.
+    PlaintextCredentialFilesUnscannable(Vec<PlaintextCredentialScanIssue>),
+    /// Plaintext credentials were found and some candidate files could not be safely inspected.
+    PlaintextCredentialFilesBlocked {
+        detected: Vec<String>,
+        unscannable: Vec<PlaintextCredentialScanIssue>,
+    },
     /// File lock acquisition failed
     LockFailed,
     /// Credential verification failed after write
@@ -118,6 +229,52 @@ impl std::fmt::Display for CredentialError {
                 WRITE_RATE_LIMIT_PER_MINUTE
             ),
             Self::IndexCorrupted => write!(f, "Credential index file is corrupted"),
+            Self::PlaintextCredentialFilesDetected(paths) if paths.len() == 1 => write!(
+                f,
+                "plaintext credential file detected at {}; delete it and re-enroll",
+                paths[0]
+            ),
+            Self::PlaintextCredentialFilesDetected(paths) => write!(
+                f,
+                "plaintext credential files detected ({}): {}; delete them and re-enroll",
+                paths.len(),
+                paths.join(", ")
+            ),
+            Self::PlaintextCredentialFilesUnscannable(issues) if issues.len() == 1 => write!(
+                f,
+                "potential plaintext credential file at {} could not be safely inspected ({}); repair the file or permissions, or remove it before startup",
+                issues[0].path,
+                issues[0].failure
+            ),
+            Self::PlaintextCredentialFilesUnscannable(issues) => {
+                let paths = issues
+                    .iter()
+                    .map(|issue| format!("{} ({})", issue.path, issue.failure))
+                    .collect::<Vec<_>>();
+                write!(
+                    f,
+                    "potential plaintext credential files could not be safely inspected ({}): {}; repair the files or permissions, or remove them before startup",
+                    issues.len(),
+                    paths.join(", ")
+                )
+            }
+            Self::PlaintextCredentialFilesBlocked {
+                detected,
+                unscannable,
+            } => {
+                let unscannable = unscannable
+                    .iter()
+                    .map(|issue| format!("{} ({})", issue.path, issue.failure))
+                    .collect::<Vec<_>>();
+                write!(
+                    f,
+                    "plaintext credential files detected ({}): {}; delete them and re-enroll; potential plaintext credential files could not be safely inspected ({}): {}; repair the files or permissions, or remove them before startup",
+                    detected.len(),
+                    detected.join(", "),
+                    unscannable.len(),
+                    unscannable.join(", ")
+                )
+            }
             Self::LockFailed => write!(f, "Failed to acquire file lock"),
             Self::VerificationFailed => write!(f, "Failed to verify credential after write"),
             Self::Internal(msg) => write!(f, "Internal error: {}", msg),
@@ -133,6 +290,346 @@ pub fn is_retryable(error: &CredentialError) -> bool {
         error,
         CredentialError::Timeout | CredentialError::IoError(_) | CredentialError::RateLimitExceeded
     )
+}
+
+pub(crate) fn reject_plaintext_credential_files(state_dir: &Path) -> Result<(), CredentialError> {
+    let mut findings = plaintext_credential_findings(state_dir);
+    findings.sort_and_dedup();
+
+    match (
+        findings.detected.is_empty(),
+        findings.unscannable.is_empty(),
+    ) {
+        (false, false) => {
+            return Err(CredentialError::PlaintextCredentialFilesBlocked {
+                detected: findings.detected,
+                unscannable: findings.unscannable,
+            });
+        }
+        (true, false) => {
+            return Err(CredentialError::PlaintextCredentialFilesUnscannable(
+                findings.unscannable,
+            ));
+        }
+        (false, true) => {
+            return Err(CredentialError::PlaintextCredentialFilesDetected(
+                findings.detected,
+            ));
+        }
+        (true, true) => {}
+    }
+
+    Ok(())
+}
+
+#[derive(Default)]
+struct PlaintextCredentialFindings {
+    detected: Vec<String>,
+    unscannable: Vec<PlaintextCredentialScanIssue>,
+}
+
+impl PlaintextCredentialFindings {
+    fn record(&mut self, path: &Path, scan: CredentialShapeScan) {
+        match scan {
+            CredentialShapeScan::Absent => {}
+            CredentialShapeScan::Present => self.detected.push(path.display().to_string()),
+            CredentialShapeScan::Indeterminate(failure) => {
+                self.unscannable.push(PlaintextCredentialScanIssue {
+                    path: path.display().to_string(),
+                    failure,
+                });
+            }
+        }
+    }
+
+    fn extend(&mut self, other: Self) {
+        self.detected.extend(other.detected);
+        self.unscannable.extend(other.unscannable);
+    }
+
+    fn sort_and_dedup(&mut self) {
+        self.detected.sort();
+        self.detected.dedup();
+        self.unscannable.sort();
+        self.unscannable.dedup();
+    }
+}
+
+fn plaintext_credential_findings(state_dir: &Path) -> PlaintextCredentialFindings {
+    let credentials_dir = state_dir.join("credentials");
+    let known_credential_paths = [
+        credentials_dir.join("oauth.json"),
+        credentials_dir.join("github-copilot.token.json"),
+        credentials_dir.join("creds.json"),
+    ];
+    let mut findings = PlaintextCredentialFindings::default();
+    for path in known_credential_paths {
+        if path.is_file() {
+            findings.record(&path, known_plaintext_file_credential_scan(&path));
+        }
+    }
+
+    findings.extend(agent_plaintext_credential_findings(state_dir));
+
+    if let Ok(entries) = fs::read_dir(&credentials_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if name.ends_with("-pairing.json") || name.ends_with("-allowFrom.json") {
+                findings.record(&path, pairing_plaintext_file_credential_scan(&path));
+            }
+        }
+    }
+
+    let whatsapp_root = credentials_dir.join("whatsapp");
+    if let Ok(accounts) = fs::read_dir(&whatsapp_root) {
+        for account in accounts.flatten() {
+            let account_path = account.path();
+            if !account_path.is_dir() {
+                continue;
+            }
+            if let Ok(files) = fs::read_dir(account_path) {
+                for file in files.flatten() {
+                    let path = file.path();
+                    if let Some(scan) = legacy_whatsapp_plaintext_file_scan(&path) {
+                        findings.record(&path, scan);
+                    }
+                }
+            }
+        }
+    }
+
+    findings
+}
+
+fn legacy_whatsapp_plaintext_file_scan(path: &Path) -> Option<CredentialShapeScan> {
+    let name = path.file_name().and_then(|name| name.to_str())?;
+    let matched_name = WHATSAPP_LEGACY_PLAINTEXT_FILENAMES.contains(&name)
+        || (name.ends_with(".json")
+            && WHATSAPP_LEGACY_PLAINTEXT_PREFIXES
+                .iter()
+                .any(|prefix| name.starts_with(prefix)));
+    matched_name.then(|| whatsapp_plaintext_file_credential_scan(path))
+}
+
+// Read the file, parse as JSON, and apply `predicate`. Unreadable,
+// unparseable, or too-deep files fail closed, but use a distinct scan-failure
+// error so operators do not mistake file-system corruption for confirmed
+// plaintext credentials.
+fn plaintext_file_credential_scan(
+    path: &Path,
+    predicate: fn(&Value) -> CredentialShapeScan,
+) -> CredentialShapeScan {
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "unable to read potential plaintext credential file; rejecting startup"
+            );
+            return CredentialShapeScan::Indeterminate(PlaintextCredentialScanFailure::ReadFailed);
+        }
+    };
+    let value = match serde_json::from_str::<Value>(&content) {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "unable to parse potential plaintext credential file; rejecting startup"
+            );
+            return CredentialShapeScan::Indeterminate(PlaintextCredentialScanFailure::InvalidJson);
+        }
+    };
+    predicate(&value)
+}
+
+fn known_plaintext_file_credential_scan(path: &Path) -> CredentialShapeScan {
+    if fs::metadata(path)
+        .map(|metadata| metadata.len() == 0)
+        .unwrap_or(false)
+    {
+        return CredentialShapeScan::Absent;
+    }
+    plaintext_file_credential_scan(path, known_json_credential_scan)
+}
+
+fn known_json_credential_scan(value: &Value) -> CredentialShapeScan {
+    match value {
+        Value::String(value) if !value.trim().is_empty() => CredentialShapeScan::Present,
+        Value::Object(_) => first_present_or_indeterminate([
+            agent_json_credential_scan(value),
+            simple_bool_credential_scan(whatsapp_json_has_credential_shape(value)),
+            simple_bool_credential_scan(pairing_json_has_credential_shape(value)),
+        ]),
+        _ => CredentialShapeScan::Absent,
+    }
+}
+
+fn whatsapp_plaintext_file_credential_scan(path: &Path) -> CredentialShapeScan {
+    plaintext_file_credential_scan(path, |value| {
+        simple_bool_credential_scan(whatsapp_json_has_credential_shape(value))
+    })
+}
+
+fn whatsapp_json_has_credential_shape(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+
+    object.keys().any(|key| {
+        WHATSAPP_LEGACY_CREDENTIAL_JSON_KEYS.contains(&key.as_str())
+            || (key == "type"
+                && object.get("type").and_then(Value::as_str) == Some("Buffer")
+                && object.get("data").is_some_and(Value::is_array))
+    })
+}
+
+fn pairing_plaintext_file_credential_scan(path: &Path) -> CredentialShapeScan {
+    plaintext_file_credential_scan(path, |value| {
+        simple_bool_credential_scan(pairing_json_has_credential_shape(value))
+    })
+}
+
+fn pairing_json_has_credential_shape(value: &Value) -> bool {
+    match value {
+        Value::String(value) => !value.trim().is_empty(),
+        Value::Array(items) => !items.is_empty(),
+        Value::Object(object) => object
+            .keys()
+            .any(|key| PAIRING_LEGACY_CREDENTIAL_JSON_KEYS.contains(&key.as_str())),
+        _ => false,
+    }
+}
+
+fn agent_plaintext_credential_findings(state_dir: &Path) -> PlaintextCredentialFindings {
+    let mut findings = PlaintextCredentialFindings::default();
+    let agents_dir = state_dir.join("agents");
+    if let Ok(entries) = fs::read_dir(agents_dir) {
+        for entry in entries.flatten() {
+            let agent_root = entry.path();
+            if !agent_root.is_dir() {
+                continue;
+            }
+            let agent_dir = agent_root.join("agent");
+            let auth_profiles = agent_dir.join("auth-profiles.json");
+            findings.record(
+                &auth_profiles,
+                agent_plaintext_file_credential_scan(&auth_profiles),
+            );
+            let auth = agent_dir.join("auth.json");
+            findings.record(&auth, agent_plaintext_file_credential_scan(&auth));
+        }
+    }
+    findings
+}
+
+fn agent_plaintext_file_credential_scan(path: &Path) -> CredentialShapeScan {
+    if !path.is_file() {
+        return CredentialShapeScan::Absent;
+    }
+    plaintext_file_credential_scan(path, agent_json_credential_scan)
+}
+
+fn simple_bool_credential_scan(has_shape: bool) -> CredentialShapeScan {
+    if has_shape {
+        CredentialShapeScan::Present
+    } else {
+        CredentialShapeScan::Absent
+    }
+}
+
+fn first_present_or_indeterminate(
+    scans: impl IntoIterator<Item = CredentialShapeScan>,
+) -> CredentialShapeScan {
+    let mut indeterminate = None;
+    for scan in scans {
+        match scan {
+            CredentialShapeScan::Present => return CredentialShapeScan::Present,
+            CredentialShapeScan::Indeterminate(failure) => indeterminate = Some(failure),
+            CredentialShapeScan::Absent => {}
+        }
+    }
+    indeterminate
+        .map(CredentialShapeScan::Indeterminate)
+        .unwrap_or(CredentialShapeScan::Absent)
+}
+
+fn agent_json_credential_scan(value: &Value) -> CredentialShapeScan {
+    agent_json_credential_scan_inner(value, 0)
+}
+
+fn agent_json_credential_scan_inner(value: &Value, depth: usize) -> CredentialShapeScan {
+    if depth > CREDENTIAL_SHAPE_SCAN_MAX_DEPTH {
+        return CredentialShapeScan::Indeterminate(
+            PlaintextCredentialScanFailure::DepthLimitExceeded,
+        );
+    }
+
+    match value {
+        Value::Object(object) => {
+            let mut indeterminate = None;
+            for (key, value) in object {
+                let scan = if AGENT_LEGACY_CREDENTIAL_JSON_KEYS.contains(&key.as_str()) {
+                    credential_value_plaintext_scan_inner(value, depth + 1)
+                } else {
+                    agent_json_credential_scan_inner(value, depth + 1)
+                };
+                match scan {
+                    CredentialShapeScan::Present => return CredentialShapeScan::Present,
+                    CredentialShapeScan::Indeterminate(failure) => indeterminate = Some(failure),
+                    CredentialShapeScan::Absent => {}
+                }
+            }
+            indeterminate
+                .map(CredentialShapeScan::Indeterminate)
+                .unwrap_or(CredentialShapeScan::Absent)
+        }
+        Value::Array(items) => first_present_or_indeterminate(
+            items
+                .iter()
+                .map(|item| agent_json_credential_scan_inner(item, depth + 1)),
+        ),
+        _ => CredentialShapeScan::Absent,
+    }
+}
+
+#[cfg(test)]
+fn credential_value_plaintext_scan(value: &Value) -> CredentialShapeScan {
+    credential_value_plaintext_scan_inner(value, 0)
+}
+
+fn credential_value_plaintext_scan_inner(value: &Value, depth: usize) -> CredentialShapeScan {
+    if depth > CREDENTIAL_SHAPE_SCAN_MAX_DEPTH {
+        return CredentialShapeScan::Indeterminate(
+            PlaintextCredentialScanFailure::DepthLimitExceeded,
+        );
+    }
+
+    match value {
+        Value::String(value) => {
+            let value = value.trim();
+            if !value.is_empty() && !value.starts_with("enc:v") {
+                CredentialShapeScan::Present
+            } else {
+                CredentialShapeScan::Absent
+            }
+        }
+        Value::Array(items) => first_present_or_indeterminate(
+            items
+                .iter()
+                .map(|item| credential_value_plaintext_scan_inner(item, depth + 1)),
+        ),
+        Value::Object(object) => first_present_or_indeterminate(
+            object
+                .values()
+                .map(|value| credential_value_plaintext_scan_inner(value, depth + 1)),
+        ),
+        _ => CredentialShapeScan::Absent,
+    }
 }
 
 /// Delete a keyring credential entry with idempotent not-found semantics.
@@ -1225,7 +1722,6 @@ pub struct MockCredentialBackend {
 }
 
 impl MockCredentialBackend {
-    #[allow(dead_code)]
     pub fn new(available: bool) -> Self {
         Self {
             credentials: Arc::new(RwLock::new(HashMap::new())),
@@ -1315,6 +1811,321 @@ mod tests {
 
         // Should reject the next write
         assert!(!tracker.check_and_record("test-plugin"));
+    }
+
+    #[test]
+    fn test_plaintext_credential_guard_detects_known_whatsapp_files() {
+        let temp = tempdir().unwrap();
+        let account_dir = temp
+            .path()
+            .join("credentials")
+            .join("whatsapp")
+            .join("default");
+        std::fs::create_dir_all(&account_dir).unwrap();
+        let legacy_path = account_dir.join("session-123.json");
+        std::fs::write(&legacy_path, r#"{"_sessions":{}}"#).unwrap();
+
+        let err = reject_plaintext_credential_files(temp.path())
+            .expect_err("known plaintext WhatsApp file should be rejected");
+        assert_eq!(
+            err,
+            CredentialError::PlaintextCredentialFilesDetected(vec![legacy_path
+                .display()
+                .to_string()])
+        );
+    }
+
+    #[test]
+    fn test_plaintext_credential_guard_reports_all_detected_files() {
+        let temp = tempdir().unwrap();
+        let credentials_dir = temp.path().join("credentials");
+        std::fs::create_dir_all(&credentials_dir).unwrap();
+        let oauth_path = credentials_dir.join("oauth.json");
+        let creds_path = credentials_dir.join("creds.json");
+        std::fs::write(&oauth_path, r#"{"access_token":"secret"}"#).unwrap();
+        std::fs::write(&creds_path, r#"{"noiseKey":{"private":"secret"}}"#).unwrap();
+
+        let err = reject_plaintext_credential_files(temp.path())
+            .expect_err("all plaintext credential files should be reported");
+        let CredentialError::PlaintextCredentialFilesDetected(paths) = err else {
+            panic!("expected plaintext credential rejection");
+        };
+
+        assert_eq!(
+            paths,
+            vec![
+                creds_path.display().to_string(),
+                oauth_path.display().to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_plaintext_credential_guard_ignores_incidental_known_files() {
+        let temp = tempdir().unwrap();
+        let credentials_dir = temp.path().join("credentials");
+        std::fs::create_dir_all(&credentials_dir).unwrap();
+        std::fs::write(credentials_dir.join("oauth.json"), "{}").unwrap();
+        std::fs::write(credentials_dir.join("github-copilot.token.json"), "\"\"").unwrap();
+        std::fs::write(credentials_dir.join("creds.json"), r#"{"note":"debug"}"#).unwrap();
+
+        reject_plaintext_credential_files(temp.path())
+            .expect("incidental known-name files should not block startup");
+    }
+
+    #[test]
+    fn test_plaintext_credential_guard_rejects_malformed_known_file() {
+        let temp = tempdir().unwrap();
+        let credentials_dir = temp.path().join("credentials");
+        std::fs::create_dir_all(&credentials_dir).unwrap();
+        let oauth_path = credentials_dir.join("oauth.json");
+        std::fs::write(&oauth_path, "{not json").unwrap();
+
+        let err = reject_plaintext_credential_files(temp.path())
+            .expect_err("malformed known-name credential file should fail closed");
+        assert_eq!(
+            err,
+            CredentialError::PlaintextCredentialFilesUnscannable(vec![
+                PlaintextCredentialScanIssue {
+                    path: oauth_path.display().to_string(),
+                    failure: PlaintextCredentialScanFailure::InvalidJson,
+                }
+            ])
+        );
+        assert!(
+            err.to_string().contains("could not be safely inspected")
+                && err.to_string().contains("invalid JSON")
+                && !err.to_string().contains("re-enroll")
+        );
+    }
+
+    #[test]
+    fn test_plaintext_credential_guard_reports_detected_and_unscannable_files_together() {
+        let temp = tempdir().unwrap();
+        let credentials_dir = temp.path().join("credentials");
+        std::fs::create_dir_all(&credentials_dir).unwrap();
+        let creds_path = credentials_dir.join("creds.json");
+        let oauth_path = credentials_dir.join("oauth.json");
+        std::fs::write(&creds_path, r#"{"access_token":"secret"}"#).unwrap();
+        std::fs::write(&oauth_path, "{not json").unwrap();
+
+        let err = reject_plaintext_credential_files(temp.path())
+            .expect_err("mixed credential findings should fail startup");
+
+        assert_eq!(
+            err,
+            CredentialError::PlaintextCredentialFilesBlocked {
+                detected: vec![creds_path.display().to_string()],
+                unscannable: vec![PlaintextCredentialScanIssue {
+                    path: oauth_path.display().to_string(),
+                    failure: PlaintextCredentialScanFailure::InvalidJson,
+                }],
+            }
+        );
+        let message = err.to_string();
+        assert!(message.contains(&creds_path.display().to_string()));
+        assert!(message.contains(&oauth_path.display().to_string()));
+        assert!(message.contains("delete them and re-enroll"));
+        assert!(message.contains("could not be safely inspected"));
+    }
+
+    #[test]
+    fn test_plaintext_credential_guard_detects_pairing_files_with_credential_shape() {
+        let temp = tempdir().unwrap();
+        let credentials_dir = temp.path().join("credentials");
+        std::fs::create_dir_all(&credentials_dir).unwrap();
+        let pairing_path = credentials_dir.join("telegram-pairing.json");
+        let allow_from_path = credentials_dir.join("telegram-allowFrom.json");
+        std::fs::write(&pairing_path, r#"{"token":"secret"}"#).unwrap();
+        std::fs::write(&allow_from_path, r#"["+15551234567"]"#).unwrap();
+
+        let err = reject_plaintext_credential_files(temp.path())
+            .expect_err("credential-shaped pairing files should be rejected");
+        let CredentialError::PlaintextCredentialFilesDetected(paths) = err else {
+            panic!("expected plaintext credential rejection");
+        };
+
+        assert_eq!(
+            paths,
+            vec![
+                allow_from_path.display().to_string(),
+                pairing_path.display().to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_plaintext_credential_guard_ignores_incidental_pairing_files() {
+        let temp = tempdir().unwrap();
+        let credentials_dir = temp.path().join("credentials");
+        std::fs::create_dir_all(&credentials_dir).unwrap();
+        std::fs::write(
+            credentials_dir.join("2026-01-15-pairing.json"),
+            r#"{"message":"debug note"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            credentials_dir.join("2026-01-15-allowFrom.json"),
+            r#"{"message":"debug note"}"#,
+        )
+        .unwrap();
+
+        reject_plaintext_credential_files(temp.path())
+            .expect("incidental pairing files should not block startup");
+    }
+
+    #[test]
+    fn test_plaintext_credential_guard_detects_non_default_agent_files() {
+        let temp = tempdir().unwrap();
+        let agent_dir = temp.path().join("agents").join("primary").join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let auth_path = agent_dir.join("auth.json");
+        std::fs::write(&auth_path, r#"{"anthropic":{"apiKey":"secret"}}"#).unwrap();
+
+        let err = reject_plaintext_credential_files(temp.path())
+            .expect_err("non-default agent plaintext credential file should be rejected");
+        assert_eq!(
+            err,
+            CredentialError::PlaintextCredentialFilesDetected(vec![auth_path
+                .display()
+                .to_string()])
+        );
+    }
+
+    #[test]
+    fn test_plaintext_credential_guard_detects_agent_auth_profile_plaintext_secret() {
+        let temp = tempdir().unwrap();
+        let agent_dir = temp.path().join("agents").join("primary").join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let auth_profiles_path = agent_dir.join("auth-profiles.json");
+        std::fs::write(
+            &auth_profiles_path,
+            r#"[{"id":"anthropic:default","provider":"anthropic","token":"secret"}]"#,
+        )
+        .unwrap();
+
+        let err = reject_plaintext_credential_files(temp.path())
+            .expect_err("agent auth profile with plaintext secret should be rejected");
+        assert_eq!(
+            err,
+            CredentialError::PlaintextCredentialFilesDetected(vec![auth_profiles_path
+                .display()
+                .to_string()])
+        );
+    }
+
+    #[test]
+    fn test_agent_credential_shape_scan_reports_depth_limit() {
+        let mut value = serde_json::json!({"note": "not credential"});
+        for index in 0..=CREDENTIAL_SHAPE_SCAN_MAX_DEPTH {
+            value = serde_json::json!({ format!("level{index}"): value });
+        }
+
+        assert_eq!(
+            agent_json_credential_scan(&value),
+            CredentialShapeScan::Indeterminate(PlaintextCredentialScanFailure::DepthLimitExceeded)
+        );
+    }
+
+    #[test]
+    fn test_agent_credential_plaintext_scan_reports_depth_limit() {
+        let mut value = serde_json::json!("enc:v2:aaa:bbb:ccc");
+        for _ in 0..=CREDENTIAL_SHAPE_SCAN_MAX_DEPTH {
+            value = serde_json::json!([value]);
+        }
+
+        assert_eq!(
+            credential_value_plaintext_scan(&value),
+            CredentialShapeScan::Indeterminate(PlaintextCredentialScanFailure::DepthLimitExceeded)
+        );
+    }
+
+    #[test]
+    fn test_plaintext_credential_guard_reports_depth_limit_as_unscannable() {
+        let temp = tempdir().unwrap();
+        let agent_dir = temp.path().join("agents").join("primary").join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let auth_path = agent_dir.join("auth.json");
+        let mut value = serde_json::json!({"note": "not credential"});
+        for index in 0..=CREDENTIAL_SHAPE_SCAN_MAX_DEPTH {
+            value = serde_json::json!({ format!("level{index}"): value });
+        }
+        std::fs::write(&auth_path, value.to_string()).unwrap();
+
+        let err = reject_plaintext_credential_files(temp.path())
+            .expect_err("too-deep credential-shaped file should fail closed");
+
+        assert_eq!(
+            err,
+            CredentialError::PlaintextCredentialFilesUnscannable(vec![
+                PlaintextCredentialScanIssue {
+                    path: auth_path.display().to_string(),
+                    failure: PlaintextCredentialScanFailure::DepthLimitExceeded,
+                }
+            ])
+        );
+        assert!(
+            err.to_string().contains("scan depth limit") && !err.to_string().contains("re-enroll")
+        );
+    }
+
+    #[test]
+    fn test_plaintext_credential_guard_ignores_current_agent_auth_profile_envelope() {
+        let temp = tempdir().unwrap();
+        let agent_dir = temp.path().join("agents").join("primary").join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("auth-profiles.json"),
+            r#"{"version":2,"profiles":[{"id":"anthropic:default","provider":"anthropic","credential_kind":"token","token":"enc:v2:aaa:bbb:ccc"}]}"#,
+        )
+        .unwrap();
+
+        reject_plaintext_credential_files(temp.path())
+            .expect("current encrypted auth profile envelope should not block startup");
+    }
+
+    #[test]
+    fn test_plaintext_credential_guard_ignores_incidental_whatsapp_files() {
+        let temp = tempdir().unwrap();
+        let account_dir = temp
+            .path()
+            .join("credentials")
+            .join("whatsapp")
+            .join("default");
+        std::fs::create_dir_all(&account_dir).unwrap();
+        std::fs::write(account_dir.join("session.enc"), "encrypted").unwrap();
+        std::fs::write(account_dir.join(".DS_Store"), "finder").unwrap();
+        std::fs::write(account_dir.join("notes.json"), "{}").unwrap();
+        std::fs::write(
+            account_dir.join("session-debug.json"),
+            r#"{"message":"operator note"}"#,
+        )
+        .unwrap();
+
+        reject_plaintext_credential_files(temp.path())
+            .expect("incidental WhatsApp files should not block startup");
+    }
+
+    #[test]
+    fn test_plaintext_credential_guard_detects_buffer_shaped_whatsapp_file() {
+        let temp = tempdir().unwrap();
+        let account_dir = temp
+            .path()
+            .join("credentials")
+            .join("whatsapp")
+            .join("default");
+        std::fs::create_dir_all(&account_dir).unwrap();
+        let legacy_path = account_dir.join("pre-key-1.json");
+        std::fs::write(&legacy_path, r#"{"type":"Buffer","data":[1,2,3]}"#).unwrap();
+
+        let err = reject_plaintext_credential_files(temp.path())
+            .expect_err("credential-shaped WhatsApp file should be rejected");
+        assert_eq!(
+            err,
+            CredentialError::PlaintextCredentialFilesDetected(vec![legacy_path
+                .display()
+                .to_string()])
+        );
     }
 
     #[tokio::test]

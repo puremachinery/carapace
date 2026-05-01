@@ -290,7 +290,7 @@ pub fn check_model_access(model_id: &str, foundation_models: &serde_json::Value)
                 return SetupCheck::validation_fail(
                     "Model access",
                     format!("Model `{bare_model}` found but lifecycle status is `{status}`"),
-                    "The model may be deprecated or not yet available. \
+                    "The model is not active or is not yet available. \
                      Check the AWS console for model status in your region."
                         .to_string(),
                     None,
@@ -501,12 +501,12 @@ mod tests {
     }
 
     #[test]
-    fn check_model_access_found_legacy() {
+    fn check_model_access_found_non_active_lifecycle_status() {
         let body = json!({
             "modelSummaries": [
                 {
                     "modelId": "anthropic.claude-v2",
-                    "modelLifecycle": { "status": "LEGACY" }
+                    "modelLifecycle": { "status": "NOT_ACTIVE" }
                 }
             ]
         });
