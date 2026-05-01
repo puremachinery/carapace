@@ -16,7 +16,7 @@ mod linux;
 #[cfg(target_os = "windows")]
 mod windows;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -52,52 +52,6 @@ const WHATSAPP_LEGACY_PLAINTEXT_PREFIXES: &[&str] = &[
     "pre-key-",
     "sender-key-",
     "session-",
-];
-const WHATSAPP_LEGACY_CREDENTIAL_JSON_KEYS: &[&str] = &[
-    "_sessions",
-    "account",
-    "accountSettings",
-    "advSecretKey",
-    "chainKey",
-    "currentRatchet",
-    "fingerprint",
-    "firstUnuploadedPreKeyId",
-    "identityKey",
-    "indexInfo",
-    "keyData",
-    "lastAccountSyncTimestamp",
-    "me",
-    "myAppStateKeyId",
-    "nextPreKeyId",
-    "noiseKey",
-    "pendingPreKey",
-    "processedHistoryMessages",
-    "registrationId",
-    "senderKeyState",
-    "senderSigningKey",
-    "signedIdentityKey",
-    "signedPreKey",
-    "signalIdentities",
-];
-const PAIRING_LEGACY_CREDENTIAL_JSON_KEYS: &[&str] = &[
-    "allowFrom",
-    "allowedFrom",
-    "allowlist",
-    "clientId",
-    "contacts",
-    "credential",
-    "credentials",
-    "deviceId",
-    "identity",
-    "jid",
-    "key",
-    "pairing",
-    "phone",
-    "secret",
-    "senders",
-    "session",
-    "store",
-    "token",
 ];
 const AGENT_LEGACY_CREDENTIAL_JSON_KEYS: &[&str] = &[
     "access_token",
@@ -148,6 +102,328 @@ enum CredentialShapeScan {
     Absent,
     Present,
     Indeterminate(PlaintextCredentialScanFailure),
+}
+
+struct PresentJsonField;
+
+impl<'de> Deserialize<'de> for PresentJsonField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let _ = serde::de::IgnoredAny::deserialize(deserializer)?;
+        Ok(Self)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyWhatsappPrimaryCredentialShape {
+    #[serde(default, alias = "noise_key")]
+    noise_key: Option<PresentJsonField>,
+    #[serde(default, alias = "signed_identity_key")]
+    signed_identity_key: Option<PresentJsonField>,
+    #[serde(default, alias = "registration_id")]
+    registration_id: Option<PresentJsonField>,
+    #[serde(default, alias = "adv_secret_key")]
+    adv_secret_key: Option<PresentJsonField>,
+}
+
+impl LegacyWhatsappPrimaryCredentialShape {
+    fn has_credential_shape(&self) -> bool {
+        self.noise_key.is_some()
+            || self.signed_identity_key.is_some()
+            || self.registration_id.is_some()
+            || self.adv_secret_key.is_some()
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyWhatsappSessionShape {
+    #[serde(default, rename = "_sessions")]
+    sessions: Option<PresentJsonField>,
+    #[serde(default, alias = "chain_key")]
+    chain_key: Option<PresentJsonField>,
+    #[serde(default, alias = "current_ratchet")]
+    current_ratchet: Option<PresentJsonField>,
+    #[serde(default, alias = "index_info")]
+    index_info: Option<PresentJsonField>,
+}
+
+impl LegacyWhatsappSessionShape {
+    fn has_credential_shape(&self) -> bool {
+        self.sessions.is_some()
+            || self.chain_key.is_some()
+            || self.current_ratchet.is_some()
+            || self.index_info.is_some()
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyWhatsappKeyMaterialShape {
+    #[serde(default, alias = "identity_key")]
+    identity_key: Option<PresentJsonField>,
+    #[serde(default, alias = "signed_pre_key")]
+    signed_pre_key: Option<PresentJsonField>,
+    #[serde(default, alias = "sender_key_state")]
+    sender_key_state: Option<PresentJsonField>,
+    #[serde(default, alias = "sender_signing_key")]
+    sender_signing_key: Option<PresentJsonField>,
+}
+
+impl LegacyWhatsappKeyMaterialShape {
+    fn has_credential_shape(&self) -> bool {
+        self.identity_key.is_some()
+            || self.signed_pre_key.is_some()
+            || self.sender_key_state.is_some()
+            || self.sender_signing_key.is_some()
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyWhatsappAccountShape {
+    #[serde(default, alias = "signal_identities")]
+    signal_identities: Option<PresentJsonField>,
+    #[serde(default)]
+    account: Option<PresentJsonField>,
+    #[serde(default, alias = "account_settings")]
+    account_settings: Option<PresentJsonField>,
+    #[serde(default)]
+    me: Option<PresentJsonField>,
+}
+
+impl LegacyWhatsappAccountShape {
+    fn has_credential_shape(&self) -> bool {
+        self.signal_identities.is_some()
+            || self.account.is_some()
+            || self.account_settings.is_some()
+            || self.me.is_some()
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyWhatsappAppStateShape {
+    #[serde(default, alias = "key_data")]
+    key_data: Option<PresentJsonField>,
+    #[serde(default)]
+    fingerprint: Option<PresentJsonField>,
+    #[serde(default, alias = "my_app_state_key_id")]
+    my_app_state_key_id: Option<PresentJsonField>,
+    #[serde(default, alias = "pending_pre_key")]
+    pending_pre_key: Option<PresentJsonField>,
+}
+
+impl LegacyWhatsappAppStateShape {
+    fn has_credential_shape(&self) -> bool {
+        self.key_data.is_some()
+            || self.fingerprint.is_some()
+            || self.my_app_state_key_id.is_some()
+            || self.pending_pre_key.is_some()
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyWhatsappSyncShape {
+    #[serde(default, alias = "processed_history_messages")]
+    processed_history_messages: Option<PresentJsonField>,
+    #[serde(default, alias = "first_unuploaded_pre_key_id")]
+    first_unuploaded_pre_key_id: Option<PresentJsonField>,
+    #[serde(default, alias = "last_account_sync_timestamp")]
+    last_account_sync_timestamp: Option<PresentJsonField>,
+    #[serde(default, alias = "next_pre_key_id")]
+    next_pre_key_id: Option<PresentJsonField>,
+}
+
+impl LegacyWhatsappSyncShape {
+    fn has_credential_shape(&self) -> bool {
+        self.processed_history_messages.is_some()
+            || self.first_unuploaded_pre_key_id.is_some()
+            || self.last_account_sync_timestamp.is_some()
+            || self.next_pre_key_id.is_some()
+    }
+}
+
+#[derive(Deserialize)]
+struct LegacyWhatsappCredentialShape {
+    // Keep these sub-shapes' field names disjoint: serde `flatten` will route a
+    // colliding key to the first matching sub-shape in declaration order.
+    #[serde(flatten)]
+    primary: LegacyWhatsappPrimaryCredentialShape,
+    #[serde(flatten)]
+    session: LegacyWhatsappSessionShape,
+    #[serde(flatten)]
+    key_material: LegacyWhatsappKeyMaterialShape,
+    #[serde(flatten)]
+    account: LegacyWhatsappAccountShape,
+    #[serde(flatten)]
+    app_state: LegacyWhatsappAppStateShape,
+    #[serde(flatten)]
+    sync: LegacyWhatsappSyncShape,
+}
+
+impl LegacyWhatsappCredentialShape {
+    fn has_credential_shape(&self) -> bool {
+        self.primary.has_credential_shape()
+            || self.session.has_credential_shape()
+            || self.key_material.has_credential_shape()
+            || self.account.has_credential_shape()
+            || self.app_state.has_credential_shape()
+            || self.sync.has_credential_shape()
+    }
+}
+
+#[derive(Deserialize)]
+struct LegacyWhatsappBufferShape {
+    #[serde(rename = "type")]
+    _kind: LegacyWhatsappBufferKind,
+    #[serde(rename = "data")]
+    _data: NonEmptyJsonArray,
+}
+
+#[derive(Deserialize)]
+enum LegacyWhatsappBufferKind {
+    #[serde(rename = "Buffer")]
+    Buffer,
+}
+
+struct NonEmptyString;
+
+impl<'de> Deserialize<'de> for NonEmptyString {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        if value.trim().is_empty() {
+            Err(<D::Error as serde::de::Error>::custom("empty string"))
+        } else {
+            Ok(Self)
+        }
+    }
+}
+
+struct NonEmptyJsonArray;
+
+impl<'de> Deserialize<'de> for NonEmptyJsonArray {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(NonEmptyJsonArrayVisitor)
+    }
+}
+
+struct NonEmptyJsonArrayVisitor;
+
+impl<'de> serde::de::Visitor<'de> for NonEmptyJsonArrayVisitor {
+    type Value = NonEmptyJsonArray;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a non-empty JSON array")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        if seq.next_element::<serde::de::IgnoredAny>()?.is_none() {
+            return Err(<A::Error as serde::de::Error>::custom("empty array"));
+        }
+        while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+        Ok(NonEmptyJsonArray)
+    }
+}
+
+#[derive(Deserialize)]
+struct LegacyPairingEnvelopeShape {
+    #[serde(default, rename = "pairingCode", alias = "pairing_code")]
+    pairing_code: Option<PresentJsonField>,
+    #[serde(default)]
+    pairing: Option<PresentJsonField>,
+    #[serde(default)]
+    credential: Option<PresentJsonField>,
+    #[serde(default)]
+    credentials: Option<PresentJsonField>,
+}
+
+impl LegacyPairingEnvelopeShape {
+    fn has_credential_shape(&self) -> bool {
+        self.pairing_code.is_some()
+            || self.pairing.is_some()
+            || self.credential.is_some()
+            || self.credentials.is_some()
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyPairingCredentialRecordShape {
+    // Pairing object detection intentionally preserves the old fail-closed key
+    // set. Some names are broad, but this guard only scans known credential
+    // paths and *-pairing/*-allowFrom files; missing a plaintext credential is
+    // worse than rejecting an incidental colocated JSON note.
+    #[serde(default)]
+    token: Option<PresentJsonField>,
+    #[serde(default)]
+    secret: Option<PresentJsonField>,
+    #[serde(default)]
+    jid: Option<PresentJsonField>,
+    #[serde(default, alias = "client_id")]
+    client_id: Option<PresentJsonField>,
+    #[serde(default, alias = "device_id")]
+    device_id: Option<PresentJsonField>,
+    #[serde(default)]
+    allow_from: Option<PresentJsonField>,
+    #[serde(default)]
+    allowed_from: Option<PresentJsonField>,
+    #[serde(default)]
+    allowlist: Option<PresentJsonField>,
+    #[serde(default)]
+    contacts: Option<PresentJsonField>,
+    #[serde(default)]
+    identity: Option<PresentJsonField>,
+    #[serde(default)]
+    key: Option<PresentJsonField>,
+    #[serde(default)]
+    phone: Option<PresentJsonField>,
+    #[serde(default)]
+    senders: Option<PresentJsonField>,
+    #[serde(default)]
+    session: Option<PresentJsonField>,
+    #[serde(default)]
+    store: Option<PresentJsonField>,
+}
+
+impl LegacyPairingCredentialRecordShape {
+    fn has_credential_shape(&self) -> bool {
+        self.token.is_some()
+            || self.secret.is_some()
+            || self.jid.is_some()
+            || self.client_id.is_some()
+            || self.device_id.is_some()
+            || self.allow_from.is_some()
+            || self.allowed_from.is_some()
+            || self.allowlist.is_some()
+            || self.contacts.is_some()
+            || self.identity.is_some()
+            || self.key.is_some()
+            || self.phone.is_some()
+            || self.senders.is_some()
+            || self.session.is_some()
+            || self.store.is_some()
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum LegacyPairingShape {
+    String(NonEmptyString),
+    Array(NonEmptyJsonArray),
 }
 
 /// Credential store errors
@@ -476,16 +752,13 @@ fn whatsapp_plaintext_file_credential_scan(path: &Path) -> CredentialShapeScan {
 }
 
 fn whatsapp_json_has_credential_shape(value: &Value) -> bool {
-    let Some(object) = value.as_object() else {
-        return false;
-    };
-
-    object.keys().any(|key| {
-        WHATSAPP_LEGACY_CREDENTIAL_JSON_KEYS.contains(&key.as_str())
-            || (key == "type"
-                && object.get("type").and_then(Value::as_str) == Some("Buffer")
-                && object.get("data").is_some_and(Value::is_array))
-    })
+    if LegacyWhatsappBufferShape::deserialize(value).is_ok() {
+        return true;
+    }
+    // The object shape intentionally deserializes any JSON object; field
+    // presence in `has_credential_shape` is the content gate.
+    LegacyWhatsappCredentialShape::deserialize(value)
+        .is_ok_and(|shape| shape.has_credential_shape())
 }
 
 fn pairing_plaintext_file_credential_scan(path: &Path) -> CredentialShapeScan {
@@ -495,13 +768,14 @@ fn pairing_plaintext_file_credential_scan(path: &Path) -> CredentialShapeScan {
 }
 
 fn pairing_json_has_credential_shape(value: &Value) -> bool {
-    match value {
-        Value::String(value) => !value.trim().is_empty(),
-        Value::Array(items) => !items.is_empty(),
-        Value::Object(object) => object
-            .keys()
-            .any(|key| PAIRING_LEGACY_CREDENTIAL_JSON_KEYS.contains(&key.as_str())),
-        _ => false,
+    match LegacyPairingShape::deserialize(value) {
+        Ok(LegacyPairingShape::String(_) | LegacyPairingShape::Array(_)) => true,
+        Err(_) => {
+            LegacyPairingEnvelopeShape::deserialize(value)
+                .is_ok_and(|shape| shape.has_credential_shape())
+                || LegacyPairingCredentialRecordShape::deserialize(value)
+                    .is_ok_and(|shape| shape.has_credential_shape())
+        }
     }
 }
 
@@ -1823,7 +2097,23 @@ mod tests {
             .join("default");
         std::fs::create_dir_all(&account_dir).unwrap();
         let legacy_path = account_dir.join("session-123.json");
-        std::fs::write(&legacy_path, r#"{"_sessions":{}}"#).unwrap();
+        std::fs::write(
+            &legacy_path,
+            serde_json::json!({
+                "noiseKey": {
+                    "private": {"type": "Buffer", "data": [1]},
+                    "public": {"type": "Buffer", "data": [2]}
+                },
+                "signedIdentityKey": {
+                    "private": {"type": "Buffer", "data": [3]},
+                    "public": {"type": "Buffer", "data": [4]}
+                },
+                "registrationId": 42,
+                "_sessions": {}
+            })
+            .to_string(),
+        )
+        .unwrap();
 
         let err = reject_plaintext_credential_files(temp.path())
             .expect_err("known plaintext WhatsApp file should be rejected");
@@ -1935,8 +2225,10 @@ mod tests {
         let credentials_dir = temp.path().join("credentials");
         std::fs::create_dir_all(&credentials_dir).unwrap();
         let pairing_path = credentials_dir.join("telegram-pairing.json");
+        let token_path = credentials_dir.join("telegram-token-pairing.json");
         let allow_from_path = credentials_dir.join("telegram-allowFrom.json");
-        std::fs::write(&pairing_path, r#"{"token":"secret"}"#).unwrap();
+        std::fs::write(&pairing_path, r#"{"pairingCode":"123-456"}"#).unwrap();
+        std::fs::write(&token_path, r#"{"token":"secret"}"#).unwrap();
         std::fs::write(&allow_from_path, r#"["+15551234567"]"#).unwrap();
 
         let err = reject_plaintext_credential_files(temp.path())
@@ -1949,7 +2241,8 @@ mod tests {
             paths,
             vec![
                 allow_from_path.display().to_string(),
-                pairing_path.display().to_string()
+                pairing_path.display().to_string(),
+                token_path.display().to_string()
             ]
         );
     }
@@ -1972,6 +2265,67 @@ mod tests {
 
         reject_plaintext_credential_files(temp.path())
             .expect("incidental pairing files should not block startup");
+    }
+
+    #[test]
+    fn test_plaintext_credential_guard_detects_pairing_files_with_broad_legacy_keys() {
+        let temp = tempdir().unwrap();
+        let credentials_dir = temp.path().join("credentials");
+        std::fs::create_dir_all(&credentials_dir).unwrap();
+        let pairing_path = credentials_dir.join("debug-pairing.json");
+        std::fs::write(
+            &pairing_path,
+            r#"{"allowFrom":["+15551234567"],"session":"operator note","identity":"alice"}"#,
+        )
+        .unwrap();
+
+        let err = reject_plaintext_credential_files(temp.path())
+            .expect_err("broad legacy pairing keys should still block startup");
+        assert_eq!(
+            err,
+            CredentialError::PlaintextCredentialFilesDetected(vec![pairing_path
+                .display()
+                .to_string()])
+        );
+    }
+
+    #[test]
+    fn test_pairing_credential_shape_detects_broad_legacy_object_fields() {
+        for value in [
+            serde_json::json!({"allowFrom": ["+15551234567"]}),
+            serde_json::json!({"allowedFrom": ["+15551234567"]}),
+            serde_json::json!({"allowlist": ["alice"]}),
+            serde_json::json!({"contacts": ["alice"]}),
+            serde_json::json!({"identity": "alice"}),
+            serde_json::json!({"key": "debug"}),
+            serde_json::json!({"phone": "+15551234567"}),
+            serde_json::json!({"senders": ["alice"]}),
+            serde_json::json!({"session": "operator note"}),
+            serde_json::json!({"store": "fixture"}),
+        ] {
+            assert!(pairing_json_has_credential_shape(&value), "{value}");
+        }
+    }
+
+    #[test]
+    fn test_pairing_credential_shape_detects_canonical_object_fields() {
+        for value in [
+            serde_json::json!({"pairingCode": "123-456"}),
+            serde_json::json!({"pairing_code": "123-456"}),
+            serde_json::json!({"pairing": {"code": "123-456"}}),
+            serde_json::json!({"pairing": {}}),
+            serde_json::json!({"credential": "pairing-secret"}),
+            serde_json::json!({"credentials": ["pairing-secret"]}),
+            serde_json::json!({"token": "pairing-secret"}),
+            serde_json::json!({"secret": "pairing-secret"}),
+            serde_json::json!({"jid": "debug@example.invalid"}),
+            serde_json::json!({"clientId": "debug-client"}),
+            serde_json::json!({"client_id": "debug-client"}),
+            serde_json::json!({"deviceId": "debug-device"}),
+            serde_json::json!({"device_id": "debug-device"}),
+        ] {
+            assert!(pairing_json_has_credential_shape(&value), "{value}");
+        }
     }
 
     #[test]
@@ -2082,6 +2436,90 @@ mod tests {
 
         reject_plaintext_credential_files(temp.path())
             .expect("current encrypted auth profile envelope should not block startup");
+    }
+
+    #[test]
+    fn test_whatsapp_credential_shape_detects_canonical_fields() {
+        let camel_case = serde_json::json!({
+            "noiseKey": {"private": {"type": "Buffer", "data": [1]}},
+            "signedIdentityKey": {"public": {"type": "Buffer", "data": [2]}},
+            "registrationId": 42,
+            "_sessions": {}
+        });
+        let snake_case = serde_json::json!({
+            "noise_key": {"private": {"type": "Buffer", "data": [1]}},
+            "signed_identity_key": {"public": {"type": "Buffer", "data": [2]}},
+            "registration_id": 42
+        });
+        let top_level_buffer = serde_json::json!({"type": "Buffer", "data": [1]});
+
+        assert!(whatsapp_json_has_credential_shape(&camel_case));
+        assert!(whatsapp_json_has_credential_shape(&snake_case));
+        assert!(whatsapp_json_has_credential_shape(&top_level_buffer));
+    }
+
+    #[test]
+    fn test_whatsapp_credential_shape_detects_each_mapped_field() {
+        for value in [
+            serde_json::json!({"noiseKey": {"private": {"type": "Buffer", "data": [1]}}}),
+            serde_json::json!({"signedIdentityKey": {"public": {"type": "Buffer", "data": [1]}}}),
+            serde_json::json!({"registrationId": 42}),
+            serde_json::json!({"_sessions": {}}),
+            serde_json::json!({"advSecretKey": "secret"}),
+            serde_json::json!({"chainKey": {"counter": 1}}),
+            serde_json::json!({"currentRatchet": {"ephemeralKeyPair": "secret"}}),
+            serde_json::json!({"indexInfo": {"baseKey": "abc"}}),
+            serde_json::json!({"identityKey": {"type": "Buffer", "data": [1]}}),
+            serde_json::json!({"signedPreKey": {"keyPair": "secret"}}),
+            serde_json::json!({"senderKeyState": {"chainKey": "secret"}}),
+            serde_json::json!({"senderSigningKey": {"type": "Buffer", "data": [1]}}),
+            serde_json::json!({"signalIdentities": [{"identifier": "alice"}]}),
+            serde_json::json!({"account": {"details": "secret"}}),
+            serde_json::json!({"accountSettings": {"unarchiveChats": false}}),
+            serde_json::json!({"me": {"id": "alice"}}),
+            serde_json::json!({"keyData": {"type": "Buffer", "data": [1]}}),
+            serde_json::json!({"fingerprint": {"rawId": 1}}),
+            serde_json::json!({"myAppStateKeyId": "app-state-key"}),
+            serde_json::json!({"pendingPreKey": {"keyId": 1}}),
+            serde_json::json!({"processedHistoryMessages": []}),
+            serde_json::json!({"firstUnuploadedPreKeyId": 1}),
+            serde_json::json!({"lastAccountSyncTimestamp": 123}),
+            serde_json::json!({"nextPreKeyId": 2}),
+            serde_json::json!({"noise_key": {"private": {"type": "Buffer", "data": [1]}}}),
+            serde_json::json!({"signed_identity_key": {"public": {"type": "Buffer", "data": [1]}}}),
+            serde_json::json!({"registration_id": 42}),
+            serde_json::json!({"adv_secret_key": "secret"}),
+            serde_json::json!({"chain_key": {"counter": 1}}),
+            serde_json::json!({"current_ratchet": {"ephemeralKeyPair": "secret"}}),
+            serde_json::json!({"index_info": {"baseKey": "abc"}}),
+            serde_json::json!({"identity_key": {"type": "Buffer", "data": [1]}}),
+            serde_json::json!({"signed_pre_key": {"keyPair": "secret"}}),
+            serde_json::json!({"sender_key_state": {"chainKey": "secret"}}),
+            serde_json::json!({"sender_signing_key": {"type": "Buffer", "data": [1]}}),
+            serde_json::json!({"signal_identities": [{"identifier": "alice"}]}),
+            serde_json::json!({"account_settings": {"unarchiveChats": false}}),
+            serde_json::json!({"key_data": {"type": "Buffer", "data": [1]}}),
+            serde_json::json!({"my_app_state_key_id": "app-state-key"}),
+            serde_json::json!({"pending_pre_key": {"keyId": 1}}),
+            serde_json::json!({"processed_history_messages": []}),
+            serde_json::json!({"first_unuploaded_pre_key_id": 1}),
+            serde_json::json!({"last_account_sync_timestamp": 123}),
+            serde_json::json!({"next_pre_key_id": 2}),
+        ] {
+            assert!(whatsapp_json_has_credential_shape(&value), "{value}");
+        }
+    }
+
+    #[test]
+    fn test_whatsapp_credential_shape_ignores_objects_without_mapped_fields() {
+        for value in [
+            serde_json::json!({}),
+            serde_json::json!({"message": "operator note"}),
+            serde_json::json!({"name": "alice", "status": "online"}),
+            serde_json::json!({"type": "Buffer", "data": []}),
+        ] {
+            assert!(!whatsapp_json_has_credential_shape(&value), "{value}");
+        }
     }
 
     #[test]
