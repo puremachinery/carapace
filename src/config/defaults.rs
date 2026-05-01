@@ -17,7 +17,6 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::env;
 use tracing::debug;
 
 // ---------------------------------------------------------------------------
@@ -499,11 +498,11 @@ impl Default for VertexDefaults {
 }
 
 fn default_vertex_project_id() -> Option<String> {
-    env::var("VERTEX_PROJECT_ID").ok()
+    super::read_config_env("VERTEX_PROJECT_ID")
 }
 
 fn default_vertex_location() -> String {
-    env::var("VERTEX_LOCATION").unwrap_or_else(|_| "us-central1".to_string())
+    super::read_config_env("VERTEX_LOCATION").unwrap_or_else(|| "us-central1".to_string())
 }
 
 // ---------------------------------------------------------------------------

@@ -57,8 +57,7 @@ pub fn persist_cli_anthropic_setup_token(
 
 pub fn anthropic_setup_token_api_key_conflict(config: &Value) -> AnthropicSetupTokenApiKeyConflict {
     AnthropicSetupTokenApiKeyConflict {
-        env_api_key_present: std::env::var("ANTHROPIC_API_KEY")
-            .ok()
+        env_api_key_present: crate::config::read_config_env("ANTHROPIC_API_KEY")
             .map(|value| !value.trim().is_empty())
             .unwrap_or(false),
         config_api_key_present: config

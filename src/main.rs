@@ -1,3 +1,5 @@
+#![deny(clippy::disallowed_methods)]
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -208,7 +210,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Initialize logging based on the CARAPACE_DEV environment variable.
 fn init_logging_from_env() -> Result<(), Box<dyn std::error::Error>> {
-    let dev_mode = std::env::var("CARAPACE_DEV")
+    let dev_mode = config::read_process_env("CARAPACE_DEV")
         .map(|v| !v.is_empty() && v != "0" && v.to_lowercase() != "false")
         .unwrap_or(false);
     let log_config = if dev_mode {
@@ -311,13 +313,13 @@ fn resolve_signal_config(cfg: &Value) -> Option<SignalConfig> {
         .and_then(|s| s.get("baseUrl"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-        .or_else(|| std::env::var("SIGNAL_CLI_URL").ok())?;
+        .or_else(|| config::read_config_env("SIGNAL_CLI_URL"))?;
 
     let phone_number = signal_cfg
         .and_then(|s| s.get("phoneNumber"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-        .or_else(|| std::env::var("SIGNAL_PHONE_NUMBER").ok())?;
+        .or_else(|| config::read_config_env("SIGNAL_PHONE_NUMBER"))?;
 
     Some(SignalConfig {
         base_url,
@@ -343,13 +345,13 @@ fn resolve_telegram_config(cfg: &Value) -> Option<TelegramConfig> {
         .and_then(|s| s.get("botToken"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-        .or_else(|| std::env::var("TELEGRAM_BOT_TOKEN").ok())?;
+        .or_else(|| config::read_config_env("TELEGRAM_BOT_TOKEN"))?;
 
     let base_url = telegram_cfg
         .and_then(|s| s.get("baseUrl"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-        .or_else(|| std::env::var("TELEGRAM_BASE_URL").ok())
+        .or_else(|| config::read_config_env("TELEGRAM_BASE_URL"))
         .unwrap_or_else(|| channels::telegram::TELEGRAM_DEFAULT_API_BASE_URL.to_string());
 
     Some(TelegramConfig {
@@ -376,30 +378,26 @@ fn resolve_discord_config(cfg: &Value) -> Option<DiscordConfig> {
         .and_then(|s| s.get("botToken"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-        .or_else(|| std::env::var("DISCORD_BOT_TOKEN").ok())?;
+        .or_else(|| config::read_config_env("DISCORD_BOT_TOKEN"))?;
 
     let base_url = discord_cfg
         .and_then(|s| s.get("baseUrl"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-        .or_else(|| std::env::var("DISCORD_BASE_URL").ok())
+        .or_else(|| config::read_config_env("DISCORD_BASE_URL"))
         .unwrap_or_else(|| channels::discord::DISCORD_DEFAULT_API_BASE_URL.to_string());
 
     let gateway_url = discord_cfg
         .and_then(|s| s.get("gatewayUrl"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-        .or_else(|| std::env::var("DISCORD_GATEWAY_URL").ok())
+        .or_else(|| config::read_config_env("DISCORD_GATEWAY_URL"))
         .unwrap_or_else(|| channels::discord_gateway::DEFAULT_DISCORD_GATEWAY_URL.to_string());
 
     let gateway_intents = discord_cfg
         .and_then(|s| s.get("gatewayIntents"))
         .and_then(|v| v.as_u64())
-        .or_else(|| {
-            std::env::var("DISCORD_GATEWAY_INTENTS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-        })
+        .or_else(|| config::read_config_env("DISCORD_GATEWAY_INTENTS").and_then(|v| v.parse().ok()))
         .unwrap_or(37377);
 
     let gateway_enabled = discord_cfg
@@ -434,13 +432,13 @@ fn resolve_slack_config(cfg: &Value) -> Option<SlackConfig> {
         .and_then(|s| s.get("botToken"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-        .or_else(|| std::env::var("SLACK_BOT_TOKEN").ok())?;
+        .or_else(|| config::read_config_env("SLACK_BOT_TOKEN"))?;
 
     let base_url = slack_cfg
         .and_then(|s| s.get("baseUrl"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-        .or_else(|| std::env::var("SLACK_BASE_URL").ok())
+        .or_else(|| config::read_config_env("SLACK_BASE_URL"))
         .unwrap_or_else(|| "https://slack.com/api".to_string());
 
     Some(SlackConfig {

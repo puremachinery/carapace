@@ -9,13 +9,16 @@ pub mod schema;
 pub mod secrets;
 pub mod watcher;
 
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Mutex, MutexGuard, RwLock};
 use regex::Regex;
 use serde_json::Value;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::OsString;
 use std::fs;
+use std::mem::ManuallyDrop;
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
@@ -99,6 +102,12 @@ pub enum ConfigError {
 
     #[error("Validation error at {path}: {message}")]
     ValidationError { path: String, message: String },
+
+    #[error("config env state is already locked on this thread")]
+    ReentrantConfigEnvAccess,
+
+    #[error("runtime env substitution attempted while config env state is locked")]
+    ReentrantConfigEnvSubstitution,
 }
 
 /// Cached configuration entry
@@ -124,26 +133,129 @@ pub(crate) struct InjectedConfigEnvState {
 static CONFIG_ENV_STATE: LazyLock<Mutex<InjectedConfigEnvState>> =
     LazyLock::new(|| Mutex::new(InjectedConfigEnvState::default()));
 
+thread_local! {
+    static CONFIG_ENV_STATE_LOCK_DEPTH: Cell<usize> = const { Cell::new(0) };
+    static CONFIG_ENV_STATE_ACTIVE_SNAPSHOT: RefCell<Option<HashMap<String, String>>> =
+        const { RefCell::new(None) };
+}
+
+struct ConfigEnvStateGuard {
+    inner: ManuallyDrop<MutexGuard<'static, InjectedConfigEnvState>>,
+}
+
+impl ConfigEnvStateGuard {
+    fn new(inner: MutexGuard<'static, InjectedConfigEnvState>) -> Self {
+        refresh_config_env_state_active_snapshot(&inner);
+        CONFIG_ENV_STATE_LOCK_DEPTH.with(|depth| {
+            depth.set(depth.get() + 1);
+        });
+        Self {
+            inner: ManuallyDrop::new(inner),
+        }
+    }
+}
+
+impl Deref for ConfigEnvStateGuard {
+    type Target = InjectedConfigEnvState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl DerefMut for ConfigEnvStateGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+impl Drop for ConfigEnvStateGuard {
+    fn drop(&mut self) {
+        // Release the mutex explicitly before marking the thread-local depth as
+        // clear, so the logical guard state never under-reports the physical
+        // mutex hold.
+        unsafe {
+            ManuallyDrop::drop(&mut self.inner);
+        }
+        CONFIG_ENV_STATE_ACTIVE_SNAPSHOT.with(|snapshot| {
+            *snapshot.borrow_mut() = None;
+        });
+        CONFIG_ENV_STATE_LOCK_DEPTH.with(|depth| {
+            depth.set(depth.get().saturating_sub(1));
+        });
+    }
+}
+
+fn config_env_state_locked_on_current_thread() -> bool {
+    CONFIG_ENV_STATE_LOCK_DEPTH.with(|depth| depth.get() > 0)
+}
+
+fn try_lock_config_env_state() -> Result<ConfigEnvStateGuard, ConfigError> {
+    if config_env_state_locked_on_current_thread() {
+        return Err(ConfigError::ReentrantConfigEnvAccess);
+    }
+    Ok(ConfigEnvStateGuard::new(CONFIG_ENV_STATE.lock()))
+}
+
+fn refresh_config_env_state_active_snapshot(state: &InjectedConfigEnvState) {
+    CONFIG_ENV_STATE_ACTIVE_SNAPSHOT.with(|snapshot| {
+        *snapshot.borrow_mut() = Some(state.active_values.clone());
+    });
+}
+
+fn read_reentrant_config_env_os(key: &str) -> Option<OsString> {
+    let config_value = CONFIG_ENV_STATE_ACTIVE_SNAPSHOT.with(|snapshot| {
+        snapshot
+            .borrow()
+            .as_ref()
+            .and_then(|active_values| active_values.get(key).map(OsString::from))
+    });
+    config_value.or_else(|| read_process_env_os(key))
+}
+
+fn read_reentrant_config_env_os_many<'a, I>(keys: I) -> Vec<(OsString, OsString)>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    CONFIG_ENV_STATE_ACTIVE_SNAPSHOT.with(|snapshot| {
+        let snapshot = snapshot.borrow();
+        let active_values = snapshot.as_ref();
+        keys.into_iter()
+            .filter_map(|key| {
+                let value = active_values
+                    .and_then(|values| values.get(key))
+                    .map(OsString::from)
+                    .or_else(|| read_process_env_os(key))?;
+                Some((OsString::from(key), value))
+            })
+            .collect()
+    })
+}
+
+fn lock_config_env_state_for_internal_state() -> ConfigEnvStateGuard {
+    try_lock_config_env_state().expect("CONFIG_ENV_STATE is not reentrant")
+}
+
 /// Snapshot of the currently-injected config env state, opaque to callers.
 pub(crate) fn snapshot_env_state() -> InjectedConfigEnvState {
-    CONFIG_ENV_STATE.lock().clone()
+    lock_config_env_state_for_internal_state().clone()
 }
 
 /// Restore process env to the state captured by [`snapshot_env_state`].
 pub(crate) fn restore_env_state(snapshot: &InjectedConfigEnvState) {
-    let mut current = CONFIG_ENV_STATE.lock();
+    let mut current = lock_config_env_state_for_internal_state();
     restore_config_env_state(snapshot, &mut current);
 }
 
 #[cfg(test)]
 pub(crate) fn apply_config_env_for_test(vars: HashMap<String, String>) {
-    let mut state = CONFIG_ENV_STATE.lock();
+    let mut state = lock_config_env_state_for_internal_state();
     apply_config_env_vars(&vars, &mut state);
 }
 
 #[cfg(test)]
 fn reset_config_env_state() {
-    let mut state = CONFIG_ENV_STATE.lock();
+    let mut state = lock_config_env_state_for_internal_state();
     let empty = InjectedConfigEnvState::default();
     restore_config_env_state(&empty, &mut state);
 }
@@ -171,15 +283,106 @@ impl Drop for ScopedEnvStateForTest {
     }
 }
 
+/// Read an environment variable that may be supplied by `config.env`.
+///
+/// Config reloads mutate process env under `CONFIG_ENV_STATE`; runtime reads of
+/// config-injectable keys must use the same lock so they cannot race
+/// `set_var`/`remove_var`.
+pub fn read_config_env(key: &str) -> Option<String> {
+    os_string_to_string(key, read_config_env_os(key)?, "config env")
+}
+
+/// Read an OS environment variable that may be supplied by `config.env`.
+///
+/// Use this for runtime forwarding of environment values where non-Unicode
+/// values must be preserved.
+pub(crate) fn read_config_env_os(key: &str) -> Option<OsString> {
+    let state = match try_lock_config_env_state() {
+        Ok(state) => state,
+        Err(ConfigError::ReentrantConfigEnvAccess) => {
+            tracing::warn!(
+                key,
+                "reentrant config env read using active snapshot fallback"
+            );
+            return read_reentrant_config_env_os(key);
+        }
+        Err(err) => unreachable!("unexpected config env lock error: {err}"),
+    };
+    state
+        .active_values
+        .get(key)
+        .map(OsString::from)
+        .or_else(|| read_process_env_os(key))
+}
+
+/// Read several config-injectable environment variables as one consistent snapshot.
+pub(crate) fn read_config_env_os_many<'a, I>(keys: I) -> Vec<(OsString, OsString)>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let state = match try_lock_config_env_state() {
+        Ok(state) => state,
+        Err(ConfigError::ReentrantConfigEnvAccess) => {
+            tracing::warn!("reentrant batched config env read using active snapshot fallback");
+            return read_reentrant_config_env_os_many(keys);
+        }
+        Err(err) => unreachable!("unexpected config env lock error: {err}"),
+    };
+    keys.into_iter()
+        .filter_map(|key| {
+            let value = state
+                .active_values
+                .get(key)
+                .map(OsString::from)
+                .or_else(|| read_process_env_os(key))?;
+            Some((OsString::from(key), value))
+        })
+        .collect()
+}
+
+/// Read a process-only environment variable.
+///
+/// Use this for loader-control, build metadata, OS/system values, and import
+/// probes that must not be shadowed by `config.env`.
+pub fn read_process_env(key: &str) -> Option<String> {
+    os_string_to_string(key, read_process_env_os(key)?, "process env")
+}
+
+/// Read a process-only OS environment variable.
+///
+/// This intentionally bypasses `CONFIG_ENV_STATE`; do not use it for values
+/// that users are allowed to inject through `config.env`.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "central raw process-env wrapper; callers must choose this explicitly"
+)]
+pub fn read_process_env_os(key: &str) -> Option<OsString> {
+    env::var_os(key)
+}
+
+fn os_string_to_string(key: &str, value: OsString, source: &str) -> Option<String> {
+    match value.into_string() {
+        Ok(value) => Some(value),
+        Err(_) => {
+            tracing::warn!(
+                env_var = %key,
+                source = %source,
+                "environment variable value is not valid UTF-8; treating it as unset"
+            );
+            None
+        }
+    }
+}
+
 /// Get the config file path.
 /// Priority: CARAPACE_CONFIG_PATH > CARAPACE_STATE_DIR/carapace.json5 > ~/.config/carapace/carapace.json5
 /// Falls back to .json extension if the .json5 file doesn't exist.
 pub fn get_config_path() -> PathBuf {
-    if let Ok(path) = env::var("CARAPACE_CONFIG_PATH") {
+    if let Some(path) = read_process_env("CARAPACE_CONFIG_PATH") {
         return PathBuf::from(path);
     }
 
-    if let Ok(state_dir) = env::var("CARAPACE_STATE_DIR") {
+    if let Some(state_dir) = read_process_env("CARAPACE_STATE_DIR") {
         let dir = PathBuf::from(state_dir);
         let json5 = dir.join("carapace.json5");
         if json5.exists() {
@@ -201,12 +404,11 @@ pub fn get_config_path() -> PathBuf {
 /// Get the cache TTL duration
 fn get_cache_ttl() -> Option<Duration> {
     // Check if caching is disabled
-    if env::var("CARAPACE_DISABLE_CONFIG_CACHE").is_ok() {
+    if read_process_env("CARAPACE_DISABLE_CONFIG_CACHE").is_some() {
         return None;
     }
 
-    let ms = env::var("CARAPACE_CONFIG_CACHE_MS")
-        .ok()
+    let ms = read_process_env("CARAPACE_CONFIG_CACHE_MS")
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(DEFAULT_CACHE_TTL_MS);
 
@@ -214,7 +416,7 @@ fn get_cache_ttl() -> Option<Duration> {
 }
 
 pub(crate) fn config_password() -> Option<Zeroizing<Vec<u8>>> {
-    let password = env::var(CONFIG_PASSWORD_ENV).ok()?;
+    let password = read_process_env(CONFIG_PASSWORD_ENV)?;
     if password.is_empty() {
         return None;
     }
@@ -385,7 +587,7 @@ pub(crate) fn load_config_pair_uncached(path: &Path) -> Result<(Value, Value), C
 fn load_raw_config_uncached(path: &Path) -> Result<Value, ConfigError> {
     // Return empty object if file doesn't exist.
     if !path.exists() {
-        let mut env_state = CONFIG_ENV_STATE.lock();
+        let mut env_state = try_lock_config_env_state()?;
         let empty_env_state = InjectedConfigEnvState::default();
         restore_config_env_state(&empty_env_state, &mut env_state);
         return Ok(Value::Object(serde_json::Map::new()));
@@ -410,7 +612,7 @@ fn load_raw_config_uncached(path: &Path) -> Result<Value, ConfigError> {
     // This intentionally mutates process env because later config/runtime
     // lookups rely on these values, but the mutation is serialized and rolled
     // back if substitution fails.
-    let mut env_state = CONFIG_ENV_STATE.lock();
+    let mut env_state = try_lock_config_env_state()?;
     let resolved_env = resolve_config_env_vars(&value, &env_state)?;
     let previous_env_state = env_state.clone();
     apply_config_env_vars(&resolved_env, &mut env_state);
@@ -597,9 +799,7 @@ fn resolve_external_env_var(
         });
     }
 
-    env::var(key).map_err(|_| ConfigError::MissingEnvVar {
-        var: key.to_string(),
-    })
+    resolve_process_env_var(key)
 }
 
 fn apply_config_env_vars(next: &HashMap<String, String>, state: &mut InjectedConfigEnvState) {
@@ -610,11 +810,7 @@ fn apply_config_env_vars(next: &HashMap<String, String>, state: &mut InjectedCon
             continue;
         }
 
-        match state.previous_values.remove(&key).flatten() {
-            Some(previous) => env::set_var(&key, previous),
-            None => env::remove_var(&key),
-        }
-        state.active_values.remove(&key);
+        restore_previous_config_env_value(&key, state);
     }
 
     for (key, value) in next {
@@ -625,12 +821,10 @@ fn apply_config_env_vars(next: &HashMap<String, String>, state: &mut InjectedCon
         {
             continue;
         }
-        if !state.active_values.contains_key(key) {
-            state.previous_values.insert(key.clone(), env::var_os(key));
-        }
-        env::set_var(key, value);
-        state.active_values.insert(key.clone(), value.clone());
+        set_config_env_value(key, value, state);
     }
+
+    refresh_config_env_state_active_snapshot(state);
 }
 
 fn restore_config_env_state(
@@ -642,17 +836,64 @@ fn restore_config_env_state(
             continue;
         }
 
-        match current.previous_values.remove(&key).flatten() {
-            Some(value) => env::set_var(&key, value),
-            None => env::remove_var(&key),
-        }
+        restore_previous_config_env_value(&key, current);
     }
 
     for (key, value) in &previous.active_values {
-        env::set_var(key, value);
+        set_process_env_value(key, value);
     }
 
     *current = previous.clone();
+    refresh_config_env_state_active_snapshot(current);
+}
+
+fn set_config_env_value(key: &str, value: &str, state: &mut InjectedConfigEnvState) {
+    let previous = (!state.active_values.contains_key(key)).then(|| read_process_env_os(key));
+
+    // Config env entries are validated by collect_config_env_entry before
+    // reaching this writer, so std::env::set_var should not reject these keys
+    // or values. Mutate process env first so the same-thread reentrant fallback
+    // never observes active_values ahead of process env.
+    set_process_env_value(key, value);
+
+    if let Some(previous) = previous {
+        state.previous_values.insert(key.to_string(), previous);
+    }
+    state
+        .active_values
+        .insert(key.to_string(), value.to_string());
+}
+
+fn restore_previous_config_env_value(key: &str, state: &mut InjectedConfigEnvState) {
+    match state.previous_values.get(key).cloned().flatten() {
+        Some(value) => set_process_env_value(key, value),
+        None => remove_process_env_value(key),
+    }
+    state.previous_values.remove(key);
+    state.active_values.remove(key);
+}
+
+#[allow(
+    clippy::disallowed_methods,
+    reason = "central serialized config-env process writer; callers must hold CONFIG_ENV_STATE"
+)]
+fn set_process_env_value<K, V>(key: K, value: V)
+where
+    K: AsRef<std::ffi::OsStr>,
+    V: AsRef<std::ffi::OsStr>,
+{
+    env::set_var(key, value);
+}
+
+#[allow(
+    clippy::disallowed_methods,
+    reason = "central serialized config-env process remover; callers must hold CONFIG_ENV_STATE"
+)]
+fn remove_process_env_value<K>(key: K)
+where
+    K: AsRef<std::ffi::OsStr>,
+{
+    env::remove_var(key);
 }
 
 /// Parse JSON5 content
@@ -814,7 +1055,9 @@ fn deep_merge(base: &mut Value, overlay: Value) {
 fn substitute_env_vars(value: &mut Value) -> Result<(), ConfigError> {
     match value {
         Value::String(s) => {
-            *s = substitute_env_in_string(s)?;
+            // The config loader calls this while holding CONFIG_ENV_STATE after
+            // installing config env values, so avoid re-locking here.
+            *s = substitute_env_in_string_with(s, resolve_process_env_var)?;
         }
         Value::Object(obj) => {
             for (_, v) in obj.iter_mut() {
@@ -831,12 +1074,27 @@ fn substitute_env_vars(value: &mut Value) -> Result<(), ConfigError> {
     Ok(())
 }
 
-/// Substitute environment variables in a single string
+/// Substitute environment variables in a single runtime string.
+///
+/// This resolves through [`read_config_env`] and therefore acquires
+/// `CONFIG_ENV_STATE`. Loader paths that already hold that lock must use
+/// `substitute_env_in_string_with(..., resolve_process_env_var)` instead.
 pub(crate) fn substitute_env_in_string(s: &str) -> Result<String, ConfigError> {
-    substitute_env_in_string_with(s, |var_name| {
-        env::var(var_name).map_err(|_| ConfigError::MissingEnvVar {
-            var: var_name.to_string(),
-        })
+    if config_env_state_locked_on_current_thread() {
+        return Err(ConfigError::ReentrantConfigEnvSubstitution);
+    }
+    substitute_env_in_string_with(s, resolve_runtime_env_var)
+}
+
+fn resolve_process_env_var(var_name: &str) -> Result<String, ConfigError> {
+    read_process_env(var_name).ok_or_else(|| ConfigError::MissingEnvVar {
+        var: var_name.to_string(),
+    })
+}
+
+fn resolve_runtime_env_var(var_name: &str) -> Result<String, ConfigError> {
+    read_config_env(var_name).ok_or_else(|| ConfigError::MissingEnvVar {
+        var: var_name.to_string(),
     })
 }
 
@@ -1101,6 +1359,67 @@ mod tests {
 
         let result = substitute_env_in_string("Bearer ${TEST_API_KEY}").unwrap();
         assert_eq!(result, "Bearer sk-secret");
+    }
+
+    #[test]
+    fn test_env_var_substitution_reads_active_config_env_state() {
+        let mut env_guard = ScopedEnv::new();
+        let _env_state_guard = ScopedEnvStateForTest::new();
+        env_guard.set("TEST_CONFIG_SUBSTITUTE_ENV", "external-value");
+        apply_config_env_for_test(HashMap::from([(
+            "TEST_CONFIG_SUBSTITUTE_ENV".to_string(),
+            "config-value".to_string(),
+        )]));
+
+        let result = substitute_env_in_string("${TEST_CONFIG_SUBSTITUTE_ENV}").unwrap();
+
+        assert_eq!(result, "config-value");
+        env_guard.unset("TEST_CONFIG_SUBSTITUTE_ENV");
+    }
+
+    #[test]
+    fn test_runtime_env_substitution_rejects_reentrant_config_env_lock() {
+        let _env_state_guard = ScopedEnvStateForTest::new();
+        let _state = lock_config_env_state_for_internal_state();
+
+        let result = substitute_env_in_string("${TEST_CONFIG_SUBSTITUTE_ENV}");
+
+        assert!(matches!(
+            result,
+            Err(ConfigError::ReentrantConfigEnvSubstitution)
+        ));
+    }
+
+    #[test]
+    fn test_config_env_readers_use_active_snapshot_when_reentrant() {
+        let mut env_guard = ScopedEnv::new();
+        let _env_state_guard = ScopedEnvStateForTest::new();
+        env_guard.unset("TEST_REENTRANT_CONFIG_ENV_READ");
+        apply_config_env_for_test(HashMap::from([(
+            "TEST_REENTRANT_CONFIG_ENV_READ".to_string(),
+            "config-value".to_string(),
+        )]));
+        // Prove the reentrant path is backed by the active config-env snapshot,
+        // not by the raw process environment side effect.
+        env_guard.unset("TEST_REENTRANT_CONFIG_ENV_READ");
+
+        let _state = lock_config_env_state_for_internal_state();
+
+        assert_eq!(
+            read_config_env("TEST_REENTRANT_CONFIG_ENV_READ").as_deref(),
+            Some("config-value")
+        );
+        assert_eq!(
+            read_config_env_os("TEST_REENTRANT_CONFIG_ENV_READ").as_deref(),
+            Some(std::ffi::OsStr::new("config-value"))
+        );
+        assert_eq!(
+            read_config_env_os_many(["TEST_REENTRANT_CONFIG_ENV_READ"]),
+            vec![(
+                OsString::from("TEST_REENTRANT_CONFIG_ENV_READ"),
+                OsString::from("config-value")
+            )]
+        );
     }
 
     #[test]
@@ -1563,38 +1882,36 @@ mod tests {
     fn test_snapshot_then_restore_env_state_reverts_config_injected_var() {
         // Test-unique key so we don't fight other env-touching tests.
         const TEST_KEY: &str = "CARAPACE_TEST_ENV_RESTORE_VAR";
-        reset_config_env_state_for_test();
-        std::env::remove_var(TEST_KEY);
+        let _env_state_guard = ScopedEnvStateForTest::new();
+        let mut env_guard = ScopedEnv::new();
+        env_guard.unset(TEST_KEY);
 
         {
-            let mut state = CONFIG_ENV_STATE.lock();
+            let mut state = lock_config_env_state_for_internal_state();
             apply_config_env_vars(
                 &HashMap::from([(TEST_KEY.to_string(), "initial".to_string())]),
                 &mut state,
             );
         }
-        assert_eq!(std::env::var(TEST_KEY).ok(), Some("initial".to_string()));
+        assert_eq!(read_process_env(TEST_KEY), Some("initial".to_string()));
 
         let snapshot = snapshot_env_state();
 
         {
-            let mut state = CONFIG_ENV_STATE.lock();
+            let mut state = lock_config_env_state_for_internal_state();
             apply_config_env_vars(
                 &HashMap::from([(TEST_KEY.to_string(), "bad".to_string())]),
                 &mut state,
             );
         }
-        assert_eq!(std::env::var(TEST_KEY).ok(), Some("bad".to_string()));
+        assert_eq!(read_process_env(TEST_KEY), Some("bad".to_string()));
 
         restore_env_state(&snapshot);
         assert_eq!(
-            std::env::var(TEST_KEY).ok(),
+            read_process_env(TEST_KEY),
             Some("initial".to_string()),
             "restore_env_state must put process env back to the snapshot value"
         );
-
-        reset_config_env_state_for_test();
-        std::env::remove_var(TEST_KEY);
     }
 
     #[test]
@@ -1772,11 +2089,11 @@ mod tests {
         assert_eq!(config["gateway"]["auth"]["token"], "sometoken");
         assert_eq!(config["vertex"]["projectId"], "someproject");
         assert_eq!(
-            env::var("TEST_INCLUDED_GATEWAY_TOKEN").unwrap(),
+            read_process_env("TEST_INCLUDED_GATEWAY_TOKEN").unwrap(),
             "sometoken"
         );
         assert_eq!(
-            env::var("TEST_INCLUDED_VERTEX_PROJECT_ID").unwrap(),
+            read_process_env("TEST_INCLUDED_VERTEX_PROJECT_ID").unwrap(),
             "someproject"
         );
 
@@ -1822,7 +2139,10 @@ mod tests {
         let config = load_config_uncached(&main_path).unwrap();
 
         assert_eq!(config["gateway"]["auth"]["token"], "nested-token");
-        assert_eq!(env::var("TEST_NESTED_ENV_INCLUDE").unwrap(), "nested-token");
+        assert_eq!(
+            read_process_env("TEST_NESTED_ENV_INCLUDE").unwrap(),
+            "nested-token"
+        );
 
         env_guard.unset("TEST_NESTED_ENV_INCLUDE");
         reset_config_env_state_for_test();
@@ -1916,14 +2236,102 @@ mod tests {
         assert_eq!(config["openai"]["apiKey"], "sk-test-from-env-block");
         assert_eq!(config["meta"]["lastVersion"], "enabled");
         assert_eq!(
-            env::var("TEST_API_KEY_FROM_ENV_BLOCK").unwrap(),
+            read_process_env("TEST_API_KEY_FROM_ENV_BLOCK").unwrap(),
             "sk-test-from-env-block"
         );
-        assert_eq!(env::var("TEST_OTHER_FLAG").unwrap(), "enabled");
+        assert_eq!(read_process_env("TEST_OTHER_FLAG").unwrap(), "enabled");
 
         env_guard.unset("TEST_API_KEY_FROM_ENV_BLOCK");
         env_guard.unset("TEST_OTHER_FLAG");
         reset_config_env_state_for_test();
+    }
+
+    #[test]
+    fn test_read_config_env_serializes_active_and_external_values() {
+        let mut env_guard = ScopedEnv::new();
+        let _env_state_guard = ScopedEnvStateForTest::new();
+        env_guard.set("TEST_SERIALIZED_CONFIG_ENV", "external-value");
+
+        assert_eq!(
+            read_config_env("TEST_SERIALIZED_CONFIG_ENV").as_deref(),
+            Some("external-value")
+        );
+
+        let dir = TempDir::new().unwrap();
+        let main_path = create_temp_config(
+            &dir,
+            "config.json5",
+            r#"{
+                "env": {
+                    "vars": {
+                        "TEST_SERIALIZED_CONFIG_ENV": "config-value"
+                    }
+                }
+            }"#,
+        );
+
+        load_config_uncached(&main_path).unwrap();
+        assert_eq!(
+            read_config_env("TEST_SERIALIZED_CONFIG_ENV").as_deref(),
+            Some("config-value")
+        );
+
+        reset_config_env_state_for_test();
+        assert_eq!(
+            read_config_env("TEST_SERIALIZED_CONFIG_ENV").as_deref(),
+            Some("external-value")
+        );
+
+        env_guard.unset("TEST_SERIALIZED_CONFIG_ENV");
+    }
+
+    #[test]
+    fn test_read_config_env_os_many_returns_consistent_snapshot() {
+        let mut env_guard = ScopedEnv::new();
+        let _env_state_guard = ScopedEnvStateForTest::new();
+        env_guard.set("TEST_CONFIG_ENV_MANY_EXTERNAL", "external-value");
+        env_guard.set("TEST_CONFIG_ENV_MANY_SHADOWED", "external-shadow");
+        env_guard.unset("TEST_CONFIG_ENV_MANY_MISSING");
+        apply_config_env_for_test(HashMap::from([(
+            "TEST_CONFIG_ENV_MANY_SHADOWED".to_string(),
+            "config-shadow".to_string(),
+        )]));
+
+        let values = read_config_env_os_many([
+            "TEST_CONFIG_ENV_MANY_SHADOWED",
+            "TEST_CONFIG_ENV_MANY_EXTERNAL",
+            "TEST_CONFIG_ENV_MANY_MISSING",
+        ]);
+
+        assert_eq!(
+            values,
+            vec![
+                (
+                    OsString::from("TEST_CONFIG_ENV_MANY_SHADOWED"),
+                    OsString::from("config-shadow"),
+                ),
+                (
+                    OsString::from("TEST_CONFIG_ENV_MANY_EXTERNAL"),
+                    OsString::from("external-value"),
+                ),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_read_config_env_rejects_non_utf8_process_value() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut env_guard = ScopedEnv::new();
+        let _env_state_guard = ScopedEnvStateForTest::new();
+        env_guard.set(
+            "TEST_NON_UTF8_CONFIG_ENV",
+            OsString::from_vec(vec![b'o', 0xff]),
+        );
+
+        assert_eq!(read_config_env("TEST_NON_UTF8_CONFIG_ENV"), None);
+        assert!(read_config_env_os("TEST_NON_UTF8_CONFIG_ENV").is_some());
     }
 
     #[test]
@@ -1956,7 +2364,7 @@ mod tests {
 
         assert_eq!(config["gateway"]["auth"]["token"], "base-token-suffix");
         assert_eq!(
-            env::var("TEST_COMPOSED_TOKEN").unwrap(),
+            read_process_env("TEST_COMPOSED_TOKEN").unwrap(),
             "base-token-suffix"
         );
 
@@ -1998,11 +2406,11 @@ mod tests {
 
         let first = load_config_uncached(&first_path).unwrap();
         assert_eq!(first["meta"]["lastVersion"], "from-config");
-        assert_eq!(env::var("TEST_RELOAD_ENV").unwrap(), "from-config");
+        assert_eq!(read_process_env("TEST_RELOAD_ENV").unwrap(), "from-config");
 
         let second = load_config_uncached(&second_path).unwrap();
         assert_eq!(second["meta"]["lastVersion"], "preexisting");
-        assert_eq!(env::var("TEST_RELOAD_ENV").unwrap(), "preexisting");
+        assert_eq!(read_process_env("TEST_RELOAD_ENV").unwrap(), "preexisting");
 
         env_guard.unset("TEST_RELOAD_ENV");
         reset_config_env_state_for_test();
@@ -2037,7 +2445,7 @@ mod tests {
             Err(ConfigError::MissingEnvVar { var }) if var == "TEST_MISSING_AFTER_INJECTION"
         ));
         assert_eq!(
-            env::var("TEST_FAILED_SUBSTITUTION_ENV").unwrap(),
+            read_process_env("TEST_FAILED_SUBSTITUTION_ENV").unwrap(),
             "preexisting"
         );
 
@@ -2085,7 +2493,7 @@ mod tests {
         let first = load_config_uncached(&working_path).unwrap();
         assert_eq!(first["meta"]["lastVersion"], "from-first-load");
         assert_eq!(
-            env::var("TEST_RELOAD_ROLLBACK_ENV").unwrap(),
+            read_process_env("TEST_RELOAD_ROLLBACK_ENV").unwrap(),
             "from-first-load"
         );
 
@@ -2095,7 +2503,7 @@ mod tests {
             Err(ConfigError::MissingEnvVar { var }) if var == "TEST_RELOAD_ROLLBACK_MISSING"
         ));
         assert_eq!(
-            env::var("TEST_RELOAD_ROLLBACK_ENV").unwrap(),
+            read_process_env("TEST_RELOAD_ROLLBACK_ENV").unwrap(),
             "from-first-load"
         );
 
@@ -2139,7 +2547,10 @@ mod tests {
 
         let first = load_config_uncached(&first_path).unwrap();
         assert_eq!(first["meta"]["lastVersion"], "first-token");
-        assert_eq!(env::var("TEST_STALE_CONFIG_ENV").unwrap(), "first-token");
+        assert_eq!(
+            read_process_env("TEST_STALE_CONFIG_ENV").unwrap(),
+            "first-token"
+        );
 
         let second = load_config_uncached(&second_path);
         assert!(matches!(
@@ -2200,12 +2611,15 @@ mod tests {
 
         let working = load_config_uncached(&working_path).unwrap();
         assert_eq!(working["meta"]["lastVersion"], "from-config");
-        assert_eq!(env::var("TEST_MISSING_CONFIG_ENV").unwrap(), "from-config");
+        assert_eq!(
+            read_process_env("TEST_MISSING_CONFIG_ENV").unwrap(),
+            "from-config"
+        );
 
         let missing_path = dir.path().join("deleted.json5");
         let missing = load_config_uncached(&missing_path).unwrap();
         assert!(missing.is_object());
-        assert!(env::var("TEST_MISSING_CONFIG_ENV").is_err());
+        assert!(read_process_env("TEST_MISSING_CONFIG_ENV").is_none());
 
         reset_config_env_state_for_test();
     }

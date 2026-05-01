@@ -358,10 +358,10 @@ mod hostname {
         }
 
         // Fallback to environment variables
-        if let Some(name) = std::env::var_os("HOSTNAME") {
+        if let Some(name) = crate::config::read_process_env_os("HOSTNAME") {
             return Ok(name);
         }
-        if let Some(name) = std::env::var_os("COMPUTERNAME") {
+        if let Some(name) = crate::config::read_process_env_os("COMPUTERNAME") {
             return Ok(name);
         }
 

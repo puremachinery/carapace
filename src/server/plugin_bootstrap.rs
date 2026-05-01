@@ -323,8 +323,9 @@ fn resolve_managed_plugin_path(
 
 fn initialize_plugin_engine() -> Result<Arc<PluginEngine>, LoaderError> {
     #[cfg(test)]
-    if let Some(message) = std::env::var_os(TEST_FORCE_PLUGIN_ENGINE_INIT_FAILURE_ENV)
-        .filter(|value| !value.is_empty())
+    if let Some(message) =
+        crate::config::read_process_env_os(TEST_FORCE_PLUGIN_ENGINE_INIT_FAILURE_ENV)
+            .filter(|value| !value.is_empty())
     {
         return Err(LoaderError::EngineError(
             message.to_string_lossy().into_owned(),
@@ -340,8 +341,9 @@ fn initialize_plugin_loader(
     plugin_engine: Arc<PluginEngine>,
 ) -> Result<Arc<PluginLoader>, LoaderError> {
     #[cfg(test)]
-    if let Some(message) = std::env::var_os(TEST_FORCE_PLUGIN_LOADER_INIT_FAILURE_ENV)
-        .filter(|value| !value.is_empty())
+    if let Some(message) =
+        crate::config::read_process_env_os(TEST_FORCE_PLUGIN_LOADER_INIT_FAILURE_ENV)
+            .filter(|value| !value.is_empty())
     {
         return Err(LoaderError::EngineError(
             message.to_string_lossy().into_owned(),
